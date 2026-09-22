@@ -274,6 +274,9 @@ class NormalizingAdapter(TensorAdapter):
     def capability_token(self, value: Optional[str]) -> None:
         self._inner.capability_token = value
 
+    def tensor_capability_token(self, array_id):
+        return self._inner.tensor_capability_token(array_id)
+
     # --- the permutation ------------------------------------------------------
 
     @property

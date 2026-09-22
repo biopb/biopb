@@ -26,13 +26,21 @@ CAPABILITY = "capability-token"
 
 
 class _Adapter:
-    """Minimal source double: an id and whether it carries a grant."""
+    """Minimal source double: an id, and what grants it carries.
+
+    *tensor_tokens* is the per-tensor half, keyed by full ``array_id`` -- what
+    ``SourceAdapter.tensor_capability_token`` answers off its attachment index.
+    """
 
     source_type = "zarr"
 
-    def __init__(self, source_id, capability_token=None):
+    def __init__(self, source_id, capability_token=None, tensor_tokens=None):
         self.source_id = source_id
         self.capability_token = capability_token
+        self._tensor_tokens = dict(tensor_tokens or {})
+
+    def tensor_capability_token(self, array_id):
+        return self._tensor_tokens.get(array_id)
 
 
 class _Middleware:
@@ -50,10 +58,23 @@ class _Context:
         return self._mw if key == "auth" else None
 
 
+#: A grant on one *tensor* of an otherwise ungated source. The uploaded-
+#: intermediate shape: many results share one source and each has its own
+#: producer, so the grant cannot sit on the source they share.
+TENSOR_CAPABILITY = "tensor-capability-token"
+
+
 def _server(token):
     server = TensorFlightServer("grpc://localhost:0", token=token)
     server.sources.register("open", _Adapter("open"))
     server.sources.register("gated", _Adapter("gated", capability_token=CAPABILITY))
+    server.sources.register(
+        "shared",
+        _Adapter(
+            "shared",
+            tensor_tokens={"shared/@fields/mine": TENSOR_CAPABILITY},
+        ),
+    )
     return server
 
 
@@ -158,6 +179,57 @@ class TestLocalMode:
 
     def test_an_ungated_source_is_open(self, local):
         local._authorize_read(_Context(None), "open", READ_PIXELS)
+
+
+class TestATensorCarriesItsOwnGrant:
+    """The half a shared source needs: a grant that covers one tensor of it.
+
+    An uploaded intermediate has a producer, and the source it lands on is
+    shared with every other upload. A grant on the source would open all of
+    them, so the tensor carries its own.
+    """
+
+    def test_it_opens_the_tensor_it_names(self, guarded):
+        guarded._authorize_read(
+            _Context(TENSOR_CAPABILITY), "shared/@fields/mine", READ_PIXELS
+        )
+
+    def test_it_does_not_open_a_sibling(self, guarded):
+        """The whole point. Both tensors live on one source, so a grant that
+        leaked across them would be a source-level grant wearing a tensor's
+        name."""
+        with pytest.raises(flight.FlightUnauthenticatedError):
+            guarded._authorize_read(
+                _Context(TENSOR_CAPABILITY), "shared/@fields/theirs", READ_PIXELS
+            )
+
+    def test_it_does_not_open_the_source_itself(self, guarded):
+        """A bare source_id names the source's default tensor, which is not the
+        granted one."""
+        with pytest.raises(flight.FlightUnauthenticatedError):
+            guarded._authorize_read(_Context(TENSOR_CAPABILITY), "shared", READ_PIXELS)
+
+    def test_the_server_token_still_opens_it(self, guarded):
+        """A capability adds access; it never takes the operator's away."""
+        guarded._authorize_read(
+            _Context(SERVER_TOKEN), "shared/@fields/mine", READ_PIXELS
+        )
+
+    def test_an_ungated_sibling_follows_the_ordinary_rule(self, guarded):
+        """One gated tensor does not gate the source: its siblings are as open
+        as the source is, which is what keeps a shared scratch source usable."""
+        guarded._authorize_read(
+            _Context(SERVER_TOKEN), "shared/@fields/theirs", READ_PIXELS
+        )
+        assert (
+            guarded._grants(SERVER_TOKEN, READ_PIXELS, "shared/@fields/theirs") is None
+        )
+
+    def test_a_source_grant_still_covers_every_tensor(self, guarded):
+        """The embedded result cache's shape, unchanged: its source *is* one
+        result, so the grant sits on the source and covers what is in it."""
+        guarded._authorize_read(_Context(CAPABILITY), "gated/0", READ_PIXELS)
+        assert guarded._grants(CAPABILITY, READ_PIXELS, "gated/0") is True
 
 
 class TestGrantsSeam:

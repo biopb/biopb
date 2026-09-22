@@ -375,16 +375,15 @@ _UPLOAD_TARGETS = {
 }
 
 
-def _roi_source_id(array_id: str) -> str:
-    """The source an annotation's tensor belongs to, for authorization.
+def _require_array_id(array_id: str) -> None:
+    """Refuse an annotation request that names no tensor.
 
-    Same split-on-the-first-'/' rule the ticket path uses: array_id is
-    authoritative, source_id is the prefix before the first '/'.
+    The authorization itself takes the whole ``array_id``
+    (``TensorFlightServer._grants``); this is only the emptiness check that
+    used to ride along with splitting it.
     """
     if not array_id:
         raise ValueError("array_id is required")
-    source_id, _ = split_array_id(array_id)
-    return source_id
 
 
 class TensorFlightServer(flight.FlightServerBase):
@@ -743,21 +742,31 @@ class TensorFlightServer(flight.FlightServerBase):
         )
 
     def _grants(
-        self, provided: Optional[str], action: str, source_id: str
+        self, provided: Optional[str], action: str, array_id: str
     ) -> Optional[bool]:
-        """Does *provided* carry a narrow grant covering (*action*, *source_id*)?
+        """Does *provided* carry a narrow grant covering (*action*, *array_id*)?
 
-        ``None`` means the source carries no grant at all, which is not a
-        refusal -- it is "this object has opted into nothing, so the ordinary
-        rule applies". ``False`` is a real refusal.
+        ``None`` means nothing on the way to this tensor carries a grant, which
+        is not a refusal -- it is "this object has opted into nothing, so the
+        ordinary rule applies". ``False`` is a real refusal.
 
-        Today a grant is a token on the adapter covering both reads of its own
-        source, so the body is an equality test. A grant table or a signed
-        token (biopb/biopb#1048) replaces this body and nothing else: call
-        sites ask here rather than comparing tokens themselves.
+        **Two places can carry one, and the source is asked first.** A grant on
+        the source covers every tensor in it, which is what the embedded result
+        cache wants: its source *is* one result. A grant on an attached tensor
+        covers that tensor alone, which is what an uploaded intermediate wants:
+        many of them share one source, and each was produced by a different
+        caller. A source that granted itself away has already decided for its
+        tensors, so its answer wins rather than being intersected.
+
+        A grant table or a signed token (biopb/biopb#1048) replaces this body
+        and nothing else: call sites ask here rather than comparing tokens
+        themselves.
         """
+        source_id, _ = split_array_id(array_id)
         adapter = self.sources.get(source_id)
-        expected = adapter.capability_token if adapter is not None else None
+        if adapter is None:
+            return None
+        expected = adapter.capability_token or adapter.tensor_capability_token(array_id)
         if not expected:
             return None
         if provided is None or not hmac.compare_digest(provided, expected):
@@ -783,32 +792,36 @@ class TensorFlightServer(flight.FlightServerBase):
             raise flight.FlightUnauthenticatedError("Invalid or missing Bearer token")
 
     def _authorize_read(
-        self, context: flight.ServerCallContext, source_id: str, action: str
+        self, context: flight.ServerCallContext, array_id: str, action: str
     ) -> None:
-        """Full access, or a narrow grant covering this read of this source.
+        """Full access, or a narrow grant covering this read of this tensor.
 
         The server-wide token is checked first and grants everything, so a
         capability *adds* access rather than replacing it -- do not reorder
         these (biopb/biopb#1048).
 
-        A source carrying no grant is as open as the catalog is, so it falls
-        through to :meth:`_authorize`. A source carrying one stays gated even in
+        Takes the whole ``array_id``, not its source half: a grant may sit on
+        the source or on one attached tensor of it (:meth:`_grants`), and only
+        the full id can tell the gated tensor from its siblings.
+
+        A tensor nothing has granted is as open as the catalog is, so it falls
+        through to :meth:`_authorize`. One carrying a grant stays gated even in
         local mode: that is why the embedded result cache can mint them on a
         server with no server-wide token at all.
 
-        Knowing a source_id is not what this gates -- a private source may still
+        Knowing an array_id is not what this gates -- a private tensor may still
         be catalogued. Reading it is.
         """
         provided = self._presented_token(context)
         if self._has_full_access(provided):
             return
-        granted = self._grants(provided, action, source_id)
+        granted = self._grants(provided, action, array_id)
         if granted:
             return
         if granted is None:
             self._authorize(context)
             return
-        raise flight.FlightUnauthenticatedError("Invalid or missing source token")
+        raise flight.FlightUnauthenticatedError("Invalid or missing capability token")
 
     @staticmethod
     def _parse(
@@ -1725,7 +1738,7 @@ class TensorFlightServer(flight.FlightServerBase):
         if not source_id:
             raise flight.FlightServerError("tensor_read: array_id is required")
 
-        self._authorize_read(context, source_id, READ_PIXELS)
+        self._authorize_read(context, read_opt.array_id, READ_PIXELS)
         mask = read_mask(read_opt)
 
         # Reduce the request array_id to the within-source field -- or None =
@@ -1963,8 +1976,9 @@ class TensorFlightServer(flight.FlightServerBase):
         with self.activity.serving_request():
             logger.debug(f"do_get: chunk_id={tensor_ticket.chunk_id[:16]}...")
 
-            source_id = routing_array_id(tensor_ticket.chunk_id).split("/")[0]
-            self._authorize_read(context, source_id, READ_PIXELS)
+            self._authorize_read(
+                context, routing_array_id(tensor_ticket.chunk_id), READ_PIXELS
+            )
 
             adapter = self._get_adapter_for_chunk(tensor_ticket.chunk_id)
 
@@ -2005,9 +2019,8 @@ class TensorFlightServer(flight.FlightServerBase):
         ``sets`` (JSON) ride the stream's schema metadata."""
         db = self._require_annotations()
         try:
-            self._authorize_read(
-                context, _roi_source_id(req.array_id), READ_ANNOTATIONS
-            )
+            _require_array_id(req.array_id)
+            self._authorize_read(context, req.array_id, READ_ANNOTATIONS)
             rois, truncated = db.list_rois(req.array_id, req.set_name)
             sets = [
                 {"set_name": name, "count": count, "reserved": is_reserved_set(name)}

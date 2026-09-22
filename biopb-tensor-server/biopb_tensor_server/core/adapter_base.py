@@ -267,12 +267,13 @@ class SourceAdapter(ABC):
     _source_type: Optional[str] = None  # Source type identifier
     _tensor_name: Optional[str] = None  # Tensor name (for multi-tensor)
 
-    # Optional per-source capability token. When set, reading this source takes
-    # either it or the server-wide token (``TensorFlightServer._authorize_read``).
-    # None = no per-source gate (falls back to the server-wide rule). Only the
-    # result-cache adapter sets it;
-    # the base default keeps the ``capability_token`` property
-    # total for every other adapter.
+    # Optional capability token. When set, reading this adapter takes either it
+    # or the server-wide token (``TensorFlightServer._authorize_read``). None =
+    # no gate here (falls back to the server-wide rule). Set on a *source* it
+    # covers every tensor in it (the result-cache adapter, whose source is one
+    # result); set on an attached *tensor* it covers that tensor alone
+    # (:meth:`tensor_capability_token`). The base default keeps the
+    # ``capability_token`` property total for every other adapter.
     _capability_token: Optional[str] = None
 
     # Optional content-version token (biopb/biopb#178), folded into every
@@ -360,6 +361,23 @@ class SourceAdapter(ABC):
     @capability_token.setter
     def capability_token(self, value: Optional[str]) -> None:
         self._capability_token = value
+
+    def tensor_capability_token(self, array_id: Optional[str]) -> Optional[str]:
+        """The grant the tensor *array_id* carries of its own, or None.
+
+        Only an **attached** tensor can carry one. A format's own tensors are
+        the source's, and whatever the source granted already covers them;
+        what the upload path put here is separable, because it was produced by
+        one caller and may be readable by that caller alone.
+
+        Read off the routable index (:meth:`_attached_for`) rather than through
+        :meth:`resolve_tensor`, so the auth path asks no format to resolve
+        anything, and a tensor still uploading is gated exactly as a published
+        one is -- a grant that only started applying at READY would leave the
+        window in between open.
+        """
+        attached = self._attached_for(self._within_source_field(array_id))
+        return attached.capability_token if attached is not None else None
 
     @property
     def content_version(self) -> Optional[bytes]:
@@ -2026,6 +2044,7 @@ _SOURCE_SCOPED_API = frozenset(
         "source_url",
         "source_type",
         "capability_token",
+        "tensor_capability_token",
         "content_version",
         "check_chunk_version",
         "check_readable",
