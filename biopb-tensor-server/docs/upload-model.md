@@ -36,35 +36,28 @@ itself.
 A result that belongs to no source of the user's needs somewhere to go. A
 writable server serves one **scratch source**, at the fixed id `scratch`
 (`adapters/scratch.py`), constructed at startup and put on the catalog. It
-is a source adapter with no bytes **and no tensors** of its own: what is
-added to it is an uploaded field like any other, under
-`<write_dir>/fields/scratch/` (Fields). The class is therefore the three
-methods `SourceAdapter` declares abstract plus the cap below, and the base
-resolves, lists and checks its tensors as it does for any source.
+holds no bytes **and no tensors** of its own: what is added to it is an
+uploaded field like any other, under `<write_dir>/fields/scratch/` (Fields).
 
 - **The id is fixed, which is the point.** A producer writes
-  `zarr://scratch/@fields/<name>` without a round trip first. There is
-  nothing to mint, nothing for a client to remember, and nothing to adopt
-  at boot -- its tensors come back through the `on_register` hook that
-  gives every source its uploaded fields (`fields_attacher`), which is the
-  whole of this source's adoption.
+  `zarr://scratch/@fields/<name>` without a round trip first -- nothing to
+  mint, nothing for a client to remember, and nothing to adopt at boot. Its
+  tensors come back through the `on_register` hook that gives every source
+  its uploaded fields (`fields_attacher`).
 - **It keeps no directory of its own**, so there is nothing under
   `write_dir` naming it and nothing to sweep. `content_version` is None,
   the base's word for content this adapter does not serve; every member
   carries its own token.
 - **It caps every lifetime on it** (`ServerConfig.scratch_ttl`, a day by
-  default), including an upload that asked for none. That is what makes it
-  a temp store rather than a shared permanent one; 0 turns the cap off and
-  makes it permanent, deliberately.
+  default), including an upload that asked for none -- which is what makes
+  it a temp store. 0 turns the cap off and makes it permanent.
 - **It is not reclaimable, and does not need to be.** Empty is its resting
   state, and it leaves no directory and no orphan row behind.
-- **Metadata is source-scoped, and it has none.** A scrap heap describes no
-  acquisition -- the tensors on it have nothing to do with each other -- so
-  a tensor that needs a physical scale is uploaded onto the source that has
-  one. `add_tensor` carries shape, dtype, grid and dim labels only; a
-  request that also sets `metadata_json` on a tensor is refused, not
-  silently dropped. The one exception is a label set's own NGFF
-  `image-label` block, which stays on its `add_tensor` request.
+- **Metadata is source-scoped, and it has none.** The tensors on it have
+  nothing to do with each other, so a tensor that needs a physical scale is
+  uploaded onto the source that has one. A request that sets
+  `metadata_json` on a tensor is refused rather than dropped; the one
+  exception is a label set's own NGFF `image-label` block.
 - **`write_dir` is never discovered.** The reconciler owns the user's
   directories; the upload subsystem is the sole registrar for everything
   under `write_dir`. The second line of defence, for a `write_dir`
@@ -179,15 +172,17 @@ returns it to PENDING yet.
   discardable.
 - **A deadline is swept at any state; idleness only at PENDING.** A
   tensor whose `ttl_seconds` has run out is discarded wherever it is on the
-  ladder -- a lifetime that stopped applying at READY would be no lifetime,
-  since READY is where a finished result spends its life. Idleness is
-  PENDING's alone: past it nothing is expected to make progress. The
-  deadline is recorded in the member's marker as an absolute wall-clock
-  time, so it survives a restart, and one that ran out while the server was
-  down is swept at boot rather than adopted and reaped later.
+  ladder -- READY is where a finished result spends its life, so a lifetime
+  that stopped applying there would be none. Idleness is PENDING's alone:
+  past it nothing is expected to make progress. The deadline is recorded in
+  the member's marker as absolute wall-clock time, so it survives a restart,
+  and one that ran out while the server was down is swept at boot rather
+  than adopted and reaped later.
 - **A tombstone is detached once it has stood for `upload_ttl`**, which is
-  what frees the name. So a discarded tensor takes two sweeps to vanish and
-  is a tombstone in between, reachable to whoever is polling it.
+  what frees the name: a discarded tensor takes two sweeps to vanish and is
+  reachable to whoever is polling it in between. An adopted tensor leaves
+  none -- with no progress record there is nowhere to stamp its age -- so
+  its discard frees the name in one step.
 
 ## Wire
 
@@ -200,8 +195,6 @@ returns it to PENDING yet.
 | `upload_status` | unchanged |
 
 Java (`TensorUploads`, `TensorFlightClient`) and the TS client mirror the
-same actions and ticket flow, with no client-side tiling or decoding. There
-is no `create_tensor` or `register_source` action, `ome_zarr:` source, or
-volatile `cache:` source in this model -- every tensor is added to a source
-by `add_tensor`, and every source is either discovered or the one the
-server serves itself.
+same actions and ticket flow, with no client-side tiling or decoding. Every
+tensor is added to a source by `add_tensor`, and every source is either
+discovered or the one the server serves itself.

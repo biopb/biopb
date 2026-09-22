@@ -40,12 +40,10 @@ def close_adapter(adapter: Optional[SourceAdapter]) -> None:
     non-inheriting test doubles.
 
     **Releases what was attached to the source as well.** An uploaded field or
-    a label set holds a store of its own, and the source it hangs off knows
-    nothing about that store's handles. Done here rather than in a ``close()``
-    override because this is the mirror of :meth:`SourceRegistry.register`,
-    which is where the attaching happens: an adapter that overrides ``close``
-    for handles of its own would otherwise have to remember to chain up, and
-    forgetting would be silent.
+    a label set holds a store of its own that the source knows nothing about.
+    Done here, the mirror of :meth:`SourceRegistry.register` where the
+    attaching happens, rather than in a ``close()`` override each adapter with
+    handles of its own would have to remember to chain up to.
     """
     if adapter is None:  # unregister of an id that was never registered
         return

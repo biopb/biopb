@@ -97,10 +97,9 @@ def _discover_tensor_server(
     if upstream_source_id is not None:
         # Single-source form: register under the alias-namespaced local id.
         if not mirrorable_upstream_id(upstream_source_id):
-            # Named outright rather than reached by enumeration, so this is a
-            # refusal and not a silent skip -- but it is refused for the same
-            # reasons (``mirrorable_upstream_id``), and an unaliased one would
-            # land on this server's own scratch id.
+            # Named outright rather than reached by enumeration, so it is
+            # refused rather than silently skipped. Same reasons either way
+            # (``mirrorable_upstream_id``).
             raise ValueError(
                 f"{source.url}: an upstream's {upstream_source_id!r} source is "
                 f"its temp store, not a source to mirror -- everything on it "

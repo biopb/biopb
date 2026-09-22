@@ -211,16 +211,14 @@ def client(writable_server):
 
 @pytest.fixture
 def source(writable_server):
-    """The source to add tensors to; what every upload needs first.
+    """The server's scratch source, which is what a test uploads onto.
 
-    Nothing on the upload path creates one, so a test that uploads starts here
-    and names its tensors ``<scheme>://<this>/@fields/<name>``. It is the
-    server's scratch source, which is always there -- there is nothing to
-    create, and the id is the same every time.
+    Nothing on the upload path creates a source, so a test that uploads names
+    its tensors ``<scheme>://<this>/@fields/<name>``.
 
     Its lifetime cap is cleared, so an upload here gets no deadline unless the
     test asks for one. A test that cares about the cap sets ``max_upload_ttl``
-    on the adapter itself (``upload_ttl_test``) or runs a server of its own
+    itself (``upload_ttl_test``) or runs a server of its own
     (``scratch_source_test``).
     """
     writable_server.sources.get(SCRATCH_SOURCE_ID).max_upload_ttl = None

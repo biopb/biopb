@@ -377,9 +377,8 @@ _UPLOAD_TARGETS = {
 def _require_array_id(array_id: str) -> None:
     """Refuse an annotation request that names no tensor.
 
-    The authorization itself takes the whole ``array_id``
-    (``TensorFlightServer._grants``); this is only the emptiness check that
-    used to ride along with splitting it.
+    Authorization takes the whole ``array_id``
+    (``TensorFlightServer._grants``); this is only the emptiness check.
     """
     if not array_id:
         raise ValueError("array_id is required")
@@ -456,10 +455,8 @@ class TensorFlightServer(flight.FlightServerBase):
                 discarded and a discarded one is unregistered
                 (``UploadManager.reap``); 0 disables the sweep.
             scratch_ttl: Ceiling, in seconds, on how long a tensor uploaded to
-                the scratch source is kept -- applied to an upload that asked
-                for no lifetime as well, so a scrap heap cannot fill up by
-                omission. 0 lets uploads there live until someone discards
-                them.
+                the scratch source is kept, applied to an upload that asked for
+                no lifetime too. 0 keeps them until someone discards them.
             metadata_db: The catalog -- the browse surface behind the
                 ``catalog`` and ``roi`` flights. ``None`` builds a catalog-less
                 server: its sources are addressed by ``source_id`` and served,
@@ -541,11 +538,9 @@ class TensorFlightServer(flight.FlightServerBase):
         # What a crashed server left half-written goes before anything can
         # register it: the caller's discovery scan runs after this returns.
         self.uploads.discard_unfinished_stores()
-        # The scratch source, for a server that can be written to: one source
-        # at a fixed id, so an intermediate result has somewhere to go without
-        # a round trip first. Registered here rather than discovered, like
-        # everything under write_dir, and registered *before* mark_ready so it
-        # is never briefly missing from a server that is serving.
+        # The scratch source, on any server that can be written to. Registered
+        # rather than discovered, like everything under write_dir, and before
+        # mark_ready so it is never missing from a server that is serving.
         if writable:
             self.uploads.install_scratch(scratch_ttl if scratch_ttl > 0 else None)
         # Reclaims dead uploads and aged tombstones (``UploadManager.reap``);
@@ -757,11 +752,10 @@ class TensorFlightServer(flight.FlightServerBase):
 
         **Two places can carry one, and the source is asked first.** A grant on
         the source covers every tensor in it, which is what the embedded result
-        cache wants: its source *is* one result. A grant on an attached tensor
-        covers that tensor alone, which is what an uploaded intermediate wants:
-        many of them share one source, and each was produced by a different
-        caller. A source that granted itself away has already decided for its
-        tensors, so its answer wins rather than being intersected.
+        cache wants, its source being one result; a grant on an attached tensor
+        covers that tensor alone, which is what an uploaded intermediate wants,
+        since many share one source and each had a different producer. A source
+        that granted itself away has already decided for its tensors.
 
         A grant table or a signed token (biopb/biopb#1048) replaces this body
         and nothing else: call sites ask here rather than comparing tokens
@@ -806,8 +800,8 @@ class TensorFlightServer(flight.FlightServerBase):
         these (biopb/biopb#1048).
 
         Takes the whole ``array_id``, not its source half: a grant may sit on
-        the source or on one attached tensor of it (:meth:`_grants`), and only
-        the full id can tell the gated tensor from its siblings.
+        one attached tensor (:meth:`_grants`), and only the full id tells it
+        from its siblings.
 
         A tensor nothing has granted is as open as the catalog is, so it falls
         through to :meth:`_authorize`. One carrying a grant stays gated even in

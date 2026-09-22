@@ -1,20 +1,19 @@
 """A tensor's lifetime: what ``add_tensor``'s ``ttl_seconds`` buys.
 
-An upload is a temp store for an intermediate result, so how long the result is
-worth keeping is the producer's to say. What that means here:
+How long an intermediate result is worth keeping is the producer's to say.
+What that means here:
 
 - a **deadline reaches a published tensor**. Idleness is PENDING's alone --
-  past it nothing is expected to make progress -- but a lifetime that stopped
-  applying at READY would be no lifetime, because READY is where a finished
-  result spends its life;
+  past it nothing is expected to make progress -- but READY is where a
+  finished result spends its life, so a lifetime that stopped applying there
+  would be none;
 - the deadline is **recorded with the store**, so it outlives the process that
-  granted it. A deadline only the uploading server remembered would be none;
-- a source may **cap** it (``max_upload_ttl``), including capping an unset
-  request, so nothing lands on a scratch source forever by omission. The cap
-  can only shorten, which is what makes it a policy rather than a default.
+  granted it;
+- a source may **cap** it (``max_upload_ttl``), an unset request included, so
+  nothing lands on a scratch source forever by omission. The cap can only
+  shorten, which makes it a policy rather than a default.
 
-Nothing here changes a tensor with no deadline: it is kept until someone
-discards it, which is what an upload onto a source the server discovered gets.
+A tensor with no deadline is unaffected: it is kept until someone discards it.
 """
 
 import json
@@ -174,9 +173,8 @@ class TestTheSweepEnforcesIt:
 class TestALabelSetIsAnUploadedTensorToo:
     """A set takes a lifetime like a field, and a cap reaches it like a field.
 
-    It is not a special case that gets to outlive the source's policy: if it
-    were, uploading a set would be the way to leave something on a temp store
-    for good.
+    Not a special case that outlives the source's policy: if it were, uploading
+    a set would be the way to leave something on a temp store for good.
     """
 
     @staticmethod
@@ -203,8 +201,8 @@ class TestALabelSetIsAnUploadedTensorToo:
     def test_a_source_cap_fills_an_unset_request_on_a_set(
         self, client, source, writable_server
     ):
-        """The hole this closes: the cap used to reach a field and not a set,
-        so a set on a capped source was kept for good."""
+        """A cap that reached a field and not a set would make uploading a set
+        the way to keep something on a capped source for good."""
         writable_server.sources.get(source).max_upload_ttl = 60
         image = self._image(client, source)
 
@@ -309,13 +307,13 @@ class TestItSurvivesARestart:
         self, writable_server, client, source, tmp_path
     ):
         """A tombstone's age is ``UploadProgress.updated_at``, stamped at the
-        discard. An adopted tensor has no record for that stamp to live on, so
-        a tombstone there could never age out and the field would stay taken
-        for good -- and it would buy nothing, since a tensor with no record
-        already polls as UNKNOWN either way.
+        discard, and an adopted tensor has no record for that stamp to live on
+        -- so one could never age out and the field would stay taken for good.
+        It would buy nothing either, since a tensor with no record polls as
+        UNKNOWN whichever side of the discard it is on.
 
-        So its expiry frees the name in one step, the way an explicit discard
-        of an adopted tensor already does (``_delete_adopted_tensor``).
+        So its expiry frees the name in one step, as an explicit discard of an
+        adopted tensor already does (``_delete_adopted_tensor``).
         """
         _publish(client, _add(client, source, ttl=600))
         client.close()

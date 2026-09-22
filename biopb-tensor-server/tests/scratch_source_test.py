@@ -1,22 +1,16 @@
 """The scratch source: somewhere to put an intermediate result, at a fixed id.
 
-An upload is a temp store. Getting one used to take a round trip -- mint a
-container, remember what came back, and hope something reaps it -- which is a
-lot of ceremony for a scrap heap, and ceremony that quietly produced permanent
-sources. A writable server offers one scratch source instead, always there,
-always at ``scratch``, so a producer writes ``zarr://scratch/@fields/<name>``
-without asking for anything first.
+A writable server always serves one, so a producer writes
+``zarr://scratch/@fields/<name>`` without asking for anything first. What is
+pinned here is what makes it safe to share:
 
-What is pinned here is what makes that safe to share:
-
-- it is **there before anything can ask**, and only where a tensor can actually
-  be put;
+- it is **there before anything can ask**, and only where a tensor can
+  actually be put;
 - it keeps **no directory of its own**, so what comes back after a restart
   comes back through the pass that re-attaches every source's uploaded fields;
 - it is **not reclaimable**: empty is its resting state, not a fault;
-- it **caps every lifetime** on it (``ServerConfig.scratch_ttl``), which is the
-  one thing that keeps a shared scrap heap from becoming a shared permanent
-  store.
+- it **caps every lifetime** on it (``ServerConfig.scratch_ttl``), which is
+  what keeps a shared scrap heap from becoming a shared permanent store.
 """
 
 import threading
@@ -96,9 +90,8 @@ class TestItIsEmptyByDefault:
         assert adapter.get_metadata() == {}
 
     def test_the_sweep_leaves_it_alone(self, writable_server, client):
-        """A registered source was dropped once it stood empty, because an
-        abandoned one left a directory and a row nothing would reach. This has
-        neither, so nothing reclaims it."""
+        """It has no directory and no orphan row, so there is nothing for the
+        sweep to reclaim: empty is its resting state."""
         desc = _publish(client, _add(client, "brief"))
         client.set_upload_status(desc.array_id, "DISCARDED")
 

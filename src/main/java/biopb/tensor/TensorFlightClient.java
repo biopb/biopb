@@ -1332,13 +1332,12 @@ public class TensorFlightClient implements AutoCloseable {
      * @param arrayId {@code "<scheme>://<source_id>/@fields/<name>"}, where
      *        <i>scheme</i> is the store format -- {@code zarr} for an OME-Zarr
      *        image group, {@code cache} for the chunks as uploaded -- and
-     *        <i>source_id</i> is a source the server already serves -- one the
-     *        server discovered, or {@code "scratch"}. The
-     *        {@code @fields} segment is not optional: an uploaded tensor keeps
-     *        its own store beside its source, and the marked segment is what
-     *        stops its id colliding with one of the file's own tensors, so a
-     *        bare {@code "<source_id>/<field>"} is a native tensor id and is
-     *        refused here. The one other form is
+     *        <i>source_id</i> is a source the server already serves -- one it
+     *        discovered, or {@code "scratch"}. The {@code @fields} segment is
+     *        not optional: an uploaded tensor keeps its own store beside its
+     *        source, and the mark is what stops its id colliding with one of
+     *        the file's own tensors, so a bare {@code "<source_id>/<field>"}
+     *        is a native tensor id and is refused here. The one other form is
      *        {@code "zarr://<image array_id>/@labels/<name>"}, a label set of an
      *        image the server already serves. A set is unsigned-integer, spans
      *        its image's non-channel axes at full length, and its all-zero
@@ -1368,15 +1367,12 @@ public class TensorFlightClient implements AutoCloseable {
     /**
      * {@link #addTensor(String, long[], String, long[], List, String)} with a lifetime.
      *
-     * <p>An upload is a temp store for an intermediate result, so how long the
-     * result is worth keeping is the producer's to say. {@code null} asks for
-     * no deadline, which is what a source the server discovered gives you.
-     *
-     * <p>A source may <i>cap</i> the lifetime -- a scratch source caps every
-     * upload on it, an unset request included -- so the answer's own
-     * {@code ttl_seconds} is the lifetime actually granted, which may be
-     * shorter than this. Past it the tensor is discarded as if you had
-     * discarded it: the store goes and the id reads {@code DISCARDED}.
+     * <p>How long the result is worth keeping is the producer's to say, and
+     * {@code null} asks for no deadline. A source may <i>cap</i> it -- a
+     * scratch source caps every upload on it, an unset request included -- so
+     * the answer's own {@code ttl_seconds} is what was granted, which may be
+     * shorter. Past it the tensor is discarded as if you had discarded it:
+     * the store goes and the id reads {@code DISCARDED}.
      *
      * @param ttlSeconds seconds to keep the tensor, or null for no deadline;
      *        must be positive, since zero is not a lifetime

@@ -203,16 +203,14 @@ def _split_grpc_url(url: str) -> tuple[str, Optional[str]]:
 def mirrorable_upstream_id(source_id: str) -> bool:
     """Whether an upstream source is one this server mirrors.
 
-    Everything but the upstream's **scratch** source, which is its own temp
-    store and not ours to re-serve.
-
-    Two reasons, either sufficient. Its id is fixed, so a lone upstream with
-    no alias -- which keeps the verbatim id (``_namespaced_source_id``) --
-    would register it locally as ``scratch``, the id this server's own scratch
-    source already holds, and ``SourceRegistry.register`` overwrites in
-    silence. And everything on it carries a deadline set by *that* server's
-    policy, so the mirror would be a catalog row and a chunk-cache namespace
-    for tensors going away on someone else's clock.
+    Everything but the upstream's **scratch** source, for either of two
+    reasons. Its id is fixed, so a lone upstream with no alias -- which keeps
+    the verbatim id (``_namespaced_source_id``) -- registers it locally as
+    ``scratch``, the id this server's own scratch source holds, and
+    ``SourceRegistry.register`` overwrites in silence. And everything on it
+    carries a deadline set by *that* server's policy, so the mirror would be a
+    catalog row and a chunk-cache namespace for tensors going away on someone
+    else's clock.
 
     Applied inside the two enumerators below rather than at their call sites,
     so a third caller cannot reintroduce it.

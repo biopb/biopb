@@ -8,12 +8,10 @@ here is only what a boundary does:
   source, and ``zarr://<array_id>/@labels/<name>`` for a label set
   (biopb/biopb#1059). Both carry a marked segment, because a bare field is a
   native tensor id and the upload path mints none. **Nothing here creates a
-  source**: the parent must already be registered, and the new tensor is
-  attached to it -- for an intermediate result that is the scratch source
-  (``adapters.scratch``), which a writable server always serves. The scheme
-  names the store format and nothing else
-  (``adapters.member_formats.STORE_FORMATS``), so the catalog row kept in step
-  is always the parent's.
+  source**: the parent must already be registered, and an intermediate result
+  goes on the scratch source (``adapters.scratch``). The scheme names the store
+  format and nothing else (``adapters.member_formats.STORE_FORMATS``), so the
+  catalog row kept in step is always the parent's.
 - **Error translation** -- adapters stay transport-agnostic and raise typed
   errors; this is where they become Flight errors.
 - **Lookup** -- ``status`` / ``set_status`` find the adapter and hand over
@@ -218,15 +216,10 @@ class UploadManager:
     def _deadline_for(self, parent: Any, desc: TensorDescriptor) -> Optional[float]:
         """When a tensor added to *parent* stops being served, or None.
 
-        Two inputs. The request's ``ttl_seconds`` is what the producer asked
-        for, and unset means "no deadline". The parent's ``max_upload_ttl`` is
-        what the source allows: a scratch source caps every lifetime on it,
-        including an unset one, so nothing lands there forever by omission,
-        while a source the server discovered caps nothing and keeps what it is
-        given until someone discards it.
-
-        The cap wins, so a request can only ever shorten a lifetime -- which is
-        what makes the cap a policy rather than a default.
+        The request's ``ttl_seconds`` is what the producer asked for, unset
+        meaning no deadline; the parent's ``max_upload_ttl`` is what the source
+        allows, and applies to an unset request too. The cap wins, so a request
+        can only shorten a lifetime -- which makes it a policy, not a default.
         """
         requested = desc.ttl_seconds if desc.HasField("ttl_seconds") else None
         if requested is not None and requested <= 0:
@@ -244,9 +237,9 @@ class UploadManager:
     def write_dir(self) -> Optional[Path]:
         """The subtree this server's uploads live under, or None if read-only.
 
-        Public because the layout under it is now one shape for every uploaded
-        tensor (``fields/<source_id>/<name>``), so naming a store is a matter
-        of knowing the root rather than asking the source that holds it.
+        Public because every uploaded tensor has the one layout under it
+        (``fields/<source_id>/<name>``), so naming a store takes the root
+        rather than the source that holds it.
         """
         return self._write_dir
 
@@ -422,8 +415,7 @@ class UploadManager:
         source already has still describes what a reader may see.
 
         It takes a deadline the same way a field does: a set is an uploaded
-        tensor, so a source that caps lifetimes caps this one too. Otherwise
-        a set would be the way to leave something on a temp store for good.
+        tensor, so a source that caps lifetimes caps this one too.
         """
         metadata = (
             self._parse_metadata_json(req_desc.metadata_json)
@@ -535,10 +527,8 @@ class UploadManager:
         finish it.
 
         **Past its deadline**: its lifetime ran out while the server was down.
-        Swept rather than adopted-and-reaped, because adopting it would serve
-        expired bytes for as long as it takes the first sweep to come round --
-        and a deadline the server honours only once it gets to it is a weaker
-        promise than the one that was made.
+        Swept rather than adopted and left to the first sweep, which would
+        serve expired bytes until it came round.
         """
         marker = member_marker(store)
         if upload_state(marker) == UPLOAD_PENDING:
@@ -593,11 +583,10 @@ class UploadManager:
         ``array_id`` carries none, because the format is a property of the
         stored tensor, read off its directory at the next registration.
 
-        **Every uploaded tensor is addressed under a marked segment**, whether
-        its source was registered or discovered (:mod:`~biopb_tensor_server.core.attached`).
-        A bare field is a native tensor id, which is the format's to mint, so
-        the upload path never answers one -- and the kind is read off the
-        field rather than off the parent's type.
+        **Every uploaded tensor is addressed under a marked segment**
+        (:mod:`~biopb_tensor_server.core.attached`). A bare field is a native
+        tensor id, which is the format's to mint, so the upload path never
+        answers one -- and the kind is read off the field, not the parent.
 
         A field is taken for as long as its tensor is served. Replacing one is
         a discard first, which is what makes an ``array_id`` name a single
@@ -665,10 +654,10 @@ class UploadManager:
     ) -> Any:
         """Mint an uploaded tensor beside its source, whatever kind it is.
 
-        One layout for both: a discovered source's bytes are the user's and
-        the scratch source holds none, so neither has anywhere of its own to
-        put a tensor. ``create_field_upload`` refuses a field that is not
-        ``@fields/<name>``, which is what answers a bare one.
+        One layout for every source: a discovered one's bytes are the user's
+        and the scratch source holds none, so neither has anywhere of its own
+        to put a tensor. ``create_field_upload`` refuses a field that is not
+        ``@fields/<name>``.
         """
         try:
             return create_field_upload(
@@ -685,16 +674,14 @@ class UploadManager:
     def install_scratch(self, max_ttl: Optional[float]) -> Optional[str]:
         """Put the scratch source on the registry and in the catalog.
 
-        Both halves of what a registered source used to need, and neither is a
-        walk: there is nothing to mint on request, because the id is fixed, and
-        nothing to adopt at boot, because the source keeps no directory of its
-        own -- its tensors come back through the ``on_register`` hook that
-        gives every source its uploaded fields (``fields.fields_attacher``).
+        Neither half is a walk: the id is fixed, and the source keeps no
+        directory of its own -- its tensors come back through the
+        ``on_register`` hook that gives every source its uploaded fields
+        (``fields.fields_attacher``).
 
         *max_ttl* caps every upload added here, an unset one included; None
         leaves them undated. Returns the id, or None on a server with no
-        ``write_dir``: with nowhere to put a tensor, a scratch source is one
-        nothing can be added to.
+        ``write_dir``, where nothing can be added anyway.
         """
         if self._write_dir is None:
             return None
@@ -774,8 +761,7 @@ class UploadManager:
         """One sweep over the registry; the unit the reclaim thread runs.
 
         Two halves, two clocks -- see *now* and *wall_now* below. A PENDING
-        upload with no write for ``ttl``
-        seconds is discarded with a reason -- the job that owned it died, and
+        upload with no write for ``ttl`` seconds is discarded with a reason -- the job that owned it died, and
         a discard is the one terminal transition there is, so a straggler
         that writes later is refused the same way it would be after an
         explicit discard. A tombstone that has stood for ``ttl`` seconds is
@@ -786,15 +772,14 @@ class UploadManager:
 
         **A deadline is swept at any state, idleness only at PENDING.** A
         tensor whose lifetime has run out is discarded wherever it is on the
-        ladder -- a deadline that stopped applying at READY would be no
-        deadline, since READY is where a finished result spends its life, and
-        an upload is a temp store for an intermediate result. Idleness is the
-        other half and is PENDING's alone: past it nothing is expected to make
-        progress, so an upload left READY without ever being finished keeps its
-        name and stays writable, which is the cost of letting a producer
-        publish early. A durable kind is swept like any other: its store goes
-        with the discard and its catalog row is dropped here, since both were
-        the server's own (biopb/biopb#1059).
+        ladder -- READY is where a finished result spends its life, so a
+        deadline that stopped applying there would be none. Idleness is
+        PENDING's alone: past it nothing is expected to make progress, so an
+        upload left READY without ever being finished keeps its name and stays
+        writable, which is the cost of letting a producer publish early. A
+        durable kind is swept like any other: its store goes with the discard
+        and its catalog row is dropped here, since both were the server's own
+        (biopb/biopb#1059).
 
         Every source's attached tensors take the same step, because a tensor is
         attached to its source rather than registered and would otherwise have
@@ -811,8 +796,8 @@ class UploadManager:
         for tests: *now* is monotonic, like ``updated_at``, and measures how
         long something has been idle; *wall_now* is unix seconds and is what a
         recorded deadline was written against (``WritableSource.expires_at``).
-        A recorded deadline has to survive a restart, which a monotonic reading
-        does not, so the two cannot be one.
+        A recorded deadline has to survive a restart, which a monotonic
+        reading does not.
 
         ``ttl <= 0`` disables the sweep whole -- deadlines included: it is the
         knob for "do not reclaim on this server", and a deadline is

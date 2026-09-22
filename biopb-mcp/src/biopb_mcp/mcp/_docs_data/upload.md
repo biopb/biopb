@@ -34,15 +34,12 @@ client.upload_array(desc, arr)                        # writes every chunk, seal
 array_id = desc.array_id                              # "scratch/@fields/my_result"
 ```
 
-Nothing is registered first and nothing comes back to remember: `scratch` is
-the id, every time, on every writable server.
-
 **The scratch source is a temp store, and says so.** Every tensor on it gets a
 deadline — the server's cap (a day, typically) when you ask for nothing, or
-`ttl_seconds=` when you want less. `desc.ttl_seconds` on the answer is the
-lifetime you actually got. Past it the tensor is discarded as if you had
-discarded it. So scratch is for an intermediate result of a chain, not for the
-finished thing a user will come back to next week.
+`ttl_seconds=` when you want less — and `desc.ttl_seconds` on the answer is
+what you got. Past it the tensor is discarded as if you had discarded it. So
+scratch is for an intermediate result of a chain, not for the finished thing a
+user comes back to next week.
 
 **The `@fields/` segment is not optional.** A bare `"<source_id>/<name>"` is
 what a *format* calls its own tensors, so the upload path refuses it — that is
@@ -66,11 +63,10 @@ not of its name.
 **Metadata is the source's, not a tensor's.** Axis labels ride on
 `add_tensor` (`dim_labels=`), but the pixel size, units and channel names are
 the source's and a tensor inherits them — a tensor that carries its own is
-refused rather than silently stripped. The scratch source has none to give:
-the tensors on it have nothing to do with each other. So for anything whose
-scale matters, upload it onto the image's own source, or say so in the ROI or
-label set that refers back to the calibrated image. [[napari-viewer]] is this
-failure from the reading end, where an uncalibrated layer measures in
+refused rather than silently stripped. The scratch source has none to give,
+so anything whose scale matters goes onto the image's own source, or into a
+label set or ROI that refers back to the calibrated image. [[napari-viewer]]
+is this failure from the reading end, where an uncalibrated layer measures in
 pixels.
 
 **A field is taken while its tensor is served** — at any of the three states

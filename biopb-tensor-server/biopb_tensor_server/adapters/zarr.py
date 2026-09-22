@@ -73,14 +73,13 @@ def with_upload_state(
 ) -> dict:
     """*zattrs* with the upload marker set to *state* (a copy; input untouched).
 
-    The rest of the marker is **kept**, which is what carries a recorded
-    deadline through publication: ``_publish_store`` rewrites the state over
-    whatever is on disk, and a lifetime the producer asked for at ``add_tensor``
-    must not be dropped by reaching READY.
+    The rest of the marker is **kept**: ``_publish_store`` rewrites the state
+    over whatever is on disk, and a deadline granted at ``add_tensor`` must
+    survive reaching READY.
 
     *expires_at* is unix seconds -- a wall clock, unlike the intervals
-    ``UploadProgress`` measures, because this one is written down and has to
-    mean the same thing to the next life of the server.
+    ``UploadProgress`` measures, because it is written down and has to mean the
+    same thing to the next life of the server.
     """
     out = dict(zattrs)
     block = dict(out.get(UPLOAD_ATTR) or {})
@@ -96,8 +95,7 @@ def with_upload_state(
 def upload_expires_at(zattrs: Any) -> Optional[float]:
     """When the marker says this upload stops being served, or None for never.
 
-    Read back at adoption so a lifetime outlives the process that granted it --
-    a deadline only the uploading server remembered would be no deadline at all.
+    Read back at adoption, so a lifetime outlives the process that granted it.
     """
     if not isinstance(zattrs, dict):
         return None
@@ -131,9 +129,8 @@ def is_upload_subsystem_store(ctx: ClaimContext) -> bool:
 
     Keyed on the ``biopb`` block the subsystem writes and nothing else does
     (``adapters.members.member_attrs``), so a user's own zarr group is
-    unaffected however it is laid out -- and on the block rather than on the
-    upload marker, because a member is the subsystem's for as long as it
-    exists, not only while it is filling.
+    unaffected however it is laid out -- and on the block rather than the
+    upload marker, because a member stays the subsystem's once it is filled.
     """
     return "member" in _biopb_block(ctx)
 

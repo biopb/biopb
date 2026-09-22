@@ -895,13 +895,11 @@ class ServerConfig:
     scratch_ttl: float = field(
         default=86400.0,
         metadata={
-            "help": "Ceiling, in seconds, on how long a tensor uploaded to the "
-            "scratch source is kept. A ceiling, not a default: an upload asking "
-            "for less gets what it asked for, one asking for more or for "
-            "nothing at all gets this. Past it the tensor is discarded as if "
-            "its producer had discarded it. 0 lets uploads there live until "
-            "someone discards them, which makes the scratch source a permanent "
-            "one."
+            "help": "Ceiling, in seconds, on how long a tensor uploaded to "
+            "the scratch source is kept, after which it is discarded. An "
+            "upload asking for less gets what it asked for; one asking for "
+            "more, or for nothing, gets this. 0 keeps them until someone "
+            "discards them."
         },
     )
     stability_window: float = field(

@@ -160,25 +160,19 @@ message TensorDescriptor {
 
   // How long the server keeps this tensor, in seconds from `add_tensor`.
   //
-  // **A request on the way in, a statement on the way out.** An upload is a
-  // temp store for an intermediate result, so its producer says how long the
-  // result is worth keeping; the server applies its own policy over that and
-  // answers with the lifetime it actually granted, which may be shorter than
-  // what was asked for. A source whose policy caps lifetimes clamps to the cap
-  // and clamps an unset request to it too, so nothing lands there forever by
-  // omission.
+  // **A request on the way in, a statement on the way out.** The server
+  // applies its own policy over what was asked for and answers with the
+  // lifetime it granted, which may be shorter: a source that caps lifetimes
+  // clamps an unset request to the cap too.
   //
-  // Unset on the way in means "no deadline, ask the source's default". Unset on
-  // the way out means the tensor has none: it is kept until someone discards
-  // it. Zero is not a lifetime and is refused rather than read as "expire
-  // immediately".
+  // Unset on the way in asks for the source's default; unset on the way out
+  // means the tensor is kept until someone discards it. Zero is not a lifetime
+  // and is refused rather than read as "expire immediately".
   //
-  // The deadline it implies is absolute and recorded with the store, so it
-  // survives a restart, and it is enforced from `add_tensor` rather than from
-  // READY: a producer that never publishes must not be able to keep bytes
-  // alive by not finishing. Past it the reclaim sweep discards the tensor as
-  // if its producer had -- the store goes, the id answers DISCARDED, and the
-  // tombstone ages out like any other.
+  // The deadline is absolute and recorded with the store, so it survives a
+  // restart, and it runs from `add_tensor` rather than from READY -- a
+  // producer that never publishes cannot keep bytes alive by not finishing.
+  // Past it the reclaim sweep discards the tensor as if its producer had.
   optional uint32 ttl_seconds = 17;
 
   // 13 was chunk_array_id, the compact-grid read plan (biopb/biopb#346); removed

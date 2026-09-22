@@ -2468,12 +2468,10 @@ class TestAnUpstreamScratchIsNotMirrored:
     """An upstream's scratch source is its temp store, and not ours to re-serve.
 
     Two reasons, either sufficient. **The id collides**: it is fixed, so a lone
-    upstream with no alias -- which keeps the verbatim id -- would register it
-    locally as ``scratch``, which on a writable proxy is the id this server's
-    own scratch source holds, and registration overwrites in silence.
-    **The contents are designed to vanish**: everything on it carries a
-    deadline set by that server's policy, so the mirror would be a catalog row
-    and a chunk-cache namespace for tensors going away on someone else's clock.
+    upstream with no alias -- which keeps the verbatim id -- registers it
+    locally as ``scratch``, the id a writable proxy's own scratch source holds,
+    and registration overwrites in silence. **The contents are designed to
+    vanish**: everything on it carries a deadline set by that server's policy.
     """
 
     ROWS = [

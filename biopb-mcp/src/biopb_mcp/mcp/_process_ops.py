@@ -17,10 +17,8 @@ on both input and output:
   round-trip) -> result uploaded back to the tensor server -> new ``array_id``.
 
 An uploaded result is a tensor of the tensor server's scratch source, at the
-fixed id ``scratch``. It survives a restart -- what used to be a volatile
-``cache:`` source a restart lost -- and it is kept for as long as that server's
-scratch lifetime, which is what an intermediate result of a chain wants: long
-enough to chain from, not forever.
+fixed id ``scratch``. It survives a restart, and is kept for as long as that
+server's scratch lifetime -- long enough to chain from, not forever.
 """
 
 import logging

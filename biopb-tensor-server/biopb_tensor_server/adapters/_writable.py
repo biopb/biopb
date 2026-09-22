@@ -38,7 +38,6 @@ from dataclasses import dataclass, field
 from enum import Enum
 from math import ceil
 from typing import (
-    TYPE_CHECKING,
     Any,
     Dict,
     Iterable,
@@ -65,9 +64,6 @@ from biopb_tensor_server.core.errors import (
     UploadSealedError,
     UploadTransitionError,
 )
-
-if TYPE_CHECKING:
-    pass
 
 logger = logging.getLogger(__name__)
 
@@ -434,14 +430,13 @@ class WritableSource:
 
     #: When this tensor stops being served, in unix seconds, or None to be kept
     #: until someone discards it. On the *adapter* rather than on
-    #: :class:`UploadProgress`, because a tensor adopted from an earlier life
-    #: has no record and its deadline still has to be enforced -- that is the
-    #: whole point of writing it down (``zarr.upload_expires_at``).
+    #: :class:`UploadProgress`, because an adopted tensor has no record and its
+    #: deadline still has to be enforced (``zarr.upload_expires_at``).
     #:
-    #: A wall clock, unlike ``updated_at``'s monotonic intervals: this one is
-    #: persisted, so it has to mean the same thing across a restart. It is set
-    #: at ``add_tensor`` and never moved, so a producer cannot hold bytes open
-    #: by writing to them, nor by never publishing.
+    #: A wall clock, unlike ``updated_at``'s monotonic intervals, because it is
+    #: persisted and has to mean the same thing across a restart. Set at
+    #: ``add_tensor`` and never moved, so a producer cannot hold bytes open by
+    #: writing to them, nor by never publishing.
     _expires_at: Optional[float] = None
 
     _upload: Optional[UploadProgress] = None
@@ -509,9 +504,8 @@ class WritableSource:
         hand back a grid no plan mints and every ``upload_chunk`` on it would
         be refused. This is the same number ``get_flight_info`` advertises.
 
-        The **lifetime is the one granted, not the one asked for**: a source
-        may cap it, so echoing the request would tell a caller its result
-        outlives a deadline it does not. Absent when the tensor has none.
+        The **lifetime is the one granted, not the one asked for**, since a
+        source may cap it. Absent when the tensor has none.
 
         Physical calibration is deliberately not echoed here: a format adds it
         only if a later read will reproduce it verbatim (issue #272).
@@ -588,10 +582,9 @@ class WritableSource:
         - *expired*: this upload was just discarded here, with a reason -- one
           terminal transition, not a second path into oblivion. Two things
           cause it. **Its lifetime ran out** (:attr:`expires_at`), which
-          reaches an upload at *any* state, published included: a deadline that
-          stopped applying at READY would be no deadline, since READY is where
-          a finished result spends its life. Or it is **PENDING with no
-          progress for** *ttl* seconds -- the job that owned it died.
+          reaches an upload at *any* state, published included -- READY is
+          where a finished result spends its life. Or it is **PENDING with no
+          progress for** *ttl* seconds, the job that owned it having died.
 
           The check and the transition share the lock hold so a ``set_status``
           racing the sweep either lands first (and the upload keeps the state
@@ -602,19 +595,17 @@ class WritableSource:
           discarded it, since a fresh tombstone's age is not yet the sweep's
           concern.
 
-        A tensor adopted from an earlier life tracks no upload but may still
-        carry a deadline, so the expiry half runs before the record is asked
-        for: there is nothing to seal, and removing the store is the whole of
-        the discard.
+        An adopted tensor tracks no upload but may still carry a deadline, so
+        the expiry half runs before the record is asked for: there is nothing
+        to seal, and removing the store is the whole of the discard.
 
-        **An adopted tensor leaves no tombstone**, and answers ``inf`` for its
-        age to say so. A tombstone's age is ``UploadProgress.updated_at``,
-        stamped at the discard; with no record there is nowhere for that stamp
-        to live, so one would never age out and the name would stay taken for
-        good. Nor would it buy anything -- with no record ``get_upload_status``
-        already answers UNKNOWN, before and after -- which is why an explicit
-        discard of an adopted tensor also removes it outright
-        (``UploadManager._delete_adopted_tensor``).
+        **It leaves no tombstone**, and answers ``inf`` for its age to say so.
+        A tombstone's age is ``UploadProgress.updated_at``, stamped at the
+        discard, and with no record there is nowhere for that stamp to live --
+        so one would never age out and the name would stay taken for good. Nor
+        would it buy anything, since ``get_upload_status`` answers UNKNOWN
+        either way, which is why an explicit discard of an adopted tensor
+        removes it outright (``UploadManager._delete_adopted_tensor``).
         """
         progress = self._upload
         if self.expired(wall_now):

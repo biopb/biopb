@@ -31,19 +31,17 @@ plane outlives the sessions that come and go against it.
 plane must be writable — the skills' own steps upload results
 (`drift-correction` step 7, `stitch-tiles` step 7) — and
 `set_upload_status(..., DISCARDED)` is total: it reaches a published tensor,
-including a fixture. The agent is handed each fixture's `array_id` anyway, so
-there was never anything to hide.
+fixtures included. The agent is handed each fixture's `array_id` anyway.
 
-What the layer buys is that nothing can happen *quietly*. A fixture is a
-tensor of the plane server's scratch source, so its name is salted with
-:attr:`secret` and a discarded name stays taken until the reclaim sweep frees
-it (`upload_ttl`) -- an agent cannot drop a fixture and put its own bytes back
-under the same id within a run. And :meth:`TensorPlane.fingerprint` samples a
-corner of the served array, which `bench/_engine` compares after every sample,
-reading it as contaminated whether the bytes changed or the tensor stopped
-being readable at all. A changed fingerprint does not fail a test — it flags
-the row, the same way `read-harness-internals` does, because `execute_code` is
-arbitrary Python.
+What the layer buys is that nothing can happen *quietly*. A fixture's field
+name is salted with :attr:`secret`, and a discarded name stays taken until the
+reclaim sweep frees it (`upload_ttl`), so an agent cannot drop a fixture and
+put its own bytes back under the same id within a run. And
+:meth:`TensorPlane.fingerprint` samples a corner of the served array, which
+`bench/_engine` compares after every sample, reading it as contaminated
+whether the bytes changed or the tensor stopped being readable at all. A
+changed fingerprint does not fail a test — it flags the row, the same way
+`read-harness-internals` does, because `execute_code` is arbitrary Python.
 
 Making a fixture genuinely undroppable means serving it from a discovery root
 instead of uploading it, which is a different plane and not this one.

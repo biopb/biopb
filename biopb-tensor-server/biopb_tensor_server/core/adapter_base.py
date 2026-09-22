@@ -365,16 +365,14 @@ class SourceAdapter(ABC):
     def tensor_capability_token(self, array_id: Optional[str]) -> Optional[str]:
         """The grant the tensor *array_id* carries of its own, or None.
 
-        Only an **attached** tensor can carry one. A format's own tensors are
-        the source's, and whatever the source granted already covers them;
-        what the upload path put here is separable, because it was produced by
-        one caller and may be readable by that caller alone.
+        Only an **attached** tensor can carry one: a format's own tensors are
+        the source's, while what the upload path put here was produced by one
+        caller and may be readable by that caller alone.
 
         Read off the routable index (:meth:`_attached_for`) rather than through
         :meth:`resolve_tensor`, so the auth path asks no format to resolve
-        anything, and a tensor still uploading is gated exactly as a published
-        one is -- a grant that only started applying at READY would leave the
-        window in between open.
+        anything and a tensor still uploading is gated exactly as a published
+        one is.
 
         Checked on every read through :meth:`TensorFlightServer._grants`, so a
         source with nothing attached (the common case) skips the field parse

@@ -304,10 +304,9 @@ def sidecar_attrs(
     upload reaches READY (``ZarrAdapter._publish_store``), and
     :func:`sidecar_label_sets` attaches nothing that is not ``ready``.
 
-    *expires_at* records the set's deadline with the set, so it outlives the
-    process that granted it -- the same place and shape a member records its
-    own (``members.member_attrs``), which is what lets the boot sweep read
-    either without knowing which it has.
+    *expires_at* records the set's deadline with the set, in the same place and
+    shape a member records its own (``members.member_attrs``), so the boot sweep
+    reads either without knowing which it has.
     """
     attrs = with_upload_state({}, state, expires_at)
     attrs["biopb"][SIDECAR_ATTR] = {
@@ -386,9 +385,8 @@ def create_label_upload(
     in place, because it is also the descriptor the client is answered with.
 
     *expires_at* is the set's deadline, recorded with the store. A set is an
-    uploaded tensor like any other here: it takes a lifetime of its own, and a
-    source that caps lifetimes caps this one too -- otherwise a set would be
-    the way to leave something on a temp store for good.
+    uploaded tensor like any other here, so a source that caps lifetimes caps
+    this one too.
 
     Raises ``ValueError`` for a request the kind cannot serve -- an
     unresolved parent, a reserved name, a dtype that is not an unsigned

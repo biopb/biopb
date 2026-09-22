@@ -926,13 +926,11 @@ class TensorFlightClient:
                 block. Metadata is source-scoped: a tensor inherits its
                 source's, and the scratch source has none.
             ttl_seconds: How long to keep this tensor, in seconds. ``None``
-                asks for no deadline, which is what a source the server
-                discovered gives you. A source may **cap** the lifetime -- the
+                asks for no deadline. A source may **cap** the lifetime -- the
                 scratch source caps every upload on it, an unset request
-                included, because it is a temp store -- so the answer's own
-                ``ttl_seconds`` is the lifetime actually granted, which may be
-                shorter than this. Past it the tensor is discarded as if you
-                had discarded it.
+                included -- so the answer's own ``ttl_seconds`` is what was
+                granted, which may be shorter. Past it the tensor is discarded
+                as if you had discarded it.
 
         Returns:
             The new tensor's descriptor, under the ``array_id`` it keeps. Its
