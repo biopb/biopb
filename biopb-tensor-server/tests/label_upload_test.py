@@ -150,7 +150,7 @@ class TestWhatTheKindRefuses:
             ("oz1/@labels/@ome", None, "are the server's own"),
             ("oz1/@labels/x", np.zeros(SHAPE, "float32"), "unsigned integer"),
             ("oz1/@labels/x", np.zeros((32, 32), "uint32"), "does not span"),
-            ("oz1/nope", None, "is not a registered source"),
+            ("oz1/nope", None, "does not name an uploaded field"),
         ],
     )
     def test_refusals(self, served, client, array_id, arr, why):
@@ -252,7 +252,9 @@ class TestTheSidecar:
         sparse = np.zeros(SHAPE, "uint32")
         sparse[:8, :8] = 1
         source = client.register_source()
-        desc = client.add_tensor(f"cache://{source}/sparse", sparse, chunk_shape=CHUNK)
+        desc = client.add_tensor(
+            f"cache://{source}/@fields/sparse", sparse, chunk_shape=CHUNK
+        )
         status = client.upload_array(desc, sparse)
         assert (status["uploaded_chunks"], status["expected_chunks"]) == (4, 4)
 

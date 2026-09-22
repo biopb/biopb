@@ -1327,21 +1327,21 @@ public class TensorFlightClient implements AutoCloseable {
      * pending, published or discarded -- is refused. Only the server's reclaim
      * sweep frees one, after a discarded upload's {@code upload_ttl}.
      *
-     * @param arrayId {@code "<scheme>://<source_id>/<field>"}, where
+     * @param arrayId {@code "<scheme>://<source_id>/@fields/<name>"}, where
      *        <i>scheme</i> is the store format -- {@code zarr} for an OME-Zarr
      *        image group, {@code cache} for the chunks as uploaded -- and
-     *        <i>source_id</i> is what {@link #registerSource} answered. The
-     *        other two forms put a tensor on a source the server
-     *        <i>discovered</i>, whose own bytes are the user's, so each keeps
-     *        its own store beside that source under a marked segment that
-     *        cannot collide with one of the file's own tensors:
-     *        {@code "<scheme>://<source_id>/@fields/<name>"} for a plain field,
-     *        and {@code "zarr://<image array_id>/@labels/<name>"} for a label
-     *        set of an image the server already serves. A set is
-     *        unsigned-integer, spans its image's non-channel axes at full
-     *        length, and its all-zero chunks are skipped by
-     *        {@link #uploadArray}. The scheme names the store format and
-     *        nothing else: the answered id carries none
+     *        <i>source_id</i> is a source the server already serves, whether it
+     *        was discovered or answered by {@link #registerSource}. The
+     *        {@code @fields} segment is not optional: an uploaded tensor keeps
+     *        its own store beside its source, and the marked segment is what
+     *        stops its id colliding with one of the file's own tensors, so a
+     *        bare {@code "<source_id>/<field>"} is a native tensor id and is
+     *        refused here. The one other form is
+     *        {@code "zarr://<image array_id>/@labels/<name>"}, a label set of an
+     *        image the server already serves. A set is unsigned-integer, spans
+     *        its image's non-channel axes at full length, and its all-zero
+     *        chunks are skipped by {@link #uploadArray}. The scheme names the
+     *        store format and nothing else: the answered id carries none
      * @param shape the tensor's shape
      * @param dtype the numpy dtype string to store it as (e.g. {@code "<u2"})
      * @param chunkShape the upload grid; null or empty means one chunk. A

@@ -16,9 +16,15 @@ import pyarrow.flight as flight
 import pytest
 from biopb.tensor import TensorFlightClient, UploadRefused
 from biopb.tensor.ticket_pb2 import ChunkBounds
+from biopb_tensor_server.adapters.fields import (
+    fields_root,
+    source_fields_dir,
+)
 from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
 from biopb_tensor_server.adapters.zarr import ZarrAdapter, upload_state
 from biopb_tensor_server.cache import CacheManager
+from biopb_tensor_server.core.adapter_base import catalog_tensors
+from biopb_tensor_server.core.attached import attached_field
 from biopb_tensor_server.core.chunk import encode_chunk_id
 from biopb_tensor_server.core.config import CacheConfig
 from biopb_tensor_server.core.discovery import ClaimContext, DiscoveryState
@@ -30,15 +36,17 @@ from tests import catalog_server
 
 def _create(client, source, field="durable"):
     return client.add_tensor(
-        f"zarr://{source}/{field}",
+        f"zarr://{source}/@fields/{field}",
         np.empty((4, 4), dtype=np.uint16),
         chunk_shape=(2, 2),
     )
 
 
 def _store(server, source, field="durable") -> Path:
-    """Where the member keeps its bytes: ``<write_dir>/sources/<name>.zarr/<field>``."""
-    return server.sources.get(source).member_store(field)
+    """Where the tensor keeps its bytes: ``<write_dir>/fields/<source_id>/<name>``."""
+    return (
+        source_fields_dir(fields_root(Path(server.uploads.write_dir)), source) / field
+    )
 
 
 # The whole 4x4 tensor is one planned chunk: a zarr store is minted on the
@@ -70,12 +78,12 @@ class TestDiscardReleasesTheStore:
         parent = writable_server.sources.get(source)
         store = _store(writable_server, source)
         assert store.is_dir()
-        assert [d.array_id for d in parent.list_tensor_descriptors()] == [desc.array_id]
+        assert [d.array_id for d in catalog_tensors(parent)] == [desc.array_id]
 
         writable_server.uploads.discard(desc.array_id, "operator said so")
 
         assert not store.exists()
-        assert parent.list_tensor_descriptors() == []
+        assert catalog_tensors(parent) == []
         # The *source* keeps its row: a member has none of its own, and the
         # source is still there to add another tensor to.
         assert source in _catalog_ids(writable_server.metadata_db)
@@ -107,7 +115,9 @@ class TestDiscardReleasesTheStore:
         _put(client, desc, fill=3)
         client.set_upload_status(desc, "READY")
         assert client.get_tensor(desc.array_id)[:2, :2].compute().max() == 3
-        adapter = writable_server.sources.get(source).members["durable"]
+        adapter = writable_server.sources.get(source).attached_tensors[
+            "@fields/durable"
+        ]
         chunk_id = encode_chunk_id(
             desc.array_id, ChunkBounds(start=[0, 0], stop=[4, 4])
         )
@@ -132,7 +142,9 @@ class TestDiscardReleasesTheStore:
         """The write lock orders a write that passed the refusal ahead of the
         disposal: whichever wins, no directory is left behind."""
         desc = _create(client, source)
-        adapter = writable_server.sources.get(source).members["durable"]
+        adapter = writable_server.sources.get(source).attached_tensors[
+            "@fields/durable"
+        ]
         store = _store(writable_server, source)
         errors = []
 
@@ -163,7 +175,7 @@ class TestAddOwnsItsDirectory:
         it did not make -- a crashed upload the boot sweep has yet to reach, or
         anything else that happens to sit under the collection."""
         theirs = _store(writable_server, source, "taken")
-        theirs.mkdir()
+        theirs.mkdir(parents=True)
         (theirs / "keep.txt").write_text("not yours")
 
         with pytest.raises(flight.FlightServerError, match="already exists"):
@@ -171,7 +183,10 @@ class TestAddOwnsItsDirectory:
 
         assert (theirs / "keep.txt").read_text() == "not yours"
         assert not (theirs / ".zarray").exists()
-        assert "taken" not in writable_server.sources.get(source).members
+        assert (
+            attached_field("taken")
+            not in writable_server.sources.get(source).attached_tensors
+        )
 
 
 class TestTheFieldCannotEscapeItsSource:
@@ -188,16 +203,16 @@ class TestTheFieldCannotEscapeItsSource:
         it -- one glob then covers the whole surface."""
         with pytest.raises(flight.FlightServerError):
             client.add_tensor(
-                f"zarr://{source}/{field}",
+                f"zarr://{source}/@fields/{field}",
                 np.empty((4, 4), np.uint16),
                 chunk_shape=(2, 2),
             )
         assert not list(tmp_path.glob("**/escaped*"))
 
     def test_the_refusal_names_the_field(self, writable_server, client, source):
-        with pytest.raises(flight.FlightServerError, match="cannot name a tensor"):
+        with pytest.raises(flight.FlightServerError, match="the field's name"):
             client.add_tensor(
-                f"zarr://{source}/..",
+                f"zarr://{source}/@fields/..",
                 np.empty((4, 4), np.uint16),
                 chunk_shape=(2, 2),
             )
@@ -260,9 +275,9 @@ class TestANameIsAPathOnEveryPlatform:
         assert "bytes" in unsafe_store_name("é" * 250)
 
     def test_the_refusal_reaches_the_client(self, writable_server, client, source):
-        with pytest.raises(flight.FlightServerError, match="cannot name a tensor"):
+        with pytest.raises(flight.FlightServerError, match="the field's name"):
             client.add_tensor(
-                f"zarr://{source}/CON",
+                f"zarr://{source}/@fields/CON",
                 np.empty((4, 4), np.uint16),
                 chunk_shape=(2, 2),
             )
@@ -286,12 +301,12 @@ class TestNamesCollideFolded:
         """Only the comparison folds: the store is written under the spelling
         the caller chose, so ``Nuclei`` stays ``Nuclei`` on disk."""
         _create(client, source, "Nuclei")
-        collection = writable_server.sources.get(source).store
-        assert [d.name for d in collection.iterdir() if d.is_dir()] == ["Nuclei"]
+        fields = _store(writable_server, source, "Nuclei").parent
+        assert [d.name for d in fields.iterdir() if d.is_dir()] == ["Nuclei"]
 
     def test_a_case_variant_of_a_taken_field_is_refused(self, client, source):
         _create(client, source, "Nuclei")
-        with pytest.raises(flight.FlightServerError, match="already has a tensor"):
+        with pytest.raises(flight.FlightServerError, match="already exists as"):
             _create(client, source, "nuclei")
 
     def test_an_unrelated_name_is_still_free(self, client, source):
@@ -402,8 +417,9 @@ class TestTheBootSweepDropsTheLegacyRow:
 
 class TestTheBootSweepRemovesAPendingMember:
     def test_a_crashed_member_is_removed_and_a_published_one_adopted(self, tmp_path):
-        """The same walk that removes what a crash left also adopts what it
-        did not: the two halves of one pass over ``sources/*/*``."""
+        """The sweep removes what a crash left; the registration hook adopts
+        what it did not. A registered source's tensors are uploaded fields, so
+        both halves are the ones every source already gets."""
         server = _restart_server(tmp_path)
         try:
             client = TensorFlightClient(f"grpc://localhost:{server.port}")
@@ -413,18 +429,18 @@ class TestTheBootSweepRemovesAPendingMember:
             done = _create(client, source, "done")
             _put(client, done)
             client.set_upload_status(done, "READY")
-            collection = server.sources.get(source).store
+            fields = _store(server, source, "crashed").parent
         finally:
             server.shutdown()
-        assert (collection / "crashed").is_dir()
+        assert (fields / "crashed").is_dir()
 
         second = _restart_server(tmp_path)
         try:
-            assert not (collection / "crashed").exists()
-            assert _marker(collection / "done") == "ready"
+            assert not (fields / "crashed").exists()
+            assert _marker(fields / "done") == "ready"
             adopted = second.sources.get(source)
-            assert [d.array_id for d in adopted.list_tensor_descriptors()] == [
-                f"{source}/done"
+            assert [d.array_id for d in catalog_tensors(adopted)] == [
+                f"{source}/@fields/done"
             ]
         finally:
             second.shutdown()
@@ -458,7 +474,9 @@ class TestTheMarker:
         upload stays PENDING for a retry."""
         desc = _create(client, source)
         _put(client, desc)
-        adapter = writable_server.sources.get(source).members["durable"]
+        adapter = writable_server.sources.get(source).attached_tensors[
+            "@fields/durable"
+        ]
         store = _store(writable_server, source)
 
         def refuse(state):
@@ -510,7 +528,7 @@ class TestTheMarker:
         zattrs = json.loads((_store(writable_server, source) / ".zattrs").read_text())
         axes = zattrs["multiscales"][0]["axes"]
         assert [a["name"] for a in axes] == ["dim0", "dim1"]
-        assert desc.array_id == f"{source}/durable"
+        assert desc.array_id == f"{source}/@fields/durable"
 
 
 class TestDiscoveryDeclinesAPendingStore:

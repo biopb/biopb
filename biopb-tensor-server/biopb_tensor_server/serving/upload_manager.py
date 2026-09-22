@@ -3,13 +3,15 @@
 Extracted from ``TensorFlightServer`` (biopb/biopb#278 item A). What is left
 here is only what a boundary does:
 
-- **Addressing** -- ``add_tensor`` takes ``<scheme>://<source_id>/<field>``
-  for a member of a registered source, ``<scheme>://<source_id>/@fields/<name>``
-  for a field on a discovered one, and ``zarr://<array_id>/@labels/<name>`` for
-  a label set (biopb/biopb#1059). Nothing here creates a source: the parent must
-  already be registered, and the new tensor is attached to it. The scheme names
-  the store format and nothing else (``adapters.registered.STORE_FORMATS``), so
-  the catalog row kept in step is always the parent's.
+- **Addressing** -- ``add_tensor`` takes
+  ``<scheme>://<source_id>/@fields/<name>`` for a tensor uploaded onto any
+  source, and ``zarr://<array_id>/@labels/<name>`` for a label set
+  (biopb/biopb#1059). Both carry a marked segment, because a bare field is a
+  native tensor id and the upload path mints none. Nothing here creates a
+  source: the parent must already be registered, and the new tensor is attached
+  to it. The scheme names the store format and nothing else
+  (``adapters.registered.STORE_FORMATS``), so the catalog row kept in step is
+  always the parent's.
 - **Error translation** -- adapters stay transport-agnostic and raise typed
   errors; this is where they become Flight errors.
 - **Lookup** -- ``status`` / ``set_status`` find the adapter and hand over
@@ -55,13 +57,16 @@ from biopb_tensor_server.adapters._writable import (
     unknown_upload_status,
     upload_of,
 )
-from biopb_tensor_server.adapters.fields import create_field_upload, fields_root
+from biopb_tensor_server.adapters.fields import (
+    create_field_upload,
+    fields_root,
+    source_fields_dir,
+)
 from biopb_tensor_server.adapters.labels import create_label_upload, labels_root
 from biopb_tensor_server.adapters.members import member_marker
 from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
 from biopb_tensor_server.adapters.registered import (
     RegisterAdapter,
-    create_member,
     create_registered_source,
     scan_registered_sources,
     sources_root,
@@ -100,10 +105,9 @@ DEFAULT_UPLOAD_TTL = 3600.0
 #: the store format and nothing else; everything after it is the tensor's
 #: ``array_id``, which is also the id it keeps and is answered with.
 _ID_GRAMMAR = (
-    "'<scheme>://<source_id>/<field>' to add a tensor to a registered source, "
-    f"'<scheme>://<source_id>/{FIELDS_SEGMENT}/<name>' to add one to a source "
-    f"the server discovered, or 'zarr://<array_id>/{LABELS_SEGMENT}/<name>' to "
-    "add a label set to one of its tensors"
+    f"'<scheme>://<source_id>/{FIELDS_SEGMENT}/<name>' to add a tensor to a "
+    f"source, or 'zarr://<array_id>/{LABELS_SEGMENT}/<name>' to add a label "
+    "set to one of its tensors"
 )
 
 
@@ -155,8 +159,8 @@ def _attached(adapter: Any) -> Dict[str, Any]:
     outside this package, and one that knows nothing about the upload path has
     none of them.
 
-    One index for every kind -- member, label set, field on a discovered source
-    -- so this boundary locates, publishes, unlists and reaps them alike
+    One index for both kinds -- uploaded field and label set -- so this
+    boundary locates, publishes, unlists and reaps them alike
     (``SourceAdapter.attached_tensors``).
     """
     return getattr(adapter, "attached_tensors", None) or {}
@@ -205,6 +209,16 @@ class UploadManager:
         self.ttl = float(ttl)
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+
+    @property
+    def write_dir(self) -> Optional[Path]:
+        """The subtree this server's uploads live under, or None if read-only.
+
+        Public because the layout under it is now one shape for every uploaded
+        tensor (``fields/<source_id>/<name>``), so naming a store is a matter
+        of knowing the root rather than asking the source that holds it.
+        """
+        return self._write_dir
 
     # -- lookup ----------------------------------------------------------------
 
@@ -309,7 +323,7 @@ class UploadManager:
     def _delete_adopted_tensor(self, array_id: str) -> Dict[str, Any]:
         """Remove a listed tensor that this life of the server did not upload.
 
-        A member or sidecar re-attached at registration carries no upload
+        A field or sidecar re-attached at registration carries no upload
         record, so :meth:`_locate` finds nothing to discard -- only a store,
         still the server's own (it was minted under ``write_dir``). Unlisted
         first, so no read can be routed to a store that is about to go.
@@ -431,31 +445,25 @@ class UploadManager:
         partial source. Runs from the server's
         constructor, before any source is registered. Returns the count.
 
-        The layouts the server mints: the members of a registered source
-        (``sources/<name>.zarr/<field>``, in either store format), the fields
-        uploaded onto a discovered one (``fields/<source_id>/<name>``, likewise),
-        the label sidecars
-        (``labels/<source_id>/*.zarr``), and -- for one more release -- the
-        single-array stores the removed ``ome_zarr:`` kind left directly under
-        ``write_dir``. They differ in what the catalog owes them, which is why
-        they are swept separately.
+        The layouts the server mints: the uploaded fields
+        (``fields/<source_id>/<name>``, in either store format), the label
+        sidecars (``labels/<source_id>/*.zarr``), and -- for one more release --
+        the single-array stores the removed ``ome_zarr:`` kind left directly
+        under ``write_dir``. They differ in what the catalog owes them, which is
+        why they are swept separately. A registered source's container
+        (``sources/<name>.zarr``) holds no tensor, so there is nothing under it
+        to sweep.
         """
         write_dir = self._write_dir
         if write_dir is None or not write_dir.is_dir():
             return 0
         removed = 0
-        for store in sorted(sources_root(write_dir).glob("*/*")):
-            # A member has no row of its own: it is a tensor of its source,
-            # whose row is rebuilt when that source is adopted -- which is
-            # after this sweep. The collection itself is never pending, so a
-            # ``.zattrs`` or ``.zgroup`` file here is simply not a directory.
-            if store.is_dir():
-                removed += self._remove_unfinished(store)
         for store in sorted(fields_root(write_dir).glob("*/*")):
-            # A field has no row of its own either: its source is the user's own
-            # file, whose row is the reconciler's. Only the *pending* ones go --
-            # a published field is the only copy of what someone uploaded, and
-            # is kept even once its source has gone away.
+            # A field has no row of its own: it is a tensor of its source, whose
+            # row is the reconciler's or is rebuilt when a registered source is
+            # adopted -- either way after this sweep. Only the *pending* ones go
+            # -- a published field is the only copy of what someone uploaded,
+            # and is kept even once its source has gone away.
             if store.is_dir():
                 removed += self._remove_unfinished(store)
         for store in sorted(labels_root(write_dir).glob("*/*.zarr")):
@@ -528,18 +536,18 @@ class UploadManager:
         """Add a tensor to a source that already exists; answer its descriptor.
 
         **Nothing here creates a source.** ``register_source`` does that, and
-        an upload names what it is adding to: ``<scheme>://<source_id>/<field>``
-        for a tensor of a registered source,
-        ``<scheme>://<source_id>/@fields/<name>`` for one on a source the server
-        discovered, and ``zarr://<array_id>/@labels/<name>`` for a label set of
-        any tensor of either. The scheme names the store
-        format (``registered.STORE_FORMATS``) and nothing else -- the answered
+        an upload names what it is adding to: ``<scheme>://<source_id>/@fields/<name>``
+        for a tensor of a source, ``zarr://<array_id>/@labels/<name>`` for a
+        label set of one of its tensors. The scheme names the store format
+        (``registered.STORE_FORMATS``) and nothing else -- the answered
         ``array_id`` carries none, because the format is a property of the
         stored tensor, read off its directory at the next registration.
 
-        Which of the three it is comes off the **field**, not the parent's
-        type: a marked segment says the upload path owns the bytes and picks
-        where they go; a bare field is the parent's own member.
+        **Every uploaded tensor is addressed under a marked segment**, whether
+        its source was registered or discovered (:mod:`~biopb_tensor_server.core.attached`).
+        A bare field is a native tensor id, which is the format's to mint, so
+        the upload path never answers one -- and the kind is read off the
+        field rather than off the parent's type.
 
         A field is taken for as long as its tensor is served. Replacing one is
         a discard first, which is what makes an ``array_id`` name a single
@@ -583,12 +591,7 @@ class UploadManager:
                 "and axes; the one exception is a label set's 'image-label' "
                 "block, which rides on its own add_tensor."
             )
-        if field == FIELDS_SEGMENT or field.startswith(f"{FIELDS_SEGMENT}/"):
-            # The *segment* dispatches, not the whole parse, so a malformed name
-            # under it is refused as a field rather than answered about members.
-            adapter = self._create_field(parent, field, scheme, req_desc)
-        else:
-            adapter = self._create_member(parent, source_id, field, scheme, req_desc)
+        adapter = self._create_field(parent, field, scheme, req_desc)
         # Attached, not listed: this routes the tensor's own writes, and the
         # published gate keeps it out of the source's tensors until READY. So no
         # catalog write is owed -- the row the source has still describes what a
@@ -597,42 +600,16 @@ class UploadManager:
         logger.info(f"Added {scheme} tensor: {adapter.array_id}")
         return adapter.upload_response(req_desc)
 
-    def _create_member(
-        self,
-        parent: Any,
-        source_id: str,
-        field: str,
-        scheme: str,
-        desc: TensorDescriptor,
-    ) -> Any:
-        """Mint a tensor of a source the server registered, inside its store."""
-        if not isinstance(parent, RegisterAdapter):
-            raise flight.FlightServerError(
-                f"add_tensor: {source_id!r} is not a registered source, so it "
-                f"has no store to put a tensor of its own in. Add it beside the "
-                f"source instead: "
-                f"'{scheme}://{source_id}/{FIELDS_SEGMENT}/<name>'."
-            )
-        try:
-            return create_member(parent, field, scheme, desc)
-        except ValueError as e:
-            raise flight.FlightServerError(f"add_tensor: {e}") from e
-
     def _create_field(
         self, parent: Any, field: str, scheme: str, desc: TensorDescriptor
     ) -> Any:
-        """Mint a tensor beside a source the server discovered.
+        """Mint an uploaded tensor beside its source, whatever kind it is.
 
-        Refused on a registered source: it has a store of its own, and a second
-        place for its tensors would be two layouts to adopt, sweep and reclaim
-        for one kind of source.
+        One layout for both: a discovered source's bytes are the user's and a
+        registered source holds none, so neither has anywhere of its own to put
+        a tensor. ``create_field_upload`` refuses a field that is not
+        ``@fields/<name>``, which is what answers a bare one.
         """
-        if isinstance(parent, RegisterAdapter):
-            raise flight.FlightServerError(
-                f"add_tensor: {parent.source_id!r} is a registered source, so "
-                f"its tensors are members of its own store: drop the "
-                f"{FIELDS_SEGMENT!r} segment."
-            )
         try:
             return create_field_upload(
                 parent, field, scheme, desc, fields_dir=fields_root(self._write_dir)
@@ -795,9 +772,9 @@ class UploadManager:
 
         Every source's attached tensors take the same step, because a tensor is
         attached to its source rather than registered and would otherwise have
-        no sweep at all: a quiet pending member, field or label set is discarded
-        (its store with it) and unlisted, and its tombstone is later detached,
-        which frees the field.
+        no sweep at all: a quiet pending field or label set is discarded (its
+        store with it) and unlisted, and its tombstone is later detached, which
+        frees the name.
 
         A registered source left with no live tensor goes with them, once it
         too has been quiet for ``ttl``. That covers both ends of the same
@@ -833,8 +810,8 @@ class UploadManager:
                     self._registry.unregister(source_id)
                     reclaimed += 1
                     logger.info(f"Reclaimed discarded upload {source_id}")
-            # ...and every tensor attached to it -- member, uploaded field or
-            # label set -- tracked on the source rather than in the registry,
+            # ...and every tensor attached to it -- uploaded field or label
+            # set -- tracked on the source rather than in the registry,
             # and taking the identical step.
             tensor_expired, tensor_reclaimed, emptied_now = self._reap_tensors(
                 adapter,
@@ -910,6 +887,14 @@ class UploadManager:
         self._drop_row(source_id)
         close_adapter(adapter)
         adapter.dispose_store()
+        if self._write_dir is not None:
+            # Every field of it is already gone -- that is what "empty" means
+            # here -- so this removes the directory they were in, which nothing
+            # else would.
+            shutil.rmtree(
+                source_fields_dir(fields_root(self._write_dir), source_id),
+                ignore_errors=True,
+            )
         logger.info(f"Reclaimed empty registered source {source_id}")
         return True
 

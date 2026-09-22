@@ -212,9 +212,9 @@ def catalog_tensors(adapter: Any) -> List[TensorDescriptor]:
     on it, and SQL reaches for ``tensors[1]`` -- and neither a label set
     (biopb/biopb#1059) nor an uploaded field may ever be that.
 
-    A registered source's members come from its ``list_tensor_descriptors``,
-    not from ``attached_fields``: a member's id carries no marked segment, so
-    nothing is listed twice.
+    A registered source has no tensors of its own, so its whole listing comes
+    from ``attached_fields`` -- which is the same path a discovered source's
+    uploaded fields take, and why nothing here needs to know which kind it has.
     """
     tensors = [catalog_entry(t) for t in adapter.list_tensor_descriptors()]
     attached = getattr(adapter, "attached_fields", None) or {}
@@ -560,11 +560,10 @@ class SourceAdapter(ABC):
         return {}, None
 
     # -- attached tensors (biopb/biopb#1059) -----------------------------------
-    # A tensor of this source the format did not produce: a label set the server
-    # minted for an upload, a field uploaded onto a source it discovered, a
-    # member of a source it registered. Not chained through __init__ (adapters
-    # set their own attributes), so the slots are class-level None,
-    # materialized on use.
+    # A tensor of this source the format did not produce: a label set the
+    # server minted for an upload, or a field uploaded onto the source. Not
+    # chained through __init__ (adapters set their own attributes), so the
+    # slots are class-level None, materialized on use.
     #
     # One index whatever the kind, keyed by within-source field, holding every
     # such tensor from ``add_tensor`` until the reclaim sweep detaches it.
@@ -740,9 +739,9 @@ class SourceAdapter(ABC):
     def attach_tensor(self, field: str, adapter: TensorAdapter) -> None:
         """Make *adapter* answer for *field* on this source.
 
-        Every kind arrives here: ``add_tensor`` attaches a member or an upload
-        the moment it mints one -- that is what routes the tensor's own writes
-        -- and the registration hooks attach what an earlier life left on disk.
+        Every kind arrives here: ``add_tensor`` attaches an upload the moment
+        it mints one -- that is what routes the tensor's own writes -- and the
+        registration hooks attach what an earlier life left on disk.
         Handed over in its own axis order and checked when the source's tensors
         are next listed, not here: an unresolved source has no tensors to check
         a set against yet, and the upload kinds validate at create anyway.
@@ -843,8 +842,8 @@ class SourceAdapter(ABC):
 
         Only a **marked** field reaches one: a label set through its
         right-to-left parse, an uploaded field through the whole of its
-        ``@fields/<name>``. Everything else -- a registered source's members
-        included -- is the format's own routing.
+        ``@fields/<name>``. Everything else is the format's own routing, which
+        is the whole of the rule -- the upload path mints no bare field.
         """
         parsed = split_label_field(field)
         if parsed is not None:

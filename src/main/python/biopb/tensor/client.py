@@ -926,18 +926,20 @@ class TensorFlightClient:
         after a discarded upload's ``upload_ttl``.
 
         Args:
-            array_id: ``"<scheme>://<source_id>/<field>"``, where *scheme* is
-                the store format -- ``zarr`` for an OME-Zarr image group,
-                ``cache`` for the chunks as uploaded -- and *source_id* is what
-                ``register_source`` answered.
+            array_id: ``"<scheme>://<source_id>/@fields/<name>"``, where
+                *scheme* is the store format -- ``zarr`` for an OME-Zarr image
+                group, ``cache`` for the chunks as uploaded -- and *source_id*
+                is a source the server already serves, whether it was
+                discovered or answered by ``register_source``.
 
-                The other two forms put a tensor on a source the server
-                **discovered**, whose own bytes are the user's, so each keeps
-                its own store beside that source and carries a marked segment
-                that cannot collide with one of the file's own tensors:
-                ``"<scheme>://<source_id>/@fields/<name>"`` for a plain field,
-                and ``"zarr://<image array_id>/@labels/<name>"`` for a label set
-                of an image the server already serves. A set is
+                The ``@fields`` segment is not optional. An uploaded tensor
+                keeps its own store beside its source, and the marked segment
+                is what stops its id colliding with one of the file's own
+                tensors -- so a bare ``"<source_id>/<field>"`` is a native
+                tensor id, which only a format mints, and is refused here.
+
+                The one other form is ``"zarr://<image array_id>/@labels/<name>"``,
+                a label set of an image the server already serves. A set is
                 unsigned-integer, spans its image's non-channel axes at full
                 length, and its all-zero chunks are skipped by
                 ``upload_array``.

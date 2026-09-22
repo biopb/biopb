@@ -1,9 +1,9 @@
 """An upload adds a tensor to a source that already exists (step 5).
 
-``register_source`` mints a container and nothing
-else; ``add_tensor`` puts ``<scheme>://<source_id>/<field>`` in it. The scheme
-names the store format and nothing else, so the answered ``array_id`` carries
-none and the format is read back off the directory at the next registration.
+``register_source`` mints a container and nothing else; ``add_tensor`` puts
+``<scheme>://<source_id>/@fields/<name>`` on it. The scheme names the store
+format and nothing else, so the answered ``array_id`` carries none and the
+format is read back off the directory at the next registration.
 
 What that buys, and what is tested here: a finished upload survives a restart
 (the gap this whole design closes, biopb/biopb#1048), several tensors share one
@@ -19,7 +19,12 @@ import pyarrow.flight as flight
 import pytest
 from biopb.tensor import TensorFlightClient
 from biopb.tensor.ticket_pb2 import ChunkBounds
+from biopb_tensor_server.adapters.fields import (
+    fields_root,
+    source_fields_dir,
+)
 from biopb_tensor_server.cache import CacheManager
+from biopb_tensor_server.core.adapter_base import catalog_tensors
 from biopb_tensor_server.core.config import CacheConfig
 
 from tests import catalog_server
@@ -35,7 +40,7 @@ def _arr(fill=1, shape=SHAPE):
 def _add(client, source, field, scheme="zarr", arr=None, **kw):
     arr = _arr() if arr is None else arr
     return client.add_tensor(
-        f"{scheme}://{source}/{field}", arr, chunk_shape=CHUNK, **kw
+        f"{scheme}://{source}/@fields/{field}", arr, chunk_shape=CHUNK, **kw
     )
 
 
@@ -44,12 +49,12 @@ class TestTheAnsweredId:
         """The format is a property of the stored tensor, not of its name: a
         reader that later asks for this id says nothing about zarr or cache."""
         desc = _add(client, source, "img")
-        assert desc.array_id == f"{source}/img"
+        assert desc.array_id == f"{source}/@fields/img"
 
     @pytest.mark.parametrize("scheme", ["zarr", "cache"])
     def test_both_formats_answer_the_same_id(self, client, source, scheme):
         desc = _add(client, source, f"f-{scheme}", scheme=scheme)
-        assert desc.array_id == f"{source}/f-{scheme}"
+        assert desc.array_id == f"{source}/@fields/f-{scheme}"
 
     @pytest.mark.parametrize("scheme", ["zarr", "cache"])
     def test_both_formats_round_trip_their_pixels(self, client, source, scheme):
@@ -69,8 +74,7 @@ class TestOneSourceManyTensors:
         _add(client, source, "filling")  # still PENDING
 
         listed = [
-            d.array_id
-            for d in writable_server.sources.get(source).list_tensor_descriptors()
+            d.array_id for d in catalog_tensors(writable_server.sources.get(source))
         ]
         assert listed == [published.array_id]
 
@@ -179,8 +183,8 @@ class TestItSurvivesARestart:
         try:
             assert second.sources.get(source) is not None
             assert [
-                d.array_id for d in second.sources.get(source).list_tensor_descriptors()
-            ] == [f"{source}/img"]
+                d.array_id for d in catalog_tensors(second.sources.get(source))
+            ] == [f"{source}/@fields/img"]
         finally:
             second.shutdown()
             CacheManager.reset()
@@ -209,7 +213,7 @@ class TestWhatItRefuses:
         [
             ("@labels", "server owns"),
             ("CON", "device name"),
-            ("..", "cannot name a tensor"),
+            ("..", "relative path component"),
             (".hidden", "starts with"),
         ],
     )
@@ -237,12 +241,12 @@ class TestWhatItRefuses:
         ):
             _add(client, "registered_nope", "img")
 
-    def test_a_discovered_source_takes_no_bare_field(
+    def test_a_bare_field_is_refused_on_a_discovered_source_too(
         self, writable_server, client, tmp_path
     ):
-        """It is the user's data: the server mints stores under ``write_dir``
-        and nowhere else, so a tensor of a discovered source goes beside it,
-        under the marked segment -- which the refusal names."""
+        """A bare field is a native tensor id, which only a format mints. The
+        rule is the source's kind-independent one, and the refusal names the
+        grammar that replaces it."""
         import zarr
 
         store = tmp_path / "theirs.zarr"
@@ -253,9 +257,11 @@ class TestWhatItRefuses:
         writable_server.register_source("theirs", adapter)
 
         with pytest.raises(
-            flight.FlightServerError, match=r"zarr://theirs/@fields/<name>"
+            flight.FlightServerError, match=r"<source_id>/@fields/<name>"
         ):
-            _add(client, "theirs", "img")
+            client.add_tensor(
+                "zarr://theirs/img", np.zeros(SHAPE, np.uint16), chunk_shape=CHUNK
+            )
 
 
 class TestALabelSetOnAMember:
@@ -272,7 +278,7 @@ class TestALabelSetOnAMember:
         )
         client.upload_array(desc, labels)
 
-        assert desc.array_id == f"{source}/img/@labels/nuclei"
+        assert desc.array_id == f"{source}/@fields/img/@labels/nuclei"
         assert client.label_sets(image.array_id) == [desc.array_id]
         np.testing.assert_array_equal(
             client.get_tensor(desc.array_id).compute(), labels
@@ -293,7 +299,7 @@ class TestALabelSetOnAMember:
 
 class TestTheStoreFollowsThePlan:
     def test_a_zarr_member_is_chunked_on_the_grid_it_is_planned_on(
-        self, writable_server, client, source
+        self, writable_server, client, source, tmp_path
     ):
         """One grid, not two: on disk, on the wire, for reads and for writes,
         and across a restart where nothing remembers what was asked for
@@ -301,13 +307,13 @@ class TestTheStoreFollowsThePlan:
         import zarr
 
         desc = _add(client, source, "img")
-        store = writable_server.sources.get(source).member_store("img")
+        store = source_fields_dir(fields_root(tmp_path), source) / "img"
         native = zarr.open_array(str(store / "0"), mode="r").chunks
 
         assert tuple(desc.chunk_shape) == native
 
     def test_a_member_carries_its_own_content_version(
-        self, writable_server, client, source
+        self, writable_server, client, source, tmp_path
     ):
         """Its own, not its source's: publishing one member must not move a
         sibling's chunk ids, and a restart must not move either."""
@@ -315,10 +321,12 @@ class TestTheStoreFollowsThePlan:
         from biopb_tensor_server.adapters.zarr import read_zattrs
 
         parent = writable_server.sources.get(source)
+        parent = writable_server.sources.get(source)
+        fields_dir = source_fields_dir(fields_root(tmp_path), source)
         first = _add(client, source, "a")
         second = _add(client, source, "b")
         tokens = {
-            field: read_member_version(read_zattrs(parent.member_store(field)))
+            field: read_member_version(read_zattrs(fields_dir / field))
             for field in ("a", "b")
         }
 

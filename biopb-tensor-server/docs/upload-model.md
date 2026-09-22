@@ -6,19 +6,22 @@ doc.
 ## Adding a tensor
 
 `add_tensor` adds a tensor to a source that already exists; nothing on the
-upload path creates one. Three forms, the scheme naming only the **store
+upload path creates one. Two forms, the scheme naming only the **store
 format** (`zarr://` or `cache://`, one lifecycle for both):
 
 | request | adds |
 |---|---|
-| `<scheme>://<source_id>/<field>` | a tensor to a registered source |
-| `<scheme>://<source_id>/@fields/<field>` | a tensor to a source the server discovered |
+| `<scheme>://<source_id>/@fields/<name>` | a tensor to a source, registered or discovered |
 | `zarr://<array_id>/@labels/<name>` | a label set to the tensor (binding and extent rules: `label-tensors.md`) |
 
-Each is refused if the parent doesn't exist, the field or name is taken, or
-the name fails the rules in Names. The answered `array_id` carries no
-scheme -- format is a property of the stored tensor, read off its directory
-at adoption -- and a bare id with no `/` is never an upload.
+Both carry a **marked segment**, whatever kind the source is: a bare field
+is a native tensor id, which only a format mints, so the upload path never
+answers one and refuses a request for one (Names).
+
+Each is refused if the parent doesn't exist, the name is taken, or it fails
+the rules in Names. The answered `array_id` carries no scheme -- format is a
+property of the stored tensor, read off its directory at adoption -- and a
+bare id with no `/` is never an upload.
 
 The write side is ticket-based (Wire): `add_tensor` creates the tensor,
 `GetFlightInfo` plans it -- answered even while the tensor is PENDING, so a
@@ -34,19 +37,19 @@ itself.
 
 ```
 <write_dir>/sources/<name>.zarr/    zarr group; .zattrs carries {"biopb": {"source": {"source_id", "content_version"}}} and the source's OME metadata
-    <field>/                        one member per added tensor
-        .zattrs                     multiscales (one level), upload marker, the member's own content_version
-        0/                          the array
-        labels/<name>/              NGFF layout for its label sets
 ```
 
-and registers a `RegisterAdapter`: a source adapter with no bytes of its
-own, holding one tensor adapter per member, as a plate holds its fields.
+and registers a `RegisterAdapter`: a source adapter with no bytes **and no
+tensors** of its own. What is added to it is an uploaded field like any
+other, stored under `<write_dir>/fields/<source_id>/` (Fields), so the
+container holds identity and metadata and nothing else. The class is
+therefore the three methods `SourceAdapter` declares abstract, and the base
+resolves, lists and checks its tensors as it does for any source.
 
 - **Metadata is source-scoped.** It rides on `register_source` and lives in
-  the group's `.zattrs`; every member inherits the physical scale, units and
+  the group's `.zattrs`; every field inherits the physical scale, units and
   channel names. `add_tensor` carries shape, dtype, grid and dim labels
-  only -- a request that also sets `metadata_json` on a member is refused,
+  only -- a request that also sets `metadata_json` on a tensor is refused,
   not silently dropped. The one exception is a label set's own NGFF
   `image-label` block, which stays on its `add_tensor` request.
 - **`write_dir` is never discovered.** The reconciler owns the user's
@@ -57,18 +60,18 @@ own, holding one tensor adapter per member, as a plate holds its fields.
   `write_dir` moving and cannot be guessed by a client that did not create
   the source. A store whose `.zattrs` is missing or unreadable is not a
   registered source -- it is swept, not served.
-- **Boot adoption is a second branch of the same sweep** that removes a
-  member a crash left PENDING: a READY collection re-registers through its
-  `RegisterAdapter`, its READY members attach to it, and a READY sidecar
-  attaches to its parent (`sidecar_attacher`).
-- An empty source (no members yet) is valid. One left empty past
+- **Boot adoption re-registers the container**; its tensors come back the
+  way every source's attached tensors do, through the `on_register` hook
+  (`fields_attacher`, `sidecar_attacher`). There is no adoption pass of its
+  own, because there is nothing under it to adopt.
+- An empty source (no tensors yet) is valid. One left empty past
   `upload_ttl`, or with only tombstoned tensors, is reclaimed (Lifecycle).
 
 ## Store formats
 
-Two member layouts under a registered source or a field on a discovered
-one, chosen by the scheme on `add_tensor` and recognized from the member
-directory at adoption (`member_marker`, `open_any_member`):
+Two member layouts for an uploaded field, chosen by the scheme on
+`add_tensor` and recognized from the member directory at adoption
+(`member_marker`, `open_any_member`):
 
 | | `zarr://` | `cache://` |
 |---|---|---|
@@ -93,22 +96,22 @@ adapter mints this build's chunk ids over the indexed bounds and keeps that
 map in memory; only an epoch bump rebuilds it. READY closes the open
 segment and writes its sidecar -- no segment is open on a READY member.
 
-## Fields on a file source
+## Uploaded fields
 
-`<scheme>://<source_id>/@fields/<field>`, where the source is one the
-server **discovered**, puts the tensor in
-`<write_dir>/fields/<source_id>/<field>/` -- a member directory in either
-store format, read back exactly as a registered source's members are. It
-is attached by the same `on_register` hook that attaches label sidecars,
-and listed after the format's own tensors.
+`<scheme>://<source_id>/@fields/<name>` puts the tensor in
+`<write_dir>/fields/<source_id>/<name>/` -- a member directory in either
+store format -- whatever kind the source is. One layout, because neither
+kind has anywhere of its own to put it: a discovered source's bytes are the
+user's, and a registered source holds none. It is attached by the same
+`on_register` hook that attaches label sidecars, and listed after the
+format's own tensors (of which a registered source has none).
 
 A field and a label set are both **attached tensors**: `SourceAdapter`
 holds one `field -> adapter` index (`_attached_tensors`), and `label_sets`,
 `label_uploads` and `attached_fields` are checked views over it --
 `label_sets` is the attached tensors whose field parses as a set, each
-checked against `label_binding_error`. `RegisterAdapter.members` is a view
-of the same index. A field differs from a label set in binding to nothing,
-decoding nothing, and mapping to no axes.
+checked against `label_binding_error`. A field differs from a label set in
+binding to nothing, decoding nothing, and mapping to no axes.
 
 A set may bind to an uploaded field, since a field is a tensor of its
 source like any other. An orphaned field -- its discovery root gone -- is
@@ -126,7 +129,9 @@ or set name may not open with it.
 Marking, not reserving, is what makes an attached id unable to collide with
 a native one: `<source_id>/<field>` is exactly the shape of a native
 tensor id, so a field or scene named `0` would otherwise shadow one of the
-file's own, while `<source_id>/@fields/0` cannot. The disk layout is
+file's own, while `<source_id>/@fields/0` cannot. The rule has no exception
+-- the upload path mints no bare field on any kind of source -- so a bare
+id always names a tensor some format produced. The disk layout is
 unaffected -- NGFF's group is still `labels/` -- only the wire id is
 marked, and the parse is right-to-left, so a set literally named `labels`
 (`.../@labels/labels`) is still legal.

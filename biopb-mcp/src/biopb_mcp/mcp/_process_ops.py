@@ -180,7 +180,7 @@ def _build_op(
                 result = da.from_array(result, chunks=result.shape)
             field = f"{_sanitize_name(op_name) or 'result'}-{os.urandom(4).hex()}"
             desc = client.add_tensor(
-                f"cache://{_result_source(client)}/{field}", result
+                f"cache://{_result_source(client)}/@fields/{field}", result
             )
             client.upload_array(desc, result)
             return desc.array_id

@@ -162,7 +162,7 @@ class TestBuildOpArrayId:
         client = MagicMock()
         client.get_tensor_pb.return_value = SerializedTensor()
         client.register_source.return_value = "registered_1"
-        client.add_tensor.return_value.array_id = "registered_1/seg-abcd"
+        client.add_tensor.return_value.array_id = "registered_1/@fields/seg-abcd"
 
         result_arr = np.ones((2, 2), dtype="uint8")
         stub = MagicMock()
@@ -172,7 +172,7 @@ class TestBuildOpArrayId:
 
         out = op("src_id")
 
-        assert out == "registered_1/seg-abcd"
+        assert out == "registered_1/@fields/seg-abcd"
         client.get_tensor_pb.assert_called_once_with("src_id")
         # Sent as lazy_data, not eager.
         sent = stub.Run.call_args[0][0]
@@ -180,7 +180,7 @@ class TestBuildOpArrayId:
         # Added to this connection's results source, then filled with the same
         # dask array: nothing creates a source on the upload path.
         array_id, template = client.add_tensor.call_args[0]
-        assert array_id.startswith("cache://registered_1/seg-")
+        assert array_id.startswith("cache://registered_1/@fields/seg-")
         assert isinstance(template, da.Array)
         desc, filled = client.upload_array.call_args[0]
         assert desc is client.add_tensor.return_value
@@ -204,7 +204,7 @@ class TestBuildOpArrayId:
         # Two results, two fields on the one source.
         ids = {call[0][0] for call in client.add_tensor.call_args_list}
         assert len(ids) == 2
-        assert all(i.startswith("cache://registered_1/seg-") for i in ids)
+        assert all(i.startswith("cache://registered_1/@fields/seg-") for i in ids)
         assert first is not None and second is not None
 
     def test_source_id_without_client_raises(self):

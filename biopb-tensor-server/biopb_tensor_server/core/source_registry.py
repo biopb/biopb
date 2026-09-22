@@ -38,9 +38,22 @@ def close_adapter(adapter: Optional[SourceAdapter]) -> None:
     instead of a silent skip (biopb/biopb#71). Never raises -- shutdown and
     unregister must not fail on a balky adapter, and the registry also accepts
     non-inheriting test doubles.
+
+    **Releases what was attached to the source as well.** An uploaded field or
+    a label set holds a store of its own, and the source it hangs off knows
+    nothing about that store's handles. Done here rather than in a ``close()``
+    override because this is the mirror of :meth:`SourceRegistry.register`,
+    which is where the attaching happens: an adapter that overrides ``close``
+    for handles of its own would otherwise have to remember to chain up, and
+    forgetting would be silent.
     """
     if adapter is None:  # unregister of an id that was never registered
         return
+    for tensor in getattr(adapter, "attached_tensors", {}).values():
+        try:
+            tensor.close()
+        except Exception:  # cleanup must not fail
+            logger.debug("error closing attached tensor", exc_info=True)
     try:
         adapter.close()
     except Exception:  # cleanup must not fail

@@ -46,8 +46,8 @@ WIRE_PROTOCOL_METADATA_KEY = "chunk_wire_protocol"
 #   ``extra_info``.
 #   Uploads add to a source rather than create one: ``register_source`` mints
 #   the source, ``add_tensor`` (was ``create_tensor``, was ``create_source``)
-#   adds ``<scheme>://<source_id>/<field>`` to it and refuses a field that
-#   exists, and DoPut carries a ``chunk_ticket`` from the tensor's own
+#   adds ``<scheme>://<source_id>/@fields/<name>`` to it and refuses a name
+#   that exists, and DoPut carries a ``chunk_ticket`` from the tensor's own
 #   GetFlightInfo plan rather than bounds the client chose.
 #   Every action takes full access, ``chunk_locate`` included.
 #   ``SerializedTensor`` is a serialized ``FlightInfo`` plus location and

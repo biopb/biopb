@@ -78,7 +78,7 @@ BOOT_TIMEOUT_S = 60.0
 
 #: The one tensor of each fixture's source. A fixture is one array, so the
 #: field carries no information and only has to be a legal name; what an agent
-#: is handed is the whole ``<source_id>/<field>``.
+#: is handed is the whole ``<source_id>/@fields/<name>``.
 FIXTURE_FIELD = "data"
 
 
@@ -156,7 +156,7 @@ class TensorPlane:
         lazy = da.from_array(array, chunks=chunk_shape)
         source_id = self.client.register_source(f"{self.secret}-{key}")
         desc = self.client.add_tensor(
-            f"cache://{source_id}/{FIXTURE_FIELD}",
+            f"cache://{source_id}/@fields/{FIXTURE_FIELD}",
             lazy,
             chunk_shape=list(chunk_shape),
             dim_labels=list(dim_labels) if dim_labels else None,

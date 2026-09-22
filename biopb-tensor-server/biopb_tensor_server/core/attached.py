@@ -3,14 +3,16 @@
 A tensor the *upload path* put on a source -- rather than one the source's own
 format produced -- is addressed under a segment marked with :data:`MARKER`::
 
-    <source_id>/@fields/<name>       a field on a source the server discovered
+    <source_id>/@fields/<name>       a field uploaded onto a source
     <image array_id>/@labels/<name>  a label set of one of its tensors
 
-The mark is what keeps such an id off a native one. ``<source_id>/<field>`` is
-exactly the shape of a native tensor id, so an attached field named ``0`` or
-``scene1`` would shadow a scene of the user's own file -- silently, since the
-attached tensors are listed after the format's own. ``<source_id>/@fields/0``
-cannot, so neither segment needs a namespace rule of its own.
+**Every** uploaded tensor, whatever kind of source it was added to. The mark is
+what keeps such an id off a native one: ``<source_id>/<field>`` is exactly the
+shape of a native tensor id, so an attached field named ``0`` or ``scene1``
+would shadow a scene of the user's own file -- silently, since the attached
+tensors are listed after the format's own. ``<source_id>/@fields/0`` cannot, so
+neither segment needs a namespace rule of its own, and a bare field always
+means a tensor some format produced.
 
 What a field *is* lives in :mod:`biopb_tensor_server.adapters.fields`; the label
 half of the grammar is :mod:`biopb_tensor_server.core.labels`.

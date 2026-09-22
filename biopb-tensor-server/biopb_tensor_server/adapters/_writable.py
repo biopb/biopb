@@ -14,7 +14,7 @@ consulted before every write, by hand, in three places.
 progress, status, disposal -- and leaves the format its own half: how a chunk
 is stored (``_store_chunk``) and what its store needs told when the upload
 ends (``_dispose_store`` on discard, ``_publish_store`` on publish). Minting
-one belongs to whoever owns the layout (``adapters.registered.create_member``,
+one belongs to whoever owns the layout (``adapters.fields.create_field_upload``,
 ``adapters.labels.create_label_upload``); the DoPut boundary
 (``serving.upload_manager``) attaches the result to its source, keeps the
 catalog row in step, and translates exceptions. Nothing else about an upload
@@ -329,7 +329,7 @@ def unsafe_field_name(name: str) -> Optional[str]:
     A field is a path component of its source's group, so it takes the store
     rules with no extension of its own, plus the marker. Applied to every name a
     client chooses for a tensor, whatever format it asked for
-    (``adapters.registered.create_member``,
+    (``adapters.fields.create_field_upload``,
     ``adapters.fields.create_field_upload``).
     """
     if name.startswith(RESERVED_MARKER):

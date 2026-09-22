@@ -128,7 +128,7 @@ class ZarrAdapter(WritableSource, TensorAdapter):
     For remote storage, uses zarr.FSStore with fsspec filesystem.
 
     Writable: a chunk-aligned ``put_chunk`` lands in the store. Only an adapter
-    minted as an upload (``adapters.registered.create_member``,
+    minted as an upload (``adapters.fields.create_field_upload``,
     ``adapters.labels.create_label_upload``) tracks one; a catalogued store
     accepts writes untracked.
 

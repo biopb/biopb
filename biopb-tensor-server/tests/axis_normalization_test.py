@@ -623,7 +623,7 @@ class TestAddTensorValidation:
         """Accepting an order takes a source to add the tensor to."""
         manager = self._manager(tmp_path)
         source = manager.register_source()
-        desc.array_id = f"cache://{source}/{desc.array_id}"
+        desc.array_id = f"cache://{source}/@fields/{desc.array_id}"
         return manager.add_tensor(desc)
 
     def test_canonical_upload_is_accepted(self, tmp_path):

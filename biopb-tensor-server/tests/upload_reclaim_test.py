@@ -21,13 +21,19 @@ import numpy as np
 import pytest
 from biopb.tensor import UploadRefused
 from biopb.tensor.ticket_pb2 import ChunkBounds
+from biopb_tensor_server.adapters.fields import (
+    fields_root,
+    source_fields_dir,
+)
+from biopb_tensor_server.core.adapter_base import catalog_tensors
+from biopb_tensor_server.core.attached import attached_field
 
 TTL = 10.0
 
 
 def _make(client, source, field="reclaim", shape=(4, 4), chunk=(2, 2)):
     return client.add_tensor(
-        f"cache://{source}/{field}",
+        f"cache://{source}/@fields/{field}",
         np.empty(shape, dtype=np.uint16),
         chunk_shape=chunk,
     )
@@ -95,18 +101,18 @@ class TestAQuietUploadExpires:
         assert client.get_upload_status(desc.array_id)["state"] == "READY"
 
     def test_a_quiet_zarr_upload_is_discarded_and_its_store_removed(
-        self, uploads, client, writable_server, source
+        self, uploads, client, writable_server, source, tmp_path
     ):
         """A member's store was the server's own, so the sweep disposes of it
         and takes the tensor out of its source's listing (biopb/biopb#1059)."""
         desc = client.add_tensor(
-            f"zarr://{source}/quiet",
+            f"zarr://{source}/@fields/quiet",
             np.empty((4, 4), dtype=np.uint16),
             chunk_shape=(2, 2),
             dim_labels=["y", "x"],
         )
         parent = writable_server.sources.get(source)
-        store = parent.member_store("quiet")
+        store = source_fields_dir(fields_root(tmp_path), source) / "quiet"
         assert store.is_dir()
 
         assert uploads.reap(now=_past_ttl()) == (1, 0)
@@ -115,10 +121,10 @@ class TestAQuietUploadExpires:
         assert status["state"] == "DISCARDED"
         assert "expired" in status["reason"]
         assert not store.exists()
-        assert parent.list_tensor_descriptors() == []
+        assert catalog_tensors(parent) == []
 
         assert uploads.reap(now=_past_ttl(margin=2 * TTL)) == (0, 1)
-        assert "quiet" not in parent.members
+        assert attached_field("quiet") not in parent.attached_tensors
 
     def test_a_zero_ttl_disables_the_sweep(self, uploads, client, source):
         desc = _make(client, source)
@@ -137,7 +143,10 @@ class TestATombstoneIsReclaimed:
 
         assert uploads.reap(now=_past_ttl()) == (0, 1)
 
-        assert "reclaim" not in writable_server.sources.get(source).members
+        assert (
+            attached_field("reclaim")
+            not in writable_server.sources.get(source).attached_tensors
+        )
         assert client.get_upload_status(desc.array_id)["state"] == "UNKNOWN"
 
     def test_a_fresh_tombstone_still_answers(self, uploads, client, source):

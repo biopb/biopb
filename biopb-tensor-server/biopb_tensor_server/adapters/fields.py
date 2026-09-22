@@ -1,10 +1,11 @@
-"""A tensor uploaded onto a source the server discovered.
+"""A tensor uploaded onto a source, whatever kind of source it is.
 
-A registered source is a container the upload path minted and may fill; a
-*discovered* source is a file of the user's, and the upload path may not write
-into it. So a field added to one keeps its bytes in a member directory of its
-own, under ``<write_dir>/fields/<source_id>/<name>/``, bound as a tensor of the
-source it was added to -- id ``<source_id>/@fields/<name>`` (``core.attached``).
+This is the one upload layout. A *discovered* source is a file of the user's
+and the upload path may not write into it; a *registered* source holds no bytes
+at all. Neither has anywhere of its own to put a tensor, so a field keeps its
+bytes in a member directory under ``<write_dir>/fields/<source_id>/<name>/``,
+bound as a tensor of the source it was added to -- id
+``<source_id>/@fields/<name>`` (``core.attached``).
 
 A field is a label sidecar without the label half: it binds to no image, is
 read from no format, and maps to no axes. So the shared machinery serves it
@@ -50,8 +51,8 @@ def fields_root(write_dir: Path) -> Path:
     """Where every source's uploaded fields live: ``<write_dir>/fields/``.
 
     The one definition of the layout, as ``registered.sources_root`` and
-    ``labels.labels_root`` are for the other two: the attacher reads it, the
-    upload kind writes under it, and the boot sweep globs it.
+    ``labels.labels_root`` are for the containers and the sidecars: the attacher
+    reads it, the upload kind writes under it, and the boot sweep globs it.
     """
     return Path(write_dir) / "fields"
 
@@ -74,7 +75,8 @@ def create_field_upload(
     *field* is the id's within-source half, ``@fields/<name>``, already split by
     the boundary. The store is a member directory in either format
     (``registered.create_member_at``) under :func:`source_fields_dir`, never
-    inside the parent's own store: those bytes are the user's.
+    inside the parent's own store -- a discovered source's bytes are the user's,
+    and a registered source has none.
 
     Raises ``ValueError`` for a request the kind cannot serve -- a field that is
     not one of these, an unusable or marked name, a name already taken on this
@@ -113,10 +115,10 @@ def scan_source_fields(source_id: str, fields_dir: Path) -> Dict[str, TensorAdap
     """The finished uploaded fields of *source_id*, keyed by within-source field.
 
     Derived from the directory rather than from a dict something has to remember
-    to fill, the shape ``registered.scan_members`` and ``labels.sidecar_label_sets``
-    both use. A field still PENDING is one a crash left behind: the boot sweep
-    removes it, and this pass skips whatever the sweep has not reached rather
-    than adopting a half-written tensor. The format is read off the directory,
+    to fill, the shape ``labels.sidecar_label_sets`` uses too. A field still
+    PENDING is one a crash left behind: the boot sweep removes it, and this pass
+    skips whatever the sweep has not reached rather than adopting a half-written
+    tensor. The format is read off the directory,
     which is what keeps the scheme out of the stored ``array_id``.
     """
     root = source_fields_dir(fields_dir, source_id)
@@ -144,7 +146,9 @@ def fields_attacher(fields_dir: Path) -> Callable[[str, Any], None]:
 
     Runs at the one registration chokepoint, because a field is keyed by
     ``source_id`` and no format knows about it -- the shape
-    ``labels.sidecar_attacher`` already has. A field that will not open costs
+    ``labels.sidecar_attacher`` already has. This is also how a registered
+    source gets its tensors back at boot: it has no format to enumerate them,
+    so adoption is this pass and nothing else. A field that will not open costs
     the field, never the source.
     """
 

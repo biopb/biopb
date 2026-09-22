@@ -7,20 +7,25 @@ missing from *discovery* -- ``write_dir`` is outside every discovery root by
 rule, and stays there -- what was missing was the adoption pass.
 
 So the properties here are: the id is the server's and is recorded, not
-derived from the path; the collection comes back under that id in the next
-life; and a directory that records no id is not a source at all.
+derived from the path; the container comes back under that id in the next life;
+and a directory that records no id is not a source at all. What it holds is not
+in it -- its tensors are uploaded fields, attached at registration like any
+other source's.
 """
 
 import json
 from pathlib import Path
 
 import pytest
+from biopb_tensor_server.adapters._writable import folded_match
 from biopb_tensor_server.adapters.registered import (
     create_registered_source,
     read_source_block,
     scan_registered_sources,
     sources_root,
 )
+from biopb_tensor_server.core.adapter_base import catalog_tensors
+from biopb_tensor_server.core.attached import attached_field
 
 
 @pytest.fixture
@@ -156,33 +161,40 @@ class TestTheSourceSurface:
         with pytest.raises(TensorNotFound, match="no tensors yet"):
             adapter.get_tensor_adapter(None)
 
-    def test_a_member_is_listed_and_addressable(self, sources_dir):
+    def test_a_field_is_listed_and_addressable(self, sources_dir):
+        """Listed through ``catalog_tensors``, which is where an attached
+        tensor joins a source's listing: the container has none of its own."""
         adapter = create_registered_source("plate", None, sources_dir)
-        member = _FakeMember(f"{adapter.source_id}/img")
-        adapter.attach_tensor("img", member)
+        field = attached_field("img")
+        member = _FakeMember(f"{adapter.source_id}/{field}")
+        adapter.attach_tensor(field, member)
 
-        assert [d.array_id for d in adapter.list_tensor_descriptors()] == [
-            f"{adapter.source_id}/img"
+        assert [d.array_id for d in catalog_tensors(adapter)] == [
+            f"{adapter.source_id}/{field}"
         ]
-        assert adapter.get_tensor_adapter(f"{adapter.source_id}/img") is member
-        assert adapter.get_tensor_adapter("img") is member
-        # With no field, the source's default is its first member.
+        assert adapter.resolve_tensor(f"{adapter.source_id}/{field}") is member
+        assert adapter.resolve_tensor(field) is member
+        # With no field, the source's default is its first published one.
         assert adapter.get_tensor_adapter(None) is member
 
     def test_an_unknown_field_is_a_resolution_miss(self, sources_dir):
         from biopb_tensor_server.core.errors import TensorNotFound
 
         adapter = create_registered_source("plate", None, sources_dir)
-        adapter.attach_tensor("img", _FakeMember("x/img"))
+        adapter.attach_tensor(attached_field("img"), _FakeMember("x/img"))
         with pytest.raises(TensorNotFound, match="has no tensor"):
             adapter.get_tensor_adapter("nope")
 
     def test_a_field_collides_folded(self, sources_dir):
         adapter = create_registered_source("plate", None, sources_dir)
-        adapter.attach_tensor("Nuclei", _FakeMember("x/Nuclei"))
+        adapter.attach_tensor(attached_field("Nuclei"), _FakeMember("x/Nuclei"))
 
-        assert adapter.taken_field("nuclei") == "Nuclei"
-        assert adapter.taken_field("membrane") is None
+        assert folded_match(attached_field("nuclei"), adapter.attached_tensors) == (
+            attached_field("Nuclei")
+        )
+        assert (
+            folded_match(attached_field("membrane"), adapter.attached_tensors) is None
+        )
 
     def test_disposing_removes_the_collection_whole(self, sources_dir):
         adapter = create_registered_source("plate", None, sources_dir)

@@ -1,8 +1,8 @@
-"""A tensor uploaded onto a source the server discovered.
+"""A tensor uploaded onto a source, whatever kind of source it is.
 
-A discovered source's bytes are the user's, so a field added to one lives
-beside it, under ``<write_dir>/fields/<source_id>/<name>/``, bound as
-``<source_id>/@fields/<name>``.
+A discovered source's bytes are the user's and a registered source holds none,
+so an uploaded field lives beside its source either way, under
+``<write_dir>/fields/<source_id>/<name>/``, bound as ``<source_id>/@fields/<name>``.
 
 Most of this file is about what the mark buys: an uploaded field cannot shadow
 a scene of the user's own file however it is named, so `labels`, `0` and
@@ -99,11 +99,22 @@ class TestWhereTheBytesGo:
             == before
         )
 
-    def test_a_registered_source_is_refused_the_segment(self, client, source):
-        """One kind of source, one layout: a collection has a store of its own,
-        and a second place for its tensors would be two to adopt and sweep."""
-        with pytest.raises(flight.FlightServerError, match="registered source"):
-            _add(client, source, "raw")
+    def test_a_registered_source_takes_the_same_layout(self, client, source, tmp_path):
+        """One kind of source, one layout. A registered source holds no bytes
+        either, so its tensors go where a discovered source's do."""
+        desc = _add(client, source, "raw")
+        client.upload_array(desc, _arr())
+
+        assert desc.array_id == f"{source}/@fields/raw"
+        assert (fields_root(tmp_path) / source / "raw").is_dir()
+        # Its container holds identity and metadata, and no tensor.
+        container = next((tmp_path / "sources").iterdir())
+        assert [p.name for p in container.iterdir() if p.is_dir()] == []
+
+    def test_a_bare_field_is_refused(self, client, source):
+        """The upload path mints no native tensor id (``core.attached``)."""
+        with pytest.raises(flight.FlightServerError, match="does not name an"):
+            client.add_tensor(f"zarr://{source}/raw", _arr(), chunk_shape=CHUNK)
 
 
 class TestItCannotShadowTheFilesOwnTensors:

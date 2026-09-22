@@ -9,8 +9,8 @@ wherever the subclass puts them.
 entry is the upload's only copy, an eviction is a loss and not a gap, and
 nothing survives the process. That is what the embedded result cache wants --
 ``biopb-image-base`` constructs one directly for a fast-return servicer's
-output, which is read once and gone. A ``cache://`` member of a registered
-source wants the opposite and subclasses it
+output, which is read once and gone. A ``cache://`` uploaded field wants the
+opposite and subclasses it
 (``adapters.cache_member.CacheMember``), keeping the same batches in segments
 under its own directory.
 

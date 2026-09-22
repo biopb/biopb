@@ -1,29 +1,24 @@
 """Sources the server mints on request, and re-adopts at boot.
 
 A *registered* source is a container the client asks for by name
-(``register_source``) and then adds tensors to. It holds no bytes of its own:
-its members are separate stores under its directory, one tensor adapter each,
-the way a plate owns its fields.
+(``register_source``) and then adds tensors to. It holds no bytes and no
+tensors of its own: what is added to it is an uploaded field like any other
+(:mod:`~biopb_tensor_server.adapters.fields`), so the class here is a source
+with an empty tensor list and the module is the container's lifecycle plus the
+member *store formats* both kinds are minted in.
 
 **Nothing under ``write_dir`` is discovered.** The reconciler owns the user's
-directories; this subsystem owns ``write_dir``, all of it -- the collections
-here, the label sidecars beside them, and (later) the fields on a file source.
-One registrar per subtree is what keeps the same bytes from reaching the
-catalog twice, once under the id its parent gives it and once under a
-path-hash id of its own. Registration therefore happens here, at two moments:
-when the client asks, and at boot, when :func:`scan_registered_sources` walks
-what the last life left behind.
-
-That boot half is the whole reason this module exists. A store minted by the
-upload path used to be registered only in the life that created it, so its
-catalog row outlived the adapter behind it and a finished upload stopped being
-readable after a restart. Nothing was missing from discovery; what was missing
-was the adoption pass (biopb/biopb#1048).
+directories; this subsystem owns ``write_dir``. One registrar per subtree is
+what keeps the same bytes from reaching the catalog twice, once under the id
+its parent gives it and once under a path-hash id of its own. Registration
+happens at two moments: when the client asks, and at boot, when
+:func:`scan_registered_sources` walks what the last life left behind. Both go
+through ``SourceRegistry.register``, which is what attaches the fields.
 
 **The id is recorded, not derived.** It is minted here, written into the
-collection's ``.zattrs``, and read back at boot -- so it survives moving
+container's ``.zattrs``, and read back at boot -- so it survives moving
 ``write_dir``, which a hash of the path would not, and it is not predictable
-from the name the client chose. A store whose ``.zattrs`` cannot be read is
+from the name the client chose. A directory whose ``.zattrs`` cannot be read is
 therefore not a registered source at all: it has no id, so it is swept rather
 than served, the same way a label sidecar that lost its token is skipped
 rather than served unversioned (``labels.sidecar_label_sets``).
@@ -42,9 +37,7 @@ from typing import Any, Dict, List, Optional
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
 from biopb_tensor_server.adapters._writable import (
-    folded_match,
     taken_store_name,
-    unsafe_field_name,
     unsafe_store_name,
     upload_grid,
 )
@@ -56,7 +49,6 @@ from biopb_tensor_server.adapters.members import (
     MEMBER_ATTR,
     MEMBER_DESCRIPTOR,
     member_attrs,
-    member_marker,
     read_member_version,
 )
 from biopb_tensor_server.adapters.ome_zarr import (
@@ -67,13 +59,9 @@ from biopb_tensor_server.adapters.ome_zarr import (
 from biopb_tensor_server.adapters.zarr import (
     UPLOAD_PENDING,
     read_zattrs,
-    upload_state,
 )
 from biopb_tensor_server.core.adapter_base import SourceAdapter, TensorAdapter
-from biopb_tensor_server.core.attached import is_published
 from biopb_tensor_server.core.errors import TensorNotFound
-from biopb_tensor_server.core.labels import split_label_field
-from biopb_tensor_server.core.source_registry import close_adapter
 
 logger = logging.getLogger(__name__)
 
@@ -83,18 +71,16 @@ __all__ = [
     "STORE_FORMATS",
     "RegisterAdapter",
     "ZarrMember",
-    "create_member",
     "create_member_at",
     "create_registered_source",
     "member_attrs",
     "open_any_member",
     "read_member_version",
-    "scan_members",
     "scan_registered_sources",
     "sources_root",
 ]
 
-#: The ``biopb`` sub-block a collection's root ``.zattrs`` carries:
+#: The ``biopb`` sub-block a container's root ``.zattrs`` carries:
 #: ``{"source": {"source_id": ..., "content_version": "<hex>"}}``. Named
 #: separately from the sidecar's ``labels`` block so one directory can never be
 #: read as the other kind.
@@ -102,7 +88,7 @@ SOURCE_ATTR = "source"
 
 #: The schemes ``add_tensor`` takes, each naming a store format and nothing
 #: else. The set is a wire contract, so the table is closed; what each does with
-#: a request is :func:`create_member`'s.
+#: a request is :func:`create_member_at`'s.
 STORE_FORMATS = ("zarr", "cache")
 
 #: What a minted ``source_id`` looks like: the shape ``generate_source_id``
@@ -177,18 +163,22 @@ def read_source_block(store: Path) -> Optional[Dict[str, Any]]:
 
 
 class RegisterAdapter(SourceAdapter):
-    """A source the server minted, owning one tensor adapter per member.
+    """A source the server minted: an empty one that takes attachments.
 
-    Holds no bytes: every read goes to a member, and a collection with no
-    member is a resolved source with an empty tensor list -- which the catalog
-    already models, since an unresolved source carries one too.
+    It has no format and no tensors of its own. Its tensors are the uploaded
+    fields attached to it, which the base resolves, lists and checks exactly as
+    it does for a source the server discovered -- a container with none is a
+    resolved source with an empty tensor list, which the catalog already
+    models. What is left here is the methods :class:`SourceAdapter` declares
+    abstract, plus the two things having no format costs it: a resolution miss
+    that cannot answer ``self``, and the clock the reclaim sweep reads.
 
     Its ``content_version`` is minted at ``register_source`` and persisted, not
-    sampled from a stat signature. It is the collection's identity, not a
-    change signal: what it separates is one registered source from the next to
-    reuse a name, so that the re-created source's chunk ids cannot collide with
-    a tombstone's still sitting in the cache. Members carry their own for the
-    same reason, so publishing one never invalidates its siblings.
+    sampled from a stat signature. It is the container's identity, not a change
+    signal: what it separates is one registered source from the next to reuse a
+    name, so that the re-created source's chunk ids cannot collide with a
+    tombstone's still sitting in the cache. Fields carry their own for the same
+    reason, so publishing one never invalidates its siblings.
     """
 
     _source_type = _ID_PREFIX
@@ -220,108 +210,59 @@ class RegisterAdapter(SourceAdapter):
         )
 
     def list_tensor_descriptors(self) -> List[TensorDescriptor]:
-        """The members a reader may see: the published ones.
+        """None of its own: every tensor here is attached.
 
-        A member is attached the moment ``add_tensor`` mints it, because that
-        is what routes its own writes, and it is enumerated only once READY
-        (``core.attached.is_published``).
-
-        These are the collection's *own* tensors, which is why they are listed
-        here rather than appended the way an uploaded field is
-        (``catalog_tensors``): a collection holds nothing else.
+        ``catalog_tensors`` appends the published uploaded fields after this,
+        which is the whole of what a registered source serves.
         """
-        return [
-            member.get_tensor_descriptor()
-            for member in self.members.values()
-            if is_published(member)
-        ]
+        return []
 
     def get_metadata(self) -> dict:
         return dict(self._metadata)
 
     def get_tensor_adapter(self, tensor_id: Optional[str]) -> TensorAdapter:
+        """The source's default tensor, or a typed miss; never ``self``.
+
+        Reached only after ``resolve_tensor`` has missed the attachment index,
+        so a named field that gets here names nothing. An unnamed one asks for
+        the source's default, which is its first published field -- of which an
+        empty container has none. Both are resolution misses rather than server
+        errors: asking a source with no tensors for its tensor is a caller's
+        mistake about what it holds.
+        """
         field = self._within_source_field(tensor_id)
-        if field is None:
-            # No field, and the source's default is its first member -- of
-            # which an empty collection has none. Named as a resolution miss
-            # rather than a server error: asking a source with no tensors for
-            # its tensor is a caller's mistake about what it holds.
-            member = next(iter(self.members.values()), None)
-            if member is None:
-                raise TensorNotFound(
-                    f"{self.source_id} has no tensors yet: add one with "
-                    f"add_tensor before reading it.",
-                    reason="empty_source",
-                )
-            return member
-        member = self.members.get(field)
-        if member is None:
+        if field:
             raise TensorNotFound(
                 f"{self.source_id} has no tensor {field!r}.",
                 reason="unknown_field",
             )
-        return member
-
-    def close(self) -> None:
-        """Release every tensor attached to the collection, members and sets.
-
-        A collection holds nothing but what was attached to it, sidecar sets
-        included -- unlike a discovered source, whose file is not the server's.
-        """
-        attached = self._attached_tensors
-        for tensor in (attached or {}).values():
-            close_adapter(tensor)
-        if attached is not None:
-            attached.clear()
-
-    # ---- members -----------------------------------------------------------
-
-    def member_store(self, field: str) -> Path:
-        """Where member *field* keeps its bytes: ``<collection>/<field>/``.
-
-        The one definition of the layout, as :func:`sources_root` is for the
-        collection: ``add_tensor`` mints under it, adoption walks it, and a
-        discard removes from it.
-        """
-        return self.store / field
-
-    @property
-    def members(self) -> Dict[str, TensorAdapter]:
-        """The collection's own tensors: what was attached under a bare field.
-
-        A view of ``SourceAdapter.attached_tensors``: the label sets attached to
-        a member are the rest of that index, told apart by the marked segment in
-        their field.
-        """
-        return {
-            field: tensor
-            for field, tensor in (self._attached_tensors or {}).items()
-            if split_label_field(field) is None
-        }
+        default = next(iter(self.attached_fields.values()), None)
+        if default is None:
+            raise TensorNotFound(
+                f"{self.source_id} has no tensors yet: add one with "
+                f"add_tensor before reading it.",
+                reason="empty_source",
+            )
+        return default
 
     def attach_tensor(self, field: str, adapter: TensorAdapter) -> None:
         """Attach, and start the empty-source clock over.
 
-        A collection that is being filled is never a candidate for the reclaim
+        A container that is being filled is never a candidate for the reclaim
         sweep, however long the filling takes (``_reclaim_empty_source``).
         """
         super().attach_tensor(field, adapter)
         self.touched_at = time.monotonic()
 
-    def taken_field(self, field: str) -> Optional[str]:
-        """The member *field* would collide with, folded, or None.
-
-        Folded because NTFS, APFS and HFS+ are case-insensitive and HFS+ stores
-        NFD: ``Nuclei`` and ``nuclei`` are two members here and one directory
-        there, so an unfolded check mints a second store the next boot on such
-        a host cannot tell from the first.
-        """
-        return folded_match(field, self.members)
-
     # ---- the store ---------------------------------------------------------
 
     def dispose_store(self) -> None:
-        """Remove the collection whole; what a discard of the source does."""
+        """Remove the container; what a discard of the source does.
+
+        Its fields are not in it -- they live under ``<write_dir>/fields/`` like
+        every other uploaded field -- so whoever discards the source removes
+        those too (``UploadManager._reclaim_empty_source``).
+        """
         shutil.rmtree(self.store, ignore_errors=True)
 
 
@@ -334,7 +275,7 @@ class ZarrMember(OmeZarrAdapter):
     :class:`~biopb_tensor_server.adapters.labels.LabelSetAdapter` without the
     label half: an ``OmeZarrAdapter`` opened on one group and given its source's
     id, so its chunk ids, catalog entry and ``get_flight_info`` answer are the
-    source's and its ``array_id`` is ``<source_id>/<field>``.
+    source's and its ``array_id`` is ``<source_id>/@fields/<name>``.
 
     Its ``content_version`` is the token in its own ``.zattrs``, not the store
     directory's stat signature: an uploaded tensor's bytes never change under
@@ -395,8 +336,8 @@ def open_member(
     than served, because a member with no token has no chunk-id namespace of
     its own and would collide with whatever last held the name.
 
-    *zattrs*, when the caller already has it (``scan_members`` reads it as the
-    boot marker), is used as-is rather than read again.
+    *zattrs*, when the caller already has it (``fields.scan_source_fields``
+    reads it as the boot marker), is used as-is rather than read again.
     """
     import zarr
 
@@ -431,36 +372,6 @@ def open_member(
     return member
 
 
-def scan_members(adapter: RegisterAdapter) -> Dict[str, TensorAdapter]:
-    """The published members of *adapter*'s collection, keyed by field.
-
-    Derived from the directory rather than from a dict something has to
-    remember to fill, the shape every other multi-tensor source here uses
-    (``OmeZarrAdapter._enumerate_hcs_fields``, ``labels.sidecar_label_sets``).
-    A member still PENDING is one a crash left behind; the boot sweep removes
-    it, and this pass skips whatever the sweep has not reached yet rather than
-    adopting a half-written tensor.
-
-    The format is read off the directory and not off a name -- a zarr member
-    carries ``.zattrs``, a cache member ``descriptor.json`` -- which is what
-    lets the scheme stay out of the stored ``array_id``.
-    """
-    members: Dict[str, TensorAdapter] = {}
-    for group in sorted(adapter.store.iterdir()):
-        if not group.is_dir() or group.name.startswith("."):
-            continue
-        marker = member_marker(group)
-        if upload_state(marker) == UPLOAD_PENDING:
-            logger.info(f"member: {group} was left pending; not adopted")
-            continue
-        member = open_any_member(
-            group, source_id=adapter.source_id, field=group.name, marker=marker
-        )
-        if member is not None:
-            members[group.name] = member
-    return members
-
-
 def open_any_member(
     group: Path, *, source_id: str, field: str, marker: Optional[dict] = None
 ) -> Optional[TensorAdapter]:
@@ -469,9 +380,9 @@ def open_any_member(
     The one dispatch on layout: the adoption pass has a directory and no idea
     which format it is, and every other caller is in the same position.
 
-    *marker*, when the caller already read it (``scan_members``'s own
-    ``member_marker`` call), is handed to whichever format this dispatches to
-    instead of being read from disk a second time.
+    *marker*, when the caller already read it (``fields.scan_source_fields``'s
+    own ``member_marker`` call), is handed to whichever format this dispatches
+    to instead of being read from disk a second time.
     """
     if (group / MEMBER_DESCRIPTOR).exists():
         return open_cache_member(
@@ -480,46 +391,14 @@ def open_any_member(
     return open_member(group, source_id=source_id, field=field, zattrs=marker)
 
 
-def create_member(
-    parent: RegisterAdapter, field: str, scheme: str, desc: TensorDescriptor
-) -> TensorAdapter:
-    """Mint member *field* of *parent* in the format *scheme* names.
-
-    Takes no metadata, because a member has none of its own: it is
-    source-scoped, rides on ``register_source``, and a member declares shape,
-    dtype, grid and axes. A label set is the one per-tensor exception and does
-    not come through here (``labels.create_label_upload``).
-
-    Raises ``ValueError`` for a request no format can serve -- an unusable or
-    marked field name, a field already taken, an unknown scheme -- and
-    nothing touches disk until every one of them has passed, so a refused
-    request leaves no store behind.
-    """
-    why = unsafe_field_name(field)
-    if why is not None:
-        raise ValueError(f"{field!r} cannot name a tensor: the name {why}.")
-    taken = parent.taken_field(field)
-    if taken is not None:
-        raise ValueError(
-            f"{parent.source_id} already has a tensor {taken!r}. A field is "
-            f"taken for as long as it is served, and two names differing only "
-            f"by case or accent form are one directory on Windows and macOS; "
-            f"discard that tensor, or add this one under another name."
-        )
-    return create_member_at(
-        parent.member_store(field), parent.source_id, field, scheme, desc
-    )
-
-
 def create_member_at(
     store: Path, source_id: str, field: str, scheme: str, desc: TensorDescriptor
 ) -> TensorAdapter:
     """Mint a member directory at *store* in the format *scheme* names.
 
     The one place a store format is chosen. The name rules and the directory
-    belong to whoever owns the layout -- :func:`create_member` for a member of a
-    registered source, ``adapters.fields.create_field_upload`` for a field on a
-    discovered one -- so both kinds get both formats.
+    belong to whoever owns the layout (``adapters.fields.create_field_upload``),
+    so a field gets both formats wherever its source came from.
     """
     if scheme == "cache":
         return create_cache_member(store, source_id, field, desc)
@@ -628,6 +507,11 @@ def scan_registered_sources(sources_dir: Path) -> Dict[str, RegisterAdapter]:
     upload stop being readable after a restart. A directory that records no
     readable id is **removed**: it has no identity to adopt, so leaving it
     would accumulate bytes nothing can reach or name.
+
+    Adopts the container alone. Its tensors are uploaded fields, so they are
+    attached by the ``on_register`` hook when the caller registers what this
+    returns (``adapters.fields.fields_attacher``) -- the same pass that gives a
+    discovered source its own.
     """
     sources_dir = Path(sources_dir)
     if not sources_dir.is_dir():
@@ -648,10 +532,7 @@ def scan_registered_sources(sources_dir: Path) -> Dict[str, RegisterAdapter]:
                 f"from {adopted[source_id].store}"
             )
             continue
-        adapter = RegisterAdapter(
+        adopted[source_id] = RegisterAdapter(
             source_id, store, block["content_version"], block["metadata"]
         )
-        for field, member in scan_members(adapter).items():
-            adapter.attach_tensor(field, member)
-        adopted[source_id] = adapter
     return adopted
