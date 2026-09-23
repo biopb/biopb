@@ -75,13 +75,19 @@ def _runtime_connection_file() -> str:
     return os.path.join(runtime, f"kernel-biopb-{uuid.uuid4()}.json")
 
 
-def attach_command(connection_file: Optional[str]) -> Optional[str]:
+def attach_command(
+    connection_file: Optional[str],
+    *,
+    python: Optional[str] = None,
+    windows: Optional[bool] = None,
+) -> Optional[str]:
     """The shell command that attaches qtconsole to *connection_file*.
 
-    Run by this process's own interpreter: biopb installs qtconsole (through
-    napari) but puts no ``jupyter`` on PATH, so a bare ``jupyter qtconsole``
-    finds nothing, or another install's. Quoted for this platform's shell,
-    since a Windows profile path may contain spaces.
+    Run by this process's own interpreter (*python*, default
+    ``sys.executable``): biopb installs qtconsole (through napari) but puts no
+    ``jupyter`` on PATH, so a bare ``jupyter qtconsole`` finds nothing, or
+    another install's. Quoted for the platform's shell (*windows*, default
+    this one's), since a Windows profile path may contain spaces.
     """
     import sys
 
@@ -89,8 +95,10 @@ def attach_command(connection_file: Optional[str]) -> Optional[str]:
     # file alone still attaches any Jupyter install's client.
     if not connection_file or getattr(sys, "frozen", False):
         return None
-    argv = [sys.executable, "-m", "qtconsole", "--existing", connection_file]
-    if os.name == "nt":
+    argv = [python or sys.executable, "-m", "qtconsole", "--existing", connection_file]
+    if windows is None:
+        windows = os.name == "nt"
+    if windows:
         import subprocess
 
         return subprocess.list2cmdline(argv)

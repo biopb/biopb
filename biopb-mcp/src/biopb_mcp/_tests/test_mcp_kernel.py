@@ -506,17 +506,17 @@ class TestHealth:
         assert not os.path.exists(conn)  # jupyter_client removes it on shutdown
 
     @pytest.mark.parametrize(
-        "osname, python, path, expected",
+        "windows, python, path, expected",
         [
             (
-                "posix",
+                False,
                 "/home/a b/.local/share/uv/tools/biopb/bin/python",
                 "/home/a b/.local/share/jupyter/runtime/kernel-1.json",
                 "'/home/a b/.local/share/uv/tools/biopb/bin/python' -m qtconsole "
                 "--existing '/home/a b/.local/share/jupyter/runtime/kernel-1.json'",
             ),
             (
-                "nt",
+                True,
                 r"C:\Users\First Last\biopb\Scripts\python.exe",
                 r"C:\Users\First Last\AppData\Roaming\jupyter\runtime\kernel-1.json",
                 r'"C:\Users\First Last\biopb\Scripts\python.exe" -m qtconsole '
@@ -526,12 +526,13 @@ class TestHealth:
         ],
     )
     def test_attach_command_runs_our_interpreter_quoted_for_the_shell(
-        self, monkeypatch, osname, python, path, expected
+        self, windows, python, path, expected
     ):
-        # Not a bare `jupyter`: biopb puts none on PATH.
-        monkeypatch.setattr(_kernel.os, "name", osname)
-        monkeypatch.setattr(sys, "executable", python)
-        assert _kernel.attach_command(path) == expected
+        # Not a bare `jupyter`: biopb puts none on PATH. The platform is passed
+        # in, never patched: `os.name` is global, and faking it mid-session
+        # makes pytest's own path handling fail on Python < 3.12.
+        got = _kernel.attach_command(path, python=python, windows=windows)
+        assert got == expected
 
     def test_no_attach_command_from_a_frozen_build(self, monkeypatch):
         monkeypatch.setattr(sys, "frozen", True, raising=False)
