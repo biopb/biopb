@@ -106,10 +106,11 @@ class GatedKernel(IPythonKernel):
     def _refuse(self, running):
         """An error reply, and the same error on iopub: a reply alone renders
         nothing in a notebook cell."""
+        text = _refusal_text(running)
         content = {
             "ename": "KernelBusy",
-            "evalue": _refusal_text(running),
-            "traceback": ["KernelBusy: " + _refusal_text(running)],
+            "evalue": text,
+            "traceback": ["KernelBusy: " + text],
         }
         self.send_response(
             self.iopub_socket, "error", content, ident=self._topic("error")

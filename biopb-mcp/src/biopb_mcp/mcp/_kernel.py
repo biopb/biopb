@@ -210,6 +210,11 @@ class KernelHost:
         self._kernel_stderr = kernel_stderr
         self._km = None
         self._kc = None
+        # Set once per _launch(), alongside self._km: the connection file (and
+        # so the attach command) is fixed for the kernel's lifetime, and
+        # health() is polled every few seconds, so it's cached rather than
+        # rebuilt on each call.
+        self._attach_command = None
         self._lock = threading.RLock()
         # Set once the kernel has launched AND its bootstrap health probe has
         # passed. The kernel is started on demand (start_kernel -> ensure_started)
@@ -389,6 +394,7 @@ class KernelHost:
             kernel_name=self._kernel_name,
             connection_file=_runtime_connection_file(),
         )
+        self._attach_command = attach_command(self._km.connection_file)
         # The client made below shares this session id, so the kernel knows
         # its host before anything can connect.
         env = dict(env)
@@ -1038,7 +1044,7 @@ class KernelHost:
                 self._watchdog_thread is not None and self._watchdog_thread.is_alive()
             ),
             "connection_file": self.connection_file,
-            "attach_command": attach_command(self.connection_file),
+            "attach_command": self._attach_command if self.is_alive() else None,
         }
 
     @property

@@ -102,10 +102,6 @@ _RUN_ON_MAIN_TIMEOUT = 300.0
 _ip = None
 _jobs = {}  # job_id -> _Job
 _jobs_by_thread = {}  # thread ident -> _Job (active worker threads only)
-# Threads whose captured output also goes on to the real stream: the main thread
-# while it runs a foreign client's cell (record_inline), whose client still has
-# to see its own output.
-_teed_threads = set()
 _job_seq = 0
 _lock = threading.RLock()
 
@@ -274,11 +270,17 @@ class _Job(_OutputBuffer):
         "verify",
         "code_preview",
         "intent_preview",
+        "tee",
     )
 
     def __init__(self, job_id, code="", origin="mcp", intent=""):
         super().__init__()
         self.job_id = job_id
+        # Whether this job's captured output also goes on to the real stream:
+        # set for a foreign client's cell (record_inline), whose client still
+        # has to see its own output; unset for a submit() job, whose worker
+        # thread has no other reader of stdout/stderr.
+        self.tee = False
         # The submitted source (as passed to submit(), before the internal
         # _REFRESH_PREFIX), so the observe UI can show what each job ran.
         self.code = code
@@ -370,7 +372,7 @@ class _Cell(_OutputBuffer):
     job.
     """
 
-    __slots__ = ("code", "status", "error_text", "job", "started", "finished")
+    __slots__ = ("code", "status", "error_text", "job", "started", "finished", "tee")
 
     def __init__(self, code, job):
         super().__init__()
@@ -381,6 +383,10 @@ class _Cell(_OutputBuffer):
         self.error_text = ""
         self.started = None
         self.finished = None
+        # A cell's own output already goes to its job via write_output below,
+        # never additionally to the real stream: only a foreign client's
+        # inline job (record_inline) ever sets this true.
+        self.tee = False
 
     def write_output(self, s):
         self.job.write_output(s)
@@ -476,7 +482,7 @@ class _JobStream:
         if job is None:
             return self._real.write(s)
         n = job.write_output(s)
-        if ident in _teed_threads:
+        if job.tee:
             return self._real.write(s)
         return n
 
@@ -868,14 +874,13 @@ def record_inline(code, origin="user"):
         # Re-asserted for the same reason as in submit().
         _install_streams()
         job = _new_job(code, origin)
+        job.tee = True
         _prune()
     ident = threading.get_ident()
     _jobs_by_thread[ident] = job
-    _teed_threads.add(ident)
     try:
         yield job
     finally:
-        _teed_threads.discard(ident)
         _jobs_by_thread.pop(ident, None)
         job.finished = time.monotonic()
         if job.status == "running":
@@ -1197,7 +1202,6 @@ def reset():
     with _lock:
         _jobs.clear()
         _jobs_by_thread.clear()
-        _teed_threads.clear()
         _owner, _owner_label = None, ""
         _agent_origin = "mcp"
 
