@@ -48,10 +48,10 @@ describe("sessionFetch", () => {
   });
 
   it("keeps the caller's own headers", async () => {
-    // The console POST needs its JSON content-type: it is what a cross-site
-    // form cannot set, and the child requires it on that route for that reason.
+    // A chat POST needs its JSON content-type: it is what a cross-site form
+    // cannot set, and the child requires it on that route for that reason.
     const spy = answering(200);
-    await sessionFetch("/session/s1/console/execute", {
+    await sessionFetch("/session/s1/chat/turn", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: "{}",
@@ -77,7 +77,7 @@ describe("sessionFetch", () => {
     // A busy kernel answers 409 and a wedged session 502. Neither is a locked
     // session, and redirecting on them would throw the user off a working page.
     answering(409);
-    const r = await sessionFetch("/session/s1/console/execute", {
+    const r = await sessionFetch("/session/s1/chat/turn", {
       method: "POST",
     });
     expect(r.status).toBe(409);

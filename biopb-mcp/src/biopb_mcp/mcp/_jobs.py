@@ -17,7 +17,7 @@ Design notes
   :class:`_Job`. They share this one runner, so the rejection above is also what
   keeps the writers off each other's toes: no preemption, no queue, one ordering
   of writes to the namespace. :func:`foreign_digest` is how the ``execute_code``
-  agent finds out its namespace changed under it; see ``docs/user-console.md``.
+  agent finds out its namespace changed under it; see ``docs/jupyter-clients.md``.
 * **One agent per kernel.** Serializing two *agents* would order their writes
   without making them mean anything — neither can see the other's model of the
   namespace. So the first non-user submitter claims the kernel and a second is
@@ -299,7 +299,7 @@ class _Job(_OutputBuffer):
         # actor: "agent" was two of these at once once the chat loop arrived,
         # and code asking "is this the agent's?" quietly meant "the MCP one's".
         #   "mcp"   — the execute_code tool, driven by an external MCP client
-        #   "user"  — a cell run by a human from the observe page
+        #   "user"  — a cell run by a human from a Jupyter client on the kernel
         #   "chat"  — the in-process chat loop (docs/chat-engines.md)
         # Set at submit and never inferred later — a job outlives the request
         # that started it, and poll/export read this long after that request is
@@ -788,10 +788,10 @@ def submit(
 
     Two deliberate holes. A **human** cell (``origin="user"``) is never gated:
     the person at the machine has standing here that no client does, and the
-    observe console has no identity to gate on anyway. And a caller with
-    ``writer=None`` — a direct in-process call, or a transport that yields no
-    client id — neither claims nor is checked, since there is nothing to tell
-    two of them apart with.
+    Jupyter client they typed it in has no identity to gate on anyway. And a
+    caller with ``writer=None`` — a direct in-process call, or a transport that
+    yields no client id — neither claims nor is checked, since there is nothing
+    to tell two of them apart with.
 
     **The recovery belongs to the human, not to a second agent.** Every tool
     that changes kernel state is gated the same way — ``interrupt_current`` here,

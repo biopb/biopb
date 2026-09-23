@@ -82,26 +82,20 @@ export default defineConfig({
       [`^${rx}/api`]: control,
       [`^${rx}/data_plane`]: control,
       // /health is unauthenticated and outside /api, and auth.ts reads it twice
-      // — authRequired() and consoleEnabled(). Unproxied it fell to the SPA
+      // — authRequired() and localRootsProxied(). Unproxied it fell to the SPA
       // fallback, and since both callers treat any failure as false, dev
-      // silently reported "no token needed, no console" whatever the control
-      // said: the console editor could never appear on a dev server.
+      // silently reported "no token needed, no chat" whatever the control
+      // said: the chat pane could never appear on a dev server.
       [`^${rx}/health`]: control,
       // Only the session *API* proxies to control — NOT the observe page at
       // /session/<id>/observe, which must fall through to vite's SPA fallback so
       // the dev bundle + HMR serve it (a bare "/session" prefix would proxy the
       // page HTML to control's built dist and break the dev module graph).
       [`^${rx}/session/[^/]+/api`]: control,
-      // The user console is a *separate* root from the session api on purpose
-      // (the control proxies it only on a loopback bind), so it needs its own
-      // rule — without it a submitted cell POSTs into the SPA fallback above,
-      // gets index.html back, and fails on the JSON parse with the editor
-      // looking perfectly functional.
-      [`^${rx}/session/[^/]+/console`]: control,
-      // The chat pane's writes share that root's fate — the control proxies
-      // `/chat/*` on exactly the same loopback condition — and so need the same
-      // rule for the same reason: unproxied, a sent turn POSTs into the SPA
-      // fallback, parses index.html as JSON and fails with the composer looking
+      // The chat pane's writes are a *separate* root from the session api on
+      // purpose (the control proxies it only on a loopback bind), so they need
+      // their own rule: unproxied, a sent turn POSTs into the SPA fallback,
+      // parses index.html as JSON and fails with the composer looking
       // perfectly functional. The chat *reads* are under /session/<id>/api and
       // are already covered above.
       [`^${rx}/session/[^/]+/chat`]: control,

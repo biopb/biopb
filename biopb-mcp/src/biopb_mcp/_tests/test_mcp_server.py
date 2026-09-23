@@ -213,12 +213,12 @@ class TestTheReferenceDocs:
         # of a second writer, and reads the note as noise.
         doc = _tool(_server.read_doc, "kernel")
         section = doc[doc.index("## You are not the only writer") :]
-        assert "observe" in section
+        assert "Jupyter" in section  # where the other writer's cells come from
         assert "poll_job" in section
         # The three rules that keep the two writers off each other: it is told
         # after the fact, it waits when busy, and it does not stop their cell --
         # including the workaround it would otherwise reach for.
-        assert "rejected as busy" in section
+        assert "your calls wait for it" in section
         assert "refuses a user job" in section
         assert "restart_kernel" in section
 
@@ -863,8 +863,7 @@ class TestJobTools:
 class TestUserActivityNote:
     """The agent's notice that a human wrote to its namespace.
 
-    See ``docs/user-console.md``: the user runs cells through the same job
-    runner, so the agent's picture of the namespace can go stale between calls
+    See ``docs/jupyter-clients.md``: the user's cells are recorded as jobs, so the agent's picture of the namespace can go stale between calls
     with nothing in its own results to say so.
     """
 

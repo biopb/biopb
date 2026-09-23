@@ -48,17 +48,6 @@ front proxies these ``/api/*`` calls (``/session/<id>/api/*`` -> this child), th
 trusted loopback hop presents a loopback Host and no Origin, so the guard still
 passes; the SPA derives its API base from ``window.location`` (the
 ``/session/<id>`` prefix), so this process needs no knowledge of its prefix.
-
-**The user console** (``/console/execute``, ``observe.console_enabled``) is the
-one route here that submits code: it is how a human runs a cell in this kernel,
-alongside the agent and through the same one-at-a-time job runner
-(``docs/user-console.md``). It lives under its own path root, not under
-``/api/``, because the *control* proxies the two differently — ``api`` always,
-``console`` only when the control is loopback-bound. That decision cannot be made
-here: the proxy hop strips Host and Origin, so this process cannot tell a browser
-from the trusted hop, and its own guard passes either way. So this module's job
-is only to be honest about which routes exist; the reachability question belongs
-to ``biopb-control``.
 """
 
 import asyncio
@@ -84,7 +73,6 @@ _USER_INTERRUPT_MSG = "Interrupted by user via the observe web UI."
 # configure() before the routes are registered/served.
 _max_output_chars = 20000
 _poll_interval_ms = 3000
-_console_enabled = True
 # Whether the built-in chat client is actually mounted on this session. Not a
 # config mirror: chat is served only on an agentless `biopb mcp view` session
 # and only when enabled, so `_setup_chat`'s verdict is the one truth. Set by
@@ -113,7 +101,6 @@ def configure(
     *,
     max_output_chars=None,
     poll_interval_ms=None,
-    console_enabled=None,
     allowed_origins=(),
     allowed_hosts=(),
 ):
@@ -121,20 +108,12 @@ def configure(
 
     ``allowed_origins`` / ``allowed_hosts`` extend the loopback Host/Origin
     allowlist (e.g. a reverse-proxy front), mirroring the ``transport`` section.
-
-    ``console_enabled`` off drops the console route entirely rather than serving
-    a refusing one — the same shape as the control's gate, so "is there a way to
-    submit code here?" has one answer, not a status code to interpret. It can
-    only narrow: with the control's gate closed the route is unreachable however
-    this is set.
     """
-    global _max_output_chars, _poll_interval_ms, _console_enabled
+    global _max_output_chars, _poll_interval_ms
     if max_output_chars is not None:
         _max_output_chars = int(max_output_chars)
     if poll_interval_ms is not None:
         _poll_interval_ms = int(poll_interval_ms)
-    if console_enabled is not None:
-        _console_enabled = bool(console_enabled)
     _http.configure(allowed_origins, allowed_hosts)
 
 
@@ -143,7 +122,7 @@ def set_session_owns_its_reap(agentless, on_shutdown=None):
 
     Must run before :func:`register_http_routes`, which reads it to decide
     whether the stop route exists at all -- an absent route rather than a
-    refusing one, the same shape the console gate uses, so "can this session be
+    refusing one, the same shape the chat gate uses, so "can this session be
     ended from here?" is one answer and not a status code to interpret.
     """
     global _agentless, _shutdown_hook
@@ -168,7 +147,6 @@ def set_chat_enabled(enabled):
 # same for the chat routes, so they are not this page's to own. Aliased rather
 # than re-spelled at each use so the route tables below stay readable.
 _route = _http.route
-_json_route = _http.json_route
 _check_origin = _http.check_origin
 _require_host = _http.require_host
 _kernel_error = _http.kernel_error
@@ -340,70 +318,6 @@ async def _api_restart(request):
     return JSONResponse({"ok": True})
 
 
-async def _console_execute(request):
-    """Run a cell the *user* typed, in the same kernel the agent uses.
-
-    Submitted through the one job runner with ``origin='user'``, so the two
-    writers are serialized by the rule that already exists: one job at a time.
-    A collision is therefore an ordinary, expected outcome — reported as ``409``
-    with *whose* job is running so the page can render it as state ("kernel busy
-    · job-7 (agent)") rather than as a failed action. There is no preemption and
-    no queue: a person who wants the kernel now uses Interrupt, which is theirs
-    to use and attributes the stop to them.
-    """
-    host, err = _require_host()
-    if err is not None:
-        return err
-    payload, err = await _http.json_body(request)
-    if err is not None:
-        return err
-    code = payload.get("code")
-    if not isinstance(code, str) or not code.strip():
-        return JSONResponse({"error": "missing 'code'"}, status_code=400)
-
-    verifying = _scratch.running()
-    if verifying is not None:
-        # The same one-at-a-time rule, and the row the page points at is in the
-        # list above (_api_jobs adds it) so "wait for it, or interrupt it from
-        # its row" stays true.
-        return JSONResponse(
-            {
-                "error": "busy",
-                "running_job_id": verifying["job_id"],
-                "running_job_origin": "mcp",
-            },
-            status_code=409,
-        )
-
-    submitted, res, _w = await _kernel_rpc._job_call(
-        host, "submit", code, origin="user"
-    )
-    if submitted is None:
-        # Distinct from the job-busy case below: this is the kernel *lock*, held
-        # by another quick snippet for a moment. Transient, so retryable.
-        if res.get("status") == "busy":
-            return JSONResponse(
-                {"error": "kernel busy", "retry": True}, status_code=503
-            )
-        return JSONResponse(
-            {
-                "error": res.get("status") or "kernel error",
-                "detail": _kernel_rpc._format_execute_result(res),
-            },
-            status_code=502,
-        )
-    if submitted.get("error") == "busy":
-        return JSONResponse(
-            {
-                "error": "busy",
-                "running_job_id": submitted.get("running_job_id"),
-                "running_job_origin": submitted.get("running_job_origin"),
-            },
-            status_code=409,
-        )
-    return JSONResponse(submitted)
-
-
 async def _api_status(request):
     host, err = _require_host()
     if err is not None:
@@ -411,19 +325,14 @@ async def _api_status(request):
     # poll_interval_ms rides the status payload so the observe SPA (served by the
     # control front, not this child) can adopt the launcher-tuned cadence instead
     # of hardcoding it — the page is now static and can't be server-templated.
-    # console_enabled rides here so the page knows whether to offer an editor at
-    # all. It is only *this* half of the answer -- the control's gate is the
-    # other -- so the SPA needs both before it renders one (see ObservePage).
-    # chat_enabled rides here for a different reader: the control's dashboard,
-    # which probes this endpoint per session anyway and needs it to label the
-    # session's link -- a `biopb mcp view` session leads with chat, an MCP
-    # client's child with the job list. Reporting it beside console_enabled
-    # keeps that one probe the whole answer.
+    # chat_enabled rides here for the control's dashboard, which probes this
+    # endpoint per session anyway and needs it to label the session's link -- a
+    # `biopb mcp view` session leads with chat, an MCP client's child with the
+    # job list -- so that one probe is the whole answer.
     return JSONResponse(
         {
             **host.health(),
             "poll_interval_ms": _poll_interval_ms,
-            "console_enabled": _console_enabled,
             "chat_enabled": _chat_enabled,
             # Two different questions, both read by the control's dashboard off
             # this one probe: chat_enabled says what the page leads with,
@@ -481,24 +390,16 @@ _ROUTES = [
 # Served only where this session owns its own reap. Under ``api`` rather than a
 # root of its own: the control already proxies that root everywhere, and it
 # already carries a comparably destructive verb in /api/kernel/restart. This is
-# not an execute surface, so it needs none of the console's local-only gating.
+# not an execute surface, so it needs none of the chat root's local-only gating.
 _SHUTDOWN_ROUTES = [
     ("/api/shutdown", ["POST"], _route(_api_shutdown)),
 ]
 
-# Under its own root, so the control can proxy it on a different rule than
-# /api/* (biopb-control `_session_proxy_roots`).
-_CONSOLE_ROUTES = [
-    ("/console/execute", ["POST"], _json_route(_console_execute)),
-]
-
 
 def _routes():
-    """The routes to serve: the data API, plus the console and the stop route
-    where each is enabled."""
+    """The routes to serve: the data API, plus the stop route where this
+    session owns its reap."""
     routes = list(_ROUTES)
-    if _console_enabled:
-        routes += _CONSOLE_ROUTES
     if _agentless:
         routes += _SHUTDOWN_ROUTES
     return routes
@@ -522,8 +423,7 @@ def register_http_routes():
         _app.mcp.custom_route(path, methods=methods)(handler)
     _mounted_http = True
     logger.info(
-        "observe API mounted on the MCP app at /api/* (console: %s, stop: %s)",
-        "on" if _console_enabled else "off",
+        "observe API mounted on the MCP app at /api/* (stop: %s)",
         "on" if _agentless else "off",
     )
 

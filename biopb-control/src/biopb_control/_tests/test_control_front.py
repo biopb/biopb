@@ -7,10 +7,10 @@ request/response bodies -- with the mount prefix stripped, and (3) the control i
 built ``web/`` SPA bundle at its root, falling back to ``index.html`` for deep
 links (``/``, ``/viewer``, ``/session/<id>/observe``) and serving hashed assets
 as real files, and (4) which session-child roots it will proxy at all — ``api``
-always, the ``console`` (an RCE into that session's kernel) only on a
-loopback-bound control, ``/mcp`` never. A trivial stdlib HTTP server stands in
-for the tensor sidecar so no real tensor server is needed; a tmp bundle stands
-in for ``web/packages/app/dist``.
+always, ``chat`` (an RCE into that session's kernel) only on a loopback-bound
+control, ``/mcp`` and the retired ``console`` never. A trivial stdlib HTTP
+server stands in for the tensor sidecar so no real tensor server is needed; a
+tmp bundle stands in for ``web/packages/app/dist``.
 """
 
 import json
@@ -54,30 +54,37 @@ from biopb_control._supervisor import DataPlaneSpec, DataPlaneSupervisor
         ("/session/s1/mcp", False),  # non-API surface (proxy allowlist 404s it)
         ("/sessionfoo/api/x", False),  # not a /session/<id>/ path
         ("/api/status", False),  # control's own API, handled by the other branch
-        # Not proxied by default, so not gated by default either -- the console
+        # Not proxied by default, so not gated by default either -- the chat
         # root only exists where _session_proxy_roots put it (test below).
-        ("/session/s1/console/execute", False),
+        ("/session/s1/chat/turn", False),
     ],
 )
 def test_is_proxied_session_path(path, guarded):
     assert _is_proxied_session_path(path) is guarded
 
 
-def test_console_root_is_gated_wherever_it_is_proxied():
-    # The auth gate reads the proxy's own root set, so enabling the console
-    # cannot open an unauthenticated execute path: the same switch that makes it
-    # reachable makes it guarded.
-    roots = _session_proxy_roots(console_enabled=True)
-    assert _is_proxied_session_path("/session/s1/console/execute", roots) is True
+def test_chat_root_is_gated_wherever_it_is_proxied():
+    # The auth gate reads the proxy's own root set, so enabling chat cannot open
+    # an unauthenticated execute path: the same switch that makes it reachable
+    # makes it guarded.
+    roots = _session_proxy_roots(loopback_bound=True)
+    assert _is_proxied_session_path("/session/s1/chat/turn", roots) is True
     assert _is_proxied_session_path("/session/s1/api/jobs", roots) is True
     assert _is_proxied_session_path("/session/s1/mcp", roots) is False
 
 
-def test_console_root_is_off_by_default():
-    assert "console" not in _session_proxy_roots(console_enabled=False)
-    assert "console" in _session_proxy_roots(console_enabled=True)
-    # Enabling the console only adds; it never displaces the always-on root.
-    assert _session_proxy_roots(console_enabled=True) >= _SESSION_ALLOWED_ROOTS
+def test_chat_root_is_off_by_default():
+    assert "chat" not in _session_proxy_roots(loopback_bound=False)
+    assert "chat" in _session_proxy_roots(loopback_bound=True)
+    # Loopback only adds; it never displaces the always-on root.
+    assert _session_proxy_roots(loopback_bound=True) >= _SESSION_ALLOWED_ROOTS
+
+
+def test_the_retired_console_root_is_never_proxied():
+    # The user console is gone (biopb-mcp docs/jupyter-clients.md); a stale
+    # route under its root must not reach a child that might still serve one.
+    for loopback in (True, False):
+        assert "console" not in _session_proxy_roots(loopback_bound=loopback)
 
 
 def _free_port() -> int:
@@ -198,12 +205,13 @@ def test_control_health_is_not_proxied(control):
     assert "path" not in payload
 
 
-def test_health_advertises_the_console_gate(control):
-    # The observe page must know before it renders an editor, and only the
+def test_health_advertises_the_local_roots_gate(control):
+    # The observe page must know before it renders a composer, and only the
     # control knows this half. Unauthenticated like `auth_required`, and for the
-    # same reason: the bundle needs it before it holds a token.
+    # same reason: the bundle needs it before it holds a token. The key is named
+    # for the retired console; it means loopback-bound.
     _status, _headers, body = _get(f"{control}/health")
-    # The fixture binds 127.0.0.1, so the console is on here.
+    # The fixture binds 127.0.0.1.
     assert json.loads(body)["console_enabled"] is True
 
 
@@ -1070,10 +1078,24 @@ def test_session_proxy_allowlists_api_surface(control, upstream):
         assert exc.value.code == 404, path
 
 
-def test_session_console_is_proxied_on_a_loopback_control(control, upstream):
-    # The user console (code into the session's kernel) rides the same hop as the
+def test_session_chat_is_proxied_on_a_loopback_control(control, upstream):
+    # A chat turn (code into the session's kernel) rides the same hop as the
     # data API, under its own root. The `control` fixture binds 127.0.0.1, which
     # is what enables it.
+    _register_session("s1", upstream)
+    req = urllib.request.Request(
+        f"{control}/session/s1/chat/turn",
+        data=b'{"text": "hi"}',
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        echoed = json.loads(resp.read())
+    assert echoed["path"] == "/chat/turn"
+    assert echoed["method"] == "POST"
+
+
+def test_the_retired_console_is_not_proxied_on_a_loopback_control(control, upstream):
     _register_session("s1", upstream)
     req = urllib.request.Request(
         f"{control}/session/s1/console/execute",
@@ -1081,10 +1103,9 @@ def test_session_console_is_proxied_on_a_loopback_control(control, upstream):
         method="POST",
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=5) as resp:
-        echoed = json.loads(resp.read())
-    assert echoed["path"] == "/console/execute"
-    assert echoed["method"] == "POST"
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(req, timeout=5)
+    assert exc.value.code == 404
 
 
 def test_session_roots_are_reachable_with_a_token(tokened_control, upstream):
@@ -1109,21 +1130,21 @@ def test_session_roots_are_reachable_with_a_token(tokened_control, upstream):
     assert json.loads(body)["path"] == "/api/jobs"
 
 
-def test_session_console_is_gated_like_the_api(control, upstream):
-    # The console is the one proxied path whose payload is arbitrary code, so it
-    # must not be reachable by DNS-rebinding or as a cross-site write. Same gate,
+def test_session_chat_is_gated_like_the_api(control, upstream):
+    # Chat is the one proxied path whose payload runs arbitrary code, so it must
+    # not be reachable by DNS-rebinding or as a cross-site write. Same gate,
     # asserted here because a new root that slipped past _guarded would be an
     # unauthenticated execute.
     _register_session("s1", upstream)
     with pytest.raises(urllib.error.HTTPError) as exc:
         _get(
-            f"{control}/session/s1/console/execute",
+            f"{control}/session/s1/chat/turn",
             headers={"Host": "evil.example:8813"},
         )
     assert exc.value.code == 421
 
     req = urllib.request.Request(
-        f"{control}/session/s1/console/execute",
+        f"{control}/session/s1/chat/turn",
         data=b"{}",
         method="POST",
         headers={"Sec-Fetch-Site": "cross-site", "Content-Type": "application/json"},
@@ -1133,15 +1154,14 @@ def test_session_console_is_gated_like_the_api(control, upstream):
     assert exc.value.code == 403
 
 
-@pytest.mark.parametrize("path", ["console/execute", "chat/turn"])
+@pytest.mark.parametrize("path", ["chat/turn"])
 def test_the_execute_capable_roots_are_post_only(control, upstream, path):
     # The CSRF gate skips safe methods (correctly -- safe verbs must not change
     # state), so a cross-site GET is forwarded unchecked to whatever the child
-    # serves. `<img src=".../console/execute?code=...">` is the shape. Pinning
-    # POST here means that claim does not depend on the child's method list --
-    # which is the whole point, and is why chat is checked too: it is the same
-    # RCE behind the same gate, and a promise about another package's route
-    # table is exactly what this refuses to rely on.
+    # serves. `<img src=".../chat/turn?text=...">` is the shape. Pinning POST
+    # here means that claim does not depend on the child's method list: a
+    # promise about another package's route table is exactly what this refuses
+    # to rely on.
     _register_session("s1", upstream)
     for method in ("GET", "HEAD", "PUT", "DELETE"):
         req = urllib.request.Request(f"{control}/session/s1/{path}?x=1", method=method)
@@ -1181,7 +1201,7 @@ def _registering_child_script(session_id: str) -> str:
     )
 
 
-def _launch_app(tmp_path, console_enabled=True):
+def _launch_app(tmp_path, loopback_bound=True):
     spec = DataPlaneSpec(
         config=tmp_path / "config.json",
         grpc_host="127.0.0.1",
@@ -1192,12 +1212,12 @@ def _launch_app(tmp_path, console_enabled=True):
         DataPlaneSupervisor(spec),
         8.0,
         f"http://127.0.0.1:{_free_port()}",
-        console_enabled=console_enabled,
+        loopback_bound=loopback_bound,
     )
 
 
 @pytest.mark.parametrize(
-    "console_enabled, has_display, can_start, reason_hint",
+    "loopback_bound, has_display, can_start, reason_hint",
     [
         (True, True, True, None),
         # A viewer this control started would open on the server's display.
@@ -1208,12 +1228,12 @@ def _launch_app(tmp_path, console_enabled=True):
     ],
 )
 def test_session_launch_gate(
-    monkeypatch, console_enabled, has_display, can_start, reason_hint
+    monkeypatch, loopback_bound, has_display, can_start, reason_hint
 ):
     from biopb_control import _control
 
     monkeypatch.setattr(_control, "_display_available", lambda: has_display)
-    ok, reason = _control._session_launch_gate(console_enabled)
+    ok, reason = _control._session_launch_gate(loopback_bound)
     assert ok is can_start
     if can_start:
         assert reason is None
@@ -1241,8 +1261,8 @@ def test_api_status_advertises_the_launch_verb(tmp_path, monkeypatch):
         assert "display" in body["start_session_blocked"]
 
 
-@pytest.mark.parametrize("console_enabled", [True, False])
-def test_start_session_is_refused_when_gated(tmp_path, monkeypatch, console_enabled):
+@pytest.mark.parametrize("loopback_bound", [True, False])
+def test_start_session_is_refused_when_gated(tmp_path, monkeypatch, loopback_bound):
     # 409, not 403: the request is fine, this deployment just cannot serve it --
     # and nothing is spawned, which is the part that matters.
     from starlette.testclient import TestClient
@@ -1254,7 +1274,7 @@ def test_start_session_is_refused_when_gated(tmp_path, monkeypatch, console_enab
     monkeypatch.setattr(
         _control.subprocess, "Popen", lambda *a, **k: spawned.append(a) or None
     )
-    app = _launch_app(tmp_path, console_enabled=console_enabled)
+    app = _launch_app(tmp_path, loopback_bound=loopback_bound)
     with TestClient(app, base_url="http://127.0.0.1:8813") as client:
         resp = client.post("/api/sessions/new")
         assert resp.status_code == 409
@@ -1483,14 +1503,12 @@ def test_launched_viewer_is_detached_from_the_control(tmp_path, monkeypatch):
         assert seen["start_new_session"] is True
 
 
-@pytest.mark.parametrize("console_enabled, expected", [(True, 502), (False, 404)])
-def test_console_root_follows_the_switch(tmp_path, console_enabled, expected):
-    # The behavioral half of the local-mode gate, asserted on build_app so the
-    # "off" case needs no public listener. The session child is deliberately a
-    # closed port, which separates the two outcomes cleanly: 404 means the root
-    # is not a route at all (nothing was forwarded), 502 means it was routed and
-    # only the child was absent. Answering the question with no upstream also
-    # keeps this independent of what a child would reply.
+@pytest.mark.parametrize("loopback_bound", [True, False])
+def test_the_retired_console_root_is_not_a_route(tmp_path, loopback_bound):
+    # The session child is deliberately a closed port, which separates the two
+    # outcomes cleanly: 404 means the root is not a route at all (nothing was
+    # forwarded), 502 means it was routed and only the child was absent. The
+    # console is retired, so 404 whatever the bind.
     from starlette.testclient import TestClient
 
     _sessions.register("s1", host="127.0.0.1", port=_free_port(), pid=os.getpid())
@@ -1504,20 +1522,20 @@ def test_console_root_follows_the_switch(tmp_path, console_enabled, expected):
         DataPlaneSupervisor(spec),
         8.0,
         f"http://127.0.0.1:{_free_port()}",
-        console_enabled=console_enabled,
+        loopback_bound=loopback_bound,
     )
     # A loopback base_url: TestClient otherwise sends `Host: testserver`, which
     # the gate refuses (421) before the routing question under test is reached.
     with TestClient(app, base_url="http://127.0.0.1:8813") as client:
         resp = client.post("/session/s1/console/execute", json={"code": "1 + 1"})
-        assert resp.status_code == expected
-        # The data API is unaffected either way -- the switch narrows one root.
+        assert resp.status_code == 404
+        # The data API is routed either way.
         assert client.get("/session/s1/api/jobs").status_code == 502
 
 
-@pytest.mark.parametrize("console_enabled", [True, False])
-def test_stop_verb_rides_the_api_root_not_the_local_gate(tmp_path, console_enabled):
-    # Stopping a session is deliberately NOT gated like the console and chat:
+@pytest.mark.parametrize("loopback_bound", [True, False])
+def test_stop_verb_rides_the_api_root_not_the_local_gate(tmp_path, loopback_bound):
+    # Stopping a session is deliberately NOT gated like chat:
     # it is not an execute surface, it lives under `api`, and `api` already
     # carries a comparably destructive verb in /api/kernel/restart. 502 both
     # ways means routed to a child that is not there -- the point is that the
@@ -1536,17 +1554,16 @@ def test_stop_verb_rides_the_api_root_not_the_local_gate(tmp_path, console_enabl
         DataPlaneSupervisor(spec),
         8.0,
         f"http://127.0.0.1:{_free_port()}",
-        console_enabled=console_enabled,
+        loopback_bound=loopback_bound,
     )
     with TestClient(app, base_url="http://127.0.0.1:8813") as client:
         assert client.post("/session/s1/api/shutdown").status_code == 502
 
 
-@pytest.mark.parametrize("console_enabled, expected", [(True, 502), (False, 404)])
-def test_chat_root_follows_the_same_switch(tmp_path, console_enabled, expected):
+@pytest.mark.parametrize("loopback_bound, expected", [(True, 502), (False, 404)])
+def test_chat_root_follows_the_same_switch(tmp_path, loopback_bound, expected):
     # The chat turn runs arbitrary code in the session kernel, so it is the same
     # RCE the allowlist exists to keep off this origin and rides the same gate.
-    # The flag reads "console" but means "this control is loopback-bound".
     from starlette.testclient import TestClient
 
     _sessions.register("s1", host="127.0.0.1", port=_free_port(), pid=os.getpid())
@@ -1560,7 +1577,7 @@ def test_chat_root_follows_the_same_switch(tmp_path, console_enabled, expected):
         DataPlaneSupervisor(spec),
         8.0,
         f"http://127.0.0.1:{_free_port()}",
-        console_enabled=console_enabled,
+        loopback_bound=loopback_bound,
     )
     with TestClient(app, base_url="http://127.0.0.1:8813") as client:
         resp = client.post("/session/s1/chat/turn", json={"text": "hi"})
@@ -1580,17 +1597,17 @@ class _StopServe(Exception):
     "host, expected",
     [("127.0.0.1", True), ("localhost", True), ("0.0.0.0", False), ("::", False)],
 )
-def test_bind_address_decides_the_console(
+def test_bind_address_decides_the_local_roots(
     monkeypatch, tmp_path, upstream, host, expected
 ):
     # The gate reads *this* listener's bind through the shared predicate: a
-    # loopback control enables the console, a network-reachable one does not --
+    # loopback control proxies the local roots, a network-reachable one does not --
     # regardless of --remote or the data plane's own bind. Asserted on the call
     # into build_app, so the "public" cases need no public listener.
     captured = {}
 
-    def _capture(*_args, console_enabled, **_kwargs):
-        captured["console"] = console_enabled
+    def _capture(*_args, loopback_bound, **_kwargs):
+        captured["loopback"] = loopback_bound
         raise _StopServe
 
     monkeypatch.setattr("biopb_control._control.build_app", _capture)
@@ -1608,7 +1625,7 @@ def test_bind_address_decides_the_console(
             ensure_timeout=8.0,
             data_web_url=upstream,
         )
-    assert captured["console"] is expected
+    assert captured["loopback"] is expected
 
 
 def test_unknown_session_returns_404(control):

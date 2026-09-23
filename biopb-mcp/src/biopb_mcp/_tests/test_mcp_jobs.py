@@ -5,7 +5,7 @@ Three layers:
 * ``TestJobRunnerUnit`` / ``TestJobOrigin`` — the in-kernel job runner driven
   directly with a fake InteractiveShell (no kernel, fast): submit/poll/interrupt,
   output capture, distributed future-cancel, and the agent/user ``origin`` split
-  (``docs/user-console.md``).
+  (``docs/jupyter-clients.md``).
 * ``TestJobConcurrency`` — a real *bare* kernel (no napari/display): proves the
   kernel main thread stays free while a background job runs (the agent is no
   longer blind).
@@ -266,7 +266,7 @@ class TestJobRunnerUnit:
 
 
 # ---------------------------------------------------------------------------
-# Two writers: the agent and a human sharing one kernel (docs/user-console.md)
+# Two writers: the agent and a human sharing one kernel (docs/jupyter-clients.md)
 # ---------------------------------------------------------------------------
 
 
@@ -544,7 +544,7 @@ class TestKernelOwner:
 
     def test_a_human_cell_is_never_gated(self, runner):
         # The person at the machine has standing no client does -- and the
-        # observe console has no identity to gate on in the first place.
+        # attached Jupyter client has no identity to gate on in the first place.
         self._wait(_jobs.submit("a = 1", writer="sess-A")["job_id"])
         jid = self._wait(_jobs.submit("b = 2", origin="user")["job_id"])["job_id"]
         assert _jobs._jobs[jid].status == "ok"

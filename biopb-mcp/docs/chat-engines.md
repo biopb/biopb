@@ -6,9 +6,9 @@ The built-in loop is for a user with no agent of their own; ACP hands the
 pane to a harness they already run -- Claude Code, opencode, etc. Neither
 replaces the other.
 
-**Chat is off whenever the control runs `--remote`**, for either engine. It
-shares the user console's gating: reachable only while the control is
-loopback-bound, on a separate proxy root, never on a public bind.
+**Chat is off whenever the control runs `--remote`**, for either engine: its
+turns are reachable only while the control is loopback-bound, on a separate
+proxy root (`chat`), never on a public bind.
 
 ## Built-in loop
 

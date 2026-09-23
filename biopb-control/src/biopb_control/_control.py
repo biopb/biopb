@@ -68,12 +68,11 @@ never imports — the proxy reaches it over loopback like any other client.
   accepted regardless of which external hostname the browser used to reach the
   control. (Rebinding/token protection for the origin as a whole is a
   follow-up, same as the data-plane proxy's.)
-- ``/session/<id>/console/*`` is the same hop for the **user console** — a code
-  cell on the observe page that runs in that session's kernel — and is proxied
-  **only when this control is loopback-bound** (``_session_proxy_roots``). It is
-  a separate root precisely so that "can a browser reach an RCE here?" stays one
-  checkable statement: ``api`` always, ``console`` local-mode only, ``/mcp``
-  never.
+- ``/session/<id>/chat/*`` is the same hop for the built-in chat client's
+  turns, which run code in that session's kernel, and is proxied **only when
+  this control is loopback-bound** (``_session_proxy_roots``). It is a separate
+  root precisely so that "can a browser reach an RCE here?" stays one checkable
+  statement: ``api`` always, ``chat`` local-mode only, ``/mcp`` never.
 
 This module lands the namespaced origin, the data-plane API proxy, per-session
 observe routing, and the control-served SPA bundle — the full single-origin
@@ -150,18 +149,20 @@ _HOP_BY_HOP = frozenset(
 # to /mcp past a naive "startswith('mcp')" check.
 _SESSION_ALLOWED_ROOTS = frozenset({"api"})
 
-# The **conditionally** proxied root: the user console, a code cell on the observe
-# page that runs in the session's kernel (biopb-mcp ``docs/user-console.md``).
-# Kept out of the set above rather than added to it, because the two are gated
-# differently and the difference is the whole point: `api` is always proxied,
-# `console` only when this control is loopback-bound.
+# The **conditionally** proxied root: the built-in chat client's one write route
+# (biopb-mcp ``mcp/_chat_api.py``). A chat turn runs arbitrary code in the
+# session kernel. Kept out of the set above rather than added to it, because the
+# two are gated differently and the difference is the whole point: `api` is
+# always proxied, `chat` only when this control is loopback-bound.
 #
 # Why a separate root at all. The allowlist exists to keep the child's /mcp — an
 # RCE on the same port — off this origin. An execute route folded into `api`
 # would put arbitrary code back through exactly that hole, silently: the
 # allowlist would still be there, still enforced, and no longer true. A distinct
-# root keeps the statement checkable — `api` always, `console` local-mode only,
+# root keeps the statement checkable — `api` always, `chat` local-mode only,
 # `/mcp` never — and makes "is RCE reachable from the browser?" one boolean.
+# The chat's *reads* live under `api`: a conversation is a read like the job
+# list.
 #
 # That boolean assumes the root is **POST-only**, and `session_proxy` enforces
 # it rather than trusting the child to: the CSRF gate skips safe methods, so a
@@ -169,44 +170,31 @@ _SESSION_ALLOWED_ROOTS = frozenset({"api"})
 #
 # Known limitation: this reads the control's own **bind**, so a loopback control
 # deliberately published by a reverse proxy (the topology biopb-mcp CLAUDE.md
-# points at for untrusted networks) reads as local and gets the console. That
+# points at for untrusted networks) reads as local and gets the chat route. That
 # operator is already responsible for the token in front of the data plane; a
 # control-side opt-out flag is the follow-up if the reverse-proxy topology stops
 # being the exception.
-_SESSION_CONSOLE_ROOT = "console"
-
-# The built-in chat client's one write route (biopb-mcp ``mcp/_chat_api.py``).
-# Gated identically to the console and for the identical reason: a chat turn
-# runs arbitrary code in the session kernel, so it is the same RCE the allowlist
-# above exists to keep off this origin. Its *reads* are not here -- they live
-# under `api`, which is both correct (a conversation is a read like the job
-# list) and required, since the POST-only assumption above would forward a
-# cross-site GET to this root unchecked.
 _SESSION_CHAT_ROOT = "chat"
 
-# The execute-capable roots, which `session_proxy` narrows to POST. Both are
-# here for the same reason the console was: the CSRF gate skips safe methods, so
-# a cross-site GET to either is forwarded unchecked, and the root's claim must
-# not rest on the child's method list. Naming the set rather than testing one
-# root means a third such root inherits the narrowing by being added here.
-_SESSION_POST_ONLY_ROOTS = frozenset({_SESSION_CONSOLE_ROOT, _SESSION_CHAT_ROOT})
+# The execute-capable roots, which `session_proxy` narrows to POST (above).
+# Naming the set rather than testing one root means a second such root inherits
+# the narrowing by being added here.
+_SESSION_POST_ONLY_ROOTS = frozenset({_SESSION_CHAT_ROOT})
 
 
-def _session_proxy_roots(console_enabled: bool) -> frozenset[str]:
+def _session_proxy_roots(loopback_bound: bool) -> frozenset[str]:
     """The session-child path roots this control will proxy.
 
     One source for both the proxy's own gate and the auth middleware, so the
     guard and the thing it guards cannot disagree about what is reachable.
 
-    The flag reads "console" for history but means **this control is
-    loopback-bound**: it is computed from the bind, not from any feature switch,
-    and it gates every execute-capable root together. Whether a given one is
-    actually served is the child's own decision (``observe.console_enabled``,
-    ``observe.chat_enabled``), which is the half this control does not and
-    should not know.
+    The flag is computed from the bind, not from any feature switch, and it
+    gates every execute-capable root together. Whether a given one is actually served
+    is the child's own decision (``observe.chat_enabled``), which is the half
+    this control does not and should not know.
     """
-    if console_enabled:
-        return _SESSION_ALLOWED_ROOTS | {_SESSION_CONSOLE_ROOT, _SESSION_CHAT_ROOT}
+    if loopback_bound:
+        return _SESSION_ALLOWED_ROOTS | {_SESSION_CHAT_ROOT}
     return _SESSION_ALLOWED_ROOTS
 
 
@@ -506,12 +494,12 @@ class _ControlAuthMiddleware:
     re-validates the forwarded token), so it is not touched here.
 
     ``session_roots`` is the proxy's own root set, so whatever that forwards is
-    what this gates — including ``/session/<id>/console/*`` when the console is
-    enabled, which is the one path where the request being gated is arbitrary
-    code. Note the gate is **necessary but not sufficient** for the console: it
+    what this gates — including ``/session/<id>/chat/*`` when the control is
+    loopback-bound, which is the one path where the request being gated runs
+    arbitrary code. Note the gate is **necessary but not sufficient** there: it
     judges the caller, not the topology, and would happily authorize an execute
-    on a public origin. What keeps the console off a public origin is that the
-    root is not proxied there at all (:func:`_session_proxy_roots`).
+    on a public origin. What keeps chat off a public origin is that the root is
+    not proxied there at all (:func:`_session_proxy_roots`).
     """
 
     def __init__(
@@ -727,20 +715,20 @@ def _display_available() -> bool:
     return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 
-def _session_launch_gate(console_enabled: bool) -> tuple[bool, str | None]:
+def _session_launch_gate(loopback_bound: bool) -> tuple[bool, str | None]:
     """Whether this control may launch a viewer, and if not, why not.
 
     Both halves are properties of this process — its bind and its environment —
     so this is settled once at startup, not per request.
 
-    ``console_enabled`` is the same "this control is loopback-bound" bit that
-    gates the console and chat proxies, and it is required here for the same
+    ``loopback_bound`` is the same bit that gates the chat proxy, and it is
+    required here for the same
     kind of reason: a remote browser cannot see a napari window that opens on
     the server. The message is returned rather than logged because the dashboard
     shows it in place of the button — a missing control with no explanation is
     the thing this is meant to avoid.
     """
-    if not console_enabled:
+    if not loopback_bound:
         return False, (
             "this control is not loopback-bound, so a viewer it started would "
             "open on the server's display, not yours"
@@ -951,7 +939,7 @@ def build_app(
     data_web_url: str,
     token: str | None = None,
     static_dir: str | Path | None = None,
-    console_enabled: bool = False,
+    loopback_bound: bool = False,
     url_prefix: str | None = None,
 ) -> Starlette:
     """Build the control-plane ASGI app.
@@ -967,11 +955,11 @@ def build_app(
     that one SPA. Split out from :func:`serve_control_api` so it is unit-testable
     against a fake upstream without binding uvicorn.
 
-    ``console_enabled`` proxies ``/session/<id>/console/*`` — the user console,
-    which **executes code in that session's kernel**. Default off, and the
-    decision is the caller's because only it knows this control's bind address:
+    ``loopback_bound`` proxies ``/session/<id>/chat/*``, whose turns **execute
+    code in that session's kernel**. Default off, and the decision is the
+    caller's because only it knows this control's bind address:
     :func:`serve_control_api` derives it from a loopback bind, so a
-    network-reachable control never carries the console however it is
+    network-reachable control never carries an execute route however it is
     configured downstream. Deliberately *not* delegated to the session child —
     the proxy hop strips Host and Origin, so the child cannot tell a browser
     from this trusted loopback hop and cannot make this call.
@@ -982,11 +970,11 @@ def build_app(
     point back at it. ``None`` (the default) is the plain root origin and changes
     nothing. It is normalized here, the single consumer.
     """
-    session_roots = _session_proxy_roots(console_enabled)
+    session_roots = _session_proxy_roots(loopback_bound)
     # Whether this control may launch a viewer session for the dashboard, and
     # the sentence explaining it when it may not (both settled here: they read
     # this process's bind and environment, neither of which changes).
-    can_start_session, start_session_blocked = _session_launch_gate(console_enabled)
+    can_start_session, start_session_blocked = _session_launch_gate(loopback_bound)
     url_prefix = normalize_url_prefix(url_prefix)
 
     # The built SPA bundle the control serves at its root (None / missing ->
@@ -1035,17 +1023,18 @@ def build_app(
         # whether to gate itself behind the unlock page. It tracks the *token*,
         # not the network mode: always true in remote (which requires one), and
         # true in local mode too when an optional token was supplied.
-        # `console_enabled` rides the same public probe for the same reason: the
-        # observe page must know whether to offer a code cell before it renders
-        # one, and an editor whose every POST 404s is worse than no editor. It
-        # discloses nothing a caller cannot already infer -- reaching this
-        # endpoint from off-box *is* the evidence that the bind is public and the
-        # console therefore off.
+        # `console_enabled` (named for the retired user console; it means this
+        # control is loopback-bound) rides the same public probe for the same
+        # reason: the observe page must know whether to offer the chat composer
+        # before it renders one, and a composer whose every POST 404s is worse
+        # than none. It discloses nothing a caller cannot already infer --
+        # reaching this endpoint from off-box *is* the evidence that the bind is
+        # public.
         return JSONResponse(
             {
                 "control": "ok",
                 "auth_required": token is not None,
-                "console_enabled": console_enabled,
+                "console_enabled": loopback_bound,
                 "data_plane": supervisor.snapshot(),
             }
         )
@@ -1218,7 +1207,7 @@ def build_app(
                 # mounts it (only a `biopb mcp view` viewer does) AND this
                 # control will proxy /chat/*. Both halves, as ObservePage needs
                 # both — answered here so the dashboard needs no second probe.
-                "chat": probe["chat"] and console_enabled,
+                "chat": probe["chat"] and loopback_bound,
                 # Whether the session serves a stop verb. Not gated on the bind
                 # the way chat is: the route lives under `api`, which is proxied
                 # everywhere, and stopping a session is no more destructive than
@@ -1472,7 +1461,7 @@ def build_app(
         sub_path = request.path_params["path"]
         # Allowlist the session data API only — the observe page itself is
         # the control-served SPA shell (session_observe below), so only /api/*
-        # proxies here (plus /console/* where the console is enabled). The
+        # proxies here (plus /chat/* when loopback-bound). The
         # child's /mcp agent transport is deliberately off this origin — agents
         # reach it directly on the child's own loopback port (stdio shim bridge /
         # `biopb mcp view`), never via the control — and this hop strips /mcp's
@@ -1487,7 +1476,7 @@ def build_app(
         # children that happen to serve them that way. The CSRF gate upstream
         # only inspects unsafe methods -- correct, since safe verbs must not
         # change state -- so a cross-site GET (`<img
-        # src=".../console/execute?code=...">`) is forwarded unchecked, exactly
+        # src=".../chat/...">`) is forwarded unchecked, exactly
         # as a GET to /api/jobs is. That is harmless only while nothing under
         # these roots acts on a GET, which is a promise about code living in
         # another package. Pinning the method here makes the roots' claim
@@ -1676,28 +1665,26 @@ def serve_control_api(
     # origin). None in local mode -> the gate falls back to a loopback Host check
     # instead.
     #
-    # The user console (arbitrary code in a session's kernel) rides this origin
-    # only when the origin is same-machine. Derived from *this* listener's bind
+    # The execute-capable roots (arbitrary code in a session's kernel) ride this
+    # origin only when the origin is same-machine. Derived from *this* listener's bind
     # through the shared predicate, not from --remote or the plane's bind: what
     # decides is who can reach this web front. Deliberately not gated by the
     # token instead — the data-plane token authorizes reading pixels and is
     # readable from the local credential file by design (biopb/biopb#470); fine
-    # for viewing, and not a credential to trade for a shell. Remote console, if
-    # ever wanted, needs its own.
-    console_enabled = not _web_auth.host_is_public_bind(host)
+    # for viewing, and not a credential to trade for a shell. A remote execute
+    # route, if ever wanted, needs its own.
+    loopback_bound = not _web_auth.host_is_public_bind(host)
     app = build_app(
         supervisor,
         ensure_timeout,
         data_web_url,
         token=spec.token,
         static_dir=spec.static_dir,
-        console_enabled=console_enabled,
+        loopback_bound=loopback_bound,
         url_prefix=spec.url_prefix,
     )
-    if not console_enabled:
-        logger.info(
-            "session console disabled: control bound to %s (not loopback)", host
-        )
+    if not loopback_bound:
+        logger.info("session chat disabled: control bound to %s (not loopback)", host)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     if sys.platform == "win32":

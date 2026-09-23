@@ -1,11 +1,11 @@
 # Jupyter clients on the session kernel
 
-Status: **implemented** except the console's retirement (step 4 of *Shape of
-the work*), which is its own change. Decided 2026-09-23.
+Status: **implemented**. Decided 2026-09-23.
 
-**Component:** `biopb-mcp` — a kernel subclass in a new in-kernel module
+**Component:** `biopb-mcp` — a kernel subclass in an in-kernel module
 (`mcp/_kernel_gate.py`), `mcp/_jobs.py` (the record), `mcp/_kernel.py` and
-`mcp/_server.py` (the connection-file hint). Retires `user-console.md`.
+`mcp/_server.py` (the connection-file hint). Replaces the observe page's user
+console.
 
 ## Goal
 
@@ -130,13 +130,50 @@ on. A frozen (PyInstaller) build reports no command, having no module tree to
 run `-m` against. A notebook from any other Jupyter install attaches with the
 connection file alone; the protocol does not care which environment the client runs in.
 
-### What retires
+### What retired
 
-The console's execute route, its `console` path root and the public-bind
-refusal in the control, the textarea and its rendering, and `user-console.md`.
-The observe page keeps job history, Stop, restart and export — the parts a
-notebook cannot do. The console doc's Serialization, Attribution and Informing
-sections carry over as they stand, because the record is the same `_Job`.
+The user console: its execute route (`/console/execute`,
+`observe.console_enabled`), the control's `console` path root, and the editor
+on the observe page. The observe page keeps job history, Stop, restart and
+export — the parts a notebook cannot do. The control's loopback-only gate now
+guards only the `chat` root; `/health` still reports it as `console_enabled`.
+A leftover `observe.console_enabled` in a config file is ignored.
+
+### Attribution: `origin` on the job
+
+`_Job` carries `origin` (`"mcp"` | `"user"` | `"chat"`, see
+[chat-engines.md](chat-engines.md)), set when the record is made and carried
+through `snapshot()`, `jobs_summary()` and `export()`. A foreign client's cell
+is `"user"`.
+
+The writer count is two by construction: the first non-user submitter claims
+the kernel and a second agent's `execute_code` is refused (keyed on the client
+id). A human's cell is never gated by that claim — an attached client carries no
+identity to gate on — and the observe page's restart is never gated either, so a
+stale claim is cleared by the person at the machine rather than seized by a
+second agent. Every tool that changes kernel state (`execute_code`,
+`interrupt_kernel`, `restart_kernel`) is gated the same way; `interrupt_kernel`
+refuses a job the asker did not start.
+
+### Informing the agent: pull, not push
+
+The agent's picture of the namespace goes stale the moment a human runs a cell,
+and it cannot be pushed a notice mid-turn — MCP server→client notifications are
+not reliably surfaced, and an idle agent has no turn to interrupt. So every
+agent-facing round trip (`execute_code`, `poll_job`, `server_status`) appends a
+note at return time:
+
+```
+[2 cells were run by the user since your last call: job-7 (ok), job-8 (error).
+Read them with poll_job('job-7'). Variables and layers may have changed.]
+```
+
+Each job carries a `seen_by_agent` flag, read by `foreign_digest()` and retired
+only by a later `ack_foreign_digest(ids)` the server makes after rendering the
+note — reading never consumes, since a probe that times out can still run at the
+kernel later. Only ids reported **terminal** are acked, without re-reading
+status. The agent is told that something changed and where to look, never what
+changed. `_MAX_RETAINED_JOBS` never evicts an unseen user job.
 
 ## Gotchas
 
@@ -156,6 +193,8 @@ sections carry over as they stand, because the record is the same `_Job`.
 - **A hard-killed session leaves its connection file behind** in the runtime
   dir, as any Jupyter kernel does; a clean shutdown removes it. Tests that kill
   a launcher set `JUPYTER_RUNTIME_DIR` so they do not litter the real one.
+- **Busy is not an error.** A refused cell while the agent computes is the
+  design working; the message says what is running and how to stop it.
 - **`execute_input` is published before `do_execute`**, so a refused cell
   still echoes its input to other-output listeners. Harmless.
 
