@@ -369,11 +369,8 @@ def _start_embedded_tensor_cache(
     from biopb_tensor_server.core.config import CacheConfig
     from biopb_tensor_server.serving.server import TensorFlightServer
 
-    # Results do not outlive the process that produced them, so the previous
-    # run's are cleared rather than adopted. Two reasons: a result's capability
-    # token is minted in memory and would not come back with it, so an adopted
-    # one would be readable by anyone reaching the port; and a consumer that
-    # never collected its result has long since gone.
+    # Clear the previous run's results since a result's capability
+    # token is minted in memory and would not survive restart.
     write_dir = cache_dir / "uploads"
     shutil.rmtree(write_dir, ignore_errors=True)
 
@@ -397,28 +394,16 @@ def _start_embedded_tensor_cache(
     # Bind to specified host (0.0.0.0 for external access)
     location = f"grpc://{tensor_host}:{tensor_port}"
 
-    # Read-only over Flight: results are written in-process, so add_tensor,
-    # set_upload_status and do_put are pure attack surface here. ``write_dir``
-    # is separate from that switch -- it is what gives this server a scratch
-    # source to add results to, which the in-process path reaches through
-    # ``uploads`` with the wire verbs still refused.
+    # The server-wide token is minted and *kept*. It exists so ``_authorize``
+    # fails closed on every action arm except ``health`` and ``chunk_locate``.
+    # Read-back is gated per result by its own capability token and unaffected.
     #
-    # Read-back is gated per result by its own capability token.
+    # Read-only over Flight: Setting a ``write_dir`` is sufficient for the
+    # in-process path to reaches through ``uploads`` with the wire verbs
+    # still refused.
     #
-    # The server-wide token is minted and *kept*: nobody is given it, and
-    # nothing here needs it. It exists so ``_authorize`` fails closed, because
-    # every action arm but ``health`` and ``chunk_locate`` takes full access --
-    # and with no token configured that check passes for anyone, which on a
-    # port bound to 0.0.0.0 leaves ``warm`` (it evicts the page-cache segments
-    # serving everything else) and ``cache_stats`` open to the world. Reads are
-    # unaffected: a capability is checked before the server-wide rule, so the
-    # holder of a result's token still reads it and still gets the localhost
-    # fast path.
-    #
-    # No catalog (metadata_db=None): a result is addressed by the array_id its
-    # SerializedTensor carries, so there is nothing here to browse and the
-    # catalog flights refuse. An op result is therefore not enumerable by
-    # anyone who merely reaches the port.
+    # No catalog (metadata_db=None): instead a result is addressed by the
+    # array_id its SerializedTensor carries.
     tensor_server = TensorFlightServer(
         location,
         token=secrets.token_urlsafe(32),
@@ -428,14 +413,9 @@ def _start_embedded_tensor_cache(
         annotations_enabled=False,
     )
 
-    # This embedded server has no data-folder scan / source-registration stage
-    # at all: the only source it serves is its scratch one, and results appear
-    # on it in-process. It is therefore ready to serve the instant its Flight
-    # port binds. The CLI launcher is the
-    # authoritative path that defers mark_ready() until after its scan; here
-    # there is nothing to wait for, so mark ready immediately -- otherwise the
-    # health action would report STARTING forever and readiness-gating clients
-    # (e.g. biopb-mcp) would wait indefinitely.
+    # Unlike the CLI launcher, which defers mark_ready() until after catalog
+    # scan; the embedded server has no catalog to scan, so it marks ready
+    # immediately.
     tensor_server.mark_ready()
 
     # Start in background thread
@@ -635,11 +615,8 @@ def run_server(
         cache_path = Path(cache_dir)
         cache_path.mkdir(parents=True, exist_ok=True)
 
-        # Parse the size string with common units, or a bare byte count. Uses
-        # dask.utils.parse_bytes for one uniform size grammar across the project
-        # (also accepts GiB/MiB/KB/TB and spaces). NOTE: parse_bytes reads "GB"
-        # as decimal 1e9 -- use "GiB" for the binary 2**30 the old ad-hoc parser
-        # assumed.
+        # NOTE: parse_bytes reads "GB" as decimal 1e9 -- use "GiB" for the binary
+        # 2**30 the old ad-hoc parser assumed.
         cache_bytes = parse_bytes(cache_size)
 
         logger.info(
