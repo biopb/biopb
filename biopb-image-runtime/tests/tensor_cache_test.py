@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import secrets
 import socket
 import threading
 import time
@@ -71,10 +72,13 @@ def served_embedded_cache(tmp_path: Path):
 
     port = _free_tcp_port()
     location = f"grpc://127.0.0.1:{port}"
-    # Mirror the production embedded server: read-only over Flight, with a
-    # write_dir for the scratch source its results go on.
+    # Mirror the production embedded server: read-only over Flight, a
+    # write_dir for the scratch source its results go on, and a server-wide
+    # token nobody is given -- there so `_authorize` fails closed.
+    server_token = secrets.token_urlsafe(16)
     tensor_server = TensorFlightServer(
         location=location,
+        token=server_token,
         writable=False,
         write_dir=tmp_path / "uploads",
         scratch_ttl=RESULT_TTL_S,
@@ -82,6 +86,7 @@ def served_embedded_cache(tmp_path: Path):
     thread = threading.Thread(target=tensor_server.serve, daemon=True)
     thread.start()
 
+    # Ungated, which is why a readiness probe needs no credential at all.
     client = TensorFlightClient(location)
     for _ in range(20):
         try:
@@ -95,10 +100,12 @@ def served_embedded_cache(tmp_path: Path):
         raise RuntimeError("Timed out waiting for tensor server to start")
 
     try:
-        yield EmbeddedTensorCache(
+        cache = EmbeddedTensorCache(
             tensor_server=tensor_server,
             external_location=location,
         )
+        cache.server_token = server_token
+        yield cache
     finally:
         tensor_server.shutdown()
         CacheManager.reset()
@@ -315,13 +322,19 @@ def test_per_source_token_gates_readback(served_embedded_cache: EmbeddedTensorCa
     with pytest.raises(flight.FlightError):
         TensorFlightClient.tensor_from_pb(no_token).compute()
 
-    # This server is catalog-less (metadata_db=None): a result is reachable
-    # only through the source_id its SerializedTensor carries, so it cannot be
-    # enumerated by someone who merely reaches the port. The catalog surface
-    # says so rather than answering "empty".
+    # Two gates, and the outer one is the server-wide token nobody holds: a
+    # caller that merely reaches the port cannot enumerate anything.
     location = served_embedded_cache._external_location
-    with pytest.raises(flight.FlightError, match="no catalog"):
+    with pytest.raises(flight.FlightUnauthenticatedError):
         TensorFlightClient(location).list_sources()
+
+    # And behind it, this server is catalog-less (metadata_db=None): a result
+    # is reachable only through the array_id its SerializedTensor carries. The
+    # catalog surface says so rather than answering "empty".
+    with pytest.raises(flight.FlightError, match="no catalog"):
+        TensorFlightClient(
+            location, token=served_embedded_cache.server_token
+        ).list_sources()
 
 
 def test_finish_seals_the_result_and_refuses_later_writes(

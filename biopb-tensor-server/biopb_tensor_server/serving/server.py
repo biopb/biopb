@@ -1121,14 +1121,29 @@ class TensorFlightServer(flight.FlightServerBase):
     ) -> Iterator[bytes]:
         """Execute a custom action.
 
-        Every arm takes full access (:meth:`_authorize`). Actions are the
-        control surface: a capability means "read this one tensor", and none of
-        what is reachable here is scoped to one tensor -- ``warm`` walks the
+        Every arm takes full access (:meth:`_authorize`) but two. Actions are
+        the control surface: a capability means "read this one tensor", and
+        what is reachable here is not scoped to one -- ``warm`` walks the
         page-cache LRU and evicts the segments serving every other source
         (biopb/biopb#1043), and a mutation on a source is never covered by a
-        read grant on it. ``chunk_locate`` is no exception, though it looks
-        like one: it is the localhost handoff for a read, and the read itself
-        (``do_get``) is where a capability is honoured.
+        read grant on it.
+
+        ``health`` is **ungated**, the way an HTTP server answers ``/healthz``
+        to anyone: it is the liveness probe, so a caller that cannot yet
+        authenticate -- an orchestrator, a readiness gate, an SDK checking the
+        protocol before its first call -- still has to be able to ask. It
+        reports status, protocol and capability flags, never a source name or
+        a path.
+
+        ``chunk_locate`` is the other, because it is not control: it is a read
+        of one tensor, an action only because Flight has no other verb for
+        handing back a byte range. It takes :meth:`_authorize_read` on the
+        chunk's own tensor, exactly as ``do_get`` does for the same ticket.
+        Treating it as control was wrong in both directions -- a capability
+        holder was refused the localhost fast path on every chunk, and on a
+        server with no server-wide token ``_authorize`` waved everyone
+        through, handing out a path and offset that is read by mmap
+        afterwards, where no later call can gate it.
 
         Args:
             context: Server call context
@@ -1138,7 +1153,7 @@ class TensorFlightServer(flight.FlightServerBase):
             Result bytes (JSON-encoded for health action)
         """
         if action.type == "health":
-            self._authorize(context)
+            # Ungated on purpose: see do_action's docstring.
             uptime_seconds = int(time.time() - self._start_time)
             with self._scan_status_lock:
                 full_scan_in_progress = self._full_scan_in_progress
@@ -1204,10 +1219,15 @@ class TensorFlightServer(flight.FlightServerBase):
             _copy_upload_status(reply, status)
             yield reply.SerializeToString()
         elif action.type == "chunk_locate":
-            self._authorize(context)
             ticket = self._parse_ticket(flight.Ticket(action.body.to_pybytes()))
             if ticket.WhichOneof("payload") != "chunk_id":
                 raise flight.FlightServerError("chunk_locate takes a chunk ticket")
+            # The ticket first, then the gate it names: routing_array_id reads
+            # the route token without decoding the chunk, the same way do_get
+            # does for this ticket.
+            self._authorize_read(
+                context, routing_array_id(ticket.chunk_id), READ_PIXELS
+            )
             yield self._handle_chunk_locate(ticket.chunk_id).encode("utf-8")
         elif action.type == "cache_stats":
             self._authorize(context)

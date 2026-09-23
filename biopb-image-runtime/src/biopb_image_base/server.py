@@ -403,9 +403,17 @@ def _start_embedded_tensor_cache(
     # source to add results to, which the in-process path reaches through
     # ``uploads`` with the wire verbs still refused.
     #
-    # Read-back is gated per result by its own capability token, which holds
-    # even with no server-wide token (``_has_full_access`` is False without
-    # one, so a grant is the whole gate rather than an addition to it).
+    # Read-back is gated per result by its own capability token.
+    #
+    # The server-wide token is minted and *kept*: nobody is given it, and
+    # nothing here needs it. It exists so ``_authorize`` fails closed, because
+    # every action arm but ``health`` and ``chunk_locate`` takes full access --
+    # and with no token configured that check passes for anyone, which on a
+    # port bound to 0.0.0.0 leaves ``warm`` (it evicts the page-cache segments
+    # serving everything else) and ``cache_stats`` open to the world. Reads are
+    # unaffected: a capability is checked before the server-wide rule, so the
+    # holder of a result's token still reads it and still gets the localhost
+    # fast path.
     #
     # No catalog (metadata_db=None): a result is addressed by the array_id its
     # SerializedTensor carries, so there is nothing here to browse and the
@@ -413,6 +421,7 @@ def _start_embedded_tensor_cache(
     # anyone who merely reaches the port.
     tensor_server = TensorFlightServer(
         location,
+        token=secrets.token_urlsafe(32),
         writable=False,
         write_dir=write_dir,
         scratch_ttl=RESULT_TTL_S,
