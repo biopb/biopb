@@ -119,6 +119,13 @@ on one tensor, never on the source it hangs off -- one source is shared by
 uploads with different producers. A private tensor may still be catalogued --
 the token gates reading, not knowing.
 
+`health` is outside both tiers and answers anyone, the way an HTTP server
+answers `/healthz`: it is the liveness probe, so a caller that cannot yet
+authenticate must still be able to ask. It reports status, protocol and
+capability flags, never a source name or a path. Every other `do_action` verb
+takes full access, except `chunk_locate`, which is a read of one tensor
+(`_authorize_read`) rather than control.
+
 Custom `do_action` verbs: `health` (reports `protocol`),
 `add_tensor`, `set_upload_status`, `chunk_locate`, `cache_stats`, `resolve`, `warm`,
 `add_source`, `remove_source` (below), and `roi_prune`.

@@ -205,3 +205,8 @@ Java (`TensorUploads`, `TensorFlightClient`) and the TS client mirror the
 same actions and ticket flow, with no client-side tiling or decoding. Every
 tensor is added to a source by `add_tensor`, and every source is either
 discovered or the one the server serves itself.
+
+A read of an uploaded tensor is gated by the grant that tensor carries, on
+`GetFlightInfo`, `do_get` and `chunk_locate` alike -- the localhost fast path
+hands back a path and an offset the client mmaps, so it is the read, not a
+handoff to one.

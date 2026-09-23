@@ -338,8 +338,8 @@ def _check_flight_protocol(
         results = client.do_action(flight.Action("health", b""), options=call_options)
         body = next(iter(results), None)
     except flight.FlightUnauthenticatedError:
-        # A capability-token holder cannot read the catalog tier, which health
-        # is on; the private call it is about to make authorizes itself.
+        # A server that gates health, which this one need not do -- the private
+        # call this client is about to make authorizes itself either way.
         return
     if body is None:
         return  # not a biopb server at all; let the first real call say so

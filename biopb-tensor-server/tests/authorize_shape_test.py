@@ -16,8 +16,12 @@ A grant sits on a *tensor*, never on the source it hangs off: one source is
 shared by uploads with different producers.
 """
 
+import json
+
 import pyarrow.flight as flight
 import pytest
+from biopb.tensor.ticket_pb2 import ChunkBounds, TensorTicket
+from biopb_tensor_server.core.chunk import encode_chunk_id
 from biopb_tensor_server.serving.server import (
     READ_ANNOTATIONS,
     READ_PIXELS,
@@ -265,6 +269,77 @@ class TestASourceCannotGateWhatIsAttachedToIt:
         guarded.sources.get("open").capability_token = "source-token"
 
         guarded._authorize_read(_Context(SERVER_TOKEN), "open", READ_PIXELS)
+
+
+class TestChunkLocateIsARead:
+    """The localhost fast path is gated like the read it replaces.
+
+    ``chunk_locate`` hands back a path and a byte offset that the client then
+    mmaps, so it *is* the read -- nothing downstream can gate it. It sits among
+    the actions only because Flight has no other verb for handing back a byte
+    range, and treating it as control was wrong twice over: a capability holder
+    was refused the fast path on every chunk, and on a server with no
+    server-wide token ``_authorize`` let anyone through.
+    """
+
+    @staticmethod
+    def _locate(server, token, array_id):
+        ticket = TensorTicket(
+            chunk_id=encode_chunk_id(array_id, ChunkBounds(start=[0], stop=[1]))
+        )
+        action = flight.Action("chunk_locate", ticket.SerializeToString())
+        return list(server.do_action(_Context(token), action))
+
+    def test_a_stranger_is_refused(self, guarded):
+        with pytest.raises(flight.FlightUnauthenticatedError):
+            self._locate(guarded, None, GATED)
+
+    def test_the_wrong_token_is_refused(self, guarded):
+        with pytest.raises(flight.FlightUnauthenticatedError):
+            self._locate(guarded, "wrong", GATED)
+
+    def test_the_capability_holder_gets_past_the_gate(self, guarded):
+        """Past the gate is the assertion: the chunk is not cached here, so the
+        answer is an ordinary miss the client falls back from. Before this it
+        was a refusal, paid on every chunk."""
+        body = self._locate(guarded, CAPABILITY, GATED)
+
+        assert json.loads(bytes(body[0])) == {"available": False}
+
+    def test_a_grant_on_one_tensor_does_not_locate_a_sibling(self, guarded):
+        with pytest.raises(flight.FlightUnauthenticatedError):
+            self._locate(guarded, CAPABILITY, "gated/0")
+
+
+class TestHealthIsUngated:
+    """The liveness probe answers anyone, the way an HTTP server answers
+    ``/healthz``.
+
+    A caller that cannot yet authenticate still has to be able to ask: an
+    orchestrator, a readiness gate, an SDK checking the protocol before its
+    first call. What it reports is status, protocol and capability flags --
+    never a source name or a path.
+    """
+
+    def _health(self, server, token):
+        action = flight.Action("health", b"")
+        body = next(iter(server.do_action(_Context(token), action)))
+        return json.loads(bytes(body))
+
+    def test_a_server_with_a_token_still_answers_a_stranger(self, guarded):
+        assert self._health(guarded, None)["status"] in ("SERVING", "STARTING")
+
+    def test_it_carries_the_protocol_a_client_checks_before_authenticating(
+        self, guarded
+    ):
+        """What the SDK reads to refuse a version-skewed server; gating it made
+        that check unreachable exactly when it is most useful."""
+        assert self._health(guarded, None)["protocol"] >= 2
+
+    def test_every_other_action_still_takes_full_access(self, guarded):
+        """Ungating health is not a crack in the rule it is an exception to."""
+        with pytest.raises(flight.FlightUnauthenticatedError):
+            list(guarded.do_action(_Context(None), flight.Action("cache_stats", b"")))
 
 
 class TestGrantsSeam:
