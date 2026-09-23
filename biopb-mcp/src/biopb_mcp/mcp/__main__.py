@@ -201,7 +201,6 @@ def _setup_observe(config, agentless=False, on_shutdown=None):
         _observe.configure(
             max_output_chars=get_setting(config, "observe.max_output_chars"),
             poll_interval_ms=get_setting(config, "observe.poll_interval_ms"),
-            console_enabled=get_setting(config, "observe.console_enabled"),
             allowed_origins=get_setting(config, "transport.allowed_origins"),
             allowed_hosts=get_setting(config, "transport.allowed_hosts"),
         )
@@ -227,7 +226,7 @@ def _is_agentless_viewer(view, shim_owned):
 def _setup_chat(config, agentless):
     """Wire up the built-in chat client.
 
-    Switched by ``observe.chat_enabled``, beside the console's. On by default,
+    Switched by ``observe.chat_enabled``. On by default,
     which costs nothing: without a model and key in ``chat`` the pane is inert,
     so it never spends the user's provider credits uninvited. Guarded like
     observe — a chat failure logs and is swallowed rather
@@ -384,7 +383,11 @@ def _serve_http(config, port, view=False):
         )
 
     bootstrap_line = "import biopb_mcp.mcp._bootstrap as _b; _b.bootstrap()"
-    extra_arguments = [f"--IPKernelApp.exec_lines={bootstrap_line}"]
+    extra_arguments = [
+        f"--IPKernelApp.exec_lines={bootstrap_line}",
+        # Gates cells from Jupyter clients other than this process's own.
+        "--IPKernelApp.kernel_class=biopb_mcp.mcp._kernel_gate.GatedKernel",
+    ]
 
     # Pin BLAS/OpenMP to one thread in the kernel.  numpy's OpenBLAS parallel
     # LU path (dgetrf_parallel, reached via np.linalg.inv) allocates a large

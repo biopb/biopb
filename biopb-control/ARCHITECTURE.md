@@ -75,7 +75,7 @@ namespace, which would collide at the root. So the control serves
 | `/data_plane/api/*` | tensor sidecar (API-only) | loopback proxy |
 | `/session/<id>/observe` | control-served SPA observe shell | in-process |
 | `/session/<id>/api/*` | that session's observe API | loopback proxy |
-| `/session/<id>/console/*` | that session's user console — **loopback-bound control only** | loopback proxy |
+| `/session/<id>/chat/*` | that session's chat turns — **loopback-bound control only** | loopback proxy |
 | `/mcp` | agent JSON-RPC — **not routed here**; shim → child, direct | — |
 
 The SPA is built with base `/` so its assets resolve from the root under any shell
@@ -101,15 +101,17 @@ authenticated, for itself and for everything it fronts.
 - **The `/session/<id>` proxy is an allowlist, not a denylist.** A session child's
   `/mcp` is arbitrary code execution sharing the same port as its observe API, and
   path normalization would let a denylist be walked around (`api/../mcp`
-  collapsing onto `/mcp`). Only a first path segment of `api` — or `console`,
+  collapsing onto `/mcp`). Only a first path segment of `api` — or `chat`,
   under the rule below — is proxied; parent traversal is rejected. (`observe` is
   not proxied at all: the page is the control's own SPA shell, served in-process.)
-- **The user console is a separate root, gated on this listener's bind.** A code
-  cell on the observe page runs in that session's kernel, so it is an RCE on the
-  same origin the allowlist above exists to keep RCE off. Folding it into `api`
-  would leave that allowlist enforced but no longer true, so it gets its own root
-  and is proxied only when the control is loopback-bound — `api` always, `console`
-  local-mode only, `/mcp` never. The control decides because only it knows its own
+- **Chat turns are a separate root, gated on this listener's bind.** A turn from
+  the observe page's chat pane runs code in that session's kernel, so it is an
+  RCE on the same origin the allowlist above exists to keep RCE off. Folding it
+  into `api` would leave that allowlist enforced but no longer true, so it gets
+  its own root and is proxied only when the control is loopback-bound — `api`
+  always, `chat` local-mode only, `/mcp` never. (The user console that first
+  used this root is retired: a Jupyter client attaches to the kernel directly,
+  biopb-mcp `docs/jupyter-clients.md`.) The control decides because only it knows its own
   bind: the proxy hop strips Host and Origin, so the child cannot tell a browser
   from this trusted hop. Not gated by the token instead: that credential
   authorizes reading pixels, is readable from a local file by design, and rides

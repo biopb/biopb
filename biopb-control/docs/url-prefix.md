@@ -110,9 +110,9 @@ vite `base` for asset URLs, injects `window.__BIOPB_BASE__` via a dev-only
 unrewritten, so the stripping middleware is genuinely exercised (a control
 started without the flag 404s rather than silently diverging). The dev proxy
 must cover every root the app calls (`/api`, `/data_plane`, `/health`,
-`/session/<id>/api`, `/session/<id>/console`); a missing one falls through to
+`/session/<id>/api`, `/session/<id>/chat`); a missing one falls through to
 vite's SPA fallback and returns HTML where JSON was expected —
-`consoleEnabled()`/`authRequired()` read `/health` and treat any failure as
+`localRootsProxied()`/`authRequired()` read `/health` and treat any failure as
 `false`.
 
 ## Still true after this
@@ -121,8 +121,8 @@ The control speaks plain HTTP with no TLS, so a prefix published through a
 portal puts the access token on the wire in the clear unless the portal
 terminates TLS in front of it.
 
-The user console is gated on the control's own bind
-(`console_enabled = not host_is_public_bind`), independent of the prefix: a
+The chat root is gated on the control's own bind
+(`loopback_bound = not host_is_public_bind`), independent of the prefix: a
 loopback-bound control published through a portal still reads as local and
-still carries the console — which for an OnDemand deployment is also the
+still carries it — which for an OnDemand deployment is also the
 intent, since the portal authenticates the job's owner.

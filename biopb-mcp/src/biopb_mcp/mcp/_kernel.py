@@ -40,6 +40,12 @@ ENV_WINDOW_CLOSE_FD = "BIOPB_WINDOW_CLOSE_FD"
 # ENV_WINDOW_CLOSE_FD above).
 ENV_SCRATCH = "BIOPB_SCRATCH_KERNEL"
 
+# Env var handing the kernel the host client's session id, so its gate
+# (_kernel_gate) can tell this process's requests from another Jupyter
+# client's. The literal is mirrored in _kernel_gate.ENV_HOST_SESSION (kept in
+# sync by this comment).
+ENV_HOST_SESSION = "BIOPB_HOST_SESSION"
+
 # Windows window-close fallback (no inherited fd there): the launcher polls this
 # probe -- the zero-arg _viewer_window_alive() the bootstrap injects into the
 # kernel namespace (see _bootstrap, mirrored by this comment) -- and tears the
@@ -47,6 +53,56 @@ ENV_SCRATCH = "BIOPB_SCRATCH_KERNEL"
 # thread; the probe itself is instant.
 _WINDOW_ALIVE_PROBE = "print(_viewer_window_alive())"
 _WINDOW_PROBE_TIMEOUT = 10.0
+
+
+def _runtime_connection_file() -> str:
+    """A fresh connection-file path in Jupyter's runtime dir.
+
+    Left unset, jupyter_client writes a tempfile, which no Jupyter tool looks
+    for. The runtime dir is per-platform (``jupyter --runtime-dir``), private
+    to the user, and where ``jupyter qtconsole --existing`` resolves a bare
+    file name.
+    """
+    import uuid
+
+    from jupyter_core.paths import jupyter_runtime_dir
+    from jupyter_core.utils import ensure_dir_exists
+
+    runtime = jupyter_runtime_dir()
+    ensure_dir_exists(runtime, mode=0o700)
+    return os.path.join(runtime, f"kernel-biopb-{uuid.uuid4()}.json")
+
+
+def attach_command(
+    connection_file: Optional[str],
+    *,
+    python: Optional[str] = None,
+    windows: Optional[bool] = None,
+) -> Optional[str]:
+    """The shell command that attaches qtconsole to *connection_file*.
+
+    Run by this process's own interpreter (*python*, default
+    ``sys.executable``): biopb installs qtconsole (through napari) but puts no
+    ``jupyter`` on PATH, so a bare ``jupyter qtconsole`` finds nothing, or
+    another install's. Quoted for the platform's shell (*windows*, default
+    this one's), since a Windows profile path may contain spaces.
+    """
+    import sys
+
+    # A frozen build has no module tree to run `-m` against; the connection
+    # file alone still attaches any Jupyter install's client.
+    if not connection_file or getattr(sys, "frozen", False):
+        return None
+    argv = [python or sys.executable, "-m", "qtconsole", "--existing", connection_file]
+    if windows is None:
+        windows = os.name == "nt"
+    if windows:
+        import subprocess
+
+        return subprocess.list2cmdline(argv)
+    import shlex
+
+    return shlex.join(argv)
 
 
 def _status_result(status: str, error_text: str) -> dict:
@@ -154,6 +210,11 @@ class KernelHost:
         self._kernel_stderr = kernel_stderr
         self._km = None
         self._kc = None
+        # Set once per _launch(), alongside self._km: the connection file (and
+        # so the attach command) is fixed for the kernel's lifetime, and
+        # health() is polled every few seconds, so it's cached rather than
+        # rebuilt on each call.
+        self._attach_command = None
         self._lock = threading.RLock()
         # Set once the kernel has launched AND its bootstrap health probe has
         # passed. The kernel is started on demand (start_kernel -> ensure_started)
@@ -329,7 +390,15 @@ class KernelHost:
         if pass_fds:
             popen_kwargs["pass_fds"] = tuple(pass_fds)
 
-        self._km = KernelManager(kernel_name=self._kernel_name)
+        self._km = KernelManager(
+            kernel_name=self._kernel_name,
+            connection_file=_runtime_connection_file(),
+        )
+        self._attach_command = attach_command(self._km.connection_file)
+        # The client made below shares this session id, so the kernel knows
+        # its host before anything can connect.
+        env = dict(env)
+        env[ENV_HOST_SESSION] = self._km.session.session
         try:
             try:
                 self._km.start_kernel(
@@ -436,8 +505,9 @@ class KernelHost:
         """Run *code* in the kernel and return a result dict.
 
         Returns ``{stdout, result_text, error_text, status}`` where ``status``
-        is one of ``ok``/``error`` (from the kernel reply), ``timeout`` (the
-        execution exceeded *timeout* and was interrupted), ``busy`` (the kernel
+        is one of ``ok``/``error`` (from the kernel reply), ``timeout`` (no
+        reply within *timeout*; nothing is interrupted, see :meth:`_run_once`),
+        ``busy`` (the kernel
         lock could not be acquired within ``busy_lock_timeout``), or
         ``starting`` (the kernel is not ready yet — see below).
 
@@ -569,14 +639,23 @@ class KernelHost:
                 output_hook=output_hook,
             )
         except (queue.Empty, TimeoutError):
-            self.interrupt()
+            # No interrupt. Everything sent here is a short snippet (agent code
+            # runs on a job thread), so overrunning means the main thread is
+            # busy with something else -- a cell from an attached Jupyter
+            # client, or a job's run_on_main slot -- and a SIGINT lands in
+            # *that*. The request stays queued and runs once the thread frees;
+            # its late reply is skipped by message id.
             return {
                 "stdout": "".join(stdout_parts),
                 "result_text": "".join(result_parts),
                 "error_text": (
-                    f"Execution exceeded {timeout}s and was interrupted. "
-                    "Wait for the kernel to settle, or call restart_kernel if "
-                    "it stays unresponsive (a blocking C call ignores SIGINT)."
+                    f"No reply within {timeout}s: the kernel's main thread is "
+                    "busy, most likely with a cell from a Jupyter client attached "
+                    "to this kernel, or with a viewer call. Nothing was "
+                    "interrupted, and this call will still run once it frees. "
+                    "Retry later. restart_kernel only if it never frees -- it "
+                    "destroys whatever the user is running, and their variables "
+                    "and layers."
                 ),
                 "status": "timeout",
             }
@@ -964,7 +1043,17 @@ class KernelHost:
             "watchdog_running": (
                 self._watchdog_thread is not None and self._watchdog_thread.is_alive()
             ),
+            "connection_file": self.connection_file,
+            "attach_command": self._attach_command if self.is_alive() else None,
         }
+
+    @property
+    def connection_file(self):
+        """Where a Jupyter client attaches to this kernel, or None when it is
+        not running."""
+        if not self.is_alive():
+            return None
+        return self._km.connection_file or None
 
     def is_alive(self) -> bool:
         try:

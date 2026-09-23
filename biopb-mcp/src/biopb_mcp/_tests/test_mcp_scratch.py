@@ -785,9 +785,8 @@ def observe_client():
     from biopb_mcp.mcp import _http, _observe
 
     host = _session_host()
-    old_host, old_console = _app._kernel_host, _observe._console_enabled
+    old_host = _app._kernel_host
     _app.set_kernel_host(host)
-    _observe.configure(console_enabled=True)
     try:
         yield (
             TestClient(
@@ -797,6 +796,5 @@ def observe_client():
         )
     finally:
         _app._kernel_host = old_host
-        _observe._console_enabled = old_console
         _http._mw = None
         _writers.clear_claim()

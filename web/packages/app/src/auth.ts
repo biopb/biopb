@@ -65,16 +65,15 @@ export async function authRequired(): Promise<boolean> {
   }
 }
 
-/** Whether this control will proxy a session's *local* roots — `/console/*` and
- * `/chat/*` — from the same public `/health` probe.
+/** Whether this control will proxy a session's *local* roots — `/chat/*` —
+ * from the same public `/health` probe.
  *
- * One bit for both, because it answers one question: whether the control is
- * loopback-bound. `/health` still calls it `console_enabled`, from when the
- * console was the only such root. It is only half the answer either way — the
- * session child has its own `observe.console_enabled` and `observe.chat_enabled`
- * — and each surface must be offered only when both halves agree, so a false
- * here is final. Defaults to false when the probe can't be read: a control whose
- * every submit 404s is worse than no editor and no chat box. */
+ * It answers whether the control is loopback-bound. `/health` calls it
+ * `console_enabled`, after the retired user console that was the first such
+ * root. It is only half the answer — the session child has its own
+ * `observe.chat_enabled` — and chat must be offered only when both halves agree,
+ * so a false here is final. Defaults to false when the probe can't be read: a
+ * composer whose every submit 404s is worse than no chat box. */
 export async function localRootsProxied(): Promise<boolean> {
   try {
     const r = await fetch(withBase("/health"));

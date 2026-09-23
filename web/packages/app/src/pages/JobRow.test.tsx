@@ -41,7 +41,7 @@ describe("JobRow", () => {
   });
 
   it("falls back to the code line when nobody said", () => {
-    // The user console submits no intent, and neither does an older child.
+    // A Jupyter client's cell carries no intent, and neither does an older child.
     for (const j of [job(), job({ intent_preview: "" })]) {
       expect(render(j)).toContain("print(1)");
     }

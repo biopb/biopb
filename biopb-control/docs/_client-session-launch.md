@@ -192,7 +192,7 @@ the user's back.
 ## Security
 
 **The gate is not the same for the two shapes.** opencode's is a loopback
-listener, so its button belongs behind the same `console_enabled` bit as the
+listener, so its button belongs behind the same `loopback_bound` bit as the
 viewer launch and the chat proxy. The relay clients are the opposite case: being
 reachable from another device is the entire point, and gating them on
 loopback-only forbids the case that makes them worth building. They need their

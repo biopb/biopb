@@ -404,23 +404,14 @@ class ObserveConfig:
         "How often (ms) the observe page polls the job list/status. Deliberately "
         "slow: each poll is a kernel round-trip competing with agent calls.",
     )
-    console_enabled: bool = _h(
-        True,
-        "Offer the user console: a code cell on the observe page that runs in "
-        "this session's kernel, serialized against the agent by the same "
-        "one-job-at-a-time rule. Off drops the route entirely. This can only "
-        "narrow the surface -- the control refuses to proxy the console at all "
-        "unless it is loopback-bound, whatever this says.",
-    )
     chat_enabled: bool = _h(
         True,
         "Offer the built-in chat client: a pane on the observe page that drives "
-        "this session's kernel through a model. Lives here beside the console "
-        "because it is the same kind of thing -- an execute-capable surface on "
-        "this page -- and because it needs the page: chat routes served without "
-        "one have nothing to reach them. On by default, but inert until the "
-        "model and key in `chat` are set, so it costs nothing to leave on. "
-        "Like the console, this can only narrow the surface.",
+        "this session's kernel through a model. Lives here because it needs the "
+        "page: chat routes served without one have nothing to reach them. On by "
+        "default, but inert until the model and key in `chat` are set, so it "
+        "costs nothing to leave on. This can only narrow the surface -- the "
+        "control refuses to proxy chat at all unless it is loopback-bound.",
     )
 
 
@@ -434,8 +425,8 @@ class ChatConfig:
     the user already runs, over the Agent Client Protocol: the ``acp_*`` settings
     describe that one. Nothing is shared between the two but the pane.
 
-    The on/off switch is **not** here: it is ``observe.chat_enabled``, beside the
-    console's, because what it turns on is a pane on the observe page. This
+    The on/off switch is **not** here: it is ``observe.chat_enabled``, because
+    what it turns on is a pane on the observe page. This
     section is only *which* agent that pane talks to, so there is one place to
     enable a surface and one place to point it somewhere.
 

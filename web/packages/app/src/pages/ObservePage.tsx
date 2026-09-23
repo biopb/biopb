@@ -55,7 +55,7 @@ interface JobSummary {
   elapsed: number;
   code_preview?: string;
   /** Why the cell was run, when whoever ran it said why. Absent on an older
-   * child, and empty for a cell nobody explained (the console's, typically).
+   * child, and empty for a cell nobody explained (a Jupyter client's, typically).
    * On a verification row it is the workflow's title: the cells arrive as bare
    * code and there is no per-cell intent to show. */
   intent_preview?: string;
@@ -126,20 +126,18 @@ export default function ObservePage() {
   const [details, setDetails] = useState<Record<string, JobDetail>>({});
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [status, setStatus] = useState("…");
+  // How to attach a Jupyter client to the session kernel; null while it is not
+  // running. Only works on the machine the session runs on.
+  const [attachCmd, setAttachCmd] = useState<string | null>(null);
   const [pollMs, setPollMs] = useState(3000);
-  // The console is offered only when BOTH the control will proxy it (it is
-  // loopback-bound) and this session child serves it (observe.console_enabled).
-  // Either half false means every submit would 404, so render no editor at all.
-  const [childConsole, setChildConsole] = useState(false);
-  // The control's half of the answer for both local roots: whether it is
-  // loopback-bound, and so whether it will proxy /console/* and /chat/* at all.
+  // The control's half of the answer for the chat root: whether it is
+  // loopback-bound, and so whether it will proxy /chat/* at all.
   const [controlLocal, setControlLocal] = useState(false);
-  // Null until probed, and null again means unreachable rather than off — the
-  // same distinction `console_enabled` draws below, and for the same reason.
+  // Null until probed, and null again means unreachable rather than off: a
+  // blip must not unmount a composer holding a half-typed turn.
   const [chatStatus, setChatStatus] = useState<ChatStatus | null>(null);
-  // Both also require a session to run in: an editor and a composer on a dead
-  // session are two more surfaces that look live and answer 404 on submit.
-  const showConsole = childConsole && controlLocal && !ended;
+  // It also requires a session to run in: a composer on a dead session looks
+  // live and answers 404 on submit.
   const showChat = !!chatStatus?.enabled && controlLocal && !ended;
 
   // The chat/work split, in pixels, remembered per browser. A preference, not
@@ -302,13 +300,12 @@ export default function ObservePage() {
     try {
       const s = await r.json();
       if (typeof s.poll_interval_ms === "number") setPollMs(s.poll_interval_ms);
-      // Only when the field is actually there. A degraded status payload (the
-      // child's 503 with no kernel host, the proxy's 502 on a wedged session)
-      // parses fine and carries no `console_enabled` — reading it as `false`
-      // would unmount the editor and throw away a half-typed cell over a blip.
-      // This is static config, not state: absent means unknown, not off.
-      if (typeof s.console_enabled === "boolean")
-        setChildConsole(s.console_enabled);
+      // Built by the child, which knows its own platform's shell quoting.
+      setAttachCmd(
+        typeof s.attach_command === "string" && s.attach_command
+          ? s.attach_command
+          : null,
+      );
       const bits = [s.alive ? "alive" : "dead"];
       if (s.busy) bits.push("busy");
       if (!s.ready) bits.push("starting");
@@ -430,50 +427,8 @@ export default function ObservePage() {
     URL.revokeObjectURL(url);
   }, [base]);
 
-  // The job holding the kernel, if any. Drives the Run button's disabled state,
-  // so a collision is shown *before* the click rather than as a failed action:
-  // one job runs at a time, and there is no preemption or queue.
-  //
-  // A verification counts, even though it runs elsewhere: the one job slot is
-  // held in the session child and spans both kernels, so a console cell
-  // submitted during one is refused.
+  // A verification running in its scratch kernel, shown on the pane toggle.
   const verifyRunning = verifyJobs.find((j) => j.status === "running") ?? null;
-  const running =
-    (jobs?.find((j) => j.status === "running") ?? null) || verifyRunning;
-
-  const runCell = useCallback(
-    async (code: string): Promise<string | null> => {
-      let r: Response;
-      try {
-        r = await sessionFetch(base + "/console/execute", {
-          method: "POST",
-          // Not decoration: a JSON content-type is one a cross-site form POST
-          // cannot set, and the child requires it on this route for exactly
-          // that reason. `sessionFetch` adds the bearer token alongside it.
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ code }),
-        });
-      } catch (e) {
-        return String(e);
-      }
-      const d = await r.json().catch(() => ({}) as Record<string, unknown>);
-      if (r.status === 409) {
-        // Reachable despite the disabled button: `poll()` below is not awaited,
-        // so a fast second click lands before the jobs list reports the cell as
-        // running — and that collision is with the user's *own* job, which is
-        // the branch whose wording has to agree with "you".
-        const who =
-          d.running_job_origin === "user"
-            ? "you already have"
-            : `${writerName(d.running_job_origin)} already has`;
-        return `${who} a cell running (${d.running_job_id}). Wait for it, or interrupt it from its row above.`;
-      }
-      if (!r.ok) return String(d.error || `submit failed (${r.status})`);
-      poll(); // show the new job immediately
-      return null;
-    },
-    [base, poll],
-  );
 
   // Offered on the running job's row rather than the header, because that is
   // what it does: the kernel runs one cell at a time, so interrupting *it* and
@@ -517,6 +472,14 @@ export default function ObservePage() {
         />
         <h1>BioPB mcp - observe</h1>
         <span id="status">{status}</span>
+        {attachCmd && !ended ? (
+          <button
+            title={`Copy: ${attachCmd}\nRun it on this machine to work in the session's namespace. Cells are refused while a job runs.`}
+            onClick={() => void navigator.clipboard?.writeText(attachCmd)}
+          >
+            Copy attach command
+          </button>
+        ) : null}
         {/* Both act on the child, so both 404 once it is gone. A dead button is
             how the page told the user nothing was wrong. */}
         {ended ? null : (
@@ -649,9 +612,6 @@ export default function ObservePage() {
           />
         ) : null}
         <div className="work">
-          {showConsole && pane === "session" ? (
-            <ConsolePanel running={running} onRun={runCell} />
-          ) : null}
           {pane === "verify" ? (
             <div className="pane-note">
               The last verification. It ran in its own scratch kernel — a
@@ -701,73 +661,6 @@ export default function ObservePage() {
         </div>
       </main>
       <style>{OBS_CSS}</style>
-    </div>
-  );
-}
-
-/** The user's own cell, run in the same kernel the agent drives.
- *
- * Busy is rendered as *state* — a disabled button naming who holds the kernel —
- * not as an error after the click. A rejected cell is the serialization rule
- * working, and showing it as a red failure would train the user to reach for
- * Interrupt reflexively. */
-function ConsolePanel({
-  running,
-  onRun,
-}: {
-  running: JobSummary | null;
-  onRun: (code: string) => Promise<string | null>;
-}) {
-  const [code, setCode] = useState("");
-  const [error, setError] = useState<string | null>(null);
-  const [submitting, setSubmitting] = useState(false);
-  const busy = running !== null;
-
-  const submit = useCallback(async () => {
-    if (!code.trim() || busy || submitting) return;
-    setSubmitting(true);
-    setError(await onRun(code));
-    setSubmitting(false);
-  }, [code, busy, submitting, onRun]);
-
-  const label = busy
-    ? `kernel busy · ${running!.job_id} (${writerName(running!.origin)})`
-    : submitting
-      ? "running…"
-      : "▶ Run";
-
-  return (
-    <div className="console">
-      {/* The Run button rides the label row rather than a bar of its own: that
-          bar cost a whole line of a column that is now a fixed height, and the
-          line it cost came off the job list. The error sits between them, where
-          there was nothing but empty space. */}
-      <div className="console-head">
-        <span className="label">your cell — runs in this session&apos;s kernel</span>
-        <span className="console-err">{error || ""}</span>
-        <button
-          className="primary"
-          disabled={busy || submitting || !code.trim()}
-          onClick={submit}
-        >
-          {label}
-        </button>
-      </div>
-      <textarea
-        className="console-input"
-        value={code}
-        spellCheck={false}
-        placeholder="viewer.layers"
-        onChange={(e) => setCode(e.target.value)}
-        title="Ctrl+Enter to run"
-        onKeyDown={(e) => {
-          // Ctrl/Cmd+Enter submits; plain Enter stays a newline (this is code).
-          if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
-            e.preventDefault();
-            submit();
-          }
-        }}
-      />
     </div>
   );
 }
@@ -952,10 +845,8 @@ const OBS_CSS = `
   /* The thread beside the jobs it drives: a chat cell shows up in that list,
      and its live stdout is what stands in for the thread's missing stream. */
   /* Both columns are their own scroll region, the height of the viewport, so
-     the page itself never scrolls: the console stays put while the job list
-     moves under it, and the composer stays put while the thread moves. A
-     single page scroll took the console off screen exactly when a running job
-     made the list long -- which is when you want to type the next cell. */
+     the page itself never scrolls: the composer stays put while the thread
+     moves, and the header while the job list does. */
   .obs-page main.with-chat { display: flex; gap: 0; align-items: flex-start;
              height: calc(100vh - 58px); box-sizing: border-box; overflow: hidden; }
   /* The fallback is the original rule, so an untouched pane is sized exactly as
@@ -968,8 +859,6 @@ const OBS_CSS = `
              min-width: 0; height: 100%; }
   .obs-page main.with-chat .work { flex: 1; min-width: 0; height: 100%;
              display: flex; flex-direction: column; }
-  /* The console keeps its natural height; only the job list scrolls. */
-  .obs-page main.with-chat .work .console { flex: 0 0 auto; }
   .obs-page main.with-chat #jobs { flex: 1; min-height: 0; overflow-y: auto;
              padding-right: 2px; }
   .obs-page .splitter { flex: 0 0 10px; align-self: stretch; cursor: col-resize;
@@ -1049,20 +938,6 @@ const OBS_CSS = `
   .obs-page pre.code { background: #0a0d0a; border-left: 2px solid #2a5; max-height: 30vh; }
   .obs-page .meta { color: #888; font-size: 12px; margin-bottom: 4px; }
   .obs-page .empty { color: #777; padding: 20px; text-align: center; }
-  .obs-page .console { border: 1px solid #333; border-radius: 5px; padding: 10px 12px;
-             margin-bottom: 12px; background: #161616; }
-  .obs-page .console-input { width: 100%; box-sizing: border-box; min-height: 68px;
-             resize: vertical; background: #0c0c0c; color: #ddd; border: 1px solid #333;
-             border-radius: 4px; padding: 8px;
-             font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
-  .obs-page .console-input:focus { outline: none; border-color: #2a5; }
-  .obs-page .console-head { display: flex; align-items: center; gap: 10px;
-             margin-bottom: 6px; }
-  .obs-page .console-head .label { margin: 0; flex: 0 0 auto; }
-  .obs-page .console-head .console-err { flex: 1; min-width: 0; text-align: right;
-             white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .obs-page .console button:disabled { opacity: .55; cursor: default; background: #222; }
-  .obs-page .console-err { color: #f99; font-size: 12px; }
   .obs-page .ended { border: 1px solid #744; background: #241a1a; color: #fbb;
              border-radius: 5px; padding: 10px 12px; margin-bottom: 12px; }
   .obs-page .ended strong { color: #fdd; }

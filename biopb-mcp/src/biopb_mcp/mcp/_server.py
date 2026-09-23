@@ -699,8 +699,9 @@ async def execute_code(
     it until the kernel restarts. A second client is refused here and by every
     other tool that changes kernel state (interrupt_kernel, restart_kernel), and
     keeps only the read-only ones. The person at the machine is exempt — they
-    can run cells from the observe page while you work, which is what the
-    user-activity notice on these results is telling you about.
+    can run cells from a Jupyter notebook attached to this kernel while you
+    work, which is what the user-activity notice on these results is telling
+    you about. While your job runs, their cells are refused.
 
     Results include print() output and the last expression's repr. Rich IPython
     display() output is not captured; use print().
@@ -1055,9 +1056,9 @@ async def interrupt_kernel() -> str:
     call (gRPC tensor fetch, native dask compute) stops only when it returns to
     Python; if YOUR job stays stuck, use restart_kernel — the guaranteed stop.
 
-    Stops YOUR job only. A cell the user ran from the observe page shares this
-    kernel and this one-job-at-a-time runner, but is not yours to stop: this
-    refuses it, and you should wait for it instead. A refusal is not a stuck
+    Stops YOUR job only. A cell the user runs from an attached Jupyter notebook
+    shares this kernel but is not yours to stop: this refuses it (and while it
+    runs, this call waits behind it), so wait for it instead. A refusal is not a stuck
     kernel and restart_kernel is not the way around it — restarting would destroy
     the user's running cell, variables and layers along with yours. Wait, or ask
     them.
@@ -1315,6 +1316,12 @@ async def server_status() -> str:
     lines.append(f"  watchdog_running: {health['watchdog_running']}")
     if health["recent_respawns"]:
         lines.append(f"  recent_respawns: {health['recent_respawns']}")
+    if health.get("connection_file"):
+        # For the user: a notebook on this kernel shares its namespace. Its
+        # cells are refused while a job runs and reported to the agent otherwise.
+        lines.append(f"  connection_file: {health['connection_file']}")
+        if health.get("attach_command"):
+            lines.append(f"    attach a notebook: {health['attach_command']}")
 
     # Kernel-state summary: dead / failed / starting / not-started are mutually
     # exclusive (each implies ready is false), so report exactly one and return —

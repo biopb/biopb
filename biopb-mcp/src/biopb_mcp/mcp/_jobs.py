@@ -17,7 +17,7 @@ Design notes
   :class:`_Job`. They share this one runner, so the rejection above is also what
   keeps the writers off each other's toes: no preemption, no queue, one ordering
   of writes to the namespace. :func:`foreign_digest` is how the ``execute_code``
-  agent finds out its namespace changed under it; see ``docs/user-console.md``.
+  agent finds out its namespace changed under it; see ``docs/jupyter-clients.md``.
 * **One agent per kernel.** Serializing two *agents* would order their writes
   without making them mean anything — neither can see the other's model of the
   namespace. So the first non-user submitter claims the kernel and a second is
@@ -44,6 +44,7 @@ Design notes
 """
 
 import ast
+import contextlib
 import ctypes
 import io
 import logging
@@ -83,13 +84,13 @@ _HEAD_SCAN_CHARS = 4096
 
 # Attribution for a KeyboardInterrupt this runner did not raise (see _run). The
 # kernel ignores SIGINT except while servicing a message (ipykernel installs
-# default_int_handler only between its pre/post handler hooks), so the realistic
-# source is the one place that sends one: KernelHost._run_once interrupting the
-# kernel when a *quick* snippet overruns its timeout.
+# default_int_handler only between its pre/post handler hooks), and the host no
+# longer sends one on a timeout, so the realistic source is a Jupyter client
+# attached to this kernel interrupting it while the job held the main thread.
 _EXTERNAL_INTERRUPT_MSG = (
     "Stopped by an interrupt sent to the whole kernel, not by an error in this "
-    "code. Most likely a short tool call (server_status / poll_job / a "
-    "screenshot) overran its timeout and interrupted the kernel to unwedge it."
+    "code. Most likely a Jupyter client attached to this kernel sent it while "
+    "this job was running on the main thread (a viewer call)."
 )
 
 # How long run_on_main waits for the main thread to service a marshaled call
@@ -269,11 +270,17 @@ class _Job(_OutputBuffer):
         "verify",
         "code_preview",
         "intent_preview",
+        "tee",
     )
 
     def __init__(self, job_id, code="", origin="mcp", intent=""):
         super().__init__()
         self.job_id = job_id
+        # Whether this job's captured output also goes on to the real stream:
+        # set for a foreign client's cell (record_inline), whose client still
+        # has to see its own output; unset for a submit() job, whose worker
+        # thread has no other reader of stdout/stderr.
+        self.tee = False
         # The submitted source (as passed to submit(), before the internal
         # _REFRESH_PREFIX), so the observe UI can show what each job ran.
         self.code = code
@@ -294,7 +301,7 @@ class _Job(_OutputBuffer):
         # actor: "agent" was two of these at once once the chat loop arrived,
         # and code asking "is this the agent's?" quietly meant "the MCP one's".
         #   "mcp"   — the execute_code tool, driven by an external MCP client
-        #   "user"  — a cell run by a human from the observe page
+        #   "user"  — a cell run by a human from a Jupyter client on the kernel
         #   "chat"  — the in-process chat loop (docs/chat-engines.md)
         # Set at submit and never inferred later — a job outlives the request
         # that started it, and poll/export read this long after that request is
@@ -365,7 +372,7 @@ class _Cell(_OutputBuffer):
     job.
     """
 
-    __slots__ = ("code", "status", "error_text", "job", "started", "finished")
+    __slots__ = ("code", "status", "error_text", "job", "started", "finished", "tee")
 
     def __init__(self, code, job):
         super().__init__()
@@ -376,6 +383,10 @@ class _Cell(_OutputBuffer):
         self.error_text = ""
         self.started = None
         self.finished = None
+        # A cell's own output already goes to its job via write_output below,
+        # never additionally to the real stream: only a foreign client's
+        # inline job (record_inline) ever sets this true.
+        self.tee = False
 
     def write_output(self, s):
         self.job.write_output(s)
@@ -466,10 +477,14 @@ class _JobStream:
         self._real = real
 
     def write(self, s):
-        job = _jobs_by_thread.get(threading.get_ident())
-        if job is not None:
-            return job.write_output(s)
-        return self._real.write(s)
+        ident = threading.get_ident()
+        job = _jobs_by_thread.get(ident)
+        if job is None:
+            return self._real.write(s)
+        n = job.write_output(s)
+        if job.tee:
+            return self._real.write(s)
+        return n
 
     def flush(self):
         try:
@@ -654,9 +669,7 @@ def _run(job, code):
         # *stop*, not a defect in the submitted code, so label and attribute it
         # rather than hand back a bare traceback -- the same reasoning that gave
         # interrupt_current its flag, applied to the door it does not own.
-        # Sharpest for a user cell: the agent is refused interrupt_current on
-        # one, yet an overrunning tool probe can still end it this way, and
-        # unlabeled it reads to the human as their own code breaking.
+        # Unlabeled, it reads as the code itself breaking.
         if not job.interrupted:
             job.interrupted = True
             job.cancel_reason = job.cancel_reason or _EXTERNAL_INTERRUPT_MSG
@@ -734,6 +747,15 @@ def _prune():
         del _jobs[terminal.pop(0)]
 
 
+def _new_job(code, origin, intent=""):
+    """Register a job record under the next id. Call with `_lock` held."""
+    global _job_seq
+    _job_seq += 1
+    job = _Job(f"job-{_job_seq}", code, origin=origin, intent=intent)
+    _jobs[job.job_id] = job
+    return job
+
+
 def submit(
     code,
     origin="mcp",
@@ -772,10 +794,10 @@ def submit(
 
     Two deliberate holes. A **human** cell (``origin="user"``) is never gated:
     the person at the machine has standing here that no client does, and the
-    observe console has no identity to gate on anyway. And a caller with
-    ``writer=None`` — a direct in-process call, or a transport that yields no
-    client id — neither claims nor is checked, since there is nothing to tell
-    two of them apart with.
+    Jupyter client they typed it in has no identity to gate on anyway. And a
+    caller with ``writer=None`` — a direct in-process call, or a transport that
+    yields no client id — neither claims nor is checked, since there is nothing
+    to tell two of them apart with.
 
     **The recovery belongs to the human, not to a second agent.** Every tool
     that changes kernel state is gated the same way — ``interrupt_current`` here,
@@ -785,7 +807,7 @@ def submit(
     from the observe page (never gated), or the session ending. That is the same
     principle as the ``origin="user"`` exemption, applied to recovery.
     """
-    global _job_seq, _owner, _owner_label, _agent_origin
+    global _owner, _owner_label, _agent_origin
     with _lock:
         if origin != "user" and writer is not None:
             if _owner is None:
@@ -809,17 +831,14 @@ def submit(
                     "running_job_id": jid,
                     "running_job_origin": j.origin,
                 }
-        _job_seq += 1
-        job_id = f"job-{_job_seq}"
         if verify_cells is not None:
             # The record's cells are the source of truth; `code` is derived from
             # them so the audit view of this job cannot disagree with the
             # workflow view of it.
             code = "\n\n# ---\n\n".join(verify_cells)
-        job = _Job(job_id, code, origin=origin, intent=intent)
+        job = _new_job(code, origin, intent)
         if verify_cells is not None:
             job.verify = _Verification(verify_title, verify_cells, job)
-        _jobs[job_id] = job
         if origin != "user":
             # Here rather than at the claim check above, because a submit that
             # is *refused* is not this kernel's agent working: both refusals
@@ -831,11 +850,41 @@ def submit(
             _agent_origin = origin
         _prune()
         thread = threading.Thread(
-            target=_run, args=(job, code), name=job_id, daemon=True
+            target=_run, args=(job, code), name=job.job_id, daemon=True
         )
         job.thread = thread
         thread.start()
-        return {"job_id": job_id, "status": "running"}
+        return {"job_id": job.job_id, "status": "running"}
+
+
+@contextlib.contextmanager
+def record_inline(code, origin="user"):
+    """Record a cell running inline on this thread as a job, for its duration.
+
+    For a foreign client's cell (``_kernel_gate``): it runs on the main thread
+    as its client expects, and the record is what tells the agent about it, the
+    same as a job from :func:`submit`. Output is teed, so the client still sees
+    its own. The caller settles ``status`` (and ``error_text``) from the reply
+    before leaving the block; a block that raises instead is an ``error``.
+
+    Not gated here: the caller refuses while a job runs, and nothing can start
+    one meanwhile, since a submit is an execute request queued behind this one.
+    """
+    with _lock:
+        # Re-asserted for the same reason as in submit().
+        _install_streams()
+        job = _new_job(code, origin)
+        job.tee = True
+        _prune()
+    ident = threading.get_ident()
+    _jobs_by_thread[ident] = job
+    try:
+        yield job
+    finally:
+        _jobs_by_thread.pop(ident, None)
+        job.finished = time.monotonic()
+        if job.status == "running":
+            job.status = "error"
 
 
 def poll(job_id):
@@ -891,16 +940,24 @@ def _running_job():
 
 
 def running_job():
-    """``{"job_id": ..., "origin": ...}`` for the running job, or ``None``.
+    """The running job's id, origin, one-line intent and code, and elapsed
+    seconds, or ``None``.
 
-    The session child's cross-kernel admission check reads this: a verification
-    runs in a *second* kernel, which this one cannot see, so the rule that only
-    one job runs at a time has to be decided a level up (``_scratch``).
+    Two readers. The session child's cross-kernel admission check: a
+    verification runs in a *second* kernel, which this one cannot see, so the
+    rule that only one job runs at a time has to be decided a level up
+    (``_scratch``). And ``_kernel_gate``'s refusal, which names the job.
     """
     job = _running_job()
     if job is None:
         return None
-    return {"job_id": job.job_id, "origin": job.origin}
+    return {
+        "job_id": job.job_id,
+        "origin": job.origin,
+        "intent": job.intent_preview,
+        "code": job.code_preview,
+        "elapsed": job.elapsed(),
+    }
 
 
 def _raise_in_thread(ident, exctype):

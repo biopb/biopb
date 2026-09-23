@@ -131,16 +131,17 @@ best-effort: a `KeyboardInterrupt` at the next bytecode, so a fetch inside a C
 call ends only when it returns. Your own Python loops are stoppable either way.
 
 ## You are not the only writer of this namespace
-The user can run their own code in this kernel, from the observe web page. It is the
-same namespace and the same viewer, so their cells can rebind a variable you set, add
+The user can run their own code in this kernel, from a Jupyter notebook or console
+attached to it. It is the same namespace and the same viewer, so their cells can rebind a variable you set, add
 or remove a layer, or import something you did not.
 
 * **You will be told, after the fact.** When user cells have run since your last call,
   a note listing them (`job-N (status)`) is appended to your `execute_code` / `poll_job`
   / `server_status` result. Read them with `poll_job`, and re-check what you rely on
   (`dir()`, `viewer.layers`, `inspect_object`) instead of trusting what you last saw.
-* **One job at a time, for both of you.** If the user is running a cell, your
-  `execute_code` is rejected as busy — wait and poll, do not try to clear it.
+* **One writer at a time.** While the user's cell runs, your calls wait for it to
+  finish; while your job runs, the user's cells are refused. Do not try to clear
+  either.
 * **Their cell is not yours to stop.** `interrupt_kernel` refuses a user job (it stops
   only your own). Do not reach for `restart_kernel` to get around that: it would
   destroy the user's variables and layers along with yours.

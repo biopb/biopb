@@ -1199,7 +1199,7 @@ async def cancel():
     """Stop the running turn.
 
     Cancelling nothing is a success: what actually happened shows up in the
-    thread on the next poll, the way the console reports an interrupt.
+    thread on the next poll, the way the job list reports an interrupt.
     """
     task = _turn_task
     if task is not None and not task.done():

@@ -7,11 +7,10 @@ security, and this one reaches a kernel.
 
 **Two roots, on purpose.** The reads live under ``/api/*``, which the control
 proxies always; the one write lives under ``/chat/*``, which the control proxies
-only when it is loopback-bound. That is the user console's split
-(``docs/user-console.md``) applied to the same problem: ``_SESSION_ALLOWED_ROOTS``
-exists to keep an RCE off the browser origin, and a chat turn runs arbitrary code
-just as surely as a console cell does. Folding the turn into ``api`` would leave
-the allowlist in place, still enforced, and no longer true.
+only when it is loopback-bound: ``_SESSION_ALLOWED_ROOTS`` exists to keep an RCE
+off the browser origin, and a chat turn runs arbitrary code. Folding the turn
+into ``api`` would leave the allowlist in place, still enforced, and no longer
+true.
 
 The split is also what the control's own gate *assumes*: it enforces the local
 root as POST-only, because its CSRF check skips safe methods and a cross-site GET
@@ -62,7 +61,7 @@ _live_len = 0
 def configure(config, *, agentless):
     """Take the resolved config; return whether chat should be served.
 
-    The switch is ``observe.chat_enabled``, beside the console's, because what it
+    The switch is ``observe.chat_enabled``, because what it
     turns on is a pane on the observe page — and it is read together with
     ``observe.enabled`` because that page is how anyone reaches these routes.
 
@@ -71,8 +70,9 @@ def configure(config, *, agentless):
     already driving does not get one. Offering it there would be technically
     sound and practically confusing -- two agents on one kernel, of which only
     one can hold the claim, so the pane would answer questions and then refuse
-    to run anything. The console has the same shape and is offered anyway,
-    because a human typing a cell is not a second agent; a chat loop is.
+    to run anything. A human in an attached notebook has the same shape and is
+    let in anyway, because a person typing a cell is not a second agent; a chat
+    loop is.
 
     Required rather than defaulted, because both answers are wrong to assume: a
     default of True serves chat to every harness-driven session, and a default
@@ -122,8 +122,8 @@ def _mod():
 def _busy_409(message="a turn is running; cancel it first"):
     """The "a turn is in flight" refusal.
 
-    State, not a failed action -- the same shape the console reports a busy
-    kernel with, so the view renders it as "wait" rather than "retry". One
+    State, not a failed action, so the view renders it as "wait" rather than
+    "retry". One
     builder because the wording is a thing the pane shows, and six hand-written
     copies had already drifted into three versions of it.
     """

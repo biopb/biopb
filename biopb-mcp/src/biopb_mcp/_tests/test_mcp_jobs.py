@@ -5,7 +5,7 @@ Three layers:
 * ``TestJobRunnerUnit`` / ``TestJobOrigin`` — the in-kernel job runner driven
   directly with a fake InteractiveShell (no kernel, fast): submit/poll/interrupt,
   output capture, distributed future-cancel, and the agent/user ``origin`` split
-  (``docs/user-console.md``).
+  (``docs/jupyter-clients.md``).
 * ``TestJobConcurrency`` — a real *bare* kernel (no napari/display): proves the
   kernel main thread stays free while a background job runs (the agent is no
   longer blind).
@@ -266,7 +266,7 @@ class TestJobRunnerUnit:
 
 
 # ---------------------------------------------------------------------------
-# Two writers: the agent and a human sharing one kernel (docs/user-console.md)
+# Two writers: the agent and a human sharing one kernel (docs/jupyter-clients.md)
 # ---------------------------------------------------------------------------
 
 
@@ -544,7 +544,7 @@ class TestKernelOwner:
 
     def test_a_human_cell_is_never_gated(self, runner):
         # The person at the machine has standing no client does -- and the
-        # observe console has no identity to gate on in the first place.
+        # attached Jupyter client has no identity to gate on in the first place.
         self._wait(_jobs.submit("a = 1", writer="sess-A")["job_id"])
         jid = self._wait(_jobs.submit("b = 2", origin="user")["job_id"])["job_id"]
         assert _jobs._jobs[jid].status == "ok"
@@ -655,6 +655,68 @@ class TestJobIntent:
         assert snap["intent"] == weird
         assert snap["status"] == "ok"
         assert snap["stdout"] == ""
+
+
+class TestRecordInline:
+    """A foreign client's cell, run inline on the calling thread and recorded
+    as a job (``_kernel_gate``, docs/jupyter-clients.md)."""
+
+    def test_output_is_teed_to_the_record_and_the_real_stream(self, runner):
+        import io
+        import sys
+
+        real = io.StringIO()
+        saved = sys.stdout
+        sys.stdout = _jobs._JobStream(real)
+        try:
+            with _jobs.record_inline("print('hi')") as job:
+                print("hi")
+                job.status = "ok"
+        finally:
+            sys.stdout = saved
+        assert real.getvalue() == "hi\n"
+        snap = _jobs.poll(job.job_id)
+        assert snap["stdout"] == "hi\n"
+        assert snap["status"] == "ok"
+        assert snap["origin"] == "user"
+        assert snap["code"] == "print('hi')"
+
+    def test_the_thread_is_released_after_the_block(self, runner):
+        import io
+        import sys
+
+        real = io.StringIO()
+        saved = sys.stdout
+        sys.stdout = _jobs._JobStream(real)
+        try:
+            with _jobs.record_inline("x = 1") as job:
+                job.status = "ok"
+            print("after")
+        finally:
+            sys.stdout = saved
+        assert real.getvalue() == "after\n"
+        assert _jobs.poll(job.job_id)["stdout"] == ""
+
+    def test_running_for_its_duration_and_named_by_running_job(self, runner):
+        with _jobs.record_inline("import time") as job:
+            running = _jobs.running_job()
+            assert running["job_id"] == job.job_id
+            assert running["origin"] == "user"
+            assert running["code"] == "import time"
+            job.status = "ok"
+        assert _jobs.running_job() is None
+        assert job.finished is not None
+
+    def test_an_unsettled_block_is_an_error(self, runner):
+        with pytest.raises(RuntimeError):
+            with _jobs.record_inline("boom()") as job:
+                raise RuntimeError("do_execute itself failed")
+        assert _jobs.poll(job.job_id)["status"] == "error"
+
+    def test_the_agent_is_told(self, runner):
+        with _jobs.record_inline("x = 1") as job:
+            job.status = "ok"
+        assert [d["job_id"] for d in _jobs.foreign_digest("mcp")] == [job.job_id]
 
 
 # ---------------------------------------------------------------------------

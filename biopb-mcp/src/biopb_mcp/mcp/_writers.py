@@ -6,9 +6,9 @@ clients writing to a single namespace and viewer:
 * **May I write?** The kernel owns the one-agent claim (``_jobs.submit`` is the
   only thing that can enforce it atomically), but this process mirrors it, for
   the reason spelled out on :data:`_claimed_by`.
-* **Who else did?** A person can run cells from the observe page, and the chat
-  loop from its own turn, leaving an agent's picture of the namespace stale with
-  nothing in its own results to say so. The foreign-activity digest is that
+* **Who else did?** A person can run cells from an attached Jupyter client, and
+  the chat loop from its own turn, leaving an agent's picture of the namespace
+  stale with nothing in its own results to say so. The foreign-activity digest is that
   notice, and its read/ack split is what makes it deferred-never-dropped.
 
 Both are policy about co-writers, so they are one module: a caller asking either
@@ -295,7 +295,8 @@ def _render_foreign_note(digest) -> str:
     """The digest as a line appended to an agent-facing result, or ``""``.
 
     The agent is not the only writer of this namespace: a person can run code
-    from the observe page, through the same job runner (``docs/user-console.md``).
+    from a Jupyter client attached to the kernel, recorded as a job the same
+    way (``docs/jupyter-clients.md``).
     That leaves the agent's picture of the namespace stale with nothing in its
     own results to say so — hence this note, appended at the same seam as
     ``_window_note``, which is how every other user-attributed fact already
