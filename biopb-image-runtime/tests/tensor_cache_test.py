@@ -100,12 +100,10 @@ def served_embedded_cache(tmp_path: Path):
         raise RuntimeError("Timed out waiting for tensor server to start")
 
     try:
-        cache = EmbeddedTensorCache(
+        yield EmbeddedTensorCache(
             tensor_server=tensor_server,
             external_location=location,
         )
-        cache.server_token = server_token
-        yield cache
     finally:
         tensor_server.shutdown()
         CacheManager.reset()
@@ -333,7 +331,7 @@ def test_per_source_token_gates_readback(served_embedded_cache: EmbeddedTensorCa
     # catalog surface says so rather than answering "empty".
     with pytest.raises(flight.FlightError, match="no catalog"):
         TensorFlightClient(
-            location, token=served_embedded_cache.server_token
+            location, token=served_embedded_cache._server._server_token
         ).list_sources()
 
 

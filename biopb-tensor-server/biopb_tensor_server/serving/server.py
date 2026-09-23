@@ -902,8 +902,13 @@ class TensorFlightServer(flight.FlightServerBase):
 
         return source_adapter.resolve_tensor(tensor_id)
 
-    def _get_adapter_for_chunk(self, chunk_id: bytes) -> TensorAdapter:
+    def _get_adapter_for_chunk(
+        self, chunk_id: bytes, array_id: Optional[str] = None
+    ) -> TensorAdapter:
         """Get the adapter responsible for a chunk, by its chunk_id.
+
+        *array_id* is ``routing_array_id(chunk_id)``, already computed by a
+        caller that gated on it -- passed through rather than re-derived.
 
         Raises rather than returning None, and maps a lookup failure itself, so
         every verb that resolves a chunk -- ``do_get`` and the cache-file locate
@@ -932,7 +937,8 @@ class TensorFlightServer(flight.FlightServerBase):
             # routing_array_id handles both a plain/versioned chunk_id and a proxy
             # envelope (whose route token IS the local array_id) without decoding an
             # opaque envelope inner (biopb/biopb#178 W1).
-            array_id = routing_array_id(chunk_id)
+            if array_id is None:
+                array_id = routing_array_id(chunk_id)
             source_id, *rest = array_id.split("/")
             rest = "/".join(rest) if rest else None
 
@@ -1192,11 +1198,13 @@ class TensorFlightServer(flight.FlightServerBase):
                 raise flight.FlightServerError("chunk_locate takes a chunk ticket")
             # The ticket first, then the gate it names: routing_array_id reads
             # the route token without decoding the chunk, the same way do_get
-            # does for this ticket.
-            self._authorize_read(
-                context, routing_array_id(ticket.chunk_id), READ_PIXELS
+            # does for this ticket. Computed once and passed on, so the
+            # adapter lookup below does not re-derive it from the chunk_id.
+            array_id = routing_array_id(ticket.chunk_id)
+            self._authorize_read(context, array_id, READ_PIXELS)
+            yield self._handle_chunk_locate(ticket.chunk_id, array_id=array_id).encode(
+                "utf-8"
             )
-            yield self._handle_chunk_locate(ticket.chunk_id).encode("utf-8")
         elif action.type == "cache_stats":
             self._authorize(context)
             from dataclasses import asdict
@@ -2010,8 +2018,14 @@ class TensorFlightServer(flight.FlightServerBase):
         )
         return flight.RecordBatchStream(table)
 
-    def _handle_chunk_locate(self, chunk_id: bytes) -> str:
+    def _handle_chunk_locate(
+        self, chunk_id: bytes, array_id: Optional[str] = None
+    ) -> str:
         """Locate a cached chunk on disk for the localhost cache-file handoff.
+
+        *array_id* is ``routing_array_id(chunk_id)``, already computed by a
+        caller that gated on it (``do_action``'s ``chunk_locate`` arm) -- passed
+        through so the adapter lookup below does not re-derive it.
 
         Locates the chunk's Arrow IPC message in the file cache and returns its
         on-disk byte range as JSON. If the chunk isn't cached yet, materializes
@@ -2035,7 +2049,7 @@ class TensorFlightServer(flight.FlightServerBase):
             return json.dumps({"available": False})
 
         with self.activity.serving_request():
-            adapter = self._get_adapter_for_chunk(chunk_id)
+            adapter = self._get_adapter_for_chunk(chunk_id, array_id=array_id)
 
             # Entries are stored under the method-stripped canonical key
             # (biopb/biopb#76); locate with the same key or a warm chunk cached
