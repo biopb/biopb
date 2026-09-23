@@ -24,7 +24,7 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 def _make(client, source, field="lifecycle", shape=(4, 4), chunk=(2, 2)):
     """Declare a tensor on *source*; the descriptor is what every write takes."""
     return client.add_tensor(
-        f"cache://{source}/{field}",
+        f"cache://{source}/@fields/{field}",
         np.empty(shape, dtype=np.uint16),
         chunk_shape=chunk,
     )
@@ -61,7 +61,7 @@ class TestOneFieldOneAdapter:
     def test_a_second_add_under_a_pending_field_is_refused(self, client, source):
         _make(client, source, field="taken")
 
-        with pytest.raises(flight.FlightServerError, match="already has a tensor"):
+        with pytest.raises(flight.FlightServerError, match="already exists as"):
             _make(client, source, field="taken")
 
     def test_the_first_upload_is_untouched_by_the_refusal(self, client, source):
@@ -79,7 +79,7 @@ class TestOneFieldOneAdapter:
         _put(client, desc, (0, 0), (2, 2))
         _set(client, desc, "READY")
 
-        with pytest.raises(flight.FlightServerError, match="already has a tensor"):
+        with pytest.raises(flight.FlightServerError, match="already exists as"):
             _make(client, source, field="done")
         assert client.get_upload_status(desc.array_id)["state"] == "READY"
 
@@ -87,26 +87,36 @@ class TestOneFieldOneAdapter:
         """The refused adapter is never attached -- the source's members are
         what show it."""
         _make(client, source, field="once")
-        members = dict(writable_server.sources.get(source).members)
+        tensors = dict(writable_server.sources.get(source).attached_tensors)
 
         with pytest.raises(flight.FlightServerError):
             _make(client, source, field="once")
-        assert dict(writable_server.sources.get(source).members) == members
+        assert dict(writable_server.sources.get(source).attached_tensors) == tensors
 
     def test_the_refusal_says_how_to_proceed(self, client, source):
         """It names the field it collided with, since the caller holding a
         fixed name has to change something."""
         _make(client, source, field="advice")
 
-        with pytest.raises(flight.FlightServerError, match="'advice'.*another name"):
+        with pytest.raises(flight.FlightServerError, match="advice.*another name"):
             _make(client, source, field="advice")
 
-    def test_the_same_field_on_two_sources_never_collides(self, client, source):
+    def test_the_same_field_on_two_sources_never_collides(
+        self, writable_server, client, source, tmp_path
+    ):
         """A field is taken on its own source, not server-wide: that is the
         whole point of adding to a source rather than minting one."""
-        other = client.register_source()
+        import zarr
+        from biopb_tensor_server.adapters.zarr import ZarrAdapter
+
+        store = tmp_path / "theirs.zarr"
+        zarr.create(store=zarr.DirectoryStore(str(store)), shape=(4, 4), dtype="uint16")
+        writable_server.register_source(
+            "theirs", ZarrAdapter(zarr.open_array(str(store), mode="r"), "theirs")
+        )
+
         first = _make(client, source, field="same")
-        second = _make(client, other, field="same")
+        second = _make(client, "theirs", field="same")
         assert first.array_id != second.array_id
 
 
@@ -286,7 +296,9 @@ class TestTheReadGate:
         _put(client, desc, (0, 0), (2, 2))
         _set(client, desc, "READY")
 
-        adapter = writable_server.sources.get(source).members["lifecycle"]
+        adapter = writable_server.sources.get(source).attached_tensors[
+            "@fields/lifecycle"
+        ]
         bounds = ChunkBounds(start=[2, 2], stop=[4, 4])
         chunk_id = mint_chunk_id(
             adapter.array_id, bounds, content_version=adapter.content_version

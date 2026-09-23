@@ -48,6 +48,7 @@ from biopb.tensor.descriptor_pb2 import (
 )
 from biopb.tensor.ticket_pb2 import ChunkBounds, TensorTicket
 
+from biopb_tensor_server.adapters.scratch import SCRATCH_SOURCE_ID
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
     TensorReadPlan,
@@ -199,8 +200,26 @@ def _split_grpc_url(url: str) -> tuple[str, Optional[str]]:
     return endpoint, source_id
 
 
+def mirrorable_upstream_id(source_id: str) -> bool:
+    """Whether an upstream source is one this server mirrors.
+
+    Everything but the upstream's **scratch** source, for either of two
+    reasons. Its id is fixed, so a lone upstream with no alias -- which keeps
+    the verbatim id (``_namespaced_source_id``) -- registers it locally as
+    ``scratch``, the id this server's own scratch source holds, and
+    ``SourceRegistry.register`` overwrites in silence. And everything on it
+    carries a deadline set by *that* server's policy, so the mirror would be a
+    catalog row and a chunk-cache namespace for tensors going away on someone
+    else's clock.
+
+    Applied inside the two enumerators below rather than at their call sites,
+    so a third caller cannot reintroduce it.
+    """
+    return source_id != SCRATCH_SOURCE_ID
+
+
 def list_upstream_source_ids(client, location: str) -> List[str]:
-    """Every source_id on an upstream tensor server.
+    """Every source_id on an upstream tensor server that we mirror.
 
     ``location`` is the upstream endpoint, named in the fallback warning. It is a
     parameter rather than something read off the client because the callers
@@ -219,7 +238,9 @@ def list_upstream_source_ids(client, location: str) -> List[str]:
     this same query and so fails identically.
     """
     rows = client.query_sources("SELECT source_id FROM sources", format="records")
-    return [row["source_id"] for row in rows]
+    return [
+        row["source_id"] for row in rows if mirrorable_upstream_id(row["source_id"])
+    ]
 
 
 # Transport failures, as opposed to "this upstream has no SQL catalog". The
@@ -252,6 +273,9 @@ def fetch_upstream_catalog(client, location: str) -> tuple[Optional[List[dict]],
     being advertised as a readable source. ``complete`` is True because the
     server-side DuckDB catalog is not truncated like ``list_sources()``.
 
+    The upstream's scratch source is left out, as it is from
+    :func:`list_upstream_source_ids`; see :func:`mirrorable_upstream_id`.
+
     ``rows`` is ``None`` when the upstream has no SQL catalog (``query_sources``
     errors) -- the caller then falls back to id-only enumeration
     (``list_upstream_source_ids``) and the per-source live sync path.
@@ -265,7 +289,7 @@ def fetch_upstream_catalog(client, location: str) -> tuple[Optional[List[dict]],
             "is_resolved, tensors, indexed_at FROM sources",
             format="records",
         )
-        return rows, True
+        return [r for r in rows if mirrorable_upstream_id(r["source_id"])], True
     except Exception as exc:
         logger.log(
             logging.DEBUG if isinstance(exc, _UNREACHABLE_ERRORS) else logging.WARNING,

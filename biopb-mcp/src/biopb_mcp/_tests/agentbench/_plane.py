@@ -27,28 +27,24 @@ would upload the same volumes again every time — and these are the large
 fixtures by construction. It is also the production shape, where a durable
 plane outlives the sessions that come and go against it.
 
-**Isolated by construction, not by cleanup.** The plane must be writable — the
-skills' own steps upload results (`drift-correction` step 7, `stitch-tiles`
-step 7) — so an agent can create sources, and it can also *drop* one:
-`set_upload_status(..., DISCARDED)` is total and reaches a published tensor. So
-isolation comes neither from cleaning up between sessions nor from the data
-being undeletable. It comes from the id:
+**Not isolated from a determined agent, and it does not claim to be.** The
+plane must be writable — the skills' own steps upload results
+(`drift-correction` step 7, `stitch-tiles` step 7) — and
+`set_upload_status(..., DISCARDED)` is total: it reaches a published tensor,
+fixtures included. The agent is handed each fixture's `array_id` anyway.
 
-    source_id = f"registered_{os.urandom(6).hex()}"    (adapters/registered.py)
+What the layer buys is that nothing can happen *quietly*. A fixture's field
+name is salted with :attr:`secret`, and a discarded name stays taken until the
+reclaim sweep frees it (`upload_ttl`), so an agent cannot drop a fixture and
+put its own bytes back under the same id within a run. And
+:meth:`TensorPlane.fingerprint` samples a corner of the served array, which
+`bench/_engine` compares after every sample, reading it as contaminated
+whether the bytes changed or the tensor stopped being readable at all. A
+changed fingerprint does not fail a test — it flags the row, the same way
+`read-harness-internals` does, because `execute_code` is arbitrary Python.
 
-The id an agent sees is **unrelated to the name the harness uploaded under**:
-minted from the process's randomness and recorded in the store. The name
-appears nowhere in a descriptor, a layer or the catalog, and it stays taken for
-as long as its directory is on disk, so a second `register_source` under it is
-refused rather than replacing the fixture in place.
-
-That is an argument, so it is also checked: :meth:`TensorPlane.fingerprint`
-samples a corner of the served array, and `bench/_engine` compares it after
-every sample -- reading it as contaminated whether the bytes changed or the
-tensor stopped being readable at all. A changed fingerprint does not fail a
-test — it flags the row, the same way `read-harness-internals` does, because
-`execute_code` is arbitrary Python and the layer's defence is that nothing can
-happen *quietly*.
+Making a fixture genuinely undroppable means serving it from a discovery root
+instead of uploading it, which is a different plane and not this one.
 """
 
 from __future__ import annotations
@@ -76,10 +72,10 @@ import numpy as np
 #: out here would report as "no tensor cases ran" rather than as a hang.
 BOOT_TIMEOUT_S = 60.0
 
-#: The one tensor of each fixture's source. A fixture is one array, so the
-#: field carries no information and only has to be a legal name; what an agent
-#: is handed is the whole ``<source_id>/<field>``.
-FIXTURE_FIELD = "data"
+#: The scratch source every writable tensor server serves, which is where a
+#: fixture is uploaded: the upload path adds a tensor to a source that already
+#: exists and creates none.
+SCRATCH_SOURCE_ID = "scratch"
 
 
 def plane_unavailable() -> str:
@@ -135,14 +131,14 @@ class TensorPlane:
     ) -> str:
         """Put one fixture array on the plane and return its ``array_id``.
 
-        Two calls, because an upload adds a tensor to a source that already
-        exists and creates none: ``register_source`` mints the container,
-        ``add_tensor`` puts one ``cache://`` tensor in it, and ``upload_array``
+        An upload adds a tensor to a source that already exists and creates
+        none, so this adds one to the plane server's scratch source:
+        ``add_tensor`` declares the ``cache://`` tensor and ``upload_array``
         fills and publishes it.
 
-        *key* names it only within this run: the name sent is salted with
-        :attr:`secret`, and the id the server answers with is not derived from
-        it.
+        *key* names it only within this run: the field name is salted with
+        :attr:`secret`, so two runs never collide and a name freed by a discard
+        is not one the harness would reuse.
 
         ``chunks`` is explicit rather than left to the uploader's default,
         because where laziness is the point the chunking *is* the thing under
@@ -154,9 +150,8 @@ class TensorPlane:
         array = np.asarray(array)
         chunk_shape = tuple(chunks) if chunks else array.shape
         lazy = da.from_array(array, chunks=chunk_shape)
-        source_id = self.client.register_source(f"{self.secret}-{key}")
         desc = self.client.add_tensor(
-            f"cache://{source_id}/{FIXTURE_FIELD}",
+            f"cache://{SCRATCH_SOURCE_ID}/@fields/{self.secret}-{key}",
             lazy,
             chunk_shape=list(chunk_shape),
             dim_labels=list(dim_labels) if dim_labels else None,
@@ -213,6 +208,11 @@ def _write_plane_config(root: Path) -> Path:
                 "server": {
                     "writable": True,
                     "write_dir": str(root / "write"),
+                    # No lifetime on this server's scratch source. A fixture
+                    # plane outlives the sessions that run against it, so the
+                    # default day-long cap -- which is right for an
+                    # intermediate result -- would be wrong for a fixture.
+                    "scratch_ttl": 0,
                 },
                 "cache": {"file_cache_dir": str(root / "cache")},
             }

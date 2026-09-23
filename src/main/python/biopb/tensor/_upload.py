@@ -36,7 +36,6 @@ from biopb.tensor._session import (
     _tensor_read_cmd,
     _unknown_upload_status,
     _upload_status_dict,
-    do_action_one_result,
     extra_info,
 )
 from biopb.tensor._tls import NO_TLS, TlsTrust
@@ -48,8 +47,6 @@ from biopb.tensor.descriptor_pb2 import (
 from biopb.tensor.ticket_pb2 import (
     ChunkBounds,
     PutCommand,
-    RegisterSource,
-    RegisterSourceResult,
     SetUploadStatus,
 )
 
@@ -399,13 +396,13 @@ class _UploadTarget:
 class UploadSession:
     """Tensor declaration and chunk upload over one Flight connection.
 
-    .. note:: Experimental. This whole API -- ``register_source`` /
-       ``add_tensor`` / ``upload_array`` / ``upload_chunk`` /
-       ``set_upload_status`` -- is experimental and its behavior may change.
+    .. note:: Experimental. This whole API -- ``add_tensor`` /
+       ``upload_array`` / ``upload_chunk`` / ``set_upload_status`` -- is
+       experimental and its behavior may change.
 
-    Declare, then fill: ``register_source`` mints something to add to,
-    ``add_tensor`` returns the server's descriptor for the new tensor, and that
-    descriptor is what every write takes.
+    Declare, then fill: ``add_tensor`` returns the server's descriptor for the
+    new tensor, and that descriptor is what every write takes. Nothing here
+    creates a source; an upload names one the server already serves.
 
     Takes the shared ``_ClientState`` its two sibling collaborators take
     (``CatalogClient``, ``ChunkFetcher``). ``TensorFlightClient`` constructs one
@@ -418,21 +415,6 @@ class UploadSession:
         # where it stands, and that read lives on the catalog client.
         self._catalog = catalog
 
-    def register_source(self, name: str = "", metadata: Optional[dict] = None) -> str:
-        """Backs TensorFlightClient.register_source; see that method."""
-        request = RegisterSource(
-            name=name or "",
-            metadata_json=json.dumps(metadata) if metadata else "",
-        )
-        body = do_action_one_result(
-            self._state,
-            flight.Action("register_source", request.SerializeToString()),
-            unavailable_hint="Registering a source is unavailable",
-        )
-        source_id = RegisterSourceResult.FromString(body).source_id
-        logger.info(f"register_source: registered {source_id}")
-        return source_id
-
     def add_tensor(
         self,
         array_id: str,
@@ -441,6 +423,7 @@ class UploadSession:
         chunk_shape: Optional[Sequence[int]] = None,
         dim_labels: Optional[Sequence[str]] = None,
         ome_metadata: Optional[dict] = None,
+        ttl_seconds: Optional[int] = None,
     ) -> TensorDescriptor:
         """Backs TensorFlightClient.add_tensor; see that method for the full
         documentation."""
@@ -460,6 +443,11 @@ class UploadSession:
             dim_labels=list(dim_labels or []),
             metadata_json=json.dumps(ome_metadata) if ome_metadata else "",
         )
+        if ttl_seconds is not None:
+            # Set through the optional field rather than passed in the
+            # constructor, so leaving it None means "unset" and not "zero" --
+            # which the server refuses.
+            req_desc.ttl_seconds = int(ttl_seconds)
 
         action = flight.Action("add_tensor", req_desc.SerializeToString())
         results = self._state.client.do_action(action, options=self._state.call_options)

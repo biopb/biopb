@@ -1,4 +1,4 @@
-# Uploads and registered sources
+# Uploads and the scratch source
 
 Scope: `biopb-tensor-server`, the Python and Java SDKs, and the MCP upload
 doc.
@@ -6,19 +6,22 @@ doc.
 ## Adding a tensor
 
 `add_tensor` adds a tensor to a source that already exists; nothing on the
-upload path creates one. Three forms, the scheme naming only the **store
+upload path creates one. Two forms, the scheme naming only the **store
 format** (`zarr://` or `cache://`, one lifecycle for both):
 
 | request | adds |
 |---|---|
-| `<scheme>://<source_id>/<field>` | a tensor to a registered source |
-| `<scheme>://<source_id>/@fields/<field>` | a tensor to a source the server discovered |
+| `<scheme>://<source_id>/@fields/<name>` | a tensor to a source, discovered or `scratch` |
 | `zarr://<array_id>/@labels/<name>` | a label set to the tensor (binding and extent rules: `label-tensors.md`) |
 
-Each is refused if the parent doesn't exist, the field or name is taken, or
-the name fails the rules in Names. The answered `array_id` carries no
-scheme -- format is a property of the stored tensor, read off its directory
-at adoption -- and a bare id with no `/` is never an upload.
+Both carry a **marked segment**, whatever kind the source is: a bare field
+is a native tensor id, which only a format mints, so the upload path never
+answers one and refuses a request for one (Names).
+
+Each is refused if the parent doesn't exist, the name is taken, or it fails
+the rules in Names. The answered `array_id` carries no scheme -- format is a
+property of the stored tensor, read off its directory at adoption -- and a
+bare id with no `/` is never an upload.
 
 The write side is ticket-based (Wire): `add_tensor` creates the tensor,
 `GetFlightInfo` plans it -- answered even while the tensor is PENDING, so a
@@ -28,47 +31,44 @@ once the tensor is READY. One planner decides what a chunk is, on both
 transports and both store formats; neither SDK tiles or decodes a ticket
 itself.
 
-## Registered sources
+## The scratch source
 
-`register_source(name="", metadata=None) -> source_id` creates
+A result that belongs to no source of the user's needs somewhere to go. A
+writable server serves one **scratch source**, at the fixed id `scratch`
+(`adapters/scratch.py`), constructed at startup and put on the catalog. It
+holds no bytes **and no tensors** of its own: what is added to it is an
+uploaded field like any other, under `<write_dir>/fields/scratch/` (Fields).
 
-```
-<write_dir>/sources/<name>.zarr/    zarr group; .zattrs carries {"biopb": {"source": {"source_id", "content_version"}}} and the source's OME metadata
-    <field>/                        one member per added tensor
-        .zattrs                     multiscales (one level), upload marker, the member's own content_version
-        0/                          the array
-        labels/<name>/              NGFF layout for its label sets
-```
-
-and registers a `RegisterAdapter`: a source adapter with no bytes of its
-own, holding one tensor adapter per member, as a plate holds its fields.
-
-- **Metadata is source-scoped.** It rides on `register_source` and lives in
-  the group's `.zattrs`; every member inherits the physical scale, units and
-  channel names. `add_tensor` carries shape, dtype, grid and dim labels
-  only -- a request that also sets `metadata_json` on a member is refused,
-  not silently dropped. The one exception is a label set's own NGFF
-  `image-label` block, which stays on its `add_tensor` request.
+- **The id is fixed, which is the point.** A producer writes
+  `zarr://scratch/@fields/<name>` without a round trip first -- nothing to
+  mint, nothing for a client to remember, and nothing to adopt at boot. Its
+  tensors come back through the `on_register` hook that gives every source
+  its uploaded fields (`fields_attacher`).
+- **It keeps no directory of its own**, so there is nothing under
+  `write_dir` naming it and nothing to sweep. `content_version` is None,
+  the base's word for content this adapter does not serve; every member
+  carries its own token.
+- **It caps every lifetime on it** (`ServerConfig.scratch_ttl`, a day by
+  default), including an upload that asked for none -- which is what makes
+  it a temp store. 0 turns the cap off and makes it permanent.
+- **It is not reclaimable, and does not need to be.** Empty is its resting
+  state, and it leaves no directory and no orphan row behind.
+- **Metadata is source-scoped, and it has none.** The tensors on it have
+  nothing to do with each other, so a tensor that needs a physical scale is
+  uploaded onto the source that has one. A request that sets
+  `metadata_json` on a tensor is refused rather than dropped; the one
+  exception is a label set's own NGFF `image-label` block.
 - **`write_dir` is never discovered.** The reconciler owns the user's
   directories; the upload subsystem is the sole registrar for everything
-  under `write_dir`.
-- **`source_id` is minted, not derived.** It is written into the group's
-  `.zattrs` at `register_source` and read back at boot, so it survives
-  `write_dir` moving and cannot be guessed by a client that did not create
-  the source. A store whose `.zattrs` is missing or unreadable is not a
-  registered source -- it is swept, not served.
-- **Boot adoption is a second branch of the same sweep** that removes a
-  member a crash left PENDING: a READY collection re-registers through its
-  `RegisterAdapter`, its READY members attach to it, and a READY sidecar
-  attaches to its parent (`sidecar_attacher`).
-- An empty source (no members yet) is valid. One left empty past
-  `upload_ttl`, or with only tombstoned tensors, is reclaimed (Lifecycle).
+  under `write_dir`. The second line of defence, for a `write_dir`
+  misplaced inside a root, is that both zarr claims decline a directory
+  carrying the member block (`is_upload_subsystem_store`).
 
 ## Store formats
 
-Two member layouts under a registered source or a field on a discovered
-one, chosen by the scheme on `add_tensor` and recognized from the member
-directory at adoption (`member_marker`, `open_any_member`):
+Two member layouts for an uploaded field, chosen by the scheme on
+`add_tensor` and recognized from the member directory at adoption
+(`member_marker`, `open_any_member`):
 
 | | `zarr://` | `cache://` |
 |---|---|---|
@@ -93,22 +93,22 @@ adapter mints this build's chunk ids over the indexed bounds and keeps that
 map in memory; only an epoch bump rebuilds it. READY closes the open
 segment and writes its sidecar -- no segment is open on a READY member.
 
-## Fields on a file source
+## Uploaded fields
 
-`<scheme>://<source_id>/@fields/<field>`, where the source is one the
-server **discovered**, puts the tensor in
-`<write_dir>/fields/<source_id>/<field>/` -- a member directory in either
-store format, read back exactly as a registered source's members are. It
-is attached by the same `on_register` hook that attaches label sidecars,
-and listed after the format's own tensors.
+`<scheme>://<source_id>/@fields/<name>` puts the tensor in
+`<write_dir>/fields/<source_id>/<name>/` -- a member directory in either
+store format -- whatever kind the source is. One layout, because neither
+kind has anywhere of its own to put it: a discovered source's bytes are the
+user's, and the scratch source holds none. It is attached by the same
+`on_register` hook that attaches label sidecars, and listed after the
+format's own tensors (of which the scratch source has none).
 
 A field and a label set are both **attached tensors**: `SourceAdapter`
 holds one `field -> adapter` index (`_attached_tensors`), and `label_sets`,
 `label_uploads` and `attached_fields` are checked views over it --
 `label_sets` is the attached tensors whose field parses as a set, each
-checked against `label_binding_error`. `RegisterAdapter.members` is a view
-of the same index. A field differs from a label set in binding to nothing,
-decoding nothing, and mapping to no axes.
+checked against `label_binding_error`. A field differs from a label set in
+binding to nothing, decoding nothing, and mapping to no axes.
 
 A set may bind to an uploaded field, since a field is a tensor of its
 source like any other. An orphaned field -- its discovery root gone -- is
@@ -126,7 +126,9 @@ or set name may not open with it.
 Marking, not reserving, is what makes an attached id unable to collide with
 a native one: `<source_id>/<field>` is exactly the shape of a native
 tensor id, so a field or scene named `0` would otherwise shadow one of the
-file's own, while `<source_id>/@fields/0` cannot. The disk layout is
+file's own, while `<source_id>/@fields/0` cannot. The rule has no exception
+-- the upload path mints no bare field on any kind of source -- so a bare
+id always names a tensor some format produced. The disk layout is
 unaffected -- NGFF's group is still `labels/` -- only the wire id is
 marked, and the parse is right-to-left, so a set literally named `labels`
 (`.../@labels/labels`) is still legal.
@@ -168,22 +170,31 @@ returns it to PENDING yet.
   store. A tensor adopted from an earlier life holds no progress record, so
   discarding it is store removal alone; a native tensor is never
   discardable.
-- **The reaper takes a source left with only tombstones**, and one
-  registered but never given a tensor, once `upload_ttl` has passed.
+- **A deadline is swept at any state; idleness only at PENDING.** A
+  tensor whose `ttl_seconds` has run out is discarded wherever it is on the
+  ladder -- READY is where a finished result spends its life, so a lifetime
+  that stopped applying there would be none. Idleness is PENDING's alone:
+  past it nothing is expected to make progress. The deadline is recorded in
+  the member's marker as absolute wall-clock time, so it survives a restart,
+  and one that ran out while the server was down is swept at boot rather
+  than adopted and reaped later.
+- **A tombstone is detached once it has stood for `upload_ttl`**, which is
+  what frees the name: a discarded tensor takes two sweeps to vanish and is
+  reachable to whoever is polling it in between. An adopted tensor leaves
+  none -- with no progress record there is nowhere to stamp its age -- so
+  its discard frees the name in one step.
 
 ## Wire
 
 | action | body |
 |---|---|
-| `register_source` | `RegisterSource` -> `RegisterSourceResult` (mints and records `source_id`) |
-| `add_tensor` | `TensorDescriptor` in, `TensorDescriptor` out (`array_id` minus scheme, the store's own chunk grid) |
+| `add_tensor` | `TensorDescriptor` in, `TensorDescriptor` out (`array_id` minus scheme, the store's own chunk grid, and `ttl_seconds` as the lifetime granted) |
 | `GetFlightInfo` | `FlightRequest.tensor_read`; answered for a PENDING tensor too; `slice_hint` limits the plan |
 | DoPut | `PutCommand.chunk_ticket` in the descriptor command, the chunk's batch as the stream |
 | `set_upload_status` | `SetUploadStatus`; READY and DISCARDED are the only settable states |
 | `upload_status` | unchanged |
 
 Java (`TensorUploads`, `TensorFlightClient`) and the TS client mirror the
-same actions and ticket flow, with no client-side tiling or decoding. There
-is no `create_tensor` action, `ome_zarr:` source, or volatile `cache:`
-source in this model -- every tensor is added to a source by `add_tensor`,
-and every source is minted by `register_source` or discovered.
+same actions and ticket flow, with no client-side tiling or decoding. Every
+tensor is added to a source by `add_tensor`, and every source is either
+discovered or the one the server serves itself.

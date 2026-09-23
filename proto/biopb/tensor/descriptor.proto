@@ -158,6 +158,23 @@ message TensorDescriptor {
   // now.
   optional bool is_resident = 16;
 
+  // How long the server keeps this tensor, in seconds from `add_tensor`.
+  //
+  // **A request on the way in, a statement on the way out.** The server
+  // applies its own policy over what was asked for and answers with the
+  // lifetime it granted, which may be shorter: a source that caps lifetimes
+  // clamps an unset request to the cap too.
+  //
+  // Unset on the way in asks for the source's default; unset on the way out
+  // means the tensor is kept until someone discards it. Zero is not a lifetime
+  // and is refused rather than read as "expire immediately".
+  //
+  // The deadline is absolute and recorded with the store, so it survives a
+  // restart, and it runs from `add_tensor` rather than from READY -- a
+  // producer that never publishes cannot keep bytes alive by not finishing.
+  // Past it the reclaim sweep discards the tensor as if its producer had.
+  optional uint32 ttl_seconds = 17;
+
   // 13 was chunk_array_id, the compact-grid read plan (biopb/biopb#346); removed
   // when the chunk_id codec was made a strictly server-side concern (the client
   // no longer regenerates chunk_ids). Reserved so the field number/name are never

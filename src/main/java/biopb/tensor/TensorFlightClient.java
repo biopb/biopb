@@ -1311,13 +1311,15 @@ public class TensorFlightClient implements AutoCloseable {
     /**
      * Declare a tensor to fill: the first half of an upload.
      *
-     * <p><b>Experimental.</b> The upload / writable-source API (source
-     * registration, tensor creation, chunk upload, and upload-status polling)
-     * may change.
+     * <p><b>Experimental.</b> The upload API (tensor creation, chunk upload,
+     * and upload-status polling) may change.
      *
-     * <p><b>An upload adds a tensor to a source that already exists</b>, so
-     * {@link #registerSource} comes first and this never creates one. Declare,
-     * then fill: the returned descriptor is the server's echo -- array_id,
+     * <p><b>An upload adds a tensor to a source that already exists</b> and
+     * never creates one. A result that belongs to no source of yours goes on
+     * the server's scratch source, at the fixed id {@code "scratch"} -- every
+     * writable server serves one, so there is nothing to ask for first.
+     * Declare, then fill: the returned descriptor is the server's echo --
+     * array_id,
      * shape, dtype, chunk_shape, dim_labels -- and is what
      * {@link #uploadArray}, {@link #uploadChunk} and {@link #setUploadStatus}
      * take. {@link #setUploadStatus} is what publishes the tensor and marks it
@@ -1327,21 +1329,20 @@ public class TensorFlightClient implements AutoCloseable {
      * pending, published or discarded -- is refused. Only the server's reclaim
      * sweep frees one, after a discarded upload's {@code upload_ttl}.
      *
-     * @param arrayId {@code "<scheme>://<source_id>/<field>"}, where
+     * @param arrayId {@code "<scheme>://<source_id>/@fields/<name>"}, where
      *        <i>scheme</i> is the store format -- {@code zarr} for an OME-Zarr
      *        image group, {@code cache} for the chunks as uploaded -- and
-     *        <i>source_id</i> is what {@link #registerSource} answered. The
-     *        other two forms put a tensor on a source the server
-     *        <i>discovered</i>, whose own bytes are the user's, so each keeps
-     *        its own store beside that source under a marked segment that
-     *        cannot collide with one of the file's own tensors:
-     *        {@code "<scheme>://<source_id>/@fields/<name>"} for a plain field,
-     *        and {@code "zarr://<image array_id>/@labels/<name>"} for a label
-     *        set of an image the server already serves. A set is
-     *        unsigned-integer, spans its image's non-channel axes at full
-     *        length, and its all-zero chunks are skipped by
-     *        {@link #uploadArray}. The scheme names the store format and
-     *        nothing else: the answered id carries none
+     *        <i>source_id</i> is a source the server already serves -- one it
+     *        discovered, or {@code "scratch"}. The {@code @fields} segment is
+     *        not optional: an uploaded tensor keeps its own store beside its
+     *        source, and the mark is what stops its id colliding with one of
+     *        the file's own tensors, so a bare {@code "<source_id>/<field>"}
+     *        is a native tensor id and is refused here. The one other form is
+     *        {@code "zarr://<image array_id>/@labels/<name>"}, a label set of an
+     *        image the server already serves. A set is unsigned-integer, spans
+     *        its image's non-channel axes at full length, and its all-zero
+     *        chunks are skipped by {@link #uploadArray}. The scheme names the
+     *        store format and nothing else: the answered id carries none
      * @param shape the tensor's shape
      * @param dtype the numpy dtype string to store it as (e.g. {@code "<u2"})
      * @param chunkShape the upload grid; null or empty means one chunk. A
@@ -1349,8 +1350,8 @@ public class TensorFlightClient implements AutoCloseable {
      *        answers with it
      * @param dimLabels optional dimension labels
      * @param omeMetadataJson ignored except for a label set's
-     *        {@code image-label} block. Metadata is source-scoped and rides on
-     *        {@link #registerSource}; a tensor inherits its source's
+     *        {@code image-label} block. Metadata is source-scoped: a tensor
+     *        inherits its source's, and the scratch source has none
      * @return the new tensor's descriptor, under the id it keeps
      */
     public TensorDescriptor addTensor(
@@ -1361,6 +1362,33 @@ public class TensorFlightClient implements AutoCloseable {
             List<String> dimLabels,
             String omeMetadataJson) {
         return uploads.addTensor(arrayId, shape, dtype, chunkShape, dimLabels, omeMetadataJson);
+    }
+
+    /**
+     * {@link #addTensor(String, long[], String, long[], List, String)} with a lifetime.
+     *
+     * <p>How long the result is worth keeping is the producer's to say, and
+     * {@code null} asks for no deadline. A source may <i>cap</i> it -- a
+     * scratch source caps every upload on it, an unset request included -- so
+     * the answer's own {@code ttl_seconds} is what was granted, which may be
+     * shorter. Past it the tensor is discarded as if you had discarded it:
+     * the store goes and the id reads {@code DISCARDED}.
+     *
+     * @param ttlSeconds seconds to keep the tensor, or null for no deadline;
+     *        must be positive, since zero is not a lifetime
+     * @return the new tensor's descriptor, its {@code ttl_seconds} the lifetime
+     *         granted
+     */
+    public TensorDescriptor addTensor(
+            String arrayId,
+            long[] shape,
+            String dtype,
+            long[] chunkShape,
+            List<String> dimLabels,
+            String omeMetadataJson,
+            Integer ttlSeconds) {
+        return uploads.addTensor(
+                arrayId, shape, dtype, chunkShape, dimLabels, omeMetadataJson, ttlSeconds);
     }
 
     /**
@@ -1391,49 +1419,6 @@ public class TensorFlightClient implements AutoCloseable {
         template.dimensions(shape);
         return uploads.addTensor(arrayId, shape, TensorUploads.numpyDtype(template.getType()),
                 chunkShape, dimLabels, omeMetadataJson);
-    }
-
-    /**
-     * Mint an empty source on the server, and answer its {@code source_id}.
-     *
-     * <p>A source is a container for tensors; this makes one, and
-     * {@code add_tensor} fills it. It is registered and readable the moment
-     * this returns, with an empty tensor list -- which the catalog models the
-     * same way it models a cloud source nobody has resolved yet.
-     *
-     * <p>Unlike an upload, a registered source has no state to move: it is not
-     * {@code PENDING}, nothing publishes it, and it outlives the process
-     * because the server re-registers it at startup rather than because
-     * anything discovers it.
-     *
-     * @param name a directory component the server names the store after, and
-     *        what a later {@code registerSource} collides with; empty asks the
-     *        server to mint one. Compared case- and accent-insensitively,
-     *        because two such names are one directory on Windows and macOS
-     * @param metadataJson the source's OME metadata as a JSON object, or null.
-     *        Source-scoped: every tensor added to it inherits the physical
-     *        scale, units and channel names from here. Carried verbatim, as on
-     *        {@link #addTensor(String, long[], String, long[], List, String)}
-     * @return the {@code source_id}, <b>minted by the server, not derived from
-     *         the name</b> -- so it survives the server's {@code write_dir}
-     *         moving, and cannot be guessed by a client that did not create it
-     * @throws org.apache.arrow.flight.FlightRuntimeException the name cannot be
-     *         a directory on some platform this store may be served from, is
-     *         already taken, or {@code metadataJson} is not a JSON object
-     */
-    public String registerSource(String name, String metadataJson) {
-        return uploads.registerSource(name, metadataJson);
-    }
-
-    /**
-     * Mint an empty source with no metadata; see
-     * {@link #registerSource(String, String)}.
-     *
-     * @param name as in {@link #registerSource(String, String)}
-     * @return the server-minted {@code source_id}
-     */
-    public String registerSource(String name) {
-        return registerSource(name, null);
     }
 
     /**

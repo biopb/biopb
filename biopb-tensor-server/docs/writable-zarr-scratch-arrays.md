@@ -1,9 +1,13 @@
 # Plan: Writable, readable, ephemeral zarr arrays on the tensor server
 
-Status: proposal — not implemented. The upload facility it builds on exists
-(`create_source` / `do_put` / `upload_status`, with `cache:` and `ome_zarr:`
-source types in `server.py`); the `scratch:` ephemeral-zarr type, `delete_source`,
-and the idle/TTL lifecycle proposed here are not yet built.
+Status: **superseded** — see `upload-model.md`. What this proposed is built,
+in a different shape: the ephemeral scratch store is one per-server source at
+the fixed id `scratch` rather than an array a client creates, the lifecycle is
+`set_upload_status` plus a per-tensor `ttl_seconds` capped by
+`ServerConfig.scratch_ttl`, and the idle sweep is `UploadManager.reap`. What
+is *not* built is the arbitrary-region `z[...] = plane` write in section 1:
+a write lands on the chunk grid the server planned, whole cells only. Kept for
+the reasoning in sections 2 onward, not as a plan.
 Scope: `biopb-tensor-server` (server + Python SDK client)
 Related: `biopb/biopb#8` (read-grid decoupling), the upload facility
 (`create_source` / `do_put` / `upload_status`).

@@ -240,6 +240,7 @@ _CONSTRAINTS = {
         "stability_window": _Range(min=0),
         "handle_reaper_ttl": _Range(min=0),
         "upload_ttl": _Range(min=0),
+        "scratch_ttl": _Range(min=0),
     },
 }
 
@@ -891,6 +892,16 @@ class ServerConfig:
             "is freed. Finished uploads are never reclaimed. 0 disables the sweep."
         },
     )
+    scratch_ttl: float = field(
+        default=86400.0,
+        metadata={
+            "help": "Ceiling, in seconds, on how long a tensor uploaded to "
+            "the scratch source is kept, after which it is discarded. An "
+            "upload asking for less gets what it asked for; one asking for "
+            "more, or for nothing, gets this. 0 keeps them until someone "
+            "discards them."
+        },
+    )
     stability_window: float = field(
         default=30.0,
         metadata={
@@ -1329,6 +1340,7 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
     _carry(server_kwargs, "full_rescan_interval", server_data, cast=float)
     _carry(server_kwargs, "handle_reaper_ttl", server_data, cast=float)
     _carry(server_kwargs, "upload_ttl", server_data, cast=float)
+    _carry(server_kwargs, "scratch_ttl", server_data, cast=float)
     _carry(server_kwargs, "stability_window", server_data, cast=float)
     _carry(server_kwargs, "aggressive_dir_pruning", server_data, cast=bool)
     _carry(server_kwargs, "claim_generic_images", server_data, cast=bool)

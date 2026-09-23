@@ -3,13 +3,15 @@
 Extracted from ``TensorFlightServer`` (biopb/biopb#278 item A). What is left
 here is only what a boundary does:
 
-- **Addressing** -- ``add_tensor`` takes ``<scheme>://<source_id>/<field>``
-  for a member of a registered source, ``<scheme>://<source_id>/@fields/<name>``
-  for a field on a discovered one, and ``zarr://<array_id>/@labels/<name>`` for
-  a label set (biopb/biopb#1059). Nothing here creates a source: the parent must
-  already be registered, and the new tensor is attached to it. The scheme names
-  the store format and nothing else (``adapters.registered.STORE_FORMATS``), so
-  the catalog row kept in step is always the parent's.
+- **Addressing** -- ``add_tensor`` takes
+  ``<scheme>://<source_id>/@fields/<name>`` for a tensor uploaded onto any
+  source, and ``zarr://<array_id>/@labels/<name>`` for a label set
+  (biopb/biopb#1059). Both carry a marked segment, because a bare field is a
+  native tensor id and the upload path mints none. **Nothing here creates a
+  source**: the parent must already be registered, and an intermediate result
+  goes on the scratch source (``adapters.scratch``). The scheme names the store
+  format and nothing else (``adapters.member_formats.STORE_FORMATS``), so the
+  catalog row kept in step is always the parent's.
 - **Error translation** -- adapters stay transport-agnostic and raise typed
   errors; this is where they become Flight errors.
 - **Lookup** -- ``status`` / ``set_status`` find the adapter and hand over
@@ -33,8 +35,9 @@ created with its adapter, lives as long as that adapter is reachable -- from
 the registry, or from its parent source for a label set -- and a discarded one
 stays reachable as a tombstone until reclaimed.
 
-The manager registers created sources through the shared ``SourceRegistry`` and
-never holds a back-reference to the server, so the collaborators stay acyclic.
+The manager registers the scratch source through the shared ``SourceRegistry``
+and never holds a back-reference to the server, so the collaborators stay
+acyclic.
 """
 
 from __future__ import annotations
@@ -55,18 +58,22 @@ from biopb_tensor_server.adapters._writable import (
     unknown_upload_status,
     upload_of,
 )
-from biopb_tensor_server.adapters.fields import create_field_upload, fields_root
+from biopb_tensor_server.adapters.fields import (
+    create_field_upload,
+    fields_root,
+)
 from biopb_tensor_server.adapters.labels import create_label_upload, labels_root
 from biopb_tensor_server.adapters.members import member_marker
 from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
-from biopb_tensor_server.adapters.registered import (
-    RegisterAdapter,
-    create_member,
-    create_registered_source,
-    scan_registered_sources,
-    sources_root,
+from biopb_tensor_server.adapters.scratch import (
+    SCRATCH_SOURCE_ID,
+    ScratchSource,
 )
-from biopb_tensor_server.adapters.zarr import UPLOAD_PENDING, upload_state
+from biopb_tensor_server.adapters.zarr import (
+    UPLOAD_PENDING,
+    upload_expires_at,
+    upload_state,
+)
 from biopb_tensor_server.core.attached import FIELDS_SEGMENT
 from biopb_tensor_server.core.axes import noncanonical_order
 from biopb_tensor_server.core.chunk import get_bounds_from_chunk_id
@@ -77,7 +84,7 @@ from biopb_tensor_server.core.errors import (
     WriteNotSupportedError,
 )
 from biopb_tensor_server.core.labels import LABELS_SEGMENT, split_label_field
-from biopb_tensor_server.core.source_registry import SourceRegistry, close_adapter
+from biopb_tensor_server.core.source_registry import SourceRegistry
 from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 
 __all__ = [
@@ -100,10 +107,9 @@ DEFAULT_UPLOAD_TTL = 3600.0
 #: the store format and nothing else; everything after it is the tensor's
 #: ``array_id``, which is also the id it keeps and is answered with.
 _ID_GRAMMAR = (
-    "'<scheme>://<source_id>/<field>' to add a tensor to a registered source, "
-    f"'<scheme>://<source_id>/{FIELDS_SEGMENT}/<name>' to add one to a source "
-    f"the server discovered, or 'zarr://<array_id>/{LABELS_SEGMENT}/<name>' to "
-    "add a label set to one of its tensors"
+    f"'<scheme>://<source_id>/{FIELDS_SEGMENT}/<name>' to add a tensor to a "
+    f"source, or 'zarr://<array_id>/{LABELS_SEGMENT}/<name>' to add a label "
+    "set to one of its tensors"
 )
 
 
@@ -155,36 +161,37 @@ def _attached(adapter: Any) -> Dict[str, Any]:
     outside this package, and one that knows nothing about the upload path has
     none of them.
 
-    One index for every kind -- member, label set, field on a discovered source
-    -- so this boundary locates, publishes, unlists and reaps them alike
+    One index for both kinds -- uploaded field and label set -- so this
+    boundary locates, publishes, unlists and reaps them alike
     (``SourceAdapter.attached_tensors``).
     """
     return getattr(adapter, "attached_tensors", None) or {}
 
 
-def _reap_step(adapter: Any, now: float, ttl: float) -> Tuple[bool, bool]:
+def _reap_step(
+    adapter: Any, now: float, ttl: float, wall_now: float
+) -> Tuple[bool, bool]:
     """One upload's turn in the sweep: ``(just expired, tombstone is stale)``.
 
     Both halves come from ``WritableSource.reap_step``; this only turns the
     tombstone's age into the sweep's yes/no, so the registered kinds and the
     label sets attached to a source take the identical step.
+
+    Two clocks, because the sweep asks two kinds of question: *now* is
+    monotonic and measures how long something has been idle, *wall_now* is the
+    wall clock a recorded deadline is written against.
     """
-    expired, age = adapter.reap_step(now, ttl)
+    expired, age = adapter.reap_step(now, ttl, wall_now)
     return expired, age is not None and age > ttl
 
 
-def _reap_outcome(expired_now: bool, stale: bool) -> Optional[str]:
-    """``"expired"``, ``"reclaimed"``, or None, for one entity's sweep step.
+def _past_deadline(expires_at: Optional[float]) -> bool:
+    """Whether a recorded deadline has already gone by, on the wall clock.
 
-    The registered kinds and a source's label uploads take the identical
-    decision in :meth:`reap`; only what each does about it -- a different
-    namespace, registry vs. a source's own dict -- differs per loop.
+    Separate from ``WritableSource.expired`` because the boot sweep asks about
+    a *directory*, before anything has opened it as an adapter.
     """
-    if expired_now:
-        return "expired"
-    if stale:
-        return "reclaimed"
-    return None
+    return expires_at is not None and time.time() >= expires_at
 
 
 class UploadManager:
@@ -205,6 +212,36 @@ class UploadManager:
         self.ttl = float(ttl)
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+
+    def _deadline_for(self, parent: Any, desc: TensorDescriptor) -> Optional[float]:
+        """When a tensor added to *parent* stops being served, or None.
+
+        The request's ``ttl_seconds`` is what the producer asked for, unset
+        meaning no deadline; the parent's ``max_upload_ttl`` is what the source
+        allows, and applies to an unset request too. The cap wins, so a request
+        can only shorten a lifetime -- which makes it a policy, not a default.
+        """
+        requested = desc.ttl_seconds if desc.HasField("ttl_seconds") else None
+        if requested is not None and requested <= 0:
+            raise flight.FlightServerError(
+                "add_tensor: ttl_seconds is a lifetime in seconds and must be "
+                "positive; leave it unset to ask for no deadline."
+            )
+        cap = getattr(parent, "max_upload_ttl", None)
+        ttl = float(requested) if requested is not None else None
+        if cap is not None:
+            ttl = float(cap) if ttl is None else min(ttl, float(cap))
+        return None if ttl is None else time.time() + ttl
+
+    @property
+    def write_dir(self) -> Optional[Path]:
+        """The subtree this server's uploads live under, or None if read-only.
+
+        Public because every uploaded tensor has the one layout under it
+        (``fields/<source_id>/<name>``), so naming a store takes the root
+        rather than the source that holds it.
+        """
+        return self._write_dir
 
     # -- lookup ----------------------------------------------------------------
 
@@ -309,7 +346,7 @@ class UploadManager:
     def _delete_adopted_tensor(self, array_id: str) -> Dict[str, Any]:
         """Remove a listed tensor that this life of the server did not upload.
 
-        A member or sidecar re-attached at registration carries no upload
+        A field or sidecar re-attached at registration carries no upload
         record, so :meth:`_locate` finds nothing to discard -- only a store,
         still the server's own (it was minted under ``write_dir``). Unlisted
         first, so no read can be routed to a store that is about to go.
@@ -376,6 +413,9 @@ class UploadManager:
         status polls; it is not *listed* until it reaches READY
         (``SourceAdapter.label_sets``). No catalog write at create: the row the
         source already has still describes what a reader may see.
+
+        It takes a deadline the same way a field does: a set is an uploaded
+        tensor, so a source that caps lifetimes caps this one too.
         """
         metadata = (
             self._parse_metadata_json(req_desc.metadata_json)
@@ -389,6 +429,7 @@ class UploadManager:
                 req_desc,
                 labels_dir=labels_root(self._write_dir),
                 metadata=metadata,
+                expires_at=self._deadline_for(parent, req_desc),
             )
         except ValueError as e:
             raise flight.FlightServerError(f"add_tensor: {e}") from e
@@ -431,31 +472,23 @@ class UploadManager:
         partial source. Runs from the server's
         constructor, before any source is registered. Returns the count.
 
-        The layouts the server mints: the members of a registered source
-        (``sources/<name>.zarr/<field>``, in either store format), the fields
-        uploaded onto a discovered one (``fields/<source_id>/<name>``, likewise),
-        the label sidecars
-        (``labels/<source_id>/*.zarr``), and -- for one more release -- the
-        single-array stores the removed ``ome_zarr:`` kind left directly under
-        ``write_dir``. They differ in what the catalog owes them, which is why
-        they are swept separately.
+        The layouts the server mints: the uploaded fields
+        (``fields/<source_id>/<name>``, in either store format), the label
+        sidecars (``labels/<source_id>/*.zarr``), and -- for one more release --
+        the single-array stores the removed ``ome_zarr:`` kind left directly
+        under ``write_dir``. They differ in what the catalog owes them, which is
+        why they are swept separately.
         """
         write_dir = self._write_dir
         if write_dir is None or not write_dir.is_dir():
             return 0
         removed = 0
-        for store in sorted(sources_root(write_dir).glob("*/*")):
-            # A member has no row of its own: it is a tensor of its source,
-            # whose row is rebuilt when that source is adopted -- which is
-            # after this sweep. The collection itself is never pending, so a
-            # ``.zattrs`` or ``.zgroup`` file here is simply not a directory.
-            if store.is_dir():
-                removed += self._remove_unfinished(store)
         for store in sorted(fields_root(write_dir).glob("*/*")):
-            # A field has no row of its own either: its source is the user's own
-            # file, whose row is the reconciler's. Only the *pending* ones go --
-            # a published field is the only copy of what someone uploaded, and
-            # is kept even once its source has gone away.
+            # A field has no row of its own: it is a tensor of its source, whose
+            # row is the reconciler's or is rebuilt when a registered source is
+            # adopted -- either way after this sweep. Only the *pending* ones go
+            # -- a published field is the only copy of what someone uploaded,
+            # and is kept even once its source has gone away.
             if store.is_dir():
                 removed += self._remove_unfinished(store)
         for store in sorted(labels_root(write_dir).glob("*/*.zarr")):
@@ -483,16 +516,29 @@ class UploadManager:
 
     @staticmethod
     def _remove_unfinished(store: Path) -> bool:
-        """Delete *store* if it is still pending; whether it was.
+        """Delete *store* if this life should not serve it; whether it was.
 
-        Through ``member_marker``, so the marker is read off whichever file
-        this store's format keeps it in -- the sweep decides before any adapter
-        is asked to open the directory, and neither format is privileged.
+        Two reasons, both read off the marker before any adapter is asked to
+        open the directory -- through ``member_marker``, so it is found in
+        whichever file this store's format keeps it in and neither format is
+        privileged.
+
+        **Still pending**: a crash left it half written, and nothing here can
+        finish it.
+
+        **Past its deadline**: its lifetime ran out while the server was down.
+        Swept rather than adopted and left to the first sweep, which would
+        serve expired bytes until it came round.
         """
-        if upload_state(member_marker(store)) != UPLOAD_PENDING:
+        marker = member_marker(store)
+        if upload_state(marker) == UPLOAD_PENDING:
+            why = "unfinished"
+        elif _past_deadline(upload_expires_at(marker)):
+            why = "expired"
+        else:
             return False
         shutil.rmtree(store, ignore_errors=True)
-        logger.info(f"Removed unfinished upload store {store}")
+        logger.info(f"Removed {why} upload store {store}")
         return True
 
     # -- write path ------------------------------------------------------------
@@ -527,19 +573,20 @@ class UploadManager:
     def add_tensor(self, req_desc: TensorDescriptor) -> TensorDescriptor:
         """Add a tensor to a source that already exists; answer its descriptor.
 
-        **Nothing here creates a source.** ``register_source`` does that, and
-        an upload names what it is adding to: ``<scheme>://<source_id>/<field>``
-        for a tensor of a registered source,
-        ``<scheme>://<source_id>/@fields/<name>`` for one on a source the server
-        discovered, and ``zarr://<array_id>/@labels/<name>`` for a label set of
-        any tensor of either. The scheme names the store
-        format (``registered.STORE_FORMATS``) and nothing else -- the answered
+        **Nothing here creates a source.** An upload names what it is adding
+        to: ``<scheme>://<source_id>/@fields/<name>`` for a tensor of a source,
+        ``zarr://<array_id>/@labels/<name>`` for a label set of one of its
+        tensors. A result that belongs to no source of the user's goes on the
+        scratch source, at the fixed id a writable server always serves
+        (``adapters.scratch.SCRATCH_SOURCE_ID``). The scheme names the store
+        format (``member_formats.STORE_FORMATS``) and nothing else -- the answered
         ``array_id`` carries none, because the format is a property of the
         stored tensor, read off its directory at the next registration.
 
-        Which of the three it is comes off the **field**, not the parent's
-        type: a marked segment says the upload path owns the bytes and picks
-        where they go; a bare field is the parent's own member.
+        **Every uploaded tensor is addressed under a marked segment**
+        (:mod:`~biopb_tensor_server.core.attached`). A bare field is a native
+        tensor id, which is the format's to mint, so the upload path never
+        answers one -- and the kind is read off the field, not the parent.
 
         A field is taken for as long as its tensor is served. Replacing one is
         a discard first, which is what makes an ``array_id`` name a single
@@ -563,9 +610,11 @@ class UploadManager:
         parent = self._registry.get(source_id)
         if parent is None:
             raise flight.FlightServerError(
-                f"add_tensor: {req_desc.array_id!r} names no registered source "
+                f"add_tensor: {req_desc.array_id!r} names no source "
                 f"{source_id!r}. A tensor is added to a source the server "
-                f"already serves; it does not create one."
+                f"already serves; it does not create one. Use "
+                f"{SCRATCH_SOURCE_ID!r} for a result that belongs to no source "
+                f"of yours."
             )
 
         if split_label_field(field) is not None:
@@ -578,17 +627,15 @@ class UploadManager:
 
         if req_desc.metadata_json:
             raise flight.FlightServerError(
-                "add_tensor: metadata is the source's, not a tensor's -- pass it "
-                "to register_source. A tensor declares shape, dtype, chunk grid "
-                "and axes; the one exception is a label set's 'image-label' "
-                "block, which rides on its own add_tensor."
+                "add_tensor: metadata is the source's, not a tensor's, and an "
+                "uploaded tensor inherits its source's. A tensor declares "
+                "shape, dtype, chunk grid and axes; the one exception is a "
+                "label set's 'image-label' block, which rides on its own "
+                "add_tensor."
             )
-        if field == FIELDS_SEGMENT or field.startswith(f"{FIELDS_SEGMENT}/"):
-            # The *segment* dispatches, not the whole parse, so a malformed name
-            # under it is refused as a field rather than answered about members.
-            adapter = self._create_field(parent, field, scheme, req_desc)
-        else:
-            adapter = self._create_member(parent, source_id, field, scheme, req_desc)
+        adapter = self._create_field(
+            parent, field, scheme, req_desc, self._deadline_for(parent, req_desc)
+        )
         # Attached, not listed: this routes the tensor's own writes, and the
         # published gate keeps it out of the source's tensors until READY. So no
         # catalog write is owed -- the row the source has still describes what a
@@ -597,116 +644,52 @@ class UploadManager:
         logger.info(f"Added {scheme} tensor: {adapter.array_id}")
         return adapter.upload_response(req_desc)
 
-    def _create_member(
+    def _create_field(
         self,
         parent: Any,
-        source_id: str,
         field: str,
         scheme: str,
         desc: TensorDescriptor,
+        expires_at: Optional[float] = None,
     ) -> Any:
-        """Mint a tensor of a source the server registered, inside its store."""
-        if not isinstance(parent, RegisterAdapter):
-            raise flight.FlightServerError(
-                f"add_tensor: {source_id!r} is not a registered source, so it "
-                f"has no store to put a tensor of its own in. Add it beside the "
-                f"source instead: "
-                f"'{scheme}://{source_id}/{FIELDS_SEGMENT}/<name>'."
-            )
-        try:
-            return create_member(parent, field, scheme, desc)
-        except ValueError as e:
-            raise flight.FlightServerError(f"add_tensor: {e}") from e
+        """Mint an uploaded tensor beside its source, whatever kind it is.
 
-    def _create_field(
-        self, parent: Any, field: str, scheme: str, desc: TensorDescriptor
-    ) -> Any:
-        """Mint a tensor beside a source the server discovered.
-
-        Refused on a registered source: it has a store of its own, and a second
-        place for its tensors would be two layouts to adopt, sweep and reclaim
-        for one kind of source.
+        One layout for every source: a discovered one's bytes are the user's
+        and the scratch source holds none, so neither has anywhere of its own
+        to put a tensor. ``create_field_upload`` refuses a field that is not
+        ``@fields/<name>``.
         """
-        if isinstance(parent, RegisterAdapter):
-            raise flight.FlightServerError(
-                f"add_tensor: {parent.source_id!r} is a registered source, so "
-                f"its tensors are members of its own store: drop the "
-                f"{FIELDS_SEGMENT!r} segment."
-            )
         try:
             return create_field_upload(
-                parent, field, scheme, desc, fields_dir=fields_root(self._write_dir)
+                parent,
+                field,
+                scheme,
+                desc,
+                fields_dir=fields_root(self._write_dir),
+                expires_at=expires_at,
             )
         except ValueError as e:
             raise flight.FlightServerError(f"add_tensor: {e}") from e
 
-    def register_source(self, name: str = "", metadata_json: str = "") -> str:
-        """Mint a source a client can add tensors to; answers its ``source_id``.
+    def install_scratch(self, max_ttl: Optional[float]) -> Optional[str]:
+        """Put the scratch source on the registry and in the catalog.
 
-        Registration, not upload: the collection holds no bytes and has no
-        upload state, so it is readable (and empty) the moment this returns.
-        What makes it outlive the process is that :meth:`adopt_registered_sources`
-        finds it again, not that anything discovers it -- ``write_dir`` stays
-        outside every discovery root.
+        Neither half is a walk: the id is fixed, and the source keeps no
+        directory of its own -- its tensors come back through the
+        ``on_register`` hook that gives every source its uploaded fields
+        (``fields.fields_attacher``).
 
-        *metadata_json* is the source's OME block as the request carried it,
-        parsed here rather than by the caller -- the same boundary, and the
-        same refusal, ``add_tensor`` gives a malformed one.
+        *max_ttl* caps every upload added here, an unset one included; None
+        leaves them undated. Returns the id, or None on a server with no
+        ``write_dir``, where nothing can be added anyway.
         """
         if self._write_dir is None:
-            raise flight.FlightServerError(
-                "register_source: write_dir is not configured, so there is "
-                "nowhere to put a source"
-            )
-        metadata = self._parse_metadata_json(metadata_json) if metadata_json else None
-        try:
-            adapter = create_registered_source(
-                name, metadata, sources_root(self._write_dir)
-            )
-        except (ValueError, OSError) as e:
-            raise flight.FlightServerError(str(e)) from e
-
-        registered = self._registry.register_new(adapter.source_id, adapter)
-        if registered is None:
-            # A minted id that is already registered means the mint collided,
-            # which 48 random bits make a non-event -- but the store is already
-            # on disk, so release it rather than leave the server's own bytes
-            # for the next boot to adopt under an id it cannot serve.
-            adapter.dispose_store()
-            close_adapter(adapter)
-            raise flight.FlightServerError(
-                f"register_source: {adapter.source_id} is already registered; retry."
-            )
-        self._sync_row(adapter.source_id, registered)
-        return adapter.source_id
-
-    def adopt_registered_sources(self) -> int:
-        """Re-register what the last life left under ``<write_dir>/sources``.
-
-        The half of registration that was missing (biopb/biopb#1048): the
-        upload path registered a minted store in the life that created it, and
-        nothing brought it back, so its catalog row outlived the adapter behind
-        it. Runs at startup after the pending sweep and before the caller's
-        discovery scan, so an adopted id is already registered by the time
-        anything can ask for it. Returns the count.
-        """
-        if self._write_dir is None:
-            return 0
-        count = 0
-        for source_id, adapter in scan_registered_sources(
-            sources_root(self._write_dir)
-        ).items():
-            if self._registry.register_new(source_id, adapter) is None:
-                # Something else already holds the id. Leave its store alone --
-                # this pass adopts, it does not arbitrate.
-                logger.warning(f"Registered source {source_id} is already served")
-                close_adapter(adapter)
-                continue
-            self._sync_row(source_id, adapter)
-            count += 1
-        if count:
-            logger.info(f"Adopted {count} registered source(s)")
-        return count
+            return None
+        adapter = ScratchSource(self._write_dir, max_ttl)
+        registered = self._registry.register(SCRATCH_SOURCE_ID, adapter)
+        self._sync_row(SCRATCH_SOURCE_ID, registered)
+        logger.info(f"Serving the scratch source as {SCRATCH_SOURCE_ID}")
+        return SCRATCH_SOURCE_ID
 
     def _sync_row(self, source_id: str, adapter: Any) -> None:
         """Put *source_id* in the catalog; the one best-effort catalog write.
@@ -772,11 +755,13 @@ class UploadManager:
 
     # -- reclamation -----------------------------------------------------------
 
-    def reap(self, now: Optional[float] = None) -> Tuple[int, int]:
-        """One sweep over the registry by ``updated_at``; the unit the thread runs.
+    def reap(
+        self, now: Optional[float] = None, wall_now: Optional[float] = None
+    ) -> Tuple[int, int]:
+        """One sweep over the registry; the unit the reclaim thread runs.
 
-        Two halves, one clock. A PENDING upload with no write for ``ttl``
-        seconds is discarded with a reason -- the job that owned it died, and
+        Two halves, two clocks -- see *now* and *wall_now* below. A PENDING
+        upload with no write for ``ttl`` seconds is discarded with a reason -- the job that owned it died, and
         a discard is the one terminal transition there is, so a straggler
         that writes later is refused the same way it would be after an
         explicit discard. A tombstone that has stood for ``ttl`` seconds is
@@ -785,58 +770,64 @@ class UploadManager:
         expired upload therefore takes two sweeps to vanish, and is a
         tombstone in between.
 
-        Only PENDING is swept. Past it the upload has been published, and a
-        published result's lifetime is its reader's, not this sweep's -- so an
+        **A deadline is swept at any state, idleness only at PENDING.** A
+        tensor whose lifetime has run out is discarded wherever it is on the
+        ladder -- READY is where a finished result spends its life, so a
+        deadline that stopped applying there would be none. Idleness is
+        PENDING's alone: past it nothing is expected to make progress, so an
         upload left READY without ever being finished keeps its name and stays
-        writable, which is the cost of letting a producer publish early. A durable
-        kind is swept like any other: its store goes with the discard and its
-        catalog row is dropped here, since both were the server's own
+        writable, which is the cost of letting a producer publish early. A
+        durable kind is swept like any other: its store goes with the discard
+        and its catalog row is dropped here, since both were the server's own
         (biopb/biopb#1059).
 
         Every source's attached tensors take the same step, because a tensor is
         attached to its source rather than registered and would otherwise have
-        no sweep at all: a quiet pending member, field or label set is discarded
-        (its store with it) and unlisted, and its tombstone is later detached,
-        which frees the field.
-
-        A registered source left with no live tensor goes with them, once it
-        too has been quiet for ``ttl``. That covers both ends of the same
-        mistake: a create nobody ever added to, and a source whose last tensor
-        was discarded. Pending counts as live, so an upload in flight never
-        has the source pulled out from under it.
+        no sweep at all: a quiet pending field or label set is discarded (its
+        store with it) and unlisted, and its tombstone is later detached, which
+        frees the name.
 
         The chunks a reclaimed tombstone wrote stay in the cache until the
         LRU evicts them. They are unreachable: a re-created name gets a fresh
         ``content_version`` namespace, so its chunk ids never collide with
         the old ones (``CachedSourceAdapter.next_content_version``).
 
-        Returns ``(expired, reclaimed)`` counts. *now* is injectable for tests;
-        it is on the monotonic clock, like ``updated_at``.
+        Returns ``(expired, reclaimed)`` counts. Both clocks are injectable
+        for tests: *now* is monotonic, like ``updated_at``, and measures how
+        long something has been idle; *wall_now* is unix seconds and is what a
+        recorded deadline was written against (``WritableSource.expires_at``).
+        A recorded deadline has to survive a restart, which a monotonic
+        reading does not.
+
+        ``ttl <= 0`` disables the sweep whole -- deadlines included: it is the
+        knob for "do not reclaim on this server", and a deadline is
+        reclamation.
         """
         ttl = self.ttl
         if ttl <= 0:
             return 0, 0
         if now is None:
             now = time.monotonic()
+        if wall_now is None:
+            wall_now = time.time()
         expired = reclaimed = 0
         for source_id, adapter in self._registry.snapshot():
             if upload_of(adapter) is not None:
-                expired_now, stale = _reap_step(adapter, now, ttl)
-                outcome = _reap_outcome(expired_now, stale)
-                if outcome == "expired":
+                expired_now, stale = _reap_step(adapter, now, ttl, wall_now)
+                if expired_now:
                     self._drop_catalog_row(adapter, source_id)
                     expired += 1
-                elif outcome == "reclaimed":
+                if stale:
                     # Safe without a compare-and-remove: a tombstone is
                     # terminal and its id cannot be re-registered while it
                     # stands, so this is still the adapter the snapshot saw.
                     self._registry.unregister(source_id)
                     reclaimed += 1
                     logger.info(f"Reclaimed discarded upload {source_id}")
-            # ...and every tensor attached to it -- member, uploaded field or
-            # label set -- tracked on the source rather than in the registry,
+            # ...and every tensor attached to it -- uploaded field or label
+            # set -- tracked on the source rather than in the registry,
             # and taking the identical step.
-            tensor_expired, tensor_reclaimed, emptied_now = self._reap_tensors(
+            tensor_expired, tensor_reclaimed = self._reap_tensors(
                 adapter,
                 source_id,
                 _attached(adapter),
@@ -846,15 +837,10 @@ class UploadManager:
                 lambda field, adapter=adapter: adapter.detach_tensor(field),
                 now,
                 ttl,
+                wall_now,
             )
             expired += tensor_expired
             reclaimed += tensor_reclaimed
-            if (
-                not emptied_now
-                and isinstance(adapter, RegisterAdapter)
-                and self._reclaim_empty_source(source_id, adapter, now, ttl)
-            ):
-                reclaimed += 1
         return expired, reclaimed
 
     def _reap_tensors(
@@ -865,53 +851,20 @@ class UploadManager:
         detach: Any,
         now: float,
         ttl: float,
-    ) -> Tuple[int, int, bool]:
-        """One reap pass over *adapter*'s attachment index.
-
-        Returns ``(expired, reclaimed, reclaimed_any)`` -- the last only
-        meaningful on a registered source, which uses it to decide whether the
-        collection itself just went empty.
-        """
+        wall_now: float,
+    ) -> Tuple[int, int]:
+        """One reap pass over *adapter*'s attachment index."""
         expired = reclaimed = 0
-        reclaimed_any = False
         for field, tensor in list(tensors.items()):
-            expired_now, stale = _reap_step(tensor, now, ttl)
-            outcome = _reap_outcome(expired_now, stale)
-            if outcome == "expired":
+            expired_now, stale = _reap_step(tensor, now, ttl, wall_now)
+            if expired_now:
                 self._unlist(adapter, field)
                 expired += 1
-            elif outcome == "reclaimed":
+            if stale:
                 detach(field)
                 reclaimed += 1
-                reclaimed_any = True
                 logger.info(f"Reclaimed discarded tensor {source_id}/{field}")
-        return expired, reclaimed, reclaimed_any
-
-    def _reclaim_empty_source(
-        self, source_id: str, adapter: RegisterAdapter, now: float, ttl: float
-    ) -> bool:
-        """Drop a registered source with no live tensor, quiet past *ttl*.
-
-        Empty means every tensor gone, tombstones included: a discarded one is
-        still reachable to whoever is polling it, so the source it belongs to
-        has to outlive it. :meth:`reap` skips this for a source it emptied in
-        the same pass, so a caller replacing a discarded tensor gets a full TTL
-        to do it in, and the clock is touched on every add, so a source being
-        filled is never a candidate however long the filling takes.
-
-        What this closes is an abandoned ``register_source`` leaving a
-        directory and a catalog row nothing will ever reach.
-        """
-        if adapter.attached_tensors:
-            return False
-        if now - adapter.touched_at < ttl:
-            return False
-        self._registry.unregister(source_id)
-        self._drop_row(source_id)
-        close_adapter(adapter)
-        adapter.dispose_store()
-        logger.info(f"Reclaimed empty registered source {source_id}")
-        return True
+        return expired, reclaimed
 
     def start_sweep(self) -> None:
         """Run :meth:`reap` on a daemon thread until :meth:`stop_sweep`.

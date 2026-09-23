@@ -41,8 +41,8 @@ message ChunkBounds {
 }
 
 // FlightDescriptor.command bytes of a DoPut; what the stream carries is the
-// oneof arm. A tensor is added to a source by the `add_tensor` action, and a
-// source itself by `register_source`; DoPut creates neither.
+// oneof arm. A tensor is added to a source by the `add_tensor` action; DoPut
+// creates nothing, and nothing creates a source.
 message PutCommand {
   oneof command {
     // The stream is one pixel chunk (writable servers only). The bytes are a
@@ -70,11 +70,11 @@ message PutCommand {
 // object it was talking about.
 message SetUploadStatus {
   // What is being moved, as `add_tensor` answered with it:
-  // `<source_id>/<field>` for a member of a registered source, or a label
-  // set's `<image array_id>/labels/<name>`. An `array_id` rather than a
+  // `<source_id>/@fields/<name>` for an uploaded tensor, or a label set's
+  // `<image array_id>/@labels/<name>`. An `array_id` rather than a
   // `source_id` because what an upload tracks is always a *tensor* of a
-  // source, never the source itself -- `register_source` creates that, and
-  // takes no upload.
+  // source, never the source itself -- a source is discovered, or is the
+  // scratch source the server serves, and neither takes an upload.
   //
   // It alone names the attempt: a name is single-use for the life of the
   // server (`add_tensor` refuses a collision), so what it finds is what the
@@ -110,38 +110,4 @@ message RoiPut {
 message RoiDelete {
   string array_id = 1;
   string set_name = 2;
-}
-
-// Body of the `register_source` action: mint an empty source to add tensors
-// to. Answered with a RegisterSourceResult.
-//
-// A source, not an upload: it holds no bytes, has no upload state to move, and
-// is readable (and empty) the moment the action returns. What makes it outlive
-// the process is that the server re-registers it at startup, not that anything
-// discovers it -- `write_dir` stays outside every discovery root.
-message RegisterSource {
-  // A directory component the server names the store after, and what a later
-  // `register_source` collides with. Empty asks the server to mint one.
-  //
-  // Compared case-insensitively and NFC-normalized, because two names that
-  // differ only that way are one directory on NTFS, APFS and HFS+ and two on
-  // ext4. Refused if it cannot be a path component on every platform that may
-  // serve this store -- a Windows device name, a trailing space or dot, a
-  // leading dot, and so on.
-  string name = 1;
-
-  // The source's OME metadata, as a JSON object. Source-scoped: every tensor
-  // added to it inherits the physical scale, units and channel names from
-  // here. A string for the same reason `TensorDescriptor.metadata_json` is --
-  // the server keeps the tree whole and does not model it.
-  string metadata_json = 2;
-}
-
-// What `register_source` answers.
-message RegisterSourceResult {
-  // The new source's id. **Minted by the server, not derived from `name`**, so
-  // it survives the server's `write_dir` moving and cannot be guessed by a
-  // client that did not create the source. Recorded in the store, which is
-  // what lets the next server life adopt it under the same id.
-  string source_id = 1;
 }

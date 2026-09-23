@@ -161,8 +161,7 @@ class TestBuildOpArrayId:
     def test_source_id_in_source_id_out(self):
         client = MagicMock()
         client.get_tensor_pb.return_value = SerializedTensor()
-        client.register_source.return_value = "registered_1"
-        client.add_tensor.return_value.array_id = "registered_1/seg-abcd"
+        client.add_tensor.return_value.array_id = "scratch/@fields/seg-abcd"
 
         result_arr = np.ones((2, 2), dtype="uint8")
         stub = MagicMock()
@@ -172,26 +171,25 @@ class TestBuildOpArrayId:
 
         out = op("src_id")
 
-        assert out == "registered_1/seg-abcd"
+        assert out == "scratch/@fields/seg-abcd"
         client.get_tensor_pb.assert_called_once_with("src_id")
         # Sent as lazy_data, not eager.
         sent = stub.Run.call_args[0][0]
         assert sent.image_data.WhichOneof("data") == "lazy_data"
-        # Added to this connection's results source, then filled with the same
-        # dask array: nothing creates a source on the upload path.
+        # Added to the server's scratch source, then filled with the same dask
+        # array: nothing creates a source on the upload path.
         array_id, template = client.add_tensor.call_args[0]
-        assert array_id.startswith("cache://registered_1/seg-")
+        assert array_id.startswith("cache://scratch/@fields/seg-")
         assert isinstance(template, da.Array)
         desc, filled = client.upload_array.call_args[0]
         assert desc is client.add_tensor.return_value
         assert filled is template
 
-    def test_the_results_source_is_registered_once_per_client(self):
-        """One source per connection, not one per result: a source is a
-        container, and a result nobody keeps is reclaimed with it."""
+    def test_every_result_is_its_own_field_of_the_one_scratch_source(self):
+        """Nothing is registered, per client or otherwise: the scratch source
+        is already there, and each result is a field on it."""
         client = MagicMock()
         client.get_tensor_pb.return_value = SerializedTensor()
-        client.register_source.return_value = "registered_1"
 
         stub = MagicMock()
         stub.Run.return_value = _eager_response(np.ones((2, 2), "uint8"), ["Y", "X"])
@@ -200,11 +198,9 @@ class TestBuildOpArrayId:
         first = op("src_id")
         second = op("src_id")
 
-        client.register_source.assert_called_once()
-        # Two results, two fields on the one source.
         ids = {call[0][0] for call in client.add_tensor.call_args_list}
         assert len(ids) == 2
-        assert all(i.startswith("cache://registered_1/seg-") for i in ids)
+        assert all(i.startswith("cache://scratch/@fields/seg-") for i in ids)
         assert first is not None and second is not None
 
     def test_source_id_without_client_raises(self):

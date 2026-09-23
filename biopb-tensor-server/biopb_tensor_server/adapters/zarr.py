@@ -68,13 +68,42 @@ def upload_state(zattrs: Any) -> Optional[str]:
     return state if isinstance(state, str) else None
 
 
-def with_upload_state(zattrs: dict, state: str) -> dict:
-    """*zattrs* with the upload marker set to *state* (a copy; the input is not touched)."""
+def with_upload_state(
+    zattrs: dict, state: str, expires_at: Optional[float] = None
+) -> dict:
+    """*zattrs* with the upload marker set to *state* (a copy; input untouched).
+
+    The rest of the marker is **kept**: ``_publish_store`` rewrites the state
+    over whatever is on disk, and a deadline granted at ``add_tensor`` must
+    survive reaching READY.
+
+    *expires_at* is unix seconds -- a wall clock, unlike the intervals
+    ``UploadProgress`` measures, because it is written down and has to mean the
+    same thing to the next life of the server.
+    """
     out = dict(zattrs)
     block = dict(out.get(UPLOAD_ATTR) or {})
-    block["upload"] = {"state": state}
+    upload = dict(block.get("upload") or {})
+    upload["state"] = state
+    if expires_at is not None:
+        upload["expires_at"] = float(expires_at)
+    block["upload"] = upload
     out[UPLOAD_ATTR] = block
     return out
+
+
+def upload_expires_at(zattrs: Any) -> Optional[float]:
+    """When the marker says this upload stops being served, or None for never.
+
+    Read back at adoption, so a lifetime outlives the process that granted it.
+    """
+    if not isinstance(zattrs, dict):
+        return None
+    upload = (zattrs.get(UPLOAD_ATTR) or {}).get("upload")
+    if not isinstance(upload, dict):
+        return None
+    deadline = upload.get("expires_at")
+    return float(deadline) if isinstance(deadline, (int, float)) else None
 
 
 def is_unfinished_upload(ctx: ClaimContext) -> bool:
@@ -90,18 +119,20 @@ def is_unfinished_upload(ctx: ClaimContext) -> bool:
 def is_upload_subsystem_store(ctx: ClaimContext) -> bool:
     """Whether the directory at *ctx* belongs to the upload subsystem.
 
-    A registered source is a ``.zarr`` group like any other, so nothing in its
-    shape stops a claim taking it -- and if it were taken, the same bytes would
-    reach the catalog twice: once under the id ``register_source`` minted, once
-    under a path hash of discovery's own. The rule that keeps them apart is
-    ``write_dir`` being outside every discovery root; this is the second line,
-    for a ``write_dir`` misplaced inside one (``write_dir_under_root`` warns).
+    An uploaded tensor's store is a ``.zarr`` group like any other, so nothing
+    in its shape stops a claim taking it -- and if it were taken, the same
+    bytes would reach the catalog twice: once as a tensor of the source it was
+    added to, once as a source of its own under a path hash of discovery's. The
+    rule that keeps them apart is ``write_dir`` being outside every discovery
+    root; this is the second line, for a ``write_dir`` misplaced inside one
+    (``write_dir_under_root`` warns).
 
-    Recognized by the ``biopb`` block the subsystem writes and nothing else
-    does (``adapters.registered.source_attrs``), so a user's own zarr group is
-    unaffected however it is laid out.
+    Keyed on the ``biopb`` block the subsystem writes and nothing else does
+    (``adapters.members.member_attrs``), so a user's own zarr group is
+    unaffected however it is laid out -- and on the block rather than the
+    upload marker, because a member stays the subsystem's once it is filled.
     """
-    return "source" in _biopb_block(ctx)
+    return "member" in _biopb_block(ctx)
 
 
 def _biopb_block(ctx: ClaimContext) -> dict:
@@ -128,7 +159,7 @@ class ZarrAdapter(WritableSource, TensorAdapter):
     For remote storage, uses zarr.FSStore with fsspec filesystem.
 
     Writable: a chunk-aligned ``put_chunk`` lands in the store. Only an adapter
-    minted as an upload (``adapters.registered.create_member``,
+    minted as an upload (``adapters.fields.create_field_upload``,
     ``adapters.labels.create_label_upload``) tracks one; a catalogued store
     accepts writes untracked.
 

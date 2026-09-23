@@ -60,8 +60,9 @@ slash-free.
 `labels/` and stays that way, because it is NGFF's and not ours; nothing derives
 one name from the other. What the marker buys is that an attached tensor's id
 can never collide with a native one: `<source_id>/<field>` is exactly the shape
-of a native tensor id, so a field named `labels` -- or, once fields attach to a
-discovered source, one named `0` -- would otherwise shadow the file's own scene.
+of a native tensor id, so a field named `labels` -- or one named `0` -- would
+otherwise shadow the file's own scene. Nothing the upload path mints wears that
+shape any more, so a bare id always names a tensor some format produced.
 A scene may plausibly be called `labels`; none is plausibly called `@labels`.
 See `core/attached.py`.
 

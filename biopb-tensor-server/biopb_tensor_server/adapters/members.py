@@ -1,8 +1,8 @@
-"""What a member of a registered source carries, whatever format it is in.
+"""What a member directory carries, whatever format it is in.
 
-A member is one uploaded tensor under its source's directory
+A member is one uploaded tensor's store, under ``<write_dir>/fields/``.
 There are two layouts -- an OME-Zarr
-image group (``adapters.registered.ZarrMember``) and a segment store
+image group (``adapters.member_formats.ZarrMember``) and a segment store
 (``adapters.cache_member.CacheMember``) -- and this is the vocabulary they
 share: the bookkeeping block, the upload marker, and how a directory is read
 back as one format or the other.
@@ -17,7 +17,11 @@ import json
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from biopb_tensor_server.adapters.zarr import read_zattrs, with_upload_state
+from biopb_tensor_server.adapters.zarr import (
+    read_zattrs,
+    upload_expires_at,
+    with_upload_state,
+)
 
 __all__ = [
     "MEMBER_ATTR",
@@ -25,6 +29,7 @@ __all__ = [
     "member_attrs",
     "member_marker",
     "read_member_version",
+    "upload_expires_at",
 ]
 
 #: The ``biopb`` sub-block a member's metadata file carries, beside the upload
@@ -38,16 +43,23 @@ MEMBER_ATTR = "member"
 MEMBER_DESCRIPTOR = "descriptor.json"
 
 
-def member_attrs(content_version: bytes, state: str) -> dict:
+def member_attrs(
+    content_version: bytes, state: str, expires_at: Optional[float] = None
+) -> dict:
     """The ``biopb`` block a member's metadata file carries.
 
     The upload marker and the member's own token, in one block: a crash before
     READY leaves a directory the boot sweep recognizes and removes, and the
     token is what namespaces the member's chunk ids against a name reclaimed
     after a discard. Identical for both formats, so the sweep reads one shape.
+
+    *expires_at* records the member's deadline with the member, so it survives
+    the process that granted it (``zarr.with_upload_state``).
     """
     return with_upload_state(
-        {"biopb": {MEMBER_ATTR: {"content_version": content_version.hex()}}}, state
+        {"biopb": {MEMBER_ATTR: {"content_version": content_version.hex()}}},
+        state,
+        expires_at,
     )
 
 

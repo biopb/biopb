@@ -38,9 +38,20 @@ def close_adapter(adapter: Optional[SourceAdapter]) -> None:
     instead of a silent skip (biopb/biopb#71). Never raises -- shutdown and
     unregister must not fail on a balky adapter, and the registry also accepts
     non-inheriting test doubles.
+
+    **Releases what was attached to the source as well.** An uploaded field or
+    a label set holds a store of its own that the source knows nothing about.
+    Done here, the mirror of :meth:`SourceRegistry.register` where the
+    attaching happens, rather than in a ``close()`` override each adapter with
+    handles of its own would have to remember to chain up to.
     """
     if adapter is None:  # unregister of an id that was never registered
         return
+    for tensor in getattr(adapter, "attached_tensors", {}).values():
+        try:
+            tensor.close()
+        except Exception:  # cleanup must not fail
+            logger.debug("error closing attached tensor", exc_info=True)
     try:
         adapter.close()
     except Exception:  # cleanup must not fail
@@ -113,30 +124,6 @@ class SourceRegistry:
             self._sources[source_id] = adapter
         logger.debug(f"Registered source: {source_id}")
         return adapter
-
-    def register_new(
-        self, source_id: str, adapter: SourceAdapter
-    ) -> Optional[SourceAdapter]:
-        """:meth:`register`, refused if *source_id* is already taken.
-
-        Returns the registered adapter, or ``None`` when the id is held -- by
-        anything, a live upload or a sealed one. Atomic, so two concurrent
-        creates of one name cannot both be told they own it. The caller still
-        owns *adapter* on a refusal and closes it.
-
-        Only ``register_source`` calls this rather than :meth:`register`
-        directly: a minted source id must not be able to displace one already
-        handed out, however unlikely the collision. Discovery and the reconciler still call
-        :meth:`register` (silent overwrite) because their source_id is
-        ``generate_source_id``'s hash of the resolved source URL -- a
-        collision there is definitionally the same source being re-registered
-        (a rescan, a content update at the same path), never a distinct
-        source claiming a name that is not its own.
-        """
-        with self._lock:
-            if source_id in self._sources:
-                return None
-            return self.register(source_id, adapter)
 
     def unregister(self, source_id: str) -> Optional[SourceAdapter]:
         """Remove a source and release its adapter's resources.

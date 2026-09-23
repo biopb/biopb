@@ -2464,6 +2464,77 @@ def test_fetch_upstream_catalog_none_on_no_sql_catalog():
     assert complete is False
 
 
+class TestAnUpstreamScratchIsNotMirrored:
+    """An upstream's scratch source is its temp store, and not ours to re-serve.
+
+    Two reasons, either sufficient. **The id collides**: it is fixed, so a lone
+    upstream with no alias -- which keeps the verbatim id -- registers it
+    locally as ``scratch``, the id a writable proxy's own scratch source holds,
+    and registration overwrites in silence. **The contents are designed to
+    vanish**: everything on it carries a deadline set by that server's policy.
+    """
+
+    ROWS = [
+        {"source_id": "zarr_a1b2c3", "source_url": "file:///d/a.zarr", "tensors": []},
+        {
+            "source_id": "scratch",
+            "source_url": "file:///w/fields/scratch",
+            "tensors": [],
+        },
+        {"source_id": "aics_ff00", "source_url": "file:///d/b.czi", "tensors": []},
+    ]
+
+    class _FakeClient:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def query_sources(self, sql, format="records"):  # noqa: A002 - fakes the real client's public `format` signature
+            if "source_url" in sql:
+                return [dict(r) for r in self._rows]
+            return [{"source_id": r["source_id"]} for r in self._rows]
+
+    def test_the_bulk_catalog_leaves_it_out(self):
+        from biopb_tensor_server.adapters.remote_tensor import fetch_upstream_catalog
+
+        rows, complete = fetch_upstream_catalog(
+            self._FakeClient(self.ROWS), "grpc://lab:8815"
+        )
+
+        assert complete is True
+        assert [r["source_id"] for r in rows] == ["zarr_a1b2c3", "aics_ff00"]
+
+    def test_the_id_only_fallback_leaves_it_out_too(self):
+        """Both enumerators, because the fallback runs exactly when the bulk
+        fetch could not -- which is no reason to start mirroring it."""
+        from biopb_tensor_server.adapters.remote_tensor import (
+            list_upstream_source_ids,
+        )
+
+        ids = list_upstream_source_ids(self._FakeClient(self.ROWS), "grpc://lab:8815")
+
+        assert ids == ["zarr_a1b2c3", "aics_ff00"]
+
+    def test_naming_it_outright_is_refused_rather_than_skipped(self):
+        """The single-source url form is a deliberate request, so it gets an
+        answer rather than an empty expansion."""
+        from biopb_tensor_server.core.config import SourceConfig
+        from biopb_tensor_server.sources.resolve import _discover_tensor_server
+
+        source = SourceConfig(url="grpc://lab:8815/scratch", type="tensor-server")
+
+        with pytest.raises(ValueError, match="temp store"):
+            _discover_tensor_server(source, None)
+
+    def test_a_local_source_merely_named_like_it_is_untouched(self):
+        """The rule is the exact id, not a prefix: a discovered source's id is
+        ``<type>_<hex>``, and nothing else is special."""
+        from biopb_tensor_server.adapters.remote_tensor import mirrorable_upstream_id
+
+        assert mirrorable_upstream_id("scratch") is False
+        assert mirrorable_upstream_id("scratchpad") is True
+        assert mirrorable_upstream_id("zarr_scratch") is True
+
+
 def test_id_enumeration_raises_rather_than_degrading():
     """A catalog-less upstream surfaces as the error it is.
 

@@ -64,6 +64,7 @@ from biopb_tensor_server.adapters.zarr import (
     UPLOAD_PENDING,
     UPLOAD_READY,
     read_zattrs,
+    upload_expires_at,
     upload_state,
     with_upload_state,
 )
@@ -290,7 +291,11 @@ def sidecar_dir(labels_dir: Path, source_id: str) -> Path:
 
 
 def sidecar_attrs(
-    image_field: str, content_version: bytes, *, state: str = UPLOAD_READY
+    image_field: str,
+    content_version: bytes,
+    *,
+    state: str = UPLOAD_READY,
+    expires_at: Optional[float] = None,
 ) -> dict:
     """The ``biopb`` block a sidecar's root ``.zattrs`` carries.
 
@@ -298,8 +303,12 @@ def sidecar_attrs(
     marker rides in the same block: ``pending`` from create, flipped when the
     upload reaches READY (``ZarrAdapter._publish_store``), and
     :func:`sidecar_label_sets` attaches nothing that is not ``ready``.
+
+    *expires_at* records the set's deadline with the set, in the same place and
+    shape a member records its own (``members.member_attrs``), so the boot sweep
+    reads either without knowing which it has.
     """
-    attrs = with_upload_state({}, state)
+    attrs = with_upload_state({}, state, expires_at)
     attrs["biopb"][SIDECAR_ATTR] = {
         "image_field": image_field,
         "content_version": content_version.hex(),
@@ -346,6 +355,9 @@ def sidecar_label_sets(source_id: str, labels_dir: Path) -> Dict[str, LabelSetAd
             # ``write_dir``, so it is still the server's to delete
             # (``delete_store``) -- unlike a label group inside a user's file.
             label_set._upload_store_path = store
+            # The deadline outlives the upload record, so an adopted set is
+            # still swept on time (``WritableSource.expired``).
+            label_set._expires_at = upload_expires_at(zattrs)
             sets[label_field(image_field, name)] = label_set
     return sets
 
@@ -360,6 +372,7 @@ def create_label_upload(
     *,
     labels_dir: Path,
     metadata: Optional[dict] = None,
+    expires_at: Optional[float] = None,
 ) -> LabelSetAdapter:
     """Mint the sidecar for a new uploaded set on *parent* and track its upload.
 
@@ -370,6 +383,10 @@ def create_label_upload(
     boundary; *desc* is the request in canonical order (the boundary refuses
     any other), and is filled in with the image's axes when it named none --
     in place, because it is also the descriptor the client is answered with.
+
+    *expires_at* is the set's deadline, recorded with the store. A set is an
+    uploaded tensor like any other here, so a source that caps lifetimes caps
+    this one too.
 
     Raises ``ValueError`` for a request the kind cannot serve -- an
     unresolved parent, a reserved name, a dtype that is not an unsigned
@@ -447,7 +464,12 @@ def create_label_upload(
     zattrs = {
         **minimal_ome_metadata(desc),
         "image-label": image_label,
-        **sidecar_attrs(parsed.image_field, content_version, state=UPLOAD_PENDING),
+        **sidecar_attrs(
+            parsed.image_field,
+            content_version,
+            state=UPLOAD_PENDING,
+            expires_at=expires_at,
+        ),
     }
     store = sidecar_dir(labels_dir, parent.source_id) / f"{parsed.name}.zarr"
     # Exclusive, like a member's store: the directory must be
@@ -481,7 +503,7 @@ def create_label_upload(
         parent_array_id=join_fields(parent.source_id, parsed.image_field),
     )
     adapter._upload_store_path = store
-    adapter.begin_upload(desc.shape, grid)
+    adapter.begin_upload(desc.shape, grid, expires_at)
     return adapter
 
 

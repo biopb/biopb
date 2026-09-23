@@ -66,8 +66,6 @@ from biopb.tensor.descriptor_pb2 import (
 from biopb.tensor.ticket_pb2 import (
     ChunkBounds,
     PutCommand,
-    RegisterSource,
-    RegisterSourceResult,
     SetUploadStatus,
     TensorTicket,
 )
@@ -85,6 +83,7 @@ from biopb_tensor_server.adapters.fields import (
     upload_attacher,
 )
 from biopb_tensor_server.adapters.labels import labels_root, sidecar_attacher
+from biopb_tensor_server.adapters.scratch import DEFAULT_SCRATCH_TTL
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.core.adapter_base import (
     SourceAdapter,
@@ -375,16 +374,14 @@ _UPLOAD_TARGETS = {
 }
 
 
-def _roi_source_id(array_id: str) -> str:
-    """The source an annotation's tensor belongs to, for authorization.
+def _require_array_id(array_id: str) -> None:
+    """Refuse an annotation request that names no tensor.
 
-    Same split-on-the-first-'/' rule the ticket path uses: array_id is
-    authoritative, source_id is the prefix before the first '/'.
+    Authorization takes the whole ``array_id``
+    (``TensorFlightServer._grants``); this is only the emptiness check.
     """
     if not array_id:
         raise ValueError("array_id is required")
-    source_id, _ = split_array_id(array_id)
-    return source_id
 
 
 class TensorFlightServer(flight.FlightServerBase):
@@ -442,6 +439,7 @@ class TensorFlightServer(flight.FlightServerBase):
         tls_cert_chain: Optional[bytes] = None,
         tls_private_key: Optional[bytes] = None,
         upload_ttl: float = DEFAULT_UPLOAD_TTL,
+        scratch_ttl: float = DEFAULT_SCRATCH_TTL,
         **kwargs,
     ):
         """Initialize the Flight server.
@@ -456,6 +454,9 @@ class TensorFlightServer(flight.FlightServerBase):
             upload_ttl: Seconds before a PENDING upload with no writes is
                 discarded and a discarded one is unregistered
                 (``UploadManager.reap``); 0 disables the sweep.
+            scratch_ttl: Ceiling, in seconds, on how long a tensor uploaded to
+                the scratch source is kept, applied to an upload that asked for
+                no lifetime too. 0 keeps them until someone discards them.
             metadata_db: The catalog -- the browse surface behind the
                 ``catalog`` and ``roi`` flights. ``None`` builds a catalog-less
                 server: its sources are addressed by ``source_id`` and served,
@@ -537,13 +538,11 @@ class TensorFlightServer(flight.FlightServerBase):
         # What a crashed server left half-written goes before anything can
         # register it: the caller's discovery scan runs after this returns.
         self.uploads.discard_unfinished_stores()
-        # ...and what it left *finished* comes back. Nothing discovers
-        # write_dir, so this pass is the only thing that re-registers a source
-        # the server minted in an earlier life (biopb/biopb#1048). Still a
-        # separate walk over a separate subtree -- the sweep takes the
-        # single-store kinds, this takes the collections -- and folding the two
-        # into one pass is what the member sweep will want.
-        self.uploads.adopt_registered_sources()
+        # The scratch source, on any server that can be written to. Registered
+        # rather than discovered, like everything under write_dir, and before
+        # mark_ready so it is never missing from a server that is serving.
+        if writable:
+            self.uploads.install_scratch(scratch_ttl if scratch_ttl > 0 else None)
         # Reclaims dead uploads and aged tombstones (``UploadManager.reap``);
         # stopped in ``shutdown``.
         self.uploads.start_sweep()
@@ -743,21 +742,30 @@ class TensorFlightServer(flight.FlightServerBase):
         )
 
     def _grants(
-        self, provided: Optional[str], action: str, source_id: str
+        self, provided: Optional[str], action: str, array_id: str
     ) -> Optional[bool]:
-        """Does *provided* carry a narrow grant covering (*action*, *source_id*)?
+        """Does *provided* carry a narrow grant covering (*action*, *array_id*)?
 
-        ``None`` means the source carries no grant at all, which is not a
-        refusal -- it is "this object has opted into nothing, so the ordinary
-        rule applies". ``False`` is a real refusal.
+        ``None`` means nothing on the way to this tensor carries a grant, which
+        is not a refusal -- it is "this object has opted into nothing, so the
+        ordinary rule applies". ``False`` is a real refusal.
 
-        Today a grant is a token on the adapter covering both reads of its own
-        source, so the body is an equality test. A grant table or a signed
-        token (biopb/biopb#1048) replaces this body and nothing else: call
-        sites ask here rather than comparing tokens themselves.
+        **Two places can carry one, and the source is asked first.** A grant on
+        the source covers every tensor in it, which is what the embedded result
+        cache wants, its source being one result; a grant on an attached tensor
+        covers that tensor alone, which is what an uploaded intermediate wants,
+        since many share one source and each had a different producer. A source
+        that granted itself away has already decided for its tensors.
+
+        A grant table or a signed token (biopb/biopb#1048) replaces this body
+        and nothing else: call sites ask here rather than comparing tokens
+        themselves.
         """
+        source_id, _ = split_array_id(array_id)
         adapter = self.sources.get(source_id)
-        expected = adapter.capability_token if adapter is not None else None
+        if adapter is None:
+            return None
+        expected = adapter.capability_token or adapter.tensor_capability_token(array_id)
         if not expected:
             return None
         if provided is None or not hmac.compare_digest(provided, expected):
@@ -783,32 +791,36 @@ class TensorFlightServer(flight.FlightServerBase):
             raise flight.FlightUnauthenticatedError("Invalid or missing Bearer token")
 
     def _authorize_read(
-        self, context: flight.ServerCallContext, source_id: str, action: str
+        self, context: flight.ServerCallContext, array_id: str, action: str
     ) -> None:
-        """Full access, or a narrow grant covering this read of this source.
+        """Full access, or a narrow grant covering this read of this tensor.
 
         The server-wide token is checked first and grants everything, so a
         capability *adds* access rather than replacing it -- do not reorder
         these (biopb/biopb#1048).
 
-        A source carrying no grant is as open as the catalog is, so it falls
-        through to :meth:`_authorize`. A source carrying one stays gated even in
+        Takes the whole ``array_id``, not its source half: a grant may sit on
+        one attached tensor (:meth:`_grants`), and only the full id tells it
+        from its siblings.
+
+        A tensor nothing has granted is as open as the catalog is, so it falls
+        through to :meth:`_authorize`. One carrying a grant stays gated even in
         local mode: that is why the embedded result cache can mint them on a
         server with no server-wide token at all.
 
-        Knowing a source_id is not what this gates -- a private source may still
+        Knowing an array_id is not what this gates -- a private tensor may still
         be catalogued. Reading it is.
         """
         provided = self._presented_token(context)
         if self._has_full_access(provided):
             return
-        granted = self._grants(provided, action, source_id)
+        granted = self._grants(provided, action, array_id)
         if granted:
             return
         if granted is None:
             self._authorize(context)
             return
-        raise flight.FlightUnauthenticatedError("Invalid or missing source token")
+        raise flight.FlightUnauthenticatedError("Invalid or missing capability token")
 
     @staticmethod
     def _parse(
@@ -1066,10 +1078,6 @@ class TensorFlightServer(flight.FlightServerBase):
         return [
             flight.ActionType("health", "Health check - returns server status JSON"),
             flight.ActionType(
-                "register_source",
-                "Mint an empty source to add tensors to; answers its source_id",
-            ),
-            flight.ActionType(
                 "add_tensor",
                 "Add a tensor to a source that already exists; answers its descriptor",
             ),
@@ -1173,21 +1181,6 @@ class TensorFlightServer(flight.FlightServerBase):
 
             req_desc = TensorDescriptor.FromString(action.body.to_pybytes())
             yield self.uploads.add_tensor(req_desc).SerializeToString()
-        elif action.type == "register_source":
-            self._authorize(context)
-            if not self._writable:
-                raise flight.FlightUnauthenticatedError("Server not in write mode")
-
-            # Every field is optional: an empty body asks for a source with a
-            # minted name and no metadata, which is the common case.
-            req = self._parse(
-                RegisterSource(),
-                action.body.to_pybytes(),
-                "register_source request",
-                allow_empty=True,
-            )
-            source_id = self.uploads.register_source(req.name, req.metadata_json)
-            yield RegisterSourceResult(source_id=source_id).SerializeToString()
         elif action.type == "set_upload_status":
             self._authorize(context)
             if not self._writable:
@@ -1725,7 +1718,7 @@ class TensorFlightServer(flight.FlightServerBase):
         if not source_id:
             raise flight.FlightServerError("tensor_read: array_id is required")
 
-        self._authorize_read(context, source_id, READ_PIXELS)
+        self._authorize_read(context, read_opt.array_id, READ_PIXELS)
         mask = read_mask(read_opt)
 
         # Reduce the request array_id to the within-source field -- or None =
@@ -1963,8 +1956,9 @@ class TensorFlightServer(flight.FlightServerBase):
         with self.activity.serving_request():
             logger.debug(f"do_get: chunk_id={tensor_ticket.chunk_id[:16]}...")
 
-            source_id = routing_array_id(tensor_ticket.chunk_id).split("/")[0]
-            self._authorize_read(context, source_id, READ_PIXELS)
+            self._authorize_read(
+                context, routing_array_id(tensor_ticket.chunk_id), READ_PIXELS
+            )
 
             adapter = self._get_adapter_for_chunk(tensor_ticket.chunk_id)
 
@@ -2005,9 +1999,8 @@ class TensorFlightServer(flight.FlightServerBase):
         ``sets`` (JSON) ride the stream's schema metadata."""
         db = self._require_annotations()
         try:
-            self._authorize_read(
-                context, _roi_source_id(req.array_id), READ_ANNOTATIONS
-            )
+            _require_array_id(req.array_id)
+            self._authorize_read(context, req.array_id, READ_ANNOTATIONS)
             rois, truncated = db.list_rois(req.array_id, req.set_name)
             sets = [
                 {"set_name": name, "count": count, "reserved": is_reserved_set(name)}
