@@ -3,20 +3,15 @@
 
 Companion to :mod:`biopb_tensor_server.adapters._ome_rois`, which imports
 every OTHER OME-XML shape kind as an annotation and drops a ``<Mask>`` (a
-``BinData`` bitmap is not annotation geometry). It IS pixels, though, and
-this is where they become the label tensor the design
-(``docs/label-tensors.md``, "Rasterizing OME masks") describes: one tensor
+``BinData`` bitmap is not annotation geometry). This module reads the
+``<Mask>`` elements and rasterizes them into a label tensor: one tensor
 per image, id ``<image>/labels/@ome``, whose label value is the 1-based
-index of the mask's ROI in that image's own ``roi_refs`` order -- stable,
-because it comes from the metadata, exactly as ``_ome_rois`` already relies
-on for its own join. Later ROI wins where masks overlap, which the same
-order gives for free: shapes are painted in ``roi_refs`` order.
+index of the mask's ROI in that image's own ``roi_refs`` order.
 
 Pure by design, like its sibling: dict in (the OME metadata), a list of
 :class:`_MaskShape` per image out (:func:`masks_by_image`).
-:class:`RasterizedMaskAdapter` is the tensor adapter that reads one; nothing
-here touches a file, and nothing here is registered by discovery -- it is
-built only by ``OmeTiffAdapter.get_embedded_labels``.
+:class:`RasterizedMaskAdapter` is the tensor adapter. Read-only.
+Built only by ``OmeTiffAdapter.get_embedded_labels``.
 """
 
 from __future__ import annotations
@@ -238,20 +233,12 @@ class RasterizedMaskAdapter(NearestPyramidMixin, TensorAdapter):
     shapes this adapter was built with (:func:`masks_by_image`). A chunk
     read decodes only the masks whose bounding box and plane pin intersect
     the requested bounds; decoded bitmaps are memoized per shape for this
-    adapter's life, so a re-read (or a neighbouring chunk) never re-decodes
-    one. Read-only: replacing the set means re-registering the file.
+    adapter's life. Read-only: replacing the set means re-registering the file.
 
     ``dim_labels`` / ``shape`` are the image's own canonical axes with the
-    channel axis dropped (design, "Extent") -- already canonical, since they
-    come from the image's own descriptor, so this adapter never needs
-    permuting (:attr:`_normalizable_axes`). Y/X are located by *label*
-    (:func:`~biopb_tensor_server.core.axes.labeled_axis_index`), never by
-    position: an interleaved RGB(A) source keeps its trailing samples axis
-    (``S``) here (``label_extent`` drops only the channel axis), so Y/X are
-    NOT reliably the last two axes. A pin (``TheZ``/``TheT``) that names an
-    axis this image does not have is inert, exactly like ``TheC`` -- the
-    channel distinction is never carried here (design, "Extent") -- and so is
-    an ``S`` axis, which no mask pins and every mask therefore paints across.
+    channel axis dropped. Y/X are located by *label*
+    (:func:`~biopb_tensor_server.core.axes.labeled_axis_index`) and an interleaved
+    RGB(A) source keeps its trailing samples axis (``S``) here.
     """
 
     _normalizable_axes = False
@@ -280,11 +267,6 @@ class RasterizedMaskAdapter(NearestPyramidMixin, TensorAdapter):
         }
         self._bitmaps: Dict[int, np.ndarray] = {}
         self._unreadable_bitmap_ids: set[int] = set()
-        # Every mask's bbox and pins, as columns: a read narrows to the masks
-        # it touches in one vector test rather than a Python loop over all of
-        # them, which at ~1 us a mask was most of a tile read (0.85 of 1.17 ms
-        # at 800 masks, and growing with the count, not with the tile). A pin
-        # of -1 is "unpinned" -- ``_mask_shape`` never keeps a negative one.
         boxes = np.array([_bbox(m) for m in self._masks], dtype=np.int64)
         self._bx0, self._by0, self._bx1, self._by1 = boxes.reshape(-1, 4).T
         self._pins = {
@@ -351,9 +333,7 @@ class RasterizedMaskAdapter(NearestPyramidMixin, TensorAdapter):
         """Return a decoded bitmap, or ``None`` for a corrupt one.
 
         Compression is deliberately deferred until a read intersects the
-        shape.  A malformed stream must therefore fail at this per-shape
-        boundary, rather than making every chunk of the whole label set
-        unreadable.  Cache the failure too, both to avoid repeated decompression
+        shape. Cache the failure too, both to avoid repeated decompression
         attempts and to emit one useful warning instead of one per chunk.
         """
         key = id(shape)
