@@ -202,6 +202,40 @@ class TestRasterizedMaskAdapter:
         out = adapter.get_data(ChunkBounds(start=[0, 0, 0], stop=[3, 2, 2]))
         assert (out == 1).all()
 
+    def test_chunk_reads_tile_to_the_same_picture_as_one_full_read(self):
+        # Random masks, some pinned to a T or Z plane, some off the edge; every
+        # chunk of a tiling must agree with one full read, which is what the
+        # vectorized candidate test has to preserve against the per-mask paint.
+        rng = np.random.default_rng(7)
+        shape = (3, 2, 16, 16)  # T Z Y X
+        masks = []
+        for _ in range(40):
+            w, h = int(rng.integers(1, 6)), int(rng.integers(1, 6))
+            x, y = int(rng.integers(-2, 16)), int(rng.integers(-2, 16))
+            pins = {}
+            if rng.random() < 0.5:
+                pins["the_t"] = int(rng.integers(0, 3))
+            if rng.random() < 0.5:
+                pins["the_z"] = int(rng.integers(0, 2))
+            masks.append(_mask(x, y, w, h, rng.random((h, w)) < 0.7, **pins))
+        meta = _meta({"Image:0": masks})
+        adapter = self._adapter(
+            self._shapes(meta, dims=("T", "Z", "Y", "X")),
+            dim_labels=("T", "Z", "Y", "X"),
+            shape=shape,
+        )
+        full = adapter.get_data(ChunkBounds(start=[0, 0, 0, 0], stop=list(shape)))
+        assert full.max() > 0
+        for t in range(3):
+            for y0 in (0, 8):
+                for x0 in (0, 8):
+                    start = [t, 0, y0, x0]
+                    stop = [t + 1, 2, y0 + 8, x0 + 8]
+                    tile = adapter.get_data(ChunkBounds(start=start, stop=stop))
+                    np.testing.assert_array_equal(
+                        tile, full[t : t + 1, :, y0 : y0 + 8, x0 : x0 + 8]
+                    )
+
     def test_read_only(self):
         adapter = self._adapter([])
         with pytest.raises(WriteNotSupportedError):
