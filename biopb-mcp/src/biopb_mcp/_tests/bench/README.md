@@ -1,6 +1,6 @@
 # The benchmark — one runner, one case directory
 
-[`biopb-mcp/docs/knowledge.md`](../../../../docs/knowledge.md) §7. Put a model in
+[`biopb-mcp/docs/knowledge.md`](../../../../docs/knowledge.md) §6. Put a model in
 front of a **real** biopb session and score what comes out.
 
 ```sh
@@ -366,7 +366,7 @@ is for this case.
 
 **A case picks its fixture on the merits, not on whether it names a skill.**
 Both kinds run against either kind: what decides is whether the conclusion
-survives synthesis. `docs/fixtures.md` records a synthetic fixture that ranked
+survives synthesis. `docs/agent-bench.md` records a synthetic fixture that ranked
 two method families in the *opposite* order from real tissue — so a case whose
 question is "which method wins here" is written against an acquisition from the
 start, and `align-stack-by-features` is. A case whose question is arithmetic on

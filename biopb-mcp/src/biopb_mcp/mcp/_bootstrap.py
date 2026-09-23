@@ -29,7 +29,7 @@ def is_scratch_kernel():
     verifies it gets one too, and what the document needs it builds for itself
     (``biopb_mcp.workflow_env``). Anything bound here for free is something a
     workflow can pass on and then fail on
-    (docs/verification-scratch-kernel.md).
+    (docs/verify-workflow.md).
 
     No Qt either, so it needs no display at all -- an earlier design took the
     session's with ``napari.Viewer(show=False)``, which is why the note about

@@ -1,5 +1,7 @@
 # Uploads and the scratch source
 
+**Experimental.** The upload/scratch-source model may still change without notice.
+
 Scope: `biopb-tensor-server`, the Python and Java SDKs, and the MCP upload
 doc.
 
@@ -12,7 +14,7 @@ format** (`zarr://` or `cache://`, one lifecycle for both):
 | request | adds |
 |---|---|
 | `<scheme>://<source_id>/@fields/<name>` | a tensor to a source, discovered or `scratch` |
-| `zarr://<array_id>/@labels/<name>` | a label set to the tensor (binding and extent rules: `label-tensors.md`) |
+| `zarr://<array_id>/@labels/<name>` | a label set to the tensor (binding and extent rules: [label-tensors.md](label-tensors.md)) |
 
 Both carry a **marked segment**, whatever kind the source is: a bare field
 is a native tensor id, which only a format mints, so the upload path never
@@ -38,7 +40,7 @@ server with a `write_dir` serves one **scratch source**, at the fixed id
 `scratch` (`adapters/scratch.py`), constructed at startup and put on the
 catalog. It holds no bytes **and no tensors** of its own: what is added to it
 is an uploaded field like any other, under `<write_dir>/fields/scratch/`
-(Fields).
+(Uploaded fields).
 
 `write_dir`, not `writable`, is the switch: `writable` serves the Flight write
 verbs, and an in-process producer wants the scratch source without them. That

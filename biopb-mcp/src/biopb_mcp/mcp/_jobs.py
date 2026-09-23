@@ -295,7 +295,7 @@ class _Job(_OutputBuffer):
         # and code asking "is this the agent's?" quietly meant "the MCP one's".
         #   "mcp"   — the execute_code tool, driven by an external MCP client
         #   "user"  — a cell run by a human from the observe page
-        #   "chat"  — the in-process chat loop (docs/chat-client-evaluation.md)
+        #   "chat"  — the in-process chat loop (docs/chat-engines.md)
         # Set at submit and never inferred later — a job outlives the request
         # that started it, and poll/export read this long after that request is
         # gone. "chat" has no writer yet and is declared ahead of one on
