@@ -508,7 +508,8 @@ def test_set_chat_enabled_leaves_the_host_allowlists_alone(host):
 
 
 def test_busy_kernel_returns_200_marker(client, host):
-    host.execute.return_value = _raw(status="busy")
+    # A timeout means the main thread is running someone's cell: transient.
+    host.execute.return_value = _raw(status="timeout")
     r = client.get("/api/jobs")
     assert r.status_code == 200
     body = r.json()

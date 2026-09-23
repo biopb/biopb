@@ -137,11 +137,12 @@ async def json_body(request):
 def kernel_error(res):
     """Map a non-ok job round-trip to a response.
 
-    A ``busy`` kernel is transient (another quick call holds the lock) -> 200
-    with a ``busy`` marker the UI retries on; anything else -> 502.
+    A ``timeout`` is transient (the kernel's main thread is running someone's
+    cell, and the call runs once it frees) -> 200 with a ``busy`` marker the UI
+    retries on; anything else -> 502.
     """
     status = res.get("status")
-    if status == "busy":
+    if status == "timeout":
         return JSONResponse({"busy": True, "jobs": []})
     return JSONResponse(
         {

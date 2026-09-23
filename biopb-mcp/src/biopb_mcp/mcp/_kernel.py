@@ -6,12 +6,13 @@ the napari viewer, dask, and the TensorFlightClient.  Running agent code there
 be interrupted (``SIGINT``) or hard-restarted (group ``SIGKILL`` + respawn)
 without taking down the MCP server process.
 
-A single ``threading.RLock`` serializes access to the one shared kernel.
+Round trips go through :class:`_kernel_io.KernelChannels` and may overlap; the
+kernel runs them one at a time. ``threading.RLock`` ``_lock`` serializes the
+lifecycle only (start, restart, shutdown, respawn).
 """
 
 import logging
 import os
-import queue
 import re
 import signal
 import threading
@@ -19,6 +20,8 @@ import time
 from typing import List, Optional
 
 from biopb._lifecycle import deathwatch as _deathwatch, winjob as _winjob
+
+from ._kernel_io import KernelChannels, KernelGone
 
 logger = logging.getLogger(__name__)
 
@@ -179,7 +182,6 @@ class KernelHost:
         kernel_name: str = "python3",
         startup_timeout: float = 60.0,
         execute_timeout: float = 120.0,
-        busy_lock_timeout: float = 5.0,
         health_probe_code: Optional[str] = "print('viewer' in dir())",
         health_probe_expect: str = "True",
         cwd: Optional[str] = None,
@@ -197,7 +199,6 @@ class KernelHost:
         self._kernel_name = kernel_name
         self._startup_timeout = startup_timeout
         self._execute_timeout = execute_timeout
-        self._busy_lock_timeout = busy_lock_timeout
         self._health_probe_code = health_probe_code
         self._health_probe_expect = health_probe_expect
         self._cwd = cwd
@@ -209,7 +210,7 @@ class KernelHost:
         self._kernel_stdout = kernel_stdout
         self._kernel_stderr = kernel_stderr
         self._km = None
-        self._kc = None
+        self._io = None  # KernelChannels, one per launched kernel
         # Set once per _launch(), alongside self._km: the connection file (and
         # so the attach command) is fixed for the kernel's lifetime, and
         # health() is polled every few seconds, so it's cached rather than
@@ -296,7 +297,7 @@ class KernelHost:
         synchronous primitive: ensure_started() (start_kernel) and the tests call
         it. Taking the lock serializes it against a concurrent restart()/
         shutdown() (which take the same lock); without it both paths mutate the
-        shared _km/_kc/_pgid state concurrently and can leave the host attached to
+        shared _km/_io/_pgid state concurrently and can leave the host attached to
         the wrong kernel or leak an orphaned kernel process. The lock is
         reentrant, so the health probe's internal execute() — and ensure_started()
         calling start() while already holding the lock — re-enter without
@@ -426,9 +427,8 @@ class KernelHost:
                             pass
             self._pgid = self._capture_pgid()
             self._assign_kernel_to_job()
-            self._kc = self._km.client()
-            self._kc.start_channels()
-            self._kc.wait_for_ready(timeout=self._startup_timeout)
+            self._io = KernelChannels(self._km)
+            self._io.start(self._startup_timeout, self._km.is_alive)
             self._start_window_watch()
         except Exception:
             self._shutdown_current()
@@ -507,9 +507,8 @@ class KernelHost:
         Returns ``{stdout, result_text, error_text, status}`` where ``status``
         is one of ``ok``/``error`` (from the kernel reply), ``timeout`` (no
         reply within *timeout*; nothing is interrupted, see :meth:`_run_once`),
-        ``busy`` (the kernel
-        lock could not be acquired within ``busy_lock_timeout``), or
-        ``starting`` (the kernel is not ready yet — see below).
+        or ``starting`` (the kernel is not ready yet — see below). Calls from
+        several threads overlap; the kernel runs them in arrival order.
 
         The kernel is started on demand (start_kernel -> ensure_started), so a
         tool call may land while it is not running — idle/never-started, a failed
@@ -569,86 +568,47 @@ class KernelHost:
         )
 
     def _execute_internal(self, code: str, timeout: Optional[float] = None) -> dict:
-        """Lock-guarded execution, bypassing the readiness wait.
+        """Execution bypassing the readiness wait.
 
         Used by the startup health probe and bootstrap-error fetch, which run
         *before* the kernel is marked ready (so they must not wait on it).
         """
         if timeout is None:
             timeout = self._execute_timeout
-
-        acquired = self._lock.acquire(timeout=self._busy_lock_timeout)
-        if not acquired:
-            return _status_result(
-                "busy",
-                "Kernel is busy with another execution. Wait for it to "
-                "finish, or call restart_kernel to force-stop it.",
-            )
-        try:
-            return self._execute_locked(code, timeout)
-        finally:
-            self._lock.release()
-
-    def _execute_locked(self, code: str, timeout: float) -> dict:
-        if self._kc is None:
+        io = self._io
+        if io is None:
             return _status_result("error", "Kernel is not running.")
-        # Never wait on a kernel whose process is gone. Its zmq channels stay
-        # open (they reconnect to nothing), so execute_interactive would block
-        # for the full `timeout` -- 120s by default -- holding the lifecycle
-        # lock throughout. With a polling client (the observe page fetches
-        # /api/jobs every ~3s) those waits overlap end to end, the lock is never
-        # free, and the watchdog cannot get it to respawn: the kernel stays dead
-        # and every poll 502s until someone restarts by hand.
+        # Never wait on a kernel whose process is gone: its zmq channels stay
+        # open (they reconnect to nothing), so the call would wait out its whole
+        # timeout for a reply that cannot come.
         if not self.is_alive():
             return _status_result("error", "Kernel is not running.")
 
-        res = self._run_once(code, timeout)
+        res = self._run_once(io, code, timeout)
         # A preceding interrupt/error aborts requests already queued at the
         # kernel; "aborted" means our code never ran, so retry once.
         if res["status"] == "aborted":
-            import time
-
             time.sleep(0.2)
-            res = self._run_once(code, timeout)
+            res = self._run_once(io, code, timeout)
         return res
 
-    def _run_once(self, code: str, timeout: float) -> dict:
-        stdout_parts: List[str] = []
-        result_parts: List[str] = []
-        error_parts: List[str] = []
-
-        def output_hook(msg):
-            msg_type = msg["header"]["msg_type"]
-            content = msg["content"]
-            if msg_type == "stream":
-                stdout_parts.append(content.get("text", ""))
-            elif msg_type in ("execute_result", "display_data"):
-                text = content.get("data", {}).get("text/plain", "")
-                if text:
-                    result_parts.append(text)
-            elif msg_type == "error":
-                tb = "\n".join(content.get("traceback", []))
-                error_parts.append(_strip_ansi(tb))
-
+    def _run_once(self, io: KernelChannels, code: str, timeout: float) -> dict:
         try:
-            reply = self._kc.execute_interactive(
-                code,
-                store_history=False,
-                allow_stdin=False,
-                timeout=timeout,
-                output_hook=output_hook,
+            call = io.execute(code, timeout)
+        except KernelGone:
+            return _status_result(
+                "error", "The kernel was shut down or restarted during this call."
             )
-        except (queue.Empty, TimeoutError):
+        except TimeoutError:
             # No interrupt. Everything sent here is a short snippet (agent code
             # runs on a job thread), so overrunning means the main thread is
             # busy with something else -- a cell from an attached Jupyter
             # client, or a job's run_on_main slot -- and a SIGINT lands in
             # *that*. The request stays queued and runs once the thread frees;
             # its late reply is skipped by message id.
-            return {
-                "stdout": "".join(stdout_parts),
-                "result_text": "".join(result_parts),
-                "error_text": (
+            return _status_result(
+                "timeout",
+                (
                     f"No reply within {timeout}s: the kernel's main thread is "
                     "busy, most likely with a cell from a Jupyter client attached "
                     "to this kernel, or with a viewer call. Nothing was "
@@ -657,19 +617,18 @@ class KernelHost:
                     "destroys whatever the user is running, and their variables "
                     "and layers."
                 ),
-                "status": "timeout",
-            }
+            )
 
         return {
-            "stdout": "".join(stdout_parts),
-            "result_text": "".join(result_parts),
-            "error_text": "".join(error_parts),
-            "status": reply["content"].get("status", "unknown"),
+            "stdout": "".join(call.stdout),
+            "result_text": "".join(call.results),
+            "error_text": "".join(_strip_ansi("\n".join(tb)) for tb in call.errors),
+            "status": call.reply.get("status", "unknown"),
         }
 
     def interrupt(self):
-        """Send SIGINT to the kernel.  Does NOT take the lock so it can fire
-        while ``execute`` is blocked on a busy kernel."""
+        """Send SIGINT to the kernel. Takes no lock, so it can fire during a
+        restart's graceful close or any call waiting on a busy kernel."""
         if self._km is not None:
             try:
                 self._km.interrupt_kernel()
@@ -697,7 +656,7 @@ class KernelHost:
             self._teardown_reason = None
             try:
                 try:
-                    self._execute_locked(_GRACEFUL_CLOSE_SNIPPET, timeout=5.0)
+                    self._execute_internal(_GRACEFUL_CLOSE_SNIPPET, timeout=5.0)
                 except Exception:
                     logger.debug("graceful close failed on restart", exc_info=True)
 
@@ -731,7 +690,7 @@ class KernelHost:
             # the SIGKILL below; the short timeout keeps this off the Ctrl-C path.
             if self.is_alive():
                 try:
-                    self._execute_locked(_GRACEFUL_CLOSE_SNIPPET, timeout=2.0)
+                    self._execute_internal(_GRACEFUL_CLOSE_SNIPPET, timeout=2.0)
                 except Exception:
                     logger.debug("graceful close on shutdown failed", exc_info=True)
             self._shutdown_current()
@@ -747,8 +706,10 @@ class KernelHost:
         # health probe (restart/respawn) before dispatching again.
         self._ready.clear()
         try:
-            if self._kc is not None:
-                self._kc.stop_channels()
+            if self._io is not None:
+                # Fails any call still waiting, rather than leaving it to time
+                # out on a kernel that is going away.
+                self._io.close()
         except Exception:
             logger.debug("stop_channels failed", exc_info=True)
 
@@ -781,7 +742,7 @@ class KernelHost:
         except Exception:
             logger.debug("cleanup_resources failed", exc_info=True)
 
-        self._kc = None
+        self._io = None
         self._pgid = None
         self._close_death_pipe()
         self._close_window_pipe()
@@ -893,13 +854,13 @@ class KernelHost:
 
         Acts only on a *positive* "window gone" reading from a healthy, idle
         kernel. Skipped (return False, retry next tick) when: an intentional
-        stop is in flight; the kernel isn't ready (mid (re)spawn); or the kernel
-        is busy -- a job holds the lock, the window is in use, and we must
-        neither contend with it nor abort it. A busy/timeout/error probe is
-        inconclusive and likewise retried; only a clean ``False`` reading (the
-        Qt window's C++ object is gone) triggers teardown. Unlike the POSIX byte
-        signal, this cannot fire mid-job (the probe can't run while the lock is
-        held) -- the close is detected on the next idle tick instead.
+        stop is in flight; the kernel isn't ready (mid (re)spawn); or its main
+        thread is busy -- a probe would only queue behind whatever holds it, one
+        more per tick. A timeout/error probe is inconclusive and likewise
+        retried; only a clean ``False`` reading (the Qt window's C++ object is
+        gone) triggers teardown. An agent job on its worker thread does not
+        hold the main thread, so, like the POSIX byte signal, this can fire
+        mid-job and stop it.
         """
         if self._stopping or not self._ready.is_set() or self.is_busy():
             return False
@@ -957,10 +918,9 @@ class KernelHost:
                     continue
                 death_seen = True
                 # Withdraw readiness *before* contending for the lock. execute()
-                # gates on _ready without taking the lock, so clearing it here
-                # turns in-flight tool calls into structured not-ready results
-                # rather than more lock acquisitions -- otherwise the respawn
-                # deadlocks against the very traffic it exists to rescue.
+                # gates on _ready, so clearing it here turns new tool calls
+                # into structured not-ready results instead of waits on a
+                # kernel that cannot answer.
                 self._ready.clear()
             # Confirm and act under the lock so we never race an in-flight
             # restart()/shutdown().
@@ -1031,7 +991,7 @@ class KernelHost:
         return env.get("DISPLAY") if env.get("BIOPB_VIRTUAL_DISPLAY") else None
 
     def health(self) -> dict:
-        """Liveness summary for server_status (cheap; takes no lock)."""
+        """Liveness summary for server_status (cheap; no kernel round trip)."""
         return {
             "alive": self.is_alive(),
             "ready": self._ready.is_set(),
@@ -1062,11 +1022,12 @@ class KernelHost:
             return False
 
     def is_busy(self) -> bool:
-        acquired = self._lock.acquire(blocking=False)
-        if acquired:
-            self._lock.release()
-            return False
-        return True
+        """Whether the kernel's main thread is running something, by its own
+        last published status -- any client's request, not only ours. An
+        agent job on its worker thread does not count: the request that
+        started it has returned."""
+        io = self._io
+        return io is not None and io.execution_state == "busy"
 
     def _kernel_pid(self):
         try:

@@ -1360,7 +1360,7 @@ async def server_status() -> str:
     if res.get("status") == "ok":
         lines.append("")
         lines.append(res.get("stdout", "").rstrip())
-    elif res.get("status") == "busy":
+    elif res.get("status") == "timeout":
         lines.append("  (kernel busy — dask/tensor/viewer status unavailable)")
     else:
         lines.append("")

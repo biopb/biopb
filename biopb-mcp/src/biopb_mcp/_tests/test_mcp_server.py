@@ -936,7 +936,7 @@ class TestUserActivityNote:
         # Nothing is acked on this path either, so the notice is deferred to the
         # next call rather than dropped.
         server_with_host.execute.side_effect = None
-        server_with_host.execute.return_value = _result(status="busy")
+        server_with_host.execute.return_value = _result(status="timeout")
         assert _writers._foreign_activity_note(server_with_host) == ""
 
     def test_execute_code_carries_the_note(self, server_with_host):
@@ -1213,7 +1213,7 @@ class TestInterruptRestart:
         # A busy kernel must never read as an unclaimed one: asking it who owns
         # it would fail *open* exactly when the holder has a job running, which
         # is when a stray restart costs the most.
-        _install_replies(server_with_host, returns=_result(status="busy"))
+        _install_replies(server_with_host, returns=_result(status="timeout"))
         _writers._claimed_by = "sess-A"
         try:
             with pytest.MonkeyPatch().context() as mp:
@@ -1366,9 +1366,9 @@ class TestServerStatus:
         assert "layers: 0" in result
 
     def test_handles_busy_kernel(self, server_with_host):
-        server_with_host.execute.return_value = _result(status="busy")
+        server_with_host.execute.return_value = _result(status="timeout")
         result = _tool(_server.server_status)
-        assert "busy" in result.lower()
+        assert "kernel busy — dask/tensor/viewer status unavailable" in result
 
     def test_no_sessions_or_bridge_sections(self, server_with_host):
         result = _tool(_server.server_status)

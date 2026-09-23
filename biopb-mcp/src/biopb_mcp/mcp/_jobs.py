@@ -1094,7 +1094,7 @@ def foreign_digest(for_origin="mcp"):
     A pure read: marking entries reported is :func:`ack_foreign_digest`, a
     **separate** call the caller makes only once the notice has actually reached
     it. Acking here instead would consume the notice on a round trip whose reply
-    never arrived — ``execute_interactive`` sends before it starts its clock, so
+    never arrived — the host sends before it starts its clock, so
     a probe that times out is still queued at the kernel and runs when the main
     thread frees up, setting the flag for a note nobody received.
     """

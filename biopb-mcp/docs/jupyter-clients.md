@@ -37,9 +37,9 @@ the file.
   output into the job's buffer, so a client sees the agent's code only if it
   opts into other-output, and never its output.
 
-The host's `RLock` is not part of this story. It guards the *client*, because
-`execute_interactive` discards iopub messages that are not its own; it does not
-order anything in the kernel.
+The host adds no ordering of its own. Its one threaded client routes every
+shell reply and iopub message to the call it answers (`mcp/_kernel_io.py`), so
+its round trips overlap and the kernel orders them with everyone else's.
 
 ## The rule: reject, never block, never reroute
 
@@ -237,18 +237,25 @@ costing nobody but the human who chose to wait. The gate and the record are
 unchanged. The lock holds ipykernel 6.31 and the dependency is unpinned;
 whether an interrupt reaches a subshell is unverified.
 
-**The host subscribes to iopub.** A reader thread in the host demuxes iopub
-by parent message id into records kept in the host process. With the
-`_JobStream` diversion removed, ipykernel attributes a worker thread's prints
-to the submit request, so a job's output streams in live and `poll_job` becomes
-a read of host memory: the observe page's polling stops sending execute
-requests into the kernel, the client `RLock` and its busy status lose their
-purpose (nothing can eat another request's iopub any more), and a poll can no
-longer overrun and SIGINT the kernel. Records survive a kernel restart and can
-hold rich outputs, so the in-kernel tee comes out again. This is a refactor of
-how the host talks to the kernel, orthogonal to subshells and to the gate,
-which stays in-kernel either way — only kernel code can refuse a request
-before it runs.
+**The host subscribes to iopub**, in three stages:
+
+1. *Transport (done).* A threaded client routes every reply and iopub message
+   by parent message id (`mcp/_kernel_io.py`). Round trips overlap instead of
+   queueing on a host lock, and "busy" is the kernel's own published status.
+2. *Records.* The kernel announces a job's start and end on iopub, under the
+   request that started it, and the host keeps the records. With the
+   `_JobStream` diversion removed, ipykernel attributes a worker thread's prints
+   to that request, so a job's output streams in live and `poll_job`, the
+   observe list, export and the foreign digest become reads of host memory: the
+   observe page's polling stops sending execute requests into the kernel.
+   Records survive a kernel restart and can hold rich outputs, so the in-kernel
+   tee comes out again.
+3. *Verification.* Scratch runs move onto the same records, with per-cell
+   boundary events, and the in-kernel output capture is deleted.
+
+This is a refactor of how the host talks to the kernel, orthogonal to
+subshells and to the gate, which stays in-kernel either way — only kernel code
+can refuse a request before it runs.
 
 ## Shape of the work
 

@@ -144,15 +144,14 @@ def _run_job_call(host, name: str, *args, timeout=None, **kwargs):
 async def _job_call(host, name: str, *args, timeout=None, **kwargs):
     """:func:`_run_job_call` off the event loop.
 
-    The round trip blocks: it waits on the kernel's lock (up to
-    ``kernel.busy_lock_timeout``) and then on the reply. Every surface in this
-    process shares one event loop -- ``/mcp``, the observe page, the chat
-    turn -- so a round trip made on it is not one caller waiting but all of
-    them: a five-second call leaves the observe page, ``/api/status`` and any
+    The round trip blocks until the kernel replies, which is as long as its
+    main thread is busy with something else. Every surface in this process
+    shares one event loop -- ``/mcp``, the observe page, the chat turn -- so a
+    round trip made on it is not one caller waiting but all of them: a
+    five-second call leaves the observe page, ``/api/status`` and any
     concurrent tool call unserved for five seconds.
 
-    The kernel host already expects concurrent callers -- its lock exists
-    because the tools and the observe API reach it at the same time -- so the
+    The kernel host takes calls from any thread and lets them overlap, so the
     thread is free of anything but the wait.
     """
     return await asyncio.to_thread(

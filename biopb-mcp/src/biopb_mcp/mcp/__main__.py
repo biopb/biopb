@@ -418,7 +418,6 @@ def _serve_http(config, port, view=False):
         kernel_name=get_setting(config, "kernel.name"),
         startup_timeout=get_setting(config, "kernel.startup_timeout"),
         execute_timeout=get_setting(config, "kernel.execute_timeout"),
-        busy_lock_timeout=get_setting(config, "kernel.busy_lock_timeout"),
         env=kernel_env,
         watchdog_interval=get_setting(config, "kernel.watchdog_interval"),
         watchdog_max_respawns=get_setting(config, "kernel.watchdog_max_respawns"),
@@ -440,7 +439,6 @@ def _serve_http(config, port, view=False):
             kernel_name=get_setting(config, "kernel.name"),
             startup_timeout=get_setting(config, "kernel.startup_timeout"),
             execute_timeout=get_setting(config, "kernel.execute_timeout"),
-            busy_lock_timeout=get_setting(config, "kernel.busy_lock_timeout"),
             env=scratch_env,
             # The session kernel's probe asks for `viewer`; this one has none by
             # design, so it asks for what a verification actually needs.

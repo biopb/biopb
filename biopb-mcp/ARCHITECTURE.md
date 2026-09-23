@@ -94,8 +94,9 @@ Shim (`--transport stdio`) is the interface the mcp clients (claude code) see, w
 The session owns a **single child Jupyter kernel** hosting the napari viewer,
 dask, and the tensor client. Agent code runs *in that kernel*, not on the MCP
 thread or napari's Qt loop — so a runaway execution can be interrupted or
-hard-restarted without killing the MCP server. A single `RLock` serializes access,
-held only for *quick* snippets, never during long compute.
+hard-restarted without killing the MCP server. The host's round trips are quick
+snippets that may overlap: one threaded client routes each reply and iopub
+message to the call it answers, and the kernel runs requests in arrival order.
 
 The kernel is **launched lazily, not at boot**, so a long-running server binds
 cheaply and never pops a napari viewer until user requested it; kernel-dependent

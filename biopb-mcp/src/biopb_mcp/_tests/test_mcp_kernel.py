@@ -90,20 +90,39 @@ class TestKernelControl:
         res = kernel.execute("print('survivor' in dir())")
         assert "False" in res["stdout"]
 
-    def test_busy_returns_busy_status(self, kernel):
-        import threading
-
-        kernel._busy_lock_timeout = 0.2
+    def test_calls_overlap_and_each_gets_its_own_output(self, kernel):
+        # No host-side lock: a second call is sent while the first runs, the
+        # kernel queues it, and neither call sees the other's output.
+        results = {}
 
         def run():
-            kernel.execute("import time; time.sleep(3)", timeout=10.0)
+            results["slow"] = kernel.execute(
+                "import time; time.sleep(1.5); print('slow')", timeout=10.0
+            )
+
+        t = threading.Thread(target=run)
+        t.start()
+        time.sleep(0.3)
+        assert kernel.is_busy()  # the kernel's own status, not a lock
+        fast = kernel.execute("print('fast')", timeout=10.0)
+        t.join(timeout=15.0)
+        assert fast["status"] == "ok" and fast["stdout"] == "fast\n"
+        assert results["slow"]["stdout"] == "slow\n"
+        assert not kernel.is_busy()
+
+    def test_a_call_in_flight_fails_fast_on_shutdown(self, kernel):
+        results = {}
+
+        def run():
+            results["res"] = kernel.execute("import time; time.sleep(30)", timeout=60.0)
 
         t = threading.Thread(target=run)
         t.start()
         time.sleep(0.5)
-        res = kernel.execute("print('x')")
-        assert res["status"] == "busy"
-        t.join(timeout=15.0)
+        kernel._shutdown_current()
+        t.join(timeout=10.0)
+        assert not t.is_alive(), "the call waited out its timeout"
+        assert results["res"]["status"] == "error"
 
 
 class TestKernelLifecycle:
@@ -151,18 +170,18 @@ class TestKernelLifecycle:
         host.start()
 
         calls = []
-        real_execute_locked = host._execute_locked
+        real_execute = host._execute_internal
         real_shutdown_current = host._shutdown_current
 
         def _spy_execute(code, timeout):
             calls.append(("execute", code, timeout))
-            return real_execute_locked(code, timeout)
+            return real_execute(code, timeout)
 
         def _spy_shutdown_current():
             calls.append(("shutdown_current",))
             return real_shutdown_current()
 
-        monkeypatch.setattr(host, "_execute_locked", _spy_execute)
+        monkeypatch.setattr(host, "_execute_internal", _spy_execute)
         monkeypatch.setattr(host, "_shutdown_current", _spy_shutdown_current)
 
         host.shutdown()
@@ -186,18 +205,18 @@ class TestKernelLifecycle:
         host.start()
 
         calls = []
-        real_execute_locked = host._execute_locked
+        real_execute = host._execute_internal
         real_shutdown_current = host._shutdown_current
 
         def _spy_execute(code, timeout):
             calls.append(("execute", code, timeout))
-            return real_execute_locked(code, timeout)
+            return real_execute(code, timeout)
 
         def _spy_shutdown_current():
             calls.append(("shutdown_current",))
             return real_shutdown_current()
 
-        monkeypatch.setattr(host, "_execute_locked", _spy_execute)
+        monkeypatch.setattr(host, "_execute_internal", _spy_execute)
         monkeypatch.setattr(host, "_shutdown_current", _spy_shutdown_current)
 
         try:
@@ -574,7 +593,7 @@ class TestStartRestartSerialization:
     """The launcher runs start() on a background thread, so a restart_kernel
     can land while the initial start() is still in _launch(). start() and
     restart() must serialize on the lifecycle lock — otherwise both mutate the
-    shared _km/_kc/_pgid state at once (wrong kernel / orphaned process)."""
+    shared _km/_io/_pgid state at once (wrong kernel / orphaned process)."""
 
     def test_restart_during_startup_is_serialized(self):
         import threading
@@ -926,7 +945,7 @@ class TestWindowClosePoll:
         assert host._teardown_reason is None
 
     def test_tick_skips_busy_kernel(self, monkeypatch):
-        # A running job holds the lock: never probe or tear down mid-job.
+        # A busy main thread would only queue the probe behind it, one per tick.
         host = self._host()
         host._ready.set()
         monkeypatch.setattr(host, "is_busy", lambda: True)
@@ -941,14 +960,14 @@ class TestWindowClosePoll:
         assert host._window_close_tick() is False
 
     def test_tick_inconclusive_probe_is_noop(self, monkeypatch):
-        # A busy/timeout/error probe must not be read as "window gone".
+        # A timeout/error probe must not be read as "window gone".
         host = self._host()
         host._ready.set()
         monkeypatch.setattr(host, "is_busy", lambda: False)
         monkeypatch.setattr(
             host,
             "_execute_internal",
-            lambda *a, **k: {"status": "busy", "stdout": ""},
+            lambda *a, **k: {"status": "timeout", "stdout": ""},
         )
         monkeypatch.setattr(
             host, "shutdown", lambda: pytest.fail("tore down on inconclusive probe")
@@ -1189,7 +1208,7 @@ class TestJupyterClientGate:
         res = gated.execute(
             "import biopb_mcp.mcp._kernel_gate as g; print(g._host_session)"
         )
-        assert res["stdout"].strip() == gated._kc.session.session
+        assert res["stdout"].strip() == gated._km.session.session
 
     def test_the_gate_is_armed_before_the_host_sends_anything(self):
         # No health probe, so the host never executes a thing: a gate that
@@ -1304,8 +1323,8 @@ class TestJupyterClientGate:
         statuses = []
         run_once = gated._run_once
 
-        def spy(code, timeout):
-            res = run_once(code, timeout)
+        def spy(io, code, timeout):
+            res = run_once(io, code, timeout)
             statuses.append(res["status"])
             return res
 

@@ -43,9 +43,9 @@ logger = logging.getLogger(__name__)
 # happened somewhere else (the observe page's, which clears it explicitly).
 #
 # **Recorded before the submit is sent, not after.** A reply can be lost while
-# the kernel goes on to claim and run the code anyway -- ``execute_interactive``
-# hands the request over before it starts its clock, so a timed-out call is still
-# queued and executes when the main thread frees up. Setting the mirror only on
+# the kernel goes on to claim and run the code anyway -- the host sends the
+# request before it starts its clock, so a timed-out call is still queued and
+# executes when the main thread frees up. Setting the mirror only on
 # the way back would leave it empty while the kernel is genuinely held, and an
 # empty mirror lets a stranger restart the session that just started. The window
 # is claimed first and corrected from whatever the kernel says, so the failure
@@ -271,8 +271,8 @@ def _ack_foreign_digest(host, digest, writer=None) -> None:
     on its way back to the agent.
 
     Split from the read because acking inside it consumed notices that were
-    never delivered: ``execute_interactive`` sends the request before it starts
-    its timeout clock, so a probe that times out is still queued at the kernel
+    never delivered: the host sends the request before it starts its timeout
+    clock, so a probe that times out is still queued at the kernel
     and runs when the main thread frees up — setting the flag for a note nobody
     received. Acking only after this process has parsed a reply keeps the
     guarantee that a notice is deferred, never dropped.
