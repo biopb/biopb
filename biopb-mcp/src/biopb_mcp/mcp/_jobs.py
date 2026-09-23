@@ -84,14 +84,13 @@ _HEAD_SCAN_CHARS = 4096
 
 # Attribution for a KeyboardInterrupt this runner did not raise (see _run). The
 # kernel ignores SIGINT except while servicing a message (ipykernel installs
-# default_int_handler only between its pre/post handler hooks), so the realistic
-# source is the one place that sends one: KernelHost._run_once interrupting the
-# kernel when a *quick* snippet overruns its timeout.
+# default_int_handler only between its pre/post handler hooks), and the host no
+# longer sends one on a timeout, so the realistic source is a Jupyter client
+# attached to this kernel interrupting it while the job held the main thread.
 _EXTERNAL_INTERRUPT_MSG = (
     "Stopped by an interrupt sent to the whole kernel, not by an error in this "
-    "code. Most likely a short tool call (server_status / poll_job / a "
-    "screenshot) overran its timeout and interrupted the kernel to unwedge it, "
-    "or a Jupyter client attached to this kernel sent an interrupt."
+    "code. Most likely a Jupyter client attached to this kernel sent it while "
+    "this job was running on the main thread (a viewer call)."
 )
 
 # How long run_on_main waits for the main thread to service a marshaled call
@@ -664,9 +663,7 @@ def _run(job, code):
         # *stop*, not a defect in the submitted code, so label and attribute it
         # rather than hand back a bare traceback -- the same reasoning that gave
         # interrupt_current its flag, applied to the door it does not own.
-        # Sharpest for a user cell: the agent is refused interrupt_current on
-        # one, yet an overrunning tool probe can still end it this way, and
-        # unlabeled it reads to the human as their own code breaking.
+        # Unlabeled, it reads as the code itself breaking.
         if not job.interrupted:
             job.interrupted = True
             job.cancel_reason = job.cancel_reason or _EXTERNAL_INTERRUPT_MSG

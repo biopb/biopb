@@ -1319,7 +1319,8 @@ async def server_status() -> str:
         # For the user: a notebook on this kernel shares its namespace. Its
         # cells are refused while a job runs and reported to the agent otherwise.
         lines.append(f"  connection_file: {health['connection_file']}")
-        lines.append(f"    attach a notebook: {health['attach_command']}")
+        if health.get("attach_command"):
+            lines.append(f"    attach a notebook: {health['attach_command']}")
 
     # Kernel-state summary: dead / failed / starting / not-started are mutually
     # exclusive (each implies ready is false), so report exactly one and return —

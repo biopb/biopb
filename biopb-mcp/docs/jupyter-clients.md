@@ -117,14 +117,18 @@ user. `KernelHost.health()` carries `connection_file` and `attach_command`;
 `server_status` prints both, and the observe page offers the command to copy:
 
 ```
-jupyter qtconsole --existing <runtime-dir>/kernel-biopb-<uuid>.json
+<session python> -m qtconsole --existing <runtime-dir>/kernel-biopb-<uuid>.json
 ```
 
-The command is built by the session child and quoted for its platform's shell
-(`shlex.quote`, or `list2cmdline` on Windows), since a Windows profile path
-can contain spaces. It works only on the machine the session runs on.
-
-qtconsole is already in the environment (a napari dependency).
+The command runs the session child's own interpreter: biopb installs ipykernel,
+`jupyter_core` and qtconsole (through napari-console) but no Jupyter front end,
+and its uv tool env puts none of their scripts on PATH, so a bare
+`jupyter qtconsole` finds nothing or another install's. It is quoted for the
+platform's shell (`shlex.join`, or `list2cmdline` on Windows), since a Windows
+profile path can contain spaces, and works only on the machine the session runs
+on. A frozen (PyInstaller) build reports no command, having no module tree to
+run `-m` against. A notebook from any other Jupyter install attaches with the
+connection file alone; the protocol does not care which environment the client runs in.
 
 ### What retires
 
@@ -142,11 +146,13 @@ sections carry over as they stand, because the record is the same `_Job`.
   pause (`_execute_locked`); the gate's test should land a poll on a refusal.
 - **A client's Ctrl-C** reaches the main thread only. If the agent's job is
   inside a `run_on_main` slot at that moment, the interrupt lands in the job,
-  which the runner labels as an external interrupt. That label names tool
-  probes as the likely source and should name a client too.
-- **A long human cell still holds the channel.** The host's tools queue behind
-  it and its 120 s timeout still applies. Unchanged from today; the gate does
-  not make it worse.
+  which the runner labels as an external interrupt naming an attached client.
+- **A long human cell holds the shell channel.** The host's calls queue behind
+  it and time out after 120 s (the observe page's poll among them). A timeout
+  sends **no interrupt**: the host once SIGINTed the kernel on one, from when
+  agent code ran on the main thread, and that landed in whatever held it — the
+  human's cell. The timed-out request stays queued and runs later; its late reply
+  is skipped by message id.
 - **A hard-killed session leaves its connection file behind** in the runtime
   dir, as any Jupyter kernel does; a clean shutdown removes it. Tests that kill
   a launcher set `JUPYTER_RUNTIME_DIR` so they do not litter the real one.

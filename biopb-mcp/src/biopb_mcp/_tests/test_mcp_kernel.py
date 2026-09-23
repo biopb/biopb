@@ -53,12 +53,17 @@ class TestKernelExecute:
         res = kernel.execute("print(my_var)")
         assert "99" in res["stdout"]
 
-    def test_timeout_interrupts(self, kernel):
-        res = kernel.execute("import time; time.sleep(10)", timeout=0.5)
+    def test_a_timeout_does_not_interrupt(self, kernel):
+        # Whatever holds the main thread past a timeout -- an attached client's
+        # cell, a job's viewer call -- is someone else's, so it runs on.
+        res = kernel.execute("import time; time.sleep(2); done = True", timeout=0.5)
         assert res["status"] == "timeout"
-        # Kernel survives and accepts new work afterwards.
-        res2 = kernel.execute("print('alive')", timeout=10.0)
-        assert "alive" in res2["stdout"]
+        assert "Nothing was interrupted" in res["error_text"]
+        # The next call queues behind it and sees it finished, not stopped; the
+        # timed-out request's late reply is not mistaken for this one's.
+        res2 = kernel.execute("print(done)", timeout=10.0)
+        assert res2["status"] == "ok"
+        assert res2["stdout"].strip() == "True"
 
 
 class TestKernelControl:
@@ -486,7 +491,7 @@ class TestHealth:
             # Where Jupyter tools look, not a tempfile.
             assert os.path.dirname(h["connection_file"]) == jupyter_runtime_dir()
             conn = h["connection_file"]
-            assert h["attach_command"].startswith("jupyter qtconsole --existing ")
+            assert h["attach_command"].endswith(f"-m qtconsole --existing {conn}")
             assert h["alive"] is True
             assert h["ready"] is True
             assert h["start_error"] is None
@@ -501,27 +506,36 @@ class TestHealth:
         assert not os.path.exists(conn)  # jupyter_client removes it on shutdown
 
     @pytest.mark.parametrize(
-        "osname, path, expected",
+        "osname, python, path, expected",
         [
             (
                 "posix",
+                "/home/a b/.local/share/uv/tools/biopb/bin/python",
                 "/home/a b/.local/share/jupyter/runtime/kernel-1.json",
-                "jupyter qtconsole --existing "
-                "'/home/a b/.local/share/jupyter/runtime/kernel-1.json'",
+                "'/home/a b/.local/share/uv/tools/biopb/bin/python' -m qtconsole "
+                "--existing '/home/a b/.local/share/jupyter/runtime/kernel-1.json'",
             ),
             (
                 "nt",
+                r"C:\Users\First Last\biopb\Scripts\python.exe",
                 r"C:\Users\First Last\AppData\Roaming\jupyter\runtime\kernel-1.json",
-                "jupyter qtconsole --existing "
-                r'"C:\Users\First Last\AppData\Roaming\jupyter\runtime\kernel-1.json"',
+                r'"C:\Users\First Last\biopb\Scripts\python.exe" -m qtconsole '
+                r'--existing "C:\Users\First Last\AppData\Roaming\jupyter'
+                r'\runtime\kernel-1.json"',
             ),
         ],
     )
-    def test_attach_command_quotes_for_the_platform_shell(
-        self, monkeypatch, osname, path, expected
+    def test_attach_command_runs_our_interpreter_quoted_for_the_shell(
+        self, monkeypatch, osname, python, path, expected
     ):
+        # Not a bare `jupyter`: biopb puts none on PATH.
         monkeypatch.setattr(_kernel.os, "name", osname)
+        monkeypatch.setattr(sys, "executable", python)
         assert _kernel.attach_command(path) == expected
+
+    def test_no_attach_command_from_a_frozen_build(self, monkeypatch):
+        monkeypatch.setattr(sys, "frozen", True, raising=False)
+        assert _kernel.attach_command("/tmp/kernel-1.json") is None
 
 
 class TestReadiness:
@@ -1261,3 +1275,13 @@ class TestJupyterClientGate:
         finally:
             gated._run_once = run_once
             self._stop_job(gated)
+
+    def test_a_host_timeout_leaves_a_long_foreign_cell_running(self, gated, foreign):
+        # A host call queued behind a client's long cell used to SIGINT it.
+        msg_id = foreign.execute("import time\nfor _ in range(40): time.sleep(0.05)")
+        time.sleep(0.5)
+        res = gated.execute("print(_jobs.jobs_view())", timeout=0.5)
+        assert res["status"] == "timeout"
+        reply = foreign.get_shell_msg(timeout=30)
+        assert reply["parent_header"]["msg_id"] == msg_id
+        assert reply["content"]["status"] == "ok"

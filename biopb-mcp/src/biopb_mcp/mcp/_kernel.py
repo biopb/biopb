@@ -76,20 +76,27 @@ def _runtime_connection_file() -> str:
 
 
 def attach_command(connection_file: Optional[str]) -> Optional[str]:
-    """The shell command that attaches qtconsole to *connection_file*, quoted
-    for this platform's shell: the runtime dir sits under a user profile,
-    which on Windows may contain spaces."""
-    if not connection_file:
+    """The shell command that attaches qtconsole to *connection_file*.
+
+    Run by this process's own interpreter: biopb installs qtconsole (through
+    napari) but puts no ``jupyter`` on PATH, so a bare ``jupyter qtconsole``
+    finds nothing, or another install's. Quoted for this platform's shell,
+    since a Windows profile path may contain spaces.
+    """
+    import sys
+
+    # A frozen build has no module tree to run `-m` against; the connection
+    # file alone still attaches any Jupyter install's client.
+    if not connection_file or getattr(sys, "frozen", False):
         return None
+    argv = [sys.executable, "-m", "qtconsole", "--existing", connection_file]
     if os.name == "nt":
         import subprocess
 
-        return subprocess.list2cmdline(
-            ["jupyter", "qtconsole", "--existing", connection_file]
-        )
+        return subprocess.list2cmdline(argv)
     import shlex
 
-    return f"jupyter qtconsole --existing {shlex.quote(connection_file)}"
+    return shlex.join(argv)
 
 
 def _status_result(status: str, error_text: str) -> dict:
@@ -492,8 +499,9 @@ class KernelHost:
         """Run *code* in the kernel and return a result dict.
 
         Returns ``{stdout, result_text, error_text, status}`` where ``status``
-        is one of ``ok``/``error`` (from the kernel reply), ``timeout`` (the
-        execution exceeded *timeout* and was interrupted), ``busy`` (the kernel
+        is one of ``ok``/``error`` (from the kernel reply), ``timeout`` (no
+        reply within *timeout*; nothing is interrupted, see :meth:`_run_once`),
+        ``busy`` (the kernel
         lock could not be acquired within ``busy_lock_timeout``), or
         ``starting`` (the kernel is not ready yet — see below).
 
@@ -625,14 +633,23 @@ class KernelHost:
                 output_hook=output_hook,
             )
         except (queue.Empty, TimeoutError):
-            self.interrupt()
+            # No interrupt. Everything sent here is a short snippet (agent code
+            # runs on a job thread), so overrunning means the main thread is
+            # busy with something else -- a cell from an attached Jupyter
+            # client, or a job's run_on_main slot -- and a SIGINT lands in
+            # *that*. The request stays queued and runs once the thread frees;
+            # its late reply is skipped by message id.
             return {
                 "stdout": "".join(stdout_parts),
                 "result_text": "".join(result_parts),
                 "error_text": (
-                    f"Execution exceeded {timeout}s and was interrupted. "
-                    "Wait for the kernel to settle, or call restart_kernel if "
-                    "it stays unresponsive (a blocking C call ignores SIGINT)."
+                    f"No reply within {timeout}s: the kernel's main thread is "
+                    "busy, most likely with a cell from a Jupyter client attached "
+                    "to this kernel, or with a viewer call. Nothing was "
+                    "interrupted, and this call will still run once it frees. "
+                    "Retry later. restart_kernel only if it never frees -- it "
+                    "destroys whatever the user is running, and their variables "
+                    "and layers."
                 ),
                 "status": "timeout",
             }

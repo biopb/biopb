@@ -778,11 +778,11 @@ class TestExecuteCode:
     def test_submit_timeout_surfaces_error(self, server_with_host):
         # The quick submit snippet itself timed out (kernel main thread wedged).
         server_with_host.execute.return_value = _result(
-            error_text="Execution exceeded 0.5s and was interrupted.",
+            error_text="No reply within 0.5s: the kernel's main thread is busy",
             status="timeout",
         )
         result = _tool(_server.execute_code, "x = 1")
-        assert "interrupted" in result
+        assert "main thread is busy" in result
 
     def test_inline_result_appends_window_closed_note(self, server_with_host):
         _install_replies(
