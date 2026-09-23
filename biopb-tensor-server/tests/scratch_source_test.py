@@ -61,12 +61,24 @@ class TestItIsThereBeforeAnythingAsks:
         readable and browsable."""
         assert writable_server.metadata_db.source_row_ipc(SCRATCH_SOURCE_ID) is not None
 
-    def test_a_read_only_server_has_none(self, tmp_path):
-        """A source nothing can be added to would be a listing with no use.
-        ``writable`` is the switch, not ``write_dir``."""
-        server = _serve(tmp_path, writable=False)
+    def test_a_server_with_nowhere_to_write_has_none(self, tmp_path):
+        """``write_dir`` is the switch, not ``writable``: with nowhere to put a
+        tensor a scratch source is one nothing can be added to."""
+        server = catalog_server(location="grpc://localhost:0", writable=True)
+        server.mark_ready()
         try:
             assert server.sources.get(SCRATCH_SOURCE_ID) is None
+        finally:
+            server.shutdown()
+            CacheManager.reset()
+
+    def test_a_read_only_server_still_has_one(self, tmp_path):
+        """Because an in-process producer uploads through ``uploads`` with the
+        Flight write path refused -- which is the embedded result cache
+        (``biopb-image-base``)."""
+        server = _serve(tmp_path, writable=False)
+        try:
+            assert server.sources.get(SCRATCH_SOURCE_ID) is not None
         finally:
             server.shutdown()
             CacheManager.reset()

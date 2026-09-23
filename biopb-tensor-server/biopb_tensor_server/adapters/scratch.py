@@ -1,4 +1,4 @@
-"""The scratch source: one per writable server, holding nothing of its own.
+"""The scratch source: one per ``write_dir``, holding nothing of its own.
 
 A producer writes an intermediate result to ``zarr://scratch/@fields/<name>``.
 The id is fixed (:data:`SCRATCH_SOURCE_ID`), so there is no container to mint
@@ -30,7 +30,8 @@ __all__ = ["DEFAULT_SCRATCH_TTL", "SCRATCH_SOURCE_ID", "ScratchSource"]
 #: ``ServerConfig.scratch_ttl``.
 DEFAULT_SCRATCH_TTL = 86400.0
 
-#: The scratch source's id, on every writable server. A plain word so a client
+#: The scratch source's id, on every server with somewhere to write. A plain
+#: word so a client
 #: can write it down; a discovered id is ``<type>_<hex>``
 #: (``discovery.generate_source_id``), so nothing collides with it.
 SCRATCH_SOURCE_ID = "scratch"
@@ -66,8 +67,7 @@ class ScratchSource(SourceAdapter):
     @classmethod
     def create_from_config(cls, config: Any) -> ScratchSource:
         raise NotImplementedError(
-            "the scratch source is the writable server's own, never configured "
-            "as a data source"
+            "the scratch source is the server's own, never configured as a data source"
         )
 
     def list_tensor_descriptors(self) -> List[TensorDescriptor]:

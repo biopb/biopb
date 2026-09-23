@@ -449,8 +449,12 @@ class TensorFlightServer(flight.FlightServerBase):
             token: The server-wide Bearer token (the catalog tier, and the
                 fallback for every source without a capability token of its
                 own). ``None`` disables it.
-            writable: Enable write mode for source creation and data upload
-            write_dir: Directory for zarr-backed uploaded sources (required if writable)
+            writable: Serve the Flight write path -- ``add_tensor``,
+                ``set_upload_status`` and DoPut. Independent of *write_dir*: an
+                in-process producer uploads through ``self.uploads`` directly
+                and wants those actions refused on the wire.
+            write_dir: Directory for uploaded tensors, and what decides whether
+                this server has a scratch source at all (required to upload)
             upload_ttl: Seconds before a PENDING upload with no writes is
                 discarded and a discarded one is unregistered
                 (``UploadManager.reap``); 0 disables the sweep.
@@ -538,11 +542,13 @@ class TensorFlightServer(flight.FlightServerBase):
         # What a crashed server left half-written goes before anything can
         # register it: the caller's discovery scan runs after this returns.
         self.uploads.discard_unfinished_stores()
-        # The scratch source, on any server that can be written to. Registered
-        # rather than discovered, like everything under write_dir, and before
-        # mark_ready so it is never missing from a server that is serving.
-        if writable:
-            self.uploads.install_scratch(scratch_ttl if scratch_ttl > 0 else None)
+        # The scratch source, wherever there is a write_dir to put a tensor in
+        # -- which is not the same as ``writable``: an in-process producer
+        # (``biopb-image-base``) uploads through ``self.uploads`` with the
+        # Flight write path refused. Registered rather than discovered, like
+        # everything under write_dir, and before mark_ready so it is never
+        # missing from a server that is serving.
+        self.uploads.install_scratch(scratch_ttl if scratch_ttl > 0 else None)
         # Reclaims dead uploads and aged tombstones (``UploadManager.reap``);
         # stopped in ``shutdown``.
         self.uploads.start_sweep()
@@ -746,16 +752,15 @@ class TensorFlightServer(flight.FlightServerBase):
     ) -> Optional[bool]:
         """Does *provided* carry a narrow grant covering (*action*, *array_id*)?
 
-        ``None`` means nothing on the way to this tensor carries a grant, which
-        is not a refusal -- it is "this object has opted into nothing, so the
-        ordinary rule applies". ``False`` is a real refusal.
+        ``None`` means this tensor carries no grant, which is not a refusal --
+        it is "this object has opted into nothing, so the ordinary rule
+        applies". ``False`` is a real refusal.
 
-        **Two places can carry one, and the source is asked first.** A grant on
-        the source covers every tensor in it, which is what the embedded result
-        cache wants, its source being one result; a grant on an attached tensor
-        covers that tensor alone, which is what an uploaded intermediate wants,
-        since many share one source and each had a different producer. A source
-        that granted itself away has already decided for its tensors.
+        **A grant covers one tensor.** Only an attached tensor carries one
+        (:meth:`SourceAdapter.tensor_capability_token`), never the source it
+        hangs off: one source is shared by uploads with different producers, so
+        a grant at source scope would open every sibling to whoever holds one
+        of them.
 
         A grant table or a signed token (biopb/biopb#1048) replaces this body
         and nothing else: call sites ask here rather than comparing tokens
@@ -765,7 +770,7 @@ class TensorFlightServer(flight.FlightServerBase):
         adapter = self.sources.get(source_id)
         if adapter is None:
             return None
-        expected = adapter.capability_token or adapter.tensor_capability_token(array_id)
+        expected = adapter.tensor_capability_token(array_id)
         if not expected:
             return None
         if provided is None or not hmac.compare_digest(provided, expected):

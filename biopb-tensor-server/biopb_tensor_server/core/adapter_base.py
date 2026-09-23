@@ -267,15 +267,6 @@ class SourceAdapter(ABC):
     _source_type: Optional[str] = None  # Source type identifier
     _tensor_name: Optional[str] = None  # Tensor name (for multi-tensor)
 
-    # Optional capability token. When set, reading this adapter takes either it
-    # or the server-wide token (``TensorFlightServer._authorize_read``). None =
-    # no gate here (falls back to the server-wide rule). Set on a *source* it
-    # covers every tensor in it (the result-cache adapter, whose source is one
-    # result); set on an attached *tensor* it covers that tensor alone
-    # (:meth:`tensor_capability_token`). The base default keeps the
-    # ``capability_token`` property total for every other adapter.
-    _capability_token: Optional[str] = None
-
     # Optional content-version token (biopb/biopb#178), folded into every
     # chunk_id this adapter mints and hence into the cache key, so a
     # re-registered source with new bytes gets a fresh cache namespace instead
@@ -341,33 +332,15 @@ class SourceAdapter(ABC):
         """
         return self._catalog_url or to_catalog_url(self._source_url)
 
-    @property
-    def capability_token(self) -> Optional[str]:
-        """Per-source capability token, or None for the server-wide auth fallback.
-
-        A *narrow grant*, never a replacement: it opens this source's pixels and
-        annotations to a holder with no server-wide token, and the server-wide
-        token still opens them too (``TensorFlightServer._authorize_read``). It
-        grants reads only -- writes, ``resolve`` and ``warm`` take full access,
-        because their cost is not scoped to this source. The catalog row stays
-        public either way. The result-cache adapter sets it -- either from
-        inside the adapter or, for an externally-granted capability (the embedded
-        tensor cache mints a per-result token), through the setter below. Assign
-        via this property, never the backing ``_capability_token`` field: the
-        typed seam is the whole point (#278E).
-        """
-        return self._capability_token
-
-    @capability_token.setter
-    def capability_token(self, value: Optional[str]) -> None:
-        self._capability_token = value
-
     def tensor_capability_token(self, array_id: Optional[str]) -> Optional[str]:
-        """The grant the tensor *array_id* carries of its own, or None.
+        """The grant the tensor *array_id* carries, or None. The only reader of
+        :attr:`TensorAdapter.capability_token`.
 
         Only an **attached** tensor can carry one: a format's own tensors are
         the source's, while what the upload path put here was produced by one
-        caller and may be readable by that caller alone.
+        caller and may be readable by that caller alone. Nothing consults a
+        *source's* own token, so a source cannot gate what is attached to it --
+        the tensors on one scratch source have different producers.
 
         Read off the routable index (:meth:`_attached_for`) rather than through
         :meth:`resolve_tensor`, so the auth path asks no format to resolve
@@ -1149,6 +1122,40 @@ class TensorAdapter(SourceAdapter):
     role-scope guard below -- so a tensor-scoped method still can never be declared
     on ``SourceAdapter``.
     """
+
+    # The grant this tensor carries of its own. When set, reading it takes
+    # either this or the server-wide token
+    # (``TensorFlightServer._authorize_read``); None = no gate here, and the
+    # server-wide rule alone. Declared at tensor scope because that is the only
+    # scope that is read: ``SourceAdapter.tensor_capability_token`` answers off
+    # the attachment index, so a token set on an adapter serving as a *source*
+    # gates nothing.
+    _capability_token: Optional[str] = None
+
+    @property
+    def capability_token(self) -> Optional[str]:
+        """The grant this tensor carries, or None for the server-wide rule.
+
+        A *narrow grant*, never a replacement: it opens this tensor's pixels
+        and annotations to a holder with no server-wide token, and the
+        server-wide token still opens them (``_authorize_read``). Reads only --
+        writes, ``resolve`` and ``warm`` take full access, because their cost
+        is not scoped to one tensor. The catalog row stays public either way.
+
+        Per tensor rather than per source, because a source is shared: an
+        uploaded result has one producer and lands beside everyone else's on
+        the scratch source, so a grant covering the source would open theirs
+        too. The embedded result cache (``biopb-image-base``) mints one per
+        result through the setter below.
+
+        Assign via this property, never the backing ``_capability_token``
+        field: the typed seam is the whole point (#278E).
+        """
+        return self._capability_token
+
+    @capability_token.setter
+    def capability_token(self, value: Optional[str]) -> None:
+        self._capability_token = value
 
     # Whether timing ``get_data`` measures what re-producing the chunk would
     # cost -- the premise the measured retention rule rests on, since "cheap"
@@ -2047,7 +2054,6 @@ _SOURCE_SCOPED_API = frozenset(
         "array_id",
         "source_url",
         "source_type",
-        "capability_token",
         "tensor_capability_token",
         "content_version",
         "check_chunk_version",
@@ -2086,6 +2092,7 @@ _SOURCE_SCOPED_API = frozenset(
 )
 _TENSOR_SCOPED_API = frozenset(
     {
+        "capability_token",
         "get_tensor_descriptor",
         "get_transfer_chunk_size",
         "read_block_shape",

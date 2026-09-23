@@ -77,10 +77,16 @@ class TestOnTheDescriptor:
         assert not desc.HasField("upload_status")
 
 
+def _gate(writable_server, source, array_id, token):
+    """Put a grant on the uploaded tensor *array_id*, the only place one sits."""
+    field = array_id[len(source) + 1 :]
+    writable_server.sources.get(source).attached_tensor(field).capability_token = token
+
+
 class TestCapabilityHolderCanPoll:
     """The reason this is not an action.
 
-    A source carrying a capability token is reachable by that token alone --
+    A tensor carrying a capability token is reachable by that token alone --
     which is exactly the fast-return handle. Under `do_action`-is-full-access,
     an action-shaped status would leave such a caller able to read the result
     but unable to learn when it was readable.
@@ -88,9 +94,7 @@ class TestCapabilityHolderCanPoll:
 
     def test_the_capability_opens_the_status(self, writable_server, client, source):
         desc = _make(client, source)
-        # The token gates the *source*: a member is reached through it, so
-        # there is nowhere else for the grant to sit.
-        writable_server.sources.get(source).capability_token = "cap-token"
+        _gate(writable_server, source, desc.array_id, "cap-token")
 
         holder = TensorFlightClient(
             f"grpc://localhost:{writable_server.port}", token="cap-token"
@@ -103,7 +107,7 @@ class TestCapabilityHolderCanPoll:
 
     def test_a_stranger_is_refused(self, writable_server, client, source):
         desc = _make(client, source)
-        writable_server.sources.get(source).capability_token = "cap-token"
+        _gate(writable_server, source, desc.array_id, "cap-token")
 
         stranger = TensorFlightClient(
             f"grpc://localhost:{writable_server.port}", token="wrong"

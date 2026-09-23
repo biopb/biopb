@@ -6,7 +6,10 @@ Optionally starts an embedded tensor cache server for lazy data handling.
 """
 
 import logging
+import os
+import re
 import secrets
+import shutil
 import threading
 from concurrent import futures
 from itertools import product
@@ -120,11 +123,29 @@ def _handle(
     )
 
 
-def _normalize_cache_source_name(source_name: Optional[str]) -> str:
-    normalized_name = source_name or ""
-    if normalized_name.startswith("cache:"):
-        normalized_name = normalized_name[6:]
-    return normalized_name
+#: The tensor server's scratch source, which every server with a ``write_dir``
+#: serves at this fixed id. Spelled out rather than imported so this module
+#: stays importable without the tensor server installed.
+SCRATCH_SOURCE_ID = "scratch"
+
+#: How long a result is kept on it. Half an hour: a fast-return consumer reads
+#: its result as soon as the job reports done, so anything still here long
+#: after that is one nobody came back for.
+RESULT_TTL_S = 30 * 60
+
+_UNSAFE_IN_A_FIELD_NAME = re.compile(r"[^A-Za-z0-9_-]+")
+
+
+def _result_field_name(source_name: Optional[str]) -> str:
+    """A field name for one result: the caller's word for it, plus a salt.
+
+    Salted because a field is taken for as long as its tensor is served, so a
+    second result under one name is refused rather than replacing it.
+    """
+    stem = _UNSAFE_IN_A_FIELD_NAME.sub(
+        "-", (source_name or "").removeprefix("cache:")
+    ).strip("-")
+    return f"{stem or 'result'}-{os.urandom(4).hex()}"
 
 
 class EmbeddedTensorCache:
@@ -154,30 +175,46 @@ class EmbeddedTensorCache:
         source_name: Optional[str] = None,
         dim_labels: Optional[Sequence[str]] = None,
     ) -> tuple[str, da.Array, tuple[int, ...]]:
+        """Declare one result; answer the ``array_id`` it will be filled under.
 
-        from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
-
+        A result is a tensor added to the scratch source, through the same
+        ``add_tensor`` boundary a remote client uses -- called in-process, so
+        the Flight write path stays refused. Adding rather than registering a
+        source of its own is what gives it a deadline (``RESULT_TTL_S``) and a
+        producer: a source is shared, and the grant below covers this tensor
+        alone.
+        """
         chunk_shape = _uniform_chunk_shape(array_template)
-        source_id = CachedSourceAdapter.upload_source_id(
-            _normalize_cache_source_name(source_name)
-        )
-
-        adapter = CachedSourceAdapter(
-            source_id=source_id,
+        descriptor = TensorDescriptor(
+            array_id=(
+                f"cache://{SCRATCH_SOURCE_ID}/@fields/{_result_field_name(source_name)}"
+            ),
             shape=list(array_template.shape),
             dtype=array_template.dtype.str,
             chunk_shape=list(chunk_shape),
-            dim_labels=list(dim_labels) if dim_labels is not None else None,
+            dim_labels=list(dim_labels) if dim_labels is not None else [],
         )
-        # Per-source capability token: the result is readable only by the caller
-        # that receives this SerializedTensor (carried in its auth_token). The
-        # embedded server runs writable=False and writes happen in-process, so
-        # this token gates read-back without a server-wide secret.
-        adapter.capability_token = secrets.token_urlsafe(32)
-        # Registry only: this server is catalog-less, and the id below goes
-        # straight back to the one caller that asked for the result.
-        self._server.register_source(source_id, adapter)
-        return source_id, array_template, chunk_shape
+        answer = self._server.uploads.add_tensor(descriptor)
+        # The capability: the result is readable by the caller that receives
+        # this SerializedTensor (it rides in the auth_token) and by nobody
+        # else. It gates read-back without a server-wide secret, which this
+        # server has none of.
+        self._result(answer.array_id).capability_token = secrets.token_urlsafe(32)
+        return answer.array_id, array_template, chunk_shape
+
+    def _result(self, array_id: str):
+        """The adapter serving one result, by the id ``add_tensor`` answered.
+
+        A result is a tensor *attached* to the scratch source rather than a
+        source of its own, so it is reached through its parent instead of
+        through the registry.
+        """
+        source_id, _, field = array_id.partition("/")
+        parent = self._server.sources.get(source_id)
+        adapter = parent.attached_tensor(field) if parent is not None else None
+        if adapter is None:
+            raise ValueError(f"Result not found: {array_id}")
+        return adapter
 
     def create_array(
         self,
@@ -185,40 +222,32 @@ class EmbeddedTensorCache:
         dim_labels: Optional[list],
         array_template: da.Array,
     ) -> tensor_proto.SerializedTensor:
-        source_id, normalized_array, chunk_shape = self._register_array_template(
+        array_id, _, _ = self._register_array_template(
             array_template=array_template,
             source_name=source_name,
             dim_labels=dim_labels,
         )
-        adapter = self._server.sources.get(source_id)
-        return _handle(
-            adapter.get_tensor_descriptor(),
-            self._external_location,
-            adapter.capability_token or "",
-        )
+        return self.to_serialized_tensor(array_id)
 
     def upload_array_chunks(
         self,
-        source_id: str,
+        array_id: str,
         endpoint: ChunkBounds,
         chunk: np.ndarray,
     ) -> None:
-        """Write one chunk into a source this process created."""
+        """Write one chunk into a result this process declared."""
         import pyarrow.flight as flight
         from biopb_tensor_server.core.errors import UploadClosedError
 
-        adapter = self._server.sources.get(source_id)
-        if adapter is None:
-            raise ValueError(f"Source not found: {source_id}")
         # The adapter counts the chunk and refuses once the upload is over; both
         # refusals surface as the exception type the wire path raises, so a
         # servicer's job discriminates on it the way a remote client would.
         try:
-            adapter.write_chunk(endpoint, chunk)
+            self._result(array_id).write_chunk(endpoint, chunk)
         except UploadClosedError as e:
             raise flight.FlightCancelledError(str(e)) from e
 
-    def finish(self, source_id: str) -> dict:
+    def finish(self, array_id: str) -> dict:
         """Seal a result: the output is complete and takes no further chunks.
 
         The counterpart to :meth:`discard`, and the only route to READY, which
@@ -232,12 +261,12 @@ class EmbeddedTensorCache:
         """
         from biopb_tensor_server.adapters._writable import UploadStatus
 
-        return self._server.uploads.set_status(source_id, UploadStatus.READY)
+        return self._server.uploads.set_status(array_id, UploadStatus.READY)
 
-    def get_upload_status(self, source_id: str) -> dict:
-        return self._server.uploads.status(source_id)
+    def get_upload_status(self, array_id: str) -> dict:
+        return self._server.uploads.status(array_id)
 
-    def discard(self, source_id: str, reason: str = "") -> dict:
+    def discard(self, array_id: str, reason: str = "") -> dict:
         """Give up on a result: drop the source, leave a tombstone saying why.
 
         For a servicer whose background job died or was told to stop. Stopping
@@ -245,7 +274,7 @@ class EmbeddedTensorCache:
         output it was going to fill, and makes any write still in flight fail
         with *reason* rather than with a missing source (biopb/biopb#1).
         """
-        return self._server.uploads.discard(source_id, reason)
+        return self._server.uploads.discard(array_id, reason)
 
     def create_source(
         self,
@@ -261,10 +290,10 @@ class EmbeddedTensorCache:
             dim_labels: Optional dimension labels
 
         Returns:
-            Source ID for use with to_serialized_tensor()
+            The result's array_id, for use with to_serialized_tensor()
         """
         dask_array = _as_dask_array(array)
-        source_id, normalized_array, chunk_shape = self._register_array_template(
+        array_id, normalized_array, chunk_shape = self._register_array_template(
             array_template=dask_array,
             source_name=source_name,
             dim_labels=dim_labels,
@@ -272,42 +301,46 @@ class EmbeddedTensorCache:
 
         for bounds in _iter_chunk_bounds(normalized_array.shape, chunk_shape):
             chunk_data = normalized_array[_bounds_to_slices(bounds)].compute()
-            self.upload_array_chunks(source_id, bounds, chunk_data)
+            self.upload_array_chunks(array_id, bounds, chunk_data)
         # Synchronous: every chunk is written by the time we get here, so this
         # is the one caller that can seal on its own behalf. `create_array`'s
-        # producer fills the source later and finishes for itself.
-        self.finish(source_id)
+        # producer fills the result later and finishes for itself.
+        self.finish(array_id)
 
         logger.debug(
-            "Created cache source %s: shape=%s, dtype=%s",
-            source_id,
+            "Created result %s: shape=%s, dtype=%s",
+            array_id,
             list(normalized_array.shape),
             normalized_array.dtype.str,
         )
-        return source_id
+        return array_id
 
     def to_serialized_tensor(
         self,
-        source_id: str,
+        array_id: str,
         tensor_id: Optional[str] = None,
     ) -> tensor_proto.SerializedTensor:
-        """Get SerializedTensor for a source with rewritten location.
+        """Get SerializedTensor for a result, with rewritten location.
 
-        auth_token carries the per-source capability token so only this caller
-        can read the result.
+        auth_token carries the result's own capability token, so only this
+        caller can read it.
 
         Args:
-            source_id: Source identifier
-            tensor_id: Tensor ID (optional for single-tensor sources)
+            array_id: The id ``create_source`` / ``create_array`` answered
+            tensor_id: Unused; a result is one tensor
 
         Returns:
             SerializedTensor protobuf with external location
         """
-        adapter = self._server.sources.get(source_id)
-        if adapter is None:
-            raise ValueError(f"Source not found: {source_id}")
+        adapter = self._result(array_id)
+        descriptor = adapter.get_tensor_descriptor()
+        remaining = adapter.remaining_ttl()
+        if remaining is not None:
+            # What the handle is for: the consumer reads this result later, and
+            # the one thing it cannot work out for itself is how much later.
+            descriptor.ttl_seconds = remaining
         return _handle(
-            adapter.get_tensor_descriptor(),
+            descriptor,
             self._external_location,
             adapter.capability_token or "",
         )
@@ -336,6 +369,14 @@ def _start_embedded_tensor_cache(
     from biopb_tensor_server.core.config import CacheConfig
     from biopb_tensor_server.serving.server import TensorFlightServer
 
+    # Results do not outlive the process that produced them, so the previous
+    # run's are cleared rather than adopted. Two reasons: a result's capability
+    # token is minted in memory and would not come back with it, so an adopted
+    # one would be readable by anyone reaching the port; and a consumer that
+    # never collected its result has long since gone.
+    write_dir = cache_dir / "uploads"
+    shutil.rmtree(write_dir, ignore_errors=True)
+
     # Clean stale lock file (from previous run/crash)
     lock_path = cache_dir / "lock"
     if lock_path.exists():
@@ -356,25 +397,32 @@ def _start_embedded_tensor_cache(
     # Bind to specified host (0.0.0.0 for external access)
     location = f"grpc://{tensor_host}:{tensor_port}"
 
-    # Read-only over Flight: results are written in-process (adapter.write_chunk),
-    # so the Flight write path (do_put / create_tensor) is pure attack surface here.
-    # Read-back is gated by per-source capability tokens (adapter.capability_token).
-    # No catalog (metadata_db=None): a result is addressed by the source_id its
+    # Read-only over Flight: results are written in-process, so add_tensor,
+    # set_upload_status and do_put are pure attack surface here. ``write_dir``
+    # is separate from that switch -- it is what gives this server a scratch
+    # source to add results to, which the in-process path reaches through
+    # ``uploads`` with the wire verbs still refused.
+    #
+    # Read-back is gated per result by its own capability token, which holds
+    # even with no server-wide token (``_has_full_access`` is False without
+    # one, so a grant is the whole gate rather than an addition to it).
+    #
+    # No catalog (metadata_db=None): a result is addressed by the array_id its
     # SerializedTensor carries, so there is nothing here to browse and the
-    # catalog flights refuse. That also means an op result is not enumerable by
-    # anyone who merely reaches the port -- only the holder of the id and its
-    # token can read it.
+    # catalog flights refuse. An op result is therefore not enumerable by
+    # anyone who merely reaches the port.
     tensor_server = TensorFlightServer(
         location,
         writable=False,
+        write_dir=write_dir,
+        scratch_ttl=RESULT_TTL_S,
         annotations_enabled=False,
     )
 
-    # This embedded server is a *bypass* of the normal tensor-server lifecycle:
-    # it hijacks a TensorFlightServer purely as scratch-pad storage for op
-    # results and has no data-folder scan / source-registration stage at all
-    # (sources appear in-process via adapter.write_chunk). It is therefore ready
-    # to serve the instant its Flight port binds. The CLI launcher is the
+    # This embedded server has no data-folder scan / source-registration stage
+    # at all: the only source it serves is its scratch one, and results appear
+    # on it in-process. It is therefore ready to serve the instant its Flight
+    # port binds. The CLI launcher is the
     # authoritative path that defers mark_ready() until after its scan; here
     # there is nothing to wait for, so mark ready immediately -- otherwise the
     # health action would report STARTING forever and readiness-gating clients
