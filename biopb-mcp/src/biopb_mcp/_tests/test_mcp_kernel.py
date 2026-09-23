@@ -477,7 +477,16 @@ class TestHealth:
                 "dead",
                 "recent_respawns",
                 "watchdog_running",
+                "connection_file",
+                "attach_command",
             }
+            assert os.path.isfile(h["connection_file"])
+            from jupyter_core.paths import jupyter_runtime_dir
+
+            # Where Jupyter tools look, not a tempfile.
+            assert os.path.dirname(h["connection_file"]) == jupyter_runtime_dir()
+            conn = h["connection_file"]
+            assert h["attach_command"].startswith("jupyter qtconsole --existing ")
             assert h["alive"] is True
             assert h["ready"] is True
             assert h["start_error"] is None
@@ -487,6 +496,32 @@ class TestHealth:
         finally:
             host.shutdown()
         assert host.health()["watchdog_running"] is False
+        assert host.health()["connection_file"] is None
+        assert host.health()["attach_command"] is None
+        assert not os.path.exists(conn)  # jupyter_client removes it on shutdown
+
+    @pytest.mark.parametrize(
+        "osname, path, expected",
+        [
+            (
+                "posix",
+                "/home/a b/.local/share/jupyter/runtime/kernel-1.json",
+                "jupyter qtconsole --existing "
+                "'/home/a b/.local/share/jupyter/runtime/kernel-1.json'",
+            ),
+            (
+                "nt",
+                r"C:\Users\First Last\AppData\Roaming\jupyter\runtime\kernel-1.json",
+                "jupyter qtconsole --existing "
+                r'"C:\Users\First Last\AppData\Roaming\jupyter\runtime\kernel-1.json"',
+            ),
+        ],
+    )
+    def test_attach_command_quotes_for_the_platform_shell(
+        self, monkeypatch, osname, path, expected
+    ):
+        monkeypatch.setattr(_kernel.os, "name", osname)
+        assert _kernel.attach_command(path) == expected
 
 
 class TestReadiness:
@@ -599,7 +634,7 @@ class TestParentDeathPipe:
         assert killed[0][1] == signal.SIGKILL
 
     @posix_only
-    def test_kernel_dies_when_launcher_dies(self):
+    def test_kernel_dies_when_launcher_dies(self, tmp_path):
         import subprocess
         import textwrap
 
@@ -623,7 +658,9 @@ class TestParentDeathPipe:
             capture_output=True,
             text=True,
             timeout=120,
-            env=dict(os.environ),
+            # The launcher dies before it can clean up, so its connection file
+            # stays behind: keep it out of the user's Jupyter runtime dir.
+            env=dict(os.environ, JUPYTER_RUNTIME_DIR=str(tmp_path)),
         )
         assert proc.stdout.strip(), proc.stderr
         pid = int(proc.stdout.strip().splitlines()[-1])
@@ -1066,3 +1103,161 @@ class TestWinJobReal:
             if proc.poll() is None:
                 proc.kill()
             t.join(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# A second Jupyter client on the session kernel (docs/jupyter-clients.md)
+# ---------------------------------------------------------------------------
+
+_GATED_ARGS = [
+    "--IPKernelApp.kernel_class=biopb_mcp.mcp._kernel_gate.GatedKernel",
+    # `_conn` because every job starts by reading `client` off it.
+    "--IPKernelApp.exec_lines=import biopb_mcp.mcp._jobs as _jobs, types; "
+    "_conn = types.SimpleNamespace(client=None); _jobs.install(get_ipython())",
+]
+
+# A job that keeps the worker thread busy and stops at the next bytecode when
+# interrupted (a bare sleep would hold the interrupt until it returned).
+_LONG_JOB = "_jobs.submit('import time\\nfor _ in range(400): time.sleep(0.05)')"
+
+
+class TestJupyterClientGate:
+    @pytest.fixture
+    def gated(self):
+        host = KernelHost(
+            extra_arguments=_GATED_ARGS,
+            health_probe_code="print('_jobs' in dir())",
+            parent_death_pipe=False,
+            window_close_pipe=False,
+            watchdog_interval=0,
+        )
+        host.start()
+        yield host
+        host.shutdown()
+
+    @pytest.fixture
+    def foreign(self, gated):
+        from jupyter_client import BlockingKernelClient
+
+        kc = BlockingKernelClient(connection_file=gated.connection_file)
+        kc.load_connection_file()
+        kc.start_channels()
+        kc.wait_for_ready(timeout=30)
+        yield kc
+        kc.stop_channels()
+
+    @staticmethod
+    def _run(kc, code, **kwargs):
+        """Execute on *kc*; return the reply content and its iopub messages."""
+        msgs = []
+        reply = kc.execute_interactive(
+            code, timeout=30, output_hook=msgs.append, **kwargs
+        )
+        return reply["content"], msgs
+
+    @staticmethod
+    def _jobs(host):
+        import ast
+
+        res = host.execute("print(repr(_jobs.export()))")
+        assert res["status"] == "ok", res
+        return ast.literal_eval(res["stdout"].strip())
+
+    @staticmethod
+    def _stop_job(host):
+        host.execute("_jobs.interrupt_current()")
+        _wait_until(
+            lambda: "None" in host.execute("print(_jobs.running_job())")["stdout"]
+        )
+
+    def test_the_host_session_is_adopted(self, gated):
+        res = gated.execute(
+            "import biopb_mcp.mcp._kernel_gate as g; print(g._host_session)"
+        )
+        assert res["stdout"].strip() == gated._kc.session.session
+
+    def test_an_idle_foreign_cell_runs_and_is_recorded(self, gated, foreign):
+        reply, msgs = self._run(foreign, "x = 41 + 1\nprint('hello')")
+        assert reply["status"] == "ok"
+        # The client still sees its own output (the tee).
+        assert any(
+            m["msg_type"] == "stream" and "hello" in m["content"]["text"] for m in msgs
+        )
+        assert gated.execute("print(x)")["stdout"].strip() == "42"
+        (job,) = [j for j in self._jobs(gated) if j["origin"] == "user"]
+        assert job["code"] == "x = 41 + 1\nprint('hello')"
+        assert job["status"] == "ok"
+        assert job["stdout"] == "hello\n"
+
+    def test_a_failing_foreign_cell_is_recorded_as_an_error(self, gated, foreign):
+        reply, _ = self._run(foreign, "1 / 0")
+        assert reply["status"] == "error"
+        (job,) = [j for j in self._jobs(gated) if j["origin"] == "user"]
+        assert job["status"] == "error"
+        assert "ZeroDivisionError" in job["error_text"]
+
+    def test_a_client_interrupt_records_the_cell_as_interrupted(self, gated, foreign):
+        msg_id = foreign.execute("import time\nfor _ in range(200): time.sleep(0.05)")
+        _wait_until(
+            lambda: any(
+                m["msg_type"] == "execute_input"
+                and m["parent_header"].get("msg_id") == msg_id
+                for m in [foreign.get_iopub_msg(timeout=5)]
+            )
+        )
+        time.sleep(0.3)
+        gated.interrupt()
+        foreign.get_shell_msg(timeout=30)
+        (job,) = [j for j in self._jobs(gated) if j["origin"] == "user"]
+        assert job["status"] == "interrupted"
+
+    def test_refused_while_a_job_runs(self, gated, foreign):
+        assert gated.execute(_LONG_JOB)["status"] == "ok"
+        try:
+            reply, msgs = self._run(foreign, "y = 1")
+            assert reply["status"] == "error"
+            assert reply["ename"] == "KernelBusy"
+            assert "job-1" in reply["evalue"]
+            assert "Stop" in reply["evalue"]
+            # Rendered in the cell, not only in the reply.
+            assert any(m["msg_type"] == "error" for m in msgs)
+            assert "y" not in gated.execute("print(dir())")["stdout"].split("'")
+            assert [j["origin"] for j in self._jobs(gated)] == ["mcp"]
+        finally:
+            self._stop_job(gated)
+
+    def test_silent_passes_while_a_job_runs(self, gated, foreign):
+        assert gated.execute(_LONG_JOB)["status"] == "ok"
+        try:
+            reply, _ = self._run(foreign, "z = 3", silent=True)
+            assert reply["status"] == "ok"
+            assert gated.execute("print(z)")["stdout"].strip() == "3"
+            assert [j["origin"] for j in self._jobs(gated)] == ["mcp"]
+        finally:
+            self._stop_job(gated)
+
+    def test_a_host_poll_queued_behind_a_refusal_is_retried(self, gated, foreign):
+        # stop_on_error makes ipykernel abort what is queued behind a refused
+        # cell; the host retries an aborted snippet once. Queue both behind a
+        # silent sleep so the poll is waiting when the refusal lands.
+        assert gated.execute(_LONG_JOB)["status"] == "ok"
+        statuses = []
+        run_once = gated._run_once
+
+        def spy(code, timeout):
+            res = run_once(code, timeout)
+            statuses.append(res["status"])
+            return res
+
+        gated._run_once = spy
+        try:
+            foreign.execute("import time; time.sleep(1.5)", silent=True)
+            foreign.execute("y = 1")
+            time.sleep(0.3)
+            res = gated.execute("print('poll')")
+            assert res["status"] == "ok"
+            assert res["stdout"].strip() == "poll"
+            assert statuses == ["aborted", "ok"]
+        finally:
+            gated._run_once = run_once
+            self._stop_job(gated)

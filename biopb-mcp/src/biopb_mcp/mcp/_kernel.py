@@ -49,6 +49,49 @@ _WINDOW_ALIVE_PROBE = "print(_viewer_window_alive())"
 _WINDOW_PROBE_TIMEOUT = 10.0
 
 
+# Tells the kernel which client session is the host's own (_kernel_gate), so a
+# cell from any other client is gated. Run before readiness, on the host's
+# client: the kernel adopts the session of the request that runs it.
+_ADOPT_SESSION_SNIPPET = (
+    "__import__('biopb_mcp.mcp._kernel_gate', fromlist=['_']).adopt_host_session()"
+)
+
+
+def _runtime_connection_file() -> str:
+    """A fresh connection-file path in Jupyter's runtime dir.
+
+    Left unset, jupyter_client writes a tempfile, which no Jupyter tool looks
+    for. The runtime dir is per-platform (``jupyter --runtime-dir``), private
+    to the user, and where ``jupyter qtconsole --existing`` resolves a bare
+    file name.
+    """
+    import uuid
+
+    from jupyter_core.paths import jupyter_runtime_dir
+    from jupyter_core.utils import ensure_dir_exists
+
+    runtime = jupyter_runtime_dir()
+    ensure_dir_exists(runtime, mode=0o700)
+    return os.path.join(runtime, f"kernel-biopb-{uuid.uuid4()}.json")
+
+
+def attach_command(connection_file: Optional[str]) -> Optional[str]:
+    """The shell command that attaches qtconsole to *connection_file*, quoted
+    for this platform's shell: the runtime dir sits under a user profile,
+    which on Windows may contain spaces."""
+    if not connection_file:
+        return None
+    if os.name == "nt":
+        import subprocess
+
+        return subprocess.list2cmdline(
+            ["jupyter", "qtconsole", "--existing", connection_file]
+        )
+    import shlex
+
+    return f"jupyter qtconsole --existing {shlex.quote(connection_file)}"
+
+
 def _status_result(status: str, error_text: str) -> dict:
     """An execute-shaped result carrying only a status and why.
 
@@ -329,7 +372,10 @@ class KernelHost:
         if pass_fds:
             popen_kwargs["pass_fds"] = tuple(pass_fds)
 
-        self._km = KernelManager(kernel_name=self._kernel_name)
+        self._km = KernelManager(
+            kernel_name=self._kernel_name,
+            connection_file=_runtime_connection_file(),
+        )
         try:
             try:
                 self._km.start_kernel(
@@ -401,6 +447,16 @@ class KernelHost:
             return
         # Use the internal executor: the public execute() waits on _ready, which
         # this probe is what *sets* — waiting on ourselves would deadlock.
+        # Adopt first, so no request of ours after readiness reads as foreign.
+        adopt = self._execute_internal(
+            _ADOPT_SESSION_SNIPPET, timeout=self._startup_timeout
+        )
+        if adopt.get("status") != "ok":
+            raise RuntimeError(
+                "Kernel could not adopt the host session "
+                f"(status={adopt.get('status')!r}, "
+                f"error={adopt.get('error_text')!r})"
+            )
         res = self._execute_internal(
             self._health_probe_code, timeout=self._startup_timeout
         )
@@ -964,7 +1020,17 @@ class KernelHost:
             "watchdog_running": (
                 self._watchdog_thread is not None and self._watchdog_thread.is_alive()
             ),
+            "connection_file": self.connection_file,
+            "attach_command": attach_command(self.connection_file),
         }
+
+    @property
+    def connection_file(self):
+        """Where a Jupyter client attaches to this kernel, or None when it is
+        not running."""
+        if not self.is_alive():
+            return None
+        return self._km.connection_file or None
 
     def is_alive(self) -> bool:
         try:

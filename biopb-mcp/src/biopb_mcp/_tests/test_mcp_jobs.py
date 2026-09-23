@@ -657,6 +657,68 @@ class TestJobIntent:
         assert snap["stdout"] == ""
 
 
+class TestRecordInline:
+    """A foreign client's cell, run inline on the calling thread and recorded
+    as a job (``_kernel_gate``, docs/jupyter-clients.md)."""
+
+    def test_output_is_teed_to_the_record_and_the_real_stream(self, runner):
+        import io
+        import sys
+
+        real = io.StringIO()
+        saved = sys.stdout
+        sys.stdout = _jobs._JobStream(real)
+        try:
+            with _jobs.record_inline("print('hi')") as job:
+                print("hi")
+                job.status = "ok"
+        finally:
+            sys.stdout = saved
+        assert real.getvalue() == "hi\n"
+        snap = _jobs.poll(job.job_id)
+        assert snap["stdout"] == "hi\n"
+        assert snap["status"] == "ok"
+        assert snap["origin"] == "user"
+        assert snap["code"] == "print('hi')"
+
+    def test_the_thread_is_released_after_the_block(self, runner):
+        import io
+        import sys
+
+        real = io.StringIO()
+        saved = sys.stdout
+        sys.stdout = _jobs._JobStream(real)
+        try:
+            with _jobs.record_inline("x = 1") as job:
+                job.status = "ok"
+            print("after")
+        finally:
+            sys.stdout = saved
+        assert real.getvalue() == "after\n"
+        assert _jobs.poll(job.job_id)["stdout"] == ""
+
+    def test_running_for_its_duration_and_named_by_running_job(self, runner):
+        with _jobs.record_inline("import time") as job:
+            running = _jobs.running_job()
+            assert running["job_id"] == job.job_id
+            assert running["origin"] == "user"
+            assert running["code"] == "import time"
+            job.status = "ok"
+        assert _jobs.running_job() is None
+        assert job.finished is not None
+
+    def test_an_unsettled_block_is_an_error(self, runner):
+        with pytest.raises(RuntimeError):
+            with _jobs.record_inline("boom()") as job:
+                raise RuntimeError("do_execute itself failed")
+        assert _jobs.poll(job.job_id)["status"] == "error"
+
+    def test_the_agent_is_told(self, runner):
+        with _jobs.record_inline("x = 1") as job:
+            job.status = "ok"
+        assert [d["job_id"] for d in _jobs.foreign_digest("mcp")] == [job.job_id]
+
+
 # ---------------------------------------------------------------------------
 # Real bare kernel: the main thread stays free while a job runs
 # ---------------------------------------------------------------------------

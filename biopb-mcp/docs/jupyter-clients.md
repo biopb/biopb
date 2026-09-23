@@ -1,14 +1,11 @@
 # Jupyter clients on the session kernel
 
-Status: **proposed** (design only; not implemented). Decided 2026-09-23.
+Status: **implemented** except the console's retirement (step 4 of *Shape of
+the work*), which is its own change. Decided 2026-09-23.
 
 **Component:** `biopb-mcp` — a kernel subclass in a new in-kernel module
 (`mcp/_kernel_gate.py`), `mcp/_jobs.py` (the record), `mcp/_kernel.py` and
 `mcp/_server.py` (the connection-file hint). Retires `user-console.md`.
-
-A leading `_` on a module in `biopb_mcp.mcp` marks it private to the package,
-as every module there is; on a doc in `docs/` it marks a design that is not
-implemented. Both apply here.
 
 ## Goal
 
@@ -112,13 +109,20 @@ the record says what ran and whether it failed, not what it drew.
 
 ### Finding the kernel
 
-Nothing logs the connection file today. `KernelHost.health()` gains
-`connection_file`; `server_status` and the observe page's status print it
-with the command to attach:
+The host names the connection file itself, `kernel-biopb-<uuid>.json` in
+`jupyter --runtime-dir`: left to `jupyter_client` it is a tempfile no Jupyter
+tool looks for. The runtime dir is per-platform (`~/.local/share/jupyter/runtime`,
+`~/Library/Jupyter/runtime`, `%APPDATA%\jupyter\runtime`) and private to the
+user. `KernelHost.health()` carries `connection_file` and `attach_command`;
+`server_status` prints both, and the observe page offers the command to copy:
 
 ```
-jupyter qtconsole --existing /home/<user>/.local/share/jupyter/runtime/kernel-<id>.json
+jupyter qtconsole --existing <runtime-dir>/kernel-biopb-<uuid>.json
 ```
+
+The command is built by the session child and quoted for its platform's shell
+(`shlex.quote`, or `list2cmdline` on Windows), since a Windows profile path
+can contain spaces. It works only on the machine the session runs on.
 
 qtconsole is already in the environment (a napari dependency).
 
@@ -143,6 +147,9 @@ sections carry over as they stand, because the record is the same `_Job`.
 - **A long human cell still holds the channel.** The host's tools queue behind
   it and its 120 s timeout still applies. Unchanged from today; the gate does
   not make it worse.
+- **A hard-killed session leaves its connection file behind** in the runtime
+  dir, as any Jupyter kernel does; a clean shutdown removes it. Tests that kill
+  a launcher set `JUPYTER_RUNTIME_DIR` so they do not litter the real one.
 - **`execute_input` is published before `do_execute`**, so a refused cell
   still echoes its input to other-output listeners. Harmless.
 

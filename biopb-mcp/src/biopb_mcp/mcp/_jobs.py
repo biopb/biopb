@@ -44,6 +44,7 @@ Design notes
 """
 
 import ast
+import contextlib
 import ctypes
 import io
 import logging
@@ -89,7 +90,8 @@ _HEAD_SCAN_CHARS = 4096
 _EXTERNAL_INTERRUPT_MSG = (
     "Stopped by an interrupt sent to the whole kernel, not by an error in this "
     "code. Most likely a short tool call (server_status / poll_job / a "
-    "screenshot) overran its timeout and interrupted the kernel to unwedge it."
+    "screenshot) overran its timeout and interrupted the kernel to unwedge it, "
+    "or a Jupyter client attached to this kernel sent an interrupt."
 )
 
 # How long run_on_main waits for the main thread to service a marshaled call
@@ -101,6 +103,10 @@ _RUN_ON_MAIN_TIMEOUT = 300.0
 _ip = None
 _jobs = {}  # job_id -> _Job
 _jobs_by_thread = {}  # thread ident -> _Job (active worker threads only)
+# Threads whose captured output also goes on to the real stream: the main thread
+# while it runs a foreign client's cell (record_inline), whose client still has
+# to see its own output.
+_teed_threads = set()
 _job_seq = 0
 _lock = threading.RLock()
 
@@ -466,10 +472,14 @@ class _JobStream:
         self._real = real
 
     def write(self, s):
-        job = _jobs_by_thread.get(threading.get_ident())
-        if job is not None:
-            return job.write_output(s)
-        return self._real.write(s)
+        ident = threading.get_ident()
+        job = _jobs_by_thread.get(ident)
+        if job is None:
+            return self._real.write(s)
+        n = job.write_output(s)
+        if ident in _teed_threads:
+            return self._real.write(s)
+        return n
 
     def flush(self):
         try:
@@ -734,6 +744,15 @@ def _prune():
         del _jobs[terminal.pop(0)]
 
 
+def _new_job(code, origin, intent=""):
+    """Register a job record under the next id. Call with `_lock` held."""
+    global _job_seq
+    _job_seq += 1
+    job = _Job(f"job-{_job_seq}", code, origin=origin, intent=intent)
+    _jobs[job.job_id] = job
+    return job
+
+
 def submit(
     code,
     origin="mcp",
@@ -785,7 +804,7 @@ def submit(
     from the observe page (never gated), or the session ending. That is the same
     principle as the ``origin="user"`` exemption, applied to recovery.
     """
-    global _job_seq, _owner, _owner_label, _agent_origin
+    global _owner, _owner_label, _agent_origin
     with _lock:
         if origin != "user" and writer is not None:
             if _owner is None:
@@ -809,17 +828,14 @@ def submit(
                     "running_job_id": jid,
                     "running_job_origin": j.origin,
                 }
-        _job_seq += 1
-        job_id = f"job-{_job_seq}"
         if verify_cells is not None:
             # The record's cells are the source of truth; `code` is derived from
             # them so the audit view of this job cannot disagree with the
             # workflow view of it.
             code = "\n\n# ---\n\n".join(verify_cells)
-        job = _Job(job_id, code, origin=origin, intent=intent)
+        job = _new_job(code, origin, intent)
         if verify_cells is not None:
             job.verify = _Verification(verify_title, verify_cells, job)
-        _jobs[job_id] = job
         if origin != "user":
             # Here rather than at the claim check above, because a submit that
             # is *refused* is not this kernel's agent working: both refusals
@@ -831,11 +847,42 @@ def submit(
             _agent_origin = origin
         _prune()
         thread = threading.Thread(
-            target=_run, args=(job, code), name=job_id, daemon=True
+            target=_run, args=(job, code), name=job.job_id, daemon=True
         )
         job.thread = thread
         thread.start()
-        return {"job_id": job_id, "status": "running"}
+        return {"job_id": job.job_id, "status": "running"}
+
+
+@contextlib.contextmanager
+def record_inline(code, origin="user"):
+    """Record a cell running inline on this thread as a job, for its duration.
+
+    For a foreign client's cell (``_kernel_gate``): it runs on the main thread
+    as its client expects, and the record is what tells the agent about it, the
+    same as a job from :func:`submit`. Output is teed, so the client still sees
+    its own. The caller settles ``status`` (and ``error_text``) from the reply
+    before leaving the block; a block that raises instead is an ``error``.
+
+    Not gated here: the caller refuses while a job runs, and nothing can start
+    one meanwhile, since a submit is an execute request queued behind this one.
+    """
+    with _lock:
+        # Re-asserted for the same reason as in submit().
+        _install_streams()
+        job = _new_job(code, origin)
+        _prune()
+    ident = threading.get_ident()
+    _jobs_by_thread[ident] = job
+    _teed_threads.add(ident)
+    try:
+        yield job
+    finally:
+        _teed_threads.discard(ident)
+        _jobs_by_thread.pop(ident, None)
+        job.finished = time.monotonic()
+        if job.status == "running":
+            job.status = "error"
 
 
 def poll(job_id):
@@ -891,16 +938,24 @@ def _running_job():
 
 
 def running_job():
-    """``{"job_id": ..., "origin": ...}`` for the running job, or ``None``.
+    """The running job's id, origin, one-line intent and code, and elapsed
+    seconds, or ``None``.
 
-    The session child's cross-kernel admission check reads this: a verification
-    runs in a *second* kernel, which this one cannot see, so the rule that only
-    one job runs at a time has to be decided a level up (``_scratch``).
+    Two readers. The session child's cross-kernel admission check: a
+    verification runs in a *second* kernel, which this one cannot see, so the
+    rule that only one job runs at a time has to be decided a level up
+    (``_scratch``). And ``_kernel_gate``'s refusal, which names the job.
     """
     job = _running_job()
     if job is None:
         return None
-    return {"job_id": job.job_id, "origin": job.origin}
+    return {
+        "job_id": job.job_id,
+        "origin": job.origin,
+        "intent": job.intent_preview,
+        "code": job.code_preview,
+        "elapsed": job.elapsed(),
+    }
 
 
 def _raise_in_thread(ident, exctype):
@@ -1145,6 +1200,7 @@ def reset():
     with _lock:
         _jobs.clear()
         _jobs_by_thread.clear()
+        _teed_threads.clear()
         _owner, _owner_label = None, ""
         _agent_origin = "mcp"
 

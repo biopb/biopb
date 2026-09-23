@@ -126,6 +126,9 @@ export default function ObservePage() {
   const [details, setDetails] = useState<Record<string, JobDetail>>({});
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [status, setStatus] = useState("…");
+  // How to attach a Jupyter client to the session kernel; null while it is not
+  // running. Only works on the machine the session runs on.
+  const [attachCmd, setAttachCmd] = useState<string | null>(null);
   const [pollMs, setPollMs] = useState(3000);
   // The console is offered only when BOTH the control will proxy it (it is
   // loopback-bound) and this session child serves it (observe.console_enabled).
@@ -309,6 +312,12 @@ export default function ObservePage() {
       // This is static config, not state: absent means unknown, not off.
       if (typeof s.console_enabled === "boolean")
         setChildConsole(s.console_enabled);
+      // Built by the child, which knows its own platform's shell quoting.
+      setAttachCmd(
+        typeof s.attach_command === "string" && s.attach_command
+          ? s.attach_command
+          : null,
+      );
       const bits = [s.alive ? "alive" : "dead"];
       if (s.busy) bits.push("busy");
       if (!s.ready) bits.push("starting");
@@ -517,6 +526,14 @@ export default function ObservePage() {
         />
         <h1>BioPB mcp - observe</h1>
         <span id="status">{status}</span>
+        {attachCmd && !ended ? (
+          <button
+            title={`Copy: ${attachCmd}\nRun it on this machine to work in the session's namespace. Cells are refused while a job runs.`}
+            onClick={() => void navigator.clipboard?.writeText(attachCmd)}
+          >
+            Copy attach command
+          </button>
+        ) : null}
         {/* Both act on the child, so both 404 once it is gone. A dead button is
             how the page told the user nothing was wrong. */}
         {ended ? null : (

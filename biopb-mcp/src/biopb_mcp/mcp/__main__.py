@@ -384,7 +384,11 @@ def _serve_http(config, port, view=False):
         )
 
     bootstrap_line = "import biopb_mcp.mcp._bootstrap as _b; _b.bootstrap()"
-    extra_arguments = [f"--IPKernelApp.exec_lines={bootstrap_line}"]
+    extra_arguments = [
+        f"--IPKernelApp.exec_lines={bootstrap_line}",
+        # Gates cells from Jupyter clients other than this process's own.
+        "--IPKernelApp.kernel_class=biopb_mcp.mcp._kernel_gate.GatedKernel",
+    ]
 
     # Pin BLAS/OpenMP to one thread in the kernel.  numpy's OpenBLAS parallel
     # LU path (dgetrf_parallel, reached via np.linalg.inv) allocates a large
