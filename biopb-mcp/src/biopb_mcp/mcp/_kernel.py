@@ -40,6 +40,12 @@ ENV_WINDOW_CLOSE_FD = "BIOPB_WINDOW_CLOSE_FD"
 # ENV_WINDOW_CLOSE_FD above).
 ENV_SCRATCH = "BIOPB_SCRATCH_KERNEL"
 
+# Env var handing the kernel the host client's session id, so its gate
+# (_kernel_gate) can tell this process's requests from another Jupyter
+# client's. The literal is mirrored in _kernel_gate.ENV_HOST_SESSION (kept in
+# sync by this comment).
+ENV_HOST_SESSION = "BIOPB_HOST_SESSION"
+
 # Windows window-close fallback (no inherited fd there): the launcher polls this
 # probe -- the zero-arg _viewer_window_alive() the bootstrap injects into the
 # kernel namespace (see _bootstrap, mirrored by this comment) -- and tears the
@@ -47,14 +53,6 @@ ENV_SCRATCH = "BIOPB_SCRATCH_KERNEL"
 # thread; the probe itself is instant.
 _WINDOW_ALIVE_PROBE = "print(_viewer_window_alive())"
 _WINDOW_PROBE_TIMEOUT = 10.0
-
-
-# Tells the kernel which client session is the host's own (_kernel_gate), so a
-# cell from any other client is gated. Run before readiness, on the host's
-# client: the kernel adopts the session of the request that runs it.
-_ADOPT_SESSION_SNIPPET = (
-    "__import__('biopb_mcp.mcp._kernel_gate', fromlist=['_']).adopt_host_session()"
-)
 
 
 def _runtime_connection_file() -> str:
@@ -391,6 +389,10 @@ class KernelHost:
             kernel_name=self._kernel_name,
             connection_file=_runtime_connection_file(),
         )
+        # The client made below shares this session id, so the kernel knows
+        # its host before anything can connect.
+        env = dict(env)
+        env[ENV_HOST_SESSION] = self._km.session.session
         try:
             try:
                 self._km.start_kernel(
@@ -462,16 +464,6 @@ class KernelHost:
             return
         # Use the internal executor: the public execute() waits on _ready, which
         # this probe is what *sets* — waiting on ourselves would deadlock.
-        # Adopt first, so no request of ours after readiness reads as foreign.
-        adopt = self._execute_internal(
-            _ADOPT_SESSION_SNIPPET, timeout=self._startup_timeout
-        )
-        if adopt.get("status") != "ok":
-            raise RuntimeError(
-                "Kernel could not adopt the host session "
-                f"(status={adopt.get('status')!r}, "
-                f"error={adopt.get('error_text')!r})"
-            )
         res = self._execute_internal(
             self._health_probe_code, timeout=self._startup_timeout
         )

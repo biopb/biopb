@@ -1185,11 +1185,36 @@ class TestJupyterClientGate:
             lambda: "None" in host.execute("print(_jobs.running_job())")["stdout"]
         )
 
-    def test_the_host_session_is_adopted(self, gated):
+    def test_the_kernel_knows_its_host_from_launch(self, gated):
         res = gated.execute(
             "import biopb_mcp.mcp._kernel_gate as g; print(g._host_session)"
         )
         assert res["stdout"].strip() == gated._kc.session.session
+
+    def test_the_gate_is_armed_before_the_host_sends_anything(self):
+        # No health probe, so the host never executes a thing: a gate that
+        # learned its host from a request would pass this cell unrecorded.
+        from jupyter_client import BlockingKernelClient
+
+        host = KernelHost(
+            extra_arguments=_GATED_ARGS,
+            health_probe_code=None,
+            parent_death_pipe=False,
+            window_close_pipe=False,
+            watchdog_interval=0,
+        )
+        host.start()
+        kc = BlockingKernelClient(connection_file=host.connection_file)
+        kc.load_connection_file()
+        kc.start_channels()
+        try:
+            kc.wait_for_ready(timeout=30)
+            reply, _ = self._run(kc, "x = 1")
+            assert reply["status"] == "ok"
+            assert [j["origin"] for j in self._jobs(host)] == ["user"]
+        finally:
+            kc.stop_channels()
+            host.shutdown()
 
     def test_an_idle_foreign_cell_runs_and_is_recorded(self, gated, foreign):
         reply, msgs = self._run(foreign, "x = 41 + 1\nprint('hello')")
@@ -1241,12 +1266,31 @@ class TestJupyterClientGate:
         finally:
             self._stop_job(gated)
 
-    def test_silent_passes_while_a_job_runs(self, gated, foreign):
+    def test_silent_code_is_gated_like_any_cell(self, gated, foreign):
+        # `silent` only stops output being broadcast; the code still runs with
+        # full effect, so it must not slip past the gate.
         assert gated.execute(_LONG_JOB)["status"] == "ok"
         try:
             reply, _ = self._run(foreign, "z = 3", silent=True)
+            assert reply["status"] == "error"
+            assert reply["ename"] == "KernelBusy"
+            assert "'z'" not in gated.execute("print(dir())")["stdout"]
+        finally:
+            self._stop_job(gated)
+        reply, _ = self._run(foreign, "z = 3", silent=True)
+        assert reply["status"] == "ok"
+        assert [j["origin"] for j in self._jobs(gated)] == ["mcp", "user"]
+
+    def test_an_empty_request_passes_while_a_job_runs(self, gated, foreign):
+        # What qtconsole sends silently: a prompt-number request, and
+        # user_expressions evaluated for its UI.
+        assert gated.execute(_LONG_JOB)["status"] == "ok"
+        try:
+            reply, _ = self._run(
+                foreign, "", silent=True, user_expressions={"k": "1 + 1"}
+            )
             assert reply["status"] == "ok"
-            assert gated.execute("print(z)")["stdout"].strip() == "3"
+            assert reply["user_expressions"]["k"]["data"]["text/plain"] == "2"
             assert [j["origin"] for j in self._jobs(gated)] == ["mcp"]
         finally:
             self._stop_job(gated)
@@ -1254,7 +1298,8 @@ class TestJupyterClientGate:
     def test_a_host_poll_queued_behind_a_refusal_is_retried(self, gated, foreign):
         # stop_on_error makes ipykernel abort what is queued behind a refused
         # cell; the host retries an aborted snippet once. Queue both behind a
-        # silent sleep so the poll is waiting when the refusal lands.
+        # sleep so the poll is waiting when the refusal lands -- in an empty
+        # request's user_expressions, the one form that passes the gate.
         assert gated.execute(_LONG_JOB)["status"] == "ok"
         statuses = []
         run_once = gated._run_once
@@ -1266,7 +1311,11 @@ class TestJupyterClientGate:
 
         gated._run_once = spy
         try:
-            foreign.execute("import time; time.sleep(1.5)", silent=True)
+            foreign.execute(
+                "",
+                silent=True,
+                user_expressions={"s": "__import__('time').sleep(1.5)"},
+            )
             foreign.execute("y = 1")
             time.sleep(0.3)
             res = gated.execute("print('poll')")

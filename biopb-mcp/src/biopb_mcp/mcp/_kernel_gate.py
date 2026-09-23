@@ -11,35 +11,33 @@ IPython catches and prints what an event callback raises, so a callback cannot
 refuse a cell.
 """
 
+import os
+
 from ipykernel.ipkernel import IPythonKernel
 
 from . import _jobs
 
-# The host's client session id, learned from the request that runs
-# :func:`adopt_host_session`. ``None`` until then, which gates nothing: the
-# kernel cannot tell the host from anyone else before it has been told.
-_host_session = None
+# Env var carrying the host client's session id, set by KernelHost._launch
+# (literal mirrored there as ENV_HOST_SESSION, kept in sync by this comment).
+# Handed over at launch rather than learned from a request, so the gate is armed
+# before the connection file lets anyone in, and no cell can re-adopt it.
+#
+# Not a security boundary: the id rides every iopub message's parent header,
+# and a client holding the connection file can already run anything. The gate
+# keeps honest clients from writing over each other; it does not stop a
+# hostile one.
+ENV_HOST_SESSION = "BIOPB_HOST_SESSION"
+
+# ``None`` when the kernel was launched without one, which gates nothing: there
+# is no host to tell apart from anyone else.
+_host_session = os.environ.get(ENV_HOST_SESSION) or None
 
 # How the refusal names whoever holds the kernel, by job origin (see _jobs._Job).
 _HOLDER = {
     "mcp": "the agent",
     "chat": "the chat agent",
-    "user": "a cell from the observe page",
+    "user": "a user's cell",
 }
-
-
-def adopt_host_session():
-    """Record the session this request came from as the host's own.
-
-    The host runs this before it marks the kernel ready, so every later request
-    from that session is its own and anything else is foreign. Adopting from a
-    request rather than passing an id means the host has nothing to generate or
-    hand over, and a kernel restart re-adopts with the new client.
-    """
-    global _host_session
-    from IPython import get_ipython
-
-    _host_session = get_ipython().kernel.get_parent("shell")["header"]["session"]
 
 
 def _refusal_text(job):
@@ -80,9 +78,12 @@ class GatedKernel(IPythonKernel):
             )
 
         session = self.get_parent("shell").get("header", {}).get("session")
-        # `silent` is a client's hidden execution -- completion, inspection --
-        # which changes nothing a record would describe.
-        if silent or _host_session is None or session == _host_session:
+        # An empty cell is a client asking for its prompt number or evaluating
+        # user_expressions (qtconsole sends both, silently). Decided on the
+        # code, not on `silent`: that flag only stops output being broadcast,
+        # and silent code runs with full effect. Completion and inspection are
+        # other message types and never reach here.
+        if not code.strip() or _host_session is None or session == _host_session:
             return await run()
 
         running = _jobs.running_job()

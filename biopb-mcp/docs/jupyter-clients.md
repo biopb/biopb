@@ -72,18 +72,32 @@ existing `exec_lines` argument, overrides `do_execute`. Not `pre_run_cell`:
 IPython wraps event callbacks in a try/except that prints and continues, so a
 callback cannot refuse a cell, and a Ctrl-C during a wait there is swallowed
 and the cell runs anyway. `do_execute` is also where the two facts the gate
-needs are arguments rather than lookups: the request's parent session id
-(`get_parent("shell")`) and its `silent` flag.
+needs are at hand: the request's parent session id (`get_parent("shell")`) and
+its code.
 
 ### Foreign is "not the host's session"
 
-The host's own client has one session id for the kernel's life. The kernel
-learns it from a marker snippet the host runs before readiness, next to the
-health probe: `_kernel_gate.adopt_host_session()` records the parent session
-of *that* request. No id is passed through the environment and nothing is
-generated up front. A request from any other session is foreign. A request
-with `silent` set — a client's hidden execution for completion or inspection —
-passes through untouched, foreign or not.
+The host's own client has one session id for the kernel's life, and it exists
+before the kernel does: `KernelManager.client()` inherits the manager's session
+id. `KernelHost` hands it over at launch (`BIOPB_HOST_SESSION`), so the gate is
+armed before the connection file lets anyone connect, and nothing a cell sends
+can re-adopt it. Learning it from a marker request instead left every request
+ungated until that marker ran, and let any client run the marker. A kernel
+restart is a new manager, so a new id. A request from any other session is
+foreign.
+
+The session id is not a secret: it rides in the parent header of every iopub
+message the host's requests produce. The gate keeps honest clients from writing
+over each other; anyone holding the connection file can run anything anyway.
+
+**An empty cell passes untouched, foreign or not** — the decision is on the
+code, not on `silent`. `silent` only stops output being broadcast; silent code
+runs with full effect, so it is gated like any cell. What clients actually send
+silently is empty: qtconsole's prompt-number request, and `user_expressions`
+evaluated for its UI. Completion and inspection are other message types and
+never reach `do_execute`. The remaining gap: `user_expressions` on an empty
+request are evaluated even while a job runs. They are expressions, and nothing
+records them.
 
 ### Refusal
 
@@ -238,11 +252,11 @@ before it runs.
 
 ## Shape of the work
 
-1. `_kernel_gate.py`: `GatedKernel(IPythonKernel)` with `do_execute`,
-   `adopt_host_session`; launch argument in `__main__`; marker snippet in
-   `KernelHost` before readiness. Tests in `_tests/test_mcp_kernel.py` with a
-   second `jupyter_client` attached to the real kernel: refused while a job
-   runs, recorded when idle, `silent` passes, a poll during a refusal.
+1. `_kernel_gate.py`: `GatedKernel(IPythonKernel)` with `do_execute`; launch
+   argument in `__main__`; the host's session id in the launch environment.
+   Tests in `_tests/test_mcp_kernel.py` with a second `jupyter_client` attached
+   to the real kernel: refused while a job runs, recorded when idle, silent code
+   gated, an empty request passing, a poll during a refusal.
 2. `_jobs.py`: `_JobStream` tee for the main thread; a `record_inline`
    context the gate wraps a foreign cell in. Tests in `test_mcp_jobs.py`.
 3. `health()` / `server_status` / observe status: the connection file and the
