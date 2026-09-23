@@ -366,8 +366,10 @@ is not adjacent to the image, so NGFF's relative path would be meaningless).
 No proto change, no Java build. A `role` column in the `tensors` struct is a
 later addition only if filtering on the path proves fragile.
 
-**Authorization.** A set is part of its parent object: a read capability on
-the parent covers its sets, and nothing else changes. Create, write and every
+**Authorization.** A set is an attached tensor, so it carries its own read
+capability or none at all -- a grant on its image does not reach it, the same
+way one on a source does not reach what is attached to it. Nothing mints one
+for a set today, so a set follows the server-wide rule. Create, write and every
 state transition are full access like every other mutation.
 
 ## Clients

@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 from biopb.tensor.client import TensorFlightClient
 from biopb.tensor.ticket_pb2 import ChunkBounds
-from biopb_image_base.server import EmbeddedTensorCache
+from biopb_image_base.server import RESULT_TTL_S, EmbeddedTensorCache
 
 
 def _free_tcp_port() -> int:
@@ -35,7 +35,14 @@ def embedded_cache(tmp_path: Path) -> EmbeddedTensorCache:
             file_max_total_bytes=128 * 1024 * 1024,
         )
     )
-    tensor_server = TensorFlightServer(location="grpc://0.0.0.0:0", writable=True)
+    # Production's shape: the Flight write path refused, a write_dir anyway --
+    # that is what gives the server the scratch source results are added to.
+    tensor_server = TensorFlightServer(
+        location="grpc://0.0.0.0:0",
+        writable=False,
+        write_dir=tmp_path / "uploads",
+        scratch_ttl=RESULT_TTL_S,
+    )
 
     try:
         yield EmbeddedTensorCache(
@@ -64,8 +71,14 @@ def served_embedded_cache(tmp_path: Path):
 
     port = _free_tcp_port()
     location = f"grpc://127.0.0.1:{port}"
-    # Mirror the production embedded server: read-only over Flight.
-    tensor_server = TensorFlightServer(location=location, writable=False)
+    # Mirror the production embedded server: read-only over Flight, with a
+    # write_dir for the scratch source its results go on.
+    tensor_server = TensorFlightServer(
+        location=location,
+        writable=False,
+        write_dir=tmp_path / "uploads",
+        scratch_ttl=RESULT_TTL_S,
+    )
     thread = threading.Thread(target=tensor_server.serve, daemon=True)
     thread.start()
 
@@ -123,6 +136,101 @@ def test_embedded_cache_reports_serving(tmp_path: Path):
         assert health["status"] == "SERVING"
     finally:
         tensor_server.shutdown()
+        CacheManager.reset()
+
+
+def test_a_result_is_a_tensor_of_the_scratch_source(embedded_cache):
+    """Added to a source that already exists, not registered as one of its own.
+
+    That is what gives it a deadline and a grant of its own; the marked
+    ``@fields`` segment is what keeps its id off a native one.
+    """
+    array_id = embedded_cache.create_source(
+        np.zeros((4, 4), dtype=np.float32), "cache:", ["Y", "X"]
+    )
+
+    source_id, _, field = array_id.partition("/")
+    assert source_id == "scratch"
+    assert field.startswith("@fields/")
+
+
+def test_a_result_carries_a_deadline(embedded_cache):
+    """The scratch source caps every upload on it, so nothing the consumer
+    never collected is held for the life of the process."""
+    array_id = embedded_cache.create_source(
+        np.zeros((4, 4), dtype=np.float32), "cache:", ["Y", "X"]
+    )
+    descriptor = TensorFlightClient.descriptor_from_pb(
+        embedded_cache.to_serialized_tensor(array_id)
+    )
+
+    assert 0 < descriptor.ttl_seconds <= RESULT_TTL_S
+
+
+def test_two_results_under_one_name_do_not_collide(embedded_cache):
+    """A field is taken while its tensor is served, so the name is salted --
+    a servicer naming every result 'cache:' would otherwise be refused the
+    second one."""
+    first = embedded_cache.create_source(
+        np.zeros((4, 4), dtype=np.float32), "cache:", ["Y", "X"]
+    )
+    second = embedded_cache.create_source(
+        np.zeros((4, 4), dtype=np.float32), "cache:", ["Y", "X"]
+    )
+
+    assert first != second
+
+
+def test_each_result_carries_its_own_grant(embedded_cache):
+    """The reason the grant is not on the source: every result shares the
+    scratch source, so one producer's token must not open another's."""
+    mine = embedded_cache.create_source(
+        np.zeros((4, 4), dtype=np.float32), "cache:", ["Y", "X"]
+    )
+    theirs = embedded_cache.create_source(
+        np.zeros((4, 4), dtype=np.float32), "cache:", ["Y", "X"]
+    )
+
+    my_token = embedded_cache.to_serialized_tensor(mine).auth_token
+    their_token = embedded_cache.to_serialized_tensor(theirs).auth_token
+
+    assert my_token and their_token and my_token != their_token
+
+
+def test_a_restart_does_not_adopt_the_last_run_s_results(tmp_path: Path):
+    """They are cleared, not re-served. A result's capability is minted in
+    memory, so one adopted from an earlier life would come back readable by
+    anyone who reaches the port.
+    """
+    from biopb_image_base.server import _start_embedded_tensor_cache
+    from biopb_tensor_server.cache import CacheManager
+
+    def _run(port):
+        CacheManager.reset()
+        server, _ = _start_embedded_tensor_cache(
+            cache_dir=tmp_path,
+            cache_size=128 * 1024 * 1024,
+            tensor_port=port,
+            tensor_host="127.0.0.1",
+        )
+        return server
+
+    first = _run(_free_tcp_port())
+    try:
+        cache = EmbeddedTensorCache(first, "grpc://127.0.0.1:9999")
+        array_id = cache.create_source(
+            np.zeros((4, 4), dtype=np.float32), "cache:", ["Y", "X"]
+        )
+        field = array_id.partition("/")[2]
+        assert first.sources.get("scratch").attached_tensor(field) is not None
+    finally:
+        first.shutdown()
+
+    second = _run(_free_tcp_port())
+    try:
+        assert second.sources.get("scratch").attached_tensors == {}
+    finally:
+        second.shutdown()
         CacheManager.reset()
 
 

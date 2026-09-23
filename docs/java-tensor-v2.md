@@ -72,7 +72,7 @@ Both gates fail closed. A server that does not state a protocol is refused
 however it declines to -- no reply, an empty body, a body that is not JSON, or
 JSON without the key are one fact, and the gate is worth nothing if the
 quietest server walks through it. The single exemption is an
-`UNAUTHENTICATED`/`UNAUTHORIZED` `health`: a per-source capability token cannot
+`UNAUTHENTICATED`/`UNAUTHORIZED` `health`: a capability token cannot
 reach the catalog tier `health` sits on, and the call it is about to make
 authorizes itself.
 

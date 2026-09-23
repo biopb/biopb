@@ -113,9 +113,11 @@ to the caller rather than decoding them into a structure of its own choosing. A 
 addressed, not listed.
 
 **Two token tiers** (`_authorize`): the catalog tier requires the server-wide
-token when one is configured; the private tiers require a source's capability
-token when the adapter carries one, else the server-wide token. A private
-source may still be catalogued -- the token gates reading, not knowing.
+token when one is configured; the private tiers require an uploaded tensor's
+capability token when it carries one, else the server-wide token. A grant sits
+on one tensor, never on the source it hangs off -- one source is shared by
+uploads with different producers. A private tensor may still be catalogued --
+the token gates reading, not knowing.
 
 Custom `do_action` verbs: `health` (reports `protocol`),
 `add_tensor`, `set_upload_status`, `chunk_locate`, `cache_stats`, `resolve`, `warm`,

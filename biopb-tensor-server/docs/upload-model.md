@@ -33,11 +33,18 @@ itself.
 
 ## The scratch source
 
-A result that belongs to no source of the user's needs somewhere to go. A
-writable server serves one **scratch source**, at the fixed id `scratch`
-(`adapters/scratch.py`), constructed at startup and put on the catalog. It
-holds no bytes **and no tensors** of its own: what is added to it is an
-uploaded field like any other, under `<write_dir>/fields/scratch/` (Fields).
+A result that belongs to no source of the user's needs somewhere to go. Any
+server with a `write_dir` serves one **scratch source**, at the fixed id
+`scratch` (`adapters/scratch.py`), constructed at startup and put on the
+catalog. It holds no bytes **and no tensors** of its own: what is added to it
+is an uploaded field like any other, under `<write_dir>/fields/scratch/`
+(Fields).
+
+`write_dir`, not `writable`, is the switch: `writable` serves the Flight write
+verbs, and an in-process producer wants the scratch source without them. That
+is `biopb-image-base`'s embedded result cache, which calls `add_tensor`
+directly and leaves `add_tensor`, `set_upload_status` and DoPut refused on the
+wire.
 
 - **The id is fixed, which is the point.** A producer writes
   `zarr://scratch/@fields/<name>` without a round trip first -- nothing to

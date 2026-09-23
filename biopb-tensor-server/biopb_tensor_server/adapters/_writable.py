@@ -452,6 +452,19 @@ class WritableSource:
             return False
         return (time.time() if wall_now is None else wall_now) >= self._expires_at
 
+    def remaining_ttl(self, wall_now: Optional[float] = None) -> Optional[int]:
+        """Seconds left on the deadline, or None when there is none.
+
+        The deadline as ``ttl_seconds`` means it: a duration, because a caller
+        has no way to compare its clock against this server's. At least 1 while
+        the tensor is still served, so a lifetime never reads as "expired" to a
+        caller that can still read it.
+        """
+        if self._expires_at is None:
+            return None
+        now = time.time() if wall_now is None else wall_now
+        return max(1, round(self._expires_at - now))
+
     # -- the format's half -----------------------------------------------------
 
     def _store_chunk(
@@ -517,10 +530,9 @@ class WritableSource:
             chunk_shape=list(self.get_transfer_chunk_size()),
             dtype=desc.dtype,
         )
-        if self._expires_at is not None:
-            # Back to a duration, which is what the field means: the caller has
-            # no way to compare its clock against this server's.
-            answer.ttl_seconds = max(1, round(self._expires_at - time.time()))
+        remaining = self.remaining_ttl()
+        if remaining is not None:
+            answer.ttl_seconds = remaining
         return answer
 
     def discard(self, reason: str = "") -> Dict[str, Any]:

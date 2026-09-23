@@ -172,9 +172,9 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
                 published already, and nothing may write to it again.
         """
         self.source_id = source_id
-        # Optional per-source capability token. When set, reading this source
-        # takes either it or the server-wide token (see
-        # TensorFlightServer._authorize_read). None = no per-source gate.
+        # The grant this tensor carries, if it is attached to a source and
+        # someone minted one for it (``TensorAdapter.capability_token``). None
+        # leaves it on the server-wide rule.
         self._capability_token: Optional[str] = None
         self._shape = tuple(shape)
         self._dtype = dtype

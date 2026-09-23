@@ -10,7 +10,10 @@ did before:
 - the server token is checked **first** and opens everything, so a capability
   *adds* access rather than replacing it;
 - a capability covers reads only, so writes, ``resolve`` and ``warm`` take full
-  access whatever token the source carries.
+  access whatever grant the tensor carries.
+
+A grant sits on a *tensor*, never on the source it hangs off: one source is
+shared by uploads with different producers.
 """
 
 import pyarrow.flight as flight
@@ -26,17 +29,19 @@ CAPABILITY = "capability-token"
 
 
 class _Adapter:
-    """Minimal source double: an id, and what grants it carries.
+    """Minimal source double: an id, and the grants its tensors carry.
 
-    *tensor_tokens* is the per-tensor half, keyed by full ``array_id`` -- what
+    *tensor_tokens* is keyed by full ``array_id`` -- what
     ``SourceAdapter.tensor_capability_token`` answers off its attachment index.
+    A source has no token of its own to offer, which is the point; the one set
+    in :class:`TestASourceCannotGateWhatIsAttachedToIt` is there to show it is
+    never consulted.
     """
 
     source_type = "zarr"
 
-    def __init__(self, source_id, capability_token=None, tensor_tokens=None):
+    def __init__(self, source_id, tensor_tokens=None):
         self.source_id = source_id
-        self.capability_token = capability_token
         self._tensor_tokens = dict(tensor_tokens or {})
 
     def tensor_capability_token(self, array_id):
@@ -63,11 +68,16 @@ class _Context:
 #: producer, so the grant cannot sit on the source they share.
 TENSOR_CAPABILITY = "tensor-capability-token"
 
+#: The gated object throughout: one tensor of a source that gates nothing else.
+GATED = "gated/@fields/result"
+
 
 def _server(token):
     server = TensorFlightServer("grpc://localhost:0", token=token)
     server.sources.register("open", _Adapter("open"))
-    server.sources.register("gated", _Adapter("gated", capability_token=CAPABILITY))
+    server.sources.register(
+        "gated", _Adapter("gated", tensor_tokens={GATED: CAPABILITY})
+    )
     server.sources.register(
         "shared",
         _Adapter(
@@ -125,13 +135,13 @@ class TestFullAccess:
 class TestNarrowGrant:
     """``_authorize_read``: full access, or a capability covering this read."""
 
-    def test_the_capability_opens_its_own_source(self, guarded):
-        guarded._authorize_read(_Context(CAPABILITY), "gated", READ_PIXELS)
+    def test_the_capability_opens_its_own_tensor(self, guarded):
+        guarded._authorize_read(_Context(CAPABILITY), GATED, READ_PIXELS)
 
     def test_it_covers_annotations_too(self, guarded):
         """One token, both reads -- today. The actions are named so that can
         stop being true without touching a call site."""
-        guarded._authorize_read(_Context(CAPABILITY), "gated", READ_ANNOTATIONS)
+        guarded._authorize_read(_Context(CAPABILITY), GATED, READ_ANNOTATIONS)
 
     def test_the_capability_does_not_open_another_source(self, guarded):
         """A grant names an object. ``open`` carries none, so the ordinary rule
@@ -139,11 +149,12 @@ class TestNarrowGrant:
         with pytest.raises(flight.FlightUnauthenticatedError):
             guarded._authorize_read(_Context(CAPABILITY), "open", READ_PIXELS)
 
-    def test_the_server_token_opens_a_gated_source(self, guarded):
-        """The reversal. The capability used to be checked first and returned,
-        so presenting the server token to a capability-bearing source was a
-        refusal -- the operator locked out of their own server."""
-        guarded._authorize_read(_Context(SERVER_TOKEN), "gated", READ_PIXELS)
+    def test_the_server_token_opens_a_gated_tensor(self, guarded):
+        """The server token is checked first, so presenting it to a
+        capability-bearing tensor opens it rather than being refused as the
+        wrong capability -- the operator is never locked out of their own
+        server."""
+        guarded._authorize_read(_Context(SERVER_TOKEN), GATED, READ_PIXELS)
 
     def test_a_source_without_a_grant_follows_the_ordinary_rule(self, guarded):
         guarded._authorize_read(_Context(SERVER_TOKEN), "open", READ_PIXELS)
@@ -157,25 +168,25 @@ class TestNarrowGrant:
             guarded._authorize_read(_Context(None), "missing", READ_PIXELS)
 
     def test_a_wrong_capability_is_refused_not_fallen_through(self, guarded):
-        """Presenting the wrong token for a gated source is a refusal, not a
+        """Presenting the wrong token for a gated tensor is a refusal, not a
         miss that then consults the server-wide rule."""
         with pytest.raises(flight.FlightUnauthenticatedError):
-            guarded._authorize_read(_Context("wrong"), "gated", READ_PIXELS)
+            guarded._authorize_read(_Context("wrong"), GATED, READ_PIXELS)
 
 
 class TestLocalMode:
     """Local mode removes the server-wide gate, not every gate."""
 
-    def test_a_gated_source_stays_gated(self, local):
+    def test_a_gated_tensor_stays_gated(self, local):
         """The embedded result cache's whole model: it mints capabilities on a
         server with no server-wide token, so if local mode opened everything
         the capability would mean nothing.
         """
         with pytest.raises(flight.FlightUnauthenticatedError):
-            local._authorize_read(_Context(None), "gated", READ_PIXELS)
+            local._authorize_read(_Context(None), GATED, READ_PIXELS)
 
     def test_the_capability_still_opens_it(self, local):
-        local._authorize_read(_Context(CAPABILITY), "gated", READ_PIXELS)
+        local._authorize_read(_Context(CAPABILITY), GATED, READ_PIXELS)
 
     def test_an_ungated_source_is_open(self, local):
         local._authorize_read(_Context(None), "open", READ_PIXELS)
@@ -225,11 +236,35 @@ class TestATensorCarriesItsOwnGrant:
             guarded._grants(SERVER_TOKEN, READ_PIXELS, "shared/@fields/theirs") is None
         )
 
-    def test_a_source_grant_still_covers_every_tensor(self, guarded):
-        """The embedded result cache's shape, unchanged: its source *is* one
-        result, so the grant sits on the source and covers what is in it."""
-        guarded._authorize_read(_Context(CAPABILITY), "gated/0", READ_PIXELS)
-        assert guarded._grants(CAPABILITY, READ_PIXELS, "gated/0") is True
+    def test_a_sibling_of_the_gated_tensor_is_not_gated(self, guarded):
+        """A grant names one tensor, so the source it hangs off keeps whatever
+        rule it had -- here the ordinary one."""
+        assert guarded._grants(SERVER_TOKEN, READ_PIXELS, "gated/0") is None
+
+
+class TestASourceCannotGateWhatIsAttachedToIt:
+    """Only a tensor carries a grant, and only the attachment index is read.
+
+    A source is shared -- every uploaded result lands on one scratch source --
+    so a token at source scope would open every producer's result to whoever
+    holds one of them. Nothing consults it, which is why the field it would
+    live in is declared on ``TensorAdapter`` and not on ``SourceAdapter``.
+    """
+
+    def test_a_token_set_on_the_source_gates_nothing(self, guarded):
+        adapter = guarded.sources.get("open")
+        adapter.capability_token = "source-token"
+
+        assert guarded._grants("source-token", READ_PIXELS, "open") is None
+        with pytest.raises(flight.FlightUnauthenticatedError):
+            guarded._authorize_read(_Context("source-token"), "open", READ_PIXELS)
+
+    def test_and_the_server_token_still_reads_it(self, guarded):
+        """The other half: a stray source token does not lock the operator out
+        of a source that is otherwise open."""
+        guarded.sources.get("open").capability_token = "source-token"
+
+        guarded._authorize_read(_Context(SERVER_TOKEN), "open", READ_PIXELS)
 
 
 class TestGrantsSeam:
@@ -243,13 +278,13 @@ class TestGrantsSeam:
         assert guarded._grants(SERVER_TOKEN, READ_PIXELS, "open") is None
 
     def test_a_matching_grant_is_true(self, guarded):
-        assert guarded._grants(CAPABILITY, READ_PIXELS, "gated") is True
+        assert guarded._grants(CAPABILITY, READ_PIXELS, GATED) is True
 
     def test_a_mismatched_token_is_false(self, guarded):
-        assert guarded._grants("wrong", READ_PIXELS, "gated") is False
+        assert guarded._grants("wrong", READ_PIXELS, GATED) is False
 
     def test_an_action_outside_the_grant_is_false(self, guarded):
-        """The right token for the right source, asked about something it does
+        """The right token for the right tensor, asked about something it does
         not cover. This is what keeps `warm` out even if a call site ever asked
         `_authorize_read` about it."""
-        assert guarded._grants(CAPABILITY, "warm", "gated") is False
+        assert guarded._grants(CAPABILITY, "warm", GATED) is False
