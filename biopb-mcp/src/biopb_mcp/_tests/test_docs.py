@@ -58,7 +58,7 @@ def test_an_id_that_could_escape_the_tier_is_not_an_id(doc_id):
 # --------------------------------------------------------------------------- #
 def test_a_banked_doc_is_unlisted_but_readable(store):
     """`_` is the release's decision not to list, and nothing more: the file
-    ships and `read_doc` returns it (knowledge.md §2)."""
+    ships and `read_doc` returns it (knowledge.md §1)."""
     ship(store, "served")
     ship(store, "_banked")
     assert _docs.shipped_ids() == ["served"]
@@ -179,7 +179,7 @@ def test_an_ignored_doc_is_not_in_the_tail_and_is_still_readable(store):
 
 
 def test_a_collection_line_is_kept_verbatim(store):
-    """Reserved for knowledge.md §9: it names no file today and must not be
+    """Reserved for knowledge.md §7: it names no file today and must not be
     reported as missing, or a seed written for a later release reads as broken."""
     ship(store, "index", "- internals/: the engine's own design docs\n")
     rendered = _docs.render_index()

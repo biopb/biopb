@@ -79,7 +79,7 @@ def valid_id(doc_id: str) -> bool:
     """True if *doc_id* names a doc: slash-separated segments, no traversal.
 
     A trailing ``/`` is not an id. It is reserved for the collections of
-    ``docs/knowledge.md`` §9 and is accepted only where that section says it is
+    ``docs/knowledge.md`` §7 and is accepted only where that section says it is
     -- verbatim in an index line -- so a seed written for a later release parses
     here and means something there.
     """
@@ -457,7 +457,7 @@ def render_index(text: str | None = None) -> str:
             continue
         named.add(doc_id)
         if doc_id.endswith("/"):
-            out.append(line)  # a collection line: kept verbatim (knowledge.md §9)
+            out.append(line)  # a collection line: kept verbatim (knowledge.md §7)
             continue
         meta = describe(doc_id)
         if meta is None:

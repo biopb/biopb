@@ -2,7 +2,7 @@
 //
 // The control is normally the origin root, but it can be published below it —
 // `biopb control start --url-prefix /node/<host>/<port>`, an Open OnDemand
-// interactive app (biopb/biopb#728, `docs/url-prefix.md`). That prefix carries a
+// interactive app (biopb/biopb#728, `biopb-control/docs/url-prefix.md`). That prefix carries a
 // compute node's hostname and a port allocated at job start, so there is no
 // build-time answer: `vite build --base=…` cannot bake it and
 // `import.meta.env.BASE_URL` is always "/". The control instead rewrites the

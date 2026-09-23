@@ -60,7 +60,7 @@ pnpm build                       # tensor-flight-client, then @biopb/web -> pack
 
 No build-time env is needed. The viewer resolves the control-proxied data plane
 (`/data_plane`) at runtime, together with any path prefix the control is
-published under (`--url-prefix`, see `docs/url-prefix.md`), so one bundle serves
+published under (`--url-prefix`, see `biopb-control/docs/url-prefix.md`), so one bundle serves
 every deployment. The control serves the
 resulting `packages/app/dist`; point it there with
 `biopb control start --static-dir <repo>/web/packages/app/dist` (the default is

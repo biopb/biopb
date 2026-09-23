@@ -6,7 +6,7 @@ somewhere that has none of the session's state. This module owns that somewhere:
 a second kernel, spawned per verification, discarded after it.
 
 Why a process and not a namespace, why the session's own display, and what
-"discarded" does *not* cover: ``docs/verification-scratch-kernel.md``.
+"discarded" does *not* cover: ``docs/verify-workflow.md``.
 
 Three things live here, and they are one module because they are one decision.
 
