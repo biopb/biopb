@@ -1,116 +1,93 @@
 # Progressive discovery & catalog freshness
 
-**Status:** implemented (Option B streaming). The server reaches `SERVING`
-immediately and streams its bootstrap scan in the background; the `health` action
-carries `full_scan_in_progress` / `last_full_scan_finished_at` as the freshness
-signal. Touches `biopb-tensor-server` (+ a client indexing-state hint in
-`biopb-mcp` and the webapp).
+Scope: `biopb-tensor-server`, with a client indexing-state hint in `biopb-mcp`
+and the webapp.
 
-## Why
+## SERVING vs. freshness
 
-The startup discovery scan can take a long time on a large data directory. It used
-to run **synchronously before the server reported `SERVING`**, so clients waited
-through the whole scan even though partial results were servable almost
-immediately. Progressive discovery makes startup: reach `SERVING` right away,
-populate the catalog in the background, and expose a **separate freshness signal**
-for how up-to-date the catalog is.
+`SERVING` means the server is up and serving the catalog, not that the catalog
+is complete. `mark_ready()` flips `health`'s status from `STARTING` to
+`SERVING` as soon as the watcher / `SourceManager` are wired and started --
+before the bootstrap scan runs. A large data directory would otherwise force
+every client to wait through the whole scan even though partial results are
+servable almost immediately.
 
-**A timestamp, not a "scan complete" boolean.** Once the catalog persists to DuckDB
-(planned), a one-shot "initial scan done" milestone stops meaning anything — on
-restart the catalog is already populated from disk. The useful question is *how
-fresh* it is, which `last_full_scan_finished_at` answers, and it **unifies boot
-with steady state**: the periodic full rescan (`full_rescan_interval`, default 1h)
-advances the same value, so there is no special "startup" concept.
+Freshness is a separate, continuous signal, not a boot milestone: `health`
+carries `full_scan_in_progress: bool` and `last_full_scan_finished_at: float |
+null` (epoch seconds, `null` until the first full scan succeeds). The same
+value backs both boot and steady state -- the periodic full rescan
+(`full_rescan_interval`, default 3600s) advances it exactly like the initial
+scan, so there is no separate "startup" concept for a client to special-case.
+Incremental rescans, which skip stable/cloud subtrees, touch neither field;
+only a force-full rescan does.
 
-## What `SERVING` now means
+## How the catalog populates
 
-`mark_ready()` / `SERVING` is **redefined** to "the server is up and serving the
-(possibly still-populating, possibly persisted) catalog" — *not* "the catalog is
-complete." `mark_ready()` is called early, right after the watcher / SourceManager
-are wired and started, instead of after the scan. Freshness is carried by two
-`health` fields, never by `SERVING`:
+The data plane is progressive-safe independent of discovery: the gRPC server
+binds and serves in `FlightServerBase.__init__` before any scan runs, and
+catalog mutation (`register_source` / `unregister_source`) and reads
+(`list_flights` / `get_flight_info` / `do_get`) already serialize on
+`_sources_lock` -- `list_flights` skips any source whose descriptor isn't
+fully built. The bootstrap scan itself runs in the `SourceManager`'s
+event-loop thread rather than blocking `mark_ready()`, and its first rescan
+fires immediately instead of waiting out the rescan interval.
 
-- `full_scan_in_progress: bool` — a full scan is running right now.
-- `last_full_scan_finished_at: float | null` — epoch seconds; `null` until the
-  first full scan succeeds. Reuses `SourceManager._last_full_rescan_at` ("last time
-  the whole tree was fully reconciled"), advanced only by a **force-full** rescan
-  (incremental rescans, which skip stable/cloud subtrees, leave it untouched).
+Within the first scan, each source registers the moment the walk claims it
+(`_stream_first_scan_add` -> `_commit_add_claim`), rather than appearing in
+one batch at end-of-walk. This is safe because the first scan is add-only --
+the catalog starts empty and force-full, so there is no removal diff to
+compute and every claim is a pure add. `_initial_scan_done` marks the
+boundary: it flips once, at the end of the first successful full scan, and
+gates the behavior below. Steady-state rescans keep the ordinary
+snapshot-diff model (`removed = current − discovered`), since only they need
+to detect removals; they do not stream. Static, explicitly-configured sources
+are seeded synchronously and never go through this path.
 
-## How it works
-
-**The data plane was already progressive-safe** — the conversion was mostly
-plumbing:
-
-- The gRPC server binds and serves in `FlightServerBase.__init__`, before any scan
-  runs; `serve()` only parks the calling thread.
-- Catalog mutation (`register_source` / `unregister_source`) and reads
-  (`list_flights` / `get_flight_info` / `do_get`) already serialize on
-  `_sources_lock`, and `list_flights` already skips any source whose descriptor
-  isn't fully built — so the wire layer never assumed a complete catalog.
-
-**Background the scan.** The monitored bootstrap scan runs in the SourceManager's
-event-loop thread instead of synchronously before `mark_ready()`. Its first rescan
-fires immediately rather than after the rescan interval. This also unblocks the
-launch-path HTTP sidecar and makes a startup `Ctrl+C` clean.
-
-**Option B — stream the first scan.** Backgrounding alone still makes the catalog
-appear in one batch at end-of-walk, because the reconcile computes a removal diff
-(`removed = current − discovered`) that needs the *whole* snapshot. Option B makes
-population progressive *within* the walk: on the **first** scan, each source is
-registered the moment the walk claims it (`_stream_first_scan_add` →
-`_commit_add_claim`), deferring only *removals* to the end-of-walk reconcile.
-
-This is low-risk precisely because the first scan is **add-only**: the catalog
-starts empty and force-full, so there are no removals and no diff to compute —
-every claim is a pure add that can register immediately. Steady-state rescans keep
-the unchanged snapshot-diff model (no streaming). Scope is monitored directories;
-static explicit sources stay seeded synchronously.
-
-**The client self-heals.** Every `health`/catalog consumer tolerates a
-partial/growing catalog via an existing re-list mechanism — `biopb-mcp`'s
-`_source_watch_loop` re-lists when `source_count` changes; the webapp polls
-`listSources()`. The only two surfaces that *misled* (showing "No sources" on an
-early/empty catalog) now branch on `full_scan_in_progress` to show "Indexing… (N so
-far)": the napari tensor-browser widget and the webapp `SourceTree`.
+Every `health`/catalog consumer tolerates a partial, growing catalog:
+`biopb-mcp`'s `_source_watch_loop` re-lists when `source_count` changes, and
+the webapp polls `listSources()`. The napari tensor-browser widget and the
+webapp `SourceTree` -- the two surfaces that would otherwise show "No
+sources" on an early/empty catalog -- branch on `full_scan_in_progress` to
+show "Indexing... (N so far)" instead.
 
 ## Gotchas
 
-- **Precache boundary.** The startup set must warm the precache **backlog** (slow,
-  idle-time), not the prompt **enqueue**. The gate is `_initial_scan_done` (set at
-  end of first scan), *not* `_runtime_phase` — backgrounding runs the scan after
-  `start()`, so `_runtime_phase` would already be true and wrongly prompt-enqueue
-  every startup source. Streamed first-scan adds route to the backlog; live
-  additions after boot prompt-enqueue.
-- **The stability gate holds for streamed adds.** Unstable / recent-mtime entries
-  (the "0 sources on fresh data" artifact) are deferred by the claim phase, so they
-  are never claimed and never streamed; the next steady-state rescan picks them up.
-- **Duplicate-add sharp edge.** `_commit_add_claim` *unregisters* on a duplicate
-  add, so a retried first scan (after a partial failure) would delete
-  already-streamed sources. `_stream_first_scan_add` guards with a presence check,
-  making re-streaming a no-op.
-- **End-of-first-scan reconcile still runs** — idempotently for already-streamed
-  adds — to stamp the freshness timestamp, clear `full_scan_in_progress`, flip
-  `_initial_scan_done`, and establish the confirmed snapshot steady-state diffs
-  against.
-- **Static-only / no-watcher configs.** `SourceManager.start()` returns early with
-  no watcher, so the event loop never runs. `cli.py` drives the completion path
-  directly (stamp the timestamp, seed the backlog) so a purely static config still
-  reports freshness — and a `background_scan_running` fallback scans synchronously
-  if the watcher failed to start, preserving registration.
-- **Incremental rescans** don't toggle the flag or timestamp (both live inside `if
-  force_full_rescan`), so the timestamp keeps meaning "last *full* reconcile."
-- **The `SERVING` contract change is the main risk.** A consumer that reads
-  `SERVING` as "catalog complete" would flash an empty catalog; every "no data" UI
-  must gate on `full_scan_in_progress` (done for the two surfaces above).
+- **Precache boundary.** The startup set warms the precache backlog (slow,
+  idle-time), not the prompt enqueue. The gate is `_initial_scan_done`, not
+  the general runtime-phase flag -- the scan runs after `start()`, so that
+  flag is already true and would otherwise prompt-enqueue every startup
+  source. Streamed first-scan adds route to the backlog; live additions after
+  boot prompt-enqueue.
+- **The stability gate holds for streamed adds.** Unstable / recent-mtime
+  entries are deferred by the claim phase, so they are never claimed or
+  streamed; the next steady-state rescan picks them up.
+- **Duplicate-add sharp edge.** `_commit_add_claim` unregisters on a
+  duplicate add, so a retried first scan (after a partial failure) would
+  otherwise delete already-streamed sources. `_stream_first_scan_add` guards
+  with a presence check, making re-streaming a no-op.
+- **End-of-first-scan reconcile still runs**, idempotently for
+  already-streamed adds, to stamp the freshness timestamp, clear
+  `full_scan_in_progress`, flip `_initial_scan_done`, and establish the
+  snapshot steady-state diffs against from then on.
+- **Static-only / no-watcher configs.** `SourceManager.start()` returns early
+  with no watcher, so the event loop never runs; `cli.py` drives the
+  completion path directly (stamp the timestamp, seed the backlog) so a
+  purely static config still reports freshness, and falls back to a
+  synchronous scan if the watcher failed to start.
+- **A consumer that reads `SERVING` as "catalog complete" is wrong** and will
+  flash an empty catalog; gate "no data" UI on `full_scan_in_progress`
+  instead.
 
 ## Not done / future
 
-- **Option A (per-root reconcile)** — scope the removal diff per monitored root so
-  each root's sources appear as it finishes (bounds steady-state staleness for
-  multi-root configs). Deferred; heavier than Option B and not needed for "serve
-  ASAP."
-- **Static directory expansion** (`resolve_all_sources`) stays synchronous;
-  persistent DuckDB will largely moot its restart cost.
-- **Persistent DuckDB catalog** — once landed, startup serves the persisted catalog
-  immediately and the background scan becomes a revalidation; the freshness
-  timestamp is exactly the staleness signal a client needs.
+- **Per-root reconcile.** The removal diff is computed over the whole
+  monitored tree, not scoped per root, so a multi-root config's steady-state
+  staleness is bounded by the slowest root rather than surfacing sources
+  root-by-root as each finishes.
+- **`resolve_all_sources` (static directory expansion) is still synchronous**
+  at startup.
+- **The catalog itself is not persisted.** `MetadataDatabase`'s `sources`
+  table is truncated on open (only `rois` and `decode_rates` survive a
+  restart), so every boot re-discovers from disk; a persisted catalog would
+  let startup serve immediately and turn the background scan into pure
+  revalidation, with `last_full_scan_finished_at` as the staleness signal.

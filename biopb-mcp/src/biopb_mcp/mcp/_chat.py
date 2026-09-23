@@ -3,7 +3,7 @@
 Runs in the **session child** — the process that owns the ``KernelHost`` and
 serves ``/mcp`` — for the same reason the dask cluster does: it must outlive
 kernel restarts, and a widget inside the kernel could be destroyed by its own
-agent. See ``docs/chat-client-evaluation.md`` for the argument.
+agent. See ``docs/chat-engines.md`` for the argument.
 
 Design notes
 ------------

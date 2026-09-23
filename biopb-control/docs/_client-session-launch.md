@@ -221,7 +221,7 @@ the card can warn before the click.
 **The ACP path should mint one instead.** `_chat_acp.py`'s listener is
 incidental — nobody browses it — so there is no reason to leave it unsecured
 once a password is available. That closes biopb#909 and makes
-[chat-acp-engine.md](chat-acp-engine.md)'s claim that eliminating the exposure
+[chat-engines.md](../../biopb-mcp/docs/chat-engines.md)'s claim that eliminating the exposure
 "requires an opencode mode that provides authenticated transport" obsolete.
 Independent of this feature.
 

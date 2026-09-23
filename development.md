@@ -248,11 +248,11 @@ durable planes and the web origin in
   `biopb-mcp/src/biopb_mcp/_tests/docs/README.md`: seed, packaging and contract
   tests in CI; simulated-user interaction runs against a real session locally,
   as a benchmark rather than a gate.
-- **Workflow verification:** `docs/verification-scratch-kernel.md` — proposed:
-  why `verify_workflow` should run in a scratch *process* rather than a scratch
+- **Workflow verification:** `biopb-mcp/docs/verify-workflow.md` —
+  why `verify_workflow` runs in a scratch *process* rather than a scratch
   namespace, what a second kernel costs, and the one-slot admission rule that
   keeps two kernels from becoming two schedulers.
-- **Agent benchmarks:** `biopb-mcp/docs/fixtures.md` — what a run is given and
+- **Agent benchmarks:** `biopb-mcp/docs/agent-bench.md` — what a run is given and
   how it is scored. One runner over one case directory, whether the case is a
   claim about a doc or about a piece of work (`_tests/agentbench/` for the
   machinery, `_tests/bench/` for the cases and the run).

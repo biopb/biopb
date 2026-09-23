@@ -1,52 +1,19 @@
-# Remote tensor server as a source type — local caching proxy
+# Remote tensor server as a source type
 
-**Status:** implemented — **experimental** (the config surface and the on-disk
-segment-cache keys for proxied sources may change without notice).
-**Component:** `biopb-tensor-server` (adapter + config/reconcile); `biopb-mcp` consumes the proxy.
-**Related:** `progressive-discovery.md`, `cloud-storage-support.md`, `tensor-server-admin-endpoint.md`.
+Scope: `biopb-tensor-server` (adapter + config/reconcile).
 
-## Why
+A config entry whose `url` is `grpc://host:port` is a source like any other, of
+type `tensor-server`: the local server mirrors that upstream's catalog and
+re-serves its data from its own local segment cache, fetching upstream only on
+a miss. Any number of upstreams may sit in one config alongside ordinary
+local/cloud sources, all behind the one cache.
 
-Add a new **source type** — *another biopb tensor server* — so a config entry whose
-`url` is `grpc://upstream-host:8815` turns the local server into a **caching proxy**:
-it mirrors the remote catalog, serves reads from its local persistent segment cache,
-and fetches upstream only on a miss. This is `biopb/biopb#178`'s **Option A (local
-caching proxy)**, framed as a per-source adapter rather than a whole-server mode —
-the two coincide, because a "whole-server proxy" is just a proxy whose sources
-happen to be `tensor-server` entries. Two user-facing wins fall out:
-
-1. **A persistent, shared segment-file cache for remote data.** On POSIX localhost,
-   MCP dask workers read the proxy's segments through the existing `chunk_locate`
-   mmap fast path — **one** cache per machine in the OS page cache instead of a
-   per-worker in-RAM `cachey` slice.
-2. **No per-worker RAM copy for local reads.** Workers point at
-   `grpc://localhost:<proxy>`, so each read is an mmap **view** cached *weakly*
-   (shared OS page-cache pages, self-evicting) rather than a strong per-worker
-   `cachey` copy — nothing is duplicated in worker RAM. (The old localhost
-   "no-cache" gate that used to zero the per-worker cache was removed; the weak
-   view cache achieves the same no-duplication outcome without disabling caching.)
-
-### The load-bearing finding — the segment cache already wraps every adapter
-
-The proxy needs almost no new caching code. `TensorAdapter.resolve_chunk_data`
-(`core/adapter_base.py`) is a base-class method shared by every adapter that already wraps
-`get_data(bounds)` in the cache: it caches when the chunk is scaled or the backend
-is an `ArrowFileBackend`, keying on the `chunk_id` via `get_or_acquire`. `do_get`
-(`serving/server.py`) calls `adapter.resolve_chunk_data(chunk_id,
-CacheManager.get_instance())`. So **any adapter whose `get_data` pulls from an
-upstream automatically inherits the segment cache, eviction, crash recovery, and the
-`chunk_locate` mmap handoff — unchanged.** Consequently `#178`'s Phase 1 (extract
-the cache down into `biopb` root to break a circular dependency) is **not needed**:
-that phase assumed the shared cache would live in the *client*; with a proxy the
-cache stays server-side and the proxy is just another server process.
+This buys two things. A read that already landed in the local file cache is a
+local `chunk_locate` mmap hit shared by every reader on the box, instead of a
+private in-RAM copy per worker; and the upstream only ever sees a request for a
+chunk this server doesn't already have.
 
 ## Config surface
-
-A remote tensor server is declared like any other source. `type` is the new
-`"tensor-server"`, auto-detected from the `grpc://` scheme (so usually omitted);
-`grpc+tls://` / `grpcs://` are recognized identically. **Any number** of upstreams
-may be configured alongside ordinary local/cloud sources in one proxy, all behind
-one segment cache.
 
 ```json
 {
@@ -62,313 +29,198 @@ one segment cache.
 }
 ```
 
-- **`url = grpc://host:port`** — mirror *every* source on the upstream (the network
-  analogue of `url = "/data/"` directory discovery).
-- **`url = grpc://host:port/<upstream_source_id>`** — mirror a single upstream
-  source (the path is the upstream `source_id`, slash-free by the `array_id` spec,
-  so the first `/` after the authority cleanly splits endpoint from source). This is
-  also the shape each *expanded* concrete source carries.
-- **`alias`** (optional, slash-free) — namespace prefix on this upstream's mirrored
-  `source_id`s. Optional for a lone upstream; **required** once a collision is
-  possible. Upstream auth rides the existing `credentials_profile` field via a
-  `storage_type="biopb-tensor"` profile carrying `token` — one token per upstream,
-  no bespoke `SourceConfig.token`. The same profile also carries per-upstream TLS
-  trust for a `grpcs://` upstream (`tls_fingerprint` / `tls_ca_file`, both
-  optional; unset falls back to TOFU pinning). The single-upstream
-  `BIOPB_UPSTREAM_TENSOR_TOKEN` env var remains as a convenience fallback for the
-  token only.
+`type` is `"tensor-server"`, auto-detected from the `grpc://`/`grpc+tls://`/
+`grpcs://` scheme, so it is usually left out.
 
-  | Key | Meaning |
-  |---|---|
-  | `token` | Bearer token for the upstream. Beats the `BIOPB_UPSTREAM_TENSOR_TOKEN` env fallback. |
-  | `tls_fingerprint` | Expected SHA-256 of the upstream's cert (colon-grouped or bare hex, as `cert init` prints it). Verified on every connect. The light form — paste what the server printed. |
-  | `tls_ca_file` | Path to a PEM to trust — a private CA, or the upstream's own leaf. |
+- **`url = grpc://host:port`** mirrors every source on the upstream (the
+  network analogue of `url = "/data/"` directory discovery).
+- **`url = grpc://host:port/<upstream_source_id>`** mirrors a single upstream
+  source. The path is the upstream `source_id`, slash-free by the `array_id`
+  spec, so the first `/` after the authority cleanly splits endpoint from
+  source; every expanded concrete source carries this shape.
+- **`alias`** (optional, slash-free) namespaces this upstream's mirrored
+  `source_id`s. Optional for a lone upstream, required once a collision is
+  possible.
 
-  **TLS trust is optional, and unset means TOFU.** The zero-config default already
-  works; configuring an anchor buys the one thing TOFU cannot — rejecting an
-  impostor in the path at *first* contact, where there is no prior use to trust.
-  Both keys set → **the CA wins, with a warning**, so an operator is never left
-  believing a fingerprint is enforced when it isn't. An unreadable `tls_ca_file`
-  **raises** rather than degrading to TOFU (see *Misconfiguration is not
-  unreachability* below) — silently undoing explicitly configured trust over a
-  typo'd path would be worse than failing. The env var stays token-only: TLS trust
-  never grew an env twin, since anything worth overriding about it is inherently
-  per-upstream.
+Upstream auth rides `credentials_profile`, a `storage_type="biopb-tensor"`
+profile:
 
-  `resolve_upstream_credentials()` (`adapters/remote_tensor.py`) produces one
-  frozen `UpstreamCredentials` from the source + config, and **all three** dial
-  sites use it: the adapter's pooled client, the reconciler's bulk catalog fetch,
-  and the bare-host expansion in `core/config.py`. The latter two dial directly,
-  outside the adapter pool, so leaving either on the old token-only path would
-  have TOFU-pinned a `grpcs://` upstream whose CA was configured.
+| Key | Meaning |
+|---|---|
+| `token` | Bearer token for the upstream. Beats the `BIOPB_UPSTREAM_TENSOR_TOKEN` env fallback (single-upstream convenience only). |
+| `tls_fingerprint` | Expected SHA-256 of the upstream's cert, as `cert init` prints it. Verified on every connect. |
+| `tls_ca_file` | Path to a PEM to trust — a private CA, or the upstream's own leaf. |
 
-**Scheme/type plumbing.** `core.remote.is_remote_url` accepts the `grpc*`
-schemes (else `Path("grpc://…").resolve()` mangles the url);
-`config.detect_source_type` maps `grpc*` → `"tensor-server"` before the remote-bail;
-`config.discover_sources` Case 0 auto-detects the type for a bare `grpc://` source
-instead of erroring "Remote URL requires explicit type" (other remote schemes still
-require an explicit `type`). `SourceConfig.type`'s `Literal` gained
-`"tensor-server"`; the dataclass gained the optional slash-free `alias`.
+TLS trust is optional; unset means TOFU pinning, which already works with zero
+config. Configuring an anchor buys the one thing TOFU cannot: rejecting an
+impostor at *first* contact. If both keys are set, the CA wins and a warning is
+logged, so an operator is never left believing an unenforced fingerprint is
+protecting them. An unreadable `tls_ca_file` raises rather than silently
+degrading to TOFU — see *Misconfiguration is not unreachability* below.
+
+`resolve_upstream_credentials()` (`adapters/remote_tensor.py`) produces one
+frozen, hashable `UpstreamCredentials` from the source + profile, and every
+dial site — the adapter's pooled client, the reconciler's bulk catalog fetch,
+and the bare-host expansion — uses it, so a `grpcs://` upstream's configured CA
+is honored everywhere it is dialed, not just on the adapter's own connection.
 
 ## The adapter — a passthrough that understands nothing
 
-`RemoteTensorAdapter(SourceAdapter, TensorAdapter)` (`adapters/remote_tensor.py`),
-registered `register(RemoteTensorAdapter, "tensor-server")`. **One
-instance per mirrored upstream source**, bound to its `(upstream_endpoint,
-upstream_source_id, alias)`, holding a lazy `TensorFlightClient(location,
-cache_bytes=0, token)`. It is format- and chunking-agnostic; the only thing it
-understands beyond passthrough is the **`array_id` rewrite** mapping its local
-(namespaced) ids to the upstream's and back.
+`RemoteTensorAdapter` (`adapters/remote_tensor.py`) fronts one source on one
+upstream, bound to `(upstream_location, upstream_source_id, local_source_id)`.
+It is format- and chunking-agnostic: it decodes no pixels, derives no chunk
+grid of its own, and treats the upstream's `chunk_id` as opaque. The only thing
+it does beyond passthrough is rewrite `array_id`s between its local
+(namespaced) space and the upstream's.
 
-**No new dispatch.** The server already routes `do_get` by
-`decode_chunk_id(chunk_id)[0].split("/")[0]` → local `source_id` → the registered
-adapter (`_get_adapter_for_chunk` in `serving/server.py`). Every mirrored source
-registers under a unique local `source_id`, so the right `RemoteTensorAdapter` (and
-thus the right upstream) is selected automatically; each instance rewrites to its
-own upstream. Multi-upstream + local sources coexist in the one flat
-`source_id`-keyed registry with **no multiplexing layer**.
+Dispatch needs no changes to support this: the server already routes `do_get`
+by the local `source_id` prefix on the chunk_id to the registered adapter, so
+each mirrored source's own `RemoteTensorAdapter` is picked automatically and
+rewrites to its own upstream. Multiple upstreams and local sources coexist in
+one flat `source_id`-keyed registry with no multiplexing layer.
 
-- **Source layer** — `list_tensor_descriptors` / `get_native_pyramid_levels`
-  mirror the upstream with `array_id` rewritten
-  local-ward. `source_url` is a display-friendly `<scheme>://<alias>:<upstream_id>`
-  (`_source_url`, folded to `<scheme>://<alias>/<upstream-path>` once a re-list
-  seeds the upstream path) — the configured `alias` and the upstream's own
-  `grpc`/`grpcs` scheme, never the dial authority; the real endpoint stays on
-  `_upstream_location` for dialing.
-  `is_resident()` is **not** overridden: a mirror's bytes are on another machine,
-  so the base's "remote scheme → non-resident" is the true answer, and a mirror
-  cannot be warmed anyway (`warm` now refuses a remote url outright rather than
-  reporting a hollow `files_total == 0`). The override used to report endpoint
-  reachability, because that False was being read as "unresolved"; `is_resolved()`
-  is that question now, seeded from the upstream row's own flag, so a mirror of a
-  source the upstream hasn't read yet reports unresolved instead of advertising
-  itself as an empty readable one (biopb/biopb#1035).
-- **Tensor layer** — `get_tensor_descriptor` mirrors upstream under the local
-  `array_id`. `get_physical_scale()` is overridden to read `physical_scale` /
-  `physical_unit` from the upstream `get_descriptor` (the server clears+refills
-  these per `GetFlightInfo`, so the base default of `None` would silently drop them).
-- **Chunk layer** — `resolve_chunk_data(chunk_id)` (chunk_id is a **proxy
-  envelope**, biopb/biopb#178 W1): the miss handler peels it
-  (`chunk.peel_proxy_envelope`) and forwards the opaque **inner** — the upstream's
-  chunk_id, carried VERBATIM, never decoded or rewritten — to the upstream `do_get`
-  (`_upstream_record_batch`), then caches the returned `RecordBatch` under the
-  envelope's own canonical key (`cache_key_for_chunk_id(chunk_id)`). Forwarding the
-  *scaled* inner means the **upstream** downsamples and only the small chunk crosses
-  the WAN.
+The local server's chunk-read path (`TensorAdapter.resolve_chunk_data` wrapping
+`get_data` in the segment cache, keyed by `chunk_id`) is shared by every
+adapter, so the proxy inherits the persistent file cache, eviction, crash
+recovery and the `chunk_locate` mmap fast path unchanged — it adds no caching
+code of its own.
 
-For this slice `get_read_plan` is the **inherited uniform-grid planner** — correct
-because a scaled chunk_id forwarded upstream is downsampled there regardless of what
-levels it advertised. Delegating `GetFlightInfo` to reuse the upstream's *advertised
-native* pyramid (so on-disk OME-Zarr levels are reused rather than recomputed) is a
-follow-up.
+- **Catalog surface** (`list_tensor_descriptors`, `get_metadata`,
+  `get_tensor_descriptor`) mirrors the upstream with `array_id` rewritten
+  local-ward, and degrades to an empty placeholder rather than raising when the
+  upstream is unreachable — see *Unreachable upstream* below.
+- **Read planning** (`plan_flight_info`) forwards the whole `GetFlightInfo` to
+  the upstream and localizes the response: only the upstream knows the grid,
+  the pyramid, and the physical scale for a given (possibly scaled) read, so
+  the proxy re-derives none of it and instead relays the caller's field mask
+  and hints upstream verbatim. On an upstream failure it falls back to the
+  inherited local planner — never worse than treating the mirror as an
+  ordinary, ungridded source.
+- **Chunk reads** (`resolve_chunk_data`) peel a **proxy envelope** off the
+  served chunk_id, forward the inner — the upstream's own chunk_id, carried
+  byte-for-byte, never decoded — to the upstream's `do_get`, and cache the
+  result under the envelope's own key. Forwarding the *scaled* inner means the
+  upstream does any downsampling, so only the small result crosses the
+  network.
+- **Writes are not forwarded.** The proxy is read-only: `add_tensor` and other
+  write verbs are refused on a mirrored source, exactly as on the wire.
 
 ## Identifier policy
 
-The proxy serves multiple upstreams + local sources under one flat,
-`source_id`-keyed catalog, so local ids must be globally unique within the proxy —
-an upstream's ids are namespaced by `alias`:
+Local ids are namespaced so multiple upstreams and local sources can share one
+flat, `source_id`-keyed catalog:
 
 ```
-local source_id = <alias>__<upstream_source_id>          (slash-free ✓)
+local source_id = <alias>__<upstream_source_id>          (slash-free)
 local array_id  = <alias>__<upstream_source_id>[/<field>]
 ```
 
-`__` is a cosmetic separator; routing never parses it back out (each adapter stores
-its `(alias, upstream_source_id)` explicitly). The `array_id` spec still holds — the
-prefix is slash-free, so the first `/` marks the source boundary and
-`source_id = array_id.split("/", 1)[0]` recovers `<alias>__<upstream_source_id>`.
-The cost of namespacing is exactly one `array_id` rewrite (the byte splice); because
-the splice preserves every byte after the `array_id` field, `chunk_id`s stay
-otherwise identical to the upstream's, so the cache and the mmap fast path are
-unaffected. Flat namespace, not per-upstream sub-catalogs, is deliberate: it lets
-the entire existing stack (registry dispatch, metadata-DB `sources`, `list_flights`,
-precache, `do_get` routing) work unchanged.
-
-**Transparency trade.** A client addresses a proxied source as `lab__experiment1`,
-not `experiment1` — not id-transparent to the upstream. A lone upstream may set no
-`alias` (ids pass through verbatim, transparency recovered), but a second upstream
-or a colliding local id makes an `alias` required.
+`__` is a cosmetic separator — nothing parses it back apart; each adapter
+already stores its `(alias, upstream_source_id)` explicitly. The `array_id`
+spec still holds: the prefix is slash-free, so `source_id =
+array_id.split("/", 1)[0]` recovers it whole. Namespacing costs exactly one
+`array_id` rewrite; everything after it in a `chunk_id` is untouched, so the
+cache and the mmap fast path are unaffected. The namespace is flat rather than
+nested per-upstream deliberately: it lets the rest of the stack (registry
+dispatch, the metadata DB, `list_flights`, precache, `do_get` routing) work
+unchanged. A lone upstream with no `alias` keeps its ids verbatim; a second
+upstream, or a colliding local id, requires one.
 
 ### The endpoint is deliberately not in the id
 
-A local id is built from `(alias, upstream_source_id)` — no host, port or scheme.
-Moving an upstream (new port, new host, `grpc://` → `grpcs://`) therefore changes
-only each mirrored source's `url`: its `source_id`, its `array_id`s and the
-`route` inside every `chunk_id` are untouched, so the persistent segment cache
-stays warm and (since #946) ROI annotations stay attached. Contrast a *local*
-source, whose id hashes its path — there an `mv` re-keys everything, and that is
-a known limitation, not a design.
+A local id is built from `(alias, upstream_source_id)` alone — no host, port
+or scheme. Moving an upstream (new port, new host, `grpc://` → `grpcs://`)
+therefore changes only that source's `url`: its `source_id`, its `array_id`s,
+and the route inside every `chunk_id` are untouched, so the persistent segment
+cache stays warm and ROI annotations stay attached. Contrast a *local* source,
+whose id hashes its path — there, moving the file re-keys everything.
 
-This is what the `alias` buys. Two upstreams offering the same
-`upstream_source_id` have to be told apart somehow, and the obvious
-discriminator — `host:port` — would fold the volatile half of the address back
-into the identity and re-key the whole mirror on a move. The alias is a stable,
-human-chosen stand-in for the endpoint.
+The `alias` is what makes this possible: two upstreams offering the same
+`upstream_source_id` must be told apart somehow, and the obvious discriminator,
+`host:port`, would fold the volatile half of the address into the identity and
+re-key the whole mirror on a move. The alias is a stable, human-chosen
+stand-in for the endpoint instead.
 
-The contract that follows: **an alias is part of the data's identity, not a
-display label.** Renaming one re-keys every source mirrored from that upstream —
-cached chunks orphan (their `route` changed) and ROI annotations detach from
-their `source_id`, going invisible to a `roi` read and ageing toward
-`prune_unseen_days`. Two corollaries:
-
-- A lone upstream with no alias keeps verbatim ids, so *adding* an alias later is
-  itself a rename. Set one from the start if a second upstream is ever likely.
-- Do not reuse a retired alias for a different upstream: if an
-  `upstream_source_id` coincides, old rows re-attach to new data, which is worse
-  than orphaning them.
+**An alias is part of the data's identity, not a display label.** Renaming one
+re-keys every source mirrored from that upstream: cached chunks orphan (their
+route changed) and ROI annotations detach from their `source_id`, going
+invisible to a `roi` read and ageing toward `prune_unseen_days`. Two
+corollaries follow: a lone upstream with no alias keeps verbatim ids, so
+*adding* an alias later is itself a rename — set one from the start if a
+second upstream is ever likely — and a retired alias should never be reused
+for a different upstream, since a coinciding `upstream_source_id` would
+re-attach old rows to new data.
 
 ## Catalog mirroring, expansion & refresh
 
-A `tensor-server` source **expands like a directory**. `config.discover_sources`'s
-`tensor-server` branch (`_discover_tensor_server`): the single-source form registers
-under the namespaced local id (`_namespaced_source_id` → `<alias>__<id>`, verbatim
-when no alias); the bare-host form connects, enumerates upstream ids, and yields one
-concrete single-source `SourceConfig` per upstream source. Each registers a
-`RemoteTensorAdapter` under its namespaced local `source_id`; from there normal
-server machinery treats it like any other source. Per-upstream tokens reach the
-adapter via `SourceClaim.extra_config` carrying `credentials_profile`.
+A `tensor-server` source expands like a directory. The single-source form
+registers under its namespaced local id; the bare-host form connects,
+enumerates the upstream's source ids, and yields one concrete single-source
+entry per upstream source — each then registers a `RemoteTensorAdapter` under
+its namespaced `source_id` and is treated like any other source from there.
+The upstream's own **scratch** source is never mirrored: it is a temp store
+whose tensors have a deadline set by that server's policy, not a catalog worth
+carrying.
 
-**Truncation-safe enumeration.** `list_upstream_source_ids(client) → (ids,
-complete)` enumerates with `query_sources("SELECT source_id FROM sources")`,
-which the server does not truncate, so `complete` is always True there. The flag
-exists because `fetch_upstream_catalog`'s is not: reconciling against a
-*truncated* list would spuriously remove sources past the cap, so the re-list
-applies **removals only when `complete`**.
+**Enumeration and seeding are one bulk query.** `fetch_upstream_catalog` reads
+every upstream source's id, tensors, metadata, `is_resolved` and `indexed_at`
+in a single server-side `query_sources`, which is not truncated (unlike
+`list_sources()`), so mirroring costs one upstream RPC regardless of catalog
+size and a re-list can safely remove sources that disappeared. An upstream
+with no SQL catalog falls back to id-only enumeration, and removals are then
+skipped — a truncated or degraded list must never be treated as a complete
+one, or a re-list would drop sources it simply failed to see.
 
-**Metadata source.** `get_metadata()` reads the upstream's DuckDB
-`sources.metadata_json` column (the raw dict, no envelope — the method's contract),
-not the wrapped `GetFlightInfo(with_metadata)` payload. `_localize_descriptor`
-clears `metadata_json` + `pyramid` so mirrored descriptors stay lean (the local
-server refills both).
-
-**Collision check.** `_resolve_tensor_server_id_collisions` runs across the
-flattened set; a clash involving a proxy **drops the collider (first wins) and
-warns** rather than aborting, so one bad source can't take down the catalog.
+**Cache staleness is versioned, not open.** The upstream's `indexed_at`
+becomes this mirror's `content_version`, folded into every chunk_id's proxy
+envelope (`b"iat:<ts>"`). A chunk_id minted against a since-superseded
+`content_version` is rejected before any I/O (`check_chunk_version`) rather
+than served stale, so an upstream that re-registers a source invalidates the
+proxy's cached chunks for it instead of leaking through them.
 
 **Refresh via `monitor=true`.** For a bare-host upstream, `monitor=true`
-generalizes the filesystem rescan into a periodic **upstream re-list** in
-`sources/reconciler.py`: `_reconcile_due_upstreams` runs each rescan tick (default
-30 s) with an **adaptive per-upstream cadence counted in ticks** — every tick while
-an upstream is changing or failing, spacing **doubling per unchanged re-list** up to
-`_UPSTREAM_RELIST_MAX_TICKS` (120 ≈ 1 h). Any change *or* connectivity failure
-resets to every-tick, so a new/recovered upstream is mirrored within ~one tick.
-`_reconcile_one_upstream` diffs the alias-namespaced desired set against
-currently-mirrored claims and applies adds/removes through the **same**
-`_commit_add_claim` / `_commit_remove_source` primitives as the filesystem
-reconcile. Best-effort: an unreachable upstream keeps its mirrored sources and
-retries.
+generalizes the filesystem rescan into a periodic re-list: each upstream has
+its own adaptive cadence, re-listing every rescan tick (default 30s) while
+changing or failing, with the period doubling per unchanged re-list up to
+about an hour. Any change or connectivity failure resets it back to
+every-tick, so a new or recovered upstream is mirrored within about one tick.
 
-**Misconfiguration is not unreachability** (#608). An `UpstreamConfigError`
-(`core/errors.py`) — raised when a credentials profile's `tls_ca_file` cannot be
-read or is empty — is the one failure the fast cadence must *not* apply to: it
-will fail identically until an operator edits the config, so re-reading the same
-broken file every tick is pure waste under a log line that says "unreachable".
-It backs the upstream off to the maximum period instead, and is reported once
-(re-reported when the error text changes) as a config error naming how long that
-back-off is. **Recovery is reported too, and resets the cadence to every-tick** —
-parking a broken upstream for an hour is only reasonable if the operator learns
-that their edit took, and an unchanged catalog on the first good re-list would
-otherwise leave it parked there. The serve-path expansion
-(`resolve_all_sources(tolerant=True)`) and the adapter-build site likewise still
-skip the source, but name it as configuration.
+**Misconfiguration is not unreachability.** A bad `credentials_profile`
+(unreadable or empty `tls_ca_file`) fails identically on every re-list, so it
+backs the upstream straight off to the slow cadence instead of burning the
+fast one retrying a typo, and is reported once as a config error naming the
+back-off. Fixing it is reported too, and resets the upstream to the fast
+cadence — an operator who edits the config needs to see that the edit took,
+not just silence.
 
 **Unreachable upstream.** A proxy "resolve" is a cheap reconnect, not a cloud
-download, so recovery is **transparent** (no `UnresolvedSourceAdapter` consent
-step). The adapter splits its surfaces: the **catalog surface degrades to a
-placeholder** — `list_tensor_descriptors` / `get_metadata` catch the failure and
-return empty, so the catalog upsert writes a row with empty tensors and
-registration's metadata-DB sync doesn't fail-and-roll-back. The **serve surface stays live** —
-`get_tensor_descriptor` / `get_data` / `resolve_chunk_data` still raise (→ retryable
-`UNAVAILABLE`) on a miss, and a failed catalog call drops the dead client so the
-next call reconnects, so real tensors reappear the moment the upstream is back.
-Already-cached chunks keep serving through an outage.
+download, so recovery is transparent — there is no unresolved-source consent
+step. The catalog surface degrades to a placeholder (`list_tensor_descriptors`
+/ `get_metadata` return empty, so registration's metadata-DB sync succeeds
+with a row of no tensors) while the serve surface stays live and raises a
+retryable error on a miss, dropping the dead upstream connection so the next
+call reconnects. Already-cached chunks keep serving through an outage.
 
-## The MCP consumer
-
-This is what makes the proxy worth building. When `biopb-mcp`'s
-`mcp.tensor.server_url` is remote (generalizable to a *list* of upstreams + local
-dirs), bootstrap launches/owns a **per-user local proxy** (whole-user cache budget)
-whose sources are those upstreams + locals, and points the dask workers at
-`grpc://localhost:<proxy>`. The localhost rules zero the per-worker `cachey` cache;
-POSIX workers read proxy segments through the `chunk_locate` mmap fast path (one
-shared page-cache copy); `cache_budget // n_workers` is retired for "workers cache
-nothing; the proxy owns the cache." Multiplexing is the payoff: a scientist's local
-scratch dir and several shared lab stores appear in **one** catalog behind **one**
-cache and **one** set of localhost-optimized workers, so the agent's `client` sees a
-single unified namespace (`lab__…`, `arc__…`, plus local ids).
-
-## Client corollary — a proxy-first napari client
-
-Once a remote store is a cached, unified, persistent proxied source, letting the
-napari client *also* dial arbitrary remotes directly is a strict downgrade (no
-cache, no unification, a second connection). So the client moved **proxy-first**:
-the tensor browser talks to **one** server (the local one), and remote data is
-reached by adding a `tensor-server` source. The inline "connect to any server" form
-(Server URL / Token fields + Connect button) is removed; **kept** are Refresh, the
-source tree, the server-side `query_sources` path, and the background
-source-watcher. The endpoint is *resolved* at connect time by asking the control
-plane, which owns the data plane and knows the port it bound
-(`TensorConnection.auto_connect`, biopb/biopb#628) — load-bearing because the
-managed proxy may sit on a non-default port. The lost "I have data on a remote
-server" workflow redirects to an "add a proxied source" affordance.
+Connections to each upstream are pooled process-wide by `(endpoint,
+credentials)`, so N sources mirrored from one upstream share one connection
+rather than opening N.
 
 ## Local-tensor-server config editing
 
-Reconfiguring the local server's `sources` (including proxied remotes) plus
-cache/pyramid/server knobs is exposed through the **web-app admin surface**, not a
-napari Qt form: `GET`/`PUT /api/config` + `GET /api/admin/status` on the `:8814`
-sidecar (restart is control-owned — the admin page calls the control's
-`POST /api/data_plane/restart`), with napari reduced to a single
-"open admin" browser action. The tool edits the tensor server's canonical config
-`~/.config/biopb/biopb.json` — **not** the biopb-mcp client config
-(`~/.config/biopb/mcp-config.json`). Because the server reads config once at startup
-(no hot-reload), applying = write → control-driven restart → reconnect, then **poll
-`health` and show scan progress** (`full_scan_in_progress`,
-`last_full_scan_finished_at`, climbing `source_count`) so the post-restart discovery
-scan isn't a blind wait. Full route/restart/auth design lives in
-**tensor-server-admin-endpoint.md**; the freshness fields it consumes are described
-in **progressive-discovery.md**.
+The server reads its config once at startup, so reconfiguring `sources`
+(including proxied remotes) is: edit `~/.config/biopb/biopb.json` — through
+`GET`/`PUT /api/config` on the tensor sidecar, or by hand — then restart the
+data plane and reconnect. `GET /api/admin/status` reports scan progress
+(`full_scan_in_progress`, `last_full_scan_finished_at`, climbing
+`source_count`) so a client can wait out the post-restart discovery scan
+instead of guessing when it's done.
 
-## Gotchas
+## Known limits
 
-- **Cache staleness is unsolved.** A persistent segment cache extends "`chunk_id` is
-  immutable" *across sessions*: if an upstream re-registers the same
-  `source_id`/`array_id` with new content, a stale cached chunk is served. The alias
-  prefix disambiguates *across* sources but carries no *content* identity over time.
-  The current key is `cache_key_for_chunk_id(chunk_id)` with **no content version**
-  folded in — the recommended fix (namespace the key by an upstream
-  `content_version`/`etag`, or fall back to the `sources.indexed_at` timestamp) is
-  **not yet built**. Until an upstream exposes a version signal, re-registered
-  content can be masked by the cache.
-- **Namespacing is not id-transparent.** Any multi-upstream / colliding-local config
-  *requires* an `alias`; a missing one drops the collider (first wins) with a warn.
-- **Chained proxies stack aliases** (`a__b__source`) and work, but a misconfigured
-  cycle (`A→B→A`) has no depth cap yet.
-- **One connection per mirrored source.** Each `RemoteTensorAdapter` builds its own
-  `TensorFlightClient`, so a bare-host upstream mirrored into N sources opens N
-  connections to the same `(endpoint, token)` (plus expansion/re-list throwaways).
-  Connection-efficiency only; the data path is unaffected (`biopb/biopb#249` —
-  pool by `(normalized_location, token)`).
-- **Bare-host down at boot needs `monitor=true` to recover.** A single-source
-  `grpc://host/<id>` down at boot registers as an empty placeholder and recovers
-  transparently, but a bare-host `grpc://host` can't be expanded (no per-source ids
-  are knowable until the upstream answers), so its recovery depends on the re-list.
-  `create_source_manager` no longer hard-fails when the *only* source is an
-  unreachable monitored upstream — the server boots empty and the re-list fills it.
-
-## Not done / future
-
-- **Read-only.** No `do_put` passthrough — source creation, `upload_array`, and the
-  lazy-input compute plane's write-back all land on whichever non-proxy server the
-  compute plane is pointed at. Forwarding writes to the upstream is a follow-up.
-- **Content version on the wire** — add `content_version`/`etag` to
-  `DataSourceDescriptor` as the clean staleness fix (see Gotchas).
-- **Read-plan delegation** — mirror the upstream's *advertised native* pyramid via
-  delegated `GetFlightInfo` so on-disk OME-Zarr levels are reused, not recomputed.
-- **Per-user eviction budget** — the proxy's `file_max_total_bytes` should default
-  to a whole-user budget, not a per-worker slice.
-- **Live `reconfigure`** — v1 apply is write + a control-driven restart; a
-  `do_action("reconfigure")` for incremental source add/remove (no full rescan)
-  is a possible follow-up.
-- **Alias ergonomics** — `<alias>__<source_id>` is verbose in the agent's `client`
-  namespace; auto-deriving a short host-based alias on first collision is open.
+- **Chained proxies** (a proxy mirroring another proxy) stack aliases
+  (`a__b__source`) and work, but a misconfigured cycle has no depth cap yet.
+- **A bare-host upstream that is down at boot** can't be expanded — no
+  per-source ids are knowable until it answers — so its sources appear only
+  once `monitor=true` re-lists it successfully; the server still boots rather
+  than failing outright when the only configured source is an unreachable
+  monitored upstream.

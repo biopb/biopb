@@ -6,8 +6,6 @@ This sub-project predates the other biopb components and was folded into the bio
 
 ## Core concept
 
-TensorFlightServer has a simple goal: to **efficiently** read very large imaging datasets, and to do it regardless of the storage format the data are in.
-
 Internally, TensorFlightServer works by **_transcoding_** — converting the original data into **Apache Arrow** format — because many legacy formats are simply too difficult to read both lazily and efficiently. Notably, TensorFlightServer's transcode process is:
 
   - **on demand** - so it only transcodes the data the user cares about
@@ -16,6 +14,7 @@ Internally, TensorFlightServer works by **_transcoding_** — converting the ori
 
 The Arrow data are then served to the user via an Arrow Flight server, which brings a few additional benefits:
 
+  - **Concurrency**: a benefit of the arrow format is its well-proven concurrency efficiency. We support thread-level, multi-process, and distributed read.
   - **Network transparency**: the data can sit anywhere on the network and still be accessible.
   - **Metadata database**: all metadata is centralized in one database and queryable using standard SQL.
   - **Language-agnostic**: the data can be read from any of the languages Arrow Flight supports.
