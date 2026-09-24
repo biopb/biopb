@@ -719,8 +719,8 @@ async def execute_code(
 
     * viewer mutations (read_doc("napari-viewer") has more):
     Mutate the viewer directly. From a run_async task too: its mutations are
-    marshaled to the main thread. run_on_main(fn) batches many mutations into
-    one hop, or touches raw Qt (viewer.window), from a task.
+    marshaled to the main thread, one hop each, so bulk viewer work and raw Qt
+    (viewer.window) belong in a cell.
 
     * data access (read_doc("tensor-server-client") has more):
     - client.query_sources(sql, format="pandas") runs server-side DuckDB and
@@ -1042,10 +1042,10 @@ async def interrupt_kernel() -> str:
     A cell runs on the kernel's main thread and gets a SIGINT, which also wakes
     a blocking sleep or wait; a task gets a KeyboardInterrupt raised into its
     thread. Either lands at the next bytecode, so a blocking C-level call (gRPC
-    tensor fetch, native compute) stops only when it returns to Python. Also
-    cancels the job's in-flight dask futures, which is what stops a blocking
-    `.compute()` -- but only on a dask `Client` a cell built. If YOUR job
-    stays stuck, use restart_kernel -- the guaranteed stop.
+    tensor fetch, native compute) stops only when it returns to Python. A
+    blocking `.compute()` on a dask `Client` cancels its own tasks when
+    interrupted; in a task that lands within 10 s. If YOUR job stays stuck,
+    use restart_kernel -- the guaranteed stop.
 
     Stops YOUR job only. A cell the user runs from an attached Jupyter notebook
     shares this kernel but is not yours to stop: this refuses it, so wait for it

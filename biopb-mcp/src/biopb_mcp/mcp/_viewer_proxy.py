@@ -50,8 +50,9 @@ _QT_TOPLEVEL = frozenset({"PyQt6", "PyQt5", "PySide6", "PySide2", "qtpy", "vispy
 class ViewerThreadError(RuntimeError):
     """Raised when a raw-Qt object is accessed off the Qt main thread.
 
-    The fail-loud alternative to a segfault: wrap the access in
-    ``run_on_main(...)`` (also injected into the kernel namespace).
+    The fail-loud alternative to a segfault. Off the main thread means a
+    ``run_async`` task (a cell runs on the main thread), so the fix is to do
+    the access in a cell.
     """
 
 
@@ -180,8 +181,8 @@ class _ContainerProxy(_HandleProxy):
 class _GuardProxy(_ProxyBase):
     """Fail-loud guard for raw-Qt objects (``viewer.window`` and below).
 
-    Usable on the main thread (e.g. inside ``run_on_main``); any off-main access
-    raises instead of returning a handle that would segfault."""
+    Usable on the main thread (a cell); any off-main access raises instead of
+    returning a handle that would segfault."""
 
     __slots__ = ()
 
@@ -190,8 +191,8 @@ class _GuardProxy(_ProxyBase):
             real = object.__getattribute__(self, "_real")
             raise ViewerThreadError(
                 f"{type(real).__module__}.{type(real).__qualname__} is a Qt "
-                "object and can only be touched on the Qt main thread. Wrap the "
-                "access in run_on_main(lambda: ...)."
+                "object and can only be touched on the Qt main thread: do this "
+                "in a cell, not in a run_async task."
             )
 
     def __getattr__(self, name):

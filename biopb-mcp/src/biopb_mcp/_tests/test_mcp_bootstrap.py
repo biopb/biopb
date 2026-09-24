@@ -23,7 +23,6 @@ def _seeded_ns():
         "np": "NP",
         "da": "DA",
         "ops": {},
-        "run_on_main": lambda f: f(),
         "_conn": object(),
         "_jobs": object(),
         "_viewer_window_alive": lambda: True,

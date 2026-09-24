@@ -597,9 +597,6 @@ def _bootstrap_impl():
     ns = {
         "_conn": conn,
         "_jobs": _jobs,
-        # Safe to bind headless: with no QCoreApplication it runs `fn` inline
-        # (see _jobs.run_on_main), so a plugin that marshals still works.
-        "run_on_main": _jobs.run_on_main,
     }
     if not is_scratch_kernel():
         # **A scratch kernel binds no workflow handles**, for the reason it

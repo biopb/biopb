@@ -107,49 +107,6 @@ class TestTasks:
         assert job.status == "error"
         assert "ZeroDivisionError" in job.error_text
 
-    def test_distributed_cancel_rebuilds_futures(self, runner, monkeypatch):
-        # _cancel() must rebuild real Future objects from dc.futures' string
-        # keys: Client.cancel() filters its arg through futures_of(), which
-        # silently drops bare strings -- so passing list(dc.futures) cancels
-        # nothing.  Assert real Futures (resolvable by futures_of) + force=True.
-        from distributed import Client, Future
-        from distributed.client import futures_of
-
-        calls = {}
-
-        class _Loop:
-            def add_callback(self, fn, *a, **k):  # swallow Future.release()
-                pass
-
-        class _StubClient:
-            futures = {"('grad', 0, 0)": object(), "('grad', 1, 0)": object()}
-            generation = 0
-            loop = _Loop()
-
-            def _inc_ref(self, key):
-                pass
-
-            def _dec_ref(self, key):
-                pass
-
-            def cancel(self, futures, force=False):
-                calls["futures"] = list(futures)
-                calls["force"] = force
-
-        # Whatever client is *live*: a cell that
-        # made its own Client() is attached just as much, and its futures are
-        # just as stuck.
-        stub = _StubClient()
-        monkeypatch.setattr(Client, "current", classmethod(lambda cls, **kw: stub))
-        job = _task(_spin)
-        _jobs._cancel_dask_futures()
-        passed = calls["futures"]
-        assert passed and all(isinstance(f, Future) for f in passed)
-        assert {f.key for f in futures_of(passed)} == set(_StubClient.futures)
-        assert calls["force"] is True
-        _jobs.interrupt(job.job_id)  # actually stop the uncooperative loop
-        _wait(job)
-
     def test_reset_clears_registry(self, runner):
         _task(lambda: None)
         assert _jobs._jobs

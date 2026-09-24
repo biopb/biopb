@@ -14,12 +14,11 @@ What this module keeps is what the host cannot do from outside:
   attributes to that cell's request) under the task. One task at a time.
 * **Stopping** (:func:`interrupt`, on the control thread): a ``SIGINT`` for
   the cell on the main thread, a ``KeyboardInterrupt`` raised into a task's
-  thread, and a cancel of the in-flight dask futures, the only
-  mid-``compute()`` stop short of ``restart_kernel``. Who may stop what is the
-  host's decision; this checks only that the job named still runs.
+  thread. Who may stop what is the host's decision; this checks only that the
+  job named still runs.
 * **Main-thread affinity.** The viewer is a Qt/vispy object bound to the main
-  thread. A task's viewer calls are marshaled through :func:`run_on_main`
-  (``_viewer_proxy`` does it for the whole ``viewer``).
+  thread. A task's viewer calls are marshaled through :func:`run_on_main`,
+  which ``_viewer_proxy`` does for the whole ``viewer``.
 """
 
 import contextlib
@@ -71,7 +70,6 @@ KERNEL_HANDLE_NAMES = frozenset(
         "np",
         "da",
         "ops",
-        "run_on_main",
         "run_async",
         "_conn",
         "_jobs",
@@ -414,33 +412,6 @@ def run_async(fn, *args, **kwargs):
     return job.job_id
 
 
-def _cancel_dask_futures():
-    """Stop the in-flight dask work: one job at a time, so all of it."""
-    # Distributed dask: cancel in-flight futures.  This is what actually stops a
-    # blocking ``.compute()`` -- its tasks ARE registered in ``dc.futures`` for
-    # the duration of the internal ``gather``, so cancelling them makes that
-    # gather raise and unwinds the job thread.  ``dc.futures`` is keyed by task
-    # key *string*, so we must rebuild ``Future`` objects from those keys:
-    # ``Client.cancel`` filters its argument through ``futures_of()``, which
-    # silently drops bare strings -- ``cancel(list(dc.futures))`` cancels nothing.
-    # One job at a time, so every tracked future belongs to this job.
-    # Whatever client a cell built: `current` finds the global default,
-    # which is what dask itself computes on (raises ValueError when there is
-    # none, i.e. the in-process default). No client without `distributed`
-    # loaded, and importing it here would cost a stop seconds.
-    if "distributed" not in sys.modules:
-        return
-    try:
-        from distributed import Client, Future
-
-        dc = Client.current(allow_global=True)
-        keys = list(dc.futures)
-        if keys:
-            dc.cancel([Future(k, dc) for k in keys], force=True)
-    except Exception:  # noqa: BLE001 - cancel is best-effort
-        logger.debug("distributed cancel failed", exc_info=True)
-
-
 def _running_task():
     """The running task, or None: one at a time (see run_async())."""
     for j in _jobs.values():
@@ -470,7 +441,7 @@ def _raise_in_thread(ident, exctype):
 
 def interrupt(key, reason=None):
     """Force-stop the job *key* names if it still runs: a ``KeyboardInterrupt``
-    where it runs, and a cancel of its dask futures.
+    where it runs.
 
     Called on the kernel's control thread (``_kernel_gate``), so it is answered
     while the main thread is busy -- including with the very cell it stops.
@@ -490,9 +461,15 @@ def interrupt(key, reason=None):
     the main thread (:func:`hold_cell`), so it gets a real ``SIGINT``, which
     also breaks a blocking sleep or wait. Checked and sent under the lock the
     cell is ended under, so the signal cannot reach the next cell (see
-    :func:`hold_cell`). Either way the in-flight dask futures are cancelled too
-    (:func:`_cancel_dask_futures`), the only mid-``compute()`` stop short of a
-    restart. *reason* (a person's Stop) is prefixed to a task's error.
+    :func:`hold_cell`). *reason* (a person's Stop) is prefixed to a task's
+    error.
+
+    **No dask cancel.** A blocking dask ``Client`` call waits in
+    ``distributed.utils.sync``, whose own ``KeyboardInterrupt`` handler cancels
+    that call's futures and nothing else's. A cell's ``SIGINT`` breaks the wait
+    at once; a task's exception lands when the wait next wakes, within 10 s
+    (hardcoded there). Cancelling every future on the client was faster for a
+    task, but took a user's compute and any persisted data with it.
     """
     with _lock:
         job = _running(key)
@@ -507,8 +484,6 @@ def interrupt(key, reason=None):
             # A cell's reason is the host's to attach (note_cancel).
             _interrupt_main()
             raised = True
-    # Off the lock: a distributed cancel is a round trip to the scheduler.
-    _cancel_dask_futures()
     return {"interrupted": raised}
 
 

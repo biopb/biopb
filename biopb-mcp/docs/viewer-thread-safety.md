@@ -74,8 +74,8 @@ exactly the graph that ships.
 - **Cost:** each marshaled op is a `QMetaObject.invokeMethod` round-trip
   that serializes with rendering — negligible normally, but it bites in hot
   loops (thousands of `set_current_step` calls across a movie's frames).
-  Escape hatch: `run_on_main(lambda: <bulk>)` (one hop for the whole
-  block). A `viewer.batched()` context is a possible future add, not built.
+  Only a `run_async` task pays it: a cell runs on the main thread, where the
+  proxy calls straight through, so bulk viewer work belongs in a cell.
 - **Timeout, not deadlock:** `future.result(timeout=_RUN_ON_MAIN_TIMEOUT)`
   raises `ViewerThreadError` on a blocked main thread rather than hanging.
   The widened marshal surface widens the deadlock surface vs. the old wrap

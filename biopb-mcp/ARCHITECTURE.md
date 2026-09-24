@@ -116,8 +116,8 @@ scheduler, shared with the napari viewer, and a cell that wants parallel
 multi-process computation builds a dask `Client` itself. Defaulting to in-process is a
 reliability choice: a long-lived cluster nobody opted into is one nobody watches,
 and a suspended host left every `.compute()` blocked on a scheduler whose workers
-were gone (**#970**). The trade is that a `.compute()` is cancellable mid-flight
-only on a dask `Client`.
+were gone (**#970**). Stop needs no dask machinery either: a blocking dask
+`Client` call cancels its own futures when interrupted.
 
 A cluster a cell spins belongs to the **kernel** — its workers are that process
 group's children, so they go down with it. There is no cluster machinery in the
