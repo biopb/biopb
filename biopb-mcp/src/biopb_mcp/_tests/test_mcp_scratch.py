@@ -52,7 +52,8 @@ def _scratch_host(
     hold=None,
     interrupt_lands=True,
 ):
-    """A stand-in scratch kernel that answers the four snippets ``_scratch`` sends.
+    """A stand-in scratch kernel host: the two job calls ``_scratch`` makes
+    into the kernel (submit, interrupt), and the job records it reads.
 
     *hold* is an ``Event``: while it is unset the kernel's job polls as still
     running, so a test can act on a verification that is genuinely in flight.
@@ -62,26 +63,29 @@ def _scratch_host(
     """
     host = MagicMock()
     host.start.side_effect = on_start or (lambda: None)
+    host.is_alive.return_value = True
     record = _cells_record(job_status, title) if record is None else record
+
+    def poll(job_id):
+        snap = {
+            "job_id": job_id,
+            "status": "running"
+            if (hold is not None and not hold.is_set())
+            else job_status,
+            "stdout": "",
+            "error_text": "",
+            "verify": {**record, "cells": [{**record["cells"][0]}]},
+        }
+        # The polled ledger carries a head, never the full output.
+        snap["verify"]["cells"][0].pop("stdout", None)
+        return snap
+
+    host.jobs.poll.side_effect = poll
+    host.jobs.verify_record.side_effect = lambda job_id: record
 
     def execute(code, *_a, **_k):
         if "_jobs.submit(" in code:
             return _envelope({"job_id": "job-1"})
-        if "_jobs.poll(" in code:
-            snap = {
-                "job_id": "job-1",
-                "status": "running"
-                if (hold is not None and not hold.is_set())
-                else job_status,
-                "stdout": "",
-                "error_text": "",
-                "verify": {**record, "cells": [{**record["cells"][0]}]},
-            }
-            # The polled ledger carries a head, never the full output.
-            snap["verify"]["cells"][0].pop("stdout", None)
-            return _envelope(snap)
-        if "_jobs.verify_record(" in code:
-            return _envelope(record)
         if "_jobs.interrupt_current(" in code:
             if interrupt_lands:
                 hold.set() if hold is not None else None
@@ -104,11 +108,12 @@ def _blocks(cells, prose="What this workflow does."):
 
 
 def _session_host(running=None):
-    """The session kernel, which ``_scratch`` asks only whether it is busy."""
+    """The session host, whose records ``_scratch`` reads only for whether a
+    job is running."""
     host = MagicMock()
-    host.execute.side_effect = lambda code, *a, **k: _envelope(
-        running if "_jobs.running_job(" in code else None
-    )
+    host.jobs.running.return_value = running
+    host.jobs.foreign_digest.return_value = []
+    host.execute.side_effect = lambda *a, **k: _envelope(None)
     return host
 
 

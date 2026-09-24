@@ -77,6 +77,49 @@ def log(runner, monkeypatch):
     return log
 
 
+class _IopubStream:
+    """``sys.stdout`` for the runner, standing in for ipykernel's: every write
+    goes to *log* as a ``stream`` message under one request, which is what
+    ipykernel does for a job thread started by that request."""
+
+    REQUEST = "req-under-test"
+
+    def __init__(self, log):
+        self._log = log
+
+    def write(self, s):
+        self._log.on_iopub(
+            {
+                "header": {"msg_type": "stream"},
+                "parent_header": {"msg_id": self.REQUEST},
+                "content": {"name": "stdout", "text": s},
+            }
+        )
+        return len(s)
+
+    def flush(self):
+        pass
+
+
+@pytest.fixture
+def iopub(log, monkeypatch):
+    """The ``log`` fixture plus the job's output, as a kernel would deliver it.
+    One job at a time, so one request stands for every submit."""
+    import contextlib
+
+    run = _jobs._exec_capture
+
+    def exec_capture(code, ns, target):
+        # At exec time, in the job's thread: pytest re-seats sys.stdout for
+        # the test body, after any fixture could have replaced it.
+        with contextlib.redirect_stdout(_IopubStream(log)):
+            return run(code, ns, target)
+
+    monkeypatch.setattr(_jobs, "_request_id", lambda: _IopubStream.REQUEST)
+    monkeypatch.setattr(_jobs, "_exec_capture", exec_capture)
+    return log
+
+
 def _wait_job(job_id, timeout=5.0):
     """Block until *job_id* leaves ``running``, and return its snapshot."""
     deadline = time.monotonic() + timeout
@@ -101,7 +144,6 @@ class TestJobRunnerUnit:
         jid = _jobs.submit("print('hello'); 1 + 2")["job_id"]
         snap = self._wait(jid)
         assert snap["status"] == "ok"
-        assert snap["stdout"] == ""
         assert snap["result_text"] == "3"
         assert "hello\n" in capsys.readouterr().out
         # The refresh prefix ran: client mirrors _conn.client.
@@ -697,7 +739,6 @@ class TestJobIntent:
         snap = self._wait(_jobs.submit("x = 1", intent=weird)["job_id"])
         assert snap["intent"] == weird
         assert snap["status"] == "ok"
-        assert snap["stdout"] == ""
 
 
 class TestRecordInline:
@@ -719,7 +760,6 @@ class TestRecordInline:
             print("hi")
             job.status = "ok"
         assert capsys.readouterr().out == "hi\n"
-        assert _jobs.poll(job.job_id)["stdout"] == ""
 
     def test_running_for_its_duration_and_named_by_running_job(self, runner):
         with _jobs.record_inline("import time") as job:
@@ -1043,64 +1083,62 @@ class TestVerification:
         _wait_job(_jobs.submit("", verify_cells=["scratch_only = 1"])["job_id"])
         assert runner["scratch_only"] == 1
 
-    def test_the_bootstrap_handles_are_still_there(self, runner):
+    def test_the_bootstrap_handles_are_still_there(self, runner, iopub):
         # A workflow that cannot reach `client` would verify nothing.
-        snap = _wait_job(
-            _jobs.submit("", verify_cells=["print(_conn is not None)"])["job_id"]
-        )
-        assert snap["status"] == "ok"
-        assert snap["verify"]["cells"][0]["stdout_head"] == "True"
+        jid = _jobs.submit("", verify_cells=["print(_conn is not None)"])["job_id"]
+        assert _wait_job(jid)["status"] == "ok"
+        assert iopub.poll(jid)["verify"]["cells"][0]["stdout_head"] == "True"
 
-    def test_cells_run_in_order_and_share_one_namespace(self, runner):
-        snap = _wait_job(
-            _jobs.submit("", verify_cells=["a = 2", "print(a * 3)\na * 3"])["job_id"]
-        )
-        cells = _jobs.verify_record(snap["job_id"])["cells"]
-        assert snap["verify"]["status"] == "ok"
+    def test_cells_run_in_order_and_share_one_namespace(self, runner, iopub):
+        jid = _jobs.submit("", verify_cells=["a = 2", "print(a * 3)\na * 3"])["job_id"]
+        _wait_job(jid)
+        assert iopub.poll(jid)["verify"]["status"] == "ok"
+        cells = iopub.verify_record(jid)["cells"]
         assert cells[1]["stdout"] == "6\n"
         assert cells[1]["result_text"] == "6"
 
-    def test_cells_after_a_failure_are_skipped_not_dropped(self, runner):
+    def test_cells_after_a_failure_are_skipped_not_dropped(self, runner, iopub):
         # Dropping them would report a workflow that mysteriously got shorter;
         # running them would report the cascade as separate defects.
-        snap = _wait_job(
-            _jobs.submit("", verify_cells=["1 / 0", "print('a')", "print('b')"])[
-                "job_id"
-            ]
-        )
-        assert [c["status"] for c in snap["verify"]["cells"]] == [
-            "error",
-            "skipped",
-            "skipped",
+        jid = _jobs.submit("", verify_cells=["1 / 0", "print('a')", "print('b')"])[
+            "job_id"
         ]
+        snap = _wait_job(jid)
+        expected = ["error", "skipped", "skipped"]
+        assert [c["status"] for c in snap["verify"]["cells"]] == expected
+        assert [c["status"] for c in iopub.poll(jid)["verify"]["cells"]] == expected
+        assert (
+            "ZeroDivisionError" in iopub.poll(jid)["verify"]["cells"][0]["error_text"]
+        )
 
-    def test_output_is_split_per_cell_and_teed_to_the_job(self, runner):
+    def test_output_is_split_per_cell_and_kept_whole_for_the_job(self, runner, iopub):
         # The notebook needs the split; poll_job on a long verification needs
         # the whole run accumulating where it always does.
-        snap = _wait_job(
-            _jobs.submit("", verify_cells=["print('one')", "print('two')"])["job_id"]
-        )
-        record = _jobs.verify_record(snap["job_id"])
+        jid = _jobs.submit("", verify_cells=["print('one')", "print('two')"])["job_id"]
+        _wait_job(jid)
+        record = iopub.verify_record(jid)
         assert [c["stdout"] for c in record["cells"]] == ["one\n", "two\n"]
-        assert snap["stdout"] == "one\ntwo\n"
+        assert iopub.poll(jid)["stdout"] == "one\ntwo\n"
 
-    def test_the_polled_record_carries_a_head_not_the_output(self, runner):
-        # The polled snapshot crosses a JSON round trip every 0.4s while a
-        # verification runs; carrying every cell's output there would ship the
+    def test_the_polled_record_carries_a_head_not_the_output(self, runner, iopub):
+        # Carrying every cell's output in the polled record would ship the
         # bytes `stdout` already holds, once more per cell, growing with the
         # workflow. The full text is read once, by verify_record(), for the
-        # notebook -- before the kernel holding it is discarded.
+        # notebook.
         big = "print('x' * 40_000)"
-        snap = _wait_job(_jobs.submit("", verify_cells=[big] * 5)["job_id"])
-        polled = snap["verify"]["cells"]
+        jid = _jobs.submit("", verify_cells=[big] * 5)["job_id"]
+        _wait_job(jid)
+        polled = iopub.poll(jid)["verify"]["cells"]
         assert all("stdout" not in c for c in polled)
         assert all(c["stdout_len"] == 40_001 for c in polled)
         assert all(c["stdout_head"] == "x" * 79 + "…" for c in polled)
         # ...and the notebook still gets all of it.
-        full = _jobs.verify_record(snap["job_id"])["cells"]
+        full = iopub.verify_record(jid)["cells"]
         assert all(len(c["stdout"]) == 40_001 for c in full)
 
-    def test_the_polled_record_does_not_grow_with_what_the_cells_printed(self, runner):
+    def test_the_polled_record_does_not_grow_with_what_the_cells_printed(
+        self, runner, iopub
+    ):
         # The property, stated as a shape rather than a number: the polled
         # record scales with the *workflow* -- a line per cell, which is the
         # point of a ledger -- and not with its output.
@@ -1108,7 +1146,8 @@ class TestVerification:
 
         def polled_size(chars):
             jid = _jobs.submit("", verify_cells=[f"print('y' * {chars})"] * 5)["job_id"]
-            return len(json.dumps(_wait_job(jid)["verify"]))
+            _wait_job(jid)
+            return len(json.dumps(iopub.poll(jid)["verify"]))
 
         # ~495,000 more characters printed across the five cells; the record
         # moves by the digits of a length and the source that names them.
@@ -1119,6 +1158,9 @@ class TestVerification:
         snap = _wait_job(_jobs.submit("", verify_cells=["a = 1", "a"])["job_id"])
         assert "a = 1" in snap["code"] and snap["code"].endswith("a")
 
-    def test_an_ordinary_job_carries_no_verification(self, runner):
-        assert _jobs.poll(_jobs.submit("1 + 1")["job_id"])["verify"] is None
-        assert _jobs.verify_record(_jobs.submit("1 + 1")["job_id"]) is None
+    def test_an_ordinary_job_carries_no_verification(self, runner, log):
+        jid = _jobs.submit("1 + 1")["job_id"]
+        _wait_job(jid)
+        assert _jobs.poll(jid)["verify"] is None
+        assert log.poll(jid)["verify"] is None
+        assert log.verify_record(jid) is None

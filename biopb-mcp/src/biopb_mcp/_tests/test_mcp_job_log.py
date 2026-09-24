@@ -178,6 +178,79 @@ class TestDigest:
         assert [d["job_id"] for d in log.foreign_digest("mcp")] == ["job-1", "job-2"]
 
 
+class TestVerification:
+    """A scratch kernel's run: one stream, split at the cell boundaries it
+    announces."""
+
+    def _verify(self, log, cells=("a = 1", "print(a)")):
+        _start(
+            log,
+            code="\n\n".join(cells),
+            verify={"title": "wf", "cells": list(cells), "created": 1.0},
+        )
+
+    def _cell(self, log, i, status="ok", **kw):
+        log.on_iopub(_event(event="cell_start", job_id="job-1", index=i))
+        if "out" in kw:
+            _print(log, kw.pop("out"))
+        log.on_iopub(
+            _event(
+                event="cell_end",
+                job_id="job-1",
+                index=i,
+                status=status,
+                elapsed=0.1,
+                **kw,
+            )
+        )
+
+    def test_output_is_split_per_cell_and_kept_whole(self):
+        log = JobLog()
+        self._verify(log)
+        self._cell(log, 0, out="one\n")
+        self._cell(log, 1, out="two\n", result_text="1")
+        _end(log)
+        full = log.verify_record("job-1")
+        assert [c["stdout"] for c in full["cells"]] == ["one\n", "two\n"]
+        assert full["cells"][1]["result_text"] == "1"
+        assert full["status"] == "ok"
+        assert log.poll("job-1")["stdout"] == "one\ntwo\n"
+
+    def test_the_polled_record_carries_heads(self):
+        log = JobLog()
+        self._verify(log)
+        self._cell(log, 0, out="one\n")
+        (cell, _second) = log.poll("job-1")["verify"]["cells"]
+        assert "stdout" not in cell
+        assert cell["stdout_head"] == "one" and cell["stdout_len"] == 4
+
+    def test_the_cells_a_failure_never_reached_are_skipped(self):
+        log = JobLog()
+        self._verify(log)
+        self._cell(log, 0, status="error", error_text="Traceback ...")
+        _end(log, status="error")
+        cells = log.poll("job-1")["verify"]["cells"]
+        assert [c["status"] for c in cells] == ["error", "skipped"]
+        assert cells[0]["error_text"] == "Traceback ..."
+
+    def test_a_kernel_death_fails_the_cell_it_died_in(self):
+        # The OOM a verification exists to catch: the cell it died in is the
+        # failure, and the rest never ran.
+        log = JobLog()
+        self._verify(log)
+        log.on_iopub(_event(event="cell_start", job_id="job-1", index=0))
+        log.kernel_gone("the scratch kernel died")
+        cells = log.verify_record("job-1")["cells"]
+        assert [c["status"] for c in cells] == ["error", "skipped"]
+        assert "died" in cells[0]["error_text"]
+
+    def test_an_ordinary_job_has_no_verification(self):
+        log = JobLog()
+        _start(log)
+        assert log.poll("job-1")["verify"] is None
+        assert log.verify_record("job-1") is None
+
+
 class TestOutputCap:
     """The bound ``_MAX_RETAINED_JOBS`` is not: that caps how many records are
     kept, not how large one gets."""

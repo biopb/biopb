@@ -431,7 +431,7 @@ def _format_verification(record: dict, job_id: str, saved_path=None) -> str:
     for i, cell in enumerate(cells, 1):
         # The head, not the output: a verification's record is polled, and the
         # full text of every cell belongs to the notebook, not to a ledger line
-        # (see _jobs._Cell.snapshot).
+        # (see _job_log._CellRecord.snapshot).
         head = (cell.get("stdout_head") or "").strip()
         lines.append(
             f"  {i}. {cell.get('status')} · {cell.get('elapsed')}s"

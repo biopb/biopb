@@ -308,8 +308,13 @@ exception is not. Blocked on the ipykernel 7 verification above.
    that still enter the kernel (submit, interrupt) return their result as a
    `user_expression` rather than a printed line, which a job's output under
    the same request could split.
-3. *Verification.* Scratch runs move onto the same records, with per-cell
-   boundary events, and the in-kernel output capture is deleted.
+3. *Verification (done).* A scratch kernel announces each cell's start and
+   end, flushing its streams first, so its host splits the one output stream
+   per cell (`_job_log._VerifyRecord`); `_scratch` polls that host's records,
+   and the session's busy check reads the session host's. The in-kernel
+   capture (`_JobStream`, the per-thread routing) is deleted. A scratch kernel
+   runs no watchdog, so `_scratch` ends the record itself when the process
+   dies, failing the cell it died in.
 
 This is a refactor of how the host talks to the kernel, orthogonal to
 subshells and to the gate, which stays in-kernel either way — only kernel code

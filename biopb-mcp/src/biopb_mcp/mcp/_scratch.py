@@ -18,8 +18,9 @@ Three things live here, and they are one module because they are one decision.
   three more times, each allocating gigabytes on a machine already under
   pressure.
 * **The run.** Submitted to that kernel through the same ``_jobs.submit``
-  door as any other job, so the per-cell record, the output capture and the
-  interrupt path are the ones that already exist.
+  door as any other job, so the interrupt path is the one that already exists,
+  and recorded the way any job is: by that kernel's host, from iopub
+  (``_job_log``), with the output split per cell.
 * **The slot.** Two kernels must not become two schedulers. The dask cluster is
   shared and finite, and the agent's whole model is "one cell at a time", so a
   verification takes the same slot ordinary work does — see :func:`start`.
@@ -148,7 +149,7 @@ def detail(job_id):
     What it shows instead of a job's stdout is the run's own progress -- which
     stage the bring-up reached, then a line per cell as each finishes. The full
     per-cell output belongs to the notebook, not to a ledger (see
-    ``_jobs._Cell.snapshot``).
+    ``_job_log._CellRecord.snapshot``).
     """
     snap = poll(job_id)
     if snap is None:
@@ -306,11 +307,10 @@ def start(
     difference is worth knowing. A session job is refused while a verification
     holds the slot **exactly**, because the slot is in this process and the
     refusal reads it. A verification is refused while a session job runs by
-    *asking* the session kernel, which is a check-then-act with a round trip in
-    it — two jobs can still start within a millisecond of each other. The
-    consequence is bounded (two jobs briefly sharing a warm cluster, not a
-    corrupted anything), and closing it properly means the session child issuing
-    every job id, which is a larger change than this one.
+    reading the session host's records, which learn of a job from iopub a moment
+    after it starts -- a check-then-act, so two jobs can still start within a
+    millisecond of each other. The consequence is bounded (two jobs briefly
+    sharing a warm cluster, not a corrupted anything).
     """
     global _run, _seq
     if _host_factory is None:
@@ -323,9 +323,9 @@ def start(
                 "running_job_id": _run["job_id"],
                 "running_job_origin": _run["origin"],
             }
-        # Ask the session kernel before claiming, so a verification does not
-        # start on top of the user's or the agent's running cell.
-        busy, _res, _w = _kernel_rpc._run_job_call(session_host, "running_job")
+        # Read the session's records before claiming, so a verification does
+        # not start on top of the user's or the agent's running cell.
+        busy = session_host.jobs.running()
         if busy:
             return {
                 "error": "busy",
@@ -527,15 +527,35 @@ def _execute(run):
 
 
 def _poll_to_completion(run, host, kernel_job_id):
-    """Watch the scratch kernel's verification job until it is terminal."""
+    """Watch the scratch kernel's verification job until it is terminal.
+
+    Reads the scratch host's records, not the kernel: the host builds them
+    from iopub, so a look costs nothing and cannot queue behind the cells.
+    """
     while True:
         with _lock:
             if run["discarded"]:
                 return
-        snap, res, _w = _kernel_rpc._run_job_call(host, "poll", kernel_job_id)
-        if snap is None:
-            _finish(run, "error", _kernel_rpc._format_execute_result(res))
+        snap = host.jobs.poll(kernel_job_id)
+        if snap.get("status") in ("running", "unknown") and not host.is_alive():
+            # A death is the verdict (an OOM means the workflow does not fit),
+            # and nothing else would end the record: this host runs no watchdog
+            # to notice. Ending it marks the cell it died in.
+            host.jobs.kernel_gone("the scratch kernel died")
+            with _lock:
+                run["record"] = host.jobs.verify_record(kernel_job_id) or run["record"]
+            _finish(
+                run,
+                "error",
+                "The scratch kernel died while running the workflow -- most "
+                "often out of memory.",
+            )
             return
+        if snap.get("status") == "unknown":
+            # The start travels on iopub, the submit's reply on the shell
+            # socket; the reply can arrive first.
+            time.sleep(0.1)
+            continue
         record = snap.get("verify")
         with _lock:
             if record is not None:
@@ -543,12 +563,8 @@ def _poll_to_completion(run, host, kernel_job_id):
             run["note"] = snap.get("stdout") or run["note"]
         if snap.get("status") != "running":
             # Terminal: swap the polled ledger for the full record, once, before
-            # the kernel holding it is discarded. Best-effort -- a kernel too far
-            # gone to answer still has a verdict, and the polled heads are a
-            # worse report but not a wrong one.
-            full, _res, _w = _kernel_rpc._run_job_call(
-                host, "verify_record", kernel_job_id
-            )
+            # the host holding it is discarded.
+            full = host.jobs.verify_record(kernel_job_id)
             with _lock:
                 if full is not None:
                     run["record"] = full
