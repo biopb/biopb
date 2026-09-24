@@ -19,7 +19,7 @@ import logging
 from mcp.server.transport_security import TransportSecurityMiddleware
 from starlette.responses import JSONResponse, PlainTextResponse
 
-from . import _app, _kernel_rpc
+from . import _app
 
 logger = logging.getLogger(__name__)
 
@@ -132,15 +132,3 @@ async def json_body(request):
     if not isinstance(payload, dict):
         return None, JSONResponse({"error": "invalid JSON body"}, status_code=400)
     return payload, None
-
-
-def kernel_error(res):
-    """Map a non-ok job round trip to a 502 carrying why."""
-    status = res.get("status")
-    return JSONResponse(
-        {
-            "error": status or "kernel error",
-            "detail": _kernel_rpc._format_execute_result(res),
-        },
-        status_code=502,
-    )

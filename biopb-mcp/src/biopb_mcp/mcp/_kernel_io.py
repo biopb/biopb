@@ -19,6 +19,10 @@ whose parent is no call of ours -- another Jupyter client's cell, a late reply
 to a call that already timed out -- is dropped, except that every ``status``
 message updates :attr:`KernelChannels.execution_state`, the kernel's own
 busy/idle.
+
+:meth:`KernelChannels.control` sends the host's requests on the control
+channel instead (``_kernel_gate``), which the kernel serves on its own thread:
+they are answered while the main thread is busy.
 """
 
 import logging
@@ -36,6 +40,24 @@ _IDLE_GRACE = 5.0
 
 # How long each readiness attempt waits for its kernel_info round trip.
 _READY_ATTEMPT = 1.0
+
+# The host's control request; mirrors _kernel_gate.CONTROL_REQUEST.
+_CONTROL_REQUEST = "biopb_request"
+
+# Requests the kernel serves on its control thread. It publishes busy and idle
+# around each, as for any request, but they say nothing about the main thread:
+# an idle after one would read as idle while a cell still runs.
+_CONTROL_REQUESTS = frozenset(
+    {
+        _CONTROL_REQUEST,
+        "shutdown_request",
+        "interrupt_request",
+        "debug_request",
+        "usage_request",
+        "abort_request",
+        "clear_request",
+    }
+)
 
 
 class KernelGone(Exception):
@@ -91,13 +113,14 @@ class KernelChannels:
         ``idle`` that was never delivered to it.
         """
         kc = self._kc
-        # All of them, though only shell and iopub are used: stop_channels
+        # All of them, though stdin and heartbeat are not used: stop_channels
         # touches every channel, creating any that were never started and then
         # closing their sockets under live streams.
         kc.start_channels()
         # Instance attributes shadow the no-op handlers; set before anything of
         # ours is sent, so no reply can arrive unrouted.
-        kc.shell_channel.call_handlers = self._on_shell
+        kc.shell_channel.call_handlers = self._on_reply
+        kc.control_channel.call_handlers = self._on_reply
         kc.iopub_channel.call_handlers = self._on_iopub
         deadline = time.monotonic() + timeout
         while True:
@@ -144,6 +167,27 @@ class KernelChannels:
         finally:
             self._forget(call)
 
+    def control(self, op, args, timeout):
+        """Run the kernel's control *op* with *args*; return its reply content.
+
+        Raises ``TimeoutError`` when no reply comes within *timeout* (the
+        kernel's own bound on the op, plus a margin for the round trip), and
+        :class:`KernelGone` when the connection closes first.
+        """
+        call = self._send(
+            _CONTROL_REQUEST,
+            {"op": op, "args": args, "timeout": timeout},
+            self._kc.control_channel,
+        )
+        try:
+            if not call.replied.wait(timeout + 1.0):
+                raise TimeoutError
+            if call.reply is None:
+                raise KernelGone
+            return call.reply
+        finally:
+            self._forget(call)
+
     def close(self):
         """Stop the channels, failing every call still waiting."""
         with self._calls_lock:
@@ -157,7 +201,7 @@ class KernelChannels:
 
     # -- internals, IO loop side ---------------------------------------------
 
-    def _send(self, msg_type, content):
+    def _send(self, msg_type, content, channel=None):
         msg = self._kc.session.msg(msg_type, content)
         call = _Call(msg["header"]["msg_id"])
         with self._calls_lock:
@@ -165,7 +209,7 @@ class KernelChannels:
                 raise KernelGone
             # Registered before the send, so the reply cannot beat it here.
             self._calls[call.msg_id] = call
-        self._kc.shell_channel.send(msg)
+        (channel or self._kc.shell_channel).send(msg)
         return call
 
     def _forget(self, call):
@@ -177,7 +221,7 @@ class KernelChannels:
         with self._calls_lock:
             return self._calls.get(msg_id)
 
-    def _on_shell(self, msg):
+    def _on_reply(self, msg):
         call = self._call_for(msg)
         if call is not None:
             call.reply = msg["content"]
@@ -199,7 +243,9 @@ class KernelChannels:
             # traffic (a foreign cell, comm/widget chatter) would otherwise pay
             # for nothing on this thread.
             state = content.get("execution_state", "")
-            self.execution_state = state
+            parent_type = (msg.get("parent_header") or {}).get("msg_type")
+            if parent_type not in _CONTROL_REQUESTS:
+                self.execution_state = state
             if state != "idle":
                 return
             call = self._call_for(msg)

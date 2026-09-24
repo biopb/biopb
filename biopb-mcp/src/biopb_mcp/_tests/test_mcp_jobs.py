@@ -54,6 +54,13 @@ def runner():
     _jobs.reset()
 
 
+def _stop(**kw):
+    """``_jobs.interrupt`` aimed at whatever is running, as the host aims it at
+    the job its records say is running."""
+    job = _jobs._running_job()
+    return _jobs.interrupt(job.job_id if job is not None else None, **kw)
+
+
 @pytest.fixture
 def log(runner, monkeypatch):
     """A host ``JobLog`` fed the runner's announcements, as iopub would.
@@ -168,7 +175,7 @@ class TestJobRunnerUnit:
             assert busy.get("error") == "busy"
             assert busy["running_job_id"] == jid
         finally:
-            _jobs.interrupt_current()
+            _stop()
         self._wait(jid)
 
     def test_worker_less_cluster_fails_the_job_instead_of_hanging(self, runner):
@@ -236,7 +243,7 @@ class TestJobRunnerUnit:
         assert passed and all(isinstance(f, Future) for f in passed)
         assert {f.key for f in futures_of(passed)} == set(_StubClient.futures)
         assert calls["force"] is True
-        _jobs.interrupt_current()  # actually stop the uncooperative loop
+        _stop()  # actually stop the uncooperative loop
         self._wait(jid)
 
     def test_poll_unknown_job(self, runner):
@@ -251,14 +258,14 @@ class TestJobRunnerUnit:
 
     # -- user-action attribution --------------------------------------------
 
-    def test_interrupt_current_stops_uncooperative_job(self, runner):
+    def test_interrupt_stops_uncooperative_job(self, runner):
         # A pure-Python loop is stoppable only by a KeyboardInterrupt raised into
-        # the worker thread (short of restart); interrupt_current also threads a
+        # the worker thread (short of restart); interrupt also threads a
         # user-supplied reason into the finalized record.
         jid = _jobs.submit("import time\nwhile True:\n    time.sleep(0.02)")["job_id"]
         while _jobs.poll(jid)["status"] != "running":
             time.sleep(0.02)
-        out = _jobs.interrupt_current(reason="forced by Bob")
+        out = _stop(reason="forced by Bob")
         assert out["job_id"] == jid and out["interrupted"] is True
         snap = self._wait(jid)
         assert snap["status"] == "interrupted"
@@ -266,13 +273,30 @@ class TestJobRunnerUnit:
         assert "forced by Bob" in snap["error_text"]
         assert "KeyboardInterrupt" in snap["error_text"]
 
-    def test_interrupt_current_when_idle(self):
+    def test_interrupt_when_idle_stops_nothing(self):
         _jobs.reset()
-        assert _jobs.interrupt_current("x") == {
-            "job_id": None,
+        assert _jobs.interrupt("job-1") == {
+            "job_id": "job-1",
             "interrupted": False,
-            "status": "idle",
+            "refused": "not_running",
+            "running_job_id": None,
         }
+
+    def test_a_stop_aimed_at_an_ended_job_does_not_land_on_the_next(self, runner):
+        # The caller's view comes from iopub and may be stale; the kernel's is
+        # not. The job the stop was aimed at is gone, so nothing is stopped.
+        done = _jobs.submit("1")["job_id"]
+        self._wait(done)
+        jid = _jobs.submit("import time\nwhile True:\n    time.sleep(0.02)")["job_id"]
+        try:
+            out = _jobs.interrupt(done)
+            assert out["refused"] == "not_running"
+            assert out["running_job_id"] == jid
+            time.sleep(0.1)
+            assert _jobs.poll(jid)["status"] == "running"
+        finally:
+            _stop()
+            self._wait(jid)
 
     def test_raise_in_thread_no_ident(self):
         assert _jobs._raise_in_thread(None, KeyboardInterrupt) == 0
@@ -297,12 +321,12 @@ class TestJobRunnerUnit:
         assert "KeyboardInterrupt" in snap["error_text"]
 
     def test_an_owned_interrupt_keeps_its_own_reason(self, runner):
-        # interrupt_current still owns the attribution when it is the cause --
+        # interrupt still owns the attribution when it is the cause --
         # the external path must not overwrite a reason someone else set.
         jid = _jobs.submit("import time\nwhile True:\n    time.sleep(0.02)")["job_id"]
         while _jobs.poll(jid)["status"] != "running":
             time.sleep(0.02)
-        _jobs.interrupt_current(reason="forced by Bob")
+        _stop(reason="forced by Bob")
         snap = self._wait(jid)
         assert snap["status"] == "interrupted"
         assert snap["cancel_reason"] == "forced by Bob"
@@ -365,7 +389,7 @@ class TestJobOrigin:
             # the advice it gets ("stop it") would be wrong.
             assert busy["running_job_origin"] == "user"
         finally:
-            _jobs.interrupt_current()
+            _stop()
         self._wait(jid)
 
     def test_agent_is_refused_a_user_job(self, runner):
@@ -373,25 +397,24 @@ class TestJobOrigin:
             "import time\nwhile True:\n    time.sleep(0.02)", origin="user"
         )["job_id"]
         try:
-            res = _jobs.interrupt_current(origin="mcp")
+            res = _stop(origin="mcp")
             assert res == {
                 "job_id": jid,
                 "interrupted": False,
-                "status": "running",
                 "refused": "foreign_job",
                 "origin": "user",
             }
             # Refused means untouched, not merely unreported.
             assert _jobs.poll(jid)["status"] == "running"
         finally:
-            _jobs.interrupt_current()
+            _stop()
         self._wait(jid)
 
     def test_user_may_stop_an_agent_job(self, runner):
         # The converse of the rule above: a person can stop anything in their
         # own session, which is what the observe UI's Interrupt does.
         jid = _jobs.submit("import time\nwhile True:\n    time.sleep(0.02)")["job_id"]
-        res = _jobs.interrupt_current(reason="stopped by the user")
+        res = _stop(reason="stopped by the user")
         assert res["interrupted"] is True
         snap = self._wait(jid)
         assert snap["status"] == "interrupted"
@@ -399,7 +422,7 @@ class TestJobOrigin:
 
     def test_agent_may_stop_its_own_job(self, runner):
         jid = _jobs.submit("import time\nwhile True:\n    time.sleep(0.02)")["job_id"]
-        assert _jobs.interrupt_current(origin="mcp")["interrupted"] is True
+        assert _stop(origin="mcp")["interrupted"] is True
         assert self._wait(jid)["status"] == "interrupted"
 
     def test_digest_reports_only_unseen_user_jobs(self, runner, log):
@@ -432,7 +455,7 @@ class TestJobOrigin:
             assert log.foreign_digest("mcp")[0]["status"] == "running"
             assert log.foreign_digest("mcp")[0]["status"] == "running"
         finally:
-            _jobs.interrupt_current()
+            _stop()
         self._wait(jid)
         final = log.foreign_digest("mcp")
         assert [d["status"] for d in final] == ["interrupted"]
@@ -490,15 +513,14 @@ class TestJobOrigin:
             "import time\nwhile True:\n    time.sleep(0.02)", origin="chat"
         )["job_id"]
         try:
-            assert _jobs.interrupt_current(origin="mcp") == {
+            assert _stop(origin="mcp") == {
                 "job_id": jid,
                 "interrupted": False,
-                "status": "running",
                 "refused": "foreign_job",
                 "origin": "chat",
             }
         finally:
-            _jobs.interrupt_current()
+            _stop()
         assert self._wait(jid)["status"] == "interrupted"
 
     def test_a_chat_sessions_own_jobs_are_evicted(self, runner, log):
@@ -538,7 +560,7 @@ class TestJobOrigin:
             assert _jobs.submit("a = 1", origin="chat")["error"] == "busy"
             assert log._agent_origin == "mcp"
         finally:
-            _jobs.interrupt_current()
+            _stop()
         self._wait(jid)
 
         # The other refusal, for the same reason.
@@ -564,7 +586,7 @@ class TestJobOrigin:
         jid = _jobs.submit(
             "import time\nwhile True:\n    time.sleep(0.02)", origin="chat"
         )["job_id"]
-        assert _jobs.interrupt_current(origin="chat")["interrupted"] is True
+        assert _stop(origin="chat")["interrupted"] is True
         assert self._wait(jid)["status"] == "interrupted"
 
     def test_the_chat_loop_is_refused_the_users_cell(self, runner):
@@ -572,15 +594,14 @@ class TestJobOrigin:
             "import time\nwhile True:\n    time.sleep(0.02)", origin="user"
         )["job_id"]
         try:
-            assert _jobs.interrupt_current(origin="chat") == {
+            assert _stop(origin="chat") == {
                 "job_id": jid,
                 "interrupted": False,
-                "status": "running",
                 "refused": "foreign_job",
                 "origin": "user",
             }
         finally:
-            _jobs.interrupt_current()
+            _stop()
         assert self._wait(jid)["status"] == "interrupted"
 
 
@@ -640,19 +661,15 @@ class TestKernelOwner:
             "import time\nwhile True:\n    time.sleep(0.02)", writer="sess-A"
         )["job_id"]
         try:
-            assert _jobs.interrupt_current(origin="mcp", writer="sess-B") == {
+            assert _stop(origin="mcp", writer="sess-B") == {
                 "job_id": jid,
                 "interrupted": False,
-                "status": "running",
                 "refused": "not_owner",
             }
             # The owner still can, and so can the human (the default origin).
-            assert (
-                _jobs.interrupt_current(origin="mcp", writer="sess-A")["interrupted"]
-                is True
-            )
+            assert _stop(origin="mcp", writer="sess-A")["interrupted"] is True
         finally:
-            _jobs.interrupt_current()
+            _stop()
         assert self._wait(jid)["status"] == "interrupted"
 
     def test_a_non_owner_may_read_the_digest_but_not_discharge_it(self, runner, log):
@@ -682,11 +699,11 @@ class TestKernelOwner:
             "import time\nwhile True:\n    time.sleep(0.02)", origin="chat"
         )["job_id"]
         try:
-            refused = _jobs.interrupt_current(origin="mcp")
+            refused = _stop(origin="mcp")
             assert refused["refused"] == "foreign_job"
             assert refused["origin"] == "chat"
         finally:
-            _jobs.interrupt_current()
+            _stop()
         self._wait(jid)
 
     def test_the_human_can_always_stop_a_held_kernel(self, runner):
@@ -695,7 +712,7 @@ class TestKernelOwner:
         jid = _jobs.submit(
             "import time\nwhile True:\n    time.sleep(0.02)", writer="sess-A"
         )["job_id"]
-        assert _jobs.interrupt_current(reason="stopped by Bob")["interrupted"] is True
+        assert _stop(reason="stopped by Bob")["interrupted"] is True
         assert self._wait(jid)["status"] == "interrupted"
 
     def test_reset_releases_the_claim(self, runner):

@@ -141,38 +141,12 @@ _DEATHWATCH_ARG = (
     "--IPKernelApp.exec_lines=import biopb._lifecycle.deathwatch as _dw; _dw.install()"
 )
 
-# Best-effort dask release, the tail of _GRACEFUL_CLOSE_SNIPPET below (no
-# standalone caller).  Goes through ``_dask_ctl`` rather than closing
-# ``_dask_client`` directly because a cluster this kernel spun is its to stop:
-# shutting the workers down gracefully is what lets them clean their spill files
-# before the group-kill takes them (biopb/biopb#13).
-_DASK_RELEASE_SNIPPET = (
-    "try:\n"
-    "    _ctl = globals().get('_dask_ctl')\n"
-    "    if _ctl is not None:\n"
-    "        _ctl.shutdown()\n"
-    "except Exception:\n"
-    "    pass\n"
-)
+# The kernel class every host kernel runs: the host's control requests
+# (restart's graceful close, stopping a job) are its ops.
+_KERNEL_CLASS_ARG = "--IPKernelApp.kernel_class=biopb_mcp.mcp._kernel_gate.GatedKernel"
 
-# Best-effort snippet run *before* the group-kill on shutdown AND restart so the
-# tensor server sees a clean Flight GOAWAY (and cancels any in-flight do_get)
-# instead of discovering the dropped connection only via async socket teardown
-# after the kill. That teardown lag is what lets a `biopb server stop` issued
-# right after Ctrl-C block on its graceful drain (pyarrow FlightServerBase.
-# shutdown waits for in-flight requests to finish) — and a restart drops the
-# connection just as abruptly, so both teardown paths share this snippet.
-# Closes the tensor client, then releases dask. Bounded + best-effort: a
-# busy/wedged kernel just falls through to the kill, so this never holds up
-# Ctrl-C beyond the short timeout in shutdown().
-_GRACEFUL_CLOSE_SNIPPET = (
-    "try:\n"
-    "    _c = globals().get('_conn')\n"
-    "    if _c is not None and getattr(_c, 'client', None) is not None:\n"
-    "        _c.client.close()\n"
-    "except Exception:\n"
-    "    pass\n"
-) + _DASK_RELEASE_SNIPPET
+# How long a control op may take in the kernel, unless its caller says.
+_CONTROL_TIMEOUT = 5.0
 
 
 def _strip_ansi(text: str) -> str:
@@ -296,6 +270,7 @@ class KernelHost:
         self._respawn_times = []  # monotonic timestamps of recent respawns
         self._dead = False  # respawn budget exhausted -> manual restart needed
         self._stopping = False  # an intentional restart/shutdown is in flight
+        self._restarting = False  # restart() in flight: calls read "starting"
 
     # -- lifecycle ------------------------------------------------------
 
@@ -362,7 +337,7 @@ class KernelHost:
         from jupyter_client import KernelManager
 
         env = self._env if self._env is not None else os.environ.copy()
-        extra_args = list(self._extra_arguments)
+        extra_args = [_KERNEL_CLASS_ARG, *self._extra_arguments]
         popen_kwargs = {}
 
         # Redirect the kernel subprocess' native stdout/stderr fds. None ->
@@ -573,9 +548,10 @@ class KernelHost:
                 "Kernel is dead (respawn budget exhausted). Call "
                 "start_kernel to launch a fresh kernel." + suffix,
             )
-        if self.is_alive():
+        if self.is_alive() or self._restarting:
             # A kernel exists but its bootstrap/health probe hasn't passed yet
-            # (e.g. a watchdog respawn in flight) — booting, not idle.
+            # (e.g. a watchdog respawn in flight), or a restart is between the
+            # kill and the relaunch — booting, not idle.
             return _status_result(
                 "starting",
                 "Kernel is still starting (napari viewer / dask bring-up). "
@@ -664,6 +640,34 @@ class KernelHost:
             res["user_expressions"] = call.reply.get("user_expressions") or {}
         return res
 
+    def control(self, op, timeout=_CONTROL_TIMEOUT, **args):
+        """Run the kernel's control *op* (``_kernel_gate``) and return its result.
+
+        On the control channel, so it does not wait behind a cell on the main
+        thread. Needs no readiness: a restart's graceful close runs after
+        readiness is cleared. Raises ``RuntimeError`` when the kernel is down or
+        the op failed, ``TimeoutError`` when it took longer than *timeout*.
+        """
+        io = self._io
+        if io is None:
+            raise RuntimeError("kernel not running")
+        try:
+            reply = io.control(op, args, timeout)
+        except KernelGone as exc:
+            raise RuntimeError("the kernel went away") from exc
+        if reply.get("status") != "ok":
+            raise RuntimeError(reply.get("evalue") or "control op failed")
+        return reply.get("r")
+
+    def _close_session(self, timeout):
+        """Close the kernel's tensor client and dask before a kill, bounded and
+        best-effort (``_kernel_gate._close_session``): a wedged kernel just
+        falls through to the kill."""
+        try:
+            self.control("close", timeout=timeout)
+        except Exception:  # noqa: BLE001
+            logger.debug("graceful close failed", exc_info=True)
+
     def interrupt(self):
         """Send SIGINT to the kernel. Takes no lock, so it can fire during a
         restart's graceful close or any call waiting on a busy kernel."""
@@ -686,6 +690,7 @@ class KernelHost:
         with self._lock:
             # Tell the watchdog this alive->dead transition is intentional.
             self._stopping = True
+            self._restarting = True
             # A restart is a recovery attempt: clear any stale failure / teardown
             # reason up front so a concurrent server_status/execute (which read
             # them without the lock) see "starting" (recovering) rather than the
@@ -694,14 +699,10 @@ class KernelHost:
             self._teardown_reason = None
             # Before the graceful close, not at the kill: calls do not take this
             # lock, so only _ready keeps a submit from landing in the kernel
-            # being replaced -- queued behind the close, after the tensor
-            # client it would use is gone.
+            # being replaced, after the tensor client it would use is gone.
             self._ready.clear()
             try:
-                try:
-                    self._execute_internal(_GRACEFUL_CLOSE_SNIPPET, timeout=5.0)
-                except Exception:
-                    logger.debug("graceful close failed on restart", exc_info=True)
+                self._close_session(timeout=5.0)
 
                 self._shutdown_current()
                 try:
@@ -715,6 +716,7 @@ class KernelHost:
                 self._respawn_times.clear()
             finally:
                 self._stopping = False
+                self._restarting = False
         # Re-arm the watchdog if it had stopped (e.g. respawn budget exhausted).
         self._start_watchdog()
 
@@ -726,18 +728,11 @@ class KernelHost:
         self._stopping = True
         self._stop_watchdog()
         with self._lock:
-            # Best-effort, bounded graceful close so the tensor server isn't left
-            # to discover SIGKILL'd connections via async socket teardown — which
-            # can make a `biopb server stop` right after Ctrl-C hang on its drain
-            # (see _GRACEFUL_CLOSE_SNIPPET). A busy/wedged kernel falls through to
-            # the SIGKILL below; the short timeout keeps this off the Ctrl-C path.
+            # The short timeout keeps the graceful close off the Ctrl-C path.
             # Readiness goes first, as in restart().
             self._ready.clear()
             if self.is_alive():
-                try:
-                    self._execute_internal(_GRACEFUL_CLOSE_SNIPPET, timeout=2.0)
-                except Exception:
-                    logger.debug("graceful close on shutdown failed", exc_info=True)
+                self._close_session(timeout=2.0)
             self._shutdown_current()
             # Terminal path only (restart() drives _shutdown_current directly and
             # must keep the job): drop the job handle so it doesn't leak and its

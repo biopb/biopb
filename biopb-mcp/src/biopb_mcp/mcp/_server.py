@@ -282,7 +282,7 @@ def _tool_busy_message(running, running_origin) -> str:
 
     Whose job is running decides the advice. Telling the agent to "stop it with
     interrupt_kernel" while *someone else* is running a cell would have it kill
-    their work; interrupt_kernel refuses that anyway (_jobs.interrupt_current),
+    their work; interrupt_kernel refuses that anyway (_jobs.interrupt),
     so the wording must not send it there.
     """
     if running_origin and running_origin != "mcp":
@@ -1031,8 +1031,8 @@ async def interrupt_kernel() -> str:
     Python; if YOUR job stays stuck, use restart_kernel — the guaranteed stop.
 
     Stops YOUR job only. A cell the user runs from an attached Jupyter notebook
-    shares this kernel but is not yours to stop: this refuses it (and while it
-    runs, this call waits behind it), so wait for it instead. A refusal is not a stuck
+    shares this kernel but is not yours to stop: this refuses it, so wait for it
+    instead. A refusal is not a stuck
     kernel and restart_kernel is not the way around it — restarting would destroy
     the user's running cell, variables and layers along with yours. Wait, or ask
     them.
@@ -1081,15 +1081,28 @@ async def interrupt_kernel() -> str:
             f"Nothing to interrupt in verification {job_id}; it may have "
             "finished already. Poll it to see."
         )
-    data, res, _w = await _kernel_rpc._job_call(
-        host, "interrupt_current", origin=_writers._local_origin.get(), writer=writer
-    )
-    if data is None:
-        return _kernel_rpc._format_execute_result(res)
+    running = host.jobs.running()
+    if running is None:
+        return "No running job to interrupt."
+    job_id = running["job_id"]
+    try:
+        data = await asyncio.to_thread(
+            host.control,
+            "interrupt",
+            job_id=job_id,
+            origin=_writers._local_origin.get(),
+            writer=writer,
+        )
+    except Exception as exc:  # noqa: BLE001 - the agent reads why
+        return f"Could not reach the kernel to interrupt {job_id}: {exc}"
+    if data.get("refused") == "not_running":
+        now = data.get("running_job_id")
+        return f"{job_id} is no longer running" + (
+            f"; {now} is. Poll it before deciding to stop it." if now else "."
+        )
     if data.get("refused") == "not_owner":
         return _writers._NOT_OWNER_MSG.format(held_by="")
     if data.get("refused") == "foreign_job":
-        running = data.get("job_id")
         # "Foreign" is not a synonym for "the user's": it is anything this agent
         # did not start. Naming the wrong writer would tell the agent to wait on
         # a person who is not there.
@@ -1098,14 +1111,14 @@ async def interrupt_kernel() -> str:
         )
         who = "The user" if by == "the user" else "Whoever started it"
         return (
-            f"Refused: {running} was started by {by}, not by you — it is not "
-            f"yours to stop. Wait for it and poll_job('{running}'). ({who} can "
+            f"Refused: {job_id} was started by {by}, not by you — it is not "
+            f"yours to stop. Wait for it and poll_job('{job_id}'). ({who} can "
             "stop it.)"
         )
     if data.get("interrupted"):
         return (
-            f"Interrupted job {data.get('job_id')} (KeyboardInterrupt raised in "
-            "its thread). If it does not stop, use restart_kernel."
+            f"Interrupted job {job_id} (KeyboardInterrupt raised in its thread). "
+            "If it does not stop, use restart_kernel."
         )
     return "No running job to interrupt."
 

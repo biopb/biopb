@@ -436,10 +436,18 @@ export default function ObservePage() {
   // row says running, so the one way to reach it idle is a job that finished
   // between the paint and the click -- and the row turning `ok` says so better
   // than an alert that reads as a mistake.
-  const interrupt = useCallback(async () => {
-    await jpost(base + "/api/kernel/interrupt");
-    poll();
-  }, [base, poll]);
+  //
+  // The row's id goes with it: the kernel stops that job only if it is still
+  // the one running, so a click that races the job's end stops nothing else.
+  const interrupt = useCallback(
+    async (jobId: string) => {
+      await jpost(
+        base + "/api/kernel/interrupt?job_id=" + encodeURIComponent(jobId),
+      );
+      poll();
+    },
+    [base, poll],
+  );
 
   const restart = useCallback(async () => {
     if (!confirm("Hard-restart the kernel? All variables and layers are lost."))
@@ -650,7 +658,7 @@ export default function ObservePage() {
                   fresh={fresh.has(j.job_id)}
                   detail={details[j.job_id]}
                   onToggle={() => toggle(j.job_id)}
-                  onInterrupt={interrupt}
+                  onInterrupt={() => interrupt(j.job_id)}
                 />
               ))
             )}

@@ -49,10 +49,6 @@ def host():
         "recent_respawns": 0,
         "watchdog_running": True,
     }
-    # What an idle kernel's interrupt_current answers.
-    h.execute.return_value = _reply(
-        {"job_id": None, "interrupted": False, "status": "idle"}
-    )
     h.jobs = ScriptedJobs()
     return h
 
@@ -300,16 +296,29 @@ class TestTheTwoKernels:
         host.execute.assert_not_called()
 
 
-def test_api_interrupt_targets_running_job(client, host):
-    host.execute.return_value = _reply({"job_id": "job-1", "interrupted": True})
-    r = client.post("/api/kernel/interrupt")
+def test_api_interrupt_stops_the_rows_job(client, host):
+    host.control.return_value = {"job_id": "job-1", "interrupted": True}
+    r = client.post("/api/kernel/interrupt?job_id=job-1")
     assert r.status_code == 200
     assert r.json()["interrupted"] is True
-    # Forces the worker thread via interrupt_current (not a main-thread SIGINT).
-    snippet = host.execute.call_args[0][0]
-    assert "interrupt_current(" in snippet
-    assert _observe._USER_INTERRUPT_MSG in snippet
+    # On the control channel, naming the row's job, attributed to the user --
+    # not a SIGINT to the whole kernel.
+    host.control.assert_called_once_with(
+        "interrupt", job_id="job-1", reason=_observe._USER_INTERRUPT_MSG
+    )
     host.interrupt.assert_not_called()
+
+
+def test_api_interrupt_without_a_row_stops_the_running_job(client, host):
+    host.jobs = ScriptedJobs(running="job-2")
+    host.control.return_value = {"job_id": "job-2", "interrupted": True}
+    client.post("/api/kernel/interrupt")
+    assert host.control.call_args.kwargs["job_id"] == "job-2"
+
+
+def test_api_interrupt_when_idle_asks_nothing(client, host):
+    assert client.post("/api/kernel/interrupt").json()["interrupted"] is False
+    host.control.assert_not_called()
 
 
 def test_api_restart(client, host):
@@ -503,10 +512,10 @@ def test_set_chat_enabled_leaves_the_host_allowlists_alone(host):
 
 
 def test_kernel_error_returns_502(client, host):
-    host.execute.return_value = _raw(status="timeout", error_text="No reply")
-    r = client.post("/api/kernel/interrupt")
+    host.control.side_effect = TimeoutError("no reply")
+    r = client.post("/api/kernel/interrupt?job_id=job-1")
     assert r.status_code == 502
-    assert r.json()["error"] == "timeout"
+    assert "no reply" in r.json()["detail"]
 
 
 # -- describe() (server_status integration) ---------------------------------
