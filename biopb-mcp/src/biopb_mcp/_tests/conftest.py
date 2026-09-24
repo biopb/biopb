@@ -72,9 +72,20 @@ class ScriptedJobs:
     recorded for the test to assert on.
     """
 
-    def __init__(self, polls=(), digest=(), summary=(), export=(), running=None):
+    def __init__(
+        self,
+        polls=(),
+        digest=(),
+        summary=(),
+        export=(),
+        running=None,
+        running_origin="mcp",
+        window=None,
+    ):
         self._polls = list(polls)
         self._running = running
+        self._running_origin = running_origin
+        self._window = window
         self._summary = list(summary)
         self._export = list(export)
         self.polled = 0
@@ -93,10 +104,20 @@ class ScriptedJobs:
         self._ids = getattr(self, "_ids", 0) + 1
         return f"job-{self._ids}"
 
-    def running(self):
+    def running(self, prefer=None):
         if self._running is None:
             return None
-        return {"job_id": self._running, "status": "running"}
+        return {
+            "job_id": self._running,
+            "status": "running",
+            "origin": self._running_origin,
+        }
+
+    def running_cell(self):
+        return None
+
+    def window_alive(self, job_id):
+        return self._window
 
     def foreign_digest(self, for_origin):
         self.digest_origins.append(for_origin)

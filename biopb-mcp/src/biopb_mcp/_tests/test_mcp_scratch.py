@@ -626,7 +626,7 @@ class TestInterrupting:
         self, monkeypatch, session_host
     ):
         monkeypatch.setattr(_scratch, "interrupt", lambda *a, **k: None)
-        session_host.jobs.running.return_value = {"job_id": "job-5"}
+        session_host.jobs.running.return_value = {"job_id": "job-5", "origin": "mcp"}
         session_host.interrupt_job.return_value = {
             "job_id": "job-5",
             "interrupted": True,

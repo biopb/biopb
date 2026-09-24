@@ -68,9 +68,18 @@ class KernelGone(Exception):
 class _Call:
     """What one request has received so far."""
 
-    __slots__ = ("msg_id", "stdout", "results", "errors", "reply", "replied", "idle")
+    __slots__ = (
+        "msg_id",
+        "stdout",
+        "results",
+        "errors",
+        "reply",
+        "replied",
+        "idle",
+        "on_reply",
+    )
 
-    def __init__(self, msg_id):
+    def __init__(self, msg_id, on_reply=None):
         self.msg_id = msg_id
         self.stdout = []
         # text/plain of execute_result and display_data, in arrival order
@@ -80,6 +89,9 @@ class _Call:
         self.reply = None
         self.replied = threading.Event()
         self.idle = threading.Event()
+        # For a call nobody waits on (send_execute): its reply, or None when
+        # the connection closes first, goes here, and nothing is collected.
+        self.on_reply = on_reply
 
 
 class KernelChannels:
@@ -167,6 +179,32 @@ class KernelChannels:
         finally:
             self._forget(call)
 
+    def send_execute(self, code, on_reply, before_send, user_expressions=None):
+        """Send *code* as a cell and return its request id at once.
+
+        For a cell that outlives any one wait (the agent's): its output is the
+        records' (``_job_log``), not collected here. *before_send(request)*
+        runs once the id exists and before the request leaves, so a record made
+        there sees all of it. *on_reply(content)* runs on the IO loop thread
+        with the shell reply, or with None if the connection closes first.
+        """
+        call = self._send(
+            "execute_request",
+            {
+                "code": code,
+                "silent": False,
+                "store_history": True,
+                "user_expressions": user_expressions or {},
+                "allow_stdin": False,
+                # A failing agent cell must not abort a user's cell queued
+                # behind it.
+                "stop_on_error": False,
+            },
+            on_reply=on_reply,
+            before_send=before_send,
+        )
+        return call.msg_id
+
     def control(self, op, args, timeout):
         """Run the kernel's control *op* with *args*; return its reply content.
 
@@ -197,18 +235,22 @@ class KernelChannels:
         for call in calls:
             call.replied.set()
             call.idle.set()
+            if call.on_reply is not None:
+                call.on_reply(None)
         self._kc.stop_channels()
 
     # -- internals, IO loop side ---------------------------------------------
 
-    def _send(self, msg_type, content, channel=None):
+    def _send(self, msg_type, content, channel=None, on_reply=None, before_send=None):
         msg = self._kc.session.msg(msg_type, content)
-        call = _Call(msg["header"]["msg_id"])
+        call = _Call(msg["header"]["msg_id"], on_reply)
         with self._calls_lock:
             if self._closed:
                 raise KernelGone
             # Registered before the send, so the reply cannot beat it here.
             self._calls[call.msg_id] = call
+        if before_send is not None:
+            before_send(call.msg_id)
         (channel or self._kc.shell_channel).send(msg)
         return call
 
@@ -223,9 +265,16 @@ class KernelChannels:
 
     def _on_reply(self, msg):
         call = self._call_for(msg)
-        if call is not None:
-            call.reply = msg["content"]
-            call.replied.set()
+        if call is None:
+            return
+        call.reply = msg["content"]
+        call.replied.set()
+        if call.on_reply is not None:
+            self._forget(call)
+            try:
+                call.on_reply(call.reply)
+            except Exception:  # noqa: BLE001 - a callback must not stop routing
+                logger.exception("reply callback failed")
 
     def _on_iopub(self, msg):
         msg_type = msg["header"]["msg_type"]
@@ -255,7 +304,7 @@ class KernelChannels:
         if msg_type not in ("stream", "execute_result", "display_data", "error"):
             return
         call = self._call_for(msg)
-        if call is None:
+        if call is None or call.on_reply is not None:
             return
         if msg_type == "stream":
             call.stdout.append(content.get("text", ""))

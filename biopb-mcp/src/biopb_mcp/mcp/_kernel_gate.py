@@ -1,14 +1,12 @@
-"""The session kernel's gate on cells from other Jupyter clients.
+"""The kernel class every host kernel runs (``docs/jupyter-clients.md``).
 
 Runs inside the kernel, as its ``kernel_class`` (``KernelHost._launch`` passes
-``--IPKernelApp.kernel_class``). A cell from any client but the host's own is
-refused while a job runs on its worker thread, and otherwise runs inline; the
-host records it as an ``origin="user"`` job from the protocol, and the agent is
-told of it (``docs/jupyter-clients.md``).
-
-The gate is ``do_execute`` rather than a ``pre_run_cell`` callback because
-IPython catches and prints what an event callback raises, so a callback cannot
-refuse a cell.
+``--IPKernelApp.kernel_class``). Every cell runs on the main thread, one at a
+time, whichever client sent it: ipykernel orders them, and a cell sent while
+another runs waits its turn. The host records the cells from the protocol.
+What this adds around each cell is small: it holds the cell as the running job
+so Stop can reach it (``_jobs.hold_cell``), and it echoes a foreign client's
+silent cell, which ipykernel does not, so the host sees it.
 
 The host's control requests land here too (:meth:`GatedKernel.biopb_request`):
 stopping a job, a job's status, the graceful close before a kill. They go on
@@ -37,14 +35,6 @@ ENV_HOST_SESSION = "BIOPB_HOST_SESSION"
 # ``None`` when the kernel was launched without one, which gates nothing: there
 # is no host to tell apart from anyone else.
 _host_session = os.environ.get(ENV_HOST_SESSION) or None
-
-# How the refusal names whoever holds the kernel, by job origin (see _jobs._Job).
-_HOLDER = {
-    "mcp": "the agent",
-    "chat": "the chat agent",
-    "user": "a user's cell",
-}
-
 
 # The host's request on the control channel, and its reply. The literals are
 # mirrored in _kernel_io (kept in sync by this comment).
@@ -77,20 +67,9 @@ def _close_session(ns):
         pass
 
 
-def _refusal_text(job):
-    what = job["intent"] or job["code"] or "(no source)"
-    holder = _HOLDER.get(job["origin"], job["origin"])
-    return (
-        f"Not run: {job['job_id']} is running for {holder} "
-        f"({job['elapsed']:.0f}s so far): {what}\n"
-        "Run this cell again once it finishes, or stop it with Stop on the "
-        "session's observe page."
-    )
-
-
 class GatedKernel(IPythonKernel):
-    """``IPythonKernel`` that refuses or records execute requests it did not
-    get from the host (module docstring)."""
+    """``IPythonKernel`` that holds each cell for Stop, echoes a foreign silent
+    cell, and serves the host's control requests (module docstring)."""
 
     async def do_execute(
         self,
@@ -115,20 +94,13 @@ class GatedKernel(IPythonKernel):
             )
 
         header = self.get_parent("shell").get("header", {})
-        session = header.get("session")
         # An empty cell is a client asking for its prompt number or evaluating
-        # user_expressions (qtconsole sends both, silently). Decided on the
-        # code, not on `silent`: that flag only stops output being broadcast,
-        # and silent code runs with full effect. Completion and inspection are
-        # other message types and never reach here.
-        if not code.strip() or _host_session is None or session == _host_session:
+        # user_expressions (qtconsole sends both, silently): nothing to hold.
+        if not code.strip():
             return await run()
+        foreign = _host_session is not None and header.get("session") != _host_session
 
-        running = _jobs.running_job()
-        if running is not None:
-            return self._refuse(running)
-
-        if silent:
+        if foreign and silent:
             # ipykernel echoes no silent request, and the host records a
             # foreign cell from its echo; silent code runs with full effect,
             # so it is echoed here.
@@ -138,7 +110,9 @@ class GatedKernel(IPythonKernel):
 
         reply = None
         try:
-            with _jobs.record_inline(code, request=header.get("msg_id")) as job:
+            with _jobs.hold_cell(
+                code, header.get("msg_id"), origin="user" if foreign else "host"
+            ) as job:
                 reply = await run()
                 if reply.get("status") == "ok":
                     job.status = "ok"
@@ -203,22 +177,40 @@ class GatedKernel(IPythonKernel):
                     reply = {"status": "error", "evalue": repr(exc)}
         self.session.send(stream, CONTROL_REPLY, reply, parent, ident=ident)
 
-    def _refuse(self, running):
-        """An error reply, and the same error on iopub: a reply alone renders
-        nothing in a notebook cell."""
-        text = _refusal_text(running)
-        content = {
-            "ename": "KernelBusy",
-            "evalue": text,
-            "traceback": ["KernelBusy: " + text],
-        }
-        self.send_response(
-            self.iopub_socket, "error", content, ident=self._topic("error")
-        )
-        return {
-            "status": "error",
-            "execution_count": self.execution_count,
-            "user_expressions": {},
-            "payload": [],
-            **content,
-        }
+    # -- the host's control requests -----------------------------------------
+
+    control_msg_types = [*IPythonKernel.control_msg_types, CONTROL_REQUEST]
+
+    async def biopb_request(self, stream, ident, parent):
+        """Run one of the host's control ops and reply with its result.
+
+        ``content`` is ``{"op": <name>, "args": {...}, "timeout": <s>}``. The op
+        runs on a worker thread, bounded by *timeout*: control requests are
+        handled one at a time, and ipykernel's own interrupt and shutdown
+        requests share that queue. Refused for any session but the host's, as
+        the execute gate is.
+        """
+        content = parent.get("content", {})
+        session = parent.get("header", {}).get("session")
+        if _host_session is not None and session != _host_session:
+            reply = {"status": "error", "evalue": "not the host's session"}
+        else:
+            ops = {
+                "interrupt": _jobs.interrupt,
+                "status": _jobs.status,
+                "poll": _jobs.poll,
+                "close": lambda: _close_session(self.shell.user_ns),
+            }
+            op = ops.get(content.get("op"))
+            if op is None:
+                reply = {"status": "error", "evalue": f"no op {content.get('op')!r}"}
+            else:
+                try:
+                    r = await asyncio.wait_for(
+                        asyncio.to_thread(op, **content.get("args", {})),
+                        content.get("timeout", 10.0),
+                    )
+                    reply = {"status": "ok", "r": r}
+                except Exception as exc:  # noqa: BLE001 - the host reads why
+                    reply = {"status": "error", "evalue": repr(exc)}
+        self.session.send(stream, CONTROL_REPLY, reply, parent, ident=ident)

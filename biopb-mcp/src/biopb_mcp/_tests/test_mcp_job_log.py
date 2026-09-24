@@ -73,25 +73,13 @@ class TestRecord:
         _print(log, "later\n")
         assert log.poll("job-1")["stdout"] == ""
 
-    def test_a_foreign_cells_traceback_is_its_error(self):
-        # The end announcement carries "ename: evalue"; the iopub error the
-        # cell's own client got carries the traceback, which says where.
+    def test_a_task_keeps_its_own_error_text(self):
+        # A task's failure is its announced end: the iopub error under the same
+        # request is the cell's (TestCells).
         log = JobLog()
-        _start(log, origin="user")
-        log.on_iopub(
-            _msg(
-                "error", "req-1", traceback=["\x1b[31mZeroDivisionError\x1b[0m", "at 1"]
-            )
-        )
-        _end(log, status="error", error_text="ZeroDivisionError: division by zero")
-        assert log.poll("job-1")["error_text"] == "ZeroDivisionError\nat 1"
-
-    def test_a_foreign_cells_result_is_its_execute_result(self):
-        log = JobLog()
-        _start(log, origin="user")
-        log.on_iopub(_msg("execute_result", "req-1", data={"text/plain": "42"}))
-        _end(log)
-        assert log.poll("job-1")["result_text"] == "42"
+        _start(log)
+        _end(log, status="error", error_text="Traceback ... ZeroDivisionError")
+        assert log.poll("job-1")["error_text"] == "Traceback ... ZeroDivisionError"
 
     def test_unknown_job(self):
         assert JobLog().poll("job-9")["status"] == "unknown"
@@ -181,23 +169,59 @@ class TestCells:
         assert rec["status"] == "interrupted"
         assert rec["error_text"] == "stopped by the user\nKI"
 
-    def test_a_refused_cell_is_not_recorded_and_proves_nothing(self):
-        # The gate refuses a cell while a task runs, after ipykernel echoed it.
+    def test_a_cell_that_ran_ends_a_cell_whose_end_was_lost(self):
+        # One cell at a time on the main thread.
         log = self._log()
-        _start(log, job_id=log.new_id(), request="submit-1")
-        _input(log, "y = 1", "c1")
-        log.on_iopub(_msg("error", "c1", ename="KernelBusy", traceback=["busy"]))
-        _idle(log, "c1")
-        assert [r["job_id"] for r in log.export()] == ["job-1"]
-        assert log.poll("job-1")["status"] == "running"
+        _input(log, "a = 1", "c1")
+        _input(log, "b = 2", "c2")
+        _idle(log, "c2")
+        (first, second) = log.export()
+        assert first["status"] == "error" and "not recorded" in first["error_text"]
+        assert second["status"] == "ok"
 
-    def test_a_cell_that_ran_ends_a_task_whose_end_was_lost(self):
+    def test_a_cell_does_not_end_a_task(self):
+        # A task runs beside the cells (run_async).
         log = self._log()
-        _start(log, job_id=log.new_id(), request="submit-1")
+        _start(log, job_id="task-1", request="c0")
         _input(log, "x = 1", "c1")
         _idle(log, "c1")
+        assert log.poll("task-1")["status"] == "running"
+
+    def test_a_task_takes_its_cells_output_and_writer(self):
+        log = self._log()
+        log.start_cell("job-1", "c1", "run_async(f)", origin="chat")
+        _print(log, "before\n", request="c1")
+        _start(log, job_id="task-1", request="c1", origin="mcp")
+        _print(log, "from the task\n", request="c1")
+        _idle(log, "c1")
+        assert log.poll("job-1")["status"] == "ok"
+        assert log.poll("job-1")["stdout"] == "before\n"
+        task = log.poll("task-1")
+        assert task["stdout"] == "from the task\n"
+        assert task["origin"] == "chat"
+        assert task["status"] == "running"
+
+    def test_a_host_cell_ends_on_its_reply_if_its_idle_is_lost(self):
+        log = self._log()
+        log.start_cell("job-1", "c1", "1/0", origin="mcp")
+        log.note_reply("job-1", {"status": "error", "ename": "ZeroDivisionError"})
+        log.cell_replied("job-1")
         assert log.poll("job-1")["status"] == "error"
-        assert "not recorded" in log.poll("job-1")["error_text"]
+
+    def test_the_viewer_window_comes_back_on_the_reply(self):
+        log = self._log()
+        log.start_cell("job-1", "c1", "x", origin="mcp")
+        assert log.window_alive("job-1") is None
+        log.note_reply(
+            "job-1",
+            {
+                "status": "ok",
+                "user_expressions": {
+                    "w": {"status": "ok", "data": {"text/plain": "False"}}
+                },
+            },
+        )
+        assert log.window_alive("job-1") is False
 
     def test_a_submits_idle_does_not_end_its_task(self):
         # The task outlives the request that started it.
@@ -206,14 +230,15 @@ class TestCells:
         _idle(log, "submit-1")
         assert log.poll("job-1")["status"] == "running"
 
-    def test_a_stop_is_named_by_the_request(self):
+    def test_the_kernel_names_a_cell_by_request_and_a_task_by_id(self):
         log = self._log()
         _input(log, "loop()", "c1")
         (rec,) = log.export()
-        assert log.request_of(rec["job_id"]) == "c1"
-        assert log.job_of("c1") == rec["job_id"]
+        assert log.stop_key(rec["job_id"]) == "c1"
+        _start(log, job_id="task-1", request="c1")
+        assert log.stop_key("task-1") == "task-1"
         _idle(log, "c1")
-        assert log.request_of(rec["job_id"]) is None
+        assert log.stop_key(rec["job_id"]) is None
 
 
 class TestLostAndGone:

@@ -53,6 +53,7 @@ import contextlib
 import ctypes
 import logging
 import os
+import secrets
 import signal
 import sys
 import threading
@@ -60,7 +61,7 @@ import time
 import traceback
 from concurrent.futures import Future
 
-from ._job_log import _MAX_RETAINED_JOBS, MSG_TYPE, _one_line
+from ._job_log import _MAX_RETAINED_JOBS, MSG_TYPE
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +114,7 @@ KERNEL_HANDLE_NAMES = frozenset(
         "da",
         "ops",
         "run_on_main",
+        "run_async",
         "_conn",
         "_jobs",
         "_dask_client",
@@ -139,8 +141,6 @@ class _Job:
         "started_wall",
         "finished",
         "verify",
-        "code_preview",
-        "intent_preview",
         "request",
         "result_text",
     )
@@ -195,10 +195,6 @@ class _Job:
         # cell. Set at submit and never after: it decides which namespace the
         # job runs in, so a job cannot become a verification once started.
         self.verify = None
-        # The one-liners the gate's refusal names the running job by
-        # (running_job), cut once here.
-        self.code_preview = _one_line(code)
-        self.intent_preview = _one_line(intent)
 
     def elapsed(self):
         end = self.finished if self.finished is not None else time.monotonic()
@@ -408,6 +404,17 @@ def _exec_cells(job, verification):
                 cell.status = "skipped"
 
 
+def check_dask():
+    """Raise if nothing a cell computes could finish (:func:`_dask_backstop`).
+
+    Run ahead of every agent cell (``_kernel.KernelHost.run_cell``), as the job
+    runner runs the backstop ahead of every task.
+    """
+    dead = _dask_backstop()
+    if dead:
+        raise RuntimeError(dead)
+
+
 def _dask_backstop():
     """Why nothing this job computes could finish, or ``None``.
 
@@ -525,16 +532,15 @@ def _publish_end(job):
     )
 
 
-def _run(job, code):
+def _run(job, body):
+    """Run *body* (no arguments) on this worker thread as *job*, and settle
+    and announce how it ended."""
     exc = None
     try:
         _dead = _dask_backstop()
         if _dead:
             raise RuntimeError(_dead)
-        if job.verify is not None:
-            _exec_cells(job, job.verify)
-        else:
-            _exec_capture(_REFRESH_PREFIX + code, _ip.user_ns, job)
+        body()
     except KeyboardInterrupt:
         exc = True
         job.error_text = traceback.format_exc()
@@ -672,13 +678,13 @@ def submit(
                     "owner": _owner_label,
                     "owner_id": _owner,
                 }
-        for jid, j in _jobs.items():
-            if j.status == "running":
-                return {
-                    "error": "busy",
-                    "running_job_id": jid,
-                    "running_job_origin": j.origin,
-                }
+        running = _running_task()
+        if running is not None:
+            return {
+                "error": "busy",
+                "running_job_id": running.job_id,
+                "running_job_origin": running.origin,
+            }
         if verify_cells is not None:
             # The record's cells are the source of truth; `code` is derived from
             # them so the audit view of this job cannot disagree with the
@@ -691,8 +697,12 @@ def submit(
         # Before the thread starts, so the host has the record before any of
         # the job's output reaches it.
         _publish_start(job)
+        if job.verify is not None:
+            body = lambda: _exec_cells(job, job.verify)  # noqa: E731
+        else:
+            body = lambda: _exec_capture(_REFRESH_PREFIX + code, _ip.user_ns, job)  # noqa: E731
         thread = threading.Thread(
-            target=_run, args=(job, code), name=job.job_id, daemon=True
+            target=_run, args=(job, body), name=job.job_id, daemon=True
         )
         job.thread = thread
         thread.start()
@@ -700,18 +710,15 @@ def submit(
 
 
 @contextlib.contextmanager
-def record_inline(code, request=None, origin="user"):
-    """Hold a foreign client's cell as the running job, for its duration.
+def hold_cell(code, request, origin="user"):
+    """Hold a cell running on the main thread as a job, for its duration.
 
-    For ``_kernel_gate``: the cell runs on the main thread, as its client
-    expects. The host records it from the protocol -- its ``execute_input``,
-    ``error`` and ``status`` -- so nothing is announced here; this is for
-    Stop, which names the cell by its *request* (:func:`interrupt`). The caller
-    settles ``status`` from the reply before leaving the block; a block that
-    raises instead is an ``error``.
-
-    Not gated here: the caller refuses while a job runs, and nothing can start
-    one meanwhile, since a submit is an execute request queued behind this one.
+    For ``_kernel_gate``, around every non-empty execute request, the host's
+    included: nothing is announced -- the host records cells from the protocol
+    -- this is for Stop, which names a cell by its *request*
+    (:func:`interrupt`). *origin* is ``"user"`` for a foreign client's cell and
+    ``"host"`` for the host's own. The caller settles ``status`` from the reply
+    before leaving the block; a block that raises instead is an ``error``.
 
     Ended under :data:`_lock`, which :func:`interrupt` checks and signals
     under: a ``SIGINT`` aimed at this cell lands before the cell is marked
@@ -735,6 +742,59 @@ def record_inline(code, request=None, origin="user"):
                 break
             except KeyboardInterrupt:
                 continue
+
+
+def run_async(fn, *args, **kwargs):
+    """Run ``fn(*args, **kwargs)`` on a worker thread; return its task id now.
+
+    For a long compute the agent wants to watch: the cell that calls this ends
+    at once, leaving the main thread -- and so the viewer and the screenshots
+    -- free while the task runs. Poll the task by its id (``poll_job``); its
+    prints and the repr of what ``fn`` returns are its record's.
+
+    One task at a time: a second call while one runs raises. The task may use
+    ``viewer``, which marshals to the main thread as it would from any thread;
+    a user's cell can run meanwhile, and the two can race over the namespace
+    and the viewer as in any asynchronous notebook. Stop a task with
+    ``interrupt_kernel``: a ``KeyboardInterrupt`` raised into its thread, which
+    lands at the next bytecode.
+
+    Everything the cell prints after this call is filed with the task, since
+    the two share the cell's request; make it the cell's last statement.
+    """
+    if not callable(fn):
+        raise TypeError("run_async takes a function: run_async(fn, *args)")
+    name = getattr(fn, "__qualname__", None) or repr(fn)
+    with _lock:
+        running = _running_task()
+        if running is not None:
+            raise RuntimeError(
+                f"{running.job_id} is still running, and one task runs at a "
+                f"time. Poll it with poll_job('{running.job_id}'), or stop it "
+                "with interrupt_kernel."
+            )
+        job = _Job(
+            f"task-{secrets.token_hex(3)}",
+            f"run_async({name})",
+            request=_request_id(),
+        )
+        _jobs[job.job_id] = job
+        _prune()
+        # Before the thread starts, so the host has the record before any of
+        # the task's output reaches it.
+        _publish_start(job)
+
+        def body():
+            value = fn(*args, **kwargs)
+            if value is not None:
+                job.result_text = repr(value)
+
+        thread = threading.Thread(
+            target=_run, args=(job, body), name=job.job_id, daemon=True
+        )
+        job.thread = thread
+        thread.start()
+    return job.job_id
 
 
 def poll(job_id):
@@ -786,33 +846,12 @@ def _cancel_dask_futures(job):
         logger.debug("distributed cancel failed", exc_info=True)
 
 
-def _running_job():
-    """The single running job, or None. One job at a time (see submit())."""
+def _running_task():
+    """The running worker-thread job, or None: one at a time (see submit())."""
     for j in _jobs.values():
-        if j.status == "running":
+        if j.status == "running" and j.thread is not None:
             return j
     return None
-
-
-def running_job():
-    """The running job's id, origin, one-line intent and code, and elapsed
-    seconds, or ``None``.
-
-    Two readers. The session child's cross-kernel admission check: a
-    verification runs in a *second* kernel, which this one cannot see, so the
-    rule that only one job runs at a time has to be decided a level up
-    (``_scratch``). And ``_kernel_gate``'s refusal, which names the job.
-    """
-    job = _running_job()
-    if job is None:
-        return None
-    return {
-        "job_id": job.job_id,
-        "origin": job.origin,
-        "intent": job.intent_preview,
-        "code": job.code_preview,
-        "elapsed": job.elapsed(),
-    }
 
 
 def _raise_in_thread(ident, exctype):
@@ -834,28 +873,27 @@ def _raise_in_thread(ident, exctype):
     return res
 
 
-def interrupt(request, reason=None, origin="user", writer=None):
+def interrupt(key, reason=None, origin=None, writer=None):
     """Force-stop *job_id* if it is the running job: cooperative cancel *plus* a
     ``KeyboardInterrupt`` where it runs.
 
     Called on the kernel's control thread (``_kernel_gate``), so it is answered
     while the main thread is busy -- including with the very cell it stops.
 
-    **The caller names the job by its request, and this checks it** under
+    **The caller names the job, and this checks it is still running** under
     :data:`_lock`: a stop aimed at a job that has just ended is ``{"refused":
-    "not_running", "running_request": ...}`` and touches nothing, rather than
-    landing on whatever runs now. The caller's view comes from iopub and may be
-    stale; the kernel's is not. The request, not the job id, because a foreign
-    cell's id is the host's, which this kernel never learns.
+    "not_running"}`` and touches nothing, rather than landing on whatever runs
+    now. The caller's view comes from iopub and may be stale; the kernel's is
+    not. *key* is a cell's request -- its id is the host's, which this kernel
+    never learns -- or a task's id.
 
-    Where the interrupt goes depends on where the job runs. A submitted job runs
-    on a worker thread, which ``SIGINT`` cannot reach (Python delivers signals
-    only to the main thread), so :func:`_raise_in_thread` raises into it; it
-    lands at the next bytecode, so a blocking C call ends when it returns. A
-    foreign client's cell runs on the main thread (:func:`record_inline`), so it
-    gets a real ``SIGINT``, which also breaks a blocking sleep or wait. Checked
+    Where the interrupt goes depends on where the job runs. A task runs on a
+    worker thread, which ``SIGINT`` cannot reach (Python delivers signals only
+    to the main thread), so :func:`_raise_in_thread` raises into it; it lands at
+    the next bytecode, so a blocking C call ends when it returns. A cell runs on
+    the main thread (:func:`hold_cell`), so it gets a real ``SIGINT``, which also breaks a blocking sleep or wait. Checked
     and sent under the lock the cell is ended under, so the signal cannot reach
-    the next cell (see :func:`record_inline`). Either way the job's in-flight
+    the next cell (see :func:`hold_cell`). Either way the job's in-flight
     dask futures are cancelled too (:func:`_cancel_dask_futures`), the only
     mid-``compute()`` stop short of a restart.
 
@@ -876,16 +914,13 @@ def interrupt(request, reason=None, origin="user", writer=None):
     caller with ``writer=None`` is not checked -- there is nothing to compare.
     """
     with _lock:
-        job = _running_job()
-        if job is None or job.request != request:
-            return {
-                "interrupted": False,
-                "refused": "not_running",
-                "running_request": job.request if job is not None else None,
-            }
-        if origin != "user" and writer is not None and _owner not in (None, writer):
+        job = _running(key)
+        if job is None:
+            return {"interrupted": False, "refused": "not_running"}
+        checked = origin not in (None, "user")
+        if checked and writer is not None and _owner not in (None, writer):
             return {"interrupted": False, "refused": "not_owner"}
-        if origin != "user" and _foreign(job, origin):
+        if checked and _foreign(job, origin):
             return {
                 "interrupted": False,
                 "refused": "foreign_job",
@@ -905,6 +940,14 @@ def interrupt(request, reason=None, origin="user", writer=None):
     # Off the lock: a distributed cancel is a round trip to the scheduler.
     _cancel_dask_futures(job)
     return {"interrupted": raised}
+
+
+def _running(key):
+    """The running job *key* names: a cell by its request, a task by its id."""
+    job = _jobs.get(key)
+    if job is not None and job.status == "running":
+        return job
+    return None
 
 
 def _interrupt_main():

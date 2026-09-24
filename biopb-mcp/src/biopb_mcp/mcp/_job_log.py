@@ -9,14 +9,16 @@ kernel round trip.
 
 Two kinds of job, told apart by how they start and end:
 
-* **A cell** -- a foreign Jupyter client's execute request -- is read from the
-  protocol itself: its ``execute_input`` starts it, an ``error`` fails it, and
-  the ``status: idle`` for its request ends it.
+* **A cell** -- an execute request, the agent's or a foreign Jupyter
+  client's -- is read from the protocol itself: an ``error`` fails it, and the
+  ``status: idle`` for its request ends it. A foreign cell starts at its
+  ``execute_input``; the host records its own as it sends them
+  (:meth:`JobLog.start_cell`), and its shell reply ends one whose idle is lost.
 * **A task** runs on a worker thread, outliving the request that started it,
   so the kernel announces its start and end as ``biopb_job`` messages
-  (``_jobs._publish``): an agent's job, its prints attributed by ipykernel to
-  the submit request, or a verification in a scratch kernel, whose cells are
-  announced one by one so its output can be split per cell here.
+  (``_jobs._publish``): a ``run_async`` task, whose prints ipykernel files
+  under the cell that started it, or a verification in a scratch kernel, whose
+  cells are announced one by one so its output can be split per cell here.
 """
 
 import io
@@ -58,10 +60,6 @@ _END_LOST = (
     "This job has ended, but how was not recorded (its end announcement was "
     "lost). Its output above is complete as far as it goes."
 )
-
-# The error a gate's refusal carries (_kernel_gate): the cell never ran, though
-# ipykernel published its execute_input before the gate saw it.
-_REFUSED = "KernelBusy"
 
 # Appended to a record settled from the kernel's own account (JobLog.settle).
 _OUTPUT_LOST = (
@@ -280,6 +278,7 @@ class _Record(_OutputBuffer):
         "verify",
         "kind",
         "ename",
+        "reply",
     )
 
     def __init__(self, event, kind="task"):
@@ -289,6 +288,8 @@ class _Record(_OutputBuffer):
         self.kind = kind
         # The iopub error's exception name, which decides how a cell ended.
         self.ename = None
+        # A host cell's shell reply, once it arrives (note_reply).
+        self.reply = None
         # The execute request this job's output is published under.
         self.request = event.get("request")
         self.code = event.get("code", "")
@@ -376,7 +377,10 @@ class JobLog:
 
     def __init__(self, host_session=None):
         self._records = {}  # job_id -> _Record, in start order
-        self._by_request = {}  # request msg_id -> _Record, running ones only
+        # request msg_id -> the running record its stream output goes to
+        self._by_request = {}
+        # request msg_id -> the running cell under it, which its idle ends
+        self._cells = {}
         self._lock = threading.Lock()
         # The highest job number seen, handed to the next kernel so its ids
         # continue rather than restart (_jobs reads it at import).
@@ -404,60 +408,114 @@ class JobLog:
         if request is None:
             return
         with self._lock:
-            rec = self._by_request.get(request)
-        if rec is None:
-            return
+            cell = self._cells.get(request)
+            # A cell's prints are its own until it starts a task, whose thread
+            # prints under the same request (run_async).
+            route = self._by_request.get(request)
         if msg_type == "stream":
-            rec.write_output(content.get("text", ""))
+            if route is not None:
+                route.write_output(content.get("text", ""))
+        elif cell is None:
+            return
         elif msg_type == "execute_result":
             text = content.get("data", {}).get("text/plain", "")
             if text:
-                rec.result_text = text
+                cell.result_text = text
         elif msg_type == "error":
-            rec.ename = content.get("ename")
-            rec.traceback = _ANSI_RE.sub("", "\n".join(content.get("traceback", [])))
-        elif (
-            msg_type == "status"
-            and content.get("execution_state") == "idle"
-            and rec.kind == "cell"
-        ):
+            cell.ename = content.get("ename")
+            cell.traceback = _ANSI_RE.sub("", "\n".join(content.get("traceback", [])))
+        elif msg_type == "status" and content.get("execution_state") == "idle":
+            self._on_cell_end(cell)
+
+    def start_cell(self, job_id, request, code, origin, intent=""):
+        """Record a cell the host is about to send under *request*. Before the
+        send, so none of its output arrives unrouted."""
+        with self._lock:
+            rec = _Record(
+                {
+                    "job_id": job_id,
+                    "request": request,
+                    "code": code,
+                    "origin": origin,
+                    "intent": intent,
+                },
+                kind="cell",
+            )
+            self._add_cell(rec)
+            if origin != "user":
+                self._agent_origin = origin
+
+    def note_reply(self, job_id, reply):
+        """Keep a host cell's shell reply: how it ended, and the viewer
+        window's state after it (:meth:`window_alive`)."""
+        with self._lock:
+            rec = self._records.get(job_id)
+            if rec is None:
+                return
+            rec.reply = reply
+            if reply.get("status") == "error" and rec.ename is None:
+                rec.ename = reply.get("ename")
+
+    def cell_replied(self, job_id):
+        """End a host cell from its shell reply, which cannot be lost -- for
+        when its idle, which marks its output complete, never arrives."""
+        with self._lock:
+            rec = self._records.get(job_id)
+        if rec is not None and rec.kind == "cell":
             self._on_cell_end(rec)
+
+    def window_alive(self, job_id):
+        """Whether the viewer window was open after *job_id*'s cell: True,
+        False, or None when unknown."""
+        with self._lock:
+            rec = self._records.get(job_id)
+            reply = rec.reply if rec is not None else None
+        value = ((reply or {}).get("user_expressions") or {}).get("w") or {}
+        text = (value.get("data") or {}).get("text/plain")
+        return {"True": True, "False": False}.get(text)
 
     def _on_cell_start(self, msg):
         parent = msg.get("parent_header") or {}
         code = msg["content"].get("code", "")
-        # The host's own snippets are not cells; an empty cell is a client
-        # asking for its prompt number, which the gate lets through unrecorded.
+        # The host's own cells are recorded as it sends them (start_cell), and
+        # its snippets are not cells; an empty cell is a client asking for its
+        # prompt number.
         if parent.get("session") == self.host_session or not code.strip():
             return
         with self._lock:
-            rec = _Record(
-                {
-                    "job_id": self._next_id(),
-                    "request": parent.get("msg_id"),
-                    "code": code,
-                    "origin": "user",
-                },
-                kind="cell",
+            self._add_cell(
+                _Record(
+                    {
+                        "job_id": self._next_id(),
+                        "request": parent.get("msg_id"),
+                        "code": code,
+                        "origin": "user",
+                    },
+                    kind="cell",
+                )
             )
-            self._records[rec.job_id] = rec
-            self._by_request[rec.request] = rec
-            self._prune()
+
+    def _add_cell(self, rec):
+        """Call with `_lock` held."""
+        self._records[rec.job_id] = rec
+        self._cells[rec.request] = rec
+        self._by_request[rec.request] = rec
+        self._prune()
 
     def _on_cell_end(self, rec):
         with self._lock:
-            self._by_request.pop(rec.request, None)
-            if rec.ename == _REFUSED:
-                # Refused by the gate while a task ran: it never ran, and its
-                # start proved nothing about the task.
-                self._records.pop(rec.job_id, None)
+            if self._cells.get(rec.request) is not rec or rec.status != "running":
                 return
-            # It ran, so the main thread was free: a task or cell still
-            # running here had ended, its end lost.
-            for other in self._records.values():
-                if other is not rec and other.status == "running":
-                    other.end("error", _END_LOST)
-                    self._by_request.pop(other.request, None)
+            del self._cells[rec.request]
+            if self._by_request.get(rec.request) is rec:
+                del self._by_request[rec.request]
+            # Cells run one at a time on the main thread, so another cell still
+            # running here had ended, its end lost. A task runs beside them.
+            for other in list(self._cells.values()):
+                other.end("error", _END_LOST)
+                del self._cells[other.request]
+                if self._by_request.get(other.request) is other:
+                    del self._by_request[other.request]
             if rec.ename == "KeyboardInterrupt":
                 status = "interrupted"
             else:
@@ -478,11 +536,18 @@ class JobLog:
             if kind == "start":
                 if job_id in self._records:
                     return  # already settled from the kernel (settle)
+                # One task at a time, so a task still running here had ended,
+                # its end lost. Cells run beside a task.
                 for other in self._records.values():
-                    if other.status == "running":
+                    if other.kind == "task" and other.status == "running":
                         other.end("error", _END_LOST)
-                        self._by_request.pop(other.request, None)
+                        if self._by_request.get(other.request) is other:
+                            del self._by_request[other.request]
                 rec = _Record(event)
+                # Started from a cell (run_async): the cell's writer is its.
+                cell = self._cells.get(rec.request)
+                if cell is not None:
+                    rec.origin = cell.origin
                 self._records[job_id] = rec
                 if rec.request:
                     self._by_request[rec.request] = rec
@@ -524,7 +589,8 @@ class JobLog:
                 if rec.traceback and event.get("status") == "error":
                     error_text = rec.traceback
                 rec.end(event.get("status", "error"), error_text, event.get("elapsed"))
-                self._by_request.pop(rec.request, None)
+                if self._by_request.get(rec.request) is rec:
+                    del self._by_request[rec.request]
 
     def kernel_gone(self, why=""):
         """End every running record: its kernel is going away."""
@@ -544,6 +610,7 @@ class JobLog:
                             cell.status = "skipped"
                     v.current = None
             self._by_request.clear()
+            self._cells.clear()
 
     def settle(self, snap):
         """Bring a record in line with the kernel's own account of the job.
@@ -589,18 +656,14 @@ class JobLog:
         with self._lock:
             return self._next_id()
 
-    def request_of(self, job_id):
-        """The request *job_id* runs under, while it runs; else None. What the
-        kernel names a job by when stopping it (``_jobs.interrupt``)."""
+    def stop_key(self, job_id):
+        """What the kernel names *job_id* by while it runs (``_jobs.interrupt``):
+        a cell's request, a task's own id; None when it does not run here."""
         with self._lock:
             rec = self._records.get(job_id)
-            return rec.request if rec is not None and rec.status == "running" else None
-
-    def job_of(self, request):
-        """The running job under *request*, or None."""
-        with self._lock:
-            rec = self._by_request.get(request)
-            return rec.job_id if rec is not None else None
+            if rec is None or rec.status != "running":
+                return None
+            return rec.request if rec.kind == "cell" else rec.job_id
 
     def note_cancel(self, job_id, reason):
         """Attribute a stop the host made: a cell's end carries no reason."""
@@ -655,10 +718,20 @@ class JobLog:
                 return None
             return rec.verify.snapshot(full=True)
 
-    def running(self):
-        """The running job's snapshot, or ``None``."""
+    def running(self, prefer=None):
+        """A running job's snapshot, or ``None``: one of origin *prefer* if
+        any, since a task can run beside another writer's cell."""
         with self._lock:
-            for rec in self._records.values():
+            live = [r for r in self._records.values() if r.status == "running"]
+            own = [r for r in live if r.origin == prefer]
+            pick = (own or live or [None])[0]
+            return pick.snapshot() if pick is not None else None
+
+    def running_cell(self):
+        """The running cell's snapshot -- whatever holds the main thread -- or
+        ``None``."""
+        with self._lock:
+            for rec in self._cells.values():
                 if rec.status == "running":
                     return rec.snapshot()
         return None

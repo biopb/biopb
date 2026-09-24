@@ -28,6 +28,7 @@ import asyncio
 import functools
 import logging
 import os
+import threading
 import time
 from typing import Annotated
 
@@ -299,72 +300,56 @@ def _tool_busy_message(running, running_origin) -> str:
     )
 
 
-def _submit_job(host, code, digest, busy_message, **kwargs):
-    """Claim the kernel, submit *code*, and classify whatever comes back.
+# Serializes _submit_job's check and send: two submits must not both find the
+# kernel free and queue a cell each.
+_submit_lock = threading.Lock()
 
-    The claim protocol -- presume before the call, then believe the kernel's
-    answer -- is the same for every writer of this namespace, and it is a
-    security-relevant one, so it is written once here. Both the MCP tools (via
-    :func:`_start_job`) and the in-process chat loop go through it.
+
+def _submit_job(host, code, digest, busy_message, intent=""):
+    """Claim the kernel, send *code* as a cell, and classify the outcome.
+
+    The claim protocol is the same for every writer of this namespace, and it
+    is a security-relevant one, so it is written once here. Both the MCP tools
+    (via :func:`_start_job`) and the in-process chat loop go through it.
 
     The origin is added here for the same reason the identity is: it is the
     caller's point of view, every seam that reads a job back compares against
-    it, and a surface that let the kernel default it recorded its cells as the
-    MCP client's (biopb/biopb#880). One contextvar, read at one seam.
+    it, and a surface that let it default recorded its cells as the MCP
+    client's (biopb/biopb#880). One contextvar, read at one seam.
 
-    What legitimately differs between those surfaces is only how a busy kernel
-    is described: a tool caller gets a job handle it can poll, the chat loop
-    never does (its path has no promote window), so it must not be told to poll
-    one. Hence *busy_message*, a ``(running_job_id, running_origin) -> str``.
+    **One job at a time.** A cell is refused while anything runs -- a cell
+    (anyone's) or a task -- rather than queued behind it: an agent that queued
+    would lose track of what ran when. What legitimately differs between the
+    surfaces is only how that refusal reads: a tool caller gets a job handle it
+    can poll, the chat loop never does, so it must not be told to poll one.
+    Hence *busy_message*, a ``(running_job_id, running_origin) -> str``.
 
     Returns ``(job_id, message, drop_note, window_alive)``; exactly one of
     *job_id* and *message* is not None. *drop_note* asks the caller to suppress
     its foreign-activity note: a running foreign job stays in the digest by
     design, so the note would report the very job the refusal already reports.
-    Keep it when other cells also finished -- those were acked and will not be
-    offered again.
+    *window_alive* is always None here: it is known only once the cell has run
+    (``host.jobs.window_alive``).
     """
     writer, writer_label = _writers._client_identity()
-    # Before the call, not after: a lost reply must not leave the kernel claimed
-    # while this process still reads as unclaimed. See _claimed_by.
-    _writers._presume_claim(writer)
-    submitted, res, window_alive = _kernel_rpc._run_job_call(
-        host,
-        "submit",
-        code,
-        job_id=host.jobs.new_id(),
-        origin=_writers._local_origin.get(),
-        writer=writer,
-        writer_label=writer_label,
-        **kwargs,
-    )
-    if submitted is None:
-        return None, _kernel_rpc._format_execute_result(res), False, window_alive
-    if submitted.get("error") == "not_owner":
-        # The authority speaking: whatever this process presumed above, the
-        # kernel just named the real holder.
-        _writers._note_claim(submitted.get("owner_id"))
-        held_by = submitted.get("owner") or ""
-        held_by = f" ({held_by})" if held_by else ""
-        return (
-            None,
-            _writers._NOT_OWNER_MSG.format(held_by=held_by),
-            False,
-            window_alive,
-        )
-    # Anything the kernel did not refuse came from the holder, "busy" included:
-    # submit() decides the claim before it looks at what is running.
-    _writers._note_claim(writer)
-    if submitted.get("error") == "busy":
-        running = submitted.get("running_job_id")
-        drop_note = [d.get("job_id") for d in digest] == [running]
-        return (
-            None,
-            busy_message(running, submitted.get("running_job_origin")),
-            drop_note,
-            window_alive,
-        )
-    return submitted["job_id"], None, False, window_alive
+    holder = _writers.take_claim(host, writer, writer_label)
+    if holder is not None:
+        held_by = f" ({holder})" if holder else ""
+        return None, _writers._NOT_OWNER_MSG.format(held_by=held_by), False, None
+    with _submit_lock:
+        running = host.jobs.running()
+        if running is not None:
+            drop_note = [d.get("job_id") for d in digest] == [running["job_id"]]
+            message = busy_message(running["job_id"], running.get("origin"))
+            return None, message, drop_note, None
+        job_id = host.jobs.new_id()
+        try:
+            host.run_cell(
+                code, job_id, origin=_writers._local_origin.get(), intent=intent
+            )
+        except Exception as exc:  # noqa: BLE001 - reported, not raised
+            return None, str(exc), False, None
+    return job_id, None, False, None
 
 
 def _poll_submitted(host, job_id):
@@ -602,6 +587,28 @@ async def _notify_doc_written(doc_id: str) -> None:
         logger.debug("docs: could not notify the index resource update", exc_info=True)
 
 
+def _own_cell_holds_main(host, what):
+    """The refusal for a tool that needs the kernel's main thread while the
+    caller's own cell holds it, or None.
+
+    Answered at once rather than queued: the tool would only wait for the cell
+    to end, and asking while it runs is a mistake in the plan -- the agent
+    started that cell -- not a busy kernel. A user's cell is not the agent's to
+    foresee, so behind one the tool still waits.
+    """
+    cell = host.jobs.running_cell()
+    if cell is None or cell.get("origin") != _writers._local_origin.get():
+        return None
+    job_id = cell["job_id"]
+    return (
+        f"Refused: your cell {job_id} is running on the kernel's main thread, "
+        f"and {what} needs that thread, so it could only wait for the cell to "
+        "end. Asking now is a mistake in the plan, not a busy kernel: run a "
+        "compute you want to watch with run_async(fn), which leaves the main "
+        f"thread free. Poll the cell with poll_job('{job_id}')."
+    )
+
+
 @mcp.tool()
 async def take_screenshot(canvas_only: bool = True) -> list:
     """Capture the napari viewer as a PNG image.
@@ -615,6 +622,9 @@ async def take_screenshot(canvas_only: bool = True) -> list:
     host, err = _app._require_kernel_host()
     if err is not None:
         return [TextContent(type="text", text=err)]
+    refusal = _own_cell_holds_main(host, "a screenshot")
+    if refusal is not None:
+        return [TextContent(type="text", text=refusal)]
 
     snippet = _SCREENSHOT_SNIPPET.format(canvas_only=bool(canvas_only))
     res = await _kernel_rpc._execute(host, snippet)
@@ -657,12 +667,15 @@ _INTENT_DESC = (
 #: so it substitutes its own (``_chat._CHAT_RUN_PARAGRAPH``); named here, and
 #: pinned by a test, so a reworded docstring fails loudly rather than quietly
 #: leaving the loop's model told to poll for a handle it will never be given.
-PROMOTE_PARAGRAPH = """Code runs in a background thread so it does not block the main thread.
+PROMOTE_PARAGRAPH = """Code runs as a cell on the kernel's main thread, like a notebook cell.
     If it finishes quickly the result is returned inline; otherwise this returns
-    a job handle (job-N) and the code keeps running. Poll it with poll_job,
-    watch it with take_screenshot / server_status, and stop it with
-    interrupt_kernel (best-effort) or restart_kernel (guaranteed). Only one job
-    runs at a time."""
+    a job handle (job-N) and the cell keeps running. Poll it with poll_job, and
+    stop it with interrupt_kernel or restart_kernel (guaranteed). While it runs
+    it holds the main thread: the viewer does not repaint and take_screenshot /
+    inspect_object refuse. For a long compute you want to watch, end the cell
+    with run_async(fn) instead -- fn runs on a worker thread, the cell returns
+    at once with a task id (task-...) to poll, and the viewer stays live. Only
+    one job runs at a time."""
 
 
 @mcp.tool()
@@ -677,12 +690,15 @@ async def execute_code(
     dict of image processing operations). np and da are also imported. Variables persist
     across calls until the kernel is restarted.
 
-    Code runs in a background thread so it does not block the main thread.
+    Code runs as a cell on the kernel's main thread, like a notebook cell.
     If it finishes quickly the result is returned inline; otherwise this returns
-    a job handle (job-N) and the code keeps running. Poll it with poll_job,
-    watch it with take_screenshot / server_status, and stop it with
-    interrupt_kernel (best-effort) or restart_kernel (guaranteed). Only one job
-    runs at a time.
+    a job handle (job-N) and the cell keeps running. Poll it with poll_job, and
+    stop it with interrupt_kernel or restart_kernel (guaranteed). While it runs
+    it holds the main thread: the viewer does not repaint and take_screenshot /
+    inspect_object refuse. For a long compute you want to watch, end the cell
+    with run_async(fn) instead -- fn runs on a worker thread, the cell returns
+    at once with a task id (task-...) to poll, and the viewer stays live. Only
+    one job runs at a time.
 
     Only one *agent* runs code in a kernel, too: whoever calls this first holds
     it until the kernel restarts. A second client is refused here and by every
@@ -690,16 +706,16 @@ async def execute_code(
     keeps only the read-only ones. The person at the machine is exempt — they
     can run cells from a Jupyter notebook attached to this kernel while you
     work, which is what the user-activity notice on these results is telling
-    you about. While your job runs, their cells are refused.
+    you about. A cell of theirs sent while yours runs waits for it; one sent
+    while a run_async task runs runs beside it.
 
     Results include print() output and the last expression's repr. Rich IPython
     display() output is not captured; use print().
 
     * viewer mutations (read_doc("napari-viewer") has more):
-    The viewer is thread-safe: mutations are auto-marshaled to the Qt main
-    thread, so mutate it directly from job code. run_on_main(fn) is optional --
-    use it to batch many mutations into one main-thread hop, or to touch raw Qt
-    (viewer.window), which still requires the main thread.
+    Mutate the viewer directly. From a run_async task too: its mutations are
+    marshaled to the main thread. run_on_main(fn) batches many mutations into
+    one hop, or touches raw Qt (viewer.window), from a task.
 
     * data access (read_doc("tensor-server-client") has more):
     - client.query_sources(sql, format="pandas") runs server-side DuckDB and
@@ -739,9 +755,7 @@ async def execute_code(
         # a verification is running in a second one, on the same dask cluster.
         return _tool_busy_message(verifying["job_id"], "mcp")
 
-    job_id, foreign_note, window_alive, msg = await _start_job(
-        host, python_code, intent=intent
-    )
+    job_id, foreign_note, _w, msg = await _start_job(host, python_code, intent=intent)
     if msg is not None:
         return msg
 
@@ -749,19 +763,18 @@ async def execute_code(
     if snap.get("status") != "running":
         return (
             _kernel_rpc._format_execute_result(snap)
-            + _kernel_rpc._window_note(window_alive)
+            + _kernel_rpc._window_note(host.jobs.window_alive(job_id))
             + foreign_note
         )
 
     partial = snap.get("stdout", "") if snap else ""
     return (
-        f"Job {job_id} is still running after {_app._promote_after:.0f}s. "
-        f"Poll it with poll_job('{job_id}'); watch with take_screenshot / "
-        f"server_status; stop with interrupt_kernel or restart_kernel.\n"
-        "Partial output:\n"
-        + (partial or "(none yet)")
-        + _kernel_rpc._window_note(window_alive)
-        + foreign_note
+        f"Job {job_id} is still running after {_app._promote_after:.0f}s, "
+        "holding the main thread: take_screenshot and inspect_object refuse "
+        f"until it ends. Poll it with poll_job('{job_id}'); stop it with "
+        "interrupt_kernel or restart_kernel. Next time, run a compute this long "
+        "with run_async(fn) to keep the viewer live.\n"
+        "Partial output:\n" + (partial or "(none yet)") + foreign_note
     )
 
 
@@ -1010,6 +1023,9 @@ async def inspect_object(object_path: str) -> str:
     host, err = _app._require_kernel_host()
     if err is not None:
         return err
+    refusal = _own_cell_holds_main(host, "inspecting an object")
+    if refusal is not None:
+        return refusal
 
     snippet = _INSPECT_TEMPLATE.replace("__PATH__", repr(object_path))
     res = await _kernel_rpc._execute(host, snippet)
@@ -1020,16 +1036,16 @@ async def inspect_object(object_path: str) -> str:
 
 @mcp.tool()
 async def interrupt_kernel() -> str:
-    """Force-stop the current job by raising KeyboardInterrupt in its thread.
+    """Force-stop your running job: your cell, or your run_async task.
 
-    Also cancels the job's in-flight dask futures, which is what actually stops a
-    blocking `.compute()` — but only while a cluster is attached (`_dask_ctl.attach()`
-    in a cell); on the in-process default there are no futures to cancel. The job runs in a
-    background worker thread, so a SIGINT (which Python delivers only to the
-    kernel main thread) can't reach it — this raises the exception directly into
-    the worker. Best-effort: it lands at the next bytecode, so a blocking C-level
-    call (gRPC tensor fetch, native dask compute) stops only when it returns to
-    Python; if YOUR job stays stuck, use restart_kernel — the guaranteed stop.
+    A cell runs on the kernel's main thread and gets a SIGINT, which also wakes
+    a blocking sleep or wait; a task gets a KeyboardInterrupt raised into its
+    thread. Either lands at the next bytecode, so a blocking C-level call (gRPC
+    tensor fetch, native compute) stops only when it returns to Python. Also
+    cancels the job's in-flight dask futures, which is what stops a blocking
+    `.compute()` -- but only while a cluster is attached (`_dask_ctl.attach()`
+    in a cell). If YOUR job stays stuck, use restart_kernel -- the guaranteed
+    stop.
 
     Stops YOUR job only. A cell the user runs from an attached Jupyter notebook
     shares this kernel but is not yours to stop: this refuses it, so wait for it
@@ -1038,8 +1054,8 @@ async def interrupt_kernel() -> str:
     the user's running cell, variables and layers along with yours. Wait, or ask
     them.
 
-    Takes no argument for which job because there is only ever one: the slot is
-    the session's, not a kernel's. So this also stops a verification of yours
+    Takes no argument for which job because you have at most one running: the
+    slot is the session's, not a kernel's. So this also stops a verification of yours
     running in its scratch kernel, and refuses one that is not yours, by the
     same rule and for the same reason.
 
@@ -1082,19 +1098,22 @@ async def interrupt_kernel() -> str:
             f"Nothing to interrupt in verification {job_id}; it may have "
             "finished already. Poll it to see."
         )
-    running = host.jobs.running()
+    origin = _writers._local_origin.get()
+    running = host.jobs.running(prefer=origin)
     if running is None:
         return "No running job to interrupt."
     job_id = running["job_id"]
-    try:
-        data = await asyncio.to_thread(
-            host.interrupt_job,
-            job_id,
-            origin=_writers._local_origin.get(),
-            writer=writer,
-        )
-    except Exception as exc:  # noqa: BLE001 - the agent reads why
-        return f"Could not reach the kernel to interrupt {job_id}: {exc}"
+    # Decided here, where the records and the claim are: the kernel stops
+    # what it is told to.
+    if _writers.claim_holder() not in (None, writer) and writer is not None:
+        return _writers._NOT_OWNER_MSG.format(held_by="")
+    if running.get("origin") != origin:
+        data = {"refused": "foreign_job", "origin": running.get("origin")}
+    else:
+        try:
+            data = await asyncio.to_thread(host.interrupt_job, job_id)
+        except Exception as exc:  # noqa: BLE001 - the agent reads why
+            return f"Could not reach the kernel to interrupt {job_id}: {exc}"
     if data.get("refused") == "not_running":
         now = data.get("running_job_id")
         return f"{job_id} is no longer running" + (
@@ -1117,8 +1136,8 @@ async def interrupt_kernel() -> str:
         )
     if data.get("interrupted"):
         return (
-            f"Interrupted job {job_id} (KeyboardInterrupt raised in its thread). "
-            "If it does not stop, use restart_kernel."
+            f"Interrupted job {job_id} (a KeyboardInterrupt, at its next "
+            "bytecode). If it does not stop, use restart_kernel."
         )
     return "No running job to interrupt."
 

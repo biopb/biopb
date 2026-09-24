@@ -19,6 +19,7 @@ import itertools
 import os
 import re
 import sys
+import threading
 import time
 import types
 
@@ -62,8 +63,8 @@ def runner(monkeypatch):
 def _stop(**kw):
     """``_jobs.interrupt`` aimed at whatever is running, as the host aims it at
     the job its records say is running."""
-    job = _jobs._running_job()
-    return _jobs.interrupt(job.request if job is not None else None, **kw)
+    job = _jobs._running_task()
+    return _jobs.interrupt(job.job_id if job is not None else None, **kw)
 
 
 @pytest.fixture
@@ -283,7 +284,6 @@ class TestJobRunnerUnit:
         assert _jobs.interrupt("req-1") == {
             "interrupted": False,
             "refused": "not_running",
-            "running_request": None,
         }
 
     def test_a_stop_aimed_at_an_ended_job_does_not_land_on_the_next(self, runner):
@@ -293,9 +293,8 @@ class TestJobRunnerUnit:
         self._wait(done)
         jid = _jobs.submit("import time\nwhile True:\n    time.sleep(0.02)")["job_id"]
         try:
-            out = _jobs.interrupt(_jobs._jobs[done].request)
+            out = _jobs.interrupt(done)
             assert out["refused"] == "not_running"
-            assert out["running_request"] == _jobs._jobs[jid].request
             time.sleep(0.1)
             assert _jobs.poll(jid)["status"] == "running"
         finally:
@@ -749,43 +748,94 @@ class TestJobIntent:
         assert snap["status"] == "ok"
 
 
-class TestRecordInline:
-    """A foreign client's cell, held as the running job while it runs inline
+class TestHoldCell:
+    """A cell, held as a running job while it runs on the main thread
     (``_kernel_gate``). The host records it from the protocol, so nothing is
     announced (``test_mcp_job_log``, and the gate's real-kernel tests)."""
 
     def test_nothing_is_announced(self, runner, log):
-        with _jobs.record_inline("print('hi')", request="req-1") as job:
+        with _jobs.hold_cell("print('hi')", "req-1") as job:
             job.status = "ok"
         assert log.export() == []
 
     def test_output_is_left_to_the_real_stream(self, runner, capsys):
-        with _jobs.record_inline("print('hi')") as job:
+        with _jobs.hold_cell("print('hi')", "req-1") as job:
             print("hi")
             job.status = "ok"
         assert capsys.readouterr().out == "hi\n"
 
     def test_running_for_its_duration(self, runner):
-        with _jobs.record_inline("import time", request="req-1") as job:
-            running = _jobs.running_job()
-            assert running["origin"] == "user"
-            assert running["code"] == "import time"
+        with _jobs.hold_cell("import time", "req-1") as job:
+            assert _jobs._running("req-1") is job
             job.status = "ok"
-        assert _jobs.running_job() is None
+        assert _jobs._running("req-1") is None
         assert job.finished is not None
 
     def test_a_stop_names_it_by_its_request(self, runner):
         # The host's id for a cell is its own; the kernel knows the request.
-        with _jobs.record_inline("x = 1", request="req-7") as job:
+        with _jobs.hold_cell("x = 1", "req-7") as job:
             assert _jobs.interrupt("req-8", origin="mcp")["refused"] == "not_running"
             assert _jobs.interrupt("req-7", origin="mcp")["refused"] == "foreign_job"
             job.status = "ok"
 
     def test_an_unsettled_block_is_an_error(self, runner):
         with pytest.raises(RuntimeError):
-            with _jobs.record_inline("boom()", request="req-1") as job:
+            with _jobs.hold_cell("boom()", "req-1") as job:
                 raise RuntimeError("do_execute itself failed")
         assert job.status == "error"
+
+
+class TestRunAsync:
+    """A long compute off the main thread, polled by its task id."""
+
+    def _wait(self, job_id, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        while _jobs.status(job_id) == "running" and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return _jobs.poll(job_id)
+
+    def test_returns_its_task_id_at_once(self, runner, log):
+        gate = threading.Event()
+        task = _jobs.run_async(gate.wait)
+        try:
+            assert task.startswith("task-")
+            assert _jobs.status(task) == "running"
+            assert log.poll(task)["status"] == "running"
+        finally:
+            gate.set()
+        assert self._wait(task)["status"] == "ok"
+        assert log.poll(task)["status"] == "ok"
+
+    def test_what_it_returns_is_its_result(self, runner):
+        task = _jobs.run_async(lambda a, b: a + b, 40, b=2)
+        assert self._wait(task)["result_text"] == "42"
+
+    def test_a_failure_is_its_error(self, runner):
+        task = _jobs.run_async(lambda: 1 / 0)
+        snap = self._wait(task)
+        assert snap["status"] == "error"
+        assert "ZeroDivisionError" in snap["error_text"]
+
+    def test_one_task_at_a_time(self, runner):
+        gate = threading.Event()
+        task = _jobs.run_async(gate.wait)
+        try:
+            with pytest.raises(RuntimeError, match=task):
+                _jobs.run_async(print)
+        finally:
+            gate.set()
+            self._wait(task)
+
+    def test_stopped_by_its_id(self, runner):
+        task = _jobs.run_async(lambda: [time.sleep(0.02) for _ in range(500)])
+        assert _jobs.interrupt(task, reason="stopped by Bob")["interrupted"] is True
+        snap = self._wait(task)
+        assert snap["status"] == "interrupted"
+        assert "stopped by Bob" in snap["error_text"]
+
+    def test_takes_a_function(self, runner):
+        with pytest.raises(TypeError):
+            _jobs.run_async("x = 1")
 
 
 # ---------------------------------------------------------------------------
