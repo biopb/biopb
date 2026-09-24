@@ -117,6 +117,11 @@ class TestKernelControl:
         # start_kernel", which would be wrong advice between kill and relaunch.
         restarter = threading.Thread(target=kernel.restart, daemon=True)
         restarter.start()
+        # From the moment it turns calls away: one sent just before reached the
+        # old kernel and fails fast with it (test_a_call_in_flight_fails_fast).
+        assert _wait_until(
+            lambda: not kernel._ready.is_set(), timeout=5.0, interval=0.01
+        )
         seen = set()
         while restarter.is_alive():
             started = time.monotonic()
