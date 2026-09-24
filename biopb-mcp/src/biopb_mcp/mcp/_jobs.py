@@ -712,6 +712,13 @@ def poll(job_id):
     return job.snapshot()
 
 
+def status(job_id):
+    """*job_id*'s status alone: what the host checks its records against, often
+    enough that the whole snapshot would be waste."""
+    job = _jobs.get(job_id)
+    return "unknown" if job is None else job.status
+
+
 def _cancel_dask_futures(job, reason=None):
     """Stop *job*'s in-flight dask work, tagging why.
 

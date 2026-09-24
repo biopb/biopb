@@ -542,26 +542,15 @@ def _poll_to_completion(run, host, kernel_job_id):
     lost announcement, not one in flight, and settle them (``JobLog.settle``).
     """
     next_check = time.monotonic() + _SETTLE_EVERY
-    disagreed = False
+    strikes = 0
     while True:
         with _lock:
             if run["discarded"]:
                 return
-        snap = host.jobs.poll(kernel_job_id)
-        if snap.get("status") in ("running", "unknown") and (
-            time.monotonic() >= next_check
-        ):
-            kernel_snap, _res, _w = _kernel_rpc._run_job_call(
-                host, "poll", kernel_job_id, timeout=_SETTLE_EVERY * 5
-            )
+        if time.monotonic() >= next_check:
+            strikes = _check_kernel(host, kernel_job_id, strikes)
             next_check = time.monotonic() + _SETTLE_EVERY
-            kernel_status = (kernel_snap or {}).get("status")
-            disagrees = kernel_status not in (None, "unknown", snap.get("status"))
-            if disagrees and disagreed:
-                host.jobs.settle(kernel_snap)
-                snap = host.jobs.poll(kernel_job_id)
-                disagrees = False
-            disagreed = disagrees
+        snap = host.jobs.poll(kernel_job_id)
         if snap.get("status") in ("running", "unknown") and not host.is_alive():
             # A death is the verdict (an OOM means the workflow does not fit),
             # and nothing else would end the record: this host runs no watchdog
@@ -596,6 +585,28 @@ def _poll_to_completion(run, host, kernel_job_id):
             _finish(run, snap.get("status"), snap.get("error_text") or None)
             return
         time.sleep(0.4)
+
+
+def _check_kernel(host, job_id, strikes):
+    """Check the records against the kernel's own status; returns the count of
+    checks in a row that disagreed. The second settles (``JobLog.settle``):
+    one disagreement may be an announcement still in flight."""
+    status = host.jobs.poll(job_id).get("status")
+    if status not in ("running", "unknown"):
+        return 0
+    kernel_status, _res, _w = _kernel_rpc._run_job_call(
+        host, "status", job_id, timeout=_SETTLE_EVERY
+    )
+    if kernel_status in (None, "unknown", status):
+        return 0
+    if strikes == 0:
+        return 1
+    snap, _res, _w = _kernel_rpc._run_job_call(
+        host, "poll", job_id, timeout=_SETTLE_EVERY
+    )
+    if snap is not None:
+        host.jobs.settle(snap)
+    return 0
 
 
 def _discard_host(host):

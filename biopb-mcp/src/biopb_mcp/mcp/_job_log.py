@@ -493,18 +493,8 @@ class JobLog:
             spec = None
             if verify is not None:
                 spec = dict(verify, cells=[c["code"] for c in verify["cells"]])
-            self._on_event(
-                {
-                    "event": "start",
-                    "job_id": job_id,
-                    "request": snap.get("request"),
-                    "origin": snap.get("origin", "mcp"),
-                    "intent": snap.get("intent", ""),
-                    "code": snap.get("code", ""),
-                    "created": snap.get("created"),
-                    "verify": spec,
-                }
-            )
+            # The snapshot carries every field the start does.
+            self._on_event(dict(snap, event="start", verify=spec))
             rec = self._records[job_id]
         if status == "running" or rec.status != "running":
             return

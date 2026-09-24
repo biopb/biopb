@@ -26,7 +26,7 @@ import pytest
 pytest.importorskip("ipykernel")
 pytest.importorskip("jupyter_client")
 
-from biopb_mcp._tests.conftest import call_tool as _tool
+from biopb_mcp._tests.conftest import call_tool as _tool, iopub_event
 from biopb_mcp.mcp import (  # noqa: E402
     _app,
     _job_log,
@@ -64,16 +64,7 @@ def log(runner, monkeypatch):
     """
     log = _job_log.JobLog()
 
-    def publish(content):
-        log.on_iopub(
-            {
-                "header": {"msg_type": _job_log.MSG_TYPE},
-                "parent_header": {},
-                "content": content,
-            }
-        )
-
-    monkeypatch.setattr(_jobs, "_publish", publish)
+    monkeypatch.setattr(_jobs, "_publish", lambda c: log.on_iopub(iopub_event(c)))
     return log
 
 

@@ -36,6 +36,31 @@ def rpc_reply(r, window_alive=True):
     }
 
 
+def iopub_event(content):
+    """A ``biopb_job`` announcement as the host's iopub listener receives it."""
+    from biopb_mcp.mcp._job_log import MSG_TYPE
+
+    return {"header": {"msg_type": MSG_TYPE}, "parent_header": {}, "content": content}
+
+
+def kernel_snapshot(status="ok", cells=None, error_text="", **job_kw):
+    """``_jobs.poll``'s answer, built from a real ``_Job`` so a field added to
+    the snapshot reaches every test that settles from one. *cells* is a list of
+    ``(code, status)`` making it a verification."""
+    from biopb_mcp.mcp import _jobs
+
+    job = _jobs._Job(
+        **{"job_id": "job-1", "code": "x = 1", "request": "req-1", **job_kw}
+    )
+    if cells is not None:
+        job.verify = _jobs._Verification("wf", [code for code, _ in cells])
+        for cell, (_code, cell_status) in zip(job.verify.cells, cells, strict=True):
+            cell.status = cell_status
+    job.status = status
+    job.error_text = error_text
+    return job.snapshot()
+
+
 class ScriptedJobs:
     """``host.jobs`` for a mock host: the host's job records, scripted.
 
