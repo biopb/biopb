@@ -254,9 +254,8 @@ brings one, moves every install to 7 with no change here. To do:
 
 1. **Pin** `ipykernel>=6.31,<7` in `biopb-mcp`'s `mcp` extra, so the cap is
    this package's decision and survives a napari upgrade.
-2. **Verify against 7.3** (required for subshells anyway): the `test_mcp_*`
-   suites and the napari smoke run in a venv with ipykernel 7.3, then move the
-   pin.
+2. **Verify against 7.3** once the cap can move: the `test_mcp_*` suites and
+   the napari smoke run in a venv with ipykernel 7.3, then move the pin.
 
 What 7 has to be checked for, since the gate and the records lean on ipykernel
 internals rather than the protocol:
@@ -298,7 +297,23 @@ running. Limits: anything touching the viewer still marshals to the main
 thread and waits there; an agent submit could then overlap a user cell, so
 the gate needs a lock shared by `submit` and `record_inline`; and stopping a
 main-thread cell from a subshell may still need SIGINT, which an async
-exception is not. Blocked on the ipykernel 7 verification above.
+exception is not.
+
+**Blocked by napari, not by verification.** `napari-console` requires
+`ipykernel<7` in its latest release (0.1.4), and napari depends on it
+unconditionally -- 0.7.0 and the current 0.9.1 alike -- so no napari upgrade
+reaches ipykernel 7. The paths: a `napari-console` release that lifts the cap;
+or a uv override of it, which every install path (`install.sh`, the lock, the
+nightly fresh resolve) would have to carry, against a cap that presumably
+guards napari's own console widget. Until then, the two lifecycle problems are
+solved inside ipykernel 6 instead, on the control channel, which ipykernel
+serves on its own thread: the graceful close in `GatedKernel.do_shutdown`
+(the host's `shutdown_request` runs it however busy the main thread is), and
+Stop as a custom control request decided in the kernel, which knows whether the
+running job is a main-thread cell (SIGINT) or a worker thread
+(`interrupt_current`). That leaves host calls queueing behind a user's cell,
+which subshells would not fully fix either: anything touching the viewer needs
+the main thread.
 
 **The host subscribes to iopub**, in three stages:
 
