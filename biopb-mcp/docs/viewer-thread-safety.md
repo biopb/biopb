@@ -9,17 +9,18 @@ catchable `ViewerThreadError`, never a process death.
 
 ## Why
 
-A `run_async` task runs agent code on a **background daemon thread**
-(`_jobs._run`) to keep the Qt main thread free; an `execute_code` cell itself
-runs on the main thread, where the proxy is a no-op. napari/Qt objects are
-**main-thread-only**, so a viewer mutation off that thread that
-emits a napari event into a Qt slot **segfaults the whole kernel** —
-confirmed by `viewer.layers.clear()` on the job thread crashing through
+An `execute_code` cell runs on the Qt main thread, where the proxy calls
+straight through. Agent code off that thread is where it matters: a `run_async`
+task, which runs on a **worker thread** (`_jobs._run`) to leave the main thread
+free, or any thread agent code starts itself. napari/Qt objects are
+**main-thread-only**, so a viewer mutation off that thread that emits a napari
+event into a Qt slot **segfaults the whole kernel** — confirmed by
+`viewer.layers.clear()` off the main thread crashing through
 `QtDims._resize_slice_labels` with no async or GL involved.
 
 The old `add_*`-only wrap (`wrap_viewer_for_threads`) was **structurally
 leaky**: any call returning a live sub-object (`viewer.layers`,
-`viewer.layers[0]`) handed the worker an unguarded handle whose next
+`viewer.layers[0]`) handed that thread an unguarded handle whose next
 mutation would crash. The fix wraps the whole reachable graph, not a method
 list.
 
@@ -84,6 +85,6 @@ exactly the graph that ships.
   viewer into internal subsystems (they already run on the main thread);
   `add_tensor` (monkeypatched on real) is reached through the proxy like
   any method.
-- **Residual (accepted):** a worker that `import napari` / `current_viewer()`
-  / pokes raw `PyQt6` gets an unwrapped handle and can still crash — only a
+- **Residual (accepted):** code off the main thread that `import napari` /
+  `current_viewer()` / pokes raw `PyQt6` gets an unwrapped handle and can still crash — only a
   separate-process viewer would close it.

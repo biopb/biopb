@@ -168,7 +168,7 @@ def run_on_main(fn, *args, **kwargs):
     """Call ``fn(*args, **kwargs)`` on the Qt main thread and return its result.
 
     A no-op dispatch when already on the main thread.  Used to make viewer
-    mutations from a background job thread safe; exceptions raised on the main
+    mutations from a task's thread safe; exceptions raised on the main
     thread are re-raised to the caller.
     """
     if threading.current_thread() is threading.main_thread():
@@ -212,8 +212,8 @@ def _publish(content):
     to ignore. The request the job's output goes under rides in the content.
 
     The send runs on ipykernel's IOPub thread, as ``OutStream`` does: the
-    Session (its msg_id counter) is not thread-safe, and a job event is sent
-    from a job thread. Streams are flushed first -- ``flush`` waits until the
+    Session (its msg_id counter) is not thread-safe, and a task's event is
+    sent from the task's thread. Streams are flushed first -- ``flush`` waits until the
     IOPub thread has taken the output -- so the job's last output is on iopub
     ahead of its end.
 

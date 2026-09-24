@@ -618,11 +618,10 @@ class KernelHost:
                 "error", "The kernel was shut down or restarted during this call."
             )
         except TimeoutError:
-            # No interrupt. Everything sent here is a short snippet (agent code
-            # runs on a job thread), so overrunning means the main thread is
-            # busy with something else -- a cell from an attached Jupyter
-            # client, or a job's run_on_main slot -- and a SIGINT lands in
-            # *that*. The request stays queued and runs once the thread frees;
+            # No interrupt. Everything sent here is a short snippet, so
+            # overrunning means the main thread is busy with something else --
+            # a cell, the agent's or an attached client's, or a task's
+            # marshaled viewer call -- and a SIGINT lands in *that*. The request stays queued and runs once the thread frees;
             # its late reply is skipped by message id.
             return _status_result(
                 "timeout",
@@ -971,9 +970,9 @@ class KernelHost:
         thread is busy -- a probe would only queue behind whatever holds it, one
         more per tick. A timeout/error probe is inconclusive and likewise
         retried; only a clean ``False`` reading (the Qt window's C++ object is
-        gone) triggers teardown. An agent job on its worker thread does not
-        hold the main thread, so, like the POSIX byte signal, this can fire
-        mid-job and stop it.
+        gone) triggers teardown. A ``run_async`` task does not hold the main
+        thread, so, like the POSIX byte signal, this can fire mid-task and stop
+        it.
         """
         if self._stopping or not self._ready.is_set() or self.is_busy():
             return False
@@ -1136,9 +1135,9 @@ class KernelHost:
 
     def is_busy(self) -> bool:
         """Whether the kernel's main thread is running something, by its own
-        last published status -- any client's request, not only ours. An
-        agent job on its worker thread does not count: the request that
-        started it has returned."""
+        last published status -- any client's request, not only ours. A
+        ``run_async`` task does not count: the cell that started it has
+        returned."""
         io = self._io
         return io is not None and io.execution_state == "busy"
 

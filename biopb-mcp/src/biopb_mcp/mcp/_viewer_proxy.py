@@ -1,14 +1,15 @@
 """Main-thread marshaling proxy for the agent-facing ``viewer``.
 
-``execute_code`` runs agent code on a background daemon thread (see ``_jobs``),
-but napari/Qt objects are **main-thread-only**: any viewer mutation from the
-worker that synchronously emits a napari event into a Qt slot touches a Qt widget
-off-thread and *segfaults the whole kernel* (e.g. ``viewer.layers.clear()`` ->
+An ``execute_code`` cell runs on the Qt main thread, but a ``run_async`` task
+runs agent code on a worker thread (see ``_jobs``), and napari/Qt objects are
+**main-thread-only**: any viewer mutation off that thread that synchronously
+emits a napari event into a Qt slot touches a Qt widget off-thread and
+*segfaults the whole kernel* (e.g. ``viewer.layers.clear()`` ->
 ``QtDims._resize_slice_labels``; biopb/biopb#100).
 
 The old mitigation wrapped only the ``add_*`` methods, which leaks: any call that
 *returns* a live napari sub-object (``viewer.layers``, ``viewer.dims``,
-``viewer.layers[0]``) hands the worker an unguarded handle. This module closes
+``viewer.layers[0]``) hands that thread an unguarded handle. This module closes
 that by putting a **transparent proxy** in the namespace as ``viewer``: the real
 ``napari.Viewer`` is untouched (napari/Qt keep their direct references); the agent
 only ever holds a proxy that
