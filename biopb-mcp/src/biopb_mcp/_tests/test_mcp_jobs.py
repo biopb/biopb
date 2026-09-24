@@ -45,7 +45,6 @@ def runner(monkeypatch):
     requests = itertools.count(1)
     monkeypatch.setattr(_jobs, "_request_id", lambda: f"req-{next(requests)}")
     ns = {
-        "_dask_client": None,
         "_conn": types.SimpleNamespace(client=None),
     }
     _jobs.install(types.SimpleNamespace(user_ns=ns))
@@ -108,29 +107,6 @@ class TestTasks:
         assert job.status == "error"
         assert "ZeroDivisionError" in job.error_text
 
-    def test_worker_less_cluster_fails_the_task_instead_of_hanging(self, runner):
-        # biopb/biopb#970's backstop: a scheduler with no workers accepts work
-        # and never runs it, so the task would block forever with no error.
-        ran = []
-
-        class _Ctl:
-            def dead_message(self):
-                return "no workers left; _dask_ctl.attach() or .detach()"
-
-        runner["_dask_ctl"] = _Ctl()
-        job = _wait(_task(ran.append, 1))
-        assert job.status == "error"
-        assert "_dask_ctl.attach()" in job.error_text
-        assert ran == []  # the function never ran
-
-    def test_healthy_attachment_does_not_block_a_task(self, runner):
-        class _Ctl:
-            def dead_message(self):
-                return None
-
-        runner["_dask_ctl"] = _Ctl()
-        assert _wait(_task(lambda: None)).status == "ok"
-
     def test_distributed_cancel_rebuilds_futures(self, runner, monkeypatch):
         # _cancel() must rebuild real Future objects from dc.futures' string
         # keys: Client.cancel() filters its arg through futures_of(), which
@@ -160,7 +136,7 @@ class TestTasks:
                 calls["futures"] = list(futures)
                 calls["force"] = force
 
-        # Whatever client is *live*, not the `_dask_client` binding: a cell that
+        # Whatever client is *live*: a cell that
         # made its own Client() is attached just as much, and its futures are
         # just as stuck.
         stub = _StubClient()
@@ -319,7 +295,6 @@ import biopb_mcp.mcp._jobs as _jobs
 from types import SimpleNamespace
 _ip = get_ipython()
 _ip.user_ns['_conn'] = SimpleNamespace(client=None)
-_ip.user_ns['_dask_client'] = None
 _jobs.install(_ip)
 print('JOBS_READY')
 """

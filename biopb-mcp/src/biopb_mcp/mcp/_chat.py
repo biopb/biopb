@@ -134,8 +134,8 @@ class TurnInProgress(RuntimeError):
 
     Refused rather than queued, as a cell is (``_server._submit_job``): a
     queued turn would be composed against a conversation its sender has not seen
-    the end of, which is an ordering nobody can inspect. The transport reports it the way the user
-    console reports a busy kernel -- as state, with a 409.
+    the end of, which is an ordering nobody can inspect. The transport reports
+    it as state, with a 409.
     """
 
 

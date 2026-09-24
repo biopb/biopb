@@ -424,22 +424,14 @@ def test_post_without_json_content_type_ok(client):
     assert r.status_code == 200
 
 
-# -- the retired user console ---------------------------------------------
+# -- status and lifecycle routes ------------------------------------------
 
 
-def _console_client():
+def _app_client():
     """A client for the app as currently configured."""
     return TestClient(
         _observe._build_standalone_app(), base_url="http://127.0.0.1:8766"
     )
-
-
-def test_the_console_route_is_gone(host):
-    # Retired for a Jupyter client on the kernel (docs/jupyter-clients.md):
-    # no route, and the status no longer advertises one.
-    client = _console_client()
-    assert client.post("/console/execute", json={"code": "1"}).status_code == 404
-    assert "console_enabled" not in client.get("/api/status").json()
 
 
 def test_status_advertises_whether_chat_is_mounted(host):
@@ -450,7 +442,7 @@ def test_status_advertises_whether_chat_is_mounted(host):
     try:
         for enabled in (True, False):
             _observe.set_chat_enabled(enabled)
-            r = _console_client().get("/api/status")
+            r = _app_client().get("/api/status")
             assert r.json()["chat_enabled"] is enabled
     finally:
         _observe.set_chat_enabled(old)
@@ -464,7 +456,7 @@ def test_status_advertises_who_owns_the_reap(host):
     try:
         for agentless in (True, False):
             _observe.set_session_owns_its_reap(agentless, on_shutdown=lambda: None)
-            r = _console_client().get("/api/status")
+            r = _app_client().get("/api/status")
             assert r.json()["agentless"] is agentless
     finally:
         _observe._agentless, _observe._shutdown_hook = old
@@ -475,7 +467,7 @@ def test_shutdown_route_absent_for_a_shim_owned_child(host):
     # shim bridging to a dead process, so the verb must not exist there at all.
     _observe.set_session_owns_its_reap(False)
     try:
-        client = _console_client()
+        client = _app_client()
         assert client.post("/api/shutdown").status_code == 404
         assert client.get("/api/jobs").status_code == 200  # untouched
     finally:
@@ -489,7 +481,7 @@ def test_shutdown_runs_the_session_teardown_after_answering(host):
     calls = []
     _observe.set_session_owns_its_reap(True, on_shutdown=lambda: calls.append(1))
     try:
-        r = _console_client().post("/api/shutdown")
+        r = _app_client().post("/api/shutdown")
         assert r.status_code == 200
         assert r.json()["stopping"] is True
     finally:

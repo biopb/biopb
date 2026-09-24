@@ -111,23 +111,20 @@ napari mutation can segfault the kernel (#100).
 
 ### dask cluster
 
-By default, the kernel's dask computes run on the in-process scheduler, shared with
-the napari viewer. If needed, the agent runs `_dask_ctl.attach()` in a cell to spin
-up a local cluster for parallel multi-process computation. The default
-can also be overridden by the user via config. Defaulting to in-process is a
-reliability choice, not a cost one: a long-lived cluster nobody opted into is one
-nobody watches, and a suspended host left every `.compute()` blocked on a scheduler
-whose workers were gone (**#970**). The trade is that a `.compute()` is cancellable
-mid-flight only while attached.
+The kernel leaves dask as dask configures itself: computes run on the in-process
+scheduler, shared with the napari viewer, and a cell that wants parallel
+multi-process computation builds a `Client` itself. Defaulting to in-process is a
+reliability choice: a long-lived cluster nobody opted into is one nobody watches,
+and a suspended host left every `.compute()` blocked on a scheduler whose workers
+were gone (**#970**). The trade is that a `.compute()` is cancellable mid-flight
+only on a `Client`.
 
-The cluster belongs to the **kernel** that asked for it — its workers are that
-process group's children, so they go down with it and nothing outlives the session
-that wanted them. That is why there is no cluster machinery in the session child at
-all: no ownership to arbitrate, no idle reaper, no scheduler address to inject. Nor
-is there an MCP tool — attaching is `Client(...)` and detaching is `close()`, so it
-belongs in the kernel with everything else agent code touches; `_dask_ctl` only adds
-config-sized spin-up, the per-worker cache budget, and the liveness `server_status`
-reports.
+A cluster a cell spins belongs to the **kernel** — its workers are that process
+group's children, so they go down with it. There is no cluster machinery in the
+session child or the kernel's bootstrap, and no MCP tool: attaching is
+`Client(...)` and detaching is `close()`. The one piece kept is the viewer's pin:
+its slice reads run in-process whatever the default scheduler is
+(`_viewer_compute`, #8).
 
 ### Data connection
 

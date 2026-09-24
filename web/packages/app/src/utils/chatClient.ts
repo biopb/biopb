@@ -286,8 +286,8 @@ function readLive(raw: unknown): LiveOutput | null {
 
 /** Start a turn. Returns an error to show, or null when it was accepted.
  *
- * A 409 is state, not a failed action — the same way the console reports a busy
- * kernel — so it comes back as prose about waiting rather than about retrying. */
+ * A 409 is state, not a failed action, so it comes back as prose about waiting
+ * rather than about retrying. */
 export async function sendTurn(
   base: string,
   text: string,

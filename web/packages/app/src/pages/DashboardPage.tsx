@@ -574,7 +574,7 @@ export default function DashboardPage() {
                 {starting ? "opening…" : "+ new viewer"}
               </button>
             ) : null}
-            {/* biopb-mcp's own global settings (transport/kernel/dask/algorithm
+            {/* biopb-mcp's own global settings (transport/kernel/algorithm
                 servers), served by the control at /api/mcp_config. It sits here
                 rather than in the header because it is what every session in
                 this list was launched with — including the ones the button

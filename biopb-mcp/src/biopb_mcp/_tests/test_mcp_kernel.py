@@ -742,14 +742,9 @@ class TestNapariBootstrap:
 
     @pytest.fixture
     def default_config_kernel(self, tmp_path):
-        """A bootstrapped kernel that reads *no* user config.
-
-        The machine's own ``mcp-config.json`` decides whether a kernel attaches
-        at startup, and an install that predates #970 has ``dask.scheduler`` set
-        to ``"distributed"`` on disk -- so a test of the *default* has to isolate
-        the config tree (``$BIOPB_CONFIG_HOME``, biopb/biopb#790) or it measures
-        this machine instead.
-        """
+        """A bootstrapped kernel that reads *no* user config: a test of the
+        *default* isolates the config tree (``$BIOPB_CONFIG_HOME``,
+        biopb/biopb#790) or it measures this machine instead."""
         line = "import biopb_mcp.mcp._bootstrap as _b; _b.bootstrap()"
         host = KernelHost(
             extra_arguments=[f"--IPKernelApp.exec_lines={line}"],
@@ -761,20 +756,16 @@ class TestNapariBootstrap:
         host.shutdown()
 
     def test_kernel_computes_in_process_by_default(self, default_config_kernel):
-        # The #970 default, end to end: a real bootstrap spins no cluster and
-        # leaves dask on the in-process scheduler the viewer reads through.
-        napari_kernel = default_config_kernel
+        # The #970 default, end to end: a real bootstrap configures no dask,
+        # so it stays on the in-process scheduler the viewer reads through.
+        # get_scheduler() is None: no Client and no configured scheduler, so
+        # each collection computes on its own default (threads for arrays).
         snippet = (
-            "import time as _t\n"
-            "for _ in range(100):\n"
-            "    if _dask_attach_done:\n"
-            "        break\n"
-            "    _t.sleep(0.05)\n"
-            "print(_dask_client, _dask_ctl.status()['mode'], "
-            "_dask_ctl.status()['scheduler'])\n"
+            "from dask.base import get_scheduler as _gs\n"
+            "print('_dask_ctl' in dir(), _gs())\n"
         )
-        res = napari_kernel.execute(snippet, 30.0)
-        assert "None in-process threads" in res["stdout"]
+        res = default_config_kernel.execute(snippet, 30.0)
+        assert "False None" in res["stdout"]
 
     def test_screenshot_round_trips(self, napari_kernel):
         snippet = (

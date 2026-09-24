@@ -86,13 +86,6 @@ export const MCP_NAV: McpNavItem[] = [
     section: "kernel",
   },
   {
-    id: "dask",
-    label: "Dask",
-    description: "The dask scheduler / cluster the kernel computes on.",
-    kind: "fields",
-    section: "dask",
-  },
-  {
     id: "tensor",
     label: "Catalog Watcher",
     description: "The background source-catalog watcher's backoff bounds.",

@@ -60,7 +60,7 @@ class TestLoadConfig:
 
     def test_deep_merge_preserves_sibling_leaves(self, mock_config_dir):
         """A partial nested override touches only its own leaf."""
-        custom_config = {"dask": {"num_workers": 4}}
+        custom_config = {"kernel": {"promote_after": 30.0}}
         config_path = mock_config_dir / CONFIG_NAME
         config_path.parent.mkdir(parents=True, exist_ok=True)
         with config_path.open("w") as f:
@@ -68,10 +68,20 @@ class TestLoadConfig:
 
         config = load_config()
 
-        assert config["dask"]["num_workers"] == 4
-        # Sibling dask defaults and other sections are intact.
-        assert config["dask"]["scheduler"] == "threads"
+        assert config["kernel"]["promote_after"] == 30.0
+        # Sibling kernel defaults and other sections are intact.
+        assert config["kernel"]["name"] == "python3"
         assert config["transport"]["kind"] == "stdio"
+
+    def test_a_retired_dask_section_is_ignored(self, mock_config_dir):
+        """The kernel no longer configures dask; an old file's section loads
+        without failing validation, and nothing reads it."""
+        config_path = mock_config_dir / CONFIG_NAME
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps({"dask": {"scheduler": "distributed"}}))
+        config = load_config()
+        assert "dask" not in DEFAULT_CONFIG
+        assert config["kernel"] == DEFAULT_CONFIG["kernel"]
 
     def test_handles_malformed_json(self, mock_config_dir):
         """Returns default config for malformed JSON."""
@@ -206,7 +216,6 @@ class TestDefaultConfig:
             "memory",
             "transport",
             "kernel",
-            "dask",
             "tensor",
             "viewer",
             "services",
@@ -241,28 +250,9 @@ class TestDefaultConfig:
         # Nothing of the skills catalog survives, nested or flat.
         assert not [k for k in services if k.startswith("skills")]
 
-    def test_dask_defaults(self):
-        """MCP dask defaults to the in-process scheduler: no cluster unless asked
-        for (`_dask_ctl.attach()`, or scheduler=distributed) -- biopb/biopb#970."""
-        dask = DEFAULT_CONFIG["dask"]
-        assert dask["scheduler"] == "threads"
-        assert dask["address"] == ""
-        assert "owner" not in dask  # the escape hatch was removed
-        for key in (
-            "num_workers",
-            "threads_per_worker",
-            "memory_limit",
-            "dashboard_address",
-        ):
-            assert key in dask
-        assert dask["dashboard_address"].startswith("127.0.0.1")
-
     def test_platform_dependent_bringup_defaults(self):
-        """startup_timeout / num_workers defaults track the platform.
-
-        Windows has no fork(), so dask LocalCluster workers cold-spawn; the
-        defaults widen the startup budget and cap the worker count there, while
-        POSIX keeps the lean values. Asserted against the module's own platform
+        """The startup budget tracks the platform: Windows has no fork(), so
+        the kernel starts cold. Asserted against the module's own platform
         constants so the test is correct on whichever OS runs it.
         """
         import os
@@ -270,17 +260,13 @@ class TestDefaultConfig:
         from biopb_mcp import _config
 
         kernel = DEFAULT_CONFIG["kernel"]
-        dask = DEFAULT_CONFIG["dask"]
         if os.name == "nt":
             assert _config._IS_WINDOWS is True
             assert kernel["startup_timeout"] == 120.0
-            assert dask["num_workers"] == 4
         else:
             assert _config._IS_WINDOWS is False
             assert kernel["startup_timeout"] == 60.0
-            assert dask["num_workers"] == 0
         assert kernel["startup_timeout"] == _config._DEFAULT_STARTUP_TIMEOUT
-        assert dask["num_workers"] == _config._DEFAULT_DASK_NUM_WORKERS
 
     def test_tensor_health_poll_defaults(self):
         """The background source watcher's backoff bounds (issue #44)."""
@@ -300,12 +286,12 @@ class TestGetSetting:
     def test_missing_falls_back_to_default_config(self):
         assert get_setting({}, "transport.port") == 8765
         assert get_setting({}, "widget.server_url") == "localhost:50051"
-        assert get_setting({}, "dask.scheduler") == "threads"
+        assert get_setting({}, "kernel.name") == "python3"
 
     def test_partial_path_falls_back(self):
-        config = {"dask": {"num_workers": 4}}
-        assert get_setting(config, "dask.scheduler") == "threads"
-        assert get_setting(config, "dask.num_workers") == 4
+        config = {"kernel": {"promote_after": 30.0}}
+        assert get_setting(config, "kernel.name") == "python3"
+        assert get_setting(config, "kernel.promote_after") == 30.0
 
     def test_explicit_default_wins_over_default_config(self):
         assert get_setting({}, "transport.port", default=42) == 42
@@ -481,11 +467,9 @@ class TestValidation:
             mock_config_dir,
             {
                 "transport": {"kind": "websocket"},
-                "dask": {"scheduler": "bogus"},
             },
         )
         assert get_setting(config, "transport.kind") == "stdio"
-        assert get_setting(config, "dask.scheduler") == "threads"
 
     def test_port_out_of_range_clamped(self, mock_config_dir):
         config = _write_and_load(mock_config_dir, {"transport": {"port": 99999}})
@@ -518,17 +502,15 @@ class TestValidation:
         assert isinstance(get_setting(config, "pyramid.downscale_factor"), int)
 
     def test_zero_is_valid_where_it_disables(self, mock_config_dir):
-        """0 is a documented sentinel for several knobs (disables the watcher /
-        lets dask pick), so it must pass validation, not be clamped."""
+        """0 is a documented sentinel for several knobs (disables the watcher),
+        so it must pass validation, not be clamped."""
         config = _write_and_load(
             mock_config_dir,
             {
-                "dask": {"num_workers": 0},
                 "kernel": {"watchdog_interval": 0},
                 "tensor": {"health_poll_min_interval": 0},
             },
         )
-        assert get_setting(config, "dask.num_workers") == 0
         assert get_setting(config, "kernel.watchdog_interval") == 0
         assert get_setting(config, "tensor.health_poll_min_interval") == 0
 

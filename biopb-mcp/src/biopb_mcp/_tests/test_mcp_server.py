@@ -1328,8 +1328,6 @@ class TestServerStatus:
 
         _requires.record_loaded_plugins(["rolling_ball"], ["labshop_tools"])
         ns = {
-            "_dask_client": None,
-            "_dask_attach_done": True,
             "_conn": MagicMock(client=None, last_status="", last_message=""),
             "viewer": MagicMock(layers=[]),
             "_viewer_window_alive": lambda: True,
@@ -1342,6 +1340,8 @@ class TestServerStatus:
         report = out.getvalue()
 
         assert "## Ops\n  restoration, segmentation" in report
+        # No Client built: dask's own default, read without _dask_ctl.
+        assert "## Dask\n  mode: in-process" in report
         assert "## Kernel plugins" in report
         assert "files: rolling_ball" in report
         assert "packages: labshop_tools" in report
@@ -1362,8 +1362,6 @@ class TestServerStatus:
         import io
 
         ns = {
-            "_dask_client": None,
-            "_dask_attach_done": True,
             "_conn": MagicMock(client=None, last_status="", last_message=""),
             "viewer": MagicMock(layers=[]),
             "_viewer_window_alive": lambda: True,

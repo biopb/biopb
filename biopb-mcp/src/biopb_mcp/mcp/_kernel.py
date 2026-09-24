@@ -402,8 +402,7 @@ class KernelHost:
                     # Own session/process group so a hard restart — or the
                     # kernel's own parent-death watcher — can group-kill the
                     # kernel and any subprocess it spawned (arbitrary agent
-                    # code). The session child owns the dask cluster in *its*
-                    # group, so this group-kill never touches it.
+                    # code, a dask cluster a cell spun).
                     start_new_session=True,
                     **popen_kwargs,
                 )
@@ -562,7 +561,7 @@ class KernelHost:
             # kill and the relaunch — booting, not idle.
             return _status_result(
                 "starting",
-                "Kernel is still starting (napari viewer / dask bring-up). "
+                "Kernel is still starting (napari viewer bring-up). "
                 "Poll server_status or retry in a few seconds.",
             )
         return _status_result(
@@ -731,7 +730,7 @@ class KernelHost:
         return reply
 
     def _close_session(self, timeout):
-        """Close the kernel's tensor client and dask before a kill, bounded and
+        """Close the kernel's tensor client before a kill, bounded and
         best-effort (``_kernel_gate._close_session``): a wedged kernel just
         falls through to the kill."""
         try:
@@ -749,7 +748,7 @@ class KernelHost:
                 logger.debug("interrupt_kernel failed", exc_info=True)
 
     def restart(self):
-        """Hard-restart: graceful-close tensor/dask, group-kill, respawn.
+        """Hard-restart: graceful-close the tensor client, group-kill, respawn.
 
         Deliberately NOT ``shutdown()`` + ``start()``: shutdown() must join
         the watchdog *outside* the lock (the watchdog may hold the lock

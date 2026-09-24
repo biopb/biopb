@@ -43,26 +43,19 @@ CONTROL_REPLY = "biopb_reply"
 
 
 def _close_session(ns):
-    """Close the tensor client, then release dask: run before every kill.
+    """Close the tensor client: run before every kill.
 
     So the tensor server sees a clean Flight GOAWAY (and cancels any in-flight
     do_get) instead of discovering the dropped connection only via socket
     teardown after the kill -- the lag that lets a `biopb server stop` right
-    after Ctrl-C block on its graceful drain. Dask goes through ``_dask_ctl``
-    because a cluster this kernel spun is its to stop: shutting the workers
-    down gracefully lets them clean their spill files (biopb/biopb#13).
-    Best-effort: a failure here just leaves it to the kill.
+    after Ctrl-C block on its graceful drain. Best-effort: a failure here just
+    leaves it to the kill, which also takes any dask cluster a cell spun (its
+    workers are this kernel's process group).
     """
     try:
         conn = ns.get("_conn")
         if conn is not None and getattr(conn, "client", None) is not None:
             conn.client.close()
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        ctl = ns.get("_dask_ctl")
-        if ctl is not None:
-            ctl.shutdown()
     except Exception:  # noqa: BLE001
         pass
 

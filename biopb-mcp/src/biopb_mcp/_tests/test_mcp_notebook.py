@@ -45,7 +45,7 @@ def test_one_job_cell_structure():
     assert "x = 1" in src
     assert job["metadata"]["biopb"]["job_id"] == "job-1"
     # Who ran it, in both places. A record predating `origin` reads as the
-    # agent, which is what every pre-console session was.
+    # agent, which is what every session before other writers was.
     assert job["metadata"]["biopb"]["origin"] == "mcp"
 
 

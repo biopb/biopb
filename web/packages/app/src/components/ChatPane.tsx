@@ -266,7 +266,7 @@ export default function ChatPane({
 
   // Escape, bound on the window rather than the composer: a reader who clicked
   // a job row to watch its output would otherwise find the key silently stops
-  // working. `escAction` holds the ordering and the two cases Escape is already
+  // working. `escAction` holds the ordering and the case Escape is already
   // spoken for; see chatKeys.ts.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -274,7 +274,6 @@ export default function ChatPane({
       const action = escAction({
         composing: e.isComposing,
         imageOpen: zoom !== null,
-        inConsole: !!document.activeElement?.closest(".console"),
         busy,
         permissionOpen: !!asking,
       });

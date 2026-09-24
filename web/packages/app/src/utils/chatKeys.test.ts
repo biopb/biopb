@@ -32,7 +32,6 @@ describe("escAction", () => {
   const state = (over: Partial<Parameters<typeof escAction>[0]> = {}) => ({
     composing: false,
     imageOpen: false,
-    inConsole: false,
     busy: false,
     ...over,
   });
@@ -51,21 +50,9 @@ describe("escAction", () => {
     expect(escAction(state({ imageOpen: true, busy: true }))).toBe("close-image");
   });
 
-  it("leaves Escape to the console when the console has focus", () => {
-    expect(escAction(state({ inConsole: true, busy: true }))).toBe("none");
-  });
-
-  it("still closes the image from the console", () => {
-    // The overlay covers the page, so focus being in the console behind it is
-    // an accident of where the reader last clicked, not a claim on the key.
-    expect(escAction(state({ inConsole: true, imageOpen: true }))).toBe(
-      "close-image",
-    );
-  });
-
   it("gives Escape to the IME before anything else", () => {
     // An IME candidate window takes Escape to dismiss itself. Killing a turn
-    // because someone reconsidered a word would be the worst of the four.
+    // because someone reconsidered a word would be the worst outcome.
     expect(escAction(state({ composing: true, busy: true }))).toBe("none");
     expect(escAction(state({ composing: true, imageOpen: true }))).toBe("none");
   });

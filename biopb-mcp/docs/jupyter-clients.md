@@ -174,12 +174,10 @@ connection file alone; the protocol does not care which environment the client r
 
 ### What retired
 
-The user console: its execute route (`/console/execute`,
-`observe.console_enabled`), the control's `console` path root, and the editor
-on the observe page. The observe page keeps job history, Stop, restart and
-export — the parts a notebook cannot do. The control's loopback-only gate now
-guards only the `chat` root; `/health` still reports it as `console_enabled`.
-A leftover `observe.console_enabled` in a config file is ignored.
+The user console, entirely: its execute route, config key, control path root
+and editor. The observe page keeps job history, Stop, restart and export — the
+parts a notebook cannot do. The control's loopback-only gate guards only the
+`chat` root, and `/health` reports it as `loopback_bound`.
 
 ### Attribution: `origin` on the job
 

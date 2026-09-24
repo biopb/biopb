@@ -75,9 +75,6 @@ KERNEL_HANDLE_NAMES = frozenset(
         "run_async",
         "_conn",
         "_jobs",
-        "_dask_client",
-        "_dask_attach_done",
-        "_dask_ctl",
         "_viewer_window_alive",
         "_resync_view",
     }
@@ -199,25 +196,6 @@ def run_on_main(fn, *args, **kwargs):
 # -- execution --------------------------------------------------------------
 
 
-def _dask_backstop():
-    """Why nothing this job computes could finish, or ``None``.
-
-    biopb/biopb#970's backstop: an attached scheduler whose workers have all gone
-    (a host suspend outliving their TTL) still *accepts* work and never runs it,
-    turning a 0.2 s read into a cell that hangs until someone interrupts it. A
-    worker count off the client makes that an error naming the fix instead. Only
-    fires while attached, which is opt-in (``_dask_ctl.attach()``).
-    """
-    ctl = _ip.user_ns.get("_dask_ctl") if _ip is not None else None
-    if ctl is None:
-        return None
-    try:
-        return ctl.dead_message()
-    except Exception:  # noqa: BLE001 - a backstop must not become the failure
-        logger.debug("dask liveness probe failed", exc_info=True)
-        return None
-
-
 def _request_id():
     """The msg_id of the execute request this thread is serving, or None
     outside a kernel (unit tests drive this module directly)."""
@@ -308,9 +286,6 @@ def _run(job, body):
     and announce how it ended."""
     exc = None
     try:
-        _dead = _dask_backstop()
-        if _dead:
-            raise RuntimeError(_dead)
         body()
     except KeyboardInterrupt:
         exc = True
@@ -449,11 +424,12 @@ def _cancel_dask_futures():
     # ``Client.cancel`` filters its argument through ``futures_of()``, which
     # silently drops bare strings -- ``cancel(list(dc.futures))`` cancels nothing.
     # One job at a time, so every tracked future belongs to this job.
-    # Whatever client is live, not the `_dask_client` binding: a cell that made
-    # its own `Client(...)` is attached just as much as `_dask_ctl.attach()` is,
-    # and its futures are just as stuck. `current` finds the global default,
+    # Whatever client a cell built: `current` finds the global default,
     # which is what dask itself computes on (raises ValueError when there is
-    # none, i.e. the in-process default).
+    # none, i.e. the in-process default). No client without `distributed`
+    # loaded, and importing it here would cost a stop seconds.
+    if "distributed" not in sys.modules:
+        return
     try:
         from distributed import Client, Future
 

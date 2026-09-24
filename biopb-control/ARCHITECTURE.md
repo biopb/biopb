@@ -109,9 +109,7 @@ authenticated, for itself and for everything it fronts.
   RCE on the same origin the allowlist above exists to keep RCE off. Folding it
   into `api` would leave that allowlist enforced but no longer true, so it gets
   its own root and is proxied only when the control is loopback-bound — `api`
-  always, `chat` local-mode only, `/mcp` never. (The user console that first
-  used this root is retired: a Jupyter client attaches to the kernel directly,
-  biopb-mcp `docs/jupyter-clients.md`.) The control decides because only it knows its own
+  always, `chat` local-mode only, `/mcp` never. The control decides because only it knows its own
   bind: the proxy hop strips Host and Origin, so the child cannot tell a browser
   from this trusted hop. Not gated by the token instead: that credential
   authorizes reading pixels, is readable from a local file by design, and rides

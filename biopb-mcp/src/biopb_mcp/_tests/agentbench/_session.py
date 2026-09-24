@@ -643,9 +643,6 @@ def _write_config(
     (root / "biopb" / "mcp-config.json").write_text(
         json.dumps(
             {
-                # One process, no cluster: the fixtures are small and a
-                # LocalCluster is the slowest part of bring-up.
-                "dask": {"scheduler": "threads"},
                 # Nothing watches a web UI during an unattended run.
                 "observe": {"enabled": False},
                 "transport": {"kind": "http"},

@@ -91,8 +91,8 @@ sets:
 **Writable (`rw`):**
 - the kernel working dir (`KernelHost._launch` passes `cwd`) — where results and
   agent scratch belong;
-- the **dask spill dir** (`_dask_ctl.DaskAttachment._spin`'s `local_directory`),
-  only while a cluster is attached;
+- the **dask spill dir** (a `LocalCluster`'s `local_directory`), only while a
+  cell has built a local cluster;
 - a private `$TMPDIR` (pyarrow / napari / Qt scratch).
 
 **Readable (only relevant when `enforce_reads=True`):**
@@ -107,22 +107,21 @@ sets:
 
 ## 5. The worker-process caveat (do not skip)
 
-The kernel and the dask workers are **different processes**: the workers are
-children of the kernel (`_dask_ctl.DaskAttachment._spin` spins
-`LocalCluster(processes=True)`), so they die with it -- but an audit hook
-installed in the kernel still does **not** run in them.
+The kernel and the dask workers are **different processes**: a local cluster a
+cell builds (`Client()` spins `LocalCluster(processes=True)`) has its workers as
+children of the kernel, so they die with it -- but an audit hook installed in the
+kernel still does **not** run in them.
 
-Since #970 a cluster is opt-in, so the default in-process path has no workers at
-all and the kernel hook is the whole guard there. The gap below opens only once
-something calls `_dask_ctl.attach()`.
+The default is in-process (#970), with no workers at all, so the kernel hook is
+the whole guard there. The gap below opens only once a cell builds a `Client`.
 
 So agent file I/O performed *inside a dask task* —
 `da.map_blocks(lambda b: open('/etc/…'))`, a custom `da.store` target — executes
 on a worker and **bypasses the kernel's hook entirely**. To actually bound FS the
-same guard must be installed in each worker via a **`WorkerPlugin` / worker-init**
-— the exact mechanism already used to split `cache_budget` across workers
-(`CLAUDE.md` §3, `dask.cache_budget`). Kernel-only enforcement is a partial
-guard and must be documented as such.
+same guard must be installed in each worker via a **worker preload**
+(`distributed.worker.preload` in dask's config, set by the bootstrap so any
+cluster a cell builds picks it up). Kernel-only enforcement is a partial guard
+and must be documented as such.
 
 Both sites read the **same allowlist** from config so they cannot drift.
 
@@ -134,12 +133,11 @@ Both sites read the **same allowlist** from config so they cannot drift.
   workdir / spill dir / tensor-cache root are resolved and appended at bootstrap,
   not hard-coded in config.
 - **Kernel:** install in `mcp/_bootstrap.py`, at the **tail** of bring-up —
-  *after* the viewer, dask, and the data connection are wired (those legitimately
+  *after* the viewer and the data connection are wired (those legitimately
   open files during setup), so the guard governs agent code only, never the
   bootstrap itself.
-- **Workers:** a `WorkerPlugin` registered where the cluster is created
-  (`mcp/_dask_ctl.py`, `DaskAttachment.attach`), applying the identical hook +
-  allowlist in each worker's `setup`.
+- **Workers:** a worker preload set in dask's config at bootstrap, applying the
+  identical hook + allowlist in each worker a cell's cluster starts.
 - **Errors:** `PermissionError` with a message that names the allowed workdir, so
   the agent gets an actionable signal ("writes are restricted to `<workdir>`;
   save through napari or `client.upload_array` instead") rather than a bare

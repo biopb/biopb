@@ -1662,7 +1662,7 @@ class TestConcurrentChunkUpload:
 
         A target holding an `UploadSession` would drag a `FlightClient` along,
         which does not pickle at all, failing every upload the moment an agent
-        called `_dask_ctl.attach()`. Surviving the round trip is the easy half:
+        built a distributed `Client`. Surviving the round trip is the easy half:
         this asserts the revived target, holding no session, dials for itself.
         """
         session = client._upload

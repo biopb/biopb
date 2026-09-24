@@ -1,7 +1,6 @@
 """Unit tests for bootstrap helpers that don't need a kernel/display.
 
-Currently the kernel plugin-file loader. (The chunk-cache budget split moved to
-test_dask_ctl.py with the function itself.)
+Currently the kernel plugin-file loader.
 """
 
 import pytest
@@ -27,9 +26,6 @@ def _seeded_ns():
         "run_on_main": lambda f: f(),
         "_conn": object(),
         "_jobs": object(),
-        "_dask_client": None,
-        "_dask_attach_done": False,
-        "_dask_ctl": object(),
         "_viewer_window_alive": lambda: True,
         "_resync_view": lambda: None,
     }

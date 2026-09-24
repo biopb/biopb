@@ -89,7 +89,7 @@ def test_list_fields_are_arrays(schema):
     [
         {"transport": {"port": 8080}},
         {"transport": {"kind": "http"}},
-        {"dask": {"scheduler": "threads"}},
+        {"kernel": {"promote_after": 30.0}},
         {"pyramid": {"downscale_factor": 2}},
         {"future_unknown": {"knob": 1}},  # additionalProperties: true
     ],
@@ -104,7 +104,7 @@ def test_accepts_valid(validator, cfg):
         {"transport": {"port": 0}},
         {"transport": {"port": 70000}},
         {"transport": {"kind": "websocket"}},
-        {"dask": {"scheduler": "bogus"}},
+        {"transport": {"kind": "bogus"}},
         {"pyramid": {"downscale_factor": 1}},
     ],
 )

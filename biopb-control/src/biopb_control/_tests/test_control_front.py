@@ -8,7 +8,7 @@ built ``web/`` SPA bundle at its root, falling back to ``index.html`` for deep
 links (``/``, ``/viewer``, ``/session/<id>/observe``) and serving hashed assets
 as real files, and (4) which session-child roots it will proxy at all — ``api``
 always, ``chat`` (an RCE into that session's kernel) only on a loopback-bound
-control, ``/mcp`` and the retired ``console`` never. A trivial stdlib HTTP
+control, ``/mcp`` never. A trivial stdlib HTTP
 server stands in for the tensor sidecar so no real tensor server is needed; a
 tmp bundle stands in for ``web/packages/app/dist``.
 """
@@ -78,13 +78,6 @@ def test_chat_root_is_off_by_default():
     assert "chat" in _session_proxy_roots(loopback_bound=True)
     # Loopback only adds; it never displaces the always-on root.
     assert _session_proxy_roots(loopback_bound=True) >= _SESSION_ALLOWED_ROOTS
-
-
-def test_the_retired_console_root_is_never_proxied():
-    # The user console is gone (biopb-mcp docs/jupyter-clients.md); a stale
-    # route under its root must not reach a child that might still serve one.
-    for loopback in (True, False):
-        assert "console" not in _session_proxy_roots(loopback_bound=loopback)
 
 
 def _free_port() -> int:
@@ -208,11 +201,10 @@ def test_control_health_is_not_proxied(control):
 def test_health_advertises_the_local_roots_gate(control):
     # The observe page must know before it renders a composer, and only the
     # control knows this half. Unauthenticated like `auth_required`, and for the
-    # same reason: the bundle needs it before it holds a token. The key is named
-    # for the retired console; it means loopback-bound.
+    # same reason: the bundle needs it before it holds a token.
     _status, _headers, body = _get(f"{control}/health")
     # The fixture binds 127.0.0.1.
-    assert json.loads(body)["console_enabled"] is True
+    assert json.loads(body)["loopback_bound"] is True
 
 
 def test_root_serves_the_spa_shell(control):
@@ -1095,19 +1087,6 @@ def test_session_chat_is_proxied_on_a_loopback_control(control, upstream):
     assert echoed["method"] == "POST"
 
 
-def test_the_retired_console_is_not_proxied_on_a_loopback_control(control, upstream):
-    _register_session("s1", upstream)
-    req = urllib.request.Request(
-        f"{control}/session/s1/console/execute",
-        data=b'{"code": "1 + 1"}',
-        method="POST",
-        headers={"Content-Type": "application/json"},
-    )
-    with pytest.raises(urllib.error.HTTPError) as exc:
-        urllib.request.urlopen(req, timeout=5)
-    assert exc.value.code == 404
-
-
 def test_session_roots_are_reachable_with_a_token(tokened_control, upstream):
     # The other half of the gate, and the half the browser depends on: a caller
     # that *does* present the token gets through to the child.
@@ -1501,36 +1480,6 @@ def test_launched_viewer_is_detached_from_the_control(tmp_path, monkeypatch):
         assert seen["creationflags"]
     else:
         assert seen["start_new_session"] is True
-
-
-@pytest.mark.parametrize("loopback_bound", [True, False])
-def test_the_retired_console_root_is_not_a_route(tmp_path, loopback_bound):
-    # The session child is deliberately a closed port, which separates the two
-    # outcomes cleanly: 404 means the root is not a route at all (nothing was
-    # forwarded), 502 means it was routed and only the child was absent. The
-    # console is retired, so 404 whatever the bind.
-    from starlette.testclient import TestClient
-
-    _sessions.register("s1", host="127.0.0.1", port=_free_port(), pid=os.getpid())
-    spec = DataPlaneSpec(
-        config=tmp_path / "config.json",
-        grpc_host="127.0.0.1",
-        grpc_port=_free_port(),
-        server_log=tmp_path / "server.log",
-    )
-    app = build_app(
-        DataPlaneSupervisor(spec),
-        8.0,
-        f"http://127.0.0.1:{_free_port()}",
-        loopback_bound=loopback_bound,
-    )
-    # A loopback base_url: TestClient otherwise sends `Host: testserver`, which
-    # the gate refuses (421) before the routing question under test is reached.
-    with TestClient(app, base_url="http://127.0.0.1:8813") as client:
-        resp = client.post("/session/s1/console/execute", json={"code": "1 + 1"})
-        assert resp.status_code == 404
-        # The data API is routed either way.
-        assert client.get("/session/s1/api/jobs").status_code == 502
 
 
 @pytest.mark.parametrize("loopback_bound", [True, False])

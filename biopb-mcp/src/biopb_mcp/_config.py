@@ -16,7 +16,7 @@ the shared biopb XDG *state* tree (``~/.local/state/biopb/mcp``), resolved via
 :mod:`biopb._locations` (no more separate top-level ``biopb-mcp`` dir).
 
 Sections are flat (no ``mcp.``/``widget.`` wrapper): ``transport`` / ``kernel`` /
-``dask`` / ``tensor`` / ``viewer`` / ``services`` / ``observe`` / ``update`` are
+``tensor`` / ``viewer`` / ``services`` / ``observe`` / ``update`` are
 the MCP-server knobs; ``widget`` / ``detection`` / ``grid`` are the demo napari
 widgets (``image_processing/``); ``pyramid`` is a GUI-independent knob read by the
 MCP kernel too; ``timeout`` / ``grpc`` / ``memory`` are compute-plane knobs
@@ -26,7 +26,9 @@ There is deliberately **no data-plane endpoint here** (biopb/biopb#628): the
 control plane owns the data plane and is asked for its address at connect time,
 so a configured URL could only be a second, staler answer -- and was how this
 machine's credential reached endpoints the control never named (#626). A legacy
-``tensor_browser`` section in an existing file is simply ignored by the merge.
+``tensor_browser`` or ``dask`` section in an existing file is carried by the
+merge and read by nothing: the kernel leaves dask as dask configures itself, and
+a cell builds a ``Client`` when it wants a cluster.
 
 Read settings with :func:`get_setting`, which falls back to ``DEFAULT_CONFIG`` so
 call sites never duplicate a default literal.
@@ -58,17 +60,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Platform-dependent defaults for the two kernel-bring-up knobs Windows pays a
-# structural penalty on. Windows has no fork(): dask's multi-process LocalCluster
-# must *spawn* every worker -- a fresh interpreter re-importing the whole
-# numpy/dask/distributed stack cold -- where POSIX forks near-free via
-# copy-on-write. With num_workers=0 (dask picks ~n_cores) that spawn+reimport
-# storm both lengthens bring-up (risking startup_timeout) and multiplies memory.
-# So Windows caps the worker count and widens the startup budget; POSIX keeps the
-# lean defaults. A user config still overrides either leaf on any platform.
+# Windows widens the kernel's startup budget: it has no fork(), so the kernel
+# and everything it imports start cold. A user config still overrides it.
 _IS_WINDOWS = os.name == "nt"
 _DEFAULT_STARTUP_TIMEOUT = 120.0 if _IS_WINDOWS else 60.0
-_DEFAULT_DASK_NUM_WORKERS = 4 if _IS_WINDOWS else 0
 
 
 def _h(default, help_text, **kw):
@@ -249,7 +244,7 @@ class KernelConfig:
     startup_timeout: float = _h(
         _DEFAULT_STARTUP_TIMEOUT,
         "Seconds to wait for kernel bring-up. 60 on POSIX; 120 on Windows, where "
-        "the cold spawn+reimport of dask workers makes bring-up legitimately slower.",
+        "a cold interpreter start makes bring-up legitimately slower.",
     )
     execute_timeout: float = _h(
         120.0,
@@ -277,48 +272,6 @@ class KernelConfig:
     )
     watchdog_respawn_window: float = _h(
         60.0, "Sliding window (seconds) over which respawns are counted."
-    )
-
-
-@dataclass
-class DaskConfig:
-    """Dask scheduler / cluster for the kernel's compute."""
-
-    scheduler: str = _h(
-        "threads",
-        'Scheduler the kernel starts on: "threads"/"synchronous" (in-process, '
-        "shared with the napari viewer; a cell runs `_dask_ctl.attach()` when a "
-        'cluster is wanted), "distributed" (spin one at kernel start, as every '
-        "session did before #970).",
-    )
-    num_workers: int = _h(
-        _DEFAULT_DASK_NUM_WORKERS,
-        "n_workers for a spun LocalCluster (0 -> dask picks ~n_cores). 0 on "
-        "POSIX (fork is cheap); capped at 4 on Windows (each worker is a cold "
-        "spawn). Does not size the in-process scheduler, which uses dask's own "
-        "default.",
-    )
-    address: str = _h(
-        "",
-        "Non-empty -> the kernel attaches to this external scheduler at startup "
-        "(wins over `scheduler`); empty -> no external cluster.",
-    )
-    threads_per_worker: int = _h(
-        1, "LocalCluster threads per worker (local cluster only)."
-    )
-    memory_limit: str = _h(
-        "auto", "LocalCluster per-worker memory limit (local cluster only)."
-    )
-    dashboard_address: str = _h(
-        "127.0.0.1:0",
-        "Bokeh dashboard bind address; loopback-only to match the server's security "
-        'model. ":0" picks a free port.',
-    )
-    cache_budget: str = _h(
-        "1G",
-        "Cluster-wide chunk-cache budget for the data-plane client, split evenly "
-        "across workers. Human size (1G/512M/2GiB) or int bytes; 0 disables. "
-        "Applies to localhost and remote alike.",
     )
 
 
@@ -559,7 +512,6 @@ class McpConfig:
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     transport: TransportConfig = field(default_factory=TransportConfig)
     kernel: KernelConfig = field(default_factory=KernelConfig)
-    dask: DaskConfig = field(default_factory=DaskConfig)
     tensor: TensorRuntimeConfig = field(default_factory=TensorRuntimeConfig)
     viewer: ViewerConfig = field(default_factory=ViewerConfig)
     services: ServicesConfig = field(default_factory=ServicesConfig)
@@ -617,10 +569,6 @@ _CONSTRAINTS = {
         "watchdog_max_respawns": Range(min=0),
         "watchdog_respawn_window": Range(min=0),
     },
-    "DaskConfig": {
-        "scheduler": Enum({"distributed", "threads", "synchronous"}),
-        "num_workers": Range(min=0),  # 0 -> dask picks ~n_cores
-    },
     "TensorRuntimeConfig": {
         "health_poll_min_interval": Range(min=0),  # 0 disables the watcher
         "health_poll_max_interval": Range(min=0),
@@ -648,7 +596,7 @@ _MISSING = MISSING
 def get_setting(config: dict, path: str, default=_MISSING):
     """Read an absolute dotted *path* from *config*, else ``DEFAULT_CONFIG``.
 
-    ``get_setting(config, "dask.scheduler")`` walks *config* by the dotted path;
+    ``get_setting(config, "kernel.promote_after")`` walks *config* by the dotted path;
     on a miss at any level it falls back to *default* if given, else to the value
     at the same path in ``DEFAULT_CONFIG``. Mutable defaults are deep-copied so
     callers cannot alias the shared ``DEFAULT_CONFIG``. Centralizing the fallback
@@ -745,7 +693,7 @@ def _deep_merge(base: dict, override: dict) -> dict:
     """Recursively merge *override* into *base* in place, returning *base*.
 
     Nested dicts are merged key-by-key so a partial user section (e.g. only
-    ``{"dask": {"num_workers": 4}}``) overrides just that leaf and leaves its
+    ``{"kernel": {"promote_after": 30}}``) overrides just that leaf and leaves its
     sibling defaults intact. Non-dict values (and dict-vs-non-dict mismatches)
     replace wholesale.
     """
