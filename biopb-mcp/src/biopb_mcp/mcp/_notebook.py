@@ -45,13 +45,13 @@ _BOOTSTRAP_HEAD = """\
 import numpy as np
 import dask.array as da
 
+from biopb.tensor import Connection
 from biopb_mcp._config import load_config
-from biopb_mcp._connection import TensorConnection
 from biopb_mcp.mcp._process_ops import build_ops_from_config
 
 config = load_config()
-_conn = TensorConnection()
-_conn.auto_connect()          # synchronous best-effort connect (no async service here)
+_conn = Connection()
+_conn.connect()               # synchronous best-effort connect
 client = _conn.client
 
 ops = build_ops_from_config(config, lambda: _conn.client)
@@ -80,7 +80,7 @@ _BOOTSTRAP_PLUGINS = """
 # User kernel plugins (~/.config/biopb/kernel/*.py and biopb_mcp.namespace entry
 # points), loaded by the kernel's own loader so a cell calling one of them --
 # `rolling_ball.subtract_background(...)` -- resolves the same name it did in the
-# session. Last, like the kernel's step 7b, so a plugin can reference the handles
+# session. Last, like the kernel's step 7, so a plugin can reference the handles
 # above. Fail-open per plugin, as in the kernel; a plugin this machine does not
 # have simply does not bind, and the cell using it fails where it is used.
 try:
@@ -296,7 +296,7 @@ _INTRO = (
     "*do* carry across cells. Cells whose header reads `interrupted` / `error` "
     "are kept verbatim — re-running one may re-trigger the same hang or "
     "failure, so skip or edit it. Only the most recent jobs are retained, so a "
-    "long session may be missing its start. `auto_connect()` asks the control "
+    "long session may be missing its start. `connect()` asks the control "
     "plane where the data plane is, so a re-run needs a running control "
     "(`biopb control start`) or `$BIOPB_TENSOR_URL`; under a headless "
     "`nbconvert --execute` the `viewer` becomes `None` and viewer cells fail."

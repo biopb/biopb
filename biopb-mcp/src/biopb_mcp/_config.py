@@ -16,7 +16,7 @@ the shared biopb XDG *state* tree (``~/.local/state/biopb/mcp``), resolved via
 :mod:`biopb._locations` (no more separate top-level ``biopb-mcp`` dir).
 
 Sections are flat (no ``mcp.``/``widget.`` wrapper): ``transport`` / ``kernel`` /
-``tensor`` / ``viewer`` / ``services`` / ``observe`` / ``update`` are
+``viewer`` / ``services`` / ``observe`` / ``update`` are
 the MCP-server knobs; ``widget`` / ``detection`` / ``grid`` are the demo napari
 widgets (``image_processing/``); ``pyramid`` is a GUI-independent knob read by the
 MCP kernel too; ``timeout`` / ``grpc`` / ``memory`` are compute-plane knobs
@@ -225,13 +225,6 @@ class TransportConfig:
         "Extra Host header values appended to the loopback allowlist. Set only when "
         "fronting the server with a reverse proxy. http transport only.",
     )
-    server_start_timeout: float = _h(
-        60.0,
-        "Give-up budget (seconds) applied twice on auto_connect's control path "
-        "(control-ensure, then boot wait), so the worst-case wall wait is ~2x "
-        "this. The $BIOPB_TENSOR_URL path spends it once, on a STARTING server. "
-        "The normal path (plane already up) has no timeout.",
-    )
 
 
 @dataclass
@@ -270,23 +263,6 @@ class KernelConfig:
     )
     watchdog_respawn_window: float = _h(
         60.0, "Sliding window (seconds) over which respawns are counted."
-    )
-
-
-@dataclass
-class TensorRuntimeConfig:
-    """Background source-catalog watcher in the kernel (#44)."""
-
-    health_poll_min_interval: float = _h(
-        2.0,
-        "Min poll interval (s) for the source-catalog watcher; it re-lists sources "
-        "when the server's source_count changes so a partial catalog self-heals. "
-        "The interval backs off to the max while stable, snaps back on a change. "
-        "0 disables the watcher.",
-    )
-    health_poll_max_interval: float = _h(
-        60.0,
-        "Max poll interval (s) the watcher backs off to while the catalog is stable.",
     )
 
 
@@ -545,11 +521,6 @@ class McpConfig:
         "The child Jupyter kernel that runs agent code: bring-up, timeouts, and "
         "the orphan watchdog.",
     )
-    tensor: TensorRuntimeConfig = _section(
-        TensorRuntimeConfig,
-        "Catalog Watcher",
-        "The background source-catalog watcher's backoff bounds.",
-    )
     viewer: ViewerConfig = _section(
         ViewerConfig, "Viewer", "How the napari viewer fetches image slices."
     )
@@ -614,7 +585,6 @@ _CONSTRAINTS = {
         "kind": Enum({"http", "stdio"}),
         "port": Range(min=1, max=65535),
         "session_log_keep": Range(min=1),  # keep at least the current
-        "server_start_timeout": Range(exclusive_min=0),
     },
     "KernelConfig": {
         "startup_timeout": Range(exclusive_min=0),
@@ -623,10 +593,6 @@ _CONSTRAINTS = {
         "watchdog_interval": Range(min=0),  # 0 disables the watchdog
         "watchdog_max_respawns": Range(min=0),
         "watchdog_respawn_window": Range(min=0),
-    },
-    "TensorRuntimeConfig": {
-        "health_poll_min_interval": Range(min=0),  # 0 disables the watcher
-        "health_poll_max_interval": Range(min=0),
     },
 }
 
@@ -780,33 +746,6 @@ def _walk_path(node: dict, keys):
     return node
 
 
-def _health_poll_not_inverted(get) -> List[Problem]:
-    """The health-poll backoff must not invert (min > max).
-
-    A cross-field rule: no per-field ``Range`` can express it, so it is declared
-    here as data and applied by the shared walker -- which is what makes the
-    control's ``PUT /api/mcp_config`` enforce it too, instead of restating the
-    comparison in its own handler. Both ends are reported, so the load path
-    resets the whole range to its defaults rather than half of it.
-    """
-    lo = get("tensor", "health_poll_min_interval")
-    hi = get("tensor", "health_poll_max_interval")
-    if not isinstance(lo, (int, float)) or not isinstance(hi, (int, float)):
-        return []  # absent or wrong-typed: the per-field pass owns that
-    if lo <= hi:
-        return []
-    message = (
-        f"health_poll_min_interval={lo!r} must be <= health_poll_max_interval={hi!r}"
-    )
-    return [
-        Problem(("tensor", "health_poll_min_interval"), message),
-        Problem(("tensor", "health_poll_max_interval"), message),
-    ]
-
-
-CROSS_FIELD_RULES = (_health_poll_not_inverted,)
-
-
 def config_problems(config: dict) -> List[Problem]:
     """Every constraint violation in *config* (empty when valid).
 
@@ -818,7 +757,6 @@ def config_problems(config: dict) -> List[Problem]:
         ((section, config.get(section, {})) for section in _SECTION_CLASSES),
         _CONSTRAINTS,
         class_names={s: cls.__name__ for s, cls in _SECTION_CLASSES.items()},
-        cross_field=CROSS_FIELD_RULES,
     )
 
 
@@ -829,26 +767,13 @@ def _validate_and_clamp(config: dict) -> dict:
     not reach the runtime, but must not take the session down either -- a raise
     here is a dead MCP client and no viewer. A leaf absent from the merged dict
     is skipped (nothing to check). Returns *config*.
-
-    Clamped to a fixpoint: resetting a per-field leaf to its default can *create*
-    a cross-field violation the first pass didn't see (a negative
-    ``health_poll_min_interval`` clamped to a default above a small but valid
-    ``max``), so re-check until clean. Converges because the defaults are
-    mutually consistent (``test_shipped_defaults_pass_the_whole_check``); the
-    bound is a belt-and-braces guard against a cycle.
     """
-    for _ in range(len(_CONSTRAINTS) + len(CROSS_FIELD_RULES) + 1):
-        problems = config_problems(config)
-        if not problems:
-            break
-        warn_and_clamp(
-            problems,
-            lambda path: _walk_path(DEFAULT_CONFIG, path),
-            lambda path, value: config[path[0]].__setitem__(
-                path[1], copy.deepcopy(value)
-            ),
-            logger,
-        )
+    warn_and_clamp(
+        config_problems(config),
+        lambda path: _walk_path(DEFAULT_CONFIG, path),
+        lambda path, value: config[path[0]].__setitem__(path[1], copy.deepcopy(value)),
+        logger,
+    )
     return config
 
 

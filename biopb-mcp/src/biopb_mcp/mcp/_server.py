@@ -149,23 +149,19 @@ print("")
 print("## Tensor Server")
 _tc = _conn.client
 if _tc is not None:
+    print("  connected: true")
+    print("  url: " + str(_conn.url))
     try:
-        print("  connected: true")
         print("  health: " + str(_tc.health_check()))
-        print("  sources_cached: " + str(len(_conn.sources or {})))
     except Exception as _e:
-        print("  connected: true")
         print("  health_error: " + str(_e))
-elif getattr(_conn, "last_status", "") == "starting":
-    print("  connected: false")
-    print("  state: starting — " + str(getattr(_conn, "last_message", "")))
 else:
     print("  connected: false")
     _lm = str(getattr(_conn, "last_message", ""))
     if _lm:
-        # issue #86: surface the reason (auth required / unreachable) instead of
-        # a bare "connected: false" the agent can't act on.
-        print("  error: " + _lm)
+        # issue #86: surface the reason (starting / auth required / unreachable)
+        # instead of a bare "connected: false" the agent can't act on.
+        print("  reason: " + _lm)
 
 print("")
 print("## Viewer")
@@ -468,7 +464,7 @@ def _viewer_base_url() -> str:
     the *user's* browser reaches it by, which nothing in this process can know.
     """
     try:
-        from biopb._endpoints import control_base_url
+        from biopb.control._endpoints import control_base_url
 
         return control_base_url()
     except Exception:  # pragma: no cover - core SDK always present in practice

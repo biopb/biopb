@@ -4,45 +4,19 @@ The control (control plane) exposes a small loopback HTTP control API. Two
 independent processes need to agree on where it listens:
 
 - the control itself (``biopb-control``, a separate workspace package), and
-- ``biopb-mcp``'s ``_connection``, which asks the control to ensure the data
-  plane is up instead of shelling out ``biopb server start`` itself.
+- its clients (:mod:`biopb.control`), which ask it where the data plane is and
+  to bring it up.
 
-Neither can import the other (``biopb-mcp`` cannot import ``biopb-control`` any
-more than it can import ``biopb-tensor-server`` — see the
-"shared config lives in core biopb SDK" rationale), so the one thing they must
-share — the endpoint — lives here in the dependency-light core ``biopb`` SDK,
-next to ``_locations`` / ``_config_constraints``. Kept stdlib-only so
-importing it never drags in the heavy server/mcp stacks.
-
-This is the anchor of the single-origin web front (see
-``biopb-mcp/ARCHITECTURE.md``): the control serves a
-Starlette/uvicorn app on this port that serves the built ``web/`` SPA bundle at
-its root (dashboard ``/``, dataviewer ``/viewer``, per-session observe
-``/session/<id>/observe`` — all React routes of one SPA), answers its own control
-API (bare ``/health``; control verbs under ``/api/*``, e.g.
-``/api/data_plane/ensure``), and reverse-proxies the supervised tensor server's
-HTTP sidecar under a ``/data_plane/*`` namespace (data API at
-``/data_plane/api/*``). Each plane owns a path prefix
-so the ``/api/*`` namespaces never collide; per-session ``/session/<id>/api/*``
-proxies to the session child on the same origin.
+A client cannot import ``biopb-control``, so the endpoint lives here in the
+dependency-light core ``biopb`` SDK. Kept stdlib-only so importing it never
+drags in the heavy server/mcp stacks.
 """
 
 import json
 import os
 import tempfile
 
-# --- the base-port convention --------------------------------------------- #
-#
-# One number places all three listeners, so a whole deployment moves together --
-# which is what lets two users run side-by-side controls on one host (each also
-# needs its own ``BIOPB_STATE_HOME``, since the pid / credential / runtime
-# records are per-state-dir).
-#
-# The base and its offsets are **the container's** (``entrypoint.sh``:
-# ``BIOPB_BASE_PORT`` default 8810, sidecar = base+4, gRPC = base+5), extended
-# with the control at base+3. Deliberately not a second convention: two
-# base-port schemes that agree at their defaults and diverge the moment either
-# base moves would be indistinguishable in a bug report.
+# Base-port convention
 BASE_DEFAULT_PORT = 8810
 CONTROL_PORT_OFFSET = 3
 SIDECAR_PORT_OFFSET = 4
@@ -70,20 +44,6 @@ CONTROL_DEFAULT_HOST = "127.0.0.1"
 CONTROL_DEFAULT_PORT = control_port_for(BASE_DEFAULT_PORT)  # 8813
 
 # --- the runtime (discovery) record --------------------------------------- #
-#
-# The control's port stopped being a constant when `--base-port` arrived: a
-# deployment that moves the base moves the control with it, and a client that
-# only knew 8813 would look in the wrong place. So a serving control publishes
-# the endpoint it actually bound, and clients read it here.
-#
-# Precedence for every reader is `BIOPB_CONTROL_*` -> this record -> the 8813
-# default. The env var stays on top so an explicit override still wins over a
-# discovered value, and the static default remains the answer when nothing is
-# running (a probe against it then simply fails to connect, exactly as before).
-#
-# Written by ``biopb_control._run`` after its bind succeeds and removed on a
-# clean stop. A crash leaves it behind, so it is a *hint*, never proof that a
-# control is alive -- every consumer already probes ``/health`` or connects.
 
 
 def _runtime_record() -> dict:
@@ -100,7 +60,7 @@ def _runtime_record() -> dict:
     ``os.environ``). Nowhere to look is just another way of having no record.
     """
     try:
-        from ._locations import control_runtime_file
+        from .._locations import control_runtime_file
 
         with open(control_runtime_file(), encoding="utf-8") as fh:
             rec = json.load(fh)
@@ -121,8 +81,8 @@ def write_runtime_record(host: str, port: int, pid: int) -> None:
     platform has no cheap create-time -- readers degrade to liveness there, as
     they do for a legacy bare-pid file.
     """
-    from ._lifecycle.proc import process_create_time
-    from ._locations import control_runtime_file
+    from .._lifecycle.proc import process_create_time
+    from .._locations import control_runtime_file
 
     path = control_runtime_file()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -134,15 +94,6 @@ def write_runtime_record(host: str, port: int, pid: int) -> None:
             "create_time": process_create_time(pid),
         }
     )
-    # Written exactly as the pid file is (daemon.write_pid_file): a *unique*
-    # sibling temp, then os.replace. Unique because the temp name is what makes
-    # concurrent writers safe -- a fixed one has two publishers truncating and
-    # writing the same file before either renames, so the record that lands can
-    # be a mix of both. Racing publishers are reachable here: only `control
-    # start` takes the start lock, so a foreground `control run` sharing the
-    # state dir is not serialized against it. And the temp is unlinked on any
-    # failure, so a full disk leaves no debris beside the record it could not
-    # replace.
     fd, tmp = tempfile.mkstemp(
         prefix=f".{path.name}-", suffix=".tmp", dir=str(path.parent)
     )
@@ -161,7 +112,7 @@ def write_runtime_record(host: str, port: int, pid: int) -> None:
 def remove_runtime_record() -> None:
     """Retract the published endpoint on a clean stop. Best-effort."""
     try:
-        from ._locations import control_runtime_file
+        from .._locations import control_runtime_file
 
         control_runtime_file().unlink()
     except (OSError, ImportError, RuntimeError):

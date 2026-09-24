@@ -25,11 +25,11 @@ both:
 ## Building the link
 
 ```python
-from biopb._endpoints import control_base_url
-url = f"{control_base_url()}/viewer?id={array_id}"
+from biopb.control import base_url
+url = f"{base_url()}/viewer?id={array_id}"
 ```
 
-`control_base_url()` is the loopback origin, `http://127.0.0.1:8813` unless the
+`base_url()` is the loopback origin, `http://127.0.0.1:8813` unless the
 control was moved. Take it from there rather than writing it out: the port is
 configurable and `server_status` reports the resolved value under
 `## Web viewer`.

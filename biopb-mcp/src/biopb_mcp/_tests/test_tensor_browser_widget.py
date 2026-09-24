@@ -1,13 +1,11 @@
 """Tests for the TensorBrowserWidget connect flow.
 
-The widget delegates connecting to ``TensorConnection.auto_connect`` — the
-single, GUI-independent connect policy shared with the MCP kernel — run on
-a worker thread, then renders the outcome on the Qt main thread via the
-``_connect_done`` signal (no modal prompt; the old blocking autostart dialog is
-gone). These tests drive that flow deterministically: the worker thread is
-*captured* rather than really spawned, so the test runs it explicitly and can
-assert both the in-flight ("Connecting…") and completed states. The connection
-is a mock whose ``auto_connect`` sets the post-connect state the render reads.
+The widget connects its ``Connection`` and lists the catalog on a worker
+thread, then renders the outcome on the Qt main thread via the
+``_connect_done`` signal. These tests drive that flow deterministically: the
+worker thread is *captured* rather than really spawned, so the test runs it
+explicitly and can assert both the in-flight ("Connecting…") and completed
+states. The connection and the source list are fakes.
 
 A real ``napari`` viewer (and thus a Qt/OpenGL context) is required, so the
 suite is skipped on macOS CI like the other viewer tests.
@@ -164,29 +162,22 @@ def widget(make_napari_viewer, monkeypatch):
     viewer = make_napari_viewer(show=False)
     conn = MagicMock()
     conn.url = "grpc://localhost:8815"
-    conn.token = None
-    conn.use_server_query = False
     # Default outcome: a connect that resolved to "not connected" (down). Tests
-    # that exercise a successful connect give auto_connect a side effect that
-    # flips these to the connected state the render reads.
-    conn.is_connected = False
-    conn.sources = {}
+    # that exercise a successful connect use _connected_with.
+    conn.client = None
     conn.last_message = ""
-    # Default: server is not mid-scan, so an empty catalog renders as a genuine
-    # "no sources" error (progressive-discovery indexing case is opt-in per test).
-    conn.scan_in_progress.return_value = False
-    conn.scan_source_count.return_value = 0
+    conn.connect.return_value = False
 
     # Capture connect workers instead of spawning real threads so the tests run
     # them explicitly (and can assert the in-flight state before completion).
     workers = []
 
     class _FakeThread:
-        def __init__(self, target=None, name=None, daemon=None):
-            self._target = target
+        def __init__(self, target=None, args=(), name=None, daemon=None):
+            self._run = lambda: target(*args)
 
         def start(self):
-            workers.append(self._target)
+            workers.append(self._run)
 
     monkeypatch.setattr(widget_mod.threading, "Thread", _FakeThread)
     # Neutralize the auto-connect-on-construction tick — the tests drive connect
@@ -194,20 +185,34 @@ def widget(make_napari_viewer, monkeypatch):
     monkeypatch.setattr(QTimer, "singleShot", lambda *a, **k: None)
 
     w = TensorBrowserWidget(viewer, connection=conn)
+    workers.clear()  # the source watcher's thread, captured at construction
+    listing = MagicMock()
+    listing.sources = {}
+    listing.use_server_query = False
+    # Default: server is not mid-scan, so an empty catalog renders as a genuine
+    # "no sources" error (progressive-discovery indexing case is opt-in per test).
+    listing.scan_in_progress.return_value = False
+    listing.scan_source_count.return_value = 0
+    w._list = listing
     # Isolate the render from tree building (which needs real descriptors).
     w._build_and_display_tree = MagicMock()
     return w, conn, workers
 
 
-def _connected_with(conn, sources, *, use_server_query=False):
-    """Make ``conn.auto_connect`` resolve to a connected state."""
+def _connected_with(w, sources, *, use_server_query=False):
+    """Make the next connect succeed and list *sources*."""
 
-    def _side_effect():
-        conn.is_connected = True
-        conn.sources = sources
-        conn.use_server_query = use_server_query
+    def _connect(url=None, token=None):
+        w._conn.client = MagicMock()
+        return True
 
-    conn.auto_connect.side_effect = _side_effect
+    def _refresh():
+        w._list.sources = sources
+        w._list.use_server_query = use_server_query
+        return sources
+
+    w._conn.connect.side_effect = _connect
+    w._list.refresh.side_effect = _refresh
 
 
 class TestTreeLayoutStability:
@@ -225,7 +230,7 @@ class TestTreeLayoutStability:
 class TestConnect:
     def test_shows_connecting_then_builds_tree(self, widget):
         w, conn, workers = widget
-        _connected_with(conn, {"a": object()})
+        _connected_with(w, {"a": object()})
 
         w._auto_connect()
 
@@ -237,9 +242,9 @@ class TestConnect:
         assert len(workers) == 1
         w._build_and_display_tree.assert_not_called()
 
-        workers.pop(0)()  # run the worker -> auto_connect + render
+        workers.pop(0)()  # run the worker -> connect + list + render
 
-        conn.auto_connect.assert_called_once()
+        conn.connect.assert_called_once()
         w._build_and_display_tree.assert_called_once()
         assert w._refresh_button.isEnabled()
         assert w._message_label.isHidden()  # status cleared once connected
@@ -248,7 +253,7 @@ class TestConnect:
 
     def test_down_shows_error_no_prompt(self, widget):
         w, conn, workers = widget
-        # auto_connect tried, failed, recorded the friendly reason. There is no
+        # connect tried, failed, recorded the friendly reason. There is no
         # dialog anymore — the failure just renders inline.
         conn.last_message = (
             "Cannot reach tensor server at grpc://localhost:8815 — is it running?"
@@ -257,7 +262,7 @@ class TestConnect:
         w._auto_connect()
         workers.pop(0)()
 
-        conn.auto_connect.assert_called_once()
+        conn.connect.assert_called_once()
         assert w._message_level == "error"
         assert not w._message_label.isHidden()
         assert "Cannot reach" in w._message_label.text()
@@ -279,7 +284,7 @@ class TestConnect:
 
     def test_empty_catalog_shows_error(self, widget):
         w, conn, workers = widget
-        _connected_with(conn, {})  # connected, but no sources
+        _connected_with(w, {})  # connected, but no sources
 
         w._auto_connect()
         workers.pop(0)()
@@ -294,9 +299,9 @@ class TestConnect:
         # catalog is "not done indexing yet", not an error -- show grey status,
         # keep Refresh enabled (more sources are coming), no error label.
         w, conn, workers = widget
-        _connected_with(conn, {})
-        conn.scan_in_progress.return_value = True
-        conn.scan_source_count.return_value = 7
+        _connected_with(w, {})
+        w._list.scan_in_progress.return_value = True
+        w._list.scan_source_count.return_value = 7
 
         w._auto_connect()
         workers.pop(0)()
@@ -311,7 +316,7 @@ class TestConnect:
 
     def test_large_catalog_enables_sql_filter(self, widget):
         w, conn, workers = widget
-        _connected_with(conn, {"a": object()}, use_server_query=True)
+        _connected_with(w, {"a": object()}, use_server_query=True)
 
         w._auto_connect()
         workers.pop(0)()
@@ -320,18 +325,40 @@ class TestConnect:
         assert w._refresh_button.isEnabled()
         assert "SQL filter" in w._filter_input.placeholderText()
 
-    def test_connect_button_is_a_plain_retry(self, widget):
-        w, _conn, workers = widget
-        # Neither the URL nor the token is user-editable any more (#413/#628):
-        # the control owns the endpoint and hands off its credential on disk, so
-        # auto_connect resolves both and Connect is just "try again" -- which is
-        # what a user needs after starting the control.
-        assert not hasattr(w, "_server_input")
-        assert not hasattr(w, "_token_input")
+    def test_connect_button_asks_the_control_again(self, widget):
+        w, conn, workers = widget
+        # While a control may answer, nothing is typed (#628): the fields stay
+        # hidden, and a typed value would not be used anyway.
+        assert w._manual_panel.isHidden()
+        w._url_input.setText("grpc://typed:1")
 
         w._on_connect_clicked()
+        workers.pop(0)()
 
-        assert len(workers) == 1  # a connect worker was started
+        conn.connect.assert_called_once_with(None, None)
+
+    def test_no_control_offers_a_url_and_token(self, widget):
+        w, conn, workers = widget
+        conn.url = None  # what a connect that found no control leaves behind
+        conn.last_message = "No biopb control plane is running"
+
+        w._auto_connect()
+        workers.pop(0)()
+
+        assert not w._manual_panel.isHidden()
+        assert not w._advanced_panel.isHidden()
+        assert "No biopb control" in w._message_label.text()
+
+    def test_a_typed_url_is_dialed_with_the_typed_token(self, widget):
+        w, conn, workers = widget
+        w._manual = True
+        w._url_input.setText(" grpc://typed:1 ")
+        w._token_input.setText("tok")
+
+        w._on_connect_clicked()
+        workers.pop(0)()
+
+        conn.connect.assert_called_once_with("grpc://typed:1", "tok")
 
 
 class TestConnectionSummary:
@@ -358,7 +385,7 @@ class TestConnectionSummary:
 
     def test_summary_shows_url_and_state_across_lifecycle(self, widget):
         w, conn, workers = widget
-        _connected_with(conn, {"a": object()})
+        _connected_with(w, {"a": object()})
 
         # Before connecting: disconnected.
         assert conn.url in w._status_summary.text()
@@ -383,7 +410,7 @@ class TestConnectionSummary:
 
     def test_stale_generation_is_dropped(self, widget):
         w, conn, workers = widget
-        _connected_with(conn, {"a": object()})
+        _connected_with(w, {"a": object()})
 
         w._auto_connect()  # gen 1, worker captured
         stale_worker = workers.pop(0)
@@ -396,12 +423,12 @@ class TestConnectionSummary:
         stale_worker()
         w._build_and_display_tree.assert_not_called()
 
-    def test_worker_signals_completion_even_if_auto_connect_raises(self, widget):
+    def test_worker_signals_completion_even_if_listing_raises(self, widget):
         w, conn, workers = widget
-        # auto_connect is documented best-effort, but the worker must still
-        # signal completion (and not die) if it ever leaks an exception.
-        conn.auto_connect.side_effect = RuntimeError("boom")
-        conn.is_connected = False
+        # The worker must still signal completion (and not die) if the listing
+        # after a connect raises.
+        _connected_with(w, {})
+        w._list.refresh.side_effect = RuntimeError("boom")
 
         w._auto_connect()
         workers.pop(0)()  # must not raise
@@ -416,20 +443,13 @@ class TestRefreshFailure:
     def test_failed_refresh_marks_disconnected_and_updates_indicator(self, widget):
         w, conn, _workers = widget
         # Start from a connected state, then make the re-list blow up (server
-        # gone). mark_disconnected is what flips is_connected on the real
-        # connection; emulate that side effect on the mock so the status line
-        # re-render reads the disconnected state.
-        conn.is_connected = True
-
-        def _drop(*_a, **_k):
-            conn.is_connected = False
-
-        conn.mark_disconnected.side_effect = _drop
-        conn.refresh.side_effect = RuntimeError("unreachable")
+        # gone): the shared client is dropped so the indicator says so.
+        conn.client = MagicMock()
+        w._list.refresh.side_effect = RuntimeError("unreachable")
 
         w._refresh()
 
-        conn.mark_disconnected.assert_called_once()
+        assert conn.client is None
         assert not w._refresh_button.isEnabled()
         assert w._message_level == "error"
         assert "lost connection" in w._message_label.text().lower()
@@ -440,16 +460,15 @@ class TestRefreshFailure:
         # The server answered fine (refresh returned sources), but building the
         # tree blows up -- a client-side bug, not a lost server. The connection
         # must stay up and the indicator must not flip to disconnected; the
-        # error is reported without dropping the client (mark_disconnected is
-        # scoped to the re-list call, not the render).
-        conn.is_connected = True
-        conn.refresh.return_value = {"a": object()}
+        # error is reported without dropping the client (that is scoped to the
+        # re-list call, not the render).
+        client = conn.client = MagicMock()
+        w._list.refresh.return_value = {"a": object()}
         w._build_and_display_tree.side_effect = RuntimeError("render boom")
 
         w._refresh()
 
-        conn.mark_disconnected.assert_not_called()
-        assert conn.is_connected
+        assert conn.client is client
         assert w._message_level == "error"
         assert "lost connection" not in w._message_label.text().lower()
 
@@ -514,7 +533,7 @@ class TestSourcesChangedGuard:
 
     def test_skipped_while_connecting(self, widget):
         w, conn, workers = widget
-        conn.is_connected = True
+        conn.client = MagicMock()
         w._connecting = True
         w._apply_filter = MagicMock()
 
@@ -525,7 +544,7 @@ class TestSourcesChangedGuard:
 
     def test_renders_when_idle(self, widget):
         w, conn, workers = widget
-        conn.is_connected = True
+        conn.client = MagicMock()
         w._connecting = False
         w._apply_filter = MagicMock()
 
@@ -535,7 +554,7 @@ class TestSourcesChangedGuard:
 
     def test_skipped_when_disconnected(self, widget):
         w, conn, workers = widget
-        conn.is_connected = False
+        conn.client = None
         w._connecting = False
         w._apply_filter = MagicMock()
 
@@ -779,8 +798,8 @@ class TestResolveAction:
         from biopb_mcp.tensor_browser import _widget as widget_mod
 
         w, conn, _ = widget
-        conn.is_connected = True
-        conn.sources = {"cloud_x": _source("cloud_x", tensors=[], is_resolved=False)}
+        conn.client = MagicMock()
+        w._list.sources = {"cloud_x": _source("cloud_x", tensors=[], is_resolved=False)}
 
         answer = widget_mod.QMessageBox.Ok if accept else widget_mod.QMessageBox.Cancel
         monkeypatch.setattr(
@@ -870,8 +889,8 @@ class TestResolveAction:
         from biopb_mcp.tensor_browser import _widget as widget_mod
 
         w, conn, _ = widget
-        conn.is_connected = True
-        conn.sources = {"cloud_x": _source("cloud_x", tensors=[], is_resolved=False)}
+        conn.client = MagicMock()
+        w._list.sources = {"cloud_x": _source("cloud_x", tensors=[], is_resolved=False)}
         monkeypatch.setattr(
             widget_mod.QMessageBox,
             "warning",
@@ -961,7 +980,7 @@ class TestResolveAction:
         from biopb_mcp.tensor_browser._widget import _TreeNode
 
         w, conn, _ = widget
-        conn.sources = {"cloud_x": _source("cloud_x", tensors=[], is_resolved=False)}
+        w._list.sources = {"cloud_x": _source("cloud_x", tensors=[], is_resolved=False)}
         w._add_tree_node(
             w._tree_widget,
             _TreeNode(
@@ -969,7 +988,7 @@ class TestResolveAction:
                 name="cloud_x.zarr",
                 node_type="source",
                 depth=0,
-                source=conn.sources["cloud_x"],
+                source=w._list.sources["cloud_x"],
             ),
         )
         item = w._tree_widget.topLevelItem(0)
@@ -1036,9 +1055,9 @@ class TestHydrateAction:
         from biopb_mcp.tensor_browser import _widget as widget_mod
 
         w, conn, _ = widget
-        conn.is_connected = True
+        conn.client = MagicMock()
         src = _source("m", tensors=["m"], source_type="zarr")
-        conn.sources = {"m": src}
+        w._list.sources = {"m": src}
         # A real tree row so the inline indicator can be read back off the item.
         self._add_row(w, src)
 
@@ -1243,7 +1262,7 @@ class TestAddToViewer:
         # `_client`/`_sources` are read-only views onto the connection.
         w, conn, _ = widget
         conn.client = MagicMock()
-        conn.sources = {"m": _source("m", tensors=["m"], source_type="zarr")}
+        w._list.sources = {"m": _source("m", tensors=["m"], source_type="zarr")}
         w._selected_source_id = "m"
         w._selected_tensor_id = "m"
         w._show_error = MagicMock()
@@ -1278,7 +1297,7 @@ class TestInfoPaneIsReadableOut:
     def _select(self, widget, source_id="ome-tiff_8cc0", tensor="Image:0"):
         w, conn, _ = widget
         array_id = f"{source_id}/{tensor}"
-        conn.sources = {source_id: _source(source_id, tensors=[array_id])}
+        w._list.sources = {source_id: _source(source_id, tensors=[array_id])}
         w._selected_source_id = source_id
         w._selected_tensor_id = array_id
         w._update_metadata_display()

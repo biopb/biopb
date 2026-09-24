@@ -5,6 +5,7 @@ for efficient multi-dimensional array storage and retrieval.
 
 Key components:
 - TensorFlightClient: Client for accessing tensors from a TensorFlightServer
+- Connection: the data plane this machine's control names, dialed and shared
 - Proto messages: TensorTicket, ChunkBounds, TensorDescriptor, SliceHint
 - query_sources / resolve hand back `sources` catalog rows; what you decode
   them into is yours (descriptors_from_rows is the deprecated proto form)
@@ -55,6 +56,11 @@ _LAZY_CLIENT_EXPORTS = (
 
 
 def __getattr__(name):
+    if name == "Connection":
+        from biopb.tensor._connection import Connection
+
+        globals()["Connection"] = Connection
+        return Connection
     if name in _LAZY_CLIENT_EXPORTS:
         from biopb.tensor import client
 
@@ -89,6 +95,7 @@ __all__ = [
     "label_image_axes",
     "split_label_array_id",
     # Client
+    "Connection",
     "TensorFlightClient",
     "ResolveCancelled",
     "UploadRefused",

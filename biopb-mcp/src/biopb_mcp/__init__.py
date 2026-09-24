@@ -2,8 +2,8 @@
 Tensor Browser napari plugin widget for human data browsing.
 
 The package root is intentionally minimal — it does not import the GUI widgets —
-so that data-layer and MCP modules (e.g. ``biopb_mcp._connection``) can be
-imported without pulling in Qt/napari. The plugin widgets live in their
+so that the MCP modules (e.g. ``biopb_mcp.workflow_env``) can be imported
+without pulling in Qt/napari. The plugin widgets live in their
 subpackages (``biopb_mcp.tensor_browser`` / ``biopb_mcp.image_processing``) and
 are referenced directly by the napari manifest (``napari.yaml``).
 """

@@ -3,44 +3,19 @@
 Where the tensor (data) plane listens, what credential reaches it, and what
 anchors its TLS: one answer, resolved in one place.
 
-It used to be four places (biopb/biopb#615). ``biopb server cache-stats`` and the
-four ``biopb tensor`` commands each *reconstructed* the endpoint from a default —
-hardcoded ``grpc://``, hardcoded port, token from the environment only — while
-biopb-mcp *asked the control*, which is the only site that can be right: the
-control chose the bind, the port, and the scheme, so its supervisor snapshot is
-the fact and everything else is a guess that goes stale the moment ``--base-port``
-or ``--tls`` moves. Reconstruction also cannot express what it does not know: a
-plane on a moved base is invisible to it, and a ``grpcs://`` plane is dialed
-plaintext and reported as down.
-
-So the order here is **ask, then guess**:
+The order here is **ask, then guess**:
 
 1. an explicit override (a ``--server`` flag), then ``BIOPB_TENSOR_URL``;
 2. the control's ``GET /health`` -> ``data_plane.grpc_url`` — authoritative,
    carrying host, port *and* scheme;
 3. the default base-port endpoint, with the scheme probed off the socket.
 
-Step 3 covers the one case discovery cannot: a plane launched directly, outside
-any control, which persists nothing for a reader to find. The port is still a
-guess there (nothing records a directly-chosen one — pass ``--server`` for that),
-but the *scheme* need not be, so :func:`probe_scheme` asks the listener instead
-of assuming. Every :class:`Endpoint` records which of the three answered, so a
-failed dial can say where the address came from rather than blaming the server.
+Step 3 covers the case of a plane launched directly, outside any control.
 
-**The credential follows the address.** Where the endpoint came from decides
-whether the control's credential file is readable for it: that file is the token
-the control wrote for the plane *it* owns, so it travels only with the endpoint
-the control itself named. An override or ``$BIOPB_TENSOR_URL`` deliberately
-routed around the control — it may name another user's server, or a lab store
-across the network — and quietly attaching this machine's credential to that dial
-would send a local secret somewhere it was never issued for. Those endpoints
-carry an explicit token or none.
-
-Deliberately stdlib-only, like ``_endpoints`` / ``_credentials`` / ``_locations``
-beside it: it is imported by the core CLI and by biopb-mcp, and importing it must
-never drag in pyarrow. Classifying a *Flight* failure therefore does not live
-here — that belongs to the layer that already has the client (see
-``biopb.tensor.cli._dial_error``).
+**The credential follows the address.** An override or ``$BIOPB_TENSOR_URL``
+deliberately routed around the control, and quietly attaching this machine's
+credential to that dial would send a local secret somewhere it was never issued
+for. Those endpoints carry an explicit token or none.
 """
 
 from __future__ import annotations
@@ -54,16 +29,9 @@ from urllib.parse import urlparse
 
 from ._endpoints import BASE_DEFAULT_PORT, control_base_url, flight_port_for
 
-# The one env var naming the data plane. ``BIOPB_TENSOR_SERVER`` (the old
-# ``biopb tensor`` spelling) was retired with #615: two names for one concept, on
-# commands that dial the same plane, is how a user ends up setting the one the
-# command they are running does not read.
 ENV_URL = "BIOPB_TENSOR_URL"
 ENV_TOKEN = "BIOPB_TENSOR_TOKEN"
 
-# Hosts that mean "this machine". A plane here has its TLS cert on this disk, so
-# it is verified against what the plane publishes rather than pinned from the
-# wire (:func:`local_fingerprint`).
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 
@@ -167,8 +135,8 @@ def local_fingerprint(url: str) -> Optional[str]:
     if not url.lower().startswith("grpcs://") or not is_local_url(url):
         return None
 
-    from . import _tls_material, _tls_record
-    from ._locations import tls_served_certs, tls_server_cert
+    from .. import _tls_material, _tls_record
+    from .._locations import tls_served_certs, tls_server_cert
 
     port = urlparse(url).port
     if port is not None:
@@ -340,6 +308,6 @@ def resolve_token(
     if not allow_credential_file:
         return None
 
-    from ._credentials import read_credential
+    from .._credentials import read_credential
 
     return read_credential()

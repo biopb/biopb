@@ -22,25 +22,38 @@ def viewer():
 def connection():
     w = MagicMock()
     w.client = None
-    w.sources = {}
     return w
 
 
-def _make_source(source_url, tensors):
-    """Create a mock catalog source."""
-    src = MagicMock()
-    src.source_url = source_url
-    src.tensors = tensors
-    return src
+def _row(source_url, array_ids):
+    """A `sources` row as ``query_sources(format="records")`` returns it."""
+    return {"source_url": source_url, "tensors": [{"array_id": a} for a in array_ids]}
 
 
-def _make_tensor(array_id, shape, dtype="float32"):
-    t = MagicMock()
-    t.array_id = array_id
-    t.shape = shape
-    t.dtype = dtype
-    t.dim_labels = []
-    return t
+def _desc(array_id, shape, dim_labels=()):
+    return TensorDescriptor(
+        array_id=array_id, shape=shape, dtype="float32", dim_labels=dim_labels
+    )
+
+
+def _serve(connection, rows, descriptors=()):
+    """Connect *connection* to a fake server holding *rows* and *descriptors*."""
+    by_id = {d.array_id: d for d in descriptors}
+
+    def query_sources(sql, format=None):  # noqa: A002 - mirrors the client
+        return [row for sid, row in rows.items() if f"'{sid}'" in sql]
+
+    def get_descriptor(array_id):
+        if array_id not in by_id:
+            raise RuntimeError(f"no such tensor: {array_id}")
+        return by_id[array_id]
+
+    client = MagicMock()
+    client.query_sources.side_effect = query_sources
+    client.get_descriptor.side_effect = get_descriptor
+    client.get_physical_scale.return_value = None
+    connection.client = client
+    return client
 
 
 class TestGetUrlStem:
@@ -78,27 +91,18 @@ class TestPatchViewerAddTensor:
             viewer.add_tensor("some_source")
 
     def test_raises_when_source_not_found(self, viewer, connection):
-        client = MagicMock()
-        # The uncached-source fetch fails -> add_tensor surfaces "not found".
-        client.get_descriptor.side_effect = RuntimeError("no such source")
-        connection.client = client
-        connection.sources = {"a": MagicMock()}
+        _serve(connection, {})
         patch_viewer_tensor_methods(viewer, connection)
 
         with pytest.raises(ValueError, match="not found"):
             viewer.add_tensor("nonexistent")
 
-    def test_fallback_to_get_descriptor_when_uncached(self, viewer, connection):
-        # Source absent from the (possibly truncated) cached catalog -> fetch the
-        # tensor descriptor directly by a bare source_id (resolves the default
-        # tensor) and wrap it as a single-tensor source.
-        client = MagicMock()
-        client.get_descriptor.return_value = TensorDescriptor(
-            array_id="remote_src", shape=[256, 256], dtype="float32"
-        )
-        client.get_physical_scale.return_value = None
-        connection.client = client
-        connection.sources = {}
+    def test_a_source_the_catalog_does_not_list_is_described_directly(
+        self, viewer, connection
+    ):
+        # No row (a tensor attached to a source rather than listed in it): the
+        # descriptor is asked for by the id itself, and the layer is named by it.
+        client = _serve(connection, {}, [_desc("remote_src", [256, 256])])
 
         mock_arr = MagicMock()
         with patch(
@@ -109,37 +113,25 @@ class TestPatchViewerAddTensor:
             name = viewer.add_tensor("remote_src")
 
         client.get_descriptor.assert_called_once_with("remote_src")
-        # No source_url on a descriptor-only fetch, so the layer name is the id.
         assert name == "remote_src"
         viewer.add_image.assert_called_once_with(
             mock_arr, name="remote_src", metadata={"array_id": "remote_src"}
         )
 
-    def test_fallback_forwards_tensor_id(self, viewer, connection):
-        # A within-source field is fetched by its qualified array_id.
-        client = MagicMock()
-        client.get_descriptor.return_value = TensorDescriptor(
-            array_id="remote_src/t2", shape=[128, 128], dtype="float32"
-        )
-        client.get_physical_scale.return_value = None
-        connection.client = client
-        connection.sources = {}
-
-        with patch(
-            "biopb_mcp._tensor_utils.build_pyramid_levels",
-            return_value=[MagicMock()],
-        ):
-            patch_viewer_tensor_methods(viewer, connection)
-            viewer.add_tensor("remote_src", tensor_id="remote_src/t2", name="x")
-
-        client.get_descriptor.assert_called_once_with("remote_src/t2")
+    def test_the_source_is_looked_up_by_a_quoted_literal(self, viewer, connection):
+        client = _serve(connection, {})
+        patch_viewer_tensor_methods(viewer, connection)
+        with pytest.raises(ValueError):
+            viewer.add_tensor("it's")
+        (sql,), _ = client.query_sources.call_args
+        assert "source_id = 'it''s'" in sql
 
     def test_auto_selects_single_tensor(self, viewer, connection):
-        tensor = _make_tensor("t1", [256, 256])
-        src = _make_source("http://server/data/my_image", [tensor])
-        connection.client = MagicMock()
-        connection.client.get_physical_scale.return_value = None
-        connection.sources = {"src1": src}
+        _serve(
+            connection,
+            {"src1": _row("http://server/data/my_image", ["t1"])},
+            [_desc("t1", [256, 256])],
+        )
 
         mock_arr = MagicMock()
         with patch(
@@ -159,11 +151,11 @@ class TestPatchViewerAddTensor:
         single-process scheduler (issue #8)."""
         from biopb_mcp._viewer_compute import _ViewerArray
 
-        tensor = _make_tensor("t1", [256, 256])
-        src = _make_source("http://server/data/my_image", [tensor])
-        connection.client = MagicMock()
-        connection.client.get_physical_scale.return_value = None
-        connection.sources = {"src1": src}
+        _serve(
+            connection,
+            {"src1": _row("http://server/data/my_image", ["t1"])},
+            [_desc("t1", [256, 256])],
+        )
 
         mock_arr = MagicMock()
         with patch(
@@ -179,23 +171,18 @@ class TestPatchViewerAddTensor:
         assert passed._scheduler == "threads"
 
     def test_requires_tensor_id_for_multi_tensor(self, viewer, connection):
-        t1 = _make_tensor("t1", [256, 256])
-        t2 = _make_tensor("t2", [128, 128])
-        src = _make_source("http://server/data/multi", [t1, t2])
-        connection.client = MagicMock()
-        connection.sources = {"src1": src}
+        _serve(connection, {"src1": _row("http://server/data/multi", ["t1", "t2"])})
         patch_viewer_tensor_methods(viewer, connection)
 
         with pytest.raises(ValueError, match="specify tensor_id"):
             viewer.add_tensor("src1")
 
     def test_explicit_tensor_id_and_name(self, viewer, connection):
-        t1 = _make_tensor("t1", [256, 256])
-        t2 = _make_tensor("t2", [128, 128])
-        src = _make_source("http://server/data/multi", [t1, t2])
-        connection.client = MagicMock()
-        connection.client.get_physical_scale.return_value = None
-        connection.sources = {"src1": src}
+        _serve(
+            connection,
+            {"src1": _row("http://server/data/multi", ["t1", "t2"])},
+            [_desc("t1", [256, 256]), _desc("t2", [128, 128])],
+        )
 
         mock_arr = MagicMock()
         with patch(
@@ -213,12 +200,12 @@ class TestPatchViewerAddTensor:
     def test_qualified_array_id_selects_the_tensor(self, viewer, connection):
         # One id, addressed exactly as client.get_tensor addresses it (#650):
         # the slash-free prefix routes, the full id picks the tensor.
-        t1 = _make_tensor("src1/t1", [256, 256])
-        t2 = _make_tensor("src1/t2", [128, 128])
-        src = _make_source("http://server/data/multi", [t1, t2])
-        connection.client = MagicMock()
-        connection.client.get_physical_scale.return_value = None
-        connection.sources = {"src1": src}
+        t2 = _desc("src1/t2", [128, 128])
+        _serve(
+            connection,
+            {"src1": _row("http://server/data/multi", ["src1/t1", "src1/t2"])},
+            [_desc("src1/t1", [256, 256]), t2],
+        )
 
         with patch("biopb_mcp._tensor_utils.add_tensor_layer") as add_layer:
             patch_viewer_tensor_methods(viewer, connection)
@@ -229,31 +216,12 @@ class TestPatchViewerAddTensor:
         assert tensor_desc is t2
         assert name == "multi/t2"
 
-    def test_qualified_array_id_when_source_uncached(self, viewer, connection):
-        # The descriptor fetch takes the full array_id, and the wrapped
-        # single-tensor source is keyed by the routing prefix.
-        client = MagicMock()
-        client.get_descriptor.return_value = TensorDescriptor(
-            array_id="remote_src/t2", shape=[128, 128], dtype="float32"
-        )
-        client.get_physical_scale.return_value = None
-        connection.client = client
-        connection.sources = {}
-
-        with patch("biopb_mcp._tensor_utils.add_tensor_layer") as add_layer:
-            patch_viewer_tensor_methods(viewer, connection)
-            viewer.add_tensor("remote_src/t2")
-
-        client.get_descriptor.assert_called_once_with("remote_src/t2")
-        _, _, source_id, tensor_id, _ = add_layer.call_args[0]
-        assert (source_id, tensor_id) == ("remote_src", "remote_src/t2")
-
     def test_legacy_source_id_keyword_still_accepted(self, viewer, connection):
-        tensor = _make_tensor("t1", [256, 256])
-        src = _make_source("http://server/data/my_image", [tensor])
-        connection.client = MagicMock()
-        connection.client.get_physical_scale.return_value = None
-        connection.sources = {"src1": src}
+        _serve(
+            connection,
+            {"src1": _row("http://server/data/my_image", ["t1"])},
+            [_desc("t1", [256, 256])],
+        )
 
         with patch(
             "biopb_mcp._tensor_utils.build_pyramid_levels",
@@ -270,11 +238,11 @@ class TestPatchViewerAddTensor:
             viewer.add_tensor()
 
     def test_multiscale_pyramid(self, viewer, connection):
-        tensor = _make_tensor("t1", [8192, 8192])
-        src = _make_source("http://server/big", [tensor])
-        connection.client = MagicMock()
-        connection.client.get_physical_scale.return_value = None
-        connection.sources = {"src1": src}
+        _serve(
+            connection,
+            {"src1": _row("http://server/big", ["t1"])},
+            [_desc("t1", [8192, 8192])],
+        )
 
         levels = [MagicMock(), MagicMock()]
         with patch(
@@ -289,25 +257,25 @@ class TestPatchViewerAddTensor:
         )
 
     def test_raises_for_invalid_tensor_id(self, viewer, connection):
-        tensor = _make_tensor("t1", [256, 256])
-        src = _make_source("http://server/data/img", [tensor])
-        connection.client = MagicMock()
-        connection.sources = {"src1": src}
+        _serve(
+            connection,
+            {"src1": _row("http://server/data/img", ["t1"])},
+            [_desc("t1", [256, 256])],
+        )
         patch_viewer_tensor_methods(viewer, connection)
 
         with pytest.raises(ValueError, match="Tensor 'wrong' not found"):
             viewer.add_tensor("src1", tensor_id="wrong")
 
     def test_applies_ome_scale_and_metadata(self, viewer, connection):
-        tensor = _make_tensor("t1", [256, 256])
-        tensor.dim_labels = ["y", "x"]
-        src = _make_source("http://server/data/cal", [tensor])
-        client = MagicMock()
+        client = _serve(
+            connection,
+            {"src1": _row("http://server/data/cal", ["t1"])},
+            [_desc("t1", [256, 256], dim_labels=["y", "x"])],
+        )
         # get_physical_scale returns the compact per-dim (scale, unit) summary
         # in source axis order [y, x] (the descriptor field, issue #31).
         client.get_physical_scale.return_value = ([0.25, 0.5], ["µm", "µm"])
-        connection.client = client
-        connection.sources = {"src1": src}
 
         # build_pyramid_levels returns the source array as served: a 2-D source
         # stays 2-D, so the level reports ndim 2 and build_layer_scale places

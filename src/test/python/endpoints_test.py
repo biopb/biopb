@@ -1,4 +1,4 @@
-"""Tests for `biopb._endpoints` — the base-port convention and control discovery.
+"""Tests for `biopb.control._endpoints` — the base-port convention and control discovery.
 
 Two things live here, and they are load-bearing for anything that has to *find*
 the control rather than start it:
@@ -20,7 +20,7 @@ the control rather than start it:
 import json
 
 import pytest
-from biopb import _endpoints
+from biopb.control import _endpoints
 
 
 @pytest.fixture(autouse=True)

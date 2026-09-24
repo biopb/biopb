@@ -18,7 +18,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
-from biopb import _data_plane
+from biopb.control import _data_plane
 
 # A throwaway self-signed leaf + its key, generated once and valid 2026-2126.
 # Static rather than minted at runtime because `cryptography` is deliberately not
@@ -222,7 +222,7 @@ class TestResolutionOrder:
         assert endpoint.origin == "default"
 
     def test_the_default_port_is_derived_not_hardcoded(self):
-        from biopb import _endpoints
+        from biopb.control import _endpoints
 
         expected = _endpoints.flight_port_for(_endpoints.BASE_DEFAULT_PORT)
         assert _data_plane.default_url().endswith(f":{expected}")

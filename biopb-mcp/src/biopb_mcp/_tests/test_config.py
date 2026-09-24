@@ -97,11 +97,6 @@ class TestLoadConfig:
         for key in ("widget", "pyramid", "timeout", "grpc", "transport"):
             assert key in config
 
-    def test_has_server_start_timeout(self):
-        """The transport section exposes the autostart boot-wait budget (#12)."""
-        defaults = get_default_config()
-        assert defaults["transport"]["server_start_timeout"] == 60.0
-
 
 class TestSaveConfig:
     """Tests for save_config function."""
@@ -206,7 +201,6 @@ class TestDefaultConfig:
             "memory",
             "transport",
             "kernel",
-            "tensor",
             "viewer",
             "services",
             "observe",
@@ -257,13 +251,6 @@ class TestDefaultConfig:
             assert _config._IS_WINDOWS is False
             assert kernel["startup_timeout"] == 60.0
         assert kernel["startup_timeout"] == _config._DEFAULT_STARTUP_TIMEOUT
-
-    def test_tensor_health_poll_defaults(self):
-        """The background source watcher's backoff bounds (issue #44)."""
-        tensor = DEFAULT_CONFIG["tensor"]
-        assert tensor["health_poll_min_interval"] == 2.0
-        assert tensor["health_poll_max_interval"] == 60.0
-        assert tensor["health_poll_min_interval"] < tensor["health_poll_max_interval"]
 
 
 class TestGetSetting:
@@ -492,17 +479,10 @@ class TestValidation:
         assert isinstance(get_setting(config, "pyramid.downscale_factor"), int)
 
     def test_zero_is_valid_where_it_disables(self, mock_config_dir):
-        """0 is a documented sentinel for several knobs (disables the watcher),
-        so it must pass validation, not be clamped."""
-        config = _write_and_load(
-            mock_config_dir,
-            {
-                "kernel": {"watchdog_interval": 0},
-                "tensor": {"health_poll_min_interval": 0},
-            },
-        )
+        """0 is a documented sentinel (disables the watchdog), so it must pass
+        validation, not be clamped."""
+        config = _write_and_load(mock_config_dir, {"kernel": {"watchdog_interval": 0}})
         assert get_setting(config, "kernel.watchdog_interval") == 0
-        assert get_setting(config, "tensor.health_poll_min_interval") == 0
 
     def test_valid_values_untouched(self, mock_config_dir):
         config = _write_and_load(
@@ -515,51 +495,6 @@ class TestValidation:
         assert get_setting(config, "pyramid.downscale_factor") == 2
         assert get_setting(config, "transport.kind") == "http"
         assert get_setting(config, "transport.port") == 9000
-
-    def test_health_poll_inverted_reset_to_defaults(self, mock_config_dir):
-        """min > max would invert the exponential backoff; both reset."""
-        defaults = get_default_config()
-        config = _write_and_load(
-            mock_config_dir,
-            {
-                "tensor": {
-                    "health_poll_min_interval": 90.0,
-                    "health_poll_max_interval": 10.0,
-                }
-            },
-        )
-        assert (
-            get_setting(config, "tensor.health_poll_min_interval")
-            == defaults["tensor"]["health_poll_min_interval"]
-        )
-        assert (
-            get_setting(config, "tensor.health_poll_max_interval")
-            == defaults["tensor"]["health_poll_max_interval"]
-        )
-
-    def test_clamping_a_leaf_cannot_leave_a_residual_inversion(self, mock_config_dir):
-        """Per-field clamping must not *introduce* a cross-field violation.
-
-        A negative min clamps to its default (2.0), which is above a small but
-        valid max (1.0) -- an inversion the first pass didn't see, since the raw
-        -1 <= 1. The load path re-checks to a fixpoint, so the loaded config is
-        clean rather than inverted the other way.
-        """
-        config = _write_and_load(
-            mock_config_dir,
-            {
-                "tensor": {
-                    "health_poll_min_interval": -1.0,
-                    "health_poll_max_interval": 1.0,
-                }
-            },
-        )
-        from biopb_mcp._config import config_problems
-
-        assert config_problems(config) == []
-        assert get_setting(config, "tensor.health_poll_min_interval") <= get_setting(
-            config, "tensor.health_poll_max_interval"
-        )
 
     def test_warns_naming_key_value_and_range(self, mock_config_dir, caplog):
         with caplog.at_level("WARNING"):
@@ -578,8 +513,7 @@ class TestValidation:
         assert load_config() == get_default_config()
 
     def test_shipped_defaults_pass_the_whole_check(self):
-        """The clamp target must itself be valid, cross-field rules included --
-        otherwise a bad leaf would be replaced by an equally invalid default and
+        """The clamp target must itself be valid -- otherwise a bad leaf would be replaced by an equally invalid default and
         the config would never converge."""
         from biopb_mcp._config import config_problems
 

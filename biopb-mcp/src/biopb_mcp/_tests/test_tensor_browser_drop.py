@@ -45,15 +45,15 @@ def _result(added=(), already=(), refreshed=(), removed=(), failed=()):
 
 
 def test_worker_maps_single_result(_qapp):
-    conn = MagicMock()
-    conn.add_source.return_value = _result(
+    sources = MagicMock()
+    sources.add.return_value = _result(
         added=["a"],
         already=["c"],
         refreshed=["c"],
         removed=["d"],
         failed=[("/p/bad", "not a recognized image format")],
     )
-    worker = _AddSourceWorker(conn, "/A")
+    worker = _AddSourceWorker(sources, "/A")
 
     captured = {}
     worker.done.connect(
@@ -63,8 +63,8 @@ def test_worker_maps_single_result(_qapp):
     )
     worker.run()  # synchronous; direct-connected slot fires inline
 
-    conn.add_source.assert_called_once()
-    assert conn.add_source.call_args.args[0] == "/A"
+    sources.add.assert_called_once()
+    assert sources.add.call_args.args[0] == "/A"
     assert captured["added"] == ["a"]
     # A re-dropped path is reported as REBUILT, not as a no-op: the worker
     # relays `refreshed`, not `already_present` (biopb/biopb#944).
@@ -74,9 +74,9 @@ def test_worker_maps_single_result(_qapp):
 
 
 def test_worker_surfaces_request_failure(_qapp):
-    conn = MagicMock()
-    conn.add_source.side_effect = RuntimeError("Path not found on server: /nope")
-    worker = _AddSourceWorker(conn, "/nope")
+    sources = MagicMock()
+    sources.add.side_effect = RuntimeError("Path not found on server: /nope")
+    worker = _AddSourceWorker(sources, "/nope")
     errors = []
     worker.failed.connect(errors.append)
 
@@ -91,9 +91,9 @@ class _GateStub:
     _connecting = False
 
     def __init__(self, connected, local, adding=False):
+        self._connected = connected
         self._conn = MagicMock()
-        self._conn.is_connected = connected
-        self._conn.is_localhost.return_value = local
+        self._conn.url = "grpc://localhost:8815" if local else "grpc://lab:8815"
         self._add_worker = MagicMock() if adding else None
 
 

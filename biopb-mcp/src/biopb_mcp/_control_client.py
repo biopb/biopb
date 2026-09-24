@@ -1,113 +1,20 @@
-"""Client for the biopb control (control plane) control API — stdlib only.
+"""Start the biopb control for the stdio shim.
 
-Since the de-daemonization (ARCHITECTURE.md, Lifecycle), ``_connection`` is a
-*pure client*: it
-never shells out ``biopb server start`` to bring the data plane up. When the
-plane is down it asks the control to ensure it, via this thin urllib client. The
-control is the durable root that owns the data plane; ``_connection`` only uses it.
-
-The endpoint is resolved from ``biopb._endpoints`` (the shared, stdlib-only
-core-SDK module), the same location the control itself binds — biopb-mcp cannot
-import ``biopb-control`` any more than it can import ``biopb-tensor-server``, so the
-one shared fact (where the control listens) lives in core ``biopb``.
+Asking a running control anything is :mod:`biopb.control`'s job. This is the
+one thing that is not: launching one, which only the shim does, because it is
+the one entry point with no human to ask.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import subprocess
 import sys
 import threading
-import urllib.request
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
-
-
-def _base_url() -> str:
-    from biopb._endpoints import control_base_url
-
-    return control_base_url()
-
-
-def _auth_headers() -> dict[str, str]:
-    """Authorization headers for a gated control ``/api/*`` request.
-
-    The control writes the resolved data-plane token to an owner-only file in the
-    user's state dir (biopb/biopb#470); we read it there so ``_control_client`` can
-    authenticate to a token-gated control instead of hoping the token reached this
-    process's environment. Carrying the token *also* clears the CSRF gate on the
-    POST (a request presenting a token header is not a forgeable cross-site one),
-    and it is what let ``/api/data_plane/ensure`` drop its auth exemption (#424
-    item 2). ``{}`` when no credential exists — the tokenless-local case, where the
-    control's gate falls back to a loopback-``Host`` check and the bare POST passes.
-    """
-    from biopb._credentials import read_credential
-
-    token = read_credential()
-    return {"X-Biopb-Token": token} if token else {}
-
-
-def control_reachable(timeout: float = 1.0) -> bool:
-    """Whether the control's control API answers ``GET /health``."""
-    try:
-        with urllib.request.urlopen(f"{_base_url()}/health", timeout=timeout) as resp:
-            return resp.status == 200
-    except Exception:
-        return False
-
-
-def data_plane_url(timeout: float = 1.0) -> str | None:
-    """The data-plane gRPC URL the control owns, or ``None`` if no control answers.
-
-    GETs the control's bare, unauthenticated ``/health`` and reads
-    ``data_plane.grpc_url`` from the supervisor snapshot. The control resolves
-    that endpoint from the bind it was started with, so it is the single source of
-    truth for *where the data plane lives* (#413) -- the model in which the admin
-    owns the data plane. ``None`` when the control is unreachable (not running) so
-    the caller falls back to its own local config; this is a plain read (unlike
-    ``ensure_data_plane`` it never spawns the plane).
-
-    Delegated to the core SDK since biopb/biopb#615, where the `biopb tensor`
-    commands became the second consumer of the same question. Two implementations
-    of "ask the control where the plane is" is exactly the split that issue is
-    about, even when both happen to be right.
-    """
-    from biopb._data_plane import control_grpc_url
-
-    return control_grpc_url(timeout=timeout)
-
-
-def ensure_data_plane(timeout: float = 60.0) -> dict | None:
-    """Ask the control to ensure the data plane is up; return its snapshot.
-
-    POSTs ``/api/data_plane/ensure`` — idempotent on the control side (spawn the
-    plane it owns, then wait until listening). Returns the ``data_plane`` snapshot dict
-    on success, or ``None`` if the control is unreachable (not running) or errored,
-    so the caller can fall back to surfacing "start the control" rather than
-    raising.
-
-    ``timeout`` is BOTH our HTTP timeout and the hint we pass the server as
-    ``?client_timeout``: the server caps its own ensure wait below this so it
-    always returns a verdict before our ``urlopen`` times out — otherwise a
-    slow-but-working control plane would look unreachable and we'd wrongly report
-    "no control plane".
-    """
-    from urllib.parse import urlencode
-
-    url = (
-        f"{_base_url()}/api/data_plane/ensure?{urlencode({'client_timeout': timeout})}"
-    )
-    req = urllib.request.Request(url, data=b"", method="POST", headers=_auth_headers())
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            payload = json.loads(resp.read().decode())
-        return payload.get("data_plane")
-    except Exception as exc:  # noqa: BLE001 - best-effort; caller handles None
-        logger.info("control ensure_data_plane failed: %s", exc)
-        return None
 
 
 def _biopb_executable() -> str | None:
@@ -144,8 +51,8 @@ def start_control_detached() -> bool:
     return immediately; the control boots in the background, in parallel with the
     session child's own (import-dominated) startup, which normally more than covers
     the control's boot. If the control still isn't reachable when the child first
-    needs the data plane, :func:`ensure_data_plane` returns ``None`` and
-    ``_connection`` surfaces the actionable "Run ``biopb control start``" status --
+    needs the data plane, :func:`biopb.control.ensure_data_plane` returns ``None``
+    and the connection surfaces the actionable "Run ``biopb control start``" status --
     the mcp server, not the shim, is where a control-interaction failure belongs.
 
     The launched process is detached from the caller's process group / console, so

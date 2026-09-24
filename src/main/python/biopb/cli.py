@@ -14,11 +14,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from . import _agents, _endpoints, _locations, _tls_material, _web_auth
-from ._endpoints import (
-    flight_port_for as _flight_port,
-    sidecar_port_for as _sidecar_port,
-)
+from . import _agents, _locations, _tls_material, _web_auth
 from ._lifecycle.daemon import (
     detach_kwargs as _detach_kwargs,
     is_our_daemon as _is_our_daemon,
@@ -33,6 +29,11 @@ from ._lifecycle.proc import (
     process_create_time as _process_create_time,
 )
 from ._locations import find_config
+from .control import _endpoints
+from .control._endpoints import (
+    flight_port_for as _flight_port,
+    sidecar_port_for as _sidecar_port,
+)
 
 console = Console()
 
@@ -512,7 +513,7 @@ def _require_control_for_view() -> None:
     so a control busy in an ``ensure`` answers late — and here a false negative is
     a hard exit, not a degraded reading.
     """
-    from . import _data_plane
+    from .control import _data_plane
 
     if os.environ.get(_data_plane.ENV_URL, "").strip():
         return
@@ -711,7 +712,7 @@ def _control_endpoint() -> Tuple[str, int]:
     Binding to a discovered value would mean a crashed control's stale record
     dictates where the next one listens.
     """
-    from ._endpoints import control_host, control_port
+    from .control._endpoints import control_host, control_port
 
     return control_host(), control_port()
 
@@ -725,7 +726,7 @@ def _control_bind_endpoint(base_port: int) -> Tuple[str, int]:
     nowhere else -- notably *not* from the published record, which describes some
     other (possibly dead) control.
     """
-    from ._endpoints import CONTROL_DEFAULT_HOST, control_port_for
+    from .control._endpoints import CONTROL_DEFAULT_HOST, control_port_for
 
     host = os.environ.get("BIOPB_CONTROL_HOST") or CONTROL_DEFAULT_HOST
     raw = os.environ.get("BIOPB_CONTROL_PORT")

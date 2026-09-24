@@ -143,9 +143,21 @@ def _layer_own_array(layer):
     return unwrap() if callable(unwrap) else data
 
 
+def _source_row(client, source_id: str) -> dict | None:
+    """The catalog row of *source_id* (``source_url``, ``tensors``), or None."""
+    from biopb.tensor._catalog_rows import sql_literal
+
+    rows = client.query_sources(
+        "SELECT source_url, tensors FROM sources "
+        f"WHERE source_id = {sql_literal(source_id)}",
+        format="records",
+    )
+    return rows[0] if rows else None
+
+
 def patch_viewer_tensor_methods(viewer, connection, compute_scheduler=None):
     """Monkey-patch ``add_tensor`` and ``tensor`` onto *viewer*, reading
-    client/sources from the live ``TensorConnection`` *connection*.
+    through the shared ``biopb.tensor.Connection`` *connection*.
 
     ``add_tensor`` puts a tensor on the viewer; ``tensor`` reads one back off
     it as a plain array (biopb/biopb#974). Only the loader needs *connection*,
@@ -201,50 +213,25 @@ def patch_viewer_tensor_methods(viewer, connection, compute_scheduler=None):
                 "Open the Tensor Browser widget and connect first."
             )
 
-        sources = connection.sources or {}
-        src = sources.get(source_id)
-        if src is None:
-            # Not in the (possibly truncated) cached catalog — fetch the tensor
-            # descriptor directly from the server and wrap it as a single-tensor
-            # source (a bare source_id resolves the source's default tensor).
-            from .._catalog import CatalogSource, CatalogTensor
-
-            try:
-                desc = client.get_descriptor(tensor_id or source_id)
-            except Exception as exc:
-                raise ValueError(
-                    f"Source '{source_id}' not found. "
-                    f"Available: {list(sources.keys())[:20]}"
-                ) from exc
-            src = CatalogSource(
-                source_id=source_id,
-                tensors=(
-                    CatalogTensor(
-                        array_id=desc.array_id,
-                        dim_labels=tuple(desc.dim_labels),
-                        shape=tuple(desc.shape),
-                        dtype=desc.dtype,
-                    ),
-                ),
-            )
-
+        # The server answers which tensor a bare source id means, and what the
+        # tensor is; nothing here keeps a catalog to ask instead.
+        row = _source_row(client, source_id)
+        tensors = [t["array_id"] for t in (row or {}).get("tensors") or []]
         if tensor_id is None:
-            if len(src.tensors) == 1:
-                tensor_id = src.tensors[0].array_id
-            else:
-                ids = [t.array_id for t in src.tensors]
+            if len(tensors) > 1:
                 raise ValueError(
-                    f"Source has {len(src.tensors)} tensors — "
-                    f"specify tensor_id. Available: {ids}"
+                    f"Source has {len(tensors)} tensors — "
+                    f"specify tensor_id. Available: {tensors}"
                 )
-
-        tensor_desc = next((t for t in src.tensors if t.array_id == tensor_id), None)
-        if tensor_desc is None:
-            raise ValueError(f"Tensor '{tensor_id}' not found in source '{source_id}'")
+            tensor_id = tensors[0] if tensors else source_id
+        try:
+            tensor_desc = client.get_descriptor(tensor_id)
+        except Exception as exc:
+            raise ValueError(f"Tensor '{tensor_id}' not found: {exc}") from exc
 
         if name is None:
-            stem = _get_url_stem(src.source_url) or source_id
-            if len(src.tensors) > 1:
+            stem = _get_url_stem((row or {}).get("source_url") or "") or source_id
+            if len(tensors) > 1:
                 name = f"{stem}/{_tensor_short_name(tensor_id)}"
             else:
                 name = stem
