@@ -133,11 +133,11 @@ ends that one as "end not recorded", since only one job runs at a time.
 A verification cannot wait for a next start, so the scratch run also polls the
 kernel's own account (`_jobs.poll`) over the shell channel every 2 s. When two
 polls in a row disagree with the record, `JobLog.settle` replays the missing
-events. The outcome is then the kernel's, and output may be missing. This
-cannot hang: once the job has ended, the scratch kernel's main thread is free,
-so the poll that reports the end is answered. The session kernel has no such
-guarantee (a user's cell can hold its main thread), so its records are settled
-only by the next start or the kernel going away.
+events. The outcome is then the kernel's, and output may be missing. The poll
+does not queue: a scratch kernel runs no user cells, only its one job, on a job
+thread, so its main thread is free. The session kernel has no such guarantee (a
+user's cell runs on its main thread), so its records are settled only by the
+next start or the kernel going away.
 
 Poll, the observe list and detail, the notebook export and the foreign-activity
 digest are reads of the host's memory, never a kernel round trip. Records
