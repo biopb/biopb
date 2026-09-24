@@ -127,15 +127,15 @@ try:
         try:
             _dc = _Client.current(allow_global=True)
         except ValueError:
-            _dc = None
+            pass
     if _dc is None:
         print("  mode: in-process (dask's default), shared with the viewer")
+    elif _dc.status != "running":
+        print("  mode: dask Client, " + str(_dc.status))
+        print("  WARNING: a .compute() would fail or block; close this dask "
+              "Client or build a new one")
     else:
-        try:
-            _info = _dc.scheduler_info(n_workers=-1)  # the default caps at 5
-        except TypeError:  # distributed without the argument
-            _info = _dc.scheduler_info()
-        _nw = len(_info.get("workers", {}))
+        _nw = len(_dc.nthreads())
         print("  mode: dask Client at " + str(_dc.scheduler.address))
         print("  workers: " + str(_nw))
         print("  dashboard: " + str(_dc.dashboard_link))

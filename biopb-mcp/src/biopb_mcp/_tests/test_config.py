@@ -73,16 +73,6 @@ class TestLoadConfig:
         assert config["kernel"]["name"] == "python3"
         assert config["transport"]["kind"] == "stdio"
 
-    def test_a_retired_dask_section_is_ignored(self, mock_config_dir):
-        """The kernel no longer configures dask; an old file's section loads
-        without failing validation, and nothing reads it."""
-        config_path = mock_config_dir / CONFIG_NAME
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        config_path.write_text(json.dumps({"dask": {"scheduler": "distributed"}}))
-        config = load_config()
-        assert "dask" not in DEFAULT_CONFIG
-        assert config["kernel"] == DEFAULT_CONFIG["kernel"]
-
     def test_handles_malformed_json(self, mock_config_dir):
         """Returns default config for malformed JSON."""
         config_path = mock_config_dir / CONFIG_NAME

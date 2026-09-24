@@ -25,10 +25,8 @@ shared by the widgets and ``ops``.
 There is deliberately **no data-plane endpoint here** (biopb/biopb#628): the
 control plane owns the data plane and is asked for its address at connect time,
 so a configured URL could only be a second, staler answer -- and was how this
-machine's credential reached endpoints the control never named (#626). A legacy
-``tensor_browser`` or ``dask`` section in an existing file is carried by the
-merge and read by nothing: the kernel leaves dask as dask configures itself, and
-a cell builds a dask ``Client`` when it wants a cluster.
+machine's credential reached endpoints the control never named (#626). A section the
+schema does not know is carried by the merge and read by nothing.
 
 Read settings with :func:`get_setting`, which falls back to ``DEFAULT_CONFIG`` so
 call sites never duplicate a default literal.

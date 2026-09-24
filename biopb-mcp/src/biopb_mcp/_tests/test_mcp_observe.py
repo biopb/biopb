@@ -72,9 +72,7 @@ def observe_state(host):
 
 @pytest.fixture
 def client():
-    return TestClient(
-        _observe._build_standalone_app(), base_url="http://127.0.0.1:8766"
-    )
+    return _app_client()
 
 
 # -- happy paths ------------------------------------------------------------

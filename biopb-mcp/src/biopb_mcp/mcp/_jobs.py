@@ -525,12 +525,10 @@ def reset():
 
 # -- viewer wrapping --------------------------------------------------------
 #
-# The agent-facing ``viewer`` is wrapped by a full main-thread marshaling proxy
-# (``_viewer_proxy.make_viewer_proxy``) rather than the old method-by-method
-# wrap, which leaked any returned handle (``viewer.layers``, ``viewer.dims``,
-# ``viewer.layers[0]``) and let off-main mutations on it segfault Qt
-# (biopb/biopb#100). ``run_on_main`` above remains the marshaling primitive the
-# proxy uses, and is still exposed for power users.
+# The agent-facing ``viewer`` is wrapped by a main-thread marshaling proxy
+# (``_viewer_proxy.make_viewer_proxy``) that also wraps every handle it returns
+# (``viewer.layers``, ``viewer.dims``, ``viewer.layers[0]``), so no off-main
+# mutation reaches Qt. ``run_on_main`` above is the primitive it marshals with.
 
 
 def install(ip):

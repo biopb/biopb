@@ -1025,9 +1025,9 @@ def build_app(
         # true in local mode too when an optional token was supplied.
         # `loopback_bound` rides the same public probe for the same reason: the
         # observe page must know whether to offer the chat composer before it
-        # renders one, and a composer whose every POST 404s is worse than none. It discloses nothing a caller cannot already infer --
-        # reaching this endpoint from off-box *is* the evidence that the bind is
-        # public.
+        # renders one, and a composer whose every POST 404s is worse than none.
+        # It discloses nothing a caller cannot already infer -- reaching this
+        # endpoint from off-box *is* the evidence that the bind is public.
         return JSONResponse(
             {
                 "control": "ok",

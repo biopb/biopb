@@ -1,8 +1,9 @@
 """Pin the napari viewer's lazy layer arrays to a single-process scheduler.
 
 A cell can put a distributed cluster behind dask's *default* scheduler (by
-building a dask ``Client``) so its heavy ``da`` computes run in parallel. The viewer, however, scrubs planes **one at a time**
-(serial ``np.asarray(data[slices])``), so computing those slices on the cluster
+building a dask ``Client``) so its heavy ``da`` computes run in parallel. The
+viewer, however, scrubs planes **one at a time** (serial
+``np.asarray(data[slices])``), so computing those slices on the cluster
 buys zero parallelism while scattering each single-chunk fetch across a rotating
 worker — the per-worker chunk cache is an opaque side-effect dask's locality
 scheduler can't see, so same-chunk reads miss (issue #8). They no longer

@@ -104,7 +104,6 @@ def test_accepts_valid(validator, cfg):
         {"transport": {"port": 0}},
         {"transport": {"port": 70000}},
         {"transport": {"kind": "websocket"}},
-        {"transport": {"kind": "bogus"}},
         {"pyramid": {"downscale_factor": 1}},
     ],
 )

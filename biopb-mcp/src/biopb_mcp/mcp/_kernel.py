@@ -621,8 +621,9 @@ class KernelHost:
             # No interrupt. Everything sent here is a short snippet, so
             # overrunning means the main thread is busy with something else --
             # a cell, the agent's or an attached client's, or a task's
-            # marshaled viewer call -- and a SIGINT lands in *that*. The request stays queued and runs once the thread frees;
-            # its late reply is skipped by message id.
+            # marshaled viewer call -- and a SIGINT lands in *that*. The
+            # request stays queued and runs once the thread frees; its late
+            # reply is skipped by message id.
             return _status_result(
                 "timeout",
                 (
