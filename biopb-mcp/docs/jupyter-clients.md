@@ -7,16 +7,13 @@ own tools all talk to it over the Jupyter protocol. Guarantees: **writers take
 turns the way notebook cells do**, **the agent is told of every cell it did not
 run**, and **Stop and shutdown never wait behind a running cell**.
 
-## Why
+## What ipykernel provides, and what is added
 
-A human working in the session wants a real notebook — the same namespace, the
-same `viewer`, the same `client` — not a console bolted onto the observe page.
-ipykernel already provides most of what that takes: it runs execute requests one
-at a time on the main thread in arrival order, whichever client sent them, and a
-client ignores iopub traffic from other sessions (qtconsole's
-`include_other_output` defaults off). So the design leans on the protocol and
-adds only what it lacks: telling the writers apart, recording what each ran,
-and a way to stop or close the kernel that does not queue behind a cell.
+ipykernel runs execute requests one at a time on the main thread in arrival
+order, whichever client sent them, and a client ignores iopub traffic from
+other sessions (qtconsole's `include_other_output` defaults off). On top of that
+the host adds: telling the writers apart, recording what each ran, and stopping
+or closing the kernel without queueing behind a cell.
 
 ## Who runs where
 
@@ -181,8 +178,7 @@ works only on the session's machine; a frozen build reports none. A client
 from any other Jupyter install attaches with the connection file alone.
 
 **JupyterLab cannot attach**: its kernel picker lists only kernels its own
-server started. The fit is a per-session kernelspec naming a provisioner that
-hands over the existing connection and no-ops kill and restart; not built.
+server started.
 
 ## Gotchas
 
@@ -207,11 +203,11 @@ hands over the existing connection and no-ops kill and restart; not built.
 - **A hard-killed session leaves its connection file** in the runtime dir, as
   any Jupyter kernel does. Tests that kill a launcher set `JUPYTER_RUNTIME_DIR`.
 
-## ipykernel 6.31 only
+## ipykernel internals relied on
 
 Every install gets ipykernel 6.31: `napari-console` 0.1.4, which every napari
-requires, caps it below 7. This design leans on 6.31 internals, which a move to
-7 has to re-verify:
+requires, caps it below 7. The kernel class and the records use these 6.31
+internals:
 
 - **`do_execute`'s signature** and `get_parent("shell")` in the kernel class —
   without them Stop cannot find a cell and silent foreign cells go unrecorded.
@@ -222,9 +218,4 @@ requires, caps it below 7. This design leans on 6.31 internals, which a move to
 - **Custom control messages** (`control_msg_types`) and their busy/idle under
   their own parent.
 - **SIGINT handling**: honoured only while a request is serviced
-  (`_jobs._EXTERNAL_INTERRUPT_MSG` leans on it), and where it lands once
-  subshells exist.
-
-ipykernel 7's subshells would let the host's snippets run beside a user's cell
-instead of queueing, but not viewer work, which needs the main thread either
-way.
+  (`_jobs._EXTERNAL_INTERRUPT_MSG` leans on it).

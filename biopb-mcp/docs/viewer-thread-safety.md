@@ -14,15 +14,12 @@ straight through. Agent code off that thread is where it matters: a `run_async`
 task, which runs on a **worker thread** (`_jobs._run`) to leave the main thread
 free, or any thread agent code starts itself. napari/Qt objects are
 **main-thread-only**, so a viewer mutation off that thread that emits a napari
-event into a Qt slot **segfaults the whole kernel** — confirmed by
-`viewer.layers.clear()` off the main thread crashing through
-`QtDims._resize_slice_labels` with no async or GL involved.
+event into a Qt slot **segfaults the whole kernel** (e.g.
+`viewer.layers.clear()` through `QtDims._resize_slice_labels`).
 
-The old `add_*`-only wrap (`wrap_viewer_for_threads`) was **structurally
-leaky**: any call returning a live sub-object (`viewer.layers`,
-`viewer.layers[0]`) handed that thread an unguarded handle whose next
-mutation would crash. The fix wraps the whole reachable graph, not a method
-list.
+A call can return a live sub-object (`viewer.layers`, `viewer.layers[0]`) whose
+next mutation would crash just the same, so the proxy covers the whole
+reachable graph: every handle it returns is itself a proxy.
 
 ## Mechanism
 
@@ -70,21 +67,17 @@ exactly the graph that ships.
 
 ## Gotchas
 
-- **Hand-rolled (~200 LOC), no `wrapt`** — `wrapt.ObjectProxy` forwards
-  synchronously, and this needs to override call/attr/setattr anyway.
 - **Cost:** each marshaled op is a `QMetaObject.invokeMethod` round-trip
   that serializes with rendering — negligible normally, but it bites in hot
   loops (thousands of `set_current_step` calls across a movie's frames).
   Only a `run_async` task pays it: a cell runs on the main thread, where the
   proxy calls straight through, so bulk viewer work belongs in a cell.
-- **Timeout, not deadlock:** `future.result(timeout=_RUN_ON_MAIN_TIMEOUT)`
-  raises `ViewerThreadError` on a blocked main thread rather than hanging.
-  The widened marshal surface widens the deadlock surface vs. the old wrap
-  — watch for agent code holding a lock the main thread needs.
+- **Timeout, not deadlock:** a marshaled call waits for the main thread, up to
+  `_RUN_ON_MAIN_TIMEOUT`, then raises `ViewerThreadError`. A task holding a
+  lock the main thread needs blocks until that timeout.
 - **Only the agent handle is proxied.** `_bootstrap` wires the *real*
   viewer into internal subsystems (they already run on the main thread);
   `add_tensor` (monkeypatched on real) is reached through the proxy like
   any method.
 - **Residual (accepted):** code off the main thread that `import napari` /
-  `current_viewer()` / pokes raw `PyQt6` gets an unwrapped handle and can still crash — only a
-  separate-process viewer would close it.
+  `current_viewer()` / pokes raw `PyQt6` gets an unwrapped handle and can still crash.
