@@ -867,16 +867,14 @@ async def verify_workflow(document: str, title: str = "") -> str:
 
     # The verification is this client's: a stranger is refused an interrupt on
     # it (_scratch.interrupt), as on the session kernel.
-    writer, label = _writers._client_identity()
+    writer, _label = _writers._client_identity()
     foreign_note = _writers._foreign_activity_note(host)
     started = await asyncio.to_thread(
         _scratch.start,
         blocks,
         title,
         host,
-        f"verify workflow: {title}" if title else "verify workflow",
         writer,
-        label,
         _writers._local_origin.get(),
     )
     if started.get("error") == "busy":
@@ -1089,8 +1087,9 @@ async def interrupt_kernel() -> str:
                 "is discarded. Your session is untouched; nothing here needs "
                 "restart_kernel."
             )
-        if data.get("refused") == "not_owner":
-            return _writers._NOT_OWNER_MSG.format(held_by="")
+        refused = _stop_refused_message(data, job_id)
+        if refused is not None:
+            return refused
         return (
             f"Nothing to interrupt in verification {job_id}; it may have "
             "finished already. Poll it to see."
@@ -1102,11 +1101,10 @@ async def interrupt_kernel() -> str:
     job_id = running["job_id"]
     # Decided here, where the records and the claim are: the kernel stops
     # what it is told to.
-    if _writers.claim_holder() not in (None, writer) and writer is not None:
-        return _writers._NOT_OWNER_MSG.format(held_by="")
-    if running.get("origin") != origin:
-        data = {"refused": "foreign_job", "origin": running.get("origin")}
-    else:
+    data = _writers.stop_refusal(
+        _writers.claim_holder(), running.get("origin"), writer, origin
+    )
+    if data is None:
         try:
             data = await asyncio.to_thread(host.interrupt_job, job_id)
         except Exception as exc:  # noqa: BLE001 - the agent reads why
@@ -1116,6 +1114,20 @@ async def interrupt_kernel() -> str:
         return f"{job_id} is no longer running" + (
             f"; {now} is. Poll it before deciding to stop it." if now else "."
         )
+    refused = _stop_refused_message(data, job_id)
+    if refused is not None:
+        return refused
+    if data.get("interrupted"):
+        return (
+            f"Interrupted job {job_id} (a KeyboardInterrupt, at its next "
+            "bytecode). If it does not stop, use restart_kernel."
+        )
+    return "No running job to interrupt."
+
+
+def _stop_refused_message(data, job_id):
+    """The tool's reply to a stop refused by ``_writers.stop_refusal``, or
+    None when *data* is no such refusal."""
     if data.get("refused") == "not_owner":
         return _writers._NOT_OWNER_MSG.format(held_by="")
     if data.get("refused") == "foreign_job":
@@ -1131,12 +1143,7 @@ async def interrupt_kernel() -> str:
             f"yours to stop. Wait for it and poll_job('{job_id}'). ({who} can "
             "stop it.)"
         )
-    if data.get("interrupted"):
-        return (
-            f"Interrupted job {job_id} (a KeyboardInterrupt, at its next "
-            "bytecode). If it does not stop, use restart_kernel."
-        )
-    return "No running job to interrupt."
+    return None
 
 
 @mcp.tool()

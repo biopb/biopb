@@ -7,9 +7,6 @@ surface).
 """
 
 import asyncio
-import logging
-
-logger = logging.getLogger(__name__)
 
 _PNG_DELIM = "<<PNG_B64>>"
 

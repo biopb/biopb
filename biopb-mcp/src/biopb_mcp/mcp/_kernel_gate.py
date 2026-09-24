@@ -110,7 +110,7 @@ class GatedKernel(IPythonKernel):
 
         reply = None
         try:
-            with _jobs.hold_cell(code, header.get("msg_id")):
+            with _jobs.hold_cell(header.get("msg_id")):
                 reply = await run()
         except KeyboardInterrupt:
             # A stop that arrived after the cell's code had returned, while

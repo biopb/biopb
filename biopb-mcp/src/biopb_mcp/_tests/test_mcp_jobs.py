@@ -166,7 +166,7 @@ class TestTasks:
         stub = _StubClient()
         monkeypatch.setattr(Client, "current", classmethod(lambda cls, **kw: stub))
         job = _task(_spin)
-        _jobs._cancel_dask_futures(job)
+        _jobs._cancel_dask_futures()
         passed = calls["futures"]
         assert passed and all(isinstance(f, Future) for f in passed)
         assert {f.key for f in futures_of(passed)} == set(_StubClient.futures)
@@ -247,24 +247,23 @@ class TestHoldCell:
     announced (``test_mcp_job_log``, and the gate's real-kernel tests)."""
 
     def test_nothing_is_announced(self, runner, log):
-        with _jobs.hold_cell("print('hi')", "req-1"):
+        with _jobs.hold_cell("req-1"):
             pass
         assert log.export() == []
 
     def test_output_is_left_to_the_real_stream(self, runner, capsys):
-        with _jobs.hold_cell("print('hi')", "req-1"):
+        with _jobs.hold_cell("req-1"):
             print("hi")
         assert capsys.readouterr().out == "hi\n"
 
     def test_running_for_its_duration(self, runner):
-        with _jobs.hold_cell("import time", "req-1") as job:
-            assert _jobs._running("req-1") is job
+        with _jobs.hold_cell("req-1"):
+            assert _jobs._running("req-1") is not None
         assert _jobs._running("req-1") is None
-        assert job.finished is not None
 
     def test_ended_even_when_the_block_raises(self, runner):
         with pytest.raises(RuntimeError):
-            with _jobs.hold_cell("boom()", "req-1"):
+            with _jobs.hold_cell("req-1"):
                 raise RuntimeError("do_execute itself failed")
         assert _jobs._running("req-1") is None
 
@@ -272,7 +271,7 @@ class TestHoldCell:
         # The host's id for a cell is its own; the kernel knows the request.
         signals = []
         monkeypatch.setattr(_jobs, "_interrupt_main", lambda: signals.append(1))
-        with _jobs.hold_cell("x = 1", "req-7"):
+        with _jobs.hold_cell("req-7"):
             assert _jobs.interrupt("req-8")["refused"] == "not_running"
             assert signals == []
             assert _jobs.interrupt("req-7") == {"interrupted": True}

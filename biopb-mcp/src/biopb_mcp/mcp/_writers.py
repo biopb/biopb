@@ -98,6 +98,26 @@ def claim_holder():
         return _claimed_by
 
 
+def stop_refusal(holder, job_origin, writer, origin):
+    """Why the client *writer*, of *origin*, may not stop a job of
+    *job_origin* on a kernel held by *holder*, as a refusal dict; None when
+    it may.
+
+    One rule for the session's jobs and a verification's: a client that does
+    not hold the kernel is refused (``not_owner``), and so is a job another
+    writer started (``foreign_job``) -- the stop would be silent to them. The
+    person at the machine (``origin="user"``) may stop anything, and a caller
+    with no identity is not checked for the claim.
+    """
+    if origin == "user":
+        return None
+    if writer is not None and holder not in (None, writer):
+        return {"refused": "not_owner"}
+    if job_origin != origin:
+        return {"refused": "foreign_job", "origin": job_origin}
+    return None
+
+
 def restart(host, writer, also_discard=None):
     """Gated restart: replace the kernel and reset the claim, atomically.
 

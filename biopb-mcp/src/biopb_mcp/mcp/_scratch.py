@@ -38,7 +38,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import _notebook, _workflow_doc
+from . import _notebook, _workflow_doc, _writers
 
 logger = logging.getLogger(__name__)
 
@@ -133,8 +133,7 @@ def _record(run, full=False, final=False):
     for code, job_id in zip(run["cells"], run["cell_jobs"], strict=True):
         out = log.outcome(job_id, full) if job_id is not None else None
         if out is None:
-            out = {"error_text": "", "elapsed": 0.0, "stdout_len": 0}
-            out["stdout_head"] = ""
+            out = {"error_text": "", "elapsed": 0.0, "stdout_len": 0, "stdout_head": ""}
             if full:
                 out.update(stdout="", result_text="")
             status = "skipped" if final else "pending"
@@ -191,7 +190,9 @@ def _snapshot(run, output=False):
         "result_text": "",
         "verify": record,
         "origin": run["origin"],
-        "intent": run["intent"],
+        "intent": f"verify workflow: {run['title']}"
+        if run["title"]
+        else "verify workflow",
         "title": run["title"],
         "cell_count": len(run["cells"]),
         "saved_path": run["saved_path"],
@@ -334,9 +335,7 @@ def verified_summary():
     }
 
 
-def start(
-    blocks, title, session_host, intent="", writer=None, writer_label="", origin="mcp"
-):
+def start(blocks, title, session_host, writer=None, origin="mcp"):
     """Take the slot and begin verifying a document in a fresh scratch kernel.
 
     *blocks* is the parsed document (:mod:`_workflow_doc`); its code blocks are
@@ -389,12 +388,12 @@ def start(
                 "running_job_origin": busy.get("origin"),
             }
         _seq += 1
+        cells = _workflow_doc.code_cells(blocks)
         _run = {
             "job_id": f"{_ID_PREFIX}{_seq}",
             "title": title,
             "blocks": list(blocks),
-            "cells": _workflow_doc.code_cells(blocks),
-            "intent": intent,
+            "cells": cells,
             "started": time.monotonic(),
             "finished": None,
             "status": "running",
@@ -408,12 +407,10 @@ def start(
             "log": None,
             # Each cell's id in those records once sent; the last is what a
             # stop names.
-            "cell_jobs": [None] * len(_workflow_doc.code_cells(blocks)),
-            # Set by interrupt: no further cell is sent.
-            "stopping": False,
-            "stop_reason": None,
+            "cell_jobs": [None] * len(cells),
+            # Set by interrupt, to why: no further cell is sent.
+            "stop": None,
             "writer": writer,
-            "writer_label": writer_label,
             "origin": origin,
             "discarded": False,
             "saved_path": None,
@@ -435,6 +432,8 @@ def _finish(run, status, error=None):
         if run["status"] != "running":
             return  # already discarded; the first verdict stands
         run["record"] = _record(run, full=True, final=True)
+        # The record holds all it needs; the dead host's records go with it.
+        run["log"] = None
     # Written *before* the verdict is published, and outside the lock (which is
     # held only to take, read and release -- see where it is declared). The
     # order matters: the status is what every reader waits on, so spooling
@@ -598,12 +597,8 @@ def _run_cells(run, host):
             # this cell to interrupt, or keeps it from being sent.
             if run["discarded"]:
                 return
-            if run["stopping"]:
-                _finish(
-                    run,
-                    "interrupted",
-                    run["stop_reason"] or "The verification was stopped.",
-                )
+            if run["stop"] is not None:
+                _finish(run, "interrupted", run["stop"])
                 return
             job_id = host.jobs.new_id()
             run["cell_jobs"][i] = job_id
@@ -612,7 +607,7 @@ def _run_cells(run, host):
         out = _await_cell(run, host, job_id)
         if out is None:
             return  # discarded
-        if out.get("died"):
+        if out["status"] != "ok" and not host.is_alive():
             _finish(
                 run,
                 "error",
@@ -633,7 +628,7 @@ def _await_cell(run, host, job_id):
     Its record ends on the request's idle, or on its shell reply, which cannot
     be lost (``KernelHost.run_cell``). A death ends it too: this host runs no
     watchdog, and a death is the verdict (an OOM means the workflow does not
-    fit), so it is checked for here.
+    fit), so it is checked for here, and the record ended.
     """
     while True:
         with _lock:
@@ -644,7 +639,7 @@ def _await_cell(run, host, job_id):
             return out
         if not host.is_alive():
             host.jobs.kernel_gone("the scratch kernel died")
-            return {**host.jobs.outcome(job_id), "died": True}
+            return host.jobs.outcome(job_id)
         time.sleep(0.1)
 
 
@@ -676,26 +671,19 @@ def interrupt(reason=None, origin="user", writer=None):
     running is interrupted, and if the run has not ended within
     :data:`_INTERRUPT_GRACE` seconds the process goes.
 
-    **Who may stop it** is the rule the session kernel's stop follows: a client
-    other than the one that asked for it gets ``not_owner``, a writer of
-    another origin ``foreign_job``, and ``origin="user"`` is exempt, so the
-    person at the machine can stop a verification they did not start.
+    **Who may stop it** is the rule the session kernel's stop follows
+    (``_writers.stop_refusal``), with the client that asked for it as the
+    holder: the person at the machine can stop a verification they did not
+    start.
     """
     with _lock:
         if _run is None or _run["status"] != "running":
             return None
         run, host = _run, _run["host"]
-        if origin != "user":
-            if writer is not None and run["writer"] not in (None, writer):
-                return {"refused": "not_owner", "job_id": run["job_id"]}
-            if run["origin"] != origin:
-                return {
-                    "refused": "foreign_job",
-                    "origin": run["origin"],
-                    "job_id": run["job_id"],
-                }
-        run["stopping"] = True
-        run["stop_reason"] = reason
+        refusal = _writers.stop_refusal(run["writer"], run["origin"], writer, origin)
+        if refusal is not None:
+            return {**refusal, "job_id": run["job_id"]}
+        run["stop"] = reason or "The verification was stopped."
         current = _current_cell(run)
     if host is None:
         # Still bringing the kernel up: stopping means discarding the attempt.

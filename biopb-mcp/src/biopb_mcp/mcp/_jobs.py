@@ -84,8 +84,19 @@ KERNEL_HANDLE_NAMES = frozenset(
 )
 
 
+class _Cell:
+    """A cell held for Stop (:func:`hold_cell`): all the kernel needs of it is
+    whether it still runs. How it ended is the host's, read from the protocol."""
+
+    __slots__ = ("status",)
+    thread = None  # on the main thread
+
+    def __init__(self):
+        self.status = "running"
+
+
 class _Job:
-    """A running cell (:func:`hold_cell`) or task (:func:`run_async`)."""
+    """A task (:func:`run_async`)."""
 
     __slots__ = (
         "job_id",
@@ -102,14 +113,12 @@ class _Job:
     )
 
     def __init__(self, job_id, code="", request=None):
-        # A task's id; None for a cell, which the host names.
         self.job_id = job_id
-        # The execute request this job's output is published under: a cell's
-        # own, or the cell's that started a task.
+        # The execute request the task's output is published under: the one
+        # of the cell that started it.
         self.request = request
         self.code = code
-        # running | ok | error | interrupted; a cell's ends as "ended", its
-        # outcome being the host's to read from the protocol
+        # running | ok | error | interrupted
         self.status = "running"
         self.error_text = ""
         # A task's return value's repr, announced with the end.
@@ -120,7 +129,6 @@ class _Job:
         # Why a person stopped it (the observe page's Stop), prefixed to the
         # error so the agent sees the stop was not its code failing.
         self.cancel_reason = None
-        # A task's worker thread; None for a cell, which runs on the main one.
         self.thread = None
         self.started = time.monotonic()
         self.finished = None
@@ -350,8 +358,8 @@ def _prune():
 
 
 @contextlib.contextmanager
-def hold_cell(code, request):
-    """Hold a cell running on the main thread as a job, for its duration.
+def hold_cell(request):
+    """Hold a cell running on the main thread, for its duration.
 
     For ``_kernel_gate``, around every non-empty execute request, whoever sent
     it: nothing is announced -- the host records cells from the protocol --
@@ -364,17 +372,15 @@ def hold_cell(code, request):
     is dropped: the cell it was aimed at is already over.
     """
     with _lock:
-        job = _Job(None, code, request=request)
-        _jobs[request] = job
+        cell = _jobs[request] = _Cell()
         _prune()
     try:
-        yield job
+        yield
     finally:
         while True:
             try:
                 with _lock:
-                    job.finished = time.monotonic()
-                    job.status = "ended"
+                    cell.status = "ended"
                 break
             except KeyboardInterrupt:
                 continue
@@ -433,13 +439,8 @@ def run_async(fn, *args, **kwargs):
     return job.job_id
 
 
-def _cancel_dask_futures(job):
-    """Stop *job*'s in-flight dask work.
-
-    Takes the job rather than its id: the one caller (:func:`interrupt`) has
-    already resolved it and established that it is running, and set the reason
-    its finalizer reports.
-    """
+def _cancel_dask_futures():
+    """Stop the in-flight dask work: one job at a time, so all of it."""
     # Distributed dask: cancel in-flight futures.  This is what actually stops a
     # blocking ``.compute()`` -- its tasks ARE registered in ``dc.futures`` for
     # the duration of the internal ``gather``, so cancelling them makes that
@@ -521,17 +522,17 @@ def interrupt(key, reason=None):
         job = _running(key)
         if job is None:
             return {"interrupted": False, "refused": "not_running"}
-        job.interrupted = True  # finalize as "interrupted"
-        if reason:
-            # Before the interrupt, so the job's finalizer sees it.
-            job.cancel_reason = reason
         if job.thread is not None:
+            job.interrupted = True  # finalize as "interrupted"
+            # Before the interrupt, so the task's finalizer sees it.
+            job.cancel_reason = reason or job.cancel_reason
             raised = bool(_raise_in_thread(job.thread.ident, KeyboardInterrupt))
         else:
+            # A cell's reason is the host's to attach (note_cancel).
             _interrupt_main()
             raised = True
     # Off the lock: a distributed cancel is a round trip to the scheduler.
-    _cancel_dask_futures(job)
+    _cancel_dask_futures()
     return {"interrupted": raised}
 
 

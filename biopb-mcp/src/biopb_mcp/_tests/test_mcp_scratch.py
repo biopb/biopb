@@ -446,7 +446,7 @@ class TestInterrupting:
         host = _scratch_host(on_start=on_start, hold=hold, interrupt_lands=lands)
         _scratch.set_host_factory(lambda: host)
         started = _scratch.start(
-            _blocks(["a = 2"]), "wf", _session_host(), writer=writer, writer_label="A"
+            _blocks(["a = 2"]), "wf", _session_host(), writer=writer
         )
         return started["job_id"], host
 
@@ -505,8 +505,7 @@ class TestInterrupting:
         )["job_id"]
         started.wait(5.0)
         with _scratch._lock:
-            _scratch._run["stopping"] = True
-            _scratch._run["stop_reason"] = "stopped between cells"
+            _scratch._run["stop"] = "stopped between cells"
         snap = _settle(job_id)
         assert snap["status"] == "interrupted"
         assert "between cells" in snap["error_text"]

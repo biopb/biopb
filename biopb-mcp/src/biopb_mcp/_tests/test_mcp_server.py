@@ -460,13 +460,12 @@ class TestVerifyWorkflow:
         monkeypatch.setattr(
             _server._scratch,
             "start",
-            lambda blocks, title, host, intent="", writer=None, label="", origin="mcp": (
+            lambda blocks, title, host, writer=None, origin="mcp": (
                 seen.update(
                     blocks=blocks,
                     title=title,
                     host=host,
                     writer=writer,
-                    label=label,
                     origin=origin,
                 )
                 or {"job_id": "verify-1"}
@@ -489,9 +488,9 @@ class TestVerifyWorkflow:
         # The title is read from the document's own heading, not asked for twice.
         assert seen["title"] == "Count foci"
         assert seen["host"] is server_with_host
-        # The run is claimed for the client that asked for it, so the scratch
-        # kernel's own one-agent check can refuse a stranger's interrupt.
-        assert (seen["writer"], seen["label"]) == ("agent-A", "A")
+        # The run is the client's that asked for it, so a stranger is refused
+        # an interrupt on it.
+        assert seen["writer"] == "agent-A"
 
     def test_a_clean_run_reports_the_verdict_and_where_to_save(
         self, server_with_host, monkeypatch
