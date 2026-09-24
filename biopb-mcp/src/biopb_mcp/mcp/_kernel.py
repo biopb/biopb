@@ -21,6 +21,7 @@ from typing import List, Optional
 
 from biopb._lifecycle import deathwatch as _deathwatch, winjob as _winjob
 
+from ._job_log import JobLog
 from ._kernel_io import KernelChannels, KernelGone
 
 logger = logging.getLogger(__name__)
@@ -48,6 +49,11 @@ ENV_SCRATCH = "BIOPB_SCRATCH_KERNEL"
 # client's. The literal is mirrored in _kernel_gate.ENV_HOST_SESSION (kept in
 # sync by this comment).
 ENV_HOST_SESSION = "BIOPB_HOST_SESSION"
+
+# Env var carrying the number a new kernel's job ids continue from, so the ids
+# in this host's records never repeat across restarts. The literal is mirrored
+# in _jobs.ENV_JOB_SEQ (kept in sync by this comment).
+ENV_JOB_SEQ = "BIOPB_JOB_SEQ"
 
 # Windows window-close fallback (no inherited fd there): the launcher polls this
 # probe -- the zero-arg _viewer_window_alive() the bootstrap injects into the
@@ -211,6 +217,9 @@ class KernelHost:
         self._kernel_stderr = kernel_stderr
         self._km = None
         self._io = None  # KernelChannels, one per launched kernel
+        # The job records, built from what each kernel publishes on iopub. One
+        # per host rather than per kernel, so they outlive a restart.
+        self.jobs = JobLog()
         # Set once per _launch(), alongside self._km: the connection file (and
         # so the attach command) is fixed for the kernel's lifetime, and
         # health() is polled every few seconds, so it's cached rather than
@@ -400,6 +409,7 @@ class KernelHost:
         # its host before anything can connect.
         env = dict(env)
         env[ENV_HOST_SESSION] = self._km.session.session
+        env[ENV_JOB_SEQ] = str(self.jobs.next_seq())
         try:
             try:
                 self._km.start_kernel(
@@ -427,7 +437,7 @@ class KernelHost:
                             pass
             self._pgid = self._capture_pgid()
             self._assign_kernel_to_job()
-            self._io = KernelChannels(self._km)
+            self._io = KernelChannels(self._km, on_iopub=self.jobs.on_iopub)
             self._io.start(self._startup_timeout, self._km.is_alive)
             self._start_window_watch()
         except Exception:
@@ -501,7 +511,12 @@ class KernelHost:
 
     # -- execution ------------------------------------------------------
 
-    def execute(self, code: str, timeout: Optional[float] = None) -> dict:
+    def execute(
+        self,
+        code: str,
+        timeout: Optional[float] = None,
+        user_expressions: Optional[dict] = None,
+    ) -> dict:
         """Run *code* in the kernel and return a result dict.
 
         Returns ``{stdout, result_text, error_text, status}`` where ``status``
@@ -521,7 +536,7 @@ class KernelHost:
         """
         if not self._ready.is_set():
             return self._not_ready_result()
-        return self._execute_internal(code, timeout)
+        return self._execute_internal(code, timeout, user_expressions)
 
     def _not_ready_result(self) -> dict:
         """Structured status for a tool call that landed while the kernel is not
@@ -567,11 +582,18 @@ class KernelHost:
             "server_status until it reports ready." + suffix,
         )
 
-    def _execute_internal(self, code: str, timeout: Optional[float] = None) -> dict:
+    def _execute_internal(
+        self,
+        code: str,
+        timeout: Optional[float] = None,
+        user_expressions: Optional[dict] = None,
+    ) -> dict:
         """Execution bypassing the readiness wait.
 
         Used by the startup health probe and bootstrap-error fetch, which run
         *before* the kernel is marked ready (so they must not wait on it).
+        With *user_expressions*, the result also carries their evaluated values
+        under ``user_expressions``.
         """
         if timeout is None:
             timeout = self._execute_timeout
@@ -584,17 +606,23 @@ class KernelHost:
         if not self.is_alive():
             return _status_result("error", "Kernel is not running.")
 
-        res = self._run_once(io, code, timeout)
+        res = self._run_once(io, code, timeout, user_expressions)
         # A preceding interrupt/error aborts requests already queued at the
         # kernel; "aborted" means our code never ran, so retry once.
         if res["status"] == "aborted":
             time.sleep(0.2)
-            res = self._run_once(io, code, timeout)
+            res = self._run_once(io, code, timeout, user_expressions)
         return res
 
-    def _run_once(self, io: KernelChannels, code: str, timeout: float) -> dict:
+    def _run_once(
+        self,
+        io: KernelChannels,
+        code: str,
+        timeout: float,
+        user_expressions: Optional[dict] = None,
+    ) -> dict:
         try:
-            call = io.execute(code, timeout)
+            call = io.execute(code, timeout, user_expressions)
         except KernelGone:
             return _status_result(
                 "error", "The kernel was shut down or restarted during this call."
@@ -619,12 +647,15 @@ class KernelHost:
                 ),
             )
 
-        return {
+        res = {
             "stdout": "".join(call.stdout),
             "result_text": "".join(call.results),
             "error_text": "".join(_strip_ansi("\n".join(tb)) for tb in call.errors),
             "status": call.reply.get("status", "unknown"),
         }
+        if user_expressions:
+            res["user_expressions"] = call.reply.get("user_expressions") or {}
+        return res
 
     def interrupt(self):
         """Send SIGINT to the kernel. Takes no lock, so it can fire during a
@@ -712,6 +743,9 @@ class KernelHost:
                 self._io.close()
         except Exception:
             logger.debug("stop_channels failed", exc_info=True)
+        # A job still running dies with its kernel, which will never announce
+        # its end.
+        self.jobs.kernel_gone(self._teardown_reason or "")
 
         # Group-kill via the pgid captured at launch — not os.getpgid(pid) now:
         # the kernel may already be dead (raising), and a recycled pid could

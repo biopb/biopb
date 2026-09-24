@@ -1,6 +1,7 @@
 """Shared pytest fixtures for biopb-mcp tests."""
 
 import asyncio
+import json
 import pathlib
 
 import pytest
@@ -17,6 +18,63 @@ def call_tool(fn, *args, **kwargs):
     ``asyncio.run`` convention the chat tests already use.
     """
     return asyncio.run(fn(*args, **kwargs))
+
+
+def rpc_reply(r, window_alive=True):
+    """A kernel ``execute`` result carrying a job call's return value *r*, the
+    way ``_kernel_rpc._run_job_call`` reads it back: a ``user_expression``
+    holding ``{"r": r, "w": <viewer window alive?>}`` as JSON."""
+    payload = json.dumps({"r": r, "w": window_alive})
+    return {
+        "stdout": "",
+        "result_text": "",
+        "error_text": "",
+        "status": "ok",
+        "user_expressions": {
+            "rpc": {"status": "ok", "data": {"text/plain": repr(payload)}}
+        },
+    }
+
+
+class ScriptedJobs:
+    """``host.jobs`` for a mock host: the host's job records, scripted.
+
+    Polls are answered from *polls* in order, the last one repeating (none:
+    every job is unknown); the job list and the export are *summary* and
+    *export*. The foreign-activity digest is *digest*, less what
+    has been acked; acks and the point of view each read was made from are
+    recorded for the test to assert on.
+    """
+
+    def __init__(self, polls=(), digest=(), summary=(), export=()):
+        self._polls = list(polls)
+        self._summary = list(summary)
+        self._export = list(export)
+        self.polled = 0
+        self._digest = list(digest)
+        self.acked = []
+        self.digest_origins = []
+
+    def poll(self, job_id):
+        self.polled += 1
+        if not self._polls:
+            return {"job_id": job_id, "status": "unknown", "error_text": ""}
+        snap = self._polls.pop(0) if len(self._polls) > 1 else self._polls[0]
+        return {"job_id": job_id, **snap}
+
+    def foreign_digest(self, for_origin):
+        self.digest_origins.append(for_origin)
+        return [d for d in self._digest if d["job_id"] not in self.acked]
+
+    def ack_foreign_digest(self, job_ids):
+        self.acked.extend(job_ids)
+        return len(job_ids)
+
+    def summary(self):
+        return list(self._summary)
+
+    def export(self):
+        return list(self._export)
 
 
 def pytest_addoption(parser):

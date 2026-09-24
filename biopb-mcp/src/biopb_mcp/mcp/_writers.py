@@ -8,8 +8,9 @@ clients writing to a single namespace and viewer:
   the reason spelled out on :data:`_claimed_by`.
 * **Who else did?** A person can run cells from an attached Jupyter client, and
   the chat loop from its own turn, leaving an agent's picture of the namespace
-  stale with nothing in its own results to say so. The foreign-activity digest is that
-  notice, and its read/ack split is what makes it deferred-never-dropped.
+  stale with nothing in its own results to say so. The foreign-activity digest
+  is that notice, read from the host's job records (``_job_log``), and its
+  read/ack split is what makes it deferred-never-dropped.
 
 Both are policy about co-writers, so they are one module: a caller asking either
 question is asking about the same relation, and "foreign" is defined by
@@ -21,7 +22,6 @@ import logging
 import threading
 
 from . import _app
-from ._kernel_rpc import _run_job_call
 
 logger = logging.getLogger(__name__)
 
@@ -251,44 +251,35 @@ def _foreign_digest(host) -> list:
     or ``[]``.
 
     "Another writer" is relative to :data:`_local_origin`, so the chat loop is
-    not handed its own cells.
-
-    A pure read — see :func:`_ack_foreign_digest` for why the ack is a second call.
-    Auxiliary, like the window-liveness probe: a kernel that answers with
-    anything but the expected list yields no digest rather than breaking the
-    result the agent actually asked for.
+    not handed its own cells. A pure read -- see :func:`_ack_foreign_digest`
+    for why the ack is a second call.
     """
-    digest, _res, _w = _run_job_call(host, "foreign_digest", _local_origin.get())
-    if not digest or not isinstance(digest, list):
-        return []
-    if not all(isinstance(d, dict) and "job_id" in d for d in digest):
-        return []
-    return digest
+    return host.jobs.foreign_digest(_local_origin.get())
 
 
 def _ack_foreign_digest(host, digest, writer=None) -> None:
     """Retire the *terminal* entries of *digest*, once the note carrying them is
     on its way back to the agent.
 
-    Split from the read because acking inside it consumed notices that were
-    never delivered: the host sends the request before it starts its timeout
-    clock, so a probe that times out is still queued at the kernel
-    and runs when the main thread frees up — setting the flag for a note nobody
-    received. Acking only after this process has parsed a reply keeps the
-    guarantee that a notice is deferred, never dropped.
+    Split from the read so a notice is retired only by the call that delivers
+    it: a result that never reaches the agent must leave it pending.
 
-    Running entries are excluded here rather than in the kernel: they were
-    reported as ``running``, which is not the final status the agent is promised,
-    so they must stay pending even if they have finished since.
+    Running entries are excluded: they were reported as ``running``, which is
+    not the final status the agent is promised, so they must stay pending even
+    if they have finished since.
 
-    *writer* is the asking client, passed through so the kernel can refuse an ack
-    from a client that does not hold it: a second client's ``poll_job`` may
-    *read* the digest, but discharging a notice the holder has not received
-    would defeat the exactly-once promise this split exists to keep.
+    **Only the kernel's holder can discharge a notice.** Reading the digest is
+    open to anyone -- a second client watching the session is welcome to see
+    that a cell ran -- but a bystander's ``poll_job`` acking it would retire a
+    notice the holder never received. Decided on the mirrored claim; a caller
+    with no identity is the in-process case and acks.
     """
+    with _claim_lock:
+        if writer is not None and _claimed_by not in (None, writer):
+            return
     ids = [d["job_id"] for d in digest if d.get("status") != "running"]
     if ids:
-        _run_job_call(host, "ack_foreign_digest", ids, writer=writer)
+        host.jobs.ack_foreign_digest(ids)
 
 
 def _render_foreign_note(digest) -> str:

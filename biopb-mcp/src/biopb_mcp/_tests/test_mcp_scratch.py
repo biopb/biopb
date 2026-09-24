@@ -17,17 +17,12 @@ from unittest.mock import MagicMock
 import pytest
 
 from biopb_mcp import _config
-from biopb_mcp._tests.conftest import call_tool as _tool
-from biopb_mcp.mcp import _app, _kernel_rpc, _scratch, _server, _writers
+from biopb_mcp._tests.conftest import call_tool as _tool, rpc_reply
+from biopb_mcp.mcp import _app, _scratch, _server, _writers
 
 
 def _envelope(result):
-    return {
-        "stdout": _kernel_rpc._JOB_DELIM + json.dumps({"r": result, "w": True}) + "\n",
-        "result_text": "",
-        "error_text": "",
-        "status": "ok",
-    }
+    return rpc_reply(result)
 
 
 def _cells_record(status="ok", title="wf"):

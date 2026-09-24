@@ -33,9 +33,10 @@ the file.
 - **A client ignores the host's traffic.** qtconsole and Lab drop iopub
   messages whose parent session is not their own (qtconsole's
   `include_other_output` defaults off); only the busy/idle indicator reacts.
-- **A job's prints never reach iopub.** `_JobStream` diverts a worker thread's
-  output into the job's buffer, so a client sees the agent's code only if it
-  opts into other-output, and never its output.
+- **A job's prints go to iopub under the host's request.** ipykernel attributes
+  a worker thread's output to the request that started the thread, the host's
+  submit, so a client sees the agent's code and output only if it opts into
+  other-output.
 
 The host adds no ordering of its own. Its one threaded client routes every
 shell reply and iopub message to the call it answers (`mcp/_kernel_io.py`), so
@@ -112,14 +113,29 @@ observe page is the tool for it.
 
 ### Record
 
-A foreign cell that runs is wrapped in a `_Job(origin="user")` for its
-duration: source from the request, status from the reply, output **teed** from
-the main-thread stream — `_JobStream` gains a tee mode for the main thread,
-writing both to the record and to the real ipykernel stream, so the notebook
-still sees its own output. `foreign_digest`, `ack_foreign_digest`, the observe
-history and the notebook export read `origin="user"` jobs already; none of
-them change. Rich output (`display_data`, `execute_result`) is not recorded:
-the record says what ran and whether it failed, not what it drew.
+The records live in the host (`mcp/_job_log.py`), built from iopub. The kernel
+announces each job's start and end as a `biopb_job` message
+(`_jobs._publish`) naming the request its output is published under; every
+`stream`, `execute_result` and `error` under that request is the job's. A
+foreign cell that runs is announced as `origin="user"` by the gate
+(`_jobs.record_inline`): source from the request, status from the reply, its
+output going to its own client as usual and filed by the host from the same
+iopub. An agent's job is announced by `submit`, its worker thread's prints
+attributed to the submit request.
+
+The announcement has no parent header: a client drops iopub from other
+sessions, and an unknown message type under its own request would be one more
+thing for it to ignore. Streams are flushed before the end is announced, so a
+job's output is complete when its record says it ended. iopub is a PUB socket
+and can drop under pressure; a start while another record is still running
+ends that one as "end not recorded", since only one job runs at a time.
+
+Poll, the observe list and detail, the notebook export and the foreign-activity
+digest are reads of the host's memory, never a kernel round trip. Records
+outlive a kernel restart: one still running when its kernel goes is ended as
+interrupted, and the next kernel's job ids continue from the host's
+(`BIOPB_JOB_SEQ`). Display output (`display_data`) is not recorded: the record
+says what ran and whether it failed, not what it drew.
 
 ### Finding the kernel
 
@@ -156,8 +172,8 @@ A leftover `observe.console_enabled` in a config file is ignored.
 ### Attribution: `origin` on the job
 
 `_Job` carries `origin` (`"mcp"` | `"user"` | `"chat"`, see
-[chat-engines.md](chat-engines.md)), set when the record is made and carried
-through `snapshot()`, `jobs_summary()` and `export()`. A foreign client's cell
+[chat-engines.md](chat-engines.md)), set when the job starts and carried
+into the host's record, its snapshot, the job list and the export. A foreign client's cell
 is `"user"`.
 
 The writer count is two by construction: the first non-user submitter claims
@@ -182,11 +198,11 @@ note at return time:
 Read them with poll_job('job-7'). Variables and layers may have changed.]
 ```
 
-Each job carries a `seen_by_agent` flag, read by `foreign_digest()` and retired
-only by a later `ack_foreign_digest(ids)` the server makes after rendering the
-note — reading never consumes, since a probe that times out can still run at the
-kernel later. Only ids reported **terminal** are acked, without re-reading
-status. The agent is told that something changed and where to look, never what
+Each host record carries a `seen_by_agent` flag, read by `foreign_digest()` and
+retired only by a later `ack_foreign_digest(ids)` once the note is rendered into
+a result the agent will receive — reading never consumes. Only the kernel's
+holder can ack, and only ids reported **terminal** are acked, without
+re-reading status. The agent is told that something changed and where to look, never what
 changed. `_MAX_RETAINED_JOBS` never evicts an unseen user job.
 
 ## Gotchas
@@ -242,14 +258,13 @@ whether an interrupt reaches a subshell is unverified.
 1. *Transport (done).* A threaded client routes every reply and iopub message
    by parent message id (`mcp/_kernel_io.py`). Round trips overlap instead of
    queueing on a host lock, and "busy" is the kernel's own published status.
-2. *Records.* The kernel announces a job's start and end on iopub, under the
-   request that started it, and the host keeps the records. With the
-   `_JobStream` diversion removed, ipykernel attributes a worker thread's prints
-   to that request, so a job's output streams in live and `poll_job`, the
-   observe list, export and the foreign digest become reads of host memory: the
-   observe page's polling stops sending execute requests into the kernel.
-   Records survive a kernel restart and can hold rich outputs, so the in-kernel
-   tee comes out again.
+2. *Records (done).* The kernel announces a job's start and end on iopub, and
+   the host keeps the records (see Record). A job's output streams in live,
+   the observe page's polling no longer sends execute requests into the
+   kernel, records survive a restart, and the in-kernel tee is gone. Job calls
+   that still enter the kernel (submit, interrupt) return their result as a
+   `user_expression` rather than a printed line, which a job's output under
+   the same request could split.
 3. *Verification.* Scratch runs move onto the same records, with per-cell
    boundary events, and the in-kernel output capture is deleted.
 
@@ -264,8 +279,8 @@ can refuse a request before it runs.
    Tests in `_tests/test_mcp_kernel.py` with a second `jupyter_client` attached
    to the real kernel: refused while a job runs, recorded when idle, silent code
    gated, an empty request passing, a poll during a refusal.
-2. `_jobs.py`: `_JobStream` tee for the main thread; a `record_inline`
-   context the gate wraps a foreign cell in. Tests in `test_mcp_jobs.py`.
+2. `_jobs.py`: a `record_inline` context the gate wraps a foreign cell in.
+   Tests in `test_mcp_jobs.py`. (The records later moved to the host, v2.)
 3. `health()` / `server_status` / observe status: the connection file and the
    attach command.
 4. Retire the console (own PR): routes, path root, control gate, page, doc.

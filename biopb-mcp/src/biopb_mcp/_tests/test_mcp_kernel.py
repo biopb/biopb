@@ -1191,11 +1191,17 @@ class TestJupyterClientGate:
 
     @staticmethod
     def _jobs(host):
-        import ast
-
-        res = host.execute("print(repr(_jobs.export()))")
-        assert res["status"] == "ok", res
-        return ast.literal_eval(res["stdout"].strip())
+        """The host's records, once every foreign cell's end has arrived: it
+        travels on iopub, which can trail the reply the client already has."""
+        _wait_until(
+            lambda: all(
+                j["status"] != "running"
+                for j in host.jobs.export()
+                if j["origin"] == "user"
+            ),
+            timeout=5.0,
+        )
+        return host.jobs.export()
 
     @staticmethod
     def _stop_job(host):
@@ -1238,7 +1244,7 @@ class TestJupyterClientGate:
     def test_an_idle_foreign_cell_runs_and_is_recorded(self, gated, foreign):
         reply, msgs = self._run(foreign, "x = 41 + 1\nprint('hello')")
         assert reply["status"] == "ok"
-        # The client still sees its own output (the tee).
+        # The client still sees its own output.
         assert any(
             m["msg_type"] == "stream" and "hello" in m["content"]["text"] for m in msgs
         )
@@ -1323,8 +1329,8 @@ class TestJupyterClientGate:
         statuses = []
         run_once = gated._run_once
 
-        def spy(io, code, timeout):
-            res = run_once(io, code, timeout)
+        def spy(*args):
+            res = run_once(*args)
             statuses.append(res["status"])
             return res
 
@@ -1349,8 +1355,69 @@ class TestJupyterClientGate:
         # A host call queued behind a client's long cell used to SIGINT it.
         msg_id = foreign.execute("import time\nfor _ in range(40): time.sleep(0.05)")
         time.sleep(0.5)
-        res = gated.execute("print(_jobs.jobs_view())", timeout=0.5)
+        res = gated.execute("print(1)", timeout=0.5)
         assert res["status"] == "timeout"
         reply = foreign.get_shell_msg(timeout=30)
         assert reply["parent_header"]["msg_id"] == msg_id
         assert reply["content"]["status"] == "ok"
+
+
+class TestHostRecords:
+    """The job records the host builds from iopub (``_job_log``)."""
+
+    @pytest.fixture
+    def host(self):
+        host = KernelHost(
+            extra_arguments=_GATED_ARGS,
+            health_probe_code="print('_jobs' in dir())",
+            parent_death_pipe=False,
+            window_close_pipe=False,
+            watchdog_interval=0,
+        )
+        host.start()
+        yield host
+        host.shutdown()
+
+    @staticmethod
+    def _submit(host, code):
+        from biopb_mcp.mcp import _kernel_rpc
+
+        sub, res, _w = _kernel_rpc._run_job_call(host, "submit", code, timeout=15.0)
+        assert sub is not None, res
+        return sub["job_id"]
+
+    def test_a_jobs_output_streams_in_while_it_runs(self, host):
+        jid = self._submit(
+            host,
+            "import time\nprint('first', flush=True)\ntime.sleep(1.5)\nprint('second')\n6 * 7",
+        )
+        assert _wait_until(lambda: "first" in host.jobs.poll(jid)["stdout"], timeout=5)
+        assert host.jobs.poll(jid)["status"] == "running"
+        assert _wait_until(lambda: host.jobs.poll(jid)["status"] == "ok", timeout=10)
+        snap = host.jobs.poll(jid)
+        assert snap["stdout"] == "first\nsecond\n"
+        assert snap["result_text"] == "42"
+
+    def test_the_submit_reply_is_not_the_jobs_output(self, host):
+        # The payload rides a user_expression, so a job printing at once cannot
+        # split it, and nothing of the call lands in the job's record.
+        jid = self._submit(host, "print('x', end='')")
+        assert _wait_until(lambda: host.jobs.poll(jid)["status"] == "ok", timeout=5)
+        assert host.jobs.poll(jid)["stdout"] == "x"
+
+    def test_a_failing_job(self, host):
+        jid = self._submit(host, "1 / 0")
+        assert _wait_until(lambda: host.jobs.poll(jid)["status"] == "error", timeout=5)
+        assert "ZeroDivisionError" in host.jobs.poll(jid)["error_text"]
+
+    def test_records_survive_a_restart_and_ids_continue(self, host):
+        done = self._submit(host, "print('kept')")
+        assert _wait_until(lambda: host.jobs.poll(done)["status"] == "ok", timeout=5)
+        running = self._submit(host, "import time\ntime.sleep(30)")
+        host.restart()
+        assert host.jobs.poll(done)["stdout"] == "kept\n"
+        snap = host.jobs.poll(running)
+        assert snap["status"] == "interrupted"
+        assert "kernel stopped" in snap["error_text"]
+        after = self._submit(host, "1")
+        assert int(after.split("-")[1]) > int(running.split("-")[1])

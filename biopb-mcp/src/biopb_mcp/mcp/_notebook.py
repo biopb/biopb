@@ -12,9 +12,9 @@ the result. Prose that is not the run's is not ours to write.
 The two answer different questions — "what happened here?" and "what should I
 run again?" — and neither substitutes for the other, so both ship.
 
-Runs in the *MCP server process* (no kernel/Qt imports): the observe UI rounds a
-:func:`biopb_mcp.mcp._jobs.export` read off the kernel main thread, then hands
-the list of job snapshots here to build an nbformat-v4 document.
+Runs in the *MCP server process* (no kernel/Qt imports): the observe UI reads
+the host's job records (``_job_log.JobLog.export``) and hands the list of job
+snapshots here to build an nbformat-v4 document.
 
 The notebook is an **audit record first, a runnable script second.** The cells
 faithfully reproduce, in order, every job's source and captured output. Re-running
@@ -306,8 +306,8 @@ _INTRO = (
 def build_notebook(jobs):
     """Build an nbformat-v4 notebook dict from a list of job snapshots.
 
-    *jobs* is the oldest-first list returned by ``_jobs.export()`` (each a
-    ``_Job.snapshot()`` dict). The result is a plain dict ready to
+    *jobs* is the oldest-first list returned by ``JobLog.export()`` (each a
+    job snapshot dict). The result is a plain dict ready to
     ``json.dumps`` into a ``.ipynb`` file.
     """
     jobs = jobs or []

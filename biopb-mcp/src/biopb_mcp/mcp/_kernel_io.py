@@ -13,14 +13,19 @@ Here nothing is discarded that someone is waiting for, so each call only waits
 for its own reply: the kernel still runs requests one at a time, in arrival
 order.
 
-Messages whose parent is no request of ours -- another Jupyter client's cells,
-a late reply to a call that already timed out -- are dropped, except that every
-``status`` message updates :attr:`KernelChannels.execution_state`, the kernel's
-own busy/idle.
+Every iopub message also goes to the *on_iopub* listener, whoever it answers:
+the host's job records (``_job_log``) are built from it. Otherwise a message
+whose parent is no call of ours -- another Jupyter client's cell, a late reply
+to a call that already timed out -- is dropped, except that every ``status``
+message updates :attr:`KernelChannels.execution_state`, the kernel's own
+busy/idle.
 """
 
+import logging
 import threading
 import time
+
+logger = logging.getLogger(__name__)
 
 # How long a call waits for its request's iopub ``idle`` once the reply is in.
 # The reply travels on the shell socket and the output on iopub, so the reply
@@ -58,7 +63,7 @@ class _Call:
 class KernelChannels:
     """Shell and iopub to one kernel, shared by every caller thread."""
 
-    def __init__(self, km):
+    def __init__(self, km, on_iopub=None):
         from jupyter_client.threaded import ThreadedKernelClient
 
         # km.client() would build whatever km.client_class names; built here so
@@ -69,6 +74,7 @@ class KernelChannels:
             connection_file=km.connection_file,
             **km.get_connection_info(session=True),
         )
+        self._on_iopub_listener = on_iopub
         self._calls = {}  # msg_id -> _Call
         self._calls_lock = threading.Lock()
         self._closed = False
@@ -106,8 +112,11 @@ class KernelChannels:
             if time.monotonic() > deadline:
                 raise RuntimeError(f"Kernel didn't respond in {timeout:g} seconds")
 
-    def execute(self, code, timeout):
+    def execute(self, code, timeout, user_expressions=None):
         """Run *code*; return its :class:`_Call` once its reply and output are in.
+
+        *user_expressions* are evaluated after the code and come back in the
+        reply (``call.reply["user_expressions"]``), not on iopub.
 
         Raises ``TimeoutError`` when no reply comes within *timeout*, and
         :class:`KernelGone` when the connection closes first. A request that
@@ -120,7 +129,7 @@ class KernelChannels:
                 "code": code,
                 "silent": False,
                 "store_history": False,
-                "user_expressions": {},
+                "user_expressions": user_expressions or {},
                 "allow_stdin": False,
                 "stop_on_error": True,
             },
@@ -177,6 +186,13 @@ class KernelChannels:
     def _on_iopub(self, msg):
         msg_type = msg["header"]["msg_type"]
         content = msg["content"]
+        # Every message, before the filters below: the job records want
+        # traffic no call is waiting for, the kernel's announcements included.
+        if self._on_iopub_listener is not None:
+            try:
+                self._on_iopub_listener(msg)
+            except Exception:  # noqa: BLE001 - a listener must not stop routing
+                logger.exception("iopub listener failed")
         if msg_type == "status":
             # Global kernel state, tracked whether or not it's this call's --
             # checked before the call lookup below, which every other client's
