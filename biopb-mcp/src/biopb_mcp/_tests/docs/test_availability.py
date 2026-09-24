@@ -66,8 +66,10 @@ from .conftest import (
 
 # What a user installs, resolved from this checkout rather than from PyPI: the
 # published biopb-mcp yields napari 0.8.0 where the source pins napari[all]
-# 0.7.0, so PyPI would answer for the last release instead of this branch.
-WORKSPACE = Path(__file__).resolve().parents[5] / "biopb-mcp"
+# 0.7.0, so PyPI would answer for the last release instead of this branch. The
+# SDK comes from the checkout too, as the installer ships it paired with mcp.
+REPO = Path(__file__).resolve().parents[5]
+WORKSPACE = REPO / "biopb-mcp"
 
 # What `install.sh` accepts (MIN_MINOR/MAX_MINOR), crossed with the three
 # platforms the catalog ships to. Nine cells, not the CI matrix's five: there is
@@ -99,7 +101,7 @@ def _resolves(requirement: str, python: str, platform: str) -> str | None:
     name = Requirement(requirement).name
     with tempfile.TemporaryDirectory() as tmp:
         reqs = Path(tmp) / "requirements.in"
-        reqs.write_text(f"{WORKSPACE}[mcp]\n{requirement}\n")
+        reqs.write_text(f"{WORKSPACE}[mcp]\n{REPO}[tensor]\n{requirement}\n")
         proc = subprocess.run(
             [
                 "uv",
