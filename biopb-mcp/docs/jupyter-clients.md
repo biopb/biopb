@@ -90,8 +90,10 @@ job's request is the job's. Two kinds of job:
   ends it. A foreign cell (`origin="user"`) starts at its `execute_input`. The
   agent's cell is recorded as the host sends it (`JobLog.start_cell`), begins
   at its own `execute_input` -- it may wait behind a user's cell -- and its
-  shell reply, which cannot be lost, ends it if its idle never arrives. The
-  host's own snippets and empty code are not cells.
+  shell reply, which cannot be lost, ends it if its idle never arrives, and
+  fails it if its iopub `error` was lost. A verification's cells are these
+  too, one request each to the scratch kernel. The host's own snippets and
+  empty code are not cells.
 - **A task** (`run_async`) runs on a worker thread and outlives the cell that
   started it, so the kernel announces its start and end as `biopb_job` messages
   (`_jobs._publish`). Its thread's prints arrive under that cell's request, and
@@ -105,13 +107,6 @@ and can drop under pressure. Cells run one at a time and tasks one at a time,
 so a cell's end ends any other cell that had begun, and a task's start any
 other task, as "end not recorded"; a cell never ends a task.
 
-A verification cannot wait for a next start, so the scratch run also checks
-the kernel's own account of the job every 2 s, on the control channel. When
-two checks in a row disagree with the record, `JobLog.settle` replays the
-missing events from `_jobs.poll`. The outcome is then the kernel's, and output
-may be missing. The session kernel's records are settled only by the next
-start or the kernel going away.
-
 Poll, the observe list and detail, the notebook export and the foreign-activity
 digest are reads of the host's memory, never a kernel round trip. Records
 outlive a kernel restart: one still running when its kernel goes is ended as
@@ -121,8 +116,8 @@ says what ran and whether it failed, not what it drew.
 ### Control channel
 
 What must not wait behind a cell goes to the kernel on the control channel,
-which ipykernel serves on its own thread: stopping a job, a job's status, and
-the graceful close before a kill. One custom request, `biopb_request`
+which ipykernel serves on its own thread: stopping a job, and the graceful
+close before a kill. One custom request, `biopb_request`
 (`GatedKernel.biopb_request`), carries an op name and its arguments; the op
 runs on a worker thread, bounded by a timeout, since control requests are
 handled one at a time and ipykernel's own interrupt and shutdown share that
@@ -130,7 +125,7 @@ queue. Refused for any session but the host's, like the gate.
 
 **Stop names its job** (`KernelHost.interrupt_job`): the host takes the id its
 records say is running, or the observe row's, and sends the kernel that job's
-request (`_jobs.interrupt(request, ...)`), since a cell's id is the host's and
+request (`_jobs.interrupt(request)`), since a cell's id is the host's and
 the kernel knows a job by its request. The kernel checks it is still the
 running job before touching anything. A stale id stops nothing and the reply
 names what runs now. A task gets a `KeyboardInterrupt` raised into its thread;
@@ -151,9 +146,8 @@ What stays on the shell channel needs the main thread or its request: the
 agent's cells, screenshot, inspect.
 
 **Who may stop what is the host's decision**: it holds the records (whose job
-it is) and the one-agent claim, and the kernel stops what it is told to. The
-scratch kernel's verification still asks the kernel to check (`origin` and
-`writer` on `_jobs.interrupt`).
+it is) and the one-agent claim, and the kernel stops what it is told to. A
+verification's stop follows the same rules, checked in `_scratch.interrupt`.
 
 ### Finding the kernel
 
@@ -338,17 +332,11 @@ either: anything touching the viewer needs the main thread.
 2. *Records (done).* The kernel announces a job's start and end on iopub, and
    the host keeps the records (see Record). A job's output streams in live,
    the observe page's polling no longer sends execute requests into the
-   kernel, records survive a restart, and the in-kernel tee is gone. Job calls
-   that still enter the kernel (submit, interrupt) return their result as a
-   `user_expression` rather than a printed line, which a job's output under
-   the same request could split.
-3. *Verification (done).* A scratch kernel announces each cell's start and
-   end, flushing its streams first, so its host splits the one output stream
-   per cell (`_job_log._VerifyRecord`); `_scratch` polls that host's records,
-   and the session's busy check reads the session host's. The in-kernel
-   capture (`_JobStream`, the per-thread routing) is deleted. A scratch kernel
-   runs no watchdog, so `_scratch` ends the record itself when the process
-   dies, failing the cell it died in.
+   kernel, records survive a restart, and the in-kernel tee is gone.
+3. *Verification (done).* Superseded by v3 stage 3: each cell is its own
+   request, recorded like any cell. A scratch kernel runs no watchdog, so
+   `_scratch` ends the record itself when the process dies, failing the cell
+   it died in.
 
 This is a refactor of how the host talks to the kernel, orthogonal to
 subshells and to the gate, which stays in-kernel either way — only kernel code

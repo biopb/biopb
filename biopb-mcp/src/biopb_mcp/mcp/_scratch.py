@@ -17,10 +17,11 @@ Three things live here, and they are one module because they are one decision.
   not fit", and respawning would re-run a workflow that just killed a process,
   three more times, each allocating gigabytes on a machine already under
   pressure.
-* **The run.** Submitted to that kernel through the same ``_jobs.submit``
-  door as any other job, so the interrupt path is the one that already exists,
-  and recorded the way any job is: by that kernel's host, from iopub
-  (``_job_log``), with the output split per cell.
+* **The run.** Each cell is its own execute request, sent once the one before
+  it ended ``ok``, and recorded the way any cell is: by that kernel's host,
+  from the protocol (``_job_log``). So the per-cell output, the stop at the
+  first failure and the completion all come from the protocol, and a stop is
+  the same interrupt any cell gets.
 * **The slot.** Two kernels must not become two schedulers. The dask cluster is
   shared and finite, and the agent's whole model is "one cell at a time", so a
   verification takes the same slot ordinary work does — see :func:`start`.
@@ -37,7 +38,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import _kernel_rpc, _notebook, _workflow_doc
+from . import _notebook, _workflow_doc
 
 logger = logging.getLogger(__name__)
 
@@ -86,54 +87,109 @@ _DRAFT_DIR = "drafts"
 
 #: How long an interrupt waits for the cells to stop before taking the process.
 #:
-#: An interrupt on the *session* kernel is best-effort by necessity: it raises
-#: KeyboardInterrupt into the job thread, which a blocking C call (a gRPC fetch,
-#: a native dask compute) does not notice until it returns to Python -- and the
-#: guaranteed stop, a group-kill, costs the user their whole session, so it is
-#: theirs to ask for.
+#: An interrupt on the *session* kernel is best-effort by necessity: a
+#: blocking C call (a gRPC fetch, a native dask compute) does not notice it
+#: until it returns to Python -- and the guaranteed stop, a group-kill, costs
+#: the user their whole session, so it is theirs to ask for.
 #:
 #: None of that holds here. A scratch kernel has no variables anyone wants, no
 #: layers, no session -- killing it costs nothing, and it was going to be
 #: discarded seconds later anyway. So the interrupt is only *briefly*
-#: best-effort: long enough for a clean stop to give the better record (the full
-#: per-cell one, rather than the last ledger polled), then the process goes.
+#: best-effort: long enough for a clean stop to give the better record, then
+#: the process goes.
 #:
 #: Which is what keeps `restart_kernel` out of this. Without the escalation, a
 #: verification wedged in a C call would leave the agent nothing but the tool
 #: that destroys the user's session, to kill a process built to be thrown away.
 _INTERRUPT_GRACE = 5.0
 
-# How often a verification's records are checked against the kernel's own
-# account (_poll_to_completion). Two checks apart is how long an announcement
-# may be in flight before it is taken as lost.
-_SETTLE_EVERY = 2.0
-
 #: Job ids issued here, in their own namespace. The session kernel issues
 #: ``job-N``; a verification never runs there, so a distinct prefix is what lets
 #: ``poll_job`` route an id to the kernel that owns it without asking either.
 _ID_PREFIX = "verify-"
+
+# error_text of a cell the run ended in, when its own record never did (the
+# kernel was taken down around it).
+_UNFINISHED = "The verification ended before this cell finished."
 
 
 def _elapsed(run):
     return round((run["finished"] or time.monotonic()) - run["started"], 1)
 
 
-def _snapshot(run):
+def _record(run, full=False, final=False):
+    """The run's per-cell record, read from the scratch host's cell records,
+    or None before a cell was sent.
+
+    *full* adds each cell's output, for the notebook; the polled record carries
+    a one-line head and a length, as the job list does for a job. *final* is
+    for the record the run ends with: a cell never sent is ``skipped``, not
+    ``pending``, and one still running when the run ended failed there.
+    """
+    log = run["log"]
+    if log is None or _current_cell(run) is None:
+        return None
+    cells = []
+    for code, job_id in zip(run["cells"], run["cell_jobs"], strict=True):
+        out = log.outcome(job_id, full) if job_id is not None else None
+        if out is None:
+            out = {"error_text": "", "elapsed": 0.0, "stdout_len": 0}
+            out["stdout_head"] = ""
+            if full:
+                out.update(stdout="", result_text="")
+            status = "skipped" if final else "pending"
+        elif out["status"] == "running":
+            status = "error" if final else "running"
+            if final:
+                out["error_text"] = out["error_text"] or _UNFINISHED
+        else:
+            # A stopped cell failed as far as the workflow is concerned; the
+            # run's own status says it was a stop.
+            status = "ok" if out["status"] == "ok" else "error"
+        cells.append({**out, "code": code, "status": status})
+    if any(c["status"] == "error" for c in cells):
+        status = "error"
+    elif all(c["status"] == "ok" for c in cells):
+        status = "ok"
+    else:
+        status = "running"
+    return {
+        "title": run["title"],
+        "created": run["created"],
+        "status": status,
+        "cells": cells,
+    }
+
+
+def _current_cell(run):
+    """The host job id of the last cell sent, or None. Call with `_lock` held."""
+    return next((j for j in reversed(run["cell_jobs"]) if j is not None), None)
+
+
+def _snapshot(run, output=False):
     """A verification rendered in the shape ``poll_job`` renders a job in.
 
-    Deliberately the same keys a ``_jobs`` snapshot carries (``job_id``,
-    ``status``, ``elapsed``, ``stdout``, ``verify``), so the tool surface has one
-    renderer rather than two: ``_server._format_job_status`` already knows what
-    to do with a ``verify`` record, and this is the same record.
+    Deliberately the same keys a host record's snapshot carries (``job_id``,
+    ``status``, ``elapsed``, ``stdout``) plus ``verify``, so the tool surface
+    has one renderer rather than two: ``_server._format_job_status`` already
+    knows what to do with a ``verify`` record. *output* puts the running
+    cell's output under the progress note, for a poll that shows it.
     """
+    record = run["record"] if run["record"] is not None else _record(run)
+    stdout = run["note"]
+    if output and run["status"] == "running" and run["log"] is not None:
+        current = _current_cell(run)
+        out = run["log"].outcome(current, full=True) if current else None
+        if out is not None and out["status"] == "running":
+            stdout += out["stdout"]
     return {
         "job_id": run["job_id"],
         "status": run["status"],
         "elapsed": _elapsed(run),
-        "stdout": run["note"],
+        "stdout": stdout,
         "error_text": run["error"] or "",
         "result_text": "",
-        "verify": run["record"],
+        "verify": record,
         "origin": run["origin"],
         "intent": run["intent"],
         "title": run["title"],
@@ -154,7 +210,7 @@ def detail(job_id):
     What it shows instead of a job's stdout is the run's own progress -- which
     stage the bring-up reached, then a line per cell as each finishes. The full
     per-cell output belongs to the notebook, not to a ledger (see
-    ``_job_log._CellRecord.snapshot``).
+    :func:`_record`).
     """
     snap = poll(job_id)
     if snap is None:
@@ -201,7 +257,7 @@ def poll(job_id):
     """The snapshot for *job_id*, or ``None`` if this is not a run we know."""
     with _lock:
         if _run is not None and _run["job_id"] == job_id:
-            return _snapshot(_run)
+            return _snapshot(_run, output=True)
     return None
 
 
@@ -292,14 +348,9 @@ def start(
     the slot, or ``{"error": <reason>}`` when no scratch kernel can be built.
 
     *writer* is the client this run belongs to, and *origin* is its point of
-    view (``"chat"`` when the in-process loop asked for the verification). Both
-    are passed straight through to
-    the scratch kernel's ``_jobs.submit``, which claims that kernel for it -- so
-    the one-agent rule on a verification is the *same* rule, enforced by the same
-    code, as on any other job. A second client is then refused an interrupt
-    there exactly as it is on the session kernel, with no second gate to keep in
-    step. It is kept here as well, but only for the seconds before the kernel
-    exists to answer for itself (see :func:`interrupt`).
+    view (``"chat"`` when the in-process loop asked for the verification):
+    a second client is refused a stop on it, as on the session kernel (see
+    :func:`interrupt`).
 
     **The slot is why the cluster can be shared.** Two clients on one
     ``LocalCluster`` sounds like contention, but under one slot there is no
@@ -347,13 +398,20 @@ def start(
             "started": time.monotonic(),
             "finished": None,
             "status": "running",
+            "created": time.time(),
             "note": "Starting a scratch kernel (a few seconds)…\n",
+            # The record the run ended with (_record, final); live until then.
             "record": None,
             "error": None,
             "host": None,
-            # The scratch kernel's own id for the run, once submitted: what a
-            # stop names (_jobs.interrupt checks it is still the running job).
-            "kernel_job_id": None,
+            # The scratch host's records, which outlive its kernel.
+            "log": None,
+            # Each cell's id in those records once sent; the last is what a
+            # stop names.
+            "cell_jobs": [None] * len(_workflow_doc.code_cells(blocks)),
+            # Set by interrupt: no further cell is sent.
+            "stopping": False,
+            "stop_reason": None,
             "writer": writer,
             "writer_label": writer_label,
             "origin": origin,
@@ -376,6 +434,7 @@ def _finish(run, status, error=None):
     with _lock:
         if run["status"] != "running":
             return  # already discarded; the first verdict stands
+        run["record"] = _record(run, full=True, final=True)
     # Written *before* the verdict is published, and outside the lock (which is
     # held only to take, read and release -- see where it is declared). The
     # order matters: the status is what every reader waits on, so spooling
@@ -504,26 +563,9 @@ def _execute(run):
             # to answer for itself. Teardown does not depend on this: the
             # `finally` below holds the host either way.
             run["host"] = host
+            run["log"] = host.jobs
             run["note"] = "Scratch kernel ready; running the workflow…\n"
-
-        submitted, res, _w = _kernel_rpc._run_job_call(
-            host,
-            "submit",
-            "",
-            job_id=host.jobs.new_id(),
-            intent=run["intent"] or "verify workflow",
-            origin=run["origin"],
-            writer=run["writer"],
-            writer_label=run["writer_label"],
-            verify_cells=run["cells"],
-            verify_title=run["title"],
-        )
-        if submitted is None or "job_id" not in submitted:
-            _finish(run, "error", _kernel_rpc._format_execute_result(res))
-            return
-        with _lock:
-            run["kernel_job_id"] = submitted["job_id"]
-        _poll_to_completion(run, host, submitted["job_id"])
+        _run_cells(run, host)
     except Exception as exc:  # noqa: BLE001 - the verdict, not a crash of ours
         # A scratch kernel that dies IS the answer -- an OOM means the workflow
         # does not fit -- so report it as a failed verification rather than as a
@@ -537,33 +579,40 @@ def _execute(run):
             _finish(run, "error", "The verification ended without a result.")
 
 
-def _poll_to_completion(run, host, kernel_job_id):
-    """Watch the scratch kernel's verification job until it is terminal.
+def _run_cells(run, host):
+    """Send the cells one request each, each once the one before ended ok.
 
-    Reads the scratch host's records, which it builds from iopub: a look costs
-    nothing and shows the cells as they go. iopub can drop a message, though,
-    so every ``_SETTLE_EVERY`` the kernel's own account is fetched over the
-    shell channel, which cannot (the cells run on a job thread, so it does not
-    queue behind them). Two looks in a row that disagree with the records are a
-    lost announcement, not one in flight, and settle them (``JobLog.settle``).
+    **Stops at the first failure.** The cells after it were written against the
+    state the failed one was supposed to produce, so running them anyway would
+    report a cascade of consequences as if they were separate defects. The rest
+    are marked ``skipped`` (:func:`_record`), so the report says how far the
+    workflow got.
+
+    Bare cells (``run_cell(bare=True)``): a verification runs the document and
+    nothing else, so the document's own first cell builds its ``client``.
     """
-    next_check = time.monotonic() + _SETTLE_EVERY
-    strikes = 0
-    while True:
+    n = len(run["cells"])
+    for i, code in enumerate(run["cells"]):
         with _lock:
+            # Checked and sent under the lock a stop takes: a stop either finds
+            # this cell to interrupt, or keeps it from being sent.
             if run["discarded"]:
                 return
-        if time.monotonic() >= next_check:
-            strikes = _check_kernel(host, kernel_job_id, strikes)
-            next_check = time.monotonic() + _SETTLE_EVERY
-        snap = host.jobs.poll(kernel_job_id)
-        if snap.get("status") in ("running", "unknown") and not host.is_alive():
-            # A death is the verdict (an OOM means the workflow does not fit),
-            # and nothing else would end the record: this host runs no watchdog
-            # to notice. Ending it marks the cell it died in.
-            host.jobs.kernel_gone("the scratch kernel died")
-            with _lock:
-                run["record"] = host.jobs.verify_record(kernel_job_id) or run["record"]
+            if run["stopping"]:
+                _finish(
+                    run,
+                    "interrupted",
+                    run["stop_reason"] or "The verification was stopped.",
+                )
+                return
+            job_id = host.jobs.new_id()
+            run["cell_jobs"][i] = job_id
+            run["note"] = f"Running cell {i + 1} of {n}…\n"
+            host.run_cell(code, job_id, run["origin"], bare=True)
+        out = _await_cell(run, host, job_id)
+        if out is None:
+            return  # discarded
+        if out.get("died"):
             _finish(
                 run,
                 "error",
@@ -571,46 +620,32 @@ def _poll_to_completion(run, host, kernel_job_id):
                 "often out of memory.",
             )
             return
-        if snap.get("status") == "unknown":
-            # The start travels on iopub, the submit's reply on the shell
-            # socket; the reply can arrive first.
-            time.sleep(0.1)
-            continue
-        record = snap.get("verify")
-        with _lock:
-            if record is not None:
-                run["record"] = record
-            run["note"] = snap.get("stdout") or run["note"]
-        if snap.get("status") != "running":
-            # Terminal: swap the polled ledger for the full record, once, before
-            # the host holding it is discarded.
-            full = host.jobs.verify_record(kernel_job_id)
-            with _lock:
-                if full is not None:
-                    run["record"] = full
-            _finish(run, snap.get("status"), snap.get("error_text") or None)
+        if out["status"] != "ok":
+            _finish(run, out["status"], out["error_text"] or None)
             return
-        time.sleep(0.4)
+    _finish(run, "ok")
 
 
-def _check_kernel(host, job_id, strikes):
-    """Check the records against the kernel's own status; returns the count of
-    checks in a row that disagreed. The second settles (``JobLog.settle``):
-    one disagreement may be an announcement still in flight. On the control
-    channel, so a check never waits behind the cells."""
-    status = host.jobs.poll(job_id).get("status")
-    if status not in ("running", "unknown"):
-        return 0
-    try:
-        kernel_status = host.control("status", timeout=_SETTLE_EVERY, job_id=job_id)
-        if kernel_status in ("unknown", status):
-            return 0
-        if strikes == 0:
-            return 1
-        host.jobs.settle(host.control("poll", timeout=_SETTLE_EVERY, job_id=job_id))
-    except Exception:  # noqa: BLE001 - the liveness check decides a dead kernel
-        logger.debug("scratch kernel check failed", exc_info=True)
-    return 0
+def _await_cell(run, host, job_id):
+    """Wait for the cell *job_id* to end; its outcome, or None if the run was
+    discarded meanwhile.
+
+    Its record ends on the request's idle, or on its shell reply, which cannot
+    be lost (``KernelHost.run_cell``). A death ends it too: this host runs no
+    watchdog, and a death is the verdict (an OOM means the workflow does not
+    fit), so it is checked for here.
+    """
+    while True:
+        with _lock:
+            if run["discarded"]:
+                return None
+        out = host.jobs.outcome(job_id)
+        if out["status"] != "running":
+            return out
+        if not host.is_alive():
+            host.jobs.kernel_gone("the scratch kernel died")
+            return {**host.jobs.outcome(job_id), "died": True}
+        time.sleep(0.1)
 
 
 def _discard_host(host):
@@ -624,65 +659,55 @@ def _discard_host(host):
 
 
 def interrupt(reason=None, origin="user", writer=None):
-    """Stop the running verification's cells, leaving its kernel up.
+    """Stop the running verification, leaving its kernel up if it stops.
 
     Returns ``None`` when there is no verification to stop -- which the caller
     must treat as "ask the session kernel instead", not as "nothing is running":
     a run that ended between the check and this call leaves the session kernel
     free to have started something.
 
-    Mirrors ``_jobs.interrupt``'s vocabulary (``{"refused":
-    "not_owner"}``, ``{"interrupted": True}``) so the tool surface routes to
-    whichever kernel holds the running job without a second one, plus
-    ``"killed"`` when the cells had to be taken with the process.
+    Mirrors the session kernel's vocabulary (``{"refused": "not_owner"}``,
+    ``{"interrupted": True}``) so the tool surface routes to whichever kernel
+    holds the running job without a second one, plus ``"killed"`` when the
+    cells had to be taken with the process.
 
     **This is the guaranteed stop for a verification**, which the session
-    kernel's interrupt deliberately is not: a cooperative interrupt gets
-    :data:`_INTERRUPT_GRACE` seconds to land, and then the process goes.
+    kernel's interrupt deliberately is not: no further cell is sent, the one
+    running is interrupted, and if the run has not ended within
+    :data:`_INTERRUPT_GRACE` seconds the process goes.
 
-    **Who may stop it is the scratch kernel's own answer**, because ``start``
-    claimed that kernel for the client that asked for the verification: a second
-    client gets ``not_owner`` from the same check that guards any other job, and
-    ``origin="user"`` is exempt there as it is here, so the person at the
-    machine can still stop a verification they did not start.
-
-    The one window that check cannot cover is the five to eight seconds before
-    the kernel exists. The rule is the same, applied locally, so a stranger
-    cannot discard an attempt during its bring-up either.
+    **Who may stop it** is the rule the session kernel's stop follows: a client
+    other than the one that asked for it gets ``not_owner``, a writer of
+    another origin ``foreign_job``, and ``origin="user"`` is exempt, so the
+    person at the machine can stop a verification they did not start.
     """
     with _lock:
         if _run is None or _run["status"] != "running":
             return None
         run, host = _run, _run["host"]
-        if (
-            host is None  # no kernel to answer for itself yet
-            and origin != "user"
-            and writer is not None
-            and run["writer"] not in (None, writer)
-        ):
-            return {"refused": "not_owner", "job_id": run["job_id"]}
-    if host is None or run["kernel_job_id"] is None:
-        # Still bringing the kernel up, or the run's id is not back from its
-        # submit: there is nothing to name yet, so stopping means discarding
-        # the whole attempt.
+        if origin != "user":
+            if writer is not None and run["writer"] not in (None, writer):
+                return {"refused": "not_owner", "job_id": run["job_id"]}
+            if run["origin"] != origin:
+                return {
+                    "refused": "foreign_job",
+                    "origin": run["origin"],
+                    "job_id": run["job_id"],
+                }
+        run["stopping"] = True
+        run["stop_reason"] = reason
+        current = _current_cell(run)
+    if host is None:
+        # Still bringing the kernel up: stopping means discarding the attempt.
         discard(reason=reason)
         return {"interrupted": True, "job_id": run["job_id"]}
-    try:
-        data = host.interrupt_job(
-            run["kernel_job_id"],
-            reason=reason,
-            origin=origin,
-            writer=writer,
-        )
-    except Exception:  # noqa: BLE001 - a kernel that cannot answer is killed below
-        logger.debug("scratch interrupt failed", exc_info=True)
-        data = {"interrupted": True}
-    if data.get("refused") in ("not_owner", "foreign_job"):
-        return {**data, "job_id": run["job_id"]}
-    if not data or not data.get("interrupted"):
-        # Nothing was running in there after all -- the run is between cells, or
-        # finishing. Let the poll loop reach its own verdict.
-        return {"interrupted": False, "job_id": run["job_id"]}
+    if current is not None:
+        try:
+            # A cell that has just ended is refused, and the run stops before
+            # the next one (_run_cells).
+            host.interrupt_job(current, reason=reason)
+        except Exception:  # noqa: BLE001 - a kernel that cannot answer is killed below
+            logger.debug("scratch interrupt failed", exc_info=True)
 
     deadline = time.monotonic() + _INTERRUPT_GRACE
     while time.monotonic() < deadline:

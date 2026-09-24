@@ -1,54 +1,27 @@
-"""In-kernel async job runner for the MCP execute_code path.
+"""The kernel's side of the jobs: holding cells for Stop, and ``run_async``.
 
-Runs *inside* the child Jupyter kernel.  ``execute_code`` submits agent code
-here; it executes in a **background daemon thread** so the kernel's main thread
-(and its integrated ``%gui qt`` Qt event loop) stays free to service quick tool
-calls — ``take_screenshot`` / ``server_status`` / ``poll_job`` — while a
-multi-minute job runs.  Long C calls will block context switching, although dask,
-gRPC and numpy all drop GIL, so the job and the viewer/tools are expected to run
-smoothly.
+Runs *inside* the child Jupyter kernel. Every cell -- the agent's, a
+verification's, a user's from an attached client -- is a plain execute request
+on the main thread, and the host records it from the protocol (``_job_log``).
+What this module keeps is what the host cannot do from outside:
 
-Design notes
-------------
-* **One job at a time.** A second :func:`submit` while a job is running is
-  rejected with the running job id (the single shared viewer / namespace makes
-  concurrent mutation unsafe).
-* **Several writers, serialized.** Jobs carry an ``origin`` — see
-  :class:`_Job`. They share this one runner, so the rejection above is also what
-  keeps the writers off each other's toes: no preemption, no queue, one ordering
-  of writes to the namespace.
-* **The records live in the host.** Each job's start and end are announced on
-  iopub (:func:`_publish`) under the request its output is published under, and
-  the host keeps the record (``_job_log``): poll, the job list, export and the
-  foreign-activity digest are reads of the host's memory. This module keeps only
-  what it takes to run and stop jobs.
-* **One agent per kernel.** Serializing two *agents* would order their writes
-  without making them mean anything — neither can see the other's model of the
-  namespace. So the first non-user submitter claims the kernel and a second is
-  refused (:func:`submit`); a human's cell is never gated. Everything that
-  changes kernel state is gated the same way — running a job, stopping one
-  (:func:`interrupt`), restarting the kernel (server-side) — while the
-  read-only tools stay open to anyone, since they mutate nothing.
-* **Main-thread affinity.** The viewer is a Qt/vispy object bound to the kernel
-  main thread.  GUI mutations from the worker thread are marshaled via
-  :func:`run_on_main`; ``_bootstrap`` wraps ``add_tensor`` + the ``add_*``
-  family so the common paths are automatic.
-* **Output.** A job thread's prints go to iopub like any cell's: ipykernel
-  attributes a thread to the request that started it, which is the submit, so
-  the host files them under the job. A verification announces each cell's
-  start and end as well, so the host can split that one stream per cell.
-* **Stopping a job.** :func:`interrupt` force-stops the running job: it
-  raises ``KeyboardInterrupt`` into the worker thread (a real ``SIGINT`` for a
-  foreign cell on the main thread) and, when a distributed dask
-  client is active (the kernel's ``Client`` attached to the session child's
-  ``LocalCluster``), :func:`_cancel` *also* cancels the client's in-flight futures
-  — the only mid-``compute()`` stop short of ``restart_kernel``.  The in-process
-  ``threads`` / ``synchronous`` schedulers have no futures to cancel, so a running
-  ``compute()`` under them is stopped by the raised ``KeyboardInterrupt`` once it
-  returns to Python bytecode, or by ``restart_kernel``.
+* **Holding the running cell** (:func:`hold_cell`, from ``_kernel_gate``), so
+  a Stop can name it and be checked against it.
+* **Tasks.** :func:`run_async` runs a long compute on a worker thread, leaving
+  the main thread -- and so Qt and the screenshots -- free. A task outlives the
+  cell that started it, so its start and end are announced on iopub
+  (:func:`_publish`), and the host files the thread's prints (which ipykernel
+  attributes to that cell's request) under the task. One task at a time.
+* **Stopping** (:func:`interrupt`, on the control thread): a ``SIGINT`` for
+  the cell on the main thread, a ``KeyboardInterrupt`` raised into a task's
+  thread, and a cancel of the in-flight dask futures, the only
+  mid-``compute()`` stop short of ``restart_kernel``. Who may stop what is the
+  host's decision; this checks only that the job named still runs.
+* **Main-thread affinity.** The viewer is a Qt/vispy object bound to the main
+  thread. A task's viewer calls are marshaled through :func:`run_on_main`
+  (``_viewer_proxy`` does it for the whole ``viewer``).
 """
 
-import ast
 import contextlib
 import ctypes
 import logging
@@ -61,13 +34,9 @@ import time
 import traceback
 from concurrent.futures import Future
 
-from ._job_log import _MAX_RETAINED_JOBS, MSG_TYPE
+from ._job_log import MSG_TYPE
 
 logger = logging.getLogger(__name__)
-
-# Prepended to every job so the namespace tracks the asynchronously-connecting
-# tensor connection service (mirrors the old _server._REFRESH_PREFIX).
-_REFRESH_PREFIX = "client = _conn.client\n"
 
 # Attribution for a KeyboardInterrupt this runner did not raise (see _run). The
 # kernel ignores SIGINT except while servicing a message (ipykernel installs
@@ -87,19 +56,8 @@ _RUN_ON_MAIN_TIMEOUT = 300.0
 
 # Module state, wired by install().
 _ip = None
-_jobs = {}  # job_id (a foreign cell: its request id) -> _Job
-# Ids for a submit that names none: a direct call, never the host's, which
-# names every job so its records and this module agree on it. Their own
-# prefix, so they cannot collide with the host's `job-N`.
-_job_seq = 0
+_jobs = {}  # a cell's request id, or a task's id -> _Job
 _lock = threading.RLock()
-
-# The one agent allowed to run code in this kernel, claimed by whoever submits
-# first and held until the kernel restarts (see :func:`submit`). An opaque id
-# supplied by the caller plus a label for the refusal message; ``None`` means
-# unclaimed.
-_owner = None
-_owner_label = ""
 
 # What the bootstrap binds into the kernel namespace. `_bootstrap` refuses to
 # let a user plugin shadow any of it (#92), and names it from here rather than
@@ -127,6 +85,8 @@ KERNEL_HANDLE_NAMES = frozenset(
 
 
 class _Job:
+    """A running cell (:func:`hold_cell`) or task (:func:`run_async`)."""
+
     __slots__ = (
         "job_id",
         "code",
@@ -134,138 +94,40 @@ class _Job:
         "error_text",
         "cancel_reason",
         "interrupted",
-        "origin",
-        "intent",
         "thread",
         "started",
-        "started_wall",
         "finished",
-        "verify",
         "request",
         "result_text",
     )
 
-    def __init__(self, job_id, code="", origin="mcp", intent="", request=None):
+    def __init__(self, job_id, code="", request=None):
+        # A task's id; None for a cell, which the host names.
         self.job_id = job_id
-        # The execute request this job's output is published under: the submit
-        # for an agent's job, the cell's own for a foreign client's.
+        # The execute request this job's output is published under: a cell's
+        # own, or the cell's that started a task.
         self.request = request
-        # The submitted source (as passed to submit(), before the internal
-        # _REFRESH_PREFIX), so the observe UI can show what each job ran.
         self.code = code
-        # running | ok | error | interrupted
+        # running | ok | error | interrupted; a cell's ends as "ended", its
+        # outcome being the host's to read from the protocol
         self.status = "running"
         self.error_text = ""
-        # The last expression's repr (_exec_capture), announced with the end.
+        # A task's return value's repr, announced with the end.
         self.result_text = ""
-        # Set by interrupt(): the job was force-stopped with a
-        # KeyboardInterrupt raised into its thread, so its finalizer labels the
-        # stop "interrupted" rather than a generic "error".
+        # Set by interrupt(), so the finalizer labels the stop "interrupted"
+        # rather than a generic "error".
         self.interrupted = False
-        # Human-readable reason a *user* acted on this job (cancel/interrupt via
-        # the observe web UI). Threaded into the finalized error_text so the
-        # agent sees the attribution through its normal poll_job / execute_code
-        # result, instead of an unexplained cancellation. None for agent-driven
-        # or untagged stops.
+        # Why a person stopped it (the observe page's Stop), prefixed to the
+        # error so the agent sees the stop was not its code failing.
         self.cancel_reason = None
-        # Who started this job. Each value names a *surface*, not a kind of
-        # actor: "agent" was two of these at once once the chat loop arrived,
-        # and code asking "is this the agent's?" quietly meant "the MCP one's".
-        #   "mcp"   — the execute_code tool, driven by an external MCP client
-        #   "user"  — a cell run by a human from a Jupyter client on the kernel
-        #   "chat"  — the in-process chat loop (docs/chat-engines.md)
-        # Set at submit and never inferred later — a job outlives the request
-        # that started it, and poll/export read this long after that request is
-        # gone. "chat" has no writer yet and is declared ahead of one on
-        # purpose: origin is the provenance an export is read by, and a value
-        # introduced after the fact cannot relabel the records made without it.
-        self.origin = origin
-        # Why this job was run, in the words of whoever asked for it — the
-        # client's own statement of purpose under "mcp", the user's turn once
-        # a chat loop fills it. Free text, optional and unvalidated: it is
-        # best-effort provenance for the notebook export, never a control input.
-        self.intent = intent
+        # A task's worker thread; None for a cell, which runs on the main one.
         self.thread = None
         self.started = time.monotonic()
-        # Wall-clock epoch at submit, for human-readable audit timestamps in the
-        # notebook export (`started` is monotonic and not displayable).
-        self.started_wall = time.time()
         self.finished = None
-        # The candidate workflow this job is verifying, or None for an ordinary
-        # cell. Set at submit and never after: it decides which namespace the
-        # job runs in, so a job cannot become a verification once started.
-        self.verify = None
 
     def elapsed(self):
         end = self.finished if self.finished is not None else time.monotonic()
         return round(end - self.started, 3)
-
-    def snapshot(self):
-        """How the job stands, without its output, which only the host has."""
-        return {
-            "job_id": self.job_id,
-            "request": self.request,
-            "code": self.code,
-            "status": self.status,
-            "result_text": self.result_text,
-            "error_text": self.error_text,
-            "cancel_reason": self.cancel_reason,
-            "origin": self.origin,
-            "intent": self.intent,
-            "elapsed": self.elapsed(),
-            "created": self.started_wall,
-            "verify": self.verify.snapshot() if self.verify is not None else None,
-        }
-
-
-class _Cell:
-    """One cell of a verification run: its source and how it ended. Its output
-    is the host's (``_job_log._CellRecord``), split from the job's stream at the
-    boundaries :func:`_exec_cells` announces."""
-
-    __slots__ = ("code", "status", "error_text", "result_text", "started", "finished")
-
-    def __init__(self, code):
-        self.code = code
-        # pending | ok | error | skipped
-        self.status = "pending"
-        self.error_text = ""
-        self.result_text = ""
-        self.started = None
-        self.finished = None
-
-    def elapsed(self):
-        if self.started is None:
-            return 0.0
-        end = self.finished if self.finished is not None else time.monotonic()
-        return round(end - self.started, 3)
-
-
-class _Verification:
-    """A candidate workflow's cells, run in order in a scratch kernel. The
-    record a notebook is built from is the host's (``_job_log._VerifyRecord``)."""
-
-    __slots__ = ("title", "cells", "created")
-
-    def __init__(self, title, cells):
-        self.title = title
-        self.cells = [_Cell(code) for code in cells]
-        self.created = time.time()
-
-    def snapshot(self):
-        return {
-            "title": self.title,
-            "created": self.created,
-            "cells": [
-                {
-                    "code": c.code,
-                    "status": c.status,
-                    "error_text": c.error_text,
-                    "result_text": c.result_text,
-                }
-                for c in self.cells
-            ],
-        }
 
 
 # -- main-thread marshaling -------------------------------------------------
@@ -327,81 +189,6 @@ def run_on_main(fn, *args, **kwargs):
 
 
 # -- execution --------------------------------------------------------------
-
-
-def _exec_capture(code, ns, job):
-    """Exec *code* in *ns*; if it ends in an expression, store its repr."""
-    tree = ast.parse(code)
-    last_expr = None
-    if tree.body and isinstance(tree.body[-1], ast.Expr):
-        last_expr = tree.body.pop()
-    if tree.body:
-        exec(compile(tree, "<job>", "exec"), ns)
-    if last_expr is not None:
-        value = eval(compile(ast.Expression(last_expr.value), "<job>", "eval"), ns)
-        if value is not None:
-            job.result_text = repr(value)
-
-
-def _exec_cells(job, verification):
-    """Run *verification*'s cells in order in one scratch namespace.
-
-    **Stops at the first failure.** The cells after it were written against the
-    state the failed one was supposed to produce, so running them anyway reports
-    a cascade of consequences as if they were separate defects. The remainder is
-    marked ``skipped`` rather than dropped, so the report says how far the
-    workflow got.
-
-    Each cell's start and end are announced (:func:`_publish` flushes the
-    streams first), so the host files the output between them under that cell,
-    as well as under the job. The failure is re-raised so the job's own
-    finalizer sets the status and does the interrupt attribution; there is one
-    place that decides how a job ended, and this is not it.
-    """
-    # The kernel's own namespace, because this only ever runs in a scratch
-    # kernel: a process spawned for this verification and discarded after it
-    # (`_scratch`). The isolation that used to be a filtered dict is the process
-    # boundary now, which is what extends it past bindings to the viewer,
-    # `sys.modules`, and anything a cell mutates in place.
-    ns = _ip.user_ns if _ip is not None else {}
-    try:
-        for index, cell in enumerate(verification.cells):
-            _publish({"event": "cell_start", "job_id": job.job_id, "index": index})
-            cell.started = time.monotonic()
-            try:
-                # No refresh prefix, unlike an ordinary cell: a verification
-                # runs the document and nothing else. `client = _conn.client`
-                # prepended here would bind a handle the document never asks
-                # for, so a workflow that forgot to build its own would pass
-                # and then fail for its reader -- the one defect this exists to
-                # catch. The document's own first cell calls `workflow_env()`.
-                _exec_capture(cell.code, ns, cell)
-                cell.status = "ok"
-            except BaseException:
-                cell.status = "error"
-                cell.error_text = traceback.format_exc()
-                raise
-            finally:
-                cell.finished = time.monotonic()
-                _publish(
-                    {
-                        "event": "cell_end",
-                        "job_id": job.job_id,
-                        "index": index,
-                        "status": cell.status,
-                        "error_text": cell.error_text,
-                        "result_text": cell.result_text,
-                        "elapsed": cell.elapsed(),
-                    }
-                )
-    finally:
-        # Whatever ended the run -- a failing cell, an interrupt -- the cells it
-        # never reached are still `pending`. Relabel them here rather than in the
-        # loop, which the raise leaves for good the moment there is anything to
-        # relabel.
-        for cell in verification.cells:
-            if cell.status == "pending":
-                cell.status = "skipped"
 
 
 def _dask_backstop():
@@ -489,20 +276,7 @@ def _publish_start(job):
             "event": "start",
             "job_id": job.job_id,
             "request": job.request,
-            "origin": job.origin,
-            "intent": job.intent,
             "code": job.code,
-            "created": job.started_wall,
-            # A verification's cells, so the host can hold a record per cell.
-            "verify": (
-                {
-                    "title": job.verify.title,
-                    "cells": [c.code for c in job.verify.cells],
-                    "created": job.verify.created,
-                }
-                if job.verify is not None
-                else None
-            ),
         }
     )
 
@@ -568,146 +342,20 @@ def _run(job, body):
         _publish_end(job)
 
 
-def _foreign(job, for_origin):
-    """Whether *job* was written by someone other than *for_origin*'s client.
-
-    "Someone else's cell" is a relation, not a property: the chat loop submits
-    as ``chat``, and a fixed "is it the MCP client's?" refused the loop its own
-    cell (biopb/biopb#880).
-    """
-    return job.origin != for_origin
-
-
 def _prune():
-    # Oldest terminal first. Only the host's copy is the record anyone reads
-    # (_job_log, which also holds unseen foreign jobs against eviction); this
-    # one serves the refusal and the stop, and a verification's poll.
-    terminal = [jid for jid, j in _jobs.items() if j.status != "running"]
-    while len(_jobs) > _MAX_RETAINED_JOBS and terminal:
-        del _jobs[terminal.pop(0)]
-
-
-def _new_job(job_id, code, origin, intent="", request=None):
-    """Register a job record, under *job_id* or the next local one. Call with
-    `_lock` held."""
-    global _job_seq
-    if job_id is None:
-        _job_seq += 1
-        job_id = f"local-{_job_seq}"
-    job = _Job(job_id, code, origin=origin, intent=intent, request=request)
-    _jobs[job_id] = job
-    return job
-
-
-def submit(
-    code,
-    job_id=None,
-    origin="mcp",
-    intent="",
-    writer=None,
-    writer_label="",
-    verify_cells=None,
-    verify_title="",
-):
-    """Start *code* in a background thread; return ``{"job_id": ...}`` or, if a
-    job is already running, ``{"error": "busy", "running_job_id": ...,
-    "running_job_origin": ...}``.
-
-    **Verification runs come through this same door**, but only ever in a
-    *scratch kernel*. With *verify_cells* — a list of cell sources — the job runs
-    them in order in this kernel's own namespace instead of running *code*, and
-    carries a :class:`_Verification` record. The session child spawns a kernel
-    per verification and discards it (``_scratch``), so "this kernel's own
-    namespace" is a fresh one and the isolation covers the viewer and
-    ``sys.modules`` too. Submitting *verify_cells* to a session kernel would run
-    the cells in the user's namespace; nothing does.
-
-    *job_id* is the host's name for the job, which its records file it under;
-    a direct call that names none gets a ``local-N`` id.
-
-    *origin* and *intent* are recorded on the job and never acted on beyond the
-    rules in :class:`_Job`; see there for the origin vocabulary. The busy return
-    carries the running job's origin because the caller's advice depends on it:
-    the agent may stop its *own* job, but another writer's is not its to stop.
-
-    **One agent per kernel.** *writer* is an opaque id for the client asking.
-    The first non-user submitter claims the kernel; a later submit under a
-    *different* id is refused with ``{"error": "not_owner", "owner": <label>}``.
-    Two agents sharing one namespace is not a race the runner can serialize away
-    — the writes land in a defined order and still mean nothing, because neither
-    agent can see the other's model of what the variables and layers are. So it
-    fails loudly at the door instead. The claim is dropped by :func:`reset`, i.e.
-    it lasts for the life of the kernel.
-
-    Two deliberate holes. A **human** cell (``origin="user"``) is never gated:
-    the person at the machine has standing here that no client does, and the
-    Jupyter client they typed it in has no identity to gate on anyway. And a
-    caller with ``writer=None`` — a direct in-process call, or a transport that
-    yields no client id — neither claims nor is checked, since there is nothing
-    to tell two of them apart with.
-
-    **The recovery belongs to the human, not to a second agent.** Every tool
-    that changes kernel state is gated the same way — ``interrupt`` here,
-    ``restart_kernel`` server-side — so a client that does not hold the kernel
-    cannot take it by force; it keeps the read-only tools and nothing else. What
-    frees a claim is the kernel going away: the person at the machine restarting
-    from the observe page (never gated), or the session ending. That is the same
-    principle as the ``origin="user"`` exemption, applied to recovery.
-    """
-    global _owner, _owner_label
-    with _lock:
-        if origin != "user" and writer is not None:
-            if _owner is None:
-                _owner, _owner_label = writer, writer_label
-            elif writer != _owner:
-                # The id as well as the label: the caller mirrors the claim, and
-                # a refusal is its chance to correct a mirror that guessed wrong.
-                return {
-                    "error": "not_owner",
-                    "owner": _owner_label,
-                    "owner_id": _owner,
-                }
-        running = _running_task()
-        if running is not None:
-            return {
-                "error": "busy",
-                "running_job_id": running.job_id,
-                "running_job_origin": running.origin,
-            }
-        if verify_cells is not None:
-            # The record's cells are the source of truth; `code` is derived from
-            # them so the audit view of this job cannot disagree with the
-            # workflow view of it.
-            code = "\n\n# ---\n\n".join(verify_cells)
-        job = _new_job(job_id, code, origin, intent, request=_request_id())
-        if verify_cells is not None:
-            job.verify = _Verification(verify_title, verify_cells)
-        _prune()
-        # Before the thread starts, so the host has the record before any of
-        # the job's output reaches it.
-        _publish_start(job)
-        if job.verify is not None:
-            body = lambda: _exec_cells(job, job.verify)  # noqa: E731
-        else:
-            body = lambda: _exec_capture(_REFRESH_PREFIX + code, _ip.user_ns, job)  # noqa: E731
-        thread = threading.Thread(
-            target=_run, args=(job, body), name=job.job_id, daemon=True
-        )
-        job.thread = thread
-        thread.start()
-        return {"job_id": job.job_id, "status": "running"}
+    # Only a running job is needed here, to stop it: the records are the
+    # host's (_job_log).
+    for key in [k for k, j in _jobs.items() if j.status != "running"]:
+        del _jobs[key]
 
 
 @contextlib.contextmanager
-def hold_cell(code, request, origin="user"):
+def hold_cell(code, request):
     """Hold a cell running on the main thread as a job, for its duration.
 
-    For ``_kernel_gate``, around every non-empty execute request, the host's
-    included: nothing is announced -- the host records cells from the protocol
-    -- this is for Stop, which names a cell by its *request*
-    (:func:`interrupt`). *origin* is ``"user"`` for a foreign client's cell and
-    ``"host"`` for the host's own. The caller settles ``status`` from the reply
-    before leaving the block; a block that raises instead is an ``error``.
+    For ``_kernel_gate``, around every non-empty execute request, whoever sent
+    it: nothing is announced -- the host records cells from the protocol --
+    this is for Stop, which names a cell by its *request* (:func:`interrupt`).
 
     Ended under :data:`_lock`, which :func:`interrupt` checks and signals
     under: a ``SIGINT`` aimed at this cell lands before the cell is marked
@@ -716,7 +364,7 @@ def hold_cell(code, request, origin="user"):
     is dropped: the cell it was aimed at is already over.
     """
     with _lock:
-        job = _Job(None, code, origin=origin, request=request)
+        job = _Job(None, code, request=request)
         _jobs[request] = job
         _prune()
     try:
@@ -726,8 +374,7 @@ def hold_cell(code, request, origin="user"):
             try:
                 with _lock:
                     job.finished = time.monotonic()
-                    if job.status == "running":
-                        job.status = "error"
+                    job.status = "ended"
                 break
             except KeyboardInterrupt:
                 continue
@@ -786,24 +433,6 @@ def run_async(fn, *args, **kwargs):
     return job.job_id
 
 
-def poll(job_id):
-    """*job_id*'s snapshot from this kernel's own copy: how it stands, without
-    output. The host's records (``_job_log``) come from iopub, which can drop a
-    message; this comes back on the shell reply, which cannot, so the host
-    settles a disagreement from it (``JobLog.settle``)."""
-    job = _jobs.get(job_id)
-    if job is None:
-        return {"job_id": job_id, "status": "unknown", "error_text": ""}
-    return job.snapshot()
-
-
-def status(job_id):
-    """*job_id*'s status alone: what the host checks its records against, often
-    enough that the whole snapshot would be waste."""
-    job = _jobs.get(job_id)
-    return "unknown" if job is None else job.status
-
-
 def _cancel_dask_futures(job):
     """Stop *job*'s in-flight dask work.
 
@@ -836,7 +465,7 @@ def _cancel_dask_futures(job):
 
 
 def _running_task():
-    """The running worker-thread job, or None: one at a time (see submit())."""
+    """The running task, or None: one at a time (see run_async())."""
     for j in _jobs.values():
         if j.status == "running" and j.thread is not None:
             return j
@@ -862,9 +491,9 @@ def _raise_in_thread(ident, exctype):
     return res
 
 
-def interrupt(key, reason=None, origin=None, writer=None):
-    """Force-stop *job_id* if it is the running job: cooperative cancel *plus* a
-    ``KeyboardInterrupt`` where it runs.
+def interrupt(key, reason=None):
+    """Force-stop the job *key* names if it still runs: a ``KeyboardInterrupt``
+    where it runs, and a cancel of its dask futures.
 
     Called on the kernel's control thread (``_kernel_gate``), so it is answered
     while the main thread is busy -- including with the very cell it stops.
@@ -874,49 +503,24 @@ def interrupt(key, reason=None, origin=None, writer=None):
     "not_running"}`` and touches nothing, rather than landing on whatever runs
     now. The caller's view comes from iopub and may be stale; the kernel's is
     not. *key* is a cell's request -- its id is the host's, which this kernel
-    never learns -- or a task's id.
+    never learns -- or a task's id. Whether the caller may stop it is the
+    host's decision, made before it gets here.
 
     Where the interrupt goes depends on where the job runs. A task runs on a
     worker thread, which ``SIGINT`` cannot reach (Python delivers signals only
     to the main thread), so :func:`_raise_in_thread` raises into it; it lands at
     the next bytecode, so a blocking C call ends when it returns. A cell runs on
-    the main thread (:func:`hold_cell`), so it gets a real ``SIGINT``, which also breaks a blocking sleep or wait. Checked
-    and sent under the lock the cell is ended under, so the signal cannot reach
-    the next cell (see :func:`hold_cell`). Either way the job's in-flight
-    dask futures are cancelled too (:func:`_cancel_dask_futures`), the only
-    mid-``compute()`` stop short of a restart.
-
-    *origin* is the asking client's own job origin, in the vocabulary the jobs
-    themselves are recorded in: ``"user"`` (the observe UI, the default: a
-    person may stop anything running in their own session), ``"mcp"`` for a
-    remote client, ``"chat"`` for the in-process loop. A **client is refused a
-    job it did not start** (``{"refused": "foreign_job"}``): the stop would be
-    silent, since attribution runs one way only -- a user stop reaches it through
-    ``cancel_reason``, but the other writer would see nothing beyond an
-    unexplained ``interrupted`` badge. "Did not start" is relative to the asker
-    (:func:`_foreign`), which is why this takes an origin rather than a fixed
-    "is it the MCP client?" flag (biopb/biopb#880).
-
-    *writer* is the asking client's id, checked against the kernel's one-agent
-    claim (:func:`submit`): a client that does not hold this kernel cannot stop
-    what runs in it (``{"refused": "not_owner"}``). As in :func:`submit`, a
-    caller with ``writer=None`` is not checked -- there is nothing to compare.
+    the main thread (:func:`hold_cell`), so it gets a real ``SIGINT``, which
+    also breaks a blocking sleep or wait. Checked and sent under the lock the
+    cell is ended under, so the signal cannot reach the next cell (see
+    :func:`hold_cell`). Either way the in-flight dask futures are cancelled too
+    (:func:`_cancel_dask_futures`), the only mid-``compute()`` stop short of a
+    restart. *reason* (a person's Stop) is prefixed to a task's error.
     """
     with _lock:
         job = _running(key)
         if job is None:
             return {"interrupted": False, "refused": "not_running"}
-        checked = origin not in (None, "user")
-        if checked and writer is not None and _owner not in (None, writer):
-            return {"interrupted": False, "refused": "not_owner"}
-        if checked and _foreign(job, origin):
-            return {
-                "interrupted": False,
-                "refused": "foreign_job",
-                # Whose job it is, so the caller can name the writer. "Foreign"
-                # is not a synonym for "the user's" -- see _foreign().
-                "origin": job.origin,
-            }
         job.interrupted = True  # finalize as "interrupted"
         if reason:
             # Before the interrupt, so the job's finalizer sees it.
@@ -961,24 +565,10 @@ def _interrupt_main():
         signal.raise_signal(signal.SIGINT)
 
 
-def owner():
-    """``{"owner": <id or None>, "label": <str>}`` — who holds this kernel."""
-    with _lock:
-        return {"owner": _owner, "label": _owner_label}
-
-
 def reset():
-    """Drop all job records and the kernel's agent claim (used on kernel restart
-    / re-bootstrap).
-
-    Releasing here is what makes the claim last exactly one kernel lifetime:
-    :func:`install` calls this on every bootstrap, and a hard restart replaces
-    the process and its module state outright.
-    """
-    global _owner, _owner_label
+    """Drop every job (on every bootstrap, :func:`install`)."""
     with _lock:
         _jobs.clear()
-        _owner, _owner_label = None, ""
 
 
 # -- viewer wrapping --------------------------------------------------------

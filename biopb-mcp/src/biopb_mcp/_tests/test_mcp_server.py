@@ -604,9 +604,7 @@ class TestVerifyWorkflow:
         monkeypatch.setattr(_server._scratch, "poll", lambda job_id: _verify_snapshot())
         result = _tool(_server.poll_job, "verify-1", wait=0)
         assert "verify-1: ok" in result and "Verified" in result
-        assert not any(
-            "_jobs.poll(" in c[0][0] for c in server_with_host.execute.call_args_list
-        )
+        assert server_with_host.jobs.polled == 0
 
 
 # -----------------------------------------------------------------------

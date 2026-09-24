@@ -14,11 +14,11 @@ Two kinds of job, told apart by how they start and end:
   ``status: idle`` for its request ends it. A foreign cell starts at its
   ``execute_input``; the host records its own as it sends them
   (:meth:`JobLog.start_cell`), and its shell reply ends one whose idle is lost.
-* **A task** runs on a worker thread, outliving the request that started it,
-  so the kernel announces its start and end as ``biopb_job`` messages
-  (``_jobs._publish``): a ``run_async`` task, whose prints ipykernel files
-  under the cell that started it, or a verification in a scratch kernel, whose
-  cells are announced one by one so its output can be split per cell here.
+  A verification's cells are these too, one request each (``_scratch``).
+* **A task** (``run_async``) runs on a worker thread, outliving the request
+  that started it, so the kernel announces its start and end as ``biopb_job``
+  messages (``_jobs._publish``); ipykernel files its prints under the cell
+  that started it.
 """
 
 import io
@@ -61,12 +61,6 @@ _END_LOST = (
     "lost). Its output above is complete as far as it goes."
 )
 
-# Appended to a record settled from the kernel's own account (JobLog.settle).
-_OUTPUT_LOST = (
-    "\n[biopb: this job's end announcement was lost on iopub; its outcome is "
-    "the kernel's, and output may be missing.]\n"
-)
-
 
 def _dropped_marker(n):
     """The line `output` prepends once the cap has discarded a head.
@@ -91,12 +85,7 @@ def _one_line(text, limit=80):
 
 
 class _OutputBuffer:
-    """Capped stdout capture, plus the last expression's repr.
-
-    Shared by a host job record and by one cell of a kernel verification run.
-    One cap, one dropped-head marker, one monotonic total -- so a cell reports
-    its output the way a job does without either having to remember to.
-    """
+    """Capped stdout capture, plus the last expression's repr."""
 
     __slots__ = ("stdout", "stdout_dropped", "result_text", "head_prefix")
 
@@ -171,91 +160,6 @@ class _OutputBuffer:
         return _one_line(self.head_prefix, limit)
 
 
-class _CellRecord(_OutputBuffer):
-    """One cell of a verification run: its source, its outcome, its output.
-
-    The job keeps the whole run's output as well, because the two readers want
-    different cuts of one stream: the notebook needs it split per cell, and
-    ``poll_job`` on a long verification needs it accumulating in one place, the
-    way it does for any other job.
-    """
-
-    __slots__ = ("code", "status", "error_text", "started", "elapsed_final")
-
-    def __init__(self, code):
-        super().__init__()
-        self.code = code
-        # pending | ok | error | skipped
-        self.status = "pending"
-        self.error_text = ""
-        self.started = None
-        self.elapsed_final = None
-
-    def elapsed(self):
-        if self.elapsed_final is not None:
-            return self.elapsed_final
-        if self.started is None:
-            return 0.0
-        return round(time.monotonic() - self.started, 3)
-
-    def snapshot(self, full=False):
-        """This cell's outcome; *full* adds the captured output.
-
-        The polled snapshot carries a one-line head and a length, the way the
-        job list does for a job: a report's ledger needs no more, and shipping
-        every cell's output on each poll would send the job's own buffer again,
-        once per cell. The notebook reads it once, with ``full=True``
-        (:meth:`JobLog.verify_record`).
-        """
-        snap = {
-            "code": self.code,
-            "status": self.status,
-            "error_text": self.error_text,
-            "elapsed": self.elapsed(),
-            "stdout_len": self.output_total(),
-            "stdout_head": self.output_head(),
-        }
-        if full:
-            snap["stdout"] = self.output()
-            snap["result_text"] = self.result_text
-        return snap
-
-
-class _VerifyRecord:
-    """A candidate workflow, its cells, and what running them did.
-
-    The record a workflow notebook is built from. Deliberately *not* a list of
-    job ids: the program that works is a rewrite of the transcript, not a
-    selection from it. So the cells are the agent's own text, and what makes
-    them trustworthy is that they ran.
-    """
-
-    __slots__ = ("title", "created", "cells", "current")
-
-    def __init__(self, spec):
-        self.title = spec.get("title", "")
-        self.created = spec.get("created") or time.time()
-        self.cells = [_CellRecord(code) for code in spec.get("cells", [])]
-        # The cell whose output is arriving, between its start and end.
-        self.current = None
-
-    def status(self):
-        """``ok`` once every cell ran, ``error`` at the first failure."""
-        if any(c.status == "error" for c in self.cells):
-            return "error"
-        if self.cells and all(c.status == "ok" for c in self.cells):
-            return "ok"
-        return "running"
-
-    def snapshot(self, full=False):
-        return {
-            "title": self.title,
-            "created": self.created,
-            "status": self.status(),
-            "cells": [c.snapshot(full=full) for c in self.cells],
-        }
-
-
 class _Record(_OutputBuffer):
     """One job, as the host has seen it."""
 
@@ -275,7 +179,6 @@ class _Record(_OutputBuffer):
         "elapsed_final",
         "code_preview",
         "intent_preview",
-        "verify",
         "kind",
         "ename",
         "reply",
@@ -319,16 +222,6 @@ class _Record(_OutputBuffer):
         # Cut once, rather than on every observe poll.
         self.code_preview = _one_line(self.code)
         self.intent_preview = _one_line(self.intent)
-        # A verification's per-cell record, or None for an ordinary job.
-        spec = event.get("verify")
-        self.verify = _VerifyRecord(spec) if spec else None
-
-    def write_output(self, s):
-        n = super().write_output(s)
-        v = self.verify
-        if v is not None and v.current is not None:
-            v.cells[v.current].write_output(s)
-        return n
 
     def elapsed(self):
         if self.elapsed_final is not None:
@@ -359,7 +252,6 @@ class _Record(_OutputBuffer):
             "intent": self.intent,
             "elapsed": self.elapsed(),
             "created": self.started_wall,
-            "verify": self.verify.snapshot() if self.verify is not None else None,
         }
 
     def summary(self):
@@ -374,6 +266,18 @@ class _Record(_OutputBuffer):
             # prefers it over the code line.
             "intent_preview": self.intent_preview,
         }
+
+
+def _verdict(rec):
+    """``(status, error_text)`` for a cell that has ended."""
+    if rec.ename == "KeyboardInterrupt":
+        status = "interrupted"
+    else:
+        status = "error" if rec.ename else "ok"
+    error_text = rec.traceback
+    if rec.cancel_reason and status != "ok":
+        error_text = rec.cancel_reason + ("\n" + error_text if error_text else "")
+    return status, error_text
 
 
 class JobLog:
@@ -457,8 +361,17 @@ class JobLog:
             if rec is None:
                 return
             rec.reply = reply
-            if reply.get("status") == "error" and rec.ename is None:
-                rec.ename = reply.get("ename")
+            # The reply carries the error too, and cannot be lost as the
+            # iopub error can.
+            if reply.get("status") == "error":
+                rec.ename = rec.ename or reply.get("ename")
+                if not rec.traceback:
+                    rec.traceback = _ANSI_RE.sub(
+                        "", "\n".join(reply.get("traceback") or [])
+                    )
+                if rec.kind == "cell" and rec.status == "ok":
+                    # Ended on its idle, its iopub error lost.
+                    rec.end(*_verdict(rec), rec.elapsed_final)
 
     def cell_replied(self, job_id):
         """End a host cell from its shell reply, which cannot be lost -- for
@@ -528,16 +441,7 @@ class JobLog:
                 del self._cells[other.request]
                 if self._by_request.get(other.request) is other:
                     del self._by_request[other.request]
-            if rec.ename == "KeyboardInterrupt":
-                status = "interrupted"
-            else:
-                status = "error" if rec.ename else "ok"
-            error_text = rec.traceback
-            if rec.cancel_reason and status != "ok":
-                error_text = rec.cancel_reason + (
-                    "\n" + error_text if error_text else ""
-                )
-            rec.end(status, error_text)
+            rec.end(*_verdict(rec))
 
     def _on_event(self, event):
         kind = event.get("event")
@@ -547,7 +451,7 @@ class JobLog:
         with self._lock:
             if kind == "start":
                 if job_id in self._records:
-                    return  # already settled from the kernel (settle)
+                    return
                 # One task at a time, so a task still running here had ended,
                 # its end lost. Cells run beside a task.
                 for other in self._records.values():
@@ -566,34 +470,10 @@ class JobLog:
                 if rec.origin != "user":
                     self._agent_origin = rec.origin
                 self._prune()
-            elif kind in ("cell_start", "cell_end"):
-                rec = self._records.get(job_id)
-                if rec is None or rec.verify is None:
-                    return
-                i = event.get("index", -1)
-                if not 0 <= i < len(rec.verify.cells):
-                    return
-                cell = rec.verify.cells[i]
-                if kind == "cell_start":
-                    cell.started = time.monotonic()
-                    rec.verify.current = i
-                else:
-                    cell.status = event.get("status", "error")
-                    cell.error_text = event.get("error_text") or ""
-                    cell.result_text = event.get("result_text") or ""
-                    cell.elapsed_final = event.get("elapsed")
-                    rec.verify.current = None
             elif kind == "end":
                 rec = self._records.get(job_id)
                 if rec is None or rec.status != "running":
                     return
-                if rec.verify is not None:
-                    # The cells a failure never reached: marked, not dropped,
-                    # so the report says how far the workflow got.
-                    rec.verify.current = None
-                    for cell in rec.verify.cells:
-                        if cell.status == "pending":
-                            cell.status = "skipped"
                 if event.get("result_text"):
                     rec.result_text = event["result_text"]
                 rec.cancel_reason = event.get("cancel_reason")
@@ -612,51 +492,8 @@ class JobLog:
                 if rec.status != "running":
                     continue
                 rec.end("interrupted", text)
-                v = rec.verify
-                if v is not None:
-                    # The cell it died in failed; the rest never ran.
-                    for i, cell in enumerate(v.cells):
-                        if i == v.current:
-                            cell.status, cell.error_text = "error", text
-                        elif cell.status == "pending":
-                            cell.status = "skipped"
-                    v.current = None
             self._by_request.clear()
             self._cells.clear()
-
-    def settle(self, snap):
-        """Bring a record in line with the kernel's own account of the job.
-
-        *snap* is ``_jobs.poll``'s, which came back on a shell reply: iopub
-        can drop, that cannot. Replays what was missed as the events would
-        have (start, cell ends, end), so a lost announcement cannot leave a
-        record unknown or running for good. The output lost with it stays lost,
-        and the record says so.
-        """
-        job_id = snap.get("job_id")
-        status = snap.get("status")
-        if not job_id or status in (None, "unknown"):
-            return
-        verify = snap.get("verify")
-        with self._lock:
-            rec = self._records.get(job_id)
-        if rec is None:
-            spec = None
-            if verify is not None:
-                spec = dict(verify, cells=[c["code"] for c in verify["cells"]])
-            # The snapshot carries every field the start does.
-            self._on_event(dict(snap, event="start", verify=spec))
-            rec = self._records[job_id]
-        if status == "running" or rec.status != "running":
-            return
-        if verify is not None and rec.verify is not None:
-            for i, cell in enumerate(verify["cells"]):
-                if cell["status"] in ("ok", "error") and (
-                    rec.verify.cells[i].status == "pending"
-                ):
-                    self._on_event(dict(cell, event="cell_end", job_id=job_id, index=i))
-        rec.write_output(_OUTPUT_LOST)
-        self._on_event(dict(snap, event="end"))
 
     def _next_id(self):
         """The next job id. Call with `_lock` held."""
@@ -708,6 +545,26 @@ class JobLog:
                 return {"job_id": job_id, "status": "unknown", "error_text": ""}
             return rec.snapshot()
 
+    def outcome(self, job_id, full=False):
+        """How *job_id* stands, without its output unless *full*: a
+        verification's per-cell ledger (``_scratch``), read on every poll. None
+        for an unknown id."""
+        with self._lock:
+            rec = self._records.get(job_id)
+            if rec is None:
+                return None
+            out = {
+                "status": rec.status,
+                "error_text": rec.error_text,
+                "elapsed": rec.elapsed(),
+                "stdout_len": rec.output_total(),
+                "stdout_head": rec.output_head(),
+            }
+            if full:
+                out["stdout"] = rec.output()
+                out["result_text"] = rec.result_text
+            return out
+
     def summary(self):
         """One light row per retained job, for the observe list."""
         with self._lock:
@@ -717,18 +574,6 @@ class JobLog:
         """Full snapshots of every retained job, for the notebook export."""
         with self._lock:
             return [r.snapshot() for r in self._records.values()]
-
-    def verify_record(self, job_id):
-        """*job_id*'s verification record with every cell's output, or None.
-
-        The other half of the polled/full split (:meth:`_CellRecord.snapshot`):
-        read once, when the run ends, for the document the record becomes.
-        """
-        with self._lock:
-            rec = self._records.get(job_id)
-            if rec is None or rec.verify is None:
-                return None
-            return rec.verify.snapshot(full=True)
 
     def running(self, prefer=None):
         """A running job's snapshot, or ``None``: one of origin *prefer* if

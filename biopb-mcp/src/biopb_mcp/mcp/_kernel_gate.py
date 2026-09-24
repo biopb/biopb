@@ -9,7 +9,7 @@ so Stop can reach it (``_jobs.hold_cell``), and it echoes a foreign client's
 silent cell, which ipykernel does not, so the host sees it.
 
 The host's control requests land here too (:meth:`GatedKernel.biopb_request`):
-stopping a job, a job's status, the graceful close before a kill. They go on
+stopping a job, and the graceful close before a kill. They go on
 the control channel, which ipykernel serves on its own thread, so none of them
 waits behind a cell on the main thread -- the cell being stopped included.
 """
@@ -110,19 +110,8 @@ class GatedKernel(IPythonKernel):
 
         reply = None
         try:
-            with _jobs.hold_cell(
-                code, header.get("msg_id"), origin="user" if foreign else "host"
-            ) as job:
+            with _jobs.hold_cell(code, header.get("msg_id")):
                 reply = await run()
-                if reply.get("status") == "ok":
-                    job.status = "ok"
-                else:
-                    job.error_text = f"{reply.get('ename')}: {reply.get('evalue')}"
-                    # A stop (Stop on the observe page, or the client's own
-                    # Ctrl-C) is not a defect, as in _jobs._run.
-                    interrupted = reply.get("ename") == "KeyboardInterrupt"
-                    job.interrupted = interrupted
-                    job.status = "interrupted" if interrupted else "error"
         except KeyboardInterrupt:
             # A stop that arrived after the cell's code had returned, while
             # ipykernel or this gate was wrapping it up. The client still gets
@@ -159,8 +148,6 @@ class GatedKernel(IPythonKernel):
         else:
             ops = {
                 "interrupt": _jobs.interrupt,
-                "status": _jobs.status,
-                "poll": _jobs.poll,
                 "close": lambda: _close_session(self.shell.user_ns),
             }
             op = ops.get(content.get("op"))

@@ -20,7 +20,7 @@ synchronous tool function directly on the event loop, and this process serves
 waits on the kernel there does not make its caller wait, it makes every caller
 wait, for as long as the round trip takes (``execute_code`` used to hold it for
 the whole ``promote_after`` window). Kernel round trips therefore go to a thread
-(``_kernel_rpc._job_call`` / ``_execute``), and the promote window is a loop
+(``_kernel_rpc._execute``), and the promote window is a loop
 sleep. Adding a tool means adding an async one.
 """
 
@@ -245,8 +245,8 @@ def _cpu_percent(psutil):
 async def _start_job(host, code, **kwargs):
     """Submit a job and resolve everything that can happen before it runs.
 
-    *code* and *kwargs* are :func:`_jobs.submit`'s own arguments, passed as
-    values. The client identity is added here rather than passed in, because
+    *code* and *kwargs* are :func:`_submit_job`'s. The client identity is
+    added here rather than passed in, because
     claiming the kernel is this function's business:
     every submitting tool answers "am I the holder?" and "is something already
     running?" the same way, and a second answer to either is a second policy.
@@ -254,15 +254,14 @@ async def _start_job(host, code, **kwargs):
     Returns ``(job_id, foreign_note, window_alive, message)``. Exactly one of
     *job_id* and *message* is not None — *message* is the finished tool reply
     for every outcome that never started a job, and *foreign_note* is what the
-    caller appends to whatever it returns instead. *window_alive* is the viewer
-    window's liveness, carried by the submit round trip -- the only one: the
-    job is read back from the host's records.
+    caller appends to whatever it returns instead. *window_alive* is always
+    None (see :func:`_submit_job`).
     """
     writer, _label = _writers._client_identity()
 
     # Read once at entry, append to whichever path returns below. The submit
-    # round trip goes to a thread for the reason on _kernel_rpc._job_call:
-    # blocking here blocks the whole process, not this one call.
+    # goes to a thread for the reason on _kernel_rpc._execute: blocking here
+    # blocks the whole process, not this one call.
     digest = _writers._foreign_digest(host)
     foreign_note = _writers._render_foreign_note(digest)
     if foreign_note:
@@ -283,8 +282,8 @@ def _tool_busy_message(running, running_origin) -> str:
 
     Whose job is running decides the advice. Telling the agent to "stop it with
     interrupt_kernel" while *someone else* is running a cell would have it kill
-    their work; interrupt_kernel refuses that anyway (_jobs.interrupt),
-    so the wording must not send it there.
+    their work; interrupt_kernel refuses that anyway, so the wording must not
+    send it there.
     """
     if running_origin and running_origin != "mcp":
         who = "The user" if running_origin == "user" else "Another writer"
@@ -417,7 +416,7 @@ def _format_verification(record: dict, job_id: str, saved_path=None) -> str:
     for i, cell in enumerate(cells, 1):
         # The head, not the output: a verification's record is polled, and the
         # full text of every cell belongs to the notebook, not to a ledger line
-        # (see _job_log._CellRecord.snapshot).
+        # (see _scratch._record).
         head = (cell.get("stdout_head") or "").strip()
         lines.append(
             f"  {i}. {cell.get('status')} · {cell.get('elapsed')}s"
@@ -866,10 +865,8 @@ async def verify_workflow(document: str, title: str = "") -> str:
         return f"{exc} Send markdown with ```python cells, or a saved .ipynb."
     title = title.strip() or _workflow_doc.title_of(blocks)
 
-    # The verification is claimed for this client, and the claim is enforced by
-    # the scratch kernel's own one-agent check (_jobs.submit) rather than a
-    # second one here -- so a stranger is refused an interrupt on it exactly as
-    # on the session kernel.
+    # The verification is this client's: a stranger is refused an interrupt on
+    # it (_scratch.interrupt), as on the session kernel.
     writer, label = _writers._client_identity()
     foreign_note = _writers._foreign_activity_note(host)
     started = await asyncio.to_thread(

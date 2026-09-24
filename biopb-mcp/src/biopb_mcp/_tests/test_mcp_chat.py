@@ -733,7 +733,7 @@ class TestExecuteCode:
 
 class TestConcurrency:
     def test_a_second_turn_is_refused_not_queued(self, chat_host):
-        # Same rule as _jobs.submit, for the same reason: a queued turn would be
+        # Same rule as a cell's, for the same reason: a queued turn would be
         # composed against a conversation its sender has not seen the end of.
         started = asyncio.Event()
         release = asyncio.Event()

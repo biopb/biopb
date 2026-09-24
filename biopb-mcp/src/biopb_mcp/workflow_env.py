@@ -19,7 +19,7 @@ already looking at their own screen.
 
 What comes back is the *connection*, not a client: a reconnect swaps the client
 out, so a document derives it per use (``client = conn.client``) the way the
-session kernel does (``_jobs._REFRESH_PREFIX``). The connection is also what
+session kernel does before an agent's cell. The connection is also what
 ``TensorBrowserWidget(viewer, connection=conn)`` takes.
 """
 

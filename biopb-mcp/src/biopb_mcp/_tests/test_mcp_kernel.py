@@ -1151,9 +1151,11 @@ _GATED_ARGS = [
     "_conn = types.SimpleNamespace(client=None); _jobs.install(get_ipython())",
 ]
 
-# A job that keeps the worker thread busy and stops at the next bytecode when
+# A task that keeps its thread busy and stops at the next bytecode when
 # interrupted (a bare sleep would hold the interrupt until it returned).
-_LONG_JOB = "_jobs.submit('import time\\nfor _ in range(400): time.sleep(0.05)')"
+_LONG_JOB = (
+    "import time\n_jobs.run_async(lambda: [time.sleep(0.05) for _ in range(400)])"
+)
 
 
 class TestJupyterClientGate:
@@ -1209,9 +1211,7 @@ class TestJupyterClientGate:
         running = host.jobs.running()
         if running is not None:
             host.interrupt_job(running["job_id"])
-        _wait_until(
-            lambda: "None" in host.execute("print(_jobs.running_job())")["stdout"]
-        )
+        assert _wait_until(lambda: host.jobs.running() is None)
 
     @staticmethod
     def _hold_main(host, kc, seconds=30, blocking=False):
@@ -1243,20 +1243,6 @@ class TestJupyterClientGate:
         (job,) = [j for j in self._jobs(gated) if j["job_id"] == job_id]
         assert job["status"] == "interrupted"
 
-    def test_the_agent_is_refused_a_foreign_cell_without_waiting_on_it(
-        self, gated, foreign
-    ):
-        job_id = self._hold_main(gated, foreign)
-        try:
-            t0 = time.monotonic()
-            out = gated.interrupt_job(job_id, origin="mcp")
-            assert out["refused"] == "foreign_job"
-            assert time.monotonic() - t0 < 5
-            assert gated.jobs.running()["job_id"] == job_id
-        finally:
-            gated.interrupt_job(job_id)
-            foreign.get_shell_msg(timeout=10)
-
     def test_a_stop_for_a_job_that_ended_stops_nothing(self, gated, foreign):
         job_id = self._hold_main(gated, foreign)
         try:
@@ -1274,9 +1260,8 @@ class TestJupyterClientGate:
         # after it says nothing about the main thread, still in the cell.
         job_id = self._hold_main(gated, foreign)
         try:
-            # Any control request: the kernel knows a foreign cell by its
-            # request, not the host's id, so this one answers "unknown".
-            gated.control("status", job_id=job_id)
+            # Any control request: this one names nothing that runs.
+            gated.control("interrupt", key="req-none")
             time.sleep(0.3)
             assert gated.is_busy()
         finally:
@@ -1458,13 +1443,10 @@ class TestHostRecords:
 
     @staticmethod
     def _submit(host, code):
-        from biopb_mcp.mcp import _kernel_rpc
-
-        sub, res, _w = _kernel_rpc._run_job_call(
-            host, "submit", code, job_id=host.jobs.new_id(), timeout=15.0
-        )
-        assert sub is not None, res
-        return sub["job_id"]
+        """Run *code* as the agent's cell; its job id."""
+        job_id = host.jobs.new_id()
+        host.run_cell(code, job_id, "mcp")
+        return job_id
 
     def test_a_jobs_output_streams_in_while_it_runs(self, host):
         jid = self._submit(
@@ -1478,9 +1460,8 @@ class TestHostRecords:
         assert snap["stdout"] == "first\nsecond\n"
         assert snap["result_text"] == "42"
 
-    def test_the_submit_reply_is_not_the_jobs_output(self, host):
-        # The payload rides a user_expression, so a job printing at once cannot
-        # split it, and nothing of the call lands in the job's record.
+    def test_the_window_probe_is_not_the_cells_output(self, host):
+        # It rides a user_expression, so nothing of it lands in the record.
         jid = self._submit(host, "print('x', end='')")
         assert _wait_until(lambda: host.jobs.poll(jid)["status"] == "ok", timeout=5)
         assert host.jobs.poll(jid)["stdout"] == "x"

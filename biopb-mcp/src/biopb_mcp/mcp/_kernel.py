@@ -137,7 +137,7 @@ _DEATHWATCH_ARG = (
 )
 
 # Prepended to an agent's cell so ``client`` tracks the tensor connection, which
-# connects asynchronously (_jobs._REFRESH_PREFIX, for a task).
+# connects asynchronously.
 _CELL_PREFIX = "client = _conn.client\n"
 
 # Whether the viewer window is still open, evaluated after an agent's cell: a
@@ -667,7 +667,7 @@ class KernelHost:
             raise RuntimeError(reply.get("evalue") or "control op failed")
         return reply.get("r")
 
-    def run_cell(self, code, job_id, origin, intent=""):
+    def run_cell(self, code, job_id, origin, intent="", bare=False):
         """Send *code* as a cell, recorded as *job_id*; return at once.
 
         The cell runs on the kernel's main thread like any client's, queued
@@ -675,6 +675,10 @@ class KernelHost:
         and ends on its request's idle, or -- if that is lost -- on its shell
         reply, which cannot be. Raises ``RuntimeError`` carrying what to do
         when the kernel is not ready (:meth:`_not_ready_result`).
+
+        *bare* sends the code alone, without the ``client`` refresh: a
+        verification runs the document and nothing else, so a workflow that
+        never builds its own ``client`` fails there, as it would for its reader.
         """
         io = self._io
         if not self._ready.is_set() or io is None:
@@ -694,15 +698,16 @@ class KernelHost:
             timer.start()
 
         return io.send_execute(
-            _CELL_PREFIX + code,
+            code if bare else _CELL_PREFIX + code,
             on_reply,
             before_send,
             user_expressions={"w": _WINDOW_ALIVE_EXPR},
         )
 
-    def interrupt_job(self, job_id, **kwargs):
+    def interrupt_job(self, job_id, reason=None):
         """Stop *job_id* if it still runs (``_jobs.interrupt``), on the control
-        channel; *kwargs* are ``reason``, ``origin``, ``writer``.
+        channel. Whether the caller may is decided before this; *reason* is a
+        person's, prefixed to the job's error.
 
         The kernel knows a cell by its request -- a cell's id is this host's --
         and a task by its own id, which is also what it is sent when the
@@ -712,10 +717,10 @@ class KernelHost:
         key = self.jobs.stop_key(job_id) or job_id
         # Before the stop, which a cell's end can follow at once; taken back
         # if the stop does not happen.
-        self.jobs.note_cancel(job_id, kwargs.get("reason"))
+        self.jobs.note_cancel(job_id, reason)
         reply = {}
         try:
-            reply = self.control("interrupt", key=key, **kwargs)
+            reply = self.control("interrupt", key=key, reason=reason)
         finally:
             if not reply.get("interrupted"):
                 self.jobs.note_cancel(job_id, None)

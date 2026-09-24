@@ -510,12 +510,11 @@ class TestCancel:
             await asyncio.sleep(3600)
 
         monkeypatch.setattr(_model, "make_model", lambda cfg: hang)
-        for name in ("_job_call", "_run_job_call", "_execute"):
-            monkeypatch.setattr(
-                _kernel_rpc,
-                name,
-                lambda *a, **k: touched.append(a) or (None, {}, None),
-            )
+        monkeypatch.setattr(
+            _kernel_rpc,
+            "_execute",
+            lambda *a, **k: touched.append(a) or (None, {}, None),
+        )
         client.post("/chat/turn", json={"text": "hello"})
         assert self._wait_for(started.is_set)
         client.post("/chat/cancel", json={})
