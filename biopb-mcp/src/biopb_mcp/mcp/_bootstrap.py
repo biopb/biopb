@@ -549,8 +549,7 @@ def _bootstrap_impl():
             # showing "Loading napari…" for that phase), so this import just
             # binds the name — the real cost is napari.Viewer() below.
             import napari
-
-            from ..tensor_browser import TensorBrowserWidget
+            from biopb_napari_widget import TensorBrowserWidget
 
             splash.message("Opening viewer…")  # the slow step
             viewer = napari.Viewer()

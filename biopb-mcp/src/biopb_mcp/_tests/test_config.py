@@ -2,7 +2,6 @@
 
 import json
 
-import numpy as np
 import pytest
 
 from biopb_mcp._config import (
@@ -10,7 +9,6 @@ from biopb_mcp._config import (
     DEFAULT_CONFIG,
     get_config_path,
     get_default_config,
-    get_grid_params,
     get_setting,
     load_config,
     save_config,
@@ -39,8 +37,8 @@ class TestLoadConfig:
     def test_loads_existing_config(self, mock_config_dir):
         """Loads and merges existing config file."""
         custom_config = {
-            "widget": {"server_url": "custom.server.org"},
-            "detection": {"min_score": 0.5},
+            "kernel": {"name": "custom-kernel"},
+            "timeout": {"health_check": 0.5},
         }
         config_path = mock_config_dir / CONFIG_NAME
         config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -50,13 +48,13 @@ class TestLoadConfig:
         config = load_config()
 
         # Custom values should override defaults
-        assert config["widget"]["server_url"] == "custom.server.org"
-        assert config["detection"]["min_score"] == 0.5
+        assert config["kernel"]["name"] == "custom-kernel"
+        assert config["timeout"]["health_check"] == 0.5
 
         # Deep merge: sibling leaves under the overridden section survive.
         defaults = get_default_config()
-        assert config["grid"] == defaults["grid"]
-        assert config["detection"]["nms"] == defaults["detection"]["nms"]
+        assert config["memory"] == defaults["memory"]
+        assert config["timeout"]["get_op_names"] == defaults["timeout"]["get_op_names"]
 
     def test_deep_merge_preserves_sibling_leaves(self, mock_config_dir):
         """A partial nested override touches only its own leaf."""
@@ -85,7 +83,7 @@ class TestLoadConfig:
 
     def test_handles_missing_keys(self, mock_config_dir):
         """Merges with defaults for missing top-level keys."""
-        custom_config = {"widget": {"server_url": "test.org"}}
+        custom_config = {"kernel": {"name": "test"}}
         config_path = mock_config_dir / CONFIG_NAME
         config_path.parent.mkdir(parents=True, exist_ok=True)
         with config_path.open("w") as f:
@@ -94,7 +92,7 @@ class TestLoadConfig:
         config = load_config()
 
         # Should have all expected keys
-        for key in ("widget", "pyramid", "timeout", "grpc", "transport"):
+        for key in ("kernel", "timeout", "grpc", "transport"):
             assert key in config
 
 
@@ -104,7 +102,7 @@ class TestSaveConfig:
     def test_creates_config_file(self, mock_config_dir):
         """Creates config file in correct location."""
         config = get_default_config()
-        config["widget"]["server_url"] = "saved.server.org"
+        config["kernel"]["name"] = "saved"
 
         save_config(config)
 
@@ -113,17 +111,17 @@ class TestSaveConfig:
     def test_saves_valid_json(self, mock_config_dir):
         """Saves valid JSON that can be loaded."""
         config = get_default_config()
-        config["detection"]["min_score"] = 0.6
+        config["timeout"]["health_check"] = 0.6
 
         save_config(config)
 
         loaded = load_config()
-        assert loaded["detection"]["min_score"] == 0.6
+        assert loaded["timeout"]["health_check"] == 0.6
 
     def test_preserves_all_values(self, mock_config_dir):
         """Preserves all config values when saving."""
         config = get_default_config()
-        config["grid"]["size_2d"] = [2048, 2048]
+        config["memory"]["warn_threshold_mb"] = 100
         config["timeout"]["detection_2d"] = 30
 
         save_config(config)
@@ -131,59 +129,8 @@ class TestSaveConfig:
         with (mock_config_dir / CONFIG_NAME).open("r") as f:
             saved = json.load(f)
 
-        assert saved["grid"]["size_2d"] == [2048, 2048]
+        assert saved["memory"]["warn_threshold_mb"] == 100
         assert saved["timeout"]["detection_2d"] == 30
-
-
-class TestGetGridParams:
-    """Tests for get_grid_params function."""
-
-    def test_2d_grid_params(self):
-        defaults = get_default_config()
-        grid_size, stride = get_grid_params(False, defaults)
-
-        assert grid_size.shape == (2,)
-        assert stride.shape == (2,)
-        assert np.array_equal(grid_size, np.array([4096, 4096]))
-        assert np.array_equal(stride, np.array([4000, 4000]))
-
-    def test_3d_grid_params(self):
-        defaults = get_default_config()
-        grid_size, stride = get_grid_params(True, defaults)
-
-        assert grid_size.shape == (3,)
-        assert stride.shape == (3,)
-        assert np.array_equal(grid_size, np.array([64, 512, 512]))
-        assert np.array_equal(stride, np.array([48, 480, 480]))
-
-    def test_custom_grid_params(self):
-        config = get_default_config()
-        config["grid"]["size_2d"] = [2048, 2048]
-        config["grid"]["stride_2d"] = [2000, 2000]
-        config["grid"]["size_3d"] = [32, 256, 256]
-        config["grid"]["stride_3d"] = [24, 240, 240]
-
-        grid_2d, stride_2d = get_grid_params(False, config)
-        assert np.array_equal(grid_2d, np.array([2048, 2048]))
-        assert np.array_equal(stride_2d, np.array([2000, 2000]))
-
-        grid_3d, stride_3d = get_grid_params(True, config)
-        assert np.array_equal(grid_3d, np.array([32, 256, 256]))
-        assert np.array_equal(stride_3d, np.array([24, 240, 240]))
-
-    def test_returns_int_dtype(self):
-        defaults = get_default_config()
-        grid_size, stride = get_grid_params(False, defaults)
-        assert grid_size.dtype in (np.int64, np.int32)
-        assert stride.dtype in (np.int64, np.int32)
-
-    def test_handles_missing_grid_config(self):
-        """Returns defaults when grid config is missing."""
-        grid = get_default_config()["grid"]
-        grid_size, stride = get_grid_params(False, {})  # empty config
-
-        assert np.array_equal(grid_size, np.array(grid["size_2d"]))
-        assert np.array_equal(stride, np.array(grid["stride_2d"]))
 
 
 class TestDefaultConfig:
@@ -192,10 +139,6 @@ class TestDefaultConfig:
     def test_has_all_required_keys(self):
         """DEFAULT_CONFIG contains all expected top-level (flat) sections."""
         required_keys = [
-            "widget",
-            "detection",
-            "grid",
-            "pyramid",
             "timeout",
             "grpc",
             "memory",
@@ -208,15 +151,6 @@ class TestDefaultConfig:
         ]
         for key in required_keys:
             assert key in DEFAULT_CONFIG
-
-    def test_widget_and_detection_and_grid(self):
-        """The demo-widget settings live in flat widget/detection/grid sections."""
-        assert DEFAULT_CONFIG["widget"]["server_url"] == "localhost:50051"
-        assert DEFAULT_CONFIG["widget"]["is_3d"] is False
-        for key in ("min_score", "size_hint", "nms", "z_aspect_ratio"):
-            assert key in DEFAULT_CONFIG["detection"]
-        for key in ("size_2d", "stride_2d", "size_3d", "stride_3d"):
-            assert key in DEFAULT_CONFIG["grid"]
 
     def test_timeout_config_complete(self):
         for key in ("health_check", "get_op_names", "detection_2d", "detection_3d"):
@@ -262,7 +196,6 @@ class TestGetSetting:
 
     def test_missing_falls_back_to_default_config(self):
         assert get_setting({}, "transport.port") == 8765
-        assert get_setting({}, "widget.server_url") == "localhost:50051"
         assert get_setting({}, "kernel.name") == "python3"
 
     def test_partial_path_falls_back(self):
@@ -305,64 +238,64 @@ class TestConfigSingleton:
         monkeypatch.setattr(cfg, "_read_and_merge_from_disk", _counting)
 
         CONFIG.reload()
-        CONFIG.get("pyramid.threshold")
+        CONFIG.get("kernel.name")
         CONFIG.get("transport.port")
         assert calls["n"] == 1  # second get hits the cache
 
         CONFIG.reload()
-        CONFIG.get("pyramid.threshold")
+        CONFIG.get("kernel.name")
         assert calls["n"] == 2  # reload forces a fresh read
 
     def test_get_falls_back_to_default_config(self):
         assert CONFIG.get("transport.port") == 8765
-        assert CONFIG.get("widget.server_url") == "localhost:50051"
+        assert CONFIG.get("kernel.name") == "python3"
 
     def test_set_persist_updates_cache_and_file(self):
         """set() with persist=True updates the cache AND the file."""
-        CONFIG.set("widget.server_url", "grpc://set:1")
+        CONFIG.set("kernel.name", "set-1")
 
-        assert CONFIG.get("widget.server_url") == "grpc://set:1"
+        assert CONFIG.get("kernel.name") == "set-1"
         with get_config_path().open() as f:
             on_disk = json.load(f)
-        assert on_disk["widget"]["server_url"] == "grpc://set:1"
+        assert on_disk["kernel"]["name"] == "set-1"
 
     def test_set_no_persist_then_save_writes_once(self):
         """persist=False defers the write; save() flushes the batch."""
-        CONFIG.set("widget.is_3d", True, persist=False)
-        CONFIG.set("widget.server_url", "deferred:1", persist=False)
+        CONFIG.set("viewer.async_slicing", False, persist=False)
+        CONFIG.set("kernel.name", "deferred", persist=False)
         assert not get_config_path().exists()
 
         CONFIG.save()
         with get_config_path().open() as f:
             on_disk = json.load(f)
-        assert on_disk["widget"]["is_3d"] is True
-        assert on_disk["widget"]["server_url"] == "deferred:1"
+        assert on_disk["viewer"]["async_slicing"] is False
+        assert on_disk["kernel"]["name"] == "deferred"
 
     def test_set_creates_missing_intermediate_section(self):
         CONFIG.set("brandnew.section.leaf", 5, persist=False)
         assert CONFIG.get("brandnew.section.leaf") == 5
 
     def test_reload_picks_up_external_edit(self):
-        assert CONFIG.get("widget.server_url") == "localhost:50051"
+        assert CONFIG.get("kernel.name") == "python3"
 
         path = get_config_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("w") as f:
-            json.dump({"widget": {"server_url": "ext:9"}}, f)
-        assert CONFIG.get("widget.server_url") == "localhost:50051"
+            json.dump({"kernel": {"name": "ext"}}, f)
+        assert CONFIG.get("kernel.name") == "python3"
 
         CONFIG.reload()
-        assert CONFIG.get("widget.server_url") == "ext:9"
+        assert CONFIG.get("kernel.name") == "ext"
 
     def test_load_config_returns_live_singleton(self):
         assert load_config() is CONFIG.as_dict()
 
     def test_save_config_shim_refreshes_cache(self):
         config = get_default_config()
-        config["detection"]["min_score"] = 0.9
+        config["timeout"]["health_check"] = 0.9
         save_config(config)
 
-        assert CONFIG.get("detection.min_score") == 0.9
+        assert CONFIG.get("timeout.health_check") == 0.9
 
     def test_get_serialized_against_concurrent_reload(self, monkeypatch):
         """get() holds the lock across _ensure_loaded + the dotted-path walk.
@@ -376,7 +309,7 @@ class TestConfigSingleton:
         path = get_config_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("w") as f:
-            json.dump({"widget": {"server_url": "disk:1"}}, f)
+            json.dump({"kernel": {"name": "disk"}}, f)
         CONFIG.reload()
 
         real_ensure = CONFIG._ensure_loaded
@@ -393,7 +326,7 @@ class TestConfigSingleton:
         result = {}
 
         def getter():
-            result["v"] = CONFIG.get("widget.server_url")
+            result["v"] = CONFIG.get("kernel.name")
 
         g = threading.Thread(target=getter)
         g.start()
@@ -406,7 +339,7 @@ class TestConfigSingleton:
         g.join(2)
         r.join(2)
 
-        assert result["v"] == "disk:1"
+        assert result["v"] == "disk"
 
 
 def _write_and_load(mock_config_dir, raw: dict) -> dict:
@@ -422,22 +355,17 @@ def _write_and_load(mock_config_dir, raw: dict) -> dict:
 class TestValidation:
     """Out-of-range / bad-enum leaves are warned and reset to defaults (#182)."""
 
-    def test_pyramid_out_of_range_clamped_to_default(self, mock_config_dir):
-        """The three shared pyramid knobs are the same bug as the tensor server:
-        a bad value would silently break build_pyramid_levels. Each resets."""
+    def test_out_of_range_clamped_to_default(self, mock_config_dir):
         defaults = get_default_config()
         config = _write_and_load(
             mock_config_dir,
-            {
-                "pyramid": {
-                    "downscale_factor": 1,  # >= 2 required (==1 -> no pyramid)
-                    "pixel_budget_cubic_root": 0,  # >= 1 (0 -> infinite loop)
-                    "threshold": -5,  # >= 1
-                }
-            },
+            {"grpc": {"max_concurrent_calls": 0}, "timeout": {"health_check": -1}},
         )
-        for key in ("downscale_factor", "pixel_budget_cubic_root", "threshold"):
-            assert get_setting(config, f"pyramid.{key}") == defaults["pyramid"][key]
+        assert (
+            config["grpc"]["max_concurrent_calls"]
+            == defaults["grpc"]["max_concurrent_calls"]
+        )
+        assert config["timeout"]["health_check"] == defaults["timeout"]["health_check"]
 
     def test_bad_enum_clamped_to_default(self, mock_config_dir):
         config = _write_and_load(
@@ -469,14 +397,14 @@ class TestValidation:
         The written value is deliberately *not* the default, so a pass means the
         default won rather than the string having been coerced to its own value.
         """
-        from biopb_mcp._config import PyramidConfig
+        from biopb_mcp._config import GrpcConfig
 
-        default = PyramidConfig().downscale_factor
+        default = GrpcConfig().max_concurrent_calls
         config = _write_and_load(
-            mock_config_dir, {"pyramid": {"downscale_factor": "8"}}
+            mock_config_dir, {"grpc": {"max_concurrent_calls": "8"}}
         )
-        assert get_setting(config, "pyramid.downscale_factor") == default
-        assert isinstance(get_setting(config, "pyramid.downscale_factor"), int)
+        assert get_setting(config, "grpc.max_concurrent_calls") == default
+        assert isinstance(get_setting(config, "grpc.max_concurrent_calls"), int)
 
     def test_zero_is_valid_where_it_disables(self, mock_config_dir):
         """0 is a documented sentinel (disables the watchdog), so it must pass
@@ -488,21 +416,21 @@ class TestValidation:
         config = _write_and_load(
             mock_config_dir,
             {
-                "pyramid": {"downscale_factor": 2},
+                "grpc": {"max_concurrent_calls": 2},
                 "transport": {"kind": "http", "port": 9000},
             },
         )
-        assert get_setting(config, "pyramid.downscale_factor") == 2
+        assert get_setting(config, "grpc.max_concurrent_calls") == 2
         assert get_setting(config, "transport.kind") == "http"
         assert get_setting(config, "transport.port") == 9000
 
     def test_warns_naming_key_value_and_range(self, mock_config_dir, caplog):
         with caplog.at_level("WARNING"):
-            _write_and_load(mock_config_dir, {"pyramid": {"downscale_factor": 1}})
+            _write_and_load(mock_config_dir, {"grpc": {"max_concurrent_calls": 0}})
         msg = "\n".join(caplog.messages)
-        assert "pyramid.downscale_factor" in msg
-        assert "1" in msg
-        assert ">= 2" in msg
+        assert "grpc.max_concurrent_calls" in msg
+        assert "0" in msg
+        assert ">= 1" in msg
 
     def test_malformed_file_still_falls_back_to_defaults(self, mock_config_dir):
         """A non-dict-JSON file is unaffected by validation (still defaults)."""
@@ -522,8 +450,7 @@ class TestValidation:
     def test_shipped_defaults_satisfy_every_constraint(self):
         """DEFAULT_CONFIG must itself pass validation -- otherwise a bad leaf
         would clamp to a default that is *also* invalid. Iterates the class-keyed
-        _CONSTRAINTS through the section->class map, pinning the pyramid defaults
-        against the shared constraint rows too."""
+        _CONSTRAINTS through the section->class map."""
         from biopb_mcp._config import (
             _CONSTRAINTS,
             _MISSING,

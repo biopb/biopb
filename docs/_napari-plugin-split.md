@@ -1,6 +1,6 @@
 # Splitting the napari plugin out of biopb-mcp
 
-Status: step 1 (below) is implemented; steps 2-4 are not.
+Status: implemented. The plugin is [biopb/biopb-napari-widget](https://github.com/biopb/biopb-napari-widget); its two image-processing widgets ship there unlisted in the manifest, as experimental.
 
 **Components:** `biopb-mcp` (the code leaves it), the core SDK (`biopb`, gains a
 `control` subpackage), a new repository `biopb/biopb-napari-widget` for the

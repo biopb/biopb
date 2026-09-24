@@ -59,8 +59,7 @@ def test_every_section_says_whether_it_is_on_the_settings_page():
 
 def test_titled_sections_carry_their_nav_prose(schema):
     titled = {k: v for k, v in schema["properties"].items() if "title" in v}
-    assert {"pyramid", "chat", "kernel"} <= set(titled)
-    assert not {"widget", "detection", "grid"} & set(titled)
+    assert {"timeout", "chat", "kernel"} <= set(titled)
     assert all(v["description"] for v in titled.values())
 
 
@@ -92,9 +91,6 @@ def test_every_constraint_reflected(schema):
 
 
 def test_list_fields_are_arrays(schema):
-    grid = schema["properties"]["grid"]["properties"]
-    assert grid["size_2d"]["type"] == "array"
-    assert grid["size_2d"]["items"]["type"] == "integer"
     services = schema["properties"]["services"]["properties"]
     assert services["process_image_servers"]["type"] == "array"
     assert services["process_image_servers"]["items"]["type"] == "string"
@@ -106,7 +102,7 @@ def test_list_fields_are_arrays(schema):
         {"transport": {"port": 8080}},
         {"transport": {"kind": "http"}},
         {"kernel": {"promote_after": 30.0}},
-        {"pyramid": {"downscale_factor": 2}},
+        {"grpc": {"max_concurrent_calls": 2}},
         {"future_unknown": {"knob": 1}},  # additionalProperties: true
     ],
 )
@@ -120,7 +116,7 @@ def test_accepts_valid(validator, cfg):
         {"transport": {"port": 0}},
         {"transport": {"port": 70000}},
         {"transport": {"kind": "websocket"}},
-        {"pyramid": {"downscale_factor": 1}},
+        {"grpc": {"max_concurrent_calls": 0}},
     ],
 )
 def test_rejects_invalid(validator, cfg):

@@ -11,7 +11,7 @@ plane implementations. Each top-level subdir is one component:
 | `src/` | **The core `biopb` SDK** — the Python package (`src/main/python/biopb`: the `tensor` Flight client, the `biopb` CLI, and the stdlib-only cross-process seams) and the Java client (`src/main/java`), plus their tests under `src/test/`. |
 | `biopb-tensor-server/` | **The data plane** — the Arrow Flight server, its format adapters, catalog, cache, and HTTP sidecar. |
 | `biopb-image-runtime/` | **The compute-plane base** — `BiopbServicerBase` and the base Docker image that algorithm servers derive from. |
-| `biopb-mcp/` | **The agent client** — the napari plugin (Tensor Browser + demo widgets) and the MCP server that drives a live napari session. |
+| `biopb-mcp/` | **The agent client** — the MCP server that drives a live napari session. Its Tensor Browser comes from [biopb-napari-widget](https://github.com/biopb/biopb-napari-widget). |
 | `biopb-control/` | **The control plane** — the single web origin; supervises the data plane and serves the browser UI. |
 | `web/` | **The browser front end** — one Vite + React SPA (dataviewer, admin, dashboard, observe), served by the control. |
 | `install/` | Installers (`install.sh` / `install.ps1`) and the GUI launcher. |
@@ -207,9 +207,7 @@ control.
   artifact. Purpose-built tools are added **only where the agent cannot do the job
   in plain Python** — the canonical example being trained-model segmentation.
   Classical operations (filtering, regionprops, blob detection) are left to the
-  agent, because wrapping them would only constrain it. The `ProcessImage`
-  widgets in the napari plugin are **demos** of how to stand up an algorithm
-  server, not the primary interface.
+  agent, because wrapping them would only constrain it.
 
 Because the agent runs arbitrary code against a live session, the session must
 survive the agent doing something wrong — which is why the kernel is a separate,
@@ -231,9 +229,9 @@ durable planes and the web origin in
   `BiopbServicerBase`, `return_lazy_or_eager`, the embedded cache.
 - **An example algorithm server:** `biopb-server/cellpose/cellpose_server.py`
   (the only remaining separate repo).
-- **Client / agent:** `biopb-mcp/src/biopb_mcp/` — `tensor_browser/` and
-  `mcp/` (`_kernel.py`, `_bootstrap.py`, `_server.py`); the data-plane
-  connection is the SDK's `biopb.tensor.Connection`.
+- **Client / agent:** `biopb-mcp/src/biopb_mcp/mcp/` (`_kernel.py`,
+  `_bootstrap.py`, `_server.py`); the data-plane connection is the SDK's
+  `biopb.tensor.Connection`, and the Tensor Browser is biopb-napari-widget's.
 - **Control plane / web origin:** `biopb-control/src/biopb_control/` —
   `_control.py` (the ASGI app: serves the `web/` SPA + proxies the data plane and
   sessions), `_supervisor.py` (data-plane subprocess lifecycle).

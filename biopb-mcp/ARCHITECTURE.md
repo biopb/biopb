@@ -2,16 +2,15 @@
 
 ## Overview
 
-`biopb-mcp` connects [napari](https://napari.org) and AI agents to biopb servers.
-It has two faces over one shared data layer:
+`biopb-mcp` is an **MCP server** that connects [napari](https://napari.org) and AI
+agents to biopb servers. It exposes a live napari viewer to an agent. Thesis:
+*"agent first; provide tools only if they help."* The agent drives napari through a
+real Python kernel; image results go to the viewer, other results to the agent's chat.
 
-1. **napari plugin** — a `Tensor Browser` widget that browses/loads images from
-   the tensor server, plus two **demo widgets** (`Object Detection`, `Image
-   Processing`) that exercise the `biopb.image` gRPC protocol. The demo widgets
-   exist to test algorithm servers; they are **not** the primary interface.
-2. **MCP server** — exposes a live napari viewer to an AI agent. Thesis: *"agent
-   first; provide tools only if they help."* The agent drives napari through a real
-   Python kernel; image results go to the viewer, other results to the agent's chat.
+The viewer docks the **Tensor Browser**, and the agent's `add_tensor` builds its
+layers through the same pipeline; both come from the separate napari plugin
+[biopb-napari-widget](https://github.com/biopb/biopb-napari-widget), which
+depends on nothing here.
 
 ---
 
@@ -124,7 +123,7 @@ group's children, so they go down with it. There is no cluster machinery in the
 session child or the kernel's bootstrap, and no MCP tool: attaching is
 `Client(...)` and detaching is `close()`. The one piece kept is the viewer's pin:
 its slice reads run in-process whatever the default scheduler is
-(`_viewer_compute`, #8).
+(biopb-napari-widget's `wrap_levels`, #8).
 
 ### Data connection
 
@@ -132,7 +131,7 @@ The kernel and the Tensor Browser share one `biopb.tensor.Connection` (the SDK's
 the plane's URL, the live Flight client, and why there is none. The kernel builds
 it and hands it to the widget, which connects it, so a reconnect in the widget is
 the agent's next `client`. It caches nothing; the catalog the tree is drawn from
-is the widget's own (`tensor_browser/_sources.py`), re-listed when the server's
+is the widget's own (biopb-napari-widget's `SourceList`), re-listed when the server's
 `source_count` moves.
 
 Where the plane is comes from `biopb.control`, the SDK's client of the control

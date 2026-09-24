@@ -1354,8 +1354,9 @@ install_biopb() {
     #     `sys.executable -m biopb_tensor_server.cli`, so the server must be
     #     importable from biopb's interpreter (this also restores
     #     `from biopb_tensor_server.config import load_config`);
-    #   - biopb-mcp is a napari plugin + MCP server that talks to the tensor
-    #     server and runs a napari viewer in this same env.
+    #   - biopb-mcp is the MCP server that talks to the tensor server and runs
+    #     a napari viewer in this same env (its widgets come from PyPI's
+    #     biopb-napari-widget).
     # biopb is the primary tool (exposes the `biopb` command); --with adds the
     # siblings to the same env and --with-executables-from also links their
     # console scripts onto PATH (plain --with does not expose executables).

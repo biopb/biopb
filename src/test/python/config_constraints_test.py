@@ -1,8 +1,8 @@
 """Unit tests for the shared config-constraint primitives.
 
 These primitives (:class:`biopb._config_constraints.Range` / ``Enum``) and the
-shared ``PYRAMID_CONSTRAINTS`` rows are consumed by both biopb-tensor-server and
-biopb-mcp, so their behavior is pinned here in the core package (biopb#34, #182).
+``PYRAMID_CONSTRAINTS`` rows live in the core package, so their behavior is
+pinned here (biopb#34, #182).
 """
 
 from biopb._config_constraints import PYRAMID_CONSTRAINTS, Enum, Range

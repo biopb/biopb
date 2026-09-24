@@ -5,16 +5,14 @@ neither can import the other's config module: ``biopb-tensor-server`` is not on
 PyPI (so ``biopb-mcp`` cannot depend on it at runtime), and the two config
 *shapes* differ (the server validates dataclass instances in ``__post_init__``;
 biopb-mcp validates a merged dict by dotted path). What they *can* share is the
-tiny, format-agnostic core: the ``Range`` / ``Enum`` primitives and the handful
-of constraint rows that describe the **same knobs** in both places.
+tiny, format-agnostic core: the ``Range`` / ``Enum`` primitives, and the
+pyramid rows below.
 
-The pyramid rows are the load-bearing case. ``pyramid.{threshold,
-downscale_factor, pixel_budget_cubic_root}`` exist in both packages (the tensor
-server's ``PyramidConfig`` copied biopb-mcp's historical defaults); an
-out-of-range value there silently breaks pyramid construction on either side
-(``downscale_factor=1`` -> a single full-res level; ``pixel_budget_cubic_root<=0``
--> an infinite loop). Declaring the bounds here once means the two packages
-cannot drift (biopb/biopb#34, #182).
+The pyramid rows are the tensor server's ``pyramid.{threshold,
+downscale_factor, pixel_budget_cubic_root}``: an out-of-range value there
+silently breaks pyramid construction (``downscale_factor=1`` -> a single
+full-res level; ``pixel_budget_cubic_root<=0`` -> an infinite loop)
+(biopb/biopb#34, #182).
 
 Deliberately stdlib-only, like the sibling :mod:`biopb._locations`, so
 importing it stays cheap and pulls in none of the heavy adapter/discovery
@@ -117,11 +115,8 @@ class Enum:
         return {"enum": sorted(self._display, key=str)}
 
 
-# The pyramid-knob bounds shared by biopb-tensor-server (PyramidConfig) and
-# biopb-mcp (the `pyramid` config section). Keyed by the leaf field name, which
-# is identical in both. `reduction_method` is intentionally absent: on-the-fly
-# reduction is a tensor-server compute concern, not a biopb-mcp knob, so its
-# enum stays local to the server.
+# The bounds of biopb-tensor-server's PyramidConfig knobs, keyed by leaf field
+# name. `reduction_method`'s enum stays local to the server.
 #
 #   downscale_factor >= 2         : must actually shrink; ==1 yields no pyramid.
 #   threshold >= 1                : max x/y extent of the coarsest level.

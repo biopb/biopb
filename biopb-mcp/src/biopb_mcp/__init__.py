@@ -1,11 +1,8 @@
-"""biopb-mcp: an MCP server that drives a napari viewer for AI agents, plus a
-Tensor Browser napari plugin widget for human data browsing.
+"""biopb-mcp: an MCP server that drives a napari viewer for AI agents.
 
-The package root is intentionally minimal — it does not import the GUI widgets —
-so that the MCP modules (e.g. ``biopb_mcp.workflow_env``) can be imported
-without pulling in Qt/napari. The plugin widgets live in their
-subpackages (``biopb_mcp.tensor_browser`` / ``biopb_mcp.image_processing``) and
-are referenced directly by the napari manifest (``napari.yaml``).
+The napari widgets it docks come from ``biopb-napari-widget``. The package root
+imports nothing heavy, so the MCP modules (e.g. ``biopb_mcp.workflow_env``)
+import without Qt/napari.
 """
 
 try:
