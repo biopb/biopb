@@ -678,7 +678,7 @@ async def _chat_engine(request):
     flight belongs to the engine that started it.
 
     The harder refusal is the kernel's. Both engines run code as an MCP client
-    and the kernel admits one (``_jobs.submit``), so a switch made after the
+    and the host admits one (``_writers.take_claim``), so a switch made after the
     outgoing engine has claimed it leaves the incoming one refused on its first
     cell -- with a ``not_owner`` deep inside a tool result, which is the worst
     possible place to learn it. The claim is released only by a kernel restart,

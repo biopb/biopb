@@ -179,6 +179,20 @@ class TestCells:
         assert first["status"] == "error" and "not recorded" in first["error_text"]
         assert second["status"] == "ok"
 
+    def test_a_host_cell_still_queued_is_not_ended_by_another(self):
+        # Sent, but waiting in the kernel's queue behind a user's cell: it has
+        # not begun, so that cell's end proves nothing about it.
+        log = self._log()
+        log.start_cell(log.new_id(), "h1", "x = 1", origin="mcp")
+        _input(log, "y = 2", "c1")
+        _idle(log, "c1")
+        assert log.poll("job-1")["status"] == "running"
+        # Once it has begun, it is one cell of the one-at-a-time sequence.
+        _input(log, "x = 1", "h1", session="host")
+        _input(log, "z = 3", "c2")
+        _idle(log, "c2")
+        assert log.poll("job-1")["status"] == "error"
+
     def test_a_cell_does_not_end_a_task(self):
         # A task runs beside the cells (run_async).
         log = self._log()
@@ -189,7 +203,7 @@ class TestCells:
 
     def test_a_task_takes_its_cells_output_and_writer(self):
         log = self._log()
-        log.start_cell("job-1", "c1", "run_async(f)", origin="chat")
+        log.start_cell(log.new_id(), "c1", "run_async(f)", origin="chat")
         _print(log, "before\n", request="c1")
         _start(log, job_id="task-1", request="c1", origin="mcp")
         _print(log, "from the task\n", request="c1")
@@ -203,14 +217,14 @@ class TestCells:
 
     def test_a_host_cell_ends_on_its_reply_if_its_idle_is_lost(self):
         log = self._log()
-        log.start_cell("job-1", "c1", "1/0", origin="mcp")
+        log.start_cell(log.new_id(), "c1", "1/0", origin="mcp")
         log.note_reply("job-1", {"status": "error", "ename": "ZeroDivisionError"})
         log.cell_replied("job-1")
         assert log.poll("job-1")["status"] == "error"
 
     def test_the_viewer_window_comes_back_on_the_reply(self):
         log = self._log()
-        log.start_cell("job-1", "c1", "x", origin="mcp")
+        log.start_cell(log.new_id(), "c1", "x", origin="mcp")
         assert log.window_alive("job-1") is None
         log.note_reply(
             "job-1",

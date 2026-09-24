@@ -22,7 +22,7 @@ Design notes
 * **The agent is a real MCP client, so it takes the kernel the ordinary way.**
   Nothing here calls the kernel. Cells arrive through ``_server``'s tool
   handlers like any other client's, which is also how the one-agent claim comes
-  to cover it (``_jobs.submit``) and why its cells show up in the job list under
+  to cover it (``_writers.take_claim``) and why its cells show up in the job list under
   ``origin="mcp"`` — it *is* an MCP client, just one we launched.
 * **Items, not messages.** ``_chat`` appends to a chat-completions transcript;
   ACP sends normalized items and then updates them in place by id. So the
@@ -619,7 +619,7 @@ async def choose_model(value, config):
 
     So this starts it. Cheap next to the alternative, and it does not take the
     kernel with it: the one-agent claim is made when a client *runs code*
-    (``_server._presume_claim``, on submit), not when one connects, so a switch
+    (``_writers.take_claim``, on its first cell), not when one connects, so a switch
     back to the built-in loop is still available afterwards.
     """
     async with _lock():

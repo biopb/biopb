@@ -9,7 +9,8 @@ description: The kernel: namespace, plugins, long-running jobs, where computes r
 Kernel is the main execution context for the agent. It is a live Python interpreter with access to
 the TensorFlightClient for browsing and retrieving image data, and — where the session has a
 display — a napari viewer window. The kernel is **stateful**: variables, imports, and viewer state
-persist across turns. Agent code runs in a background thread to keep the main Qt thread responsive.
+persist across turns. Agent code runs as a cell on the kernel's main thread, like a notebook cell:
+while it runs the viewer does not repaint. Run a long compute you want to watch with `run_async(fn)`.
 
 **There are two ways to show the user an image**, and which ones this session has is a fact about
 the session, not about the work: the napari window ([[napari-viewer]]) and the browser page the control
@@ -75,10 +76,20 @@ plugin modules are registered for by-value pickling, so a dask worker does not
 need the plugin dir.
 
 ## Long-running jobs
-A slow `execute_code` call runs in a background thread and returns a `job-N` handle;
-watch it with `poll_job` / `take_screenshot` / `server_status`, stop it with `interrupt_kernel`
-(best-effort, raises KeyboardInterrupt into the job and cancels in-flight dask tasks) or
-`restart_kernel` (guaranteed, kills the kernel). Notes:
+A slow `execute_code` call returns a `job-N` handle while the cell keeps running on the main
+thread. Meanwhile the viewer does not repaint, and `take_screenshot` / `inspect_object` refuse
+until it ends -- asking for one then is a mistake in the plan. For a compute you want to watch,
+end the cell with `run_async(fn, *args)` instead: `fn` runs on a worker thread, the call returns
+a `task-...` id at once, and the viewer and screenshots stay live. Notes on tasks:
+* One task at a time. What `fn` prints and returns is the task's record (`poll_job(task_id)`).
+* Everything the cell prints after `run_async` is filed with the task, since the two share the
+  cell's request: make `run_async` the cell's last statement.
+* A task may mutate `viewer` (its calls are marshaled to the main thread). A user's cell can run
+  meanwhile, and the two can race over the namespace and the viewer.
+
+Stop a cell or a task with `interrupt_kernel` (a KeyboardInterrupt at the next bytecode; it also
+cancels in-flight dask tasks while a cluster is attached) or `restart_kernel` (guaranteed, kills
+the kernel). Notes:
 * **`poll_job` waits for you — do not spin on it.** It watches a running job for
   `wait` seconds (10 by default, 30 max) and answers the moment the job ends, so
   calling it back-to-back asks the same question sooner and costs you a round trip
@@ -139,9 +150,9 @@ or remove a layer, or import something you did not.
   a note listing them (`job-N (status)`) is appended to your `execute_code` / `poll_job`
   / `server_status` result. Read them with `poll_job`, and re-check what you rely on
   (`dir()`, `viewer.layers`, `inspect_object`) instead of trusting what you last saw.
-* **One writer at a time.** While the user's cell runs, your calls wait for it to
-  finish; while your job runs, the user's cells are refused. Do not try to clear
-  either.
+* **One cell at a time.** While the user's cell runs, your new cells are refused and
+  your other calls wait for it; while your cell runs, theirs waits for it. A user's cell
+  can run while your `run_async` task does. Do not try to clear either.
 * **Their cell is not yours to stop.** `interrupt_kernel` refuses a user job (it stops
   only your own). Do not reach for `restart_kernel` to get around that: it would
   destroy the user's variables and layers along with yours.

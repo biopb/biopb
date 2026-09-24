@@ -209,9 +209,10 @@ class TestTheReferenceDocs:
         assert "Jupyter" in section  # where the other writer's cells come from
         assert "poll_job" in section
         # The three rules that keep the two writers off each other: it is told
-        # after the fact, it waits when busy, and it does not stop their cell --
-        # including the workaround it would otherwise reach for.
-        assert "your calls wait for it" in section
+        # after the fact, one cell runs at a time, and it does not stop their
+        # cell -- including the workaround it would otherwise reach for.
+        assert "your new cells are refused" in section
+        assert "theirs waits for it" in section
         assert "refuses a user job" in section
         assert "restart_kernel" in section
 
@@ -737,7 +738,9 @@ class TestExecuteCode:
         assert "start_kernel" in result
 
     def test_inline_result_appends_window_closed_note(self, server_with_host):
-        _install_replies(server_with_host, polls=[_snapshot(stdout="done\n")], window=False)
+        _install_replies(
+            server_with_host, polls=[_snapshot(stdout="done\n")], window=False
+        )
         result = _tool(_server.execute_code, "viewer.add_image(arr)")
         assert "done" in result
         assert "viewer window is closed" in result

@@ -53,7 +53,7 @@ from . import _app, _kernel_rpc, _server, _writers
 
 logger = logging.getLogger(__name__)
 
-#: This loop's client id, for the kernel's one-agent claim (``_jobs.submit``).
+#: This loop's client id, for the one-agent claim (``_writers.take_claim``).
 #: A fixed string rather than a per-view id, because every view drives the one
 #: conversation: the loop is a single writer no matter how many windows are open.
 WRITER_ID = "biopb-chat"
@@ -132,9 +132,9 @@ _turn_lock = asyncio.Lock()
 class TurnInProgress(RuntimeError):
     """Raised when a turn is asked for while one is already running.
 
-    Refused rather than queued, matching ``_jobs.submit``: a queued turn would
-    be composed against a conversation its sender has not seen the end of, which
-    is an ordering nobody can inspect. The transport reports it the way the user
+    Refused rather than queued, as a cell is (``_server._submit_job``): a
+    queued turn would be composed against a conversation its sender has not seen
+    the end of, which is an ordering nobody can inspect. The transport reports it the way the user
     console reports a busy kernel -- as state, with a 409.
     """
 

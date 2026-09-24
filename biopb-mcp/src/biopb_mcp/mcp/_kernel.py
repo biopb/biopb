@@ -136,14 +136,9 @@ _DEATHWATCH_ARG = (
     "--IPKernelApp.exec_lines=import biopb._lifecycle.deathwatch as _dw; _dw.install()"
 )
 
-# Prepended to an agent's cell, on one line so the cell's own line numbers
-# shift by one: ``client`` tracks the tensor connection, which connects
-# asynchronously, and a dead dask cluster fails the cell rather than hanging it
-# (biopb/biopb#970; the job runner does both for a task).
-_CELL_PREFIX = (
-    "client = _conn.client; "
-    "globals().get('_jobs') and _jobs.check_dask()\n"
-)
+# Prepended to an agent's cell so ``client`` tracks the tensor connection, which
+# connects asynchronously (_jobs._REFRESH_PREFIX, for a task).
+_CELL_PREFIX = "client = _conn.client\n"
 
 # Whether the viewer window is still open, evaluated after an agent's cell: a
 # user-closed window turns viewer mutations into silent no-ops. None where the

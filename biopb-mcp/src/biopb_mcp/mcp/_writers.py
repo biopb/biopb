@@ -199,7 +199,7 @@ def _client_identity():
     The streamable-http transport mints a per-connection ``mcp-session-id``, so
     two clients reaching one session child are distinguishable even though the
     tool surface itself is stateless — this is the id the kernel's one-agent
-    claim is keyed on (``_jobs.submit``). ``clientInfo.name`` from the initialize
+    claim is keyed on (``take_claim``). ``clientInfo.name`` from the initialize
     handshake rides along as a label, purely so a refusal can name who holds the
     kernel.
 

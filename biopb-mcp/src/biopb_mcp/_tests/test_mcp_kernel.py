@@ -1358,35 +1358,34 @@ class TestJupyterClientGate:
         (job,) = [j for j in self._jobs(gated) if j["origin"] == "user"]
         assert job["status"] == "interrupted"
 
-    def test_refused_while_a_job_runs(self, gated, foreign):
+    def test_a_foreign_cell_waits_for_the_agents_cell(self, gated, foreign):
+        # Both run on the main thread, one at a time: the user's cell queues
+        # behind the agent's instead of being refused.
+        job = gated.jobs.new_id()
+        gated.run_cell("import time\nfor _ in range(20): time.sleep(0.05)", job, "mcp")
+        assert _wait_until(gated.is_busy, timeout=5, interval=0.01)
+        reply, _ = self._run(foreign, "y = 1")
+        assert reply["status"] == "ok"
+        assert gated.jobs.poll(job)["status"] == "ok"
+        assert gated.execute("print(y)")["stdout"].strip() == "1"
+        assert [j["origin"] for j in self._jobs(gated)] == ["mcp", "user"]
+
+    def test_a_foreign_cell_runs_beside_a_task(self, gated, foreign):
         assert gated.execute(_LONG_JOB)["status"] == "ok"
         try:
-            reply, msgs = self._run(foreign, "y = 1")
-            assert reply["status"] == "error"
-            assert reply["ename"] == "KernelBusy"
-            assert "local-1" in reply["evalue"]
-            assert "Stop" in reply["evalue"]
-            # Rendered in the cell, not only in the reply.
-            assert any(m["msg_type"] == "error" for m in msgs)
-            assert "y" not in gated.execute("print(dir())")["stdout"].split("'")
-            assert [j["origin"] for j in self._jobs(gated)] == ["mcp"]
+            reply, _ = self._run(foreign, "y = 1")
+            assert reply["status"] == "ok"
+            assert gated.jobs.running(prefer="mcp")["status"] == "running"
         finally:
             self._stop_job(gated)
 
-    def test_silent_code_is_gated_like_any_cell(self, gated, foreign):
+    def test_silent_code_is_recorded_like_any_cell(self, gated, foreign):
         # `silent` only stops output being broadcast; the code still runs with
-        # full effect, so it must not slip past the gate.
-        assert gated.execute(_LONG_JOB)["status"] == "ok"
-        try:
-            reply, _ = self._run(foreign, "z = 3", silent=True)
-            assert reply["status"] == "error"
-            assert reply["ename"] == "KernelBusy"
-            assert "'z'" not in gated.execute("print(dir())")["stdout"]
-        finally:
-            self._stop_job(gated)
+        # full effect, so the agent is told of it all the same.
         reply, _ = self._run(foreign, "z = 3", silent=True)
         assert reply["status"] == "ok"
-        assert [j["origin"] for j in self._jobs(gated)] == ["mcp", "user"]
+        (job,) = self._jobs(gated)
+        assert job["origin"] == "user" and job["code"] == "z = 3"
 
     def test_an_empty_request_passes_while_a_job_runs(self, gated, foreign):
         # What qtconsole sends silently: a prompt-number request, and
@@ -1402,12 +1401,10 @@ class TestJupyterClientGate:
         finally:
             self._stop_job(gated)
 
-    def test_a_host_poll_queued_behind_a_refusal_is_retried(self, gated, foreign):
-        # stop_on_error makes ipykernel abort what is queued behind a refused
-        # cell; the host retries an aborted snippet once. Queue both behind a
-        # sleep so the poll is waiting when the refusal lands -- in an empty
-        # request's user_expressions, the one form that passes the gate.
-        assert gated.execute(_LONG_JOB)["status"] == "ok"
+    def test_a_host_call_aborted_by_a_failing_cell_is_retried(self, gated, foreign):
+        # A client's stop_on_error makes ipykernel abort what is queued behind
+        # its failing cell; the host retries an aborted snippet once. Queue both
+        # behind a sleep so the poll is waiting when the failure lands.
         statuses = []
         run_once = gated._run_once
 
@@ -1423,7 +1420,7 @@ class TestJupyterClientGate:
                 silent=True,
                 user_expressions={"s": "__import__('time').sleep(1.5)"},
             )
-            foreign.execute("y = 1")
+            foreign.execute("1 / 0")
             time.sleep(0.3)
             res = gated.execute("print('poll')")
             assert res["status"] == "ok"
@@ -1431,7 +1428,6 @@ class TestJupyterClientGate:
             assert statuses == ["aborted", "ok"]
         finally:
             gated._run_once = run_once
-            self._stop_job(gated)
 
     def test_a_host_timeout_leaves_a_long_foreign_cell_running(self, gated, foreign):
         # A host call queued behind a client's long cell used to SIGINT it.

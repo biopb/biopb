@@ -279,6 +279,7 @@ class _Record(_OutputBuffer):
         "kind",
         "ename",
         "reply",
+        "began",
     )
 
     def __init__(self, event, kind="task"):
@@ -290,6 +291,9 @@ class _Record(_OutputBuffer):
         self.ename = None
         # A host cell's shell reply, once it arrives (note_reply).
         self.reply = None
+        # Whether it has started running: a host cell is recorded when sent,
+        # and may wait in the kernel's queue behind someone else's.
+        self.began = kind != "cell" or event.get("origin") == "user"
         # The execute request this job's output is published under.
         self.request = event.get("request")
         self.code = event.get("code", "")
@@ -478,9 +482,16 @@ class JobLog:
         parent = msg.get("parent_header") or {}
         code = msg["content"].get("code", "")
         # The host's own cells are recorded as it sends them (start_cell), and
-        # its snippets are not cells; an empty cell is a client asking for its
-        # prompt number.
-        if parent.get("session") == self.host_session or not code.strip():
+        # start here; its snippets are not cells. An empty cell is a client
+        # asking for its prompt number.
+        if parent.get("session") == self.host_session:
+            with self._lock:
+                rec = self._cells.get(parent.get("msg_id"))
+                if rec is not None:
+                    rec.began = True
+                    rec.started = time.monotonic()
+            return
+        if not code.strip():
             return
         with self._lock:
             self._add_cell(
@@ -509,9 +520,10 @@ class JobLog:
             del self._cells[rec.request]
             if self._by_request.get(rec.request) is rec:
                 del self._by_request[rec.request]
-            # Cells run one at a time on the main thread, so another cell still
-            # running here had ended, its end lost. A task runs beside them.
-            for other in list(self._cells.values()):
+            # Cells run one at a time on the main thread, so another cell that
+            # had begun had ended, its end lost; one still queued has not. A
+            # task runs beside them.
+            for other in [c for c in self._cells.values() if c.began]:
                 other.end("error", _END_LOST)
                 del self._cells[other.request]
                 if self._by_request.get(other.request) is other:
@@ -652,7 +664,7 @@ class JobLog:
         return f"job-{self._seq}"
 
     def new_id(self):
-        """An id for a job the host is about to submit (``_jobs.submit``)."""
+        """An id for a job the host is about to start (``run_cell``)."""
         with self._lock:
             return self._next_id()
 

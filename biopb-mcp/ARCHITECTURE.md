@@ -103,11 +103,11 @@ cheaply and never pops a napari viewer until user requested it; kernel-dependent
 tools return a structured not-ready status until then. **Closing the napari window
 tears the kernel back down to idle**, and `start_kernel` rebuilds it.
 
-Because napari viewer is launched within the jupyter kernel, agents' jobs are run
-in a background thread, so the Qt loop stays free to respond to user and agent inputs
-alike. The agent-facing `viewer` object is a **main-thread marshaling proxy** over
-the real `napari.Viewer`, because an off-main napari mutation can segfault the kernel
-(#100).
+An agent's code runs as a cell on the kernel's main thread, like a notebook user's,
+so the Qt loop pauses while it runs; a long compute can run on a worker thread through
+`run_async`, keeping the viewer live. The agent-facing `viewer` object is a
+**main-thread marshaling proxy** over the real `napari.Viewer`, because an off-main
+napari mutation can segfault the kernel (#100).
 
 ### dask cluster
 

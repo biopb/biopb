@@ -404,17 +404,6 @@ def _exec_cells(job, verification):
                 cell.status = "skipped"
 
 
-def check_dask():
-    """Raise if nothing a cell computes could finish (:func:`_dask_backstop`).
-
-    Run ahead of every agent cell (``_kernel.KernelHost.run_cell``), as the job
-    runner runs the backstop ahead of every task.
-    """
-    dead = _dask_backstop()
-    if dead:
-        raise RuntimeError(dead)
-
-
 def _dask_backstop():
     """Why nothing this job computes could finish, or ``None``.
 
