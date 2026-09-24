@@ -95,12 +95,12 @@ the kernel). Notes:
   calling it back-to-back asks the same question sooner and costs you a round trip
   for nothing. Raise `wait` if you have nothing to do until the job finishes; pass
   `wait=0` only for a snapshot you are not about to ask for again.
-* **A blocking `.compute()` is interruptible** — on a distributed `Client`
+* **A blocking `.compute()` is interruptible** — on a dask `Client`
   `interrupt_kernel` cancels the in-flight dask tasks, so the `.compute()` raises and
   the job ends. On the in-process default (see below) the stop is best-effort.
 * **Your own long loops** (per-chunk / per-file) are stopped by `interrupt_kernel`, which
   raises `KeyboardInterrupt` into the loop at the next iteration — no cooperative check needed.
-* **Progress on a big graph:** submit with a distributed `Client` (see below) and
+* **Progress on a big graph:** submit with a dask `Client` (see below) and
   consume results as they land — this gives a live processed count via `poll_job`:
   ```python
   from dask.distributed import as_completed
@@ -123,19 +123,19 @@ When the work is CPU-heavy and parallel — a per-tile filter over a big stack, 
 segmentation sweep — put it on a cluster from a cell, the ordinary dask way:
 
 ```python
-from dask.distributed import Client
-dask_client = Client()                    # a local cluster, workers in this kernel
-dask_client = Client("tcp://host:8786")   # or an external scheduler
-dask_client.close()                       # back to in-process
+from dask.distributed import Client as DaskClient   # not `client`, the tensor one
+dask_client = DaskClient()                    # a local cluster, workers in this kernel
+dask_client = DaskClient("tcp://host:8786")   # or an external scheduler
+dask_client.close()                           # back to in-process
 ```
 
-A live `Client` becomes dask's default, so plain `.compute()` calls go to it. A
+A live dask `Client` becomes dask's default, so plain `.compute()` calls go to it. A
 local cluster's workers belong to this kernel and go with it: `restart_kernel`
 starts in-process again. `server_status`'s `## Dask` section says which is in
 effect, and warns when an attached cluster has lost its workers (a host suspend
 does that, and a `.compute()` would then block forever).
 
-One real difference: **a `.compute()` is fully cancellable only on a `Client`**
+One real difference: **a `.compute()` is fully cancellable only on a dask `Client`**
 — `interrupt_kernel` cancels the in-flight futures. In-process the stop is
 best-effort: a `KeyboardInterrupt` at the next bytecode, so a fetch inside a C
 call ends only when it returns. Your own Python loops are stoppable either way.

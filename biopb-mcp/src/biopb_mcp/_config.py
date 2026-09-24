@@ -28,7 +28,7 @@ so a configured URL could only be a second, staler answer -- and was how this
 machine's credential reached endpoints the control never named (#626). A legacy
 ``tensor_browser`` or ``dask`` section in an existing file is carried by the
 merge and read by nothing: the kernel leaves dask as dask configures itself, and
-a cell builds a ``Client`` when it wants a cluster.
+a cell builds a dask ``Client`` when it wants a cluster.
 
 Read settings with :func:`get_setting`, which falls back to ``DEFAULT_CONFIG`` so
 call sites never duplicate a default literal.

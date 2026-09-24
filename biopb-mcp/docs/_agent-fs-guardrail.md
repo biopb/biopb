@@ -113,7 +113,7 @@ children of the kernel, so they die with it -- but an audit hook installed in th
 kernel still does **not** run in them.
 
 The default is in-process (#970), with no workers at all, so the kernel hook is
-the whole guard there. The gap below opens only once a cell builds a `Client`.
+the whole guard there. The gap below opens only once a cell builds a dask `Client`.
 
 So agent file I/O performed *inside a dask task* —
 `da.map_blocks(lambda b: open('/etc/…'))`, a custom `da.store` target — executes

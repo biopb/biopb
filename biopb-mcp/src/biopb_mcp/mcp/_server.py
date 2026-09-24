@@ -117,7 +117,7 @@ except Exception as _e:
 print("")
 print("## Dask")
 # Where a .compute() runs: dask's own default, in-process unless a cell built a
-# distributed Client. Read without importing distributed, which only a cell that
+# dask Client. Read without importing distributed, which only a cell that
 # built one has loaded.
 try:
     import sys as _sys
@@ -136,12 +136,12 @@ try:
         except TypeError:  # distributed without the argument
             _info = _dc.scheduler_info()
         _nw = len(_info.get("workers", {}))
-        print("  mode: distributed Client at " + str(_dc.scheduler.address))
+        print("  mode: dask Client at " + str(_dc.scheduler.address))
         print("  workers: " + str(_nw))
         print("  dashboard: " + str(_dc.dashboard_link))
         if _nw == 0:
             print("  WARNING: no workers left -- a .compute() would block forever; "
-                  "close this Client or build a new one")
+                  "close this dask Client or build a new one")
 except Exception as _e:
     print("  error: " + str(_e))
 
@@ -1044,7 +1044,7 @@ async def interrupt_kernel() -> str:
     thread. Either lands at the next bytecode, so a blocking C-level call (gRPC
     tensor fetch, native compute) stops only when it returns to Python. Also
     cancels the job's in-flight dask futures, which is what stops a blocking
-    `.compute()` -- but only on a distributed `Client` a cell built. If YOUR job
+    `.compute()` -- but only on a dask `Client` a cell built. If YOUR job
     stays stuck, use restart_kernel -- the guaranteed stop.
 
     Stops YOUR job only. A cell the user runs from an attached Jupyter notebook

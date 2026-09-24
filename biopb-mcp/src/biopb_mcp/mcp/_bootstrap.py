@@ -4,7 +4,7 @@ Injected via IPython ``exec_lines`` so it runs before the kernel services any
 tool calls.  It enables the Qt event loop, opens a visible napari viewer with
 the Tensor Browser widget, and populates the ``execute_code`` namespace. Dask
 is left as dask configures itself: computes run in-process unless a cell builds
-a ``Client``.
+a dask ``Client``.
 
 A failure here does not abort the kernel (exec_lines errors are swallowed by
 IPython), so ``bootstrap`` prints a ``BOOTSTRAP_ERROR`` sentinel that the
