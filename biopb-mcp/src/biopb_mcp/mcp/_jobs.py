@@ -208,6 +208,7 @@ class _Job:
         """How the job stands, without its output, which only the host has."""
         return {
             "job_id": self.job_id,
+            "request": self.request,
             "code": self.code,
             "status": self.status,
             "result_text": self.result_text,
@@ -260,7 +261,12 @@ class _Verification:
             "title": self.title,
             "created": self.created,
             "cells": [
-                {"code": c.code, "status": c.status, "error_text": c.error_text}
+                {
+                    "code": c.code,
+                    "status": c.status,
+                    "error_text": c.error_text,
+                    "result_text": c.result_text,
+                }
                 for c in self.cells
             ],
         }
@@ -696,9 +702,10 @@ def record_inline(code, request=None, origin="user"):
 
 
 def poll(job_id):
-    """*job_id*'s snapshot from this kernel's own copy. What a verification is
-    polled with; the session's records are the host's (``_job_log``), where an
-    ordinary job's output is."""
+    """*job_id*'s snapshot from this kernel's own copy: how it stands, without
+    output. The host's records (``_job_log``) come from iopub, which can drop a
+    message; this comes back on the shell reply, which cannot, so the host
+    settles a disagreement from it (``JobLog.settle``)."""
     job = _jobs.get(job_id)
     if job is None:
         return {"job_id": job_id, "status": "unknown", "error_text": ""}

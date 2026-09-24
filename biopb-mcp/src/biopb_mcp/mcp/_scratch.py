@@ -103,6 +103,11 @@ _DRAFT_DIR = "drafts"
 #: that destroys the user's session, to kill a process built to be thrown away.
 _INTERRUPT_GRACE = 5.0
 
+# How often a verification's records are checked against the kernel's own
+# account (_poll_to_completion). Two checks apart is how long an announcement
+# may be in flight before it is taken as lost.
+_SETTLE_EVERY = 2.0
+
 #: Job ids issued here, in their own namespace. The session kernel issues
 #: ``job-N``; a verification never runs there, so a distinct prefix is what lets
 #: ``poll_job`` route an id to the kernel that owns it without asking either.
@@ -529,14 +534,34 @@ def _execute(run):
 def _poll_to_completion(run, host, kernel_job_id):
     """Watch the scratch kernel's verification job until it is terminal.
 
-    Reads the scratch host's records, not the kernel: the host builds them
-    from iopub, so a look costs nothing and cannot queue behind the cells.
+    Reads the scratch host's records, which it builds from iopub: a look costs
+    nothing and shows the cells as they go. iopub can drop a message, though,
+    so every ``_SETTLE_EVERY`` the kernel's own account is fetched over the
+    shell channel, which cannot (the cells run on a job thread, so it does not
+    queue behind them). Two looks in a row that disagree with the records are a
+    lost announcement, not one in flight, and settle them (``JobLog.settle``).
     """
+    next_check = time.monotonic() + _SETTLE_EVERY
+    disagreed = False
     while True:
         with _lock:
             if run["discarded"]:
                 return
         snap = host.jobs.poll(kernel_job_id)
+        if snap.get("status") in ("running", "unknown") and (
+            time.monotonic() >= next_check
+        ):
+            kernel_snap, _res, _w = _kernel_rpc._run_job_call(
+                host, "poll", kernel_job_id, timeout=_SETTLE_EVERY * 5
+            )
+            next_check = time.monotonic() + _SETTLE_EVERY
+            kernel_status = (kernel_snap or {}).get("status")
+            disagrees = kernel_status not in (None, "unknown", snap.get("status"))
+            if disagrees and disagreed:
+                host.jobs.settle(kernel_snap)
+                snap = host.jobs.poll(kernel_job_id)
+                disagrees = False
+            disagreed = disagrees
         if snap.get("status") in ("running", "unknown") and not host.is_alive():
             # A death is the verdict (an OOM means the workflow does not fit),
             # and nothing else would end the record: this host runs no watchdog

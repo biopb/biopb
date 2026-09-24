@@ -55,6 +55,12 @@ _END_LOST = (
     "lost). Its output above is complete as far as it goes."
 )
 
+# Appended to a record settled from the kernel's own account (JobLog.settle).
+_OUTPUT_LOST = (
+    "\n[biopb: this job's end announcement was lost on iopub; its outcome is "
+    "the kernel's, and output may be missing.]\n"
+)
+
 
 def _dropped_marker(n):
     """The line `output` prepends once the cap has discarded a head.
@@ -397,6 +403,8 @@ class JobLog:
             return
         with self._lock:
             if kind == "start":
+                if job_id in self._records:
+                    return  # already settled from the kernel (settle)
                 for other in self._records.values():
                     if other.status == "running":
                         other.end("error", _END_LOST)
@@ -464,6 +472,50 @@ class JobLog:
                             cell.status = "skipped"
                     v.current = None
             self._by_request.clear()
+
+    def settle(self, snap):
+        """Bring a record in line with the kernel's own account of the job.
+
+        *snap* is ``_jobs.poll``'s, which came back on a shell reply: iopub
+        can drop, that cannot. Replays what was missed as the events would
+        have (start, cell ends, end), so a lost announcement cannot leave a
+        record unknown or running for good. The output lost with it stays lost,
+        and the record says so.
+        """
+        job_id = snap.get("job_id")
+        status = snap.get("status")
+        if not job_id or status in (None, "unknown"):
+            return
+        verify = snap.get("verify")
+        with self._lock:
+            rec = self._records.get(job_id)
+        if rec is None:
+            spec = None
+            if verify is not None:
+                spec = dict(verify, cells=[c["code"] for c in verify["cells"]])
+            self._on_event(
+                {
+                    "event": "start",
+                    "job_id": job_id,
+                    "request": snap.get("request"),
+                    "origin": snap.get("origin", "mcp"),
+                    "intent": snap.get("intent", ""),
+                    "code": snap.get("code", ""),
+                    "created": snap.get("created"),
+                    "verify": spec,
+                }
+            )
+            rec = self._records[job_id]
+        if status == "running" or rec.status != "running":
+            return
+        if verify is not None and rec.verify is not None:
+            for i, cell in enumerate(verify["cells"]):
+                if cell["status"] in ("ok", "error") and (
+                    rec.verify.cells[i].status == "pending"
+                ):
+                    self._on_event(dict(cell, event="cell_end", job_id=job_id, index=i))
+        rec.write_output(_OUTPUT_LOST)
+        self._on_event(dict(snap, event="end"))
 
     def next_seq(self):
         """The number the next kernel's first job id should follow."""

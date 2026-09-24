@@ -152,6 +152,81 @@ class TestLostAndGone:
         assert log.next_seq() == 7
 
 
+class TestSettle:
+    """The kernel's own account, fetched on a shell reply, settles what iopub
+    lost."""
+
+    def _kernel(self, status="ok", cells=None, **kw):
+        snap = {
+            "job_id": "job-1",
+            "request": "req-1",
+            "code": "x = 1",
+            "status": status,
+            "result_text": "",
+            "error_text": "",
+            "cancel_reason": None,
+            "origin": "mcp",
+            "intent": "",
+            "elapsed": 1.5,
+            "created": 5.0,
+            "verify": None,
+            **kw,
+        }
+        if cells is not None:
+            snap["verify"] = {
+                "title": "wf",
+                "created": 5.0,
+                "cells": [
+                    {"code": c, "status": s, "error_text": "", "result_text": ""}
+                    for c, s in cells
+                ],
+            }
+        return snap
+
+    def test_a_lost_end_is_settled(self):
+        log = JobLog()
+        _start(log)
+        _print(log, "partial\n")
+        log.settle(self._kernel(status="error", error_text="boom"))
+        snap = log.poll("job-1")
+        assert snap["status"] == "error"
+        assert snap["error_text"] == "boom"
+        assert snap["elapsed"] == 1.5
+        assert snap["stdout"].startswith("partial\n")
+        assert "lost on iopub" in snap["stdout"]
+
+    def test_a_lost_start_is_replayed_and_a_running_job_stays_running(self):
+        log = JobLog()
+        log.settle(self._kernel(status="running"))
+        assert log.poll("job-1")["status"] == "running"
+        # Its output, now that the request is known, is filed under it.
+        _print(log, "later\n")
+        assert log.poll("job-1")["stdout"] == "later\n"
+
+    def test_a_verification_gets_its_cells_from_the_kernel(self):
+        log = JobLog()
+        log.settle(
+            self._kernel(status="error", cells=[("a = 1", "ok"), ("1/0", "error")])
+        )
+        cells = log.verify_record("job-1")["cells"]
+        assert [c["status"] for c in cells] == ["ok", "error"]
+        assert log.poll("job-1")["status"] == "error"
+
+    def test_a_settled_record_is_not_touched_again(self):
+        log = JobLog()
+        _start(log)
+        _end(log, status="ok")
+        log.settle(self._kernel(status="error"))
+        assert log.poll("job-1")["status"] == "ok"
+        assert "lost" not in log.poll("job-1")["stdout"]
+
+    def test_the_late_original_start_does_not_reopen_it(self):
+        log = JobLog()
+        log.settle(self._kernel(status="ok"))
+        _start(log)
+        assert log.poll("job-1")["status"] == "ok"
+
+
 class TestDigest:
     def test_reports_only_unseen_foreign_jobs(self):
         log = JobLog()

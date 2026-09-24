@@ -213,6 +213,89 @@ class TestRunningAVerification:
         )
 
 
+class TestLostAnnouncements:
+    """iopub can drop; the run must still end. The kernel's own account, over
+    the shell channel, settles the records (``JobLog.settle``)."""
+
+    @pytest.fixture(autouse=True)
+    def quick(self, monkeypatch):
+        monkeypatch.setattr(_scratch, "_SETTLE_EVERY", 0.05)
+
+    def _host(self, log):
+        from biopb_mcp.mcp._job_log import JobLog
+
+        kernel = {
+            "job_id": "job-1",
+            "request": "req-1",
+            "code": "a = 2",
+            "status": "ok",
+            "result_text": "",
+            "error_text": "",
+            "cancel_reason": None,
+            "origin": "mcp",
+            "intent": "",
+            "elapsed": 0.2,
+            "created": 1.0,
+            "verify": {
+                "title": "wf",
+                "created": 1.0,
+                "cells": [
+                    {
+                        "code": "a = 2",
+                        "status": "ok",
+                        "error_text": "",
+                        "result_text": "",
+                    }
+                ],
+            },
+        }
+        host = MagicMock()
+        host.is_alive.return_value = True
+        host.jobs = JobLog()
+        log(host.jobs)
+
+        def execute(code, *_a, **_k):
+            if "_jobs.submit(" in code:
+                return _envelope({"job_id": "job-1"})
+            if "_jobs.poll(" in code:
+                return _envelope(kernel)
+            return _envelope(None)
+
+        host.execute.side_effect = execute
+        return host
+
+    def _run(self, host):
+        _scratch.set_host_factory(lambda: host)
+        return _settle(
+            _scratch.start(_blocks(["a = 2"]), "wf", _session_host())["job_id"]
+        )
+
+    def test_a_lost_end_does_not_hang_the_run(self):
+        from biopb_mcp.mcp._job_log import MSG_TYPE
+
+        def announce_start(jobs):
+            jobs.on_iopub(
+                {
+                    "header": {"msg_type": MSG_TYPE},
+                    "parent_header": {},
+                    "content": {
+                        "event": "start",
+                        "job_id": "job-1",
+                        "request": "req-1",
+                        "verify": {"title": "wf", "cells": ["a = 2"]},
+                    },
+                }
+            )
+
+        snap = self._run(self._host(announce_start))
+        assert snap["status"] == "ok"
+        assert _scratch.verified()["cells"][0]["status"] == "ok"
+
+    def test_nothing_on_iopub_at_all_does_not_hang_the_run(self):
+        snap = self._run(self._host(lambda jobs: None))
+        assert snap["status"] == "ok"
+
+
 class TestTheRunList:
     """What the observe page's verification pane reads.
 
