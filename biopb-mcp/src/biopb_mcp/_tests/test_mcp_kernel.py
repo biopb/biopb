@@ -1184,17 +1184,16 @@ class TestJupyterClientGate:
         return reply["content"], msgs
 
     @staticmethod
-    def _jobs(host):
-        """The host's records, once every foreign cell's end has arrived: it
-        travels on iopub, which can trail the reply the client already has."""
-        _wait_until(
-            lambda: all(
-                j["status"] != "running"
-                for j in host.jobs.export()
-                if j["origin"] == "user"
-            ),
-            timeout=5.0,
-        )
+    def _jobs(host, users=1):
+        """The host's records, once *users* foreign cells have been recorded and
+        ended: both travel on iopub, which can trail the reply the client
+        already has."""
+
+        def settled():
+            mine = [j for j in host.jobs.export() if j["origin"] == "user"]
+            return len(mine) >= users and all(j["status"] != "running" for j in mine)
+
+        _wait_until(settled, timeout=5.0)
         return host.jobs.export()
 
     @staticmethod
@@ -1373,7 +1372,7 @@ class TestJupyterClientGate:
             )
             assert reply["status"] == "ok"
             assert reply["user_expressions"]["k"]["data"]["text/plain"] == "2"
-            assert [j["origin"] for j in self._jobs(gated)] == ["mcp"]
+            assert [j["origin"] for j in self._jobs(gated, users=0)] == ["mcp"]
         finally:
             self._stop_job(gated)
 
