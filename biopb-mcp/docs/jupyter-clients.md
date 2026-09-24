@@ -210,7 +210,7 @@ changed. `_MAX_RETAINED_JOBS` never evicts an unseen user job.
 - **`stop_on_error`.** Most clients send it true, so a foreign cell that
   errors — including the refusal — makes ipykernel abort requests already
   queued behind it. The host retries an `aborted` snippet once after a short
-  pause (`_execute_locked`); the gate's test should land a poll on a refusal.
+  pause (`_execute_internal`); the gate's test should land a poll on a refusal.
 - **A client's Ctrl-C** reaches the main thread only. If the agent's job is
   inside a `run_on_main` slot at that moment, the interrupt lands in the job,
   which the runner labels as an external interrupt naming an attached client.
@@ -242,6 +242,41 @@ while the kernel pid lives, and **no-ops kill and terminate** — Lab's restart
 and close-notebook must not take the session's kernel down. Until it exists,
 "connect a notebook" means qtconsole.
 
+## Open: ipykernel version
+
+**Unverified against ipykernel 7, and not pinned.** `biopb-mcp` depends on an
+unpinned `ipykernel`; the lock (and so dev and CI) holds 6.31, while PyPI has
+7.3.0 and `install.sh` resolves fresh. A new install most likely runs 7.x,
+which nothing here has been tested on. To do:
+
+1. **Pin** `ipykernel>=6.31,<7` in `biopb-mcp`'s `mcp` extra, so what installs
+   is what is tested.
+2. **Verify against 7.3**: the `test_mcp_*` suites and the napari smoke run in
+   a venv with ipykernel 7.3, then move the pin.
+
+What 7 has to be checked for, since the gate and the records lean on ipykernel
+internals rather than the protocol:
+
+- **The `do_execute` override.** 6.31 calls `async do_execute(code, silent,
+  store_history, user_expressions, allow_stdin, *, cell_meta, cell_id)`, and
+  the gate reads the request's session and `msg_id` from `get_parent("shell")`.
+  Both signature and accessor have to hold, or the gate stops gating.
+- **Worker-thread output attribution.** A job's prints reach iopub under the
+  submit request because 6.31 maps a thread started during a request to that
+  request (`_associate_new_top_level_threads_with`). The records depend on it
+  (see Record); without it a job's output is filed under no job.
+- **Announcements from a worker thread.** `session.send` on `iopub_socket`
+  from the job thread, ordered after a stream flush from the same thread.
+- **Interrupt semantics.** Today: SIGINT is honoured only while a request is
+  being serviced (`_jobs._EXTERNAL_INTERRUPT_MSG` leans on this), a client's
+  Ctrl-C lands in the main thread, and Stop raises into the job's worker thread
+  with `PyThreadState_SetAsyncExc`, which does not break a blocking C call
+  until it returns. Under 7: whether SIGINT is still gated the same way,
+  where it lands with subshells running, and whether an interrupt reaches a
+  subshell at all.
+- **`stop_on_error`**: an errored or refused cell still aborts what is queued
+  behind it with status `aborted`, which the host retries once.
+
 ## v2 shape
 
 Two independent changes, either of which can come first.
@@ -249,9 +284,17 @@ Two independent changes, either of which can come first.
 **Subshells (ipykernel 7).** The host's tools move onto a subshell of their
 own, so a foreign cell on the main shell no longer holds them up. That is what
 turns the refusal into a bounded wait: the human's cell waits for the job,
-costing nobody but the human who chose to wait. The gate and the record are
-unchanged. The lock holds ipykernel 6.31 and the dependency is unpinned;
-whether an interrupt reaches a subshell is unverified.
+costing nobody but the human who chose to wait. It also takes the host's
+lifecycle calls off the main queue: restart's graceful close currently waits
+(up to 5 s) behind whatever holds the main thread and is skipped exactly when
+the kernel is busiest, and the observe page's Stop runs `interrupt_current`
+behind a user's long cell -- the one it was pressed to stop. Decided in the
+kernel from a subshell, Stop also needs no host-side guess at what is
+running. Limits: anything touching the viewer still marshals to the main
+thread and waits there; an agent submit could then overlap a user cell, so
+the gate needs a lock shared by `submit` and `record_inline`; and stopping a
+main-thread cell from a subshell may still need SIGINT, which an async
+exception is not. Blocked on the ipykernel 7 verification above.
 
 **The host subscribes to iopub**, in three stages:
 
