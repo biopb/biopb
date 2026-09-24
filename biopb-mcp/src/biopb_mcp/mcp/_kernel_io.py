@@ -178,7 +178,20 @@ class KernelChannels:
         msg_type = msg["header"]["msg_type"]
         content = msg["content"]
         if msg_type == "status":
-            self.execution_state = content.get("execution_state", "")
+            # Global kernel state, tracked whether or not it's this call's --
+            # checked before the call lookup below, which every other client's
+            # traffic (a foreign cell, comm/widget chatter) would otherwise pay
+            # for nothing on this thread.
+            state = content.get("execution_state", "")
+            self.execution_state = state
+            if state != "idle":
+                return
+            call = self._call_for(msg)
+            if call is not None:
+                call.idle.set()
+            return
+        if msg_type not in ("stream", "execute_result", "display_data", "error"):
+            return
         call = self._call_for(msg)
         if call is None:
             return
@@ -190,5 +203,3 @@ class KernelChannels:
                 call.results.append(text)
         elif msg_type == "error":
             call.errors.append(content.get("traceback", []))
-        elif msg_type == "status" and content.get("execution_state") == "idle":
-            call.idle.set()
