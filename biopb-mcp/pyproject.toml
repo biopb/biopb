@@ -88,14 +88,8 @@ tables = [
 # can't init a GL canvas under Qt 6.11). The release pipeline surfaces this
 # version as a `versions.json` release attribute that install.sh reads to pin
 # `napari[all]==` at deploy time (release.yaml + install/install.sh). Bump here.
-# distributed floor: the session child owns the LocalCluster (DaskClusterHost),
-# so its worker processes live in the *session child's* process group, not the
-# kernel's. On an abnormal session-child death (SIGKILL/OOM) neither _shutdown nor
-# the atexit close runs to reap them — the sole remaining cleanup is dask's own
-# "worker shuts down when it loses the scheduler" behavior, which only holds since
-# the `reconnect` era ended (>=2023.9). Pin a floor so orphan-hardening (issue #13)
-# can't silently regress on an older distributed. See biopb._lifecycle.deathwatch
-# and mcp/_cluster.
+# distributed: for a cell that builds a dask Client (the kernel guide's cluster
+# recipe); the kernel itself never imports it.
 # packaging: imported by mcp/_update.py (version compare for the update check).
 # It always arrives transitively, but the import is direct, so declare it.
 # matplotlib / scikit-learn: nothing in this package imports them. They are for

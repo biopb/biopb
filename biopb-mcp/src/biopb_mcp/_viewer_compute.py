@@ -1,9 +1,9 @@
 """Pin the napari viewer's lazy layer arrays to a single-process scheduler.
 
-The agent can put a distributed cluster behind dask's *default* scheduler
-(``_dask_ctl.attach()``, or ``dask.scheduler = "distributed"``) so its heavy
-``da`` computes run in parallel. The viewer, however, scrubs planes **one at a time**
-(serial ``np.asarray(data[slices])``), so computing those slices on the cluster
+A cell can put a distributed cluster behind dask's *default* scheduler (by
+building a dask ``Client``) so its heavy ``da`` computes run in parallel. The
+viewer, however, scrubs planes **one at a time** (serial
+``np.asarray(data[slices])``), so computing those slices on the cluster
 buys zero parallelism while scattering each single-chunk fetch across a rotating
 worker — the per-worker chunk cache is an opaque side-effect dask's locality
 scheduler can't see, so same-chunk reads miss (issue #8). They no longer
@@ -11,8 +11,8 @@ scheduler can't see, so same-chunk reads miss (issue #8). They no longer
 back as a zero-copy mmap view of the server's own segment file (#571), which N
 workers share through the page cache rather than each holding a copy.
 
-Since #970 the kernel's default is in-process, so this pin is belt-and-braces on
-the default path — load-bearing once something has attached a cluster.
+The kernel's default is in-process (#970), so this pin is belt-and-braces on
+the default path — load-bearing once a cell has built a dask ``Client``.
 
 ``wrap_levels`` wraps each layer array in a :class:`_ViewerArray` proxy that
 forces the *implicit* materialization napari performs (``np.asarray`` ->

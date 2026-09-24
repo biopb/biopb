@@ -1023,18 +1023,16 @@ def build_app(
         # whether to gate itself behind the unlock page. It tracks the *token*,
         # not the network mode: always true in remote (which requires one), and
         # true in local mode too when an optional token was supplied.
-        # `console_enabled` (named for the retired user console; it means this
-        # control is loopback-bound) rides the same public probe for the same
-        # reason: the observe page must know whether to offer the chat composer
-        # before it renders one, and a composer whose every POST 404s is worse
-        # than none. It discloses nothing a caller cannot already infer --
-        # reaching this endpoint from off-box *is* the evidence that the bind is
-        # public.
+        # `chat_proxied` rides the same public probe for the same reason: the
+        # observe page must know whether to offer the chat composer before it
+        # renders one, and a composer whose every POST 404s is worse than none.
+        # It follows the bind alone, so it discloses nothing a caller cannot
+        # already infer from reaching this endpoint.
         return JSONResponse(
             {
                 "control": "ok",
                 "auth_required": token is not None,
-                "console_enabled": loopback_bound,
+                "chat_proxied": _SESSION_CHAT_ROOT in session_roots,
                 "data_plane": supervisor.snapshot(),
             }
         )

@@ -1,14 +1,15 @@
 """Main-thread marshaling proxy for the agent-facing ``viewer``.
 
-``execute_code`` runs agent code on a background daemon thread (see ``_jobs``),
-but napari/Qt objects are **main-thread-only**: any viewer mutation from the
-worker that synchronously emits a napari event into a Qt slot touches a Qt widget
-off-thread and *segfaults the whole kernel* (e.g. ``viewer.layers.clear()`` ->
+An ``execute_code`` cell runs on the Qt main thread, but a ``run_async`` task
+runs agent code on a worker thread (see ``_jobs``), and napari/Qt objects are
+**main-thread-only**: any viewer mutation off that thread that synchronously
+emits a napari event into a Qt slot touches a Qt widget off-thread and
+*segfaults the whole kernel* (e.g. ``viewer.layers.clear()`` ->
 ``QtDims._resize_slice_labels``; biopb/biopb#100).
 
 The old mitigation wrapped only the ``add_*`` methods, which leaks: any call that
 *returns* a live napari sub-object (``viewer.layers``, ``viewer.dims``,
-``viewer.layers[0]``) hands the worker an unguarded handle. This module closes
+``viewer.layers[0]``) hands that thread an unguarded handle. This module closes
 that by putting a **transparent proxy** in the namespace as ``viewer``: the real
 ``napari.Viewer`` is untouched (napari/Qt keep their direct references); the agent
 only ever holds a proxy that
@@ -50,8 +51,9 @@ _QT_TOPLEVEL = frozenset({"PyQt6", "PyQt5", "PySide6", "PySide2", "qtpy", "vispy
 class ViewerThreadError(RuntimeError):
     """Raised when a raw-Qt object is accessed off the Qt main thread.
 
-    The fail-loud alternative to a segfault: wrap the access in
-    ``run_on_main(...)`` (also injected into the kernel namespace).
+    The fail-loud alternative to a segfault. Off the main thread means a
+    ``run_async`` task (a cell runs on the main thread), so the fix is to do
+    the access in a cell.
     """
 
 
@@ -180,8 +182,8 @@ class _ContainerProxy(_HandleProxy):
 class _GuardProxy(_ProxyBase):
     """Fail-loud guard for raw-Qt objects (``viewer.window`` and below).
 
-    Usable on the main thread (e.g. inside ``run_on_main``); any off-main access
-    raises instead of returning a handle that would segfault."""
+    Usable on the main thread (a cell); any off-main access raises instead of
+    returning a handle that would segfault."""
 
     __slots__ = ()
 
@@ -190,8 +192,8 @@ class _GuardProxy(_ProxyBase):
             real = object.__getattribute__(self, "_real")
             raise ViewerThreadError(
                 f"{type(real).__module__}.{type(real).__qualname__} is a Qt "
-                "object and can only be touched on the Qt main thread. Wrap the "
-                "access in run_on_main(lambda: ...)."
+                "object and can only be touched on the Qt main thread: do this "
+                "in a cell, not in a run_async task."
             )
 
     def __getattr__(self, name):

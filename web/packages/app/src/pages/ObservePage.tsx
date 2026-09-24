@@ -6,7 +6,7 @@ import {
   useState,
 } from "react";
 import { useParams } from "react-router-dom";
-import { localRootsProxied } from "../auth";
+import { chatProxied } from "../auth";
 import ChatPane from "../components/ChatPane";
 import { fetchChatStatus, type ChatStatus } from "../utils/chatClient";
 import { arrivals } from "../utils/jobArrivals";
@@ -129,15 +129,15 @@ export default function ObservePage() {
   // running. Only works on the machine the session runs on.
   const [attachCmd, setAttachCmd] = useState<string | null>(null);
   const [pollMs, setPollMs] = useState(3000);
-  // The control's half of the answer for the chat root: whether it is
-  // loopback-bound, and so whether it will proxy /chat/* at all.
-  const [controlLocal, setControlLocal] = useState(false);
+  // The control's half of the answer for the chat root: whether it will
+  // proxy /chat/* at all.
+  const [controlChat, setControlChat] = useState(false);
   // Null until probed, and null again means unreachable rather than off: a
   // blip must not unmount a composer holding a half-typed turn.
   const [chatStatus, setChatStatus] = useState<ChatStatus | null>(null);
   // It also requires a session to run in: a composer on a dead session looks
   // live and answers 404 on submit.
-  const showChat = !!chatStatus?.enabled && controlLocal && !ended;
+  const showChat = !!chatStatus?.enabled && controlChat && !ended;
 
   // The chat/work split, in pixels, remembered per browser. A preference, not
   // state anyone else needs, so localStorage rather than the server -- and every
@@ -312,13 +312,13 @@ export default function ObservePage() {
     }
   }, [base]);
 
-  // Both halves of the local-root answer are config, fixed for the life of the
+  // Both halves of the chat answer are config, fixed for the life of the
   // page — the control's follows its bind, the child's follows its config
   // file — so probe once rather than on every poll.
   useEffect(() => {
     let live = true;
-    localRootsProxied().then((on) => {
-      if (live) setControlLocal(on);
+    chatProxied().then((on) => {
+      if (live) setControlChat(on);
     });
     return () => {
       live = false;
@@ -628,10 +628,8 @@ export default function ObservePage() {
               {workflow?.saved_path ? (
                 <div className="saved">
                   Saved{" "}
-                  <code>
-                    {controlLocal
-                      ? workflow.saved_path
-                      : baseName(workflow.saved_path)}
+                  <code title={workflow.saved_path}>
+                    {baseName(workflow.saved_path)}
                   </code>
                 </div>
               ) : null}

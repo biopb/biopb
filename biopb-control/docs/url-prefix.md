@@ -112,7 +112,7 @@ started without the flag 404s rather than silently diverging). The dev proxy
 must cover every root the app calls (`/api`, `/data_plane`, `/health`,
 `/session/<id>/api`, `/session/<id>/chat`); a missing one falls through to
 vite's SPA fallback and returns HTML where JSON was expected —
-`localRootsProxied()`/`authRequired()` read `/health` and treat any failure as
+`chatProxied()`/`authRequired()` read `/health` and treat any failure as
 `false`.
 
 ## Still true after this

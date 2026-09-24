@@ -24,13 +24,12 @@ serves ([[web-viewer]]). `server_status` says which. Do not assume a window exis
 | `viewer` | napari.Viewer | The napari window, where the session has one. `viewer.add_tensor(array_id)` puts a tensor on it; `viewer.tensor(layer)` reads one back as a plain dask array. Check `## Viewer` in `server_status` before relying on anything being *seen* — the object is bound even when nothing is on screen |
 | `np/da` | module | imported packages: numpy and dask.array |
 | `ops` | dict[str, callable] | biopb.image ProcessImage operations from configured servers (may be empty) |
-| `run_on_main` | callable | runs `fn` on the Qt main thread and returns its result. Use it to **batch** many viewer mutations into one main-thread hop, or to touch raw Qt (`viewer.window`). |
 
 - The `viewer` is a napari window, made **thread-safe** by marshaling known
   mutations (`viewer.dims`, `viewer.camera`, layer properties, `viewer.layers.remove()`,
-  the `add_*()` family, …) to the Qt main thread. One caveat: raw Qt (`viewer.window`)
-  still requires the main thread — off-thread access raises a clear error, so wrap it in
-  `run_on_main()`. See [[napari-viewer]] for the full set of viewer operations, including
+  the `add_*()` family, …) to the Qt main thread. A cell already runs there; the
+  marshaling matters in a `run_async` task. Raw Qt (`viewer.window`) works only on the
+  main thread: from a task it raises a clear error, so do it in a cell. See [[napari-viewer]] for the full set of viewer operations, including
   mouse events.
 - The `client` represents a `TensorFlightClient` instance. Data from the client are
   lazy, thread-safe, picklable dask arrays. See [[tensor-server-client]] for the full set of client
@@ -87,25 +86,24 @@ a `task-...` id at once, and the viewer and screenshots stay live. Notes on task
 * A task may mutate `viewer` (its calls are marshaled to the main thread). A user's cell can run
   meanwhile, and the two can race over the namespace and the viewer.
 
-Stop a cell or a task with `interrupt_kernel` (a KeyboardInterrupt at the next bytecode; it also
-cancels in-flight dask tasks while a cluster is attached) or `restart_kernel` (guaranteed, kills
-the kernel). Notes:
+Stop a cell or a task with `interrupt_kernel` (a KeyboardInterrupt at the next bytecode) or
+`restart_kernel` (guaranteed, kills the kernel). Notes:
 * **`poll_job` waits for you — do not spin on it.** It watches a running job for
   `wait` seconds (10 by default, 30 max) and answers the moment the job ends, so
   calling it back-to-back asks the same question sooner and costs you a round trip
   for nothing. Raise `wait` if you have nothing to do until the job finishes; pass
   `wait=0` only for a snapshot you are not about to ask for again.
-* **A blocking `.compute()` is interruptible** — while a cluster is attached
-  `interrupt_kernel` cancels the in-flight dask tasks, so the `.compute()` raises and
-  the job ends. On the in-process default (see below) the stop is best-effort.
+* **A blocking `.compute()` is interruptible.** In a cell it stops at once, on either
+  scheduler; on a dask `Client` the compute's own tasks are cancelled with it. In a
+  `run_async` task the stop lands when dask's wait next wakes — on a dask `Client`,
+  within 10 s.
 * **Your own long loops** (per-chunk / per-file) are stopped by `interrupt_kernel`, which
   raises `KeyboardInterrupt` into the loop at the next iteration — no cooperative check needed.
-* **Progress on a big graph:** submit with the distributed client
-  (`_dask_client`, bound only while a cluster is attached — see below) and consume
-  results as they land — this gives a live processed count via `poll_job`:
+* **Progress on a big graph:** submit with a dask `Client` (see below) and
+  consume results as they land — this gives a live processed count via `poll_job`:
   ```python
   from dask.distributed import as_completed
-  futs = _dask_client.compute(list_of_dask_results)   # list of Futures, non-blocking
+  futs = dask_client.compute(list_of_dask_results)   # list of Futures, non-blocking
   done = []
   for fut in as_completed(futs):
       done.append(fut.result())
@@ -121,25 +119,24 @@ processes adds hops rather than speed — and a cluster nobody asked for is one 
 quietly dies with the laptop lid and hangs every later `.compute()` (#970).
 
 When the work is CPU-heavy and parallel — a per-tile filter over a big stack, a
-segmentation sweep — put it on a cluster from a cell:
+segmentation sweep — put it on a cluster from a cell, the ordinary dask way:
 
 ```python
-_dask_ctl.attach()                 # spin a local cluster (sized from config)
-_dask_ctl.attach("tcp://host:8786")  # or an external scheduler
-_dask_ctl.detach()                 # back to in-process
+from dask.distributed import Client as DaskClient   # not `client`, the tensor one
+dask_client = DaskClient()                    # a local cluster, workers in this kernel
+dask_client = DaskClient("tcp://host:8786")   # or an external scheduler
+dask_client.close()                           # back to in-process
 ```
 
-The cluster lives as long as this kernel does. There is no tool for this because
-there is nothing a tool would add: `.attach()` is `Client(...)` and `.detach()` is
-`.close()`, and a client you build yourself works the same way — `_dask_ctl` just
-also sizes the cluster from config and splits the chunk-cache budget across its
-workers. `server_status`'s `## Dask` section always says which mode is in effect.
-`restart_kernel` starts in-process again.
+A live dask `Client` becomes dask's default, so plain `.compute()` calls go to it. A
+local cluster's workers belong to this kernel and go with it: `restart_kernel`
+starts in-process again. `server_status`'s `## Dask` section says which is in
+effect, and warns when an attached cluster has lost its workers (a host suspend
+does that, and a `.compute()` would then block forever).
 
-One real difference: **a `.compute()` is fully cancellable only while attached**
-— `interrupt_kernel` cancels the in-flight futures. In-process the stop is
-best-effort: a `KeyboardInterrupt` at the next bytecode, so a fetch inside a C
-call ends only when it returns. Your own Python loops are stoppable either way.
+Either way a stop reaches Python code at its next bytecode, so a chunk fetch
+inside a C call ends only when it returns. Your own Python loops are stoppable
+either way.
 
 ## You are not the only writer of this namespace
 The user can run their own code in this kernel, from a Jupyter notebook or console

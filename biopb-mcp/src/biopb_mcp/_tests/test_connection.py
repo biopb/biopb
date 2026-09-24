@@ -368,37 +368,6 @@ class TestConnect:
 
         assert writes == []
 
-    def test_on_connect_hook_fires_with_final_url_token(self, monkeypatch):
-        client = _fake_client({"a": MagicMock()})
-        monkeypatch.setattr(
-            _connection, "TensorFlightClient", lambda url, token=None, **_: client
-        )
-
-        seen = []
-        conn = TensorConnection()
-        conn.on_connect = lambda url, token: seen.append((url, token))
-        conn.connect("grpc://host:9", token="t")
-
-        # the hook must receive the *final* (url, token) settled by connect()
-        assert seen == [("grpc://host:9", "t")]
-
-    def test_on_connect_hook_failure_does_not_break_connect(self, monkeypatch):
-        sources = {"a": MagicMock()}
-        client = _fake_client(sources)
-        monkeypatch.setattr(
-            _connection, "TensorFlightClient", lambda url, token=None, **_: client
-        )
-
-        def boom(url, token, **_):
-            raise RuntimeError("hook boom")
-
-        conn = TensorConnection()
-        conn.on_connect = boom
-        # connect must still succeed despite a failing hook
-        result = conn.connect("grpc://host:9", token="t")
-        assert conn.is_connected is True
-        assert set(result) == set(sources)
-
     def test_use_server_query_above_threshold(self, monkeypatch):
         big = {str(i): MagicMock() for i in range(SERVER_QUERY_THRESHOLD + 1)}
         client = _fake_client(big)

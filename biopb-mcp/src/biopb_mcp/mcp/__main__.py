@@ -341,8 +341,8 @@ def _serve_http(config, port, view=False):
     # accept -- leaving the server "alive but not serving."
     # The Selector loop's also silences zmq's "Proactor does not implement
     # add_reader" warning, since jupyter_client's kernel channels want exactly
-    # this loop. Safe to set because both child kernel and Dask's `LocalCluster`
-    # uses synchronous `subprocess.Popen`, so the Selector loop's lack of
+    # this loop. Safe to set because the child kernel uses synchronous
+    # `subprocess.Popen`, so the Selector loop's lack of
     # asyncio-subprocess support is fine. Caveat: the Windows Selector loop is
     # select()-based (FD_SETSIZE 512); this single-agent localhost transport
     # handles only the listener plus a handful of /mcp + observe connections,
@@ -531,13 +531,12 @@ def _serve_http(config, port, view=False):
         except Exception:  # noqa: BLE001 - teardown is best-effort
             logger.debug("stopping the ACP agent failed", exc_info=True)
 
-    # Backstop for the exits that skip _shutdown, matching the dask cluster's.
+    # Backstop for the exits that skip _shutdown.
     atexit.register(_stop_acp_agent)
 
     def _shutdown(reason):
         """One teardown for every deliberate-exit path — POSIX signals, the
-        server loop returning: reap the kernel, close the session-child-owned
-        dask cluster, remove our scratch, exit.
+        server loop returning: reap the kernel, remove our scratch, exit.
 
         Skips Python finalization: this process still has a live asyncio/epoll
         event-loop thread and the numpy OpenBLAS worker pool running, and
@@ -558,10 +557,9 @@ def _serve_http(config, port, view=False):
         # attached to. Cheap and idempotent when chat never ran.
         _stop_acp_agent()
         host.shutdown()
-        # Any dask cluster went with the kernel — it is the kernel that spins one
-        # now, and its workers are that process group's. The Xvfb display is the
-        # one thing here that outlives a kernel restart, so it goes down only on
-        # this path (its X clients died with the kernel).
+        # Any dask cluster a cell spun went with the kernel's process group. The
+        # Xvfb display is the one thing here that outlives a kernel restart, so
+        # it goes down only on this path (its X clients died with the kernel).
         _xvfb.stop(xvfb_proc)
         os._exit(0)
 

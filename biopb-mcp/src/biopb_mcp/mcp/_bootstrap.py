@@ -1,9 +1,10 @@
 """Bootstrap executed *inside* the MCP child kernel.
 
 Injected via IPython ``exec_lines`` so it runs before the kernel services any
-tool calls.  It enables the Qt event loop, configures dask in the process
-where compute actually happens, opens a visible napari viewer with the Tensor
-Browser widget, and populates the ``execute_code`` namespace.
+tool calls.  It enables the Qt event loop, opens a visible napari viewer with
+the Tensor Browser widget, and populates the ``execute_code`` namespace. Dask
+is left as dask configures itself: computes run in-process unless a cell builds
+a dask ``Client``.
 
 A failure here does not abort the kernel (exec_lines errors are swallowed by
 IPython), so ``bootstrap`` prints a ``BOOTSTRAP_ERROR`` sentinel that the
@@ -22,8 +23,8 @@ logger = logging.getLogger(__name__)
 def is_scratch_kernel():
     """Whether this kernel was spawned to verify a workflow (``_scratch``).
 
-    A scratch kernel is the bootstrap's machinery -- the job runner, the dask
-    attach, the connection -- and **none of its workflow handles**: no
+    A scratch kernel is the bootstrap's machinery -- the job runner and the
+    connection -- and **none of its workflow handles**: no
     ``viewer``, ``np``, ``da``, ``client`` or ``ops``, and no user plugins.
     Whoever opens the saved notebook gets a bare kernel, so the run that
     verifies it gets one too, and what the document needs it builds for itself
@@ -337,7 +338,7 @@ def _load_entry_point_plugins(ip) -> list[str]:
     the escape hatch for a plugin that must bind several names itself: it is called
     with a read-through snapshot of the namespace and only its new bindings are
     merged, each past the reserved-name guard. That snapshot is taken at load time,
-    when ``client`` is still the ``None`` seeded at step 7 -- a hook wanting the
+    when ``client`` is still the ``None`` seeded at step 6 -- a hook wanting the
     live client must read it per call (see ``plugins/__init__.py``).
 
     Fail-open per entry point. Returns the names that loaded (see
@@ -414,7 +415,7 @@ def _load_namespace_plugins(ip, config) -> None:
     Two sources, both fail-open per unit so one bad plugin never breaks the
     bootstrap (the ``build_ops`` / skills precedent): ``*.py`` files under
     ``~/.config/biopb/kernel/`` and installed ``biopb_mcp.namespace`` entry points.
-    Called after the built-in handles exist (step 7) so plugins can reference them.
+    Called after the built-in handles exist (step 6) so plugins can reference them.
     Gated by ``services.namespace_enabled``.
 
     What loaded is reported to :mod:`._requires` and printed by ``server_status``,
@@ -497,7 +498,7 @@ def _bootstrap_impl():
     # Heavy core imports, now covered by the splash. dask.array is the slow one
     # here; napari is pulled in transitively on some platforms, so this is the
     # phase the "Loading napari…" cue is for (the later `import napari` is then a
-    # no-op — see step 4). numpy/da are bound for the execute_code namespace.
+    # no-op — see step 3). numpy/da are bound for the execute_code namespace.
     splash.message("Loading napari…")  # a no-op in a scratch kernel
     import dask.array as da
     import numpy as np
@@ -507,40 +508,10 @@ def _bootstrap_impl():
     from ._process_ops import build_ops_from_config
 
     # 2. Data-access service (dask-free), shared by the widget and the agent
-    #    namespace. Created before dask so the viewer can come up without waiting
-    #    on the attach thread below.
+    #    namespace.
     conn = TensorConnection()
 
-    # 3. Settle dask on a background thread so the viewer opens immediately.
-    #    The default is the *in-process* scheduler the viewer's own slice reads
-    #    use (#8), so there is nothing to wait for and nothing to go stale
-    #    (#970); a cluster is an explicit act -- a cell calling
-    #    `_dask_ctl.attach()`, or a config that asks at startup -- and spinning
-    #    or connecting to one costs seconds, which is why this stays off the
-    #    bootstrap thread. Until it settles `_dask_client` is None;
-    #    interrupt_kernel / server_status guard for that. `_dask_ctl` owns the
-    #    whole arrangement, cluster included (see _dask_ctl).
-    import threading
-
-    from ._dask_ctl import DaskAttachment
-
-    # DaskAttachment seeds `_dask_client` (None) and `_dask_attach_done` (False,
-    # until the thread below resolves to a Client or to the in-process scheduler)
-    # -- it owns both bindings, so it is the one that writes them.
-    dask_ctl = DaskAttachment(config, ip)
-    ip.user_ns["_dask_ctl"] = dask_ctl
-
-    # on_connect fires (in the kernel) after every successful connect with the
-    # final (url, token), which is what bounds the workers' chunk cache -- the
-    # token is only known post-connect. It races the attach thread; whichever
-    # arrives second registers the plugin (_dask_ctl holds the lock for both).
-    conn.on_connect = dask_ctl.on_connect
-
-    threading.Thread(
-        target=dask_ctl.start, name="biopb-dask-attach", daemon=True
-    ).start()
-
-    # 4. napari viewer + Tensor Browser -- unless this is a scratch kernel.
+    # 3. napari viewer + Tensor Browser -- unless this is a scratch kernel.
     #
     # **A scratch kernel is headless by policy.** The viewer is how an agent
     # shows something to a person; a verification has no person in it, so a
@@ -553,10 +524,10 @@ def _bootstrap_impl():
     # and ~1.7 s of napari.Viewer() that nobody was going to look at.
     viewer = None
     if not is_scratch_kernel():
-        # 4. napari viewer + Tensor Browser (auto-connects on its own tick).
-        #    compute_scheduler pins the viewer's serial slice reads to a
-        #    single-process scheduler so they share the main-process chunk cache
-        #    instead of scattering across the distributed cluster (issue #8).
+        #    The browser auto-connects on its own tick. compute_scheduler pins
+        #    the viewer's serial slice reads to a single-process scheduler so
+        #    they share the main-process chunk cache instead of scattering
+        #    across a cluster a cell attached (issue #8).
         compute_scheduler = get_setting(config, "viewer.compute_scheduler")
         # Enable napari async slicing via its NAPARI_ASYNC env override, set
         # BEFORE importing napari. The settings singleton reads the env at load,
@@ -607,7 +578,7 @@ def _bootstrap_impl():
             splash.close()
             raise
 
-    # 5. ProcessImage ops: thin Run() callables for each configured servicer.
+    # 4. ProcessImage ops: thin Run() callables for each configured servicer.
     #    client_getter reads conn.client lazily so the async-connecting tensor
     #    client is picked up at call time.
     try:
@@ -616,24 +587,16 @@ def _bootstrap_impl():
         logger.exception("Failed to build ProcessImage ops")
         ops = {}
 
-    # 6. Async job runner: execute_code runs in a background kernel thread so
-    #    the main thread / Qt loop stays free for screenshot/status mid-job.
-    #    install() stores the shell, installs the thread-aware stdout streams,
-    #    and clears any prior job state.
+    # 5. The kernel's side of the jobs: cells held for Stop, run_async tasks.
+    #    install() stores the shell and clears any prior job state.
     _jobs.install(ip)
-    # 7. Namespace for execute_code.  client is refreshed per-job by the job
-    #    runner (the connection service connects asynchronously).
-    #    _dask_client was seeded to None at step 3 and is filled by the background
-    #    attach thread; not set here so it stays the sole writer (a threads-mode
-    #    attach can finish before this runs).
+    # 6. Namespace for execute_code.  client is refreshed before each agent
+    #    cell (the connection service connects asynchronously).
     #    _viewer_window_alive lets the tools detect a user-closed window (the
     #    Python `viewer` survives a window close, so mutations silently no-op).
     ns = {
         "_conn": conn,
         "_jobs": _jobs,
-        # Safe to bind headless: with no QCoreApplication it runs `fn` inline
-        # (see _jobs.run_on_main), so a plugin that marshals still works.
-        "run_on_main": _jobs.run_on_main,
     }
     if not is_scratch_kernel():
         # **A scratch kernel binds no workflow handles**, for the reason it
@@ -688,7 +651,7 @@ def _bootstrap_impl():
         # for the reader, so the verification has to reach them the same way.
         _load_namespace_plugins(ip, config)
 
-    # 8. Background source-catalog watcher (issue #44): a daemon thread that
+    # 7. Background source-catalog watcher (issue #44): a daemon thread that
     #    health-checks the server and re-lists sources when its source_count
     #    changes, so a catalog cached while the server was still indexing
     #    self-heals — for the agent (reads `_conn.sources` live) and, in a GUI

@@ -45,7 +45,6 @@ def runner(monkeypatch):
     requests = itertools.count(1)
     monkeypatch.setattr(_jobs, "_request_id", lambda: f"req-{next(requests)}")
     ns = {
-        "_dask_client": None,
         "_conn": types.SimpleNamespace(client=None),
     }
     _jobs.install(types.SimpleNamespace(user_ns=ns))
@@ -107,72 +106,6 @@ class TestTasks:
         job = _wait(_task(lambda: 1 / 0))
         assert job.status == "error"
         assert "ZeroDivisionError" in job.error_text
-
-    def test_worker_less_cluster_fails_the_task_instead_of_hanging(self, runner):
-        # biopb/biopb#970's backstop: a scheduler with no workers accepts work
-        # and never runs it, so the task would block forever with no error.
-        ran = []
-
-        class _Ctl:
-            def dead_message(self):
-                return "no workers left; _dask_ctl.attach() or .detach()"
-
-        runner["_dask_ctl"] = _Ctl()
-        job = _wait(_task(ran.append, 1))
-        assert job.status == "error"
-        assert "_dask_ctl.attach()" in job.error_text
-        assert ran == []  # the function never ran
-
-    def test_healthy_attachment_does_not_block_a_task(self, runner):
-        class _Ctl:
-            def dead_message(self):
-                return None
-
-        runner["_dask_ctl"] = _Ctl()
-        assert _wait(_task(lambda: None)).status == "ok"
-
-    def test_distributed_cancel_rebuilds_futures(self, runner, monkeypatch):
-        # _cancel() must rebuild real Future objects from dc.futures' string
-        # keys: Client.cancel() filters its arg through futures_of(), which
-        # silently drops bare strings -- so passing list(dc.futures) cancels
-        # nothing.  Assert real Futures (resolvable by futures_of) + force=True.
-        from distributed import Client, Future
-        from distributed.client import futures_of
-
-        calls = {}
-
-        class _Loop:
-            def add_callback(self, fn, *a, **k):  # swallow Future.release()
-                pass
-
-        class _StubClient:
-            futures = {"('grad', 0, 0)": object(), "('grad', 1, 0)": object()}
-            generation = 0
-            loop = _Loop()
-
-            def _inc_ref(self, key):
-                pass
-
-            def _dec_ref(self, key):
-                pass
-
-            def cancel(self, futures, force=False):
-                calls["futures"] = list(futures)
-                calls["force"] = force
-
-        # Whatever client is *live*, not the `_dask_client` binding: a cell that
-        # made its own Client() is attached just as much, and its futures are
-        # just as stuck.
-        stub = _StubClient()
-        monkeypatch.setattr(Client, "current", classmethod(lambda cls, **kw: stub))
-        job = _task(_spin)
-        _jobs._cancel_dask_futures()
-        passed = calls["futures"]
-        assert passed and all(isinstance(f, Future) for f in passed)
-        assert {f.key for f in futures_of(passed)} == set(_StubClient.futures)
-        assert calls["force"] is True
-        _jobs.interrupt(job.job_id)  # actually stop the uncooperative loop
-        _wait(job)
 
     def test_reset_clears_registry(self, runner):
         _task(lambda: None)
@@ -319,7 +252,6 @@ import biopb_mcp.mcp._jobs as _jobs
 from types import SimpleNamespace
 _ip = get_ipython()
 _ip.user_ns['_conn'] = SimpleNamespace(client=None)
-_ip.user_ns['_dask_client'] = None
 _jobs.install(_ip)
 print('JOBS_READY')
 """

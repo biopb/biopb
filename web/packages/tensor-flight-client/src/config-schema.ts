@@ -23,6 +23,8 @@ export interface SchemaProp {
   enum?: unknown[];
   minimum?: number;
   maximum?: number;
+  /** A section's settings-page label; sections without one stay off the page. */
+  title?: string;
   /** Prose docstring (from the config field's `metadata["help"]`). */
   description?: string;
   /** Human validation-rule hint (bounds / accepted values), rendered as a

@@ -59,11 +59,11 @@ export function sessionVerdict(
  *
  * The redirect matches what every other page already does with a 401
  * (`AdminPage`, `LogsPage`, `McpAdminPage`). It also settles a gate the observe
- * page could not otherwise ask about: the console and the chat pane decide
- * *whether to render at all* from two advertised halves — the control is
+ * page could not otherwise ask about: the chat pane decides *whether to
+ * render at all* from two advertised halves — the control is
  * loopback-bound, and the child serves the root — and a token gate is a third
  * the deployment has but neither half reports. Both halves say yes under
- * `--token`, so an editor appeared and every submit 401'd. Leaving the page
+ * `--token`, so a composer appeared and every submit 401'd. Leaving the page
  * closes that gap without the gate having to grow a third term.
  */
 export async function sessionFetch(

@@ -14,12 +14,11 @@ What this module keeps is what the host cannot do from outside:
   attributes to that cell's request) under the task. One task at a time.
 * **Stopping** (:func:`interrupt`, on the control thread): a ``SIGINT`` for
   the cell on the main thread, a ``KeyboardInterrupt`` raised into a task's
-  thread, and a cancel of the in-flight dask futures, the only
-  mid-``compute()`` stop short of ``restart_kernel``. Who may stop what is the
-  host's decision; this checks only that the job named still runs.
+  thread. Who may stop what is the host's decision; this checks only that the
+  job named still runs.
 * **Main-thread affinity.** The viewer is a Qt/vispy object bound to the main
-  thread. A task's viewer calls are marshaled through :func:`run_on_main`
-  (``_viewer_proxy`` does it for the whole ``viewer``).
+  thread. A task's viewer calls are marshaled through :func:`run_on_main`,
+  which ``_viewer_proxy`` does for the whole ``viewer``.
 """
 
 import contextlib
@@ -71,13 +70,9 @@ KERNEL_HANDLE_NAMES = frozenset(
         "np",
         "da",
         "ops",
-        "run_on_main",
         "run_async",
         "_conn",
         "_jobs",
-        "_dask_client",
-        "_dask_attach_done",
-        "_dask_ctl",
         "_viewer_window_alive",
         "_resync_view",
     }
@@ -173,7 +168,7 @@ def run_on_main(fn, *args, **kwargs):
     """Call ``fn(*args, **kwargs)`` on the Qt main thread and return its result.
 
     A no-op dispatch when already on the main thread.  Used to make viewer
-    mutations from a background job thread safe; exceptions raised on the main
+    mutations from a task's thread safe; exceptions raised on the main
     thread are re-raised to the caller.
     """
     if threading.current_thread() is threading.main_thread():
@@ -199,25 +194,6 @@ def run_on_main(fn, *args, **kwargs):
 # -- execution --------------------------------------------------------------
 
 
-def _dask_backstop():
-    """Why nothing this job computes could finish, or ``None``.
-
-    biopb/biopb#970's backstop: an attached scheduler whose workers have all gone
-    (a host suspend outliving their TTL) still *accepts* work and never runs it,
-    turning a 0.2 s read into a cell that hangs until someone interrupts it. A
-    worker count off the client makes that an error naming the fix instead. Only
-    fires while attached, which is opt-in (``_dask_ctl.attach()``).
-    """
-    ctl = _ip.user_ns.get("_dask_ctl") if _ip is not None else None
-    if ctl is None:
-        return None
-    try:
-        return ctl.dead_message()
-    except Exception:  # noqa: BLE001 - a backstop must not become the failure
-        logger.debug("dask liveness probe failed", exc_info=True)
-        return None
-
-
 def _request_id():
     """The msg_id of the execute request this thread is serving, or None
     outside a kernel (unit tests drive this module directly)."""
@@ -236,8 +212,8 @@ def _publish(content):
     to ignore. The request the job's output goes under rides in the content.
 
     The send runs on ipykernel's IOPub thread, as ``OutStream`` does: the
-    Session (its msg_id counter) is not thread-safe, and a job event is sent
-    from a job thread. Streams are flushed first -- ``flush`` waits until the
+    Session (its msg_id counter) is not thread-safe, and a task's event is
+    sent from the task's thread. Streams are flushed first -- ``flush`` waits until the
     IOPub thread has taken the output -- so the job's last output is on iopub
     ahead of its end.
 
@@ -308,9 +284,6 @@ def _run(job, body):
     and announce how it ended."""
     exc = None
     try:
-        _dead = _dask_backstop()
-        if _dead:
-            raise RuntimeError(_dead)
         body()
     except KeyboardInterrupt:
         exc = True
@@ -439,32 +412,6 @@ def run_async(fn, *args, **kwargs):
     return job.job_id
 
 
-def _cancel_dask_futures():
-    """Stop the in-flight dask work: one job at a time, so all of it."""
-    # Distributed dask: cancel in-flight futures.  This is what actually stops a
-    # blocking ``.compute()`` -- its tasks ARE registered in ``dc.futures`` for
-    # the duration of the internal ``gather``, so cancelling them makes that
-    # gather raise and unwinds the job thread.  ``dc.futures`` is keyed by task
-    # key *string*, so we must rebuild ``Future`` objects from those keys:
-    # ``Client.cancel`` filters its argument through ``futures_of()``, which
-    # silently drops bare strings -- ``cancel(list(dc.futures))`` cancels nothing.
-    # One job at a time, so every tracked future belongs to this job.
-    # Whatever client is live, not the `_dask_client` binding: a cell that made
-    # its own `Client(...)` is attached just as much as `_dask_ctl.attach()` is,
-    # and its futures are just as stuck. `current` finds the global default,
-    # which is what dask itself computes on (raises ValueError when there is
-    # none, i.e. the in-process default).
-    try:
-        from distributed import Client, Future
-
-        dc = Client.current(allow_global=True)
-        keys = list(dc.futures)
-        if keys:
-            dc.cancel([Future(k, dc) for k in keys], force=True)
-    except Exception:  # noqa: BLE001 - cancel is best-effort
-        logger.debug("distributed cancel failed", exc_info=True)
-
-
 def _running_task():
     """The running task, or None: one at a time (see run_async())."""
     for j in _jobs.values():
@@ -494,7 +441,7 @@ def _raise_in_thread(ident, exctype):
 
 def interrupt(key, reason=None):
     """Force-stop the job *key* names if it still runs: a ``KeyboardInterrupt``
-    where it runs, and a cancel of its dask futures.
+    where it runs.
 
     Called on the kernel's control thread (``_kernel_gate``), so it is answered
     while the main thread is busy -- including with the very cell it stops.
@@ -514,9 +461,15 @@ def interrupt(key, reason=None):
     the main thread (:func:`hold_cell`), so it gets a real ``SIGINT``, which
     also breaks a blocking sleep or wait. Checked and sent under the lock the
     cell is ended under, so the signal cannot reach the next cell (see
-    :func:`hold_cell`). Either way the in-flight dask futures are cancelled too
-    (:func:`_cancel_dask_futures`), the only mid-``compute()`` stop short of a
-    restart. *reason* (a person's Stop) is prefixed to a task's error.
+    :func:`hold_cell`). *reason* (a person's Stop) is prefixed to a task's
+    error.
+
+    **No dask cancel.** A blocking dask ``Client`` call waits in
+    ``distributed.utils.sync``, whose own ``KeyboardInterrupt`` handler cancels
+    that call's futures and nothing else's. A cell's ``SIGINT`` breaks the wait
+    at once; a task's exception lands when the wait next wakes, within 10 s
+    (hardcoded there). Cancelling every future on the client was faster for a
+    task, but took a user's compute and any persisted data with it.
     """
     with _lock:
         job = _running(key)
@@ -531,8 +484,6 @@ def interrupt(key, reason=None):
             # A cell's reason is the host's to attach (note_cancel).
             _interrupt_main()
             raised = True
-    # Off the lock: a distributed cancel is a round trip to the scheduler.
-    _cancel_dask_futures()
     return {"interrupted": raised}
 
 
@@ -574,12 +525,10 @@ def reset():
 
 # -- viewer wrapping --------------------------------------------------------
 #
-# The agent-facing ``viewer`` is wrapped by a full main-thread marshaling proxy
-# (``_viewer_proxy.make_viewer_proxy``) rather than the old method-by-method
-# wrap, which leaked any returned handle (``viewer.layers``, ``viewer.dims``,
-# ``viewer.layers[0]``) and let off-main mutations on it segfault Qt
-# (biopb/biopb#100). ``run_on_main`` above remains the marshaling primitive the
-# proxy uses, and is still exposed for power users.
+# The agent-facing ``viewer`` is wrapped by a main-thread marshaling proxy
+# (``_viewer_proxy.make_viewer_proxy``) that also wraps every handle it returns
+# (``viewer.layers``, ``viewer.dims``, ``viewer.layers[0]``), so no off-main
+# mutation reaches Qt. ``run_on_main`` above is the primitive it marshals with.
 
 
 def install(ip):

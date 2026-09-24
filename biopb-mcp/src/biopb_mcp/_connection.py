@@ -230,17 +230,9 @@ class TensorConnection:
         # succeeds. The endpoint's source of truth is the control (#413), asked at
         # connect time by :meth:`auto_connect`; nothing here is read from config
         # and nothing is written back to it. ``token`` is simply the credential the
-        # live connection uses, published for the dask cache plugin (via
-        # ``on_connect``) and the ``server_status`` tool.
+        # live connection uses, published for the ``server_status`` tool.
         self.url: str | None = None
         self.token: str | None = None
-
-        # Optional callback invoked after every successful connect with the
-        # final (url, token). Lets a caller react once the connection params are
-        # settled -- e.g. the MCP bootstrap registers the dask chunk-cache
-        # plugin here, since the token is only known after connect. Kept as a
-        # plain callable so this service stays GUI/dask-free.
-        self.on_connect = None
 
         # Optional callback invoked (from the watcher's daemon thread) after the
         # background source watcher re-lists the catalog, with the fresh sources
@@ -318,11 +310,6 @@ class TensorConnection:
             self.use_server_query = len(sources) > SERVER_QUERY_THRESHOLD
             self.last_status = "connected"
             self.last_message = ""
-            if self.on_connect is not None:
-                try:
-                    self.on_connect(self.url, self.token)
-                except Exception:  # noqa: BLE001 - hook is best-effort
-                    logger.exception("on_connect hook failed")
             return sources
         except ServerStarting:
             raise
@@ -722,9 +709,8 @@ class TensorConnection:
         bootstrap or the widget so the policy is unit-testable without Qt/napari
         and neither caller reimplements it. It is a *mechanism the caller
         drives*, not something the constructor does: ``connect`` blocks on
-        network I/O and ``on_connect`` is wired only after construction, so
-        self-connecting in ``__init__`` would both stall the constructor and skip
-        the cache-plugin hook. Both callers run it **off their main thread** —
+        network I/O, so self-connecting in ``__init__`` would stall the
+        constructor. Both callers run it **off their main thread** —
         the MCP kernel on a daemon thread (``execute_code`` refreshes ``client``
         from ``_conn.client`` per job, so a late connect is still picked up), the
         widget on a worker thread that signals the tree render back to the Qt

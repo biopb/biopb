@@ -523,9 +523,9 @@ class TestCancel:
 
 
 def test_routes_are_not_mounted_when_chat_is_off():
-    # Off drops the surface entirely rather than serving a refusing one, the
-    # same shape the console's gate takes: "is there a way to submit here?" has
-    # one answer rather than a status code to interpret.
+    # Off drops the surface entirely rather than serving a refusing one: "is
+    # there a way to submit here?" has one answer rather than a status code to
+    # interpret.
     cfg = chat_config()
     cfg["observe"]["chat_enabled"] = False
     assert _chat_api.configure(cfg, agentless=True) is False

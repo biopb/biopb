@@ -116,26 +116,32 @@ except Exception as _e:
 
 print("")
 print("## Dask")
-# Which scheduler this kernel's computes run on -- the arrangement, not just a
-# worker count, because "attached to a cluster that has lost its workers" is the
-# state that used to be invisible until a .compute() hung forever (#970).
+# Where a .compute() runs: dask's own default, in-process unless a cell built a
+# dask Client. Read without importing distributed, which only a cell that
+# built one has loaded.
 try:
-    _dst = _dask_ctl.status()
-    if _dst["mode"] == "attached":
-        _own = " (spun by this kernel)" if _dst["owned"] else " (external)"
-        print("  mode: attached to " + str(_dst["address"]) + _own)
-        print("  workers: " + str(_dst["workers"]))
-        print("  dashboard: " + str(_dst["dashboard"]))
-        if _dst["cache_budget_per_worker"] is not None:
-            print("  chunk_cache: " + str(_dst["cache_budget_per_worker"]) + " B/worker")
-        if _dst["warning"]:
-            print("  WARNING: " + _dst["warning"])
-    elif _dst["mode"] == "attaching":
-        print("  mode: attaching (still connecting to a cluster)")
+    import sys as _sys
+    _dc = None
+    if "distributed" in _sys.modules:
+        from distributed import Client as _Client
+        try:
+            _dc = _Client.current(allow_global=True)
+        except ValueError:
+            pass
+    if _dc is None:
+        print("  mode: in-process (dask's default), shared with the viewer")
+    elif _dc.status != "running":
+        print("  mode: dask Client, " + str(_dc.status))
+        print("  WARNING: a .compute() would fail or block; close this dask "
+              "Client or build a new one")
     else:
-        print("  mode: in-process (" + str(_dst["scheduler"]) + "), shared with the viewer")
-        print("    `_dask_ctl.attach()` in a cell spins a cluster for multi-process")
-        print("    parallelism / a cancellable compute; the `kernel` doc explains when")
+        _nw = len(_dc.nthreads())
+        print("  mode: dask Client at " + str(_dc.scheduler.address))
+        print("  workers: " + str(_nw))
+        print("  dashboard: " + str(_dc.dashboard_link))
+        if _nw == 0:
+            print("  WARNING: no workers left -- a .compute() would block forever; "
+                  "close this dask Client or build a new one")
 except Exception as _e:
     print("  error: " + str(_e))
 
@@ -713,8 +719,8 @@ async def execute_code(
 
     * viewer mutations (read_doc("napari-viewer") has more):
     Mutate the viewer directly. From a run_async task too: its mutations are
-    marshaled to the main thread. run_on_main(fn) batches many mutations into
-    one hop, or touches raw Qt (viewer.window), from a task.
+    marshaled to the main thread, one hop each, so bulk viewer work and raw Qt
+    (viewer.window) belong in a cell.
 
     * data access (read_doc("tensor-server-client") has more):
     - client.query_sources(sql, format="pandas") runs server-side DuckDB and
@@ -1036,11 +1042,10 @@ async def interrupt_kernel() -> str:
     A cell runs on the kernel's main thread and gets a SIGINT, which also wakes
     a blocking sleep or wait; a task gets a KeyboardInterrupt raised into its
     thread. Either lands at the next bytecode, so a blocking C-level call (gRPC
-    tensor fetch, native compute) stops only when it returns to Python. Also
-    cancels the job's in-flight dask futures, which is what stops a blocking
-    `.compute()` -- but only while a cluster is attached (`_dask_ctl.attach()`
-    in a cell). If YOUR job stays stuck, use restart_kernel -- the guaranteed
-    stop.
+    tensor fetch, native compute) stops only when it returns to Python. A
+    blocking `.compute()` on a dask `Client` cancels its own tasks when
+    interrupted; in a task that lands within 10 s. If YOUR job stays stuck,
+    use restart_kernel -- the guaranteed stop.
 
     Stops YOUR job only. A cell the user runs from an attached Jupyter notebook
     shares this kernel but is not yours to stop: this refuses it, so wait for it

@@ -11,13 +11,12 @@ closed window has none. `server_status`'s `## Viewer` says which you are
 in; [[web-viewer]] is the route that works either way. Everything below assumes
 a window.
 
-**Threading:** the `viewer` is thread-safe — every mutation (layer properties,
+**Threading:** a cell runs on the Qt main thread, so it mutates the `viewer`
+directly. From a `run_async` task every mutation (layer properties,
 `viewer.dims`, `viewer.layers.remove()`, `viewer.camera`, the `add_*()` family)
-is automatically marshaled to the Qt main thread, so mutate it directly from job
-code. `run_on_main()` is optional: use it to **batch** many mutations into one
-main-thread hop (one round-trip instead of one per mutation), or to touch raw Qt
-(`viewer.window`), which still requires the main thread and otherwise raises a
-clear error off-thread.
+is marshaled to the main thread for you, one round-trip each — so put bulk
+viewer work in a cell. Raw Qt (`viewer.window`) works only on the main thread:
+from a task it raises a clear error.
 
 **If the user closes the napari window**, the kernel is torn down to idle and
 any running job is stopped. `server_status` then reports the kernel `not
@@ -115,19 +114,13 @@ viewer.layers.remove(viewer.layers["name"])
 layer_name = viewer.add_tensor("source_id")                  # single-tensor source
 layer_name = viewer.add_tensor("source_id/t1", name="my_layer")
 
-# Layer properties (auto-marshaled — set directly; each runs on the main thread)
+# Layer properties (set directly)
 layer = viewer.layers["name"]
 layer.visible = False
 layer.opacity = 0.7
 layer.colormap = "viridis"
 layer.contrast_limits = [0, 255]
 layer.blending = "additive"     # "translucent", "additive", "minimum", "opaque"
-
-# To apply many at once in a single main-thread hop, batch with run_on_main:
-def _style():
-    layer = viewer.layers["name"]
-    layer.visible, layer.opacity, layer.colormap = False, 0.7, "viridis"
-run_on_main(_style)
 ```
 
 ## Dimensions (sliders)

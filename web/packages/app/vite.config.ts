@@ -82,7 +82,7 @@ export default defineConfig({
       [`^${rx}/api`]: control,
       [`^${rx}/data_plane`]: control,
       // /health is unauthenticated and outside /api, and auth.ts reads it twice
-      // — authRequired() and localRootsProxied(). Unproxied it fell to the SPA
+      // — authRequired() and chatProxied(). Unproxied it fell to the SPA
       // fallback, and since both callers treat any failure as false, dev
       // silently reported "no token needed, no chat" whatever the control
       // said: the chat pane could never appear on a dev server.
