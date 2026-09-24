@@ -47,6 +47,9 @@ class _Jobs:
     def __init__(self, host):
         self._host = host
 
+    def new_id(self):
+        return "job-1"
+
     def poll(self, job_id):
         h = self._host
         state = h._states.pop(0) if len(h._states) > 1 else h._states[0]
@@ -119,13 +122,11 @@ def chat_host():
 
     host.execute.side_effect = execute
 
-    def control(op, timeout=None, **args):
-        if op == "interrupt":
-            host.interrupts.append(args)
-            return {"job_id": args["job_id"], "interrupted": True}
-        return None
+    def interrupt_job(job_id, **kwargs):
+        host.interrupts.append((job_id, kwargs))
+        return {"job_id": job_id, "interrupted": True}
 
-    host.control.side_effect = control
+    host.interrupt_job.side_effect = interrupt_job
 
     old_host, old_poll = _app._kernel_host, _chat._POLL_INTERVAL
     _app.set_kernel_host(host)

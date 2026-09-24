@@ -2,8 +2,8 @@
 
 Runs inside the kernel, as its ``kernel_class`` (``KernelHost._launch`` passes
 ``--IPKernelApp.kernel_class``). A cell from any client but the host's own is
-refused while a job runs on its worker thread, and otherwise runs inline,
-announced as an ``origin="user"`` job so the host records it and the agent is
+refused while a job runs on its worker thread, and otherwise runs inline; the
+host records it as an ``origin="user"`` job from the protocol, and the agent is
 told of it (``docs/jupyter-clients.md``).
 
 The gate is ``do_execute`` rather than a ``pre_run_cell`` callback because
@@ -127,6 +127,14 @@ class GatedKernel(IPythonKernel):
         running = _jobs.running_job()
         if running is not None:
             return self._refuse(running)
+
+        if silent:
+            # ipykernel echoes no silent request, and the host records a
+            # foreign cell from its echo; silent code runs with full effect,
+            # so it is echoed here.
+            self._publish_execute_input(
+                code, self.get_parent("shell"), self.execution_count
+            )
 
         reply = None
         try:

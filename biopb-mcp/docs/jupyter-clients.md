@@ -112,22 +112,31 @@ tried would itself be refused, and the observe page is the tool for it.
 
 ### Record
 
-The records live in the host (`mcp/_job_log.py`), built from iopub. The kernel
-announces each job's start and end as a `biopb_job` message
-(`_jobs._publish`) naming the request its output is published under; every
-`stream`, `execute_result` and `error` under that request is the job's. A
-foreign cell that runs is announced as `origin="user"` by the gate
-(`_jobs.record_inline`): source from the request, status from the reply, its
-output going to its own client as usual and filed by the host from the same
-iopub. An agent's job is announced by `submit`, its worker thread's prints
-attributed to the submit request.
+The records live in the host (`mcp/_job_log.py`), built from iopub, and the
+host names every job (`job-N`, one counter for the host's life, so ids never
+repeat across restarts). Every `stream`, `execute_result` and `error` under a
+job's request is the job's. Two kinds of job:
+
+- **A foreign cell** is read from the protocol, as `origin="user"`: its
+  `execute_input` starts it, an iopub `error` fails it (`KeyboardInterrupt`:
+  interrupted), and the `status: idle` for its request ends it. The host skips
+  its own session's requests and empty code (a client's prompt-number
+  request). ipykernel echoes no silent request, so the gate echoes a non-empty
+  silent one itself: silent code runs with full effect. A cell the gate refuses
+  was still echoed, before the gate saw it; the host drops the record when its
+  error is `KernelBusy`.
+- **A task** runs on a worker thread and outlives the request that started it,
+  so the kernel announces its start and end as `biopb_job` messages
+  (`_jobs._publish`): an agent's job, submitted under the id the host gives it,
+  its worker thread's prints attributed to the submit request.
 
 The announcement has no parent header: a client drops iopub from other
 sessions, and an unknown message type under its own request would be one more
 thing for it to ignore. Streams are flushed before the end is announced, so a
 job's output is complete when its record says it ended. iopub is a PUB socket
-and can drop under pressure; a start while another record is still running
-ends that one as "end not recorded", since only one job runs at a time.
+and can drop under pressure; a task's start, or a cell that ran, ends any
+record still running as "end not recorded", since only one job runs at a
+time.
 
 A verification cannot wait for a next start, so the scratch run also checks
 the kernel's own account of the job every 2 s, on the control channel. When
@@ -139,8 +148,7 @@ start or the kernel going away.
 Poll, the observe list and detail, the notebook export and the foreign-activity
 digest are reads of the host's memory, never a kernel round trip. Records
 outlive a kernel restart: one still running when its kernel goes is ended as
-interrupted, and the next kernel's job ids continue from the host's
-(`BIOPB_JOB_SEQ`). Display output (`display_data`) is not recorded: the record
+interrupted. Display output (`display_data`) is not recorded: the record
 says what ran and whether it failed, not what it drew.
 
 ### Control channel
@@ -153,10 +161,12 @@ runs on a worker thread, bounded by a timeout, since control requests are
 handled one at a time and ipykernel's own interrupt and shutdown share that
 queue. Refused for any session but the host's, like the gate.
 
-**Stop names its job** (`_jobs.interrupt(job_id, ...)`): the host sends the id
-its records say is running, or the observe row's, and the kernel checks it is
-still the running job before touching anything. A stale id stops nothing and
-the reply names what runs now. A worker-thread job gets a `KeyboardInterrupt`
+**Stop names its job** (`KernelHost.interrupt_job`): the host takes the id its
+records say is running, or the observe row's, and sends the kernel that job's
+request (`_jobs.interrupt(request, ...)`), since a cell's id is the host's and
+the kernel knows a job by its request. The kernel checks it is still the
+running job before touching anything. A stale id stops nothing and the reply
+names what runs now. A worker-thread job gets a `KeyboardInterrupt`
 raised into its thread; a foreign cell on the main thread gets a real `SIGINT`
 to the kernel process alone (`km.interrupt_kernel` signals the whole process
 group, dask workers included), which also wakes a blocking sleep. The check and

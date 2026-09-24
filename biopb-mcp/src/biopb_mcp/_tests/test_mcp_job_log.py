@@ -118,6 +118,104 @@ class TestRecord:
         assert log.poll("job-1")["created"] == 123.0
 
 
+def _input(log, code, request, session="client"):
+    log.on_iopub(
+        {
+            "header": {"msg_type": "execute_input"},
+            "parent_header": {"msg_id": request, "session": session},
+            "content": {"code": code},
+        }
+    )
+
+
+def _idle(log, request):
+    log.on_iopub(_msg("status", request, execution_state="idle"))
+
+
+class TestCells:
+    """A foreign client's cell, read from the protocol: its execute_input
+    starts it, an error fails it, its request's idle ends it."""
+
+    def _log(self):
+        return JobLog(host_session="host")
+
+    def _only(self, log):
+        (rec,) = log.export()
+        return rec
+
+    def test_a_cell_runs_and_ends_on_its_idle(self):
+        log = self._log()
+        _input(log, "print('hi')", "c1")
+        _print(log, "hi\n", request="c1")
+        rec = self._only(log)
+        assert rec["status"] == "running"
+        assert rec["origin"] == "user" and rec["code"] == "print('hi')"
+        _idle(log, "c1")
+        rec = self._only(log)
+        assert rec["status"] == "ok" and rec["stdout"] == "hi\n"
+
+    def test_the_hosts_own_requests_are_not_cells(self):
+        log = self._log()
+        _input(log, "_jobs.submit('x')", "h1", session="host")
+        _input(log, "   ", "c1")  # a client asking for its prompt number
+        assert log.export() == []
+
+    def test_an_error_fails_it_with_its_traceback(self):
+        log = self._log()
+        _input(log, "1/0", "c1")
+        log.on_iopub(
+            _msg("error", "c1", ename="ZeroDivisionError", traceback=["Zero", "at 1"])
+        )
+        _idle(log, "c1")
+        rec = self._only(log)
+        assert rec["status"] == "error" and rec["error_text"] == "Zero\nat 1"
+
+    def test_a_stop_is_interrupted_and_says_who(self):
+        log = self._log()
+        _input(log, "loop()", "c1")
+        (rec,) = log.export()
+        log.note_cancel(rec["job_id"], "stopped by the user")
+        log.on_iopub(_msg("error", "c1", ename="KeyboardInterrupt", traceback=["KI"]))
+        _idle(log, "c1")
+        rec = self._only(log)
+        assert rec["status"] == "interrupted"
+        assert rec["error_text"] == "stopped by the user\nKI"
+
+    def test_a_refused_cell_is_not_recorded_and_proves_nothing(self):
+        # The gate refuses a cell while a task runs, after ipykernel echoed it.
+        log = self._log()
+        _start(log, job_id=log.new_id(), request="submit-1")
+        _input(log, "y = 1", "c1")
+        log.on_iopub(_msg("error", "c1", ename="KernelBusy", traceback=["busy"]))
+        _idle(log, "c1")
+        assert [r["job_id"] for r in log.export()] == ["job-1"]
+        assert log.poll("job-1")["status"] == "running"
+
+    def test_a_cell_that_ran_ends_a_task_whose_end_was_lost(self):
+        log = self._log()
+        _start(log, job_id=log.new_id(), request="submit-1")
+        _input(log, "x = 1", "c1")
+        _idle(log, "c1")
+        assert log.poll("job-1")["status"] == "error"
+        assert "not recorded" in log.poll("job-1")["error_text"]
+
+    def test_a_submits_idle_does_not_end_its_task(self):
+        # The task outlives the request that started it.
+        log = self._log()
+        _start(log, job_id=log.new_id(), request="submit-1")
+        _idle(log, "submit-1")
+        assert log.poll("job-1")["status"] == "running"
+
+    def test_a_stop_is_named_by_the_request(self):
+        log = self._log()
+        _input(log, "loop()", "c1")
+        (rec,) = log.export()
+        assert log.request_of(rec["job_id"]) == "c1"
+        assert log.job_of("c1") == rec["job_id"]
+        _idle(log, "c1")
+        assert log.request_of(rec["job_id"]) is None
+
+
 class TestLostAndGone:
     def test_a_new_start_ends_a_record_whose_end_was_lost(self):
         # Only one job runs at a time, so a start proves the last one is over.
@@ -146,11 +244,11 @@ class TestLostAndGone:
         _end(log, status="ok")
         assert log.poll("job-1")["status"] == "interrupted"
 
-    def test_the_next_kernel_continues_the_ids(self):
-        log = JobLog()
-        assert log.next_seq() == 0
-        _start(log, job_id="job-7")
-        assert log.next_seq() == 7
+    def test_ids_are_the_hosts_and_never_repeat(self):
+        log = JobLog(host_session="host")
+        assert log.new_id() == "job-1"
+        _input(log, "x = 1", request="c1")
+        assert log.new_id() == "job-3"
 
 
 class TestSettle:

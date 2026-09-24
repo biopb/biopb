@@ -332,6 +332,7 @@ def _submit_job(host, code, digest, busy_message, **kwargs):
         host,
         "submit",
         code,
+        job_id=host.jobs.new_id(),
         origin=_writers._local_origin.get(),
         writer=writer,
         writer_label=writer_label,
@@ -1087,9 +1088,8 @@ async def interrupt_kernel() -> str:
     job_id = running["job_id"]
     try:
         data = await asyncio.to_thread(
-            host.control,
-            "interrupt",
-            job_id=job_id,
+            host.interrupt_job,
+            job_id,
             origin=_writers._local_origin.get(),
             writer=writer,
         )

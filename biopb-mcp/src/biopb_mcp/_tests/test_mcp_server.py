@@ -1013,19 +1013,18 @@ class TestInterruptRestart:
         """A host whose records say job-3 is running, and whose kernel answers
         the stop with *reply*."""
         host.jobs = ScriptedJobs(running="job-3")
-        host.control.return_value = {"job_id": "job-3", **reply}
+        host.interrupt_job.return_value = {"job_id": "job-3", **reply}
         return host
 
     def test_interrupt_forces_running_job(self, server_with_host):
         self._stopping(server_with_host, {"interrupted": True})
         result = _tool(_server.interrupt_kernel)
-        (op,), kwargs = server_with_host.control.call_args
-        assert op == "interrupt" and kwargs["job_id"] == "job-3"
+        assert server_with_host.interrupt_job.call_args.args == ("job-3",)
         assert "job-3" in result
 
     def test_interrupt_no_running_job(self, server_with_host):
         assert "No running job" in _tool(_server.interrupt_kernel)
-        server_with_host.control.assert_not_called()
+        server_with_host.interrupt_job.assert_not_called()
 
     def test_interrupt_no_host(self):
         _app._kernel_host = None
@@ -1051,7 +1050,7 @@ class TestInterruptRestart:
         # without it the refusal below can never trigger.
         self._stopping(server_with_host, {"interrupted": True})
         _tool(_server.interrupt_kernel)
-        assert server_with_host.control.call_args.kwargs["origin"] == "mcp"
+        assert server_with_host.interrupt_job.call_args.kwargs["origin"] == "mcp"
 
     def test_interrupt_from_the_chat_loop_asks_as_the_chat_loop(self, server_with_host):
         # Asked as a fixed "mcp", the runner read a chat cell as another
@@ -1063,7 +1062,7 @@ class TestInterruptRestart:
             _tool(_server.interrupt_kernel)
         finally:
             _writers._local_origin.reset(token)
-        assert server_with_host.control.call_args.kwargs["origin"] == "chat"
+        assert server_with_host.interrupt_job.call_args.kwargs["origin"] == "chat"
 
     def test_interrupt_refused_when_another_client_holds_the_kernel(
         self, server_with_host

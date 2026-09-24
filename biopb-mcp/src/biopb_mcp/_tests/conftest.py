@@ -89,6 +89,10 @@ class ScriptedJobs:
         snap = self._polls.pop(0) if len(self._polls) > 1 else self._polls[0]
         return {"job_id": job_id, **snap}
 
+    def new_id(self):
+        self._ids = getattr(self, "_ids", 0) + 1
+        return f"job-{self._ids}"
+
     def running(self):
         if self._running is None:
             return None

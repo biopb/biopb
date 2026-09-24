@@ -1208,7 +1208,7 @@ class TestJupyterClientGate:
     def _stop_job(host):
         running = host.jobs.running()
         if running is not None:
-            host.control("interrupt", job_id=running["job_id"])
+            host.interrupt_job(running["job_id"])
         _wait_until(
             lambda: "None" in host.execute("print(_jobs.running_job())")["stdout"]
         )
@@ -1235,7 +1235,7 @@ class TestJupyterClientGate:
         # a blocking sleep wakes up to take it.
         job_id = self._hold_main(gated, foreign, blocking=True)
         t0 = time.monotonic()
-        out = gated.control("interrupt", job_id=job_id, reason="stopped by the user")
+        out = gated.interrupt_job(job_id, reason="stopped by the user")
         assert out["interrupted"] is True
         reply = foreign.get_shell_msg(timeout=10)["content"]
         assert reply["ename"] == "KeyboardInterrupt"
@@ -1249,24 +1249,24 @@ class TestJupyterClientGate:
         job_id = self._hold_main(gated, foreign)
         try:
             t0 = time.monotonic()
-            out = gated.control("interrupt", job_id=job_id, origin="mcp")
+            out = gated.interrupt_job(job_id, origin="mcp")
             assert out["refused"] == "foreign_job"
             assert time.monotonic() - t0 < 5
             assert gated.jobs.running()["job_id"] == job_id
         finally:
-            gated.control("interrupt", job_id=job_id)
+            gated.interrupt_job(job_id)
             foreign.get_shell_msg(timeout=10)
 
     def test_a_stop_for_a_job_that_ended_stops_nothing(self, gated, foreign):
         job_id = self._hold_main(gated, foreign)
         try:
-            out = gated.control("interrupt", job_id="job-999")
+            out = gated.interrupt_job("job-999")
             assert out["refused"] == "not_running"
             assert out["running_job_id"] == job_id
             time.sleep(0.3)
             assert gated.jobs.running()["job_id"] == job_id
         finally:
-            gated.control("interrupt", job_id=job_id)
+            gated.interrupt_job(job_id)
             foreign.get_shell_msg(timeout=10)
 
     def test_a_control_request_does_not_read_as_idle(self, gated, foreign):
@@ -1274,11 +1274,13 @@ class TestJupyterClientGate:
         # after it says nothing about the main thread, still in the cell.
         job_id = self._hold_main(gated, foreign)
         try:
-            assert gated.control("status", job_id=job_id) == "running"
+            # Any control request: the kernel knows a foreign cell by its
+            # request, not the host's id, so this one answers "unknown".
+            gated.control("status", job_id=job_id)
             time.sleep(0.3)
             assert gated.is_busy()
         finally:
-            gated.control("interrupt", job_id=job_id)
+            gated.interrupt_job(job_id)
             foreign.get_shell_msg(timeout=10)
 
     def test_restart_closes_the_session_while_a_cell_holds_the_main_thread(
@@ -1362,7 +1364,7 @@ class TestJupyterClientGate:
             reply, msgs = self._run(foreign, "y = 1")
             assert reply["status"] == "error"
             assert reply["ename"] == "KernelBusy"
-            assert "job-1" in reply["evalue"]
+            assert "local-1" in reply["evalue"]
             assert "Stop" in reply["evalue"]
             # Rendered in the cell, not only in the reply.
             assert any(m["msg_type"] == "error" for m in msgs)
@@ -1462,7 +1464,9 @@ class TestHostRecords:
     def _submit(host, code):
         from biopb_mcp.mcp import _kernel_rpc
 
-        sub, res, _w = _kernel_rpc._run_job_call(host, "submit", code, timeout=15.0)
+        sub, res, _w = _kernel_rpc._run_job_call(
+            host, "submit", code, job_id=host.jobs.new_id(), timeout=15.0
+        )
         assert sub is not None, res
         return sub["job_id"]
 

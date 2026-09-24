@@ -100,11 +100,12 @@ def _scratch_host(
             return _envelope({"job_id": "job-1"})
         return _envelope(None)
 
+    def interrupt_job(job_id, **_kw):
+        if interrupt_lands and hold is not None:
+            hold.set()
+        return {"interrupted": True, "job_id": job_id}
+
     def control(op, timeout=None, **args):
-        if op == "interrupt":
-            if interrupt_lands and hold is not None:
-                hold.set()
-            return {"interrupted": True, "job_id": args["job_id"]}
         if kernel is not None:
             return kernel["status"] if op == "status" else kernel
         # No kernel account scripted: it agrees with the records.
@@ -112,6 +113,7 @@ def _scratch_host(
 
     host.execute.side_effect = execute
     host.control.side_effect = control
+    host.interrupt_job.side_effect = interrupt_job
     return host
 
 
@@ -526,9 +528,9 @@ class TestInterrupting:
         # Handed to the kernel, which owns the decision; it answered yes.
         assert data["interrupted"] is True
         assert data["job_id"] == job_id
-        (call,) = [c for c in host.control.call_args_list if c.args[0] == "interrupt"]
+        (call,) = host.interrupt_job.call_args_list
         # Naming the run's job in its kernel, which checks it is still running.
-        assert call.kwargs["job_id"] == "job-1"
+        assert call.args == ("job-1",)
         assert call.kwargs["origin"] == "mcp" and call.kwargs["writer"] == "agent-A"
 
     def test_a_stranger_cannot_stop_it_during_the_bring_up(self):
@@ -625,9 +627,12 @@ class TestInterrupting:
     ):
         monkeypatch.setattr(_scratch, "interrupt", lambda *a, **k: None)
         session_host.jobs.running.return_value = {"job_id": "job-5"}
-        session_host.control.return_value = {"job_id": "job-5", "interrupted": True}
+        session_host.interrupt_job.return_value = {
+            "job_id": "job-5",
+            "interrupted": True,
+        }
         _tool(_server.interrupt_kernel)
-        assert session_host.control.call_args.kwargs["job_id"] == "job-5"
+        assert session_host.interrupt_job.call_args.args == ("job-5",)
 
     def test_the_tool_reports_a_refusal_as_a_refusal(self, monkeypatch, session_host):
         # Not as "no running job to interrupt" -- an agent told that would reach
@@ -639,7 +644,7 @@ class TestInterrupting:
         )
         result = _tool(_server.interrupt_kernel)
         assert "already in use" in result
-        session_host.control.assert_not_called()
+        session_host.interrupt_job.assert_not_called()
 
 
 class TestDiscarding:

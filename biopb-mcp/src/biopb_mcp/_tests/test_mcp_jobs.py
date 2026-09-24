@@ -15,6 +15,7 @@ Three layers:
   jobs.
 """
 
+import itertools
 import os
 import re
 import sys
@@ -39,12 +40,16 @@ from biopb_mcp.mcp._kernel import KernelHost  # noqa: E402
 
 
 @pytest.fixture
-def runner():
+def runner(monkeypatch):
     """The in-kernel job runner wired to a fake InteractiveShell (no kernel).
 
     Defined at module level so the runner classes below share one definition;
-    each test still gets a fresh namespace and a cleared job table.
+    each test still gets a fresh namespace and a cleared job table. Each submit
+    gets a request id of its own, as it would from a kernel: a stop names the
+    job by it.
     """
+    requests = itertools.count(1)
+    monkeypatch.setattr(_jobs, "_request_id", lambda: f"req-{next(requests)}")
     ns = {
         "_dask_client": None,
         "_conn": types.SimpleNamespace(client=None),
@@ -58,7 +63,7 @@ def _stop(**kw):
     """``_jobs.interrupt`` aimed at whatever is running, as the host aims it at
     the job its records say is running."""
     job = _jobs._running_job()
-    return _jobs.interrupt(job.job_id if job is not None else None, **kw)
+    return _jobs.interrupt(job.request if job is not None else None, **kw)
 
 
 @pytest.fixture
@@ -266,7 +271,7 @@ class TestJobRunnerUnit:
         while _jobs.poll(jid)["status"] != "running":
             time.sleep(0.02)
         out = _stop(reason="forced by Bob")
-        assert out["job_id"] == jid and out["interrupted"] is True
+        assert out["interrupted"] is True
         snap = self._wait(jid)
         assert snap["status"] == "interrupted"
         assert snap["cancel_reason"] == "forced by Bob"
@@ -275,11 +280,10 @@ class TestJobRunnerUnit:
 
     def test_interrupt_when_idle_stops_nothing(self):
         _jobs.reset()
-        assert _jobs.interrupt("job-1") == {
-            "job_id": "job-1",
+        assert _jobs.interrupt("req-1") == {
             "interrupted": False,
             "refused": "not_running",
-            "running_job_id": None,
+            "running_request": None,
         }
 
     def test_a_stop_aimed_at_an_ended_job_does_not_land_on_the_next(self, runner):
@@ -289,9 +293,9 @@ class TestJobRunnerUnit:
         self._wait(done)
         jid = _jobs.submit("import time\nwhile True:\n    time.sleep(0.02)")["job_id"]
         try:
-            out = _jobs.interrupt(done)
+            out = _jobs.interrupt(_jobs._jobs[done].request)
             assert out["refused"] == "not_running"
-            assert out["running_job_id"] == jid
+            assert out["running_request"] == _jobs._jobs[jid].request
             time.sleep(0.1)
             assert _jobs.poll(jid)["status"] == "running"
         finally:
@@ -399,7 +403,6 @@ class TestJobOrigin:
         try:
             res = _stop(origin="mcp")
             assert res == {
-                "job_id": jid,
                 "interrupted": False,
                 "refused": "foreign_job",
                 "origin": "user",
@@ -514,7 +517,6 @@ class TestJobOrigin:
         )["job_id"]
         try:
             assert _stop(origin="mcp") == {
-                "job_id": jid,
                 "interrupted": False,
                 "refused": "foreign_job",
                 "origin": "chat",
@@ -595,7 +597,6 @@ class TestJobOrigin:
         )["job_id"]
         try:
             assert _stop(origin="chat") == {
-                "job_id": jid,
                 "interrupted": False,
                 "refused": "foreign_job",
                 "origin": "user",
@@ -662,7 +663,6 @@ class TestKernelOwner:
         )["job_id"]
         try:
             assert _stop(origin="mcp", writer="sess-B") == {
-                "job_id": jid,
                 "interrupted": False,
                 "refused": "not_owner",
             }
@@ -750,18 +750,14 @@ class TestJobIntent:
 
 
 class TestRecordInline:
-    """A foreign client's cell, run inline on the calling thread and announced
-    as a job (``_kernel_gate``, docs/jupyter-clients.md)."""
+    """A foreign client's cell, held as the running job while it runs inline
+    (``_kernel_gate``). The host records it from the protocol, so nothing is
+    announced (``test_mcp_job_log``, and the gate's real-kernel tests)."""
 
-    def test_announced_with_its_request(self, runner, log):
+    def test_nothing_is_announced(self, runner, log):
         with _jobs.record_inline("print('hi')", request="req-1") as job:
             job.status = "ok"
-        snap = log.poll(job.job_id)
-        assert snap["status"] == "ok"
-        assert snap["origin"] == "user"
-        assert snap["code"] == "print('hi')"
-        # Its output is filed by that request.
-        assert log._records[job.job_id].request == "req-1"
+        assert log.export() == []
 
     def test_output_is_left_to_the_real_stream(self, runner, capsys):
         with _jobs.record_inline("print('hi')") as job:
@@ -769,27 +765,27 @@ class TestRecordInline:
             job.status = "ok"
         assert capsys.readouterr().out == "hi\n"
 
-    def test_running_for_its_duration_and_named_by_running_job(self, runner):
-        with _jobs.record_inline("import time") as job:
+    def test_running_for_its_duration(self, runner):
+        with _jobs.record_inline("import time", request="req-1") as job:
             running = _jobs.running_job()
-            assert running["job_id"] == job.job_id
             assert running["origin"] == "user"
             assert running["code"] == "import time"
             job.status = "ok"
         assert _jobs.running_job() is None
         assert job.finished is not None
 
-    def test_an_unsettled_block_is_an_error(self, runner, log):
-        with pytest.raises(RuntimeError):
-            with _jobs.record_inline("boom()") as job:
-                raise RuntimeError("do_execute itself failed")
-        assert _jobs.poll(job.job_id)["status"] == "error"
-        assert log.poll(job.job_id)["status"] == "error"
-
-    def test_the_agent_is_told(self, runner, log):
-        with _jobs.record_inline("x = 1") as job:
+    def test_a_stop_names_it_by_its_request(self, runner):
+        # The host's id for a cell is its own; the kernel knows the request.
+        with _jobs.record_inline("x = 1", request="req-7") as job:
+            assert _jobs.interrupt("req-8", origin="mcp")["refused"] == "not_running"
+            assert _jobs.interrupt("req-7", origin="mcp")["refused"] == "foreign_job"
             job.status = "ok"
-        assert [d["job_id"] for d in log.foreign_digest("mcp")] == [job.job_id]
+
+    def test_an_unsettled_block_is_an_error(self, runner):
+        with pytest.raises(RuntimeError):
+            with _jobs.record_inline("boom()", request="req-1") as job:
+                raise RuntimeError("do_execute itself failed")
+        assert job.status == "error"
 
 
 # ---------------------------------------------------------------------------

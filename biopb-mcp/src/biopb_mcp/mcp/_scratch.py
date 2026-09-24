@@ -510,6 +510,7 @@ def _execute(run):
             host,
             "submit",
             "",
+            job_id=host.jobs.new_id(),
             intent=run["intent"] or "verify workflow",
             origin=run["origin"],
             writer=run["writer"],
@@ -667,9 +668,8 @@ def interrupt(reason=None, origin="user", writer=None):
         discard(reason=reason)
         return {"interrupted": True, "job_id": run["job_id"]}
     try:
-        data = host.control(
-            "interrupt",
-            job_id=run["kernel_job_id"],
+        data = host.interrupt_job(
+            run["kernel_job_id"],
             reason=reason,
             origin=origin,
             writer=writer,

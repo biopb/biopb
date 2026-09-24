@@ -50,11 +50,6 @@ ENV_SCRATCH = "BIOPB_SCRATCH_KERNEL"
 # sync by this comment).
 ENV_HOST_SESSION = "BIOPB_HOST_SESSION"
 
-# Env var carrying the number a new kernel's job ids continue from, so the ids
-# in this host's records never repeat across restarts. The literal is mirrored
-# in _jobs.ENV_JOB_SEQ (kept in sync by this comment).
-ENV_JOB_SEQ = "BIOPB_JOB_SEQ"
-
 # Windows window-close fallback (no inherited fd there): the launcher polls this
 # probe -- the zero-arg _viewer_window_alive() the bootstrap injects into the
 # kernel namespace (see _bootstrap, mirrored by this comment) -- and tears the
@@ -384,7 +379,7 @@ class KernelHost:
         # its host before anything can connect.
         env = dict(env)
         env[ENV_HOST_SESSION] = self._km.session.session
-        env[ENV_JOB_SEQ] = str(self.jobs.next_seq())
+        self.jobs.host_session = self._km.session.session
         try:
             try:
                 self._km.start_kernel(
@@ -658,6 +653,47 @@ class KernelHost:
         if reply.get("status") != "ok":
             raise RuntimeError(reply.get("evalue") or "control op failed")
         return reply.get("r")
+
+    def interrupt_job(self, job_id, **kwargs):
+        """Stop *job_id* if it still runs (``_jobs.interrupt``), on the control
+        channel; *kwargs* are ``reason``, ``origin``, ``writer``.
+
+        The kernel names a job by its request, since a cell's id is this
+        host's; the reply is translated back, ``running_job_id`` naming what
+        runs instead when *job_id* no longer does.
+        """
+        request = self.jobs.request_of(job_id)
+        if request is None:
+            # A task whose start announcement is lost or still in flight: the
+            # kernel knows it by the id this host gave it.
+            try:
+                snap = self.control("poll", job_id=job_id)
+            except Exception:  # noqa: BLE001 - then it is not running
+                snap = None
+            if snap and snap.get("status") == "running":
+                request = snap.get("request")
+        if request is None:
+            running = self.jobs.running()
+            return {
+                "job_id": job_id,
+                "interrupted": False,
+                "refused": "not_running",
+                "running_job_id": running["job_id"] if running else None,
+            }
+        # Before the stop, which a cell's end can follow at once; taken back
+        # if the stop does not happen.
+        reason = kwargs.get("reason")
+        self.jobs.note_cancel(job_id, reason)
+        reply = {}
+        try:
+            reply = self.control("interrupt", request=request, **kwargs)
+        finally:
+            if not reply.get("interrupted"):
+                self.jobs.note_cancel(job_id, None)
+        reply["job_id"] = job_id
+        if "running_request" in reply:
+            reply["running_job_id"] = self.jobs.job_of(reply.pop("running_request"))
+        return reply
 
     def _close_session(self, timeout):
         """Close the kernel's tensor client and dask before a kill, bounded and

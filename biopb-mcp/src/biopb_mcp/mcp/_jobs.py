@@ -84,15 +84,13 @@ _EXTERNAL_INTERRUPT_MSG = (
 # multiscale texture upload can take a while.
 _RUN_ON_MAIN_TIMEOUT = 300.0
 
-# Env var carrying the number this kernel's job ids continue from: the host
-# keeps the records across kernel restarts, so ids must not start over. The
-# literal is mirrored in _kernel.ENV_JOB_SEQ (kept in sync by this comment).
-ENV_JOB_SEQ = "BIOPB_JOB_SEQ"
-
 # Module state, wired by install().
 _ip = None
-_jobs = {}  # job_id -> _Job
-_job_seq = int(os.environ.get(ENV_JOB_SEQ) or 0)
+_jobs = {}  # job_id (a foreign cell: its request id) -> _Job
+# Ids for a submit that names none: a direct call, never the host's, which
+# names every job so its records and this module agree on it. Their own
+# prefix, so they cannot collide with the host's `job-N`.
+_job_seq = 0
 _lock = threading.RLock()
 
 # The one agent allowed to run code in this kernel, claimed by whoever submits
@@ -594,17 +592,21 @@ def _prune():
         del _jobs[terminal.pop(0)]
 
 
-def _new_job(code, origin, intent="", request=None):
-    """Register a job record under the next id. Call with `_lock` held."""
+def _new_job(job_id, code, origin, intent="", request=None):
+    """Register a job record, under *job_id* or the next local one. Call with
+    `_lock` held."""
     global _job_seq
-    _job_seq += 1
-    job = _Job(f"job-{_job_seq}", code, origin=origin, intent=intent, request=request)
-    _jobs[job.job_id] = job
+    if job_id is None:
+        _job_seq += 1
+        job_id = f"local-{_job_seq}"
+    job = _Job(job_id, code, origin=origin, intent=intent, request=request)
+    _jobs[job_id] = job
     return job
 
 
 def submit(
     code,
+    job_id=None,
     origin="mcp",
     intent="",
     writer=None,
@@ -624,6 +626,9 @@ def submit(
     namespace" is a fresh one and the isolation covers the viewer and
     ``sys.modules`` too. Submitting *verify_cells* to a session kernel would run
     the cells in the user's namespace; nothing does.
+
+    *job_id* is the host's name for the job, which its records file it under;
+    a direct call that names none gets a ``local-N`` id.
 
     *origin* and *intent* are recorded on the job and never acted on beyond the
     rules in :class:`_Job`; see there for the origin vocabulary. The busy return
@@ -679,7 +684,7 @@ def submit(
             # them so the audit view of this job cannot disagree with the
             # workflow view of it.
             code = "\n\n# ---\n\n".join(verify_cells)
-        job = _new_job(code, origin, intent, request=_request_id())
+        job = _new_job(job_id, code, origin, intent, request=_request_id())
         if verify_cells is not None:
             job.verify = _Verification(verify_title, verify_cells)
         _prune()
@@ -696,14 +701,14 @@ def submit(
 
 @contextlib.contextmanager
 def record_inline(code, request=None, origin="user"):
-    """Record a cell running inline on this thread as a job, for its duration.
+    """Hold a foreign client's cell as the running job, for its duration.
 
-    For a foreign client's cell (``_kernel_gate``): it runs on the main thread
-    as its client expects, and the record is what tells the agent about it, the
-    same as a job from :func:`submit`. Its output goes to its own client as
-    usual, under *request*, which is how the host files it too. The caller
-    settles ``status`` (and ``error_text``) from the reply before leaving the
-    block; a block that raises instead is an ``error``.
+    For ``_kernel_gate``: the cell runs on the main thread, as its client
+    expects. The host records it from the protocol -- its ``execute_input``,
+    ``error`` and ``status`` -- so nothing is announced here; this is for
+    Stop, which names the cell by its *request* (:func:`interrupt`). The caller
+    settles ``status`` from the reply before leaving the block; a block that
+    raises instead is an ``error``.
 
     Not gated here: the caller refuses while a job runs, and nothing can start
     one meanwhile, since a submit is an execute request queued behind this one.
@@ -715,9 +720,9 @@ def record_inline(code, request=None, origin="user"):
     is dropped: the cell it was aimed at is already over.
     """
     with _lock:
-        job = _new_job(code, origin, request=request)
+        job = _Job(None, code, origin=origin, request=request)
+        _jobs[request] = job
         _prune()
-    _publish_start(job)
     try:
         yield job
     finally:
@@ -730,7 +735,6 @@ def record_inline(code, request=None, origin="user"):
                 break
             except KeyboardInterrupt:
                 continue
-        _publish_end(job)
 
 
 def poll(job_id):
@@ -830,18 +834,19 @@ def _raise_in_thread(ident, exctype):
     return res
 
 
-def interrupt(job_id, reason=None, origin="user", writer=None):
+def interrupt(request, reason=None, origin="user", writer=None):
     """Force-stop *job_id* if it is the running job: cooperative cancel *plus* a
     ``KeyboardInterrupt`` where it runs.
 
     Called on the kernel's control thread (``_kernel_gate``), so it is answered
     while the main thread is busy -- including with the very cell it stops.
 
-    **The caller names the job, and this checks it** under :data:`_lock`: a
-    stop aimed at a job that has just ended is ``{"refused": "not_running",
-    "running_job_id": ...}`` and touches nothing, rather than landing on
-    whatever runs now. The caller's view comes from iopub and may be stale; the
-    kernel's is not.
+    **The caller names the job by its request, and this checks it** under
+    :data:`_lock`: a stop aimed at a job that has just ended is ``{"refused":
+    "not_running", "running_request": ...}`` and touches nothing, rather than
+    landing on whatever runs now. The caller's view comes from iopub and may be
+    stale; the kernel's is not. The request, not the job id, because a foreign
+    cell's id is the host's, which this kernel never learns.
 
     Where the interrupt goes depends on where the job runs. A submitted job runs
     on a worker thread, which ``SIGINT`` cannot reach (Python delivers signals
@@ -872,18 +877,16 @@ def interrupt(job_id, reason=None, origin="user", writer=None):
     """
     with _lock:
         job = _running_job()
-        if job is None or job.job_id != job_id:
+        if job is None or job.request != request:
             return {
-                "job_id": job_id,
                 "interrupted": False,
                 "refused": "not_running",
-                "running_job_id": job.job_id if job is not None else None,
+                "running_request": job.request if job is not None else None,
             }
         if origin != "user" and writer is not None and _owner not in (None, writer):
-            return {"job_id": job_id, "interrupted": False, "refused": "not_owner"}
+            return {"interrupted": False, "refused": "not_owner"}
         if origin != "user" and _foreign(job, origin):
             return {
-                "job_id": job_id,
                 "interrupted": False,
                 "refused": "foreign_job",
                 # Whose job it is, so the caller can name the writer. "Foreign"
@@ -901,7 +904,7 @@ def interrupt(job_id, reason=None, origin="user", writer=None):
             raised = True
     # Off the lock: a distributed cancel is a round trip to the scheduler.
     _cancel_dask_futures(job)
-    return {"job_id": job_id, "interrupted": raised}
+    return {"interrupted": raised}
 
 
 def _interrupt_main():
