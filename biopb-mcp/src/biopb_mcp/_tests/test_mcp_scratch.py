@@ -4,9 +4,10 @@ The session child half of ``verify_workflow``: spawning a second kernel,
 running the cells there, collecting the record, and discarding the process.
 The kernel half — how the cells themselves run — is ``test_mcp_jobs.py``.
 
-No real kernel here. ``_scratch`` reaches its kernel only through
-``_kernel_rpc``, which is ``host.execute(snippet)`` and a JSON envelope back, so
-a host that answers snippets by content exercises the whole path.
+No real kernel here. ``_scratch`` sends each cell with ``host.run_cell`` and
+reads how it went from ``host.jobs``, so a host whose ``run_cell`` plays the
+protocol into real records exercises the whole path. Real kernels are
+``test_mcp_jobs.py`` (``TestJobConcurrency``).
 """
 
 import json
@@ -17,101 +18,68 @@ from unittest.mock import MagicMock
 import pytest
 
 from biopb_mcp import _config
-from biopb_mcp._tests.conftest import (
-    call_tool as _tool,
-    iopub_event,
-    kernel_snapshot,
-    rpc_reply,
-)
+from biopb_mcp._tests.conftest import call_tool as _tool, rpc_reply
 from biopb_mcp.mcp import _app, _scratch, _server, _writers
+from biopb_mcp.mcp._job_log import JobLog
 
 
-def _envelope(result):
-    return rpc_reply(result)
-
-
-def _cells_record(status="ok", title="wf"):
+def _msg(msg_type, request, session=None, **content):
     return {
-        "title": title,
-        "created": 1_700_000_000.0,
-        "status": status,
-        "cells": [
-            {
-                "code": "a = 2",
-                "status": status,
-                "stdout": "full output",
-                "stdout_head": "full",
-                "stdout_len": 11,
-                "error_text": "",
-                "elapsed": 0.1,
-            }
-        ],
+        "header": {"msg_type": msg_type},
+        "parent_header": {"msg_id": request, "session": session},
+        "content": content,
     }
 
 
-def _scratch_host(
-    job_status="ok",
-    record=None,
-    on_start=None,
-    title="wf",
-    hold=None,
-    interrupt_lands=True,
-    jobs=None,
-    kernel=None,
-):
-    """A stand-in scratch kernel host: the calls ``_scratch`` makes into the
-    kernel (submit; interrupt and status on the control channel), and the job
-    records it reads.
+def _scratch_host(job_status="ok", on_start=None, hold=None, interrupt_lands=True):
+    """A stand-in scratch kernel host over real job records (``JobLog``): its
+    ``run_cell`` plays the protocol a cell produces -- the echo, a line of
+    output, an error for a failing cell, the idle.
 
-    *hold* is an ``Event``: while it is unset the kernel's job polls as still
-    running, so a test can act on a verification that is genuinely in flight.
-    *interrupt_lands* False models the case the escalation exists for -- cells
-    wedged in a C call, where the KeyboardInterrupt is accepted and changes
-    nothing. *jobs* replaces the scripted records with real ones, and *kernel*
-    is what the kernel's own ``_jobs.poll`` answers.
+    *job_status* is how every cell ends (``"ok"`` or ``"error"``). *hold* is an
+    ``Event``: while it is unset a cell stays running, so a test can act on a
+    verification that is genuinely in flight. *interrupt_lands* False models
+    the case the escalation exists for -- cells wedged in a C call, where the
+    interrupt is accepted and changes nothing.
     """
     host = MagicMock()
     host.start.side_effect = on_start or (lambda: None)
     host.is_alive.return_value = True
-    record = _cells_record(job_status, title) if record is None else record
+    log = JobLog(host_session="host")
+    host.jobs = log
+    stopped = threading.Event()
 
-    def poll(job_id):
-        snap = {
-            "job_id": job_id,
-            "status": "running"
-            if (hold is not None and not hold.is_set())
-            else job_status,
-            "stdout": "",
-            "error_text": "",
-            "verify": {**record, "cells": [{**record["cells"][0]}]},
-        }
-        # The polled ledger carries a head, never the full output.
-        snap["verify"]["cells"][0].pop("stdout", None)
-        return snap
+    def finish(request, status):
+        log.on_iopub(_msg("stream", request, name="stdout", text="full output"))
+        if status != "ok":
+            ename = "KeyboardInterrupt" if status == "interrupted" else "ValueError"
+            log.on_iopub(_msg("error", request, ename=ename, traceback=[ename]))
+        log.on_iopub(_msg("status", request, execution_state="idle"))
 
-    if jobs is not None:
-        host.jobs = jobs
-    else:
-        host.jobs.poll.side_effect = poll
-        host.jobs.verify_record.side_effect = lambda job_id: record
+    def run_cell(code, job_id, origin, intent="", bare=False):
+        request = f"req-{job_id}"
+        log.start_cell(job_id, request, code, origin, intent)
+        log.on_iopub(_msg("execute_input", request, session="host", code=code))
+        if hold is None:
+            finish(request, job_status)
+        else:
 
-    def execute(code, *_a, **_k):
-        if "_jobs.submit(" in code:
-            return _envelope({"job_id": "job-1"})
-        return _envelope(None)
+            def later():
+                hold.wait()
+                finish(request, "interrupted" if stopped.is_set() else job_status)
 
-    def control(op, timeout=None, **args):
-        if op == "interrupt":
-            if interrupt_lands and hold is not None:
-                hold.set()
-            return {"interrupted": True, "job_id": args["job_id"]}
-        if kernel is not None:
-            return kernel["status"] if op == "status" else kernel
-        # No kernel account scripted: it agrees with the records.
-        return host.jobs.poll(args["job_id"])["status"] if op == "status" else None
+            threading.Thread(target=later, daemon=True).start()
+        return request
 
-    host.execute.side_effect = execute
-    host.control.side_effect = control
+    def interrupt_job(job_id, reason=None):
+        log.note_cancel(job_id, reason)
+        if interrupt_lands and hold is not None:
+            stopped.set()
+            hold.set()
+        return {"interrupted": True, "job_id": job_id}
+
+    host.run_cell.side_effect = run_cell
+    host.interrupt_job.side_effect = interrupt_job
     return host
 
 
@@ -132,7 +100,7 @@ def _session_host(running=None):
     host = MagicMock()
     host.jobs.running.return_value = running
     host.jobs.foreign_digest.return_value = []
-    host.execute.side_effect = lambda *a, **k: _envelope(None)
+    host.execute.side_effect = lambda *a, **k: rpc_reply(None)
     return host
 
 
@@ -175,22 +143,67 @@ class TestRunningAVerification:
 
         assert snap["status"] == "ok"
         assert _scratch.verified()["title"] == "wf"
-        assert _scratch.verified_summary() == {
-            "job_id": "verify-1",
-            "title": "wf",
-            "cells": 1,
-            "created": 1_700_000_000.0,
-            "saved_path": _scratch.verified()["saved_path"],
-        }
+        summary = _scratch.verified_summary()
+        assert summary["job_id"] == "verify-1" and summary["cells"] == 1
+        assert summary["created"] == _scratch.verified()["created"]
 
     def test_the_kept_record_is_the_full_one_not_the_polled_ledger(self):
-        # The poll ships a head every 0.4s; the document needs the output. It is
-        # read once, before the kernel holding it is discarded -- after which
-        # there is nobody left to ask.
+        # The poll carries a head; the document needs the output.
         host = _scratch_host()
         _scratch.set_host_factory(lambda: host)
-        _settle(_scratch.start(_blocks(["a = 2"]), "wf", _session_host())["job_id"])
+        job_id = _scratch.start(_blocks(["a = 2"]), "wf", _session_host())["job_id"]
+        _settle(job_id)
         assert _scratch.verified()["cells"][0]["stdout"] == "full output"
+
+    def test_each_cell_is_its_own_request_sent_bare_as_its_writer(self):
+        # Bare: a document that never builds its own `client` must fail here,
+        # as it would for its reader. The origin is the asker's, which the
+        # stop rules read.
+        host = _scratch_host()
+        _scratch.set_host_factory(lambda: host)
+        _settle(
+            _scratch.start(
+                _blocks(["a = 2", "print(a)"]), "wf", _session_host(), origin="chat"
+            )["job_id"]
+        )
+        calls = host.run_cell.call_args_list
+        assert [c.args[0] for c in calls] == ["a = 2", "print(a)"]
+        assert all(c.args[2] == "chat" and c.kwargs["bare"] for c in calls)
+
+    def test_the_cells_after_a_failure_are_skipped_not_sent(self):
+        host = _scratch_host(job_status="error")
+        _scratch.set_host_factory(lambda: host)
+        snap = _settle(
+            _scratch.start(_blocks(["1/0", "a = 1", "b = 2"]), "bad", _session_host())[
+                "job_id"
+            ]
+        )
+        assert snap["status"] == "error"
+        assert host.run_cell.call_count == 1
+        cells = snap["verify"]["cells"]
+        assert [c["status"] for c in cells] == ["error", "skipped", "skipped"]
+        assert cells[0]["error_text"] == "ValueError"
+
+    def test_a_kernel_death_mid_cell_is_the_verdict(self):
+        # The OOM a verification exists to catch: the cell it died in failed,
+        # and the rest never ran.
+        hold = threading.Event()
+        host = _scratch_host(hold=hold)
+        host.is_alive.return_value = False
+        _scratch.set_host_factory(lambda: host)
+        try:
+            snap = _settle(
+                _scratch.start(_blocks(["a = 2", "b = 3"]), "wf", _session_host())[
+                    "job_id"
+                ]
+            )
+        finally:
+            hold.set()
+        assert snap["status"] == "error"
+        assert "died" in snap["error_text"]
+        cells = snap["verify"]["cells"]
+        assert [c["status"] for c in cells] == ["error", "skipped"]
+        assert "died" in cells[0]["error_text"]
 
     def test_the_scratch_kernel_is_discarded_either_way(self):
         for status in ("ok", "error"):
@@ -232,48 +245,6 @@ class TestRunningAVerification:
         )
 
 
-class TestLostAnnouncements:
-    """iopub can drop; the run must still end. The kernel's own account, over
-    the shell channel, settles the records (``JobLog.settle``)."""
-
-    @pytest.fixture(autouse=True)
-    def quick(self, monkeypatch):
-        monkeypatch.setattr(_scratch, "_SETTLE_EVERY", 0.05)
-
-    def _run(self, announce):
-        from biopb_mcp.mcp._job_log import JobLog
-
-        jobs = JobLog()
-        announce(jobs)
-        kernel = kernel_snapshot(code="a = 2", cells=[("a = 2", "ok")])
-        host = _scratch_host(jobs=jobs, kernel=kernel)
-        _scratch.set_host_factory(lambda: host)
-        return _settle(
-            _scratch.start(_blocks(["a = 2"]), "wf", _session_host())["job_id"]
-        )
-
-    def test_a_lost_end_does_not_hang_the_run(self):
-        def announce_start(jobs):
-            jobs.on_iopub(
-                iopub_event(
-                    {
-                        "event": "start",
-                        "job_id": "job-1",
-                        "request": "req-1",
-                        "verify": {"title": "wf", "cells": ["a = 2"]},
-                    }
-                )
-            )
-
-        snap = self._run(announce_start)
-        assert snap["status"] == "ok"
-        assert _scratch.verified()["cells"][0]["status"] == "ok"
-
-    def test_nothing_on_iopub_at_all_does_not_hang_the_run(self):
-        snap = self._run(lambda jobs: None)
-        assert snap["status"] == "ok"
-
-
 class TestTheRunList:
     """What the observe page's verification pane reads.
 
@@ -283,10 +254,10 @@ class TestTheRunList:
     """
 
     def test_the_pane_shows_the_last_run(self):
-        _scratch.set_host_factory(lambda: _scratch_host(title="first"))
+        _scratch.set_host_factory(lambda: _scratch_host())
         first = _scratch.start(_blocks(["a = 2"]), "first", _session_host())["job_id"]
         _settle(first)
-        _scratch.set_host_factory(lambda: _scratch_host(title="second"))
+        _scratch.set_host_factory(lambda: _scratch_host())
         second = _scratch.start(_blocks(["b = 3"]), "second", _session_host())["job_id"]
         _settle(second)
 
@@ -321,7 +292,7 @@ class TestTheRunList:
         assert _scratch.verified_summary() is None
 
     def test_a_later_failure_replaces_an_earlier_pass(self):
-        _scratch.set_host_factory(lambda: _scratch_host(title="good"))
+        _scratch.set_host_factory(lambda: _scratch_host())
         good = _scratch.start(_blocks(["a = 2"]), "good", _session_host())["job_id"]
         _settle(good)
         assert _scratch.verified_summary()["job_id"] == good
@@ -334,7 +305,7 @@ class TestTheRunList:
         assert _scratch.verified() is None
 
     def test_a_run_that_passes_is_written_to_the_spool(self, spool):
-        _scratch.set_host_factory(lambda: _scratch_host(title="segment nuclei"))
+        _scratch.set_host_factory(lambda: _scratch_host())
         _settle(
             _scratch.start(_blocks(["a = 2"]), "segment nuclei", _session_host())[
                 "job_id"
@@ -463,73 +434,83 @@ class TestTheSlot:
         )
         result = _tool(_server.execute_code, "x = 1")
         assert "verify-1" in result and "already running" in result
-        assert not any(
-            "_jobs.submit(" in c[0][0] for c in session_host.execute.call_args_list
-        )
+        session_host.run_cell.assert_not_called()
 
 
 class TestInterrupting:
-    """Stopping a verification, and who is allowed to.
-
-    The claim is the scratch kernel's own: ``start`` submits with the verifying
-    client's writer, so that kernel's ``_jobs.submit`` claims it and its
-    ``interrupt`` refuses everyone else -- the same rule as any other
-    job, enforced by the same code.
-    """
+    """Stopping a verification, and who is allowed to: the rule the session
+    kernel's stop follows, checked here (``_scratch.interrupt``)."""
 
     def _running(self, writer="agent-A", on_start=None, hold=None, lands=True):
         """Start a verification, optionally held mid-flight by *hold*."""
         host = _scratch_host(on_start=on_start, hold=hold, interrupt_lands=lands)
         _scratch.set_host_factory(lambda: host)
         started = _scratch.start(
-            _blocks(["a = 2"]), "wf", _session_host(), writer=writer, writer_label="A"
+            _blocks(["a = 2"]), "wf", _session_host(), writer=writer
         )
         return started["job_id"], host
 
-    def test_the_run_claims_its_kernel_for_the_client_that_asked(self):
-        job_id, host = self._running()
-        _settle(job_id)
-        (submit,) = [
-            c[0][0] for c in host.execute.call_args_list if "_jobs.submit(" in c[0][0]
-        ]
-        assert "writer='agent-A'" in submit and "writer_label='A'" in submit
-
-    def test_the_run_is_submitted_with_the_origin_that_asked_for_it(self):
-        # The scratch kernel's own foreign-job check reads it, so a chat-started
-        # verification recorded as the MCP client's would be one the chat loop
-        # could not stop.
-        host = _scratch_host()
-        _scratch.set_host_factory(lambda: host)
-        _settle(
-            _scratch.start(_blocks(["a = 2"]), "wf", _session_host(), origin="chat")[
-                "job_id"
-            ]
-        )
-        (submit,) = [
-            c[0][0] for c in host.execute.call_args_list if "_jobs.submit(" in c[0][0]
-        ]
-        assert "origin='chat'" in submit
+    def _in_flight(self, job_id):
+        deadline = time.monotonic() + 5.0
+        while not _scratch.poll(job_id)["stdout"].startswith("Running cell"):
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
 
     def test_the_owning_agent_stops_its_own_verification(self):
         hold = threading.Event()
         job_id, host = self._running(hold=hold)
         try:
-            deadline = time.monotonic() + 5.0
-            while time.monotonic() < deadline:
-                if not _scratch.poll(job_id)["stdout"].startswith("Starting"):
-                    break
-                time.sleep(0.01)
+            self._in_flight(job_id)
             data = _scratch.interrupt(None, "mcp", "agent-A")
         finally:
             hold.set()
-        _settle(job_id)
-        # Handed to the kernel, which owns the decision; it answered yes.
-        assert data["interrupted"] is True
-        assert data["job_id"] == job_id
-        (call,) = [c for c in host.control.call_args_list if c.args[0] == "interrupt"]
-        # Naming the run's job in its kernel, which checks it is still running.
-        assert call.kwargs["job_id"] == "job-1"
-        assert call.kwargs["origin"] == "mcp" and call.kwargs["writer"] == "agent-A"
+        assert data == {"interrupted": True, "job_id": job_id}
+        # Naming the running cell, which its kernel checks is still running.
+        (call,) = host.interrupt_job.call_args_list
+        assert call.args == ("job-1",)
+        snap = _scratch.poll(job_id)
+        assert snap["status"] == "interrupted"
+        assert snap["verify"]["cells"][0]["status"] == "error"
+
+    def test_a_stranger_cannot_stop_it(self):
+        hold = threading.Event()
+        job_id, host = self._running(hold=hold)
+        try:
+            self._in_flight(job_id)
+            assert _scratch.interrupt(None, "mcp", "agent-B") == {
+                "refused": "not_owner",
+                "job_id": job_id,
+            }
+            # Nor can a writer of another origin: the chat loop did not ask
+            # for this one.
+            assert _scratch.interrupt(None, "chat", None)["refused"] == "foreign_job"
+            host.interrupt_job.assert_not_called()
+        finally:
+            hold.set()
+        assert _settle(job_id)["status"] == "ok"
+
+    def test_a_stop_between_cells_sends_no_further_cell(self):
+        # Nothing running to interrupt, but the run still stops: the next
+        # cell is checked for the stop under the lock it is sent under.
+        started = threading.Event()
+
+        def on_start():
+            started.set()
+            time.sleep(0.2)
+
+        host = _scratch_host(on_start=on_start)
+        _scratch.set_host_factory(lambda: host)
+        job_id = _scratch.start(
+            _blocks(["a = 2", "b = 3"]), "wf", _session_host(), writer="agent-A"
+        )["job_id"]
+        started.wait(5.0)
+        with _scratch._lock:
+            _scratch._run["stop"] = "stopped between cells"
+        snap = _settle(job_id)
+        assert snap["status"] == "interrupted"
+        assert "between cells" in snap["error_text"]
+        host.run_cell.assert_not_called()
+        assert snap["verify"] is None
 
     def test_a_stranger_cannot_stop_it_during_the_bring_up(self):
         # The one window the kernel cannot answer for itself: it does not exist
@@ -569,11 +550,7 @@ class TestInterrupting:
         hold = threading.Event()
         job_id, host = self._running(hold=hold, lands=False)
         try:
-            deadline = time.monotonic() + 5.0
-            while time.monotonic() < deadline:
-                if not _scratch.poll(job_id)["stdout"].startswith("Starting"):
-                    break
-                time.sleep(0.01)
+            self._in_flight(job_id)
             data = _scratch.interrupt(None, "mcp", "agent-A")
         finally:
             hold.set()
@@ -588,11 +565,7 @@ class TestInterrupting:
         hold = threading.Event()
         job_id, _host = self._running(hold=hold, lands=True)
         try:
-            deadline = time.monotonic() + 5.0
-            while time.monotonic() < deadline:
-                if not _scratch.poll(job_id)["stdout"].startswith("Starting"):
-                    break
-                time.sleep(0.01)
+            self._in_flight(job_id)
             data = _scratch.interrupt(None, "mcp", "agent-A")
         finally:
             hold.set()
@@ -624,10 +597,13 @@ class TestInterrupting:
         self, monkeypatch, session_host
     ):
         monkeypatch.setattr(_scratch, "interrupt", lambda *a, **k: None)
-        session_host.jobs.running.return_value = {"job_id": "job-5"}
-        session_host.control.return_value = {"job_id": "job-5", "interrupted": True}
+        session_host.jobs.running.return_value = {"job_id": "job-5", "origin": "mcp"}
+        session_host.interrupt_job.return_value = {
+            "job_id": "job-5",
+            "interrupted": True,
+        }
         _tool(_server.interrupt_kernel)
-        assert session_host.control.call_args.kwargs["job_id"] == "job-5"
+        assert session_host.interrupt_job.call_args.args == ("job-5",)
 
     def test_the_tool_reports_a_refusal_as_a_refusal(self, monkeypatch, session_host):
         # Not as "no running job to interrupt" -- an agent told that would reach
@@ -639,7 +615,7 @@ class TestInterrupting:
         )
         result = _tool(_server.interrupt_kernel)
         assert "already in use" in result
-        session_host.control.assert_not_called()
+        session_host.interrupt_job.assert_not_called()
 
 
 class TestDiscarding:
@@ -778,7 +754,7 @@ class TestRouting:
         assert "a = 2" in detail["code"] and "print(a * 3)" in detail["code"]
         # ...and a line per cell, not the per-cell output (that is the
         # notebook's).
-        assert "1. ok · 0.1s · full" in detail["stdout"]
+        assert "1. ok · " in detail["stdout"] and " · full" in detail["stdout"]
         # The scratch kernel's hidden viewer is not the session's window.
         assert detail["window_alive"] is None
 
@@ -814,8 +790,8 @@ class TestRouting:
         assert "running the workflow" in body["stdout"]
         assert body["code"] == "a = 2"
         assert body["truncated"] is False
-        # Answered from this process; the session kernel was never asked.
-        assert not any("_jobs.poll(" in c[0][0] for c in host.execute.call_args_list)
+        # Answered from this process; the session's records were never asked.
+        host.jobs.poll.assert_not_called()
 
     def test_an_unknown_verification_id_still_404s(self, observe_client):
         client, _host = observe_client

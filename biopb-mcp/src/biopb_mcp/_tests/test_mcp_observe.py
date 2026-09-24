@@ -297,28 +297,28 @@ class TestTheTwoKernels:
 
 
 def test_api_interrupt_stops_the_rows_job(client, host):
-    host.control.return_value = {"job_id": "job-1", "interrupted": True}
+    host.interrupt_job.return_value = {"job_id": "job-1", "interrupted": True}
     r = client.post("/api/kernel/interrupt?job_id=job-1")
     assert r.status_code == 200
     assert r.json()["interrupted"] is True
     # On the control channel, naming the row's job, attributed to the user --
     # not a SIGINT to the whole kernel.
-    host.control.assert_called_once_with(
-        "interrupt", job_id="job-1", reason=_observe._USER_INTERRUPT_MSG
+    host.interrupt_job.assert_called_once_with(
+        "job-1", reason=_observe._USER_INTERRUPT_MSG
     )
     host.interrupt.assert_not_called()
 
 
 def test_api_interrupt_without_a_row_stops_the_running_job(client, host):
     host.jobs = ScriptedJobs(running="job-2")
-    host.control.return_value = {"job_id": "job-2", "interrupted": True}
+    host.interrupt_job.return_value = {"job_id": "job-2", "interrupted": True}
     client.post("/api/kernel/interrupt")
-    assert host.control.call_args.kwargs["job_id"] == "job-2"
+    assert host.interrupt_job.call_args.args == ("job-2",)
 
 
 def test_api_interrupt_when_idle_asks_nothing(client, host):
     assert client.post("/api/kernel/interrupt").json()["interrupted"] is False
-    host.control.assert_not_called()
+    host.interrupt_job.assert_not_called()
 
 
 def test_api_restart(client, host):
@@ -512,7 +512,7 @@ def test_set_chat_enabled_leaves_the_host_allowlists_alone(host):
 
 
 def test_kernel_error_returns_502(client, host):
-    host.control.side_effect = TimeoutError("no reply")
+    host.interrupt_job.side_effect = TimeoutError("no reply")
     r = client.post("/api/kernel/interrupt?job_id=job-1")
     assert r.status_code == 502
     assert "no reply" in r.json()["detail"]

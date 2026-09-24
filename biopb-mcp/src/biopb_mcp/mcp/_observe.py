@@ -278,7 +278,7 @@ async def _api_interrupt(request):
         job_id = running["job_id"]
     try:
         data = await asyncio.to_thread(
-            host.control, "interrupt", job_id=job_id, reason=_USER_INTERRUPT_MSG
+            host.interrupt_job, job_id, reason=_USER_INTERRUPT_MSG
         )
     except Exception as exc:  # noqa: BLE001 - reported, not raised
         return JSONResponse({"error": "kernel error", "detail": str(exc)}, 502)

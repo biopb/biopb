@@ -9,9 +9,10 @@ catchable `ViewerThreadError`, never a process death.
 
 ## Why
 
-`execute_code` runs agent code on a **background daemon thread**
-(`_jobs._run`) to keep the Qt main thread free and interruptible. napari/Qt
-objects are **main-thread-only**, so a viewer mutation off that thread that
+A `run_async` task runs agent code on a **background daemon thread**
+(`_jobs._run`) to keep the Qt main thread free; an `execute_code` cell itself
+runs on the main thread, where the proxy is a no-op. napari/Qt objects are
+**main-thread-only**, so a viewer mutation off that thread that
 emits a napari event into a Qt slot **segfaults the whole kernel** —
 confirmed by `viewer.layers.clear()` on the job thread crashing through
 `QtDims._resize_slice_labels` with no async or GL involved.

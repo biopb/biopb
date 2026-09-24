@@ -650,6 +650,10 @@ def _bootstrap_impl():
                 "da": da,
                 "client": None,
                 "ops": ops,
+                # A long compute off the main thread (docs/jupyter-clients.md);
+                # a workflow document does not get it, since its reader has
+                # no such helper either.
+                "run_async": _jobs.run_async,
             }
         )
     if viewer is not None:

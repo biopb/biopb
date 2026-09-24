@@ -26,10 +26,6 @@ def _envelope(value, window_alive=True):
 class _Kernel(MagicMock):
     """A kernel host whose job answers can be scripted per call."""
 
-    def script_submit(self, reply):
-        """Make the next ``submit`` return *reply* instead of a fresh job."""
-        self._submit = reply
-
     def script_job(self, states):
         """Answer successive polls with ``(status, stdout)`` from *states*.
 
@@ -46,6 +42,18 @@ class _Jobs:
 
     def __init__(self, host):
         self._host = host
+
+    def new_id(self):
+        return "job-1"
+
+    def running(self, prefer=None):
+        return self._host._running
+
+    def running_cell(self):
+        return None
+
+    def window_alive(self, job_id):
+        return None
 
     def poll(self, job_id):
         h = self._host
@@ -90,7 +98,7 @@ def chat_host():
         "recent_respawns": 0,
         "watchdog_running": True,
     }
-    host._submit = None
+    host._running = None
     host._states = [("ok", "")]
     host.interrupts = []
     # What another writer has run and the loop has not been told about, and the
@@ -102,12 +110,9 @@ def chat_host():
     host.events = []
     host.jobs = _Jobs(host)
 
+    host.run_cell.side_effect = lambda *a, **k: host.events.append("submit")
+
     def execute(code, *_args, **_kwargs):
-        if "_jobs.submit(" in code:
-            host.events.append("submit")
-            if host._submit is not None:
-                return _envelope(host._submit)
-            return _envelope({"job_id": "job-1", "status": "running"})
         if _kernel_rpc._PNG_DELIM in code or "screenshot" in code:
             return {
                 "stdout": _kernel_rpc._PNG_DELIM + _PNG + "\n",
@@ -119,13 +124,11 @@ def chat_host():
 
     host.execute.side_effect = execute
 
-    def control(op, timeout=None, **args):
-        if op == "interrupt":
-            host.interrupts.append(args)
-            return {"job_id": args["job_id"], "interrupted": True}
-        return None
+    def interrupt_job(job_id, **kwargs):
+        host.interrupts.append((job_id, kwargs))
+        return {"job_id": job_id, "interrupted": True}
 
-    host.control.side_effect = control
+    host.interrupt_job.side_effect = interrupt_job
 
     old_host, old_poll = _app._kernel_host, _chat._POLL_INTERVAL
     _app.set_kernel_host(host)
@@ -531,16 +534,11 @@ class TestExecuteCode:
             {"content": "done"},
         )
         asyncio.run(_chat.run_turn("set x", model))
-        (snippet,) = [
-            c[0][0]
-            for c in chat_host.execute.call_args_list
-            if "_jobs.submit(" in c[0][0]
-        ]
         # Its own origin, so the notebook export and the observe badge do not
         # read a chat cell as an MCP agent's...
-        assert "origin='chat'" in snippet
-        # ...and its own writer id, so the kernel's one-agent claim covers it.
-        assert "writer='biopb-chat'" in snippet
+        assert chat_host.run_cell.call_args.kwargs["origin"] == "chat"
+        # ...and its own writer id, so the one-agent claim covers it.
+        assert _writers.claim_holder() == "biopb-chat"
 
     def test_the_model_is_not_told_to_poll_for_a_handle_it_never_gets(self, chat_host):
         # _dispatch already overrides the behaviour; the description has to be
@@ -630,11 +628,6 @@ class TestExecuteCode:
         # retire a notice the agent working here never received.
         chat_host._digest = [{"job_id": "job-7", "status": "ok", "origin": "user"}]
         _writers._note_claim("someone-else")
-        chat_host._submit = {
-            "error": "not_owner",
-            "owner": "other",
-            "owner_id": "someone-else",
-        }
         model = _scripted(
             {"content": "", "tool_calls": [_call("execute_code", python_code="x = 1")]},
             {"content": "done"},
@@ -658,12 +651,7 @@ class TestExecuteCode:
             {"content": "done"},
         )
         asyncio.run(_chat.run_turn("measure the drift", model))
-        (snippet,) = [
-            c[0][0]
-            for c in chat_host.execute.call_args_list
-            if "_jobs.submit(" in c[0][0]
-        ]
-        assert "intent='measure the drift'" in snippet
+        assert chat_host.run_cell.call_args.kwargs["intent"] == "measure the drift"
 
     def test_the_models_own_intent_wins(self, chat_host):
         model = _scripted(
@@ -676,12 +664,7 @@ class TestExecuteCode:
             {"content": "done"},
         )
         asyncio.run(_chat.run_turn("measure the drift", model))
-        (snippet,) = [
-            c[0][0]
-            for c in chat_host.execute.call_args_list
-            if "_jobs.submit(" in c[0][0]
-        ]
-        assert "intent='warm the cache'" in snippet
+        assert chat_host.run_cell.call_args.kwargs["intent"] == "warm the cache"
 
     def test_partial_output_is_reported_while_the_job_runs(self, chat_host):
         # The whole reason the promote window is dropped: a long cell must show
@@ -735,9 +718,7 @@ class TestExecuteCode:
         assert seen == ["aaa", "zzz"]
 
     def test_a_kernel_held_by_another_client_is_reported_not_retried(self, chat_host):
-        chat_host.script_submit(
-            {"error": "not_owner", "owner": "claude-code", "owner_id": "sess-A"}
-        )
+        _writers._note_claim("sess-A", label="claude-code")
         model = _scripted(
             {"content": "", "tool_calls": [_call("execute_code", python_code="x = 1")]},
             {"content": "I cannot run code here."},
@@ -745,14 +726,14 @@ class TestExecuteCode:
         asyncio.run(_chat.run_turn("go", model))
         tool_msg = [m for m in _chat.history() if m["role"] == "tool"][0]
         assert "already in use by another client (claude-code)" in tool_msg["content"]
-        # The refusal names the real holder, so the mirror is corrected rather
-        # than left guessing at the loop.
+        # Refused, not claimed: the holder keeps the kernel.
         assert _writers._claimed_by == "sess-A"
+        chat_host.run_cell.assert_not_called()
 
 
 class TestConcurrency:
     def test_a_second_turn_is_refused_not_queued(self, chat_host):
-        # Same rule as _jobs.submit, for the same reason: a queued turn would be
+        # Same rule as a cell's, for the same reason: a queued turn would be
         # composed against a conversation its sender has not seen the end of.
         started = asyncio.Event()
         release = asyncio.Event()

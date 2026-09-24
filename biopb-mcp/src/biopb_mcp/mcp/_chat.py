@@ -53,7 +53,7 @@ from . import _app, _kernel_rpc, _server, _writers
 
 logger = logging.getLogger(__name__)
 
-#: This loop's client id, for the kernel's one-agent claim (``_jobs.submit``).
+#: This loop's client id, for the one-agent claim (``_writers.take_claim``).
 #: A fixed string rather than a per-view id, because every view drives the one
 #: conversation: the loop is a single writer no matter how many windows are open.
 WRITER_ID = "biopb-chat"
@@ -132,9 +132,9 @@ _turn_lock = asyncio.Lock()
 class TurnInProgress(RuntimeError):
     """Raised when a turn is asked for while one is already running.
 
-    Refused rather than queued, matching ``_jobs.submit``: a queued turn would
-    be composed against a conversation its sender has not seen the end of, which
-    is an ordering nobody can inspect. The transport reports it the way the user
+    Refused rather than queued, as a cell is (``_server._submit_job``): a
+    queued turn would be composed against a conversation its sender has not seen
+    the end of, which is an ordering nobody can inspect. The transport reports it the way the user
     console reports a busy kernel -- as state, with a 409.
     """
 
@@ -289,10 +289,12 @@ def _clean_schema(schema):
 #: :func:`_dispatch`; the description has to be overridden at the same seam, or
 #: the model is told to poll for a handle it will never be given -- and offered
 #: ``poll_job`` to do it with.
-_CHAT_RUN_PARAGRAPH = """Code runs in a background thread so it does not block the main thread.
+_CHAT_RUN_PARAGRAPH = """Code runs as a cell on the kernel's main thread, like a notebook cell.
     This call waits for the cell to finish and returns its output -- there is no
-    job handle and nothing to poll for. Only one job runs at a time; stop a cell
-    with interrupt_kernel (best-effort) or restart_kernel (guaranteed).
+    job handle for a cell. While it runs the viewer does not repaint; for a long
+    compute, end the cell with run_async(fn), which returns a task id at once and
+    runs fn on a worker thread -- poll the task with poll_job. Only one job runs
+    at a time; stop one with interrupt_kernel or restart_kernel (guaranteed).
 
     poll_job still reads cells *the user* ran from the observe page, which is
     what the activity notice on these results points you at."""

@@ -6,7 +6,7 @@ publishing them is ``test_mcp_kernel`` (``TestHostRecords``).
 
 import pytest
 
-from biopb_mcp._tests.conftest import iopub_event, kernel_snapshot
+from biopb_mcp._tests.conftest import iopub_event
 from biopb_mcp.mcp import _job_log
 from biopb_mcp.mcp._job_log import JobLog
 
@@ -73,25 +73,13 @@ class TestRecord:
         _print(log, "later\n")
         assert log.poll("job-1")["stdout"] == ""
 
-    def test_a_foreign_cells_traceback_is_its_error(self):
-        # The end announcement carries "ename: evalue"; the iopub error the
-        # cell's own client got carries the traceback, which says where.
+    def test_a_task_keeps_its_own_error_text(self):
+        # A task's failure is its announced end: the iopub error under the same
+        # request is the cell's (TestCells).
         log = JobLog()
-        _start(log, origin="user")
-        log.on_iopub(
-            _msg(
-                "error", "req-1", traceback=["\x1b[31mZeroDivisionError\x1b[0m", "at 1"]
-            )
-        )
-        _end(log, status="error", error_text="ZeroDivisionError: division by zero")
-        assert log.poll("job-1")["error_text"] == "ZeroDivisionError\nat 1"
-
-    def test_a_foreign_cells_result_is_its_execute_result(self):
-        log = JobLog()
-        _start(log, origin="user")
-        log.on_iopub(_msg("execute_result", "req-1", data={"text/plain": "42"}))
-        _end(log)
-        assert log.poll("job-1")["result_text"] == "42"
+        _start(log)
+        _end(log, status="error", error_text="Traceback ... ZeroDivisionError")
+        assert log.poll("job-1")["error_text"] == "Traceback ... ZeroDivisionError"
 
     def test_unknown_job(self):
         assert JobLog().poll("job-9")["status"] == "unknown"
@@ -113,9 +101,184 @@ class TestRecord:
             "intent",
             "elapsed",
             "created",
-            "verify",
         }
         assert log.poll("job-1")["created"] == 123.0
+
+
+def _input(log, code, request, session="client"):
+    log.on_iopub(
+        {
+            "header": {"msg_type": "execute_input"},
+            "parent_header": {"msg_id": request, "session": session},
+            "content": {"code": code},
+        }
+    )
+
+
+def _idle(log, request):
+    log.on_iopub(_msg("status", request, execution_state="idle"))
+
+
+class TestCells:
+    """A foreign client's cell, read from the protocol: its execute_input
+    starts it, an error fails it, its request's idle ends it."""
+
+    def _log(self):
+        return JobLog(host_session="host")
+
+    def _only(self, log):
+        (rec,) = log.export()
+        return rec
+
+    def test_a_cell_runs_and_ends_on_its_idle(self):
+        log = self._log()
+        _input(log, "print('hi')", "c1")
+        _print(log, "hi\n", request="c1")
+        rec = self._only(log)
+        assert rec["status"] == "running"
+        assert rec["origin"] == "user" and rec["code"] == "print('hi')"
+        _idle(log, "c1")
+        rec = self._only(log)
+        assert rec["status"] == "ok" and rec["stdout"] == "hi\n"
+
+    def test_the_hosts_own_requests_are_not_cells(self):
+        log = self._log()
+        _input(log, "_viewer_window_alive()", "h1", session="host")
+        _input(log, "   ", "c1")  # a client asking for its prompt number
+        assert log.export() == []
+
+    def test_an_error_fails_it_with_its_traceback(self):
+        log = self._log()
+        _input(log, "1/0", "c1")
+        log.on_iopub(
+            _msg("error", "c1", ename="ZeroDivisionError", traceback=["Zero", "at 1"])
+        )
+        _idle(log, "c1")
+        rec = self._only(log)
+        assert rec["status"] == "error" and rec["error_text"] == "Zero\nat 1"
+
+    def test_a_stop_is_interrupted_and_says_who(self):
+        log = self._log()
+        _input(log, "loop()", "c1")
+        (rec,) = log.export()
+        log.note_cancel(rec["job_id"], "stopped by the user")
+        log.on_iopub(_msg("error", "c1", ename="KeyboardInterrupt", traceback=["KI"]))
+        _idle(log, "c1")
+        rec = self._only(log)
+        assert rec["status"] == "interrupted"
+        assert rec["error_text"] == "stopped by the user\nKI"
+
+    def test_a_cell_that_ran_ends_a_cell_whose_end_was_lost(self):
+        # One cell at a time on the main thread.
+        log = self._log()
+        _input(log, "a = 1", "c1")
+        _input(log, "b = 2", "c2")
+        _idle(log, "c2")
+        (first, second) = log.export()
+        assert first["status"] == "error" and "not recorded" in first["error_text"]
+        assert second["status"] == "ok"
+
+    def test_a_host_cell_still_queued_is_not_ended_by_another(self):
+        # Sent, but waiting in the kernel's queue behind a user's cell: it has
+        # not begun, so that cell's end proves nothing about it.
+        log = self._log()
+        log.start_cell(log.new_id(), "h1", "x = 1", origin="mcp")
+        _input(log, "y = 2", "c1")
+        _idle(log, "c1")
+        assert log.poll("job-1")["status"] == "running"
+        # Once it has begun, it is one cell of the one-at-a-time sequence.
+        _input(log, "x = 1", "h1", session="host")
+        _input(log, "z = 3", "c2")
+        _idle(log, "c2")
+        assert log.poll("job-1")["status"] == "error"
+
+    def test_a_cell_does_not_end_a_task(self):
+        # A task runs beside the cells (run_async).
+        log = self._log()
+        _start(log, job_id="task-1", request="c0")
+        _input(log, "x = 1", "c1")
+        _idle(log, "c1")
+        assert log.poll("task-1")["status"] == "running"
+
+    def test_a_task_takes_its_cells_output_and_writer(self):
+        log = self._log()
+        log.start_cell(log.new_id(), "c1", "run_async(f)", origin="chat")
+        _print(log, "before\n", request="c1")
+        _start(log, job_id="task-1", request="c1", origin="mcp")
+        _print(log, "from the task\n", request="c1")
+        _idle(log, "c1")
+        assert log.poll("job-1")["status"] == "ok"
+        assert log.poll("job-1")["stdout"] == "before\n"
+        task = log.poll("task-1")
+        assert task["stdout"] == "from the task\n"
+        assert task["origin"] == "chat"
+        assert task["status"] == "running"
+
+    def test_a_host_cell_ends_on_its_reply_if_its_idle_is_lost(self):
+        log = self._log()
+        log.start_cell(log.new_id(), "c1", "1/0", origin="mcp")
+        log.note_reply("job-1", {"status": "error", "ename": "ZeroDivisionError"})
+        log.cell_replied("job-1")
+        assert log.poll("job-1")["status"] == "error"
+
+    def test_the_reply_fails_a_cell_whose_iopub_error_was_lost(self):
+        # Its idle ended it "ok"; the reply, which cannot be lost, says not.
+        log = self._log()
+        log.start_cell(log.new_id(), "c1", "1/0", origin="mcp")
+        _input(log, "1/0", "c1", session="host")
+        _idle(log, "c1")
+        assert log.poll("job-1")["status"] == "ok"
+        log.note_reply(
+            "job-1",
+            {"status": "error", "ename": "ZeroDivisionError", "traceback": ["Zero"]},
+        )
+        snap = log.poll("job-1")
+        assert snap["status"] == "error" and snap["error_text"] == "Zero"
+
+    def test_the_outcome_is_light_unless_asked_for_in_full(self):
+        log = self._log()
+        log.start_cell(log.new_id(), "c1", "print('one')\n1", origin="mcp")
+        _print(log, "one\n", request="c1")
+        log.on_iopub(_msg("execute_result", "c1", data={"text/plain": "1"}))
+        _idle(log, "c1")
+        light = log.outcome("job-1")
+        assert light["status"] == "ok" and "stdout" not in light
+        assert light["stdout_head"] == "one" and light["stdout_len"] == 4
+        full = log.outcome("job-1", full=True)
+        assert full["stdout"] == "one\n" and full["result_text"] == "1"
+        assert log.outcome("job-9") is None
+
+    def test_the_viewer_window_comes_back_on_the_reply(self):
+        log = self._log()
+        log.start_cell(log.new_id(), "c1", "x", origin="mcp")
+        assert log.window_alive("job-1") is None
+        log.note_reply(
+            "job-1",
+            {
+                "status": "ok",
+                "user_expressions": {
+                    "w": {"status": "ok", "data": {"text/plain": "False"}}
+                },
+            },
+        )
+        assert log.window_alive("job-1") is False
+
+    def test_a_submits_idle_does_not_end_its_task(self):
+        # The task outlives the request that started it.
+        log = self._log()
+        _start(log, job_id=log.new_id(), request="submit-1")
+        _idle(log, "submit-1")
+        assert log.poll("job-1")["status"] == "running"
+
+    def test_the_kernel_names_a_cell_by_request_and_a_task_by_id(self):
+        log = self._log()
+        _input(log, "loop()", "c1")
+        (rec,) = log.export()
+        assert log.stop_key(rec["job_id"]) == "c1"
+        _start(log, job_id="task-1", request="c1")
+        assert log.stop_key("task-1") == "task-1"
+        _idle(log, "c1")
+        assert log.stop_key(rec["job_id"]) is None
 
 
 class TestLostAndGone:
@@ -146,58 +309,11 @@ class TestLostAndGone:
         _end(log, status="ok")
         assert log.poll("job-1")["status"] == "interrupted"
 
-    def test_the_next_kernel_continues_the_ids(self):
-        log = JobLog()
-        assert log.next_seq() == 0
-        _start(log, job_id="job-7")
-        assert log.next_seq() == 7
-
-
-class TestSettle:
-    """The kernel's own account, fetched on a shell reply, settles what iopub
-    lost."""
-
-    def test_a_lost_end_is_settled(self):
-        log = JobLog()
-        _start(log)
-        _print(log, "partial\n")
-        log.settle(kernel_snapshot(status="error", error_text="boom"))
-        snap = log.poll("job-1")
-        assert snap["status"] == "error"
-        assert snap["error_text"] == "boom"
-        assert snap["stdout"].startswith("partial\n")
-        assert "lost on iopub" in snap["stdout"]
-
-    def test_a_lost_start_is_replayed_and_a_running_job_stays_running(self):
-        log = JobLog()
-        log.settle(kernel_snapshot(status="running"))
-        assert log.poll("job-1")["status"] == "running"
-        # Its output, now that the request is known, is filed under it.
-        _print(log, "later\n")
-        assert log.poll("job-1")["stdout"] == "later\n"
-
-    def test_a_verification_gets_its_cells_from_the_kernel(self):
-        log = JobLog()
-        log.settle(
-            kernel_snapshot(status="error", cells=[("a = 1", "ok"), ("1/0", "error")])
-        )
-        cells = log.verify_record("job-1")["cells"]
-        assert [c["status"] for c in cells] == ["ok", "error"]
-        assert log.poll("job-1")["status"] == "error"
-
-    def test_a_settled_record_is_not_touched_again(self):
-        log = JobLog()
-        _start(log)
-        _end(log, status="ok")
-        log.settle(kernel_snapshot(status="error"))
-        assert log.poll("job-1")["status"] == "ok"
-        assert "lost" not in log.poll("job-1")["stdout"]
-
-    def test_the_late_original_start_does_not_reopen_it(self):
-        log = JobLog()
-        log.settle(kernel_snapshot(status="ok"))
-        _start(log)
-        assert log.poll("job-1")["status"] == "ok"
+    def test_ids_are_the_hosts_and_never_repeat(self):
+        log = JobLog(host_session="host")
+        assert log.new_id() == "job-1"
+        _input(log, "x = 1", request="c1")
+        assert log.new_id() == "job-3"
 
 
 class TestDigest:
@@ -226,77 +342,79 @@ class TestDigest:
         assert [d["job_id"] for d in log.foreign_digest("mcp")] == ["job-1", "job-2"]
 
 
-class TestVerification:
-    """A scratch kernel's run: one stream, split at the cell boundaries it
-    announces."""
+class TestPointOfView:
+    """The digest and the eviction hold read "foreign" from the agent's own
+    origin: the last non-user writer to run a cell."""
 
-    def _verify(self, log, cells=("a = 1", "print(a)")):
-        _start(
-            log,
-            code="\n\n".join(cells),
-            verify={"title": "wf", "cells": list(cells), "created": 1.0},
-        )
+    def _cell(self, log, origin, code="a = 1"):
+        """An ended cell of *origin*: the host's own, or a user's."""
+        request = f"r{len(log._records) + 1}"
+        if origin == "user":
+            _input(log, code, request)
+        else:
+            log.start_cell(log.new_id(), request, code, origin=origin)
+            _input(log, code, request, session="host")
+        _idle(log, request)
+        return log.export()[-1]["job_id"]
 
-    def _cell(self, log, i, status="ok", **kw):
-        log.on_iopub(_event(event="cell_start", job_id="job-1", index=i))
-        if "out" in kw:
-            _print(log, kw.pop("out"))
-        log.on_iopub(
-            _event(
-                event="cell_end",
-                job_id="job-1",
-                index=i,
-                status=status,
-                elapsed=0.1,
-                **kw,
-            )
-        )
+    def _fill(self, log, origin):
+        for _ in range(_job_log._MAX_RETAINED_JOBS + 5):
+            self._cell(log, origin)
 
-    def test_output_is_split_per_cell_and_kept_whole(self):
-        log = JobLog()
-        self._verify(log)
-        self._cell(log, 0, out="one\n")
-        self._cell(log, 1, out="two\n", result_text="1")
-        _end(log)
-        full = log.verify_record("job-1")
-        assert [c["stdout"] for c in full["cells"]] == ["one\n", "two\n"]
-        assert full["cells"][1]["result_text"] == "1"
-        assert full["status"] == "ok"
-        assert log.poll("job-1")["stdout"] == "one\ntwo\n"
+    def _log(self):
+        return JobLog(host_session="host")
 
-    def test_the_polled_record_carries_heads(self):
-        log = JobLog()
-        self._verify(log)
-        self._cell(log, 0, out="one\n")
-        (cell, _second) = log.poll("job-1")["verify"]["cells"]
-        assert "stdout" not in cell
-        assert cell["stdout_head"] == "one" and cell["stdout_len"] == 4
+    def test_a_running_user_cell_stays_in_the_digest_until_it_ends(self):
+        # Reading never consumes, so a running cell stays reported: otherwise
+        # the agent would hear that a cell started and never learn how it
+        # ended. (Excluding it from the ack is the caller's job.)
+        log = self._log()
+        _input(log, "loop()", "c1")
+        (entry,) = log.foreign_digest("mcp")
+        assert entry["status"] == "running"
+        _idle(log, "c1")
+        assert [d["status"] for d in log.foreign_digest("mcp")] == ["ok"]
+        log.ack_foreign_digest([entry["job_id"]])
+        assert log.foreign_digest("mcp") == []
 
-    def test_the_cells_a_failure_never_reached_are_skipped(self):
-        log = JobLog()
-        self._verify(log)
-        self._cell(log, 0, status="error", error_text="Traceback ...")
-        _end(log, status="error")
-        cells = log.poll("job-1")["verify"]["cells"]
-        assert [c["status"] for c in cells] == ["error", "skipped"]
-        assert cells[0]["error_text"] == "Traceback ..."
+    def test_prune_never_evicts_an_unreported_user_cell(self):
+        # The digest entry is the agent's only notice that its namespace
+        # changed under it; evicting the record would drop the notice.
+        log = self._log()
+        user = self._cell(log, "user")
+        self._fill(log, "mcp")
+        assert user in log._records
+        log.ack_foreign_digest([user])
+        # Once reported it is an ordinary record again, and prunes normally.
+        self._fill(log, "mcp")
+        assert user not in log._records
 
-    def test_a_kernel_death_fails_the_cell_it_died_in(self):
-        # The OOM a verification exists to catch: the cell it died in is the
-        # failure, and the rest never ran.
-        log = JobLog()
-        self._verify(log)
-        log.on_iopub(_event(event="cell_start", job_id="job-1", index=0))
-        log.kernel_gone("the scratch kernel died")
-        cells = log.verify_record("job-1")["cells"]
-        assert [c["status"] for c in cells] == ["error", "skipped"]
-        assert "died" in cells[0]["error_text"]
+    def test_a_chat_cell_is_foreign_to_the_mcp_agent_as_a_users_is(self):
+        log = self._log()
+        chat = self._cell(log, "chat")
+        self._cell(log, "mcp")
+        assert [(d["job_id"], d["origin"]) for d in log.foreign_digest("mcp")] == [
+            (chat, "chat")
+        ]
+        self._fill(log, "mcp")
+        assert chat in log._records
 
-    def test_an_ordinary_job_has_no_verification(self):
-        log = JobLog()
-        _start(log)
-        assert log.poll("job-1")["verify"] is None
-        assert log.verify_record("job-1") is None
+    def test_a_chat_sessions_own_cells_are_evicted(self):
+        # From a fixed "mcp" every chat cell was foreign and could never be
+        # acked, so the cap bounded nothing (biopb/biopb#879).
+        log = self._log()
+        self._fill(log, "chat")
+        assert len(log._records) == _job_log._MAX_RETAINED_JOBS
+
+    def test_a_chat_session_still_holds_the_users_unreported_cell(self):
+        log = self._log()
+        user = self._cell(log, "user")
+        self._fill(log, "chat")
+        assert user in log._records
+        assert [d["job_id"] for d in log.foreign_digest("chat")] == [user]
+        assert log.ack_foreign_digest([user]) == 1
+        self._fill(log, "chat")
+        assert user not in log._records
 
 
 class TestOutputCap:

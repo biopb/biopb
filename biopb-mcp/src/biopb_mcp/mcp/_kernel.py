@@ -22,7 +22,7 @@ from typing import List, Optional
 from biopb._lifecycle import deathwatch as _deathwatch, winjob as _winjob
 
 from ._job_log import JobLog
-from ._kernel_io import KernelChannels, KernelGone
+from ._kernel_io import _IDLE_GRACE, KernelChannels, KernelGone
 
 logger = logging.getLogger(__name__)
 
@@ -49,11 +49,6 @@ ENV_SCRATCH = "BIOPB_SCRATCH_KERNEL"
 # client's. The literal is mirrored in _kernel_gate.ENV_HOST_SESSION (kept in
 # sync by this comment).
 ENV_HOST_SESSION = "BIOPB_HOST_SESSION"
-
-# Env var carrying the number a new kernel's job ids continue from, so the ids
-# in this host's records never repeat across restarts. The literal is mirrored
-# in _jobs.ENV_JOB_SEQ (kept in sync by this comment).
-ENV_JOB_SEQ = "BIOPB_JOB_SEQ"
 
 # Windows window-close fallback (no inherited fd there): the launcher polls this
 # probe -- the zero-arg _viewer_window_alive() the bootstrap injects into the
@@ -140,6 +135,15 @@ def _status_result(status: str, error_text: str) -> dict:
 _DEATHWATCH_ARG = (
     "--IPKernelApp.exec_lines=import biopb._lifecycle.deathwatch as _dw; _dw.install()"
 )
+
+# Prepended to an agent's cell so ``client`` tracks the tensor connection, which
+# connects asynchronously.
+_CELL_PREFIX = "client = _conn.client\n"
+
+# Whether the viewer window is still open, evaluated after an agent's cell: a
+# user-closed window turns viewer mutations into silent no-ops. None where the
+# bootstrap bound no probe.
+_WINDOW_ALIVE_EXPR = "globals().get('_viewer_window_alive', lambda: None)()"
 
 # The kernel class every host kernel runs: the host's control requests
 # (restart's graceful close, stopping a job) are its ops.
@@ -271,6 +275,9 @@ class KernelHost:
         self._dead = False  # respawn budget exhausted -> manual restart needed
         self._stopping = False  # an intentional restart/shutdown is in flight
         self._restarting = False  # restart() in flight: calls read "starting"
+        # Which kernel this is, counted per launch: a claim on the kernel lasts
+        # one generation (_writers).
+        self.generation = 0
 
     # -- lifecycle ------------------------------------------------------
 
@@ -384,7 +391,8 @@ class KernelHost:
         # its host before anything can connect.
         env = dict(env)
         env[ENV_HOST_SESSION] = self._km.session.session
-        env[ENV_JOB_SEQ] = str(self.jobs.next_seq())
+        self.jobs.host_session = self._km.session.session
+        self.generation += 1
         try:
             try:
                 self._km.start_kernel(
@@ -658,6 +666,69 @@ class KernelHost:
         if reply.get("status") != "ok":
             raise RuntimeError(reply.get("evalue") or "control op failed")
         return reply.get("r")
+
+    def run_cell(self, code, job_id, origin, intent="", bare=False):
+        """Send *code* as a cell, recorded as *job_id*; return at once.
+
+        The cell runs on the kernel's main thread like any client's, queued
+        behind whatever runs there. Its record (``self.jobs``) fills from iopub
+        and ends on its request's idle, or -- if that is lost -- on its shell
+        reply, which cannot be. Raises ``RuntimeError`` carrying what to do
+        when the kernel is not ready (:meth:`_not_ready_result`).
+
+        *bare* sends the code alone, without the ``client`` refresh: a
+        verification runs the document and nothing else, so a workflow that
+        never builds its own ``client`` fails there, as it would for its reader.
+        """
+        io = self._io
+        if not self._ready.is_set() or io is None:
+            raise RuntimeError(self._not_ready_result()["error_text"])
+
+        def before_send(request):
+            self.jobs.start_cell(job_id, request, code, origin, intent)
+
+        def on_reply(reply):
+            if reply is None:
+                return  # the kernel went away; its records say so
+            self.jobs.note_reply(job_id, reply)
+            # The idle marks the output complete and normally ends the record
+            # first; the reply ends it only if that idle never comes.
+            timer = threading.Timer(_IDLE_GRACE, self.jobs.cell_replied, (job_id,))
+            timer.daemon = True
+            timer.start()
+
+        return io.send_execute(
+            code if bare else _CELL_PREFIX + code,
+            on_reply,
+            before_send,
+            user_expressions={"w": _WINDOW_ALIVE_EXPR},
+        )
+
+    def interrupt_job(self, job_id, reason=None):
+        """Stop *job_id* if it still runs (``_jobs.interrupt``), on the control
+        channel. Whether the caller may is decided before this; *reason* is a
+        person's, prefixed to the job's error.
+
+        The kernel knows a cell by its request -- a cell's id is this host's --
+        and a task by its own id, which is also what it is sent when the
+        records do not hold it as running (its start may be in flight). When
+        *job_id* no longer runs, ``running_job_id`` names what does.
+        """
+        key = self.jobs.stop_key(job_id) or job_id
+        # Before the stop, which a cell's end can follow at once; taken back
+        # if the stop does not happen.
+        self.jobs.note_cancel(job_id, reason)
+        reply = {}
+        try:
+            reply = self.control("interrupt", key=key, reason=reason)
+        finally:
+            if not reply.get("interrupted"):
+                self.jobs.note_cancel(job_id, None)
+        reply["job_id"] = job_id
+        if reply.get("refused") == "not_running":
+            running = self.jobs.running()
+            reply["running_job_id"] = running["job_id"] if running else None
+        return reply
 
     def _close_session(self, timeout):
         """Close the kernel's tensor client and dask before a kill, bounded and

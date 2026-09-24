@@ -13,7 +13,7 @@ def call_tool(fn, *args, **kwargs):
     """Drive an ``async def`` MCP tool from a synchronous test.
 
     The tools are async so their kernel round trips go to a thread rather
-    than stalling the process's one event loop (``_kernel_rpc._job_call``).
+    than stalling the process's one event loop (``_kernel_rpc._execute``).
     The suite stays synchronous and gives each call its own loop -- the
     ``asyncio.run`` convention the chat tests already use.
     """
@@ -21,9 +21,8 @@ def call_tool(fn, *args, **kwargs):
 
 
 def rpc_reply(r, window_alive=True):
-    """A kernel ``execute`` result carrying a job call's return value *r*, the
-    way ``_kernel_rpc._run_job_call`` reads it back: a ``user_expression``
-    holding ``{"r": r, "w": <viewer window alive?>}`` as JSON."""
+    """A kernel ``execute`` result carrying *r* in a ``user_expression``, as
+    ``{"r": r, "w": <viewer window alive?>}`` JSON."""
     payload = json.dumps({"r": r, "w": window_alive})
     return {
         "stdout": "",
@@ -43,24 +42,6 @@ def iopub_event(content):
     return {"header": {"msg_type": MSG_TYPE}, "parent_header": {}, "content": content}
 
 
-def kernel_snapshot(status="ok", cells=None, error_text="", **job_kw):
-    """``_jobs.poll``'s answer, built from a real ``_Job`` so a field added to
-    the snapshot reaches every test that settles from one. *cells* is a list of
-    ``(code, status)`` making it a verification."""
-    from biopb_mcp.mcp import _jobs
-
-    job = _jobs._Job(
-        **{"job_id": "job-1", "code": "x = 1", "request": "req-1", **job_kw}
-    )
-    if cells is not None:
-        job.verify = _jobs._Verification("wf", [code for code, _ in cells])
-        for cell, (_code, cell_status) in zip(job.verify.cells, cells, strict=True):
-            cell.status = cell_status
-    job.status = status
-    job.error_text = error_text
-    return job.snapshot()
-
-
 class ScriptedJobs:
     """``host.jobs`` for a mock host: the host's job records, scripted.
 
@@ -72,9 +53,20 @@ class ScriptedJobs:
     recorded for the test to assert on.
     """
 
-    def __init__(self, polls=(), digest=(), summary=(), export=(), running=None):
+    def __init__(
+        self,
+        polls=(),
+        digest=(),
+        summary=(),
+        export=(),
+        running=None,
+        running_origin="mcp",
+        window=None,
+    ):
         self._polls = list(polls)
         self._running = running
+        self._running_origin = running_origin
+        self._window = window
         self._summary = list(summary)
         self._export = list(export)
         self.polled = 0
@@ -89,10 +81,24 @@ class ScriptedJobs:
         snap = self._polls.pop(0) if len(self._polls) > 1 else self._polls[0]
         return {"job_id": job_id, **snap}
 
-    def running(self):
+    def new_id(self):
+        self._ids = getattr(self, "_ids", 0) + 1
+        return f"job-{self._ids}"
+
+    def running(self, prefer=None):
         if self._running is None:
             return None
-        return {"job_id": self._running, "status": "running"}
+        return {
+            "job_id": self._running,
+            "status": "running",
+            "origin": self._running_origin,
+        }
+
+    def running_cell(self):
+        return None
+
+    def window_alive(self, job_id):
+        return self._window
 
     def foreign_digest(self, for_origin):
         self.digest_origins.append(for_origin)

@@ -44,7 +44,9 @@ def _job_reply(window_alive=True, **payload):
     return _job_envelope(payload, window_alive=window_alive)
 
 
-def _install_replies(host, *, returns=None, queue=None, digest=(), polls=()):
+def _install_replies(
+    host, *, returns=None, queue=None, digest=(), polls=(), **jobs_kwargs
+):
     """Script a mock host: kernel replies, and the job records it holds.
 
     ``queue`` answers kernel round trips in order; ``returns`` answers anything
@@ -61,7 +63,7 @@ def _install_replies(host, *, returns=None, queue=None, digest=(), polls=()):
         return returns if returns is not None else _result()
 
     host.execute.side_effect = execute
-    host.jobs = ScriptedJobs(polls, digest)
+    host.jobs = ScriptedJobs(polls, digest, **jobs_kwargs)
     return host
 
 
@@ -207,9 +209,10 @@ class TestTheReferenceDocs:
         assert "Jupyter" in section  # where the other writer's cells come from
         assert "poll_job" in section
         # The three rules that keep the two writers off each other: it is told
-        # after the fact, it waits when busy, and it does not stop their cell --
-        # including the workaround it would otherwise reach for.
-        assert "your calls wait for it" in section
+        # after the fact, one cell runs at a time, and it does not stop their
+        # cell -- including the workaround it would otherwise reach for.
+        assert "your new cells are refused" in section
+        assert "theirs waits for it" in section
         assert "refuses a user job" in section
         assert "restart_kernel" in section
 
@@ -457,13 +460,12 @@ class TestVerifyWorkflow:
         monkeypatch.setattr(
             _server._scratch,
             "start",
-            lambda blocks, title, host, intent="", writer=None, label="", origin="mcp": (
+            lambda blocks, title, host, writer=None, origin="mcp": (
                 seen.update(
                     blocks=blocks,
                     title=title,
                     host=host,
                     writer=writer,
-                    label=label,
                     origin=origin,
                 )
                 or {"job_id": "verify-1"}
@@ -486,9 +488,9 @@ class TestVerifyWorkflow:
         # The title is read from the document's own heading, not asked for twice.
         assert seen["title"] == "Count foci"
         assert seen["host"] is server_with_host
-        # The run is claimed for the client that asked for it, so the scratch
-        # kernel's own one-agent check can refuse a stranger's interrupt.
-        assert (seen["writer"], seen["label"]) == ("agent-A", "A")
+        # The run is the client's that asked for it, so a stranger is refused
+        # an interrupt on it.
+        assert seen["writer"] == "agent-A"
 
     def test_a_clean_run_reports_the_verdict_and_where_to_save(
         self, server_with_host, monkeypatch
@@ -601,9 +603,7 @@ class TestVerifyWorkflow:
         monkeypatch.setattr(_server._scratch, "poll", lambda job_id: _verify_snapshot())
         result = _tool(_server.poll_job, "verify-1", wait=0)
         assert "verify-1: ok" in result and "Verified" in result
-        assert not any(
-            "_jobs.poll(" in c[0][0] for c in server_with_host.execute.call_args_list
-        )
+        assert server_with_host.jobs.polled == 0
 
 
 # -----------------------------------------------------------------------
@@ -631,44 +631,42 @@ class TestExecuteCode:
         result = _tool(_server.execute_code, "print('hi')")
         assert "not initialized" in result
 
-    def test_submits_code_via_job_runner(self, server_with_host):
-        _install_replies(
-            server_with_host, returns=_job_reply(job_id="job-1", status="running")
-        )
+    @staticmethod
+    def _cell(host):
+        """The one cell the tool sent: ``(code, job_id, kwargs)``."""
+        ((code, job_id), kwargs) = host.run_cell.call_args
+        return code, job_id, kwargs
+
+    def test_sends_the_code_as_a_cell(self, server_with_host):
+        _install_replies(server_with_host, polls=[_snapshot(status="running")])
         _app.set_promote_after(0.0)  # return a handle immediately
         result = _tool(_server.execute_code, "print('hi')")
-        # By content, not by position: the tool also carries the user-activity
-        # digest round-trip, so "the first call" is not the submit.
-        (snippet,) = [
-            c[0][0]
-            for c in server_with_host.execute.call_args_list
-            if "_jobs.submit(" in c[0][0]
-        ]
-        assert "print('hi')" in snippet  # code embedded via repr
-        assert "job-1" in result  # job handle returned
+        code, job_id, kwargs = self._cell(server_with_host)
+        assert code == "print('hi')"
+        assert kwargs["origin"] == "mcp"
+        assert job_id in result  # job handle returned
 
-    def test_intent_rides_the_submit_snippet(self, server_with_host):
-        # The job runner lives in the kernel, so the field only reaches the
-        # record if it is marshaled into the submit snippet -- and it must be
-        # repr'd like the code, since it is arbitrary user-supplied text.
-        _install_replies(
-            server_with_host, returns=_job_reply(job_id="job-1", status="running")
-        )
+    def test_intent_rides_the_cell(self, server_with_host):
+        _install_replies(server_with_host, polls=[_snapshot(status="running")])
         _app.set_promote_after(0.0)
         _tool(_server.execute_code, "x = 1", intent="isolate the nuclei channel")
-        (snippet,) = [
-            c[0][0]
-            for c in server_with_host.execute.call_args_list
-            if "_jobs.submit(" in c[0][0]
-        ]
-        assert "intent='isolate the nuclei channel'" in snippet
+        assert self._cell(server_with_host)[2]["intent"] == "isolate the nuclei channel"
 
-    def test_refusal_when_another_client_holds_the_kernel(self, server_with_host):
-        _install_replies(
-            server_with_host,
-            returns=_job_reply(error="not_owner", owner="claude-code"),
-        )
+    def test_intent_is_optional(self, server_with_host):
+        # Every existing MCP client calls execute_code with one argument.
+        _install_replies(server_with_host, polls=[_snapshot(status="running")])
+        _app.set_promote_after(0.0)
+        _tool(_server.execute_code, "x = 1")
+        assert self._cell(server_with_host)[2]["intent"] == ""
+
+    def test_refusal_when_another_client_holds_the_kernel(
+        self, server_with_host, monkeypatch
+    ):
+        _install_replies(server_with_host)
+        _writers._note_claim("sess-A", label="claude-code")
+        monkeypatch.setattr(_writers, "_client_identity", lambda: ("sess-B", "B"))
         result = _tool(_server.execute_code, "x = 1")
+        server_with_host.run_cell.assert_not_called()
         assert "already in use by another client (claude-code)" in result
         # It must be told what still works, or it reads the refusal as a broken
         # kernel...
@@ -678,59 +676,28 @@ class TestExecuteCode:
         assert "restart_kernel" not in result
         assert "the user's to do" in result
 
-    def test_writer_identity_rides_the_submit_snippet(self, server_with_host):
-        # Outside a request there is no client, so nothing is claimed -- the
-        # kernel reads writer=None as "nothing to tell two callers apart with".
-        _install_replies(
-            server_with_host, returns=_job_reply(job_id="job-1", status="running")
-        )
-        _app.set_promote_after(0.0)
+    def test_the_first_writer_claims_the_kernel(self, server_with_host, monkeypatch):
+        _install_replies(server_with_host, polls=[_snapshot()])
+        monkeypatch.setattr(_writers, "_client_identity", lambda: ("sess-A", "A"))
         _tool(_server.execute_code, "x = 1")
-        (snippet,) = [
-            c[0][0]
-            for c in server_with_host.execute.call_args_list
-            if "_jobs.submit(" in c[0][0]
-        ]
-        assert "writer=None" in snippet
-
-    def test_intent_is_optional(self, server_with_host):
-        # Every existing MCP client calls execute_code with one argument.
-        _install_replies(
-            server_with_host, returns=_job_reply(job_id="job-1", status="running")
-        )
-        _app.set_promote_after(0.0)
-        _tool(_server.execute_code, "x = 1")
-        (snippet,) = [
-            c[0][0]
-            for c in server_with_host.execute.call_args_list
-            if "_jobs.submit(" in c[0][0]
-        ]
-        assert "intent=''" in snippet
+        assert _writers.claim_holder() == "sess-A"
 
     def test_inline_result_when_job_finishes_fast(self, server_with_host):
-        # submit -> running, first poll -> terminal ok with output.
         _install_replies(
-            server_with_host,
-            returns=_job_reply(job_id="job-1", status="running"),
-            polls=[_snapshot(stdout="hello\n", result_text="3")],
+            server_with_host, polls=[_snapshot(stdout="hello\n", result_text="3")]
         )
         result = _tool(_server.execute_code, "print('hello'); 1 + 2")
         assert "hello" in result
         assert "3" in result
 
     def test_no_output_message(self, server_with_host):
-        _install_replies(
-            server_with_host,
-            returns=_job_reply(job_id="job-1", status="running"),
-            polls=[_snapshot(stdout="", result_text="")],
-        )
+        _install_replies(server_with_host, polls=[_snapshot(stdout="", result_text="")])
         result = _tool(_server.execute_code, "x = 42")
         assert result == "(no output)"
 
     def test_error_path_includes_traceback(self, server_with_host):
         _install_replies(
             server_with_host,
-            returns=_job_reply(job_id="job-1", status="running"),
             polls=[
                 _snapshot(
                     status="error",
@@ -742,53 +709,39 @@ class TestExecuteCode:
         assert "division by zero" in result
 
     def test_promotes_to_job_handle_when_slow(self, server_with_host):
-        _install_replies(
-            server_with_host, returns=_job_reply(job_id="job-7", status="running")
-        )
+        _install_replies(server_with_host, polls=[_snapshot(status="running")])
         _app.set_promote_after(0.0)
         result = _tool(_server.execute_code, "while True: pass")
-        assert "job-7" in result
+        job_id = self._cell(server_with_host)[1]
+        assert f"poll_job('{job_id}')" in result
         assert "still running" in result
-        assert "poll_job" in result
+        # It holds the main thread: the handle says what that costs, and the
+        # way to avoid it next time.
+        assert "take_screenshot" in result and "run_async" in result
 
     def test_busy_rejects_second_job(self, server_with_host):
-        _install_replies(
-            server_with_host,
-            returns=_job_reply(error="busy", running_job_id="job-3"),
-        )
+        _install_replies(server_with_host, running="job-3")
         result = _tool(_server.execute_code, "x = 1")
+        server_with_host.run_cell.assert_not_called()
         assert "already running" in result
         assert "job-3" in result
 
-    def test_submit_timeout_surfaces_error(self, server_with_host):
-        # The quick submit snippet itself timed out (kernel main thread wedged).
-        server_with_host.execute.return_value = _result(
-            error_text="No reply within 0.5s: the kernel's main thread is busy",
-            status="timeout",
+    def test_a_kernel_that_is_not_ready_says_what_to_do(self, server_with_host):
+        _install_replies(server_with_host)
+        server_with_host.run_cell.side_effect = RuntimeError(
+            "Kernel not started. Call start_kernel first."
         )
         result = _tool(_server.execute_code, "x = 1")
-        assert "main thread is busy" in result
+        assert "start_kernel" in result
 
     def test_inline_result_appends_window_closed_note(self, server_with_host):
         _install_replies(
-            server_with_host,
-            returns=_job_reply(job_id="job-1", status="running", window_alive=False),
-            polls=[_snapshot(stdout="done\n")],
+            server_with_host, polls=[_snapshot(stdout="done\n")], window=False
         )
         result = _tool(_server.execute_code, "viewer.add_image(arr)")
         assert "done" in result
         assert "viewer window is closed" in result
         assert "restart_kernel" in result
-
-    def test_job_handle_appends_window_closed_note(self, server_with_host):
-        _install_replies(
-            server_with_host,
-            returns=_job_reply(job_id="job-7", status="running", window_alive=False),
-        )
-        _app.set_promote_after(0.0)
-        result = _tool(_server.execute_code, "while True: pass")
-        assert "job-7" in result
-        assert "viewer window is closed" in result
 
 
 class TestJobTools:
@@ -925,12 +878,7 @@ class TestUserActivityNote:
         assert "job-7 (ok)" in _tool(_server.poll_job, "job-1")
 
     def test_busy_on_a_user_cell_tells_the_agent_to_wait(self, server_with_host):
-        _install_replies(
-            server_with_host,
-            returns=_job_reply(
-                error="busy", running_job_id="job-9", running_job_origin="user"
-            ),
-        )
+        _install_replies(server_with_host, running="job-9", running_origin="user")
         result = _tool(_server.execute_code, "x = 1")
         assert "The user is running a cell" in result
         assert "job-9" in result
@@ -942,12 +890,7 @@ class TestUserActivityNote:
     def test_busy_on_a_chat_cell_does_not_call_it_the_user(self, server_with_host):
         # Same refusal, different writer: the advice must not attribute a chat
         # agent's cell to the person sitting there.
-        _install_replies(
-            server_with_host,
-            returns=_job_reply(
-                error="busy", running_job_id="job-9", running_job_origin="chat"
-            ),
-        )
+        _install_replies(server_with_host, running="job-9", running_origin="chat")
         result = _tool(_server.execute_code, "x = 1")
         assert "Another writer is running a cell" in result
         assert "The user" not in result
@@ -964,12 +907,7 @@ class TestUserActivityNote:
         assert "job-7 (ok, chat)" in result
 
     def test_busy_on_its_own_job_keeps_the_stop_advice(self, server_with_host):
-        _install_replies(
-            server_with_host,
-            returns=_job_reply(
-                error="busy", running_job_id="job-3", running_job_origin="mcp"
-            ),
-        )
+        _install_replies(server_with_host, running="job-3", running_origin="mcp")
         result = _tool(_server.execute_code, "x = 1")
         assert "already running" in result
         assert "interrupt_kernel" in result
@@ -1013,19 +951,18 @@ class TestInterruptRestart:
         """A host whose records say job-3 is running, and whose kernel answers
         the stop with *reply*."""
         host.jobs = ScriptedJobs(running="job-3")
-        host.control.return_value = {"job_id": "job-3", **reply}
+        host.interrupt_job.return_value = {"job_id": "job-3", **reply}
         return host
 
     def test_interrupt_forces_running_job(self, server_with_host):
         self._stopping(server_with_host, {"interrupted": True})
         result = _tool(_server.interrupt_kernel)
-        (op,), kwargs = server_with_host.control.call_args
-        assert op == "interrupt" and kwargs["job_id"] == "job-3"
+        assert server_with_host.interrupt_job.call_args.args == ("job-3",)
         assert "job-3" in result
 
     def test_interrupt_no_running_job(self, server_with_host):
         assert "No running job" in _tool(_server.interrupt_kernel)
-        server_with_host.control.assert_not_called()
+        server_with_host.interrupt_job.assert_not_called()
 
     def test_interrupt_no_host(self):
         _app._kernel_host = None
@@ -1046,24 +983,21 @@ class TestInterruptRestart:
         assert "job-3 is no longer running" in result
         assert "job-4" in result
 
-    def test_interrupt_asks_as_the_agent(self, server_with_host):
-        # The asking origin is what lets the runner refuse a user's cell;
-        # without it the refusal below can never trigger.
+    def test_the_agent_stops_its_own_job(self, server_with_host):
         self._stopping(server_with_host, {"interrupted": True})
-        _tool(_server.interrupt_kernel)
-        assert server_with_host.control.call_args.kwargs["origin"] == "mcp"
+        assert "Interrupted job job-3" in _tool(_server.interrupt_kernel)
 
-    def test_interrupt_from_the_chat_loop_asks_as_the_chat_loop(self, server_with_host):
-        # Asked as a fixed "mcp", the runner read a chat cell as another
-        # writer's and refused the loop its own job (biopb/biopb#880) -- on the
-        # session kernel, where the stop is not guaranteed.
+    def test_the_chat_loop_stops_its_own_cell(self, server_with_host):
+        # Asked as a fixed "mcp", the chat loop's own cell read as another
+        # writer's and the loop was refused it (biopb/biopb#880).
         self._stopping(server_with_host, {"interrupted": True})
+        server_with_host.jobs = ScriptedJobs(running="job-3", running_origin="chat")
         token = _writers._local_origin.set("chat")
         try:
             _tool(_server.interrupt_kernel)
         finally:
             _writers._local_origin.reset(token)
-        assert server_with_host.control.call_args.kwargs["origin"] == "chat"
+        assert server_with_host.interrupt_job.call_args.args == ("job-3",)
 
     def test_interrupt_refused_when_another_client_holds_the_kernel(
         self, server_with_host
@@ -1102,35 +1036,28 @@ class TestInterruptRestart:
         server_with_host.restart.assert_called_once()
         assert _writers._claimed_by is None
 
-    def test_a_lost_submit_reply_still_leaves_the_kernel_claimed(
-        self, server_with_host
-    ):
-        # execute_interactive hands the request over before it starts its clock,
-        # so a timed-out submit still runs -- the kernel claims and starts the
-        # job while this process sees nothing come back. Recording the claim only
-        # on the way back would leave the mirror empty and let a stranger restart
-        # the session that just began.
-        _install_replies(server_with_host, returns=_result(status="timeout"))
+    def test_the_claim_is_taken_before_the_cell_leaves(self, server_with_host):
+        # Taken, not presumed: the cell is sent after the claim is recorded, so
+        # no reply -- lost or late -- can leave the kernel held but unclaimed,
+        # which would let a stranger restart the session that just began.
+        _install_replies(server_with_host, polls=[_snapshot()])
+        claimed_at_send = []
+        server_with_host.run_cell.side_effect = lambda *a, **k: claimed_at_send.append(
+            _writers.claim_holder()
+        )
         with pytest.MonkeyPatch().context() as mp:
             mp.setattr(_writers, "_client_identity", lambda: ("sess-A", "claude-code"))
             _tool(_server.execute_code, "x = 1")
-        assert _writers._claimed_by == "sess-A"
+        assert claimed_at_send == ["sess-A"]
 
         with pytest.MonkeyPatch().context() as mp:
             mp.setattr(_writers, "_client_identity", lambda: ("sess-B", "other"))
             assert "already in use" in _tool(_server.restart_kernel)
         server_with_host.restart.assert_not_called()
 
-    def test_a_refusal_corrects_a_mirror_that_guessed_wrong(self, server_with_host):
-        # The presumed claim is only a guess when this process has seen none. The
-        # kernel's refusal names the real holder, and that must win -- otherwise
-        # a stranger's first call would leave itself recorded as the owner.
-        _install_replies(
-            server_with_host,
-            returns=_job_reply(
-                error="not_owner", owner="claude-code", owner_id="sess-A"
-            ),
-        )
+    def test_a_strangers_refused_cell_leaves_the_claim_alone(self, server_with_host):
+        _install_replies(server_with_host)
+        _writers._note_claim("sess-A", label="claude-code")
         with pytest.MonkeyPatch().context() as mp:
             mp.setattr(_writers, "_client_identity", lambda: ("sess-B", "other"))
             assert "already in use" in _tool(_server.execute_code, "x = 1")
@@ -1175,11 +1102,11 @@ class TestInterruptRestart:
             _writers.clear_claim()
 
     def test_interrupt_refused_on_a_user_job(self, server_with_host):
-        self._stopping(
-            server_with_host,
-            {"interrupted": False, "refused": "foreign_job", "origin": "user"},
-        )
+        self._stopping(server_with_host, {"interrupted": True})
+        server_with_host.jobs = ScriptedJobs(running="job-3", running_origin="user")
         result = _tool(_server.interrupt_kernel)
+        # Decided from the records: the kernel is never asked.
+        server_with_host.interrupt_job.assert_not_called()
         # Must not read as "nothing was running" -- the agent would retry or move
         # on, when what it should do is wait for a person.
         assert "No running job" not in result
@@ -1256,14 +1183,11 @@ class TestStartKernel:
     def test_execute_code_when_not_started_points_to_start_kernel(
         self, server_with_host
     ):
-        # A kernel-dependent tool funnels through host.execute(); a not_started
-        # status must surface the "call start_kernel" guidance verbatim.
-        server_with_host.execute.return_value = _result(
-            status="not_started",
-            error_text=(
-                "Kernel not started. Call start_kernel first, then poll "
-                "server_status until it reports ready."
-            ),
+        # A cell sent to a kernel that is not ready carries the host's
+        # "call start_kernel" guidance verbatim.
+        server_with_host.run_cell.side_effect = RuntimeError(
+            "Kernel not started. Call start_kernel first, then poll "
+            "server_status until it reports ready."
         )
         result = _tool(_server.execute_code, "1 + 1")
         assert "start_kernel" in result

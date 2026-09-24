@@ -1,8 +1,7 @@
 # Verifying a workflow
 
-**Component:** `biopb-mcp` — `mcp/_scratch.py` (the scratch kernel and the
-slot), `mcp/_jobs.py` (`_Verification`, `_exec_cells`), `mcp/_server.py`
-(`verify_workflow`), `mcp/_notebook.py` (`build_workflow_notebook`),
+**Component:** `biopb-mcp` — `mcp/_scratch.py` (the scratch kernel, the run
+and the slot), `mcp/_server.py` (`verify_workflow`), `mcp/_notebook.py` (`build_workflow_notebook`),
 `mcp/_bootstrap.py`, `mcp/_observe.py` (`/api/notebook?workflow=1`).
 **Related:** [`knowledge.md`](knowledge.md) — the *other* way a workflow is
 kept; [`viewer-thread-safety.md`](viewer-thread-safety.md) and
@@ -109,9 +108,13 @@ would silently re-run it several times on a machine already under
 pressure. The scratch host reports the death as the result rather than
 recovering from it.
 
-The run also **stops at the first failure** — later cells were written
-against state the failed one was supposed to produce, so they're marked
-`skipped` rather than reported as independent defects.
+Each cell is its own execute request (`KernelHost.run_cell`, sent bare: no
+`client` refresh), recorded by the scratch host from the protocol like any
+cell, and the next is sent only once it ended `ok`. So the run **stops at the
+first failure** — later cells were written against state the failed one was
+supposed to produce, so they're marked `skipped` rather than reported as
+independent defects. The shell reply ends a cell whose idle was lost, so the
+run always completes.
 
 ## Admission: one slot, owned by the session child
 
@@ -121,17 +124,15 @@ without becoming a second scheduler. The slot lives in the **session
 child** (`_scratch.py`), not inside either kernel: `execute_code` checks
 `_scratch.running()` before submitting a session job, and `_scratch.start()`
 reads the session host's job records (`host.jobs.running()`) before claiming
-the slot for a verification. Kernel-side admission (`_jobs.py`'s busy scan) is
-unchanged and still handles ordinary job-vs-job contention on its own
-kernel; the child's slot layers on top for the cross-kernel case.
+the slot for a verification. Within the session kernel, the host refuses an
+agent's cell while another job runs; the child's slot layers on top for the
+cross-kernel case. The child names a verification `verify-N`, which is what
+lets `poll_job` route without asking either kernel.
 
-**One accepted gap:** the child issues the scratch kernel's own job ids
-(`verify-N`, which is what lets `poll_job` route without asking either
-kernel), but the session kernel still issues its own `job-N`s, and a
-verification checks the session through its host's records, which learn of a
-job from iopub a moment after it starts — a check-then-act, so two jobs can
-start within roughly a millisecond of each other. Closing it fully means the child issuing every job id, a
-larger change than this.
+**One accepted gap:** a verification checks the session through its host's
+records, which learn of a user's cell from iopub a moment after it starts — a
+check-then-act, so the two can start within roughly a millisecond of each
+other.
 
 A scratch kernel gets the default in-process scheduler like any other
 fresh kernel; a workflow cell that wants a cluster attaches one explicitly,
@@ -139,9 +140,8 @@ and the global slot is what keeps two kernels from computing at once even
 then — the cost is that a verification's dask workers start cold and can't
 reuse the session's warm chunk cache.
 
-`interrupt_kernel` names the running job, and the kernel running it checks
-that it still is before stopping it, so which kernel to signal is the session
-child's business. Its
+`interrupt_kernel` on a verification sends no further cell and interrupts the
+running one, so which kernel to signal is the session child's business. Its
 *meaning* changes for a scratch kernel: on the session kernel interrupt is
 deliberately best-effort (a hard stop would cost the user their whole
 session), but a scratch kernel has nothing to lose, so its interrupt
