@@ -28,7 +28,7 @@ shutdown when the control is alive to ask for it; the bind is only the backstop
 for when it is not.
 
 Readiness beyond "port bound" (the progressive-discovery ``SERVING`` scan) is
-left to the *client*: ``biopb-mcp``'s ``_connection`` connects and waits the
+left to the *client*: ``biopb.tensor.Connection`` connects and waits the
 server through its data-folder scan itself. The supervisor's job ends at "the
 process is up and listening".
 """

@@ -231,9 +231,9 @@ durable planes and the web origin in
   `BiopbServicerBase`, `return_lazy_or_eager`, the embedded cache.
 - **An example algorithm server:** `biopb-server/cellpose/cellpose_server.py`
   (the only remaining separate repo).
-- **Client / agent:** `biopb-mcp/src/biopb_mcp/` — `_connection.py` (data
-  service), `tensor_browser/`, and `mcp/` (`_kernel.py`, `_bootstrap.py`,
-  `_server.py`).
+- **Client / agent:** `biopb-mcp/src/biopb_mcp/` — `tensor_browser/` and
+  `mcp/` (`_kernel.py`, `_bootstrap.py`, `_server.py`); the data-plane
+  connection is the SDK's `biopb.tensor.Connection`.
 - **Control plane / web origin:** `biopb-control/src/biopb_control/` —
   `_control.py` (the ASGI app: serves the `web/` SPA + proxies the data plane and
   sessions), `_supervisor.py` (data-plane subprocess lifecycle).

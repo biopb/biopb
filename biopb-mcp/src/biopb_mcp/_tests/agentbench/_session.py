@@ -24,7 +24,7 @@ probe, because offscreen Qt has no GL context.)
 **No tensor plane.** A developer box often has a data plane up, and then
 `client` is live and the agent can wander into whatever that machine's catalog
 happens to hold — so a finding might not reproduce anywhere else. The child is
-pointed at an unreachable URL instead: `auto_connect` fails best-effort,
+pointed at an unreachable URL instead: the connect fails best-effort,
 `client` lands as ``None``, and the fixture reaches the agent as a napari layer
 and nothing else. Every skill's Parameters table already accepts "a layer on
 `viewer`" as a source, and a session with no tensor plane is a real

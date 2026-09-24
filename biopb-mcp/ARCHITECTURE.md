@@ -128,27 +128,25 @@ its slice reads run in-process whatever the default scheduler is
 
 ### Data connection
 
-`TensorConnection` is a **GUI-independent** data-access service — it imports
-neither Qt nor napari — so the `TensorBrowserWidget` and the MCP kernel
-share one implementation. It owns the tensor Flight client and the source catalog.
-It resolves no endpoint from config and persists nothing.
+The kernel and the Tensor Browser share one `biopb.tensor.Connection` (the SDK's):
+the plane's URL, the live Flight client, and why there is none. The kernel builds
+it and hands it to the widget, which connects it, so a reconnect in the widget is
+the agent's next `client`. It caches nothing; the catalog the tree is drawn from
+is the widget's own (`tensor_browser/_sources.py`), re-listed when the server's
+`source_count` moves.
 
-Its connect policy: the **control is the only source of a data plane** (#628). One
-`ensure_data_plane` call both brings the plane up if it is down and returns the
-*authoritative* gRPC endpoint. `$BIOPB_TENSOR_URL` is the one escape hatch, for
-connecting to a data-server _not_ supervised by the control; it bypasses the
-control completely — not consulted, and no local plane started as a side effect.
-The control's own credential (the token file it writes for the plane it owns) is
-**never** forwarded to such a server: authenticate it with `$BIOPB_TENSOR_TOKEN`
-instead. A local TLS data server is trusted from disk (its cert is already on this
-machine).
+Where the plane is comes from `biopb.control`, the SDK's client of the control
+(#628): one `ensure_data_plane` call brings the plane up if it is down and returns
+its endpoint and credential. `$BIOPB_TENSOR_URL` is the one escape hatch, for a
+data server the control does not supervise; it bypasses the control completely,
+and the control's credential is **never** sent to it — authenticate it with
+`$BIOPB_TENSOR_TOKEN`. A local TLS data server is trusted from disk. The contract
+is `docs/discovery-contract.md`.
 
-Because the control is the only source, a session that has none has no data at
-all. An agent harness launching over the stdio shim gets one for free — the shim
-starts the control — but a plain `napari` session does not, and the Tensor Browser
-says so ("No biopb control plane is running"); `biopb control start` is the fix,
-and `biopb mcp view` refuses to open without one rather than presenting an empty
-viewer.
+A session with no control has no data plane to be told about. The stdio shim
+starts the control for an agent harness; a plain `napari` session does not, and
+the Tensor Browser then offers a URL and token field; `biopb mcp view` refuses to
+open without one.
 
 ### Ports, logs, and per-user isolation
 

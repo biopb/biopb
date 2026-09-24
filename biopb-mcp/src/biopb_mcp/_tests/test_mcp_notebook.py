@@ -222,7 +222,7 @@ def test_the_workflow_export_has_no_bootstrap_cell_and_the_audit_one_does():
     doing it, so there is nothing left to rebuild on its behalf.
     """
     wf = _notebook.build_workflow_notebook(_record())
-    assert "TensorConnection" not in json.dumps(wf)
+    assert "Connection()" not in json.dumps(wf)
 
     audit = "".join(_notebook.build_notebook([])["cells"][1]["source"])
     assert "import napari" in audit and "napari.Viewer()" in audit
@@ -269,7 +269,7 @@ def test_the_bootstrap_cell_loads_kernel_plugins_after_the_handles():
     # A workflow calling `rolling_ball.subtract_background(...)` verified fine —
     # the scratch namespace has the plugins, because they are in the bootstrap
     # baseline — and then failed on a fresh kernel, because this cell rebuilt
-    # every handle except them. Ordered last, like the kernel's own step 7b, so
+    # every handle except them. Ordered last, like the kernel's own step 7, so
     # a plugin can reference the handles above it.
     src = _notebook.BOOTSTRAP_SRC
     assert "_load_namespace_plugins" in src

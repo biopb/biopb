@@ -1,6 +1,6 @@
 # Splitting the napari plugin out of biopb-mcp
 
-Status: **proposed** (design only; not implemented).
+Status: step 1 (below) is implemented; steps 2-4 are not.
 
 **Components:** `biopb-mcp` (the code leaves it), the core SDK (`biopb`, gains a
 `control` subpackage), a new repository `biopb/biopb-napari-widget` for the
@@ -63,11 +63,13 @@ control's HTTP API, and the plane answers for itself over Flight.
 | `refresh`, `query_sources`, `resolve_source`, `add_source`, `remove_source`, `warm_source` | the tensor server's, over Flight; `biopb.tensor.TensorFlightClient` has them |
 | `start_source_watch` | a re-list timer over the same Flight call |
 | `is_localhost` | `biopb._data_plane.is_local_url`, which exists |
-| `is_connected`, `mark_disconnected`, the connect error messages | the caller's own state |
+| `is_connected`, `mark_disconnected` | the caller's own state (`client is None`) |
 
 What remains is one small object in the SDK, `biopb.tensor.Connection`: the
-endpoint from `biopb.control.data_plane()`, `connect()`, `client`, `url` and
-`last_message`. It caches nothing. It lives in the SDK because everything that
+endpoint from `biopb.control.ensure_data_plane()`, `connect()`, `client`, `url`
+and `last_message`, which carries the connect error messages. It caches
+nothing. `health` answers anyone, so `connect()` makes one catalog call as
+well, which is the one that checks the token. It lives in the SDK because everything that
 connects uses it, and most of them have no napari: the kernel, the scratch
 kernel, the saved-workflow bootstrap cell (`mcp/_notebook.py`) and
 `workflow_env()`, which returns it to a saved workflow, so `client` stays.
@@ -109,6 +111,7 @@ biopb.control
     data_plane()          -> {"url", "token"} | None      /health, then the credential file
     ensure_data_plane()   -> the same, starting the plane  POST /api/data_plane/ensure
     base_url()            -> where the control listens     biopb._endpoints
+    is_local_url(url)     -> whether url is this machine   the drag-drop gate, the TLS rule
 ```
 
 Rules for it:
@@ -129,44 +132,7 @@ Rules for it:
 
 `biopb.control` is one implementation of a language-neutral contract, so that a
 Java client (next to the Java `TensorFlightClient`) can find the same plane with
-the same token. The contract is files, environment variables and two HTTP calls.
-Today it exists only as the Python in `_endpoints`, `_locations`,
-`_credentials` and `_data_plane`; it gets a page of its own under `docs/`, and
-this section is that page's draft.
-
-**State directory.** `$BIOPB_STATE_HOME/biopb` when set (it must be absolute),
-else `~/.local/state/biopb`, on every platform. `XDG_*` is not read.
-
-**The control.** Host and port, each resolved on its own:
-`BIOPB_CONTROL_HOST` / `BIOPB_CONTROL_PORT`, then `control.json` in the state
-directory (`{"host", "port", …}`, written by a serving control and left behind
-by a crashed one, so a hint to probe, not proof), then `127.0.0.1:8813`.
-
-**The plane's address**, first answer wins:
-
-1. `$BIOPB_TENSOR_URL`;
-2. the control's `GET /health` (unauthenticated): `data_plane.grpc_url`;
-3. `127.0.0.1:8815`, scheme probed off the socket.
-
-**The token**, first answer wins: `$BIOPB_TENSOR_TOKEN`, then
-`tensor-server.token` in the state directory (owner-only, one line) **only when
-the address came from the control**, else none. It goes to the control as the
-`X-Biopb-Token` header and to the plane as a Flight bearer token.
-
-**Starting the plane.** `POST /api/data_plane/ensure?client_timeout=<seconds>`
-with the token header when there is one. The control answers before `client_timeout`; a 200
-carries `{"data_plane": {…, "grpc_url"}}`.
-
-**A local TLS plane.** For a loopback `grpcs://` address the client verifies
-the certificate the plane presents against a SHA-256 fingerprint it reads
-locally: `tls-served.json` in the state directory, keyed by port, else the
-digest of `tls/server-cert.pem`. A local TLS plane with neither is an error,
-not a fallback to trust-on-first-use.
-
-**Stability.** The files, variables, header, query parameter and the
-`data_plane.grpc_url` field above are the contract: fields are added, never
-renamed or removed, and a change is an SDK release. The rest of `/health` (for
-example `auth_required`, `chat_proxied`) is the web UI's and is not part of it.
+the same token: [discovery-contract.md](discovery-contract.md).
 
 ## Config
 

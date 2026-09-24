@@ -17,7 +17,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, NamedTuple, Sequence, Set
 from urllib.parse import urlparse
 
-from biopb.tensor import ResolveCancelled
+from biopb.control import is_local_url
+from biopb.tensor import Connection, ResolveCancelled
 from biopb.tensor._labels import split_label_array_id
 from qtpy.QtCore import QRect, Qt, QThread, QTimer, Signal
 from qtpy.QtGui import QColor
@@ -42,8 +43,8 @@ from qtpy.QtWidgets import (
 )
 
 from .._catalog import CatalogSource
-from .._connection import TensorConnection
 from .._tensor_utils import add_tensor_layer
+from ._sources import SourceList
 
 if TYPE_CHECKING:
     import napari
@@ -220,7 +221,7 @@ def _is_unresolved(src: CatalogSource) -> bool:
 
 
 class _ResolveWorker(QThread):
-    """Runs the blocking ``TensorConnection.resolve_source`` off the GUI thread.
+    """Runs the blocking ``SourceList.resolve`` off the GUI thread.
 
     Resolving a cloud source downloads the whole file (a recall that can take
     minutes), so it must not run on the Qt event loop. This thread does the work
@@ -237,9 +238,9 @@ class _ResolveWorker(QThread):
     cancelled = Signal()
     progress = Signal(object)  # ResolveProgress
 
-    def __init__(self, conn: TensorConnection, source_id: str):
+    def __init__(self, sources: SourceList, source_id: str):
         super().__init__()
-        self._conn = conn
+        self._sources = sources
         self._source_id = source_id
         self._cancel = threading.Event()
 
@@ -249,7 +250,7 @@ class _ResolveWorker(QThread):
 
     def run(self):
         try:
-            descriptor = self._conn.resolve_source(
+            descriptor = self._sources.resolve(
                 self._source_id,
                 on_progress=self.progress.emit,
                 should_cancel=self._cancel.is_set,
@@ -330,7 +331,7 @@ class _WarmProgressDelegate(QStyledItemDelegate):
 
 
 class _WarmWorker(QThread):
-    """Runs the blocking ``TensorConnection.warm_source`` off the GUI thread.
+    """Runs the blocking ``SourceList.warm`` off the GUI thread.
 
     Warming asks the server to recall all of a resolved source's member files
     (server-side; no pixels cross the wire), which can take minutes, so it must
@@ -345,9 +346,9 @@ class _WarmWorker(QThread):
     cancelled = Signal()
     progress = Signal(object)  # WarmProgress
 
-    def __init__(self, conn: TensorConnection, source_id: str):
+    def __init__(self, sources: SourceList, source_id: str):
         super().__init__()
-        self._conn = conn
+        self._sources = sources
         self._source_id = source_id
         self._cancel = threading.Event()
 
@@ -357,7 +358,7 @@ class _WarmWorker(QThread):
 
     def run(self):
         try:
-            done = self._conn.warm_source(
+            done = self._sources.warm(
                 self._source_id,
                 on_progress=self.progress.emit,
                 should_cancel=self._cancel.is_set,
@@ -456,7 +457,7 @@ def _dir_exceeds_entry_threshold(path: str) -> bool:
 
 
 class _AddSourceWorker(QThread):
-    """Runs ``TensorConnection.add_source`` for one dropped path off the GUI thread.
+    """Runs ``SourceList.add`` for one dropped path off the GUI thread.
 
     Registering a dropped file/dir asks the server to discover + catalog it,
     which for a plain folder is a slow recursive walk that may add many sources,
@@ -477,9 +478,9 @@ class _AddSourceWorker(QThread):
     done = Signal(object)  # (added, refreshed, removed, failed)
     failed = Signal(str)
 
-    def __init__(self, conn: TensorConnection, path: str):
+    def __init__(self, sources: SourceList, path: str):
         super().__init__()
-        self._conn = conn
+        self._sources = sources
         self._path = path
         self._cancel = threading.Event()
 
@@ -489,7 +490,7 @@ class _AddSourceWorker(QThread):
 
     def run(self):
         try:
-            result = self._conn.add_source(
+            result = self._sources.add(
                 self._path,
                 on_progress=self.progress.emit,
                 should_cancel=self._cancel.is_set,
@@ -508,7 +509,7 @@ class _AddSourceWorker(QThread):
 
 
 class _RemoveSourceWorker(QThread):
-    """Runs ``TensorConnection.remove_source`` for one dropped branch off the GUI thread.
+    """Runs ``SourceList.remove`` for one dropped branch off the GUI thread.
 
     Removal is quick server-side (unregister N adapters), but a rescan may briefly
     hold the catalog lock, so it runs off the Qt event loop like the add worker.
@@ -520,14 +521,14 @@ class _RemoveSourceWorker(QThread):
     done = Signal(object)  # (removed_ids, failed)
     failed = Signal(str)
 
-    def __init__(self, conn: TensorConnection, root_url: str):
+    def __init__(self, sources: SourceList, root_url: str):
         super().__init__()
-        self._conn = conn
+        self._sources = sources
         self._root_url = root_url
 
     def run(self):
         try:
-            result = self._conn.remove_source(self._root_url)
+            result = self._sources.remove(self._root_url)
         except Exception as exc:  # surface the SDK/server message to the user
             self.failed.emit(str(exc))
             return
@@ -914,14 +915,14 @@ _MESSAGE_STYLES = {
 class TensorBrowserWidget(QWidget):
     """Widget to browse and load tensors from a TensorFlight server."""
 
-    # Emitted (via the connection's on_sources_changed hook) when the background
-    # source watcher re-lists the catalog from its daemon thread. A Qt signal —
-    # not a direct call or QTimer — because the watcher fires off the Qt main
-    # thread; the queued connection marshals the tree rebuild back onto it.
+    # Emitted (via the source list's on_changed hook) when the background source
+    # watcher re-lists the catalog from its daemon thread. A Qt signal — not a
+    # direct call or QTimer — because the watcher fires off the Qt main thread;
+    # the queued connection marshals the tree rebuild back onto it.
     _sources_changed = Signal(object)
 
     # Emitted (with the connect generation) from the background connect worker
-    # when an auto_connect attempt finishes. A Qt signal — not a direct call —
+    # when a connect attempt finishes. A Qt signal — not a direct call —
     # because the worker runs off the Qt main thread; the queued connection
     # marshals the tree render back onto it. See :meth:`_start_connect`.
     _connect_done = Signal(int)
@@ -929,14 +930,18 @@ class TensorBrowserWidget(QWidget):
     def __init__(
         self,
         viewer: "napari.viewer.Viewer",
-        connection: TensorConnection | None = None,
+        connection: Connection | None = None,
         compute_scheduler: str | None = None,
     ):
         super().__init__()
         self._viewer = viewer
-        # The data layer is owned by a TensorConnection service that this
-        # widget consumes. When constructed standalone (no MCP), build our own.
-        self._conn = connection or TensorConnection()
+        # Shared with the MCP kernel when it hands one in, so a reconnect here
+        # is the agent's next ``client`` too. Standalone, the widget owns it.
+        self._conn = connection or Connection()
+        self._list = SourceList(self._conn)
+        # Set once a connect finds no control: the URL and token fields are
+        # then how a plane is named, until the control answers again.
+        self._manual = False
         # When set (MCP context), pin loaded layers' slice reads to a
         # single-process scheduler so the serial viewer shares the main-process
         # chunk cache instead of scattering across the cluster (issue #8). None
@@ -952,14 +957,10 @@ class TensorBrowserWidget(QWidget):
         # user's manual collapses.
         self._initial_expand_done: bool = False
 
-        # Connect runs the shared, non-blocking auto_connect policy on a worker
-        # thread (see :meth:`_start_connect`) so the viewer stays responsive and
-        # nothing blocks the kernel's Qt loop. ``_connecting`` is True while a
-        # worker is in flight (the source watcher skips re-rendering then, to
-        # avoid fighting the connect that is about to repaint). ``_connect_gen``
-        # is a supersession token: each new connect bumps it so a stale worker's
-        # result is dropped when the user retargets a different server (the old
-        # local server, if one was launched, is left running).
+        # Connect runs on a worker thread (see :meth:`_start_connect`).
+        # ``_connecting`` is True while one is in flight (the watcher skips
+        # re-rendering then). ``_connect_gen`` is a supersession token: each
+        # new connect bumps it so a stale worker's result is dropped.
         self._connecting: bool = False
         self._connect_gen: int = 0
 
@@ -994,35 +995,34 @@ class TensorBrowserWidget(QWidget):
         self._remove_retain: set = set()
         self._setup_ui()
 
-        # Self-heal the tree when the background source watcher re-lists a
-        # catalog that was cached mid-index (issue #44). The watcher runs on a
-        # daemon thread, so it reaches the GUI through a queued signal. In the
-        # MCP context the kernel bootstrap also starts the watch on this same
-        # shared connection; start_source_watch is idempotent, so the duplicate
-        # call here (covering the standalone plugin) is harmless.
+        # Self-heal the tree when the watcher re-lists a catalog listed
+        # mid-index (issue #44). It runs on a daemon thread, so it reaches the
+        # GUI through a queued signal.
         self._sources_changed.connect(self._on_sources_changed)
-        self._conn.on_sources_changed = self._sources_changed.emit
-        self._conn.start_source_watch()
+        self._list.on_changed = self._sources_changed.emit
+        self._list.start_watch()
 
-        # Render a background auto_connect's outcome on the Qt main thread.
+        # Render a background connect's outcome on the Qt main thread.
         self._connect_done.connect(self._on_connect_done)
 
         # Auto-connect on next event loop tick
         QTimer.singleShot(0, self._auto_connect)
 
-    # The client and source catalog live on the connection service; expose them
-    # read-only so the widget's internal read sites stay unchanged.
     @property
     def _client(self):
         return self._conn.client
 
     @property
+    def _connected(self) -> bool:
+        return self._conn.client is not None
+
+    @property
     def _sources(self):
-        return self._conn.sources
+        return self._list.sources
 
     @property
     def _use_server_query(self):
-        return self._conn.use_server_query
+        return self._list.use_server_query
 
     def _setup_ui(self):
         """Build the UI layout."""
@@ -1053,15 +1053,35 @@ class TensorBrowserWidget(QWidget):
         layout.addWidget(self._status_summary)
 
         # Advanced connection panel — hidden until the summary line is clicked.
-        # Holds the Connect/Refresh controls. Neither the data-plane URL nor its
-        # token is user-editable: the control (control plane) owns the data plane,
-        # is the single source of truth for its endpoint (#413), and hands off the
-        # credential for it on disk (#470) — so both are resolved at connect time,
-        # not typed here (#628). The summary line shows the resolved URL.
+        # Holds Connect/Refresh and, only once a connect has found no control,
+        # a URL and token to dial instead. While a control answers, it names
+        # the plane and its credential, and nothing here is typed (#628).
         self._advanced_panel = QWidget()
         adv_layout = QVBoxLayout(self._advanced_panel)
         adv_layout.setContentsMargins(0, 0, 0, 0)
         adv_layout.setSpacing(4)
+
+        self._manual_panel = QWidget()
+        manual_layout = QVBoxLayout(self._manual_panel)
+        manual_layout.setContentsMargins(0, 0, 0, 0)
+        manual_layout.setSpacing(4)
+        self._url_input = QLineEdit()
+        self._url_input.setPlaceholderText("grpc://host:8815")
+        self._url_input.returnPressed.connect(self._on_connect_clicked)
+        self._token_input = QLineEdit()
+        self._token_input.setPlaceholderText("token (optional)")
+        self._token_input.setEchoMode(QLineEdit.Password)
+        self._token_input.returnPressed.connect(self._on_connect_clicked)
+        for label, field in (
+            ("Server:", self._url_input),
+            ("Token:", self._token_input),
+        ):
+            row = QHBoxLayout()
+            row.addWidget(QLabel(label))
+            row.addWidget(field)
+            manual_layout.addLayout(row)
+        self._manual_panel.setVisible(False)
+        adv_layout.addWidget(self._manual_panel)
 
         # Connect and Refresh buttons
         btn_layout = QHBoxLayout()
@@ -1178,31 +1198,28 @@ class TensorBrowserWidget(QWidget):
         layout.addWidget(self._message_label)
 
     def _on_connect_clicked(self, *args):
-        """Connect button handler: re-run the connect policy.
+        """Connect button handler: dial the typed URL, or ask the control again.
 
-        Nothing about the endpoint is typed here (#413/#628) — ``auto_connect``
-        resolves both address and credential — so this is a plain retry, which is
-        exactly what a user needs after starting the control.
+        With no URL typed this is a plain retry, which is what a user needs
+        after starting the control.
         """
-        self._start_connect()
+        url = self._url_input.text().strip() if self._manual else ""
+        token = self._token_input.text().strip() or None
+        self._start_connect(url or None, token)
 
     def _auto_connect(self):
         """Connect on startup using the resolved URL/token (no user prompt)."""
         self._start_connect()
 
-    def _start_connect(self):
-        """Run the shared auto-connect policy on a worker thread.
+    def _start_connect(self, url: str | None = None, token: str | None = None):
+        """Connect, then list the catalog, on a worker thread.
 
-        Delegates to :meth:`TensorConnection.auto_connect` — the shared
-        non-blocking policy (try the URL, wait through a
-        ``STARTING`` data-folder scan, and auto-start a local biopb server as a
-        last resort when the URL is local and the CLI is installed) — run off the
-        Qt main thread. Two reasons it must not run inline: the viewer stays
-        responsive while the server binds/scans, and, in the MCP context, the
-        widget lives in the kernel whose Qt loop ``start_kernel`` waits on, so a
-        blocking connect (or a modal prompt — now gone) here would wedge the
-        kernel. Completion is marshaled back via ``_connect_done``; a generation
-        token drops the result of any connect the user has since superseded.
+        :meth:`Connection.connect` blocks through the plane's boot, so it must
+        not run on the Qt main thread: the viewer stays responsive, and in the
+        MCP context the widget lives in the kernel whose Qt loop
+        ``start_kernel`` waits on. Completion is marshaled back via
+        ``_connect_done``; a generation token drops the result of any connect
+        the user has since superseded.
         """
         self._clear_error()
         self._clear_status()
@@ -1222,22 +1239,28 @@ class TensorBrowserWidget(QWidget):
         self._show_status(f"Connecting to {target}…", sticky=True)
 
         def _worker():
-            # auto_connect is best-effort: it swallows its own failures and
-            # records last_status/last_message, so we only signal completion and
-            # let _on_connect_done read the outcome off the connection. The
-            # except is belt-and-suspenders — always signal, never let the
-            # worker thread die with an unhandled exception.
+            # connect() records its own failure on last_message; the list is
+            # read here too, so the main thread only renders.
             try:
-                self._conn.auto_connect()
-            except Exception:
+                self._list.clear()
+                connected = self._conn.connect(url, token)
+                if url is None:
+                    # No control answered (the env URL would have set one).
+                    self._manual = not connected and self._conn.url is None
+                if connected:
+                    self._list.update_health()
+                    self._list.refresh()
+            except Exception as exc:
                 logger.exception("Connect worker failed")
+                self._conn.client = None
+                self._conn.last_message = f"Could not list the catalog: {exc}"
             finally:
                 self._connect_done.emit(gen)
 
         threading.Thread(target=_worker, name="tbw-connect", daemon=True).start()
 
     def _on_connect_done(self, gen: int):
-        """Render the outcome of a background ``auto_connect`` (main thread).
+        """Render the outcome of a background connect (main thread).
 
         Queued from ``_connect_done``. A stale generation (the user retargeted a
         different server while this one was still connecting) is dropped; the
@@ -1251,10 +1274,13 @@ class TensorBrowserWidget(QWidget):
         self._update_status_summary()
         self._update_drop_hint()
 
-        if not self._conn.is_connected:
-            # auto_connect recorded the friendly reason (no control / down / still
-            # starting); the fallback covers only a connection that failed without
-            # one, which cannot name an endpoint either.
+        self._manual_panel.setVisible(self._manual)
+        if not self._connected:
+            if self._manual:
+                # Open the panel so the fields that answer this are in view.
+                self._advanced_expanded = True
+                self._advanced_panel.setVisible(True)
+                self._update_status_summary()
             self._show_error(
                 self._conn.last_message or "Could not reach the biopb data plane."
             )
@@ -1262,7 +1288,7 @@ class TensorBrowserWidget(QWidget):
             self._refresh_button.setEnabled(False)
             return
 
-        sources = self._conn.sources
+        sources = self._list.sources
         if not sources:
             # While the server is still indexing, keep Refresh enabled (more
             # sources are coming, and the watcher re-lists as they appear); a
@@ -1303,7 +1329,7 @@ class TensorBrowserWidget(QWidget):
         url = html.escape(self._conn.url or "(no server)")
         if self._connecting:
             glyph, color, state = "◌", "#888", "connecting…"
-        elif self._conn.is_connected:
+        elif self._connected:
             glyph, color, state = "●", "#4ade80", "connected"
         else:
             glyph, color, state = "○", "#f87171", "disconnected"
@@ -1325,11 +1351,11 @@ class TensorBrowserWidget(QWidget):
         the tree automatically as sources are found. Returns True in that case,
         False when the catalog is genuinely empty (an error is shown).
         """
-        if self._conn.scan_in_progress():
+        if self._list.scan_in_progress():
             self._clear_error()
             self._show_status(
                 f"Indexing data folder… "
-                f"({self._conn.scan_source_count()} sources so far). "
+                f"({self._list.scan_source_count()} sources so far). "
                 "The list updates automatically as sources are found.",
                 sticky=True,
             )
@@ -1413,9 +1439,9 @@ class TensorBrowserWidget(QWidget):
         against a connected, **localhost** server: a dropped path is a client-side
         filesystem path, meaningful to the server only when they share a disk.
         """
-        if self._connecting or not self._conn.is_connected:
+        if self._connecting or not self._connected:
             return False, "Not connected — connect to add data by drag-drop"
-        if not self._conn.is_localhost():
+        if not (self._conn.url and is_local_url(self._conn.url)):
             return False, "Connected to a remote server — drag-drop unavailable"
         if self._add_worker is not None:
             return False, "Adding data…"
@@ -1528,7 +1554,7 @@ class TensorBrowserWidget(QWidget):
         if self._add_worker is not None:
             return  # one add at a time
         self._clear_error()
-        worker = _AddSourceWorker(self._conn, path)
+        worker = _AddSourceWorker(self._list, path)
         self._add_worker = worker
         self._add_retain.add(worker)
         worker.progress.connect(self._on_add_progress)
@@ -1605,21 +1631,20 @@ class TensorBrowserWidget(QWidget):
         """Refresh the source list from server."""
         self._clear_error()
 
-        if not self._conn.is_connected:
+        if not self._connected:
             self._show_error("Not connected")
             return
 
         try:
-            sources = self._conn.refresh()
+            sources = self._list.refresh()
         except Exception:
-            # A failed re-list on a previously-"connected" server almost always
-            # means the server is gone. is_connected doesn't self-revalidate, so
-            # without this the status line would stay a stale "connected"; drop
-            # the client to make the indicator honest and steer the user to
-            # reconnect. Scoped to the re-list call itself -- a later tree-render
-            # error is a client-side bug, not a lost server, and must not nuke a
-            # live connection. Stopgap until a live health signal exists (#319).
-            self._conn.mark_disconnected("Lost connection to server")
+            # A failed re-list almost always means the server is gone. Drop the
+            # shared client so the indicator, and the agent's next job, say so;
+            # a reconnect restores both. Scoped to the re-list call: a later
+            # render error is a client-side bug, not a lost server.
+            self._conn.client = None
+            self._conn.last_message = "Lost connection to server"
+            self._list.clear()
             self._show_error("Refresh failed — lost connection to server")
             self._refresh_button.setEnabled(False)
             self._update_status_summary()
@@ -1654,22 +1679,15 @@ class TensorBrowserWidget(QWidget):
         only while connected and not mid-(re)connect, to avoid fighting a
         concurrent connect that is about to repaint anyway.
         """
-        if not self._conn.is_connected or self._connecting:
+        if not self._connected or self._connecting:
             return
         self._clear_error()
         self._apply_filter()
 
     def closeEvent(self, event):
-        """Detach our source-watch hook, but leave the watcher running.
-
-        The ``TensorConnection`` is shared with the kernel/agent (which reads
-        ``sources`` live and starts its own watch on the same connection), so we
-        must not stop the watcher when only this widget closes — that would kill
-        the agent's self-healing. We just drop our callback so the daemon thread
-        stops emitting into this soon-to-be-destroyed widget (issue #44).
-        """
-        if self._conn.on_sources_changed == self._sources_changed.emit:
-            self._conn.on_sources_changed = None
+        """Stop the watcher; the list is this widget's alone."""
+        self._list.on_changed = None
+        self._list.stop_watch()
         super().closeEvent(event)
 
     def _build_and_display_tree(self, filtered_ids: Set[str] | None = None):
@@ -1826,7 +1844,7 @@ class TensorBrowserWidget(QWidget):
         if self._remove_worker is not None:
             return  # one removal at a time
         self._clear_error()
-        worker = _RemoveSourceWorker(self._conn, root_url)
+        worker = _RemoveSourceWorker(self._list, root_url)
         self._remove_worker = worker
         self._remove_retain.add(worker)
         worker.done.connect(self._on_remove_done)
@@ -2072,7 +2090,7 @@ class TensorBrowserWidget(QWidget):
         watcher won't pick it up (issue #44); we refresh explicitly here.
         """
         src = self._sources.get(source_id)
-        if not src or not self._conn.is_connected:
+        if not src or not self._connected:
             return
 
         parts = _get_path_parts(src.source_url)
@@ -2106,7 +2124,7 @@ class TensorBrowserWidget(QWidget):
         progress.setAutoReset(False)
         progress.setValue(0)
 
-        worker = _ResolveWorker(self._conn, source_id)
+        worker = _ResolveWorker(self._list, source_id)
         # Own the worker by its thread lifetime (held until `finished`), so a
         # later/overlapping resolve can't drop its only ref and have the QThread
         # destroyed mid-run.
@@ -2248,14 +2266,14 @@ class TensorBrowserWidget(QWidget):
         slow cloud chunk recall (zarr / ome-zarr) fills the row as it progresses.
         """
         src = self._sources.get(source_id)
-        if not src or not self._conn.is_connected:
+        if not src or not self._connected:
             return
         if source_id in self._warms:  # already hydrating -- don't double-start
             return
 
         self._clear_error()
 
-        worker = _WarmWorker(self._conn, source_id)
+        worker = _WarmWorker(self._list, source_id)
         self._warms[source_id] = _WarmState(worker=worker)  # UI state
         self._warm_retain.add(worker)  # GC owner, held until `finished`
         # Indeterminate until the first server count arrives.

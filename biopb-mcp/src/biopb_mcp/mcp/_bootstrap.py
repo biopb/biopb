@@ -502,14 +502,14 @@ def _bootstrap_impl():
     splash.message("Loading napari…")  # a no-op in a scratch kernel
     import dask.array as da
     import numpy as np
+    from biopb.tensor import Connection
 
-    from .._connection import TensorConnection
     from . import _jobs
     from ._process_ops import build_ops_from_config
 
-    # 2. Data-access service (dask-free), shared by the widget and the agent
-    #    namespace.
-    conn = TensorConnection()
+    # 2. The data-plane connection, shared by the widget and the agent
+    #    namespace: the widget connects it, and each agent cell reads its client.
+    conn = Connection()
 
     # 3. napari viewer + Tensor Browser -- unless this is a scratch kernel.
     #
@@ -641,7 +641,7 @@ def _bootstrap_impl():
     # reads _viewer_window_alive with a default, so its absence is expected.
     ip.user_ns.update(ns)
 
-    # 7b. User "bring your own tool" plugins (#92): load *.py files from
+    # 7. User "bring your own tool" plugins (#92): load *.py files from
     #     ~/.config/biopb/kernel/ and biopb_mcp.namespace entry points into the
     #     namespace now that the built-in handles (viewer/client/np/da/ops) exist,
     #     so a plugin's code can reference them. Fail-open per plugin; the reserved
@@ -650,18 +650,3 @@ def _bootstrap_impl():
         # Not here either, and for the same reason: `workflow_env()` loads them
         # for the reader, so the verification has to reach them the same way.
         _load_namespace_plugins(ip, config)
-
-    # 7. Background source-catalog watcher (issue #44): a daemon thread that
-    #    health-checks the server and re-lists sources when its source_count
-    #    changes, so a catalog cached while the server was still indexing
-    #    self-heals — for the agent (reads `_conn.sources` live) and, in a GUI
-    #    session, the widget (which wires its own tree rebuild and also starts
-    #    the watch; the call is idempotent). Thread-based, not a QTimer, so a
-    #    busy Qt loop never starves the poll.
-    try:
-        conn.start_source_watch(
-            min_interval=get_setting(config, "tensor.health_poll_min_interval"),
-            max_interval=get_setting(config, "tensor.health_poll_max_interval"),
-        )
-    except Exception:
-        logger.exception("Failed to start source watcher")
