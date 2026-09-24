@@ -493,7 +493,7 @@ class TestCacheStatsCommand:
         kwargs = mock_fc_class.call_args.kwargs
         # No control answered (see the autouse fixture), so this is the default
         # endpoint -- base+5, derived, not the literal 8815 spelled in a command.
-        from biopb import _data_plane
+        from biopb.control import _data_plane
 
         assert kwargs["location"] == _data_plane.default_url()
         assert kwargs["token"] is None
@@ -501,7 +501,7 @@ class TestCacheStatsCommand:
     def test_the_control_plane_decides_the_endpoint(self, monkeypatch):
         """A published endpoint wins over the default — #615's central claim."""
         monkeypatch.setattr(
-            "biopb._data_plane.control_grpc_url",
+            "biopb.control._data_plane.control_grpc_url",
             lambda timeout=1.0: "grpc://127.0.0.1:9915",
         )
         with patch("biopb.tensor.cli.TensorFlightClient") as mock_fc_class:
@@ -571,10 +571,10 @@ class TestCacheStatsCommand:
 
         Classified by type, so it names the certificate rather than a token.
         """
-        from biopb import _data_plane
+        from biopb.control import _data_plane
 
         monkeypatch.setattr(
-            "biopb._data_plane.control_grpc_url",
+            "biopb.control._data_plane.control_grpc_url",
             lambda timeout=1.0: "grpcs://127.0.0.1:8815",
         )
         result = runner.invoke(app, ["cache-stats"])  # no cert in the state dir
@@ -624,7 +624,7 @@ class TestEveryCommandClassifiesItsFailures:
     @pytest.mark.parametrize("argv,method", CASES)
     def test_an_unreachable_plane_says_so_and_names_the_endpoint(self, argv, method):
         import pyarrow.flight as flight
-        from biopb import _data_plane
+        from biopb.control import _data_plane
 
         result = self._run(argv, method, flight.FlightUnavailableError("refused"))
 

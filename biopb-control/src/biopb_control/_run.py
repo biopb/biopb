@@ -21,7 +21,8 @@ import threading
 from pathlib import Path
 from typing import Optional
 
-from biopb import _credentials, _endpoints
+from biopb import _credentials
+from biopb.control import _endpoints
 
 from ._control import serve_control_api
 from ._supervisor import DataPlaneSpec, DataPlaneSupervisor

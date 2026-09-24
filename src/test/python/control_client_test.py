@@ -94,15 +94,6 @@ class TestEnsureDataPlane:
         assert control.ensure_data_plane(timeout=1.0) is None
 
 
-def test_the_private_modules_are_aliases_not_copies():
-    """Patching the old name must still reach the code that runs."""
-    from biopb import _data_plane, _endpoints
-    from biopb.control import _data_plane as dp, _endpoints as ep
-
-    assert _data_plane is dp
-    assert _endpoints is ep
-
-
 def test_importing_it_does_not_import_pyarrow():
     import subprocess
     import sys

@@ -464,7 +464,7 @@ def _viewer_base_url() -> str:
     the *user's* browser reaches it by, which nothing in this process can know.
     """
     try:
-        from biopb._endpoints import control_base_url
+        from biopb.control._endpoints import control_base_url
 
         return control_base_url()
     except Exception:  # pragma: no cover - core SDK always present in practice

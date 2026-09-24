@@ -407,7 +407,8 @@ def test_a_local_sdk_client_reads_a_plane_serving_a_byo_cert(
     """
     import numpy as np
     import zarr
-    from biopb import _data_plane, _tls_material, _tls_record
+    from biopb import _tls_material, _tls_record
+    from biopb.control import _data_plane
     from biopb.tensor import TensorFlightClient
     from biopb_tensor_server import ZarrAdapter
 

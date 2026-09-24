@@ -125,7 +125,7 @@ def main(argv: list[str] | None = None) -> int:
     # `--control-host` (or BIOPB_CONTROL_HOST) -- e.g. behind an operator's own
     # TLS proxy.
     from biopb import _web_auth
-    from biopb._endpoints import control_host, control_port
+    from biopb.control._endpoints import control_host, control_port
 
     resolved_control_host = args.control_host or control_host()
 

@@ -8,7 +8,7 @@ Commands:
     cache-stats  Show the server's cache hit/miss diagnostics
 
 Every command dials the *same* plane through the one resolver in
-``biopb._data_plane`` (biopb/biopb#615): ``--server`` -> ``BIOPB_TENSOR_URL`` ->
+``biopb.control._data_plane`` (biopb/biopb#615): ``--server`` -> ``BIOPB_TENSOR_URL`` ->
 the control plane's published endpoint -> the default. ``--server`` stays because
 a plane launched directly on a custom port is recorded nowhere and so cannot be
 discovered; everything else is asked for rather than reconstructed.
@@ -27,7 +27,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from biopb import _data_plane
+from biopb.control import _data_plane
 from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS
 from biopb.tensor.client import TensorFlightClient
 

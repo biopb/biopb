@@ -62,7 +62,7 @@ control's HTTP API, and the plane answers for itself over Flight.
 | `health`, `scan_in_progress`, `scan_source_count`, the health poll and its two backoff keys | `TensorFlightClient.health_check()`, the plane's own answer (`full_scan_in_progress`); it works with or without a control |
 | `refresh`, `query_sources`, `resolve_source`, `add_source`, `remove_source`, `warm_source` | the tensor server's, over Flight; `biopb.tensor.TensorFlightClient` has them |
 | `start_source_watch` | a re-list timer over the same Flight call |
-| `is_localhost` | `biopb._data_plane.is_local_url`, which exists |
+| `is_localhost` | `biopb.control.is_local_url` |
 | `is_connected`, `mark_disconnected` | the caller's own state (`client is None`) |
 
 What remains is one small object in the SDK, `biopb.tensor.Connection`: the
@@ -110,7 +110,7 @@ becomes a public subpackage:
 biopb.control
     data_plane()          -> {"url", "token"} | None      /health, then the credential file
     ensure_data_plane()   -> the same, starting the plane  POST /api/data_plane/ensure
-    base_url()            -> where the control listens     biopb._endpoints
+    base_url()            -> where the control listens     biopb.control._endpoints
     is_local_url(url)     -> whether url is this machine   the drag-drop gate, the TLS rule
 ```
 
@@ -125,8 +125,8 @@ Rules for it:
   this surface is what that floor promises. Server-side registries the control
   reads (`_sessions`, `_web_auth`, `_agents`) stay private at the top level.
 - The client half of `_control_client.py`, `_data_plane.py` and `_endpoints.py`
-  become its implementation under `biopb/control/`; `biopb._endpoints` remains
-  as an alias while the monorepo's other packages migrate.
+  become its implementation under `biopb/control/`, and the monorepo imports
+  them from there.
 
 ## The discovery contract
 
