@@ -244,15 +244,19 @@ and close-notebook must not take the session's kernel down. Until it exists,
 
 ## Open: ipykernel version
 
-**Unverified against ipykernel 7, and not pinned.** `biopb-mcp` depends on an
-unpinned `ipykernel`; the lock (and so dev and CI) holds 6.31, while PyPI has
-7.3.0 and `install.sh` resolves fresh. A new install most likely runs 7.x,
-which nothing here has been tested on. To do:
+**Everything here is verified on ipykernel 6.31 only.** `biopb-mcp` declares
+`ipykernel` unbounded, but it is capped transitively: `napari==0.7.0` pulls in
+`napari-console` 0.1.4, which requires `ipykernel<7`. So the lock, CI (which
+installs from it), the nightly fresh resolve (`unlocked-resolve.yaml`) and a
+user's `install.sh` all get 6.31, while PyPI has 7.3.0. The cap is someone
+else's: a `napari-console` release that lifts it, or a napari upgrade that
+brings one, moves every install to 7 with no change here. To do:
 
-1. **Pin** `ipykernel>=6.31,<7` in `biopb-mcp`'s `mcp` extra, so what installs
-   is what is tested.
-2. **Verify against 7.3**: the `test_mcp_*` suites and the napari smoke run in
-   a venv with ipykernel 7.3, then move the pin.
+1. **Pin** `ipykernel>=6.31,<7` in `biopb-mcp`'s `mcp` extra, so the cap is
+   this package's decision and survives a napari upgrade.
+2. **Verify against 7.3** (required for subshells anyway): the `test_mcp_*`
+   suites and the napari smoke run in a venv with ipykernel 7.3, then move the
+   pin.
 
 What 7 has to be checked for, since the gate and the records lean on ipykernel
 internals rather than the protocol:
