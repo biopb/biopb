@@ -50,7 +50,6 @@ from . import _app, _kernel_rpc, _server, _writers
 
 # The kernel round trip, off the loop. Bound here under the name this module
 # uses so a test can still swap it (test_mcp_chat_api).
-from ._kernel_rpc import _job_call
 
 logger = logging.getLogger(__name__)
 
@@ -399,10 +398,9 @@ async def _run_code(arguments, on_progress):
     code = arguments.get("python_code") or ""
     intent = arguments.get("intent") or _last_user_text()
 
-    # Off the loop, like every other kernel round trip here. The context copy
-    # carries `_local_origin`, which is what keeps this loop's own cells out of
-    # its own digest.
-    digest = await asyncio.to_thread(_writers._foreign_digest, host)
+    # Read under this dispatch's `_local_origin`, which is what keeps this
+    # loop's own cells out of its own digest.
+    digest = _writers._foreign_digest(host)
     foreign_note = _writers._render_foreign_note(digest)
 
     def deliver(text):
@@ -454,10 +452,7 @@ async def _run_code(arguments, on_progress):
     try:
         while True:
             await asyncio.sleep(_POLL_INTERVAL)
-            snap, res, _w = await _job_call(host, "poll", job_id)
-            if snap is None:
-                _running_job_id = None
-                return deliver(_kernel_rpc._format_execute_result(res))
+            snap = _server._poll_submitted(host, job_id)
             out = snap.get("stdout") or ""
             # Diffed against the job's monotonic total, not against `len(out)`:
             # the output cap compacts the buffer from the front mid-cell, so a
@@ -571,7 +566,7 @@ async def _discharge_notice():
     """Retire the activity notice now that the result carrying it is recorded.
 
     The read/ack split exists so a notice is **deferred, never dropped**
-    (:func:`_jobs.ack_foreign_digest`), and the ack is meant to happen "once the
+    (:func:`_writers._ack_foreign_digest`), and the ack is meant to happen "once the
     note carrying them is on its way back to the agent". In this loop the note
     is on its way back when it is in ``_messages``: the next projection carries
     it whatever becomes of this turn.
@@ -587,7 +582,7 @@ async def _discharge_notice():
     host = _app._kernel_host
     if not digest or host is None:
         return
-    await asyncio.to_thread(_writers._ack_foreign_digest, host, digest, WRITER_ID)
+    _writers._ack_foreign_digest(host, digest, WRITER_ID)
 
 
 #: Framing for the compacted prefix, so the model reads it as the record it is

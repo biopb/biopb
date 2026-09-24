@@ -257,9 +257,6 @@ class KernelConfig:
         "inspect / job submit+poll), not long jobs -- execute_code runs agent code "
         "in a background thread that may run indefinitely.",
     )
-    busy_lock_timeout: float = _h(
-        5.0, "Seconds to wait for the kernel RLock before reporting busy."
-    )
     promote_after: float = _h(
         10.0,
         "Seconds execute_code waits before promoting a job: completes within this "
@@ -615,7 +612,6 @@ _CONSTRAINTS = {
     "KernelConfig": {
         "startup_timeout": Range(exclusive_min=0),
         "execute_timeout": Range(exclusive_min=0),
-        "busy_lock_timeout": Range(exclusive_min=0),
         "promote_after": Range(exclusive_min=0),
         "watchdog_interval": Range(min=0),  # 0 disables the watchdog
         "watchdog_max_respawns": Range(min=0),

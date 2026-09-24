@@ -1,6 +1,6 @@
 """Tests for the audit-notebook serializer (_notebook.py).
 
-Pure-function tests: build_notebook turns a list of _jobs.export() snapshots into
+Pure-function tests: build_notebook turns a list of JobLog.export() snapshots into
 an nbformat-v4 dict. No kernel, no Qt.
 """
 

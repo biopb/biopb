@@ -3,8 +3,8 @@
 Runs inside the kernel, as its ``kernel_class`` (``__main__`` passes
 ``--IPKernelApp.kernel_class``). A cell from any client but the host's own is
 refused while a job runs on its worker thread, and otherwise runs inline,
-recorded as an ``origin="user"`` job so the agent is told of it
-(``docs/jupyter-clients.md``).
+announced as an ``origin="user"`` job so the host records it and the agent is
+told of it (``docs/jupyter-clients.md``).
 
 The gate is ``do_execute`` rather than a ``pre_run_cell`` callback because
 IPython catches and prints what an event callback raises, so a callback cannot
@@ -77,7 +77,8 @@ class GatedKernel(IPythonKernel):
                 cell_id=cell_id,
             )
 
-        session = self.get_parent("shell").get("header", {}).get("session")
+        header = self.get_parent("shell").get("header", {})
+        session = header.get("session")
         # An empty cell is a client asking for its prompt number or evaluating
         # user_expressions (qtconsole sends both, silently). Decided on the
         # code, not on `silent`: that flag only stops output being broadcast,
@@ -90,7 +91,7 @@ class GatedKernel(IPythonKernel):
         if running is not None:
             return self._refuse(running)
 
-        with _jobs.record_inline(code) as job:
+        with _jobs.record_inline(code, request=header.get("msg_id")) as job:
             reply = await run()
             if reply.get("status") == "ok":
                 job.status = "ok"

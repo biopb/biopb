@@ -14,7 +14,7 @@ from starlette.applications import Starlette
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
-from biopb_mcp.mcp import _chat, _chat_api, _model, _observe
+from biopb_mcp.mcp import _chat, _chat_api, _kernel_rpc, _model, _observe
 
 # The shape the launcher actually threads: `load_config()` returns a **dict**,
 # and every consumer reads it with `get_setting`, which falls back to
@@ -510,9 +510,12 @@ class TestCancel:
             await asyncio.sleep(3600)
 
         monkeypatch.setattr(_model, "make_model", lambda cfg: hang)
-        monkeypatch.setattr(
-            _chat, "_job_call", lambda *a, **k: touched.append(a) or (None, {}, None)
-        )
+        for name in ("_job_call", "_run_job_call", "_execute"):
+            monkeypatch.setattr(
+                _kernel_rpc,
+                name,
+                lambda *a, **k: touched.append(a) or (None, {}, None),
+            )
         client.post("/chat/turn", json={"text": "hello"})
         assert self._wait_for(started.is_set)
         client.post("/chat/cancel", json={})

@@ -218,22 +218,6 @@ try:
         print(_line)
 except Exception as _e:
     print("  error: " + str(_e))
-
-print("")
-print("## Jobs")
-try:
-    _js = _jobs.jobs_summary()
-    if _js:
-        for _j in _js:
-            print(
-                "  - " + _j["job_id"] + ": " + _j["status"]
-                + " (" + str(_j["elapsed"]) + "s, stdout "
-                + str(_j["stdout_len"]) + "b)"
-            )
-    else:
-        print("  (none)")
-except Exception as _e:
-    print("  error: " + str(_e))
 """
 
 
@@ -269,19 +253,19 @@ async def _start_job(host, code, **kwargs):
     Returns ``(job_id, foreign_note, window_alive, message)``. Exactly one of
     *job_id* and *message* is not None — *message* is the finished tool reply
     for every outcome that never started a job, and *foreign_note* is what the
-    caller appends to whatever it returns instead. *window_alive* rides along
-    because the submit round trip carries it too, and with a promote window of
-    zero it is the only one there will be.
+    caller appends to whatever it returns instead. *window_alive* is the viewer
+    window's liveness, carried by the submit round trip -- the only one: the
+    job is read back from the host's records.
     """
     writer, _label = _writers._client_identity()
 
-    # Read once at entry, append to whichever path returns below. Every kernel
-    # round trip below goes to a thread for the reason on _kernel_rpc._job_call:
+    # Read once at entry, append to whichever path returns below. The submit
+    # round trip goes to a thread for the reason on _kernel_rpc._job_call:
     # blocking here blocks the whole process, not this one call.
-    digest = await asyncio.to_thread(_writers._foreign_digest, host)
+    digest = _writers._foreign_digest(host)
     foreign_note = _writers._render_foreign_note(digest)
     if foreign_note:
-        await asyncio.to_thread(_writers._ack_foreign_digest, host, digest, writer)
+        _writers._ack_foreign_digest(host, digest, writer)
 
     job_id, message, drop_note, window_alive = await asyncio.to_thread(
         _submit_job, host, code, digest, _tool_busy_message, **kwargs
@@ -382,34 +366,38 @@ def _submit_job(host, code, digest, busy_message, **kwargs):
     return submitted["job_id"], None, False, window_alive
 
 
-async def _await_job(host, job_id, window_alive=None, budget=None, snap=None):
-    """Poll *job_id* until it is terminal or *budget* seconds run out.
+def _poll_submitted(host, job_id):
+    """*job_id*'s snapshot, for a job this caller has just submitted.
+
+    Its start travels on iopub and the submit's reply on the shell socket, so
+    the reply can arrive first: until the record appears, the job is running as
+    far as the caller knows, not unknown.
+    """
+    snap = host.jobs.poll(job_id)
+    if snap.get("status") == "unknown":
+        return {"job_id": job_id, "status": "running", "stdout": ""}
+    return snap
+
+
+async def _await_job(host, job_id, budget=None, submitted=False):
+    """*job_id*'s snapshot once it is terminal, or when *budget* seconds run out.
 
     *budget* defaults to the promote window, which is what a submitting tool
-    waits; ``poll_job`` passes its own. Returns ``(snap, res, window_alive)``.
-    *snap* is None when a poll round trip failed, and *res* is the raw kernel
-    reply to report instead. Otherwise a ``status`` of ``running`` means the
+    waits; ``poll_job`` passes its own. A ``status`` of ``running`` means the
     budget expired and the caller hands back a job handle rather than a result.
+    *submitted* is the submitting tool's: see :func:`_poll_submitted`.
 
-    *window_alive* seeds the flag with the submit round trip's, and *snap* the
-    snapshot, so a budget short enough to poll zero times still reports a closed
-    viewer and still answers with whatever its caller already knew. A submitting
-    tool has no snapshot yet and passes none, which reads as "running".
-
-    The wait is a loop sleep and each probe is a thread hop, so waiting costs
-    this process nothing: for however long it runs, the loop is free to serve
-    the observe page and any other client.
+    Each look is a read of the host's records (``host.jobs``), and the wait a
+    loop sleep, so waiting costs the kernel nothing and leaves this process's
+    loop free for every other caller.
     """
+    look = _poll_submitted if submitted else (lambda h, j: h.jobs.poll(j))
     deadline = time.monotonic() + (_app._promote_after if budget is None else budget)
-    snap, res = ({"status": "running"} if snap is None else snap), None
-    while time.monotonic() < deadline:
-        await asyncio.sleep(0.4)
-        snap, res, window_alive = await _kernel_rpc._job_call(host, "poll", job_id)
-        if snap is None:
-            return None, res, None
-        if snap.get("status") != "running":
-            break
-    return snap, res, window_alive
+    snap = look(host, job_id)
+    while snap.get("status") == "running" and time.monotonic() < deadline:
+        await asyncio.sleep(0.2)
+        snap = look(host, job_id)
+    return snap
 
 
 def _format_verification(record: dict, job_id: str, saved_path=None) -> str:
@@ -443,7 +431,7 @@ def _format_verification(record: dict, job_id: str, saved_path=None) -> str:
     for i, cell in enumerate(cells, 1):
         # The head, not the output: a verification's record is polled, and the
         # full text of every cell belongs to the notebook, not to a ledger line
-        # (see _jobs._Cell.snapshot).
+        # (see _job_log._CellRecord.snapshot).
         head = (cell.get("stdout_head") or "").strip()
         lines.append(
             f"  {i}. {cell.get('status')} · {cell.get('elapsed')}s"
@@ -756,9 +744,7 @@ async def execute_code(
     if msg is not None:
         return msg
 
-    snap, res, window_alive = await _await_job(host, job_id, window_alive)
-    if snap is None:
-        return _kernel_rpc._format_execute_result(res) + foreign_note
+    snap = await _await_job(host, job_id, submitted=True)
     if snap.get("status") != "running":
         return (
             _kernel_rpc._format_execute_result(snap)
@@ -871,7 +857,7 @@ async def verify_workflow(document: str, title: str = "") -> str:
     # second one here -- so a stranger is refused an interrupt on it exactly as
     # on the session kernel.
     writer, label = _writers._client_identity()
-    foreign_note = await asyncio.to_thread(_writers._foreign_activity_note, host)
+    foreign_note = _writers._foreign_activity_note(host)
     started = await asyncio.to_thread(
         _scratch.start,
         blocks,
@@ -995,7 +981,7 @@ async def poll_job(
     if err is not None:
         return err
 
-    foreign_note = await asyncio.to_thread(_writers._foreign_activity_note, host)
+    foreign_note = _writers._foreign_activity_note(host)
     if _scratch.owns(job_id):
         # A verification runs in a kernel this one cannot see. The id says which,
         # because the session child issued it (_scratch._ID_PREFIX).
@@ -1005,24 +991,12 @@ async def poll_job(
         if snap.get("status") == "running" and wait > 0:
             snap = await _await_verification(job_id, min(wait, _POLL_WAIT_MAX))
         return _format_job_status(snap) + foreign_note
-    snap, res, window_alive = await _kernel_rpc._job_call(host, "poll", job_id)
-    if snap is not None and snap.get("status") == "running" and wait > 0:
-        # Probe first, wait second: a job that is already terminal -- the common
-        # case for a caller that has been polling -- answers with no delay, and
-        # only a genuinely running one costs the wait.
-        snap, res, window_alive = await _await_job(
-            host, job_id, window_alive, budget=min(wait, _POLL_WAIT_MAX), snap=snap
-        )
-    if snap is None:
-        return _kernel_rpc._format_execute_result(res) + foreign_note
+    # A job that is already terminal -- the common case for a caller that has
+    # been polling -- answers with no delay; only a running one costs the wait.
+    snap = await _await_job(host, job_id, budget=min(max(wait, 0), _POLL_WAIT_MAX))
     if snap.get("status") == "unknown":
         return f"No such job '{job_id}'." + foreign_note
-    note = (
-        _kernel_rpc._window_note(window_alive)
-        if snap.get("status") != "running"
-        else ""
-    )
-    return _format_job_status(snap) + note + foreign_note
+    return _format_job_status(snap) + foreign_note
 
 
 @mcp.tool()
@@ -1360,7 +1334,7 @@ async def server_status() -> str:
     if res.get("status") == "ok":
         lines.append("")
         lines.append(res.get("stdout", "").rstrip())
-    elif res.get("status") == "busy":
+    elif res.get("status") == "timeout":
         lines.append("  (kernel busy — dask/tensor/viewer status unavailable)")
     else:
         lines.append("")
@@ -1368,11 +1342,20 @@ async def server_status() -> str:
             "  kernel query error: " + (res.get("error_text") or str(res.get("status")))
         )
 
-    # Only on this path: the early returns above are all "kernel not usable",
-    # where the digest round-trip cannot land anyway.
-    return "\n".join(lines) + await asyncio.to_thread(
-        _writers._foreign_activity_note, host
-    )
+    # From the host's records, so the list survives a kernel that is busy.
+    lines.append("")
+    lines.append("## Jobs")
+    jobs = host.jobs.summary()
+    for j in jobs:
+        lines.append(
+            f"  - {j['job_id']}: {j['status']} ({j['elapsed']}s, "
+            f"stdout {j['stdout_len']}b)"
+        )
+    if not jobs:
+        lines.append("  (none)")
+
+    # Only on this path: the early returns above are all "kernel not usable".
+    return "\n".join(lines) + _writers._foreign_activity_note(host)
 
 
 # ---------------------------------------------------------------------------

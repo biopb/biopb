@@ -120,17 +120,17 @@ a time, so verification takes the same admission slot ordinary work does
 without becoming a second scheduler. The slot lives in the **session
 child** (`_scratch.py`), not inside either kernel: `execute_code` checks
 `_scratch.running()` before submitting a session job, and `_scratch.start()`
-asks the session kernel's `_jobs.running_job()` before claiming the slot
-for a verification. Kernel-side admission (`_jobs.py`'s busy scan) is
+reads the session host's job records (`host.jobs.running()`) before claiming
+the slot for a verification. Kernel-side admission (`_jobs.py`'s busy scan) is
 unchanged and still handles ordinary job-vs-job contention on its own
 kernel; the child's slot layers on top for the cross-kernel case.
 
 **One accepted gap:** the child issues the scratch kernel's own job ids
 (`verify-N`, which is what lets `poll_job` route without asking either
 kernel), but the session kernel still issues its own `job-N`s, and a
-verification checks the session kernel by *asking* it — a check-then-act
-with a round trip, so two jobs can start within roughly a millisecond of
-each other. Closing it fully means the child issuing every job id, a
+verification checks the session through its host's records, which learn of a
+job from iopub a moment after it starts — a check-then-act, so two jobs can
+start within roughly a millisecond of each other. Closing it fully means the child issuing every job id, a
 larger change than this.
 
 A scratch kernel gets the default in-process scheduler like any other

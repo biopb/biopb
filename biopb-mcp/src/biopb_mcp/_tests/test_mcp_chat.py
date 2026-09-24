@@ -12,21 +12,15 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from biopb_mcp._tests.conftest import rpc_reply
 from biopb_mcp.mcp import _app, _chat, _kernel_rpc, _server, _writers
 
 _PNG = base64.b64encode(b"\x89PNG\r\n\x1a\n").decode()
 
 
 def _envelope(value, window_alive=True):
-    """A kernel reply carrying the job runner's ``<<JOB_JSON>>`` payload."""
-    return {
-        "stdout": _kernel_rpc._JOB_DELIM
-        + json.dumps({"r": value, "w": window_alive})
-        + "\n",
-        "result_text": "",
-        "error_text": "",
-        "status": "ok",
-    }
+    """A kernel reply carrying a job call's return value."""
+    return rpc_reply(value, window_alive)
 
 
 class _Kernel(MagicMock):
@@ -45,6 +39,40 @@ class _Kernel(MagicMock):
         field, which is what an older child looks like.
         """
         self._states = list(states)
+
+
+class _Jobs:
+    """``host.jobs`` for the chat fixture, answering from its scripted state."""
+
+    def __init__(self, host):
+        self._host = host
+
+    def poll(self, job_id):
+        h = self._host
+        state = h._states.pop(0) if len(h._states) > 1 else h._states[0]
+        snap = {
+            "job_id": job_id,
+            "status": state[0],
+            "stdout": state[1],
+            "result_text": "",
+            "error_text": "",
+            "elapsed": 0.1,
+        }
+        if len(state) > 2:
+            snap["stdout_total"] = state[2]
+        return snap
+
+    def foreign_digest(self, for_origin):
+        self._host.digest_origins.append(for_origin)
+        return list(self._host._digest)
+
+    def ack_foreign_digest(self, job_ids):
+        self._host.acked.append(list(job_ids))
+        self._host.events.append("ack")
+        return len(job_ids)
+
+    def summary(self):
+        return []
 
 
 @pytest.fixture
@@ -69,33 +97,20 @@ def chat_host():
     # acks it sends back. Empty by default: most tests are not about the notice.
     host._digest = []
     host.acked = []
+    host.digest_origins = []
+    # Submits and acks, in order.
+    host.events = []
+    host.jobs = _Jobs(host)
 
     def execute(code, *_args, **_kwargs):
         if "_jobs.submit(" in code:
+            host.events.append("submit")
             if host._submit is not None:
                 return _envelope(host._submit)
             return _envelope({"job_id": "job-1", "status": "running"})
-        if "_jobs.poll(" in code:
-            state = host._states.pop(0) if len(host._states) > 1 else host._states[0]
-            snap = {
-                "job_id": "job-1",
-                "status": state[0],
-                "stdout": state[1],
-                "result_text": "",
-                "error_text": "",
-                "elapsed": 0.1,
-            }
-            if len(state) > 2:
-                snap["stdout_total"] = state[2]
-            return _envelope(snap)
         if "_jobs.interrupt_current(" in code:
             host.interrupts.append(code)
             return _envelope({"job_id": "job-1", "interrupted": True, "status": "ok"})
-        if "_jobs.foreign_digest(" in code:
-            return _envelope(host._digest)
-        if "_jobs.ack_foreign_digest(" in code:
-            host.acked.append(code)
-            return _envelope(len(host._digest))
         if _kernel_rpc._PNG_DELIM in code or "screenshot" in code:
             return {
                 "stdout": _kernel_rpc._PNG_DELIM + _PNG + "\n",
@@ -578,12 +593,7 @@ class TestExecuteCode:
             {"content": "done"},
         )
         asyncio.run(_chat.run_turn("set x", model))
-        (snippet,) = [
-            c[0][0]
-            for c in chat_host.execute.call_args_list
-            if "foreign_digest(" in c[0][0]
-        ]
-        assert "foreign_digest('chat')" in snippet
+        assert chat_host.digest_origins == ["chat"]
 
     def test_the_notice_is_not_discharged_until_the_result_is_recorded(self, chat_host):
         # The ack promises the agent *has been told*, and it has been told when
@@ -597,10 +607,7 @@ class TestExecuteCode:
             {"content": "done"},
         )
         asyncio.run(_chat.run_turn("set x", model))
-        calls = [c[0][0] for c in chat_host.execute.call_args_list]
-        submitted = next(i for i, c in enumerate(calls) if "_jobs.submit(" in c)
-        acked = next(i for i, c in enumerate(calls) if "ack_foreign_digest(" in c)
-        assert acked > submitted
+        assert chat_host.events == ["submit", "ack"]
 
     def test_the_notice_is_discharged_only_once_it_has_been_delivered(self, chat_host):
         chat_host._digest = [{"job_id": "job-7", "status": "ok", "origin": "user"}]
@@ -609,10 +616,26 @@ class TestExecuteCode:
             {"content": "done"},
         )
         asyncio.run(_chat.run_turn("set x", model))
-        # Acked as the loop, because the kernel refuses an ack from a client
-        # that does not hold it -- a bystander must not retire a notice the
-        # agent working here never received.
-        assert chat_host.acked and "writer='biopb-chat'" in chat_host.acked[0]
+        assert chat_host.acked == [["job-7"]]
+
+    def test_the_notice_is_not_discharged_by_a_loop_that_does_not_hold_the_kernel(
+        self, chat_host
+    ):
+        # Acked as the loop, and only the holder may: a bystander must not
+        # retire a notice the agent working here never received.
+        chat_host._digest = [{"job_id": "job-7", "status": "ok", "origin": "user"}]
+        _writers._note_claim("someone-else")
+        chat_host._submit = {
+            "error": "not_owner",
+            "owner": "other",
+            "owner_id": "someone-else",
+        }
+        model = _scripted(
+            {"content": "", "tool_calls": [_call("execute_code", python_code="x = 1")]},
+            {"content": "done"},
+        )
+        asyncio.run(_chat.run_turn("set x", model))
+        assert chat_host.acked == []
 
     def test_nothing_is_acked_when_there_is_nothing_to_report(self, chat_host):
         model = _scripted(

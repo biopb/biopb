@@ -16,8 +16,12 @@ Design notes
 * **Several writers, serialized.** Jobs carry an ``origin`` — see
   :class:`_Job`. They share this one runner, so the rejection above is also what
   keeps the writers off each other's toes: no preemption, no queue, one ordering
-  of writes to the namespace. :func:`foreign_digest` is how the ``execute_code``
-  agent finds out its namespace changed under it; see ``docs/jupyter-clients.md``.
+  of writes to the namespace.
+* **The records live in the host.** Each job's start and end are announced on
+  iopub (:func:`_publish`) under the request its output is published under, and
+  the host keeps the record (``_job_log``): poll, the job list, export and the
+  foreign-activity digest are reads of the host's memory. This module keeps only
+  what it takes to run and stop jobs.
 * **One agent per kernel.** Serializing two *agents* would order their writes
   without making them mean anything — neither can see the other's model of the
   namespace. So the first non-user submitter claims the kernel and a second is
@@ -29,10 +33,10 @@ Design notes
   main thread.  GUI mutations from the worker thread are marshaled via
   :func:`run_on_main`; ``_bootstrap`` wraps ``add_tensor`` + the ``add_*``
   family so the common paths are automatic.
-* **Output capture.** A thread-aware stdout/stderr dispatcher (installed once by
-  :func:`install`) routes a job thread's prints into that job's buffer instead
-  of the kernel's iopub stream — keeping worker output out of iopub and away
-  from the main-thread ``<<JOB_JSON>>`` reply line.
+* **Output.** A job thread's prints go to iopub like any cell's: ipykernel
+  attributes a thread to the request that started it, which is the submit, so
+  the host files them under the job. A verification announces each cell's
+  start and end as well, so the host can split that one stream per cell.
 * **Stopping a job.** :func:`interrupt_current` force-stops the running job: it
   raises ``KeyboardInterrupt`` into the worker thread and, when a distributed dask
   client is active (the kernel's ``Client`` attached to the session child's
@@ -46,41 +50,21 @@ Design notes
 import ast
 import contextlib
 import ctypes
-import io
 import logging
+import os
 import sys
 import threading
 import time
 import traceback
 from concurrent.futures import Future
 
+from ._job_log import _MAX_RETAINED_JOBS, MSG_TYPE, _one_line
+
 logger = logging.getLogger(__name__)
 
 # Prepended to every job so the namespace tracks the asynchronously-connecting
 # tensor connection service (mirrors the old _server._REFRESH_PREFIX).
 _REFRESH_PREFIX = "client = _conn.client\n"
-
-# Keep at most this many terminal job records before evicting the oldest. The
-# ceiling is what a workflow can be *reconstructed* from: rewriting a session
-# into a clean program (:func:`submit` with ``verify_cells``) reads the
-# transcript, so eviction takes away the source material for the one step
-# nothing can automate. Raised from 32 once _MAX_JOB_OUTPUT_CHARS bounded a
-# single record -- until then one runaway cell grew without limit and a record
-# count bounded nothing.
-_MAX_RETAINED_JOBS = 200
-
-# Keep at most this many characters of one job's captured output. This is the
-# bound _MAX_RETAINED_JOBS is not: that caps how many records are kept, while a
-# single cell printing in a loop grew its buffer without limit, so 32 records
-# bounded nothing. Well above observe's 20k display cap, so a truncated *view*
-# still means "there is more in the record" rather than "the record ends here".
-_MAX_JOB_OUTPUT_CHARS = 200_000
-
-# How much of the front of a stream `write_output` copies aside so that
-# `output_head` can find the first line without rebuilding the buffer. Two
-# orders of magnitude above the 80-char line it has to find, so the only text
-# it can miss is a first line already too long to survive the cap anyway.
-_HEAD_SCAN_CHARS = 4096
 
 # Attribution for a KeyboardInterrupt this runner did not raise (see _run). The
 # kernel ignores SIGINT except while servicing a message (ipykernel installs
@@ -98,11 +82,15 @@ _EXTERNAL_INTERRUPT_MSG = (
 # multiscale texture upload can take a while.
 _RUN_ON_MAIN_TIMEOUT = 300.0
 
+# Env var carrying the number this kernel's job ids continue from: the host
+# keeps the records across kernel restarts, so ids must not start over. The
+# literal is mirrored in _kernel.ENV_JOB_SEQ (kept in sync by this comment).
+ENV_JOB_SEQ = "BIOPB_JOB_SEQ"
+
 # Module state, wired by install().
 _ip = None
 _jobs = {}  # job_id -> _Job
-_jobs_by_thread = {}  # thread ident -> _Job (active worker threads only)
-_job_seq = 0
+_job_seq = int(os.environ.get(ENV_JOB_SEQ) or 0)
 _lock = threading.RLock()
 
 # The one agent allowed to run code in this kernel, claimed by whoever submits
@@ -111,23 +99,6 @@ _lock = threading.RLock()
 # unclaimed.
 _owner = None
 _owner_label = ""
-
-# That agent's own job origin ("mcp", or "chat" for the in-process loop),
-# recorded by every non-user submit that starts a job. "Foreign" is a relation,
-# not a property, so every reader of it needs a point of view -- and the two
-# internal readers (:func:`_prune`, :func:`ack_foreign_digest`) have no asker to
-# take one from: they run under whoever submitted, which may be the human whose
-# cells the agent has yet to be told about. So the agent's is recorded here and
-# read from here. Until an agent submits, "mcp".
-#
-# Deliberately *not* conditioned on `writer`, the way the claim is. Identity and
-# point of view are different axes: a caller with no id neither claims nor is
-# checked (there is nothing to compare), but its cells are still recorded with
-# its origin, and a view that ignored them would call an unidentified chat
-# loop's own jobs foreign to it -- the #879 defect, for the one caller least
-# able to notice. One agent per kernel is what keeps a single value honest, and
-# where the claim can enforce that it does.
-_agent_origin = "mcp"
 
 # What the bootstrap binds into the kernel namespace. `_bootstrap` refuses to
 # let a user plugin shadow any of it (#92), and names it from here rather than
@@ -153,106 +124,7 @@ KERNEL_HANDLE_NAMES = frozenset(
 )
 
 
-def _dropped_marker(n):
-    """The line `output` prepends once the cap has discarded a head.
-
-    One spelling, because `output_head` has to recognise the same sentence it
-    would otherwise have to re-derive from the rebuilt text.
-    """
-    return f"...({n} earlier chars dropped)..."
-
-
-class _OutputBuffer:
-    """Capped stdout capture, plus the last expression's repr.
-
-    Shared by a job and by one cell of a verification run, because the two are
-    written to through the same two doors: :class:`_JobStream` routes a thread's
-    prints to whichever is bound to that thread, and :func:`_exec_capture`
-    stores the last expression's repr on whatever it is handed. One cap, one
-    dropped-head marker, one monotonic total -- so a cell reports its output the
-    way a job does without either having to remember to.
-    """
-
-    __slots__ = ("stdout", "stdout_dropped", "result_text", "head_prefix")
-
-    def __init__(self):
-        self.stdout = io.StringIO()
-        # Characters the cap has discarded from the front of `stdout`. Kept so
-        # the record can say it is partial and so a reader tracking growth has
-        # a number that only ever increases (see `output_total`).
-        self.stdout_dropped = 0
-        self.result_text = ""
-        # A bounded copy of the start of the stream, so `output_head` never has
-        # to rebuild the whole buffer to answer with one line. See there.
-        self.head_prefix = ""
-
-    def write_output(self, s):
-        """Append captured output, keeping at most the newest cap-worth.
-
-        The tail survives, for the reason the detail view keeps the tail: while
-        a cell is still running the newest output is the informative part.
-
-        Compacted at twice the cap rather than on every write, so the rewrite
-        happens once per cap-worth of output instead of once per print. Only the
-        job's own worker thread writes here (`_jobs_by_thread` is keyed by
-        thread), so no lock: a reader racing the swap gets the pre-compaction
-        buffer, which is longer but never torn.
-        """
-        if len(self.head_prefix) < _HEAD_SCAN_CHARS:
-            self.head_prefix += s[: _HEAD_SCAN_CHARS - len(self.head_prefix)]
-        n = self.stdout.write(s)
-        if self.stdout.tell() > 2 * _MAX_JOB_OUTPUT_CHARS:
-            text = self.stdout.getvalue()
-            keep = text[-_MAX_JOB_OUTPUT_CHARS:]
-            self.stdout_dropped += len(text) - len(keep)
-            buf = io.StringIO()
-            buf.write(keep)
-            self.stdout = buf
-        return n
-
-    def output(self):
-        """The captured output, marked when the cap dropped its head.
-
-        The marker is added on read rather than stored, so it cannot itself be
-        compacted away later, and so every consumer -- the agent's poll, the
-        observe detail, the notebook cell -- says the same thing without each
-        having to remember to.
-        """
-        text = self.stdout.getvalue()
-        if not self.stdout_dropped:
-            return text
-        return _dropped_marker(self.stdout_dropped) + "\n" + text
-
-    def output_total(self):
-        """Everything this buffer has ever taken, including what was dropped.
-
-        Monotonic, which `len(stdout)` is not once the cap compacts. A reader
-        streaming the output as it grows has to diff against this.
-
-        `tell()` rather than `len(getvalue())`: the buffer is append-only, so
-        the two agree, but `getvalue()` copies it -- and `jobs_summary` asks
-        every retained job for this on each ~1s observe poll.
-        """
-        return self.stdout_dropped + self.stdout.tell()
-
-    def output_head(self, limit=80):
-        """First non-blank line of :meth:`output`, without rebuilding it.
-
-        `_one_line(self.output())` would copy the whole capped buffer (up to
-        `_MAX_JOB_OUTPUT_CHARS`) to keep 80 characters, once per cell per poll
-        while a verification runs. `write_output` keeps the first
-        `_HEAD_SCAN_CHARS` instead, which is where a first line short enough to
-        survive `limit` must be. An opening run of whitespace longer than that
-        scan reports no head rather than a later line -- a preview field, and
-        nothing prints 4 KB of blanks before its first word.
-        """
-        if self.stdout_dropped:
-            # The real head is gone; say so, the way `output` does.
-            return _one_line(_dropped_marker(self.stdout_dropped), limit)
-        return _one_line(self.head_prefix, limit)
-
-
-class _Job(_OutputBuffer):
+class _Job:
     __slots__ = (
         "job_id",
         "code",
@@ -262,7 +134,6 @@ class _Job(_OutputBuffer):
         "interrupted",
         "origin",
         "intent",
-        "seen_by_agent",
         "thread",
         "started",
         "started_wall",
@@ -270,23 +141,23 @@ class _Job(_OutputBuffer):
         "verify",
         "code_preview",
         "intent_preview",
-        "tee",
+        "request",
+        "result_text",
     )
 
-    def __init__(self, job_id, code="", origin="mcp", intent=""):
-        super().__init__()
+    def __init__(self, job_id, code="", origin="mcp", intent="", request=None):
         self.job_id = job_id
-        # Whether this job's captured output also goes on to the real stream:
-        # set for a foreign client's cell (record_inline), whose client still
-        # has to see its own output; unset for a submit() job, whose worker
-        # thread has no other reader of stdout/stderr.
-        self.tee = False
+        # The execute request this job's output is published under: the submit
+        # for an agent's job, the cell's own for a foreign client's.
+        self.request = request
         # The submitted source (as passed to submit(), before the internal
         # _REFRESH_PREFIX), so the observe UI can show what each job ran.
         self.code = code
         # running | ok | error | interrupted
         self.status = "running"
         self.error_text = ""
+        # The last expression's repr (_exec_capture), announced with the end.
+        self.result_text = ""
         # Set by interrupt_current(): the job was force-stopped with a
         # KeyboardInterrupt raised into its thread, so its finalizer labels the
         # stop "interrupted" rather than a generic "error".
@@ -314,11 +185,6 @@ class _Job(_OutputBuffer):
         # a chat loop fills it. Free text, optional and unvalidated: it is
         # best-effort provenance for the notebook export, never a control input.
         self.intent = intent
-        # Whether the execute_code agent has been told about this *foreign* job
-        # (via foreign_digest). Unset on the agent's own jobs, which need no
-        # notice. One flag, because there is one reader; a second in-process
-        # reader would need this per-reader, not a bool.
-        self.seen_by_agent = False
         self.thread = None
         self.started = time.monotonic()
         # Wall-clock epoch at submit, for human-readable audit timestamps in the
@@ -329,9 +195,8 @@ class _Job(_OutputBuffer):
         # cell. Set at submit and never after: it decides which namespace the
         # job runs in, so a job cannot become a verification once started.
         self.verify = None
-        # The one-liners `jobs_summary` shows, cut once here rather than on
-        # every observe poll: `code` and `intent` are fixed at submit, and the
-        # summary re-split every retained job's full source at ~1 Hz.
+        # The one-liners the gate's refusal names the running job by
+        # (running_job), cut once here.
         self.code_preview = _one_line(code)
         self.intent_preview = _one_line(intent)
 
@@ -340,13 +205,12 @@ class _Job(_OutputBuffer):
         return round(end - self.started, 3)
 
     def snapshot(self):
+        """How the job stands, without its output, which only the host has."""
         return {
             "job_id": self.job_id,
+            "request": self.request,
             "code": self.code,
             "status": self.status,
-            "stdout": self.output(),
-            "stdout_dropped": self.stdout_dropped,
-            "stdout_total": self.output_total(),
             "result_text": self.result_text,
             "error_text": self.error_text,
             "cancel_reason": self.cancel_reason,
@@ -354,43 +218,25 @@ class _Job(_OutputBuffer):
             "intent": self.intent,
             "elapsed": self.elapsed(),
             "created": self.started_wall,
-            # Present only on a verification run, so an ordinary poll is
-            # unchanged and a client that predates this ignores the key. Light:
-            # a job snapshot is the *polled* shape, and the cells' output is
-            # already here once, in `stdout` (see _Cell.snapshot).
             "verify": self.verify.snapshot() if self.verify is not None else None,
         }
 
 
-class _Cell(_OutputBuffer):
-    """One cell of a verification run: its source, its outcome, its output.
+class _Cell:
+    """One cell of a verification run: its source and how it ended. Its output
+    is the host's (``_job_log._CellRecord``), split from the job's stream at the
+    boundaries :func:`_exec_cells` announces."""
 
-    Prints are teed to the owning job as well as kept here, because the two
-    readers want different cuts of the same stream: the notebook needs the
-    output split per cell, and ``poll_job`` on a long verification needs the
-    whole run's output accumulating in one place, the way it does for any other
-    job.
-    """
+    __slots__ = ("code", "status", "error_text", "result_text", "started", "finished")
 
-    __slots__ = ("code", "status", "error_text", "job", "started", "finished", "tee")
-
-    def __init__(self, code, job):
-        super().__init__()
+    def __init__(self, code):
         self.code = code
-        self.job = job
         # pending | ok | error | skipped
         self.status = "pending"
         self.error_text = ""
+        self.result_text = ""
         self.started = None
         self.finished = None
-        # A cell's own output already goes to its job via write_output below,
-        # never additionally to the real stream: only a foreign client's
-        # inline job (record_inline) ever sets this true.
-        self.tee = False
-
-    def write_output(self, s):
-        self.job.write_output(s)
-        return super().write_output(s)
 
     def elapsed(self):
         if self.started is None:
@@ -398,109 +244,32 @@ class _Cell(_OutputBuffer):
         end = self.finished if self.finished is not None else time.monotonic()
         return round(end - self.started, 3)
 
-    def snapshot(self, full=False):
-        """This cell's outcome; *full* adds the captured output.
-
-        The output is the expensive half, and not because building the dict
-        costs anything -- it is that this crosses a JSON round trip out of the
-        kernel every 0.4s while a verification runs. Shipping every cell's
-        output there sends the same bytes the job's own teed buffer already
-        carries, once more per cell: a 20-cell run polled 1.2 MB where an
-        ordinary job polls 200 KB, growing linearly with the workflow.
-
-        So the polled snapshot carries a one-line head and a length, the way
-        :func:`jobs_summary` does for a job, and the text is read once with
-        ``full=True`` by :func:`verified` when the notebook is built. The
-        ledger a report prints needs no more than the head; the notebook needs
-        all of it, and asks for it exactly once.
-        """
-        snap = {
-            "code": self.code,
-            "status": self.status,
-            "error_text": self.error_text,
-            "elapsed": self.elapsed(),
-            "stdout_len": self.output_total(),
-            "stdout_head": self.output_head(),
-        }
-        if full:
-            snap["stdout"] = self.output()
-            snap["result_text"] = self.result_text
-        return snap
-
 
 class _Verification:
-    """A candidate workflow, its cells, and what running them in a scratch
-    namespace did.
-
-    The record a workflow notebook is built from. It is deliberately *not* a
-    list of job ids: the program that works is a rewrite of the transcript, not
-    a selection from it — a cell that created a variable and a later cell that
-    corrected its value merge into one, and neither keeping nor dropping either
-    original gives a runnable document. So the cells here are the agent's own
-    text, and what makes them trustworthy is that they ran.
-    """
+    """A candidate workflow's cells, run in order in a scratch kernel. The
+    record a notebook is built from is the host's (``_job_log._VerifyRecord``)."""
 
     __slots__ = ("title", "cells", "created")
 
-    def __init__(self, title, cells, job):
+    def __init__(self, title, cells):
         self.title = title
-        self.cells = [_Cell(code, job) for code in cells]
+        self.cells = [_Cell(code) for code in cells]
         self.created = time.time()
 
-    def status(self):
-        """``ok`` once every cell ran, ``error`` at the first failure."""
-        if any(c.status == "error" for c in self.cells):
-            return "error"
-        if self.cells and all(c.status == "ok" for c in self.cells):
-            return "ok"
-        return "running"
-
-    def snapshot(self, full=False):
-        """The record; *full* carries each cell's captured output (see
-        :meth:`_Cell.snapshot`)."""
+    def snapshot(self):
         return {
             "title": self.title,
             "created": self.created,
-            "status": self.status(),
-            "cells": [c.snapshot(full=full) for c in self.cells],
+            "cells": [
+                {
+                    "code": c.code,
+                    "status": c.status,
+                    "error_text": c.error_text,
+                    "result_text": c.result_text,
+                }
+                for c in self.cells
+            ],
         }
-
-
-# -- output capture ---------------------------------------------------------
-
-
-class _JobStream:
-    """stdout/stderr proxy: route a job thread's writes to its job buffer,
-    otherwise delegate to the real (ipykernel) stream."""
-
-    def __init__(self, real):
-        self._real = real
-
-    def write(self, s):
-        ident = threading.get_ident()
-        job = _jobs_by_thread.get(ident)
-        if job is None:
-            return self._real.write(s)
-        n = job.write_output(s)
-        if job.tee:
-            return self._real.write(s)
-        return n
-
-    def flush(self):
-        try:
-            return self._real.flush()
-        except Exception:  # noqa: BLE001 - flush is best-effort
-            pass
-
-    def __getattr__(self, name):
-        return getattr(self._real, name)
-
-
-def _install_streams():
-    if not isinstance(sys.stdout, _JobStream):
-        sys.stdout = _JobStream(sys.stdout)
-    if not isinstance(sys.stderr, _JobStream):
-        sys.stderr = _JobStream(sys.stderr)
 
 
 # -- main-thread marshaling -------------------------------------------------
@@ -587,13 +356,12 @@ def _exec_cells(job, verification):
     marked ``skipped`` rather than dropped, so the report says how far the
     workflow got.
 
-    Prints route to the current cell — teed to the job — by rebinding this
-    thread's ``_jobs_by_thread`` entry around each one. The failure is re-raised
-    so the job's own finalizer sets the status and does the interrupt
-    attribution; there is one place that decides how a job ended, and this is
-    not it.
+    Each cell's start and end are announced (:func:`_publish` flushes the
+    streams first), so the host files the output between them under that cell,
+    as well as under the job. The failure is re-raised so the job's own
+    finalizer sets the status and does the interrupt attribution; there is one
+    place that decides how a job ended, and this is not it.
     """
-    ident = threading.get_ident()
     # The kernel's own namespace, because this only ever runs in a scratch
     # kernel: a process spawned for this verification and discarded after it
     # (`_scratch`). The isolation that used to be a filtered dict is the process
@@ -601,8 +369,8 @@ def _exec_cells(job, verification):
     # `sys.modules`, and anything a cell mutates in place.
     ns = _ip.user_ns if _ip is not None else {}
     try:
-        for cell in verification.cells:
-            _jobs_by_thread[ident] = cell
+        for index, cell in enumerate(verification.cells):
+            _publish({"event": "cell_start", "job_id": job.job_id, "index": index})
             cell.started = time.monotonic()
             try:
                 # No refresh prefix, unlike an ordinary cell: a verification
@@ -619,7 +387,17 @@ def _exec_cells(job, verification):
                 raise
             finally:
                 cell.finished = time.monotonic()
-                _jobs_by_thread[ident] = job
+                _publish(
+                    {
+                        "event": "cell_end",
+                        "job_id": job.job_id,
+                        "index": index,
+                        "status": cell.status,
+                        "error_text": cell.error_text,
+                        "result_text": cell.result_text,
+                        "elapsed": cell.elapsed(),
+                    }
+                )
     finally:
         # Whatever ended the run -- a failing cell, an interrupt -- the cells it
         # never reached are still `pending`. Relabel them here rather than in the
@@ -649,8 +427,87 @@ def _dask_backstop():
         return None
 
 
+def _request_id():
+    """The msg_id of the execute request this thread is serving, or None
+    outside a kernel (unit tests drive this module directly)."""
+    kernel = getattr(_ip, "kernel", None)
+    try:
+        return kernel.get_parent("shell")["header"]["msg_id"]
+    except Exception:  # noqa: BLE001 - no kernel, or no request in flight
+        return None
+
+
+def _publish(content):
+    """Announce a job event to the host on iopub (``_job_log`` reads it).
+
+    No parent header: a Jupyter client drops iopub from other sessions, and an
+    unknown message type under its own request would be one more thing for it
+    to ignore. The request the job's output goes under rides in the content.
+
+    The send runs on ipykernel's IOPub thread, as ``OutStream`` does: the
+    Session (its msg_id counter) is not thread-safe, and a job event is sent
+    from a job thread. Streams are flushed first -- ``flush`` waits until the
+    IOPub thread has taken the output -- so the job's last output is on iopub
+    ahead of its end.
+    """
+    kernel = getattr(_ip, "kernel", None)
+    iopub = getattr(kernel, "iopub_thread", None)
+    if iopub is None:
+        return
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except Exception:  # noqa: BLE001 - flush is best-effort
+            pass
+
+    def send():
+        try:
+            kernel.session.send(iopub, MSG_TYPE, content, ident=MSG_TYPE.encode())
+        except Exception:  # noqa: BLE001 - a lost event must not fail the job
+            logger.debug("job event not published", exc_info=True)
+
+    iopub.schedule(send)
+
+
+def _publish_start(job):
+    _publish(
+        {
+            "event": "start",
+            "job_id": job.job_id,
+            "request": job.request,
+            "origin": job.origin,
+            "intent": job.intent,
+            "code": job.code,
+            "created": job.started_wall,
+            # A verification's cells, so the host can hold a record per cell.
+            "verify": (
+                {
+                    "title": job.verify.title,
+                    "cells": [c.code for c in job.verify.cells],
+                    "created": job.verify.created,
+                }
+                if job.verify is not None
+                else None
+            ),
+        }
+    )
+
+
+def _publish_end(job):
+    _publish(
+        {
+            "event": "end",
+            "job_id": job.job_id,
+            "status": job.status,
+            "error_text": job.error_text,
+            "result_text": job.result_text,
+            "cancel_reason": job.cancel_reason,
+            "elapsed": job.elapsed(),
+        }
+    )
+
+
 def _run(job, code):
-    _jobs_by_thread[threading.get_ident()] = job
     exc = None
     try:
         _dead = _dask_backstop()
@@ -677,7 +534,6 @@ def _run(job, code):
         exc = True
         job.error_text = traceback.format_exc()
     finally:
-        _jobs_by_thread.pop(threading.get_ident(), None)
         job.finished = time.monotonic()
         # A user-triggered interrupt raises KeyboardInterrupt into the thread,
         # surfacing here as exc; interrupt_current flags it so the stop is
@@ -696,62 +552,33 @@ def _run(job, code):
                 if not job.error_text
                 else job.cancel_reason + "\n" + job.error_text
             )
-
-
-def _has_running_job():
-    return any(j.status == "running" for j in _jobs.values())
+        _publish_end(job)
 
 
 def _foreign(job, for_origin):
     """Whether *job* was written by someone other than *for_origin*'s client.
 
-    The rules this serves — the digest and the eviction hold — are about *whose*
-    job it is from that client's point of view, and both were written when "not
-    the agent" and "the user" were the same set. They are not once a chat loop
-    submits, so the test is spelled out here rather than inlined as
-    ``origin == "user"``.
-
-    Deliberately not the interrupt's question, which is "is this the *asker's*
-    job?" — see :func:`interrupt_current`. Answering it with this one refused
-    the chat loop its own cell.
-
-    *for_origin* is the asking client's own origin, because "someone else's
-    cell" is a relation, not a property: the chat loop submits as ``chat``, so
-    reading the digest from the MCP client's fixed point of view reported the
-    loop its own cells back to it as another writer's. Deliberately no default:
-    one used to stand in for the point of view here, and every caller that had
-    none silently got the MCP client's (biopb/biopb#879). A caller with no asker
-    to read one from wants :data:`_agent_origin`, and should say so.
+    "Someone else's cell" is a relation, not a property: the chat loop submits
+    as ``chat``, and a fixed "is it the MCP client's?" refused the loop its own
+    cell (biopb/biopb#880).
     """
     return job.origin != for_origin
 
 
 def _prune():
-    # Evict oldest-first, but never a foreign job the agent has not been told
-    # about yet: that digest entry is the agent's only notice that its namespace
-    # changed under it, and evicting the record silently drops the notice. So
-    # the cap can be exceeded — bounded by how many cells another writer runs
-    # between two agent calls, which is small.
-    #
-    # Foreign to _agent_origin, not to the submitter this runs under: a chat
-    # session's own jobs are foreign to "mcp" and can never be acked (the digest
-    # does not offer a client its own cells), so from that fixed point of view
-    # both halves of the guard held forever and the cap bounded nothing.
-    terminal = [
-        jid
-        for jid, j in _jobs.items()
-        if j.status != "running"
-        and not (_foreign(j, _agent_origin) and not j.seen_by_agent)
-    ]
+    # Oldest terminal first. Only the host's copy is the record anyone reads
+    # (_job_log, which also holds unseen foreign jobs against eviction); this
+    # one serves the refusal and the stop, and a verification's poll.
+    terminal = [jid for jid, j in _jobs.items() if j.status != "running"]
     while len(_jobs) > _MAX_RETAINED_JOBS and terminal:
         del _jobs[terminal.pop(0)]
 
 
-def _new_job(code, origin, intent=""):
+def _new_job(code, origin, intent="", request=None):
     """Register a job record under the next id. Call with `_lock` held."""
     global _job_seq
     _job_seq += 1
-    job = _Job(f"job-{_job_seq}", code, origin=origin, intent=intent)
+    job = _Job(f"job-{_job_seq}", code, origin=origin, intent=intent, request=request)
     _jobs[job.job_id] = job
     return job
 
@@ -807,7 +634,7 @@ def submit(
     from the observe page (never gated), or the session ending. That is the same
     principle as the ``origin="user"`` exemption, applied to recovery.
     """
-    global _owner, _owner_label, _agent_origin
+    global _owner, _owner_label
     with _lock:
         if origin != "user" and writer is not None:
             if _owner is None:
@@ -820,10 +647,6 @@ def submit(
                     "owner": _owner_label,
                     "owner_id": _owner,
                 }
-        # Re-assert the thread-aware stream wrap (idempotent) so a job thread's
-        # output is captured even if something replaced sys.stdout since
-        # install() — and so it works under pytest's per-phase capture.
-        _install_streams()
         for jid, j in _jobs.items():
             if j.status == "running":
                 return {
@@ -836,19 +659,13 @@ def submit(
             # them so the audit view of this job cannot disagree with the
             # workflow view of it.
             code = "\n\n# ---\n\n".join(verify_cells)
-        job = _new_job(code, origin, intent)
+        job = _new_job(code, origin, intent, request=_request_id())
         if verify_cells is not None:
-            job.verify = _Verification(verify_title, verify_cells, job)
-        if origin != "user":
-            # Here rather than at the claim check above, because a submit that
-            # is *refused* is not this kernel's agent working: both refusals
-            # ("not_owner", and "busy" a few lines up) return before this, so
-            # the point of view only moves for a job that exists. Letting a
-            # refusal move it left the next ack unable to discharge the
-            # previous agent's notices, which pins them against eviction --
-            # biopb/biopb#879 again, by another route.
-            _agent_origin = origin
+            job.verify = _Verification(verify_title, verify_cells)
         _prune()
+        # Before the thread starts, so the host has the record before any of
+        # the job's output reaches it.
+        _publish_start(job)
         thread = threading.Thread(
             target=_run, args=(job, code), name=job.job_id, daemon=True
         )
@@ -858,40 +675,48 @@ def submit(
 
 
 @contextlib.contextmanager
-def record_inline(code, origin="user"):
+def record_inline(code, request=None, origin="user"):
     """Record a cell running inline on this thread as a job, for its duration.
 
     For a foreign client's cell (``_kernel_gate``): it runs on the main thread
     as its client expects, and the record is what tells the agent about it, the
-    same as a job from :func:`submit`. Output is teed, so the client still sees
-    its own. The caller settles ``status`` (and ``error_text``) from the reply
-    before leaving the block; a block that raises instead is an ``error``.
+    same as a job from :func:`submit`. Its output goes to its own client as
+    usual, under *request*, which is how the host files it too. The caller
+    settles ``status`` (and ``error_text``) from the reply before leaving the
+    block; a block that raises instead is an ``error``.
 
     Not gated here: the caller refuses while a job runs, and nothing can start
     one meanwhile, since a submit is an execute request queued behind this one.
     """
     with _lock:
-        # Re-asserted for the same reason as in submit().
-        _install_streams()
-        job = _new_job(code, origin)
-        job.tee = True
+        job = _new_job(code, origin, request=request)
         _prune()
-    ident = threading.get_ident()
-    _jobs_by_thread[ident] = job
+    _publish_start(job)
     try:
         yield job
     finally:
-        _jobs_by_thread.pop(ident, None)
         job.finished = time.monotonic()
         if job.status == "running":
             job.status = "error"
+        _publish_end(job)
 
 
 def poll(job_id):
+    """*job_id*'s snapshot from this kernel's own copy: how it stands, without
+    output. The host's records (``_job_log``) come from iopub, which can drop a
+    message; this comes back on the shell reply, which cannot, so the host
+    settles a disagreement from it (``JobLog.settle``)."""
     job = _jobs.get(job_id)
     if job is None:
         return {"job_id": job_id, "status": "unknown", "error_text": ""}
     return job.snapshot()
+
+
+def status(job_id):
+    """*job_id*'s status alone: what the host checks its records against, often
+    enough that the whole snapshot would be waste."""
+    job = _jobs.get(job_id)
+    return "unknown" if job is None else job.status
 
 
 def _cancel_dask_futures(job, reason=None):
@@ -1040,150 +865,6 @@ def interrupt_current(reason=None, origin="user", writer=None):
     return {"job_id": job.job_id, "interrupted": bool(raised)}
 
 
-def _one_line(text, limit=80):
-    """First non-blank line of *text*, trimmed and length-capped.
-
-    Keeps jobs_summary light (the full source and the full intent are both in
-    the per-job snapshot) while giving each list row an identifying one-liner.
-    """
-    for line in text.splitlines():
-        line = line.strip()
-        if line:
-            return line if len(line) <= limit else line[: limit - 1] + "…"
-    return ""
-
-
-def jobs_summary():
-    return [
-        {
-            "job_id": j.job_id,
-            "status": j.status,
-            "origin": j.origin,
-            "elapsed": j.elapsed(),
-            "stdout_len": j.output_total(),
-            "code_preview": j.code_preview,
-            # Why the cell was run, when whoever ran it said. The observe list
-            # prefers it over the code line: "isolate the nuclei channel" tells
-            # the person watching what is happening to their data, and
-            # `arr = arr[..., 1]` makes them reconstruct it.
-            "intent_preview": j.intent_preview,
-        }
-        for j in _jobs.values()
-    ]
-
-
-def foreign_digest(for_origin="mcp"):
-    """Jobs the asking agent did not start and has not been told about yet,
-    oldest-first.
-
-    Returns ``[{"job_id", "status", "elapsed", "origin"}, ...]``; *origin* is
-    carried because the caller words the notice differently for a person than
-    for another agent. This is the agent's only notice that a second writer
-    touched its namespace — a redefined variable, a deleted layer — so it is
-    read on every agent-facing round trip and rendered into that call's result
-    (``_server._foreign_activity_note``). Pull, not push:
-    an MCP server->client notification is not reliably surfaced mid-turn, and
-    when the agent is idle there is no turn to interrupt.
-
-    *for_origin* is the asking client's own job origin -- ``"mcp"`` for a remote
-    client, ``"chat"`` for the in-process loop -- so each is told about the
-    *other* writers rather than about itself. ``seen_by_agent`` stays a single
-    flag because the kernel's one-agent claim makes the two mutually exclusive:
-    only one of them is ever the agent being promised a notice exactly once.
-
-    A pure read: marking entries reported is :func:`ack_foreign_digest`, a
-    **separate** call the caller makes only once the notice has actually reached
-    it. Acking here instead would consume the notice on a round trip whose reply
-    never arrived — ``execute_interactive`` sends before it starts its clock, so
-    a probe that times out is still queued at the kernel and runs when the main
-    thread frees up, setting the flag for a note nobody received.
-    """
-    with _lock:
-        return [
-            {
-                "job_id": j.job_id,
-                "status": j.status,
-                "elapsed": j.elapsed(),
-                "origin": j.origin,
-            }
-            for j in _jobs.values()
-            if _foreign(j, for_origin) and not j.seen_by_agent
-        ]
-
-
-def ack_foreign_digest(job_ids, writer=None):
-    """Mark the jobs in *job_ids* as reported; return how many were marked.
-
-    **Only the kernel's owner can discharge a notice.** Reading the digest is
-    open to anyone — a second client watching the session is welcome to see that
-    a cell ran — but ``seen_by_agent`` records that *the agent working here* has
-    been told, and it is promised the notice exactly once. A bystander's
-    ``poll_job`` acking it would retire a notice the owner never received, which
-    is the one failure this whole split exists to prevent. A caller with
-    ``writer=None`` is the in-process case and acks as before; an unclaimed
-    kernel has no owner to defer to.
-
-    *job_ids* is what the caller actually told the agent **and reported as
-    terminal** — never the whole digest. The status is deliberately **not**
-    consulted here: a job reported ``running`` that finished a moment later must
-    stay pending, because "job-7 ran (running)" is not the final status
-    the agent is promised exactly once. Re-reading the status instead would ack
-    precisely that job and retire it unheard — the race this split exists to
-    close. A status is monotone into terminal, so an id reported terminal is
-    still terminal now; no re-check can add information.
-    """
-    wanted = set(job_ids)
-    with _lock:
-        if writer is not None and _owner not in (None, writer):
-            return 0
-        acked = 0
-        for job in _jobs.values():
-            if (
-                _foreign(job, _agent_origin)
-                and not job.seen_by_agent
-                and job.job_id in wanted
-            ):
-                job.seen_by_agent = True
-                acked += 1
-        return acked
-
-
-def export():
-    """Full snapshots of all retained jobs, oldest-first, for notebook export.
-
-    A read like :func:`jobs_summary` (round-tripped on the kernel main thread, no
-    background job thread), but carrying each job's *full* source and captured
-    output so the observe UI can serialize the session to a Jupyter notebook.
-    """
-    return [j.snapshot() for j in _jobs.values()]
-
-
-def verify_record(job_id):
-    """*job_id*'s verification record with every cell's full output, or ``None``.
-
-    The other half of the polled/full split (:meth:`_Cell.snapshot`): a poll
-    ships a head and a length once every 0.4 s, and this is read **once**, when
-    the run ends, for the document the record exists to become. The session child
-    calls it before discarding the scratch kernel -- after which there is nobody
-    left to ask.
-    """
-    job = _jobs.get(job_id)
-    if job is None or job.verify is None:
-        return None
-    return job.verify.snapshot(full=True)
-
-
-def jobs_view():
-    """``{"jobs": [...]}`` for the observe poll.
-
-    The page also redraws from whether a verified workflow is available to
-    download, but that is no longer a fact about this kernel: verification runs
-    in a scratch kernel the session child spawns and discards, so the child
-    holds the record and merges it into this reply (``_observe._api_jobs``).
-    """
-    return {"jobs": jobs_summary()}
-
-
 def owner():
     """``{"owner": <id or None>, "label": <str>}`` — who holds this kernel."""
     with _lock:
@@ -1198,12 +879,10 @@ def reset():
     :func:`install` calls this on every bootstrap, and a hard restart replaces
     the process and its module state outright.
     """
-    global _owner, _owner_label, _agent_origin
+    global _owner, _owner_label
     with _lock:
         _jobs.clear()
-        _jobs_by_thread.clear()
         _owner, _owner_label = None, ""
-        _agent_origin = "mcp"
 
 
 # -- viewer wrapping --------------------------------------------------------
@@ -1217,9 +896,8 @@ def reset():
 
 
 def install(ip):
-    """Wire the job runner into the kernel: store the InteractiveShell, install
-    the thread-aware streams, and clear any prior job state."""
+    """Wire the job runner into the kernel: store the InteractiveShell and
+    clear any prior job state."""
     global _ip
     _ip = ip
-    _install_streams()
     reset()

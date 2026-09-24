@@ -5,8 +5,8 @@ this module covers only the child's ``/api/*`` that the page calls.
 
 Routes are exercised over the standalone Starlette app via Starlette's
 ``TestClient`` — no real socket, no real kernel. The kernel is a ``MagicMock``
-host returning canned ``execute`` results carrying the ``<<JOB_JSON>>`` envelope
-the in-kernel job runner prints, exactly as ``test_mcp_server.py`` does.
+host whose job records are a ``ScriptedJobs``, and whose ``execute`` returns a
+job call's canned reply, as in ``test_mcp_server.py``.
 
 The Host/Origin guard requires a loopback Host with a port, so the client's
 ``base_url`` is ``http://127.0.0.1:8766`` (matches the ``127.0.0.1:*`` allowlist
@@ -19,18 +19,13 @@ from unittest.mock import MagicMock
 import pytest
 from starlette.testclient import TestClient
 
-from biopb_mcp.mcp import _app, _http, _kernel_rpc, _observe, _scratch
+from biopb_mcp._tests.conftest import ScriptedJobs, rpc_reply
+from biopb_mcp.mcp import _app, _http, _observe, _scratch
 
 
 def _reply(r, window_alive=True):
-    """A kernel ``execute`` result whose stdout carries ``{"r": r, "w": ...}``."""
-    env = {"r": r, "w": window_alive}
-    return {
-        "stdout": _kernel_rpc._JOB_DELIM + json.dumps(env) + "\n",
-        "result_text": "",
-        "error_text": "",
-        "status": "ok",
-    }
+    """A kernel ``execute`` result carrying a job call's return value *r*."""
+    return rpc_reply(r, window_alive)
 
 
 def _raw(status="ok", stdout="", error_text=""):
@@ -54,7 +49,11 @@ def host():
         "recent_respawns": 0,
         "watchdog_running": True,
     }
-    h.execute.return_value = _reply({"jobs": [], "workflow": None})  # jobs_view()
+    # What an idle kernel's interrupt_current answers.
+    h.execute.return_value = _reply(
+        {"job_id": None, "interrupted": False, "status": "idle"}
+    )
+    h.jobs = ScriptedJobs()
     return h
 
 
@@ -92,40 +91,40 @@ def test_observe_page_is_not_served_by_the_child(client):
 
 
 def test_api_jobs_lists_summary(client, host):
-    host.execute.return_value = _reply(
-        {
-            "jobs": [
-                {
-                    "job_id": "job-1",
-                    "status": "running",
-                    "elapsed": 1.2,
-                    "stdout_len": 5,
-                    "code_preview": "print('hi')",
-                }
-            ],
-            "workflow": None,
-        }
+    host.jobs = ScriptedJobs(
+        summary=[
+            {
+                "job_id": "job-1",
+                "status": "running",
+                "elapsed": 1.2,
+                "stdout_len": 5,
+                "code_preview": "print('hi')",
+            }
+        ]
     )
     r = client.get("/api/jobs")
     assert r.status_code == 200
     body = r.json()
     assert body["jobs"][0]["job_id"] == "job-1"
     assert body["jobs"][0]["code_preview"] == "print('hi')"
+    # The host's records: the poll never enters the kernel.
+    host.execute.assert_not_called()
 
 
 def test_api_job_detail(client, host):
-    host.execute.return_value = _reply(
-        {
-            "job_id": "job-1",
-            "code": "print('hi')",
-            "status": "ok",
-            "stdout": "hi",
-            "result_text": "",
-            "error_text": "",
-            "cancel_reason": None,
-            "elapsed": 0.1,
-        },
-        window_alive=True,
+    host.jobs = ScriptedJobs(
+        polls=[
+            {
+                "job_id": "job-1",
+                "code": "print('hi')",
+                "status": "ok",
+                "stdout": "hi",
+                "result_text": "",
+                "error_text": "",
+                "cancel_reason": None,
+                "elapsed": 0.1,
+            }
+        ]
     )
     r = client.get("/api/jobs/job-1")
     assert r.status_code == 200
@@ -134,12 +133,12 @@ def test_api_job_detail(client, host):
     assert body["stdout"] == "hi"
     assert body["truncated"] is False
     assert body["stdout_len"] == 2
-    assert body["window_alive"] is True
+    host.execute.assert_not_called()
 
 
 def test_api_notebook_downloads_ipynb(client, host):
-    host.execute.return_value = _reply(
-        [
+    host.jobs = ScriptedJobs(
+        export=[
             {
                 "job_id": "job-1",
                 "code": "x = 1\nx",
@@ -166,8 +165,7 @@ def test_api_notebook_downloads_ipynb(client, host):
     )
     r = client.get("/api/notebook")
     assert r.status_code == 200
-    # The export round-trip asks the kernel for the full job history.
-    assert "export()" in host.execute.call_args[0][0]
+    host.execute.assert_not_called()
     assert r.headers["content-type"].startswith("application/x-ipynb+json")
     assert ".ipynb" in r.headers["content-disposition"]
     assert r.headers["x-filename"].endswith(".ipynb")
@@ -218,7 +216,6 @@ def test_api_notebook_workflow_serves_the_verified_run(client, host, monkeypatch
 
 
 def test_api_notebook_workflow_404s_when_nothing_is_verified(client, host):
-    host.execute.return_value = _reply(None)
     r = client.get("/api/notebook?workflow=1")
     assert r.status_code == 404
 
@@ -226,13 +223,12 @@ def test_api_notebook_workflow_404s_when_nothing_is_verified(client, host):
 def test_api_notebook_defaults_to_the_audit_export(client, host):
     # The default is unchanged, so a bookmarked URL and an older page both still
     # get the document they asked for.
-    host.execute.return_value = _reply([])
-    assert client.get("/api/notebook").status_code == 200
-    assert "export()" in host.execute.call_args[0][0]
+    r = client.get("/api/notebook")
+    assert r.status_code == 200
+    assert r.json()["nbformat"] == 4
 
 
 def test_api_notebook_empty_session(client, host):
-    host.execute.return_value = _reply([])
     r = client.get("/api/notebook")
     assert r.status_code == 200
     nb = json.loads(r.text)
@@ -283,8 +279,8 @@ class TestTheTwoKernels:
         return snap
 
     def test_verifications_are_their_own_list(self, client, host, monkeypatch):
-        host.execute.return_value = _reply(
-            {"jobs": [{"job_id": "job-1", "status": "ok", "elapsed": 0.1}]}
+        host.jobs = ScriptedJobs(
+            summary=[{"job_id": "job-1", "status": "ok", "elapsed": 0.1}]
         )
         self._running_verification(monkeypatch)
         body = client.get("/api/jobs").json()
@@ -362,16 +358,18 @@ def test_api_503_without_host(client):
 def test_detail_truncates_to_tail(client, host):
     _observe.configure(max_output_chars=50)
     big = "".join(str(i % 10) for i in range(200))
-    host.execute.return_value = _reply(
-        {
-            "job_id": "job-1",
-            "status": "ok",
-            "stdout": big,
-            "result_text": "",
-            "error_text": "",
-            "cancel_reason": None,
-            "elapsed": 0.1,
-        }
+    host.jobs = ScriptedJobs(
+        polls=[
+            {
+                "job_id": "job-1",
+                "status": "ok",
+                "stdout": big,
+                "result_text": "",
+                "error_text": "",
+                "cancel_reason": None,
+                "elapsed": 0.1,
+            }
+        ]
     )
     body = client.get("/api/jobs/job-1").json()
     assert body["truncated"] is True
@@ -384,9 +382,6 @@ def test_detail_truncates_to_tail(client, host):
 
 
 def test_detail_unknown_job_404(client, host):
-    host.execute.return_value = _reply(
-        {"job_id": "nope", "status": "unknown", "error_text": ""}
-    )
     assert client.get("/api/jobs/nope").status_code == 404
 
 
@@ -504,21 +499,14 @@ def test_set_chat_enabled_leaves_the_host_allowlists_alone(host):
     assert _http._extra_hosts == ("front",)
 
 
-# -- busy kernel ------------------------------------------------------------
-
-
-def test_busy_kernel_returns_200_marker(client, host):
-    host.execute.return_value = _raw(status="busy")
-    r = client.get("/api/jobs")
-    assert r.status_code == 200
-    body = r.json()
-    assert body["busy"] is True and body["jobs"] == []
+# -- kernel errors ----------------------------------------------------------
 
 
 def test_kernel_error_returns_502(client, host):
-    host.execute.return_value = _raw(status="error", error_text="kaboom")
-    r = client.get("/api/jobs")
+    host.execute.return_value = _raw(status="timeout", error_text="No reply")
+    r = client.post("/api/kernel/interrupt")
     assert r.status_code == 502
+    assert r.json()["error"] == "timeout"
 
 
 # -- describe() (server_status integration) ---------------------------------

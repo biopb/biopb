@@ -173,9 +173,9 @@ async def _api_jobs(request):
     host, err = _require_host()
     if err is not None:
         return err
-    result, res, _w = await _kernel_rpc._job_call(host, "jobs_view")
-    if result is None:
-        return _kernel_error(res)
+    # The host's records: this poll runs about once a second for the life of
+    # the session and never enters the kernel.
+    result = {"jobs": host.jobs.summary()}
     # The scratch kernel's runs and its verified workflow are the session
     # child's to report: both live here, and the session kernel cannot see
     # either. Its runs are a *separate* list rather than rows merged into
@@ -204,9 +204,7 @@ async def _api_job_detail(request):
         snap["truncated"] = truncated
         snap["stdout_len"] = full_len
         return JSONResponse(snap)
-    snap, res, win = await _kernel_rpc._job_call(host, "poll", job_id)
-    if snap is None:
-        return _kernel_error(res)
+    snap = host.jobs.poll(job_id)
     if snap.get("status") == "unknown":
         return JSONResponse({"error": "no such job", "job_id": job_id}, 404)
     shown, truncated, full_len = _truncate_tail(snap.get("stdout", ""))
@@ -218,7 +216,6 @@ async def _api_job_detail(request):
     total = snap.get("stdout_total", full_len)
     snap["truncated"] = truncated or total > full_len
     snap["stdout_len"] = total
-    snap["window_alive"] = win
     return JSONResponse(snap)
 
 
@@ -243,13 +240,7 @@ async def _api_notebook(request):
         filename = _notebook.suggested_workflow_filename(record.get("title", ""))
         return _notebook_response(nb, filename)
 
-    # Read the full job history on the kernel main thread (a plain read like
-    # jobs_summary(), no background job thread), then serialize to a notebook in
-    # this process.
-    jobs, res, _w = await _kernel_rpc._job_call(host, "export")
-    if jobs is None:
-        return _kernel_error(res)
-    nb = _notebook.build_notebook(jobs)
+    nb = _notebook.build_notebook(host.jobs.export())
     filename = _notebook.suggested_filename()
     return _notebook_response(nb, filename)
 

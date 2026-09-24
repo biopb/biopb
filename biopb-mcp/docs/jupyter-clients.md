@@ -33,13 +33,14 @@ the file.
 - **A client ignores the host's traffic.** qtconsole and Lab drop iopub
   messages whose parent session is not their own (qtconsole's
   `include_other_output` defaults off); only the busy/idle indicator reacts.
-- **A job's prints never reach iopub.** `_JobStream` diverts a worker thread's
-  output into the job's buffer, so a client sees the agent's code only if it
-  opts into other-output, and never its output.
+- **A job's prints go to iopub under the host's request.** ipykernel attributes
+  a worker thread's output to the request that started the thread, the host's
+  submit, so a client sees the agent's code and output only if it opts into
+  other-output.
 
-The host's `RLock` is not part of this story. It guards the *client*, because
-`execute_interactive` discards iopub messages that are not its own; it does not
-order anything in the kernel.
+The host adds no ordering of its own. Its one threaded client routes every
+shell reply and iopub message to the call it answers (`mcp/_kernel_io.py`), so
+its round trips overlap and the kernel orders them with everyone else's.
 
 ## The rule: reject, never block, never reroute
 
@@ -112,14 +113,38 @@ observe page is the tool for it.
 
 ### Record
 
-A foreign cell that runs is wrapped in a `_Job(origin="user")` for its
-duration: source from the request, status from the reply, output **teed** from
-the main-thread stream — `_JobStream` gains a tee mode for the main thread,
-writing both to the record and to the real ipykernel stream, so the notebook
-still sees its own output. `foreign_digest`, `ack_foreign_digest`, the observe
-history and the notebook export read `origin="user"` jobs already; none of
-them change. Rich output (`display_data`, `execute_result`) is not recorded:
-the record says what ran and whether it failed, not what it drew.
+The records live in the host (`mcp/_job_log.py`), built from iopub. The kernel
+announces each job's start and end as a `biopb_job` message
+(`_jobs._publish`) naming the request its output is published under; every
+`stream`, `execute_result` and `error` under that request is the job's. A
+foreign cell that runs is announced as `origin="user"` by the gate
+(`_jobs.record_inline`): source from the request, status from the reply, its
+output going to its own client as usual and filed by the host from the same
+iopub. An agent's job is announced by `submit`, its worker thread's prints
+attributed to the submit request.
+
+The announcement has no parent header: a client drops iopub from other
+sessions, and an unknown message type under its own request would be one more
+thing for it to ignore. Streams are flushed before the end is announced, so a
+job's output is complete when its record says it ended. iopub is a PUB socket
+and can drop under pressure; a start while another record is still running
+ends that one as "end not recorded", since only one job runs at a time.
+
+A verification cannot wait for a next start, so the scratch run also polls the
+kernel's own account (`_jobs.poll`) over the shell channel every 2 s. When two
+polls in a row disagree with the record, `JobLog.settle` replays the missing
+events. The outcome is then the kernel's, and output may be missing. The poll
+does not queue: a scratch kernel runs no user cells, only its one job, on a job
+thread, so its main thread is free. The session kernel has no such guarantee (a
+user's cell runs on its main thread), so its records are settled only by the
+next start or the kernel going away.
+
+Poll, the observe list and detail, the notebook export and the foreign-activity
+digest are reads of the host's memory, never a kernel round trip. Records
+outlive a kernel restart: one still running when its kernel goes is ended as
+interrupted, and the next kernel's job ids continue from the host's
+(`BIOPB_JOB_SEQ`). Display output (`display_data`) is not recorded: the record
+says what ran and whether it failed, not what it drew.
 
 ### Finding the kernel
 
@@ -156,8 +181,8 @@ A leftover `observe.console_enabled` in a config file is ignored.
 ### Attribution: `origin` on the job
 
 `_Job` carries `origin` (`"mcp"` | `"user"` | `"chat"`, see
-[chat-engines.md](chat-engines.md)), set when the record is made and carried
-through `snapshot()`, `jobs_summary()` and `export()`. A foreign client's cell
+[chat-engines.md](chat-engines.md)), set when the job starts and carried
+into the host's record, its snapshot, the job list and the export. A foreign client's cell
 is `"user"`.
 
 The writer count is two by construction: the first non-user submitter claims
@@ -182,11 +207,11 @@ note at return time:
 Read them with poll_job('job-7'). Variables and layers may have changed.]
 ```
 
-Each job carries a `seen_by_agent` flag, read by `foreign_digest()` and retired
-only by a later `ack_foreign_digest(ids)` the server makes after rendering the
-note — reading never consumes, since a probe that times out can still run at the
-kernel later. Only ids reported **terminal** are acked, without re-reading
-status. The agent is told that something changed and where to look, never what
+Each host record carries a `seen_by_agent` flag, read by `foreign_digest()` and
+retired only by a later `ack_foreign_digest(ids)` once the note is rendered into
+a result the agent will receive — reading never consumes. Only the kernel's
+holder can ack, and only ids reported **terminal** are acked, without
+re-reading status. The agent is told that something changed and where to look, never what
 changed. `_MAX_RETAINED_JOBS` never evicts an unseen user job.
 
 ## Gotchas
@@ -194,7 +219,7 @@ changed. `_MAX_RETAINED_JOBS` never evicts an unseen user job.
 - **`stop_on_error`.** Most clients send it true, so a foreign cell that
   errors — including the refusal — makes ipykernel abort requests already
   queued behind it. The host retries an `aborted` snippet once after a short
-  pause (`_execute_locked`); the gate's test should land a poll on a refusal.
+  pause (`_execute_internal`); the gate's test should land a poll on a refusal.
 - **A client's Ctrl-C** reaches the main thread only. If the agent's job is
   inside a `run_on_main` slot at that moment, the interrupt lands in the job,
   which the runner labels as an external interrupt naming an attached client.
@@ -226,6 +251,44 @@ while the kernel pid lives, and **no-ops kill and terminate** — Lab's restart
 and close-notebook must not take the session's kernel down. Until it exists,
 "connect a notebook" means qtconsole.
 
+## Open: ipykernel version
+
+**Everything here is verified on ipykernel 6.31 only.** `biopb-mcp` declares
+`ipykernel` unbounded, but it is capped transitively: `napari==0.7.0` pulls in
+`napari-console` 0.1.4, which requires `ipykernel<7`. So the lock, CI (which
+installs from it), the nightly fresh resolve (`unlocked-resolve.yaml`) and a
+user's `install.sh` all get 6.31, while PyPI has 7.3.0. The cap is someone
+else's: a `napari-console` release that lifts it, or a napari upgrade that
+brings one, moves every install to 7 with no change here. To do:
+
+1. **Pin** `ipykernel>=6.31,<7` in `biopb-mcp`'s `mcp` extra, so the cap is
+   this package's decision and survives a napari upgrade.
+2. **Verify against 7.3** once the cap can move: the `test_mcp_*` suites and
+   the napari smoke run in a venv with ipykernel 7.3, then move the pin.
+
+What 7 has to be checked for, since the gate and the records lean on ipykernel
+internals rather than the protocol:
+
+- **The `do_execute` override.** 6.31 calls `async do_execute(code, silent,
+  store_history, user_expressions, allow_stdin, *, cell_meta, cell_id)`, and
+  the gate reads the request's session and `msg_id` from `get_parent("shell")`.
+  Both signature and accessor have to hold, or the gate stops gating.
+- **Worker-thread output attribution.** A job's prints reach iopub under the
+  submit request because 6.31 maps a thread started during a request to that
+  request (`_associate_new_top_level_threads_with`). The records depend on it
+  (see Record); without it a job's output is filed under no job.
+- **Announcements from a worker thread.** `session.send` on `iopub_socket`
+  from the job thread, ordered after a stream flush from the same thread.
+- **Interrupt semantics.** Today: SIGINT is honoured only while a request is
+  being serviced (`_jobs._EXTERNAL_INTERRUPT_MSG` leans on this), a client's
+  Ctrl-C lands in the main thread, and Stop raises into the job's worker thread
+  with `PyThreadState_SetAsyncExc`, which does not break a blocking C call
+  until it returns. Under 7: whether SIGINT is still gated the same way,
+  where it lands with subshells running, and whether an interrupt reaches a
+  subshell at all.
+- **`stop_on_error`**: an errored or refused cell still aborts what is queued
+  behind it with status `aborted`, which the host retries once.
+
 ## v2 shape
 
 Two independent changes, either of which can come first.
@@ -233,22 +296,57 @@ Two independent changes, either of which can come first.
 **Subshells (ipykernel 7).** The host's tools move onto a subshell of their
 own, so a foreign cell on the main shell no longer holds them up. That is what
 turns the refusal into a bounded wait: the human's cell waits for the job,
-costing nobody but the human who chose to wait. The gate and the record are
-unchanged. The lock holds ipykernel 6.31 and the dependency is unpinned;
-whether an interrupt reaches a subshell is unverified.
+costing nobody but the human who chose to wait. It also takes the host's
+lifecycle calls off the main queue: restart's graceful close currently waits
+(up to 5 s) behind whatever holds the main thread and is skipped exactly when
+the kernel is busiest, and the observe page's Stop runs `interrupt_current`
+behind a user's long cell -- the one it was pressed to stop. Decided in the
+kernel from a subshell, Stop also needs no host-side guess at what is
+running. Limits: anything touching the viewer still marshals to the main
+thread and waits there; an agent submit could then overlap a user cell, so
+the gate needs a lock shared by `submit` and `record_inline`; and stopping a
+main-thread cell from a subshell may still need SIGINT, which an async
+exception is not.
 
-**The host subscribes to iopub.** A reader thread in the host demuxes iopub
-by parent message id into records kept in the host process. With the
-`_JobStream` diversion removed, ipykernel attributes a worker thread's prints
-to the submit request, so a job's output streams in live and `poll_job` becomes
-a read of host memory: the observe page's polling stops sending execute
-requests into the kernel, the client `RLock` and its busy status lose their
-purpose (nothing can eat another request's iopub any more), and a poll can no
-longer overrun and SIGINT the kernel. Records survive a kernel restart and can
-hold rich outputs, so the in-kernel tee comes out again. This is a refactor of
-how the host talks to the kernel, orthogonal to subshells and to the gate,
-which stays in-kernel either way — only kernel code can refuse a request
-before it runs.
+**Blocked by napari, not by verification.** `napari-console` requires
+`ipykernel<7` in its latest release (0.1.4), and napari depends on it
+unconditionally -- 0.7.0 and the current 0.9.1 alike -- so no napari upgrade
+reaches ipykernel 7. The paths: a `napari-console` release that lifts the cap;
+or a uv override of it, which every install path (`install.sh`, the lock, the
+nightly fresh resolve) would have to carry, against a cap that presumably
+guards napari's own console widget. Until then, the two lifecycle problems are
+solved inside ipykernel 6 instead, on the control channel, which ipykernel
+serves on its own thread: the graceful close in `GatedKernel.do_shutdown`
+(the host's `shutdown_request` runs it however busy the main thread is), and
+Stop as a custom control request decided in the kernel, which knows whether the
+running job is a main-thread cell (SIGINT) or a worker thread
+(`interrupt_current`). That leaves host calls queueing behind a user's cell,
+which subshells would not fully fix either: anything touching the viewer needs
+the main thread.
+
+**The host subscribes to iopub**, in three stages:
+
+1. *Transport (done).* A threaded client routes every reply and iopub message
+   by parent message id (`mcp/_kernel_io.py`). Round trips overlap instead of
+   queueing on a host lock, and "busy" is the kernel's own published status.
+2. *Records (done).* The kernel announces a job's start and end on iopub, and
+   the host keeps the records (see Record). A job's output streams in live,
+   the observe page's polling no longer sends execute requests into the
+   kernel, records survive a restart, and the in-kernel tee is gone. Job calls
+   that still enter the kernel (submit, interrupt) return their result as a
+   `user_expression` rather than a printed line, which a job's output under
+   the same request could split.
+3. *Verification (done).* A scratch kernel announces each cell's start and
+   end, flushing its streams first, so its host splits the one output stream
+   per cell (`_job_log._VerifyRecord`); `_scratch` polls that host's records,
+   and the session's busy check reads the session host's. The in-kernel
+   capture (`_JobStream`, the per-thread routing) is deleted. A scratch kernel
+   runs no watchdog, so `_scratch` ends the record itself when the process
+   dies, failing the cell it died in.
+
+This is a refactor of how the host talks to the kernel, orthogonal to
+subshells and to the gate, which stays in-kernel either way — only kernel code
+can refuse a request before it runs.
 
 ## Shape of the work
 
@@ -257,8 +355,8 @@ before it runs.
    Tests in `_tests/test_mcp_kernel.py` with a second `jupyter_client` attached
    to the real kernel: refused while a job runs, recorded when idle, silent code
    gated, an empty request passing, a poll during a refusal.
-2. `_jobs.py`: `_JobStream` tee for the main thread; a `record_inline`
-   context the gate wraps a foreign cell in. Tests in `test_mcp_jobs.py`.
+2. `_jobs.py`: a `record_inline` context the gate wraps a foreign cell in.
+   Tests in `test_mcp_jobs.py`. (The records later moved to the host, v2.)
 3. `health()` / `server_status` / observe status: the connection file and the
    attach command.
 4. Retire the console (own PR): routes, path root, control gate, page, doc.

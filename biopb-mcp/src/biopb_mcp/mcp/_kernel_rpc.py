@@ -1,9 +1,9 @@
 """The kernel round trip: calling into the in-kernel job runner, and reading back.
 
-Runs **in the MCP server process**. Every tool call and every observe/chat poll
+Runs **in the MCP server process**. Every call into the in-kernel job runner
 crosses this seam, and it is the same crossing each time: build a call
-expression, wrap it in a snippet that prints a delimited JSON payload, run it
-through the kernel host, and parse what comes back.
+expression, wrap it in a snippet that stores a JSON payload, run it through the
+kernel host with that payload as a ``user_expression``, and parse the reply.
 
 There is no marshaller on this hop -- the kernel execs source text -- so
 :func:`_call_expr` is what makes passing values safe: ``repr`` on every argument
@@ -14,6 +14,7 @@ A leaf module: it knows the shape of the hop and nothing about who is making it
 (no claim, no digest, no tool surface).
 """
 
+import ast
 import asyncio
 import functools
 import json
@@ -23,9 +24,12 @@ logger = logging.getLogger(__name__)
 
 _PNG_DELIM = "<<PNG_B64>>"
 
-# Delimiter for the single-line JSON payload the in-kernel job runner prints in
-# reply to a submit/poll/cancel/list snippet (mirrors the _PNG_DELIM pattern).
-_JOB_DELIM = "<<JOB_JSON>>"
+# The kernel variable a job call's JSON payload is stored in, and read back
+# from as a user_expression. Stored rather than printed: a job's own prints are
+# published under the submit request (ipykernel attributes a thread to the
+# request that started it), so a printed payload shared its stream with them.
+_RPC_VAR = "_biopb_rpc"
+_RPC_EXPRESSIONS = {"rpc": _RPC_VAR}
 
 # Sentinel printed by the screenshot snippet when the napari window has been
 # closed (the viewer survives in the namespace, but its canvas is destroyed).
@@ -56,7 +60,7 @@ def _call_expr(name: str, *args, **kwargs) -> str:
 
 
 def _payload_snippet(expr: str) -> str:
-    """Build a snippet that prints *expr*'s value as delimited JSON.
+    """Build a snippet that stores *expr*'s value as JSON in :data:`_RPC_VAR`.
 
     ``expr`` is a fully-formed expression, normally a call from
     :func:`_call_expr` (agent code is RCE by design, but embedding via ``repr``
@@ -70,10 +74,9 @@ def _payload_snippet(expr: str) -> str:
     round-trip.
     """
     return (
-        "import json as _json\n"
-        "print('" + _JOB_DELIM + "' + _json.dumps("
+        "import json as _json\n" + _RPC_VAR + " = _json.dumps("
         "{'r': " + expr + ", "
-        "'w': globals().get('_viewer_window_alive', lambda: None)()}))\n"
+        "'w': globals().get('_viewer_window_alive', lambda: None)()})\n"
     )
 
 
@@ -104,14 +107,15 @@ def _extract_delimited(text: str, delimiter: str) -> str | None:
     return None
 
 
-def _extract_json(text: str):
-    """Parse the single-line ``<<JOB_JSON>>`` payload from a job snippet."""
-    payload = _extract_delimited(text, _JOB_DELIM)
-    if payload is None:
+def _extract_payload(res: dict):
+    """The JSON payload a job snippet stored, from its reply's user_expressions,
+    or None. It comes back as the ``text/plain`` repr of a ``str``."""
+    value = (res.get("user_expressions") or {}).get("rpc") or {}
+    if value.get("status") != "ok":
         return None
     try:
-        return json.loads(payload)
-    except (ValueError, TypeError):
+        return json.loads(ast.literal_eval(value["data"]["text/plain"]))
+    except (KeyError, ValueError, TypeError, SyntaxError):
         return None
 
 
@@ -131,11 +135,13 @@ def _run_job_call(host, name: str, *args, timeout=None, **kwargs):
     wedged one sooner than two minutes.
     """
     res = host.execute(
-        _payload_snippet(_call_expr("_jobs." + name, *args, **kwargs)), timeout
+        _payload_snippet(_call_expr("_jobs." + name, *args, **kwargs)),
+        timeout,
+        _RPC_EXPRESSIONS,
     )
     if res.get("status") != "ok":
         return None, res, None
-    payload = _extract_json(res.get("stdout", ""))
+    payload = _extract_payload(res)
     if payload is None:
         return None, res, None
     return payload.get("r"), res, payload.get("w")
@@ -144,15 +150,14 @@ def _run_job_call(host, name: str, *args, timeout=None, **kwargs):
 async def _job_call(host, name: str, *args, timeout=None, **kwargs):
     """:func:`_run_job_call` off the event loop.
 
-    The round trip blocks: it waits on the kernel's lock (up to
-    ``kernel.busy_lock_timeout``) and then on the reply. Every surface in this
-    process shares one event loop -- ``/mcp``, the observe page, the chat
-    turn -- so a round trip made on it is not one caller waiting but all of
-    them: a five-second call leaves the observe page, ``/api/status`` and any
+    The round trip blocks until the kernel replies, which is as long as its
+    main thread is busy with something else. Every surface in this process
+    shares one event loop -- ``/mcp``, the observe page, the chat turn -- so a
+    round trip made on it is not one caller waiting but all of them: a
+    five-second call leaves the observe page, ``/api/status`` and any
     concurrent tool call unserved for five seconds.
 
-    The kernel host already expects concurrent callers -- its lock exists
-    because the tools and the observe API reach it at the same time -- so the
+    The kernel host takes calls from any thread and lets them overlap, so the
     thread is free of anything but the wait.
     """
     return await asyncio.to_thread(

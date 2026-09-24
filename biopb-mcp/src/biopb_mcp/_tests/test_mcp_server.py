@@ -15,7 +15,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from biopb_mcp._tests.conftest import call_tool as _tool
+from biopb_mcp._tests.conftest import ScriptedJobs, call_tool as _tool, rpc_reply
 from biopb_mcp.mcp import _app, _kernel_rpc, _server, _writers
 
 
@@ -35,9 +35,7 @@ def _job_envelope(r, window_alive=True):
     The snippet wraps the call result as ``{"r": <result>, "w": <window
     alive?>}``.
     """
-    return _result(
-        stdout=_kernel_rpc._JOB_DELIM + json.dumps({"r": r, "w": window_alive}) + "\n"
-    )
+    return rpc_reply(r, window_alive)
 
 
 def _job_reply(window_alive=True, **payload):
@@ -46,32 +44,24 @@ def _job_reply(window_alive=True, **payload):
     return _job_envelope(payload, window_alive=window_alive)
 
 
-def _install_replies(host, *, returns=None, queue=None, digest=()):
-    """Install kernel replies that dispatch on the *snippet*, not on call order.
+def _install_replies(host, *, returns=None, queue=None, digest=(), polls=()):
+    """Script a mock host: kernel replies, and the job records it holds.
 
-    Agent-facing tools carry a user-activity digest round-trip
-    (``_writers._foreign_activity_note``) alongside the call each test is actually
-    about. Answering that by content — rather than letting it consume a slot in
-    an ordered ``side_effect`` list — keeps every test's queue one-to-one with
-    the calls it asserts on, so an auxiliary round-trip can be added or removed
-    without renumbering unrelated tests.
-
-    ``queue`` is consumed in order; ``returns`` answers anything after it (or
-    everything, if no queue). ``digest`` is the user-job list the digest call
-    returns — empty by default, i.e. "the user ran nothing".
+    ``queue`` answers kernel round trips in order; ``returns`` answers anything
+    after it (or everything, if no queue). ``polls`` are the job snapshots the
+    host's records give, in order, and ``digest`` the foreign-activity digest
+    they hold — empty by default, i.e. "the user ran nothing". See
+    :class:`ScriptedJobs`.
     """
     pending = list(queue or [])
 
     def execute(code, *_args, **_kwargs):
-        if "_jobs.foreign_digest(" in code:
-            return _job_envelope(list(digest))
-        if "_jobs.ack_foreign_digest(" in code:
-            return _job_envelope(0)
         if pending:
             return pending.pop(0)
         return returns if returns is not None else _result()
 
     host.execute.side_effect = execute
+    host.jobs = ScriptedJobs(polls, digest)
     return host
 
 
@@ -138,6 +128,7 @@ def mock_kernel_host():
         "watchdog_running": True,
     }
     host.execute.return_value = _result()
+    host.jobs = ScriptedJobs()
     host.virtual_display = None  # real display unless a test says otherwise
     return host
 
@@ -720,10 +711,8 @@ class TestExecuteCode:
         # submit -> running, first poll -> terminal ok with output.
         _install_replies(
             server_with_host,
-            queue=[
-                _job_reply(job_id="job-1", status="running"),
-                _job_reply(**_snapshot(stdout="hello\n", result_text="3")),
-            ],
+            returns=_job_reply(job_id="job-1", status="running"),
+            polls=[_snapshot(stdout="hello\n", result_text="3")],
         )
         result = _tool(_server.execute_code, "print('hello'); 1 + 2")
         assert "hello" in result
@@ -732,10 +721,8 @@ class TestExecuteCode:
     def test_no_output_message(self, server_with_host):
         _install_replies(
             server_with_host,
-            queue=[
-                _job_reply(job_id="job-1", status="running"),
-                _job_reply(**_snapshot(stdout="", result_text="")),
-            ],
+            returns=_job_reply(job_id="job-1", status="running"),
+            polls=[_snapshot(stdout="", result_text="")],
         )
         result = _tool(_server.execute_code, "x = 42")
         assert result == "(no output)"
@@ -743,14 +730,12 @@ class TestExecuteCode:
     def test_error_path_includes_traceback(self, server_with_host):
         _install_replies(
             server_with_host,
-            queue=[
-                _job_reply(job_id="job-1", status="running"),
-                _job_reply(
-                    **_snapshot(
-                        status="error",
-                        error_text="Traceback...\nZeroDivisionError: division by zero",
-                    )
-                ),
+            returns=_job_reply(job_id="job-1", status="running"),
+            polls=[
+                _snapshot(
+                    status="error",
+                    error_text="Traceback...\nZeroDivisionError: division by zero",
+                )
             ],
         )
         result = _tool(_server.execute_code, "1 / 0")
@@ -787,10 +772,8 @@ class TestExecuteCode:
     def test_inline_result_appends_window_closed_note(self, server_with_host):
         _install_replies(
             server_with_host,
-            queue=[
-                _job_reply(job_id="job-1", status="running", window_alive=False),
-                _job_reply(window_alive=False, **_snapshot(stdout="done\n")),
-            ],
+            returns=_job_reply(job_id="job-1", status="running", window_alive=False),
+            polls=[_snapshot(stdout="done\n")],
         )
         result = _tool(_server.execute_code, "viewer.add_image(arr)")
         assert "done" in result
@@ -812,9 +795,7 @@ class TestJobTools:
     def test_poll_job_formats_status(self, server_with_host):
         _install_replies(
             server_with_host,
-            returns=_job_reply(
-                **_snapshot(status="running", stdout="step 1\n", elapsed=2.5)
-            ),
+            polls=[_snapshot(status="running", stdout="step 1\n", elapsed=2.5)],
         )
         # wait=0: this is about how a running job renders, not about waiting.
         result = _tool(_server.poll_job, "job-1", wait=0)
@@ -822,33 +803,20 @@ class TestJobTools:
         assert "step 1" in result
 
     def test_poll_job_unknown(self, server_with_host):
-        _install_replies(
-            server_with_host,
-            returns=_job_reply(job_id="job-9", status="unknown", error_text=""),
-        )
+        _install_replies(server_with_host)
         assert "No such job" in _tool(_server.poll_job, "job-9")
 
-    def test_poll_job_terminal_appends_window_closed_note(self, server_with_host):
-        _install_replies(
-            server_with_host,
-            returns=_job_reply(
-                window_alive=False, **_snapshot(status="ok", stdout="done\n")
-            ),
-        )
-        result = _tool(_server.poll_job, "job-1")
-        assert "viewer window is closed" in result
+    def test_poll_job_never_enters_the_kernel(self, server_with_host):
+        _install_replies(server_with_host, polls=[_snapshot(status="ok")])
+        assert "job-1: ok" in _tool(_server.poll_job, "job-1")
+        server_with_host.execute.assert_not_called()
 
-    def test_poll_job_running_omits_window_note(self, server_with_host):
-        # A still-running job: no terminal result yet, so no closed-window note.
-        _install_replies(
-            server_with_host,
-            returns=_job_reply(
-                window_alive=False, **_snapshot(status="running", stdout="step\n")
-            ),
-        )
-        # wait=0: this is about how a running job renders, not about waiting.
-        result = _tool(_server.poll_job, "job-1", wait=0)
-        assert "viewer window is closed" not in result
+    def test_a_job_just_submitted_is_running_until_its_record_arrives(
+        self, server_with_host
+    ):
+        # The submit's reply can beat the job's start announcement here.
+        _install_replies(server_with_host)
+        assert _server._poll_submitted(server_with_host, "job-1")["status"] == "running"
 
     def test_job_tools_no_host(self):
         _app._kernel_host = None
@@ -873,7 +841,7 @@ class TestUserActivityNote:
     ]
 
     def test_no_note_when_the_user_ran_nothing(self, server_with_host):
-        _install_replies(server_with_host, returns=_job_reply(**_snapshot()))
+        _install_replies(server_with_host)
         assert _writers._foreign_activity_note(server_with_host) == ""
 
     def test_note_lists_the_jobs_and_points_at_poll_job(self, server_with_host):
@@ -889,28 +857,26 @@ class TestUserActivityNote:
         # which would be a second thing to keep true.
         assert "re-check" in note
 
-    def test_ack_is_a_second_call_naming_only_terminal_jobs(self, server_with_host):
-        # The read must not ack: execute_interactive sends before it starts its
-        # timeout clock, so a probe that times out still runs at the kernel
-        # later -- acking inside it would retire a notice nobody received.
+    def test_ack_names_only_terminal_jobs(self, server_with_host):
         running = {"job_id": "job-9", "status": "running", "elapsed": 1.0}
         _install_replies(server_with_host, digest=[*self._DIGEST, running])
         _writers._foreign_activity_note(server_with_host)
-        calls = [c[0][0] for c in server_with_host.execute.call_args_list]
         # Named point of view: the digest is read as whoever is asking, so an
         # MCP client is not handed the chat loop's cells (or its own).
-        assert any("_jobs.foreign_digest('mcp')" in c for c in calls)
-        (ack,) = [c for c in calls if "ack_foreign_digest(" in c]
+        assert server_with_host.jobs.digest_origins == ["mcp"]
         # Terminal ones only: a job reported `running` was not given its final
         # status, so it must stay pending.
-        assert "'job-7'" in ack and "'job-8'" in ack
-        assert "job-9" not in ack
+        assert server_with_host.jobs.acked == ["job-7", "job-8"]
 
     def test_no_ack_when_there_is_nothing_to_report(self, server_with_host):
         _install_replies(server_with_host, digest=[])
         assert _writers._foreign_activity_note(server_with_host) == ""
-        calls = [c[0][0] for c in server_with_host.execute.call_args_list]
-        assert not [c for c in calls if "ack_foreign_digest(" in c]
+        assert server_with_host.jobs.acked == []
+
+    def test_the_digest_never_enters_the_kernel(self, server_with_host):
+        _install_replies(server_with_host, digest=self._DIGEST)
+        assert _writers._foreign_activity_note(server_with_host)
+        server_with_host.execute.assert_not_called()
 
     def test_note_says_a_repeat_is_not_a_new_cell(self, server_with_host):
         # foreign_digest re-reports a still-running cell every round trip, so the
@@ -924,28 +890,11 @@ class TestUserActivityNote:
         assert "since your last call" not in note
         assert "repeats until it ends" in note
 
-    def test_malformed_digest_yields_no_note(self, server_with_host):
-        # Auxiliary, like the window-liveness probe: it must never break the
-        # result the agent actually asked for.
-        for bad in ("not-a-list", [{"no_job_id": 1}], [None]):
-            server_with_host.execute.side_effect = None
-            server_with_host.execute.return_value = _job_envelope(bad)
-            assert _writers._foreign_activity_note(server_with_host) == ""
-
-    def test_unreachable_kernel_yields_no_note(self, server_with_host):
-        # Nothing is acked on this path either, so the notice is deferred to the
-        # next call rather than dropped.
-        server_with_host.execute.side_effect = None
-        server_with_host.execute.return_value = _result(status="busy")
-        assert _writers._foreign_activity_note(server_with_host) == ""
-
     def test_execute_code_carries_the_note(self, server_with_host):
         _install_replies(
             server_with_host,
-            queue=[
-                _job_reply(job_id="job-1", status="running"),
-                _job_reply(**_snapshot(stdout="done\n")),
-            ],
+            returns=_job_reply(job_id="job-1", status="running"),
+            polls=[_snapshot(stdout="done\n")],
             digest=self._DIGEST,
         )
         result = _tool(_server.execute_code, "x = 1")
@@ -953,28 +902,24 @@ class TestUserActivityNote:
         assert "job-7 (ok)" in result
 
     def test_a_non_owners_read_does_not_discharge_the_notice(self, server_with_host):
-        # poll_job is open to a watching client, but the ack must carry that
-        # client's id so the kernel can refuse it: retiring a notice the holder
-        # never received is the one failure the read/ack split exists to prevent.
+        # poll_job is open to a watching client, but retiring a notice the
+        # holder never received is the one failure the read/ack split exists to
+        # prevent.
         _install_replies(
             server_with_host,
-            returns=_job_reply(**_snapshot(status="ok")),
+            polls=[_snapshot(status="ok")],
             digest=self._DIGEST,
         )
+        _writers._note_claim("sess-A")
         with pytest.MonkeyPatch().context() as mp:
             mp.setattr(_writers, "_client_identity", lambda: ("sess-B", "other"))
-            _tool(_server.poll_job, "job-1")
-        (snippet,) = [
-            c[0][0]
-            for c in server_with_host.execute.call_args_list
-            if "ack_foreign_digest(" in c[0][0]
-        ]
-        assert "writer='sess-B'" in snippet
+            assert "job-7 (ok)" in _tool(_server.poll_job, "job-1")
+        assert server_with_host.jobs.acked == []
 
     def test_poll_job_carries_the_note(self, server_with_host):
         _install_replies(
             server_with_host,
-            returns=_job_reply(**_snapshot(status="ok", stdout="out\n")),
+            polls=[_snapshot(status="ok", stdout="out\n")],
             digest=self._DIGEST,
         )
         assert "job-7 (ok)" in _tool(_server.poll_job, "job-1")
@@ -1011,7 +956,7 @@ class TestUserActivityNote:
     def test_note_names_the_writer_when_it_is_not_the_user(self, server_with_host):
         _install_replies(
             server_with_host,
-            returns=_job_reply(**_snapshot(status="ok", stdout="out\n")),
+            polls=[_snapshot(status="ok", stdout="out\n")],
             digest=[{"job_id": "job-7", "status": "ok", "origin": "chat"}],
         )
         result = _tool(_server.poll_job, "job-1")
@@ -1213,7 +1158,7 @@ class TestInterruptRestart:
         # A busy kernel must never read as an unclaimed one: asking it who owns
         # it would fail *open* exactly when the holder has a job running, which
         # is when a stray restart costs the most.
-        _install_replies(server_with_host, returns=_result(status="busy"))
+        _install_replies(server_with_host, returns=_result(status="timeout"))
         _writers._claimed_by = "sess-A"
         try:
             with pytest.MonkeyPatch().context() as mp:
@@ -1366,9 +1311,9 @@ class TestServerStatus:
         assert "layers: 0" in result
 
     def test_handles_busy_kernel(self, server_with_host):
-        server_with_host.execute.return_value = _result(status="busy")
+        server_with_host.execute.return_value = _result(status="timeout")
         result = _tool(_server.server_status)
-        assert "busy" in result.lower()
+        assert "kernel busy — dask/tensor/viewer status unavailable" in result
 
     def test_no_sessions_or_bridge_sections(self, server_with_host):
         result = _tool(_server.server_status)
@@ -1807,9 +1752,7 @@ class TestPollJobRendersAVerification:
         monkeypatch.setattr(_server.asyncio, "sleep", _no_sleep)
 
     def test_a_terminal_verification_polls_as_its_report(self, server_with_host):
-        _install_replies(
-            server_with_host, returns=_job_reply(**_verify_snapshot(job_id="job-1"))
-        )
+        _install_replies(server_with_host, polls=[_verify_snapshot(job_id="job-1")])
         result = _tool(_server.poll_job, "job-1")
         assert "job-1: ok" in result
         assert "Verified" in result
@@ -1819,15 +1762,14 @@ class TestPollJobRendersAVerification:
         snap = _verify_snapshot()
         snap["status"] = "running"
         snap["stdout"] = "one\n"
-        _install_replies(server_with_host, returns=_job_reply(**snap))
+        _install_replies(server_with_host, polls=[snap])
         # wait=0: this is about how a running job renders, not about waiting.
         result = _tool(_server.poll_job, "job-1", wait=0)
         assert "Partial output" in result and "one" in result
 
     def test_an_ordinary_job_is_unaffected(self, server_with_host):
         _install_replies(
-            server_with_host,
-            returns=_job_reply(**_snapshot(status="ok", stdout="hi\n")),
+            server_with_host, polls=[_snapshot(status="ok", stdout="hi\n")]
         )
         assert "hi" in _tool(_server.poll_job, "job-1")
 
@@ -1888,8 +1830,8 @@ class TestToolsDoNotStallTheEventLoop:
         _app.set_promote_after(1.0)
         _install_replies(
             server_with_host,
-            queue=[_job_reply(job_id="job-1")],
-            returns=_job_reply(**_snapshot(status="running")),
+            returns=_job_reply(job_id="job-1"),
+            polls=[_snapshot(status="running")],
         )
         ticks, result = asyncio.run(self._ticks_during(_server.execute_code("x = 1")))
         assert "still running" in result
@@ -1996,13 +1938,11 @@ class TestPollJobWaits:
 
     @staticmethod
     def _polls(host):
-        """How many `_jobs.poll(...)` round trips the kernel has been sent."""
-        return sum(
-            1 for call in host.execute.call_args_list if "_jobs.poll(" in call.args[0]
-        )
+        """How many times the host's records were read for the job."""
+        return host.jobs.polled
 
     def test_a_terminal_job_answers_immediately(self, server_with_host):
-        _install_replies(server_with_host, returns=_job_reply(**_snapshot(status="ok")))
+        _install_replies(server_with_host, polls=[_snapshot(status="ok")])
         started = time.monotonic()
         assert "job-1: ok" in _tool(_server.poll_job, "job-1")
         # Probe first, wait second: a finished job costs one round trip and no
@@ -2011,9 +1951,7 @@ class TestPollJobWaits:
         assert self._polls(server_with_host) == 1
 
     def test_an_unknown_job_answers_immediately(self, server_with_host):
-        _install_replies(
-            server_with_host, returns=_job_reply(**_snapshot(status="unknown"))
-        )
+        _install_replies(server_with_host)
         started = time.monotonic()
         assert "No such job" in _tool(_server.poll_job, "job-9", wait=30)
         assert time.monotonic() - started < 1.0
@@ -2021,8 +1959,7 @@ class TestPollJobWaits:
 
     def test_wait_zero_is_the_old_one_shot_behaviour(self, server_with_host):
         _install_replies(
-            server_with_host,
-            returns=_job_reply(**_snapshot(status="running", stdout="a\n")),
+            server_with_host, polls=[_snapshot(status="running", stdout="a\n")]
         )
         result = _tool(_server.poll_job, "job-1", wait=0)
         assert "job-1: running" in result and "a" in result
@@ -2035,12 +1972,11 @@ class TestPollJobWaits:
         # rather than burn the rest of its budget.
         _install_replies(
             server_with_host,
-            queue=[
-                _job_reply(**_snapshot(status="running")),
-                _job_reply(**_snapshot(status="running")),
-                _job_reply(**_snapshot(status="ok", stdout="done\n")),
+            polls=[
+                _snapshot(status="running"),
+                _snapshot(status="running"),
+                _snapshot(status="ok", stdout="done\n"),
             ],
-            returns=_job_reply(**_snapshot(status="ok", stdout="done\n")),
         )
         started = time.monotonic()
         result = _tool(_server.poll_job, "job-1", wait=30)
@@ -2051,8 +1987,7 @@ class TestPollJobWaits:
 
     def test_the_wait_is_bounded_for_a_job_that_keeps_running(self, server_with_host):
         _install_replies(
-            server_with_host,
-            returns=_job_reply(**_snapshot(status="running", stdout="a\n")),
+            server_with_host, polls=[_snapshot(status="running", stdout="a\n")]
         )
         started = time.monotonic()
         result = _tool(_server.poll_job, "job-1", wait=1.0)
@@ -2066,14 +2001,12 @@ class TestPollJobWaits:
         into a retry."""
         budgets = []
 
-        async def record(host, job_id, window_alive=None, budget=None, snap=None):
+        async def record(host, job_id, budget=None, submitted=False):
             budgets.append(budget)
-            return snap, None, window_alive
+            return _snapshot(status="running")
 
         monkeypatch.setattr(_server, "_await_job", record)
-        _install_replies(
-            server_with_host, returns=_job_reply(**_snapshot(status="running"))
-        )
+        _install_replies(server_with_host, polls=[_snapshot(status="running")])
         _tool(_server.poll_job, "job-1", wait=3600)
         assert budgets == [_server._POLL_WAIT_MAX]
 

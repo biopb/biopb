@@ -17,17 +17,17 @@ from unittest.mock import MagicMock
 import pytest
 
 from biopb_mcp import _config
-from biopb_mcp._tests.conftest import call_tool as _tool
-from biopb_mcp.mcp import _app, _kernel_rpc, _scratch, _server, _writers
+from biopb_mcp._tests.conftest import (
+    call_tool as _tool,
+    iopub_event,
+    kernel_snapshot,
+    rpc_reply,
+)
+from biopb_mcp.mcp import _app, _scratch, _server, _writers
 
 
 def _envelope(result):
-    return {
-        "stdout": _kernel_rpc._JOB_DELIM + json.dumps({"r": result, "w": True}) + "\n",
-        "result_text": "",
-        "error_text": "",
-        "status": "ok",
-    }
+    return rpc_reply(result)
 
 
 def _cells_record(status="ok", title="wf"):
@@ -56,37 +56,51 @@ def _scratch_host(
     title="wf",
     hold=None,
     interrupt_lands=True,
+    jobs=None,
+    kernel=None,
 ):
-    """A stand-in scratch kernel that answers the four snippets ``_scratch`` sends.
+    """A stand-in scratch kernel host: the two job calls ``_scratch`` makes
+    into the kernel (submit, interrupt), and the job records it reads.
 
     *hold* is an ``Event``: while it is unset the kernel's job polls as still
     running, so a test can act on a verification that is genuinely in flight.
     *interrupt_lands* False models the case the escalation exists for -- cells
     wedged in a C call, where the KeyboardInterrupt is accepted and changes
-    nothing.
+    nothing. *jobs* replaces the scripted records with real ones, and *kernel*
+    is what the kernel's own ``_jobs.poll`` answers.
     """
     host = MagicMock()
     host.start.side_effect = on_start or (lambda: None)
+    host.is_alive.return_value = True
     record = _cells_record(job_status, title) if record is None else record
+
+    def poll(job_id):
+        snap = {
+            "job_id": job_id,
+            "status": "running"
+            if (hold is not None and not hold.is_set())
+            else job_status,
+            "stdout": "",
+            "error_text": "",
+            "verify": {**record, "cells": [{**record["cells"][0]}]},
+        }
+        # The polled ledger carries a head, never the full output.
+        snap["verify"]["cells"][0].pop("stdout", None)
+        return snap
+
+    if jobs is not None:
+        host.jobs = jobs
+    else:
+        host.jobs.poll.side_effect = poll
+        host.jobs.verify_record.side_effect = lambda job_id: record
 
     def execute(code, *_a, **_k):
         if "_jobs.submit(" in code:
             return _envelope({"job_id": "job-1"})
-        if "_jobs.poll(" in code:
-            snap = {
-                "job_id": "job-1",
-                "status": "running"
-                if (hold is not None and not hold.is_set())
-                else job_status,
-                "stdout": "",
-                "error_text": "",
-                "verify": {**record, "cells": [{**record["cells"][0]}]},
-            }
-            # The polled ledger carries a head, never the full output.
-            snap["verify"]["cells"][0].pop("stdout", None)
-            return _envelope(snap)
-        if "_jobs.verify_record(" in code:
-            return _envelope(record)
+        if kernel is not None and "_jobs.poll(" in code:
+            return _envelope(kernel)
+        if kernel is not None and "_jobs.status(" in code:
+            return _envelope(kernel["status"])
         if "_jobs.interrupt_current(" in code:
             if interrupt_lands:
                 hold.set() if hold is not None else None
@@ -109,11 +123,12 @@ def _blocks(cells, prose="What this workflow does."):
 
 
 def _session_host(running=None):
-    """The session kernel, which ``_scratch`` asks only whether it is busy."""
+    """The session host, whose records ``_scratch`` reads only for whether a
+    job is running."""
     host = MagicMock()
-    host.execute.side_effect = lambda code, *a, **k: _envelope(
-        running if "_jobs.running_job(" in code else None
-    )
+    host.jobs.running.return_value = running
+    host.jobs.foreign_digest.return_value = []
+    host.execute.side_effect = lambda *a, **k: _envelope(None)
     return host
 
 
@@ -211,6 +226,48 @@ class TestRunningAVerification:
             "unavailable"
             in _scratch.start(_blocks(["1"]), "", _session_host())["error"]
         )
+
+
+class TestLostAnnouncements:
+    """iopub can drop; the run must still end. The kernel's own account, over
+    the shell channel, settles the records (``JobLog.settle``)."""
+
+    @pytest.fixture(autouse=True)
+    def quick(self, monkeypatch):
+        monkeypatch.setattr(_scratch, "_SETTLE_EVERY", 0.05)
+
+    def _run(self, announce):
+        from biopb_mcp.mcp._job_log import JobLog
+
+        jobs = JobLog()
+        announce(jobs)
+        kernel = kernel_snapshot(code="a = 2", cells=[("a = 2", "ok")])
+        host = _scratch_host(jobs=jobs, kernel=kernel)
+        _scratch.set_host_factory(lambda: host)
+        return _settle(
+            _scratch.start(_blocks(["a = 2"]), "wf", _session_host())["job_id"]
+        )
+
+    def test_a_lost_end_does_not_hang_the_run(self):
+        def announce_start(jobs):
+            jobs.on_iopub(
+                iopub_event(
+                    {
+                        "event": "start",
+                        "job_id": "job-1",
+                        "request": "req-1",
+                        "verify": {"title": "wf", "cells": ["a = 2"]},
+                    }
+                )
+            )
+
+        snap = self._run(announce_start)
+        assert snap["status"] == "ok"
+        assert _scratch.verified()["cells"][0]["status"] == "ok"
+
+    def test_nothing_on_iopub_at_all_does_not_hang_the_run(self):
+        snap = self._run(lambda jobs: None)
+        assert snap["status"] == "ok"
 
 
 class TestTheRunList:

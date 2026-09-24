@@ -94,7 +94,6 @@ interface JobDetail {
   truncated?: boolean;
   stdout_len?: number;
   elapsed?: number;
-  window_alive?: boolean;
   stdout?: string;
   result_text?: string;
   error_text?: string;
@@ -235,12 +234,10 @@ export default function ObservePage() {
     // a good job list with the empty one an error body parses as.
     if (sessionVerdict(r.status) !== "live") return;
     const data: {
-      busy?: boolean;
       jobs?: JobSummary[];
       verify_jobs?: JobSummary[];
       workflow?: WorkflowSummary | null;
     } = await r.json().catch(() => ({}));
-    if (data.busy) return; // transient; keep current render
     setWorkflow(data.workflow ?? null);
     const list = data.jobs || [];
     // Absent on an older child, which is not the same as "none ran": an empty
@@ -707,10 +704,7 @@ export function JobRow({
   const meta =
     detail == null
       ? ""
-      : note +
-        detail.elapsed +
-        "s" +
-        (detail.window_alive === false ? " · viewer window closed" : "");
+      : note + detail.elapsed + "s";
 
   return (
     <div
