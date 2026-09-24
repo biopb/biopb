@@ -270,6 +270,7 @@ class KernelHost:
         self._respawn_times = []  # monotonic timestamps of recent respawns
         self._dead = False  # respawn budget exhausted -> manual restart needed
         self._stopping = False  # an intentional restart/shutdown is in flight
+        self._restarting = False  # restart() in flight: calls read "starting"
 
     # -- lifecycle ------------------------------------------------------
 
@@ -547,9 +548,10 @@ class KernelHost:
                 "Kernel is dead (respawn budget exhausted). Call "
                 "start_kernel to launch a fresh kernel." + suffix,
             )
-        if self.is_alive():
+        if self.is_alive() or self._restarting:
             # A kernel exists but its bootstrap/health probe hasn't passed yet
-            # (e.g. a watchdog respawn in flight) — booting, not idle.
+            # (e.g. a watchdog respawn in flight), or a restart is between the
+            # kill and the relaunch — booting, not idle.
             return _status_result(
                 "starting",
                 "Kernel is still starting (napari viewer / dask bring-up). "
@@ -688,6 +690,7 @@ class KernelHost:
         with self._lock:
             # Tell the watchdog this alive->dead transition is intentional.
             self._stopping = True
+            self._restarting = True
             # A restart is a recovery attempt: clear any stale failure / teardown
             # reason up front so a concurrent server_status/execute (which read
             # them without the lock) see "starting" (recovering) rather than the
@@ -713,6 +716,7 @@ class KernelHost:
                 self._respawn_times.clear()
             finally:
                 self._stopping = False
+                self._restarting = False
         # Re-arm the watchdog if it had stopped (e.g. respawn budget exhausted).
         self._start_watchdog()
 

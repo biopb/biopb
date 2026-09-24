@@ -110,24 +110,23 @@ class TestKernelControl:
         assert results["slow"]["stdout"] == "slow\n"
         assert not kernel.is_busy()
 
-    def test_a_restart_turns_new_calls_away_before_its_graceful_close(self, kernel):
-        # The close waits behind whatever holds the main thread; a call made
-        # meanwhile must not reach the kernel being replaced (a submit there
-        # would start a job that is killed, after its tensor client closed).
-        holder = threading.Thread(
-            target=kernel.execute, args=("import time; time.sleep(2)",), daemon=True
-        )
-        holder.start()
-        time.sleep(0.3)
+    def test_a_restart_turns_new_calls_away_until_it_is_back(self, kernel):
+        # A call made mid-restart must not reach the kernel being replaced (a
+        # submit there would start a job that is killed, after its tensor
+        # client closed), and is told the kernel is starting -- not "call
+        # start_kernel", which would be wrong advice between kill and relaunch.
         restarter = threading.Thread(target=kernel.restart, daemon=True)
         restarter.start()
-        time.sleep(0.3)
-        started = time.monotonic()
-        res = kernel.execute("x = 1", timeout=30.0)
-        assert res["status"] == "starting", res
-        assert time.monotonic() - started < 1.0
+        seen = set()
+        while restarter.is_alive():
+            started = time.monotonic()
+            res = kernel.execute("x = 1", timeout=30.0)
+            if res["status"] != "ok":
+                seen.add(res["status"])
+                assert time.monotonic() - started < 1.0
+            time.sleep(0.05)
         restarter.join(timeout=60.0)
-        holder.join(timeout=10.0)
+        assert seen == {"starting"}
         assert kernel.execute("print('back')")["stdout"] == "back\n"
 
     def test_a_call_in_flight_fails_fast_on_shutdown(self, kernel):
@@ -1210,10 +1209,16 @@ class TestJupyterClientGate:
         )
 
     @staticmethod
-    def _hold_main(host, kc, seconds=30):
-        """Start a foreign cell that holds the main thread in a blocking sleep;
-        return its job id once the host's records have it running."""
-        kc.execute(f"import time\ntime.sleep({seconds})")
+    def _hold_main(host, kc, seconds=30, blocking=False):
+        """Start a foreign cell that holds the main thread, in one blocking
+        sleep or in short ones; return its job id once the host's records have
+        it running."""
+        code = (
+            f"import time\ntime.sleep({seconds})"
+            if blocking
+            else f"import time\nfor _ in range({seconds * 20}): time.sleep(0.05)"
+        )
+        kc.execute(code)
         _wait_until(lambda: host.jobs.running() is not None, timeout=10.0)
         running = host.jobs.running()
         assert running is not None and running["origin"] == "user"
@@ -1223,7 +1228,7 @@ class TestJupyterClientGate:
         # The observe page's Stop, on a user's cell. On the control channel,
         # so it is not queued behind the cell it stops, and a real SIGINT, so
         # a blocking sleep wakes up to take it.
-        job_id = self._hold_main(gated, foreign)
+        job_id = self._hold_main(gated, foreign, blocking=True)
         t0 = time.monotonic()
         out = gated.control("interrupt", job_id=job_id, reason="stopped by the user")
         assert out["interrupted"] is True

@@ -48,7 +48,6 @@ Design notes
   returns to Python bytecode, or by ``restart_kernel``.
 """
 
-import _thread
 import ast
 import contextlib
 import ctypes
@@ -452,6 +451,11 @@ def _publish(content):
     from a job thread. Streams are flushed first -- ``flush`` waits until the
     IOPub thread has taken the output -- so the job's last output is on iopub
     ahead of its end.
+
+    Sent from that thread straight to its socket (:class:`_OnIOPubThread`):
+    ``send_multipart`` would queue it a second time, behind output a flush
+    timer queued meanwhile, and a cell's start would then trail the cell's
+    first output.
     """
     kernel = getattr(_ip, "kernel", None)
     iopub = getattr(kernel, "iopub_thread", None)
@@ -465,11 +469,24 @@ def _publish(content):
 
     def send():
         try:
-            kernel.session.send(iopub, MSG_TYPE, content, ident=MSG_TYPE.encode())
+            kernel.session.send(
+                _OnIOPubThread(iopub), MSG_TYPE, content, ident=MSG_TYPE.encode()
+            )
         except Exception:  # noqa: BLE001 - a lost event must not fail the job
             logger.debug("job event not published", exc_info=True)
 
     iopub.schedule(send)
+
+
+class _OnIOPubThread:
+    """The IOPub thread's socket, for a send already running on that thread.
+
+    ``_really_send`` is what the thread's own queue ends in; it is ipykernel's
+    (6.x) and not public, so without it the send is queued as usual.
+    """
+
+    def __init__(self, iopub):
+        self.send_multipart = getattr(iopub, "_really_send", iopub.send_multipart)
 
 
 def _publish_start(job):
@@ -888,17 +905,25 @@ def interrupt(job_id, reason=None, origin="user", writer=None):
 
 
 def _interrupt_main():
-    """``SIGINT`` to this process, which Python delivers to the main thread.
+    """``SIGINT`` to the main thread, so a cell blocked in a sleep or a wait
+    wakes up to take it.
 
-    A real signal on POSIX, so a cell blocked in a sleep or a wait wakes up to
-    take it; ``interrupt_main`` elsewhere, which lands at the next bytecode.
     Only this process, where ``km.interrupt_kernel`` signals the whole group
-    (dask workers included).
+    (dask workers included). On POSIX, to the main thread itself: a
+    process-directed signal may be taken by another thread, leaving the main
+    thread's wait unbroken. On Windows ``raise_signal`` runs Python's C handler,
+    which sets the event a main-thread sleep waits on; ``interrupt_main`` only
+    sets the flag, which waits for the sleep to end.
+
+    Safe only while the main thread runs a request: ipykernel installs the
+    ``KeyboardInterrupt`` handler for exactly that span, and outside it a
+    raised SIGINT would take the default action. :func:`interrupt` holds the
+    lock the cell is ended under, so the cell is still in its request.
     """
     if os.name == "posix":
-        os.kill(os.getpid(), signal.SIGINT)
+        signal.pthread_kill(threading.main_thread().ident, signal.SIGINT)
     else:
-        _thread.interrupt_main()
+        signal.raise_signal(signal.SIGINT)
 
 
 def owner():
