@@ -198,13 +198,13 @@ def test_control_health_is_not_proxied(control):
     assert "path" not in payload
 
 
-def test_health_advertises_the_local_roots_gate(control):
+def test_health_advertises_whether_chat_is_proxied(control):
     # The observe page must know before it renders a composer, and only the
     # control knows this half. Unauthenticated like `auth_required`, and for the
     # same reason: the bundle needs it before it holds a token.
     _status, _headers, body = _get(f"{control}/health")
     # The fixture binds 127.0.0.1.
-    assert json.loads(body)["loopback_bound"] is True
+    assert json.loads(body)["chat_proxied"] is True
 
 
 def test_root_serves_the_spa_shell(control):

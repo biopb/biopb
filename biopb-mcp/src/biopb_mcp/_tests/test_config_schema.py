@@ -10,7 +10,7 @@ import dataclasses
 import pytest
 from jsonschema import Draft202012Validator
 
-from biopb_mcp._config import _CONSTRAINTS, _SECTION_CLASSES, DEFAULT_CONFIG
+from biopb_mcp._config import _CONSTRAINTS, _SECTION_CLASSES, DEFAULT_CONFIG, McpConfig
 from biopb_mcp._config_schema import build_mcp_config_schema
 
 
@@ -46,6 +46,22 @@ def test_every_scalar_field_is_a_property(schema):
             if f.name.startswith("_"):
                 continue
             assert f.name in props, f"{section}.{f.name} missing from schema"
+
+
+def test_every_section_says_whether_it_is_on_the_settings_page():
+    # The settings nav is read off the schema, so a section added with a bare
+    # field() would be silently absent; `_section` makes the choice explicit.
+    for f in dataclasses.fields(McpConfig):
+        assert "title" in f.metadata, f"{f.name}: declare it with _section()"
+        if f.metadata["title"]:
+            assert f.metadata["summary"], f"{f.name} has a title but no summary"
+
+
+def test_titled_sections_carry_their_nav_prose(schema):
+    titled = {k: v for k, v in schema["properties"].items() if "title" in v}
+    assert {"pyramid", "chat", "kernel"} <= set(titled)
+    assert not {"widget", "detection", "grid"} & set(titled)
+    assert all(v["description"] for v in titled.values())
 
 
 def test_scalar_defaults_and_help_emitted(schema):

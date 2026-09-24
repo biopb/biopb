@@ -8,7 +8,7 @@
 // Two roots, following the child's split: the reads are `/api/*`, which the
 // control always proxies, and the writes are `/chat/*`, which it proxies only
 // when it is loopback-bound. A write therefore 404s on a control that will not
-// serve it, which is why the pane gates on `localRootsProxied()` as well.
+// serve it, which is why the pane gates on `chatProxied()` as well.
 //
 // Everything goes through `sessionFetch`: both roots are behind the control's
 // auth gate, and a token is optional rather than absent on a loopback control

@@ -497,25 +497,82 @@ class UpdateConfig:
     )
 
 
+def _section(cls, title=None, summary=None):
+    """A top-level section. *title* and *summary* are its settings-page nav
+    label and panel prose (schema ``title`` / ``description``); a section with
+    no title is left off the page, still editable as raw JSON."""
+    return field(default_factory=cls, metadata={"title": title, "summary": summary})
+
+
 @dataclass
 class McpConfig:
-    """The whole biopb-mcp config: one field per top-level section."""
+    """The whole biopb-mcp config: one field per top-level section, in the
+    settings page's nav order."""
 
-    widget: WidgetConfig = field(default_factory=WidgetConfig)
-    detection: DetectionConfig = field(default_factory=DetectionConfig)
-    grid: GridConfig = field(default_factory=GridConfig)
-    pyramid: PyramidConfig = field(default_factory=PyramidConfig)
-    timeout: TimeoutConfig = field(default_factory=TimeoutConfig)
-    grpc: GrpcConfig = field(default_factory=GrpcConfig)
-    memory: MemoryConfig = field(default_factory=MemoryConfig)
-    transport: TransportConfig = field(default_factory=TransportConfig)
-    kernel: KernelConfig = field(default_factory=KernelConfig)
-    tensor: TensorRuntimeConfig = field(default_factory=TensorRuntimeConfig)
-    viewer: ViewerConfig = field(default_factory=ViewerConfig)
-    services: ServicesConfig = field(default_factory=ServicesConfig)
-    observe: ObserveConfig = field(default_factory=ObserveConfig)
-    chat: ChatConfig = field(default_factory=ChatConfig)
-    update: UpdateConfig = field(default_factory=UpdateConfig)
+    # The experimental image_processing/ demo widgets: not on the settings page.
+    widget: WidgetConfig = _section(WidgetConfig)
+    detection: DetectionConfig = _section(DetectionConfig)
+    grid: GridConfig = _section(GridConfig)
+
+    pyramid: PyramidConfig = _section(
+        PyramidConfig,
+        "Pyramid",
+        "How multiscale pyramids are built for large tensors added to the viewer.",
+    )
+    services: ServicesConfig = _section(
+        ServicesConfig,
+        "Services",
+        "ProcessImage algorithm servers wired into the kernel as `ops`, and the "
+        "knowledge store.",
+    )
+    timeout: TimeoutConfig = _section(
+        TimeoutConfig, "Timeouts", "Per-call gRPC timeouts for the compute plane."
+    )
+    grpc: GrpcConfig = _section(
+        GrpcConfig, "gRPC", "gRPC channel limits for the compute plane."
+    )
+    memory: MemoryConfig = _section(
+        MemoryConfig, "Memory", "Chunk-size guardrails for eager transfers."
+    )
+    transport: TransportConfig = _section(
+        TransportConfig,
+        "Transport",
+        "The MCP server's front-end transport (stdio / http) and its network guards.",
+    )
+    kernel: KernelConfig = _section(
+        KernelConfig,
+        "Kernel",
+        "The child Jupyter kernel that runs agent code: bring-up, timeouts, and "
+        "the orphan watchdog.",
+    )
+    tensor: TensorRuntimeConfig = _section(
+        TensorRuntimeConfig,
+        "Catalog Watcher",
+        "The background source-catalog watcher's backoff bounds.",
+    )
+    viewer: ViewerConfig = _section(
+        ViewerConfig, "Viewer", "How the napari viewer fetches image slices."
+    )
+    observe: ObserveConfig = _section(
+        ObserveConfig,
+        "Observe",
+        "The loopback web UI for watching execute_code job history (http "
+        "transport only).",
+    )
+    chat: ChatConfig = _section(
+        ChatConfig,
+        "Chat",
+        "Which model the built-in chat pane talks to. The on/off switch is on "
+        "the Observe page (chat_enabled); the provider key is not here, by "
+        "design — this file is served to the browser, so the key lives in an "
+        "owner-only credential file.",
+    )
+    update: UpdateConfig = _section(
+        UpdateConfig,
+        "Updates",
+        "The kernel-start auto-updater that offers to re-run the installer on a "
+        "newer release.",
+    )
 
 
 # Section name -> its dataclass, derived from McpConfig so the two never drift.

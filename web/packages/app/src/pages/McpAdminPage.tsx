@@ -10,8 +10,7 @@ import { authHeaders, redirectToUnlock } from "../auth";
 import { SectionFields } from "../components/admin/SectionFields";
 import { RawJsonPanel } from "../components/admin/RawJsonPanel";
 import {
-  MCP_DEFAULT_NAV_ID,
-  MCP_NAV,
+  mcpNav,
   mcpNavIdForErrorPath,
   mcpNavItemById,
 } from "../components/admin/mcpSections";
@@ -88,7 +87,8 @@ export default function McpAdminPage() {
   const [schema, setSchema] = useState<ConfigSchema | null>(null);
   const [path, setPath] = useState<string>("");
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [active, setActive] = useState<string>(MCP_DEFAULT_NAV_ID);
+  // Empty until chosen: the first section, once the schema names them.
+  const [active, setActive] = useState<string>("");
 
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -138,14 +138,16 @@ export default function McpAdminPage() {
   );
   const hasErrors = combinedErrors.length > 0;
 
+  const nav = useMemo(() => mcpNav(schema), [schema]);
+
   const erroredNavIds = useMemo(() => {
     const ids = new Set<string>();
     for (const e of combinedErrors) {
-      const id = mcpNavIdForErrorPath(e.path);
+      const id = mcpNavIdForErrorPath(nav, e.path);
       if (id) ids.add(id);
     }
     return ids;
-  }, [combinedErrors]);
+  }, [combinedErrors, nav]);
 
   async function onSave() {
     if (!config || hasErrors) return;
@@ -179,7 +181,7 @@ export default function McpAdminPage() {
     }
   }
 
-  const activeItem = mcpNavItemById(active);
+  const activeItem = mcpNavItemById(nav, active);
   // Show every field of the active section directly (no common/advanced split for
   // the mcp page): commonFields = all of the section's schema keys.
   const commonFields = activeItem.section
@@ -216,12 +218,12 @@ export default function McpAdminPage() {
 
       <main className="app-main admin-main">
         <nav className="admin-nav" aria-label="Settings sections">
-          {MCP_NAV.map((item) => (
+          {nav.map((item) => (
             <button
               key={item.id}
               type="button"
-              className={`admin-nav-item${item.id === active ? " active" : ""}`}
-              aria-current={item.id === active ? "page" : undefined}
+              className={`admin-nav-item${item.id === activeItem.id ? " active" : ""}`}
+              aria-current={item.id === activeItem.id ? "page" : undefined}
               onClick={() => setActive(item.id)}
             >
               <span className="admin-nav-label">{item.label}</span>
