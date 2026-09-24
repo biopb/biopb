@@ -1009,70 +1009,66 @@ class TestInspectObject:
 
 
 class TestInterruptRestart:
+    def _stopping(self, host, reply):
+        """A host whose records say job-3 is running, and whose kernel answers
+        the stop with *reply*."""
+        host.jobs = ScriptedJobs(running="job-3")
+        host.control.return_value = {"job_id": "job-3", **reply}
+        return host
+
     def test_interrupt_forces_running_job(self, server_with_host):
-        server_with_host.execute.return_value = _job_reply(
-            job_id="job-3", interrupted=True
-        )
+        self._stopping(server_with_host, {"interrupted": True})
         result = _tool(_server.interrupt_kernel)
-        snippet = server_with_host.execute.call_args[0][0]
-        assert "interrupt_current(" in snippet
+        (op,), kwargs = server_with_host.control.call_args
+        assert op == "interrupt" and kwargs["job_id"] == "job-3"
         assert "job-3" in result
 
     def test_interrupt_no_running_job(self, server_with_host):
-        server_with_host.execute.return_value = _job_reply(
-            job_id=None, interrupted=False
-        )
         assert "No running job" in _tool(_server.interrupt_kernel)
+        server_with_host.control.assert_not_called()
 
     def test_interrupt_no_host(self):
         _app._kernel_host = None
         assert "not initialized" in _tool(_server.interrupt_kernel)
 
+    def test_a_job_that_already_ended_is_not_stopped(self, server_with_host):
+        # The records named job-3; the kernel says it is over and job-4 runs.
+        # Nothing is stopped, and the agent is told what runs now.
+        self._stopping(
+            server_with_host,
+            {
+                "interrupted": False,
+                "refused": "not_running",
+                "running_job_id": "job-4",
+            },
+        )
+        result = _tool(_server.interrupt_kernel)
+        assert "job-3 is no longer running" in result
+        assert "job-4" in result
+
     def test_interrupt_asks_as_the_agent(self, server_with_host):
         # The asking origin is what lets the runner refuse a user's cell;
         # without it the refusal below can never trigger.
-        _install_replies(
-            server_with_host, returns=_job_reply(job_id="job-3", interrupted=True)
-        )
+        self._stopping(server_with_host, {"interrupted": True})
         _tool(_server.interrupt_kernel)
-        (snippet,) = [
-            c[0][0]
-            for c in server_with_host.execute.call_args_list
-            if "interrupt_current(" in c[0][0]
-        ]
-        assert "origin='mcp'" in snippet
+        assert server_with_host.control.call_args.kwargs["origin"] == "mcp"
 
     def test_interrupt_from_the_chat_loop_asks_as_the_chat_loop(self, server_with_host):
         # Asked as a fixed "mcp", the runner read a chat cell as another
         # writer's and refused the loop its own job (biopb/biopb#880) -- on the
         # session kernel, where the stop is not guaranteed.
-        _install_replies(
-            server_with_host, returns=_job_reply(job_id="job-3", interrupted=True)
-        )
+        self._stopping(server_with_host, {"interrupted": True})
         token = _writers._local_origin.set("chat")
         try:
             _tool(_server.interrupt_kernel)
         finally:
             _writers._local_origin.reset(token)
-        (snippet,) = [
-            c[0][0]
-            for c in server_with_host.execute.call_args_list
-            if "interrupt_current(" in c[0][0]
-        ]
-        assert "origin='chat'" in snippet
+        assert server_with_host.control.call_args.kwargs["origin"] == "chat"
 
     def test_interrupt_refused_when_another_client_holds_the_kernel(
         self, server_with_host
     ):
-        _install_replies(
-            server_with_host,
-            returns=_job_reply(
-                job_id="job-3",
-                interrupted=False,
-                status="running",
-                refused="not_owner",
-            ),
-        )
+        self._stopping(server_with_host, {"interrupted": False, "refused": "not_owner"})
         result = _tool(_server.interrupt_kernel)
         assert "already in use by another client" in result
         # The recovery named must be the person, not restart_kernel -- which is
@@ -1179,14 +1175,9 @@ class TestInterruptRestart:
             _writers.clear_claim()
 
     def test_interrupt_refused_on_a_user_job(self, server_with_host):
-        _install_replies(
+        self._stopping(
             server_with_host,
-            returns=_job_reply(
-                job_id="job-3",
-                interrupted=False,
-                status="running",
-                refused="foreign_job",
-            ),
+            {"interrupted": False, "refused": "foreign_job", "origin": "user"},
         )
         result = _tool(_server.interrupt_kernel)
         # Must not read as "nothing was running" -- the agent would retry or move

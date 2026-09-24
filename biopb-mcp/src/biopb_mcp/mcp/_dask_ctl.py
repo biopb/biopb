@@ -294,7 +294,7 @@ class DaskAttachment:
         self._mark_settled()
         return self.status()
 
-    # Teardown for the kernel's own shutdown path (_kernel._DASK_RELEASE_SNIPPET),
+    # Teardown for the kernel's own shutdown path (_kernel_gate._close_session),
     # which wants the workers stopped gracefully so they clean their spill files
     # rather than being reaped with the process group.
     shutdown = detach

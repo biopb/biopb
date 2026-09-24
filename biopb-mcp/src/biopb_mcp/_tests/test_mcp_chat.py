@@ -108,9 +108,6 @@ def chat_host():
             if host._submit is not None:
                 return _envelope(host._submit)
             return _envelope({"job_id": "job-1", "status": "running"})
-        if "_jobs.interrupt_current(" in code:
-            host.interrupts.append(code)
-            return _envelope({"job_id": "job-1", "interrupted": True, "status": "ok"})
         if _kernel_rpc._PNG_DELIM in code or "screenshot" in code:
             return {
                 "stdout": _kernel_rpc._PNG_DELIM + _PNG + "\n",
@@ -121,6 +118,14 @@ def chat_host():
         return {"stdout": "", "result_text": "", "error_text": "", "status": "ok"}
 
     host.execute.side_effect = execute
+
+    def control(op, timeout=None, **args):
+        if op == "interrupt":
+            host.interrupts.append(args)
+            return {"job_id": args["job_id"], "interrupted": True}
+        return None
+
+    host.control.side_effect = control
 
     old_host, old_poll = _app._kernel_host, _chat._POLL_INTERVAL
     _app.set_kernel_host(host)

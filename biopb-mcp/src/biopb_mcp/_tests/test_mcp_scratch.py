@@ -59,8 +59,9 @@ def _scratch_host(
     jobs=None,
     kernel=None,
 ):
-    """A stand-in scratch kernel host: the two job calls ``_scratch`` makes
-    into the kernel (submit, interrupt), and the job records it reads.
+    """A stand-in scratch kernel host: the calls ``_scratch`` makes into the
+    kernel (submit; interrupt and status on the control channel), and the job
+    records it reads.
 
     *hold* is an ``Event``: while it is unset the kernel's job polls as still
     running, so a test can act on a verification that is genuinely in flight.
@@ -97,17 +98,20 @@ def _scratch_host(
     def execute(code, *_a, **_k):
         if "_jobs.submit(" in code:
             return _envelope({"job_id": "job-1"})
-        if kernel is not None and "_jobs.poll(" in code:
-            return _envelope(kernel)
-        if kernel is not None and "_jobs.status(" in code:
-            return _envelope(kernel["status"])
-        if "_jobs.interrupt_current(" in code:
-            if interrupt_lands:
-                hold.set() if hold is not None else None
-            return _envelope({"interrupted": True, "job_id": "job-1"})
         return _envelope(None)
 
+    def control(op, timeout=None, **args):
+        if op == "interrupt":
+            if interrupt_lands and hold is not None:
+                hold.set()
+            return {"interrupted": True, "job_id": args["job_id"]}
+        if kernel is not None:
+            return kernel["status"] if op == "status" else kernel
+        # No kernel account scripted: it agrees with the records.
+        return host.jobs.poll(args["job_id"])["status"] if op == "status" else None
+
     host.execute.side_effect = execute
+    host.control.side_effect = control
     return host
 
 
@@ -469,7 +473,7 @@ class TestInterrupting:
 
     The claim is the scratch kernel's own: ``start`` submits with the verifying
     client's writer, so that kernel's ``_jobs.submit`` claims it and its
-    ``interrupt_current`` refuses everyone else -- the same rule as any other
+    ``interrupt`` refuses everyone else -- the same rule as any other
     job, enforced by the same code.
     """
 
@@ -522,12 +526,10 @@ class TestInterrupting:
         # Handed to the kernel, which owns the decision; it answered yes.
         assert data["interrupted"] is True
         assert data["job_id"] == job_id
-        (call,) = [
-            c[0][0]
-            for c in host.execute.call_args_list
-            if "_jobs.interrupt_current(" in c[0][0]
-        ]
-        assert "origin='mcp'" in call and "writer='agent-A'" in call
+        (call,) = [c for c in host.control.call_args_list if c.args[0] == "interrupt"]
+        # Naming the run's job in its kernel, which checks it is still running.
+        assert call.kwargs["job_id"] == "job-1"
+        assert call.kwargs["origin"] == "mcp" and call.kwargs["writer"] == "agent-A"
 
     def test_a_stranger_cannot_stop_it_during_the_bring_up(self):
         # The one window the kernel cannot answer for itself: it does not exist
@@ -622,11 +624,10 @@ class TestInterrupting:
         self, monkeypatch, session_host
     ):
         monkeypatch.setattr(_scratch, "interrupt", lambda *a, **k: None)
+        session_host.jobs.running.return_value = {"job_id": "job-5"}
+        session_host.control.return_value = {"job_id": "job-5", "interrupted": True}
         _tool(_server.interrupt_kernel)
-        assert any(
-            "_jobs.interrupt_current(" in c[0][0]
-            for c in session_host.execute.call_args_list
-        )
+        assert session_host.control.call_args.kwargs["job_id"] == "job-5"
 
     def test_the_tool_reports_a_refusal_as_a_refusal(self, monkeypatch, session_host):
         # Not as "no running job to interrupt" -- an agent told that would reach
@@ -638,10 +639,7 @@ class TestInterrupting:
         )
         result = _tool(_server.interrupt_kernel)
         assert "already in use" in result
-        assert not any(
-            "_jobs.interrupt_current(" in c[0][0]
-            for c in session_host.execute.call_args_list
-        )
+        session_host.control.assert_not_called()
 
 
 class TestDiscarding:

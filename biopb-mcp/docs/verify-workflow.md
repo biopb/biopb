@@ -139,8 +139,9 @@ and the global slot is what keeps two kernels from computing at once even
 then — the cost is that a verification's dask workers start cold and can't
 reuse the session's warm chunk cache.
 
-`interrupt_kernel` resolves through the kernel's own "single running job"
-check, so which kernel to signal is the session child's business. Its
+`interrupt_kernel` names the running job, and the kernel running it checks
+that it still is before stopping it, so which kernel to signal is the session
+child's business. Its
 *meaning* changes for a scratch kernel: on the session kernel interrupt is
 deliberately best-effort (a hard stop would cost the user their whole
 session), but a scratch kernel has nothing to lose, so its interrupt

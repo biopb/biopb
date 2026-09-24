@@ -60,11 +60,11 @@ from starlette.background import BackgroundTask
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-from . import _app, _http, _kernel_rpc, _notebook, _scratch, _writers
+from . import _app, _http, _notebook, _scratch, _writers
 
 logger = logging.getLogger(__name__)
 
-# Reason string threaded into the job record (via _jobs.interrupt_current) so the
+# Reason string threaded into the job record (via _jobs.interrupt) so the
 # agent sees, through its normal poll_job / execute_code result, that a *user* —
 # not it — stopped the work.
 _USER_INTERRUPT_MSG = "Interrupted by user via the observe web UI."
@@ -149,7 +149,6 @@ def set_chat_enabled(enabled):
 _route = _http.route
 _check_origin = _http.check_origin
 _require_host = _http.require_host
-_kernel_error = _http.kernel_error
 
 
 def _truncate_tail(text):
@@ -269,13 +268,20 @@ async def _api_interrupt(request):
     if _scratch.running() is not None:
         data = await asyncio.to_thread(_scratch.interrupt, _USER_INTERRUPT_MSG)
         return JSONResponse(data or {"interrupted": False})
-    # Force a KeyboardInterrupt into the running job's worker thread (SIGINT only
-    # reaches the kernel main thread, not the job), attributed to the user.
-    data, res, _w = await _kernel_rpc._job_call(
-        host, "interrupt_current", _USER_INTERRUPT_MSG
-    )
-    if data is None:
-        return _kernel_error(res)
+    # The row's job, which the kernel stops only if it is still the one
+    # running; without one, the job the records say is running.
+    job_id = request.query_params.get("job_id")
+    if job_id is None:
+        running = host.jobs.running()
+        if running is None:
+            return JSONResponse({"interrupted": False, "status": "idle"})
+        job_id = running["job_id"]
+    try:
+        data = await asyncio.to_thread(
+            host.control, "interrupt", job_id=job_id, reason=_USER_INTERRUPT_MSG
+        )
+    except Exception as exc:  # noqa: BLE001 - reported, not raised
+        return JSONResponse({"error": "kernel error", "detail": str(exc)}, 502)
     return JSONResponse(data)
 
 

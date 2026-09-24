@@ -179,73 +179,51 @@ class TestKernelLifecycle:
             host.shutdown()
         assert b"NATIVE_FD1_MARKER" in log.read_bytes()
 
-    def test_shutdown_attempts_graceful_close_before_kill(self, monkeypatch):
-        # On shutdown the kernel should be asked to close the tensor client /
-        # dask *before* _shutdown_current() group-kills it, so the tensor
-        # server sees a clean Flight GOAWAY rather than an abrupt socket drop
-        # (which can hang a subsequent `biopb server stop`).
-        from biopb_mcp.mcp import _kernel
+    @staticmethod
+    def _closable(host, marker):
+        """Bind a ``_conn`` whose client's close writes *marker*, the way the
+        kernel's graceful close (``_kernel_gate._close_session``) finds it."""
+        host.execute(
+            "import types\n"
+            "class _Client:\n"
+            f"    def close(self): open({str(marker)!r}, 'w').write('closed')\n"
+            "_conn = types.SimpleNamespace(client=_Client())"
+        )
 
+    def _spy_kill(self, host, monkeypatch, marker):
+        """Record, at the group-kill, whether the close had run."""
+        seen = []
+        real = host._shutdown_current
+
+        def spy():
+            seen.append(marker.exists())
+            return real()
+
+        monkeypatch.setattr(host, "_shutdown_current", spy)
+        return seen
+
+    def test_shutdown_closes_the_session_before_the_kill(self, monkeypatch, tmp_path):
+        # So the tensor server sees a clean Flight GOAWAY rather than an abrupt
+        # socket drop (which can hang a subsequent `biopb server stop`).
         host = KernelHost(health_probe_code=None, startup_timeout=60.0)
         host.start()
-
-        calls = []
-        real_execute = host._execute_internal
-        real_shutdown_current = host._shutdown_current
-
-        def _spy_execute(code, timeout):
-            calls.append(("execute", code, timeout))
-            return real_execute(code, timeout)
-
-        def _spy_shutdown_current():
-            calls.append(("shutdown_current",))
-            return real_shutdown_current()
-
-        monkeypatch.setattr(host, "_execute_internal", _spy_execute)
-        monkeypatch.setattr(host, "_shutdown_current", _spy_shutdown_current)
-
+        marker = tmp_path / "closed"
+        self._closable(host, marker)
+        seen = self._spy_kill(host, monkeypatch, marker)
         host.shutdown()
-
-        # The graceful-close snippet ran, bounded, before the group-kill.
-        assert calls[0][0] == "execute"
-        assert calls[0][1] is _kernel._GRACEFUL_CLOSE_SNIPPET
-        assert calls[0][2] == 2.0
-        assert ("shutdown_current",) in calls
-        assert calls.index(("shutdown_current",)) > 0
+        assert seen == [True]
         assert not host.is_alive()
 
-    def test_restart_attempts_graceful_close_before_kill(self, monkeypatch):
-        # restart() drops the tensor connection just as abruptly as shutdown(),
-        # so it must send the same graceful-close snippet (not just the dask
-        # release) before _shutdown_current() group-kills the old kernel --
-        # only the timeout budget differs (restart is not on the Ctrl-C path).
-        from biopb_mcp.mcp import _kernel
-
+    def test_restart_closes_the_session_before_the_kill(self, monkeypatch, tmp_path):
+        # A restart drops the tensor connection just as abruptly as a shutdown.
         host = KernelHost(health_probe_code=None, startup_timeout=60.0)
         host.start()
-
-        calls = []
-        real_execute = host._execute_internal
-        real_shutdown_current = host._shutdown_current
-
-        def _spy_execute(code, timeout):
-            calls.append(("execute", code, timeout))
-            return real_execute(code, timeout)
-
-        def _spy_shutdown_current():
-            calls.append(("shutdown_current",))
-            return real_shutdown_current()
-
-        monkeypatch.setattr(host, "_execute_internal", _spy_execute)
-        monkeypatch.setattr(host, "_shutdown_current", _spy_shutdown_current)
-
         try:
+            marker = tmp_path / "closed"
+            self._closable(host, marker)
+            seen = self._spy_kill(host, monkeypatch, marker)
             host.restart()
-
-            assert calls[0][0] == "execute"
-            assert calls[0][1] is _kernel._GRACEFUL_CLOSE_SNIPPET
-            assert calls[0][2] == 5.0
-            assert ("shutdown_current",) in calls
+            assert seen == [True]
             # Unlike shutdown, a restart respawns: the host comes back alive.
             assert host.is_alive()
         finally:
@@ -1164,7 +1142,6 @@ class TestWinJobReal:
 # ---------------------------------------------------------------------------
 
 _GATED_ARGS = [
-    "--IPKernelApp.kernel_class=biopb_mcp.mcp._kernel_gate.GatedKernel",
     # `_conn` because every job starts by reading `client` off it.
     "--IPKernelApp.exec_lines=import biopb_mcp.mcp._jobs as _jobs, types; "
     "_conn = types.SimpleNamespace(client=None); _jobs.install(get_ipython())",
@@ -1225,10 +1202,83 @@ class TestJupyterClientGate:
 
     @staticmethod
     def _stop_job(host):
-        host.execute("_jobs.interrupt_current()")
+        running = host.jobs.running()
+        if running is not None:
+            host.control("interrupt", job_id=running["job_id"])
         _wait_until(
             lambda: "None" in host.execute("print(_jobs.running_job())")["stdout"]
         )
+
+    @staticmethod
+    def _hold_main(host, kc, seconds=30):
+        """Start a foreign cell that holds the main thread in a blocking sleep;
+        return its job id once the host's records have it running."""
+        kc.execute(f"import time\ntime.sleep({seconds})")
+        _wait_until(lambda: host.jobs.running() is not None, timeout=10.0)
+        running = host.jobs.running()
+        assert running is not None and running["origin"] == "user"
+        return running["job_id"]
+
+    def test_stop_reaches_a_foreign_cell_on_the_main_thread(self, gated, foreign):
+        # The observe page's Stop, on a user's cell. On the control channel,
+        # so it is not queued behind the cell it stops, and a real SIGINT, so
+        # a blocking sleep wakes up to take it.
+        job_id = self._hold_main(gated, foreign)
+        t0 = time.monotonic()
+        out = gated.control("interrupt", job_id=job_id, reason="stopped by the user")
+        assert out["interrupted"] is True
+        reply = foreign.get_shell_msg(timeout=10)["content"]
+        assert reply["ename"] == "KeyboardInterrupt"
+        assert time.monotonic() - t0 < 10
+        (job,) = [j for j in self._jobs(gated) if j["job_id"] == job_id]
+        assert job["status"] == "interrupted"
+
+    def test_the_agent_is_refused_a_foreign_cell_without_waiting_on_it(
+        self, gated, foreign
+    ):
+        job_id = self._hold_main(gated, foreign)
+        try:
+            t0 = time.monotonic()
+            out = gated.control("interrupt", job_id=job_id, origin="mcp")
+            assert out["refused"] == "foreign_job"
+            assert time.monotonic() - t0 < 5
+            assert gated.jobs.running()["job_id"] == job_id
+        finally:
+            gated.control("interrupt", job_id=job_id)
+            foreign.get_shell_msg(timeout=10)
+
+    def test_a_stop_for_a_job_that_ended_stops_nothing(self, gated, foreign):
+        job_id = self._hold_main(gated, foreign)
+        try:
+            out = gated.control("interrupt", job_id="job-999")
+            assert out["refused"] == "not_running"
+            assert out["running_job_id"] == job_id
+            time.sleep(0.3)
+            assert gated.jobs.running()["job_id"] == job_id
+        finally:
+            gated.control("interrupt", job_id=job_id)
+            foreign.get_shell_msg(timeout=10)
+
+    def test_a_control_request_does_not_read_as_idle(self, gated, foreign):
+        # The kernel publishes busy/idle around a control request too; the idle
+        # after it says nothing about the main thread, still in the cell.
+        job_id = self._hold_main(gated, foreign)
+        try:
+            assert gated.control("status", job_id=job_id) == "running"
+            time.sleep(0.3)
+            assert gated.is_busy()
+        finally:
+            gated.control("interrupt", job_id=job_id)
+            foreign.get_shell_msg(timeout=10)
+
+    def test_restart_closes_the_session_while_a_cell_holds_the_main_thread(
+        self, gated, foreign, tmp_path
+    ):
+        marker = tmp_path / "closed"
+        TestKernelLifecycle._closable(gated, marker)
+        self._hold_main(gated, foreign, seconds=60)
+        gated.restart()
+        assert marker.exists()
 
     def test_the_kernel_knows_its_host_from_launch(self, gated):
         res = gated.execute(

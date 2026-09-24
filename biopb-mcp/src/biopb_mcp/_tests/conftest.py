@@ -65,14 +65,16 @@ class ScriptedJobs:
     """``host.jobs`` for a mock host: the host's job records, scripted.
 
     Polls are answered from *polls* in order, the last one repeating (none:
-    every job is unknown); the job list and the export are *summary* and
+    every job is unknown); the running job is *running*, an id or ``None``;
+    the job list and the export are *summary* and
     *export*. The foreign-activity digest is *digest*, less what
     has been acked; acks and the point of view each read was made from are
     recorded for the test to assert on.
     """
 
-    def __init__(self, polls=(), digest=(), summary=(), export=()):
+    def __init__(self, polls=(), digest=(), summary=(), export=(), running=None):
         self._polls = list(polls)
+        self._running = running
         self._summary = list(summary)
         self._export = list(export)
         self.polled = 0
@@ -86,6 +88,11 @@ class ScriptedJobs:
             return {"job_id": job_id, "status": "unknown", "error_text": ""}
         snap = self._polls.pop(0) if len(self._polls) > 1 else self._polls[0]
         return {"job_id": job_id, **snap}
+
+    def running(self):
+        if self._running is None:
+            return None
+        return {"job_id": self._running, "status": "running"}
 
     def foreign_digest(self, for_origin):
         self.digest_origins.append(for_origin)

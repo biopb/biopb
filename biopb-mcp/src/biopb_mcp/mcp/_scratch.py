@@ -351,6 +351,9 @@ def start(
             "record": None,
             "error": None,
             "host": None,
+            # The scratch kernel's own id for the run, once submitted: what a
+            # stop names (_jobs.interrupt checks it is still the running job).
+            "kernel_job_id": None,
             "writer": writer,
             "writer_label": writer_label,
             "origin": origin,
@@ -517,6 +520,8 @@ def _execute(run):
         if submitted is None or "job_id" not in submitted:
             _finish(run, "error", _kernel_rpc._format_execute_result(res))
             return
+        with _lock:
+            run["kernel_job_id"] = submitted["job_id"]
         _poll_to_completion(run, host, submitted["job_id"])
     except Exception as exc:  # noqa: BLE001 - the verdict, not a crash of ours
         # A scratch kernel that dies IS the answer -- an OOM means the workflow
@@ -590,22 +595,20 @@ def _poll_to_completion(run, host, kernel_job_id):
 def _check_kernel(host, job_id, strikes):
     """Check the records against the kernel's own status; returns the count of
     checks in a row that disagreed. The second settles (``JobLog.settle``):
-    one disagreement may be an announcement still in flight."""
+    one disagreement may be an announcement still in flight. On the control
+    channel, so a check never waits behind the cells."""
     status = host.jobs.poll(job_id).get("status")
     if status not in ("running", "unknown"):
         return 0
-    kernel_status, _res, _w = _kernel_rpc._run_job_call(
-        host, "status", job_id, timeout=_SETTLE_EVERY
-    )
-    if kernel_status in (None, "unknown", status):
-        return 0
-    if strikes == 0:
-        return 1
-    snap, _res, _w = _kernel_rpc._run_job_call(
-        host, "poll", job_id, timeout=_SETTLE_EVERY
-    )
-    if snap is not None:
-        host.jobs.settle(snap)
+    try:
+        kernel_status = host.control("status", timeout=_SETTLE_EVERY, job_id=job_id)
+        if kernel_status in ("unknown", status):
+            return 0
+        if strikes == 0:
+            return 1
+        host.jobs.settle(host.control("poll", timeout=_SETTLE_EVERY, job_id=job_id))
+    except Exception:  # noqa: BLE001 - the liveness check decides a dead kernel
+        logger.debug("scratch kernel check failed", exc_info=True)
     return 0
 
 
@@ -627,7 +630,7 @@ def interrupt(reason=None, origin="user", writer=None):
     a run that ended between the check and this call leaves the session kernel
     free to have started something.
 
-    Mirrors ``_jobs.interrupt_current``'s vocabulary (``{"refused":
+    Mirrors ``_jobs.interrupt``'s vocabulary (``{"refused":
     "not_owner"}``, ``{"interrupted": True}``) so the tool surface routes to
     whichever kernel holds the running job without a second one, plus
     ``"killed"`` when the cells had to be taken with the process.
@@ -657,16 +660,25 @@ def interrupt(reason=None, origin="user", writer=None):
             and run["writer"] not in (None, writer)
         ):
             return {"refused": "not_owner", "job_id": run["job_id"]}
-    if host is None:
-        # Still bringing the kernel up: there is nothing to interrupt yet, so
-        # stopping means discarding the whole attempt.
+    if host is None or run["kernel_job_id"] is None:
+        # Still bringing the kernel up, or the run's id is not back from its
+        # submit: there is nothing to name yet, so stopping means discarding
+        # the whole attempt.
         discard(reason=reason)
         return {"interrupted": True, "job_id": run["job_id"]}
-    data, _res, _w = _kernel_rpc._run_job_call(
-        host, "interrupt_current", reason, origin=origin, writer=writer
-    )
-    if data and data.get("refused"):
-        return data
+    try:
+        data = host.control(
+            "interrupt",
+            job_id=run["kernel_job_id"],
+            reason=reason,
+            origin=origin,
+            writer=writer,
+        )
+    except Exception:  # noqa: BLE001 - a kernel that cannot answer is killed below
+        logger.debug("scratch interrupt failed", exc_info=True)
+        data = {"interrupted": True}
+    if data.get("refused") in ("not_owner", "foreign_job"):
+        return {**data, "job_id": run["job_id"]}
     if not data or not data.get("interrupted"):
         # Nothing was running in there after all -- the run is between cells, or
         # finishing. Let the poll loop reach its own verdict.

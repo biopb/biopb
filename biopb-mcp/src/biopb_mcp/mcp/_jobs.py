@@ -27,7 +27,7 @@ Design notes
   namespace. So the first non-user submitter claims the kernel and a second is
   refused (:func:`submit`); a human's cell is never gated. Everything that
   changes kernel state is gated the same way — running a job, stopping one
-  (:func:`interrupt_current`), restarting the kernel (server-side) — while the
+  (:func:`interrupt`), restarting the kernel (server-side) — while the
   read-only tools stay open to anyone, since they mutate nothing.
 * **Main-thread affinity.** The viewer is a Qt/vispy object bound to the kernel
   main thread.  GUI mutations from the worker thread are marshaled via
@@ -37,8 +37,9 @@ Design notes
   attributes a thread to the request that started it, which is the submit, so
   the host files them under the job. A verification announces each cell's
   start and end as well, so the host can split that one stream per cell.
-* **Stopping a job.** :func:`interrupt_current` force-stops the running job: it
-  raises ``KeyboardInterrupt`` into the worker thread and, when a distributed dask
+* **Stopping a job.** :func:`interrupt` force-stops the running job: it
+  raises ``KeyboardInterrupt`` into the worker thread (a real ``SIGINT`` for a
+  foreign cell on the main thread) and, when a distributed dask
   client is active (the kernel's ``Client`` attached to the session child's
   ``LocalCluster``), :func:`_cancel` *also* cancels the client's in-flight futures
   — the only mid-``compute()`` stop short of ``restart_kernel``.  The in-process
@@ -47,11 +48,13 @@ Design notes
   returns to Python bytecode, or by ``restart_kernel``.
 """
 
+import _thread
 import ast
 import contextlib
 import ctypes
 import logging
 import os
+import signal
 import sys
 import threading
 import time
@@ -158,7 +161,7 @@ class _Job:
         self.error_text = ""
         # The last expression's repr (_exec_capture), announced with the end.
         self.result_text = ""
-        # Set by interrupt_current(): the job was force-stopped with a
+        # Set by interrupt(): the job was force-stopped with a
         # KeyboardInterrupt raised into its thread, so its finalizer labels the
         # stop "interrupted" rather than a generic "error".
         self.interrupted = False
@@ -525,7 +528,7 @@ def _run(job, code):
         # inside a run_on_main slot on the main thread when it landed. It is a
         # *stop*, not a defect in the submitted code, so label and attribute it
         # rather than hand back a bare traceback -- the same reasoning that gave
-        # interrupt_current its flag, applied to the door it does not own.
+        # interrupt its flag, applied to the door it does not own.
         # Unlabeled, it reads as the code itself breaking.
         if not job.interrupted:
             job.interrupted = True
@@ -536,7 +539,7 @@ def _run(job, code):
     finally:
         job.finished = time.monotonic()
         # A user-triggered interrupt raises KeyboardInterrupt into the thread,
-        # surfacing here as exc; interrupt_current flags it so the stop is
+        # surfacing here as exc; interrupt flags it so the stop is
         # labeled "interrupted" rather than a generic "error".
         if job.interrupted:
             job.status = "interrupted"
@@ -627,7 +630,7 @@ def submit(
     to tell two of them apart with.
 
     **The recovery belongs to the human, not to a second agent.** Every tool
-    that changes kernel state is gated the same way — ``interrupt_current`` here,
+    that changes kernel state is gated the same way — ``interrupt`` here,
     ``restart_kernel`` server-side — so a client that does not hold the kernel
     cannot take it by force; it keeps the read-only tools and nothing else. What
     frees a claim is the kernel going away: the person at the machine restarting
@@ -687,6 +690,12 @@ def record_inline(code, request=None, origin="user"):
 
     Not gated here: the caller refuses while a job runs, and nothing can start
     one meanwhile, since a submit is an execute request queued behind this one.
+
+    Ended under :data:`_lock`, which :func:`interrupt` checks and signals
+    under: a ``SIGINT`` aimed at this cell lands before the cell is marked
+    ended -- in the cell, or at the latest in the lock wait here, which a
+    signal interrupts -- so it can never reach the next one. Landing here it
+    is dropped: the cell it was aimed at is already over.
     """
     with _lock:
         job = _new_job(code, origin, request=request)
@@ -695,9 +704,15 @@ def record_inline(code, request=None, origin="user"):
     try:
         yield job
     finally:
-        job.finished = time.monotonic()
-        if job.status == "running":
-            job.status = "error"
+        while True:
+            try:
+                with _lock:
+                    job.finished = time.monotonic()
+                    if job.status == "running":
+                        job.status = "error"
+                break
+            except KeyboardInterrupt:
+                continue
         _publish_end(job)
 
 
@@ -719,19 +734,13 @@ def status(job_id):
     return "unknown" if job is None else job.status
 
 
-def _cancel_dask_futures(job, reason=None):
-    """Stop *job*'s in-flight dask work, tagging why.
+def _cancel_dask_futures(job):
+    """Stop *job*'s in-flight dask work.
 
-    Takes the job rather than its id: the one caller
-    (:func:`interrupt_current`) has already resolved it and established that it
-    is running, and re-deriving both here only created return values -- an
-    "unknown" job, a non-running one -- that no caller could observe.
+    Takes the job rather than its id: the one caller (:func:`interrupt`) has
+    already resolved it and established that it is running, and set the reason
+    its finalizer reports.
     """
-    # Set the reason before cancelling futures: the job only unwinds after the
-    # future-cancel makes its gather raise, so its finalizer is guaranteed to
-    # see the reason.
-    if reason:
-        job.cancel_reason = reason
     # Distributed dask: cancel in-flight futures.  This is what actually stops a
     # blocking ``.compute()`` -- its tasks ARE registered in ``dc.futures`` for
     # the duration of the internal ``gather``, so cancelling them makes that
@@ -804,65 +813,92 @@ def _raise_in_thread(ident, exctype):
     return res
 
 
-def interrupt_current(reason=None, origin="user", writer=None):
-    """Force-stop the running job: cooperative cancel *plus* a ``KeyboardInterrupt``
-    raised directly into the job's worker thread.
+def interrupt(job_id, reason=None, origin="user", writer=None):
+    """Force-stop *job_id* if it is the running job: cooperative cancel *plus* a
+    ``KeyboardInterrupt`` where it runs.
 
-    ``SIGINT`` can't do this — Python delivers signals only to the kernel main
-    thread, while the job runs in a background worker — so a pure-Python loop
-    would otherwise be stoppable only by ``restart_kernel``. This first runs
-    :func:`_cancel` (attribution reason + in-flight dask-future cancel), then
-    forces the worker thread via :func:`_raise_in_thread`. The exception lands at
-    the next bytecode, so a blocking C call ends when it returns. ``{"interrupted":
-    False, "status": "idle"}`` when the kernel is idle.
+    Called on the kernel's control thread (``_kernel_gate``), so it is answered
+    while the main thread is busy -- including with the very cell it stops.
+
+    **The caller names the job, and this checks it** under :data:`_lock`: a
+    stop aimed at a job that has just ended is ``{"refused": "not_running",
+    "running_job_id": ...}`` and touches nothing, rather than landing on
+    whatever runs now. The caller's view comes from iopub and may be stale; the
+    kernel's is not.
+
+    Where the interrupt goes depends on where the job runs. A submitted job runs
+    on a worker thread, which ``SIGINT`` cannot reach (Python delivers signals
+    only to the main thread), so :func:`_raise_in_thread` raises into it; it
+    lands at the next bytecode, so a blocking C call ends when it returns. A
+    foreign client's cell runs on the main thread (:func:`record_inline`), so it
+    gets a real ``SIGINT``, which also breaks a blocking sleep or wait. Checked
+    and sent under the lock the cell is ended under, so the signal cannot reach
+    the next cell (see :func:`record_inline`). Either way the job's in-flight
+    dask futures are cancelled too (:func:`_cancel_dask_futures`), the only
+    mid-``compute()`` stop short of a restart.
 
     *origin* is the asking client's own job origin, in the vocabulary the jobs
     themselves are recorded in: ``"user"`` (the observe UI, the default: a
     person may stop anything running in their own session), ``"mcp"`` for a
     remote client, ``"chat"`` for the in-process loop. A **client is refused a
     job it did not start** (``{"refused": "foreign_job"}``): the stop would be
-    silent, since attribution runs one way only — a user stop reaches it through
+    silent, since attribution runs one way only -- a user stop reaches it through
     ``cancel_reason``, but the other writer would see nothing beyond an
-    unexplained ``interrupted`` badge. The human has the observe UI and can stop
-    their own work; a program has no consent to.
-
-    "Did not start" is therefore relative to the asker, which is why this takes
-    an origin rather than a fixed "is it the MCP client?" flag: the flag refused
-    the chat loop the cell it had just run itself (biopb/biopb#880), on the one
-    kernel where the interrupt is not guaranteed.
+    unexplained ``interrupted`` badge. "Did not start" is relative to the asker
+    (:func:`_foreign`), which is why this takes an origin rather than a fixed
+    "is it the MCP client?" flag (biopb/biopb#880).
 
     *writer* is the asking client's id, checked against the kernel's one-agent
     claim (:func:`submit`): a client that does not hold this kernel cannot stop
-    what runs in it (``{"refused": "not_owner"}``). Stopping a job is a change to
-    kernel state, so it is gated like running one; only the read-only tools stay
-    open to a second client. As in :func:`submit`, a caller with ``writer=None``
-    is not checked — there is nothing to compare.
+    what runs in it (``{"refused": "not_owner"}``). As in :func:`submit`, a
+    caller with ``writer=None`` is not checked -- there is nothing to compare.
     """
-    job = _running_job()
-    if job is None:
-        return {"job_id": None, "interrupted": False, "status": "idle"}
-    if origin != "user" and writer is not None and _owner not in (None, writer):
-        return {
-            "job_id": job.job_id,
-            "interrupted": False,
-            "status": "running",
-            "refused": "not_owner",
-        }
-    if origin != "user" and _foreign(job, origin):
-        return {
-            "job_id": job.job_id,
-            "interrupted": False,
-            "status": "running",
-            "refused": "foreign_job",
-            # Whose job it is, so the caller can name the writer. "Foreign" is
-            # no longer a synonym for "the user's" -- see _foreign().
-            "origin": job.origin,
-        }
-    job.interrupted = True  # finalize as "interrupted"
-    _cancel_dask_futures(job, reason=reason)
-    ident = job.thread.ident if job.thread is not None else None
-    raised = _raise_in_thread(ident, KeyboardInterrupt)
-    return {"job_id": job.job_id, "interrupted": bool(raised)}
+    with _lock:
+        job = _running_job()
+        if job is None or job.job_id != job_id:
+            return {
+                "job_id": job_id,
+                "interrupted": False,
+                "refused": "not_running",
+                "running_job_id": job.job_id if job is not None else None,
+            }
+        if origin != "user" and writer is not None and _owner not in (None, writer):
+            return {"job_id": job_id, "interrupted": False, "refused": "not_owner"}
+        if origin != "user" and _foreign(job, origin):
+            return {
+                "job_id": job_id,
+                "interrupted": False,
+                "refused": "foreign_job",
+                # Whose job it is, so the caller can name the writer. "Foreign"
+                # is not a synonym for "the user's" -- see _foreign().
+                "origin": job.origin,
+            }
+        job.interrupted = True  # finalize as "interrupted"
+        if reason:
+            # Before the interrupt, so the job's finalizer sees it.
+            job.cancel_reason = reason
+        if job.thread is not None:
+            raised = bool(_raise_in_thread(job.thread.ident, KeyboardInterrupt))
+        else:
+            _interrupt_main()
+            raised = True
+    # Off the lock: a distributed cancel is a round trip to the scheduler.
+    _cancel_dask_futures(job)
+    return {"job_id": job_id, "interrupted": raised}
+
+
+def _interrupt_main():
+    """``SIGINT`` to this process, which Python delivers to the main thread.
+
+    A real signal on POSIX, so a cell blocked in a sleep or a wait wakes up to
+    take it; ``interrupt_main`` elsewhere, which lands at the next bytecode.
+    Only this process, where ``km.interrupt_kernel`` signals the whole group
+    (dask workers included).
+    """
+    if os.name == "posix":
+        os.kill(os.getpid(), signal.SIGINT)
+    else:
+        _thread.interrupt_main()
 
 
 def owner():

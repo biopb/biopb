@@ -68,8 +68,8 @@ cell is an execute request and queues behind it.
 
 ### The gate lives in `do_execute`, not in an IPython event
 
-A kernel subclass, passed as `--IPKernelApp.kernel_class=...` beside the
-existing `exec_lines` argument, overrides `do_execute`. Not `pre_run_cell`:
+A kernel subclass (`mcp/_kernel_gate.py`), which `KernelHost` launches every
+kernel with (`--IPKernelApp.kernel_class=...`), overrides `do_execute`. Not `pre_run_cell`:
 IPython wraps event callbacks in a try/except that prints and continues, so a
 callback cannot refuse a cell, and a Ctrl-C during a wait there is swallowed
 and the cell runs anyway. `do_execute` is also where the two facts the gate
@@ -105,11 +105,10 @@ records them.
 If `_jobs` has a running job, the override returns an `error` reply and
 publishes an iopub `error` message under the request's parent (a reply alone
 renders nothing in a notebook cell). The text names the job id, its intent and
-elapsed time, and says where to stop it: the observe page's Stop, which calls
-`interrupt_current` with user origin, is never gated, and reaches the worker
-thread that a client's own interrupt cannot. There is no in-kernel escape
-hatch; a `_jobs.interrupt_current()` cell would itself be refused, and the
-observe page is the tool for it.
+elapsed time, and says where to stop it: the observe page's Stop, which is
+never gated, and reaches the worker thread that a client's own interrupt
+cannot (see Control channel). There is no in-kernel escape hatch; a cell that
+tried would itself be refused, and the observe page is the tool for it.
 
 ### Record
 
@@ -130,14 +129,12 @@ job's output is complete when its record says it ended. iopub is a PUB socket
 and can drop under pressure; a start while another record is still running
 ends that one as "end not recorded", since only one job runs at a time.
 
-A verification cannot wait for a next start, so the scratch run also polls the
-kernel's own account (`_jobs.poll`) over the shell channel every 2 s. When two
-polls in a row disagree with the record, `JobLog.settle` replays the missing
-events. The outcome is then the kernel's, and output may be missing. The poll
-does not queue: a scratch kernel runs no user cells, only its one job, on a job
-thread, so its main thread is free. The session kernel has no such guarantee (a
-user's cell runs on its main thread), so its records are settled only by the
-next start or the kernel going away.
+A verification cannot wait for a next start, so the scratch run also checks
+the kernel's own account of the job every 2 s, on the control channel. When
+two checks in a row disagree with the record, `JobLog.settle` replays the
+missing events from `_jobs.poll`. The outcome is then the kernel's, and output
+may be missing. The session kernel's records are settled only by the next
+start or the kernel going away.
 
 Poll, the observe list and detail, the notebook export and the foreign-activity
 digest are reads of the host's memory, never a kernel round trip. Records
@@ -145,6 +142,36 @@ outlive a kernel restart: one still running when its kernel goes is ended as
 interrupted, and the next kernel's job ids continue from the host's
 (`BIOPB_JOB_SEQ`). Display output (`display_data`) is not recorded: the record
 says what ran and whether it failed, not what it drew.
+
+### Control channel
+
+What must not wait behind a cell goes to the kernel on the control channel,
+which ipykernel serves on its own thread: stopping a job, a job's status, and
+the graceful close before a kill. One custom request, `biopb_request`
+(`GatedKernel.biopb_request`), carries an op name and its arguments; the op
+runs on a worker thread, bounded by a timeout, since control requests are
+handled one at a time and ipykernel's own interrupt and shutdown share that
+queue. Refused for any session but the host's, like the gate.
+
+**Stop names its job** (`_jobs.interrupt(job_id, ...)`): the host sends the id
+its records say is running, or the observe row's, and the kernel checks it is
+still the running job before touching anything. A stale id stops nothing and
+the reply names what runs now. A worker-thread job gets a `KeyboardInterrupt`
+raised into its thread; a foreign cell on the main thread gets a real `SIGINT`
+to the kernel process alone (`km.interrupt_kernel` signals the whole process
+group, dask workers included), which also wakes a blocking sleep. The check and
+the signal happen under the lock `record_inline` ends the cell under, so the
+signal lands in that cell or, at the latest, in the lock wait that ends it, and
+never in the next one. One window is ipykernel's: a signal arriving after the
+cell's code returned but before the gate settles it surfaces in ipykernel's
+wrap-up, as any Jupyter interrupt can; the gate still sends the client a reply.
+
+**The busy/idle around a control request is ignored.** ipykernel publishes a
+status for every request, control ones included, and an idle after a control
+request would read as idle while a cell still holds the main thread.
+
+What stays on the shell channel needs the main thread or its request: submit
+(a job's output is filed under the submit), screenshot, inspect.
 
 ### Finding the kernel
 
@@ -279,11 +306,14 @@ internals rather than the protocol:
   (see Record); without it a job's output is filed under no job.
 - **Announcements from a worker thread.** `session.send` on `iopub_socket`
   from the job thread, ordered after a stream flush from the same thread.
+- **The control channel.** A custom request type registered through
+  `control_msg_types` and served on the control thread (see Control channel),
+  and control requests publishing busy/idle under their own parent.
 - **Interrupt semantics.** Today: SIGINT is honoured only while a request is
   being serviced (`_jobs._EXTERNAL_INTERRUPT_MSG` leans on this), a client's
-  Ctrl-C lands in the main thread, and Stop raises into the job's worker thread
-  with `PyThreadState_SetAsyncExc`, which does not break a blocking C call
-  until it returns. Under 7: whether SIGINT is still gated the same way,
+  Ctrl-C or Stop lands a main-thread cell's SIGINT in the main thread, and Stop
+  raises into a job's worker thread with `PyThreadState_SetAsyncExc`, which
+  does not break a blocking C call until it returns. Under 7: whether SIGINT is still gated the same way,
   where it lands with subshells running, and whether an interrupt reaches a
   subshell at all.
 - **`stop_on_error`**: an errored or refused cell still aborts what is queued
@@ -296,17 +326,10 @@ Two independent changes, either of which can come first.
 **Subshells (ipykernel 7).** The host's tools move onto a subshell of their
 own, so a foreign cell on the main shell no longer holds them up. That is what
 turns the refusal into a bounded wait: the human's cell waits for the job,
-costing nobody but the human who chose to wait. It also takes the host's
-lifecycle calls off the main queue: restart's graceful close currently waits
-(up to 5 s) behind whatever holds the main thread and is skipped exactly when
-the kernel is busiest, and the observe page's Stop runs `interrupt_current`
-behind a user's long cell -- the one it was pressed to stop. Decided in the
-kernel from a subshell, Stop also needs no host-side guess at what is
-running. Limits: anything touching the viewer still marshals to the main
-thread and waits there; an agent submit could then overlap a user cell, so
-the gate needs a lock shared by `submit` and `record_inline`; and stopping a
-main-thread cell from a subshell may still need SIGINT, which an async
-exception is not.
+costing nobody but the human who chose to wait. Limits: anything touching the
+viewer still marshals to the main thread and waits there, and an agent submit
+could then overlap a user cell, so the gate needs a lock shared by `submit`
+and `record_inline`.
 
 **Blocked by napari, not by verification.** `napari-console` requires
 `ipykernel<7` in its latest release (0.1.4), and napari depends on it
@@ -314,15 +337,11 @@ unconditionally -- 0.7.0 and the current 0.9.1 alike -- so no napari upgrade
 reaches ipykernel 7. The paths: a `napari-console` release that lifts the cap;
 or a uv override of it, which every install path (`install.sh`, the lock, the
 nightly fresh resolve) would have to carry, against a cap that presumably
-guards napari's own console widget. Until then, the two lifecycle problems are
-solved inside ipykernel 6 instead, on the control channel, which ipykernel
-serves on its own thread: the graceful close in `GatedKernel.do_shutdown`
-(the host's `shutdown_request` runs it however busy the main thread is), and
-Stop as a custom control request decided in the kernel, which knows whether the
-running job is a main-thread cell (SIGINT) or a worker thread
-(`interrupt_current`). That leaves host calls queueing behind a user's cell,
-which subshells would not fully fix either: anything touching the viewer needs
-the main thread.
+guards napari's own console widget. The lifecycle calls that must not queue
+behind a user's cell -- Stop and restart's graceful close -- are on the
+control channel instead (done, see Control channel). That leaves the other
+host calls queueing behind a user's cell, which subshells would not fully fix
+either: anything touching the viewer needs the main thread.
 
 **The host subscribes to iopub**, in three stages:
 
