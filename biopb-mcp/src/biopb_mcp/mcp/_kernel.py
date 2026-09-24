@@ -534,9 +534,14 @@ class KernelHost:
         / retry). ``server_status`` is a cheap, non-blocking readiness probe meant
         for exactly this.
         """
+        # The channels are read *before* readiness: a restart clears _ready
+        # before it replaces them, so a call that sees _ready set holds either
+        # the ready kernel's or the outgoing one's (then failed by its close) --
+        # never the next kernel's before its bootstrap has run.
+        io = self._io
         if not self._ready.is_set():
             return self._not_ready_result()
-        return self._execute_internal(code, timeout, user_expressions)
+        return self._execute_internal(code, timeout, user_expressions, io=io)
 
     def _not_ready_result(self) -> dict:
         """Structured status for a tool call that landed while the kernel is not
@@ -587,6 +592,7 @@ class KernelHost:
         code: str,
         timeout: Optional[float] = None,
         user_expressions: Optional[dict] = None,
+        io: Optional[KernelChannels] = None,
     ) -> dict:
         """Execution bypassing the readiness wait.
 
@@ -597,7 +603,8 @@ class KernelHost:
         """
         if timeout is None:
             timeout = self._execute_timeout
-        io = self._io
+        if io is None:
+            io = self._io
         if io is None:
             return _status_result("error", "Kernel is not running.")
         # Never wait on a kernel whose process is gone: its zmq channels stay
@@ -685,6 +692,11 @@ class KernelHost:
             # old error while we rebuild. A fresh failure below records a new one.
             self._start_error = None
             self._teardown_reason = None
+            # Before the graceful close, not at the kill: calls do not take this
+            # lock, so only _ready keeps a submit from landing in the kernel
+            # being replaced -- queued behind the close, after the tensor
+            # client it would use is gone.
+            self._ready.clear()
             try:
                 try:
                     self._execute_internal(_GRACEFUL_CLOSE_SNIPPET, timeout=5.0)
@@ -719,6 +731,8 @@ class KernelHost:
             # can make a `biopb server stop` right after Ctrl-C hang on its drain
             # (see _GRACEFUL_CLOSE_SNIPPET). A busy/wedged kernel falls through to
             # the SIGKILL below; the short timeout keeps this off the Ctrl-C path.
+            # Readiness goes first, as in restart().
+            self._ready.clear()
             if self.is_alive():
                 try:
                     self._execute_internal(_GRACEFUL_CLOSE_SNIPPET, timeout=2.0)

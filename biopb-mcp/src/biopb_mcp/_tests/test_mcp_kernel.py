@@ -110,6 +110,26 @@ class TestKernelControl:
         assert results["slow"]["stdout"] == "slow\n"
         assert not kernel.is_busy()
 
+    def test_a_restart_turns_new_calls_away_before_its_graceful_close(self, kernel):
+        # The close waits behind whatever holds the main thread; a call made
+        # meanwhile must not reach the kernel being replaced (a submit there
+        # would start a job that is killed, after its tensor client closed).
+        holder = threading.Thread(
+            target=kernel.execute, args=("import time; time.sleep(2)",), daemon=True
+        )
+        holder.start()
+        time.sleep(0.3)
+        restarter = threading.Thread(target=kernel.restart, daemon=True)
+        restarter.start()
+        time.sleep(0.3)
+        started = time.monotonic()
+        res = kernel.execute("x = 1", timeout=30.0)
+        assert res["status"] == "starting", res
+        assert time.monotonic() - started < 1.0
+        restarter.join(timeout=60.0)
+        holder.join(timeout=10.0)
+        assert kernel.execute("print('back')")["stdout"] == "back\n"
+
     def test_a_call_in_flight_fails_fast_on_shutdown(self, kernel):
         results = {}
 
