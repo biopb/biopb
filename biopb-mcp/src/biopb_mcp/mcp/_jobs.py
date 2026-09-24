@@ -438,24 +438,29 @@ def _publish(content):
     unknown message type under its own request would be one more thing for it
     to ignore. The request the job's output goes under rides in the content.
 
-    Streams are flushed first, from this thread, so the job's last output is on
-    iopub ahead of its end: both go out through ipykernel's one IOPub thread, in
-    the order they were handed to it.
+    The send runs on ipykernel's IOPub thread, as ``OutStream`` does: the
+    Session (its msg_id counter) is not thread-safe, and a job event is sent
+    from a job thread. Streams are flushed first -- ``flush`` waits until the
+    IOPub thread has taken the output -- so the job's last output is on iopub
+    ahead of its end.
     """
     kernel = getattr(_ip, "kernel", None)
-    if kernel is None or getattr(kernel, "iopub_socket", None) is None:
+    iopub = getattr(kernel, "iopub_thread", None)
+    if iopub is None:
         return
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.flush()
         except Exception:  # noqa: BLE001 - flush is best-effort
             pass
-    try:
-        kernel.session.send(
-            kernel.iopub_socket, MSG_TYPE, content, ident=MSG_TYPE.encode()
-        )
-    except Exception:  # noqa: BLE001 - a lost event must not fail the job
-        logger.debug("job event not published", exc_info=True)
+
+    def send():
+        try:
+            kernel.session.send(iopub, MSG_TYPE, content, ident=MSG_TYPE.encode())
+        except Exception:  # noqa: BLE001 - a lost event must not fail the job
+            logger.debug("job event not published", exc_info=True)
+
+    iopub.schedule(send)
 
 
 def _publish_start(job):
