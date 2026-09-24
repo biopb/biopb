@@ -1,6 +1,7 @@
 # Jupyter clients on the session kernel
 
-Status: **implemented**. Decided 2026-09-23.
+Status: **implemented**, decided 2026-09-23. **v3 planned** (2026-09-24): agent
+cells move to the main thread, which undoes most of what follows -- see v3.
 
 **Component:** `biopb-mcp` — a kernel subclass in an in-kernel module
 (`mcp/_kernel_gate.py`), `mcp/_jobs.py` (the record), `mcp/_kernel.py` and
@@ -366,6 +367,99 @@ either: anything touching the viewer needs the main thread.
 This is a refactor of how the host talks to the kernel, orthogonal to
 subshells and to the gate, which stays in-kernel either way — only kernel code
 can refuse a request before it runs.
+
+## v3: agent cells on the main thread
+
+Planned 2026-09-24, not started.
+
+**Why.** The worker thread existed to keep the main thread free during a
+long job, for Qt and the host's calls. Two things took that away. A user's
+cell from an attached client holds the main thread anyway. And the calls that
+must not wait behind it, Stop and the graceful close, now use the control
+channel. What the thread still costs is synchronization that ipykernel
+already provides: the gate's refusal, `record_inline`, the custom
+announcements, output attribution through ipykernel's thread-to-request map,
+and `settle`.
+
+**Shape.** The agent's code is a plain execute request from the host, like a
+user's cell, and ipykernel runs them one at a time on the main thread. A
+foreign cell sent while the agent's cell runs waits its turn instead of being
+refused, which is what the subshells plan (v2) was for, without
+ipykernel 7. The gate's refusal and `record_inline` go. The one-agent claim
+moves to the host, where every agent call enters. `GatedKernel` keeps only the
+control ops.
+
+**Records from the standard protocol.**
+- **A cell's start:** its `execute_input` on iopub gives the code. The origin
+  comes from the parent's session; the host knows its own requests' origin
+  and intent by message id.
+- **Its end:** the `status: idle` for that request.
+- **A failure:** an iopub `error`.
+
+The host's own cells end on their shell reply, which cannot be lost. A
+foreign cell whose idle was lost is ended by the next cell's start, as now.
+The custom announcements remain only for `run_async`.
+
+**`execute_code`** sends the request with `stop_on_error=False`, so a
+failing agent cell does not abort a user's cell queued behind it. It waits
+out its budget and, if the cell is still running, returns the request id as
+the job id. A client's tool-call timeout makes that early return necessary.
+
+**`poll_job`** reads a record by id, never entering the kernel. It covers
+two uses: an agent cell that outlived `execute_code`'s budget, and a
+`run_async` task. Both share one id space. The record says which it is, so the
+agent can tell why a screenshot was refused.
+
+**Main-thread tools fail fast.** `take_screenshot` and `inspect_object` need
+the main thread. While the agent's own cell holds it, they answer at once with
+an error rather than queue. A screenshot asked for then is an error in the
+agent's reasoning, not a transient condition, so the message says what runs
+and names `run_async`. `server_status` and job state stay answerable (control
+ops, host memory).
+
+**`run_async`** is a helper in the namespace for a long compute the agent
+wants to watch.
+- **Threading:** it runs the work on a thread and returns a task id at once,
+  leaving the main thread, and so Qt and the screenshots, free.
+- **Records:** it announces the task's start and end, and the host files the
+  thread's output under the task's record. The output arrives under the
+  request that started it, which has already ended.
+- **The viewer:** the task uses the viewer proxy, which marshals to the main
+  thread, as a job does today.
+- **Stopping:** Stop raises into the task's thread.
+
+This is today's worker-thread machinery, narrowed to the agent's opt-in.
+
+**Stop** on a cell, of either origin, is the control channel's SIGINT, and
+on a task the raise into its thread. The ownership rules are unchanged.
+
+**Verification** sends each cell as its own execute request to the scratch
+kernel. The per-cell output, the stop at the first failure and the completion
+all come from the protocol. The cell announcements and `settle` go.
+
+**Costs, accepted:**
+- **Qt freezes while an agent cell runs.** The window stops responding, and
+  some platforms show "not responding". This is what a notebook user already
+  lives with, and `run_async` is the way out.
+- **Races.** A `run_async` task can race a user's cell over the namespace or
+  the viewer, as in any async notebook. The agent sees it in the records, so
+  the foreign-activity digest reports a foreign cell at its start, not only
+  at its end.
+- **Output attribution for a task** still leans on ipykernel's thread map, so
+  that item on the ipykernel 7 list narrows to `run_async`.
+
+**Stays:** the control channel, the session/scratch slot, `run_on_main` and
+the viewer proxy (for tasks), and the host's records.
+
+**Staging:**
+1. **Records.** Build the host's records from `execute_input`, `status` and
+   `error`, keyed by request id. The worker-thread path keeps its
+   announcements until stage 2.
+2. **Agent cells on the main thread.** `execute_code` sends plain requests;
+   add `run_async`, the fail-fast main-thread tools, and the kernel doc for
+   agents; remove the gate's refusal, `record_inline` and the job thread.
+3. **Verification.** One request per cell; delete the cell announcements and
+   `settle`.
 
 ## Shape of the work
 
