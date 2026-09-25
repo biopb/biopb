@@ -1,9 +1,9 @@
 """The reserved set namespace: server-owned annotation layers are read-only.
 
-Design: ``docs/roi-annotations.md`` and biopb/biopb#951. A reserved set is filled
-from the source file and replaced wholesale when that file changes, so a client
-write landing in one would be discarded at the next re-import rather than stored.
-The store refuses it instead of trusting clients to honour the naming rule.
+See biopb/biopb#951. A reserved set is filled from the source file and replaced
+wholesale when that file changes, so a client write landing in one would be
+discarded at the next re-import rather than stored. The store refuses it instead of
+trusting clients to honour the naming rule.
 
 The importer does not exist yet; these plant reserved rows with direct SQL, which
 is also the only way to get one past the guard being tested.

@@ -8,7 +8,7 @@
  * `TileInfo.volume` — the one scale it keeps a whole volume warm at. A client
  * that computed its own would have to reimplement the server's pyramid planner,
  * and landing one rung away misses every warmed chunk and pays a cold decode of
- * the source. See biopb-tensor-server/docs/precache-policy.md §5.
+ * the source.
  */
 
 import { sliderAxes } from "@biopb/tensor-flight-client";

@@ -34,8 +34,6 @@ The readers skip only what they cannot *open* -- a float dtype, an unreadable
 ``.zattrs`` -- with a warning; whether a set spans its image is checked once
 for every origin where the sets meet (``SourceAdapter.label_binding_error``,
 from the upload's create and from ``label_sets``).
-
-Design: ``biopb-tensor-server/docs/label-tensors.md``.
 """
 
 from __future__ import annotations

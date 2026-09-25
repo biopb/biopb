@@ -216,7 +216,7 @@ def _should_try_cachefile(location: str) -> bool:
 
 
 # ------------------------------------------------------------------------------
-# The remote counterpart: our own on-disk chunk cache (docs/client-disk-cache.md)
+# The remote counterpart: our own on-disk chunk cache
 # ------------------------------------------------------------------------------
 #
 # Same shape as the fast path above -- a chunk lives in a file we can mmap -- and
@@ -1015,7 +1015,7 @@ def _fetch_chunk_distributed(
     # reaches the strong cache on a remote read, which is the point: holding a
     # private RAM copy of bytes already in the page cache is double-buffering,
     # N-fold across N workers. It stays as the fallback for when the disk cache
-    # is unavailable -- see docs/client-disk-cache.md.
+    # is unavailable.
     if is_view:
         _view_cache_put(location, token, cache_key, arr)
     elif cache is not None:

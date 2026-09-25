@@ -8,7 +8,7 @@
  * stop the OrthographicView controller (deck.gl dispatches picking events and
  * the controller independently), so a drag-traced shape would pan the canvas out
  * from under itself. Clicking needs none of that, and for tracing an outline at
- * zoom it is the better interaction anyway. See docs/roi-annotations-ui.md.
+ * zoom it is the better interaction anyway.
  */
 
 import type { RoiGeometry } from "@biopb/tensor-flight-client";

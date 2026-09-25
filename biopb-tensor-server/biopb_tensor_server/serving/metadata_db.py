@@ -8,7 +8,7 @@ Database Schema:
 - JSON column for full metadata access via DuckDB JSON operators
 - Shape summary column for quick size estimates
 - rois table: user-drawn ROI annotations, one row per ROI, anchored on the
-  unversioned array_id (docs/roi-annotations.md)
+  unversioned array_id
 - decode_rates table: measured full-resolution decode throughput per array_id,
   the input for cache.cheap_decode_mbps (core/retention.py)
 
@@ -275,7 +275,7 @@ class NumpyEncoder(json.JSONEncoder):
 
 
 # ---------------------------------------------------------------------------
-# ROI annotation helpers (docs/roi-annotations.md)
+# ROI annotation helpers
 # ---------------------------------------------------------------------------
 
 # Only the 2-D vector arms of biopb.image.ROI are stored. `mask` carries a
@@ -296,7 +296,7 @@ _MAX_ROI_ID_LEN = 128
 # (`_tensor_desc_by_array_id` strips and validates in one step). A store keyed by
 # array_id never resolves anything, so a missed strip was silent: the annotation
 # filed itself under a phantom tensor whose id is never minted again once content
-# changes, with a source_id matching no catalog row. See docs/roi-annotations.md.
+# changes, with a source_id matching no catalog row.
 _VERSION_SEP = "@"
 
 
@@ -598,7 +598,7 @@ class MetadataDatabase:
         max_rois_per_tensor: Cap on stored annotations per tensor. Deliberately
             human-scale: it is the line between an annotation store and an
             object store, and it is what lets the read path be a single
-            whole-set fetch (see docs/roi-annotations.md).
+            whole-set fetch.
 
     Example:
         db = MetadataDatabase()
@@ -845,13 +845,13 @@ class MetadataDatabase:
         # Index on source_url for path filtering
         conn.execute("CREATE INDEX idx_source_url ON sources(source_url)")
 
-        # User-drawn ROI annotations, one row per ROI (design:
-        # docs/roi-annotations.md). A sibling table, deliberately NOT a field
-        # inside a source row: sources.metadata_json is adapter-produced and
-        # rewritten by the INSERT OR REPLACE in sync_source_added(), so an
-        # annotation parked there would be destroyed by the next rescan.
-        # Whether the annotations predate this build has to be asked before the
-        # CREATE, which is what makes them indistinguishable afterwards.
+        # User-drawn ROI annotations, one row per ROI. A sibling table,
+        # deliberately NOT a field inside a source row: sources.metadata_json is
+        # adapter-produced and rewritten by the INSERT OR REPLACE in
+        # sync_source_added(), so an annotation parked there would be destroyed
+        # by the next rescan. Whether the annotations predate this build has to
+        # be asked before the CREATE, which is what makes them indistinguishable
+        # afterwards.
         had_rois = bool(
             conn.execute(
                 "SELECT 1 FROM duckdb_tables() WHERE table_name = 'rois'"
@@ -1527,7 +1527,7 @@ class MetadataDatabase:
         logger.debug(f"Removed source from metadata database: {source_id}")
 
     # ------------------------------------------------------------------
-    # ROI annotations (docs/roi-annotations.md)
+    # ROI annotations
     # ------------------------------------------------------------------
 
     # Columns a client owns: rewritten verbatim by every update. Everything not
@@ -1796,7 +1796,7 @@ class MetadataDatabase:
         return True, source_url
 
     # ------------------------------------------------------------------
-    # The orphan clock (docs/roi-annotations.md, "Staleness")
+    # The orphan clock
     # ------------------------------------------------------------------
 
     def mark_sources_seen(self) -> int:

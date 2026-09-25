@@ -1062,9 +1062,9 @@ class TestSkipUnscaledCoarsestLevel:
 class TestSparsePlanAndIndependentGates:
     """The plan carries full resolution plus the levels precache warms, no more.
 
-    The two gates of docs/precache-policy.md §5.1 are not separate code: a target
-    is emitted only where it shrinks something, so the list length *is* the
-    verdict. These rows are that table.
+    The 2-D and 3-D warm-target gates are not separate code: a target is emitted
+    only where it shrinks something, so the list length *is* the verdict. These
+    rows are that table.
     """
 
     # (name, shape, labels, warmed scales)

@@ -103,8 +103,7 @@ class _ClientState:
 
     The Flight connection handles and nothing else. **The SDK caches no
     descriptors**: every one is fetched per call. Memoizing is a caller's policy,
-    since only the caller knows what invalidates it --
-    ``biopb-tensor-server/docs/source-descriptor-retirement.md``.
+    since only the caller knows what invalidates it.
     """
 
     raw_client: flight.FlightClient
@@ -1112,7 +1111,7 @@ class CatalogClient:
         )
         return RemoveSourceResult.FromString(result_bytes)
 
-    # ---- label sets (biopb-tensor-server/docs/label-tensors.md) ----
+    # ---- label sets ----
 
     def label_sets(self, image_array_id: str) -> List[str]:
         """Backs TensorFlightClient.label_sets; see that method."""
@@ -1123,7 +1122,7 @@ class CatalogClient:
         )
         return table.column(0).to_pylist()
 
-    # ---- ROI annotations (biopb-tensor-server/docs/roi-annotations.md) ----
+    # ---- ROI annotations ----
 
     def list_rois(self, array_id: str, set_name: str = "") -> "RoiListResult":
         """Backs TensorFlightClient.list_rois; see that method."""

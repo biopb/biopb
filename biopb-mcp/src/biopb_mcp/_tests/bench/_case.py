@@ -50,8 +50,8 @@ BLOCKING_BUDGET = 3
 
 #: The namespace a case falls back to when it declares none of its own. A
 #: curated case is found at ``$BIOPB_FIXTURES/<namespace>/<case_id>/``
-#: and every artifact path starts the same way (`docs/agent-bench.md`), so this is
-#: a directory name on somebody's disk and not merely a label.
+#: and every artifact path starts the same way, so this is a directory name on
+#: somebody's disk and not merely a label.
 TASK_NAMESPACE = "tasks"
 
 #: The two environments a fixture array can arrive in. Peers, not a ladder:
@@ -130,7 +130,7 @@ class Case:
     or a file on disk — is decided here, when the case is written, never
     resolved at run time. Covering one subject both ways is *two cases*, each
     with its own `case_id`, and `(namespace, case_id)` is what names a run's
-    artifacts (`docs/agent-bench.md`).
+    artifacts.
 
     The fixture is a spec rather than a built value so a case module costs
     nothing at import: 30 of these are collected by every ordinary test run,

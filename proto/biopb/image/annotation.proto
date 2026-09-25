@@ -7,8 +7,7 @@ import "biopb/image/roi.proto";
 option java_multiple_files = true;
 option java_package = "biopb.image";
 
-// User-drawn ROI annotations on a served tensor. Design:
-// biopb-tensor-server/docs/roi-annotations.md
+// User-drawn ROI annotations on a served tensor.
 //
 // Lives in biopb.image, not biopb.tensor, for two reasons: it wraps
 // biopb.image.ROI, and biopb.image already imports biopb.tensor

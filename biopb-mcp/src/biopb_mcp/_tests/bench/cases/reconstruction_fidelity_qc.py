@@ -8,7 +8,7 @@ costs nothing, RSE and RSP give the same ranking, and any assumed PSF between
 0.6x and 4x the true one passes. All of that is measured below. What fails is
 correlating without matching resolution at all.
 
-A deferred-tier case (`docs/skill-candidates.md`). NanoJ-SQUIRREL was
+A deferred-tier case. NanoJ-SQUIRREL was
 **prescreened and dropped** 2026-08-06 as tier-conditional: all six arms found
 the widefield comparison unaided, so the *idea* is not the hard part. What
 separated the tiers was a single step -- blur to the camera's resolution before

@@ -1,6 +1,6 @@
 """Strahler ordering as benchmark data: how branched is this arbor, really?
 
-A deferred-tier case (`docs/skill-candidates.md`). SNT arbor morphometrics was
+A deferred-tier case. SNT arbor morphometrics was
 **prescreened and dropped** 2026-08-06 for the shipped catalog — every Sonnet
 arm collapsed degree-2 runs into branches unprompted and said so. It is here
 anyway, because the rejection is conditional on the consuming tier: every Haiku

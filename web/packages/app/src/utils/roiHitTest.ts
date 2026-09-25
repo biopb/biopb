@@ -7,7 +7,7 @@
  * would answer that hover itself and blank the readout wherever an annotation
  * lies. Hit-testing here costs nothing extra, because the whole annotation set
  * is already resident -- which is one of the reasons the read path fetches it
- * whole (docs/roi-annotations-ui.md).
+ * whole.
  */
 
 import type { RoiAnnotation } from "@biopb/tensor-flight-client";

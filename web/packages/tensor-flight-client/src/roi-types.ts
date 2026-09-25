@@ -5,9 +5,6 @@
  * canonical JSON (int64 as strings, bytes as base64, oneofs as bare keys,
  * every default-valued field simply absent), which is a poor thing to hand a
  * React component. `roi-json.ts` converts at this seam.
- *
- * Backend contract: biopb-tensor-server/docs/roi-annotations.md.
- * SPA design: docs/roi-annotations-ui.md.
  */
 
 /** A vertex in LEVEL-0 pixel coordinates, in the tensor's own Y/X axes. */

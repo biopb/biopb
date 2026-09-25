@@ -10,7 +10,7 @@ being two cases rather than one case with a switch.
 
 **The prescreen said a synthetic fixture could not do this, and that was true of
 the fixture it had rather than of synthetic data.**
-`docs/skill-candidates.md` records: *"The first fixture was synthetic and did
+The prescreen recorded: *"The first fixture was synthetic and did
 not discriminate -- affine, TPS and reference landed within ~1 px of each other
 -- which is why the real-data version exists."* Reproduced here, that failure
 is a property of the *deformation*, not of the synthesis: a non-affine term

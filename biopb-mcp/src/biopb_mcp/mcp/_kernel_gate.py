@@ -1,4 +1,4 @@
-"""The kernel class every host kernel runs (``docs/jupyter-clients.md``).
+"""The kernel class every host kernel runs.
 
 Runs inside the kernel, as its ``kernel_class`` (``KernelHost._launch`` passes
 ``--IPKernelApp.kernel_class``). Every cell runs on the main thread, one at a

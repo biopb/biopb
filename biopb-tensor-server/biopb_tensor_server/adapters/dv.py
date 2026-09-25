@@ -1,12 +1,12 @@
 """Native ``mrc``-package adapter for DeltaVision DV files.
 
 BioIO reads a DV through ``bioio-dv``, whose Dask array pays the same
-graph-rebuild-per-read cost the other bioio-backed formats do (see
-``docs/dask-bypass-benchmarks.md``, biopb/biopb#799 phase 3). Unlike CZI or
-plain TIFF, DV has no block structure to over-read around: the file is one
-flat, C-contiguous pixel blob at a fixed offset, and ``bioio-dv`` itself reads
-it through :mod:`mrc` -- the same package this adapter uses directly. So the
-win here is purely the graph-construction overhead, not I/O shape.
+graph-rebuild-per-read cost the other bioio-backed formats do (biopb/biopb#799
+phase 3). Unlike CZI or plain TIFF, DV has no block structure to over-read
+around: the file is one flat, C-contiguous pixel blob at a fixed offset, and
+``bioio-dv`` itself reads it through :mod:`mrc` -- the same package this
+adapter uses directly. So the win here is purely the graph-construction
+overhead, not I/O shape.
 
 :class:`mrc.DVFile` (the actively maintained reader in ``mrc._new``, distinct
 from the legacy ``Mrc``/``Mrc2`` classes ``adapters/mrc.py`` uses for plain

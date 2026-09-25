@@ -1133,7 +1133,7 @@ class TestWinJobReal:
 
 
 # ---------------------------------------------------------------------------
-# A second Jupyter client on the session kernel (docs/jupyter-clients.md)
+# A second Jupyter client on the session kernel
 # ---------------------------------------------------------------------------
 
 _GATED_ARGS = [

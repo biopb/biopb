@@ -8,8 +8,7 @@ user reaching for the bare SDK is avoiding.
 
 So the client writes each fetched chunk to a file and mmaps it back, calling
 ``do_get`` only on a miss. The OS page cache is then the cross-process shared
-cache a per-process LRU can never be. Design rationale, measurements, and the
-policy comparison behind every constant here: ``docs/client-disk-cache.md``.
+cache a per-process LRU can never be.
 
 Three properties carry the design:
 

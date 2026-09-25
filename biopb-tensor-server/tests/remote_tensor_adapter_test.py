@@ -1,6 +1,6 @@
 """Tests for the RemoteTensorAdapter caching passthrough proxy (biopb/biopb#178).
 
-Covers the §2 adapter slice of docs/remote-tensor-cache.md:
+Covers the adapter and its data path:
 - the grpc:// url split,
 - end-to-end proxying: a local server fronting an in-process *upstream* server
   mirrors its catalog and serves identical pixels through the proxy,

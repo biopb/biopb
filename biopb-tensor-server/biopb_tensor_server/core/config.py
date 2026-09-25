@@ -470,16 +470,15 @@ class SourceConfig:
         # Compute is_remote from URL
         object.__setattr__(self, "_is_remote", _is_remote_url(self.url))
 
-        # Mint the id from the URL unless the caller supplied one. This is
-        # durable identity -- the metadata DB's ROI rows and the segment-cache
-        # keys hang off it -- so whatever enters the hash becomes something a
-        # user cannot change without detaching their data. Url-derivation's known
-        # cost is that `mv` re-keys a local source (docs/roi-annotations.md).
-        # Supplying an id explicitly is how the tensor-server proxy opts out:
-        # `sources.resolve._namespaced_source_id` builds one from (alias,
-        # upstream_source_id) with no endpoint in it, so a moved upstream keeps
-        # its cache and its annotations (docs/remote-tensor-cache.md). Config
-        # never reaches this branch -- `sources.source_id` is ignored with a warning
+        # Mint the id from the URL unless the caller supplied one. This is durable
+        # identity -- the metadata DB's ROI rows and the segment-cache keys hang off
+        # it -- so whatever enters the hash becomes something a user cannot change
+        # without detaching their data. Url-derivation's known cost is that `mv`
+        # re-keys a local source. Supplying an id explicitly is how the
+        # tensor-server proxy opts out: `sources.resolve._namespaced_source_id`
+        # builds one from (alias, upstream_source_id) with no endpoint in it, so a
+        # moved upstream keeps its cache and its annotations. Config never reaches
+        # this branch -- `sources.source_id` is ignored with a warning
         # (biopb/biopb#308) -- so an explicit id is always internal.
         if self.source_id is None:
             detected_type = self.type or detect_source_type(self.url) or "data"
@@ -737,7 +736,7 @@ class CatalogConfig:
     are not under ``annotations`` any more (biopb/biopb#1002):
 
     - ``sources`` -- scan output, dropped and recreated on every open.
-    - ``rois`` -- drawn annotations (docs/roi-annotations.md). Nothing can
+    - ``rois`` -- drawn annotations. Nothing can
       reproduce these, which is what makes the file worth having.
     - ``decode_rates`` -- the cache's measured per-tensor decode throughput.
       Re-measurable by reading, but a run's worth of it at a time.
@@ -770,7 +769,7 @@ class CatalogConfig:
 
 @dataclass
 class AnnotationsConfig:
-    """User-drawn ROI annotations (biopb-tensor-server/docs/roi-annotations.md).
+    """User-drawn ROI annotations.
 
     Annotations live in the DuckDB catalog next to ``sources`` and are served
     on the ``roi`` flight (DoGet / DoPut, authorized per source). They are NOT

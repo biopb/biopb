@@ -684,9 +684,9 @@ def _validate_and_clamp(config: dict) -> dict:
     return config
 
 
-# Keys renamed by the knowledge-store redesign (biopb-mcp/docs/knowledge.md §1),
-# read for one release so an existing config file is not silently ignored. The
-# new key wins where both are present.
+# Keys renamed by the knowledge-store redesign, read for one release so an
+# existing config file is not silently ignored. The new key wins where both are
+# present.
 _RENAMED_KEYS = {
     "services": {
         "skills_local_dir": "docs_local_dir",

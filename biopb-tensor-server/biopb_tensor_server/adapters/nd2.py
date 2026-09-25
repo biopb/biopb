@@ -1,13 +1,13 @@
 """Native ``nd2``-package adapter for Nikon ND2 files.
 
 BioIO reads an ND2 through ``bioio-nd2``, whose Dask array pays the same
-graph-rebuild-per-read cost every other bioio-backed format does (see
-``docs/dask-bypass-benchmarks.md``). biopb/biopb#797 already bypassed that
-graph for pixel reads by calling ``nd2.read_frame`` directly from inside
-BioIO's ``NikonAdapter`` -- but scene enumeration, dimension labels and
-metadata still went through BioIO's ``BioImage``/OME conversion. This module
-finishes the migration (biopb/biopb#799 phase 3): every fact this adapter
-reports, structural or physical, is read from the ``nd2`` package alone.
+graph-rebuild-per-read cost every other bioio-backed format does.
+biopb/biopb#797 already bypassed that graph for pixel reads by calling
+``nd2.read_frame`` directly from inside BioIO's ``NikonAdapter`` -- but scene
+enumeration, dimension labels and metadata still went through BioIO's
+``BioImage``/OME conversion. This module finishes the migration
+(biopb/biopb#799 phase 3): every fact this adapter reports, structural or
+physical, is read from the ``nd2`` package alone.
 
 **One tensor per XY stage position.** ``ND2File.sizes`` folds ``P`` (nd2's
 XY-position loop) in as an ordinary loop axis alongside ``T``/``Z``: every

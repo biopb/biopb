@@ -5,8 +5,9 @@ this program run on its own? — and the only honest way to answer it is to run 
 somewhere that has none of the session's state. This module owns that somewhere:
 a second kernel, spawned per verification, discarded after it.
 
-Why a process and not a namespace, why the session's own display, and what
-"discarded" does *not* cover: ``docs/verify-workflow.md``.
+A process rather than a clean namespace, because the viewer, ``sys.modules``
+and anything mutated in place would stay shared with the session, and a
+workflow leaning on session state would verify green and fail on a fresh kernel.
 
 Three things live here, and they are one module because they are one decision.
 

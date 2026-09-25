@@ -98,12 +98,11 @@ _EXPERIMENTAL_SOURCE_MESSAGES = {
     "cloud": (
         "Cloud / synced-folder sources (cloud=true, e.g. OneDrive Files "
         "On-Demand) are EXPERIMENTAL: resolve-on-serve and hydrate-ahead behavior "
-        "may change. See docs/cloud-storage-support.md."
+        "may change."
     ),
     "tensor-server": (
         "Remote tensor-server proxy sources (type=tensor-server) are "
-        "EXPERIMENTAL: the caching-passthrough proxy may change. "
-        "See docs/remote-tensor-cache.md."
+        "EXPERIMENTAL: the caching-passthrough proxy may change."
     ),
     "remote-url": (
         "Remote URL sources (s3://, http(s)://, ...) are EXPERIMENTAL and may change."

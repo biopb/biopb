@@ -162,7 +162,7 @@ class TestDefaultConfig:
         # Docs ship on: they are package data, so the default install always has
         # something to answer with and there is nothing to fetch.
         assert services["docs_local_dir"] == ""
-        # Docs are package data, not a fetch (biopb-mcp/docs/knowledge.md §1).
+        # Docs are package data, not a fetch.
         assert "skills_catalog_url" not in services
         assert "skills_cache_ttl" not in services
         # Nothing of the skills catalog survives, nested or flat.

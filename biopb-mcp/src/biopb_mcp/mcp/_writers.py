@@ -294,10 +294,9 @@ def _render_foreign_note(digest) -> str:
 
     The agent is not the only writer of this namespace: a person can run code
     from a Jupyter client attached to the kernel, recorded as a job the same
-    way (``docs/jupyter-clients.md``).
-    That leaves the agent's picture of the namespace stale with nothing in its
-    own results to say so — hence this note, appended at the same seam as
-    ``_window_note``, which is how every other user-attributed fact already
+    way. That leaves the agent's picture of the namespace stale with nothing
+    in its own results to say so — hence this note, appended at the same seam
+    as ``_window_note``, which is how every other user-attributed fact already
     reaches the agent (``cancel_reason``, ``teardown_reason``).
 
     Deliberately says *that* something changed, not *what*: the agent is told to

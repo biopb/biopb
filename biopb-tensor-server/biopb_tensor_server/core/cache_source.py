@@ -121,10 +121,11 @@ def cache_sourced_units(
     hands its bytes back through a file read that is then materialised. On
     an 8192^2 uint16 zarr chunked at 4096, one scale-16 virtual chunk, page
     cache warm: 99 -> 9 ms for ``nearest``, 141 -> 56 ms for ``area``, and
-    the codec barely moves either (docs/fused-scaling-path.md, sec 9). An
-    adapter whose ``get_data`` is *already* an mmap crop has nothing to gain,
-    and those are the ones that report no :attr:`~.adapter_base.TensorAdapter.read_block_shape` and
-    implement :meth:`~.adapter_base.TensorAdapter.get_decimated_data`, so they never arrive here.
+    the codec barely moves either. An adapter whose ``get_data`` is
+    *already* an mmap crop has nothing to gain, and those are the ones that
+    report no :attr:`~.adapter_base.TensorAdapter.read_block_shape` and
+    implement :meth:`~.adapter_base.TensorAdapter.get_decimated_data`, so
+    they never arrive here.
 
     **The unit follows the reduction's cost model.** A pick needs none of
     what it skips, so the smallest unit that still tiles into whole chunks

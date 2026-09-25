@@ -1,4 +1,4 @@
-"""Tests for the client-side on-disk chunk cache (docs/client-disk-cache.md)."""
+"""Tests for the client-side on-disk chunk cache."""
 
 import os
 import stat

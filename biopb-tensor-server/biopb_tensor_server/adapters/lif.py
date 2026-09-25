@@ -1,14 +1,14 @@
 """Native ``readlif`` adapter for Leica LIF files.
 
 BioIO reads a LIF through ``bioio-lif``, whose Dask array pays the same
-graph-rebuild-per-read cost every other bioio-backed format does (see
-``docs/dask-bypass-benchmarks.md``, biopb/biopb#799 phase 3). Unlike CZI or
-plain TIFF, ``readlif`` offers no region-of-interest read: ``LifImage.get_frame``
-always decodes one whole plane, and it reopens the file for every call rather
-than holding a handle (``LifImage._get_item``) -- there is no I/O shape to win
-back here, only the graph-construction overhead BioIO's Dask array adds on
-top of that same per-plane reopen. That is why this is the lowest-payoff
-format in the phase-3 set.
+graph-rebuild-per-read cost every other bioio-backed format does
+(biopb/biopb#799 phase 3). Unlike CZI or plain TIFF, ``readlif`` offers no
+region-of-interest read: ``LifImage.get_frame`` always decodes one whole plane,
+and it reopens the file for every call rather than holding a handle
+(``LifImage._get_item``) -- there is no I/O shape to win back here, only the
+graph-construction overhead BioIO's Dask array adds on top of that same
+per-plane reopen. That is why this is the lowest-payoff format in the phase-3
+set.
 
 **Scope.**  Every image in a local LIF container. A LIF file can hold several
 images (Leica's project tree), each becoming its own tensor -- the same
