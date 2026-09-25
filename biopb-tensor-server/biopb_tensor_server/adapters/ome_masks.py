@@ -40,8 +40,7 @@ __all__ = ["RasterizedMaskAdapter", "masks_by_image", "strip_mask_bindata"]
 logger = logging.getLogger(__name__)
 
 #: The dtype every rasterized set carries -- small next to any real
-#: instance count, and the recommendation the design makes for an uploaded
-#: set too (``docs/label-tensors.md``, "Dtype").
+#: instance count, and the recommended dtype for an uploaded set too.
 _DTYPE = "<u4"
 
 

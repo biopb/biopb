@@ -86,8 +86,7 @@ _NETWORK_FUSE_SUBTYPES = frozenset(
 # are local POSIX and mmap fine -- but a cache placed here is stored in the very
 # resource it exists to conserve, so its pages are unevictable RAM plus a mapping
 # that is also RAM. Strictly worse than the in-memory LRU it would be replacing,
-# and silently so, which is why the client's disk cache refuses one
-# (docs/client-disk-cache.md).
+# and silently so, which is why the client's disk cache refuses one.
 _MEMORY_FSTYPES = frozenset({"tmpfs", "ramfs", "devtmpfs"})
 
 # Windows file-attribute bits marking non-resident (cloud placeholder / HSM stub)

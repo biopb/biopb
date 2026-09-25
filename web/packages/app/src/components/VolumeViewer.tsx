@@ -13,8 +13,7 @@
  * `VolumeViewer`/`VolumeLayer`, Viv's packaged 3-D path, is deliberately not
  * used: it reads `loader[resolution]` and issues `Z / 2**resolution` separate
  * raster requests, decimating Z in the browser. Driven directly, this consumes
- * the same coarsest level napari's 3-D mode reads, in one request. See
- * biopb-tensor-server/docs/precache-policy.md §3.1.
+ * the same coarsest level napari's 3-D mode reads, in one request.
  *
  * Default-exported so the route can `lazy()` it, for the same reason
  * {@link TileViewer} is.

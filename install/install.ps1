@@ -40,7 +40,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
 # Where to fetch the engine from when running via `irm | iex` (no script on disk).
-# Served from biopb.org alongside install.ps1 (see docs/release-model.md).
+# Served from biopb.org alongside install.ps1.
 $EngineUrl = "https://biopb.org/biopb-engine.ps1"
 
 # Release pin -- stamped at publish, empty in the committed source (twin of

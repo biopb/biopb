@@ -18,12 +18,12 @@ content_version. A later ``do_get`` peels the envelope and forwards the inner
 VERBATIM -- no decode, no rewrite of the upstream id (biopb/biopb#178 W1). The
 upstream array_id is read once at flight-info time only to build the local route.
 
-Scope of this slice (§2 of ``docs/remote-tensor-cache.md``): the adapter + its
-data path, constructible directly (and via ``create_from_config`` for the
-single-source ``grpc://host:port/<upstream_source_id>`` url form). Catalog
-expansion of a bare ``grpc://host:port`` into one source per upstream tensor,
-alias namespacing of the registered ``source_id``, the collision check, and the
-monitor->re-list refresh are the next slice (§3).
+This module is the adapter and its data path, constructible directly (and via
+``create_from_config`` for the single-source
+``grpc://host:port/<upstream_source_id>`` url form). Catalog expansion of a bare
+``grpc://host:port`` into one source per upstream tensor, alias namespacing of
+the registered ``source_id`` and the collision check live in
+:mod:`biopb_tensor_server.sources.resolve`.
 """
 
 from __future__ import annotations

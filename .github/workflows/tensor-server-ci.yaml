@@ -2,11 +2,11 @@ name: Tensor Server CI
 
 # Test/build on branch pushes & PRs; PUBLISH the tensor-server Docker image on a
 # FINAL `release-vX.Y.Z` tag (an rc/a/b prerelease tag tests + builds but publishes
-# nothing). The tensor server tracks the product line (docs/release-model.md):
-# the same `release-v*` tag cuts the wheel bundle + GitHub release (release.yaml)
-# and builds the Docker image here — this workflow owns the image build, not
-# release.yaml. (Path filters are not evaluated for tag pushes, so a `release-v*`
-# tag triggers this regardless of the pull_request `paths` below.)
+# nothing). The tensor server tracks the product line: the same `release-v*` tag
+# cuts the wheel bundle + GitHub release (release.yaml) and builds the Docker
+# image here — this workflow owns the image build, not release.yaml. (Path
+# filters are not evaluated for tag pushes, so a `release-v*` tag triggers this
+# regardless of the pull_request `paths` below.)
 on:
   push:
     branches:

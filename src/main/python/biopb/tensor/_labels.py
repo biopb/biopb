@@ -15,8 +15,6 @@ pyramid level.
 The marker is on the id, not on disk: an OME-Zarr store's own group stays
 ``labels/``. It is what stops an uploaded tensor's id colliding with a native
 one, since a scene may plausibly be called ``labels`` and not ``@labels``.
-
-Design: ``biopb-tensor-server/docs/label-tensors.md``.
 """
 
 from __future__ import annotations

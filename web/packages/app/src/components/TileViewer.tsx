@@ -11,8 +11,6 @@
  *
  * Default-exported so the route can `lazy()` it: deck.gl and luma.gl are by far
  * the largest thing the app depends on and no other page needs them.
- *
- * See biopb-tensor-server/docs/remote-viewer-tiles.md.
  */
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";

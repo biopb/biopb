@@ -1,4 +1,4 @@
-# Signature contracts for the shipped knowledge store (biopb-mcp/docs/knowledge.md §7).
+# Signature contracts for the shipped knowledge store.
 #
 # A doc body is an un-versioned assertion about someone else's API. This job
 # proves those assertions against the real library -- that the parameter exists,

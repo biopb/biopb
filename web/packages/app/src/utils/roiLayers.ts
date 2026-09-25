@@ -9,8 +9,6 @@
  * **Geometry needs no transform.** `DetailView` renders in level-0 image
  * pixels, which is exactly the space `annotation.proto` stores ROI coordinates
  * in.
- *
- * See docs/roi-annotations-ui.md.
  */
 
 import { PathLayer, PolygonLayer, ScatterplotLayer } from "@deck.gl/layers";
@@ -167,7 +165,7 @@ export function roiPath(geometry: RoiGeometry): XY[] | null {
  *
  * Filtering in memory rather than fetching per plane is deliberate -- the play
  * driver steps an axis every 100 ms, and a fetch per frame would leave the
- * overlay trailing the image. See docs/roi-annotations-ui.md.
+ * overlay trailing the image.
  */
 export function visibleRois(
   rois: RoiAnnotation[],

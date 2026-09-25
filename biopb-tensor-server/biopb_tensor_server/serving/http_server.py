@@ -662,7 +662,7 @@ async def _abort_if_client_gone(request: Request, ctx: _SidecarContext) -> None:
 # Preferred tile edge in pixels. 512x512 uint16 is 512 KB on the wire, which is
 # where the per-request cost of the control's /data_plane proxy stops dominating
 # (biopb/biopb#762): below ~256 KB of payload the deployment spends its capacity
-# on proxy overhead rather than pixels. See docs/remote-viewer-tiles.md.
+# on proxy overhead rather than pixels.
 _TILE_TARGET_EDGE = 512
 
 # Tiles are cached by URL, and the URL carries no token -- auth rides in the
@@ -891,9 +891,9 @@ def _tile_edge(
     Chosen so a tile *nests* inside a stored chunk -- ``chunk / 2**k`` -- rather
     than equalling it. Straddling a chunk boundary is what costs: locally it is
     a few extra page touches, but against a proxied upstream it turns one cold
-    chunk pull into two (docs/remote-viewer-tiles.md). Nesting keeps the segment
-    cache hitting while letting the transport unit be sized for latency instead
-    of for mmap locality, which is the whole point of separating the two.
+    chunk pull into two. Nesting keeps the segment cache hitting while letting
+    the transport unit be sized for latency instead of for mmap locality, which
+    is the whole point of separating the two.
     """
     height, width = int(shape[y_idx]), int(shape[x_idx])
     plane_max = max(height, width, 1)
@@ -1151,10 +1151,10 @@ def _tile_read(
 
     The remainder is decimated in-process rather than asked of the data plane as
     a separate scaled read, so one advertised level serves the whole tail of the
-    ladder above it (docs/precache-policy.md 4.2) and mints no second cache
-    entry. A rung *finer* than every advertised level reads full resolution,
-    which is the planner's own position: it omits the intermediate rungs because
-    they cost a client a level-0 read anyway and save it nothing.
+    ladder above it (a strided ``nearest`` pick composes exactly) and mints no
+    second cache entry. A rung *finer* than every advertised level reads full
+    resolution, which is the planner's own position: it omits the intermediate
+    rungs because they cost a client a level-0 read anyway and save it nothing.
 
     What the level is decides what the read costs. A **computed** level is the
     one precache warmed, so this is a warm read plus a decimation. A **native**
@@ -1217,9 +1217,9 @@ def _tile_read(
 # A volume is not a rung of either ladder: `XR3DLayer` and napari's 3-D mode
 # both upload one whole 3-D texture, so there is nothing to tile and nothing to
 # zoom between. What they need is the single scale the precache worker keeps a
-# whole volume warm at -- the Flight ladder's coarsest level (N1,
-# docs/precache-policy.md 3.2, 5). The server decides it; a client that guessed
-# would miss the warm chunks by a factor of two and pay a cold decode.
+# whole volume warm at -- the Flight ladder's coarsest level. The server decides
+# it; a client that guessed would miss the warm chunks by a factor of two and
+# pay a cold decode.
 
 
 def _volume_plan(
@@ -1438,8 +1438,8 @@ def _volume_spacing(
 
 
 # The scale decisions a caller may delegate to the server. One today; named
-# rather than boolean because the warm set has two targets (2-D and 3-D,
-# docs/precache-policy.md 5) and "the warm scale" would not say which.
+# rather than boolean because the warm set has two targets (2-D and 3-D) and
+# "the warm scale" would not say which.
 _SCALE_POLICIES = ("volume",)
 
 
@@ -2307,7 +2307,7 @@ async def get_source(source_id: str, request: Request) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
-# ROI annotations (biopb-tensor-server/docs/roi-annotations.md)
+# ROI annotations
 #
 # Its own /api/rois/* namespace, so nothing here is shadowed by the greedy
 # /api/sources/{source_id:path} catch-all. Bodies are canonical proto3 JSON in
@@ -2581,7 +2581,7 @@ async def get_tile(
     ``png``/``jpeg`` forms this route used to serve: they have no caller since the
     server-rendered viewer was retired, and answering raw bytes to a request that
     asked for an image would be the silent-wrong-content failure the ``sel`` work
-    was written to avoid (docs/remote-viewer-tiles.md).
+    was written to avoid.
 
     Response headers mirror /api/slice (``X-Shape``/``X-Dtype``/``X-Dim-Labels``)
     plus ``X-Tile-Size``/``X-Tile-Level``/``X-Tile-Col``/``X-Tile-Row`` so a
@@ -2817,7 +2817,7 @@ async def slice_tensor(req: SliceRequest, request: Request) -> Response:
     The scale is normally the caller's (``scale_hint``). ``scale_policy`` hands
     that decision back to the server: ``"volume"`` reads at the one scale a
     whole 3-D volume is kept warm at, which is the level napari 3-D and
-    ``XR3DLayer`` upload as a single texture (docs/precache-policy.md 5). A
+    ``XR3DLayer`` upload as a single texture. A
     client cannot compute that itself without reimplementing the pyramid
     planner, and a guess that lands one rung away misses every warmed chunk and
     pays a cold decode of the source instead. The two are mutually exclusive:

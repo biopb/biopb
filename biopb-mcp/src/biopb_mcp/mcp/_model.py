@@ -4,8 +4,7 @@
 be tested with no key and no network. This is the real one, and it is small on
 purpose — the spike that settled hand-roll-vs-vendor found the model call was
 about a dozen lines of ``httpx`` and that every hard problem was biopb-specific
-plumbing a framework would not have known about either
-(``docs/chat-engines.md``).
+plumbing a framework would not have known about either.
 
 **Where the key lives.** In an owner-only credential file, not in
 ``mcp-config.json`` and not in the environment. The config file is served whole

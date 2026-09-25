@@ -28,7 +28,6 @@ Completeness of the handle set is enforced by a graph-walk test (see
 unregistered handle type fails CI instead of segfaulting at runtime. That walk
 follows *public attribute access* rather than pydantic fields, because napari
 publishes some handles (the overlays) as properties over a private container.
-See ``docs/viewer-thread-safety.md``.
 """
 
 import functools

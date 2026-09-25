@@ -3,8 +3,7 @@
 /**
  * The annotations panel: what this tensor holds, and what is on screen.
  *
- * Read-only for now -- it names the sets, counts them, and switches them on and
- * off. Drawing tools land in the next phase (docs/roi-annotations-ui.md).
+ * It names the sets, counts them, and switches them on and off.
  *
  * Rendered only alongside the 2-D viewer. In volume mode there is no overlay to
  * govern, so a list of annotations drawn nowhere would be a control over

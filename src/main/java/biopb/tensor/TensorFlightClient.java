@@ -761,7 +761,7 @@ public class TensorFlightClient implements AutoCloseable {
         }
     }
 
-    // ---- label sets (biopb-tensor-server/docs/label-tensors.md) -----------
+    // ---- label sets -------------------------------------------------------
 
     /**
      * The {@code array_id}s of the label sets served under an image.
@@ -790,7 +790,7 @@ public class TensorFlightClient implements AutoCloseable {
         return sets;
     }
 
-    // ---- ROI annotations (biopb-tensor-server/docs/roi-annotations.md) ----
+    // ---- ROI annotations --------------------------------------------------
 
     /**
      * Fetch a tensor's ROI annotations.

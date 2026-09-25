@@ -1,6 +1,6 @@
 """A bleaching time series as benchmark data: which cells actually changed?
 
-A deferred-tier case (`docs/skill-candidates.md`). Photobleaching correction was
+A deferred-tier case. Photobleaching correction was
 **prescreened and dropped** 2026-08-03: the claimed non-trivial part — choosing
 between ratio, exponential fit and histogram matching according to what is being
 measured — did not survive contact, because both cold arms picked an

@@ -1,11 +1,11 @@
 """Colocalization as benchmark data: how much of one channel sits on the other?
 
-A deferred-tier case (`docs/skill-candidates.md`). Colocalization coefficients
-were **prescreened and dropped** 2026-08-03 for the shipped catalog — both cold
-Sonnet arms produced Costes thresholding, Manders above threshold and a
-randomization test unprompted, and agreed with a reference to three significant
-figures. It is here anyway, because the *work* is real whether or not a skill
-for it is served, and because a rejection is conditional on the consuming tier.
+A deferred-tier case. Colocalization coefficients were **prescreened and
+dropped** 2026-08-03 for the shipped catalog — both cold Sonnet arms produced
+Costes thresholding, Manders above threshold and a randomization test
+unprompted, and agreed with a reference to three significant figures. It is
+here anyway, because the *work* is real whether or not a skill for it is
+served, and because a rejection is conditional on the consuming tier.
 
 **What that screen could not build, and this fixture is.** The entry records a
 second finding: *no scene separated the correct procedure from the naive one*.

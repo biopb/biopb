@@ -3,8 +3,8 @@
 The control is the process that owns this machine's data plane: it chose the
 bind, the port and the scheme, and it wrote the credential. This package asks
 it, over its HTTP API, and is the one supported way to do so from outside the
-monorepo. ``docs/discovery-contract.md`` is the language-neutral contract it
-implements.
+monorepo. It implements a language-neutral contract, so a client in another
+language can do the same over plain HTTP.
 
 It never starts a process and imports nothing beyond the standard library, so
 it can be imported where ``biopb.tensor`` (pyarrow) cannot.

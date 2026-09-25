@@ -6,8 +6,7 @@ every read re-optimizes the whole graph (so cost tracks the *file's* plane
 count, not the request), and the block is always a whole plane
 (``chunk_shape = shape[-2:]``), so a tile request materializes the plane and
 discards most of it.  A 256x256 tile out of a 4096x4096 plane costs 31.4 ms
-that way against 1.09 ms through ``pylibCZIrw.read(roi=...)``; see
-``docs/dask-bypass-benchmarks.md``.
+that way against 1.09 ms through ``pylibCZIrw.read(roi=...)``.
 
 This adapter reads through libCZI directly: ``read(plane=..., scene=...,
 roi=...)`` decodes only the subblocks the requested region covers.
@@ -505,10 +504,9 @@ class CziAdapter(TensorAdapter):
         4, 5, 6, 8, 16 and 17: bit-identical to ``downsample_block(..., 'nearest')``
         on every divisible extent and off by one on every indivisible one.
 
-        Note that makes divisibility the predicate, *not* powers of two. The
-        design doc inferred a power-of-two guard from a single 4096/3 case;
-        3 fails there because 4096 is not a multiple of 3, and 3x on a 510-wide
-        ROI is exact. Non-dyadic scales are in scope.
+        Divisibility is the predicate, *not* powers of two: 3x fails on 4096
+        only because 4096 is not a multiple of 3, and 3x on a 510-wide ROI is
+        exact. Non-dyadic scales are in scope.
         """
         if self.scene_position is None or reduction_method != "nearest":
             return None

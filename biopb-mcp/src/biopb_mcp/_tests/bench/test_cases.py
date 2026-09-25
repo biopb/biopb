@@ -136,8 +136,8 @@ def test_a_fixture_tree_does_not_change_what_a_procedural_case_runs(
     replaced a case's own fixture, silently and per machine. **Substituting the
     data makes it a different experiment with the same name** — the truth
     changes, the achievable accuracy changes, and the conclusion can invert,
-    which was measured rather than supposed (`docs/agent-bench.md`). It is a
-    root path now, and a procedural case must not so much as look at it.
+    which was measured rather than supposed. It is a root path now, and a
+    procedural case must not so much as look at it.
     """
     case = next(c for c in CASES if c.fixture.kind == "synthetic")
     decoy = tmp_path / case.namespace / case.case_id

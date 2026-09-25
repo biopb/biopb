@@ -3,9 +3,9 @@
 
 The installer seeds a fresh (config-less) install with this bundle so the product
 opens onto real, populated microscopy data instead of an empty catalog — the
-drag-drop / admin-page paths are how a user then adds their own data (see
-docs/release-model.md). The bundle is produced ONCE here, in CI, so its bytes are
-fixed and checksummed into the release; it is never fetched at install time.
+drag-drop / admin-page paths are how a user then adds their own data. The
+bundle is produced ONCE here, in CI, so its bytes are fixed and checksummed
+into the release; it is never fetched at install time.
 
 Every image is drawn from ``skimage.data`` and is confirmed **CC0 / public
 domain** (see the ``LICENSE`` column below and the emitted ``LICENSES.txt``). We

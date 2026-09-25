@@ -32,7 +32,7 @@ dependencies = [
   # through 24). Below it, the batch could pin the handle and unlink would fail
   # with WinError 32. Do not lower without re-running the version sweep.
   "pyarrow >= 14.0.0",
-  "zarr >= 2.0.0, <3",  # biopb's Zarr/OmeZarr adapters target the zarr 2.x API; zarr 3 (py>=3.11 only) is a separate port. See docs/aicsimageio-to-bioio-migration.md
+  "zarr >= 2.0.0, <3",  # biopb's Zarr/OmeZarr adapters target the zarr 2.x API; zarr 3 (py>=3.11 only) is a separate port.
   "dask[array] >= 2024.0.0",
   "cachey >= 0.1.0",  # required by biopb.tensor.client (SDK TensorFlightClient); the SDK only declares it under its [tensor] extra, which we don't pull
   "fsspec",  # remote sources (S3/GCS/HTTP) and zarr FSStore
@@ -40,8 +40,7 @@ dependencies = [
   # Upper bound: tifffile 2025.5.21 dropped Zarr 2 support and requires Zarr 3
   # (2025.5.10 is the last release that reads via a Zarr-2 store). OmeTiffAdapter's
   # read path opens series.aszarr() as a Zarr-2 store, matching the zarr<3 pin
-  # above, so tifffile must stay on the Zarr-2 line. See
-  # docs/aicsimageio-to-bioio-migration.md.
+  # above, so tifffile must stay on the Zarr-2 line.
   "tifffile >= 2024.8.10, < 2025.5.21",
   # OmeTiffAdapter parses OME-XML with it (ome_tiff.py:310), and that adapter is
   # always registered because tifffile is a core dep -- so this is a core
@@ -106,8 +105,7 @@ dependencies = [
   # is its own plugin with modern, uncapped deps, so none re-imposes the
   # numpy<2 / tifffile<2023.3.15 caps aicsimageio did. Not in the default
   # install since biopb/biopb#799: the native adapters own every local vendor
-  # format, leaving bioio the Java bridge and remote sources. See
-  # docs/aicsimageio-to-bioio-migration.md.
+  # format, leaving bioio the Java bridge and remote sources.
   aics = [
     "bioio >= 3.0",
     "bioio-lif",       # Leica LIF (readlif)
@@ -125,12 +123,12 @@ dependencies = [
     # in the registry ahead of the generic bioio fallback, so a .zarr store never
     # reaches a bioio reader. (2) It requires zarr>=3, which collides with the
     # zarr<3 pin above; adopting it is the same trigger as the deferred zarr 2->3
-    # port. See docs/aicsimageio-to-bioio-migration.md.
+    # port.
   ]
   # Zeiss CZI reader, split out of [aics]: bioio-czi -> pylibczirw publishes
   # arm64-macOS / Linux / Windows wheels but NO Intel-macOS wheel (any version),
   # so on an Intel Mac it would compile libCZI from source and fail. The installers
-  # add this everywhere except Intel macOS. See docs/aicsimageio-to-bioio-migration.md.
+  # add this everywhere except Intel macOS.
   czi = [
     "bioio-czi",
   ]

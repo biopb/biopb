@@ -20,8 +20,6 @@ chosen by (``RESERVED_PREFIX``).
 This module is pure: strings and shapes. What a set *is* lives in
 :mod:`biopb_tensor_server.adapters.labels`, and how a source answers for one in
 :class:`~biopb_tensor_server.core.adapter_base.SourceAdapter`.
-
-Design: ``biopb-tensor-server/docs/label-tensors.md``.
 """
 
 from __future__ import annotations

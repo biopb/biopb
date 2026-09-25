@@ -784,8 +784,8 @@ class TestJobTools:
 class TestUserActivityNote:
     """The agent's notice that a human wrote to its namespace.
 
-    See ``docs/jupyter-clients.md``: the user's cells are recorded as jobs, so the agent's picture of the namespace can go stale between calls
-    with nothing in its own results to say so.
+    The user's cells are recorded as jobs, so the agent's picture of the
+    namespace can go stale between calls with nothing in its own results to say so.
     """
 
     _DIGEST = [

@@ -1,6 +1,6 @@
 """Local thickness as benchmark data: how thick is this structure?
 
-A deferred-tier case (`docs/skill-candidates.md`). Local thickness was
+A deferred-tier case. Local thickness was
 **prescreened and dropped** 2026-08-03 for the shipped catalog — both cold
 Sonnet arms named Hildebrand & Ruegsegger, passed `sampling=spacing`, and swept
 radii largest-first, matching or beating the reference. It is here anyway,

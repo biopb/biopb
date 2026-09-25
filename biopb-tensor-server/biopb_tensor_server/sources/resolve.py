@@ -64,8 +64,7 @@ def _namespaced_source_id(alias: Optional[str], upstream_source_id: str) -> str:
     mirror on a move; the alias is the stable stand-in that does not.
 
     The contract: an alias is part of the identity, not a label. Renaming one
-    re-keys every source mirrored from that upstream. See
-    ``docs/remote-tensor-cache.md``.
+    re-keys every source mirrored from that upstream.
     """
     return f"{alias}__{upstream_source_id}" if alias else upstream_source_id
 

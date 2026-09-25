@@ -4,7 +4,7 @@ This module provides a base class and format-specific subclasses for reading
 various microscopy formats through bioio's BioImage class. bioio is the
 maintained successor to aicsimageio (its API is a near drop-in); each vendor
 reader ships as its own ``bioio-*`` plugin, so a slimmer install pulls only the
-formats it needs. See docs/aicsimageio-to-bioio-migration.md.
+formats it needs.
 
 Format-specific subclasses provide meaningful source_type values:
 - ZeissAdapter: "zeiss" (CZI, LSM)

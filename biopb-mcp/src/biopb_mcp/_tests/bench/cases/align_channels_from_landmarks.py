@@ -30,7 +30,7 @@ Three metrics, and the last is the one worth having:
     with a straight face. Quoting the fitting residual is therefore not a small
     reporting slip; it is the whole failure, and it is invisible from the run's
     own output. The landmark-registration prescreen found no model that fell
-    for it (`docs/skill-candidates.md`), which is a result worth being able to
+    for it, which is a result worth being able to
     re-measure rather than assume keeps holding.
 """
 

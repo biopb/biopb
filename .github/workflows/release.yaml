@@ -1,7 +1,7 @@
 # Product deployment (the GitHub release bundle), triggered by a single
-# `release-v*` tag. See docs/release-model.md. Produces, from the tagged commit,
-# the GitHub release: wheel set + mcp sdist + webapp + samples + installers — the
-# installer's single source of truth.
+# `release-v*` tag. Produces, from the tagged commit, the GitHub release: wheel
+# set + mcp sdist + webapp + samples + installers — the installer's single
+# source of truth.
 # Docker images are NOT built here: biopb-tensor-server's image is built by
 # tensor-server-ci on this same `release-v*` tag, and biopb-image-base on the SDK
 # `v*` tag (image-runtime-ci). PyPI is likewise separate — biopb publishes to PyPI
@@ -29,10 +29,10 @@ jobs:
   # release moves Docker :latest and ships a non-prerelease GitHub release (the
   # installer's source of truth), so publishing it off unmerged code is a
   # mistake. RC/prerelease tags (…rc1/a1/b1) are EXEMPT: by design they are cut
-  # off dev to validate the deployment before it lands on main
-  # (docs/release-model.md). When a final tag points at an off-main commit we
-  # skip the whole run (a noop) rather than publish it. Manual workflow_dispatch
-  # is a dry run that never pushes, so it always proceeds.
+  # off dev to validate the deployment before it lands on main. When a final tag
+  # points at an off-main commit we skip the whole run (a noop) rather than
+  # publish it. Manual workflow_dispatch is a dry run that never pushes, so it
+  # always proceeds.
   guard:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -80,8 +80,7 @@ jobs:
   # so it needs nothing but the checkout — no wheels, no Docker. Compiled UNSIGNED
   # for now: no code-signing cert is provisioned yet, so the .exe trips a
   # SmartScreen "Unknown publisher" warning. Wire up signing later by registering
-  # an iscc sign tool and uncommenting `SignTool=biopbsign` in biopb-setup.iss
-  # (see install/docs/windows-installer.md "Code signing").
+  # an iscc sign tool and uncommenting `SignTool=biopbsign` in biopb-setup.iss.
   windows-installer:
     needs: guard
     if: needs.guard.outputs.proceed == 'true'
@@ -212,14 +211,14 @@ jobs:
           pnpm -C web --filter @biopb/web build
           tar -czf release-wheels/webapp.tar.gz -C web/packages/app dist
 
-      # Curated CC0 sample images (docs/release-model.md). A fresh, config-less
-      # install seeds these so the product opens onto real microscopy data instead
-      # of an empty catalog; drag-drop / the admin page are how users add their
-      # own. The bytes are fixed and checksummed into the release -- never fetched
-      # from a third party at install time. Isolated, pinned env: skimage/pooch/
-      # tifffile are build-only. The archive root holds the files directly
-      # (installer extracts with no strip). The default (lite) set omits the
-      # ~250 MB palisades_of_vogt sample.
+      # Curated CC0 sample images. A fresh, config-less install seeds these so the
+      # product opens onto real microscopy data instead of an empty catalog;
+      # drag-drop / the admin page are how users add their own. The bytes are
+      # fixed and checksummed into the release -- never fetched from a third party
+      # at install time. Isolated, pinned env: skimage/pooch/tifffile are
+      # build-only. The archive root holds the files directly (installer extracts
+      # with no strip). The default (lite) set omits the ~250 MB palisades_of_vogt
+      # sample.
       #
       # The bundle is STATIC -- it only changes when .github/scripts/build_samples.py (the
       # curated set) or the skimage pin change -- so cache it keyed on exactly
@@ -313,7 +312,7 @@ jobs:
 
       # Pull the Windows installer built by the windows-installer job into the
       # release-asset dir so the glob below attaches it. The .exe is UNSIGNED for
-      # now (no cert yet — see install/docs/windows-installer.md).
+      # now (no cert yet).
       - name: Download Windows installer
         uses: actions/download-artifact@v4
         with:
@@ -366,8 +365,7 @@ jobs:
       # The GitHub release is the installer's source of truth. Explicit globs
       # (not release-wheels/*) so the .gitignore uv drops in the out-dir is not
       # uploaded. Installer scripts come from the repo-root install/ (the canonical
-      # copy users track — see docs/release-model.md), now pinned to this release
-      # by the step above.
+      # copy users track), now pinned to this release by the step above.
       - name: Create GitHub release
         if: steps.ver.outputs.is_tag == 'true'
         uses: softprops/action-gh-release@v2

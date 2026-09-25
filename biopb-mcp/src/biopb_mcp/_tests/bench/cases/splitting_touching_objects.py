@@ -1,6 +1,6 @@
 """Touching nuclei as benchmark data: how many are there, and where do they part?
 
-A deferred-tier case (`docs/skill-candidates.md`). Splitting touching objects was
+A deferred-tier case. Splitting touching objects was
 **ablated and dropped** 2026-08-03 — three cold arms all passed
 `sampling=spacing` to the distance transform, all used marker-controlled
 watershed masked to the input, and every one matched or beat the skill-informed

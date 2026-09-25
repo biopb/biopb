@@ -1,8 +1,8 @@
 """One spelling for a server location (``biopb.tensor._location``).
 
 The canonical form is a cross-SDK contract -- the disk chunk cache names its
-per-server directory after it (docs/client-disk-cache.md), so a second SDK
-sharing that tree has to land on the same string. These are the vectors.
+per-server directory after it, so a second SDK sharing that tree has to
+land on the same string. These are the vectors.
 """
 
 import pytest

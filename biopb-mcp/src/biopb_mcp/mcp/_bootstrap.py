@@ -29,12 +29,11 @@ def is_scratch_kernel():
     Whoever opens the saved notebook gets a bare kernel, so the run that
     verifies it gets one too, and what the document needs it builds for itself
     (``biopb_mcp.workflow_env``). Anything bound here for free is something a
-    workflow can pass on and then fail on
-    (docs/verify-workflow.md).
+    workflow can pass on and then fail on.
 
-    No Qt either, so it needs no display at all -- an earlier design took the
-    session's with ``napari.Viewer(show=False)``, which is why the note about
-    offscreen GL is in that document rather than here.
+    No Qt either, so it needs no display at all. A hidden
+    ``napari.Viewer(show=False)`` is no substitute: its screenshots come back
+    black, and under an offscreen Qt platform it renders nothing at all.
 
     The literal mirrors ``_kernel.ENV_SCRATCH``, which is where the launcher
     sets it; spelled out rather than imported because ``_kernel`` belongs to the
@@ -612,9 +611,9 @@ def _bootstrap_impl():
                 "da": da,
                 "client": None,
                 "ops": ops,
-                # A long compute off the main thread (docs/jupyter-clients.md);
-                # a workflow document does not get it, since its reader has
-                # no such helper either.
+                # A long compute off the main thread; a workflow document
+                # does not get it, since its reader has no such helper
+                # either.
                 "run_async": _jobs.run_async,
             }
         )
@@ -623,7 +622,7 @@ def _bootstrap_impl():
         # arbitrary job-thread code (viewer/layers/dims/camera mutations) can't
         # segfault Qt -- the real viewer is touched only on the Qt main thread.
         # Internal subsystems (helpers, tools, the Tensor Browser widget) keep
-        # the real viewer. See docs/viewer-thread-safety.md.
+        # the real viewer.
         from ._helpers import (
             patch_viewer_tensor_methods,
             resync_view_for_capture,

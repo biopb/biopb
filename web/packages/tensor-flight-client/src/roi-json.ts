@@ -1,7 +1,8 @@
 /**
  * The proto3-canonical-JSON codec for ROI annotations.
  *
- * Hand-written rather than generated (see docs/roi-annotations-ui.md). Four
+ * Hand-written rather than generated: protobuf-es types would still need the
+ * same int64/base64/oneof conversion here, and would add a Node toolchain. Four
  * properties of the wire format drive every line here, and all four are silent
  * failures if missed:
  *

@@ -714,7 +714,6 @@ PRECACHE_DOWNSCALE_FACTOR = 2
 # 448**3 = 90 Mvox. The coarsest level is uploaded whole as one 3-D texture by
 # both renderers, and Viv casts it to float32 -- measured on a Quadro P2000,
 # 90 Mvox holds 50 fps there where 512**3 (134 Mvox) drops to 17.
-# See docs/precache-policy.md 9.1.
 PRECACHE_PIXEL_BUDGET_CUBIC_ROOT = 448
 # 2048**2. Caps the 2-D rungs, and is chosen to land on the level deck.gl asks
 # for at fit-to-view in a ~1500-2000px window, so the warmed level is the one
@@ -793,8 +792,7 @@ def _pyramid_levels(
 
     Everything below documents the levels themselves.
 
-    Full resolution, then the two levels the precache worker warms (see
-    ``docs/precache-policy.md`` §4.1, §5):
+    Full resolution, then the two levels the precache worker warms:
 
     - **the 2-D target**, X and Y only, halved by ``downscale_factor`` until the
       plane fits ``plane_max_pixels`` (and X/Y fit ``threshold``). Z is left

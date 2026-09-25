@@ -1,9 +1,9 @@
 # CI for biopb-mcp (the MCP server). Lives in the monorepo at
 # biopb-mcp/. This is a TEST-ONLY workflow: biopb-mcp is no longer published to
 # PyPI (the product ships as the release-v* wheel triple the installer
-# file://-installs — see docs/release-model.md). biopb-mcp is a product component,
-# so its version comes from the single `release-v*` tag (setuptools_scm stamps the
-# clean X.Y.Z onto the wheel built in release.yaml); there is no per-package tag.
+# file://-installs). biopb-mcp is a product component, so its version comes from
+# the single `release-v*` tag (setuptools_scm stamps the clean X.Y.Z onto the
+# wheel built in release.yaml); there is no per-package tag.
 #
 # push and pull_request carry the SAME paths filter so branch-push and PR runs are
 # scoped identically (test-only, MCP-relevant changes), with no tag trigger.

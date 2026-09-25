@@ -126,10 +126,10 @@ $script:BiopbPinnedRelease = ''
 # napari/Qt process -- machine-specific state that has no business in a roaming
 # profile (which on managed machines is synced/redirected, inviting locks and slow
 # logons). This matches the rest of the installer, which is deliberately Local (the
-# Inno GUI installs under {localappdata}\biopb; see docs/windows-installer.md). Set
-# at script scope so it is inherited by every `uv` invocation in install AND
-# uninstall. An explicit user UV_TOOL_DIR wins. Runs on dot-source too, so the
-# console front-end (which dot-sources this engine) gets it before it drives uv.
+# Inno GUI installs under {localappdata}\biopb). Set at script scope so it is
+# inherited by every `uv` invocation in install AND uninstall. An explicit user
+# UV_TOOL_DIR wins. Runs on dot-source too, so the console front-end (which
+# dot-sources this engine) gets it before it drives uv.
 if ((-not $env:UV_TOOL_DIR) -and $env:LOCALAPPDATA) {
     $env:UV_TOOL_DIR = Join-Path $env:LOCALAPPDATA "uv\tools"
 }

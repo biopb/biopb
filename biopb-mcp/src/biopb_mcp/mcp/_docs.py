@@ -1,8 +1,7 @@
 """The knowledge store: flat markdown docs in two tiers, and an agent-edited index.
 
-See ``docs/knowledge.md``. A doc is a markdown file; its **id is its path under
-the tier directory, minus ``.md``**, and may contain ``/``. Two tiers, both read
-fresh on every access:
+A doc is a markdown file; its **id is its path under the tier directory, minus
+``.md``**, and may contain ``/``. Two tiers, both read fresh on every access:
 
 * **shipped** — ``_docs_data/`` inside the wheel, read-only. Every file in it
   ships and reads back by id. A ``_``-prefixed name is **banked**: the release
@@ -78,10 +77,10 @@ _SEGMENT = re.compile(r"\A[A-Za-z0-9_][A-Za-z0-9._-]*\Z")
 def valid_id(doc_id: str) -> bool:
     """True if *doc_id* names a doc: slash-separated segments, no traversal.
 
-    A trailing ``/`` is not an id. It is reserved for the collections of
-    ``docs/knowledge.md`` §7 and is accepted only where that section says it is
-    -- verbatim in an index line -- so a seed written for a later release parses
-    here and means something there.
+    A trailing ``/`` is not an id. It is reserved for future collections and
+    is accepted only verbatim in an index line (``- <id>/:``, kept as one
+    entry) -- so a seed written for a later release parses here and means
+    something there.
     """
     if not doc_id or doc_id != doc_id.strip():
         return False

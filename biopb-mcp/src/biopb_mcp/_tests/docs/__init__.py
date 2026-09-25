@@ -1,7 +1,7 @@
 """The deterministic layers of the knowledge store: packaging, seed, contracts.
 
 No agent, no session, no display. They run against the store this package ships
-(``biopb_mcp/mcp/_docs_data/*.md``) -- see ``biopb-mcp/docs/knowledge.md``.
+(``biopb_mcp/mcp/_docs_data/*.md``).
 
 There is no schema layer any more, and that is the point of the redesign: a doc
 is a markdown file with optional frontmatter, and the tolerant reader in

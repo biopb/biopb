@@ -196,7 +196,7 @@ export interface AppState {
    */
   tileInfoFor: string | null;
 
-  // --- ROI annotations (docs/roi-annotations-ui.md) -----------------------
+  // --- ROI annotations ----------------------------------------------------
   /**
    * The rows held for the tensor in view, across every scope that has landed.
    * Filtered to the plane and to the visible sets at render time.
@@ -291,7 +291,7 @@ export interface AppState {
   /** A write that failed or lost a conditional put, for the panel to report. */
   roiWriteError: string | null;
 
-  // --- label overlay (biopb-tensor-server/docs/label-tensors.md) ----------
+  // --- label overlay ------------------------------------------------------
   /**
    * The label set drawn over the image, as its whole `array_id`, or null.
    *

@@ -7,8 +7,6 @@ look an upload up (the parent's ``label_uploads``, not the registry) and a
 catalog row that is the parent's; what it buys the client is the ordinary
 ``add_tensor`` / ``upload_array`` / ``set_upload_status`` round trip, with
 a discard to free the name again.
-
-Design: ``biopb-tensor-server/docs/label-tensors.md``.
 """
 
 import json

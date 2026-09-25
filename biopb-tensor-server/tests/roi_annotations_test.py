@@ -1,9 +1,8 @@
 """ROI annotations: the DuckDB store, the Flight actions, and the sidecar routes.
 
-Design: ``docs/roi-annotations.md``. The store-level cases pin the decisions that
-are easy to regress -- geometry acceptance, level-0 bbox derivation, plane pinning,
-per-ROI rev/conflict, the cap -- while one gRPC round-trip and one FastAPI pass
-exercise the wire in each direction.
+The store-level cases pin the decisions that are easy to regress -- geometry
+acceptance, level-0 bbox derivation, plane pinning, per-ROI rev/conflict, the cap --
+while one gRPC round-trip and one FastAPI pass exercise the wire in each direction.
 """
 
 import json

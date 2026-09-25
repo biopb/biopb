@@ -1676,10 +1676,11 @@ class TestTileGeometry:
 class TestTileSynthesisIsExact:
     """Reducing the warm level must equal a direct read at the coarser level.
 
-    The property docs/precache-policy.md 4.2 rests on: `nearest` is a strided
-    pick, so `data[::32]` and `data[::8][::4]` select the same elements and
-    `ceil(ceil(n/a)/b) == ceil(n/(a*b))` gives the same count. Ragged extents
-    included -- those are where a padding reducer would diverge.
+    The property the tile route's in-process decimation of a warm level rests
+    on: `nearest` is a strided pick, so `data[::32]` and `data[::8][::4]` select
+    the same elements and `ceil(ceil(n/a)/b) == ceil(n/(a*b))` gives the same
+    count. Ragged extents included -- those are where a padding reducer would
+    diverge.
     """
 
     @pytest.mark.parametrize("extent", [4096, 4000, 3999, 1001])
@@ -2851,9 +2852,9 @@ class TestIntegrationLoneQualifiedTensor:
 class TestVolumePlan:
     """The scale a 3-D read resolves to, and the tensors that have none.
 
-    The expected scales are docs/precache-policy.md 5.1's table: this plan IS
-    the Flight ladder's coarsest level, so a divergence here means the sidecar
-    and the precache worker have stopped agreeing about what is warm.
+    The expected scales are the 3-D warm target's: this plan IS the Flight
+    ladder's coarsest level, so a divergence here means the sidecar and the
+    precache worker have stopped agreeing about what is warm.
     """
 
     @pytest.mark.parametrize(

@@ -39,8 +39,7 @@ same port**, and routes by namespace so no two upstreams share a path prefix:
                                      namespacing, base ``/``. (No bundle ->
                                      API-only.) ``url_prefix`` republishes the
                                      whole origin under a reverse-proxy path
-                                     prefix at run time; see
-                                     ``docs/url-prefix.md``.
+                                     prefix at run time.
 - ``/data_plane/{api,livez,...}`` is reverse-proxied to the supervised tensor
   server's HTTP sidecar — a ``Mount`` that strips its prefix, so the sidecar
   (which serves ``/api/*`` at its own root) needs no knowledge of
@@ -832,7 +831,7 @@ def _is_our_launch(rec: dict, launch_token: str) -> bool:
     """Whether session record ``rec`` is the viewer this launch just spawned.
 
     biopb-mcp and biopb-control are never mismatched -- they read the same
-    ``release-v*`` tag (docs/release-model.md) -- so every viewer this control
+    ``release-v*`` tag -- so every viewer this control
     can launch echoes the token; there is no older biopb-mcp to fall back to a
     pid match for.
     """

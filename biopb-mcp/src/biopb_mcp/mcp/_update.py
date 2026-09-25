@@ -7,7 +7,7 @@ degrades to "no update" and is logged at debug. Nothing here raises into the
 bootstrap, and nothing here applies an update or pops UI; this module only
 answers *"is there a newer deployment than the one installed?"*.
 
-Design notes that pin this to the current release model (``docs/release-model.md``):
+Design notes that pin this to the current release model:
 
 * The product ships on the ``biopb/biopb`` ``release-v*`` line, NOT on
   ``/releases/latest`` (repo-wide; would surface a ``v*`` SDK/library tag). We
@@ -36,7 +36,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 # The deployment release line. Fixed (not configurable): the installer and the
-# release pipeline both hard-code this prefix (docs/release-model.md).
+# release pipeline both hard-code this prefix.
 RELEASE_TAG_PREFIX = "release-v"
 
 _GITHUB_API = "https://api.github.com"
@@ -245,8 +245,8 @@ def check_for_update(
 # it runs on the Qt main thread (the popup's button signal delivers there).
 # `_update_popup` keeps the clipboard copy, which needs Qt.
 # ---------------------------------------------------------------------------
-# The published install/upgrade one-liners (docs/release-model.md). Re-running
-# the script is how a user updates; the nagger just surfaces the command.
+# The published install/upgrade one-liners. Re-running the script is how
+# a user updates; the nagger just surfaces the command.
 _INSTALL_SH = "curl -fsSL https://biopb.org/install.sh | bash"
 _INSTALL_PS1 = "irm https://biopb.org/install.ps1 | iex"
 
