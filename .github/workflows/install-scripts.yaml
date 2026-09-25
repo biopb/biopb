@@ -3,7 +3,6 @@
 # one-liner URLs:
 #   - install/install.sh       -> biopb.org/install.sh
 #   - install/install.ps1      -> biopb.org/install.ps1
-#   - install/uninstall.ps1    -> biopb.org/uninstall.ps1
 #   - install/biopb-engine.ps1 -> biopb.org/biopb-engine.ps1
 #
 # They land in a reserved /install/ subtree of the webroot that biopb-site's
@@ -36,14 +35,13 @@ on:
     paths:
       - 'install/**'
       - '.github/workflows/install-scripts.yaml'
-  # Publish. Narrow to exactly the served files -- a change to the .iss or
+  # Publish. Narrow to exactly the three served files -- a change to the .iss or
   # the README is not a reason to rsync.
   push:
     branches: [main]
     paths:
       - 'install/install.sh'
       - 'install/install.ps1'
-      - 'install/uninstall.ps1'
       - 'install/biopb-engine.ps1'
   workflow_dispatch:
 
@@ -236,11 +234,11 @@ jobs:
 
       - name: Publish install scripts with rsync
         run: |
-          # Stage exactly the served scripts, then mirror with --delete so
+          # Stage exactly the three served scripts, then mirror with --delete so
           # the reserved /install/ subtree holds only these (and drops any file
           # that was renamed/removed upstream) -- mirrors api-docs.yaml.
           mkdir -p _install_publish
-          cp install/install.sh install/install.ps1 install/uninstall.ps1 install/biopb-engine.ps1 _install_publish/
+          cp install/install.sh install/install.ps1 install/biopb-engine.ps1 _install_publish/
           ssh -i ~/.ssh/id_ed25519 jyu@biopb.org \
             'mkdir -p /var/www/biopb.org/install'
           rsync -avz --delete \

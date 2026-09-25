@@ -151,32 +151,31 @@ and `irm|iex` paths alike.
 
 ## Uninstall
 
-`install.sh` takes an `--uninstall` flag (mirrors the Windows installer's
-Add/Remove Programs entry). It stops the data and MCP servers, unregisters biopb
-from any detected agent (Claude Code/Desktop, Codex CLI, Cursor, opencode), and
-removes the shared `uv` tool environment, the web interface, the Jupyter kernel
-and the Desktop shortcut. Add `--purge` to also delete config and cached
-data — your **image data is never touched**.
+Each install saves its own release's uninstaller in
+`~/.local/share/biopb/uninstall/`, so uninstalling runs the code that installed
+it. It stops the data and MCP servers, unregisters biopb from any detected agent
+(Claude Code/Desktop, Codex CLI, Cursor, opencode), and removes the shared `uv`
+tool environment, the web interface, the Jupyter kernel and the Desktop
+shortcut. Add `--purge` to also delete config and cached data — your **image
+data is never touched**.
 
 ```sh
 # Remove the stack, keep config + cached data
-curl -fsSL https://biopb.org/install.sh | bash -s -- --uninstall
+~/.local/share/biopb/uninstall/uninstall.sh
 
 # Remove everything biopb owns, including config and cache
-curl -fsSL https://biopb.org/install.sh | bash -s -- --uninstall --purge
+~/.local/share/biopb/uninstall/uninstall.sh --purge
 ```
 
 `--purge` deletes `~/.config/biopb`, `~/.local/state/biopb` (logs, session
 registry, pids), and `~/.local/share/biopb` (samples). `uv` and any AI
-agent (e.g. opencode) are left installed.
+agent (e.g. opencode) are left installed. An install older than this has no
+saved uninstaller: run its release's `install.sh --uninstall`.
 
-On Windows, a GUI install uninstalls through Add/Remove Programs, and a
-PowerShell install through the matching script, which asks whether to delete
-config and cached data too:
-
-```powershell
-irm https://biopb.org/uninstall.ps1 | iex
-```
+On Windows, a GUI install uninstalls through Add/Remove Programs. A PowerShell
+install runs `%USERPROFILE%\.local\share\biopb\uninstall\uninstall.cmd`, which
+asks whether to delete config and cached data too (`-Purge` / `-KeepData`
+answer up front).
 
 ## Testing the installers
 

@@ -999,6 +999,29 @@ function Invoke-Precompile {
     }
 }
 
+# Keep the installed release's own engine and uninstall.ps1 (its assets) in
+# $Dir, with an uninstall.cmd that runs them, so a later uninstall is the code
+# that installed this rather than whatever is newest. Best-effort.
+function Save-Uninstaller {
+    param($Release, [string]$Dir)
+    try {
+        if (-not $Release) { throw "no release" }
+        New-Item -ItemType Directory -Force -Path $Dir | Out-Null
+        foreach ($name in 'biopb-engine.ps1', 'uninstall.ps1') {
+            $asset = $Release.assets | Where-Object { $_.name -eq $name } | Select-Object -First 1
+            if (-not $asset) { throw "$($Release.tag_name) has no $name" }
+            Invoke-WebRequest -Uri $asset.browser_download_url -OutFile (Join-Path $Dir $name) -ErrorAction Stop
+        }
+        # Double-clickable, and past a Restricted execution policy.
+        Set-FileUtf8NoBom -Path (Join-Path $Dir 'uninstall.cmd') -Content `
+            "@powershell -NoProfile -ExecutionPolicy Bypass -File ""%~dp0uninstall.ps1"" %*`r`n"
+        Report-Ok "Uninstaller saved: $(Join-Path $Dir 'uninstall.cmd')"
+    } catch {
+        Remove-Item -LiteralPath $Dir -Recurse -Force -ErrorAction SilentlyContinue
+        Report-Note "Could not save the uninstaller ($($_.Exception.Message)); uninstall through this release's uninstall.ps1"
+    }
+}
+
 # The biopb env's interpreter, or $null when there is no env.
 function Get-ToolPython {
     $toolDir = (uv tool dir 2>$null)
@@ -1541,6 +1564,7 @@ function Invoke-BiopbInstall {
     # Warm the bytecode cache now (admin-free) so the first viewer launch is fast.
     Invoke-Precompile
     Install-KernelSpec
+    Save-Uninstaller -Release $release -Dir (Join-Path $DataRoot "uninstall")
 
     # Record the installed deployment version as the kernel-start auto-updater's
     # baseline (issue #87): the check compares the latest release-v* deployment's
@@ -1893,12 +1917,16 @@ function Invoke-BiopbUninstall {
         } else {
             Report-Warn "uv not found; skipped package removal"
         }
-        # The web interface is installed program files, not the user's data.
-        $webapp = Join-Path (Get-BiopbTree "BIOPB_DATA_HOME" ".local\share") "webapp"
+        # The web interface and the saved uninstaller are installed program
+        # files, not the user's data. The uninstaller can go while it runs: its
+        # script and this engine are already read into memory.
+        $dataRoot = Get-BiopbTree "BIOPB_DATA_HOME" ".local\share"
+        $webapp = Join-Path $dataRoot "webapp"
         if (Test-Path -LiteralPath $webapp) {
             Remove-Item -LiteralPath $webapp -Recurse -Force -ErrorAction SilentlyContinue
             if (-not (Test-Path -LiteralPath $webapp)) { Report-Ok "Removed the web interface ($webapp)" }
         }
+        Remove-Item -LiteralPath (Join-Path $dataRoot "uninstall") -Recurse -Force -ErrorAction SilentlyContinue
 
         Report-Step 3 "Deregistering MCP clients..."
         Remove-McpClients -BiopbHome $BiopbHome

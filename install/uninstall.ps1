@@ -2,12 +2,11 @@
 .SYNOPSIS
     biopb stack uninstaller (Windows / PowerShell)
 .DESCRIPTION
-    Usage: irm https://biopb.org/uninstall.ps1 | iex
-    Removes what install.ps1 installed, through the same engine's teardown (the
-    GUI install's Add/Remove Programs entry runs the same one). Asks whether to
-    also delete config and cached data; your images are never touched.
-    Unattended: & ([scriptblock]::Create((irm https://biopb.org/uninstall.ps1))) -Purge
-    (or -KeepData) answers that question up front.
+    Saved with the install, beside that release's engine, by biopb-engine.ps1:
+    run %USERPROFILE%\.local\share\biopb\uninstall\uninstall.cmd. Removes the
+    install through the engine's teardown (the GUI install's Add/Remove Programs
+    entry runs the same one). Asks whether to also delete config and cached
+    data; your images are never touched. -Purge or -KeepData answers up front.
 #>
 param(
     [switch]$Purge,
@@ -16,15 +15,12 @@ param(
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
-# A sibling engine (a checkout, the unpacked GUI installer) wins; otherwise the
-# biopb.org one, whose teardown removes any release's install.
-$local = if ($PSScriptRoot) { Join-Path $PSScriptRoot 'biopb-engine.ps1' } else { $null }
-if ($local -and (Test-Path -LiteralPath $local)) {
-    $engine = Get-Content -Raw -LiteralPath $local
-} else {
-    Write-Host "  Fetching the biopb engine..."
-    $engine = Invoke-RestMethod -Uri "https://biopb.org/biopb-engine.ps1"
+# The engine of the release that installed this, saved beside it.
+$enginePath = if ($PSScriptRoot) { Join-Path $PSScriptRoot 'biopb-engine.ps1' } else { '' }
+if (-not $enginePath -or -not (Test-Path -LiteralPath $enginePath)) {
+    throw "biopb-engine.ps1 not found beside uninstall.ps1; run the uninstall.cmd saved with your install"
 }
+$engine = Get-Content -Raw -LiteralPath $enginePath
 
 if (-not $Purge -and -not $KeepData) {
     $canAsk = [Environment]::UserInteractive -and -not [Console]::IsInputRedirected -and

@@ -3,8 +3,17 @@
 from __future__ import annotations
 
 import json
+import subprocess
 
-from conftest import bash, ps_literal, pwsh, requires_posix, requires_pwsh
+from conftest import (
+    SYSTEM_PATH,
+    bash,
+    ps_literal,
+    pwsh,
+    requires_posix,
+    requires_pwsh,
+    sh,
+)
 
 
 @requires_posix
@@ -45,13 +54,12 @@ def test_remove_mcp_clients_edits_the_opencode_file_opencode_reads(tmp_path):
 
 def _run_uninstall_ps1(tmp_path, *args):
     """Run uninstall.ps1 over a fake install in tmp_path; returns (webapp, samples, config)."""
-    import subprocess
-
     from conftest import INSTALL_DIR, PWSH, _pwsh_base_env
 
     share = tmp_path / ".local" / "share" / "biopb"
     (share / "webapp").mkdir(parents=True)
     (share / "samples").mkdir()
+    (share / "uninstall").mkdir()
     config = tmp_path / ".config" / "biopb" / "biopb.json"
     config.parent.mkdir(parents=True)
     config.write_text("{}")
@@ -80,9 +88,68 @@ def test_uninstall_ps1_removes_the_install_and_keeps_data(tmp_path):
     webapp, samples, config = _run_uninstall_ps1(tmp_path)
     assert not webapp.exists()
     assert samples.exists() and config.exists()
+    assert not (tmp_path / ".local" / "share" / "biopb" / "uninstall").exists()
 
 
 @requires_pwsh
 def test_uninstall_ps1_purge_removes_data(tmp_path):
     webapp, samples, config = _run_uninstall_ps1(tmp_path, "-Purge")
     assert not webapp.exists() and not samples.exists() and not config.exists()
+
+
+# --- the saved uninstaller ---------------------------------------------------
+
+RELEASE_JSON = json.dumps(
+    {
+        "assets": [
+            {
+                "browser_download_url": "https://example.test/dl/release-v9.9.9/install.sh"
+            },
+        ]
+    }
+)
+
+
+@requires_posix
+def test_save_uninstaller_keeps_the_release_installer(tmp_path, stub_bin):
+    make, stubs = stub_bin
+    # curl -fsSL <url> -o <dest>: the "downloaded" installer echoes its arguments.
+    make("curl", 'printf \'#!/usr/bin/env bash\\necho "$@"\\n\' > "$4"')
+    dest = tmp_path / "uninstall"
+    bash(
+        f"_save_uninstaller {sh(dest)}",
+        env={"RELEASE_JSON": RELEASE_JSON},
+        path=f"{stubs}:{SYSTEM_PATH}",
+    )
+    ran = subprocess.run(
+        [str(dest / "uninstall.sh"), "--purge"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert ran.stdout.strip() == "--uninstall --purge"
+
+
+@requires_posix
+def test_save_uninstaller_without_the_asset_is_a_note(tmp_path, stub_bin):
+    make, stubs = stub_bin
+    make("curl", "exit 22")
+    dest = tmp_path / "uninstall"
+    result = bash(
+        f"_save_uninstaller {sh(dest)}",
+        env={"RELEASE_JSON": RELEASE_JSON},
+        path=f"{stubs}:{SYSTEM_PATH}",
+    )
+    assert "Could not save the uninstaller" in result.stdout
+    assert not (dest / "uninstall.sh").exists()
+
+
+@requires_pwsh
+def test_save_uninstaller_ps1_without_the_asset_leaves_nothing(tmp_path):
+    dest = tmp_path / "uninstall"
+    result = pwsh(
+        "Save-Uninstaller -Release ([pscustomobject]@{ tag_name = 'release-v9.9.9'; assets = @() })"
+        f" -Dir {ps_literal(dest)}"
+    )
+    assert "Could not save the uninstaller" in result.stdout
+    assert not dest.exists()

@@ -931,6 +931,30 @@ _precompile_bytecode() {
     _ok "Bytecode precompiled (first viewer launch will be faster)"
 }
 
+# Keep the installed release's own installer (its install.sh asset, stamped with
+# its tag) in $1, with an uninstall.sh that runs it, so a later uninstall is the
+# code that installed this rather than whatever is newest. Best-effort; needs
+# _fetch_latest_release.
+_save_uninstaller() {
+    local dir="$1" url
+    url=$(_release_asset_url 'install\.sh')
+    if [ -z "$url" ] || ! mkdir -p "$dir" 2>/dev/null \
+        || ! curl -fsSL "$url" -o "$dir/install.sh.tmp" 2>/dev/null \
+        || ! mv -f "$dir/install.sh.tmp" "$dir/install.sh"; then
+        rm -f "$dir/install.sh.tmp" 2>/dev/null
+        _note "Could not save the uninstaller; uninstall with this release's install.sh --uninstall"
+        return 0
+    fi
+    cat > "$dir/uninstall.sh" <<'SH'
+#!/usr/bin/env bash
+# Uninstall biopb with the installer of the release that installed it.
+exec bash "$(dirname "$0")/install.sh" --uninstall "$@"
+SH
+    chmod +x "$dir/uninstall.sh" 2>/dev/null || true
+    _ok "Uninstaller saved: $dir/uninstall.sh"
+    return 0
+}
+
 # The biopb env's interpreter, or nothing (status 1) when there is no env.
 _tool_python() {
     local tool_dir
@@ -1552,6 +1576,7 @@ install_biopb() {
     # Warm the bytecode cache now (admin-free) so the first viewer launch is fast.
     _precompile_bytecode
     _install_kernelspec "$(_tool_python)"
+    _save_uninstaller "${BIOPB_DATA_HOME:-$HOME/.local/share}/biopb/uninstall"
 
     # Record the installed deployment version as the kernel-start auto-updater's
     # baseline (issue #87): the check compares the latest release-v* deployment's
@@ -2000,11 +2025,14 @@ uninstall_biopb() {
         _warn "uv not found; cannot remove the biopb tool environment"
         _info "  install uv and run: ${CYAN}uv tool uninstall biopb${RESET}"
     fi
-    # The web interface is installed program files, not the user's data.
-    local webapp="${BIOPB_DATA_HOME:-$HOME/.local/share}/biopb/webapp"
-    if [ -d "$webapp" ] && rm -rf "$webapp" 2>/dev/null; then
-        _ok "Removed the web interface ($webapp)"
+    # The web interface and the saved uninstaller are installed program files,
+    # not the user's data. Removing the uninstaller while it runs is safe: bash
+    # holds the open file.
+    local data_base="${BIOPB_DATA_HOME:-$HOME/.local/share}/biopb"
+    if [ -d "$data_base/webapp" ] && rm -rf "$data_base/webapp" 2>/dev/null; then
+        _ok "Removed the web interface ($data_base/webapp)"
     fi
+    rm -rf "$data_base/uninstall" 2>/dev/null || true
     _remove_desktop_shortcut
 
     # Optional purge of config + cached/state data. Never the user's images:
