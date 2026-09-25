@@ -87,14 +87,15 @@ uploads as a prerelease, which `pip` ignores unless `--pre`.
 
 Two independent workflows fire on the same tag, from the tagged commit:
 
-1. **`release.yaml`** builds `biopb`, `biopb-tensor-server`, `biopb-mcp`,
-   `biopb-control` wheels (+ mcp sdist) and the data-browser `webapp.tar.gz`, plus
-   the curated `biopb-samples.tar.gz`, and attaches them — with `versions.json` +
+1. **`release.yaml`** builds `biopb-tensor-server`, `biopb-mcp`, `biopb-control`
+   wheels (+ mcp sdist) and the data-browser `webapp.tar.gz`, plus the curated
+   `biopb-samples.tar.gz`, and attaches them — with `versions.json` +
    `SHA256SUMS` + `install.sh`/`install.ps1` + the Windows GUI installer — to the
-   **GitHub release `release-v<R>`**. **This is the installer's single source of
-   truth** (it `file://`-installs the wheels; from PyPI it takes only
-   `napari[all]`, pinned, and `biopb-napari-widget`, which biopb-mcp depends on).
-   `release.yaml` itself builds **no Docker**.
+   **GitHub release `release-v<R>`**. **This is the installer's source of truth**
+   (it `file://`-installs the wheels; from PyPI it takes the `biopb` SDK and
+   `napari[all]`, both pinned by `versions.json`, and `biopb-napari-widget`,
+   which biopb-mcp depends on). The SDK is not a release asset; `release.yaml`
+   builds it only to check it against PyPI. It builds **no Docker**.
 2. **`tensor-server-ci`**'s `publish` job builds the `biopb-tensor-server` image
    and pushes it to **ghcr.io + Docker Hub `jiyuuchc/`**, tagged with the version
    **and** `:latest`. This is the ONLY place the tensor-server image is
@@ -102,8 +103,8 @@ Two independent workflows fire on the same tag, from the tagged commit:
    and builds the image but publishes nothing.
 
 `versions.json` carries `release`, `tensor_server` (the shipped wheel's version —
-now the same `release-v*` line, so equal to `release` on a real tag), and `napari`
-(the pinned Qt binding). Docker versions are **not** in it.
+now the same `release-v*` line, so equal to `release` on a real tag), `napari`
+(the pinned Qt binding) and `biopb` (the SDK pin). Docker versions are **not** in it.
 
 ### `v*` → PyPI/Maven + the image-base image (`image-runtime-ci`)
 

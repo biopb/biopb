@@ -214,7 +214,7 @@ biopb/biopb#653 for the reasoning.
 ## Notes
 
 - Release assets are read from the `biopb/biopb` GitHub Releases API; the latest
-  `release-v*` deployment carries all four wheels (`biopb-mcp`, `biopb`,
-  `biopb-tensor-server`, `biopb-control`) plus the webapp tarball. The
-  `release.yaml` CI builds the set from the tagged commit so they are shipped
-  together as one matched set (see `../docs/release-model.md`).
+  `release-v*` deployment carries the `biopb-mcp`, `biopb-tensor-server` and
+  `biopb-control` wheels plus the webapp tarball, built from the tagged commit
+  as one matched set. The `biopb` SDK comes from PyPI, pinned to the version the
+  release's `versions.json` names (see `../docs/release-model.md`).
