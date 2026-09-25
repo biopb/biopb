@@ -1,4 +1,4 @@
-# CI for biopb-mcp (napari plugin + MCP server). Lives in the monorepo at
+# CI for biopb-mcp (the MCP server). Lives in the monorepo at
 # biopb-mcp/. This is a TEST-ONLY workflow: biopb-mcp is no longer published to
 # PyPI (the product ships as the release-v* wheel triple the installer
 # file://-installs — see docs/release-model.md). biopb-mcp is a product component,
@@ -172,6 +172,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0  # setuptools_scm: the resolve builds biopb from here
 
       # `biopb`'s build generates the protobuf stubs, and it is installed below
       # because biopb_mcp._config imports biopb._locations.

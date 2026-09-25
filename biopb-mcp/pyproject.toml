@@ -10,7 +10,6 @@ authors = [
 ]
 classifiers = [
     "Development Status :: 2 - Pre-Alpha",
-    "Framework :: napari",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
@@ -28,9 +27,10 @@ classifiers = [
 # matches the classifiers above (3.10-3.12 only).
 requires-python = ">=3.10,<3.13"
 dependencies = [
+    # The Tensor Browser the kernel docks, and add_tensor's layer pipeline.
+    "biopb-napari-widget >= 0.1.0rc2",
     "numpy",
     "pandas",
-    "magicgui",
     "qtpy",
     "scikit-image",
     # scipy: arrives transitively via scikit-image, but the built-in rolling-ball
@@ -52,29 +52,11 @@ dependencies = [
     # -- where 1.15.3 is the newest scipy, since 1.16 requires 3.11 -- it means
     # 1.14.1. Retire this with the 3.10 floor, not before.
     "scipy != 1.15.*",
-    # 0.6.3: query_sources(format=...) for pandas/arrow results (agent guidance
-    # in guide://tensor, issue #27); also carries the 0.5.8 localhost cache
-    # disable + configure_cache/worker-init cache plugin (data-plane chunk-cache
-    # budget used by mcp/_bootstrap._register_cache_plugin).
-    "biopb[tensor] >= 0.6.4",
-    # ome-zarr-py: backs the napari OME-Zarr writers (biopb_mcp._writers, the
-    # `contributions.writers` in napari.yaml). Already arrives transitively via
-    # biopb[tensor], but the writers hard-import it, so a direct dep makes the
-    # requirement explicit.
-    "ome-zarr >= 0.6.1",
-    "opencv-python-headless",
-    # grpcio (runtime) comes via biopb[tensor]; grpcio-health-checking pulls it
-    # too and provides grpc_health.v1 used in image_processing/_grpc.py. We do
-    # NOT depend on grpcio-tools: it is a build-time codegen plugin, is never
-    # imported at runtime, and being unpinned it drags resolvers down to an
-    # ancient, unbuildable grpcio-tools when co-installed with biopb.
-    "grpcio-health-checking",
+    # biopb.control and biopb.tensor.Connection.
+    "biopb[tensor] >= 0.11.0rc2",
 ]
 
 [project.optional-dependencies]
-tables = [
-    "napari-skimage-regionprops",  # For annotation table display
-]
 # The MCP server is a standalone process (not a plugin loaded inside a running
 # napari) that constructs its own napari.Viewer() in the kernel bootstrap, so it
 # must bring napari and a real Qt binding itself — qtpy in the core deps is only
@@ -110,7 +92,6 @@ tables = [
 # back to 0.8.0 installs a server that cannot start. Lift the cap only together
 # with the FastMCP port and a re-examined override.
 mcp = ["mcp>=1.20,<2", "uvicorn>=0.29", "jupyter_client", "ipykernel", "psutil", "distributed>=2023.9.0", "napari[all]==0.7.0", "pyqt6", "packaging", "matplotlib", "scikit-learn", "agent-client-protocol>=0.12,<1"]
-3d = ["vedo"] # 3d rendering from mesh
 
 # Test/dev dependencies live in a PEP 735 dependency *group* rather than a
 # `testing` extra so they stay out of biopb-mcp's published metadata (groups are
@@ -168,9 +149,6 @@ biopb-mcp = "biopb_mcp.mcp.__main__:main"
 # (biopb_mcp/plugins/) into ~/.config/biopb/kernel/ — the #92 "bring your own
 # tool" example, delivered as a visible file rather than a buried entry point.
 biopb-mcp-seed-plugins = "biopb_mcp.plugins._seed:_cli"
-
-[project.entry-points."napari.manifest"]
-biopb-mcp = "biopb_mcp:napari.yaml"
 
 [project.urls]
 "Bug Tracker" = "https://github.com/biopb/biopb/issues"

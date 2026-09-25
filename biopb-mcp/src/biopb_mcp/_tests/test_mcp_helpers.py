@@ -106,7 +106,7 @@ class TestPatchViewerAddTensor:
 
         mock_arr = MagicMock()
         with patch(
-            "biopb_mcp._tensor_utils.build_pyramid_levels",
+            "biopb_napari_widget._tensor_utils.build_pyramid_levels",
             return_value=[mock_arr],
         ):
             patch_viewer_tensor_methods(viewer, connection)
@@ -135,7 +135,7 @@ class TestPatchViewerAddTensor:
 
         mock_arr = MagicMock()
         with patch(
-            "biopb_mcp._tensor_utils.build_pyramid_levels",
+            "biopb_napari_widget._tensor_utils.build_pyramid_levels",
             return_value=[mock_arr],
         ):
             patch_viewer_tensor_methods(viewer, connection)
@@ -149,7 +149,7 @@ class TestPatchViewerAddTensor:
     def test_compute_scheduler_wraps_layer_array(self, viewer, connection):
         """With a scheduler set, the array passed to add_image is pinned to a
         single-process scheduler (issue #8)."""
-        from biopb_mcp._viewer_compute import _ViewerArray
+        from biopb_napari_widget._viewer_compute import _ViewerArray
 
         _serve(
             connection,
@@ -159,7 +159,7 @@ class TestPatchViewerAddTensor:
 
         mock_arr = MagicMock()
         with patch(
-            "biopb_mcp._tensor_utils.build_pyramid_levels",
+            "biopb_napari_widget._tensor_utils.build_pyramid_levels",
             return_value=[mock_arr],
         ):
             patch_viewer_tensor_methods(viewer, connection, compute_scheduler="threads")
@@ -186,7 +186,7 @@ class TestPatchViewerAddTensor:
 
         mock_arr = MagicMock()
         with patch(
-            "biopb_mcp._tensor_utils.build_pyramid_levels",
+            "biopb_napari_widget._tensor_utils.build_pyramid_levels",
             return_value=[mock_arr],
         ):
             patch_viewer_tensor_methods(viewer, connection)
@@ -207,7 +207,7 @@ class TestPatchViewerAddTensor:
             [_desc("src1/t1", [256, 256]), t2],
         )
 
-        with patch("biopb_mcp._tensor_utils.add_tensor_layer") as add_layer:
+        with patch("biopb_napari_widget.add_tensor_layer") as add_layer:
             patch_viewer_tensor_methods(viewer, connection)
             name = viewer.add_tensor("src1/t2")
 
@@ -224,7 +224,7 @@ class TestPatchViewerAddTensor:
         )
 
         with patch(
-            "biopb_mcp._tensor_utils.build_pyramid_levels",
+            "biopb_napari_widget._tensor_utils.build_pyramid_levels",
             return_value=[MagicMock()],
         ):
             patch_viewer_tensor_methods(viewer, connection)
@@ -246,7 +246,7 @@ class TestPatchViewerAddTensor:
 
         levels = [MagicMock(), MagicMock()]
         with patch(
-            "biopb_mcp._tensor_utils.build_pyramid_levels",
+            "biopb_napari_widget._tensor_utils.build_pyramid_levels",
             return_value=levels,
         ):
             patch_viewer_tensor_methods(viewer, connection)
@@ -283,7 +283,7 @@ class TestPatchViewerAddTensor:
         mock_arr = MagicMock()
         mock_arr.ndim = 2
         with patch(
-            "biopb_mcp._tensor_utils.build_pyramid_levels",
+            "biopb_napari_widget._tensor_utils.build_pyramid_levels",
             return_value=[mock_arr],
         ):
             patch_viewer_tensor_methods(viewer, connection)
@@ -446,8 +446,7 @@ class TestViewerTensor:
     def _loaded_layer(levels, array_id="t1"):
         """A layer as ``add_tensor_layer`` builds one: wrapped, with an origin."""
         import napari
-
-        from biopb_mcp._viewer_compute import wrap_levels
+        from biopb_napari_widget import wrap_levels
 
         wrapped = wrap_levels(levels, "synchronous")
         metadata = {"array_id": array_id} if array_id else {}
@@ -581,9 +580,9 @@ class TestViewerTensor:
         the real viewer's GL canvas segfaults on offscreen runners.
         """
         import dask.array as da
+        from biopb_napari_widget import wrap_levels
         from napari.components import ViewerModel
 
-        from biopb_mcp._viewer_compute import wrap_levels
         from biopb_mcp.mcp._viewer_proxy import make_viewer_proxy
 
         real = ViewerModel()

@@ -17,10 +17,8 @@ the shared biopb XDG *state* tree (``~/.local/state/biopb/mcp``), resolved via
 
 Sections are flat (no ``mcp.``/``widget.`` wrapper): ``transport`` / ``kernel`` /
 ``viewer`` / ``services`` / ``observe`` / ``update`` are
-the MCP-server knobs; ``widget`` / ``detection`` / ``grid`` are the demo napari
-widgets (``image_processing/``); ``pyramid`` is a GUI-independent knob read by the
-MCP kernel too; ``timeout`` / ``grpc`` / ``memory`` are compute-plane knobs
-shared by the widgets and ``ops``.
+the MCP-server knobs; ``timeout`` / ``grpc`` / ``memory`` are compute-plane knobs
+read by ``ops``. The napari widgets keep their own settings (biopb-napari-widget).
 
 There is deliberately **no data-plane endpoint here** (biopb/biopb#628): the
 control plane owns the data plane and is asked for its address at connect time,
@@ -42,19 +40,16 @@ import os
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import List, Optional
 
-# Shared with the tensor server: the constraint primitives (so the pyramid knobs
-# are validated by the exact same rules in both packages -- the same bug, not an
-# analogous one; biopb/biopb#182, #34) and the config-file location.
+# Shared with the tensor server: the constraint primitives (so a knob is judged
+# by the same rules in both packages; biopb/biopb#182, #34) and the config-file
+# location.
 from biopb import _locations
-from biopb._config_constraints import PYRAMID_CONSTRAINTS, Enum, Range
+from biopb._config_constraints import Enum, Range
 from biopb._config_io import atomic_write_json
 from biopb._config_validate import MISSING, Problem, check_sections, warn_and_clamp
 from biopb._locations import mcp_config_path
-
-if TYPE_CHECKING:
-    import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -80,82 +75,6 @@ def _hlist(default_list, help_text):
 # Each maps 1:1 to a top-level section in mcp-config.json; every field's `help`
 # becomes its schema `description` (the single source of truth). List fields are
 # added to the schema by the composer in _config_schema.py.
-
-
-@dataclass
-class WidgetConfig:
-    """Settings for the experimental napari demo widgets (image_processing/).
-
-    Only those widgets read this section; the MCP server does not.
-    """
-
-    server_url: str = _h(
-        "localhost:50051", "ProcessImage server the demo widgets target."
-    )
-    is_3d: bool = _h(
-        False, "Whether the demo widgets operate in 3D mode (persisted toggle)."
-    )
-
-
-@dataclass
-class DetectionConfig:
-    """Object-detection parameters for the demo widgets."""
-
-    min_score: float = _h(0.4, "Minimum detection score to keep a predicted object.")
-    size_hint: float = _h(
-        32.0, "Approximate object size (px) hint passed to the detector."
-    )
-    nms: str = _h("Off", "Non-maximum-suppression mode for overlapping detections.")
-    z_aspect_ratio: float = _h(1.0, "Z-vs-XY voxel aspect ratio for 3D detection.")
-
-
-@dataclass
-class GridConfig:
-    """Tiling grid for large-image detection (size/stride per 2D and 3D mode).
-
-    Each is a per-axis pixel vector; stride < size gives overlap between tiles.
-    """
-
-    size_2d: List[int] = _hlist([4096, 4096], "2D tile size [y, x] (px).")
-    stride_2d: List[int] = _hlist(
-        [4000, 4000], "2D tile stride [y, x] (px); < size overlaps tiles."
-    )
-    size_3d: List[int] = _hlist([64, 512, 512], "3D tile size [z, y, x] (px).")
-    stride_3d: List[int] = _hlist(
-        [48, 480, 480], "3D tile stride [z, y, x] (px); < size overlaps tiles."
-    )
-
-
-@dataclass
-class PyramidConfig:
-    """Multiscale pyramid construction for large tensors.
-
-    Shared by the Tensor Browser widget and MCP ``add_tensor`` (both call
-    ``_tensor_utils.build_pyramid_levels``), so it is GUI-independent and lives at
-    the top level rather than under ``widget``. The numeric bounds are the
-    identical rows the tensor server enforces (PYRAMID_CONSTRAINTS), so the two
-    cannot drift.
-    """
-
-    threshold: int = _h(
-        4096,
-        "Build a pyramid only if an x/y dimension exceeds this size; also the stop "
-        "criterion (coarsest level fits within threshold in x and y).",
-    )
-    downscale_factor: int = _h(
-        2,
-        "Linear downscale between successive levels. 2x keeps every level on the "
-        "dyadic grid the browser tile route also uses, and keeps napari's "
-        "level pick (the coarsest still above the canvas) from over-fetching by "
-        "up to 4x per axis.",
-    )
-    pixel_budget_cubic_root: int = _h(
-        448,
-        "Per-axis edge length of the coarsest level's 3D whole-volume read (#29); "
-        "the voxel budget is this value cubed. 448 -> ~90M voxels, measured as "
-        "the point a float32 volume stays interactive (biopb-tensor-server "
-        "docs/precache-policy.md 9.1).",
-    )
 
 
 @dataclass
@@ -485,16 +404,6 @@ class McpConfig:
     """The whole biopb-mcp config: one field per top-level section, in the
     settings page's nav order."""
 
-    # The experimental image_processing/ demo widgets: not on the settings page.
-    widget: WidgetConfig = _section(WidgetConfig)
-    detection: DetectionConfig = _section(DetectionConfig)
-    grid: GridConfig = _section(GridConfig)
-
-    pyramid: PyramidConfig = _section(
-        PyramidConfig,
-        "Pyramid",
-        "How multiscale pyramids are built for large tensors added to the viewer.",
-    )
     services: ServicesConfig = _section(
         ServicesConfig,
         "Services",
@@ -554,10 +463,8 @@ _SECTION_CLASSES = {
 
 
 # Per-class validation rules (biopb/biopb#182). Keyed by class name like the
-# tensor server's table; the shared Range/Enum primitives judge the same knobs
-# (notably the pyramid rows) identically in both packages.
+# tensor server's table, judged by the same shared Range/Enum primitives.
 _CONSTRAINTS = {
-    "PyramidConfig": {**PYRAMID_CONSTRAINTS},
     "TimeoutConfig": {
         "health_check": Range(exclusive_min=0),
         "get_op_names": Range(exclusive_min=0),
@@ -944,13 +851,3 @@ def save_config(config: dict) -> None:
     """
     atomic_write_json(get_config_path(), config, raise_on_error=False)
     CONFIG.reload()
-
-
-def get_grid_params(is_3d: bool, config: dict) -> Tuple[np.ndarray, np.ndarray]:
-    """Get grid size and stride from config as (grid_size, stride) int arrays."""
-    import numpy as np
-
-    suffix = "3d" if is_3d else "2d"
-    grid_size = np.array(get_setting(config, f"grid.size_{suffix}"), dtype=int)
-    stride = np.array(get_setting(config, f"grid.stride_{suffix}"), dtype=int)
-    return grid_size, stride

@@ -20,14 +20,14 @@ warnings.warn(
     stacklevel=2,
 )
 
-# biopb-mcp's package root is intentionally bare; the widgets now live in
-# subpackages. Re-export them here so legacy top-level imports keep working.
+# The widgets now live in biopb-napari-widget. Re-export them here so legacy
+# top-level imports keep working.
 from biopb_mcp import __version__  # noqa: F401,E402
-from biopb_mcp.image_processing import (  # noqa: F401,E402
+from biopb_napari_widget import TensorBrowserWidget  # noqa: F401,E402
+from biopb_napari_widget.image_processing import (  # noqa: F401,E402
     ImageProcessingWidget,
     ObjectDetectionWidget,
 )
-from biopb_mcp.tensor_browser import TensorBrowserWidget  # noqa: F401,E402
 
 __all__ = [
     "ImageProcessingWidget",

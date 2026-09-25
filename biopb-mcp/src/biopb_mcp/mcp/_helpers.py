@@ -164,7 +164,7 @@ def patch_viewer_tensor_methods(viewer, connection, compute_scheduler=None):
     but both are installed here so both are discoverable on the viewer.
 
     *compute_scheduler*, when set, pins the loaded layer's slice reads to a
-    single-process dask scheduler (see ``_viewer_compute.wrap_levels``) so the
+    single-process dask scheduler (see ``biopb_napari_widget.wrap_levels``) so the
     serial viewer hits the shared main-process chunk cache instead of scattering
     across the distributed cluster (issue #8)."""
 
@@ -190,8 +190,7 @@ def patch_viewer_tensor_methods(viewer, connection, compute_scheduler=None):
             The name of the created viewer layer.
         """
         from biopb.tensor.client import split_array_id
-
-        from .._tensor_utils import add_tensor_layer
+        from biopb_napari_widget import add_tensor_layer
 
         if array_id is None:  # legacy keyword form: add_tensor(source_id="...")
             array_id = source_id
