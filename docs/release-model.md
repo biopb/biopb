@@ -87,8 +87,9 @@ Two independent workflows fire on the same tag, from the tagged commit:
    the curated `biopb-samples.tar.gz`, and attaches them — with `versions.json` +
    `SHA256SUMS` + `install.sh`/`install.ps1` + the Windows GUI installer — to the
    **GitHub release `release-v<R>`**. **This is the installer's single source of
-   truth** (it `file://`-installs the wheels; nothing from PyPI except
-   `napari[all]`). `release.yaml` itself builds **no Docker**.
+   truth** (it `file://`-installs the wheels; from PyPI it takes only
+   `napari[all]`, pinned, and `biopb-napari-widget`, which biopb-mcp depends on).
+   `release.yaml` itself builds **no Docker**.
 2. **`tensor-server-ci`**'s `publish` job builds the `biopb-tensor-server` image
    and pushes it to **ghcr.io + Docker Hub `jiyuuchc/`**, tagged with the version
    **and** `:latest`. This is the ONLY place the tensor-server image is
@@ -129,6 +130,20 @@ The check needs a **clean** version with no `+gSHA` local segment (a Docker
 reference forbids `+`): both jobs derive `$VER` straight from the tag name
 (`${GITHUB_REF#refs/tags/…}`), which is always clean, so no sanitization is
 needed.
+
+## The napari plugin: a separate repo
+
+`biopb-napari-widget` (the Tensor Browser and the OME-Zarr writers) lives in
+[biopb/biopb-napari-widget](https://github.com/biopb/biopb-napari-widget) and is a
+third release line: its own `v*` tags publish it to PyPI. It pins a floor on
+`biopb`, and biopb-mcp pins a floor on it, so a change that crosses the boundary
+releases in order: the SDK (`v*` here), then the plugin, then the product that
+raises biopb-mcp's floor.
+
+Outside the monorepo the plugin can lag an SDK protocol change (the SDK refuses
+older Flight servers, #1018). Its CI's `sdk-head` job runs its tests against
+this repo's `dev` to catch that before an SDK release. The plugin leaves napari
+unpinned; biopb-mcp pins it exactly (see `versions.json` above).
 
 ## Installer
 
