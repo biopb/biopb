@@ -154,8 +154,8 @@ and `irm|iex` paths alike.
 `install.sh` takes an `--uninstall` flag (mirrors the Windows installer's
 Add/Remove Programs entry). It stops the data and MCP servers, unregisters biopb
 from any detected agent (Claude Code/Desktop, Codex CLI, Cursor, opencode), and
-removes the shared `uv` tool environment, the Jupyter kernel and the Desktop
-shortcut. Add `--purge` to also delete config and cached
+removes the shared `uv` tool environment, the web interface, the Jupyter kernel
+and the Desktop shortcut. Add `--purge` to also delete config and cached
 data — your **image data is never touched**.
 
 ```sh
@@ -167,9 +167,19 @@ curl -fsSL https://biopb.org/install.sh | bash -s -- --uninstall --purge
 ```
 
 `--purge` deletes `~/.config/biopb`, `~/.local/state/biopb` (logs, session
-registry, pids), and `~/.local/share/biopb` (webapp, samples). `uv` and any AI
+registry, pids), and `~/.local/share/biopb` (samples). `uv` and any AI
 agent (e.g. opencode) are left installed.
-On Windows, uninstall through Add/Remove Programs instead.
+
+On Windows, a GUI install uninstalls through Add/Remove Programs. A PowerShell
+install uninstalls through the same script:
+
+```powershell
+# Remove the stack, keep config + cached data
+$env:BIOPB_UNINSTALL = "1"; irm https://biopb.org/install.ps1 | iex
+
+# Remove everything biopb owns, including config and cache
+$env:BIOPB_PURGE = "1"; irm https://biopb.org/install.ps1 | iex
+```
 
 ## Testing the installers
 

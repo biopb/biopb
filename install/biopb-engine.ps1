@@ -1893,6 +1893,12 @@ function Invoke-BiopbUninstall {
         } else {
             Report-Warn "uv not found; skipped package removal"
         }
+        # The web interface is installed program files, not the user's data.
+        $webapp = Join-Path (Get-BiopbTree "BIOPB_DATA_HOME" ".local\share") "webapp"
+        if (Test-Path -LiteralPath $webapp) {
+            Remove-Item -LiteralPath $webapp -Recurse -Force -ErrorAction SilentlyContinue
+            if (-not (Test-Path -LiteralPath $webapp)) { Report-Ok "Removed the web interface ($webapp)" }
+        }
 
         Report-Step 3 "Deregistering MCP clients..."
         Remove-McpClients -BiopbHome $BiopbHome

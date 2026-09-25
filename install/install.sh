@@ -2000,6 +2000,11 @@ uninstall_biopb() {
         _warn "uv not found; cannot remove the biopb tool environment"
         _info "  install uv and run: ${CYAN}uv tool uninstall biopb${RESET}"
     fi
+    # The web interface is installed program files, not the user's data.
+    local webapp="${BIOPB_DATA_HOME:-$HOME/.local/share}/biopb/webapp"
+    if [ -d "$webapp" ] && rm -rf "$webapp" 2>/dev/null; then
+        _ok "Removed the web interface ($webapp)"
+    fi
     _remove_desktop_shortcut
 
     # Optional purge of config + cached/state data. Never the user's images:
