@@ -76,6 +76,10 @@ are produced.
   the control plane (if it isn't already up) and open the dashboard in your
   default browser. Set `BIOPB_INSTALL_SHORTCUT=0` to skip creating it. You can
   run `biopb dashboard` from a terminal at any time instead.
+- **A Jupyter kernel, "Python (biopb)"**, so any Jupyter you already have can
+  run notebooks in biopb's environment. It is a fresh kernel of its own, not the
+  agent's session. Set `BIOPB_INSTALL_KERNELSPEC=0` to skip it; uninstalling
+  removes it.
 - The installer also registers the biopb MCP server with any detected agent
   (Claude Code/Desktop, Codex CLI, Cursor, opencode) and can install opencode if
   none is found. biopb-mcp speaks MCP over **stdio**, so the agent spawns
@@ -147,25 +151,31 @@ and `irm|iex` paths alike.
 
 ## Uninstall
 
-`install.sh` takes an `--uninstall` flag (mirrors the Windows installer's
-Add/Remove Programs entry). It stops the data and MCP servers, unregisters biopb
-from any detected agent (Claude Code/Desktop, Codex CLI, Cursor, opencode), and
-removes the
-shared `uv` tool environment. Add `--purge` to also delete config and cached
-data — your **image data is never touched**.
+Each install saves its own release's uninstaller in
+`~/.local/share/biopb/uninstall/`, so uninstalling runs the code that installed
+it. It stops the data and MCP servers, unregisters biopb from any detected agent
+(Claude Code/Desktop, Codex CLI, Cursor, opencode), and removes the shared `uv`
+tool environment, the web interface, the Jupyter kernel and the Desktop
+shortcut. Add `--purge` to also delete config and cached data — your **image
+data is never touched**.
 
 ```sh
 # Remove the stack, keep config + cached data
-curl -fsSL https://biopb.org/install.sh | bash -s -- --uninstall
+~/.local/share/biopb/uninstall/uninstall.sh
 
 # Remove everything biopb owns, including config and cache
-curl -fsSL https://biopb.org/install.sh | bash -s -- --uninstall --purge
+~/.local/share/biopb/uninstall/uninstall.sh --purge
 ```
 
 `--purge` deletes `~/.config/biopb`, `~/.local/state/biopb` (logs, session
-registry, pids), and `~/.local/share/biopb` (webapp, samples). `uv` and any AI
-agent (e.g. opencode) are left installed.
-On Windows, uninstall through Add/Remove Programs instead.
+registry, pids), and `~/.local/share/biopb` (samples). `uv` and any AI
+agent (e.g. opencode) are left installed. An install older than this has no
+saved uninstaller: run its release's `install.sh --uninstall`.
+
+On Windows, a GUI install uninstalls through Add/Remove Programs. A PowerShell
+install runs `%USERPROFILE%\.local\share\biopb\uninstall\uninstall.cmd`, which
+asks whether to delete config and cached data too (`-Purge` / `-KeepData`
+answer up front).
 
 ## Testing the installers
 

@@ -931,6 +931,105 @@ _precompile_bytecode() {
     _ok "Bytecode precompiled (first viewer launch will be faster)"
 }
 
+# Keep the installed release's own installer (its install.sh asset, stamped with
+# its tag) in $1, with an uninstall.sh that runs it, so a later uninstall is the
+# code that installed this rather than whatever is newest. Best-effort; needs
+# _fetch_latest_release.
+_save_uninstaller() {
+    local dir="$1" url
+    url=$(_release_asset_url 'install\.sh')
+    if [ -z "$url" ] || ! mkdir -p "$dir" 2>/dev/null \
+        || ! curl -fsSL "$url" -o "$dir/install.sh.tmp" 2>/dev/null \
+        || ! mv -f "$dir/install.sh.tmp" "$dir/install.sh"; then
+        rm -f "$dir/install.sh.tmp" 2>/dev/null
+        _note "Could not save the uninstaller; uninstall with this release's install.sh --uninstall"
+        return 0
+    fi
+    cat > "$dir/uninstall.sh" <<'SH'
+#!/usr/bin/env bash
+# Uninstall biopb with the installer of the release that installed it.
+exec bash "$(dirname "$0")/install.sh" --uninstall "$@"
+SH
+    chmod +x "$dir/uninstall.sh" 2>/dev/null || true
+    _ok "Uninstaller saved: $dir/uninstall.sh"
+    return 0
+}
+
+# The biopb env's interpreter, or nothing (status 1) when there is no env.
+_tool_python() {
+    local tool_dir
+    tool_dir=$(uv tool dir 2>/dev/null) || return 1
+    [ -x "$tool_dir/biopb/bin/python" ] || return 1
+    printf '%s\n' "$tool_dir/biopb/bin/python"
+}
+
+# Where the per-user "biopb" kernel spec lives, and whose it is: prints a state
+# line (absent | ours | foreign) then the spec dir. Asks $1's own jupyter_core,
+# which resolves the same user dir any Jupyter of this user searches. "ours"
+# means the spec runs an interpreter inside $1's env; any other spec named biopb
+# is the user's. biopb-engine.ps1 carries the same program.
+_kernelspec_state() {
+    "$1" - <<'PY'
+import json, os, sys
+from jupyter_core.paths import jupyter_data_dir
+
+spec = os.path.join(jupyter_data_dir(), "kernels", "biopb")
+try:
+    with open(os.path.join(spec, "kernel.json")) as f:
+        argv0 = json.load(f)["argv"][0]
+except FileNotFoundError:
+    state = "absent"
+except Exception:
+    state = "foreign"
+else:
+    env = os.path.normcase(os.path.abspath(sys.prefix)) + os.sep
+    ours = os.path.normcase(os.path.abspath(argv0)).startswith(env)
+    state = "ours" if ours else "foreign"
+print(state)
+print(spec)
+PY
+}
+
+# Register the biopb env as a Jupyter kernel, "Python (biopb)", so a Jupyter
+# installed anywhere else can run notebooks in it. A standalone kernel, not the
+# agent's session kernel. Rewritten on every install (the env path survives an
+# upgrade); a user's own spec named biopb is left alone. Best-effort; skip with
+# BIOPB_INSTALL_KERNELSPEC=0. $1 is the env's interpreter (_tool_python).
+_install_kernelspec() {
+    if [ "${BIOPB_INSTALL_KERNELSPEC:-1}" = "0" ]; then
+        _note "Jupyter kernel skipped (BIOPB_INSTALL_KERNELSPEC=0)"
+        return 0
+    fi
+    local py state spec
+    py=${1:-}
+    [ -n "$py" ] || return 0
+    { read -r state && read -r spec; } < <(_kernelspec_state "$py" 2>/dev/null) || return 0
+    if [ "$state" = "foreign" ]; then
+        _note "Kept the existing Jupyter kernel spec at $spec"
+        return 0
+    fi
+    if "$py" -m ipykernel install --user --name biopb --display-name "Python (biopb)" >/dev/null 2>&1; then
+        _ok "Jupyter kernel \"Python (biopb)\" registered"
+    else
+        _note "Could not register the Jupyter kernel; skipping"
+    fi
+    return 0
+}
+
+# Remove the kernel spec _install_kernelspec wrote; $1 as there, so the env
+# must still be present.
+_remove_kernelspec() {
+    local py state spec
+    py=${1:-}
+    [ -n "$py" ] || return 0
+    { read -r state && read -r spec; } < <(_kernelspec_state "$py" 2>/dev/null) || return 0
+    [ "$state" = "ours" ] || return 0
+    if rm -rf "$spec" 2>/dev/null; then
+        _ok "Removed the Jupyter kernel spec $spec"
+    fi
+    return 0
+}
+
 # Drop a double-clickable "biopb Dashboard" shortcut on the user's Desktop that
 # runs `biopb dashboard` (start the control plane if needed, then open the
 # browser). Best-effort: a failure only means no icon, never aborts the install.
@@ -1476,6 +1575,8 @@ install_biopb() {
 
     # Warm the bytecode cache now (admin-free) so the first viewer launch is fast.
     _precompile_bytecode
+    _install_kernelspec "$(_tool_python)"
+    _save_uninstaller "${BIOPB_DATA_HOME:-$HOME/.local/share}/biopb/uninstall"
 
     # Record the installed deployment version as the kernel-start auto-updater's
     # baseline (issue #87): the check compares the latest release-v* deployment's
@@ -1843,6 +1944,21 @@ _unregister_agents() {
     return 0
 }
 
+# Remove the "biopb Dashboard" launchers _install_desktop_shortcut writes, on
+# whichever platform wrote them.
+_remove_desktop_shortcut() {
+    local f
+    for f in \
+        "$HOME/Desktop/biopb Dashboard.command" \
+        "$HOME/Desktop/biopb-dashboard.desktop" \
+        "$HOME/.local/share/applications/biopb-dashboard.desktop"; do
+        if [ -f "$f" ] && rm -f "$f" 2>/dev/null; then
+            _ok "Removed $f"
+        fi
+    done
+    return 0
+}
+
 # Print usage for the flag-driven entry point to stderr (help is diagnostic, and
 # stdout may be the curl|bash pipe).
 _usage() {
@@ -1898,6 +2014,8 @@ uninstall_biopb() {
     #    their console scripts: biopb, biopb-tensor-server, biopb-mcp).
     _step "[3/3] Removing biopb packages..."
     if command -v uv &>/dev/null; then
+        # The spec's owner is judged by the env's interpreter, so before it goes.
+        _remove_kernelspec "$(_tool_python)"
         if uv tool uninstall biopb &>/dev/null; then
             _ok "Removed the biopb tool environment (biopb, biopb-tensor-server, biopb-mcp)"
         else
@@ -1907,6 +2025,15 @@ uninstall_biopb() {
         _warn "uv not found; cannot remove the biopb tool environment"
         _info "  install uv and run: ${CYAN}uv tool uninstall biopb${RESET}"
     fi
+    # The web interface and the saved uninstaller are installed program files,
+    # not the user's data. Removing the uninstaller while it runs is safe: bash
+    # holds the open file.
+    local data_base="${BIOPB_DATA_HOME:-$HOME/.local/share}/biopb"
+    if [ -d "$data_base/webapp" ] && rm -rf "$data_base/webapp" 2>/dev/null; then
+        _ok "Removed the web interface ($data_base/webapp)"
+    fi
+    rm -rf "$data_base/uninstall" 2>/dev/null || true
+    _remove_desktop_shortcut
 
     # Optional purge of config + cached/state data. Never the user's images:
     # only biopb's own dotfile dirs are removed, never any configured data dir.

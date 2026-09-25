@@ -757,8 +757,10 @@ function Remove-McpClients {
     $ErrorActionPreference = 'SilentlyContinue'
 
     # Claude Code (via the CLI).
+    # Registration uses user scope; the bare form covers older wirings.
     if (Get-Command claude -ErrorAction SilentlyContinue) {
-        & claude mcp remove biopb *> $null
+        & claude mcp remove biopb -s user *> $null
+        if ($LASTEXITCODE -ne 0) { & claude mcp remove biopb *> $null }
         if ($LASTEXITCODE -eq 0) { Report-Ok "Claude Code: removed biopb" }
     }
 
@@ -770,10 +772,16 @@ function Remove-McpClients {
     }
 
     # JSON-config clients: delete the biopb entry under its container property.
+    # opencode reads opencode.jsonc over opencode.json, and registration writes
+    # the one it reads; a .jsonc with comments fails to parse and is reported.
+    $opencode = Join-Path $BiopbHome ".config\opencode\opencode.jsonc"
+    if (-not (Test-Path -LiteralPath $opencode)) {
+        $opencode = Join-Path $BiopbHome ".config\opencode\opencode.json"
+    }
     $targets = @(
         @{ File = (Join-Path $env:APPDATA "Claude\claude_desktop_config.json"); Prop = 'mcpServers'; Label = 'Claude Desktop' },
         @{ File = (Join-Path $BiopbHome ".cursor\mcp.json");                     Prop = 'mcpServers'; Label = 'Cursor' },
-        @{ File = (Join-Path $BiopbHome ".config\opencode\opencode.json");       Prop = 'mcp';        Label = 'opencode' }
+        @{ File = $opencode;                                                      Prop = 'mcp';        Label = 'opencode' }
     )
     foreach ($t in $targets) {
         if (-not (Test-Path -LiteralPath $t.File)) { continue }
@@ -989,6 +997,110 @@ function Invoke-Precompile {
     } catch {
         # Non-fatal: the first run just recompiles, exactly as before this ran.
     }
+}
+
+# Keep the installed release's own engine and uninstall.ps1 (its assets) in
+# $Dir, with an uninstall.cmd that runs them, so a later uninstall is the code
+# that installed this rather than whatever is newest. Best-effort.
+function Save-Uninstaller {
+    param($Release, [string]$Dir)
+    try {
+        if (-not $Release) { throw "no release" }
+        New-Item -ItemType Directory -Force -Path $Dir | Out-Null
+        foreach ($name in 'biopb-engine.ps1', 'uninstall.ps1') {
+            $asset = $Release.assets | Where-Object { $_.name -eq $name } | Select-Object -First 1
+            if (-not $asset) { throw "$($Release.tag_name) has no $name" }
+            Invoke-WebRequest -Uri $asset.browser_download_url -OutFile (Join-Path $Dir $name) -ErrorAction Stop
+        }
+        # Double-clickable, and past a Restricted execution policy.
+        Set-FileUtf8NoBom -Path (Join-Path $Dir 'uninstall.cmd') -Content `
+            "@powershell -NoProfile -ExecutionPolicy Bypass -File ""%~dp0uninstall.ps1"" %*`r`n"
+        Report-Ok "Uninstaller saved: $(Join-Path $Dir 'uninstall.cmd')"
+    } catch {
+        Remove-Item -LiteralPath $Dir -Recurse -Force -ErrorAction SilentlyContinue
+        Report-Note "Could not save the uninstaller ($($_.Exception.Message)); uninstall through this release's uninstall.ps1"
+    }
+}
+
+# The biopb env's interpreter, or $null when there is no env.
+function Get-ToolPython {
+    $toolDir = (uv tool dir 2>$null)
+    if (-not $toolDir) { return $null }
+    # Windows tool-venv layout puts the interpreter under Scripts\ (bin/ on POSIX).
+    $py = Join-Path $toolDir 'biopb\Scripts\python.exe'
+    if (Test-Path -LiteralPath $py) { return $py }
+    return $null
+}
+
+# The same program as install.sh's _kernelspec_state: prints absent | ours |
+# foreign, then the per-user "biopb" kernel spec dir, as the env's own
+# jupyter_core resolves it. Fed on stdin, so no quote survives PowerShell 5.1's
+# native command-line quoting to break it.
+$script:KernelSpecStateProgram = @'
+import json, os, sys
+from jupyter_core.paths import jupyter_data_dir
+
+spec = os.path.join(jupyter_data_dir(), "kernels", "biopb")
+try:
+    with open(os.path.join(spec, "kernel.json")) as f:
+        argv0 = json.load(f)["argv"][0]
+except FileNotFoundError:
+    state = "absent"
+except Exception:
+    state = "foreign"
+else:
+    env = os.path.normcase(os.path.abspath(sys.prefix)) + os.sep
+    ours = os.path.normcase(os.path.abspath(argv0)).startswith(env)
+    state = "ours" if ours else "foreign"
+print(state)
+print(spec)
+'@
+
+function Get-KernelSpecState {
+    param([string]$Python)
+    $out = @($script:KernelSpecStateProgram | & $Python - 2>$null)
+    if ($LASTEXITCODE -ne 0 -or $out.Count -lt 2) { return $null }
+    return @{ State = $out[0].Trim(); Dir = $out[1].Trim() }
+}
+
+# Register the biopb env as a Jupyter kernel, "Python (biopb)" (see install.sh's
+# _install_kernelspec). Best-effort; skip with BIOPB_INSTALL_KERNELSPEC=0.
+# -Python overrides the interpreter (tests).
+function Install-KernelSpec {
+    param([string]$Python = "")
+    if ($env:BIOPB_INSTALL_KERNELSPEC -eq '0') {
+        Report-Info "Jupyter kernel skipped (BIOPB_INSTALL_KERNELSPEC=0)"
+        return
+    }
+    try {
+        # Function-scoped: a native command's stderr must not end the install.
+        $ErrorActionPreference = 'Continue'
+        if (-not $Python) { $Python = Get-ToolPython }
+        if (-not $Python) { return }
+        $spec = Get-KernelSpecState -Python $Python
+        if (-not $spec) { return }
+        if ($spec.State -eq 'foreign') {
+            Report-Note "Kept the existing Jupyter kernel spec at $($spec.Dir)"
+            return
+        }
+        & $Python -m ipykernel install --user --name biopb --display-name "Python (biopb)" *> $null
+        if ($LASTEXITCODE -eq 0) { Report-Ok 'Jupyter kernel "Python (biopb)" registered' }
+        else { Report-Note "Could not register the Jupyter kernel; skipping" }
+    } catch { }
+}
+
+# Remove the kernel spec Install-KernelSpec wrote; needs the env still present.
+function Remove-KernelSpec {
+    param([string]$Python = "")
+    try {
+        $ErrorActionPreference = 'Continue'
+        if (-not $Python) { $Python = Get-ToolPython }
+        if (-not $Python) { return }
+        $spec = Get-KernelSpecState -Python $Python
+        if (-not $spec -or $spec.State -ne 'ours') { return }
+        Remove-Item -LiteralPath $spec.Dir -Recurse -Force -ErrorAction SilentlyContinue
+        if (-not (Test-Path -LiteralPath $spec.Dir)) { Report-Ok "Removed the Jupyter kernel spec $($spec.Dir)" }
+    } catch { }
 }
 
 # Drop a "biopb Dashboard" shortcut (.lnk) on the user's Desktop that runs
@@ -1451,6 +1563,8 @@ function Invoke-BiopbInstall {
 
     # Warm the bytecode cache now (admin-free) so the first viewer launch is fast.
     Invoke-Precompile
+    Install-KernelSpec
+    Save-Uninstaller -Release $release -Dir (Join-Path $DataRoot "uninstall")
 
     # Record the installed deployment version as the kernel-start auto-updater's
     # baseline (issue #87): the check compares the latest release-v* deployment's
@@ -1796,16 +1910,36 @@ function Invoke-BiopbUninstall {
 
         Report-Step 2 "Removing biopb packages..."
         if (Get-Command uv -ErrorAction SilentlyContinue) {
+            # The spec's owner is judged by the env's interpreter, so before it goes.
+            Remove-KernelSpec
             try { uv tool uninstall biopb *> $null } catch { }
             Report-Ok "Removed the biopb uv tool environment (and its console shims)"
         } else {
             Report-Warn "uv not found; skipped package removal"
         }
+        # The web interface and the saved uninstaller are installed program
+        # files, not the user's data. The uninstaller can go while it runs: its
+        # script and this engine are already read into memory.
+        $dataRoot = Get-BiopbTree "BIOPB_DATA_HOME" ".local\share"
+        $webapp = Join-Path $dataRoot "webapp"
+        if (Test-Path -LiteralPath $webapp) {
+            Remove-Item -LiteralPath $webapp -Recurse -Force -ErrorAction SilentlyContinue
+            if (-not (Test-Path -LiteralPath $webapp)) { Report-Ok "Removed the web interface ($webapp)" }
+        }
+        Remove-Item -LiteralPath (Join-Path $dataRoot "uninstall") -Recurse -Force -ErrorAction SilentlyContinue
 
         Report-Step 3 "Deregistering MCP clients..."
         Remove-McpClients -BiopbHome $BiopbHome
 
         Report-Step 4 "Cleaning up..."
+        # The same Desktop Install-DesktopShortcut resolves.
+        $desktop = [Environment]::GetFolderPath('Desktop')
+        if (-not $desktop) { $desktop = Join-Path $BiopbHome 'Desktop' }
+        $lnk = Join-Path $desktop 'biopb Dashboard.lnk'
+        if (Test-Path -LiteralPath $lnk) {
+            Remove-Item -LiteralPath $lnk -Force -ErrorAction SilentlyContinue
+            if (-not (Test-Path -LiteralPath $lnk)) { Report-Ok "Removed $lnk" }
+        }
         if ($Purge) {
             # The file-backend cache lives in the system temp dir (the tensor
             # server's _default_file_cache_dir), NOT under .local\share, so the
