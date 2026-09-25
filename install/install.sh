@@ -970,14 +970,15 @@ PY
 # installed anywhere else can run notebooks in it. A standalone kernel, not the
 # agent's session kernel. Rewritten on every install (the env path survives an
 # upgrade); a user's own spec named biopb is left alone. Best-effort; skip with
-# BIOPB_INSTALL_KERNELSPEC=0. $1 overrides the interpreter (tests).
+# BIOPB_INSTALL_KERNELSPEC=0. $1 is the env's interpreter (_tool_python).
 _install_kernelspec() {
     if [ "${BIOPB_INSTALL_KERNELSPEC:-1}" = "0" ]; then
         _note "Jupyter kernel skipped (BIOPB_INSTALL_KERNELSPEC=0)"
         return 0
     fi
     local py state spec
-    py=${1:-$(_tool_python)} || return 0
+    py=${1:-}
+    [ -n "$py" ] || return 0
     { read -r state && read -r spec; } < <(_kernelspec_state "$py" 2>/dev/null) || return 0
     if [ "$state" = "foreign" ]; then
         _note "Kept the existing Jupyter kernel spec at $spec"
@@ -991,10 +992,12 @@ _install_kernelspec() {
     return 0
 }
 
-# Remove the kernel spec _install_kernelspec wrote; needs the env still present.
+# Remove the kernel spec _install_kernelspec wrote; $1 as there, so the env
+# must still be present.
 _remove_kernelspec() {
     local py state spec
-    py=${1:-$(_tool_python)} || return 0
+    py=${1:-}
+    [ -n "$py" ] || return 0
     { read -r state && read -r spec; } < <(_kernelspec_state "$py" 2>/dev/null) || return 0
     [ "$state" = "ours" ] || return 0
     if rm -rf "$spec" 2>/dev/null; then
@@ -1548,7 +1551,7 @@ install_biopb() {
 
     # Warm the bytecode cache now (admin-free) so the first viewer launch is fast.
     _precompile_bytecode
-    _install_kernelspec
+    _install_kernelspec "$(_tool_python)"
 
     # Record the installed deployment version as the kernel-start auto-updater's
     # baseline (issue #87): the check compares the latest release-v* deployment's
@@ -1972,7 +1975,7 @@ uninstall_biopb() {
     _step "[3/3] Removing biopb packages..."
     if command -v uv &>/dev/null; then
         # The spec's owner is judged by the env's interpreter, so before it goes.
-        _remove_kernelspec
+        _remove_kernelspec "$(_tool_python)"
         if uv tool uninstall biopb &>/dev/null; then
             _ok "Removed the biopb tool environment (biopb, biopb-tensor-server, biopb-mcp)"
         else
