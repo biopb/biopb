@@ -43,36 +43,75 @@ app = typer.Typer(
 )
 
 
-def _add_optional_typer(name: str, import_path: str, help: str) -> None:
-    """Register a subcommand whose imports may fail.
+class _LazySubcommands(typer.core.TyperGroup):
+    """A subcommand group whose module is imported on first use, not at startup.
 
     The tensor/image subcommands pull in optional dependencies (installed via
-    biopb[tensor]) that may be absent or broken (e.g. a transient
-    numcodecs/zarr ImportError). When that happens we still want the rest of
-    the CLI (version, server management) to work, so we register a stub that
-    surfaces the error only when the subcommand is actually invoked.
+    biopb[tensor]) that are heavy -- `biopb.tensor.client` alone imports
+    dask.array, which drags pandas and scipy along -- and that may be absent or
+    broken (e.g. a transient numcodecs/zarr ImportError). Importing them at
+    registration made every `biopb` invocation, `biopb version` included, pay
+    ~0.7 s for a module it never used. Here the group knows only its name and
+    help until something asks for its commands: the module loads when the group
+    is invoked, its own help is rendered, or a shell completion lists it.
+    `biopb --help` lists the group without loading it.
+
+    An import failure is reported the way the eager stub did: any `biopb <name>
+    ...` invocation prints the error and the install hint and exits 1, so the
+    rest of the CLI (version, server management) keeps working.
     """
-    import importlib
 
-    try:
-        module = importlib.import_module(import_path)
-        app.add_typer(module.app, name=name, help=help)
-    except Exception as exc:  # noqa: BLE001 - degrade gracefully on any import error
-        error = exc
+    import_path: str = ""  # set on the per-group subclass by `_add_optional_typer`
 
-        # Register a catch-all command so that any `biopb <name> ...` invocation
-        # surfaces the import error instead of a confusing crash or usage error.
-        @app.command(
-            name=name,
-            help=f"{help} (unavailable - optional dependencies missing)",
-            context_settings={"ignore_unknown_options": True, "allow_extra_args": True},
-        )
-        def _unavailable(args: List[str] = typer.Argument(None)) -> None:
+    def __init__(self, **attrs) -> None:
+        self._loaded: Optional[dict] = None
+        self._error: Optional[BaseException] = None
+        super().__init__(**attrs)
+
+    # `TyperGroup` keeps its subcommands in a plain `commands` dict that every
+    # path reads (listing, resolution, help, suggestions); making it a property
+    # is the one hook that covers them all. The constructor's assignment of an
+    # empty dict is discarded.
+    @property
+    def commands(self) -> dict:
+        self._ensure_loaded()
+        return self._loaded or {}
+
+    @commands.setter
+    def commands(self, value) -> None:
+        pass
+
+    def _ensure_loaded(self) -> None:
+        if self._loaded is not None or self._error is not None:
+            return
+        import importlib
+
+        try:
+            module = importlib.import_module(self.import_path)
+            self._loaded = dict(typer.main.get_group(module.app).commands)
+        except Exception as exc:  # noqa: BLE001 - degrade gracefully on any import error
+            self._error = exc
+            self.help = f"{self.help} (unavailable - optional dependencies missing)"
+
+    def invoke(self, ctx: typer.Context):
+        self._ensure_loaded()
+        if self._error is not None:
             console.print(
-                f"[red]The '{name}' commands are unavailable:[/red] {error}\n"
+                f"[red]The '{self.name}' commands are unavailable:[/red] {self._error}\n"
                 r"[yellow]Install optional dependencies with: pip install 'biopb\[tensor]'[/yellow]"
             )
             raise typer.Exit(1)
+        return super().invoke(ctx)
+
+    def format_help(self, ctx, formatter) -> None:
+        self._ensure_loaded()  # so a failed import's note is in the help text
+        return super().format_help(ctx, formatter)
+
+
+def _add_optional_typer(name: str, import_path: str, help: str) -> None:
+    """Register `import_path`'s Typer `app` as the `name` subcommand group, lazily."""
+    cls = type(f"_Lazy_{name}", (_LazySubcommands,), {"import_path": import_path})
+    app.add_typer(typer.Typer(), name=name, help=help, cls=cls)
 
 
 # TensorFlight client diagnostics
