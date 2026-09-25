@@ -757,8 +757,10 @@ function Remove-McpClients {
     $ErrorActionPreference = 'SilentlyContinue'
 
     # Claude Code (via the CLI).
+    # Registration uses user scope; the bare form covers older wirings.
     if (Get-Command claude -ErrorAction SilentlyContinue) {
-        & claude mcp remove biopb *> $null
+        & claude mcp remove biopb -s user *> $null
+        if ($LASTEXITCODE -ne 0) { & claude mcp remove biopb *> $null }
         if ($LASTEXITCODE -eq 0) { Report-Ok "Claude Code: removed biopb" }
     }
 
@@ -770,10 +772,16 @@ function Remove-McpClients {
     }
 
     # JSON-config clients: delete the biopb entry under its container property.
+    # opencode reads opencode.jsonc over opencode.json, and registration writes
+    # the one it reads; a .jsonc with comments fails to parse and is reported.
+    $opencode = Join-Path $BiopbHome ".config\opencode\opencode.jsonc"
+    if (-not (Test-Path -LiteralPath $opencode)) {
+        $opencode = Join-Path $BiopbHome ".config\opencode\opencode.json"
+    }
     $targets = @(
         @{ File = (Join-Path $env:APPDATA "Claude\claude_desktop_config.json"); Prop = 'mcpServers'; Label = 'Claude Desktop' },
         @{ File = (Join-Path $BiopbHome ".cursor\mcp.json");                     Prop = 'mcpServers'; Label = 'Cursor' },
-        @{ File = (Join-Path $BiopbHome ".config\opencode\opencode.json");       Prop = 'mcp';        Label = 'opencode' }
+        @{ File = $opencode;                                                      Prop = 'mcp';        Label = 'opencode' }
     )
     foreach ($t in $targets) {
         if (-not (Test-Path -LiteralPath $t.File)) { continue }
@@ -1890,6 +1898,14 @@ function Invoke-BiopbUninstall {
         Remove-McpClients -BiopbHome $BiopbHome
 
         Report-Step 4 "Cleaning up..."
+        # The same Desktop Install-DesktopShortcut resolves.
+        $desktop = [Environment]::GetFolderPath('Desktop')
+        if (-not $desktop) { $desktop = Join-Path $BiopbHome 'Desktop' }
+        $lnk = Join-Path $desktop 'biopb Dashboard.lnk'
+        if (Test-Path -LiteralPath $lnk) {
+            Remove-Item -LiteralPath $lnk -Force -ErrorAction SilentlyContinue
+            if (-not (Test-Path -LiteralPath $lnk)) { Report-Ok "Removed $lnk" }
+        }
         if ($Purge) {
             # The file-backend cache lives in the system temp dir (the tensor
             # server's _default_file_cache_dir), NOT under .local\share, so the

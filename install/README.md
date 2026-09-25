@@ -154,8 +154,8 @@ and `irm|iex` paths alike.
 `install.sh` takes an `--uninstall` flag (mirrors the Windows installer's
 Add/Remove Programs entry). It stops the data and MCP servers, unregisters biopb
 from any detected agent (Claude Code/Desktop, Codex CLI, Cursor, opencode), and
-removes the
-shared `uv` tool environment. Add `--purge` to also delete config and cached
+removes the shared `uv` tool environment, the Jupyter kernel and the Desktop
+shortcut. Add `--purge` to also delete config and cached
 data — your **image data is never touched**.
 
 ```sh

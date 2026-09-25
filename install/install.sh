@@ -1919,6 +1919,21 @@ _unregister_agents() {
     return 0
 }
 
+# Remove the "biopb Dashboard" launchers _install_desktop_shortcut writes, on
+# whichever platform wrote them.
+_remove_desktop_shortcut() {
+    local f
+    for f in \
+        "$HOME/Desktop/biopb Dashboard.command" \
+        "$HOME/Desktop/biopb-dashboard.desktop" \
+        "$HOME/.local/share/applications/biopb-dashboard.desktop"; do
+        if [ -f "$f" ] && rm -f "$f" 2>/dev/null; then
+            _ok "Removed $f"
+        fi
+    done
+    return 0
+}
+
 # Print usage for the flag-driven entry point to stderr (help is diagnostic, and
 # stdout may be the curl|bash pipe).
 _usage() {
@@ -1985,6 +2000,7 @@ uninstall_biopb() {
         _warn "uv not found; cannot remove the biopb tool environment"
         _info "  install uv and run: ${CYAN}uv tool uninstall biopb${RESET}"
     fi
+    _remove_desktop_shortcut
 
     # Optional purge of config + cached/state data. Never the user's images:
     # only biopb's own dotfile dirs are removed, never any configured data dir.
