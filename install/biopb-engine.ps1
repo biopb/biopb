@@ -1218,7 +1218,7 @@ function Invoke-BiopbInstall {
         return $result
     }
 
-    # All three wheels (+ webapp) are pulled from ONE biopb release-v* deployment.
+    # The product wheels (+ webapp) are pulled from ONE biopb release-v* deployment.
     $BiopbRepoUrl = "https://github.com/biopb/biopb"
     $RepoUrl      = $BiopbRepoUrl
     $ReleaseRepo  = "biopb/biopb"
@@ -1393,7 +1393,8 @@ function Invoke-BiopbInstall {
     }
 
     # Resolve the wheel set from a single release-v* build (a matched set);
-    # never let the resolver pull biopb/tensor-server/mcp from PyPI.
+    # never let the resolver pull tensor-server/mcp/control from PyPI. The SDK
+    # they were built against comes from PyPI, pinned exactly.
     try { $release = Get-LatestRelease -Repo $ReleaseRepo -TagPrefix $ReleaseTagPrefix -AllowRc $AllowRc -PinTag $PinTag } catch { $release = $null }
     if (-not $release) {
         if ($PinTag) {
@@ -1404,27 +1405,49 @@ function Invoke-BiopbInstall {
             throw "Could not fetch the latest biopb release-v* deployment from $ReleaseRepo (check network and rerun)."
         }
     }
+    # versions.json pins the SDK and napari to the versions this release was
+    # built and tested with, and carries the `release` version recorded below.
+    # A release without the manifest (or without `biopb`) ships the SDK as a
+    # wheel asset instead.
+    $versions = $null
+    $verAsset = $release.assets | Where-Object { $_.name -eq 'versions.json' } | Select-Object -First 1
+    if ($verAsset) {
+        # Via a file: PS 5.1 hands back .Content as a byte[] for the
+        # application/octet-stream GitHub serves assets as.
+        $verFile = Join-Path $env:TEMP "biopb-versions.json"
+        try {
+            Invoke-WebRequest -Uri $verAsset.browser_download_url -OutFile $verFile -UseBasicParsing
+            $versions = Get-Content -Raw -LiteralPath $verFile | ConvertFrom-Json
+        } catch { $versions = $null }
+        Remove-Item -LiteralPath $verFile -Force -ErrorAction SilentlyContinue
+    }
+    $sdkPin = if ($versions) { $versions.biopb } else { $null }
+    $napariReq = if ($versions -and $versions.napari) { "napari[all]==$($versions.napari)" } else { "napari[all]" }
     $mcpAsset    = $release.assets | Where-Object { $_.name -match '^biopb_mcp-.*\.whl$' } | Select-Object -First 1
-    $sdkAsset    = $release.assets | Where-Object { $_.name -match '^biopb-.*\.whl$' } | Select-Object -First 1
+    $sdkAsset    = if ($sdkPin) { $null } else { $release.assets | Where-Object { $_.name -match '^biopb-.*\.whl$' } | Select-Object -First 1 }
     $tensorAsset = $release.assets | Where-Object { $_.name -match '^biopb_tensor_server-.*\.whl$' } | Select-Object -First 1
     # biopb-control (control plane). Its underscore filename (biopb_control-…) is not
     # matched by the sdk pattern '^biopb-.*' above, so the two stay distinct.
     $controlAsset  = $release.assets | Where-Object { $_.name -match '^biopb_control-.*\.whl$' } | Select-Object -First 1
-    if (-not $mcpAsset -or -not $sdkAsset -or -not $tensorAsset -or -not $controlAsset) {
-        throw "Release $($release.tag_name) is missing one of the biopb wheels."
+    if (-not $mcpAsset -or -not ($sdkPin -or $sdkAsset) -or -not $tensorAsset -or -not $controlAsset) {
+        throw "Release $($release.tag_name) is missing one of the biopb wheels (or its versions.json could not be read)."
     }
     Report-Info "Installing from release $($release.tag_name)"
     $wheelsDir = Join-Path $env:TEMP "biopb-wheels"
     if (Test-Path -LiteralPath $wheelsDir) { Remove-Item -LiteralPath $wheelsDir -Recurse -Force }
     New-Item -ItemType Directory -Force -Path $wheelsDir | Out-Null
     $mcpWhl    = Join-Path $wheelsDir $mcpAsset.name
-    $sdkWhl    = Join-Path $wheelsDir $sdkAsset.name
     $tensorWhl = Join-Path $wheelsDir $tensorAsset.name
     $controlWhl  = Join-Path $wheelsDir $controlAsset.name
     Invoke-WebRequest -Uri $mcpAsset.browser_download_url -OutFile $mcpWhl
-    Invoke-WebRequest -Uri $sdkAsset.browser_download_url -OutFile $sdkWhl
     Invoke-WebRequest -Uri $tensorAsset.browser_download_url -OutFile $tensorWhl
     Invoke-WebRequest -Uri $controlAsset.browser_download_url -OutFile $controlWhl
+    $wheels = @($mcpWhl, $tensorWhl, $controlWhl)
+    if ($sdkAsset) {
+        $sdkWhl = Join-Path $wheelsDir $sdkAsset.name
+        Invoke-WebRequest -Uri $sdkAsset.browser_download_url -OutFile $sdkWhl
+        $wheels += $sdkWhl
+    }
 
     # Verify the wheels against the release's SHA256SUMS before installing them
     # (issue #87 trust item). Hard-fail on a mismatch or a wheel missing from a
@@ -1446,7 +1469,7 @@ function Invoke-BiopbInstall {
             $m = [regex]::Match($line.Trim(), '^([0-9a-fA-F]{64})\s+\*?(.+)$')
             if ($m.Success) { $sums[$m.Groups[2].Value] = $m.Groups[1].Value.ToLower() }
         }
-        foreach ($w in @($mcpWhl, $sdkWhl, $tensorWhl, $controlWhl)) {
+        foreach ($w in $wheels) {
             $base = Split-Path -Leaf $w
             $expected = $sums[$base]
             if (-not $expected) { throw "No checksum for $base in the release SHA256SUMS" }
@@ -1460,7 +1483,7 @@ function Invoke-BiopbInstall {
 
     # Direct file:// references pin each package to this exact wheel.
     $mcpReq    = "biopb-mcp[mcp] @ $(([System.Uri]$mcpWhl).AbsoluteUri)"
-    $biopbReq  = "biopb[tensor] @ $(([System.Uri]$sdkWhl).AbsoluteUri)"
+    $biopbReq  = if ($sdkPin) { "biopb[tensor]==$sdkPin" } else { "biopb[tensor] @ $(([System.Uri]$sdkWhl).AbsoluteUri)" }
     $tensorReq = "biopb-tensor-server[$tensorExtras] @ $(([System.Uri]$tensorWhl).AbsoluteUri)"
     $controlReq  = "biopb-control @ $(([System.Uri]$controlWhl).AbsoluteUri)"
 
@@ -1474,10 +1497,10 @@ function Invoke-BiopbInstall {
         "--with", $tensorReq,
         "--with-executables-from", "biopb-tensor-server"
     )
-    Report-Info "including biopb-mcp + napari"
+    Report-Info "including biopb-mcp + $napariReq"
     $installArgs += @(
         "--with", $mcpReq,
-        "--with", "napari[all]",
+        "--with", $napariReq,
         "--with-executables-from", "biopb-mcp"
     )
     # biopb-control (control plane): `biopb control …` runs through the core CLI (which
@@ -1568,14 +1591,10 @@ function Invoke-BiopbInstall {
 
     # Record the installed deployment version as the kernel-start auto-updater's
     # baseline (issue #87): the check compares the latest release-v* deployment's
-    # versions.json `release` against this marker. Read `release` from the same
-    # manifest; fall back to the tag (release-vX.Y.Z -> X.Y.Z). Best-effort — a
-    # write failure only re-prompts a future update, never the install.
-    $releaseVersion = ""
-    $verAsset = $release.assets | Where-Object { $_.name -eq 'versions.json' } | Select-Object -First 1
-    if ($verAsset) {
-        try { $releaseVersion = ((Invoke-WebRequest -Uri $verAsset.browser_download_url -UseBasicParsing).Content | ConvertFrom-Json).release } catch { $releaseVersion = "" }
-    }
+    # versions.json `release` against this marker, read above; fall back to the
+    # tag (release-vX.Y.Z -> X.Y.Z). Best-effort — a write failure only
+    # re-prompts a future update, never the install.
+    $releaseVersion = if ($versions) { $versions.release } else { "" }
     if (-not $releaseVersion) { $releaseVersion = ($release.tag_name -replace "^$([regex]::Escape($ReleaseTagPrefix))", "") }
     try {
         if (-not (Test-Path -LiteralPath $ConfigDir)) { New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null }

@@ -1099,10 +1099,9 @@ EOF
 install_biopb() {
     set -euo pipefail
 
-    # All three wheels (+ webapp) are pulled from ONE biopb release-v*
-    # deployment — a mutually-paired set built from the tagged commit. All three
-    # packages live in the biopb monorepo (biopb-mcp and biopb-tensor-server are
-    # subdirectories of biopb/biopb).
+    # The product wheels (+ webapp) are pulled from ONE biopb release-v*
+    # deployment — a mutually-paired set built from the tagged commit; the SDK
+    # they pin comes from PyPI.
     BIOPB_REPO_URL="https://github.com/biopb/biopb"
     REPO_URL="$BIOPB_REPO_URL"        # webapp release-asset fallback URL
     RELEASE_REPO="biopb/biopb"        # owner/name for the GitHub Releases API
@@ -1355,19 +1354,12 @@ install_biopb() {
         TENSOR_EXTRAS="$TENSOR_EXTRAS,czi"
     fi
 
-    # Resolve where the three packages come from. They must be installed as a
-    # matched set from a single build: the tensor server is self-contained and
-    # may use proto fields newer than any biopb on PyPI, and biopb-mcp is tightly
-    # coupled to both — so all three are pinned to the sibling wheels from one
-    # release-v* deployment (release CI builds the mutually-paired set from
-    # the tagged commit) and the resolver is never allowed to pull biopb /
-    # biopb-tensor-server / biopb-mcp from PyPI. One download is one consistent
-    # set — no PyPI-vs-release version skew.
+    # Resolve where the packages come from. biopb-tensor-server, biopb-mcp and
+    # biopb-control are installed as a matched set from one release-v*
+    # deployment (release CI builds them from the tagged commit), never from
+    # PyPI. The SDK they were built against is pinned exactly and comes from
+    # PyPI. napari is pinned to the tested version from the same manifest.
     local biopb_req tensor_req mcp_req control_req
-    # napari is the one runtime dep resolved from PyPI. We pin it to the exact
-    # version this release was built/tested against (carried in its versions.json
-    # attribute, read below) so the deployed object graph matches the graph-walk
-    # thread-safety test — and so the napari[all] Qt binding is the tested one.
     local napari_req="napari[all]"
     if ! _fetch_latest_release; then
         if [ -n "${PIN_TAG:-}" ]; then
@@ -1385,33 +1377,26 @@ install_biopb() {
         fi
         exit 1
     fi
-    local mcp_url sdk_url tensor_url control_url
-    mcp_url=$(_release_asset_url 'biopb_mcp-[^/]+\.whl')
-    sdk_url=$(_release_asset_url 'biopb-[^/]+\.whl')
-    tensor_url=$(_release_asset_url 'biopb_tensor_server-[^/]+\.whl')
-    # biopb-control (control plane) wheel. Its filename uses an underscore
-    # (biopb_control-…), so the sdk regex `biopb-…` above never matches it.
-    control_url=$(_release_asset_url 'biopb_control-[^/]+\.whl')
-    if [ -z "$mcp_url" ] || [ -z "$sdk_url" ] || [ -z "$tensor_url" ] || [ -z "$control_url" ]; then
-        _err "Release $RELEASE_TAG is missing one of the biopb wheels."
-        _info "Try again later, or report this against $RELEASE_REPO."
-        exit 1
-    fi
     # Pin napari from the release's versions.json attribute so the installed
     # napari is identical to the one this release was built/tested against
     # (closes the last dev/deploy version-skew — and the napari[all] Qt
     # binding, which is napari-version-dependent). The same manifest carries the
     # deployment `release` version, which we record post-install as the
-    # auto-updater's baseline (issue #87). Tolerant: an older release without the
-    # manifest falls back to the unversioned napari spec and a tag-derived
-    # version. RELEASE_VERSION is read here but written only after a clean install.
-    local versions_url versions_json napari_pin
+    # auto-updater's baseline (issue #87), and the `biopb` SDK version, which is
+    # installed from PyPI (release CI checks that PyPI's wheel is the SDK this
+    # release was built with). Tolerant: an older release without the manifest
+    # falls back to the unversioned napari spec and a tag-derived version, and
+    # one without `biopb` ships the SDK as a wheel asset. RELEASE_VERSION is read
+    # here but written only after a clean install.
+    local versions_url versions_json napari_pin sdk_pin=""
     versions_url=$(_release_asset_url 'versions\.json')
     if [ -n "$versions_url" ]; then
         versions_json=$(curl -fsSL "$versions_url" 2>/dev/null) || versions_json=""
         napari_pin=$(printf '%s' "$versions_json" \
             | sed -n 's/.*"napari"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
         [ -n "$napari_pin" ] && napari_req="napari[all]==$napari_pin"
+        sdk_pin=$(printf '%s' "$versions_json" \
+            | sed -n 's/.*"biopb"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
         RELEASE_VERSION=$(printf '%s' "$versions_json" \
             | sed -n 's/.*"release"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
     fi
@@ -1419,6 +1404,18 @@ install_biopb() {
     # or lacks `release`, so the recorded baseline is always a clean PEP 440
     # version the update check can compare with packaging.version.
     RELEASE_VERSION="${RELEASE_VERSION:-${RELEASE_TAG#"${RELEASE_TAG_PREFIX:-release-v}"}}"
+    local mcp_url sdk_url="" tensor_url control_url
+    mcp_url=$(_release_asset_url 'biopb_mcp-[^/]+\.whl')
+    [ -n "$sdk_pin" ] || sdk_url=$(_release_asset_url 'biopb-[^/]+\.whl')
+    tensor_url=$(_release_asset_url 'biopb_tensor_server-[^/]+\.whl')
+    # biopb-control (control plane) wheel. Its filename uses an underscore
+    # (biopb_control-…), so the sdk regex `biopb-…` above never matches it.
+    control_url=$(_release_asset_url 'biopb_control-[^/]+\.whl')
+    if [ -z "$mcp_url" ] || [ -z "$sdk_pin$sdk_url" ] || [ -z "$tensor_url" ] || [ -z "$control_url" ]; then
+        _err "Release $RELEASE_TAG is missing one of the biopb wheels (or its versions.json could not be read)."
+        _info "Try again later, or report this against $RELEASE_REPO."
+        exit 1
+    fi
     _info "Installing from release $RELEASE_TAG"
     WHEELS_DIR=$(mktemp -d)
     # Remove the wheel download dir on any exit (success, error, or set -e).
@@ -1426,24 +1423,31 @@ install_biopb() {
     # Declared first, assigned after: `local x=$(cmd)` takes local's own exit
     # status, so a failing _urldecode/basename would sail past `set -e` and leave
     # a truncated path to curl into.
-    local mcp_whl sdk_whl tensor_whl control_whl
+    local mcp_whl sdk_whl="" tensor_whl control_whl
     mcp_whl="$WHEELS_DIR/$(_urldecode "$(basename "$mcp_url")")"
-    sdk_whl="$WHEELS_DIR/$(_urldecode "$(basename "$sdk_url")")"
     tensor_whl="$WHEELS_DIR/$(_urldecode "$(basename "$tensor_url")")"
     control_whl="$WHEELS_DIR/$(_urldecode "$(basename "$control_url")")"
     curl -fsSL "$mcp_url" -o "$mcp_whl"
-    curl -fsSL "$sdk_url" -o "$sdk_whl"
     curl -fsSL "$tensor_url" -o "$tensor_whl"
     curl -fsSL "$control_url" -o "$control_whl"
+    if [ -n "$sdk_url" ]; then
+        sdk_whl="$WHEELS_DIR/$(_urldecode "$(basename "$sdk_url")")"
+        curl -fsSL "$sdk_url" -o "$sdk_whl"
+    fi
     # Verify the downloaded wheels against the release's SHA256SUMS before they
     # are file://-installed (aborts on a mismatch; fails open on an older release
     # without the manifest). See the auto-updater trust item in issue #87.
-    _verify_wheels "$mcp_whl" "$sdk_whl" "$tensor_whl" "$control_whl"
+    _verify_wheels "$mcp_whl" "$tensor_whl" "$control_whl" ${sdk_whl:+"$sdk_whl"}
     # Direct file:// references pin each package to this exact wheel, so uv
     # resolves their inter-dependencies (the server's `biopb`, biopb-mcp's
-    # `biopb[tensor]`, the control plane's `biopb`) to the downloaded set rather than PyPI.
+    # `biopb[tensor]`, the control plane's `biopb`) to the downloaded set; the
+    # SDK is pinned exactly to its PyPI release.
     mcp_req="biopb-mcp[mcp] @ file://$mcp_whl"
-    biopb_req="biopb[tensor] @ file://$sdk_whl"
+    if [ -n "$sdk_pin" ]; then
+        biopb_req="biopb[tensor]==$sdk_pin"
+    else
+        biopb_req="biopb[tensor] @ file://$sdk_whl"
+    fi
     tensor_req="biopb-tensor-server[$TENSOR_EXTRAS] @ file://$tensor_whl"
     control_req="biopb-control @ file://$control_whl"
 
@@ -1462,11 +1466,7 @@ install_biopb() {
     #
     # biopb-mcp requires the [mcp] extra (mcp, uvicorn, jupyter_client, ipykernel,
     # psutil) — without it `import mcp` fails; the extra is applied to the pinned
-    # wheel/ref ($mcp_req) just like the others. It now ships in the biopb-mcp
-    # release alongside biopb + tensor-server (one matched set, now four wheels), so unlike the
-    # old layout it is no longer pulled from PyPI. napari[all] is the one runtime
-    # dep still resolved from PyPI, but pinned to the release's versions.json
-    # version ($napari_req, set above) so it matches the tested build.
+    # wheel ($mcp_req) just like the others.
     local install_args=(
         --upgrade
         --force

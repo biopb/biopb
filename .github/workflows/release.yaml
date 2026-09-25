@@ -151,7 +151,7 @@ jobs:
     needs: [guard, windows-installer]
     if: needs.guard.outputs.proceed == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     permissions:
       contents: write   # create the GitHub release
     env:
@@ -191,10 +191,11 @@ jobs:
 
       # Build the wheel set the GitHub release ships (the installer file://-installs
       # these). release-wheels/ holds the GitHub-release assets; biopb-mcp also
-      # ships an sdist.
+      # ships an sdist. The SDK wheel is built only to check it against PyPI,
+      # which is where the installer takes it from.
       - name: Build wheels
         run: |
-          uv build --package biopb --wheel --out-dir release-wheels
+          uv build --package biopb --wheel --out-dir sdk-wheel
           uv build --package biopb-tensor-server --wheel --out-dir release-wheels
           uv build --package biopb-mcp --out-dir release-wheels
           uv build --package biopb-control --wheel --out-dir release-wheels
@@ -299,16 +300,36 @@ jobs:
           nver=$(git show HEAD:biopb-mcp/pyproject.toml | grep -oE 'napari\[all\]==[0-9][^"]+' | head -1 | sed -E 's/.*==//')
           [ -n "$nver" ] || { echo "ERROR: no napari[all]== pin in biopb-mcp/pyproject.toml" >&2; exit 1; }
           echo "napari=$nver" >> "$GITHUB_OUTPUT"
+          # The SDK the installer takes from PyPI: the nearest v* tag. The next
+          # step checks it is the SDK this commit builds.
+          sdk=$(git describe --tags --match 'v[0-9]*' --abbrev=0 HEAD)
+          sdk="${sdk#v}"
+          echo "sdk=$sdk" >> "$GITHUB_OUTPUT"
           # versions.json — the installer-readable release-attribute manifest. The
-          # installer reads `napari` (pins the tested Qt binding) and `release`
-          # (the update baseline); `tensor_server` reports the shipped wheel's
+          # installer reads `napari` (pins the tested Qt binding), `biopb` (the
+          # SDK pin) and `release` (the update baseline); `tensor_server` reports the shipped wheel's
           # version (now the same `release-v*` line, so == release on a real tag).
           # Docker versions are NOT here — the tensor-server image ships on this
           # same `release-v*` tag (tensor-server-ci), image-base on the SDK `v*`.
           cat > release-wheels/versions.json <<EOF
-          { "release": "$REL", "tensor_server": "$tver", "napari": "$nver" }
+          { "release": "$REL", "tensor_server": "$tver", "napari": "$nver", "biopb": "$sdk" }
           EOF
-          echo "tensor-server=$tver  napari=$nver  release=$REL  prerelease=$PRERELEASE"
+          echo "tensor-server=$tver  napari=$nver  biopb=$sdk  release=$REL  prerelease=$PRERELEASE"
+
+      # The installer takes the SDK from PyPI, so the SDK at this commit must be a
+      # published one: the nearest v* tag, byte-identical to its PyPI wheel. A v*
+      # tag on this same commit publishes concurrently (python-ci), hence the
+      # wait. A dry run reports a mismatch as a warning and carries on.
+      - name: Check the SDK is on PyPI
+        run: |
+          set -uo pipefail
+          if [ "${{ steps.ver.outputs.is_tag }}" = true ]; then
+            python3 .github/scripts/check_sdk_on_pypi.py \
+              sdk-wheel/biopb-*.whl "${{ steps.ver.outputs.sdk }}" --wait 1800
+          elif ! python3 .github/scripts/check_sdk_on_pypi.py \
+              sdk-wheel/biopb-*.whl "${{ steps.ver.outputs.sdk }}"; then
+            echo "::warning::The SDK differs from biopb ${{ steps.ver.outputs.sdk }} on PyPI; a release of this commit needs a new v* tag first."
+          fi
 
       # Pull the Windows installer built by the windows-installer job into the
       # release-asset dir so the glob below attaches it. The .exe is UNSIGNED for
@@ -394,14 +415,15 @@ jobs:
             ```
 
             ### Assets
-            - `biopb-*.whl`, `biopb_tensor_server-*.whl`, `biopb_mcp-*.whl`,
+            - `biopb_tensor_server-*.whl`, `biopb_mcp-*.whl`,
               `biopb_control-*.whl` — the version-paired wheel set (installer
               `file://`-installs these)
             - `webapp.tar.gz` — the data-browser web UI
             - `biopb-samples.tar.gz` — curated CC0 sample images a fresh install
               seeds so the viewer opens onto real data (see `LICENSES.txt` inside)
-            - `versions.json` — release manifest (pins `napari`; carries the
-              `release` version the installer records as the update baseline)
+            - `versions.json` — release manifest (pins `napari` and the `biopb`
+              SDK, which the installer takes from PyPI; carries the `release`
+              version the installer records as the update baseline)
             - `SHA256SUMS` — digests of the assets above; the installer verifies
               the wheel set against it before installing
             - `install.sh` / `install.ps1` — bootstrap installers, pinned to this
