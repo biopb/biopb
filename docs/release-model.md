@@ -49,6 +49,11 @@ The tags are independent: an SDK-only change is just `v<A>`; a product change
 when one commit changes both lines. A commit that is not on a clean tag (a dry
 run) just yields a `.devN+gSHA` version, which is fine for testing.
 
+One ordering rule: a product release ships only with a published SDK.
+`release.yaml` fails unless the SDK at the release commit is byte-identical to
+the PyPI wheel of the nearest `v*` tag. So if the SDK changed since that tag,
+cut a new `v<A>` first (on the same commit is fine; the check waits for PyPI).
+
 Because every product-bundle package reads `release-v*` from the **same release
 commit**, `release.yaml`'s `setuptools_scm` build produces **clean** wheel
 versions for all of them (`biopb_tensor_server 0.11.0`, `biopb_mcp 0.11.0`,
