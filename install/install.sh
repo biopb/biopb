@@ -931,6 +931,78 @@ _precompile_bytecode() {
     _ok "Bytecode precompiled (first viewer launch will be faster)"
 }
 
+# The biopb env's interpreter, or nothing (status 1) when there is no env.
+_tool_python() {
+    local tool_dir
+    tool_dir=$(uv tool dir 2>/dev/null) || return 1
+    [ -x "$tool_dir/biopb/bin/python" ] || return 1
+    printf '%s\n' "$tool_dir/biopb/bin/python"
+}
+
+# Where the per-user "biopb" kernel spec lives, and whose it is: prints a state
+# line (absent | ours | foreign) then the spec dir. Asks $1's own jupyter_core,
+# which resolves the same user dir any Jupyter of this user searches. "ours"
+# means the spec runs an interpreter inside $1's env; any other spec named biopb
+# is the user's. biopb-engine.ps1 carries the same program.
+_kernelspec_state() {
+    "$1" - <<'PY'
+import json, os, sys
+from jupyter_core.paths import jupyter_data_dir
+
+spec = os.path.join(jupyter_data_dir(), "kernels", "biopb")
+try:
+    with open(os.path.join(spec, "kernel.json")) as f:
+        argv0 = json.load(f)["argv"][0]
+except FileNotFoundError:
+    state = "absent"
+except Exception:
+    state = "foreign"
+else:
+    env = os.path.normcase(os.path.abspath(sys.prefix)) + os.sep
+    ours = os.path.normcase(os.path.abspath(argv0)).startswith(env)
+    state = "ours" if ours else "foreign"
+print(state)
+print(spec)
+PY
+}
+
+# Register the biopb env as a Jupyter kernel, "Python (biopb)", so a Jupyter
+# installed anywhere else can run notebooks in it. A standalone kernel, not the
+# agent's session kernel. Rewritten on every install (the env path survives an
+# upgrade); a user's own spec named biopb is left alone. Best-effort; skip with
+# BIOPB_INSTALL_KERNELSPEC=0. $1 overrides the interpreter (tests).
+_install_kernelspec() {
+    if [ "${BIOPB_INSTALL_KERNELSPEC:-1}" = "0" ]; then
+        _note "Jupyter kernel skipped (BIOPB_INSTALL_KERNELSPEC=0)"
+        return 0
+    fi
+    local py state spec
+    py=${1:-$(_tool_python)} || return 0
+    { read -r state && read -r spec; } < <(_kernelspec_state "$py" 2>/dev/null) || return 0
+    if [ "$state" = "foreign" ]; then
+        _note "Kept the existing Jupyter kernel spec at $spec"
+        return 0
+    fi
+    if "$py" -m ipykernel install --user --name biopb --display-name "Python (biopb)" >/dev/null 2>&1; then
+        _ok "Jupyter kernel \"Python (biopb)\" registered"
+    else
+        _note "Could not register the Jupyter kernel; skipping"
+    fi
+    return 0
+}
+
+# Remove the kernel spec _install_kernelspec wrote; needs the env still present.
+_remove_kernelspec() {
+    local py state spec
+    py=${1:-$(_tool_python)} || return 0
+    { read -r state && read -r spec; } < <(_kernelspec_state "$py" 2>/dev/null) || return 0
+    [ "$state" = "ours" ] || return 0
+    if rm -rf "$spec" 2>/dev/null; then
+        _ok "Removed the Jupyter kernel spec $spec"
+    fi
+    return 0
+}
+
 # Drop a double-clickable "biopb Dashboard" shortcut on the user's Desktop that
 # runs `biopb dashboard` (start the control plane if needed, then open the
 # browser). Best-effort: a failure only means no icon, never aborts the install.
@@ -1476,6 +1548,7 @@ install_biopb() {
 
     # Warm the bytecode cache now (admin-free) so the first viewer launch is fast.
     _precompile_bytecode
+    _install_kernelspec
 
     # Record the installed deployment version as the kernel-start auto-updater's
     # baseline (issue #87): the check compares the latest release-v* deployment's
@@ -1898,6 +1971,8 @@ uninstall_biopb() {
     #    their console scripts: biopb, biopb-tensor-server, biopb-mcp).
     _step "[3/3] Removing biopb packages..."
     if command -v uv &>/dev/null; then
+        # The spec's owner is judged by the env's interpreter, so before it goes.
+        _remove_kernelspec
         if uv tool uninstall biopb &>/dev/null; then
             _ok "Removed the biopb tool environment (biopb, biopb-tensor-server, biopb-mcp)"
         else

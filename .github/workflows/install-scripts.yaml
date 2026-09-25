@@ -168,8 +168,9 @@ jobs:
       # --durations: the slowest cases, printed. This leg's cost is interpreter
       # startup rather than anything the tests do, and that is invisible in a
       # green run until it walks into the timeout -- which is how it was found.
+      # ipykernel stands in for the biopb env in the kernel-spec tests.
       - name: Run the installer tests
-        run: uv run --no-project --with pytest pytest -v --color=yes --durations=10 install/test
+        run: uv run --no-project --with pytest --with ipykernel pytest -v --color=yes --durations=10 install/test
 
       - name: Confirm the right PowerShell was exercised
         shell: bash

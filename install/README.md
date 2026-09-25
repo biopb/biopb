@@ -76,6 +76,10 @@ are produced.
   the control plane (if it isn't already up) and open the dashboard in your
   default browser. Set `BIOPB_INSTALL_SHORTCUT=0` to skip creating it. You can
   run `biopb dashboard` from a terminal at any time instead.
+- **A Jupyter kernel, "Python (biopb)"**, so any Jupyter you already have can
+  run notebooks in biopb's environment. It is a fresh kernel of its own, not the
+  agent's session. Set `BIOPB_INSTALL_KERNELSPEC=0` to skip it; uninstalling
+  removes it.
 - The installer also registers the biopb MCP server with any detected agent
   (Claude Code/Desktop, Codex CLI, Cursor, opencode) and can install opencode if
   none is found. biopb-mcp speaks MCP over **stdio**, so the agent spawns

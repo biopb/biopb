@@ -991,6 +991,87 @@ function Invoke-Precompile {
     }
 }
 
+# The biopb env's interpreter, or $null when there is no env.
+function Get-ToolPython {
+    $toolDir = (uv tool dir 2>$null)
+    if (-not $toolDir) { return $null }
+    # Windows tool-venv layout puts the interpreter under Scripts\ (bin/ on POSIX).
+    $py = Join-Path $toolDir 'biopb\Scripts\python.exe'
+    if (Test-Path -LiteralPath $py) { return $py }
+    return $null
+}
+
+# The same program as install.sh's _kernelspec_state: prints absent | ours |
+# foreign, then the per-user "biopb" kernel spec dir, as the env's own
+# jupyter_core resolves it. Fed on stdin, so no quote survives PowerShell 5.1's
+# native command-line quoting to break it.
+$script:KernelSpecStateProgram = @'
+import json, os, sys
+from jupyter_core.paths import jupyter_data_dir
+
+spec = os.path.join(jupyter_data_dir(), "kernels", "biopb")
+try:
+    with open(os.path.join(spec, "kernel.json")) as f:
+        argv0 = json.load(f)["argv"][0]
+except FileNotFoundError:
+    state = "absent"
+except Exception:
+    state = "foreign"
+else:
+    env = os.path.normcase(os.path.abspath(sys.prefix)) + os.sep
+    ours = os.path.normcase(os.path.abspath(argv0)).startswith(env)
+    state = "ours" if ours else "foreign"
+print(state)
+print(spec)
+'@
+
+function Get-KernelSpecState {
+    param([string]$Python)
+    $out = @($script:KernelSpecStateProgram | & $Python - 2>$null)
+    if ($LASTEXITCODE -ne 0 -or $out.Count -lt 2) { return $null }
+    return @{ State = $out[0].Trim(); Dir = $out[1].Trim() }
+}
+
+# Register the biopb env as a Jupyter kernel, "Python (biopb)" (see install.sh's
+# _install_kernelspec). Best-effort; skip with BIOPB_INSTALL_KERNELSPEC=0.
+# -Python overrides the interpreter (tests).
+function Install-KernelSpec {
+    param([string]$Python = "")
+    if ($env:BIOPB_INSTALL_KERNELSPEC -eq '0') {
+        Report-Info "Jupyter kernel skipped (BIOPB_INSTALL_KERNELSPEC=0)"
+        return
+    }
+    try {
+        # Function-scoped: a native command's stderr must not end the install.
+        $ErrorActionPreference = 'Continue'
+        if (-not $Python) { $Python = Get-ToolPython }
+        if (-not $Python) { return }
+        $spec = Get-KernelSpecState -Python $Python
+        if (-not $spec) { return }
+        if ($spec.State -eq 'foreign') {
+            Report-Note "Kept the existing Jupyter kernel spec at $($spec.Dir)"
+            return
+        }
+        & $Python -m ipykernel install --user --name biopb --display-name "Python (biopb)" *> $null
+        if ($LASTEXITCODE -eq 0) { Report-Ok 'Jupyter kernel "Python (biopb)" registered' }
+        else { Report-Note "Could not register the Jupyter kernel; skipping" }
+    } catch { }
+}
+
+# Remove the kernel spec Install-KernelSpec wrote; needs the env still present.
+function Remove-KernelSpec {
+    param([string]$Python = "")
+    try {
+        $ErrorActionPreference = 'Continue'
+        if (-not $Python) { $Python = Get-ToolPython }
+        if (-not $Python) { return }
+        $spec = Get-KernelSpecState -Python $Python
+        if (-not $spec -or $spec.State -ne 'ours') { return }
+        Remove-Item -LiteralPath $spec.Dir -Recurse -Force -ErrorAction SilentlyContinue
+        if (-not (Test-Path -LiteralPath $spec.Dir)) { Report-Ok "Removed the Jupyter kernel spec $($spec.Dir)" }
+    } catch { }
+}
+
 # Drop a "biopb Dashboard" shortcut (.lnk) on the user's Desktop that runs
 # `biopb dashboard` -- start the control plane if needed, then open the browser.
 # Best-effort: a failure only means no icon, never aborts the install. Skip with
@@ -1451,6 +1532,7 @@ function Invoke-BiopbInstall {
 
     # Warm the bytecode cache now (admin-free) so the first viewer launch is fast.
     Invoke-Precompile
+    Install-KernelSpec
 
     # Record the installed deployment version as the kernel-start auto-updater's
     # baseline (issue #87): the check compares the latest release-v* deployment's
@@ -1796,6 +1878,8 @@ function Invoke-BiopbUninstall {
 
         Report-Step 2 "Removing biopb packages..."
         if (Get-Command uv -ErrorAction SilentlyContinue) {
+            # The spec's owner is judged by the env's interpreter, so before it goes.
+            Remove-KernelSpec
             try { uv tool uninstall biopb *> $null } catch { }
             Report-Ok "Removed the biopb uv tool environment (and its console shims)"
         } else {
