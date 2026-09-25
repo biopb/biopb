@@ -170,15 +170,12 @@ curl -fsSL https://biopb.org/install.sh | bash -s -- --uninstall --purge
 registry, pids), and `~/.local/share/biopb` (samples). `uv` and any AI
 agent (e.g. opencode) are left installed.
 
-On Windows, a GUI install uninstalls through Add/Remove Programs. A PowerShell
-install uninstalls through the same script:
+On Windows, a GUI install uninstalls through Add/Remove Programs, and a
+PowerShell install through the matching script, which asks whether to delete
+config and cached data too:
 
 ```powershell
-# Remove the stack, keep config + cached data
-$env:BIOPB_UNINSTALL = "1"; irm https://biopb.org/install.ps1 | iex
-
-# Remove everything biopb owns, including config and cache
-$env:BIOPB_PURGE = "1"; irm https://biopb.org/install.ps1 | iex
+irm https://biopb.org/uninstall.ps1 | iex
 ```
 
 ## Testing the installers

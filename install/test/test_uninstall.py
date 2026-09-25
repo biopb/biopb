@@ -43,46 +43,46 @@ def test_remove_mcp_clients_edits_the_opencode_file_opencode_reads(tmp_path):
     )
 
 
-@requires_pwsh
-def test_install_ps1_uninstalls_when_asked(tmp_path):
-    """The `irm | iex` path's only uninstall: removes install payload, keeps config."""
+def _run_uninstall_ps1(tmp_path, *args):
+    """Run uninstall.ps1 over a fake install in tmp_path; returns (webapp, samples, config)."""
     import subprocess
 
     from conftest import INSTALL_DIR, PWSH, _pwsh_base_env
 
     share = tmp_path / ".local" / "share" / "biopb"
-    webapp = share / "webapp"
-    webapp.mkdir(parents=True)
-    samples = share / "samples"
-    samples.mkdir()
+    (share / "webapp").mkdir(parents=True)
+    (share / "samples").mkdir()
     config = tmp_path / ".config" / "biopb" / "biopb.json"
     config.parent.mkdir(parents=True)
     config.write_text("{}")
-    env = {
-        **_pwsh_base_env(),
-        "USERPROFILE": str(tmp_path),
-        "HOME": str(tmp_path),
-        "BIOPB_UNINSTALL": "1",
-        "BIOPB_NONINTERACTIVE": "1",
-    }
+    env = {**_pwsh_base_env(), "USERPROFILE": str(tmp_path), "HOME": str(tmp_path)}
     # No uv/claude/codex/biopb reachable, and every tool-dir root the engine
     # force-stops processes under is inside tmp_path.
     env.pop("UV_TOOL_DIR", None)
     env["LOCALAPPDATA"] = env["APPDATA"] = str(tmp_path / "appdata")
+    env["TEMP"] = str(tmp_path / "temp")
     env["PATH"] = str(tmp_path / "empty-bin")
+    script = str(INSTALL_DIR / "uninstall.ps1")
     result = subprocess.run(
-        [
-            PWSH,
-            "-NoProfile",
-            "-NonInteractive",
-            "-File",
-            str(INSTALL_DIR / "install.ps1"),
-        ],
+        [PWSH, "-NoProfile", "-NonInteractive", "-File", script, *args],
         capture_output=True,
         text=True,
         env=env,
         timeout=120,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+    return share / "webapp", share / "samples", config
+
+
+@requires_pwsh
+def test_uninstall_ps1_removes_the_install_and_keeps_data(tmp_path):
+    """Unattended with no answer given: keep data, never prompt."""
+    webapp, samples, config = _run_uninstall_ps1(tmp_path)
     assert not webapp.exists()
-    assert samples.exists() and config.exists(), "a plain uninstall keeps data"
+    assert samples.exists() and config.exists()
+
+
+@requires_pwsh
+def test_uninstall_ps1_purge_removes_data(tmp_path):
+    webapp, samples, config = _run_uninstall_ps1(tmp_path, "-Purge")
+    assert not webapp.exists() and not samples.exists() and not config.exists()

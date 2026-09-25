@@ -85,16 +85,6 @@ $ISSUE_URL = "https://github.com/biopb/biopb-mcp/issues/new"
 # asked unattended, so the off-site IP-logging servers are never silently enabled.
 $script:NonInteractive = [bool]$env:BIOPB_NONINTERACTIVE -and ($env:BIOPB_NONINTERACTIVE -ne '0')
 
-# `irm | iex` passes no arguments, so uninstall is chosen by env var (named apart from
-# the engine's own -Uninstall/-Purge, which dot-sourcing it rebinds):
-#   $env:BIOPB_UNINSTALL = "1"  remove the stack (the engine's -Uninstall)
-#   $env:BIOPB_PURGE = "1"      also delete config and cached data (implies it)
-$script:BiopbPurge = ($env:BIOPB_PURGE -eq '1')
-$script:BiopbUninstall = ($env:BIOPB_UNINSTALL -eq '1') -or $script:BiopbPurge
-# Cleared at once: `iex` runs in the caller's session, where a leftover value
-# would turn the next install into another uninstall.
-Remove-Item Env:BIOPB_UNINSTALL, Env:BIOPB_PURGE -ErrorAction SilentlyContinue
-
 # ----- Output helpers used by the front-end's own prompts/summary -------------
 function Write-Step { param([string]$Msg) Write-Host ""; Write-Host $Msg -ForegroundColor White }
 function Write-Ok   { param([string]$Msg) Write-Host "  $Msg" -ForegroundColor Green }
@@ -260,19 +250,13 @@ function Show-Summary {
 # Main
 # ============================================================================
 Show-Banner
-$reportOnFailure = if ($script:BiopbUninstall) { $false } else { Invoke-Preflight }
+$reportOnFailure = Invoke-Preflight
 
 try {
     # Dot-source at SCRIPT scope (not inside a helper) so the engine's functions --
     # Invoke-BiopbInstall, Report-* -- persist through Main. An in-memory
     # scriptblock (not a .ps1 file) so it runs under a Restricted ExecutionPolicy.
     . ([scriptblock]::Create((Resolve-EngineSource)))
-
-    if ($script:BiopbUninstall) {
-        Invoke-BiopbUninstall -Purge:$script:BiopbPurge -Mode console
-        Wait-ForExit
-        return
-    }
 
     $BiopbHome  = $env:USERPROFILE
     # biopb.json is the only config format (biopb/biopb#34).

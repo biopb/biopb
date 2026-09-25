@@ -436,11 +436,11 @@ jobs:
         if: steps.ver.outputs.is_tag == 'true' && steps.ver.outputs.prerelease != 'true'
         run: |
           set -euo pipefail
-          # Stage exactly the three served scripts, then mirror with --delete so
+          # Stage exactly the served scripts, then mirror with --delete so
           # the reserved /install/ subtree holds only these (and drops any file
           # renamed/removed upstream) -- mirrors api-docs.yaml.
           mkdir -p _install_publish
-          cp install/install.sh install/install.ps1 install/biopb-engine.ps1 _install_publish/
+          cp install/install.sh install/install.ps1 install/uninstall.ps1 install/biopb-engine.ps1 _install_publish/
 
           mkdir -p ~/.ssh
           echo "${{ secrets.BIOPB_ORG_SSH_KEY }}" > ~/.ssh/id_ed25519
