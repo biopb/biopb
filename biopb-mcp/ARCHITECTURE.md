@@ -10,7 +10,11 @@ real Python kernel; image results go to the viewer, other results to the agent's
 The viewer docks the **Tensor Browser**, and the agent's `add_tensor` builds its
 layers through the same pipeline; both come from the separate napari plugin
 [biopb-napari-widget](https://github.com/biopb/biopb-napari-widget), which
-depends on nothing here.
+depends on nothing here. biopb-mcp imports only its three root exports:
+`TensorBrowserWidget`, `add_tensor_layer` and `wrap_levels`. `add_tensor_layer`
+builds napari layers, so it cannot live in the napari-free SDK, and it must not
+be copied back here: sharing it is what keeps the browser and `add_tensor` in
+agreement on what a layer is (label sets, axes, pyramids).
 
 ---
 
