@@ -320,15 +320,17 @@ jobs:
       # The installer takes the SDK from PyPI, so the SDK at this commit must be a
       # published one: the nearest v* tag, byte-identical to its PyPI wheel. A v*
       # tag on this same commit publishes concurrently (python-ci), hence the
-      # wait. A dry run reports a mismatch without failing.
+      # wait. A dry run reports a mismatch as a warning and carries on.
       - name: Check the SDK is on PyPI
-        continue-on-error: ${{ steps.ver.outputs.is_tag != 'true' }}
         run: |
-          set -euo pipefail
-          wait=0
-          [ "${{ steps.ver.outputs.is_tag }}" = true ] && wait=1800
-          python3 .github/scripts/check_sdk_on_pypi.py \
-            sdk-wheel/biopb-*.whl "${{ steps.ver.outputs.sdk }}" --wait "$wait"
+          set -uo pipefail
+          if [ "${{ steps.ver.outputs.is_tag }}" = true ]; then
+            python3 .github/scripts/check_sdk_on_pypi.py \
+              sdk-wheel/biopb-*.whl "${{ steps.ver.outputs.sdk }}" --wait 1800
+          elif ! python3 .github/scripts/check_sdk_on_pypi.py \
+              sdk-wheel/biopb-*.whl "${{ steps.ver.outputs.sdk }}"; then
+            echo "::warning::The SDK differs from biopb ${{ steps.ver.outputs.sdk }} on PyPI; a release of this commit needs a new v* tag first."
+          fi
 
       # Pull the Windows installer built by the windows-installer job into the
       # release-asset dir so the glob below attaches it. The .exe is UNSIGNED for
