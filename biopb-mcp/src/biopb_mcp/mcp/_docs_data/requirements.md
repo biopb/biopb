@@ -65,10 +65,11 @@ uv-managed, say so and name `~/.config/biopb/extra-packages.txt`: the install
 lands now but is gone at the next biopb upgrade unless the requirement is in
 that file.
 
-**The viewer.** `## Viewer` says whether there is a window on screen. *Headless*
-means there is none this session; *`window: CLOSED`* means the user closed it,
-and `restart_kernel` restores it (ask — layers are lost). Neither is a reason to
-stop, and neither means the result cannot be seen: upload it and send a
+**The viewer.** `## Viewer` says whether there is a window on screen. *`none`*
+means this session has no viewer — no `viewer` in the namespace — and names why:
+the user turned it off, napari is not installed, or there is no display;
+*`window: CLOSED`* means the user closed it, and `restart_kernel` restores it
+(ask — layers are lost). Neither is a reason to stop, and neither means the result cannot be seen: upload it and send a
 [[web-viewer]] link, which does not depend on this session having a display at
 all. What you lose is `take_screenshot` — unless your host gives you browser
 automation, in which case you open that link and look at it yourself.

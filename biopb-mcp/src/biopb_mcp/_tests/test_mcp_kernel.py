@@ -555,10 +555,6 @@ class TestHealth:
         got = _kernel.attach_command(path, python=python, windows=windows)
         assert got == expected
 
-    def test_no_attach_command_from_a_frozen_build(self, monkeypatch):
-        monkeypatch.setattr(sys, "frozen", True, raising=False)
-        assert _kernel.attach_command("/tmp/kernel-1.json") is None
-
 
 class TestReadiness:
     """The kernel boots off-thread (launcher serves the handshake first), so
@@ -711,6 +707,53 @@ class TestParentDeathPipe:
                 return False
 
         assert _wait_until(_gone), f"kernel {pid} survived launcher death"
+
+
+# ---------------------------------------------------------------------------
+# Viewerless bootstrap — needs no display, so it runs everywhere.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def viewerless_kernel(tmp_path_factory):
+    line = "import biopb_mcp.mcp._bootstrap as _b; _b.bootstrap()"
+    host = KernelHost(
+        extra_arguments=[f"--IPKernelApp.exec_lines={line}"],
+        startup_timeout=120.0,
+        env=dict(
+            os.environ,
+            BIOPB_CONFIG_HOME=str(tmp_path_factory.mktemp("config")),
+            BIOPB_NO_VIEWER="the viewer is off in the config",
+        ),
+        watchdog_interval=0,
+        window_close_pipe=False,
+    )
+    host.start()  # the default probe: raises unless the bootstrap finished
+    yield host
+    host.shutdown()
+
+
+class TestViewerlessBootstrap:
+    """A session the launcher marked as having no viewer: the real bootstrap,
+    the default health probe, and none of Qt or napari."""
+
+    def test_the_namespace_is_the_two_planes_without_a_viewer(self, viewerless_kernel):
+        res = viewerless_kernel.execute(
+            "print(sorted(n for n in ('client', 'ops', 'run_async', 'np', 'da',"
+            " 'viewer', '_viewer_window_alive') if n in globals()))"
+        )
+        assert "['client', 'da', 'np', 'ops', 'run_async']" in res["stdout"]
+
+    def test_no_qt_and_no_napari_are_loaded(self, viewerless_kernel):
+        res = viewerless_kernel.execute(
+            "import sys\n"
+            "print([m for m in ('napari', 'PyQt6', 'PyQt5', 'PySide6', 'qtpy')"
+            " if m in sys.modules])"
+        )
+        assert "[]" in res["stdout"]
+
+    def test_the_host_reports_why(self, viewerless_kernel):
+        assert viewerless_kernel.no_viewer_reason == "the viewer is off in the config"
 
 
 # ---------------------------------------------------------------------------

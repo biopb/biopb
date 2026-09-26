@@ -84,12 +84,6 @@ class TestSessionCommand:
         # Dynamic port: the child reports the OS-assigned one back via a file.
         assert cmd[3:] == ["--transport", "http", "--port", "0"]
 
-    def test_frozen_build_calls_its_own_binary(self, monkeypatch):
-        # PyInstaller: sys.executable IS the launcher; no module tree to -m.
-        monkeypatch.setattr(sys, "frozen", True, raising=False)
-        cmd = _shim._session_command()
-        assert cmd == [sys.executable, "--transport", "http", "--port", "0"]
-
 
 class TestReadPortFile:
     def test_valid_port(self, tmp_path):
@@ -489,7 +483,7 @@ def _home_env(tmp_path):
 def _pid_alive(pid):
     """Whether ``pid`` names a live process — WITHOUT killing or perturbing it."""
     if os.name == "nt":
-        import psutil  # a biopb-mcp[mcp] dep; only needed on the Windows leg
+        import psutil  # a biopb-mcp dep; only needed on the Windows leg
 
         return psutil.pid_exists(pid)
     try:

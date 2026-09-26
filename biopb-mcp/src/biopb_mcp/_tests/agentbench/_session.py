@@ -11,9 +11,11 @@ What this module owns is bring-up, a synchronous façade over the async MCP
 client, and three environment facts that have to be *forced* rather than
 inherited, because each of them silently changes what a run is testing:
 
-**A display, and a GL context behind it.** With no `$DISPLAY` the launcher
-spawns its own Xvfb and renders the viewer there (`mcp/_xvfb.py`), so a
-display-less box with the `xvfb` package installed runs these tests unaided.
+**A display, and a GL context behind it.** The config tree below turns on
+`viewer.virtual_display`, so with no `$DISPLAY` the launcher spawns its own
+Xvfb and renders the viewer there (`mcp/_xvfb.py`) instead of running without
+one: a display-less box with the `xvfb` package installed runs these tests
+unaided.
 What still cannot be conjured is the binary itself (plus Mesa's software GL
 behind it): absent both a display and Xvfb, the session child fails fast at
 spawn — so these tests **skip with instructions** rather than pay the slow
@@ -646,6 +648,9 @@ def _write_config(
                 # Nothing watches a web UI during an unattended run.
                 "observe": {"enabled": False},
                 "transport": {"kind": "http"},
+                # A display-less box renders on the launcher's Xvfb rather than
+                # running without a viewer, which the cases assume.
+                "viewer": {"virtual_display": True},
             }
         ),
         encoding="utf-8",

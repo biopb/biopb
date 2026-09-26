@@ -322,7 +322,6 @@ class TestJobConcurrency:
                 env=env,
                 watchdog_interval=0,
                 window_close_pipe=False,
-                health_probe_code="print('_jobs' in dir())",
             )
         )
         session = KernelHost(health_probe_code=None, startup_timeout=60.0)

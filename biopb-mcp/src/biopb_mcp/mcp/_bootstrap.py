@@ -1,14 +1,15 @@
 """Bootstrap executed *inside* the MCP child kernel.
 
 Injected via IPython ``exec_lines`` so it runs before the kernel services any
-tool calls.  It enables the Qt event loop, opens a visible napari viewer with
-the Tensor Browser widget, and populates the ``execute_code`` namespace. Dask
-is left as dask configures itself: computes run in-process unless a cell builds
-a dask ``Client``.
+tool calls.  It populates the ``execute_code`` namespace: the data plane
+(``client``), the algorithm plane (``ops`` and the user's plugin modules), and
+-- when the session has a viewer -- enables the Qt event loop and opens a
+napari viewer with the Tensor Browser widget. Dask is left as dask configures
+itself: computes run in-process unless a cell builds a dask ``Client``.
 
 A failure here does not abort the kernel (exec_lines errors are swallowed by
 IPython), so ``bootstrap`` prints a ``BOOTSTRAP_ERROR`` sentinel that the
-host's health probe detects via the absence of ``viewer`` in the namespace.
+host's health probe detects via the absence of ``_jobs`` in the namespace.
 """
 
 import logging
@@ -40,6 +41,20 @@ def is_scratch_kernel():
     session child and this module runs in the kernel.
     """
     return bool(os.environ.get("BIOPB_SCRATCH_KERNEL"))
+
+
+def no_viewer_reason():
+    """Why this kernel has no napari viewer, or None when it has one.
+
+    A scratch kernel never has one: the viewer is how an agent shows something
+    to a person, and a verification has no person in it. Any other kernel has
+    none when the launcher says so -- it decides (config, whether napari is
+    installed, whether there is a display) and hands the kernel its reason in
+    ``BIOPB_NO_VIEWER``; the literal mirrors ``_kernel.ENV_NO_VIEWER``.
+    """
+    if is_scratch_kernel():
+        return "a scratch kernel verifies a workflow and has no viewer"
+    return os.environ.get("BIOPB_NO_VIEWER") or None
 
 
 def _install_window_close_hook(viewer):
@@ -455,7 +470,7 @@ def bootstrap():
         tb = traceback.format_exc()
         # Stash the traceback in the kernel namespace so the host's health
         # probe can fetch and surface it.  exec_lines output is otherwise
-        # swallowed by IPython, leaving the probe with only "viewer absent".
+        # swallowed by IPython, leaving the probe with only "_jobs absent".
         try:
             from IPython import get_ipython
 
@@ -484,21 +499,20 @@ def _bootstrap_impl():
     #    fails open to _NullSplash when Qt is unavailable.
     from ._splash import _NullSplash, show_splash
 
-    # A scratch kernel is headless *by policy*, not by circumstance: the viewer
-    # exists so an agent can show something to a person, and a verification has
-    # no person in it. Skipping Qt entirely is what makes that policy free --
-    # no event loop, no GL, no display, and none of napari's ~330 MiB.
-    if is_scratch_kernel():
-        splash = _NullSplash()
-    else:
+    # A kernel without a viewer skips Qt entirely: no event loop, no GL, no
+    # display, and none of napari's ~330 MiB.
+    want_viewer = no_viewer_reason() is None
+    if want_viewer:
         ip.enable_gui("qt")
         splash = show_splash()
+    else:
+        splash = _NullSplash()
 
     # Heavy core imports, now covered by the splash. dask.array is the slow one
     # here; napari is pulled in transitively on some platforms, so this is the
     # phase the "Loading napari…" cue is for (the later `import napari` is then a
     # no-op — see step 3). numpy/da are bound for the execute_code namespace.
-    splash.message("Loading napari…")  # a no-op in a scratch kernel
+    splash.message("Loading napari…")  # a no-op without a viewer
     import dask.array as da
     import numpy as np
     from biopb.tensor import Connection
@@ -510,19 +524,9 @@ def _bootstrap_impl():
     #    namespace: the widget connects it, and each agent cell reads its client.
     conn = Connection()
 
-    # 3. napari viewer + Tensor Browser -- unless this is a scratch kernel.
-    #
-    # **A scratch kernel is headless by policy.** The viewer is how an agent
-    # shows something to a person; a verification has no person in it, so a
-    # workflow that reaches for `viewer` is a workflow that will not run as the
-    # document it is about to become. It is the sharpest case of the wider rule
-    # below: the reader of a saved workflow gets a bare kernel, so the run that
-    # verifies it gets one too.
-    #
-    # It also costs nothing to enforce: no Qt, no GL, no display, and ~330 MiB
-    # and ~1.7 s of napari.Viewer() that nobody was going to look at.
+    # 3. napari viewer + Tensor Browser -- when the kernel has one.
     viewer = None
-    if not is_scratch_kernel():
+    if want_viewer:
         #    The browser auto-connects on its own tick. compute_scheduler pins
         #    the viewer's serial slice reads to a single-process scheduler so
         #    they share the main-process chunk cache instead of scattering
@@ -634,8 +638,8 @@ def _bootstrap_impl():
         ns["viewer"] = make_viewer_proxy(viewer)
         ns["_viewer_window_alive"] = lambda: viewer_window_alive(viewer)
         ns["_resync_view"] = lambda: resync_view_for_capture(viewer)
-    # `viewer` is simply absent in a scratch kernel -- a workflow that uses it
-    # raises NameError, which is the verdict. The job-status snippet already
+    # `viewer` is simply absent without one -- in a scratch kernel a workflow
+    # that uses it raises NameError, which is the verdict. The job-status snippet already
     # reads _viewer_window_alive with a default, so its absence is expected.
     ip.user_ns.update(ns)
 

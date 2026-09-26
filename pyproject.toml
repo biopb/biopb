@@ -27,8 +27,8 @@ dependencies = [
     # commands; installed here so the gated subcommands' "available" path is
     # exercised in the test environment. Resolves to the in-tree workspace
     # member (see [tool.uv.sources]), not PyPI. The base package is enough (the
-    # heavy `[mcp]` napari/pyqt stack is only needed to actually run the server,
-    # which the CLI launches in a child process, not in-test).
+    # `[napari]` viewer stack is only needed to actually run a session, which
+    # the CLI launches in a child process, not in-test).
     "biopb-mcp",
   ]
   tensor = [
@@ -113,8 +113,8 @@ biopb-control = { workspace = true }
 #
 # Safe only because pyjwt imports cryptography lazily AND the SDK itself never
 # imports it -- true on mcp 1.x, false on 2.x, which imports it at module scope
-# from `mcp/server/request_state.py`. That is one of the reasons biopb-mcp's
-# `[mcp]` extra caps `mcp<2`; this override and that cap move together.
+# from `mcp/server/request_state.py`. That is one of the reasons biopb-mcp
+# caps `mcp<2`; this override and that cap move together.
 override-dependencies = ["pyjwt>=2.10.1"]
 
 # Exclude anyio 4.13.0: it ships a `fail_after` typo (yields an undefined

@@ -18,7 +18,7 @@ import json
 import subprocess
 
 import pytest
-from conftest import INSTALL_SH, bash, requires_posix, sh
+from conftest import ENGINE_PS1, INSTALL_SH, bash, requires_posix, sh
 
 # install.sh never runs on Windows -- that platform gets install.ps1 and the
 # engine, which test_python_probe.py and test_extras_contract.py cover there.
@@ -100,6 +100,44 @@ def test_urldecode(encoded, decoded):
 def test_urldecode_leaves_percent_encoded_percent_alone():
     """%25 is a literal '%', and decoding it must not start a second round."""
     assert bash("_urldecode '100%25done.whl'").stdout == "100%done.whl"
+
+
+# --- versions.json and the install_schema floor ------------------------------
+
+VERSIONS_JSON = (
+    '{ "release": "0.15.0", "tensor_server": "0.15.0", "napari": "0.7.0", '
+    '"biopb": "0.11.0", "install_schema": 1 }'
+)
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("release", "0.15.0"),
+        ("napari", "0.7.0"),
+        ("biopb", "0.11.0"),
+        ("install_schema", "1"),  # a bare number, not a string
+        ("missing", ""),  # absent
+    ],
+)
+def test_manifest_field(field, value):
+    out = bash(f"_manifest_field {sh(field)} {sh(VERSIONS_JSON)}").stdout
+    assert out.strip() == value
+
+
+def test_install_schema_is_the_same_in_both_installers():
+    """release.yaml writes install.sh's number into versions.json, and the
+    engine checks against its own: two numbers, one floor."""
+    import re
+
+    sh_schema = re.search(r"^INSTALL_SCHEMA=(\d+)$", INSTALL_SH.read_text(), re.M)
+    ps_schema = re.search(
+        r"^\$script:InstallSchema = (\d+)$",
+        ENGINE_PS1.read_text(encoding="utf-8"),
+        re.M,
+    )
+    assert sh_schema and ps_schema
+    assert sh_schema.group(1) == ps_schema.group(1)
 
 
 # --- _release_asset_url ------------------------------------------------------

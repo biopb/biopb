@@ -94,7 +94,7 @@ Two independent workflows fire on the same tag, from the tagged commit:
    **GitHub release `release-v<R>`**. **This is the installer's source of truth**
    (it `file://`-installs the wheels; from PyPI it takes the `biopb` SDK and
    `napari[all]`, both pinned by `versions.json`, and `biopb-napari-widget`,
-   which biopb-mcp depends on). The SDK is not a release asset; `release.yaml`
+   which biopb-mcp's `[napari]` extra brings). The SDK is not a release asset; `release.yaml`
    builds it only to check it against PyPI. It builds **no Docker**.
 2. **`tensor-server-ci`**'s `publish` job builds the `biopb-tensor-server` image
    and pushes it to **ghcr.io + Docker Hub `jiyuuchc/`**, tagged with the version
@@ -104,7 +104,17 @@ Two independent workflows fire on the same tag, from the tagged commit:
 
 `versions.json` carries `release`, `tensor_server` (the shipped wheel's version —
 now the same `release-v*` line, so equal to `release` on a real tag), `napari`
-(the pinned Qt binding) and `biopb` (the SDK pin). Docker versions are **not** in it.
+(the pinned Qt binding), `biopb` (the SDK pin) and `install_schema`. Docker
+versions are **not** in it.
+
+`install_schema` pairs an installer with the releases it can install.
+`install.sh`'s `INSTALL_SCHEMA` (and the engine's `$script:InstallSchema`, kept
+equal by a test) is the only number an installer accepts, and `release.yaml`
+copies it into each release's manifest. A release that declares another, or none
+(every release before the napari plugin split), is refused with a pointer to the
+installer published alongside it, so an installer carries no compatibility code
+for older releases. Bump it when a change
+to the release makes an earlier installer wrong for it.
 
 ### `v*` → PyPI/Maven + the image-base image (`image-runtime-ci`)
 
@@ -177,13 +187,13 @@ stable** release (prereleases skipped).
 (`biopb-engine.ps1`) and drives it. When it is pinned (or `BIOPB_INSTALL_VERSION`
 is set) it fetches the engine **from that release's GitHub assets** — a versioned
 copy that matches the wheels — instead of the unversioned biopb.org one, falling
-back to biopb.org only if the release predates the engine-as-asset. So a lone
+back to biopb.org only if that fetch fails. So a lone
 `install.ps1` downloaded from a release is self-contained: one script resolves a
 release and pulls the engine **and** wheels from it, exactly like `install.sh`
 (no separate engine download — which is why `biopb-engine.ps1` is also a release
 asset). A sibling `biopb-engine.ps1` on disk (a checkout) still wins. Overrides
 (all paths): `BIOPB_INSTALL_VERSION=X.Y.Z` installs/downgrades to an exact
-release; `BIOPB_INSTALL_RC=1` tracks the latest candidate (ignores the pin, since
+release that declares the installer's `install_schema`; `BIOPB_INSTALL_RC=1` tracks the latest candidate (ignores the pin, since
 rc builds are not published to `biopb.org`).
 
 **Canonical location: the repo-root `install/`** — this is the copy users track.

@@ -664,8 +664,9 @@ async def _probe_session(client: httpx.AsyncClient, rec: dict) -> dict:
 #   * it refuses unless it could plausibly reach the user's screen
 #     (:func:`_session_launch_gate`), and
 #   * it launches `--view` specifically, never a plain http session. A non-view
-#     session with a stale DISPLAY falls back to a virtual display and renders
-#     where nobody can see it — #98 exactly. `--view` refuses instead.
+#     session that cannot reach a display quietly runs without a viewer (or, if
+#     configured, on a virtual display nobody sees) — #98 exactly. `--view`
+#     refuses instead, and opens a window even where `viewer.enabled` is off.
 #
 # What it does not do is own the result: the child is detached, self-registers,
 # and self-de-registers, so the *registry* still only ever observes, and a

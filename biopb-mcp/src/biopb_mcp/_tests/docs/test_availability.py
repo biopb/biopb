@@ -101,7 +101,7 @@ def _resolves(requirement: str, python: str, platform: str) -> str | None:
     name = Requirement(requirement).name
     with tempfile.TemporaryDirectory() as tmp:
         reqs = Path(tmp) / "requirements.in"
-        reqs.write_text(f"{WORKSPACE}[mcp]\n{REPO}[tensor]\n{requirement}\n")
+        reqs.write_text(f"{WORKSPACE}[napari]\n{REPO}[tensor]\n{requirement}\n")
         proc = subprocess.run(
             [
                 "uv",

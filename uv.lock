@@ -677,47 +677,47 @@ provides-extras = ["test"]
 name = "biopb-mcp"
 source = { editable = "biopb-mcp" }
 dependencies = [
-    { name = "biopb", extra = ["tensor"] },
-    { name = "biopb-napari-widget" },
-    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-    { name = "pandas", version = "2.3.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "pandas", version = "3.0.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-    { name = "qtpy" },
-    { name = "scikit-image", version = "0.25.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "scikit-image", version = "0.26.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-    { name = "scipy", version = "1.14.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
-    { name = "scipy", version = "1.18.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
-]
-
-[package.optional-dependencies]
-mcp = [
     { name = "agent-client-protocol" },
+    { name = "biopb", extra = ["tensor"] },
     { name = "distributed" },
     { name = "ipykernel" },
     { name = "jupyter-client" },
     { name = "matplotlib", version = "3.10.9", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "matplotlib", version = "3.11.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "mcp" },
-    { name = "napari", extra = ["all"] },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "packaging" },
+    { name = "pandas", version = "2.3.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "pandas", version = "3.0.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "psutil" },
-    { name = "pyqt6" },
+    { name = "scikit-image", version = "0.25.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "scikit-image", version = "0.26.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "scikit-learn", version = "1.7.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "scikit-learn", version = "1.9.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "scipy", version = "1.14.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
+    { name = "scipy", version = "1.18.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "uvicorn" },
+]
+
+[package.optional-dependencies]
+napari = [
+    { name = "biopb-napari-widget" },
+    { name = "napari", extra = ["all"] },
+    { name = "pyqt6" },
+    { name = "qtpy" },
 ]
 
 [package.dev-dependencies]
 integration = [
     { name = "biopb", extra = ["tensor"] },
-    { name = "biopb-mcp", extra = ["mcp"] },
+    { name = "biopb-mcp", extra = ["napari"] },
     { name = "biopb-tensor-server", extra = ["web"] },
 ]
 testing = [
     { name = "biopb", extra = ["tensor"] },
-    { name = "biopb-mcp", extra = ["mcp"] },
+    { name = "biopb-mcp", extra = ["napari"] },
     { name = "biopb-tensor-server", extra = ["web"] },
     { name = "pytest" },
     { name = "pytest-cov" },
@@ -728,37 +728,37 @@ testing = [
 
 [package.metadata]
 requires-dist = [
-    { name = "agent-client-protocol", marker = "extra == 'mcp'", specifier = ">=0.12,<1" },
+    { name = "agent-client-protocol", specifier = ">=0.12,<1" },
     { name = "biopb", extras = ["tensor"], editable = "." },
-    { name = "biopb-napari-widget", specifier = ">=0.1.0rc2" },
-    { name = "distributed", marker = "extra == 'mcp'", specifier = ">=2023.9.0" },
-    { name = "ipykernel", marker = "extra == 'mcp'" },
-    { name = "jupyter-client", marker = "extra == 'mcp'" },
-    { name = "matplotlib", marker = "extra == 'mcp'" },
-    { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.20,<2" },
-    { name = "napari", extras = ["all"], marker = "extra == 'mcp'", specifier = "==0.7.0" },
+    { name = "biopb-napari-widget", marker = "extra == 'napari'", specifier = ">=0.1.0rc2" },
+    { name = "distributed", specifier = ">=2023.9.0" },
+    { name = "ipykernel" },
+    { name = "jupyter-client" },
+    { name = "matplotlib" },
+    { name = "mcp", specifier = ">=1.20,<2" },
+    { name = "napari", extras = ["all"], marker = "extra == 'napari'", specifier = "==0.7.0" },
     { name = "numpy" },
-    { name = "packaging", marker = "extra == 'mcp'" },
+    { name = "packaging" },
     { name = "pandas" },
-    { name = "psutil", marker = "extra == 'mcp'" },
-    { name = "pyqt6", marker = "extra == 'mcp'" },
-    { name = "qtpy" },
+    { name = "psutil" },
+    { name = "pyqt6", marker = "extra == 'napari'" },
+    { name = "qtpy", marker = "extra == 'napari'" },
     { name = "scikit-image" },
-    { name = "scikit-learn", marker = "extra == 'mcp'" },
+    { name = "scikit-learn" },
     { name = "scipy", specifier = "!=1.15.*" },
-    { name = "uvicorn", marker = "extra == 'mcp'", specifier = ">=0.29" },
+    { name = "uvicorn", specifier = ">=0.29" },
 ]
-provides-extras = ["mcp"]
+provides-extras = ["napari"]
 
 [package.metadata.requires-dev]
 integration = [
     { name = "biopb", extras = ["tensor"], editable = "." },
-    { name = "biopb-mcp", extras = ["mcp"], editable = "biopb-mcp" },
+    { name = "biopb-mcp", extras = ["napari"], editable = "biopb-mcp" },
     { name = "biopb-tensor-server", extras = ["web"], editable = "biopb-tensor-server" },
 ]
 testing = [
     { name = "biopb", extras = ["tensor"], editable = "." },
-    { name = "biopb-mcp", extras = ["mcp"], editable = "biopb-mcp" },
+    { name = "biopb-mcp", extras = ["napari"], editable = "biopb-mcp" },
     { name = "biopb-tensor-server", extras = ["web"], editable = "biopb-tensor-server" },
     { name = "pytest" },
     { name = "pytest-cov" },

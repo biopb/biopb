@@ -47,6 +47,12 @@ from ._app import mcp
 
 logger = logging.getLogger(__name__)
 
+#: What a session without a viewer loses, and the route that replaces it.
+_NO_VIEWER_HINT = (
+    "there is no `viewer` and no take_screenshot, so show results through the "
+    'web viewer (read_doc("web-viewer"))'
+)
+
 _SCREENSHOT_SNIPPET = (
     "import base64 as _b64, cv2 as _cv2\n"
     "if not _viewer_window_alive():\n"
@@ -129,7 +135,7 @@ try:
         except ValueError:
             pass
     if _dc is None:
-        print("  mode: in-process (dask's default), shared with the viewer")
+        print("  mode: in-process (dask's default)")
     elif _dc.status != "running":
         print("  mode: dask Client, " + str(_dc.status))
         print("  WARNING: a .compute() would fail or block; close this dask "
@@ -167,38 +173,44 @@ print("")
 print("## Viewer")
 import os as _os
 import sys as _sys
-if _sys.platform == "darwin" or _os.name == "nt":
-    # Mirrors _has_display(): the native window server is ambient, so $DISPLAY
-    # (XQuartz, VcXsrv) says nothing about where Qt actually renders.
-    print("  display: (host window server)")
-elif _os.environ.get("BIOPB_VIRTUAL_DISPLAY"):
-    # Launcher-owned Xvfb (#90). A silent degradation: every tool below still
-    # works, so the agent relaying it is the only thing that reaches the user
-    # (#892). Kept as loud as start_kernel's — a session can reach here without
-    # having seen that message (context cleared, kernel already up).
-    print("  display: VIRTUAL (Xvfb " + str(_os.environ.get("DISPLAY", "?")) + ")")
-    print("    The user sees NO napari window, and software GL renders 3-D")
-    print("    volumes ~13x slower than a real GPU. Show results through the")
-    print("    web viewer instead (## Web viewer above) — it needs no display")
-    print("    here and is what the user can actually look at.")
-    print("    Say so once, and ask: usually the host does have a display and")
-    print("    the MCP client dropped $DISPLAY on the way in (Codex CLI does),")
-    print("    in which case a restart with it set gives them a real window.")
+from biopb_mcp.mcp._bootstrap import no_viewer_reason as _no_viewer_reason
+_no_viewer = _no_viewer_reason()
+if _no_viewer:
+    print("  none -- " + _no_viewer)
+    print("    " + __NO_VIEWER_HINT__)
 else:
-    print("  display: " + str(
-        _os.environ.get("DISPLAY") or _os.environ.get("WAYLAND_DISPLAY") or "?"
-    ))
-if not _viewer_window_alive():
-    print("  window: CLOSED — the napari window was closed; layer mutations")
-    print("    won't display. Data/compute still work; restart_kernel to restore,")
-    print("    or show results through the web viewer, which needs no window.")
-    print("  layers: " + str(len(viewer.layers)) + " (model only, not shown)")
-else:
-    print("  window: open")
-    print("  layers: " + str(len(viewer.layers)))
-    for _layer in list(viewer.layers)[:10]:
-        _shape = getattr(_layer.data, "shape", "?")
-        print("    - " + str(_layer.name) + " (" + str(_shape) + ")")
+    if _sys.platform == "darwin" or _os.name == "nt":
+        # Mirrors _has_display(): the native window server is ambient, so $DISPLAY
+        # (XQuartz, VcXsrv) says nothing about where Qt actually renders.
+        print("  display: (host window server)")
+    elif _os.environ.get("BIOPB_VIRTUAL_DISPLAY"):
+        # Launcher-owned Xvfb (#90). A silent degradation: every tool below still
+        # works, so the agent relaying it is the only thing that reaches the user
+        # (#892). Kept as loud as start_kernel's — a session can reach here without
+        # having seen that message (context cleared, kernel already up).
+        print("  display: VIRTUAL (Xvfb " + str(_os.environ.get("DISPLAY", "?")) + ")")
+        print("    The user sees NO napari window, and software GL renders 3-D")
+        print("    volumes ~13x slower than a real GPU. Show results through the")
+        print("    web viewer instead (## Web viewer above) — it needs no display")
+        print("    here and is what the user can actually look at.")
+        print("    Say so once, and ask: usually the host does have a display and")
+        print("    the MCP client dropped $DISPLAY on the way in (Codex CLI does),")
+        print("    in which case a restart with it set gives them a real window.")
+    else:
+        print("  display: " + str(
+            _os.environ.get("DISPLAY") or _os.environ.get("WAYLAND_DISPLAY") or "?"
+        ))
+    if not _viewer_window_alive():
+        print("  window: CLOSED — the napari window was closed; layer mutations")
+        print("    won't display. Data/compute still work; restart_kernel to restore,")
+        print("    or show results through the web viewer, which needs no window.")
+        print("  layers: " + str(len(viewer.layers)) + " (model only, not shown)")
+    else:
+        print("  window: open")
+        print("  layers: " + str(len(viewer.layers)))
+        for _layer in list(viewer.layers)[:10]:
+            _shape = getattr(_layer.data, "shape", "?")
+            print("    - " + str(_layer.name) + " (" + str(_shape) + ")")
 
 print("")
 print("## Ops")
@@ -221,7 +233,7 @@ try:
         print(_line)
 except Exception as _e:
     print("  error: " + str(_e))
-"""
+""".replace("__NO_VIEWER_HINT__", repr(_NO_VIEWER_HINT))
 
 
 # Whether psutil's CPU counter has a previous reading to measure against.
@@ -612,7 +624,10 @@ def _own_cell_holds_main(host, what):
 
 @mcp.tool()
 async def take_screenshot(canvas_only: bool = True) -> list:
-    """Capture the napari viewer as a PNG image.
+    """Capture the napari viewer as a PNG image, where the session has one.
+
+    A session without a viewer refuses, saying why; show a result through the
+    web viewer there instead (read_doc("web-viewer")).
 
     Args:
         canvas_only: If True, capture only the canvas area. If False,
@@ -623,6 +638,16 @@ async def take_screenshot(canvas_only: bool = True) -> list:
     host, err = _app._require_kernel_host()
     if err is not None:
         return [TextContent(type="text", text=err)]
+    if host.no_viewer_reason:
+        return [
+            TextContent(
+                type="text",
+                text=(
+                    "No screenshot: this session has no napari viewer "
+                    f"({host.no_viewer_reason}): {_NO_VIEWER_HINT}."
+                ),
+            )
+        ]
     refusal = _own_cell_holds_main(host, "a screenshot")
     if refusal is not None:
         return [TextContent(type="text", text=refusal)]
@@ -672,11 +697,11 @@ PROMOTE_PARAGRAPH = """Code runs as a cell on the kernel's main thread, like a n
     If it finishes quickly the result is returned inline; otherwise this returns
     a job handle (job-N) and the cell keeps running. Poll it with poll_job, and
     stop it with interrupt_kernel or restart_kernel (guaranteed). While it runs
-    it holds the main thread: the viewer does not repaint and take_screenshot /
+    it holds the main thread: a viewer does not repaint and take_screenshot /
     inspect_object refuse. For a long compute you want to watch, end the cell
     with run_async(fn) instead -- fn runs on a worker thread, the cell returns
-    at once with a task id (task-...) to poll, and the viewer stays live. Only
-    one job runs at a time."""
+    at once with a task id (task-...) to poll, and the main thread stays free.
+    Only one job runs at a time."""
 
 
 @mcp.tool()
@@ -684,22 +709,25 @@ async def execute_code(
     python_code: str,
     intent: Annotated[str, Field(description=_INTENT_DESC)] = "",
 ) -> str:
-    """Execute Python code in the napari kernel.
+    """Execute Python code in the session's kernel.
 
-    The kernel is a full Jupyter/IPython kernel (imports allowed) with the
-    namespace: viewer (with add_tensor/tensor methods), client(image data access), and ops (a
-    dict of image processing operations). np and da are also imported. Variables persist
-    across calls until the kernel is restarted.
+    The kernel is a full Jupyter/IPython kernel (imports allowed). Its namespace
+    always holds the data plane -- client (image data access) -- and the
+    algorithm plane -- ops (a dict of server-side image-processing operations)
+    and the user's kernel plugin modules; np and da are imported. A viewer (a
+    napari viewer with add_tensor/tensor methods) is there only when the session
+    has one: server_status's ## Viewer says. Variables persist across calls
+    until the kernel is restarted.
 
     Code runs as a cell on the kernel's main thread, like a notebook cell.
     If it finishes quickly the result is returned inline; otherwise this returns
     a job handle (job-N) and the cell keeps running. Poll it with poll_job, and
     stop it with interrupt_kernel or restart_kernel (guaranteed). While it runs
-    it holds the main thread: the viewer does not repaint and take_screenshot /
+    it holds the main thread: a viewer does not repaint and take_screenshot /
     inspect_object refuse. For a long compute you want to watch, end the cell
     with run_async(fn) instead -- fn runs on a worker thread, the cell returns
-    at once with a task id (task-...) to poll, and the viewer stays live. Only
-    one job runs at a time.
+    at once with a task id (task-...) to poll, and the main thread stays free.
+    Only one job runs at a time.
 
     Only one *agent* runs code in a kernel, too: whoever calls this first holds
     it until the kernel restarts. A second client is refused here and by every
@@ -713,8 +741,8 @@ async def execute_code(
     Results include print() output and the last expression's repr. Rich IPython
     display() output is not captured; use print().
 
-    * viewer mutations (read_doc("napari-viewer") has more):
-    Mutate the viewer directly. From a run_async task too: its mutations are
+    * viewer mutations, where there is a viewer (read_doc("napari-viewer") has
+    more): Mutate the viewer directly. From a run_async task too: its mutations are
     marshaled to the main thread, one hop each, so bulk viewer work and raw Qt
     (viewer.window) belong in a cell.
 
@@ -734,9 +762,9 @@ async def execute_code(
     - resolved is not the same as local. Assume a cloud or synced-folder
       source's bytes may not be on the serving machine, so its first read can
       be slow or fail offline -- say so before starting one, not after.
-    - viewer.add_tensor(array_id) loads a tensor as a layer (auto-handles the
-      multiscale pyramid); client.get_tensor(array_id) returns a lazy dask
-      array without adding a layer. Both take the same id: "source_id/t1"
+    - client.get_tensor(array_id) returns a lazy dask array;
+      viewer.add_tensor(array_id), where there is a viewer, loads it as a layer
+      (auto-handles the multiscale pyramid). Both take the same id: "source_id/t1"
       within a multi-tensor source, a bare "source_id" for a single-tensor one.
     - reading pixels back off a layer is not plain napari: layer.data is
       napari's MultiScaleData sequence of pyramid levels when layer.multiscale,
@@ -774,7 +802,7 @@ async def execute_code(
         "holding the main thread: take_screenshot and inspect_object refuse "
         f"until it ends. Poll it with poll_job('{job_id}'); stop it with "
         "interrupt_kernel or restart_kernel. Next time, run a compute this long "
-        "with run_async(fn) to keep the viewer live.\n"
+        "with run_async(fn) to keep the main thread free.\n"
         "Partial output:\n" + (partial or "(none yet)") + foreign_note
     )
 
@@ -1149,7 +1177,8 @@ def _stop_refused_message(data, job_id):
 
 @mcp.tool()
 async def start_kernel() -> str:
-    """Start biopb: bring up the napari viewer, dask, and the tensor client.
+    """Start biopb: bring up the kernel with the tensor client, ops and kernel
+    plugins -- and the napari viewer, where the session has one.
 
     Call this as the first action of every session, and whenever the user asks
     to start, open, or launch biopb, napari, or the viewer. Nothing auto-starts
@@ -1172,9 +1201,15 @@ async def start_kernel() -> str:
         return err
     result = await asyncio.to_thread(host.ensure_started)
     if result.get("state") == "ready":
+        if host.no_viewer_reason:
+            return (
+                "Kernel ready: the tensor client (`client`), `ops` and the kernel "
+                "plugins are up; use execute_code now. This session has no napari "
+                f"viewer ({host.no_viewer_reason}): {_NO_VIEWER_HINT}."
+            )
         ready = (
-            "Kernel ready. The napari viewer, dask, and tensor client are up; "
-            "use execute_code / take_screenshot now."
+            "Kernel ready. The tensor client, `ops`, the kernel plugins and the "
+            "napari viewer are up; use execute_code / take_screenshot now."
         )
         # A virtual display is a silent degradation: screenshots still work, so
         # nothing downstream notices, but the user is watching a window that
@@ -1208,9 +1243,10 @@ async def restart_kernel() -> str:
     """Hard-restart the kernel: the guaranteed stop for runaway execution.
 
     Kills the kernel process group (reaping any dask child processes) and
-    respawns a fresh kernel, rebuilding the tensor client and the napari
-    viewer. All variables defined in previous execute_code calls are lost; a
-    new viewer window replaces the old one.
+    respawns a fresh kernel, rebuilding the tensor client, ops and plugins, and
+    the napari viewer where the session has one. All variables defined in
+    previous execute_code calls are lost; a new viewer window replaces the old
+    one.
 
     This destroys the USER's work too, not only yours — their running cell,
     their variables, their layers — and it is not undoable or announced to them
@@ -1248,7 +1284,8 @@ async def restart_kernel() -> str:
     if refusal is not None:
         return refusal
     note = f" Verification {discarded} was discarded with it." if discarded else ""
-    return "Kernel restarted. Viewer rebuilt; previous variables are gone." + note
+    rebuilt = "" if host.no_viewer_reason else " Viewer rebuilt;"
+    return f"Kernel restarted.{rebuilt} Previous variables are gone." + note
 
 
 @mcp.tool()

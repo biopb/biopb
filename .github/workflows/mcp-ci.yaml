@@ -124,8 +124,8 @@ jobs:
       # Resolve the whole workspace so biopb[tensor] and biopb-tensor-server[web]
       # come from the in-tree members (the server is never on PyPI). uv is the
       # workspace-aware installer; this is why CI no longer uses tox+pip.
-      - name: Install (workspace, mcp extra + testing group)
-        run: uv sync --package biopb-mcp --extra mcp --group testing --python ${{ matrix.python-version }}
+      - name: Install (workspace, napari extra + testing group)
+        run: uv sync --package biopb-mcp --extra napari --group testing --python ${{ matrix.python-version }}
 
       - name: Run tests
         env:

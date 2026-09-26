@@ -121,6 +121,9 @@ $ProgressPreference = 'SilentlyContinue'  # speeds up Invoke-WebRequest
 # LHS verbatim -- the stamp anchors on it.
 $script:BiopbPinnedRelease = ''
 
+# Must equal install.sh's INSTALL_SCHEMA (a test enforces it).
+$script:InstallSchema = 1
+
 # Install the uv tool environment under %LOCALAPPDATA%, not uv's Roaming default
 # (%APPDATA%\uv\tools). The biopb tool env holds native binaries and a long-lived
 # napari/Qt process -- machine-specific state that has no business in a roaming
@@ -1407,8 +1410,7 @@ function Invoke-BiopbInstall {
     }
     # versions.json pins the SDK and napari to the versions this release was
     # built and tested with, and carries the `release` version recorded below.
-    # A release without the manifest (or without `biopb`) ships the SDK as a
-    # wheel asset instead.
+    # Its `install_schema` must equal this engine's.
     $versions = $null
     $verAsset = $release.assets | Where-Object { $_.name -eq 'versions.json' } | Select-Object -First 1
     if ($verAsset) {
@@ -1421,16 +1423,18 @@ function Invoke-BiopbInstall {
         } catch { $versions = $null }
         Remove-Item -LiteralPath $verFile -Force -ErrorAction SilentlyContinue
     }
-    $sdkPin = if ($versions) { $versions.biopb } else { $null }
-    $napariReq = if ($versions -and $versions.napari) { "napari[all]==$($versions.napari)" } else { "napari[all]" }
+    if (-not $versions -or "$($versions.install_schema)" -ne "$script:InstallSchema") {
+        throw "Release $($release.tag_name) is not supported by this installer. Install it with the installer published alongside it: https://github.com/$ReleaseRepo/releases/download/$($release.tag_name)/install.ps1"
+    }
+    if (-not $versions.biopb -or -not $versions.napari -or -not $versions.release) {
+        throw "Release $($release.tag_name) has an incomplete versions.json."
+    }
+    $napariReq   = "napari[all]==$($versions.napari)"
     $mcpAsset    = $release.assets | Where-Object { $_.name -match '^biopb_mcp-.*\.whl$' } | Select-Object -First 1
-    $sdkAsset    = if ($sdkPin) { $null } else { $release.assets | Where-Object { $_.name -match '^biopb-.*\.whl$' } | Select-Object -First 1 }
     $tensorAsset = $release.assets | Where-Object { $_.name -match '^biopb_tensor_server-.*\.whl$' } | Select-Object -First 1
-    # biopb-control (control plane). Its underscore filename (biopb_control-…) is not
-    # matched by the sdk pattern '^biopb-.*' above, so the two stay distinct.
     $controlAsset  = $release.assets | Where-Object { $_.name -match '^biopb_control-.*\.whl$' } | Select-Object -First 1
-    if (-not $mcpAsset -or -not ($sdkPin -or $sdkAsset) -or -not $tensorAsset -or -not $controlAsset) {
-        throw "Release $($release.tag_name) is missing one of the biopb wheels (or its versions.json could not be read)."
+    if (-not $mcpAsset -or -not $tensorAsset -or -not $controlAsset) {
+        throw "Release $($release.tag_name) is missing one of the biopb wheels."
     }
     Report-Info "Installing from release $($release.tag_name)"
     $wheelsDir = Join-Path $env:TEMP "biopb-wheels"
@@ -1443,47 +1447,39 @@ function Invoke-BiopbInstall {
     Invoke-WebRequest -Uri $tensorAsset.browser_download_url -OutFile $tensorWhl
     Invoke-WebRequest -Uri $controlAsset.browser_download_url -OutFile $controlWhl
     $wheels = @($mcpWhl, $tensorWhl, $controlWhl)
-    if ($sdkAsset) {
-        $sdkWhl = Join-Path $wheelsDir $sdkAsset.name
-        Invoke-WebRequest -Uri $sdkAsset.browser_download_url -OutFile $sdkWhl
-        $wheels += $sdkWhl
-    }
 
     # Verify the wheels against the release's SHA256SUMS before installing them
-    # (issue #87 trust item). Hard-fail on a mismatch or a wheel missing from a
-    # SHA256SUMS that exists; fail open (warn) when the release predates it.
+    # (issue #87 trust item). Hard-fail on a mismatch, a wheel missing from
+    # SHA256SUMS, or no SHA256SUMS at all.
     $sumsAsset = $release.assets | Where-Object { $_.name -eq 'SHA256SUMS' } | Select-Object -First 1
-    if ($sumsAsset) {
-        $sums = @{}
-        # Download to a temp file and read it back rather than reading .Content
-        # directly: GitHub serves SHA256SUMS as application/octet-stream, and
-        # PowerShell 5.1's Invoke-WebRequest returns .Content as a byte[] for
-        # non-text content types -- splitting a byte[] on "`n" yields individual
-        # bytes, so the regex matches nothing and every wheel fails with
-        # "No checksum for ...". -OutFile + Get-Content -Raw sidesteps the
-        # encoding trap and matches the wheel-download pattern above.
-        $sumsFile = Join-Path $wheelsDir "SHA256SUMS"
-        Invoke-WebRequest -Uri $sumsAsset.browser_download_url -OutFile $sumsFile -UseBasicParsing
-        foreach ($line in ((Get-Content -Raw -LiteralPath $sumsFile) -split "`n")) {
-            # "<64-hex>  <filename>" (a leading '*' marks binary mode — strip it).
-            $m = [regex]::Match($line.Trim(), '^([0-9a-fA-F]{64})\s+\*?(.+)$')
-            if ($m.Success) { $sums[$m.Groups[2].Value] = $m.Groups[1].Value.ToLower() }
-        }
-        foreach ($w in $wheels) {
-            $base = Split-Path -Leaf $w
-            $expected = $sums[$base]
-            if (-not $expected) { throw "No checksum for $base in the release SHA256SUMS" }
-            $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $w).Hash.ToLower()
-            if ($actual -ne $expected) { throw "Checksum mismatch for $base - refusing to install (expected $expected, got $actual)" }
-        }
-        Report-Ok "Wheel checksums verified"
-    } else {
-        Report-Warn "Release $($release.tag_name) has no SHA256SUMS; skipping wheel integrity check"
+    if (-not $sumsAsset) { throw "Release $($release.tag_name) has no SHA256SUMS; refusing to install unverified wheels" }
+    $sums = @{}
+    # Download to a temp file and read it back rather than reading .Content
+    # directly: GitHub serves SHA256SUMS as application/octet-stream, and
+    # PowerShell 5.1's Invoke-WebRequest returns .Content as a byte[] for
+    # non-text content types -- splitting a byte[] on "`n" yields individual
+    # bytes, so the regex matches nothing and every wheel fails with
+    # "No checksum for ...". -OutFile + Get-Content -Raw sidesteps the
+    # encoding trap and matches the wheel-download pattern above.
+    $sumsFile = Join-Path $wheelsDir "SHA256SUMS"
+    Invoke-WebRequest -Uri $sumsAsset.browser_download_url -OutFile $sumsFile -UseBasicParsing
+    foreach ($line in ((Get-Content -Raw -LiteralPath $sumsFile) -split "`n")) {
+        # "<64-hex>  <filename>" (a leading '*' marks binary mode — strip it).
+        $m = [regex]::Match($line.Trim(), '^([0-9a-fA-F]{64})\s+\*?(.+)$')
+        if ($m.Success) { $sums[$m.Groups[2].Value] = $m.Groups[1].Value.ToLower() }
     }
+    foreach ($w in $wheels) {
+        $base = Split-Path -Leaf $w
+        $expected = $sums[$base]
+        if (-not $expected) { throw "No checksum for $base in the release SHA256SUMS" }
+        $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $w).Hash.ToLower()
+        if ($actual -ne $expected) { throw "Checksum mismatch for $base - refusing to install (expected $expected, got $actual)" }
+    }
+    Report-Ok "Wheel checksums verified"
 
     # Direct file:// references pin each package to this exact wheel.
-    $mcpReq    = "biopb-mcp[mcp] @ $(([System.Uri]$mcpWhl).AbsoluteUri)"
-    $biopbReq  = if ($sdkPin) { "biopb[tensor]==$sdkPin" } else { "biopb[tensor] @ $(([System.Uri]$sdkWhl).AbsoluteUri)" }
+    $mcpReq    = "biopb-mcp[napari] @ $(([System.Uri]$mcpWhl).AbsoluteUri)"
+    $biopbReq  = "biopb[tensor]==$($versions.biopb)"
     $tensorReq = "biopb-tensor-server[$tensorExtras] @ $(([System.Uri]$tensorWhl).AbsoluteUri)"
     $controlReq  = "biopb-control @ $(([System.Uri]$controlWhl).AbsoluteUri)"
 
@@ -1591,11 +1587,9 @@ function Invoke-BiopbInstall {
 
     # Record the installed deployment version as the kernel-start auto-updater's
     # baseline (issue #87): the check compares the latest release-v* deployment's
-    # versions.json `release` against this marker, read above; fall back to the
-    # tag (release-vX.Y.Z -> X.Y.Z). Best-effort — a write failure only
-    # re-prompts a future update, never the install.
-    $releaseVersion = if ($versions) { $versions.release } else { "" }
-    if (-not $releaseVersion) { $releaseVersion = ($release.tag_name -replace "^$([regex]::Escape($ReleaseTagPrefix))", "") }
+    # versions.json `release` against this marker, read above. Best-effort — a
+    # write failure only re-prompts a future update, never the install.
+    $releaseVersion = $versions.release
     try {
         if (-not (Test-Path -LiteralPath $ConfigDir)) { New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null }
         Set-FileUtf8NoBom -Path (Join-Path $ConfigDir "release.version") -Content $releaseVersion
@@ -1710,7 +1704,7 @@ function Invoke-BiopbInstall {
                 try { Invoke-WebRequest -Uri $sUrl -OutFile $sTarball } catch { $sOk = $false }
                 # Soft checksum check: never seed corrupt/tampered data, but never
                 # abort the install over it. $expectedSum stays $null on any lookup
-                # miss (older release, fetch error) -> treated as "not verifiable".
+                # miss (fetch error) -> treated as "not verifiable".
                 if ($sOk) {
                     $expectedSum = $null
                     try {

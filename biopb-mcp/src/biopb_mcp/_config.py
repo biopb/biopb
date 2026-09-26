@@ -187,7 +187,22 @@ class KernelConfig:
 
 @dataclass
 class ViewerConfig:
-    """napari viewer slice-read behavior in the kernel."""
+    """The napari viewer, for a session that has one."""
+
+    enabled: bool = _h(
+        True,
+        "Open a napari viewer window in the kernel, bound as `viewer`. Needs the "
+        "biopb-mcp[napari] extra and a display; without either the session runs "
+        "with no viewer, and results are shown through the web viewer. Off -> "
+        "never open one. `biopb mcp view` opens one regardless.",
+    )
+    virtual_display: bool = _h(
+        False,
+        "On a Linux host with no display, render the viewer on a launcher-owned "
+        "Xvfb virtual display instead of running without one. Screenshots work, "
+        "but no window is visible and 3-D volumes render in software GL; meant "
+        "for tests. Needs the Xvfb binary.",
+    )
 
     compute_scheduler: str = _h(
         "threads",

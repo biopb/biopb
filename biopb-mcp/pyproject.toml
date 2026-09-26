@@ -27,11 +27,21 @@ classifiers = [
 # matches the classifiers above (3.10-3.12 only).
 requires-python = ">=3.10,<3.13"
 dependencies = [
-    # The Tensor Browser the kernel docks, and add_tensor's layer pipeline.
-    "biopb-napari-widget >= 0.1.0rc2",
+    # mcp <2: 2.x deleted `mcp.server.fastmcp`, which `mcp/_server.py` is built
+    # on, and imports cryptography at module scope, which our pyjwt override
+    # (root pyproject / install.sh) drops. Lift the cap only together with the
+    # FastMCP port and a re-examined override.
+    "mcp >= 1.20, < 2",
+    "uvicorn >= 0.29",
+    "jupyter_client",
+    "ipykernel",
+    "psutil",
+    "agent-client-protocol >= 0.12, < 1",
+    # packaging: imported by mcp/_update.py (version compare for the update check).
+    # It always arrives transitively, but the import is direct, so declare it.
+    "packaging",
     "numpy",
     "pandas",
-    "qtpy",
     "scikit-image",
     # scipy: arrives transitively via scikit-image, but the built-in rolling-ball
     # kernel plugin (biopb_mcp/plugins/) hard-imports scipy.ndimage, so make the
@@ -52,46 +62,43 @@ dependencies = [
     # -- where 1.15.3 is the newest scipy, since 1.16 requires 3.11 -- it means
     # 1.14.1. Retire this with the 3.10 floor, not before.
     "scipy != 1.15.*",
+    # distributed: for a cell that builds a dask Client (the kernel guide's cluster
+    # recipe); the kernel itself never imports it.
+    "distributed >= 2023.9.0",
+    # matplotlib / scikit-learn: nothing in this package imports them. They are for
+    # the agent's kernel namespace -- guide://kernel names them as importable, so the
+    # install has to make that true. Neither is guaranteed otherwise: matplotlib
+    # reaches an env only through *optional* extras of napari/tifffile/vedo, and
+    # scikit-learn through nothing at all.
+    "matplotlib",
+    "scikit-learn",
     # biopb.control and biopb.tensor.Connection.
     "biopb[tensor] >= 0.11.0rc2",
 ]
 
 [project.optional-dependencies]
-# The MCP server is a standalone process (not a plugin loaded inside a running
-# napari) that constructs its own napari.Viewer() in the kernel bootstrap, so it
-# must bring napari and a real Qt binding itself — qtpy in the core deps is only
-# a shim. napari is pinned EXACTLY (not a floor) and is the single source of
-# truth for the version: dev/CI (`uv sync ... --extra mcp`), the published wheel,
-# and the installer all resolve the identical napari, so the graph-walk
+# The viewer: the kernel constructs its own napari.Viewer() with the Tensor
+# Browser docked, so it must bring napari and a real Qt binding itself (qtpy is
+# only a shim). Optional because a session need not show one -- the web SPA can
+# be the user's view.
+#
+# napari is pinned EXACTLY (not a floor) and is the single source of truth for
+# the version: dev/CI (`uv sync ... --extra napari`), the published wheel, and
+# the installer all resolve the identical napari, so the graph-walk
 # thread-safety test certifies the same object graph that actually ships (see
-# _jobs.wrap_viewer_for_threads). `[all]` brings PyQt6 in modern napari — its
+# _jobs.wrap_viewer_for_threads). `[all]` brings PyQt6 in modern napari -- its
 # default Qt binding is version-dependent, so the exact pin freezes that too
 # (>=0.7 was also needed to stay off the 0.6.x line, which pins vispy<0.16 and
 # can't init a GL canvas under Qt 6.11). The release pipeline surfaces this
 # version as a `versions.json` release attribute that install.sh reads to pin
 # `napari[all]==` at deploy time (release.yaml + install/install.sh). Bump here.
-# distributed: for a cell that builds a dask Client (the kernel guide's cluster
-# recipe); the kernel itself never imports it.
-# packaging: imported by mcp/_update.py (version compare for the update check).
-# It always arrives transitively, but the import is direct, so declare it.
-# matplotlib / scikit-learn: nothing in this package imports them. They are for
-# the agent's kernel namespace — guide://kernel names them as importable, so the
-# install has to make that true. Neither is guaranteed otherwise: matplotlib
-# reaches an env only through *optional* extras of napari/tifffile/vedo, and
-# scikit-learn through nothing at all.
-#
-# mcp <2: the 2.0 SDK is a breaking rewrite. It deleted `mcp.server.fastmcp`
-# outright -- `mcp/_server.py` builds the whole server on `FastMCP` -- and it
-# added a module-scope `cryptography` import (`mcp/server/request_state.py`, the
-# 2026-07-28 sealed-`requestState` codec) on the path `import mcp` itself walks,
-# while still declaring that dep only as `pyjwt[crypto]`. Our pyjwt override
-# (root pyproject / install.sh) un-requests that extra, so 2.x dies at
-# `from mcp import types` with ModuleNotFoundError: cryptography before it ever
-# reaches the FastMCP breakage. The floor alone let install.sh -- which resolves
-# fresh from PyPI, not from uv.lock -- swallow the new major, so every release
-# back to 0.8.0 installs a server that cannot start. Lift the cap only together
-# with the FastMCP port and a re-examined override.
-mcp = ["mcp>=1.20,<2", "uvicorn>=0.29", "jupyter_client", "ipykernel", "psutil", "distributed>=2023.9.0", "napari[all]==0.7.0", "pyqt6", "packaging", "matplotlib", "scikit-learn", "agent-client-protocol>=0.12,<1"]
+napari = [
+    "napari[all]==0.7.0",
+    "pyqt6",
+    "qtpy",
+    # The Tensor Browser the kernel docks, and add_tensor's layer pipeline.
+    "biopb-napari-widget >= 0.1.0rc2",
+]
 
 # Test/dev dependencies live in a PEP 735 dependency *group* rather than a
 # `testing` extra so they stay out of biopb-mcp's published metadata (groups are
@@ -99,7 +106,7 @@ mcp = ["mcp>=1.20,<2", "uvicorn>=0.29", "jupyter_client", "ipykernel", "psutil",
 # biopb-tensor-server, which is NOT on PyPI; they resolve it from the in-tree
 # workspace member (root [tool.uv.workspace] / [tool.uv.sources]), so install
 # with uv (CI uses uv too — tox/pip are not workspace-aware):
-#   uv sync --package biopb-mcp --extra mcp --group testing
+#   uv sync --package biopb-mcp --extra napari --group testing
 # A plain `pip install biopb-mcp[...]` can never pull the tensor server (not on
 # PyPI); that would require publishing biopb-tensor-server and exposing it as a
 # normal extra.
@@ -117,12 +124,11 @@ mcp = ["mcp>=1.20,<2", "uvicorn>=0.29", "jupyter_client", "ipykernel", "psutil",
 # (`biopb server start`) imports its HTTP server at module load, so without it
 # even importing the CLI raises ModuleNotFoundError: fastapi.
 integration = [
-    "biopb-mcp[mcp]",  # MCP server deps (napari>=0.7, pyqt6, jupyter_client, …)
+    "biopb-mcp[napari]",  # the viewer: napari, pyqt6, biopb-napari-widget
     "biopb[tensor]",
     "biopb-tensor-server[web]",
 ]
-# Full stack + test tooling. = integration plus pytest. (napari/pyqt6 come in
-# via biopb-mcp[mcp] in the integration group.)
+# Full stack + test tooling. = integration plus pytest.
 testing = [
     {include-group = "integration"},
     "pytest",  # https://docs.pytest.org/en/latest/contents.html

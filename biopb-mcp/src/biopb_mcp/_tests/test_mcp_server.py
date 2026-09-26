@@ -11,6 +11,7 @@ import json
 import sys
 import threading
 import time
+import types
 from unittest.mock import MagicMock
 
 import pytest
@@ -132,6 +133,7 @@ def mock_kernel_host():
     host.execute.return_value = _result()
     host.jobs = ScriptedJobs()
     host.virtual_display = None  # real display unless a test says otherwise
+    host.no_viewer_reason = None  # a viewer unless a test says otherwise
     return host
 
 
@@ -285,6 +287,15 @@ class TestTakeScreenshot:
         assert result[0].type == "text"
         assert "window was closed" in result[0].text
         assert "restart_kernel" in result[0].text
+
+    def test_no_viewer_refuses_without_a_kernel_round_trip(self, server_with_host):
+        server_with_host.no_viewer_reason = "napari is not installed"
+        result = _tool(_server.take_screenshot)
+        assert result[0].type == "text"
+        assert "no napari viewer" in result[0].text
+        assert "napari is not installed" in result[0].text
+        assert "web viewer" in result[0].text
+        server_with_host.execute.assert_not_called()
 
 
 # -----------------------------------------------------------------------
@@ -1170,6 +1181,15 @@ class TestStartKernel:
         # route rather than a dead end.
         assert "web viewer" in result
 
+    def test_no_viewer_says_why_and_names_the_web_viewer(self, server_with_host):
+        server_with_host.ensure_started.return_value = {"state": "ready"}
+        server_with_host.no_viewer_reason = "no display detected"
+        result = _tool(_server.start_kernel)
+        assert "Kernel ready" in result
+        assert "no napari viewer (no display detected)" in result
+        assert "no `viewer`" in result
+        assert "web viewer" in result
+
     def test_virtual_display_is_not_reported_on_the_failure_path(
         self, server_with_host
     ):
@@ -1199,6 +1219,19 @@ class TestStartKernel:
 
 
 class TestServerStatus:
+    def test_the_kernel_snippet_reports_no_viewer_without_touching_one(
+        self, monkeypatch, capsys
+    ):
+        # Run the in-kernel snippet here, in a namespace with no `viewer` and no
+        # `_viewer_window_alive`: a NameError would mean it still assumes one.
+        monkeypatch.setenv("BIOPB_NO_VIEWER", "the viewer is off in the config")
+        ns = {"_conn": types.SimpleNamespace(client=None, last_message="")}
+        exec(_server._STATUS_SNIPPET, ns)
+        out = capsys.readouterr().out
+        viewer = out.split("## Viewer")[1].split("## ")[0]
+        assert "none -- the viewer is off in the config" in viewer
+        assert "web viewer" in viewer
+
     def test_reports_not_initialized(self):
         _app._kernel_host = None
         result = _tool(_server.server_status)
