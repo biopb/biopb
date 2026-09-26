@@ -197,10 +197,10 @@ class TestSpawnSession:
         child, url, session_id = _shim.spawn_session(
             _cfg(kernel_log=str(tmp_path / "d.log")),
             timeout=5,
-            on_spawned=spawned.append,
+            on_spawned=lambda *a: spawned.append(a),
         )
         assert url == "http://127.0.0.1:54321/mcp"
-        assert spawned == [child]
+        assert spawned == [(child, session_id)]
         # The child registers itself, under the id minted here.
         assert captured["env"]["BIOPB_MCP_SESSION_ID"] == session_id
         assert captured["env"]["DISPLAY"] == ":test-99"
@@ -226,6 +226,16 @@ class TestReapSession:
         assert proc.poll() is None
         _shim._reap_session(OwnedChild.adopt(proc))
         assert proc.poll() is not None
+
+    def test_drops_the_record_a_killed_child_could_not(self, tmp_path, monkeypatch):
+        # Windows kills the child outright, so its _shutdown never runs.
+        from biopb import _sessions
+
+        monkeypatch.setenv("BIOPB_SESSIONS_DIR", str(tmp_path / "sessions"))
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        _sessions.register("20260101-000000-1", port=1, pid=proc.pid)
+        _shim._reap_session(OwnedChild.adopt(proc), "20260101-000000-1")
+        assert _sessions.read_session("20260101-000000-1") is None
 
     def test_idempotent_on_dead_child(self):
         proc = subprocess.Popen([sys.executable, "-c", "pass"])
@@ -455,7 +465,7 @@ class TestLazySession:
         def _spawn(config, on_spawned=None):
             child = _Child()
             spawns.append(child)
-            on_spawned(child)
+            on_spawned(child, "sid")
             if len(spawns) <= fail:
                 raise RuntimeError(f"spawn {len(spawns)} failed")
             return child, "http://127.0.0.1:1/mcp", "sid"
@@ -480,7 +490,9 @@ class TestLazySession:
         monkeypatch.setattr(_shim, "spawn_session", _spawn)
         monkeypatch.setattr(_shim, "streamablehttp_client", _client)
         monkeypatch.setattr(_shim, "ClientSession", _Session)
-        monkeypatch.setattr(_shim, "_reap_session", reaped.append)
+        monkeypatch.setattr(
+            _shim, "_reap_session", lambda child, sid: reaped.append(child)
+        )
         monkeypatch.setattr(
             _shim._control_client, "start_control_detached", lambda: True
         )
@@ -699,14 +711,9 @@ class TestEndToEnd:
             assert shim.wait(timeout=40) == 0
             _await_dead(child_pid, timeout=20)
             assert _port_listening(port) is False  # server truly gone
-            # No routing ghost: POSIX reaps with SIGTERM, and the child drops
-            # its own record; Windows force-kills the tree, leaving a record
-            # whose dead pid the registry prunes on the next read.
-            if os.name == "nt":
-                for leftover in reg_dir.glob("*.json"):
-                    assert not _pid_alive(json.loads(leftover.read_text())["pid"])
-            else:
-                assert list(reg_dir.glob("*.json")) == []
+            # No routing ghost, on every OS: the reap drops the record even
+            # where it kills the child outright (Windows).
+            assert list(reg_dir.glob("*.json")) == []
         finally:
             if shim.poll() is None:
                 shim.kill()
@@ -721,13 +728,15 @@ class TestServe:
         armed, reaped = [], []
 
         async def _fake_serve(lazy):
-            lazy._own("CHILD")
+            lazy._own("CHILD", "sid")
 
         monkeypatch.setattr(_shim, "_install_shim_reaper", armed.append)
         monkeypatch.setattr(_shim, "_install_client_death_watchdog", armed.append)
         monkeypatch.setattr(_shim, "_serve_stdio", _fake_serve)
-        monkeypatch.setattr(_shim, "_reap_session", reaped.append)
+        monkeypatch.setattr(
+            _shim, "_reap_session", lambda child, sid: reaped.append((child, sid))
+        )
 
         _shim.serve(object())
         assert len(armed) == 2
-        assert reaped == ["CHILD"]
+        assert reaped == [("CHILD", "sid")]

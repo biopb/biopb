@@ -134,7 +134,8 @@ control reads, and neither imports the other.
 
 Every session on a dynamic port **publishes itself** — a shim-owned child under
 the id its shim minted, an agentless `biopb mcp view` session under its own — and
-drops its record on the way out. The control only ever reads.
+drops its record on the way out; a shim also drops its child's once it has reaped
+it, since Windows kills the child outright. The control only ever reads.
 
 Lookups **self-heal**, pruning records whose owning pid is dead — or alive on a
 recycled pid, caught by a create-time token — so a dead session expires to a clean

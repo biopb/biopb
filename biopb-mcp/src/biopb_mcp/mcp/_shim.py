@@ -194,7 +194,8 @@ def spawn_session(config, timeout=SESSION_START_TIMEOUT, on_spawned=None):
     dynamic port the child reports back, and ties the child's lifetime to this
     shim (POSIX process group; Windows Job Object). On any startup failure the
     child is reaped before the error propagates, so a failed bring-up never leaks
-    a process. *on_spawned* gets the child as soon as it exists, so a reap that
+    a process. *on_spawned* gets ``(child, session_id)`` as soon as the child
+    exists, so a reap that
     fires during the bring-up can find it.
 
     The child registers itself with the control under ``session_id``, minted
@@ -239,7 +240,7 @@ def spawn_session(config, timeout=SESSION_START_TIMEOUT, on_spawned=None):
         if logged_to_file:
             log.close()  # the child holds its own duplicate of the fd
     if on_spawned is not None:
-        on_spawned(child)
+        on_spawned(child, session_id)
 
     try:
         # The child listens before it reports, so a reported port is ready.
@@ -256,13 +257,16 @@ def spawn_session(config, timeout=SESSION_START_TIMEOUT, on_spawned=None):
     return child, f"http://127.0.0.1:{port}/mcp", session_id
 
 
-def _reap_session(child):
+def _reap_session(child, session_id=None):
     """Tear down the owned child and its kernel grandchild (idempotent).
 
-    POSIX sends SIGTERM first, so the child drops its own registry record; a
-    force kill leaves that to the registry's pid-liveness prune.
+    Then drop *session_id*'s registry record: the child drops its own on
+    SIGTERM, but Windows kills it outright, and a dead child's record is anyone's
+    to prune.
     """
     child.stop(timeout=REAP_TIMEOUT)
+    if session_id is not None:
+        _sessions.unregister(session_id)
 
 
 def _install_shim_reaper(reap):
@@ -417,6 +421,7 @@ class _LazySession:
     def __init__(self, config):
         self._config = config
         self.child = None
+        self.session_id = None
         self.task_group = None
         self._session = None
         self._lock = anyio.Lock()
@@ -425,10 +430,10 @@ class _LazySession:
     def reap(self):
         """Tear down the child, if one was spawned. Safe from any thread."""
         if self.child is not None:
-            _reap_session(self.child)
+            _reap_session(self.child, self.session_id)
 
-    def _own(self, child):
-        self.child = child
+    def _own(self, child, session_id):
+        self.child, self.session_id = child, session_id
 
     async def get(self):
         """The connected ClientSession, starting the child if need be."""
@@ -438,8 +443,9 @@ class _LazySession:
                     self._session = await self.task_group.start(self._serve)
                 except Exception as e:
                     logger.exception("biopb-mcp session failed to start")
-                    self.reap()
-                    self.child = None
+                    # Off the loop: the reap waits for the child to exit.
+                    await anyio.to_thread.run_sync(self.reap)
+                    self.child = self.session_id = None
                     raise RuntimeError(
                         f"the biopb-mcp session did not start: {e}"
                     ) from e
