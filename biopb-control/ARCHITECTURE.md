@@ -22,14 +22,11 @@ Two rules keep that tree correct, and every change here must preserve them.
 - **I1 — the control never *owns* a session.** A session serving an MCP client is
   spawned by that client's shim and only **registers itself**, so the control routes to
   and lists it without holding it. The one session the control may *launch* is an
-  agentless `biopb mcp view` viewer, whose only other spawner is a terminal; that
-  child is detached and self-registering, so the registry still only observes and
-  a control restart never closes the user's window. What both preserve is
-  biopb/biopb-mcp#98: a session inherits its spawner's environment, and the wrong
-  one puts the napari viewer where the user is not. So a launch is refused unless
-  this control is loopback-bound **and** has a display of its own, and it launches
-  `--view`, which exits rather than falling back to a virtual display nobody can
-  see.
+  agentless one for the dashboard, driven through its chat pane or a Jupyter
+  client; that child is detached and self-registering, so the registry still only
+  observes and a control restart never ends the user's session. Its config decides
+  whether it gets a napari viewer, and it runs without one where napari or a
+  display is missing.
 - **I2 — the control stays lean and subprocess-based.** It supervises components
   as subprocesses, never by importing them, so no Qt/napari/dask/kernel ever enters
   this process. Facts shared with those components — the control endpoint, the
@@ -70,7 +67,7 @@ namespace, which would collide at the root. So the control serves
 | Path | Target | Hop |
 |---|---|---|
 | `/`, `/viewer`, `/admin`, `/assets/*` | control-served `web/` SPA | in-process |
-| `/api/*` | control's own API (status, sessions, data-plane verbs, viewer launch) | in-process |
+| `/api/*` | control's own API (status, sessions, data-plane verbs, session launch) | in-process |
 | `/health` | bare liveness | in-process |
 | `/data_plane/api/*` | tensor sidecar (API-only) | loopback proxy |
 | `/session/<id>/observe` | control-served SPA observe shell | in-process |
@@ -142,22 +139,21 @@ recycled pid, caught by a create-time token — so a dead session expires to a c
 "session ended" rather than a hang.
 
 `POST /api/sessions/new` is the third way a session comes to exist: the control
-spawns `biopb mcp view` and waits for it to appear in this registry, matched on
-a per-launch token it hands the child. Registration is an exact readiness signal — `--view` opens
-its window *before* it registers — so a record means a viewer really opened, and
-a child that dies first never registers and comes back with its own log tail.
+spawns `biopb-mcp --transport http --port 0 --start-kernel` and waits for it to
+appear in this registry, matched on a per-launch token it hands the child.
+Registration is an exact readiness signal — the kernel (and any window) starts
+*before* it registers — and a child that dies first never registers and comes
+back with its own log tail.
 Each launch writes **its own** file under `state/biopb/mcp/viewers/` (pruned to
 the newest few), beside the shim's per-session logs and for the same reason: a
-shared file interleaves concurrent viewers, and lines that cannot be attributed
+shared file interleaves concurrent sessions, and lines that cannot be attributed
 to a process are no use for diagnosing a session that is still running. The
 child is told the path, so `server_status` names the file its output really
 went to.
-The verb is offered only where it can work (I1); the dashboard reads that from
-`/api/status` and shows the refusal in the button's place.
 
 **Stopping one is not the mirror image.** The control does not signal a pid — it
 proxies `/session/<id>/api/shutdown`, and the session runs the same teardown
-Ctrl-C does. So ownership never enters it: a viewer started from a terminal and
+Ctrl-C does. So ownership never enters it: a session started from a terminal and
 one started here are the same process ending itself, and the control keeps no
 record of which it launched. The route rides `api` rather than the local-only
 gate (it is not an execute surface, and `api` already carries the kernel

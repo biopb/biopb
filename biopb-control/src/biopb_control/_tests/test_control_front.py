@@ -1153,24 +1153,22 @@ def test_the_execute_capable_roots_are_post_only(control, upstream, path):
     assert status == 200
 
 
-# --- launching a viewer session (POST /api/sessions/new) ------------------ #
+# --- launching a session (POST /api/sessions/new) ------------------------- #
 
 
 def _launchable(monkeypatch, tmp_path, argv):
-    """Make the launch verb runnable in a test: a display this control believes
-    in, an isolated state tree for the child log, and *argv* standing in for the
-    real `python -m biopb_mcp.mcp --view`."""
+    """Make the launch verb runnable in a test: an isolated state tree for the
+    child log, and *argv* standing in for the real session command."""
     from biopb_control import _control
 
     monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path / "state"))
-    monkeypatch.setattr(_control, "_display_available", lambda: True)
-    monkeypatch.setattr(_control, "_viewer_argv", lambda: argv)
+    monkeypatch.setattr(_control, "_session_argv", lambda: argv)
 
 
 def _registering_child_script(session_id: str) -> str:
-    """Source for a stand-in ``--view`` child: register under *session_id*,
+    """Source for a stand-in session child: register under *session_id*,
     echoing the launch token it was handed, then stay alive like a real
-    viewer would."""
+    session would."""
     return (
         "import os, time;"
         "from biopb import _locations, _sessions;"
@@ -1195,70 +1193,36 @@ def _launch_app(tmp_path, loopback_bound=True):
     )
 
 
-@pytest.mark.parametrize(
-    "loopback_bound, has_display, can_start, reason_hint",
-    [
-        (True, True, True, None),
-        # A viewer this control started would open on the server's display.
-        (False, True, False, "loopback"),
-        # Nowhere to put a window: it would fail every time, so do not offer it.
-        (True, False, False, "display"),
-        (False, False, False, "loopback"),  # the bind is reported first
-    ],
-)
-def test_session_launch_gate(
-    monkeypatch, loopback_bound, has_display, can_start, reason_hint
-):
+def test_session_argv_is_an_agentless_http_session():
+    # `--port 0` is what makes the child agentless and self-publishing, and
+    # `--start-kernel` what makes its registration mean "ready". No `--view`: the
+    # session's config decides on a viewer, and it runs without one where it
+    # cannot have one.
     from biopb_control import _control
 
-    monkeypatch.setattr(_control, "_display_available", lambda: has_display)
-    ok, reason = _control._session_launch_gate(loopback_bound)
-    assert ok is can_start
-    if can_start:
-        assert reason is None
-    else:
-        assert reason and reason_hint in reason
-
-
-def test_api_status_advertises_the_launch_verb(tmp_path, monkeypatch):
-    # The dashboard shows the button only where the control says it works, and
-    # shows the refusal in its place otherwise -- so both ride /api/status.
-    from starlette.testclient import TestClient
-
-    from biopb_control import _control
-
-    monkeypatch.setattr(_control, "_display_available", lambda: True)
-    with TestClient(_launch_app(tmp_path), base_url="http://127.0.0.1:8813") as client:
-        body = client.get("/api/status").json()
-        assert body["can_start_session"] is True
-        assert body["start_session_blocked"] is None
-
-    monkeypatch.setattr(_control, "_display_available", lambda: False)
-    with TestClient(_launch_app(tmp_path), base_url="http://127.0.0.1:8813") as client:
-        body = client.get("/api/status").json()
-        assert body["can_start_session"] is False
-        assert "display" in body["start_session_blocked"]
+    argv = _control._session_argv()
+    assert argv[1:3] == ["-m", "biopb_mcp.mcp"]
+    assert "--view" not in argv
+    assert argv[argv.index("--transport") + 1] == "http"
+    assert argv[argv.index("--port") + 1] == "0"
+    assert "--start-kernel" in argv
 
 
 @pytest.mark.parametrize("loopback_bound", [True, False])
-def test_start_session_is_refused_when_gated(tmp_path, monkeypatch, loopback_bound):
-    # 409, not 403: the request is fine, this deployment just cannot serve it --
-    # and nothing is spawned, which is the part that matters.
+def test_start_session_is_offered_on_any_bind(tmp_path, monkeypatch, loopback_bound):
+    # No display or bind gate: a session without a viewer is still useful.
     from starlette.testclient import TestClient
 
     from biopb_control import _control
 
-    spawned = []
-    monkeypatch.setattr(_control, "_display_available", lambda: False)
-    monkeypatch.setattr(
-        _control.subprocess, "Popen", lambda *a, **k: spawned.append(a) or None
-    )
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    monkeypatch.setattr(_control, "_launch_session", lambda wait: {"state": "starting"})
     app = _launch_app(tmp_path, loopback_bound=loopback_bound)
     with TestClient(app, base_url="http://127.0.0.1:8813") as client:
         resp = client.post("/api/sessions/new")
-        assert resp.status_code == 409
-        assert resp.json()["error"]
-    assert spawned == []
+        assert resp.status_code == 200
+        assert resp.json() == {"state": "starting"}
 
 
 def test_start_session_waits_for_the_child_to_register(tmp_path, monkeypatch):
@@ -1297,7 +1261,7 @@ def test_a_viewer_behind_a_trampoline_is_still_recognised(tmp_path, monkeypatch)
         f"sys.exit(subprocess.run([sys.executable, '-c', {grandchild!r}]).returncode)"
     )
     _launchable(monkeypatch, tmp_path, [sys.executable, "-c", stub])
-    monkeypatch.setattr(_control, "_VIEWER_START_TIMEOUT", 30.0)
+    monkeypatch.setattr(_control, "_SESSION_START_TIMEOUT", 30.0)
     with TestClient(_launch_app(tmp_path), base_url="http://127.0.0.1:8813") as client:
         body = client.post("/api/sessions/new").json()
     assert body["state"] == "started"
@@ -1313,7 +1277,7 @@ def test_another_launch_in_flight_is_not_mistaken_for_ours(tmp_path, monkeypatch
     _launchable(
         monkeypatch, tmp_path, [sys.executable, "-c", "import time; time.sleep(30)"]
     )
-    monkeypatch.setattr(_control, "_VIEWER_START_TIMEOUT", 1.0)
+    monkeypatch.setattr(_control, "_SESSION_START_TIMEOUT", 1.0)
 
     calls = []
     real_popen = _control.subprocess.Popen
@@ -1332,7 +1296,7 @@ def test_another_launch_in_flight_is_not_mistaken_for_ours(tmp_path, monkeypatch
 
     monkeypatch.setattr(_control.subprocess, "Popen", _spy)
     try:
-        body = _control._launch_viewer(1.0)
+        body = _control._launch_session(1.0)
         assert body["state"] == "starting"
         assert "session_id" not in body
     finally:
@@ -1369,7 +1333,7 @@ def test_each_launch_gets_its_own_log(tmp_path, monkeypatch):
     with TestClient(_launch_app(tmp_path), base_url="http://127.0.0.1:8813") as client:
         old = client.post("/api/sessions/new").json()
         monkeypatch.setattr(
-            _control, "_viewer_argv", lambda: [sys.executable, "-c", second]
+            _control, "_session_argv", lambda: [sys.executable, "-c", second]
         )
         new = client.post("/api/sessions/new").json()
 
@@ -1436,7 +1400,7 @@ def test_the_child_is_told_where_its_log_went(tmp_path, monkeypatch):
 
     _launchable(monkeypatch, tmp_path, [sys.executable, "-c", "pass"])
     monkeypatch.setattr(_control.subprocess, "Popen", _spy)
-    _control._launch_viewer(5.0)
+    _control._launch_session(5.0)
     logged = seen["env"][_locations.MCP_SESSION_LOG_ENV]
     assert Path(logged).name.startswith("viewer-")
     assert Path(logged).exists()
@@ -1453,7 +1417,7 @@ def test_start_session_returns_starting_when_the_child_is_slow(tmp_path, monkeyp
     _launchable(
         monkeypatch, tmp_path, [sys.executable, "-c", "import time; time.sleep(30)"]
     )
-    monkeypatch.setattr(_control, "_VIEWER_START_TIMEOUT", 1.0)
+    monkeypatch.setattr(_control, "_SESSION_START_TIMEOUT", 1.0)
     with TestClient(_launch_app(tmp_path), base_url="http://127.0.0.1:8813") as client:
         body = client.post("/api/sessions/new").json()
     assert body["state"] == "starting"
@@ -1475,7 +1439,7 @@ def test_launched_viewer_is_detached_from_the_control(tmp_path, monkeypatch):
 
     _launchable(monkeypatch, tmp_path, [sys.executable, "-c", "pass"])
     monkeypatch.setattr(_control.subprocess, "Popen", _spy)
-    _control._launch_viewer(5.0)
+    _control._launch_session(5.0)
     if sys.platform == "win32":
         assert seen["creationflags"]
     else:

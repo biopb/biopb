@@ -114,11 +114,6 @@ export default function DashboardPage() {
   const [plugins, setPlugins] = useState<PluginsRec | null>(null);
   const [verbBusy, setVerbBusy] = useState(false);
   const [agentsBusy, setAgentsBusy] = useState(false);
-  // Whether this control will launch a viewer session, and the sentence it gave
-  // for refusing. Both from /api/status; undefined on an older control, which is
-  // read as "no" so the button appears only where it is known to work.
-  const [canStart, setCanStart] = useState(false);
-  const [startBlocked, setStartBlocked] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
   // Which session's stop is in flight, so only that row's button goes busy.
   const [stoppingId, setStoppingId] = useState<string | null>(null);
@@ -148,8 +143,6 @@ export default function DashboardPage() {
       setConnOk(true);
       setDataPlane(s.data_plane || {});
       if (s.version) setVersion(s.version);
-      setCanStart(!!s.can_start_session);
-      setStartBlocked(s.start_session_blocked || null);
     } catch {
       setConn("control unreachable");
       setConnOk(false);
@@ -237,9 +230,9 @@ export default function DashboardPage() {
     return () => clearInterval(id);
   }, [pollStatus, pollSessions, pollAgents, pollAlgos, pollBackendReady]);
 
-  // Launching a viewer is slow by nature: the control waits for the child to
-  // open its napari window before it answers, so this holds for as long as a
-  // cold Qt/napari import takes. Bound it with an AbortController and tell the
+  // Launching a session is slow by nature: the control waits for the child to
+  // start its kernel (and napari window, where it has one) before it answers,
+  // so this holds for as long as a cold Qt/napari import takes. Bound it with an AbortController and tell the
   // control our bound (?client_timeout), so it answers "starting" just before we
   // would give up rather than leaving us to time out over a working launch.
   const startSession = useCallback(async () => {
@@ -265,11 +258,11 @@ export default function DashboardPage() {
         setStartMsg({
           err: false,
           text:
-            "Still opening the viewer — it will appear here when it is up." +
+            "Still starting the session — it will appear here when it is up." +
             (res.log_path ? `\nLog: ${res.log_path}` : ""),
         });
       } else {
-        setStartMsg({ err: false, text: "Viewer session started." });
+        setStartMsg({ err: false, text: "Session started." });
       }
     } catch (e) {
       setStartMsg({ err: true, text: String(e) });
@@ -289,7 +282,7 @@ export default function DashboardPage() {
     async (id: string) => {
       if (
         !confirm(
-          `Stop session ${id}?\n\nThe napari window closes and any running ` +
+          `Stop session ${id}?\n\nIts kernel (and napari window) closes and any running ` +
             `work is lost. If it was started with \`biopb mcp view\` in a ` +
             `terminal, that terminal returns.`,
         )
@@ -564,16 +557,14 @@ export default function DashboardPage() {
         <div className="card">
           <h2 className="with-actions">
             Sessions
-            {canStart ? (
-              <button
-                className="mini"
-                onClick={startSession}
-                disabled={starting}
-                title="Open a napari viewer session on this machine"
-              >
-                {starting ? "opening…" : "+ new viewer"}
-              </button>
-            ) : null}
+            <button
+              className="mini"
+              onClick={startSession}
+              disabled={starting}
+              title="Start a session on this machine"
+            >
+              {starting ? "starting…" : "+ new session"}
+            </button>
             {/* biopb-mcp's own global settings (transport/kernel/algorithm
                 servers), served by the control at /api/mcp_config. It sits here
                 rather than in the header because it is what every session in
@@ -632,7 +623,7 @@ export default function DashboardPage() {
                         className="mini stop"
                         onClick={() => stopSession(s.session_id)}
                         disabled={stoppingId === s.session_id}
-                        title="Stop this session (closes its napari window)"
+                        title="Stop this session"
                         aria-label={`Stop session ${s.session_id}`}
                       >
                         {stoppingId === s.session_id ? "…" : "✕"}
@@ -647,9 +638,6 @@ export default function DashboardPage() {
             <p className={startMsg.err ? "note err launch" : "note launch"}>
               {startMsg.text}
             </p>
-          ) : null}
-          {!canStart && startBlocked ? (
-            <p className="note">Cannot open a viewer here: {startBlocked}.</p>
           ) : null}
         </div>
       </main>
