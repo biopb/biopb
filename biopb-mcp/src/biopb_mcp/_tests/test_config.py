@@ -96,6 +96,53 @@ class TestLoadConfig:
             assert key in config
 
 
+class TestRetiredKeys:
+    """A key that no longer exists is dropped, and said out loud.
+
+    The people who set one are the people a retirement affects most, and an
+    unknown key is otherwise kept by the merge, ignored by the constraints and
+    invisible in the admin editor -- so the setting goes on looking honoured
+    forever.
+    """
+
+    def test_a_retired_key_does_not_survive_the_load(self, mock_config_dir):
+        config = _write_and_load(mock_config_dir, {"chat": {"engine": "acp"}})
+        assert "engine" not in config["chat"]
+
+    def test_every_acp_setting_goes_with_it(self, mock_config_dir):
+        config = _write_and_load(
+            mock_config_dir,
+            {
+                "chat": {
+                    "acp_agent": "opencode",
+                    "acp_command": "/usr/bin/opencode",
+                    "acp_model": "openai/gpt-5.5",
+                    "acp_permission": "allow",
+                }
+            },
+        )
+        assert not [k for k in config["chat"] if k.startswith("acp_")]
+
+    def test_it_says_what_to_do_instead(self, mock_config_dir, caplog):
+        """Dropping it silently is the failure worth designing against: the
+        pane falls back to a loop this user never configured, and reports it
+        as `chat.model` being unset without ever mentioning the engine."""
+        with caplog.at_level("WARNING"):
+            _write_and_load(mock_config_dir, {"chat": {"engine": "acp"}})
+        assert any(
+            "chat.engine" in r.message and "chat.model" in r.message
+            for r in caplog.records
+        )
+
+    def test_the_siblings_are_untouched(self, mock_config_dir):
+        # Dropping the retired key must not take the section with it: an ACP
+        # user who also set a base_url is still pointing at that endpoint.
+        config = _write_and_load(
+            mock_config_dir, {"chat": {"engine": "acp", "base_url": "http://x/v1"}}
+        )
+        assert config["chat"]["base_url"] == "http://x/v1"
+
+
 class TestSaveConfig:
     """Tests for save_config function."""
 

@@ -36,7 +36,6 @@ dependencies = [
     "jupyter_client",
     "ipykernel",
     "psutil",
-    "agent-client-protocol >= 0.12, < 1",
     # packaging: imported by mcp/_update.py (version compare for the update check).
     # It always arrives transitively, but the import is direct, so declare it.
     "packaging",
