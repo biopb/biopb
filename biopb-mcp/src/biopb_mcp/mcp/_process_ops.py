@@ -36,6 +36,7 @@ from biopb.image.utils import (
     deserialize_image_data,
     serialize_from_numpy_to_image_data,
 )
+from biopb.tensor._location import same_location
 from google.protobuf import json_format, struct_pb2
 
 from .._config import get_setting
@@ -118,21 +119,7 @@ def _refusal(name: str, exc: grpc.RpcError) -> Exception:
     return RuntimeError(f"{name}: {code.name}: {detail}")
 
 
-def _same_plane(a: str, b: str) -> bool:
-    """Whether two locations name one server: scheme spelling and loopback
-    aliases aside."""
-
-    def key(location: str):
-        parsed = urlparse(location.replace("grpc+tls://", "grpcs://"))
-        host = (parsed.hostname or "").lower()
-        if host in ("localhost", "::1", "0.0.0.0"):
-            host = "127.0.0.1"
-        return parsed.scheme, host, parsed.port
-
-    try:
-        return key(a) == key(b)
-    except ValueError:
-        return False
+_same_plane = same_location
 
 
 class _Server:
@@ -401,7 +388,6 @@ class Ops:
         self._inactivity_timeout = inactivity_timeout
         self._options = channel_options
         self._ops: Dict[str, Callable] = {}
-        self._rows: Optional[List[dict]] = None
 
     # --- by name --------------------------------------------------------- #
 
@@ -437,7 +423,6 @@ class Ops:
     def bind(self, rows: Optional[List[dict]]) -> None:
         """Bind every op the rows advertise. An op name two servers share is
         bound as ``<server>_<op>`` for both."""
-        self._rows = rows
         entries = []
         for row in rows or []:
             if not row.get("ops"):

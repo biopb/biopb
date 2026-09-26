@@ -49,6 +49,7 @@ from ._supervisor import (
     _HEALTHY_RESET_SECONDS,
     ServiceProcess,
     ServiceSpec,
+    tail_file,
 )
 
 logger = logging.getLogger(__name__)
@@ -60,6 +61,9 @@ INSTALL_TIMEOUT = 3600.0
 DESCRIBE_TIMEOUT = 600.0
 #: Log lines an ``error`` carries.
 ERROR_TAIL_LINES = 20
+#: Bytes read off the end of a log file before splitting into lines (see
+#: ``tail_file``); bounds the read regardless of how many lines are asked for.
+_LOG_TAIL_MAX_BYTES = 64 * 1024
 
 #: The token a server checks; the runtime's ``TOKEN_ENV``.
 TOKEN_ENV = "BIOPB_ALGORITHM_TOKEN"
@@ -94,17 +98,6 @@ def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
-
-
-def _tail(path: Path, lines: int) -> list[str]:
-    try:
-        with open(path, "rb") as fh:
-            fh.seek(0, os.SEEK_END)
-            fh.seek(max(0, fh.tell() - 64 * 1024))
-            text = fh.read().decode("utf-8", errors="replace")
-    except OSError:
-        return []
-    return text.splitlines()[-lines:]
 
 
 class ScriptEntry(ServiceProcess):
@@ -168,6 +161,9 @@ class ScriptEntry(ServiceProcess):
             label=f"algorithm {self.name}",
         )
 
+    def _probe_target(self) -> tuple[str, int]:
+        return "127.0.0.1", self._port
+
     def _open_log(self):
         self._log_rotated = True
         return super()._open_log()
@@ -213,7 +209,8 @@ class ScriptEntry(ServiceProcess):
             fh.write(text)
 
     def _fail(self, what: str, file_hash: Optional[str]) -> None:
-        tail = "\n".join(_tail(self._log, ERROR_TAIL_LINES))
+        lines, _truncated = tail_file(self._log, ERROR_TAIL_LINES, _LOG_TAIL_MAX_BYTES)
+        tail = "\n".join(lines)
         self._error = f"{what}\n{tail}".strip()
         self._failed_hash = file_hash
         logger.warning("algorithm %s: %s", self.name, what)
@@ -396,7 +393,12 @@ class ScriptEntry(ServiceProcess):
 
     # --- status ---------------------------------------------------------- #
 
-    def state(self) -> str:
+    def state(
+        self, cached: Optional[dict] = None, file_hash: Optional[str] = None
+    ) -> str:
+        """The entry's state. *cached*/*file_hash*, when already at hand (see
+        :meth:`row`), skip re-reading the describe cache and re-hashing the
+        script file."""
         with self._lock:
             if self._installer is not None:
                 return "installing"
@@ -406,18 +408,21 @@ class ScriptEntry(ServiceProcess):
                 return "up" if self._was_up else "starting"
             if self._want:
                 return "starting"  # between a crash and its restart
-            cached = self.cached()
-            if cached is not None and cached["hash"] == _file_hash(self.path):
+            if cached is None:
+                cached = self.cached()
+            if file_hash is None:
+                file_hash = _file_hash(self.path)
+            if cached is not None and cached["hash"] == file_hash:
                 return "stopped"
             return "new"
 
     def row(self) -> dict:
         with self._lock:
-            state = self.state()
             cached = self.cached()
+            file_hash = _file_hash(self.path)
+            state = self.state(cached, file_hash)
             current = cached is not None and (
-                cached["hash"] == _file_hash(self.path)
-                or cached["hash"] == self._running_hash
+                cached["hash"] == file_hash or cached["hash"] == self._running_hash
             )
             oplist = cached["oplist"] if current else {}
             running = state in ("up", "starting") and self._proc is not None
@@ -433,11 +438,12 @@ class ScriptEntry(ServiceProcess):
             )
 
     def logs(self, lines: int) -> dict:
+        tail, _truncated = tail_file(self._log, lines, _LOG_TAIL_MAX_BYTES)
         return {
             "name": self.name,
             "path": str(self._log),
             "exists": self._log.exists(),
-            "lines": _tail(self._log, lines),
+            "lines": tail,
         }
 
 
@@ -506,27 +512,33 @@ class AlgorithmPlane:
             entry, **_algorithms.probe(entry["url"], timeout=timeout)
         )
 
-    def rows(self, *, probe: bool = True, timeout: float = 4.0) -> list[dict]:
-        """A row per entry; url entries probed concurrently when *probe*."""
-        listed = self._entries()
-        if not listed:
-            return []
-        from concurrent.futures import ThreadPoolExecutor
+    def rows(
+        self,
+        *,
+        probe: bool = True,
+        timeout: float = 4.0,
+        entries: Optional[list[dict]] = None,
+    ) -> list[dict]:
+        """A row per entry; url entries probed concurrently when *probe*.
 
-        with ThreadPoolExecutor(max_workers=min(8, len(listed))) as pool:
-            return list(
-                pool.map(lambda e: self._row(e, probe=probe, timeout=timeout), listed)
-            )
+        *entries*, when the caller already listed the registry (see
+        :meth:`refresh`), skips listing it again.
+        """
+        if entries is None:
+            entries = self._entries()
+        return _algorithms.sweep(
+            entries, lambda e: self._row(e, probe=probe, timeout=timeout)
+        )
 
     def refresh(self) -> list[dict]:
         """Install and describe every new or edited script entry, in the
         background; answer the rows."""
-        self._entries()
+        listed = self._entries()
         with self._lock:
             scripts = list(self._scripts.values())
         for script in scripts:
             script.start_install(retry_failed=False)
-        return self.rows()
+        return self.rows(entries=listed)
 
     def _find(self, name: str) -> tuple[Optional[dict], Optional[ScriptEntry]]:
         entry = next((e for e in self._entries() if e["name"] == name), None)

@@ -301,16 +301,21 @@ def status(entry: dict, *, timeout: float = _DEFAULT_TIMEOUT) -> dict:
     return row(entry, **probe(entry["url"], timeout=timeout))
 
 
+def sweep(items: list, fn, *, max_workers: int = 8) -> list:
+    """Apply *fn* to every item in *items* concurrently, in a pool sized to the
+    batch (never more than *max_workers*). Empty *items* skips the pool."""
+    if not items:
+        return []
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(items))) as pool:
+        return list(pool.map(fn, items))
+
+
 def statuses(*, timeout: float = _DEFAULT_TIMEOUT) -> list[dict]:
     """A row for every registry entry, url entries probed concurrently.
 
     A script entry reads ``unknown`` here: its state is the control's, which
     runs it.
     """
-    listed = entries()
-    if not listed:
-        return []
-    from concurrent.futures import ThreadPoolExecutor
-
-    with ThreadPoolExecutor(max_workers=min(8, len(listed))) as pool:
-        return list(pool.map(lambda e: status(e, timeout=timeout), listed))
+    return sweep(entries(), lambda e: status(e, timeout=timeout))

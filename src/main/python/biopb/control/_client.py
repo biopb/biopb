@@ -19,6 +19,24 @@ def base_url() -> str:
     return control_base_url()
 
 
+def _request(method: str, path: str, params: dict, timeout: float) -> dict:
+    """The control's JSON answer to *method* ``path`` with *params* as its query
+    string; raises ``OSError`` when no control answers and
+    ``urllib.error.HTTPError`` when it refuses."""
+    token = _data_plane.resolve_token()
+    query = f"?{urlencode(params)}" if params else ""
+    req = urllib.request.Request(
+        f"{base_url()}{path}{query}",
+        data=b"" if method == "POST" else None,
+        method=method,
+        # The token also clears the control's CSRF gate on a POST. Without one
+        # (a tokenless local control) the gate falls back to a loopback Host.
+        headers={"X-Biopb-Token": token} if token else {},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode())
+
+
 def _answer(url: Optional[str]) -> Optional[dict]:
     """``{"url", "token"}`` for a plane the control named, else ``None``.
 
@@ -50,18 +68,10 @@ def ensure_data_plane(timeout: float = 60.0) -> Optional[dict]:
     rather than as a timeout that looks like no control at all. ``None`` when
     no control answers or it could not bring the plane up.
     """
-    token = _data_plane.resolve_token()
-    req = urllib.request.Request(
-        f"{base_url()}/api/data_plane/ensure?{urlencode({'client_timeout': timeout})}",
-        data=b"",
-        method="POST",
-        # The token also clears the control's CSRF gate on this POST. Without one
-        # (a tokenless local control) the gate falls back to a loopback Host.
-        headers={"X-Biopb-Token": token} if token else {},
-    )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            payload = json.loads(resp.read().decode())
+        payload = _request(
+            "POST", "/api/data_plane/ensure", {"client_timeout": timeout}, timeout
+        )
     except Exception as exc:  # noqa: BLE001 - no answer is None, not an error
         logger.info("control ensure_data_plane failed: %s", exc)
         return None

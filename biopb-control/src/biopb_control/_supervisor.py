@@ -62,6 +62,38 @@ _BACKOFF_SCHEDULE = (0.0, 1.0, 2.0, 4.0, 8.0, 15.0, 30.0)
 _HEALTHY_RESET_SECONDS = 60.0
 
 
+def tail_file(path: Path, max_lines: int, max_bytes: int) -> Tuple[list[str], bool]:
+    """Return ``(lines, truncated)`` for the tail of *path*.
+
+    Reads at most the final *max_bytes* and returns at most *max_lines* lines from
+    the end. ``truncated`` is True when older content exists that was not returned
+    (the byte window didn't reach the file start, or the line cap trimmed more).
+
+    A supervised child (and its native libraries) emits arbitrary bytes, so decode
+    UTF-8 with ``errors="replace"`` rather than risk a decode error. When the byte
+    window starts mid-file its first line is almost certainly a fragment, so drop
+    it. Missing files return no lines rather than raising.
+    """
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return [], False
+    read_bytes = min(size, max_bytes)
+    with path.open("rb") as f:
+        if read_bytes < size:
+            f.seek(size - read_bytes)
+        data = f.read(read_bytes)
+    partial = read_bytes < size
+    lines = data.decode("utf-8", "replace").splitlines()
+    if partial and lines:
+        lines = lines[1:]  # drop the leading fragment
+    truncated = partial
+    if len(lines) > max_lines:
+        lines = lines[-max_lines:]
+        truncated = True
+    return lines, truncated
+
+
 @dataclass
 class ServiceSpec:
     """How to run one supervised child: its command line, its environment, the
@@ -101,6 +133,14 @@ class ServiceProcess:
     def _service_spec(self) -> ServiceSpec:
         raise NotImplementedError
 
+    def _probe_target(self) -> Tuple[str, int]:
+        """``(host, port)`` for the liveness probe. Derived from
+        :meth:`_service_spec` by default; a subclass whose bind is fixed
+        independent of the rest of its spec (argv, env) should override this so
+        a probe -- run every supervision tick -- does not rebuild them."""
+        spec = self._service_spec()
+        return spec.host, spec.port
+
     @property
     def log_path(self) -> Optional[Path]:
         """The file the child's stdout/stderr is appended to, or ``None`` when
@@ -109,9 +149,9 @@ class ServiceProcess:
         return Path(p) if p is not None else None
 
     def _port_up(self, timeout: float = 0.5) -> bool:
-        spec = self._service_spec()
+        host, port = self._probe_target()
         try:
-            with socket.create_connection((spec.host, spec.port), timeout=timeout):
+            with socket.create_connection((host, port), timeout=timeout):
                 return True
         except OSError:
             return False
@@ -398,6 +438,9 @@ class DataPlaneSupervisor(ServiceProcess):
             log_path=self._spec.server_log,
             label="data plane",
         )
+
+    def _probe_target(self) -> Tuple[str, int]:
+        return self._probe_host, self._spec.grpc_port
 
     # --- liveness / argv / env ------------------------------------------- #
 

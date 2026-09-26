@@ -10,29 +10,9 @@ from __future__ import annotations
 
 import json
 import urllib.error
-import urllib.request
 from typing import Optional
-from urllib.parse import urlencode
 
-from . import _data_plane
-from ._endpoints import control_base_url
-
-
-def _request(method: str, path: str, params: dict, timeout: float):
-    """The control's JSON answer; raises ``OSError`` when no control answers
-    and ``urllib.error.HTTPError`` when it refuses."""
-    token = _data_plane.resolve_token()
-    query = f"?{urlencode(params)}" if params else ""
-    req = urllib.request.Request(
-        f"{control_base_url()}{path}{query}",
-        data=b"" if method == "POST" else None,
-        method=method,
-        # The token also clears the control's CSRF gate on a POST. Without one
-        # (a tokenless local control) the gate falls back to a loopback Host.
-        headers={"X-Biopb-Token": token} if token else {},
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode())
+from ._client import _request
 
 
 def _listing(method: str, path: str, timeout: float) -> Optional[list[dict]]:

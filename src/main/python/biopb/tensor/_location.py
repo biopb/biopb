@@ -29,6 +29,10 @@ from urllib.parse import urlsplit
 _DEFAULT_SCHEME = "grpc+tcp"
 _SCHEME_ALIASES = {"grpc": "grpc+tcp", "grpcs": "grpc+tls"}
 
+# Loopback spellings folded onto one host by same_location() -- unlike
+# canonical_location(), which keeps them apart (see its docstring).
+_LOOPBACK_ALIASES = frozenset({"localhost", "::1", "0.0.0.0"})
+
 
 def canonical_location(location: str) -> str:
     """The canonical spelling of *location*.
@@ -54,6 +58,29 @@ def canonical_location(location: str) -> str:
         host = f"[{host}]"
     netloc = f"{host}:{port}" if port is not None else host
     return f"{scheme}://{netloc}{parts.path.rstrip('/')}"
+
+
+def same_location(a: str, b: str) -> bool:
+    """Whether *a* and *b* name the same server, loopback aliases folded in.
+
+    For "is this already the server I'm talking to" rather than a cache key: a
+    same-machine deployment mixes ``localhost``/``127.0.0.1``/``0.0.0.0``/``::1``
+    freely, so (unlike :func:`canonical_location`) those fold onto one host here.
+    Falls back to False on anything unparseable.
+    """
+
+    def key(location: str):
+        try:
+            parts = urlsplit(canonical_location(location))
+        except ValueError:
+            return None
+        host = parts.hostname or ""
+        if host in _LOOPBACK_ALIASES:
+            host = "127.0.0.1"
+        return parts.scheme, host, parts.port
+
+    ka = key(a)
+    return ka is not None and ka == key(b)
 
 
 def location_host(location: str) -> str:

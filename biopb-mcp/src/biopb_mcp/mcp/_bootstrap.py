@@ -519,7 +519,7 @@ def _bootstrap_impl():
     from biopb.tensor import Connection
 
     from . import _jobs
-    from ._process_ops import build_ops_from_config
+    from ._process_ops import Ops, build_ops_from_config
 
     # 2. The data-plane connection, shared by the widget and the agent
     #    namespace: the widget connects it, and each agent cell reads its client.
@@ -588,7 +588,9 @@ def _bootstrap_impl():
         ops = build_ops_from_config(config, lambda: conn.client)
     except Exception:
         logger.exception("Failed to build the ops")
-        ops = {}
+        # Unbound rather than a bare {}, so callers (ops.status(), the kernel
+        # banner) see one type of `ops` regardless of which branch ran.
+        ops = Ops(lambda: conn.client)
 
     # 5. The kernel's side of the jobs: cells held for Stop, run_async tasks.
     #    install() stores the shell and clears any prior job state.
