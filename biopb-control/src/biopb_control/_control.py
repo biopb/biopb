@@ -124,7 +124,7 @@ from starlette.responses import (
 from starlette.routing import Mount, Route
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from ._algorithm_plane import AlgorithmPlane
+from ._algorithm_plane import INSTALL_TIMEOUT, AlgorithmPlane
 from ._supervisor import DataPlaneSupervisor
 
 logger = logging.getLogger(__name__)
@@ -134,6 +134,8 @@ logger = logging.getLogger(__name__)
 # out, else the client treats a working-but-slow control plane as unreachable.
 _RESPONSE_MARGIN = 5.0
 _MIN_ENSURE_WAIT = 1.0
+# An algorithm verb's wait when the client sends no ?client_timeout.
+_ALGORITHM_WAIT_DEFAULT = 60.0
 
 # Response headers we must not copy verbatim from the upstream tensor server:
 # hop-by-hop headers and framing that StreamingResponse re-derives itself.
@@ -557,6 +559,21 @@ def _bounded_ensure_wait(ensure_timeout: float, client_timeout: float) -> float:
     if client_timeout <= 0:
         return ensure_timeout
     return max(_MIN_ENSURE_WAIT, min(ensure_timeout, client_timeout - _RESPONSE_MARGIN))
+
+
+def _algorithm_wait(client_timeout: float) -> float:
+    """How long an algorithm entry's ``ensure``/``restart`` waits.
+
+    Its ensure may first install the entry's environment, so the data plane's
+    ``ensure_timeout`` does not bound it: the client's timeout does (less the
+    margin), capped by how long an install may take. Without a client hint it
+    waits ``_ALGORITHM_WAIT_DEFAULT``; the row then says what is still running.
+    """
+    if client_timeout <= 0:
+        return _ALGORITHM_WAIT_DEFAULT
+    return max(
+        _MIN_ENSURE_WAIT, min(INSTALL_TIMEOUT, client_timeout - _RESPONSE_MARGIN)
+    )
 
 
 def _loopback_url(host: str, port: int, scheme: str = "http") -> str:
@@ -1256,7 +1273,7 @@ def build_app(
             client_timeout = float(request.query_params.get("client_timeout", "0"))
         except ValueError:
             client_timeout = 0.0
-        wait = _bounded_ensure_wait(ensure_timeout, client_timeout)
+        wait = _algorithm_wait(client_timeout)
         try:
             return JSONResponse(verb(name, wait))
         except KeyError:

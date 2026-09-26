@@ -378,6 +378,20 @@ def test_bounded_ensure_wait():
     assert _bounded_ensure_wait(30, 0) == 30  # no hint -> configured value
 
 
+def test_algorithm_wait_follows_the_client_not_ensure_timeout():
+    from biopb_control._algorithm_plane import INSTALL_TIMEOUT
+    from biopb_control._control import (
+        _ALGORITHM_WAIT_DEFAULT,
+        _RESPONSE_MARGIN,
+        _algorithm_wait,
+    )
+
+    assert _algorithm_wait(900) == 900 - _RESPONSE_MARGIN
+    assert _algorithm_wait(10 * INSTALL_TIMEOUT) == INSTALL_TIMEOUT
+    assert _algorithm_wait(3) == 1.0
+    assert _algorithm_wait(0) == _ALGORITHM_WAIT_DEFAULT
+
+
 def test_control_api_health_and_ensure(spec, monkeypatch):
     import json
     import urllib.request
