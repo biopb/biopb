@@ -59,6 +59,11 @@ def shrink(image: Tensor("YX")):
     return image[::2, ::2]
 
 
+@op(input="blocks", block_shape=16, dtype=np.uint8)
+def masked(image: Tensor("YX"), level: float, labels: Tensor("YX")):
+    return ((image > level) & (labels > 0)).astype(np.uint8)
+
+
 @op(input="lazy")
 def frames(movie: Tensor("TYX")):
     for t in range(movie.shape[0]):
@@ -102,6 +107,7 @@ ALL = [
     threshold,
     smooth,
     shrink,
+    masked,
     frames,
     track,
     localize,
@@ -256,6 +262,17 @@ def test_blocks_matches_the_whole_image(server):
     assert list(out.dim_labels) == ["T", "Y", "X"]
     expected = np.stack([uniform_filter(f, size=3, mode="nearest") for f in movie])
     np.testing.assert_allclose(_value(event.outputs["result"]), expected, rtol=1e-6)
+
+
+def test_blocks_passes_tensors_by_name(server):
+    image = np.random.rand(40, 37).astype(np.float32)
+    labels = np.zeros((40, 37), np.uint16)
+    labels[5:30, 10:20] = 1
+    (event,) = server.call(
+        "masked", image=_eager(image), labels=_eager(labels), level=_json(0.5)
+    )
+    expected = ((image > 0.5) & (labels > 0)).astype(np.uint8)
+    np.testing.assert_array_equal(_value(event.outputs["result"]), expected)
 
 
 def test_blocks_refuses_a_non_pixelwise_op(server):

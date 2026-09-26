@@ -551,7 +551,9 @@ def _blocks(definition: _OpDef, pixels: Dict[str, _Pixels], kwargs: Dict[str, An
 
     def apply(*blocks):
         inner = [b.reshape(b.shape[len(others) :]) for b in blocks]
-        out = np.asarray(definition.fn(*inner, **kwargs))
+        out = np.asarray(
+            definition.fn(**dict(zip(names, inner, strict=True)), **kwargs)
+        )
         if out.shape != inner[0].shape:
             raise ValueError(
                 f"input='blocks' is for pixelwise ops: a {inner[0].shape} block "
