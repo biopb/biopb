@@ -91,16 +91,13 @@ are produced.
 ## Config & data locations
 
 - Data-server config: `~/.config/biopb/biopb.json` (preserved on rerun)
-- biopb-mcp config: `~/.config/biopb/mcp-config.json` (optional; the installer
-  doesn't create it, and defaults apply when absent)
+- Algorithm registry: `~/.config/biopb/algorithms/`, one file per server. With
+  consent, a fresh install adds `cellpose.json`, the cellpose server at
+  `cellpose.biopb.org` (off-site; it logs client IPs)
 - MCP client definition: `~/.config/biopb/mcp.json`
 - Agent kernel plugins: `~/.config/biopb/kernel/` (drop a `*.py` here to add tools
   to the agent's namespace; the installer seeds a `rolling_ball.py` example there,
   never clobbering your edits)
-- Algorithm servers: `~/.config/biopb/algorithms/` (one file per server -- a
-  `<name>.py` server file the control runs under uv, or a `<name>.json` holding
-  `{"url": "grpc://host:port"}` for one running elsewhere. The installer seeds
-  nothing here; the control creates the directory on first start.)
 - Extra Python packages: `~/.config/biopb/extra-packages.txt` (see below)
 - Webapp: `~/.local/share/biopb/webapp`
 
@@ -148,7 +145,9 @@ rerun with an existing config — keeps that config untouched and asks nothing.
 It is an **upgrade** feature, not a fresh-install one: with no existing config
 the installer won't guess a data directory, so a *fresh* unattended install
 **errors out unless `BIOPB_DATA_DIR` is set** (which lets you provision a new box
-unattended on purpose). Both console front-ends
+unattended on purpose). The remote algorithm plugins stay **off** unless
+`BIOPB_REMOTE_PLUGINS=1` (consent can't be asked unattended, so the off-site
+IP-logging servers are never enabled silently). Both console front-ends
 (`install.sh`, `install.ps1`) honor these; the env vars apply to the `curl|bash`
 and `irm|iex` paths alike.
 

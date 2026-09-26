@@ -67,12 +67,12 @@ python find` before handing it to `uv tool install`.
 ## Architecture: one engine, two front-ends
 
 ```
-                 choices (keep-or-reset config)
+                 choices (plugins consent; keep-or-reset config)
                           │
    ┌──────────────────────┴───────────────────────┐
    │                                               │
 install.ps1 (console front-end)        biopb-setup.iss (Inno GUI front-end)
-   │  banner, preflight, prompts            │  keep/reset dialog
+   │  banner, preflight, prompts            │  welcome, options page, keep/reset dialog
    │  dot-sources engine, -Mode console     │  runs engine as child, -Mode gui
    └──────────────────────┬────────────────┘
                           │  calls Invoke-BiopbInstall / runs the .ps1
@@ -91,8 +91,8 @@ Both front-ends go through the same `Report-*` calls, so they can never drift on
 | File | Role |
 |---|---|
 | `install/biopb-engine.ps1` | Headless engine. Dual-use: **dot-sourced** (defines functions only — guarded by `$MyInvocation.InvocationName`) or **run directly** (executes in `-Mode gui`). |
-| `install/install.ps1` | Console front-end. Banner, preflight, then drives the engine `-Mode console` in-process and renders the summary. Never prompts for a data directory — a fresh install seeds samples; an existing config is kept untouched. |
-| `install/gui/biopb-setup.iss` | Inno Setup wizard. Always passes `-Webapp`; keep/reset dialog → `-KeepConfig` (Yes) / `-Reset` (No); runs the engine and parses its tagged stream. No data-directory page. |
+| `install/install.ps1` | Console front-end. Banner, preflight, remote-plugins consent, then drives the engine `-Mode console` in-process and renders the summary. Never prompts for a data directory — a fresh install seeds samples; an existing config is kept untouched. |
+| `install/gui/biopb-setup.iss` | Inno Setup wizard. Options page → `-Webapp`/`-NoRemotePlugins`; keep/reset dialog → `-KeepConfig` (Yes) / `-Reset` (No); runs the engine and parses its tagged stream. No data-directory page. |
 
 ## The progress protocol (the integration seam)
 
@@ -150,11 +150,12 @@ policies still require a *signed* engine — signing is the sole fix there.
 | Wizard page | Feeds | Replaces |
 |---|---|---|
 | Welcome / license | — | — |
-| Ready — keep-config dialog on leaving it *(existing config only)* | `-KeepConfig` (Yes) / `-Reset` (No) | console keep-config note |
+| Options (custom page) | `-Webapp`, `-NoRemotePlugins` | components + remote-plugins consent |
+| Keep-config dialog *(existing config only)* | `-KeepConfig` (Yes) / `-Reset` (No) | console keep-config note |
 | Progress | parses `STEP`/log records | the console `[n/7]` output |
 | Finish | `RESULT` records | the console summary |
 
-**Existing config / keep behavior.** On leaving the Ready page the wizard
+**Existing config / keep behavior.** On leaving the Options page the wizard
 checks for `%USERPROFILE%\.config\biopb\biopb.json` (a fixed path, so it catches
 both prior GUI *and* `irm|iex` console installs). If present, a Yes/No dialog offers to keep the
 current configuration — the GUI equivalent of the console/Linux "Keep my current
@@ -225,7 +226,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File install\biopb-engine.ps1 -Mo
 ```
 
 A `/DDryRun` build passes `-DryRun` to the engine (via an `#ifdef` in
-`biopb-setup.iss`); a normal build never does. Watch for: the keep/reset dialog when a config already exists (Yes
+`biopb-setup.iss`); a normal build never does. Watch for: the options page
+(remote-plugins checkbox), the keep/reset dialog when a config already exists (Yes
 → `-KeepConfig`, No → `-Reset`), the marquee bar animating, the log memo
 scrolling, and the finish page picking up the `RESULT` records.
 

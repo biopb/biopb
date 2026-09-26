@@ -72,7 +72,10 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 ; No [Components]/[Types]: component selection was removed (biopb/biopb#237) --
 ; the web interface (now carrying the server admin page) is always installed and
-; Bio-Formats is opt-in via $env:BIOPB_INSTALL_BIOFORMATS.
+; Bio-Formats is opt-in via $env:BIOPB_INSTALL_BIOFORMATS. The one remaining
+; choice (remote-plugin consent, default on) is presented on a custom page (see
+; [Code] InitializeWizard) with its description on the line beneath the checkbox,
+; matching install.sh / the console front-end.
 
 [Files]
 ; Stage the headless engine. The online model ships just this; everything else
@@ -81,6 +84,8 @@ Source: "..\biopb-engine.ps1"; DestDir: "{app}"; Flags: ignoreversion
 
 [Code]
 var
+  OptionsPage:  TWizardPage;
+  CbRemote:     TNewCheckBox;
   ProgressPage: TOutputMarqueeProgressWizardPage;
   LogMemo:      TNewMemo;
 
@@ -120,12 +125,61 @@ const
 function SendMessage(hWnd: HWND; Msg: UINT; wParam: Longint; lParam: Longint): Longint;
   external 'SendMessageW@user32.dll stdcall';
 
-procedure InitializeWizard;
+{ Add one option to the custom page: a checkbox at the current Y, then its
+  description wrapped on the line(s) directly underneath (indented under the
+  checkbox text). Advances Top past both. Returns the checkbox so the caller can
+  read .Checked later. }
+function AddOption(var Top: Integer; const Title, Desc: String; Checked: Boolean; DescHeight: Integer): TNewCheckBox;
+var
+  cb:  TNewCheckBox;
+  lbl: TNewStaticText;
 begin
+  cb := TNewCheckBox.Create(OptionsPage);
+  cb.Parent  := OptionsPage.Surface;
+  cb.Left    := 0;
+  cb.Top     := Top;
+  cb.Width   := OptionsPage.SurfaceWidth;
+  cb.Height  := ScaleY(17);
+  cb.Caption := Title;
+  cb.Checked := Checked;
+  Top := Top + cb.Height + ScaleY(2);
+
+  lbl := TNewStaticText.Create(OptionsPage);
+  lbl.Parent   := OptionsPage.Surface;
+  lbl.Left     := ScaleX(18);   { indent under the checkbox text }
+  lbl.Top      := Top;
+  lbl.Width    := OptionsPage.SurfaceWidth - ScaleX(18);
+  lbl.AutoSize := False;
+  lbl.WordWrap := True;
+  lbl.Height   := DescHeight;
+  lbl.Caption  := Desc;
+  Top := Top + DescHeight + ScaleY(12);
+
+  Result := cb;
+end;
+
+procedure InitializeWizard;
+var
+  T: Integer;
+begin
+  { Component selection is no longer offered (biopb/biopb#237): biopb-mcp, the
+    data server, and the web interface (image viewer + server admin page) are
+    always installed; Bio-Formats is opt-in only via $env:BIOPB_INSTALL_BIOFORMATS.
+    The page now carries a single privacy choice -- the remote-plugin consent --
+    with its description on the line(s) directly beneath the checkbox.
+    ASCII-only text keeps the .iss codepage-safe. }
+  OptionsPage := CreateCustomPage(wpWelcome,
+    'Remote algorithm plugins',
+    'biopb-mcp, the data server, and the web interface are always installed.');
+  T := ScaleY(4);
+  CbRemote := AddOption(T, 'Remote algorithm plugins',
+    'Use off-site servers (hosted at UConn Health) for tasks like cell segmentation. Those servers log your IP address; uncheck to keep them disabled.',
+    True, ScaleY(50));
+
   { Detect a previous install the same way the engine/console do: the config is
     at a fixed home-relative path (covers both GUI and `irm|iex` console
-    installs). If present, we offer to keep it on the way out of the Ready page
-    (see NextButtonClick); declining passes the engine -Reset, which re-wires the
+    installs). If present, we offer to keep it on the way out of this page (see
+    NextButtonClick); declining passes the engine -Reset, which re-wires the
     server to the sample bundle. No data-directory page is created -- like the
     console, the installer never asks for a microscopy folder. }
   { biopb.json is the only config format (biopb/biopb#34). }
@@ -181,6 +235,8 @@ begin
     Bio-Formats is no longer a GUI option (opt in via $env:BIOPB_INSTALL_BIOFORMATS
     before launching, or rerun the console installer). }
   Args := Args + ' -Webapp';
+  { Default ON; unchecking it disables the off-site cellpose server (IP logging). }
+  if not CbRemote.Checked then Args := Args + ' -NoRemotePlugins';
 #ifdef DryRun
   { Built with `iscc /DDryRun`: the engine walks the steps but changes nothing,
     so the whole wizard can be exercised safely. Absent in a normal build. }
@@ -339,12 +395,12 @@ end;
 function NextButtonClick(CurPageID: Integer): Boolean;
 begin
   Result := True;
-  { Leaving the Ready page with an existing config present: ask whether to keep
+  { Leaving the options page with an existing config present: ask whether to keep
     it -- the GUI equivalent of the console/Linux "Keep my current config file
     (default)" choice. Yes -> keep untouched; No -> reset to the sample images
     (the engine's -Reset re-wires the sources to the sample bundle and preserves
     your other settings). Either way we never prompt for a data folder. }
-  if (CurPageID = wpReady) and ConfigExists then
+  if (CurPageID = OptionsPage.ID) and ConfigExists then
     KeepConfig := (MsgBox(
       'An existing biopb configuration was found:' + #13#10 +
       ConfigPath + #13#10#13#10 +
