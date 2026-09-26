@@ -427,14 +427,15 @@ def _load_namespace_plugins(ip, config) -> None:
     """Load user "bring your own tool" plugins into the kernel namespace (#92).
 
     Two sources, both fail-open per unit so one bad plugin never breaks the
-    bootstrap (the ``build_ops`` / skills precedent): ``*.py`` files under
+    bootstrap (the ``build_ops`` / docs precedent): ``*.py`` files under
     ``~/.config/biopb/kernel/`` and installed ``biopb_mcp.namespace`` entry points.
     Called after the built-in handles exist (step 6) so plugins can reference them.
     Gated by ``services.namespace_enabled``.
 
     What loaded is reported to :mod:`._requires` and printed by ``server_status``,
-    so a skill's ``plugin:<name>`` is answered from the load's actual outcome
-    instead of from the presence of a file this fail-open loader may have skipped.
+    so a doc's kernel-plugin requirement is answered from the load's actual
+    outcome instead of from the presence of a file this fail-open loader may have
+    skipped.
     """
     from .._config import get_setting
     from . import _requires

@@ -8,18 +8,18 @@ whether it can be installed at all, and the two deserve different answers:
                                                   the next C-extension import
     unavailable   install time, before anything   loud, and the user sees it
 
-Damage is fatal everywhere and cannot be worked around from a skill body, so it
-is a gate. Unavailability is not that: `checklist:` informs the agent and gates
-nothing, so a missing wheel is a gap the agent names to the user and works
+Damage is fatal everywhere and cannot be worked around from a doc body, so it
+is a gate. Unavailability is not that: a Requirements line informs the agent and
+gates nothing, so a missing wheel is a gap the agent names to the user and works
 around -- with the body's fallback where there is one, and an improvised one
 otherwise. This layer therefore **reports** the platform holes rather than
 rejecting them, which is the point of running the whole grid: an author who can
-see "3 of 9, all the 3.12 cells" can decide whether the skill needs a fallback
+see "3 of 9, all the 3.12 cells" can decide whether the doc needs a fallback
 spelled out, and nobody has to find out from a user.
 
 One floor is still a gate. A package that installs on **no** supported cell is
 not a platform gap, it is a declaration nobody can ever satisfy -- the agent
-would improvise its way around the token every single time, and the catalog
+would improvise its way around the requirement every single time, and the catalog
 would be advertising a path that does not exist.
 
 **Why `uv pip compile` and not another `--dry-run`.** `--dry-run` answers for
@@ -137,22 +137,23 @@ def test_the_extractor_finds_third_party_packages(docs_dir):
     assert _declared(docs_dir) == [("needs-things", "some-package>=2.0")]
 
 
-def verdict(skill_id, requirement, unavailable) -> str | None:
+def verdict(doc_id, requirement, unavailable) -> str | None:
     """The rejection message for a package missing on *unavailable* cells, or None.
 
     Split out from the grid so the rule is testable without a resolver: what a
     coverage hole earns is the whole substance of #680, and it should not be
-    checkable only by shipping a bad skill.
+    checkable only by shipping a bad doc.
     """
     if len(unavailable) < len(PYTHONS) * len(PLATFORMS):
         return None  # a hole is reported by the caller; the agent routes around it
     return (
-        f"{skill_id} declares pkg:{requirement}, which installs on none of the "
-        f"{len(PYTHONS) * len(PLATFORMS)} supported interpreter/platform cells.\n\n"
-        "That is not a platform gap the agent can work around -- it is a token no "
-        "session will ever satisfy, so every run improvises past it while the "
-        "catalog advertises a path nobody has. Drop the dependency, or move it "
-        "behind the algorithm plane as an ops:<kind> server."
+        f"{doc_id} declares a requirement on {requirement}, which installs on "
+        f"none of the {len(PYTHONS) * len(PLATFORMS)} supported "
+        "interpreter/platform cells.\n\n"
+        "That is not a platform gap the agent can work around -- it is a "
+        "requirement no session will ever satisfy, so every run improvises past "
+        "it while the catalog advertises a path nobody has. Drop the dependency, "
+        "or move it behind the algorithm plane as an `ops` server."
     )
 
 
@@ -167,8 +168,8 @@ class TestVerdict:
 
     def test_a_platform_hole_is_reported_not_rejected(self):
         """psfmodels has no cp312 wheel, and 3.12 is what macOS and Windows users
-        get by default -- but `checklist:` informs rather than gates, so the skill
-        still ships and those sessions route around the token."""
+        get by default -- but a Requirements line informs rather than gates, so the
+        doc still ships and those sessions route around the requirement."""
         assert verdict("s", "psfmodels", self.SOME) is None
 
     def test_but_installing_nowhere_is_a_dead_declaration(self):
@@ -178,11 +179,11 @@ class TestVerdict:
 
 @pytest.mark.availability
 @pytest.mark.parametrize(
-    ("skill_id", "requirement"),
+    ("doc_id", "requirement"),
     DECLARED,
     ids=[f"{s}:{r}" for s, r in DECLARED],
 )
-def test_a_declared_package_can_be_installed_where_we_ship(skill_id, requirement):
+def test_a_declared_package_can_be_installed_where_we_ship(doc_id, requirement):
     if shutil.which("uv") is None:
         pytest.skip("uv is not on PATH")
     unavailable = {
@@ -197,8 +198,8 @@ def test_a_declared_package_can_be_installed_where_we_ship(skill_id, requirement
         # needs a fallback spelled out, and the resolver's own message is what
         # tells a missing wheel from a version conflict.
         cells = ", ".join(f"py{p} {plat}" for p, plat in sorted(unavailable))
-        print(f"\n{skill_id} · {requirement}: unavailable on {len(unavailable)}/9")
+        print(f"\n{doc_id} · {requirement}: unavailable on {len(unavailable)}/9")
         print(f"  {cells}\n{next(iter(unavailable.values()))}")
 
-    if message := verdict(skill_id, requirement, unavailable):
+    if message := verdict(doc_id, requirement, unavailable):
         pytest.fail(message)

@@ -171,11 +171,11 @@ class TestSeeding:
         assert plug.DEFAULT_RADIUS == 50.0
         assert ip.user_ns["np"] is np
 
-    def test_a_skill_can_name_the_seeded_plugin_by_file_stem(self, tmp_path):
-        # The token↔file contract a skill author relies on: `plugin:rolling_ball`
-        # in frontmatter is answered by `rolling_ball.py` appearing in the
-        # server_status report. Since #664 the namespace agrees with that token —
-        # the stem is also the name bound in `dir()`.
+    def test_a_doc_can_name_the_seeded_plugin_by_file_stem(self, tmp_path):
+        # The name↔file contract a doc author relies on: a `rolling_ball` kernel
+        # plugin on the Requirements line is answered by `rolling_ball.py`
+        # appearing in the server_status report. Since #664 the namespace agrees
+        # with that name — the stem is also the name bound in `dir()`.
         from biopb_mcp.mcp import _bootstrap, _requires
         from biopb_mcp.plugins._seed import seed_kernel_plugins
 

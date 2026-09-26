@@ -106,9 +106,9 @@ else:
 """
 
 _STATUS_SNIPPET = """
-# This kernel's interpreter -- the one a skill's `pkg:` requirement is about, and
+# This kernel's interpreter -- the one a doc's package requirement is about, and
 # not necessarily the server process's env (the kernelspec need not be it). The
-# common such token is `pkg:biopb-mcp>=X`, how a skill says it needs a release
+# most common such requirement is `biopb-mcp>=X`, how a doc says it needs a release
 # that carries some plugin, so report that one instead of making the agent import.
 # The interpreter, and how to install into it, come from _requires (which decides
 # the command from the env's shape) rather than being composed here.
@@ -224,7 +224,7 @@ print("")
 # What the plugin loader actually loaded, which neither the kernel dir (fail-open:
 # a file that raised is on disk and not loaded) nor dir() (a file contributes its
 # function names, not its own name) can tell the agent. It reads this to resolve a
-# skill's `plugin:<name>` requirement.
+# doc's kernel-plugin requirement.
 print("## Kernel plugins")
 try:
     from biopb_mcp.mcp import _requires as _req
@@ -1295,8 +1295,8 @@ async def server_status() -> str:
     Returns CPU/memory usage (this MCP process / host), kernel liveness, and —
     queried from the kernel — its biopb-mcp/python versions, dask scheduler info,
     tensor server connectivity, viewer layer count, the available `ops`, and which
-    kernel plugins loaded. Use before heavy computation, and to resolve a skill's
-    `checklist:` list.
+    kernel plugins loaded. Use before heavy computation, and to resolve a
+    procedure doc's Requirements line.
     """
     import psutil
 

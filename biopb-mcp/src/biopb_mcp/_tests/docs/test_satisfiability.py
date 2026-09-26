@@ -1,8 +1,8 @@
-"""A skill may not declare a package that damages the environment to install.
+"""A doc may not declare a package that damages the environment to install.
 
-The rule, plainly: every `pkg:` token a shipped skill declares must install into
-a biopb environment **without moving anything already there**. A skill that
-fails this is not a skill with a caveat — it is a bug, and it should be rejected
+The rule, plainly: every package a shipped doc declares must install into
+a biopb environment **without moving anything already there**. A doc that
+fails this is not a doc with a caveat — it is a bug, and it should be rejected
 in review rather than shipped with a workaround.
 
 The failure mode is not a conflict a user would notice. It is a resolver that
@@ -21,17 +21,17 @@ mismatch — and after the `restart_kernel` that suggests, the whole session com
 back up on the numpy the tensor stack was deliberately moved off.
 
 Why this cannot be fixed in the doc body. The `kernel` doc offers the agent
-three answers to a missing `pkg:` token: the user installs it, the agent installs
-it after consent, or the skill's degraded path. The second is the harmful one,
-and a warning in one skill's prose does not make it safe — the agent is following
-a general guide, and the next skill would have to repeat the warning. Nor does
+three answers to a missing package: the user installs it, the agent installs
+it after consent, or the doc's degraded path. The second is the harmful one,
+and a warning in one doc's prose does not make it safe — the agent is following
+a general guide, and the next doc would have to repeat the warning. Nor does
 "install it in its own environment" help: the agent's only execution surface is
 the kernel's interpreter, so a package in some other venv is not importable.
 A package that needs its own environment belongs behind the algorithm plane, as
-an `ops:<kind>` server that is called rather than imported.
+an `ops` server that is called rather than imported.
 
 So this gate is unconditional. There is no allowlist and no xfail: those would
-be a place to record that a known-bad skill ships anyway, which is the outcome
+be a place to record that a known-bad doc ships anyway, which is the outcome
 the gate exists to prevent.
 
 **One question, not two.** Whether the package can be installed on this platform
@@ -144,14 +144,16 @@ def test_a_declared_package_installs_without_moving_anything(requirement):
             continue
 
     assert not moved, (
-        f"a skill declares pkg:{requirement}, and installing it would move "
-        f"packages this environment already has:\n  " + "\n  ".join(moved) + "\n\n"
+        f"a doc declares a requirement on {requirement}, and installing it "
+        f"would move packages this environment already has:\n  "
+        + "\n  ".join(moved)
+        + "\n\n"
         "The install succeeds, so the agent and the user both get this silently, "
         "under a live kernel that has already imported the old versions.\n"
         "This is not fixable with a warning in the doc body -- the kernel doc "
         "offers the agent an install-it-for-you path, and a package in a "
         "separate environment is not importable from the kernel at all.\n"
-        "Either the skill drops the dependency (use its degraded path as the "
+        "Either the doc drops the dependency (use its degraded path as the "
         "only path), or the package moves behind the algorithm plane as an "
-        "ops:<kind> server that is called rather than imported."
+        "`ops` server that is called rather than imported."
     )

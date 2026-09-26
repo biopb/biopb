@@ -8,7 +8,7 @@ Two segmentations with identical pixel Dice can differ completely in F1 once a
 merge across touching nuclei is charged as one false positive plus two false
 negatives.
 
-Delivered as a kernel plugin rather than as a snippet in the skill body because
+Delivered as a kernel plugin rather than as a snippet in the doc body because
 the matching is the part that is easy to get subtly wrong and cheap to unit-test:
 
 - **Objects are matched one-to-one by maximum total IoU** (``linear_sum_assignment``),

@@ -1352,7 +1352,7 @@ class TestServerStatus:
 
     def test_kernel_snippet_reports_ops_and_plugins(self):
         # The snippet runs *in* the kernel, so run it against a stand-in namespace:
-        # it is what an agent resolves a skill's `ops:` / `plugin:` against, and
+        # it is what an agent resolves a doc's ops / plugin requirements against,
         # every section has to survive the same exec.
         import contextlib
         import io
@@ -1378,8 +1378,8 @@ class TestServerStatus:
         assert "## Kernel plugins" in report
         assert "files: rolling_ball" in report
         assert "packages: labshop_tools" in report
-        # `pkg:biopb-mcp>=X` (a skill needing a release-carried plugin) is
-        # answered here, from the kernel's own interpreter, not by an import.
+        # A `biopb-mcp>=X` requirement (a doc needing a release-carried plugin)
+        # is answered here, from the kernel's own interpreter, not by an import.
         import biopb_mcp
 
         assert "biopb-mcp: " + biopb_mcp.__version__ in report

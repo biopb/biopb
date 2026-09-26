@@ -70,7 +70,7 @@ ENV_GUARD_MARKERS = "BIOPB_GUARD_MARKERS"
 #: the tolerances, the persona's facts) or the doc an ablated arm is supposed to
 #: lack. Both have happened: a measured `skill+asked` arm reached its procedure
 #: by walking the installed package and opening
-#: `mcp/_skills_data/drift-correction.md`.
+#: `mcp/_skills_data/drift-correction.md` (that tree is `mcp/_docs_data/` now).
 #:
 #: Recording rather than refusing, on purpose. The agent is curious, not
 #: adversarial, and it says what it did in the trace; what the layer actually
