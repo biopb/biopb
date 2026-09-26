@@ -13,8 +13,8 @@ license = "MIT"
 # The core serves inline pixels: enough for a server file whose inputs and
 # results fit in a message. Lazy input and a plane sink need [lazy].
 dependencies = [
-  # The Ops protocol.
-  "biopb >= 0.11.0rc4",
+  # The Ops protocol; .dev0 admits a dev build before the v0.11.0rc4 tag.
+  "biopb >= 0.11.0rc4.dev0",
   "grpcio",
   "grpcio-health-checking",
   "protobuf",
