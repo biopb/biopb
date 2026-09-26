@@ -21,10 +21,9 @@ same port**, and routes by namespace so no two upstreams share a path prefix:
                                      dashboard polls).
 - ``GET  /api/sessions``          -> the live MCP sessions from the registry, each
                                      with its ``/session/<id>/observe`` link.
-- ``POST /api/sessions/new``      -> launch an agentless ``biopb mcp view``
-                                     session on this machine's display. Refused
-                                     unless this control is loopback-bound and
-                                     has a display of its own; the child is
+- ``POST /api/sessions/new``      -> launch an agentless session on this
+                                     machine; its config decides whether it
+                                     gets a napari viewer. The child is
                                      detached and self-registering, so the
                                      control launches it without owning it.
 - ``GET  /`` (and every other non-API, non-proxy GET) -> the built ``web/``
@@ -627,7 +626,7 @@ async def _probe_session(client: httpx.AsyncClient, rec: dict) -> dict:
     The two booleans come off the same response rather than extra requests, and
     answer different questions. ``chat_enabled`` says what that session's page
     leads with, which is how the dashboard labels its link. ``agentless`` says
-    who owns the reap — only a ``biopb mcp view`` viewer ends itself, a
+    who owns the reap — only an agentless session ends itself, a
     shim-owned child is its shim's to reap — which is how the dashboard decides
     whether to offer a stop. Both absent on an older child, which reads as
     False: an observe link and no stop button, the behaviour that predates them.
@@ -650,39 +649,35 @@ async def _probe_session(client: httpx.AsyncClient, rec: dict) -> dict:
         return dict(_PROBE_UNKNOWN)
 
 
-# --- launching a viewer session ------------------------------------------- #
+# --- launching a session ---------------------------------------------------- #
 #
 # Invariant I1 (ARCHITECTURE.md) says the control observes sessions and never
 # spawns them, and its reason is a *display* one: a session spawned from the
 # control's frozen environment would put the agent's napari viewer somewhere the
-# user is not (biopb/biopb-mcp#98). That reason covers a session serving an MCP
-# client — whose spawner is that client's shim anyway — but not an agentless
-# `biopb mcp view` viewer, whose only natural spawner is the person at the
-# machine, and whose only way to exist until now was a terminal command. So the
-# control may *launch* one, under two conditions that keep #98 shut:
+# user is not (biopb/biopb-mcp#98). That covers a session serving an MCP client,
+# whose spawner is that client's shim anyway. It does not cover the session the
+# dashboard's "new session" opens: an agentless one, driven by the person at the
+# dashboard through its chat pane or a Jupyter client, and useful with no
+# viewer at all. Whether it gets one is its own config's call, made the way
+# every session makes it -- viewer.enabled, napari installed, a display -- and a
+# session that cannot have one runs without it rather than failing.
 #
-#   * it refuses unless it could plausibly reach the user's screen
-#     (:func:`_session_launch_gate`), and
-#   * it launches `--view` specifically, never a plain http session. A non-view
-#     session that cannot reach a display quietly runs without a viewer (or, if
-#     configured, on a virtual display nobody sees) — #98 exactly. `--view`
-#     refuses instead, and opens a window even where `viewer.enabled` is off.
-#
-# What it does not do is own the result: the child is detached, self-registers,
-# and self-de-registers, so the *registry* still only ever observes, and a
-# control restart does not close the user's viewer.
+# What the control does not do is own the result: the child is detached,
+# self-registers, and self-de-registers, so the *registry* still only ever
+# observes, and a control restart does not end the user's session.
 
-# How long POST /api/sessions/new waits for a launched viewer to publish itself.
-# Generous because `--view` starts the kernel and opens the napari window
-# *before* it registers, so this covers a cold Qt/napari import and not just the
-# http stack the stdio shim waits on. Expiring is not a failure — the child is
-# still coming up and the dashboard's own poll picks it up when it lands.
-_VIEWER_START_TIMEOUT = 150.0
-_VIEWER_POLL_INTERVAL = 0.25
+# How long POST /api/sessions/new waits for a launched session to publish
+# itself. Generous because the session starts its kernel -- and a napari window
+# where it has one -- *before* it registers, so this covers a cold Qt/napari
+# import and not just the http stack the stdio shim waits on. Expiring is not a
+# failure: the child is still coming up and the dashboard's own poll picks it up
+# when it lands.
+_SESSION_START_TIMEOUT = 150.0
+_SESSION_POLL_INTERVAL = 0.25
 
-# Characters of this launch's own output echoed back when the viewer dies before
-# registering. That tail is the whole diagnosis (a dead display, a broken
-# install) and the only one the dashboard can show.
+# Characters of this launch's own output echoed back when the session dies
+# before registering. That tail is the whole diagnosis (a broken install, a bad
+# config) and the only one the dashboard can show.
 _VIEWER_LOG_TAIL = 2000
 
 # How many past launches' logs to keep. Matches the shim's session-log retention
@@ -692,65 +687,31 @@ _VIEWER_LOG_KEEP = 5
 
 # Cap on same-second name collisions before giving up on a log for this launch.
 # Two dashboard launches inside one second is already a double-click; a hundred
-# is a bug, and a viewer that starts without a log beats one that does not start.
+# is a bug, and a session that starts without a log beats one that does not.
 _VIEWER_LOG_ATTEMPTS = 100
 
 
-def _display_available() -> bool:
-    """Whether this process could put a window on the user's screen.
+def _session_argv() -> list[str]:
+    """The command that starts an agentless session.
 
-    macOS and Windows always have a window server; on Linux it takes an X11 or
-    Wayland session in *this* process's environment, because that is what a
-    launched child inherits. A duplicate of biopb-mcp's ``_has_display`` rather
-    than a call into it: the control may not import biopb-mcp (I2).
-
-    Only ever used to decide whether to *offer* a launch. A set-but-dead
-    ``DISPLAY`` (a control that outlived the login session that started it) is
-    not catchable this cheaply and passes — which is safe, because the child
-    re-checks, and fails and exits without registering rather than rendering
-    somewhere invisible.
+    A plain http session on ``--port 0``, which is what makes it agentless and
+    self-publishing (N of them never collide on the configured MCP port), with
+    its kernel started before it publishes itself so it is ready to use. Run
+    as a module of *this* interpreter -- the supervisor's idiom for the data
+    plane -- so it resolves through the environment the control was installed
+    into and needs no console script on PATH. Importing nothing of it here
+    keeps I2.
     """
-    if sys.platform == "darwin" or os.name == "nt":
-        return True
-    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
-
-
-def _session_launch_gate(loopback_bound: bool) -> tuple[bool, str | None]:
-    """Whether this control may launch a viewer, and if not, why not.
-
-    Both halves are properties of this process — its bind and its environment —
-    so this is settled once at startup, not per request.
-
-    ``loopback_bound`` is the same bit that gates the chat proxy, and it is
-    required here for the same
-    kind of reason: a remote browser cannot see a napari window that opens on
-    the server. The message is returned rather than logged because the dashboard
-    shows it in place of the button — a missing control with no explanation is
-    the thing this is meant to avoid.
-    """
-    if not loopback_bound:
-        return False, (
-            "this control is not loopback-bound, so a viewer it started would "
-            "open on the server's display, not yours"
-        )
-    if not _display_available():
-        return False, (
-            "no display is available to this control plane "
-            "($DISPLAY/$WAYLAND_DISPLAY are unset); start it from a desktop "
-            "session, or run `biopb mcp view` in a terminal that has one"
-        )
-    return True, None
-
-
-def _viewer_argv() -> list[str]:
-    """The command that starts an agentless viewer session.
-
-    ``--port 0`` so N viewers never collide on the configured MCP port. Run as a
-    module of *this* interpreter — the supervisor's idiom for the data plane —
-    so it resolves through the environment the control was installed into and
-    needs no console script on PATH. Importing nothing of it here keeps I2.
-    """
-    return [sys.executable, "-m", "biopb_mcp.mcp", "--view", "--port", "0"]
+    return [
+        sys.executable,
+        "-m",
+        "biopb_mcp.mcp",
+        "--transport",
+        "http",
+        "--port",
+        "0",
+        "--start-kernel",
+    ]
 
 
 def _prune_viewer_logs(log_dir, keep: int) -> None:
@@ -829,23 +790,23 @@ def _viewer_log_tail(path) -> str:
 
 
 def _is_our_launch(rec: dict, launch_token: str) -> bool:
-    """Whether session record ``rec`` is the viewer this launch just spawned.
+    """Whether session record ``rec`` is the session this launch just spawned.
 
     biopb-mcp and biopb-control are never mismatched -- they read the same
-    ``release-v*`` tag -- so every viewer this control
+    ``release-v*`` tag -- so every session this control
     can launch echoes the token; there is no older biopb-mcp to fall back to a
     pid match for.
     """
     return rec.get(_locations.LAUNCH_TOKEN_FIELD) == launch_token
 
 
-def _launch_viewer(timeout: float) -> dict:
-    """Start an agentless viewer session; wait for it to publish itself.
+def _launch_session(timeout: float) -> dict:
+    """Start an agentless session; wait for it to publish itself.
 
-    Registration is the readiness signal, and it is an exact one: ``--view``
-    runs its eager ``host.ensure_started()`` *before* ``_register_session``
-    (biopb-mcp ``mcp/__main__.py``), so a record appearing means a napari window
-    really opened, and a child that dies first never registers. The record is
+    Registration is the readiness signal: ``--start-kernel`` runs
+    ``host.ensure_started()`` *before* ``_register_session`` (biopb-mcp
+    ``mcp/__main__.py``), so a record appearing means the kernel -- and any
+    napari window -- came up, and a child that dies first never registers. The record is
     matched on a per-launch token we hand the child in its environment
     (:data:`biopb._locations.MCP_LAUNCH_TOKEN_ENV`), so a session someone else
     starts concurrently is never mistaken for this one.
@@ -853,26 +814,26 @@ def _launch_viewer(timeout: float) -> dict:
     The token replaced a pid match, which looked exact and was not: on Windows a
     venv's ``Scripts/python.exe`` is frequently a *trampoline* (uv's, and pip's
     console-script launchers) that re-spawns the real interpreter and waits on
-    it, so ``proc.pid`` is the stub and the pid the viewer registers is its own.
+    it, so ``proc.pid`` is the stub and the pid the session registers is its own.
     They never matched, and every dashboard launch on such an install waited out
     the full timeout over a window that had been open for seconds — then, if the
     user closed the session inside that window, reported the trampoline's
     forwarded exit as "exited before it opened" (biopb#1084).
 
     Detached (:func:`detach_kwargs`) and then forgotten: the ``Popen`` handle is
-    held only long enough to notice an early exit, never to reap or restart. A
-    viewer is the user's window, and a control restart must not close it.
+    held only long enough to notice an early exit, never to reap or restart. The
+    session is the user's, and a control restart must not end it.
 
     Returns ``{"state": "started"|"starting"|"failed", ...}``; only ``failed``
     carries ``error`` and ``log``.
     """
     log_fh, log_path = _open_viewer_log()
-    argv = _viewer_argv()
-    logger.info("Launching viewer session: %s (log: %s)", " ".join(argv), log_path)
+    argv = _session_argv()
+    logger.info("Launching session: %s (log: %s)", " ".join(argv), log_path)
     # The environment is inherited: it carries the DISPLAY/XAUTHORITY/
     # WAYLAND_DISPLAY (or the Aqua session, or the Windows station) that decides
-    # where the window lands. That inheritance is the whole risk #98 named and
-    # the whole reason for the gate above. Two additions ride on top of it: the
+    # whether the session can have a window, and where. Two additions ride on
+    # top of it: the
     # per-launch token we recognise the child's registration by, and where its
     # own output went, so `server_status` can name the file rather than guessing
     # the canonical one -- the same thing the shim does for its child.
@@ -889,7 +850,7 @@ def _launch_viewer(timeout: float) -> dict:
             **detach_kwargs(),
         )
     except OSError as exc:
-        logger.exception("Could not launch a viewer session")
+        logger.exception("Could not launch a session")
         return {"state": "failed", "error": str(exc), "log": "", "log_path": None}
     finally:
         if log_fh is not None:
@@ -901,10 +862,8 @@ def _launch_viewer(timeout: float) -> dict:
             session_id = rec.get("session_id")
             if session_id and _is_our_launch(rec, launch_token):
                 # The record's pid, not ours: behind a trampoline the process we
-                # spawned is a stub and the viewer is the pid it published.
-                logger.info(
-                    "Viewer session %s is up (pid %s)", session_id, rec.get("pid")
-                )
+                # spawned is a stub and the session is the pid it published.
+                logger.info("Session %s is up (pid %s)", session_id, rec.get("pid"))
                 return {
                     "state": "started",
                     "session_id": session_id,
@@ -912,10 +871,10 @@ def _launch_viewer(timeout: float) -> dict:
                 }
         code = proc.poll()
         if code is not None:
-            logger.error("Viewer session exited with code %s before starting", code)
+            logger.error("Session exited with code %s before starting", code)
             return {
                 "state": "failed",
-                "error": f"the viewer exited with code {code} before it opened",
+                "error": f"the session exited with code {code} before it started",
                 "log": _viewer_log_tail(log_path) if log_path else "",
                 # Named so a tail that was truncated, or empty because no log
                 # could be opened, still leads somewhere.
@@ -925,12 +884,12 @@ def _launch_viewer(timeout: float) -> dict:
             # Still alive, just slow (a cold napari import on a loaded box). Say
             # so instead of failing: the dashboard polls /api/sessions anyway and
             # will show it the moment it registers.
-            logger.info("Viewer session still starting after %.0fs", timeout)
+            logger.info("Session still starting after %.0fs", timeout)
             return {
                 "state": "starting",
                 "log_path": str(log_path) if log_path else None,
             }
-        time.sleep(_VIEWER_POLL_INTERVAL)
+        time.sleep(_SESSION_POLL_INTERVAL)
 
 
 def build_app(
@@ -971,10 +930,6 @@ def build_app(
     nothing. It is normalized here, the single consumer.
     """
     session_roots = _session_proxy_roots(loopback_bound)
-    # Whether this control may launch a viewer session for the dashboard, and
-    # the sentence explaining it when it may not (both settled here: they read
-    # this process's bind and environment, neither of which changes).
-    can_start_session, start_session_blocked = _session_launch_gate(loopback_bound)
     url_prefix = normalize_url_prefix(url_prefix)
 
     # The built SPA bundle the control serves at its root (None / missing ->
@@ -1167,18 +1122,12 @@ def build_app(
         # __version__` only works while those two stay in that order.
         from . import __version__
 
-        # `can_start_session` rides here (not /health) because the button it
-        # gates lives on the token-gated dashboard, and the reason rides with it
-        # so the page can say *why* there is no button instead of just not
-        # having one.
         return JSONResponse(
             {
                 "control": "ok",
                 "version": __version__,
                 "data_plane": supervisor.snapshot(),
                 "sessions": len(_sessions.list_sessions()),
-                "can_start_session": can_start_session,
-                "start_session_blocked": start_session_blocked,
             }
         )
 
@@ -1202,7 +1151,7 @@ def build_app(
                 "observe_url": f"/session/{rec['session_id']}/observe",
                 "kernel": probe["kernel"],
                 # Whether that page will lead with the chat client: the child
-                # mounts it (only a `biopb mcp view` viewer does) AND this
+                # mounts it (only an agentless session does) AND this
                 # control will proxy /chat/*. Both halves, as ObservePage needs
                 # both — answered here so the dashboard needs no second probe.
                 "chat": probe["chat"] and loopback_bound,
@@ -1217,23 +1166,18 @@ def build_app(
         return JSONResponse({"sessions": sessions})
 
     def api_session_new(request: Request) -> JSONResponse:
-        # Launch an agentless viewer on this machine's display. Sync: it spawns
-        # and then blocks polling the registry, so Starlette runs it in the
-        # threadpool. Gated at startup rather than here (nothing it reads can
-        # change), and 409 rather than 403 — the request is fine, this
-        # deployment just cannot serve it.
-        if not can_start_session:
-            return JSONResponse({"error": start_session_blocked}, status_code=409)
+        # Launch an agentless session on this machine. Sync: it spawns and then
+        # blocks polling the registry, so Starlette runs it in the threadpool.
         # The client passes ?client_timeout=<its HTTP timeout>; bound our wait
         # below it so a slow-but-working launch comes back as "starting" rather
-        # than as a browser-side timeout with a viewer still coming up behind it.
+        # than as a browser-side timeout with a session still coming up behind it.
         try:
             client_timeout = float(request.query_params.get("client_timeout", "0"))
         except ValueError:
             client_timeout = 0.0
-        wait = _bounded_ensure_wait(_VIEWER_START_TIMEOUT, client_timeout)
+        wait = _bounded_ensure_wait(_SESSION_START_TIMEOUT, client_timeout)
         try:
-            return JSONResponse(_launch_viewer(wait))
+            return JSONResponse(_launch_session(wait))
         except Exception as exc:  # noqa: BLE001 - report, never crash the handler
             logger.exception("session launch failed")
             return JSONResponse({"error": str(exc)}, status_code=500)
