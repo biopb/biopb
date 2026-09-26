@@ -45,10 +45,10 @@ where it was missed, and keeps lineage where cells divide.
 ## Steps
 
 1. **Check the requirements** *(blocking)*. Resolve the Requirements line against
-   `server_status`; [[requirements]] covers a gap. Read the
-   `pkg:laptrack` version with `importlib.metadata.version("laptrack")`, not
-   `laptrack.__version__` — the attribute reads `0.17.0` inside the `0.17.1`
-   distribution, so an import-time check calls a correct install too old.
+   `server_status`; [[requirements]] covers a gap. Read the `laptrack` version
+   with `importlib.metadata.version("laptrack")`, not `laptrack.__version__` —
+   the attribute reads `0.17.0` inside the `0.17.1` distribution, so an
+   import-time check calls a correct install too old.
 
    Without `laptrack`, the degraded path is a global assignment per frame pair
    (`scipy.optimize.linear_sum_assignment`, `MAX_STEP_PX` the admissible cost) —

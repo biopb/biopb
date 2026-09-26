@@ -19,9 +19,8 @@ Conventions:
   by the loader — use it for notes/helpers, not agent-visible tools.
 - Name the file what you want the agent to type. A file that would shadow a
   built-in handle (``viewer.py``, ``client.py``, ``np.py``, ``da.py``, ``ops.py``)
-  is skipped with a warning; nothing else is reserved. The stem is also the token
-  a skill's ``plugin:<name>`` requirement names, and what ``server_status``
-  reports.
+  is skipped with a warning; nothing else is reserved. The stem is also the name
+  a doc's kernel-plugin requirement names, and what ``server_status`` reports.
 - ``__all__`` is worth declaring: it is what ``from <plugin> import *`` and
   tooling read.
 - The module docstring's first line is the summary shown in the control

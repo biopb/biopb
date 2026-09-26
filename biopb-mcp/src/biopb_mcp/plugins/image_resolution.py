@@ -29,7 +29,7 @@ decorrelation reports **0.11x**, worse than the 0.52x a naive random FRC split
 gives. Merging repeat blinks first does not rescue it (0.08x). Use ``frc`` on
 localizations, always.
 
-Delivered as a kernel plugin rather than as a snippet in a skill body for the same
+Delivered as a kernel plugin rather than as a snippet in a doc body for the same
 reason ``segmentation_qc`` is: the arithmetic is short but wrong in ways that are
 invisible in the output. Every one of these changes the reported number by tens of
 percent and none of them changes how the answer *looks*:

@@ -44,7 +44,7 @@ chromatic error that was not there.
 ## Steps
 
 1. **Check the requirements** *(blocking)*. Resolve the Requirements line against
-   `server_status`, and `import pystackreg` for the `pkg:` token —
+   `server_status`, and `import pystackreg` for the package —
    [[requirements]] covers a gap.
 
    Without `pystackreg`, the degraded path is `skimage.registration.

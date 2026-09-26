@@ -103,7 +103,7 @@ turns over.
    later as `FailedEstimationAccessError: FailedEstimation is not callable`.
 
 4. **Fit direct-to-reference, and fall back to the neighbour when the inliers
-   run out.** This is the decision the whole skill exists for:
+   run out.** This is the decision this whole procedure exists for:
 
    ```python
    feats = [describe(s) for s in STACK]

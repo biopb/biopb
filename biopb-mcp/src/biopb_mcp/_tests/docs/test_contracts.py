@@ -1,11 +1,11 @@
-"""A skill body is an un-versioned assertion about someone else's API.
+"""A doc body is an un-versioned assertion about someone else's API.
 
 `_tests/docs/README.md`. The satisfiability gate next door answers "may this
 package be installed at all"; this answers the two questions after it — "does it
 import once installed" (#670: `stardist` resolves clean and imports nothing,
 because its TensorFlow dependency hides under an extra) and "does the surface the
-body quotes still look like that". All three have to be true before a `pkg:`
-token is honest.
+body quotes still look like that". All three have to be true before a package
+requirement is honest.
 
 The layer exists because of what has actually broken. `m2stitch.stitch_images`
 defaults `row_col_transpose=True` and swaps rows and cols for you, so a body that
@@ -15,19 +15,19 @@ default in a library nobody in this repo owns.
 
 It went unmanned once already: the original module was written entirely for
 `flatfield-and-stitch-tiles` and was deleted with it in #667, leaving §4 with the
-note "returns with the first skill whose package passes §4a". That is
+note "returns with the first doc whose package passes §4a". That is
 `drift-correction`. To stop the same thing happening silently a second time,
-`test_every_declared_package_is_covered_here` fails when a shipped skill declares
+`test_every_declared_package_is_covered_here` fails when a shipped doc declares
 a third-party package this module says nothing about -- the same shape as the
 phrasing-table check in test_retrieval.py.
 
-**When these run, and why not more often.** `.github/workflows/skill-contracts.yaml`,
-on pull requests that touch a skill file or this module -- not on every PR and
+**When these run, and why not more often.** `.github/workflows/doc-contracts.yaml`,
+on pull requests that touch a doc file or this module -- not on every PR and
 not on a schedule.
 
-The trigger follows the risk. A skill declares a *bounded* package range
+The trigger follows the risk. A doc declares a *bounded* package range
 (`~=`, so a floor plus an upper bound at the next minor), which means the API
-these assertions pin cannot move underneath a shipped skill: what a user
+these assertions pin cannot move underneath a shipped doc: what a user
 resolves is inside the range the assertions were proved against. Upstream
 releasing a new minor is therefore not an event this layer needs to hear about,
 which rules out a cron.
@@ -41,16 +41,17 @@ excludes what every other interpreter actually installs. `~=3.4` is the
 narrowest range that is true everywhere, and the assertions below are proved
 against both ends of it. A package whose minor version tracks the interpreter
 cannot be pinned like one whose does not. What remains is our own editing -- a body rewritten to
-pass `tmats` positionally, a new skill written against an API nobody ran -- and
+pass `tmats` positionally, a new doc written against an API nobody ran -- and
 that is change-triggered, so it belongs on the PR that does it.
 
 A package going stale inside its own range is caught elsewhere, by the
-satisfiability gate: it resolves every declared token on every matrix cell, so a
+satisfiability gate: it resolves every declared package on every matrix cell,
+so a
 range that stops installing fails there rather than here.
 
 Each package is installed into its **own ephemeral env** by that workflow, never
-into the shared test env. Two skills' packages are then never resolved together,
-so a future pair that cannot co-exist costs neither skill its contract test --
+into the shared test env. Two docs' packages are then never resolved together,
+so a future pair that cannot co-exist costs neither doc its contract test --
 and no unrelated PR pays for a dependency it does not use.
 """
 
@@ -201,7 +202,7 @@ def test_the_installed_version_is_inside_every_declared_range(declared):
 
 # --- pystackreg, for drift-correction -------------------------------------
 #
-# Guarded per-package, not at module scope: skill_contracts.py runs this module
+# Guarded per-package, not at module scope: doc_contracts.py runs this module
 # once per declared package, so in another package's env pystackreg is
 # legitimately absent and only its own assertions should skip. A module-level
 # importorskip would take the whole file down with it, including the checks
@@ -215,7 +216,7 @@ def StackReg():
 
 @pytest.fixture(scope="module")
 def drifting_movie():
-    """A (T, Y, X) movie with a known per-frame shift -- the shape the skill's
+    """A (T, Y, X) movie with a known per-frame shift -- the shape the doc's
     `MOVIE` parameter describes."""
     rng = np.random.default_rng(0)
     img = 100 + 3000 * ndimage.gaussian_filter(
@@ -299,9 +300,9 @@ def test_transform_stack_returns_float64(StackReg, drifting_movie):
 # defaults rather than about arity, because that is where this library's
 # surface is sharp: a wrong default here does not raise, it returns tracks.
 #
-# This skill ships only because biopb-mcp excludes scipy 1.15 for its own
+# This doc ships only because biopb-mcp excludes scipy 1.15 for its own
 # reasons (see its pyproject, and scipy#22501). Had it not, §4a would have
-# rejected the token on 3.10 -- where 1.15.3 is the newest scipy -- since
+# rejected the requirement on 3.10 -- where 1.15.3 is the newest scipy -- since
 # laptrack pins against exactly that series and the resolver's only answer is
 # to move a live kernel's scipy backwards.
 
@@ -468,11 +469,11 @@ def test_the_returned_rows_are_frame_sorted_and_carry_no_way_back(LapTrack, two_
     assert not (track_df["label"].to_numpy() == shuffled["label"].to_numpy()).all()
 
 
-def test_the_distribution_version_is_the_one_the_checklist_can_be_resolved_on():
+def test_the_distribution_version_is_the_one_requirements_can_be_resolved_on():
     """Step 1 tells the agent to read `importlib.metadata.version` and not
     `laptrack.__version__`, because the module attribute is stale: 0.17.1 ships
-    `__version__ = "0.17.0"`. An agent resolving `pkg:laptrack~=0.17.1` off the
-    attribute reports a correct install as unmet.
+    `__version__ = "0.17.0"`. An agent resolving a `laptrack~=0.17.1` requirement
+    off the attribute reports a correct install as unmet.
 
     Asserted as the *inequality*, so this stops being a special case the day
     upstream fixes it -- at which point step 1's sentence should go.
@@ -761,7 +762,7 @@ def test_spacing_is_honoured_by_the_constructor(skan_api, z_line):
     says this is not the same as scaling the answer at the end.
 
     If `spacing` were ever ignored, nothing downstream would raise -- the
-    lengths would simply come back in voxels, which on this skill's own failure
+    lengths would simply come back in voxels, which on this doc's own failure
     table is the 79.8%-of-truth row.
     """
     Skeleton, summarize = skan_api
@@ -827,7 +828,7 @@ def test_path_coordinates_stays_in_voxels_even_with_spacing(skan_api, z_line):
     correct because `path_coordinates` returns raw voxel indices. If skan ever
     applied the spacing here too, nothing would raise -- every length would be
     scaled twice, and on this fixture that is a 5x error in the one number the
-    skill exists to report.
+    doc exists to report.
     """
     Skeleton, _ = skan_api
     coords = Skeleton(z_line, spacing=(0.5, 0.1, 0.1)).path_coordinates(0)

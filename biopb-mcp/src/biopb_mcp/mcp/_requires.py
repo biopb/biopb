@@ -1,14 +1,15 @@
-"""The two `checklist:` facts the session can't show the agent by itself.
+"""The two Requirements facts the session can't show the agent by itself.
 
-A skill declares what it touches (``viewer``, ``tensor``, ``dask``, ``ops:<kind>``,
-``plugin:<name>``, ``pkg:<name>``). The agent resolves that list itself, against
-``server_status`` and — for a ``pkg:`` token — an import: five of the six are
-already in front of it, more accurately than a helper could bucket them (a closed
-napari window, the scheduler behind ``da``, the real ImportError). What it cannot
-see is *which plugin files loaded* and *how to add a package to this env*; this
-module supplies both to the status report.
+A procedure doc opens with a **Requirements** line naming what its steps touch: a
+viewer, the data plane, dask, an ``ops`` kind, a kernel plugin, a third-party
+package. The agent resolves that line itself, against ``server_status`` and — for
+a package — an import: five of the six are already in front of it, more accurately
+than a helper could bucket them (a closed napari window, the scheduler behind
+``da``, the real ImportError). What it cannot see is *which plugin files loaded*
+and *how to add a package to this env*; this module supplies both to the status
+report. The ``requirements`` doc is the reader's half of the same contract.
 
-``plugin:<name>`` is not derivable, which is why the record exists:
+A kernel plugin is not derivable, which is why the record exists:
 
 * The loader is **fail-open per unit**: a file that raises on ``exec``, or loses a
   name to the reserved-name guard, is on disk and *not* in the namespace. So
@@ -55,7 +56,7 @@ def versions_status_lines(
 ) -> list[str]:
     """The body of ``## Versions``: this kernel's build, and how to add a package.
 
-    The interpreter is named, not just its version, because a ``pkg:`` requirement
+    The interpreter is named, not just its version, because a package requirement
     is about *this* env while a bare ``pip install`` targets whatever env the user's
     shell has active — an install that succeeds and leaves the import here still
     failing. Which command is right depends on the env, so it is decided here
@@ -116,8 +117,8 @@ def plugin_status_lines() -> list[str]:
     """The body of the ``## Kernel plugins`` section of ``server_status``.
 
     Formatted here rather than in the status snippet so it is unit-testable
-    without a kernel. A skill's ``plugin:<name>`` matches a name on either of the
-    two name lines (``dir:`` is not one of them);
+    without a kernel. A doc's kernel-plugin requirement matches a name on either
+    of the two name lines (``dir:`` is not one of them);
     they are printed apart so the "not listed → it failed to load" reading is
     only offered where it holds. Both lines print unconditionally, so a name
     absent from the report is absent because it did not load -- not because the

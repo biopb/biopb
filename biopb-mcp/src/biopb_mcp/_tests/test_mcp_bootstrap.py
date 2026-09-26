@@ -227,10 +227,10 @@ class TestLoadPluginFiles:
         _bootstrap._load_plugin_files(_FakeIP(_seeded_ns()), tmp_path / "nope")
 
     def test_only_the_files_that_survived_are_reported_as_loaded(self, tmp_path):
-        # The record `server_status` reports a skill's `plugin:<name>` from. It
-        # cannot be a directory listing: this loader is fail-open, so a file that
-        # raised is on disk and *not* in the namespace -- the distinction the
-        # record exists to get right.
+        # The record `server_status` reports a doc's kernel-plugin requirement
+        # from. It cannot be a directory listing: this loader is fail-open, so a
+        # file that raised is on disk and *not* in the namespace -- the
+        # distinction the record exists to get right.
         (tmp_path / "good.py").write_text("def ok():\n    return 1\n", encoding="utf-8")
         (tmp_path / "bad.py").write_text(
             'raise RuntimeError("boom")\n', encoding="utf-8"
@@ -243,9 +243,9 @@ class TestLoadPluginFiles:
 class TestPluginRecordReachesServerStatus:
     """The loader -> `_requires` record -> `server_status` handoff.
 
-    What a skill's `plugin:<name>` is resolved against: not the kernel dir (this
-    loader is fail-open) and not `dir()` (a file contributes its function names,
-    not its own name).
+    What a doc's kernel-plugin requirement is resolved against: not the kernel
+    dir (this loader is fail-open) and not `dir()` (a file contributes its
+    function names, not its own name).
     """
 
     def test_a_file_that_failed_to_load_is_absent_from_the_report(
@@ -282,8 +282,9 @@ class TestPluginRecordReachesServerStatus:
     def test_files_and_entry_points_are_reported_apart(self):
         from biopb_mcp.mcp import _requires
 
-        # A `plugin:<name>` matches either, but only a *file* has the "on disk yet
-        # missing here" story, so the two are not merged into one list.
+        # A kernel-plugin requirement matches either, but only a *file* has the
+        # "on disk yet missing here" story, so the two are not merged into one
+        # list.
         _requires.record_loaded_plugins(["rolling_ball"], ["labshop_tools"])
         report = "\n".join(_requires.plugin_status_lines())
         assert "files: rolling_ball" in report
@@ -300,7 +301,7 @@ class TestPluginRecordReachesServerStatus:
 
         # An omitted line would make "my plugin isn't listed" ambiguous: absent
         # because it didn't load, or because that half of the report was skipped?
-        # The agent resolving `plugin:<name>` has to be able to tell.
+        # The agent resolving a kernel-plugin requirement has to be able to tell.
         _requires.record_loaded_plugins(["rolling_ball"])
         report = "\n".join(_requires.plugin_status_lines())
         assert "files: rolling_ball" in report

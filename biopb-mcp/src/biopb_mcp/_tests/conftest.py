@@ -116,7 +116,7 @@ class ScriptedJobs:
 
 
 def pytest_addoption(parser):
-    """Register the benchmark's run options (`--bench-fixtures`, `--bench-skills`, …).
+    """Register the benchmark's run options (`--bench-fixtures`, `--bench-docs`, …).
 
     Here rather than in `bench/conftest.py` because pytest calls this hook only
     on the conftests it loads at *startup* — the rootdir's and those on the way

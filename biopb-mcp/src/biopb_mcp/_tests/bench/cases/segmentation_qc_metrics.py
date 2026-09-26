@@ -297,9 +297,9 @@ CASE = Case(
     collect={"precision": "precision", "recall": "recall", "f1": "f1"},
     score=verify,
     save_artifacts=save_artifacts,
-    # `checklist: plugin:segmentation_qc`, and the body says there is no degraded
-    # path. Without this the session has no such plugin and the run would be
-    # scoring an environment the skill declares it cannot work in.
+    # The doc requires the `segmentation_qc` plugin, and its body says there is
+    # no degraded path. Without this the session has no such plugin and the run
+    # would be scoring an environment the doc declares it cannot work in.
     plugins=("segmentation_qc",),
     # It must be able to answer which layer is which.
     persona_must_know=("labels_run_a", "labels_run_b", "by hand"),

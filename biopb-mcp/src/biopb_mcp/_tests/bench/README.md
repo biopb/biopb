@@ -546,13 +546,13 @@ case brought a plane up. The isolation does not weaken as the run goes on.
 
 **A config tree of our own.** `BIOPB_CONFIG_HOME` points at a temp dir, so the run
 reads neither the developer's `mcp-config.json` nor their personal
-`~/.config/biopb/skills/*.md`. The catalog under test is the shipped one.
+`~/.config/biopb/docs/*.md`. The catalog under test is the shipped one.
 
 **Only the kernel plugins a case asks for.** That same temp tree means an empty
-`~/.config/biopb/kernel/`, so a skill declaring `plugin:segmentation_qc` would
-be scored in a session where its own `checklist:` cannot be met. `Case.plugins`
-seeds the ones it names, from the copies biopb-mcp ships, through the real
-loader — and nothing else, because a plugin the skill never declared is an
+`~/.config/biopb/kernel/`, so a doc requiring the `segmentation_qc` plugin would
+be scored in a session where its own Requirements line cannot be met.
+`Case.plugins` seeds the ones it names, from the copies biopb-mcp ships, through
+the real loader — and nothing else, because a plugin no doc required is an
 environment difference nobody chose.
 
 ## Arrays cross by file, not by literal
