@@ -286,6 +286,12 @@ def test_embedded_create_array_tracks_upload_status(
     assert status["uploaded_chunks"] == 1
 
 
+def test_embedded_cache_takes_a_smaller_last_chunk(embedded_cache: EmbeddedTensorCache):
+    array = da.arange(5 * 7, dtype=np.int32).reshape(5, 7).rechunk((2, 3))
+    array_id = embedded_cache.create_source(array, "cache:", ["Y", "X"])
+    assert embedded_cache.get_upload_status(array_id)["state"] == "READY"
+
+
 @pytest.mark.parametrize("method_name", ["create_array", "create_source"])
 def test_embedded_cache_rejects_non_uniform_chunks(
     embedded_cache: EmbeddedTensorCache,

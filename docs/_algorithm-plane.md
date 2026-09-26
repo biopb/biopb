@@ -1,6 +1,8 @@
 # The algorithm plane under the control
 
-Status: **proposed** (design only; not implemented).
+Status: **in progress**. Step 1 (protocol and runtime) is implemented, except
+that a streaming op still sends each yielded item through the sink on its own
+rather than into one tensor.
 
 **Components:** the image protocol (`proto/biopb/image/`, a new `Ops` service),
 `biopb-image-runtime` (a function-level API and a PyPI wheel), `biopb-control`
@@ -150,12 +152,12 @@ experimental and move when they are rebuilt. `ImageData`, `ImageAnnotation`,
 from biopb_image_base import Tensor, op, serve
 
 @op(description="Mean intensity and area per label", labels=["measurement"])
-def label_stats(image: Tensor["YX"], labels: Tensor["YX"]) -> dict:
+def label_stats(image: Tensor("YX"), labels: Tensor("YX")) -> dict:
     from skimage.measure import regionprops_table
     return regionprops_table(labels, image, properties=["label", "area", "mean_intensity"])
 
 @op(description="Gaussian denoise", labels=["denoising"], input="blocks", overlap=16)
-def gaussian(image: Tensor["YX"], sigma: float = 2.0):
+def gaussian(image: Tensor("YX"), sigma: float = 2.0):
     from skimage.filters import gaussian as g
     return g(image, sigma=sigma, preserve_range=True)
 
@@ -170,9 +172,11 @@ op list as JSON and exits without binding a port. The pieces exist in
 `biopb_image_base.common` (`parse_kwargs`, `validate_kwargs`, the decoding,
 the servicer base with its error translation).
 
-- **Arguments come from the signature.** A parameter annotated `Tensor[axes]`
+- **Arguments come from the signature.** A parameter annotated `Tensor(axes)`
   is a tensor argument; every other parameter is a kwarg, and its default goes
-  into `OpInfo.kwargs`. Everything the shape does not say (three channels for
+  into `OpInfo.kwargs`. It is a call, not `Tensor["YX"]`, because linters and
+  type checkers read a string in a subscript as a forward reference; a
+  type-checked file writes `Annotated[np.ndarray, Tensor("YX")]`. Everything the shape does not say (three channels for
   an RGB model, a dtype range, isotropic Z) stays in the function: it raises
   `ValueError`, and the base translates that to `INVALID_ARGUMENT`.
 - **`axes` is what the function sees.** It gets exactly those axes, in that
