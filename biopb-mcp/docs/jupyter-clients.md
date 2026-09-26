@@ -58,7 +58,7 @@ qtconsole's prompt-number request, `user_expressions` for its UI — and empty
 code is never a cell.
 
 **Who wrote it** is `origin` on the record: `"mcp"` (the `execute_code` tool),
-`"chat"` (the in-process chat loop, [chat-engines.md](chat-engines.md)) or
+`"chat"` (the in-process chat loop, [chat.md](chat.md)) or
 `"user"` (a foreign client). A task takes the origin of the cell that started
 it.
 

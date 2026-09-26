@@ -275,13 +275,11 @@ class ObserveConfig:
 
 @dataclass
 class ChatConfig:
-    """Which agent drives the chat pane, and how to reach it.
+    """Which model drives the chat pane, and how to reach it.
 
-    Two engines. ``builtin`` is the in-process loop (``mcp/_chat.py``) talking to
-    an OpenAI-compatible endpoint: ``model`` / ``base_url`` / ``api_key_env`` /
-    ``request_timeout`` describe it. ``acp`` hands the pane to a coding harness
-    the user already runs, over the Agent Client Protocol: the ``acp_*`` settings
-    describe that one. Nothing is shared between the two but the pane.
+    One engine: the in-process loop (``mcp/_chat.py``) talking to an
+    OpenAI-compatible endpoint, which ``model`` / ``base_url`` / ``api_key_env``
+    / ``request_timeout`` describe.
 
     The on/off switch is **not** here: it is ``observe.chat_enabled``, because
     what it turns on is a pane on the observe page. This
@@ -296,12 +294,6 @@ class ChatConfig:
     a person may reasonably want to change and no one needs to keep secret.
     """
 
-    engine: str = _h(
-        "builtin",
-        "Which agent drives the pane: 'builtin' (the in-process loop, needs a "
-        "model and a provider key) or 'acp' (a coding harness you already have, "
-        "which brings its own model and its own subscription).",
-    )
     model: str = _h(
         "",
         "Model id to send, e.g. 'gpt-4o' or 'deepseek-v4'. Empty means chat is "
@@ -351,32 +343,6 @@ class ChatConfig:
         "sends and does not offer take_screenshot. A model without vision does "
         "not merely fail the screenshot -- the image is stored and re-sent, so "
         "every later turn fails too, which is what 'auto' recovers from.",
-    )
-    acp_agent: str = _h(
-        "opencode",
-        "Which ACP harness to run when engine is 'acp'. Only 'opencode' is "
-        "supported: it is the one that ships an ACP mode natively and honours "
-        "the MCP server handed to it in the session handshake.",
-    )
-    acp_command: str = _h(
-        "",
-        "Absolute path to the harness binary, overriding the usual lookup. For "
-        "an install PATH does not reach; empty means resolve 'opencode' the "
-        "normal way.",
-    )
-    acp_model: str = _h(
-        "",
-        "Model the harness should use, in its own spelling (opencode: "
-        "'openai/gpt-5.5'). Empty takes whatever the harness defaults to — "
-        "which is a model you did not choose, on a provider that may not even "
-        "be reachable. Ignored by a harness that exposes no model setting.",
-    )
-    acp_permission: str = _h(
-        "ask",
-        "What to do when the harness asks permission to run something: 'ask' "
-        "puts the request in the pane, 'allow' answers yes for you. A harness "
-        "brings its own file and shell tools, so 'allow' is unattended access "
-        "to this machine, not just to the viewer.",
     )
 
 
@@ -497,10 +463,7 @@ _CONSTRAINTS = {
     },
     "ChatConfig": {
         "request_timeout": Range(exclusive_min=0),
-        "engine": Enum({"builtin", "acp"}),
         "api": Enum({"completions", "responses"}),
-        "acp_agent": Enum({"opencode"}),
-        "acp_permission": Enum({"ask", "allow"}),
         "vision": Enum({"auto", "on", "off"}),
     },
     "TransportConfig": {

@@ -218,19 +218,16 @@ Surface *that* line rather than reimplementing the check — it stays truthful i
 their default changes. A pre-launch `os.environ` check is still worth having so
 the card can warn before the click.
 
-**The ACP path should mint one instead.** `_chat_acp.py`'s listener is
-incidental — nobody browses it — so there is no reason to leave it unsecured
-once a password is available. That closes biopb#909 and makes
-[chat-engines.md](../../biopb-mcp/docs/chat-engines.md)'s claim that eliminating the exposure
-"requires an opencode mode that provides authenticated transport" obsolete.
-Independent of this feature.
+**A web session runs under the user's own opencode settings**, where `bash`
+and `edit` default to `allow`. Nothing is pinned on their behalf: this is a
+harness the user chose to open, on a machine already theirs, and rewriting its
+permissions from under it would be the surprising answer rather than the safe
+one. Recorded here so it does not later read as an oversight.
 
-Because the web launcher does not reuse the ACP launcher, it also does not
-inherit its `OPENCODE_CONFIG_CONTENT` permission pinning: a web session runs
-under the user's own opencode settings, where `bash` and `edit` default to
-`allow`. That is the right answer for a harness the user chose to open, and the
-deliberate difference between the two paths is recorded here so it does not read
-as an oversight later.
+The other side of that comparison used to be the chat pane's ACP engine, which
+started opencode itself and therefore *did* pin permissions through
+`OPENCODE_CONFIG_CONTENT`. That engine has been retired, so this is the only
+launcher left and there is no second policy to reconcile it with.
 
 **The relay clients expose no local listener.** Claude Code polls Anthropic's
 backend over outbound HTTPS; Codex opens an outbound websocket to a chatgpt.com
@@ -301,8 +298,7 @@ on Windows, or on systemd without `enable-linger`.
   child and its own napari window. Codex re-reads its config live, so
   register-then-start works in either order; Claude Code has no per-session MCP
   override on the remote-control path, so there is no way to hand it this
-  session's `/mcp` the way the ACP engine does. Label the button honestly rather
-  than implying attachment.
+  session's `/mcp`. Label the button honestly rather than implying attachment.
 - Codex transcript retention while remote control is connected.
 - Whether opencode and Codex's daemon path work on Windows at all; `_agents`
   already carries Windows config paths for all five clients, so registration is

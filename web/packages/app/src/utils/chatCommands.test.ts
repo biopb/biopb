@@ -1,14 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
-  COMMANDS,
-  acpContextReport,
   contextReport,
-  localCommands,
   matchCommands,
   modelReport,
   parseCommand,
 } from "./chatCommands";
-import type { AgentCommand, ContextUsage } from "./chatClient";
 import type { ChatMessage } from "./chatThread";
 
 const msg = (over: Partial<ChatMessage> = {}): ChatMessage => ({
@@ -155,117 +151,6 @@ describe("contextReport", () => {
   });
 });
 
-const advertised: AgentCommand[] = [
-  { name: "review", description: "Review the diff", hint: "path" },
-  { name: "init", description: "Write an agent file", hint: "" },
-];
-
-describe("the two command namespaces", () => {
-  it("drops /compact but keeps /context under a hosted harness", () => {
-    // /compact folds the built-in loop's projection of the thread, which the
-    // harness never reads -- and ACP has no compaction method, so there is
-    // nothing to forward it to either. /context survives because the question
-    // is still the user's to ask and the agent answers it itself, and /model
-    // because both engines can be moved off the model they started on.
-    expect(localCommands("acp").map((c) => c.typed)).toEqual([
-      "/new",
-      "/context",
-      "/model",
-    ]);
-    expect(localCommands("builtin")).toEqual(COMMANDS);
-  });
-
-  it("sends an advertised command through as text, arguments and all", () => {
-    // ACP has no method for invoking one: the agent parses its own prefix, and
-    // its `input.hint` exists precisely because these take arguments.
-    expect(parseCommand("/review src/x.ts", "acp", advertised)).toEqual({
-      kind: "send",
-      text: "/review src/x.ts",
-    });
-  });
-
-  it("still refuses a name in neither namespace", () => {
-    // What keeps a typo'd /conect from silently becoming a prompt.
-    const parsed = parseCommand("/conect", "acp", advertised);
-    expect(parsed.kind).toBe("reject");
-    if (parsed.kind === "reject") expect(parsed.message).toContain("/review");
-  });
-
-  it("resolves a collision to the local command", () => {
-    const withNew: AgentCommand[] = [
-      { name: "new", description: "the agent's own", hint: "" },
-    ];
-    expect(parseCommand("/new", "acp", withNew)).toEqual({
-      kind: "command",
-      name: "new",
-      arg: "",
-    });
-  });
-
-  it("does not offer the agent's commands at all", () => {
-    // Accepted but not advertised. biopb gives the harness an empty throwaway
-    // cwd, and a coding agent's commands are about a project: /review has no
-    // repo, /init writes a file that dies with the temp dir. Listing them would
-    // advertise no-ops.
-    expect(matchCommands("/rev", "acp")).toEqual([]);
-    expect(matchCommands("/", "acp").map((c) => c.typed)).toEqual([
-      "/new",
-      "/context",
-      "/model",
-    ]);
-  });
-
-  it("leaves a path that starts with a slash as prose", () => {
-    expect(parseCommand("/data/run3/stack.tif is the one", "acp", advertised)).toEqual(
-      { kind: "send", text: "/data/run3/stack.tif is the one" },
-    );
-  });
-});
-
-describe("acpContextReport", () => {
-  const usage = (over: Partial<ContextUsage> = {}): ContextUsage => ({
-    used: 12000,
-    size: 200000,
-    cost: 0,
-    ...over,
-  });
-
-  it("reports the agent's own numbers, not an estimate", () => {
-    const out = acpContextReport(usage(), "opencode");
-    expect(out).toContain("12,000 of 200,000 tokens (6%)");
-  });
-
-  it("says what to do about a full context, and it is not /compact", () => {
-    const out = acpContextReport(usage(), "opencode");
-    expect(out).toContain("/new");
-    expect(out).not.toContain("/compact");
-  });
-
-  it("shows a genuine zero cost rather than hiding it", () => {
-    // A subscription model really does report 0; hiding it would read as "not
-    // measured", which is a different claim.
-    expect(acpContextReport(usage({ cost: 0 }), "opencode")).toContain("$0.0000");
-  });
-
-  it("omits cost the agent did not price", () => {
-    expect(acpContextReport(usage({ cost: null }), "opencode")).not.toContain("$");
-  });
-
-  it("copes with a size the agent did not give", () => {
-    const out = acpContextReport(usage({ size: null }), "opencode");
-    expect(out).toContain("12,000 tokens");
-    expect(out).not.toContain("%");
-  });
-
-  it("says so before the agent has reported anything", () => {
-    // Rather than rendering "0 tokens", which is a measurement, not a silence.
-    expect(acpContextReport(null, "opencode")).toContain("not reported");
-    expect(acpContextReport(usage({ used: null }), "opencode")).toContain(
-      "not reported",
-    );
-  });
-});
-
 describe("modelReport", () => {
   const choice = (value: string) => ({ value, name: value });
 
@@ -273,17 +158,17 @@ describe("modelReport", () => {
     const out = modelReport("openai/gpt-5.5", [
       choice("openai/gpt-5.5"),
       choice("anthropic/claude-sonnet-5"),
-    ], "acp");
+    ]);
     expect(out).toContain("openai/gpt-5.5");
     expect(out).toContain("anthropic/claude-sonnet-5");
     expect(out).toContain("/model <name>");
   });
 
   it("stops short of a wall of text, and says how much it left out", () => {
-    // A harness fronting several providers advertises dozens, and the column
-    // is narrow. Silently truncating would read as the whole list.
+    // A provider fronting several families publishes dozens, and the column is
+    // narrow. Silently truncating would read as the whole list.
     const many = Array.from({ length: 30 }, (_, i) => choice(`m-${i}`));
-    const out = modelReport("m-0", many, "acp");
+    const out = modelReport("m-0", many);
     expect(out).not.toContain("m-29");
     expect(out).toContain("18 more");
   });
@@ -291,18 +176,12 @@ describe("modelReport", () => {
   it("does not read an unpublished list as a single-model provider", () => {
     // `GET /models` is optional in the OpenAI-compatible shape: an endpoint
     // that does not answer it still serves completions.
-    const out = modelReport("test-model", [], "builtin");
+    const out = modelReport("test-model", []);
     expect(out).toContain("test-model");
     expect(out).toContain("publishes no list");
   });
 
-  it("says a harness has not listed yet, rather than that it has none", () => {
-    // Empty here is almost always "not started": the agent states its models
-    // when a session opens, and biopb opens one only when it is needed.
-    expect(modelReport("m", [], "acp")).toContain("once it is running");
-  });
-
   it("reports an unset model as unset rather than as blank", () => {
-    expect(modelReport("", [], "builtin")).toContain("No model is set.");
+    expect(modelReport("", [])).toContain("No model is set.");
   });
 });

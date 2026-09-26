@@ -35,26 +35,15 @@ export function sendsOnEnter(e: {
  * reaches us as a cancel, and treating it as one would kill a turn because
  * someone changed their mind about a word.
  */
-export type EscAction =
-  | "close-image"
-  | "refuse-permission"
-  | "cancel-turn"
-  | "none";
+export type EscAction = "close-image" | "cancel-turn" | "none";
 
 export function escAction(state: {
   composing: boolean;
   imageOpen: boolean;
   busy: boolean;
-  permissionOpen?: boolean;
 }): EscAction {
   if (state.composing) return "none";
   if (state.imageOpen) return "close-image";
-  // Ahead of the cancel, and the reason is the dismiss-innermost rule rather
-  // than an exception to it: a question the agent is blocked on is the
-  // innermost thing on screen. It is also the kinder reading of the keypress --
-  // "no, don't do that" refuses one action, where a cancel throws away the
-  // whole turn that led to it.
-  if (state.permissionOpen) return "refuse-permission";
   return state.busy ? "cancel-turn" : "none";
 }
 
