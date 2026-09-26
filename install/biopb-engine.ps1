@@ -638,7 +638,7 @@ function Test-IsCloudPath {
 # Microscopy subfolder under a cloud root is preferred over the whole synced root.
 # Detect installed agent systems and register the biopb MCP server with each.
 function Set-McpClients {
-    param([string]$BiopbHome, [string]$ConfigDir)
+    param([string]$ConfigDir)
 
     # Best-effort agent wiring must never abort the install. Under the script's
     # ErrorActionPreference='Stop', a native CLI that writes to stderr -- e.g.
@@ -1781,7 +1781,7 @@ function Invoke-BiopbInstall {
     # interrupted -- and the control plane comes up on demand anyway when the agent
     # first launches biopb-mcp.
     Report-Step 6 "Configuring MCP client..."
-    Set-McpClients -BiopbHome $BiopbHome -ConfigDir $ConfigDir
+    Set-McpClients -ConfigDir $ConfigDir
 
     # ===== 7. Start the control plane (which owns the data plane) =====
     Report-Step 7 "Starting control plane..."

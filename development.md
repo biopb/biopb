@@ -81,6 +81,12 @@ Generated, not committed. `buf generate` (config in `buf.gen.yaml`, protos under
 A source checkout needs `buf` on PATH (end users installing from release wheels do
 not; the wheels ship the generated stubs).
 
+Generation only ever *adds*: `clean: false` in `buf.gen.yaml`, because the output
+directories hold hand-written source too (`src/main/python/biopb` is the SDK).
+So when a `.proto` is deleted or renamed, its old stubs stay in your tree -- still
+importable locally, and packaged into any wheel you build from it. Delete them by
+hand after a protocol removal.
+
 ### Testing
 
 **Python:** `pytest` per package — the data plane in `biopb-tensor-server/tests/`,

@@ -214,7 +214,8 @@ def probe(
     - ``up``: it answered.
     - ``unreachable``: nothing answered in time (down, bad host, TLS mismatch).
     - ``error``: it answered with an error, including a server that does not
-      implement ``Ops`` (such as one of the retired ``ProcessImage`` protocol).
+      implement ``Ops``, such as one still speaking the retired ``ProcessImage``
+      protocol.
     - ``invalid``: the URL is not ``grpc://`` or ``grpcs://``.
 
     Never raises.

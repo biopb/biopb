@@ -55,8 +55,8 @@ a `<name>.json` file there:
 ```
 
 The control probes it and the kernel binds its ops into `ops`. A server that
-does not implement `Ops` (such as one of the retired `ProcessImage` protocol)
-is listed as an error.
+does not implement `Ops` -- one still speaking the retired `ProcessImage`
+protocol, say -- is listed as an error.
 
 ## The Docker base image
 
@@ -144,7 +144,6 @@ biopb-image-runtime/
 │   ├── common.py           # Token interceptor, error translation
 │   ├── health.py           # gRPC health check
 │   ├── logging_config.py   # Logging setup
-│   ├── debug.py            # Stats, GPU info (nvidia-smi)
 │   ├── stitch.py           # Stitching tiled segmentations
 │   └── dynamics_local.py   # Flow dynamics for stitching
 ├── tests/

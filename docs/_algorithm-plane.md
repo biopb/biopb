@@ -169,9 +169,9 @@ if __name__ == "__main__":
 `serve()` builds the `OpList` from the decorated functions, decodes the
 arguments, validates and merges kwargs, calls the function, encodes the
 outputs, and parses `--host`/`--port`/`--describe`. `--describe` prints the
-op list as JSON and exits without binding a port. The pieces exist in
-`biopb_image_base.common` (`parse_kwargs`, `validate_kwargs`, the decoding,
-the servicer base with its error translation).
+op list as JSON and exits without binding a port. The pieces are in
+`biopb_image_base.ops` (`describe`, the argument decoding, the servicer), over
+the error translation in `biopb_image_base.common` (`server_context`).
 
 - **Arguments come from the signature.** A parameter annotated `Tensor(axes)`
   is a tensor argument; every other parameter is a kwarg, and its default goes

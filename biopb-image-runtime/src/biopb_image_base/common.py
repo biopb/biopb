@@ -7,7 +7,7 @@ import logging
 import sys
 import traceback
 import uuid
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from typing import Optional
 
 import grpc
@@ -66,8 +66,8 @@ class TokenValidationInterceptor(grpc.ServerInterceptor):
 
 
 @contextmanager
-def server_context(context: grpc.ServicerContext, lock=None):
-    """Run a handler's body under *lock* (if any), translating its exceptions.
+def server_context(context: grpc.ServicerContext, lock):
+    """Run a handler's body under *lock*, translating its exceptions.
 
     ``ValueError`` becomes ``INVALID_ARGUMENT``, ``NotImplementedError``
     ``UNIMPLEMENTED``, and anything else ``INTERNAL``; each is logged with its
@@ -76,7 +76,7 @@ def server_context(context: grpc.ServicerContext, lock=None):
     the ``yield from`` so the lock and the translation span the whole stream.
     """
     try:
-        with lock if lock is not None else nullcontext():
+        with lock:
             yield
 
     except grpc.RpcError:

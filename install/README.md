@@ -97,6 +97,10 @@ are produced.
 - Agent kernel plugins: `~/.config/biopb/kernel/` (drop a `*.py` here to add tools
   to the agent's namespace; the installer seeds a `rolling_ball.py` example there,
   never clobbering your edits)
+- Algorithm servers: `~/.config/biopb/algorithms/` (one file per server -- a
+  `<name>.py` server file the control runs under uv, or a `<name>.json` holding
+  `{"url": "grpc://host:port"}` for one running elsewhere. The installer seeds
+  nothing here; the control creates the directory on first start.)
 - Extra Python packages: `~/.config/biopb/extra-packages.txt` (see below)
 - Webapp: `~/.local/share/biopb/webapp`
 

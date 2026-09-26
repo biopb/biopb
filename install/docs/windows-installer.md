@@ -150,7 +150,7 @@ policies still require a *signed* engine — signing is the sole fix there.
 | Wizard page | Feeds | Replaces |
 |---|---|---|
 | Welcome / license | — | — |
-| Keep-config dialog *(existing config only)* | `-KeepConfig` (Yes) / `-Reset` (No) | console keep-config note |
+| Ready — keep-config dialog on leaving it *(existing config only)* | `-KeepConfig` (Yes) / `-Reset` (No) | console keep-config note |
 | Progress | parses `STEP`/log records | the console `[n/7]` output |
 | Finish | `RESULT` records | the console summary |
 
