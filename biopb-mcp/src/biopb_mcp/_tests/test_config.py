@@ -105,25 +105,20 @@ class TestRetiredKeys:
     forever.
     """
 
-    def _written(self, mock_config_dir, chat):
-        config_path = mock_config_dir / CONFIG_NAME
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        with config_path.open("w") as f:
-            json.dump({"chat": chat}, f)
-        return load_config()
-
     def test_a_retired_key_does_not_survive_the_load(self, mock_config_dir):
-        config = self._written(mock_config_dir, {"engine": "acp"})
+        config = _write_and_load(mock_config_dir, {"chat": {"engine": "acp"}})
         assert "engine" not in config["chat"]
 
     def test_every_acp_setting_goes_with_it(self, mock_config_dir):
-        config = self._written(
+        config = _write_and_load(
             mock_config_dir,
             {
-                "acp_agent": "opencode",
-                "acp_command": "/usr/bin/opencode",
-                "acp_model": "openai/gpt-5.5",
-                "acp_permission": "allow",
+                "chat": {
+                    "acp_agent": "opencode",
+                    "acp_command": "/usr/bin/opencode",
+                    "acp_model": "openai/gpt-5.5",
+                    "acp_permission": "allow",
+                }
             },
         )
         assert not [k for k in config["chat"] if k.startswith("acp_")]
@@ -133,7 +128,7 @@ class TestRetiredKeys:
         pane falls back to a loop this user never configured, and reports it
         as `chat.model` being unset without ever mentioning the engine."""
         with caplog.at_level("WARNING"):
-            self._written(mock_config_dir, {"engine": "acp"})
+            _write_and_load(mock_config_dir, {"chat": {"engine": "acp"}})
         assert any(
             "chat.engine" in r.message and "chat.model" in r.message
             for r in caplog.records
@@ -142,8 +137,8 @@ class TestRetiredKeys:
     def test_the_siblings_are_untouched(self, mock_config_dir):
         # Dropping the retired key must not take the section with it: an ACP
         # user who also set a base_url is still pointing at that endpoint.
-        config = self._written(
-            mock_config_dir, {"engine": "acp", "base_url": "http://x/v1"}
+        config = _write_and_load(
+            mock_config_dir, {"chat": {"engine": "acp", "base_url": "http://x/v1"}}
         )
         assert config["chat"]["base_url"] == "http://x/v1"
 
