@@ -14,6 +14,7 @@ from biopb_mcp._config import McpConfig
 from biopb_mcp.mcp import __main__ as launcher
 from biopb_mcp.mcp.__main__ import (
     _config_defaults,
+    _decide_viewer,
     _has_display,
     _is_agentless_viewer,
     _parse_args,
@@ -166,6 +167,63 @@ class TestHasDisplay:
         monkeypatch.delenv("DISPLAY", raising=False)
         monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
         assert _has_display() is True
+
+
+class TestDecideViewer:
+    """Whether a session gets a viewer: the config wants one, napari is
+    installed, and there is a display -- or Xvfb, which only the config opts
+    into. `--view` is a person asking for a window, so it fails instead."""
+
+    @pytest.fixture
+    def host(self, monkeypatch):
+        """A host with napari installed and a display; tests take them away."""
+        import importlib.util
+
+        state = {"napari": True, "display": True}
+        real_find_spec = importlib.util.find_spec
+
+        def find_spec(name, *a, **kw):
+            if name in ("napari", "biopb_napari_widget"):
+                return object() if state["napari"] else None
+            return real_find_spec(name, *a, **kw)
+
+        monkeypatch.setattr(importlib.util, "find_spec", find_spec)
+        monkeypatch.setattr(launcher, "_has_display", lambda: state["display"])
+        return state
+
+    @staticmethod
+    def _config(**viewer):
+        return {"viewer": viewer}
+
+    def test_a_viewer_by_default(self, host):
+        assert _decide_viewer(self._config()) == (None, False)
+
+    def test_config_turns_it_off(self, host):
+        reason, virtual = _decide_viewer(self._config(enabled=False))
+        assert "viewer.enabled" in reason and virtual is False
+
+    def test_none_without_napari(self, host):
+        host["napari"] = False
+        reason, _ = _decide_viewer(self._config())
+        assert "biopb-mcp[napari]" in reason
+
+    def test_no_display_means_no_viewer_not_xvfb(self, host):
+        host["display"] = False
+        reason, virtual = _decide_viewer(self._config())
+        assert "no display" in reason and virtual is False
+
+    def test_xvfb_only_when_the_config_opts_in(self, host):
+        host["display"] = False
+        assert _decide_viewer(self._config(virtual_display=True)) == (None, True)
+
+    def test_view_overrides_the_config(self, host):
+        assert _decide_viewer(self._config(enabled=False), view=True) == (None, False)
+
+    @pytest.mark.parametrize("missing", ["napari", "display"])
+    def test_view_fails_where_it_cannot_have_a_window(self, host, missing):
+        host[missing] = False
+        with pytest.raises(RuntimeError):
+            _decide_viewer(self._config(virtual_display=True), view=True)
 
 
 class TestSetupObserve:

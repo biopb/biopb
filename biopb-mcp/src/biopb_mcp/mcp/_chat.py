@@ -291,7 +291,7 @@ def _clean_schema(schema):
 #: ``poll_job`` to do it with.
 _CHAT_RUN_PARAGRAPH = """Code runs as a cell on the kernel's main thread, like a notebook cell.
     This call waits for the cell to finish and returns its output -- there is no
-    job handle for a cell. While it runs the viewer does not repaint; for a long
+    job handle for a cell. While it runs a viewer does not repaint; for a long
     compute, end the cell with run_async(fn), which returns a task id at once and
     runs fn on a worker thread -- poll the task with poll_job. Only one job runs
     at a time; stop one with interrupt_kernel or restart_kernel (guaranteed).

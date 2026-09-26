@@ -99,6 +99,7 @@ def chat_host():
         "watchdog_running": True,
     }
     host._running = None
+    host.no_viewer_reason = None
     host._states = [("ok", "")]
     host.interrupts = []
     # What another writer has run and the loop has not been told about, and the
@@ -558,7 +559,7 @@ class TestExecuteCode:
         # this fails rather than quietly restoring the wire wording.
         assert _server.PROMOTE_PARAGRAPH not in payload["description"]
         # ...and the rest is still the registry's own words, not a copy.
-        assert "napari kernel" in payload["description"]
+        assert "session's kernel" in payload["description"]
 
     def test_intent_asks_for_itself_on_the_parameter(self, chat_host):
         # A function-calling model reads the schema per argument. With the

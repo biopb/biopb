@@ -6,50 +6,59 @@ description: The kernel: namespace, plugins, long-running jobs, where computes r
 
 **Operation Guardrails** are in session `instructions`. Apply on every turn — follow them throughout.
 
-Kernel is the main execution context for the agent. It is a live Python interpreter with access to
-the TensorFlightClient for browsing and retrieving image data, and — where the session has a
-display — a napari viewer window. The kernel is **stateful**: variables, imports, and viewer state
-persist across turns. Agent code runs as a cell on the kernel's main thread, like a notebook cell:
-while it runs the viewer does not repaint. Run a long compute you want to watch with `run_async(fn)`.
-
-**There are two ways to show the user an image**, and which ones this session has is a fact about
-the session, not about the work: the napari window ([[napari-viewer]]) and the browser page the control
-serves ([[web-viewer]]). `server_status` says which. Do not assume a window exists.
+Kernel is the main execution context for the agent: a live, **stateful** Python interpreter —
+variables and imports persist across turns. Agent code runs as a cell on the kernel's main thread,
+like a notebook cell. Run a long compute you want to watch with `run_async(fn)`.
 
 ## Namespace
 
+Every session's namespace holds two planes:
+
+- **The data plane** — `client`, the tensor server: browse the catalog, read tensors, upload
+  results.
+- **The algorithm plane** — `ops`, the server-side image-processing operations, and the user's
+  **kernel plugin** modules (below).
+
+A napari `viewer` is **optional**: it is there only when the user has configured one and this
+machine can show it (the napari extra installed, a display). `server_status`'s `## Viewer` says
+whether this session has one, and why not when it does not. Do not assume it. The browser page
+the control serves ([[web-viewer]]) shows the user an image either way; the napari window
+([[napari-viewer]]) is the other route, where there is one.
+
 | Name | Type | Description |
 |------|------|-------------|
-| `client` | TensorFlightClient or None | Connection to the data server for browsing/retrieving image data. Marshaled and thread-safe. |
-| `viewer` | napari.Viewer | The napari window, where the session has one. `viewer.add_tensor(array_id)` puts a tensor on it; `viewer.tensor(layer)` reads one back as a plain dask array. Check `## Viewer` in `server_status` before relying on anything being *seen* — the object is bound even when nothing is on screen |
+| `client` | TensorFlightClient or None | The data plane: browse and retrieve image data from the tensor server. Marshaled and thread-safe. |
+| `ops` | dict[str, callable] | The algorithm plane: biopb.image ProcessImage operations from configured servers (may be empty) |
+| *plugin modules* | module | The algorithm plane: the user's kernel plugins, one module each (see below) |
 | `np/da` | module | imported packages: numpy and dask.array |
-| `ops` | dict[str, callable] | biopb.image ProcessImage operations from configured servers (may be empty) |
+| `viewer` | napari.Viewer | **Only where the session has one.** `viewer.add_tensor(array_id)` puts a tensor on it; `viewer.tensor(layer)` reads one back as a plain dask array. Check `## Viewer` in `server_status` before relying on anything being *seen* — the object is bound even when its window is closed |
 
-- The `viewer` is a napari window, made **thread-safe** by marshaling known
-  mutations (`viewer.dims`, `viewer.camera`, layer properties, `viewer.layers.remove()`,
-  the `add_*()` family, …) to the Qt main thread. A cell already runs there; the
-  marshaling matters in a `run_async` task. Raw Qt (`viewer.window`) works only on the
-  main thread: from a task it raises a clear error, so do it in a cell. See [[napari-viewer]] for the full set of viewer operations, including
-  mouse events.
 - The `client` represents a `TensorFlightClient` instance. Data from the client are
   lazy, thread-safe, picklable dask arrays. See [[tensor-server-client]] for the full set of client
   operations, including browsing sources and reading tensors ([[upload]] is the write
-  side); and see
-  [[napari-viewer]] for how a layer's pixels differ from the server's. **Read a layer's pixels with `viewer.tensor(layer)`** — `layer.data` is
-  packaged for the renderer, and handing a multiscale one to numpy silently computes on
-  the lowest pyramid level.
+  side).
 - `ops` maps op name -> an inspectable callable that runs dedicated image-processing logic.
   The callable is a thin wrapper around a `biopb.image.ProcessImage` gRPC service on a configured
   server. The callable can take either a numpy array (eager) or a tensor-server array_id string
   (lazy). See [[ops]] for details.
+- The `viewer`, where there is one, is a napari window made **thread-safe** by marshaling known
+  mutations (`viewer.dims`, `viewer.camera`, layer properties, `viewer.layers.remove()`,
+  the `add_*()` family, …) to the Qt main thread. A cell already runs there; the
+  marshaling matters in a `run_async` task. Raw Qt (`viewer.window`) works only on the
+  main thread: from a task it raises a clear error, so do it in a cell. See [[napari-viewer]]
+  for the full set of viewer operations, including mouse events, and for how a layer's pixels
+  differ from the server's. **Read a layer's pixels with `viewer.tensor(layer)`** — `layer.data`
+  is packaged for the renderer, and handing a multiscale one to numpy silently computes on
+  the lowest pyramid level.
 - **Only `np` and `da` are pre-imported.** Everything else needs an explicit
   import, and these are guaranteed installed: `pandas`, `skimage`, `scipy`,
-  `sklearn`, `matplotlib`, `cv2` (opencv-headless), `ome_zarr`, `napari`. The
-  kernel is stateful, so one import per session is enough.
+  `sklearn`, `matplotlib`, `cv2` (opencv-headless), `ome_zarr`. `napari` is
+  installed where the session can have a viewer. The kernel is stateful, so one
+  import per session is enough.
 
 ## Kernel plugins
 
-**User plugins may add more names** beyond the table above: each `*.py` file in
+**User plugins are the rest of the algorithm plane**: each `*.py` file in
 `~/.config/biopb/kernel/`, and each installed `biopb_mcp.namespace` package, is
 loaded at kernel start and bound as **one module, named after the file** —
 `rolling_ball.py` becomes `rolling_ball`, and its functions are called as
@@ -76,15 +85,15 @@ need the plugin dir.
 
 ## Long-running jobs
 A slow `execute_code` call returns a `job-N` handle while the cell keeps running on the main
-thread. Meanwhile the viewer does not repaint, and `take_screenshot` / `inspect_object` refuse
+thread. Meanwhile a viewer does not repaint, and `take_screenshot` / `inspect_object` refuse
 until it ends -- asking for one then is a mistake in the plan. For a compute you want to watch,
 end the cell with `run_async(fn, *args)` instead: `fn` runs on a worker thread, the call returns
-a `task-...` id at once, and the viewer and screenshots stay live. Notes on tasks:
+a `task-...` id at once, and the main thread stays free. Notes on tasks:
 * One task at a time. What `fn` prints and returns is the task's record (`poll_job(task_id)`).
 * Everything the cell prints after `run_async` is filed with the task, since the two share the
   cell's request: make `run_async` the cell's last statement.
-* A task may mutate `viewer` (its calls are marshaled to the main thread). A user's cell can run
-  meanwhile, and the two can race over the namespace and the viewer.
+* A task may mutate a `viewer` (its calls are marshaled to the main thread). A user's cell can run
+  meanwhile, and the two can race over the namespace.
 
 Stop a cell or a task with `interrupt_kernel` (a KeyboardInterrupt at the next bytecode) or
 `restart_kernel` (guaranteed, kills the kernel). Notes:
@@ -112,7 +121,7 @@ Stop a cell or a task with `interrupt_kernel` (a KeyboardInterrupt at the next b
 
 ## Where your computes run
 
-The kernel starts on the **in-process scheduler**, the same one the napari viewer
+The kernel starts on the **in-process scheduler**, the same one a napari viewer
 reads through. That is the right default for this workload: a chunk read over
 loopback is IO-bound and comes back as an mmap view, so routing it through worker
 processes adds hops rather than speed — and a cluster nobody asked for is one that
@@ -140,19 +149,19 @@ either way.
 
 ## You are not the only writer of this namespace
 The user can run their own code in this kernel, from a Jupyter notebook or console
-attached to it. It is the same namespace and the same viewer, so their cells can rebind a variable you set, add
+attached to it. It is the same namespace, so their cells can rebind a variable you set, add
 or remove a layer, or import something you did not.
 
 * **You will be told, after the fact.** When user cells have run since your last call,
   a note listing them (`job-N (status)`) is appended to your `execute_code` / `poll_job`
   / `server_status` result. Read them with `poll_job`, and re-check what you rely on
-  (`dir()`, `viewer.layers`, `inspect_object`) instead of trusting what you last saw.
+  (`dir()`, `inspect_object`) instead of trusting what you last saw.
 * **One cell at a time.** While the user's cell runs, your new cells are refused and
   your other calls wait for it; while your cell runs, theirs waits for it. A user's cell
   can run while your `run_async` task does. Do not try to clear either.
 * **Their cell is not yours to stop.** `interrupt_kernel` refuses a user job (it stops
   only your own). Do not reach for `restart_kernel` to get around that: it would
-  destroy the user's variables and layers along with yours.
+  destroy the user's variables along with yours.
 * **But no second agent.** The user is the only other writer you will meet: whichever
   agent runs code first holds the kernel until it restarts, and another client is
   refused by everything that changes kernel state — `execute_code`, `interrupt_kernel`,

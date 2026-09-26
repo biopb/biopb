@@ -6,10 +6,12 @@ description: The napari window, where the session has one — reading a layer, l
 
 **This is the napari window, and a session need not have one.** It is the
 display surface that can show an array without uploading it, and the one
-`take_screenshot` captures — but it needs a display, and a headless session or a
-closed window has none. `server_status`'s `## Viewer` says which you are
-in; [[web-viewer]] is the route that works either way. Everything below assumes
-a window.
+`take_screenshot` captures — but it is optional: the user configures it, and the
+machine needs napari and a display. A session without one has no `viewer` in
+the namespace at all, and one whose window was closed has a `viewer` nobody
+sees. `server_status`'s `## Viewer` says which you are in, and why there is
+none; [[web-viewer]] is the route that works either way. Everything below
+assumes a window.
 
 **Threading:** a cell runs on the Qt main thread, so it mutates the `viewer`
 directly. From a `run_async` task every mutation (layer properties,

@@ -3,9 +3,17 @@
 ## Overview
 
 `biopb-mcp` is an **MCP server** that connects [napari](https://napari.org) and AI
-agents to biopb servers. It exposes a live napari viewer to an agent. Thesis:
-*"agent first; provide tools only if they help."* The agent drives napari through a
-real Python kernel; image results go to the viewer, other results to the agent's chat.
+agents to biopb servers. It gives an agent a live Python kernel holding the data
+plane (`client`) and the algorithm plane (`ops` and plugin modules), plus a napari
+viewer where the session has one. Thesis: *"agent first; provide tools only if they
+help."* Image results go to the viewer or the control's web viewer, other results to
+the agent's chat.
+
+The viewer is optional: it needs the `[napari]` extra, `viewer.enabled`, and a
+display. The launcher decides once per session and hands the kernel its reason when
+there is none; the kernel then skips Qt and napari entirely. A display-less host runs
+without one unless `viewer.virtual_display` opts into a launcher-owned Xvfb, which is
+for tests.
 
 The viewer docks the **Tensor Browser**, and the agent's `add_tensor` builds its
 layers through the same pipeline; both come from the separate napari plugin
@@ -94,8 +102,8 @@ Shim (`--transport stdio`) is the interface the mcp clients (claude code) see, w
 
 ### The kernel
 
-The session owns a **single child Jupyter kernel** hosting the napari viewer,
-dask, and the tensor client. Agent code runs *in that kernel*, not on the MCP
+The session owns a **single child Jupyter kernel** hosting the tensor client, dask,
+`ops`, the plugin modules and, where there is one, the napari viewer. Agent code runs *in that kernel*, not on the MCP
 thread or napari's Qt loop — so a runaway execution can be interrupted or
 hard-restarted without killing the MCP server. The host's round trips are quick
 snippets that may overlap: one threaded client routes each reply and iopub
@@ -103,8 +111,9 @@ message to the call it answers, and the kernel runs requests in arrival order.
 
 The kernel is **launched lazily, not at boot**, so a long-running server binds
 cheaply and never pops a napari viewer until user requested it; kernel-dependent
-tools return a structured not-ready status until then. **Closing the napari window
-tears the kernel back down to idle**, and `start_kernel` rebuilds it.
+tools return a structured not-ready status until then. The health probe waits for
+the bootstrap's `_jobs`, not for `viewer`. **Closing the napari window tears the
+kernel back down to idle**, and `start_kernel` rebuilds it.
 
 An agent's code runs as a cell on the kernel's main thread, like a notebook user's,
 so the Qt loop pauses while it runs; a long compute can run on a worker thread through
@@ -169,8 +178,8 @@ shows the cause inline; the full server output is in
 
 ### Extending the kernel namespace
 
-The agent's capability surface **is** the kernel namespace (e.g., `viewer`, `client`,
-`ops`, `np`/`da`), so a user adds capability by simply *putting objects in scope*.
+The agent's capability surface **is** the kernel namespace (`client`, `ops`,
+`np`/`da`, and `viewer` where there is one), so a user adds capability by simply *putting objects in scope*.
 Two paths feed it: `*.py` files in a user kernel dir, and `biopb_mcp.namespace` entry
 points for published plugin packages. Either way a plugin is loaded as a **module and
 bound under one name** — its file stem or entry-point name (#664) — so its helpers and

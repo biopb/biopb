@@ -44,6 +44,12 @@ ENV_WINDOW_CLOSE_FD = "BIOPB_WINDOW_CLOSE_FD"
 # ENV_WINDOW_CLOSE_FD above).
 ENV_SCRATCH = "BIOPB_SCRATCH_KERNEL"
 
+# Env var the launcher sets when the session has no viewer, carrying why (config
+# off, napari not installed, no display). Its presence makes the bootstrap skip
+# Qt and napari; its value is what the tools tell the agent. The literal is
+# mirrored in _bootstrap.no_viewer_reason (kept in sync by this comment).
+ENV_NO_VIEWER = "BIOPB_NO_VIEWER"
+
 # Env var handing the kernel the host client's session id, so its gate
 # (_kernel_gate) can tell this process's requests from another Jupyter
 # client's. The literal is mirrored in _kernel_gate.ENV_HOST_SESSION (kept in
@@ -164,7 +170,7 @@ class KernelHost:
         kernel_name: str = "python3",
         startup_timeout: float = 60.0,
         execute_timeout: float = 120.0,
-        health_probe_code: Optional[str] = "print('viewer' in dir())",
+        health_probe_code: Optional[str] = "print('_jobs' in dir())",
         health_probe_expect: str = "True",
         cwd: Optional[str] = None,
         env: Optional[dict] = None,
@@ -476,8 +482,8 @@ class KernelHost:
 
     def _bootstrap_error_detail(self) -> str:
         """Best-effort fetch of the traceback ``_bootstrap.bootstrap()`` stashes
-        in the kernel namespace, so a probe failure says *why* the viewer is
-        absent (a missing dep, a Qt/GL init error) instead of just ``False``.
+        in the kernel namespace, so a probe failure says *why* the bootstrap
+        failed (a missing dep, a Qt/GL init error) instead of just ``False``.
         """
         try:
             res = self._execute_internal(
@@ -559,7 +565,7 @@ class KernelHost:
             # kill and the relaunch — booting, not idle.
             return _status_result(
                 "starting",
-                "Kernel is still starting (napari viewer bring-up). "
+                "Kernel is still starting. "
                 "Poll server_status or retry in a few seconds.",
             )
         return _status_result(
@@ -1100,6 +1106,12 @@ class KernelHost:
         the session child's own environ never carries it."""
         env = self._env or {}
         return env.get("DISPLAY") if env.get("BIOPB_VIRTUAL_DISPLAY") else None
+
+    @property
+    def no_viewer_reason(self):
+        """Why this session has no napari viewer, or None when it has one. Set by
+        the launcher in the kernel env it hands us (ENV_NO_VIEWER)."""
+        return (self._env or {}).get(ENV_NO_VIEWER) or None
 
     def health(self) -> dict:
         """Liveness summary for server_status (cheap; no kernel round trip)."""
