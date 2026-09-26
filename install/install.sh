@@ -12,7 +12,8 @@
 # seeds nothing. An existing config is always kept untouched on rerun.
 #
 # Unattended upgrades: set BIOPB_NONINTERACTIVE=1 to suppress every prompt (keeps
-# an existing config). Example:
+# an existing config; leaves the remote algorithm plugins off unless
+# BIOPB_REMOTE_PLUGINS=1). Example:
 #   curl -fsSL https://biopb.org/install.sh | BIOPB_NONINTERACTIVE=1 bash
 #
 # This installs prebuilt wheels from a biopb GitHub release-v* deployment (the
@@ -391,6 +392,43 @@ _read_extra_packages() {
     done < "$EXTRA_PACKAGES_FILE"
 }
 
+# Seed the algorithm registry under config dir $1 on a fresh install. The
+# cellpose server on biopb.org is off-site and logs client IPs, so it is added
+# only with consent, asked once: when neither the registry nor an older
+# install's mcp-config.json exists (the control moves that file's servers into
+# the registry). Declining leaves the registry empty; _confirm defaults to Yes.
+_seed_algorithm_registry() {
+    local algorithms="$1/algorithms"
+    if [ -d "$algorithms" ] || [ -f "$1/mcp-config.json" ]; then
+        _ok "Algorithm registry kept ($algorithms)"
+    else
+        _info "BioPB ships with algorithm plugins that use remote servers for"
+        _info "certain computations, e.g. cell segmentation. The servers are"
+        _info "hosted at UConn Health and log client IP addresses."
+        _info ""
+        local remote=1
+        if [ "${NONINTERACTIVE:-0}" = "1" ]; then
+            # Consent can't be asked unattended: enable only on explicit opt-in.
+            if [ "${BIOPB_REMOTE_PLUGINS:-0}" = "1" ]; then
+                _ok "Remote algorithm plugins enabled (BIOPB_REMOTE_PLUGINS=1)"
+            else
+                remote=0
+                _ok "Remote algorithm plugins disabled (non-interactive; set BIOPB_REMOTE_PLUGINS=1 to enable)"
+            fi
+        elif _confirm "Enable the remote algorithm plugins?"; then
+            _ok "Remote algorithm plugins enabled"
+        else
+            remote=0
+            _ok "Remote algorithm plugins disabled (add servers later in $algorithms)"
+        fi
+        mkdir -p "$algorithms"
+        if [ "$remote" = "1" ]; then
+            printf '{"url": "grpcs://cellpose.biopb.org:443"}\n' > "$algorithms/cellpose.json"
+            _ok "Added the cellpose server: $algorithms/cellpose.json"
+        fi
+    fi
+}
+
 # Detect installed agent systems and register the biopb MCP server with each.
 # Always drops a canonical, client-agnostic definition at $CONFIG_DIR/mcp.json.
 # If nothing is detected, prints guidance so the user can wire it up themselves.
@@ -402,6 +440,8 @@ _setup_mcp() {
     mcp_cmd=$(command -v biopb-mcp 2>/dev/null || echo "biopb-mcp")
 
     mkdir -p "$CONFIG_DIR"
+
+    _seed_algorithm_registry "$CONFIG_DIR"
 
     # Seed the built-in example kernel plugin(s) into ~/.config/biopb/kernel/ so
     # they load into the agent kernel namespace at startup and are visible as a
@@ -1201,7 +1241,10 @@ install_biopb() {
     # same zero-question path as an interactive fresh install: it seeds the sample
     # bundle and points the config there (fail-soft — a fetch/checksum problem
     # just leaves an empty folder). Set BIOPB_DATA_DIR to index your own folder,
-    # or BIOPB_INSTALL_SAMPLES=0 to skip seeding and start empty.
+    # or BIOPB_INSTALL_SAMPLES=0 to skip seeding and start empty. Either way the
+    # remote algorithm plugins stay DISABLED unless BIOPB_REMOTE_PLUGINS=1 —
+    # consent can't be asked unattended, so we never silently enable the off-site
+    # IP-logging servers.
     if [ -n "${BIOPB_NONINTERACTIVE:-}" ] && [ "${BIOPB_NONINTERACTIVE}" != "0" ]; then
         NONINTERACTIVE=1
         _info "Non-interactive mode (BIOPB_NONINTERACTIVE=1): prompts suppressed"
@@ -1698,6 +1741,10 @@ install_biopb() {
         _info "  open it anytime with: ${CYAN}biopb dashboard${RESET} (or the Desktop shortcut)"
         echo ""
     fi
+
+    _info "Algorithm registry (one file per server):"
+    _cmd "  $CONFIG_DIR/algorithms/"
+    echo ""
 
     _info "Data server configuration file:"
     _cmd "  $ACTIVE_CONFIG"

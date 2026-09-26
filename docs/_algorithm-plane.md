@@ -2,8 +2,8 @@
 
 Status: **implemented**, except for the widget (biopb-napari-widget): its
 unregistered image-processing widgets still call the deleted protocols and are
-left as they are. The installers seed no remote server until cellpose.biopb.org
-serves `Ops`.
+left as they are. With consent, a fresh install adds cellpose.biopb.org, which
+serves `Ops` and `ProcessImage` from one URL, as the url entry `cellpose.json`.
 
 **Components:** the image protocol (`proto/biopb/image/`, a new `Ops` service),
 `biopb-image-runtime` (a function-level API and a PyPI wheel), `biopb-control`
@@ -380,4 +380,4 @@ Each step leaves the monorepo working.
    retired, a detection model becoming an op that returns a label image.
 4. **Retirement.** `ProcessImage`, `ObjectDetection` and their messages
    deleted; the examples and the Docker base image on `Ops`. The installers
-   stop seeding cellpose.biopb.org, a `ProcessImage` server.
+   seed cellpose.biopb.org, now on `Ops`, as a url entry.
