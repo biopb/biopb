@@ -33,6 +33,7 @@ import logging
 import os
 import secrets
 import shutil
+import signal
 import socket
 import subprocess
 import threading
@@ -41,6 +42,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from biopb import _algorithms, _locations
+from biopb._lifecycle import winjob as _winjob
 
 from ._supervisor import (
     _BACKOFF_SCHEDULE,
@@ -169,6 +171,29 @@ class ScriptEntry(ServiceProcess):
     def _open_log(self):
         self._log_rotated = True
         return super()._open_log()
+
+    # The server is uv's child, not the process spawned, so a stop takes the
+    # whole tree: the process group on POSIX (the child leads its own
+    # session), the Job Object on Windows, where killing uv alone would leave
+    # the server running.
+
+    def _ask_to_stop(self, proc: subprocess.Popen) -> None:
+        if os.name == "nt":
+            _winjob.terminate_job(self._winjob)
+            return
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except OSError:
+            proc.terminate()
+
+    def _terminate(self, proc: subprocess.Popen, timeout: float = 10.0) -> None:
+        pgid = proc.pid
+        super()._terminate(proc, timeout)
+        if os.name != "nt":
+            try:
+                os.killpg(pgid, signal.SIGKILL)  # whatever outlived uv
+            except OSError:
+                pass
 
     # --- install and describe ------------------------------------------- #
 

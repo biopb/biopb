@@ -21,7 +21,7 @@ from biopb import _algorithms
 from biopb_control._algorithm_plane import AlgorithmPlane
 
 _FAKE_UV = """
-import os, sys
+import subprocess, sys
 args = sys.argv[1:]
 verb = args[0]
 i = args.index("--script")
@@ -32,7 +32,8 @@ if verb in ("lock", "sync"):
         print("fake uv: resolution failed", file=sys.stderr)
         sys.exit(1)
     sys.exit(0)
-os.execv(sys.executable, [sys.executable, script, *rest])
+# Like uv: the script runs as a child, and uv exits with it.
+sys.exit(subprocess.call([sys.executable, script, *rest]))
 """
 
 _SERVER = """
@@ -104,6 +105,16 @@ def plane(tmp_path, registry, monkeypatch):
     p.stop_all()
 
 
+def _crash(entry) -> None:
+    """Kill an entry's uv and server at once, as an OOM kill would."""
+    if os.name == "nt":
+        from biopb._lifecycle import winjob
+
+        winjob.terminate_job(entry._winjob)
+    else:
+        os.killpg(entry._proc.pid, signal.SIGKILL)
+
+
 def _row(plane, name) -> dict:
     return next(r for r in plane.rows(probe=False) if r["name"] == name)
 
@@ -147,6 +158,8 @@ def test_an_edit_takes_effect_on_ensure(plane, registry):
     first = plane.ensure("seg", wait=30.0)
     path.write_text(_server(["alpha", "gamma"]))
     row = plane.ensure("seg", wait=30.0)
+    # The old server went with its uv.
+    assert _algorithms.probe(first["url"], timeout=2)["state"] == "unreachable"
     assert row["state"] == "up", row["error"]
     assert [o["name"] for o in row["ops"]] == ["alpha", "gamma"]
     assert row["url"] != first["url"] or row["token"] != first["token"]
@@ -196,7 +209,7 @@ def test_a_crash_after_serving_restarts(plane, registry):
     (registry / "seg.py").write_text(_server())
     row = plane.ensure("seg", wait=30.0)
     assert row["state"] == "up"
-    os.kill(plane._scripts["seg"]._proc.pid, signal.SIGKILL)
+    _crash(plane._scripts["seg"])
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
         plane.tick()
@@ -209,8 +222,9 @@ def test_a_crash_after_serving_restarts(plane, registry):
 
 def test_stop_and_logs(plane, registry):
     (registry / "seg.py").write_text(_server())
-    plane.ensure("seg", wait=30.0)
+    url = plane.ensure("seg", wait=30.0)["url"]
     assert plane.stop("seg")["state"] == "stopped"
+    assert _algorithms.probe(url, timeout=2)["state"] == "unreachable"
     logs = plane.logs("seg", 100)
     assert logs["exists"] and any(
         "starting algorithm seg" in line for line in logs["lines"]
@@ -221,10 +235,11 @@ def test_a_removed_file_stops_its_server(plane, registry):
     path = registry / "seg.py"
     path.write_text(_server())
     plane.ensure("seg", wait=30.0)
-    proc = plane._scripts["seg"]._proc
+    row = _row(plane, "seg")
     path.unlink()
     assert plane.rows(probe=False) == []
-    assert proc.wait(timeout=10) is not None
+    # The server itself is gone, not only uv.
+    assert _algorithms.probe(row["url"], timeout=2)["state"] == "unreachable"
 
 
 def test_url_entries_are_not_managed(plane, registry):

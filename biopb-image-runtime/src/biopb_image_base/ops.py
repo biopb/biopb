@@ -834,6 +834,11 @@ def serve(
         return
 
     setup_logging(get_log_level_from_env())
+    # Under the control, die with it: it passes a parent-death pipe, so a
+    # control that dies uncatchably leaves no server holding a GPU.
+    from biopb._lifecycle import deathwatch
+
+    deathwatch.install()
     token = os.environ.get(TOKEN_ENV) or None
     if token is None and not _is_loopback(args.host):
         import secrets
