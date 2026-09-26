@@ -642,11 +642,11 @@ def _serve_http(config, port, view=False, start_kernel=False):
         logger.info("Starting the kernel (Ctrl-C to stop)...")
         state = host.ensure_started()
         if state["state"] == "error":
+            # Exit rather than serve a broken kernel: no client is attached yet
+            # to retry it, and a launcher that sees us die unregistered reports
+            # our log instead of a session that cannot run anything.
             logger.error("The kernel did not start: %s", state["error"])
-            # A window was the point of `biopb mcp view`; any other session
-            # stays up, and start_kernel or the dashboard can retry.
-            if view:
-                return 1  # atexit reaps the kernel/cluster and cleans the spill dir
+            return 1  # atexit reaps the kernel/cluster and cleans the spill dir
 
     # A session on a dynamic port publishes itself; a direct `--transport http`
     # launch binds the configured fixed port its operator already knows. Done
