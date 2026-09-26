@@ -635,43 +635,47 @@ testing = [{ name = "pytest" }]
 name = "biopb-image-base"
 source = { editable = "biopb-image-runtime" }
 dependencies = [
-    { name = "biopb", extra = ["tensor"] },
-    { name = "dask", extra = ["array"] },
+    { name = "biopb" },
     { name = "grpcio" },
     { name = "grpcio-health-checking" },
-    { name = "imageio" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "protobuf" },
-    { name = "pyarrow" },
-    { name = "scipy", version = "1.14.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
-    { name = "scipy", version = "1.18.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
-    { name = "typer" },
 ]
 
 [package.optional-dependencies]
+lazy = [
+    { name = "biopb", extra = ["tensor"] },
+]
+stitch = [
+    { name = "scipy", version = "1.14.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
+    { name = "scipy", version = "1.18.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+]
 test = [
+    { name = "biopb", extra = ["tensor"] },
     { name = "biopb-tensor-server" },
     { name = "pytest" },
+    { name = "scipy", version = "1.14.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
+    { name = "scipy", version = "1.18.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "biopb", extras = ["tensor"], editable = "." },
+    { name = "biopb", editable = "." },
+    { name = "biopb", extras = ["tensor"], marker = "extra == 'lazy'", editable = "." },
+    { name = "biopb", extras = ["tensor"], marker = "extra == 'test'", editable = "." },
     { name = "biopb-tensor-server", marker = "extra == 'test'", editable = "biopb-tensor-server" },
-    { name = "dask", extras = ["array"] },
     { name = "grpcio" },
     { name = "grpcio-health-checking" },
-    { name = "imageio" },
     { name = "numpy" },
     { name = "protobuf" },
-    { name = "pyarrow", specifier = ">=14.0.0" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=7.0" },
-    { name = "scipy" },
-    { name = "typer" },
+    { name = "scipy", marker = "extra == 'stitch'" },
+    { name = "scipy", marker = "extra == 'test'" },
 ]
-provides-extras = ["test"]
+provides-extras = ["lazy", "stitch", "test"]
 
 [[package]]
 name = "biopb-mcp"

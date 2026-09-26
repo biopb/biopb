@@ -5,28 +5,34 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "biopb-image-base"
 dynamic = ["version"]
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 authors = [{name = "Ji Yu", email = "jyu@uchc.edu"}]
-description = "Base utilities for biopb.image gRPC services"
+description = "Serve functions over the biopb.image Ops protocol"
 readme = "README.md"
 license = "MIT"
+# The core serves inline pixels: enough for a server file whose inputs and
+# results fit in a message. Lazy input and a plane sink need [lazy].
 dependencies = [
-  "biopb[tensor]",
+  "biopb",
   "grpcio",
   "grpcio-health-checking",
   "protobuf",
   "numpy",
-  "scipy",
-  "imageio",
-  "typer",
-  "pyarrow >= 14.0.0",
-  "dask[array]",
 ]
 
 [project.optional-dependencies]
+lazy = [
+  "biopb[tensor]",
+]
+# The flow-stitching helpers (stitch, dynamics_local).
+stitch = [
+  "scipy",
+]
 test = [
   "pytest >= 7.0",
+  "biopb[tensor]",
   "biopb-tensor-server",
+  "scipy",
 ]
 
 [tool.setuptools.packages.find]
@@ -34,11 +40,9 @@ where = ["src"]
 include = ["biopb_image_base*"]
 
 # Versioned off the SDK tag `v*` (shared with biopb Python/Java), NOT the product
-# `release-v*`. image-base is the foundation others build compute servers on and
-# is distributed only as a Docker base image (no wheel, no PyPI); tying it to the
-# SDK line means it bumps (and its image republishes) exactly when the SDK bumps,
-# and a product-only `release-v*` release leaves it untouched (its idempotent
-# Docker publish skips the unchanged version). root = ".." (monorepo subdir); the
+# `release-v*`: a server file's header resolves it from PyPI next to biopb, so
+# the wheel publishes on the SDK's tag (python-ci), as does the Docker base
+# image (image-runtime-ci). root = ".." (monorepo subdir); the
 # --match keeps `git describe` off the product's `release-v*` tags.
 [tool.setuptools_scm]
 version_file = "src/biopb_image_base/_version.py"

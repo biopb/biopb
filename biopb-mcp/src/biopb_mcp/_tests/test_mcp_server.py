@@ -1390,7 +1390,7 @@ class TestServerStatus:
         assert sys.executable in report
         assert "add a package" in report
 
-    def test_kernel_snippet_names_the_config_key_when_no_ops(self):
+    def test_kernel_snippet_reports_the_ops_status(self):
         import contextlib
         import io
 
@@ -1398,13 +1398,13 @@ class TestServerStatus:
             "_conn": MagicMock(client=None, last_status="", last_message=""),
             "viewer": MagicMock(layers=[]),
             "_viewer_window_alive": lambda: True,
-            "ops": {},
+            "ops": MagicMock(status=lambda: "seg (script): failed\n  error: x"),
             "_jobs": MagicMock(jobs_summary=list),
         }
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             exec(_server._STATUS_SNIPPET, ns)  # noqa: S102 - the canned snippet
-        assert "services.process_image_servers" in out.getvalue()
+        assert "## Ops\n  seg (script): failed\n    error: x" in out.getvalue()
 
     def test_idle_kernel_reports_not_started(self, server_with_host):
         # Not alive and not ready (never started / torn down): point the agent

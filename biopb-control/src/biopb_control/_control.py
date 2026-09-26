@@ -19,6 +19,11 @@ same port**, and routes by namespace so no two upstreams share a path prefix:
 - ``GET  /api/status``            -> the control's own liveness + the data-plane
                                      snapshot + a live-session count (what the
                                      dashboard polls).
+- ``GET  /api/algorithms``        -> every algorithm registry entry, with its state
+                                     and cached ops; a script entry's row carries
+                                     its loopback url and token.
+- ``POST /api/algorithms/{refresh,ensure,stop,restart}``, ``GET
+  /api/algorithms/logs`` -> the algorithm plane's verbs (``?name=``).
 - ``GET  /api/sessions``          -> the live MCP sessions from the registry, each
                                      with its ``/session/<id>/observe`` link.
 - ``POST /api/sessions/new``      -> launch an agentless session on this
@@ -98,7 +103,6 @@ import httpx
 import uvicorn
 from biopb import (
     _agents,
-    _algorithms,
     _kernel_plugins,
     _locations,
     _sessions,
@@ -120,6 +124,7 @@ from starlette.responses import (
 from starlette.routing import Mount, Route
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from ._algorithm_plane import INSTALL_TIMEOUT, AlgorithmPlane
 from ._supervisor import DataPlaneSupervisor
 
 logger = logging.getLogger(__name__)
@@ -129,6 +134,8 @@ logger = logging.getLogger(__name__)
 # out, else the client treats a working-but-slow control plane as unreachable.
 _RESPONSE_MARGIN = 5.0
 _MIN_ENSURE_WAIT = 1.0
+# An algorithm verb's wait when the client sends no ?client_timeout.
+_ALGORITHM_WAIT_DEFAULT = 60.0
 
 # Response headers we must not copy verbatim from the upstream tensor server:
 # hop-by-hop headers and framing that StreamingResponse re-derives itself.
@@ -554,6 +561,21 @@ def _bounded_ensure_wait(ensure_timeout: float, client_timeout: float) -> float:
     return max(_MIN_ENSURE_WAIT, min(ensure_timeout, client_timeout - _RESPONSE_MARGIN))
 
 
+def _algorithm_wait(client_timeout: float) -> float:
+    """How long an algorithm entry's ``ensure``/``restart`` waits.
+
+    Its ensure may first install the entry's environment, so the data plane's
+    ``ensure_timeout`` does not bound it: the client's timeout does (less the
+    margin), capped by how long an install may take. Without a client hint it
+    waits ``_ALGORITHM_WAIT_DEFAULT``; the row then says what is still running.
+    """
+    if client_timeout <= 0:
+        return _ALGORITHM_WAIT_DEFAULT
+    return max(
+        _MIN_ENSURE_WAIT, min(INSTALL_TIMEOUT, client_timeout - _RESPONSE_MARGIN)
+    )
+
+
 def _loopback_url(host: str, port: int, scheme: str = "http") -> str:
     """A loopback-reachable base URL for a server that may bind a wildcard.
 
@@ -900,6 +922,7 @@ def build_app(
     static_dir: str | Path | None = None,
     loopback_bound: bool = False,
     url_prefix: str | None = None,
+    algorithms: AlgorithmPlane | None = None,
 ) -> Starlette:
     """Build the control-plane ASGI app.
 
@@ -928,8 +951,13 @@ def build_app(
     under it are stripped before routing and the served SPA shell is rewritten to
     point back at it. ``None`` (the default) is the plain root origin and changes
     nothing. It is normalized here, the single consumer.
+
+    ``algorithms`` is the algorithm plane the ``/api/algorithms`` verbs drive;
+    by default one over the user's registry.
     """
     session_roots = _session_proxy_roots(loopback_bound)
+    if algorithms is None:
+        algorithms = AlgorithmPlane()
     url_prefix = normalize_url_prefix(url_prefix)
 
     # The built SPA bundle the control serves at its root (None / missing ->
@@ -1214,14 +1242,10 @@ def build_app(
         return _agent_action(request, _agents.unregister)
 
     def api_algorithms(_request: Request) -> JSONResponse:
-        # The configured algorithm-plane servers (biopb.image ProcessImage
-        # servicers listed in the biopb-mcp config) with a live health + ops
-        # probe. Read-only inspection — no lifecycle control (the pending
-        # algorithm plane).
-        # Sync: statuses() reads a config file and makes blocking gRPC calls (run
-        # concurrently, bounded by one probe timeout), so Starlette runs it in the
-        # threadpool. Polled on demand (a dashboard button), not on the interval,
-        # because it dials external servers.
+        # Every registry entry with its state and cached ops: a script entry as
+        # the algorithm plane supervises it, a url entry probed live (so this
+        # is polled on demand, not on the interval). Sync: it hashes files and
+        # makes blocking gRPC calls, so Starlette runs it in the threadpool.
         #
         # `plugins` folds in the kernel-namespace "bring your own tool" surface
         # (biopb/biopb-mcp#92) -- a static, stdlib-only listing of the ~/.config/
@@ -1230,7 +1254,7 @@ def build_app(
         # algorithm-plane card; a summary read failure degrades to empty rather
         # than 500-ing the servers view alongside it.
         try:
-            servers = _algorithms.statuses()
+            servers = algorithms.rows()
         except Exception as exc:  # noqa: BLE001 - report, never crash the handler
             logger.exception("api/algorithms failed")
             return JSONResponse({"error": str(exc)}, status_code=500)
@@ -1240,6 +1264,55 @@ def build_app(
             logger.exception("api/algorithms plugin summary failed")
             plugins = {"dir": "", "files": [], "entry_points": []}
         return JSONResponse({"servers": servers, "plugins": plugins})
+
+    def _algorithm_verb(request: Request, verb) -> JSONResponse:
+        # One entry's verb, by ?name=. An unknown name is 404; a verb a url
+        # entry does not take (stop, restart, logs) is 400.
+        name = request.query_params.get("name", "")
+        try:
+            client_timeout = float(request.query_params.get("client_timeout", "0"))
+        except ValueError:
+            client_timeout = 0.0
+        wait = _algorithm_wait(client_timeout)
+        try:
+            return JSONResponse(verb(name, wait))
+        except KeyError:
+            return JSONResponse({"error": f"no algorithm {name!r}"}, status_code=404)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        except Exception as exc:  # noqa: BLE001 - report, never crash the handler
+            logger.exception("api/algorithms verb failed")
+            return JSONResponse({"error": str(exc)}, status_code=500)
+
+    def algorithms_refresh(_request: Request) -> JSONResponse:
+        try:
+            return JSONResponse({"servers": algorithms.refresh()})
+        except Exception as exc:  # noqa: BLE001 - report, never crash the handler
+            logger.exception("api/algorithms/refresh failed")
+            return JSONResponse({"error": str(exc)}, status_code=500)
+
+    def algorithms_ensure(request: Request) -> JSONResponse:
+        return _algorithm_verb(
+            request, lambda name, wait: {"server": algorithms.ensure(name, wait)}
+        )
+
+    def algorithms_stop(request: Request) -> JSONResponse:
+        return _algorithm_verb(
+            request, lambda name, _wait: {"server": algorithms.stop(name)}
+        )
+
+    def algorithms_restart(request: Request) -> JSONResponse:
+        return _algorithm_verb(
+            request, lambda name, wait: {"server": algorithms.restart(name, wait)}
+        )
+
+    def algorithms_logs(request: Request) -> JSONResponse:
+        try:
+            n = int(request.query_params.get("lines", _LOG_TAIL_DEFAULT_LINES))
+        except (TypeError, ValueError):
+            n = _LOG_TAIL_DEFAULT_LINES
+        n = max(1, min(n, _LOG_TAIL_MAX_LINES))
+        return _algorithm_verb(request, lambda name, _wait: algorithms.logs(name, n))
 
     def api_mcp_config(_request: Request) -> JSONResponse:
         # The biopb-mcp settings editor's backing read: the raw on-disk config +
@@ -1528,6 +1601,11 @@ def build_app(
         Route("/api/agents/{agent_id}/register", agent_register, methods=["POST"]),
         Route("/api/agents/{agent_id}/unregister", agent_unregister, methods=["POST"]),
         Route("/api/algorithms", api_algorithms, methods=["GET"]),
+        Route("/api/algorithms/refresh", algorithms_refresh, methods=["POST"]),
+        Route("/api/algorithms/ensure", algorithms_ensure, methods=["POST"]),
+        Route("/api/algorithms/stop", algorithms_stop, methods=["POST"]),
+        Route("/api/algorithms/restart", algorithms_restart, methods=["POST"]),
+        Route("/api/algorithms/logs", algorithms_logs, methods=["GET"]),
         Route("/api/mcp_config", api_mcp_config, methods=["GET"]),
         Route("/api/mcp_config", api_mcp_config_save, methods=["PUT"]),
         Mount("/data_plane", sidecar),
@@ -1588,6 +1666,7 @@ def serve_control_api(
     supervisor: DataPlaneSupervisor,
     ensure_timeout: float,
     data_web_url: str | None = None,
+    algorithms: AlgorithmPlane | None = None,
 ) -> tuple[_ControlServer, threading.Thread]:
     """Start the control-plane web origin on ``host:port`` in a background thread.
 
@@ -1624,6 +1703,7 @@ def serve_control_api(
         static_dir=spec.static_dir,
         loopback_bound=loopback_bound,
         url_prefix=spec.url_prefix,
+        algorithms=algorithms,
     )
     if not loopback_bound:
         logger.info("session chat disabled: control bound to %s (not loopback)", host)

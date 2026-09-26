@@ -63,72 +63,32 @@ _HEALTHY_RESET_SECONDS = 60.0
 
 
 @dataclass
-class DataPlaneSpec:
-    """Everything needed to launch + probe the tensor server, resolved by the
-    caller (the ``biopb control`` CLI) so the supervisor imports no server config.
+class ServiceSpec:
+    """How to run one supervised child: its command line, its environment, the
+    loopback address its liveness probe connects to, and its log file.
 
-    ``grpc_host`` / ``grpc_port`` are the **bind** the control dictates: they are
-    passed to the child as ``--host``/``--port`` (biopb/biopb#604 -- the plane's
-    bind left ``biopb.json`` and is now the launcher's call). Because the control
-    chooses the bind rather than reading it back, it cannot hold a stale view of
-    one, and there is nothing to re-derive after a restart.
-
-    ``grpc_host`` may be a wildcard (``0.0.0.0``/``::``) in remote mode; the
-    liveness probe uses :attr:`DataPlaneSupervisor._probe_host`, which maps a
-    wildcard onto the matching loopback address, since a wildcard is a bind
-    target and not a connect target.
-
-    ``tls`` serves the flight plane over TLS (``--tls``); clients then dial
-    ``grpcs://``. ``tls_cert``/``tls_key`` name an operator-supplied certificate
-    to serve instead of the self-signed one the plane mints into the state tree,
-    and ``sans`` names extra hosts for a cert the plane does mint -- all three
-    forwarded to ``launch`` verbatim (biopb/biopb#913). They are the caller's to
-    validate; the supervisor only passes them on.
-
-    ``token`` is the data-plane access token the caller resolved:
-    always set in remote mode, and ``None`` in local mode *unless* a token was
-    supplied there too (local mode allows an optional token — enforcement is
-    independent of the loopback/public bind).
+    ``env`` is the child's whole environment. ``log_path`` ``None`` sends its
+    output to the control's own stderr.
     """
 
-    config: Path
-    grpc_host: str = "127.0.0.1"
-    grpc_port: int = 8815
-    tls: bool = False
-    tls_cert: Optional[Path] = None
-    tls_key: Optional[Path] = None
-    sans: Tuple[str, ...] = ()
-    web_host: str = "127.0.0.1"
-    web_port: int = 8814
-    # The built web/ SPA bundle. Consumed by the *control* (it is the single web
-    # origin and serves the bundle itself, see _control.build_app), NOT forwarded
-    # to the tensor subprocess — the sidecar no longer serves static assets.
-    static_dir: Optional[Path] = None
-    log_level: str = "INFO"
-    server_log: Optional[Path] = None
-    token: Optional[str] = None
-    # Path prefix a reverse proxy publishes the control's web origin under (an
-    # Open OnDemand `/node/<host>/<port>` route, biopb/biopb#728). Consumed only
-    # by the web front (_control.build_app normalizes it); None = root origin.
-    url_prefix: Optional[str] = None
+    argv: list[str]
+    env: dict
+    host: str
+    port: int
+    log_path: Optional[Path] = None
+    label: str = "service"
 
 
-@dataclass
-class _State:
-    want: bool = False  # should the plane be running (set by ensure/stop)
-    failures: int = 0  # consecutive failed/crashed attempts (drives backoff)
-    restarts: int = 0  # total restarts since control start (for status)
-    next_attempt_at: float = 0.0  # monotonic; earliest time to (re)spawn
-    up_since: Optional[float] = None  # monotonic; when we last observed it up
-    last_error: Optional[str] = None
-    last_exit_code: Optional[int] = None  # exit code of the most recent crash
+class ServiceProcess:
+    """The mechanics of one supervised child, for a policy to drive.
 
+    Spawns the child bound to the control's lifetime (module docstring),
+    appends its output to its log, reaps it, stops it, and probes its port.
+    Deciding when to do which -- backoff, conflicts, states -- is the
+    subclass's.
+    """
 
-class DataPlaneSupervisor:
-    """Persistent supervisor for the tensor (data) plane subprocess."""
-
-    def __init__(self, spec: DataPlaneSpec):
-        self._spec = spec
+    def __init__(self) -> None:
         self._proc: Optional[subprocess.Popen] = None
         self._log_fh = None
         # Death-binding handles (see the module docstring). POSIX: the write end
@@ -137,86 +97,24 @@ class DataPlaneSupervisor:
         # reused across restarts, closed only on final stop.
         self._death_w: Optional[int] = None
         self._winjob = None
-        self._state = _State()
-        self._lock = threading.RLock()
+
+    def _service_spec(self) -> ServiceSpec:
+        raise NotImplementedError
 
     @property
     def log_path(self) -> Optional[Path]:
-        """The file the data-plane subprocess's stdout/stderr is appended to, or
-        ``None`` when no ``server_log`` was configured (output then goes to the
-        control's own stderr). A public accessor so the control's log endpoint can
-        tail it without reaching into ``_spec``."""
-        p = self._spec.server_log
+        """The file the child's stdout/stderr is appended to, or ``None`` when
+        it goes to the control's own stderr."""
+        p = self._service_spec().log_path
         return Path(p) if p is not None else None
 
-    # --- liveness / argv / env ------------------------------------------- #
-
-    @property
-    def _probe_host(self) -> str:
-        """A connect()-able form of the bind. A wildcard is a bind target only;
-        map it onto the matching loopback address (IPv4 wildcard -> 127.0.0.1,
-        IPv6 -> ::1, so a ``::``-bound server with IPV6_V6ONLY still answers)."""
-        host = self._spec.grpc_host
-        if host in ("0.0.0.0", ""):
-            return "127.0.0.1"
-        if host == "::":
-            return "::1"
-        return host
-
     def _port_up(self, timeout: float = 0.5) -> bool:
+        spec = self._service_spec()
         try:
-            with socket.create_connection(
-                (self._probe_host, self._spec.grpc_port), timeout=timeout
-            ):
+            with socket.create_connection((spec.host, spec.port), timeout=timeout):
                 return True
         except OSError:
             return False
-
-    def _build_argv(self) -> list[str]:
-        s = self._spec
-        argv = [
-            sys.executable,
-            "-m",
-            "biopb_tensor_server.cli",
-            "launch",
-            "--config",
-            str(s.config),
-            "--host",
-            str(s.grpc_host),
-            "--port",
-            str(s.grpc_port),
-            "--web-port",
-            str(s.web_port),
-            "--web-host",
-            str(s.web_host),
-            "--log-level",
-            str(s.log_level),
-        ]
-        if s.tls:
-            argv.append("--tls")
-        # Both or neither -- `launch` exits 2 on a half pair, and the caller has
-        # already refused one, so this cannot emit a lone flag.
-        if s.tls_cert and s.tls_key:
-            argv += ["--tls-cert", str(s.tls_cert), "--tls-key", str(s.tls_key)]
-        for san in s.sans:
-            argv += ["--san", san]
-        return argv
-
-    def _child_env(self) -> dict:
-        env = os.environ.copy()
-        if self._spec.token:
-            env["BIOPB_TENSOR_TOKEN"] = self._spec.token
-        # No token resolved (tokenless local mode): the tensor `launch` runs
-        # tokenless on its own because the config binds the flight server to
-        # loopback — no bypass signal is needed or read anymore. (A local
-        # deployment *may* still carry a token; then the branch above sets it.)
-        #
-        # Mark the plane as control-owned so its HTTP sidecar reports
-        # `supervised` on /api/admin/status; the admin UI then routes restarts
-        # through the control (POST /api/data_plane/restart) rather than telling
-        # the user the plane is self-managed (biopb/biopb#418).
-        env["BIOPB_DATA_PLANE_SUPERVISED"] = "1"
-        return env
 
     def _open_log(self):
         """Open (once) the append-binary file the child's stdout/stderr go to.
@@ -234,7 +132,7 @@ class DataPlaneSupervisor:
         """
         if self._log_fh is not None:
             return self._log_fh
-        path = self._spec.server_log
+        path = self.log_path
         if path is None:
             self._log_fh = getattr(sys.stderr, "buffer", sys.stderr)
             return self._log_fh
@@ -243,53 +141,44 @@ class DataPlaneSupervisor:
             _locations.rotate_log(Path(path))
             self._log_fh = open(path, "ab", buffering=0)  # noqa: SIM115 - long-lived handle stored on self._log_fh for the spawned subprocess's lifetime
         except OSError:
-            logger.warning("Cannot open data-plane log %s; using stderr", path)
+            logger.warning("Cannot open log %s; using stderr", path)
             self._log_fh = getattr(sys.stderr, "buffer", sys.stderr)
         return self._log_fh
 
-    # --- lifecycle ------------------------------------------------------- #
+    def _start_process(self) -> None:
+        """Spawn the child, bound to the control's lifetime. Raises ``OSError``
+        on a failed bring-up, with nothing left half-armed.
 
-    def _spawn_locked(self) -> bool:
-        """(Re)spawn the data plane. Returns True on success, False on a spawn
-        failure that has been counted toward the backoff.
-
-        Any ``OSError`` from bring-up -- the parent-death pipe's ``os.pipe`` under
-        fd exhaustion (EMFILE/ENFILE), or ``Popen`` (a bad executable, ENOMEM,
-        EAGAIN/too many processes) -- is treated like a failed attempt: ``failures``
-        is bumped, the backoff window is armed, and ``last_error`` records it,
-        rather than propagating. That keeps a failing spawn from escaping ``ensure``
-        / ``tick`` (and the ``/data_plane/ensure`` handler) uncounted and hammering
-        with no backoff. So the pipe arm runs *inside* the try, alongside ``Popen``.
+        Any ``OSError`` counts: the parent-death pipe's ``os.pipe`` under fd
+        exhaustion (EMFILE/ENFILE), or ``Popen`` (a bad executable, ENOMEM,
+        EAGAIN/too many processes). So the pipe arm runs inside the try,
+        alongside ``Popen``.
         """
-        argv = self._build_argv()
+        spec = self._service_spec()
         log = self._open_log()
         try:
             log.write(
-                f"\n--- control: starting data plane at "
+                f"\n--- control: starting {spec.label} at "
                 f"{time.strftime('%Y-%m-%d %H:%M:%S')} ---\n".encode()
             )
         except (OSError, ValueError):
             pass
-        logger.info("Spawning data plane: %s", " ".join(argv))
-        # The plane is a tracked child bound to the control's lifetime (module
-        # docstring): while the control lives it owns and reaps this child
-        # directly; if the control dies uncatchably the child reaps *itself* off
-        # the parent-death pipe (POSIX) or the OS reaps it off the closed Job
-        # Object (Windows), so a dead control never orphans the plane into a
-        # port-holding conflict.
-        env = self._child_env()
+        logger.info("Spawning %s: %s", spec.label, " ".join(spec.argv))
+        # A tracked child bound to the control's lifetime (module docstring):
+        # while the control lives it owns and reaps this child directly; if the
+        # control dies uncatchably the child reaps *itself* off the parent-death
+        # pipe (POSIX) or the OS reaps it off the closed Job Object (Windows).
+        env = dict(spec.env)
         popen_kwargs: dict = {}
         if os.name == "nt":
             popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-        # Arm the pipe inside the try so an os.pipe() failure (fd exhaustion) is
-        # counted toward the backoff exactly like a Popen failure, not raised out
-        # of ensure/tick uncounted. death_r is pre-set so `finally` can reference
-        # it whether or not the arm completed.
+        # death_r is pre-set so `finally` can reference it whether or not the
+        # arm completed.
         death_r = None
         try:
             death_r = self._arm_parent_death(env, popen_kwargs)
             self._proc = subprocess.Popen(
-                argv,
+                spec.argv,
                 stdin=subprocess.DEVNULL,
                 stdout=log,
                 stderr=log,
@@ -297,14 +186,9 @@ class DataPlaneSupervisor:
                 close_fds=True,
                 **popen_kwargs,
             )
-        except OSError as exc:
+        except OSError:
             self._close_death_pipe()  # drop the half-armed write end
-            st = self._state
-            st.failures += 1
-            st.last_error = f"failed to spawn data plane: {exc}"
-            st.next_attempt_at = time.monotonic() + self._backoff()
-            logger.error(st.last_error)
-            return False
+            raise
         finally:
             # The child inherited its own copy of the read end; close the
             # control's copy so only the child's death (or ours) shuts the pipe.
@@ -314,8 +198,6 @@ class DataPlaneSupervisor:
                 except OSError:
                     pass
         self._assign_to_job()
-        self._state.up_since = None
-        return True
 
     def _arm_parent_death(self, env: dict, popen_kwargs: dict) -> Optional[int]:
         """POSIX: arm the child's parent-death pipe; return the read fd to close
@@ -391,6 +273,221 @@ class DataPlaneSupervisor:
         # spawn re-arms a fresh pipe (the reused Windows job is left intact).
         self._close_death_pipe()
         return rc
+
+    def _close_child_bindings(self) -> None:
+        """Release the death-binding handles after the child is stopped.
+
+        Closes the POSIX parent-death pipe and, on Windows, force-reaps any
+        surviving job member and closes the Job Object (the graceful ``_terminate``
+        has usually already emptied it). Called only on a full stop — a crash
+        respawn keeps the reused job and re-arms the pipe."""
+        self._close_death_pipe()
+        if self._winjob is not None:
+            _winjob.terminate_job(self._winjob)
+            _winjob.close_job(self._winjob)
+            self._winjob = None
+
+    def _terminate(self, proc: subprocess.Popen, timeout: float = 10.0) -> None:
+        if proc.poll() is not None:
+            return
+        self._ask_to_stop(proc)
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                pass
+        self._stopped()
+
+    def _ask_to_stop(self, proc: subprocess.Popen) -> None:
+        """A graceful stop: SIGTERM, which is TerminateProcess on Windows."""
+        proc.terminate()
+
+    def _stopped(self) -> None:
+        """After the child has exited, however it was stopped."""
+
+    def _close_log(self) -> None:
+        fh = self._log_fh
+        self._log_fh = None
+        if fh is not None and fh is not getattr(sys.stderr, "buffer", sys.stderr):
+            try:
+                fh.close()
+            except OSError:
+                pass
+
+
+@dataclass
+class DataPlaneSpec:
+    """Everything needed to launch + probe the tensor server, resolved by the
+    caller (the ``biopb control`` CLI) so the supervisor imports no server config.
+
+    ``grpc_host`` / ``grpc_port`` are the **bind** the control dictates: they are
+    passed to the child as ``--host``/``--port`` (biopb/biopb#604 -- the plane's
+    bind left ``biopb.json`` and is now the launcher's call). Because the control
+    chooses the bind rather than reading it back, it cannot hold a stale view of
+    one, and there is nothing to re-derive after a restart.
+
+    ``grpc_host`` may be a wildcard (``0.0.0.0``/``::``) in remote mode; the
+    liveness probe uses :attr:`DataPlaneSupervisor._probe_host`, which maps a
+    wildcard onto the matching loopback address, since a wildcard is a bind
+    target and not a connect target.
+
+    ``tls`` serves the flight plane over TLS (``--tls``); clients then dial
+    ``grpcs://``. ``tls_cert``/``tls_key`` name an operator-supplied certificate
+    to serve instead of the self-signed one the plane mints into the state tree,
+    and ``sans`` names extra hosts for a cert the plane does mint -- all three
+    forwarded to ``launch`` verbatim (biopb/biopb#913). They are the caller's to
+    validate; the supervisor only passes them on.
+
+    ``token`` is the data-plane access token the caller resolved:
+    always set in remote mode, and ``None`` in local mode *unless* a token was
+    supplied there too (local mode allows an optional token — enforcement is
+    independent of the loopback/public bind).
+    """
+
+    config: Path
+    grpc_host: str = "127.0.0.1"
+    grpc_port: int = 8815
+    tls: bool = False
+    tls_cert: Optional[Path] = None
+    tls_key: Optional[Path] = None
+    sans: Tuple[str, ...] = ()
+    web_host: str = "127.0.0.1"
+    web_port: int = 8814
+    # The built web/ SPA bundle. Consumed by the *control* (it is the single web
+    # origin and serves the bundle itself, see _control.build_app), NOT forwarded
+    # to the tensor subprocess — the sidecar no longer serves static assets.
+    static_dir: Optional[Path] = None
+    log_level: str = "INFO"
+    server_log: Optional[Path] = None
+    token: Optional[str] = None
+    # Path prefix a reverse proxy publishes the control's web origin under (an
+    # Open OnDemand `/node/<host>/<port>` route, biopb/biopb#728). Consumed only
+    # by the web front (_control.build_app normalizes it); None = root origin.
+    url_prefix: Optional[str] = None
+
+
+@dataclass
+class _State:
+    want: bool = False  # should the plane be running (set by ensure/stop)
+    failures: int = 0  # consecutive failed/crashed attempts (drives backoff)
+    restarts: int = 0  # total restarts since control start (for status)
+    next_attempt_at: float = 0.0  # monotonic; earliest time to (re)spawn
+    up_since: Optional[float] = None  # monotonic; when we last observed it up
+    last_error: Optional[str] = None
+    last_exit_code: Optional[int] = None  # exit code of the most recent crash
+
+
+class DataPlaneSupervisor(ServiceProcess):
+    """Persistent supervisor for the tensor (data) plane subprocess."""
+
+    def __init__(self, spec: DataPlaneSpec):
+        super().__init__()
+        self._spec = spec
+        self._state = _State()
+        self._lock = threading.RLock()
+
+    def _service_spec(self) -> ServiceSpec:
+        return ServiceSpec(
+            argv=self._build_argv(),
+            env=self._child_env(),
+            host=self._probe_host,
+            port=self._spec.grpc_port,
+            log_path=self._spec.server_log,
+            label="data plane",
+        )
+
+    # --- liveness / argv / env ------------------------------------------- #
+
+    @property
+    def _probe_host(self) -> str:
+        """A connect()-able form of the bind. A wildcard is a bind target only;
+        map it onto the matching loopback address (IPv4 wildcard -> 127.0.0.1,
+        IPv6 -> ::1, so a ``::``-bound server with IPV6_V6ONLY still answers)."""
+        host = self._spec.grpc_host
+        if host in ("0.0.0.0", ""):
+            return "127.0.0.1"
+        if host == "::":
+            return "::1"
+        return host
+
+    @property
+    def grpc_url(self) -> str:
+        """Where a client on this machine dials the plane."""
+        scheme = "grpcs" if self._spec.tls else "grpc"
+        return f"{scheme}://{self._probe_host}:{self._spec.grpc_port}"
+
+    def _build_argv(self) -> list[str]:
+        s = self._spec
+        argv = [
+            sys.executable,
+            "-m",
+            "biopb_tensor_server.cli",
+            "launch",
+            "--config",
+            str(s.config),
+            "--host",
+            str(s.grpc_host),
+            "--port",
+            str(s.grpc_port),
+            "--web-port",
+            str(s.web_port),
+            "--web-host",
+            str(s.web_host),
+            "--log-level",
+            str(s.log_level),
+        ]
+        if s.tls:
+            argv.append("--tls")
+        # Both or neither -- `launch` exits 2 on a half pair, and the caller has
+        # already refused one, so this cannot emit a lone flag.
+        if s.tls_cert and s.tls_key:
+            argv += ["--tls-cert", str(s.tls_cert), "--tls-key", str(s.tls_key)]
+        for san in s.sans:
+            argv += ["--san", san]
+        return argv
+
+    def _child_env(self) -> dict:
+        env = os.environ.copy()
+        if self._spec.token:
+            env["BIOPB_TENSOR_TOKEN"] = self._spec.token
+        # No token resolved (tokenless local mode): the tensor `launch` runs
+        # tokenless on its own because the config binds the flight server to
+        # loopback — no bypass signal is needed or read anymore. (A local
+        # deployment *may* still carry a token; then the branch above sets it.)
+        #
+        # Mark the plane as control-owned so its HTTP sidecar reports
+        # `supervised` on /api/admin/status; the admin UI then routes restarts
+        # through the control (POST /api/data_plane/restart) rather than telling
+        # the user the plane is self-managed (biopb/biopb#418).
+        env["BIOPB_DATA_PLANE_SUPERVISED"] = "1"
+        return env
+
+    # --- lifecycle ------------------------------------------------------- #
+
+    def _spawn_locked(self) -> bool:
+        """(Re)spawn the data plane. Returns True on success, False on a spawn
+        failure that has been counted toward the backoff.
+
+        A failed bring-up (:meth:`ServiceProcess._start_process`) is treated
+        like a failed attempt: ``failures`` is bumped, the backoff window is
+        armed, and ``last_error`` records it, rather than propagating. That
+        keeps a failing spawn from escaping ``ensure`` / ``tick`` (and the
+        ``/data_plane/ensure`` handler) uncounted and hammering with no backoff.
+        """
+        try:
+            self._start_process()
+        except OSError as exc:
+            st = self._state
+            st.failures += 1
+            st.last_error = f"failed to spawn data plane: {exc}"
+            st.next_attempt_at = time.monotonic() + self._backoff()
+            logger.error(st.last_error)
+            return False
+        self._state.up_since = None
+        return True
 
     def _note_healthy(self) -> None:
         """Record that the plane is up; after a sustained healthy run, clear the
@@ -521,46 +618,25 @@ class DataPlaneSupervisor:
         self._close_child_bindings()
         self._close_log()
 
-    def _close_child_bindings(self) -> None:
-        """Release the death-binding handles after the child is stopped.
-
-        Closes the POSIX parent-death pipe and, on Windows, force-reaps any
-        surviving job member and closes the Job Object (the graceful ``_terminate``
-        has usually already emptied it). Called only on a full stop — a crash
-        respawn keeps the reused job and re-arms the pipe."""
-        self._close_death_pipe()
-        if self._winjob is not None:
-            _winjob.terminate_job(self._winjob)
-            _winjob.close_job(self._winjob)
-            self._winjob = None
-
-    def _terminate(self, proc: subprocess.Popen, timeout: float = 10.0) -> None:
-        if proc.poll() is not None:
-            return
-        sentinel = self._win_stop_sentinel()
-        if sys.platform == "win32":
-            # os.kill/terminate is an uncatchable TerminateProcess on Windows, so
-            # the server never runs its shutdown handler. It instead watches for a
-            # stop-sentinel file (http_server._install_windows_shutdown_listener);
-            # drop it for a graceful stop, then hard-kill as a backstop.
-            try:
-                sentinel.parent.mkdir(parents=True, exist_ok=True)
-                sentinel.write_text("stop")
-            except OSError:
-                pass
-        else:
+    def _ask_to_stop(self, proc: subprocess.Popen) -> None:
+        if sys.platform != "win32":
             proc.terminate()  # SIGTERM; the server's handler catches it
+            return
+        # os.kill/terminate is an uncatchable TerminateProcess on Windows, so
+        # the server never runs its shutdown handler. It instead watches for a
+        # stop-sentinel file (http_server._install_windows_shutdown_listener);
+        # drop it for a graceful stop, then hard-kill as a backstop.
+        sentinel = self._win_stop_sentinel()
         try:
-            proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            try:
-                proc.wait(timeout=2.0)
-            except subprocess.TimeoutExpired:
-                pass
+            sentinel.parent.mkdir(parents=True, exist_ok=True)
+            sentinel.write_text("stop")
+        except OSError:
+            pass
+
+    def _stopped(self) -> None:
         if sys.platform == "win32":
             try:
-                sentinel.unlink()
+                self._win_stop_sentinel().unlink()
             except OSError:
                 pass
 
@@ -571,15 +647,6 @@ class DataPlaneSupervisor:
         # cannot disagree — a single fixed name under the biopb state dir, not
         # keyed by PID.
         return _locations.tensor_stop_sentinel()
-
-    def _close_log(self) -> None:
-        fh = self._log_fh
-        self._log_fh = None
-        if fh is not None and fh is not getattr(sys.stderr, "buffer", sys.stderr):
-            try:
-                fh.close()
-            except OSError:
-                pass
 
     # --- status ---------------------------------------------------------- #
 
@@ -604,10 +671,7 @@ class DataPlaneSupervisor:
                 state = "stopped"
             return {
                 "state": state,
-                "grpc_url": (
-                    f"{'grpcs' if self._spec.tls else 'grpc'}://"
-                    f"{self._probe_host}:{self._spec.grpc_port}"
-                ),
+                "grpc_url": self.grpc_url,
                 "web_url": f"http://{self._spec.web_host}:{self._spec.web_port}/",
                 "pid": self._proc.pid if child_alive else None,
                 "restarts": st.restarts,

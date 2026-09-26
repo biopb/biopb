@@ -22,7 +22,7 @@ the control serves ([[web-viewer]]) shows the user an image either way; the napa
 | Name | Type | Description |
 |------|------|-------------|
 | `client` | TensorFlightClient or None | The data plane: browse and retrieve image data from the tensor server. Marshaled and thread-safe. |
-| `ops` | dict[str, callable] | The algorithm plane: biopb.image ProcessImage operations from configured servers (may be empty) |
+| `ops` | Ops | The algorithm plane: the ops of the algorithm servers this machine's control knows, by name or attribute (may be empty) |
 | *plugin modules* | module | The algorithm plane: the user's kernel plugins, one module each (see below) |
 | `np/da` | module | imported packages: numpy and dask.array |
 | `viewer` | napari.Viewer | **Only where the session has one.** `viewer.add_tensor(array_id)` puts a tensor on it; `viewer.tensor(layer)` reads one back as a plain dask array. Check `## Viewer` in `server_status` before relying on anything being *seen* — the object is bound even when its window is closed |
@@ -31,10 +31,10 @@ the control serves ([[web-viewer]]) shows the user an image either way; the napa
   lazy, thread-safe, picklable dask arrays. See [[tensor-server-client]] for the full set of client
   operations, including browsing sources and reading tensors ([[upload]] is the write
   side).
-- `ops` maps op name -> an inspectable callable that runs dedicated image-processing logic.
-  The callable is a thin wrapper around a `biopb.image.ProcessImage` gRPC service on a configured
-  server. The callable can take either a numpy array (eager) or a tensor-server array_id string
-  (lazy). See [[ops]] for details.
+- `ops` holds inspectable callables that run image-processing logic on an algorithm
+  server, each taking numpy arrays (eager) or tensor-server array_id strings (lazy). A package
+  the kernel cannot import goes behind one as a server file. See [[ops]] and
+  [[algorithm-servers]].
 - The `viewer`, where there is one, is a napari window made **thread-safe** by marshaling known
   mutations (`viewer.dims`, `viewer.camera`, layer properties, `viewer.layers.remove()`,
   the `add_*()` family, …) to the Qt main thread. A cell already runs there; the

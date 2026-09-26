@@ -581,13 +581,13 @@ def _bootstrap_impl():
             splash.close()
             raise
 
-    # 4. ProcessImage ops: thin Run() callables for each configured servicer.
+    # 4. The algorithm plane's ops, bound from the control's registry.
     #    client_getter reads conn.client lazily so the async-connecting tensor
     #    client is picked up at call time.
     try:
         ops = build_ops_from_config(config, lambda: conn.client)
     except Exception:
-        logger.exception("Failed to build ProcessImage ops")
+        logger.exception("Failed to build the ops")
         ops = {}
 
     # 5. The kernel's side of the jobs: cells held for Stop, run_async tasks.

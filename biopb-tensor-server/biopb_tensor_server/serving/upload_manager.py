@@ -50,6 +50,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Tuple
 
+import pyarrow as pa
 import pyarrow.flight as flight
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
@@ -778,7 +779,9 @@ class UploadManager:
         expected_shape = tuple(
             stop - start for start, stop in zip(bounds.start, bounds.stop, strict=True)
         )
-        dtype = table.schema.field(0).type.to_pandas_dtype()
+        # Not DataType.to_pandas_dtype(): it imports pandas, which the server
+        # does not depend on.
+        dtype = pa.array([], type=data_column.type).to_numpy(zero_copy_only=False).dtype
         try:
             adapter.put_chunk(bounds, data_column, expected_shape, dtype)
         except UploadClosedError as e:

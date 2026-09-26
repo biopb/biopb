@@ -1,0 +1,76 @@
+syntax = "proto3";
+
+package biopb.image;
+
+import "biopb/image/image_data.proto";
+import "biopb/tensor/serialized.proto";
+import "google/protobuf/empty.proto";
+import "google/protobuf/struct.proto";
+
+option java_multiple_files = true;
+option java_package = "biopb.image";
+
+// An argument or a result: pixels, or anything else as JSON.
+//
+// Pixels are the only structured type because they are too big for anything
+// else. ROIs, tables, scores and prompts are JSON the caller reads.
+message Arg {
+  oneof kind {
+    // Inline pixels.
+    Tensor eager = 1;
+    // Pixels by reference, carrying their own read token.
+    biopb.tensor.SerializedTensor lazy = 2;
+    google.protobuf.Value json = 3;
+  }
+}
+
+// One call of one op. `args` holds the tensor arguments and the kwargs alike;
+// the op's `OpInfo` says which is which.
+message Call {
+  string op = 1;
+  map<string, Arg> args = 2;
+}
+
+// One step of a call. A plain op sends one event; a streaming op sends one
+// per item. The call ends when the stream does.
+message Event {
+  // A single return value is `result`; a tuple is `0`, `1`, ...
+  map<string, Arg> outputs = 1;
+  // Free text.
+  string progress = 2;
+}
+
+// A tensor argument's contract.
+message TensorArg {
+  // The axes the function sees, e.g. "YX".
+  string axes = 1;
+  // The server iterates the other axes; otherwise they must be singleton.
+  bool mapped = 2;
+}
+
+message OpInfo {
+  string name = 1;
+  string description = 2;
+  // For grouping, e.g. ["segmentation"] or ["denoising", "pretrained"].
+  repeated string labels = 3;
+  // The non-tensor arguments with their defaults; null when required.
+  google.protobuf.Struct kwargs = 4;
+  // The tensor arguments.
+  map<string, TensorArg> tensors = 5;
+}
+
+message OpList {
+  repeated OpInfo ops = 1;
+  // Changes when any op changes.
+  string fingerprint = 2;
+}
+
+// A server of named ops over tensors and JSON.
+//
+// There is no call deadline: a client times out on silence between events,
+// and stops a call by cancelling it. A failure inside a call is the RPC's
+// status: INVALID_ARGUMENT for arguments the op refuses, INTERNAL otherwise.
+service Ops {
+  rpc Call(biopb.image.Call) returns (stream Event);
+  rpc Describe(google.protobuf.Empty) returns (OpList);
+}

@@ -208,9 +208,9 @@ class TestGetSetting:
 
     def test_mutable_default_is_isolated_copy(self):
         """Mutating a returned mutable default must not touch DEFAULT_CONFIG."""
-        servers = get_setting({}, "services.process_image_servers")
-        servers.append("grpc://x:1")
-        assert DEFAULT_CONFIG["services"]["process_image_servers"] == []
+        origins = get_setting({}, "transport.allowed_origins")
+        origins.append("http://x")
+        assert DEFAULT_CONFIG["transport"]["allowed_origins"] == []
 
     def test_unknown_path_without_default_raises(self):
         with pytest.raises(KeyError):
