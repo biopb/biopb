@@ -277,9 +277,9 @@ class ObserveConfig:
 class ChatConfig:
     """Which model drives the chat pane, and how to reach it.
 
-    One engine: the in-process loop (``mcp/_chat.py``) talking to an
-    OpenAI-compatible endpoint, which ``model`` / ``base_url`` / ``api_key_env``
-    / ``request_timeout`` describe.
+    The pane is an in-process loop (``mcp/_chat.py``) talking to an
+    OpenAI-compatible endpoint: ``model`` / ``base_url`` / ``api_key_env`` /
+    ``request_timeout`` describe it.
 
     The on/off switch is **not** here: it is ``observe.chat_enabled``, because
     what it turns on is a pane on the observe page. This
@@ -671,9 +671,38 @@ _RENAMED_KEYS = {
     },
 }
 
+# Keys that no longer exist at all, with what to say about each. Dropped rather
+# than carried, and *said* rather than dropped quietly: an unknown key is
+# otherwise kept by the merge, ignored by the constraints, and invisible in the
+# admin editor, so the setting goes on looking honoured forever.
+_RETIRED_KEYS = {
+    "chat": {
+        "engine": "the pane is the in-process loop; set chat.model",
+        "acp_agent": "the ACP engine is gone",
+        "acp_command": "the ACP engine is gone",
+        "acp_model": "the ACP engine is gone; set chat.model",
+        "acp_permission": "the ACP engine is gone",
+    },
+}
 
-def _apply_renames(config: dict) -> dict:
-    """Carry a retired key's value onto its replacement, in place."""
+
+def _apply_key_changes(config: dict) -> dict:
+    """Reconcile a config file with keys this release moved or dropped, in place.
+
+    Retirements first, then renames: the two sets are disjoint, and doing it in
+    this order means a key that is retired *and* shares a name with a rename
+    target cannot be resurrected by the second pass.
+    """
+    for section, mapping in _RETIRED_KEYS.items():
+        values = config.get(section)
+        if not isinstance(values, dict):
+            continue
+        for key, advice in mapping.items():
+            if key in values:
+                values.pop(key)
+                logger.warning(
+                    "config: %s.%s is retired and ignored -- %s", section, key, advice
+                )
     for section, mapping in _RENAMED_KEYS.items():
         values = config.get(section)
         if not isinstance(values, dict):
@@ -711,7 +740,7 @@ def _read_and_merge_from_disk() -> dict:
 
         # Deep-merge with defaults so partial user sections override only their own
         # leaves and every expected key still resolves.
-        merged = _deep_merge(get_default_config(), _apply_renames(config))
+        merged = _deep_merge(get_default_config(), _apply_key_changes(config))
         # Reject out-of-range / bad-enum leaves (warn + reset) before any hot path
         # reads them (biopb/biopb#182).
         _validate_and_clamp(merged)

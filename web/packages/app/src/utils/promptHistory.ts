@@ -94,8 +94,9 @@ export function abandon(h: PromptHistory): PromptHistory {
   return h.at === null ? h : { ...h, at: null, draft: "" };
 }
 
-/** The prompts a thread already shows, oldest first. Both engines reduce to the
- * same `ThreadItem[]`, so this reads either one. */
+/** The prompts a thread already shows, oldest first. It reads the rendered
+ * thread rather than the wire format, so it does not care how the items got
+ * there. */
 export function pastPrompts(thread: ThreadItem[]): string[] {
   const out: string[] = [];
   for (const item of thread) {

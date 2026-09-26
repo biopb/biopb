@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   cancelTurn,
   compactThread,
@@ -59,7 +66,8 @@ export default function ChatPane({
 }) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   // Who is answering. Held here rather than read from the once-probed status
-  // because `/model` moves it, from this window or another one.
+  // because `/model` moves it, from this window or another one -- the poll
+  // carries it, so a switch made anywhere in the session reaches this header.
   const [model, setModelState] = useState(status.model);
   useEffect(() => setModelState(status.model), [status.model]);
   const [busy, setBusy] = useState(false);
@@ -104,6 +112,9 @@ export default function ChatPane({
     if (!page) return; // unreachable; keep what is on screen
     setBusy(page.busy);
     setLive(page.live);
+    // Empty only from a child too old to send it; keeping what we have beats
+    // blanking the header.
+    if (page.model) setModelState(page.model);
     // No early return above this: while a cell runs the thread gains no
     // messages at all, so a poll with an empty page is exactly the poll whose
     // live output matters. Skipping the rest on `!messages.length` would have
@@ -148,8 +159,15 @@ export default function ChatPane({
 
   // The wire thread, projected onto what the pane renders. Everything below
   // this line renders one shape and knows nothing about where it came from.
-  const thread = applyLiveOutput(fromChatHistory(messages, busy), live);
-  const groups = groupThread(thread);
+  //
+  // Memoised because the composer's text lives in this component: without it
+  // every keystroke re-walks the whole conversation, rebuilding the item list,
+  // the tool-call index and every group's hoisted images.
+  const thread = useMemo(
+    () => applyLiveOutput(fromChatHistory(messages, busy), live),
+    [messages, busy, live],
+  );
+  const groups = useMemo(() => groupThread(thread), [thread]);
 
   const stop = useCallback(async () => {
     await cancelTurn(base);
@@ -230,7 +248,8 @@ export default function ChatPane({
       }
       // Not announced here beyond the fact of it: the name in the header comes
       // from the child on the next poll, and two places saying it is two places
-      // that can disagree.
+      // that can disagree. That poll is `/api/chat/history`, which carries the
+      // model for exactly this.
       setNotice(`Switched to ${wanted}.`);
       poll();
     },
@@ -329,9 +348,7 @@ export default function ChatPane({
     <section className="chat">
       <div className="chat-head">
         <span className="chat-title">chat</span>
-        <span className="chat-model" title="the built-in loop">
-          {model}
-        </span>
+        <span className="chat-model">{model}</span>
         {/* Shown only once there is something to fold: a control that cannot
             act is how the observe page's Interrupt earned its "No running job."
             dialog. */}

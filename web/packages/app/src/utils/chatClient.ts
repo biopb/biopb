@@ -33,6 +33,10 @@ export interface ChatStatus {
 
 export interface HistoryPage {
   messages: ChatMessage[];
+  /** Who is answering, as of this read. Carried here rather than on the
+   * once-probed status because `/model` is session state: it is not persisted,
+   * it reaches every window, and this is the only read the pane repeats. */
+  model: string;
   /** Whether this page is the whole thread rather than a delta — a cursor the
    * child did not recognise, which after a reset is every other window's. */
   full: boolean;
@@ -128,10 +132,7 @@ export async function fetchHistory(
   base: string,
   cursor: string | null,
 ): Promise<HistoryPage | null> {
-  const q =
-    cursor === null || cursor === ""
-      ? ""
-      : "?after=" + encodeURIComponent(cursor);
+  const q = cursor ? "?after=" + encodeURIComponent(cursor) : "";
   try {
     const r = await sessionFetch(base + "/api/chat/history" + q);
     if (!r.ok) return null;
@@ -141,6 +142,9 @@ export async function fetchHistory(
       // Absent on an older child, where every page was effectively a delta.
       full: !!j.full,
       busy: !!j.busy,
+      // Empty on an older child, which the pane reads as "keep what you have"
+      // rather than as "no model is set".
+      model: typeof j.model === "string" ? j.model : "",
       live: readLive(j.partial),
     };
   } catch {

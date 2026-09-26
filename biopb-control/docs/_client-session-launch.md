@@ -226,8 +226,9 @@ one. Recorded here so it does not later read as an oversight.
 
 The other side of that comparison used to be the chat pane's ACP engine, which
 started opencode itself and therefore *did* pin permissions through
-`OPENCODE_CONFIG_CONTENT`. That engine has been retired, so this is the only
-launcher left and there is no second policy to reconcile it with.
+`OPENCODE_CONFIG_CONTENT`. That engine has been retired, so this
+proposal is the only launcher in question and there is no second policy to
+reconcile it with.
 
 **The relay clients expose no local listener.** Claude Code polls Anthropic's
 backend over outbound HTTPS; Codex opens an outbound websocket to a chatgpt.com

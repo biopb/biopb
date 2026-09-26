@@ -134,9 +134,8 @@ async def _api_chat_status(request):
             "enabled": _enabled,
             "ready": ready,
             "reason": reason,
-            "busy": _busy(),
-            # Who is answering. One field, because to a reader it is one fact.
-            "model": _who(ready),
+            "busy": _chat.busy(),
+            "model": get_setting(_config, "chat.model") if ready else "",
             # How much of the thread the model no longer sees in full. The pane
             # renders every message either way, so without this the compaction
             # would be invisible to the person who asked for it.
@@ -145,16 +144,8 @@ async def _api_chat_status(request):
     )
 
 
-def _busy():
-    return _chat.busy()
-
-
-def _who(ready):
-    return get_setting(_config, "chat.model") if ready else ""
-
-
 async def _api_chat_models(request):
-    """What this engine can be pointed at, and what it is pointed at now.
+    """What the loop can be pointed at, and what it is pointed at now.
 
     Read when ``/model`` is typed rather than polled: the list changes only when
     the session does, and it is long enough that carrying it on every poll would
@@ -218,6 +209,10 @@ async def _api_chat_history(request):
     rather than a route of its own because a view wants the two together: the
     thread says which tool is running, and this says what it has printed since.
 
+    ``model`` rides it for the same reason, and because this is the only read
+    the pane repeats: ``/model`` is not persisted and reaches every window of
+    the session, so a header that learned the model once at mount would go on
+    naming the one it was switched off.
     """
     messages = _chat.history()
     after = request.query_params.get("after")
@@ -240,6 +235,7 @@ async def _api_chat_history(request):
             # nothing said since looks like.
             "full": full,
             "busy": _chat.busy(),
+            "model": get_setting(_config, "chat.model"),
             "partial": _partial(),
         }
     )
@@ -317,7 +313,7 @@ def _in_flight():
     holds.
     """
     task = _turn_task
-    return _busy() or (task is not None and not task.done())
+    return _chat.busy() or (task is not None and not task.done())
 
 
 async def _chat_turn(request):
@@ -361,7 +357,7 @@ async def _chat_cancel(request):
     # nothing, because nothing of it ran. That is the right thread -- the turn
     # is wholly absent rather than half-present -- but a view waiting for a
     # cancellation message would wait forever, so it is told which happened.
-    started = _busy()
+    started = _chat.busy()
     task = _turn_task
     # Only the turn. A cell it started keeps running, exactly as one started
     # through `execute_code` does when its MCP client goes away: the call stops

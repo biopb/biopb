@@ -110,16 +110,14 @@ const MODEL_LIST_MAX = 12;
  * else is claimed. */
 const COMMANDISH = /^\/[a-zA-Z]+$/;
 
-const listing = (specs: CommandSpec[]) =>
-  specs
-    .map((c) =>
-      c.aliases.length ? `${c.typed} (or ${c.aliases.join(", ")})` : c.typed,
-    )
-    .join(", ");
+const listing = () =>
+  COMMANDS.map((c) =>
+    c.aliases.length ? `${c.typed} (or ${c.aliases.join(", ")})` : c.typed,
+  ).join(", ");
 
-function lookup(token: string, specs: CommandSpec[]): CommandSpec | undefined {
+function lookup(token: string): CommandSpec | undefined {
   const t = token.toLowerCase();
-  return specs.find((c) => c.typed === t || c.aliases.includes(t));
+  return COMMANDS.find((c) => c.typed === t || c.aliases.includes(t));
 }
 
 /**
@@ -134,11 +132,11 @@ export function parseCommand(input: string): Parsed {
   const text = input.trim();
   const [first, ...rest] = text.split(/\s+/);
   if (!first || !COMMANDISH.test(first)) return { kind: "send", text };
-  const spec = lookup(first, COMMANDS);
+  const spec = lookup(first);
   if (!spec) {
     return {
       kind: "reject",
-      message: `Unknown command ${first}. Available: ${listing(COMMANDS)}.`,
+      message: `Unknown command ${first}. Available: ${listing()}.`,
     };
   }
   // Rejected rather than ignored, for every command that does not declare one:

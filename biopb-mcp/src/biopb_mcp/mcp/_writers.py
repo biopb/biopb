@@ -88,11 +88,10 @@ def clear_claim():
 def claim_holder():
     """Who holds this kernel, as far as this process has seen, or ``None``.
 
-    A read for a caller deciding whether an action is worth offering at all --
-    the chat pane's engine switch, which would otherwise hand the session to a
-    second client that is then refused on its first cell. A claim on a kernel
-    since respawned still reads as held until the next :func:`take_claim`,
-    which is the safe direction.
+    A read for the stop path (:func:`stop_refusal`), which has to know who the
+    kernel answers to before it lets one client stop another's job. A claim on
+    a kernel since respawned still reads as held until the next
+    :func:`take_claim`, which is the safe direction.
     """
     with _claim_lock:
         return _claimed_by

@@ -55,6 +55,18 @@ describe("fetchHistory", () => {
     expect((await fetchHistory("/s", "m-1"))!.full).toBe(false);
   });
 
+  it("keeps who is answering, so a /model switch reaches every window", () => {
+    // This is the only read the pane repeats; the header would otherwise name
+    // the model it was switched off until the page is reloaded.
+    answering({ messages: [], busy: false, full: true, model: "other-model" });
+    return fetchHistory("/s", null).then((p) => expect(p!.model).toBe("other-model"));
+  });
+
+  it("reads a child that sends none as keep-what-you-have, not as unset", async () => {
+    answering({ messages: [], busy: false });
+    expect((await fetchHistory("/s", "m-1"))!.model).toBe("");
+  });
+
   it("is null when the read fails, so the pane keeps its thread", async () => {
     vi.stubGlobal(
       "fetch",

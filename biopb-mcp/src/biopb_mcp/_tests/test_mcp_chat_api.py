@@ -85,6 +85,20 @@ class TestStatus:
             "compacted": 0,
         }
 
+    def test_the_history_read_carries_who_is_answering(self, client, configured):
+        """The only read the pane repeats, so it is where a `/model` switch
+        reaches a window that did not make it. Without this the header names
+        the model it was switched off until the page is reloaded."""
+        assert client.get("/api/chat/history").json()["model"] == "test-model"
+
+        client.post(
+            "/chat/model",
+            json={"model": "other-model"},
+            headers={"Content-Type": "application/json"},
+        )
+
+        assert client.get("/api/chat/history").json()["model"] == "other-model"
+
     def test_reports_why_it_is_not_ready(self, client, configured):
         configured["chat"]["model"] = ""
         body = client.get("/api/chat/status").json()
