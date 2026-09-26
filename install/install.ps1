@@ -133,8 +133,9 @@ function Resolve-EngineSource {
     # BIOPB_INSTALL_VERSION), fetch the engine FROM THAT RELEASE's assets: a
     # versioned, immutable copy that matches the wheels we install, so a lone
     # install.ps1 downloaded from a release is fully self-contained (no second
-    # download). Old releases predate the engine-as-asset, so fall back to the
-    # biopb.org copy on any fetch error.
+    # download). Falls back to the biopb.org copy on a fetch error; that engine
+    # refuses a release older than its install_schema floor and names the
+    # installer shipped with it.
     if ($EngineTag) {
         $releaseEngine = "https://github.com/biopb/biopb/releases/download/$EngineTag/biopb-engine.ps1"
         try {

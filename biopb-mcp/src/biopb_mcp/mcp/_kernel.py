@@ -93,9 +93,7 @@ def attach_command(
     """
     import sys
 
-    # A frozen build has no module tree to run `-m` against; the connection
-    # file alone still attaches any Jupyter install's client.
-    if not connection_file or getattr(sys, "frozen", False):
+    if not connection_file:
         return None
     argv = [python or sys.executable, "-m", "qtconsole", "--existing", connection_file]
     if windows is None:

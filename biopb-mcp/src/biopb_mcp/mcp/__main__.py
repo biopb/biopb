@@ -11,7 +11,7 @@ it with::
     biopb-mcp        # console script
     python -m biopb_mcp.mcp
 
-Install the optional dependencies first: ``pip install biopb-mcp[mcp]``.
+The viewer needs the ``napari`` extra: ``pip install biopb-mcp[napari]``.
 """
 
 import argparse

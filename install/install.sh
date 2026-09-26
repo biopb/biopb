@@ -22,7 +22,8 @@
 # into BIOPB_PINNED_RELEASE below), so re-fetching the one-liner is how you move
 # to a newer version. A raw / git-checkout copy has no pin and tracks the latest
 # STABLE release. Overrides:
-#   BIOPB_INSTALL_VERSION=X.Y.Z  install/downgrade to an exact release
+#   BIOPB_INSTALL_VERSION=X.Y.Z  install/downgrade to an exact release (one that
+#                                declares INSTALL_SCHEMA; see below)
 #   BIOPB_INSTALL_RC=1           track the latest release candidate (a/b/rc,
 #                                typically cut off dev) — the fast path for
 #                                testing an upcoming release before it lands.
@@ -49,6 +50,13 @@ fi
 # BIOPB_INSTALL_VERSION. Keep the `BIOPB_PINNED_RELEASE=` LHS verbatim -- the stamp
 # anchors on it.
 BIOPB_PINNED_RELEASE=""
+
+# The release layout this installer is written for: release.yaml writes the same
+# number into each release's versions.json as `install_schema`, and a release that
+# declares another (or none, i.e. one from before the napari plugin split) is
+# refused with a pointer to the installer shipped alongside it. Bump both together
+# when a change to the release makes an earlier installer wrong for it.
+INSTALL_SCHEMA=1
 
 _step() { printf "\n${BOLD}%s${RESET}\n" "$*"; }
 _ok()   { printf "  ${GREEN}%s${RESET}\n" "$*"; }
@@ -605,6 +613,13 @@ _release_asset_url() {
         | grep -E "/$1\$" | head -1 || true
 }
 
+# Print string field $1 of the one-line versions.json manifest $2 (a bare number
+# too, e.g. install_schema), or nothing when absent.
+_manifest_field() {
+    printf '%s' "$2" \
+        | sed -n 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*"\{0,1\}\([^",}[:space:]]*\).*/\1/p'
+}
+
 # Print the SHA-256 hex digest of file $1, or nothing if no tool is available
 # (Linux ships GNU `sha256sum`; macOS ships `shasum`). The empty result lets the
 # caller skip the integrity check rather than abort on a toolless host.
@@ -618,20 +633,17 @@ _sha256() {
 
 # Verify each wheel path in "$@" against the release's SHA256SUMS asset before it
 # is file://-installed. Hard-fails (exits) on a checksum mismatch or a wheel with
-# no entry in a SHA256SUMS that exists. Fails OPEN (warns, returns 0) when the
-# release predates checksums or no sha256 tool is present, so installs of older
-# releases — and toolless hosts — still work. Requires _fetch_latest_release.
+# no entry in SHA256SUMS, and when SHA256SUMS itself cannot be fetched. Only a
+# host with no sha256 tool skips the check (with a warning). Requires
+# _fetch_latest_release.
 _verify_wheels() {
-    local sums_url sums
+    local sums_url sums=""
     sums_url=$(_release_asset_url 'SHA256SUMS')
-    if [ -z "$sums_url" ]; then
-        _warn "Release $RELEASE_TAG has no SHA256SUMS; skipping wheel integrity check"
-        return 0
+    [ -n "$sums_url" ] && sums=$(curl -fsSL "$sums_url" 2>/dev/null)
+    if [ -z "$sums" ]; then
+        _err "Could not fetch SHA256SUMS for release $RELEASE_TAG; refusing to install unverified wheels"
+        exit 1
     fi
-    sums=$(curl -fsSL "$sums_url" 2>/dev/null) || {
-        _warn "Could not fetch SHA256SUMS; skipping wheel integrity check"
-        return 0
-    }
 
     local f base expected actual
     for f in "$@"; do
@@ -1359,8 +1371,7 @@ install_biopb() {
     # deployment (release CI builds them from the tagged commit), never from
     # PyPI. The SDK they were built against is pinned exactly and comes from
     # PyPI. napari is pinned to the tested version from the same manifest.
-    local biopb_req tensor_req mcp_req control_req
-    local napari_req="napari[all]"
+    local biopb_req tensor_req mcp_req control_req napari_req
     if ! _fetch_latest_release; then
         if [ -n "${PIN_TAG:-}" ]; then
             _err "Could not fetch biopb release $PIN_TAG from $RELEASE_REPO."
@@ -1377,42 +1388,41 @@ install_biopb() {
         fi
         exit 1
     fi
-    # Pin napari from the release's versions.json attribute so the installed
-    # napari is identical to the one this release was built/tested against
-    # (closes the last dev/deploy version-skew — and the napari[all] Qt
-    # binding, which is napari-version-dependent). The same manifest carries the
-    # deployment `release` version, which we record post-install as the
-    # auto-updater's baseline (issue #87), and the `biopb` SDK version, which is
-    # installed from PyPI (release CI checks that PyPI's wheel is the SDK this
-    # release was built with). Tolerant: an older release without the manifest
-    # falls back to the unversioned napari spec and a tag-derived version, and
-    # one without `biopb` ships the SDK as a wheel asset. RELEASE_VERSION is read
-    # here but written only after a clean install.
-    local versions_url versions_json napari_pin sdk_pin=""
+    # The release's versions.json pins napari (and so the napari[all] Qt
+    # binding) and the `biopb` SDK, installed from PyPI, to the versions the
+    # release was built and tested with, and carries the deployment `release`
+    # version, recorded post-install as the auto-updater's baseline (issue #87).
+    # Its `install_schema` is the floor: this installer supports only releases
+    # that declare the schema it was written for, and names the installer that
+    # does fit an older one. RELEASE_VERSION is read here but written only after
+    # a clean install.
+    local versions_url versions_json="" release_schema napari_pin sdk_pin
     versions_url=$(_release_asset_url 'versions\.json')
     if [ -n "$versions_url" ]; then
         versions_json=$(curl -fsSL "$versions_url" 2>/dev/null) || versions_json=""
-        napari_pin=$(printf '%s' "$versions_json" \
-            | sed -n 's/.*"napari"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
-        [ -n "$napari_pin" ] && napari_req="napari[all]==$napari_pin"
-        sdk_pin=$(printf '%s' "$versions_json" \
-            | sed -n 's/.*"biopb"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
-        RELEASE_VERSION=$(printf '%s' "$versions_json" \
-            | sed -n 's/.*"release"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
     fi
-    # Fall back to the tag (release-vX.Y.Z -> X.Y.Z) when the manifest is absent
-    # or lacks `release`, so the recorded baseline is always a clean PEP 440
-    # version the update check can compare with packaging.version.
-    RELEASE_VERSION="${RELEASE_VERSION:-${RELEASE_TAG#"${RELEASE_TAG_PREFIX:-release-v}"}}"
-    local mcp_url sdk_url="" tensor_url control_url
+    release_schema=$(_manifest_field install_schema "$versions_json")
+    if [ "$release_schema" != "$INSTALL_SCHEMA" ]; then
+        _err "Release $RELEASE_TAG is not supported by this installer."
+        _info "Install it with the installer published alongside it:"
+        _cmd "curl -fsSL https://github.com/$RELEASE_REPO/releases/download/$RELEASE_TAG/install.sh | bash"
+        exit 1
+    fi
+    napari_pin=$(_manifest_field napari "$versions_json")
+    sdk_pin=$(_manifest_field biopb "$versions_json")
+    RELEASE_VERSION=$(_manifest_field release "$versions_json")
+    if [ -z "$napari_pin" ] || [ -z "$sdk_pin" ] || [ -z "$RELEASE_VERSION" ]; then
+        _err "Release $RELEASE_TAG has an incomplete versions.json."
+        _info "Try again later, or report this against $RELEASE_REPO."
+        exit 1
+    fi
+    napari_req="napari[all]==$napari_pin"
+    local mcp_url tensor_url control_url
     mcp_url=$(_release_asset_url 'biopb_mcp-[^/]+\.whl')
-    [ -n "$sdk_pin" ] || sdk_url=$(_release_asset_url 'biopb-[^/]+\.whl')
     tensor_url=$(_release_asset_url 'biopb_tensor_server-[^/]+\.whl')
-    # biopb-control (control plane) wheel. Its filename uses an underscore
-    # (biopb_control-…), so the sdk regex `biopb-…` above never matches it.
     control_url=$(_release_asset_url 'biopb_control-[^/]+\.whl')
-    if [ -z "$mcp_url" ] || [ -z "$sdk_pin$sdk_url" ] || [ -z "$tensor_url" ] || [ -z "$control_url" ]; then
-        _err "Release $RELEASE_TAG is missing one of the biopb wheels (or its versions.json could not be read)."
+    if [ -z "$mcp_url" ] || [ -z "$tensor_url" ] || [ -z "$control_url" ]; then
+        _err "Release $RELEASE_TAG is missing one of the biopb wheels."
         _info "Try again later, or report this against $RELEASE_REPO."
         exit 1
     fi
@@ -1423,31 +1433,22 @@ install_biopb() {
     # Declared first, assigned after: `local x=$(cmd)` takes local's own exit
     # status, so a failing _urldecode/basename would sail past `set -e` and leave
     # a truncated path to curl into.
-    local mcp_whl sdk_whl="" tensor_whl control_whl
+    local mcp_whl tensor_whl control_whl
     mcp_whl="$WHEELS_DIR/$(_urldecode "$(basename "$mcp_url")")"
     tensor_whl="$WHEELS_DIR/$(_urldecode "$(basename "$tensor_url")")"
     control_whl="$WHEELS_DIR/$(_urldecode "$(basename "$control_url")")"
     curl -fsSL "$mcp_url" -o "$mcp_whl"
     curl -fsSL "$tensor_url" -o "$tensor_whl"
     curl -fsSL "$control_url" -o "$control_whl"
-    if [ -n "$sdk_url" ]; then
-        sdk_whl="$WHEELS_DIR/$(_urldecode "$(basename "$sdk_url")")"
-        curl -fsSL "$sdk_url" -o "$sdk_whl"
-    fi
     # Verify the downloaded wheels against the release's SHA256SUMS before they
-    # are file://-installed (aborts on a mismatch; fails open on an older release
-    # without the manifest). See the auto-updater trust item in issue #87.
-    _verify_wheels "$mcp_whl" "$tensor_whl" "$control_whl" ${sdk_whl:+"$sdk_whl"}
+    # are file://-installed. See the auto-updater trust item in issue #87.
+    _verify_wheels "$mcp_whl" "$tensor_whl" "$control_whl"
     # Direct file:// references pin each package to this exact wheel, so uv
     # resolves their inter-dependencies (the server's `biopb`, biopb-mcp's
     # `biopb[tensor]`, the control plane's `biopb`) to the downloaded set; the
     # SDK is pinned exactly to its PyPI release.
-    mcp_req="biopb-mcp[mcp] @ file://$mcp_whl"
-    if [ -n "$sdk_pin" ]; then
-        biopb_req="biopb[tensor]==$sdk_pin"
-    else
-        biopb_req="biopb[tensor] @ file://$sdk_whl"
-    fi
+    mcp_req="biopb-mcp[napari] @ file://$mcp_whl"
+    biopb_req="biopb[tensor]==$sdk_pin"
     tensor_req="biopb-tensor-server[$TENSOR_EXTRAS] @ file://$tensor_whl"
     control_req="biopb-control @ file://$control_whl"
 
@@ -1463,10 +1464,6 @@ install_biopb() {
     # biopb is the primary tool (exposes the `biopb` command); --with adds the
     # siblings to the same env and --with-executables-from also links their
     # console scripts onto PATH (plain --with does not expose executables).
-    #
-    # biopb-mcp requires the [mcp] extra (mcp, uvicorn, jupyter_client, ipykernel,
-    # psutil) — without it `import mcp` fails; the extra is applied to the pinned
-    # wheel ($mcp_req) just like the others.
     local install_args=(
         --upgrade
         --force
@@ -1500,21 +1497,12 @@ install_biopb() {
     # wheels, so an Intel Mac found no wheel and compiled the sdist -- failing on a
     # stock machine without OpenSSL dev headers. Supersedes the Intel-mac pin from
     # 024ca79 (biopb#355). Safe because pyjwt imports cryptography lazily, only for
-    # the asymmetric algorithms we never exercise; HS256 and `import mcp` are fine.
-    #
-    # `mcp<2` for the same reason, one layer up: "`import mcp` is fine" holds on
-    # 1.x only. The 2.0 SDK imports cryptography at module scope
-    # (`mcp/server/request_state.py`) on that very path, so the override above
-    # strips a dep it hard-needs -- and 2.0 also deleted `mcp.server.fastmcp`,
-    # which biopb-mcp's server is built on. The cap lives here as well as in
-    # biopb-mcp's `[mcp]` extra because THIS file is what fixes an already-
-    # published release: it is fetched fresh from biopb.org on every run and
-    # overrides whatever the downloaded wheels declare, so it covers every
-    # version back to 0.8.0, all of which carry an uncapped `mcp>=1.20` and
-    # would otherwise resolve 2.x and install a server that cannot start.
-    printf 'pyjwt>=2.10.1\nmcp<2\n' > "$WHEELS_DIR/overrides.txt"
+    # the asymmetric algorithms we never exercise; HS256 and `import mcp` are fine
+    # on mcp 1.x, which biopb-mcp caps at (2.0 imports cryptography at module
+    # scope).
+    printf 'pyjwt>=2.10.1\n' > "$WHEELS_DIR/overrides.txt"
     install_args+=(--overrides "$WHEELS_DIR/overrides.txt")
-    _info "  dropping transitive cryptography (pyjwt[crypto] -> pyjwt override); capping mcp<2"
+    _info "  dropping transitive cryptography (pyjwt[crypto] -> pyjwt override)"
 
     # No MCP server to stop before the new wheels land: each AI client's stdio
     # shim spawns and owns its own ephemeral session, reaped on disconnect, so

@@ -287,13 +287,13 @@ jobs:
           # gets a setuptools_scm dev version.
           tver=$(ls release-wheels/biopb_tensor_server-*.whl | sed -E 's#.*/biopb_tensor_server-([^-]+)-py3.*#\1#')
           echo "tensor=$tver" >> "$GITHUB_OUTPUT"
-          # napari is pinned exactly in biopb-mcp's [mcp] extra (the single source
+          # napari is pinned exactly in biopb-mcp's [napari] extra (the single source
           # of truth). Surface it as a release attribute so the installer pins the
           # same napari the wheel was built/tested against (see install/install.sh).
           # Read it from the PRISTINE committed blob, not the working tree: the
           # earlier `uv build --package biopb-mcp` step invokes setuptools, which
           # normalizes (rewrites) biopb-mcp/pyproject.toml in place and drops the
-          # `mcp = [... "napari[all]==…" …]` line, so a working-tree grep finds
+          # `"napari[all]==…"` line, so a working-tree grep finds
           # nothing and `set -e` aborts the step silently. `git show HEAD:` is
           # immune to that mutation. (Tag push & dry-run both checkout a commit, so
           # HEAD resolves to it.)
@@ -307,12 +307,17 @@ jobs:
           echo "sdk=$sdk" >> "$GITHUB_OUTPUT"
           # versions.json — the installer-readable release-attribute manifest. The
           # installer reads `napari` (pins the tested Qt binding), `biopb` (the
-          # SDK pin) and `release` (the update baseline); `tensor_server` reports the shipped wheel's
+          # SDK pin), `install_schema` (the installer layout this release fits,
+          # read from install.sh's INSTALL_SCHEMA; an installer refuses a
+          # release that declares another) and `release` (the update
+          # baseline); `tensor_server` reports the shipped wheel's
           # version (now the same `release-v*` line, so == release on a real tag).
           # Docker versions are NOT here — the tensor-server image ships on this
           # same `release-v*` tag (tensor-server-ci), image-base on the SDK `v*`.
+          schema=$(sed -n 's/^INSTALL_SCHEMA=\([0-9][0-9]*\)$/\1/p' install/install.sh)
+          [ -n "$schema" ] || { echo "ERROR: no INSTALL_SCHEMA= in install/install.sh" >&2; exit 1; }
           cat > release-wheels/versions.json <<EOF
-          { "release": "$REL", "tensor_server": "$tver", "napari": "$nver", "biopb": "$sdk" }
+          { "release": "$REL", "tensor_server": "$tver", "napari": "$nver", "biopb": "$sdk", "install_schema": $schema }
           EOF
           echo "tensor-server=$tver  napari=$nver  biopb=$sdk  release=$REL  prerelease=$PRERELEASE"
 

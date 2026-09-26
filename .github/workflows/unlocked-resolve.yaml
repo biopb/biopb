@@ -25,7 +25,7 @@
 # gate people learn to ignore. It informs; it does not block.
 #
 # When it goes red, the fix is a decision, not a revert: cap the offending
-# dependency (see biopb-mcp's `[mcp]` extra for the `mcp<2` precedent) or port
+# dependency (see biopb-mcp's `mcp<2` for the precedent) or port
 # the code to the new major. Either way the choice gets made deliberately,
 # before a release, instead of by a user's install.
 name: Unlocked Resolve
@@ -116,7 +116,7 @@ jobs:
       # rewrites uv.lock in the runner's checkout; nothing commits it.
       - name: Install (unlocked resolve)
         run: >-
-          uv sync --package biopb-mcp --extra mcp --group testing
+          uv sync --package biopb-mcp --extra napari --group testing
           --upgrade --python ${{ matrix.python-version }}
 
       - name: Record what was actually installed

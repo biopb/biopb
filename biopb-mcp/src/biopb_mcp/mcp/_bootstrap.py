@@ -491,6 +491,13 @@ def _bootstrap_impl():
     if is_scratch_kernel():
         splash = _NullSplash()
     else:
+        import importlib.util
+
+        if importlib.util.find_spec("napari") is None:
+            raise ImportError(
+                "The viewer needs napari, which is not installed: "
+                "pip install 'biopb-mcp[napari]'"
+            )
         ip.enable_gui("qt")
         splash = show_splash()
 

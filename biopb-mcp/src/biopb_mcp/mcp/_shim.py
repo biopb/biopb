@@ -107,16 +107,9 @@ def _session_command():
     """The argv that launches the http session child this shim owns.
 
     Binds a dynamic port (``--port 0``); the child reports the OS-assigned port
-    back through the file named in ``BIOPB_PORT_REPORT_FILE``. A frozen
-    (PyInstaller) build has no importable module tree behind ``sys.executable``,
-    but its entry binary *is* the launcher, so plain args suffice; a normal
-    install re-enters via ``-m``.
+    back through the file named in ``BIOPB_PORT_REPORT_FILE``.
     """
-    if getattr(sys, "frozen", False):
-        cmd = [sys.executable]
-    else:
-        cmd = [sys.executable, "-m", "biopb_mcp.mcp"]
-    return [*cmd, "--transport", "http", "--port", "0"]
+    return [sys.executable, "-m", "biopb_mcp.mcp", "--transport", "http", "--port", "0"]
 
 
 def _session_log_path(config, session_id):

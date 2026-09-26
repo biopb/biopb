@@ -531,7 +531,7 @@ def _require_biopb_mcp() -> None:
         console.print(
             "[red]The 'mcp' commands require the biopb-mcp package, which is "
             "not installed.[/red]\n"
-            r"[yellow]Install it with: pip install 'biopb-mcp\[mcp]'[/yellow]"
+            r"[yellow]Install it with: pip install 'biopb-mcp\[napari]'[/yellow]"
         )
         raise typer.Exit(1)
 

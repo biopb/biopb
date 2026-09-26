@@ -555,10 +555,6 @@ class TestHealth:
         got = _kernel.attach_command(path, python=python, windows=windows)
         assert got == expected
 
-    def test_no_attach_command_from_a_frozen_build(self, monkeypatch):
-        monkeypatch.setattr(sys, "frozen", True, raising=False)
-        assert _kernel.attach_command("/tmp/kernel-1.json") is None
-
 
 class TestReadiness:
     """The kernel boots off-thread (launcher serves the handshake first), so
