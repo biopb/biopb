@@ -183,7 +183,8 @@ exclude = ["biopb_mcp._tests", "biopb_mcp._tests.*"]
 # quotes an API of a particular runtime, so it rides that runtime's upgrade cycle
 # rather than being fetched. Everything ships: what the agent is *offered* is the
 # seed index's decision.
-"biopb_mcp.mcp" = ["_docs_data/*.md", "_docs_data/**/*.md"]
+# _surface.json is what the stdio shim advertises before its session child exists.
+"biopb_mcp.mcp" = ["_docs_data/*.md", "_docs_data/**/*.md", "_surface.json"]
 
 # Dropping biopb_mcp._tests from packages.find is not enough on its own: once it
 # is no longer a package, setuptools reclassifies its files as *data* of the

@@ -785,7 +785,7 @@ def live_session(
             except Exception:  # noqa: BLE001 - teardown must not mask a failure
                 pass
         if child is not None:
-            _shim._reap_session(child, session_id)
+            _shim._reap_session(child)
         for key, value in saved.items():
             if value is None:
                 os.environ.pop(key, None)

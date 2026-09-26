@@ -1,0 +1,364 @@
+{
+  "capabilities": {
+    "experimental": {},
+    "prompts": {
+      "listChanged": false
+    },
+    "resources": {
+      "listChanged": false,
+      "subscribe": false
+    },
+    "tools": {
+      "listChanged": false
+    }
+  },
+  "prompts": [],
+  "resource_templates": [],
+  "resources": [
+    {
+      "description": "The doc index, for hosts that subscribe to resources.\n\n    The same text the handshake carries and ``read_doc(\"index\")`` returns. It is\n    a resource as well so a host that honours ``resources/updated`` re-reads it\n    after a write -- the nearest thing MCP has to a harness injecting recall.\n    Nothing depends on it; the tool is the contract.\n    ",
+      "mimeType": "text/plain",
+      "name": "get_index",
+      "uri": "docs://index"
+    }
+  ],
+  "tools": [
+    {
+      "description": "Read one doc from the biopb knowledge store.\n\n    `id` is what the index lists. `read_doc(\"index\")` returns the index itself\n    -- the catalog of everything readable, with the agent's own hooks -- and is\n    worth re-reading when the session's handshake copy has gone stale.\n\n    A doc links another as `[[other-id]]`; follow one with another `read_doc`.\n    ",
+      "inputSchema": {
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "read_docArguments",
+        "type": "object"
+      },
+      "name": "read_doc",
+      "outputSchema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "read_docOutput",
+        "type": "object"
+      }
+    },
+    {
+      "description": "Write a doc into the biopb knowledge store. Returns a diff of the change.\n\n    Two forms. `body` writes the whole doc. `old`/`new` replaces one exact\n    occurrence of `old` -- the cheaper form, and the only sane one for the\n    index, which is long enough that rewriting it loses lines. The call is\n    refused if `old` is absent or matches more than once, so include enough\n    surrounding text to name one place. Several edits are several calls.\n\n    Writing a shipped doc creates your own copy shadowing it; the shipped file\n    is never touched, so an upgrade can still replace it. There is no delete:\n    retire a doc of your own by removing its index entry, and a shipped one by\n    adding its id to the index's `ignored:` line.\n\n    A new doc is filed in the index automatically, under `## Unfiled` -- move\n    the line where it belongs next time you edit the index.\n\n    Five rules, and they are what keep this store worth reading:\n\n    - Write only a **validated, multi-step** procedure -- one the user has just\n      confirmed on real data. A doc is a claim that the procedure works.\n    - Never a **dataset-specific** one. A source_id, an array_id or a pathname\n      makes it unusable by the next session; that run belongs in a notebook.\n    - Phrase the index hook **as the user's request**, not as an implementation\n      summary. It is what a later session matches against.\n    - **Update an existing doc rather than write a near-duplicate.** Read the\n      index first, and prefer an `old`/`new` edit to a new file.\n    - **Verify that a name, flag or call the doc quotes still exists** before\n      relying on it. Nothing else checks a doc of yours.\n\n    `read_doc(\"authoring\")` has what a procedure doc must contain.\n    ",
+      "inputSchema": {
+        "properties": {
+          "body": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Body"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "new": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "New"
+          },
+          "old": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Old"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "write_docArguments",
+        "type": "object"
+      },
+      "name": "write_doc",
+      "outputSchema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "write_docOutput",
+        "type": "object"
+      }
+    },
+    {
+      "description": "Capture the napari viewer as a PNG image, where the session has one.\n\n    A session without a viewer refuses, saying why; show a result through the\n    web viewer there instead (read_doc(\"web-viewer\")).\n\n    Args:\n        canvas_only: If True, capture only the canvas area. If False,\n            capture the entire viewer window.\n\n    Returns a PNG screenshot as an image content block.\n    ",
+      "inputSchema": {
+        "properties": {
+          "canvas_only": {
+            "default": true,
+            "title": "Canvas Only",
+            "type": "boolean"
+          }
+        },
+        "title": "take_screenshotArguments",
+        "type": "object"
+      },
+      "name": "take_screenshot"
+    },
+    {
+      "description": "Execute Python code in the session's kernel.\n\n    The kernel is a full Jupyter/IPython kernel (imports allowed). Its namespace\n    always holds the data plane -- client (image data access) -- and the\n    algorithm plane -- ops (a dict of server-side image-processing operations)\n    and the user's kernel plugin modules; np and da are imported. A viewer (a\n    napari viewer with add_tensor/tensor methods) is there only when the session\n    has one: server_status's ## Viewer says. Variables persist across calls\n    until the kernel is restarted.\n\n    Code runs as a cell on the kernel's main thread, like a notebook cell.\n    If it finishes quickly the result is returned inline; otherwise this returns\n    a job handle (job-N) and the cell keeps running. Poll it with poll_job, and\n    stop it with interrupt_kernel or restart_kernel (guaranteed). While it runs\n    it holds the main thread: a viewer does not repaint and take_screenshot /\n    inspect_object refuse. For a long compute you want to watch, end the cell\n    with run_async(fn) instead -- fn runs on a worker thread, the cell returns\n    at once with a task id (task-...) to poll, and the main thread stays free.\n    Only one job runs at a time.\n\n    Only one *agent* runs code in a kernel, too: whoever calls this first holds\n    it until the kernel restarts. A second client is refused here and by every\n    other tool that changes kernel state (interrupt_kernel, restart_kernel), and\n    keeps only the read-only ones. The person at the machine is exempt — they\n    can run cells from a Jupyter notebook attached to this kernel while you\n    work, which is what the user-activity notice on these results is telling\n    you about. A cell of theirs sent while yours runs waits for it; one sent\n    while a run_async task runs runs beside it.\n\n    Results include print() output and the last expression's repr. Rich IPython\n    display() output is not captured; use print().\n\n    * viewer mutations, where there is a viewer (read_doc(\"napari-viewer\") has\n    more): Mutate the viewer directly. From a run_async task too: its mutations are\n    marshaled to the main thread, one hop each, so bulk viewer work and raw Qt\n    (viewer.window) belong in a cell.\n\n    * data access (read_doc(\"tensor-server-client\") has more):\n    - client.query_sources(sql, format=\"pandas\") runs server-side DuckDB and\n      returns a DataFrame. The `sources` table columns are: source_id,\n      source_url, source_type, indexed_at, metadata_json, is_resolved, and\n      `tensors`, a LIST of STRUCT(array_id, dim_labels, shape, dtype) with one\n      entry per tensor (note source_url, not \"url\"). This is the browse\n      surface; there is no other. Structure is a per-tensor question, so ask it\n      of `tensors`: `WHERE len(list_filter(tensors, t -> t.dtype='uint16')) > 0`,\n      or `tensors[1].dtype` for the source's first tensor (DuckDB lists are\n      1-indexed, unlike `tensors[0]` in Python/TS code). An unresolved (cloud)\n      source has an empty `tensors`, so any such predicate hides it; use\n      `is_resolved` to filter on them on purpose (e.g. `WHERE NOT is_resolved`\n      to list what hasn't been resolved yet).\n    - resolved is not the same as local. Assume a cloud or synced-folder\n      source's bytes may not be on the serving machine, so its first read can\n      be slow or fail offline -- say so before starting one, not after.\n    - client.get_tensor(array_id) returns a lazy dask array;\n      viewer.add_tensor(array_id), where there is a viewer, loads it as a layer\n      (auto-handles the multiscale pyramid). Both take the same id: \"source_id/t1\"\n      within a multi-tensor source, a bare \"source_id\" for a single-tensor one.\n    - reading pixels back off a layer is not plain napari: layer.data is\n      napari's MultiScaleData sequence of pyramid levels when layer.multiscale,\n      in display axis order ([..., Z, Y, X], at the source's own rank), and\n      lazy -- np.asarray() of it silently gives the *lowest* level. Use\n      viewer.tensor(layer), which returns a plain full-resolution dask array\n      from any layer, and read_doc(\"napari-viewer\") before measuring or computing from\n      a layer.\n    ",
+      "inputSchema": {
+        "properties": {
+          "intent": {
+            "default": "",
+            "description": "One short sentence on *why* you are running this cell -- the goal you are pursuing for the user, not a restatement of what the code does. Recorded with the job and written into the session's notebook export, which is otherwise a log of code with no record of what anyone was trying to achieve. Leave it empty rather than padding it.",
+            "title": "Intent",
+            "type": "string"
+          },
+          "python_code": {
+            "title": "Python Code",
+            "type": "string"
+          }
+        },
+        "required": [
+          "python_code"
+        ],
+        "title": "execute_codeArguments",
+        "type": "object"
+      },
+      "name": "execute_code",
+      "outputSchema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "execute_codeOutput",
+        "type": "object"
+      }
+    },
+    {
+      "description": "Check that a workflow notebook runs on its own, in a scratch kernel.\n\n    Use this when the user wants a workflow they have just proven kept as a\n    document. **You write the whole document** — prose and code — and this runs\n    it; on success the notebook is saved for them and this tool reports where.\n    Tell them the path; do not write the file yourself.\n\n    **The format** is markdown with fenced ``python`` cells. Each fence is one\n    notebook cell, run in order; everything between them is markdown, rendered\n    as written. A fence in another language (```bash) is prose about a command,\n    not a cell. The first ``# `` heading becomes the title. A saved ``.ipynb``\n    is also accepted verbatim, which is what to send back when the user has\n    edited one.\n\n    Write it as a document, not as a list of cells with comments: a heading, a\n    sentence on what each step does and why in the terms the user would use\n    (\"the threshold is 0.4 because the background peak sits at 0.3\"), and the\n    code between them. That prose is most of what makes the notebook usable\n    months later, and you are the only one who knows it.\n\n    **It starts with its own setup cell.** The scratch kernel is given nothing —\n    no ``client``, no ``ops``, no ``np``, no plugins, no ``viewer`` — because\n    the reader's kernel will have nothing either. So the first cell is the\n    document's own environment:\n\n        import numpy as np\n        from biopb_mcp.workflow_env import workflow_env\n\n        conn, ops = workflow_env()\n        client = conn.client\n\n    A workflow that skips it fails with ``NameError``, which is the verdict: it\n    would have failed the same way for whoever opened the notebook.\n\n    **Rewrite the session, do not select from it.** The program that works is\n    almost never a subsequence of what was run: a cell that created a variable\n    and a later cell that corrected its value have to merge into one, and dead\n    ends, retries and debugging prints drop out. Read the session with poll_job\n    and write the document you *mean*.\n\n    **There is no `viewer`, and that is deliberate.** The viewer exists so you\n    can show something to the person you are working with, and nobody is\n    watching a verification. Write the workflow to *compute* and to ``print``\n    what matters; leave displaying the result to the live session.\n\n    **Failing is normal; the draft is where you fix it.** Every attempt, pass or\n    fail, is written to a draft file in the document's own format, and this tool\n    reports its path. On a failure, **read that file, edit it, and send the\n    whole thing back** — do not retype the document from memory, because the\n    user may have edited it themselves in the meantime, and their edit is the\n    one that should survive. A pass promotes the draft to the saved notebook and\n    removes it.\n\n    **The live session is untouched** — its variables, its layers, its viewer.\n    Bringing the scratch kernel up takes a few seconds, and while a verification\n    runs the session kernel accepts no cells (one job at a time, across both).\n\n    **What it proves:** every cell runs, in order, on a bare kernel with\n    biopb-mcp installed. That covers the whole class of defect that makes a\n    transcript unrunnable — a cell reading a variable an earlier discarded cell\n    created, a handle only this session had.\n\n    **What it does not.** The numbers are right: check them. And a scratch\n    *process* is not a scratch *world* — it talks to the same tensor server and\n    the same filesystem, so `client.upload_array` / `add_source`,\n    and any cell that writes a file, write through for real. Verify a workflow\n    three times and you have three uploaded arrays. **Say so before running one\n    that writes.**\n\n    Args:\n        document: the workflow, as markdown with fenced ``python`` cells (or a\n            complete ``.ipynb`` document).\n        title: overrides the document's own ``# `` heading. Names the saved\n            file; leave it out unless the heading is wrong.\n    ",
+      "inputSchema": {
+        "properties": {
+          "document": {
+            "title": "Document",
+            "type": "string"
+          },
+          "title": {
+            "default": "",
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "document"
+        ],
+        "title": "verify_workflowArguments",
+        "type": "object"
+      },
+      "name": "verify_workflow",
+      "outputSchema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "verify_workflowOutput",
+        "type": "object"
+      }
+    },
+    {
+      "description": "Get the status and output of a job started by execute_code.\n\n    Returns the job's status (running/ok/error/interrupted), elapsed time, and\n    output so far (full output once terminal). Job records persist until the\n    kernel is restarted (older terminal jobs are eventually evicted).\n\n    **This call already waits, so do not poll it in a loop.** A running job is\n    watched here for up to `wait` seconds and answered the instant it ends;\n    calling again immediately just asks the same question sooner and buys\n    nothing. If you have nothing else to do until the job finishes, raise\n    `wait` rather than calling more often. A terminal job, an unknown job id\n    and a dead kernel all answer immediately whatever `wait` says.\n    ",
+      "inputSchema": {
+        "properties": {
+          "job_id": {
+            "title": "Job Id",
+            "type": "string"
+          },
+          "wait": {
+            "default": 10.0,
+            "description": "Seconds to wait for a *running* job before answering. The call returns the moment the job finishes, so this is a ceiling and not a delay -- a job that ends in 2s answers in 2s. Leave it alone unless you have a reason: the default (10s) is there so watching a job costs a handful of calls instead of hundreds. Raise it (up to 30s) when you have nothing to do until the job ends; set it to 0 only when you want a snapshot right now and will not immediately ask again.",
+            "minimum": 0,
+            "title": "Wait",
+            "type": "number"
+          }
+        },
+        "required": [
+          "job_id"
+        ],
+        "title": "poll_jobArguments",
+        "type": "object"
+      },
+      "name": "poll_job",
+      "outputSchema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "poll_jobOutput",
+        "type": "object"
+      }
+    },
+    {
+      "description": "Inspect a live object in the napari kernel namespace.\n\n    Returns the type, docstring, and public methods/attributes.\n    Example: inspect_object(\"viewer.layers\") or inspect_object(\"viewer.camera\")\n    ",
+      "inputSchema": {
+        "properties": {
+          "object_path": {
+            "title": "Object Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "object_path"
+        ],
+        "title": "inspect_objectArguments",
+        "type": "object"
+      },
+      "name": "inspect_object",
+      "outputSchema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "inspect_objectOutput",
+        "type": "object"
+      }
+    },
+    {
+      "description": "Force-stop your running job: your cell, or your run_async task.\n\n    A cell runs on the kernel's main thread and gets a SIGINT, which also wakes\n    a blocking sleep or wait; a task gets a KeyboardInterrupt raised into its\n    thread. Either lands at the next bytecode, so a blocking C-level call (gRPC\n    tensor fetch, native compute) stops only when it returns to Python. A\n    blocking `.compute()` on a dask `Client` cancels its own tasks when\n    interrupted; in a task that lands within 10 s. If YOUR job stays stuck,\n    use restart_kernel -- the guaranteed stop.\n\n    Stops YOUR job only. A cell the user runs from an attached Jupyter notebook\n    shares this kernel but is not yours to stop: this refuses it, so wait for it\n    instead. A refusal is not a stuck\n    kernel and restart_kernel is not the way around it — restarting would destroy\n    the user's running cell, variables and layers along with yours. Wait, or ask\n    them.\n\n    Takes no argument for which job because you have at most one running: the\n    slot is the session's, not a kernel's. So this also stops a verification of yours\n    running in its scratch kernel, and refuses one that is not yours, by the\n    same rule and for the same reason.\n\n    **On a verification it is the guaranteed stop, not a best-effort one.** If\n    the cells do not stop promptly the scratch kernel is killed outright and\n    discarded — which is safe precisely because nothing in it is anyone's work.\n    So a stuck verification never needs restart_kernel: reaching for it there\n    would destroy the user's session to end a process that exists to be thrown\n    away.\n    ",
+      "inputSchema": {
+        "properties": {},
+        "title": "interrupt_kernelArguments",
+        "type": "object"
+      },
+      "name": "interrupt_kernel",
+      "outputSchema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "interrupt_kernelOutput",
+        "type": "object"
+      }
+    },
+    {
+      "description": "Start biopb: bring up the kernel with the tensor client, ops and kernel\n    plugins -- and the napari viewer, where the session has one.\n\n    Call this as the first action of every session, and whenever the user asks\n    to start, open, or launch biopb, napari, or the viewer. Nothing auto-starts\n    and every other kernel tool fails until this returns, so when in doubt call\n    it -- a ready kernel is a no-op.\n\n    It BLOCKS until the kernel is ready (or the bring-up fails), so on return\n    you can use execute_code / take_screenshot / inspect_object directly, with\n    no polling.\n\n    It is also the recovery path: after a failed start, a dead kernel, or the\n    user closing the viewer window (which tears the kernel down to idle), call\n    it again to rebuild. A kernel that is already up is left untouched, so this\n    is not the way to clear a wedged or misbehaving one -- that is\n    interrupt_kernel (stop the running job) or restart_kernel (hard-restart,\n    discarding the user's work, which this never does).\n    ",
+      "inputSchema": {
+        "properties": {},
+        "title": "start_kernelArguments",
+        "type": "object"
+      },
+      "name": "start_kernel",
+      "outputSchema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "start_kernelOutput",
+        "type": "object"
+      }
+    },
+    {
+      "description": "Hard-restart the kernel: the guaranteed stop for runaway execution.\n\n    Kills the kernel process group (reaping any dask child processes) and\n    respawns a fresh kernel, rebuilding the tensor client, ops and plugins, and\n    the napari viewer where the session has one. All variables defined in\n    previous execute_code calls are lost; a new viewer window replaces the old\n    one.\n\n    This destroys the USER's work too, not only yours — their running cell,\n    their variables, their layers — and it is not undoable or announced to them\n    beforehand. So it is not the way past a refused interrupt_kernel or a kernel\n    busy with a user cell: neither is a runaway. Use it when the kernel is truly\n    wedged, and prefer asking first when someone is working in it.\n\n    It is also not the way past a kernel held by another client: if you do not\n    hold this one, this is refused too, and restarting it is the user's to do.\n    ",
+      "inputSchema": {
+        "properties": {},
+        "title": "restart_kernelArguments",
+        "type": "object"
+      },
+      "name": "restart_kernel",
+      "outputSchema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "restart_kernelOutput",
+        "type": "object"
+      }
+    },
+    {
+      "description": "Report server health, system load, and resource usage.\n\n    Returns CPU/memory usage (this MCP process / host), kernel liveness, and —\n    queried from the kernel — its biopb-mcp/python versions, dask scheduler info,\n    tensor server connectivity, viewer layer count, the available `ops`, and which\n    kernel plugins loaded. Use before heavy computation, and to resolve a skill's\n    `checklist:` list.\n    ",
+      "inputSchema": {
+        "properties": {},
+        "title": "server_statusArguments",
+        "type": "object"
+      },
+      "name": "server_status",
+      "outputSchema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "server_statusOutput",
+        "type": "object"
+      }
+    }
+  ]
+}

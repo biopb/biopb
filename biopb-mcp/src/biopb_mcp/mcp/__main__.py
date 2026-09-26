@@ -44,6 +44,11 @@ ENV_PORT_REPORT_FILE = "BIOPB_PORT_REPORT_FILE"
 # now three processes across two packages that must agree on one string.
 ENV_SESSION_LOG = MCP_SESSION_LOG_ENV
 
+# Env var carrying the id the stdio shim minted for this session (it names the
+# session's logfile, so the shim needs it before we exist). Kept in sync with
+# _shim.ENV_SESSION_ID. Absent for a `biopb mcp view` session, which mints its own.
+ENV_SESSION_ID = "BIOPB_MCP_SESSION_ID"
+
 # Env var naming the launch this viewer belongs to, set by the control when it
 # spawns one from the dashboard. Echoed into our registry record so that
 # launcher can pick our session out of the registry; absent for every other way
@@ -75,32 +80,31 @@ def _report_port(path, port):
         logger.warning("Could not write port report file %s", path, exc_info=True)
 
 
-def _register_view_session(port):
-    """Publish this agentless viewer in the session registry; return its id.
+def _register_session(port, session_id=None):
+    """Publish this session in the session registry; return its id.
 
     The control lists live sessions and proxies ``/session/<id>/*`` from this
     registry, so a session nobody publishes is a session with no observe page
-    and no dashboard entry. The stdio shim publishes the child it owns
-    (``_shim.spawn_session``); a `biopb mcp view` session has no shim, so it
-    publishes itself.
+    and no dashboard entry. Every session on a dynamic port publishes itself --
+    a shim-owned child under *session_id*, the id its shim minted, a `biopb mcp
+    view` session under a fresh one -- and drops the record in ``_shutdown``.
 
-    Best-effort, and broadly caught for the same reason the shim's publish is
-    (biopb/biopb#422): a registry write failure — a serialization error, an
-    unwritable state dir — must cost the viewer its discoverability and nothing
-    else. Returns ``None`` in that case, leaving the caller nothing to
-    de-register.
+    Best-effort, and broadly caught (biopb/biopb#422): a registry write failure
+    -- a serialization error, an unwritable state dir -- must cost the session
+    its discoverability and nothing else. Returns ``None`` in that case, leaving
+    the caller nothing to de-register.
     """
     from biopb import _sessions
 
     # Whoever launched us gets their token back on the record, so they can
     # recognise *this* session rather than guessing from a pid they may not even
-    # hold (see MCP_LAUNCH_TOKEN_ENV). Nothing else reads it, and a viewer
-    # started by hand carries none.
+    # hold (see MCP_LAUNCH_TOKEN_ENV). Nothing else reads it, and a session
+    # started any other way carries none.
     launched_by = os.environ.get(ENV_LAUNCH_TOKEN)
     extra = {LAUNCH_TOKEN_FIELD: launched_by} if launched_by else {}
 
     try:
-        session_id = _sessions.new_session_id()
+        session_id = session_id or _sessions.new_session_id()
         _sessions.register(
             session_id,
             port=port,
@@ -253,11 +257,11 @@ def _setup_observe(config, agentless=False, on_shutdown=None):
 def _is_agentless_viewer(view, shim_owned):
     """Whether this session is a viewer a human opened, not a harness's child.
 
-    Two things follow from it and must not drift apart: such a session publishes
-    *itself* to the registry (nothing else owns its reap), and it is the only
-    kind that gets the built-in chat loop. A shim-owned child is serving an MCP
-    client; a direct ``--transport http`` launch is neither, and publishes no
-    session at all, so it has no observe page for a pane to live on.
+    Two things follow from it and must not drift apart: such a session owns its
+    own reap (it serves the stop route), and it is the only kind that gets the
+    built-in chat loop. A shim-owned child is serving an MCP client; a direct
+    ``--transport http`` launch is neither, and publishes no session at all, so
+    it has no observe page for a pane to live on.
     """
     return bool(view and not shim_owned)
 
@@ -373,6 +377,10 @@ def _serve_http(config, port, view=False):
     from .._config import get_setting
     from . import _app, _scratch, _server, _xvfb
     from ._kernel import ENV_NO_VIEWER, ENV_SCRATCH, KernelHost
+
+    # Taken out of the environment the kernel inherits: a session started from a
+    # cell must mint its own id, not overwrite this one's record.
+    minted_id = os.environ.pop(ENV_SESSION_ID, None)
 
     # Windows: serve on the Selector event loop, not the default Proactor one
     # (biopb/biopb#383). The Proactor accept loop treats *any* OSError from
@@ -539,7 +547,12 @@ def _serve_http(config, port, view=False):
         listen_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         listen_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listen_sock.bind(("127.0.0.1", port))  # port 0 -> OS assigns one
+        # Listening from here on, so a connection that arrives before uvicorn
+        # starts accepting (the shim's, the control's) queues instead of being
+        # refused.
+        listen_sock.listen()
         port = listen_sock.getsockname()[1]
+        _app.set_mcp_url(f"http://127.0.0.1:{port}/mcp")
         if shim_owned:
             _report_port(report_file, port)
         else:  # view
@@ -586,9 +599,8 @@ def _serve_http(config, port, view=False):
         # Drop the routing record before anything else, so a control stops
         # routing here while this process can still refuse a connection cleanly
         # rather than after it has stopped answering. Teardown and
-        # de-registration are one path, as they are in the shim's _reap_session;
-        # the registry's own pid-liveness prune is the backstop for a kill this
-        # never runs for.
+        # de-registration are one path; the registry's own pid-liveness prune is
+        # the backstop for a kill this never runs for.
         _unregister_session(session_id)
         # Before the kernel: an ACP harness holds an MCP session against this
         # server, so it is a client, and clients go before the thing they are
@@ -636,14 +648,12 @@ def _serve_http(config, port, view=False):
             logger.exception("Failed to open the viewer; exiting")
             return 1  # atexit reaps the kernel/cluster and cleans the spill dir
 
-    # Only the agentless viewer registers *itself*: a shim-owned child is
-    # published by the shim that owns its reap (and so its de-registration), and
-    # a direct `--transport http` launch binds the configured fixed port its
-    # operator already knows. Done last, with the kernel up and the serve loop
-    # the next statement, so a record implies a session that is all but
-    # answering.
-    if _is_agentless_viewer(view, shim_owned):
-        session_id = _register_view_session(port)
+    # A session on a dynamic port publishes itself; a direct `--transport http`
+    # launch binds the configured fixed port its operator already knows. Done
+    # last, with a `--view` window up and the serve loop the next statement, so
+    # a record implies a session that is all but answering.
+    if dynamic_port:
+        session_id = _register_session(port, minted_id)
 
     _server.run(
         port,

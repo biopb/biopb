@@ -843,7 +843,7 @@ def _launch_viewer(timeout: float) -> dict:
     """Start an agentless viewer session; wait for it to publish itself.
 
     Registration is the readiness signal, and it is an exact one: ``--view``
-    runs its eager ``host.ensure_started()`` *before* ``_register_view_session``
+    runs its eager ``host.ensure_started()`` *before* ``_register_session``
     (biopb-mcp ``mcp/__main__.py``), so a record appearing means a napari window
     really opened, and a child that dies first never registers. The record is
     matched on a per-launch token we hand the child in its environment

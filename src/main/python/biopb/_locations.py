@@ -104,7 +104,7 @@ LAUNCH_TOKEN_FIELD = "launch_token"
 # working directory (opencode desktop does) has that value inherited by the
 # biopb-mcp shim it spawns, while a control plane started from a terminal keeps
 # the default. The two then disagree about where the state tree is, and the
-# session registry -- whose whole contract is that the shim writes what the
+# session registry -- whose whole contract is that a session writes what the
 # control reads (see ``biopb._sessions``) -- silently splits in half.
 #
 # The other consumers of the state tree hid the same skew behind fallbacks: the
@@ -358,7 +358,7 @@ def sessions_dir() -> Path:
 
     ``BIOPB_SESSIONS_DIR`` overrides the location (used by tests and unusual
     deployments); otherwise ``state/biopb/sessions``. The override must be an
-    absolute path -- this registry is the one directory a shim and a control
+    absolute path -- this registry is the one directory a session and a control
     *must* agree on, and they do not share a working directory
     (:func:`_require_absolute`).
     """
