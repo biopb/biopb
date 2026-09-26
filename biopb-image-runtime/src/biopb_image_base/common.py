@@ -7,9 +7,12 @@ Provides:
 - Lazy data handling utilities for co-deployed tensor server
 """
 
+from __future__ import annotations
+
 import functools
 import inspect
 import logging
+import sys
 import threading
 import time
 import traceback
@@ -18,12 +21,13 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING, Optional, Union
 
 import biopb.image as proto
-import dask.array as da
 import grpc
 import numpy as np
 from biopb.image.utils import deserialize_image_data, serialize_from_numpy_to_image_data
 
 if TYPE_CHECKING:
+    import dask.array as da
+
     from biopb_image_base.server import EmbeddedTensorCache
 
 _AUTH_HEADER_KEY = "authorization"
@@ -31,6 +35,16 @@ _MAX_MSG_SIZE = 1024 * 1024 * 128  # 128MB
 _MAX_EAGER_SIZE = 1024 * 1024 * 64  # 64MB - threshold for returning lazy data
 
 logger = logging.getLogger(__name__)
+
+
+def _is_dask_array(arr) -> bool:
+    """True if *arr* is a dask array, without importing dask to find out.
+
+    dask comes with the ``[lazy]`` extra. A dask array cannot exist in a process
+    that never imported ``dask.array``, so its absence is a definitive "no".
+    """
+    da_mod = sys.modules.get("dask.array")
+    return da_mod is not None and isinstance(arr, da_mod.Array)
 
 
 # =============================================================================
@@ -125,7 +139,7 @@ def encode_image(
 
 def return_lazy_or_eager(
     result: Union[np.ndarray, da.Array],
-    tensor_cache: Optional["EmbeddedTensorCache"] = None,
+    tensor_cache: Optional[EmbeddedTensorCache] = None,
     dim_labels: Optional[list] = None,
     max_eager_size: int = _MAX_EAGER_SIZE,
 ) -> proto.ImageData:
@@ -146,7 +160,7 @@ def return_lazy_or_eager(
     Raises:
         ValueError: If tensor_cache not provided for lazy result
     """
-    is_lazy = isinstance(result, da.Array)
+    is_lazy = _is_dask_array(result)
     nbytes = result.nbytes if hasattr(result, "nbytes") else 0
 
     if is_lazy or nbytes > max_eager_size:
@@ -240,7 +254,7 @@ def ensure_eager(image: Union[np.ndarray, da.Array]) -> np.ndarray:
     Raises:
         ValueError: If image is a lazy dask array
     """
-    if isinstance(image, da.Array):
+    if _is_dask_array(image):
         raise ValueError(
             "Lazy data (dask array) not supported. "
             "Services currently only process eager data. "
@@ -493,7 +507,7 @@ class BiopbServicerBase(
     def __init__(
         self,
         use_lock: bool = True,
-        tensor_cache: Optional["EmbeddedTensorCache"] = None,
+        tensor_cache: Optional[EmbeddedTensorCache] = None,
     ):
         self._lock = threading.RLock() if use_lock else None
         self._use_lock = use_lock

@@ -33,7 +33,7 @@ from biopb_image_base.logging_config import LogLevel, setup_logging
 
 logger = logging.getLogger(__name__)
 
-_NON_UNIFORM_CHUNKS_ERROR = "Non-uniform dask chunks are not supported; rechunk to a uniform grid before uploading."
+_NON_UNIFORM_CHUNKS_ERROR = "Non-uniform dask chunks are not supported; rechunk to a regular grid before uploading."
 
 
 def _resolve_tensor_external_location(
@@ -70,8 +70,10 @@ def _as_dask_array(array: Union[np.ndarray, da.Array]) -> da.Array:
 
 
 def _uniform_chunk_shape(array: da.Array) -> tuple[int, ...]:
-    if not all(len(set(axis_chunks)) == 1 for axis_chunks in array.chunks):
-        raise ValueError(_NON_UNIFORM_CHUNKS_ERROR)
+    """The chunk grid of *array*: one size per axis, a smaller last chunk allowed."""
+    for axis_chunks in array.chunks:
+        if len(set(axis_chunks[:-1])) > 1 or axis_chunks[-1] > axis_chunks[0]:
+            raise ValueError(_NON_UNIFORM_CHUNKS_ERROR)
     return tuple(int(axis_chunks[0]) for axis_chunks in array.chunks)
 
 
@@ -538,6 +540,66 @@ def _pyarrow_available() -> bool:
     return importlib.util.find_spec("pyarrow") is not None
 
 
+def start_embedded_cache(
+    cache_dir: str,
+    cache_size: str = "32GB",
+    *,
+    ip: str = "0.0.0.0",
+    local: bool = False,
+    tensor_port: int = 8817,
+    tensor_external_location: Optional[str] = None,
+) -> Optional[EmbeddedTensorCache]:
+    """Start the embedded tensor server a remote deployment returns results through.
+
+    Answers ``None`` where pyarrow cannot run, so the server serves inline
+    results only.
+    """
+    if not _pyarrow_available():
+        # No-SSE4.2/AVX build: pyarrow (hence the lazy/Flight side channel) is
+        # unavailable. Do not start the tensor server -- it would crash. Lazy
+        # (dask) requests will be cleanly rejected by the servicer instead.
+        logger.warning(
+            "Tensor cache (lazy data side channel) was requested (cache_dir) "
+            "but pyarrow is not available -- this looks like a build for a CPU "
+            "without SSE4.2/AVX. Disabling the tensor server; only eager image "
+            "data is supported and lazy (dask) input/output will be rejected."
+        )
+        return None
+
+    cache_path = Path(cache_dir)
+    cache_path.mkdir(parents=True, exist_ok=True)
+
+    # NOTE: parse_bytes reads "GB" as decimal 1e9 -- use "GiB" for the binary
+    # 2**30 the old ad-hoc parser assumed.
+    cache_bytes = parse_bytes(cache_size)
+
+    logger.info(f"Starting embedded tensor cache at {cache_dir} (size: {cache_size})")
+
+    # Determine external location for SerializedTensor
+    external_location = _resolve_tensor_external_location(
+        ip=ip,
+        local=local,
+        tensor_port=tensor_port,
+        tensor_external_location=tensor_external_location,
+    )
+
+    # Start embedded tensor server (binds to 0.0.0.0 for external access)
+    tensor_server, bind_location = _start_embedded_tensor_cache(
+        cache_dir=cache_path,
+        cache_size=cache_bytes,
+        tensor_port=tensor_port,
+        tensor_host="0.0.0.0",
+    )
+
+    logger.info(f"Tensor server listening on {bind_location}")
+    logger.info(f"Tensor server advertised at {external_location}")
+    # Create wrapper with location rewriting
+    return EmbeddedTensorCache(
+        tensor_server=tensor_server,
+        external_location=external_location,
+    )
+
+
 def run_server(
     servicer,
     port: int = 50051,
@@ -601,51 +663,15 @@ def run_server(
         )
 
     tensor_cache = None
-    if cache_dir is not None and not _pyarrow_available():
-        # No-SSE4.2/AVX build: pyarrow (hence the lazy/Flight side channel) is
-        # unavailable. Do not start the tensor server -- it would crash. Lazy
-        # (dask) requests will be cleanly rejected by the servicer instead.
-        logger.warning(
-            "Tensor cache (lazy data side channel) was requested (cache_dir) "
-            "but pyarrow is not available -- this looks like a build for a CPU "
-            "without SSE4.2/AVX. Disabling the tensor server; only eager image "
-            "data is supported and lazy (dask) input/output will be rejected."
-        )
-    elif cache_dir is not None:
-        cache_path = Path(cache_dir)
-        cache_path.mkdir(parents=True, exist_ok=True)
-
-        # NOTE: parse_bytes reads "GB" as decimal 1e9 -- use "GiB" for the binary
-        # 2**30 the old ad-hoc parser assumed.
-        cache_bytes = parse_bytes(cache_size)
-
-        logger.info(
-            f"Starting embedded tensor cache at {cache_dir} (size: {cache_size})"
-        )
-
-        # Determine external location for SerializedTensor
-        external_location = _resolve_tensor_external_location(
+    if cache_dir is not None:
+        tensor_cache = start_embedded_cache(
+            cache_dir,
+            cache_size,
             ip=ip,
             local=local,
             tensor_port=tensor_port,
             tensor_external_location=tensor_external_location,
         )
-
-        # Start embedded tensor server (binds to 0.0.0.0 for external access)
-        tensor_server, bind_location = _start_embedded_tensor_cache(
-            cache_dir=cache_path,
-            cache_size=cache_bytes,
-            tensor_port=tensor_port,
-            tensor_host="0.0.0.0",
-        )
-
-        # Create wrapper with location rewriting
-        tensor_cache = EmbeddedTensorCache(
-            tensor_server=tensor_server,
-            external_location=external_location,
-        )
-        logger.info(f"Tensor server listening on {bind_location}")
-        logger.info(f"Tensor server advertised at {external_location}")
 
     logger.info("server starting ...")
 
