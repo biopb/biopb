@@ -1,7 +1,9 @@
 # The algorithm plane under the control
 
 Status: **in progress**. Steps 1 (protocol and runtime) and 2 (control) are
-implemented, and step 3 (clients) except for the widget (biopb-napari-widget).
+implemented, and step 3 (clients) except for the widget: its Image
+Processing widget's move to `Ops` is deferred, and its Object Detection widget
+is retired rather than moved.
 
 **Components:** the image protocol (`proto/biopb/image/`, a new `Ops` service),
 `biopb-image-runtime` (a function-level API and a PyPI wheel), `biopb-control`
@@ -373,6 +375,9 @@ Each step leaves the monorepo working.
    `biopb.control.algorithms()`.
 3. **Clients.** The kernel's `ops` on `Ops`, reading the control; the widget's
    server choice and client; `biopb image`; the docs-store page;
-   `server_status`.
+   `server_status`. The widget's part is deferred: its Image Processing widget
+   calls `ProcessImage` until it moves, and its Object Detection widget is
+   retired, a detection model becoming an op that returns a label image.
 4. **Retirement.** `ProcessImage`, `ObjectDetection` and their messages
-   deleted; the examples and the Docker base image on `Ops`.
+   deleted; the examples and the Docker base image on `Ops`. `ProcessImage`
+   goes only after the Image Processing widget has moved.
