@@ -36,6 +36,10 @@ _promote_after: float = 10.0
 # `--transport http` / `biopb mcp view`) rather than a file.
 _session_log_path: str | None = None
 
+# This session's own /mcp url (set by the launcher when it binds a dynamic
+# port), for a client it starts itself -- the chat pane's ACP harness.
+_mcp_url: str | None = None
+
 # Handed to the client in the initialize handshake (the only handshake-time
 # carrier MCP defines). Clients that honor it inject it into the model's
 # context from the first turn (compliance is up to the client/agent), so this
@@ -189,6 +193,12 @@ def set_promote_after(seconds: float):
     """Set how long execute_code waits inline before returning a job handle."""
     global _promote_after
     _promote_after = float(seconds)
+
+
+def set_mcp_url(url: str | None):
+    """Record where this session serves ``/mcp``."""
+    global _mcp_url
+    _mcp_url = url
 
 
 def set_session_log_path(path: str | None):

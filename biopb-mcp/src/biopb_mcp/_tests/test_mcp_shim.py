@@ -2,14 +2,14 @@
 
 Unit tests cover the session-spawn logic (dynamic-port handoff, env
 inheritance, startup/timeout), the port-report file parsing, the reap, the
-faithful initialize replay (the `instructions` field above all — losing it is
-the defect that disqualified delegating to mcp-proxy), and the request
-forwarding of the vendored proxy. One end-to-end test runs the real thing:
-``biopb-mcp --transport stdio`` as a subprocess, which must spawn its own http
-session child, bridge a full JSON-RPC session, and — the shim-owned session model —
-**reap** that child when the client hangs up (the shared daemon used to survive).
+lazy start, the shipped surface snapshot, and the request forwarding of the
+vendored proxy. One end-to-end test runs the real thing: ``biopb-mcp
+--transport stdio`` as a subprocess, which must answer the handshake and the
+listings with no child, spawn its own http session child on the first tool
+call, and **reap** that child when the client hangs up.
 """
 
+import contextlib
 import json
 import os
 import re
@@ -21,11 +21,14 @@ import time
 
 import anyio
 import pytest
-from biopb import _sessions
 from biopb._lifecycle.owned_child import OwnedChild
 from mcp import types
 
-from biopb_mcp.mcp import _shim
+from biopb_mcp.mcp import (
+    _server,  # noqa: F401 - registers the tools
+    _shim,
+)
+from biopb_mcp.mcp._app import mcp
 
 
 def _free_port():
@@ -34,27 +37,33 @@ def _free_port():
         return s.getsockname()[1]
 
 
+def _port_listening(port, timeout=0.5):
+    """Whether something accepts TCP connections on 127.0.0.1:<port>."""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 def _cfg(**transport):
     return {"transport": transport}
 
 
-# A stand-in session child: reads its port-report file from the env, binds a
-# dynamic port, publishes it atomically (temp + os.replace, as the real child
-# does), then accepts connections so the readiness probe succeeds. It must
-# accept, not merely listen(): the probe opens a fresh TCP connection on every
-# poll, and an un-drained backlog makes a later probe fail on macOS's stricter
-# socket stack (the real uvicorn child accepts, so this is a fixture artifact).
+# A stand-in session child: reads its port-report file from the env, binds and
+# listens on a dynamic port, publishes it atomically (temp + os.replace), as the
+# real child does, then accepts connections so a test's own probe succeeds.
 _FAKE_CHILD = (
     "import os, socket, sys, threading, time\n"
     "pf = os.environ['BIOPB_PORT_REPORT_FILE']\n"
     "s = socket.socket()\n"
     "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
     "s.bind(('127.0.0.1', 0))\n"
+    "s.listen(16)\n"
     "port = s.getsockname()[1]\n"
     "tmp = pf + '.tmp'\n"
     "open(tmp, 'w').write(str(port))\n"
     "os.replace(tmp, pf)\n"
-    "s.listen(16)\n"
     "def _serve():\n"
     "    while True:\n"
     "        try:\n"
@@ -64,17 +73,6 @@ _FAKE_CHILD = (
     "threading.Thread(target=_serve, daemon=True).start()\n"
     "time.sleep(30)\n"
 )
-
-
-class TestPortListening:
-    def test_true_for_listening_socket(self):
-        with socket.socket() as s:
-            s.bind(("127.0.0.1", 0))
-            s.listen(1)
-            assert _shim._port_listening(s.getsockname()[1]) is True
-
-    def test_false_for_closed_port(self):
-        assert _shim._port_listening(_free_port()) is False
 
 
 class TestSessionCommand:
@@ -160,22 +158,15 @@ class TestSpawnSession:
             m = re.match(r"http://127\.0\.0\.1:(\d+)/mcp$", url)
             assert m, url
             port = int(m.group(1))
-            assert _shim._port_listening(port) is True
+            assert _port_listening(port) is True
             assert child.poll() is None  # still running while we bridge
             if os.name == "nt":
                 assert child.job is not None  # Windows: a kill-on-close Job Object
             else:
                 assert child.job is None  # POSIX: reaped via the group, not a job
-            # Self-registered so the control can discover + proxy to it.
-            rec = _sessions.read_session(session_id)
-            assert rec is not None
-            assert rec["port"] == port and rec["pid"] == child.pid
-            assert rec["mcp_url"] == url
         finally:
-            _shim._reap_session(child, session_id)
+            _shim._reap_session(child)
         assert child.poll() is not None  # reaped on the way out
-        # Reap de-registers, so the record is gone.
-        assert _sessions.read_session(session_id) is None
 
     def test_inherits_live_env_and_wires_dynamic_port(self, tmp_path, monkeypatch):
         # The #98 fix: the child inherits THIS shim's current environment, so a
@@ -201,12 +192,17 @@ class TestSpawnSession:
         from biopb._lifecycle import owned_child
 
         monkeypatch.setattr(owned_child.subprocess, "Popen", _fake_popen)
-        monkeypatch.setattr(_shim, "_await_listening", lambda *a, **k: None)
 
+        spawned = []
         child, url, session_id = _shim.spawn_session(
-            _cfg(kernel_log=str(tmp_path / "d.log")), timeout=5
+            _cfg(kernel_log=str(tmp_path / "d.log")),
+            timeout=5,
+            on_spawned=lambda *a: spawned.append(a),
         )
         assert url == "http://127.0.0.1:54321/mcp"
+        assert spawned == [(child, session_id)]
+        # The child registers itself, under the id minted here.
+        assert captured["env"]["BIOPB_MCP_SESSION_ID"] == session_id
         assert captured["env"]["DISPLAY"] == ":test-99"
         assert captured["env"]["BIOPB_PORT_REPORT_FILE"]  # port channel wired
         # session log path handed to the child (here the kernel_log override).
@@ -230,6 +226,16 @@ class TestReapSession:
         assert proc.poll() is None
         _shim._reap_session(OwnedChild.adopt(proc))
         assert proc.poll() is not None
+
+    def test_drops_the_record_a_killed_child_could_not(self, tmp_path, monkeypatch):
+        # Windows kills the child outright, so its _shutdown never runs.
+        from biopb import _sessions
+
+        monkeypatch.setenv("BIOPB_SESSIONS_DIR", str(tmp_path / "sessions"))
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        _sessions.register("20260101-000000-1", port=1, pid=proc.pid)
+        _shim._reap_session(OwnedChild.adopt(proc), "20260101-000000-1")
+        assert _sessions.read_session("20260101-000000-1") is None
 
     def test_idempotent_on_dead_child(self):
         proc = subprocess.Popen([sys.executable, "-c", "pass"])
@@ -318,12 +324,12 @@ class TestClientDeathWatchdog:
     def test_installer_is_noop_off_windows(self):
         if os.name == "nt":
             pytest.skip("Windows arms a real watchdog thread")
-        assert _shim._install_client_death_watchdog(object(), "sid") is None
+        assert _shim._install_client_death_watchdog(lambda: None) is None
 
     def test_not_armed_when_client_unidentifiable(self, monkeypatch):
         monkeypatch.setattr(_shim, "_is_windows", lambda: True)
         monkeypatch.setattr(_shim, "_find_client_process", lambda: None)
-        assert _shim._install_client_death_watchdog(object(), "sid") is None
+        assert _shim._install_client_death_watchdog(lambda: None) is None
 
     def test_not_armed_when_client_handle_unopenable(self, monkeypatch):
         # A client we found but cannot open (returns None) must not arm --
@@ -331,7 +337,7 @@ class TestClientDeathWatchdog:
         monkeypatch.setattr(_shim, "_is_windows", lambda: True)
         monkeypatch.setattr(_shim, "_find_client_process", lambda: _FakeProc([]))
         monkeypatch.setattr(_shim._winjob, "open_for_wait", lambda pid: None)
-        assert _shim._install_client_death_watchdog(object(), "sid") is None
+        assert _shim._install_client_death_watchdog(lambda: None) is None
 
     def test_arms_thread_when_client_found_and_openable(self, monkeypatch):
         import threading
@@ -340,7 +346,7 @@ class TestClientDeathWatchdog:
         monkeypatch.setattr(_shim, "_find_client_process", lambda: _FakeProc([]))
         monkeypatch.setattr(_shim._winjob, "open_for_wait", lambda pid: "HANDLE")
         monkeypatch.setattr(_shim, "_client_deathwatch", lambda *a, **k: None)
-        t = _shim._install_client_death_watchdog(object(), "sid")
+        t = _shim._install_client_death_watchdog(lambda: None)
         assert isinstance(t, threading.Thread)
         t.join(timeout=5)
 
@@ -348,25 +354,19 @@ class TestClientDeathWatchdog:
         events = []
         monkeypatch.setattr(_shim._winjob, "wait_for_process", lambda h: True)
         monkeypatch.setattr(
-            _shim, "_reap_session", lambda c, s=None: events.append(("reap", s))
-        )
-        monkeypatch.setattr(
             _shim.os, "_exit", lambda code: events.append(("exit", code))
         )
-        _shim._client_deathwatch("HANDLE", 4242, object(), "sid")
-        # The client's exit must both reap (de-registering the session) and exit.
-        assert events == [("reap", "sid"), ("exit", 0)]
+        _shim._client_deathwatch("HANDLE", 4242, lambda: events.append("reap"))
+        # The client's exit must both reap and exit.
+        assert events == ["reap", ("exit", 0)]
 
     def test_does_not_reap_on_wait_error(self, monkeypatch):
         # An undecided wait (error / not-signalled) must NOT tear down a session
         # that may still be live -- the other teardown paths remain the backstop.
         events = []
         monkeypatch.setattr(_shim._winjob, "wait_for_process", lambda h: False)
-        monkeypatch.setattr(
-            _shim, "_reap_session", lambda *a, **k: events.append("reap")
-        )
         monkeypatch.setattr(_shim.os, "_exit", lambda code: events.append("exit"))
-        _shim._client_deathwatch("HANDLE", 4242, object(), "sid")
+        _shim._client_deathwatch("HANDLE", 4242, lambda: events.append("reap"))
         assert events == []
 
 
@@ -375,10 +375,6 @@ class _FakeRemote:
 
     def __init__(self):
         self.calls = []
-
-    async def list_tools(self):
-        self.calls.append("list_tools")
-        return types.ListToolsResult(tools=[])
 
     async def call_tool(self, name, arguments, progress_callback=None, *, meta=None):
         self.calls.append(("call_tool", name, arguments, meta))
@@ -391,23 +387,37 @@ class _FakeRemote:
         return types.ReadResourceResult(contents=[])
 
 
+def _connect_to(remote):
+    async def connect():
+        return remote
+
+    return connect
+
+
+async def _no_child():
+    raise AssertionError("a listing must not start the session child")
+
+
 class TestBuildProxy:
     def _call(self, handler, req):
         return anyio.run(lambda: handler(req))
 
-    def test_list_tools_forwards(self):
-        remote = _FakeRemote()
-        app = _shim.build_proxy(remote)
-        result = self._call(
+    def test_lists_come_from_the_fastmcp_server_not_the_child(self):
+        app = _shim.build_proxy(_no_child, mcp._mcp_server)
+        tools = self._call(
             app.request_handlers[types.ListToolsRequest],
             types.ListToolsRequest(method="tools/list"),
         )
-        assert remote.calls == ["list_tools"]
-        assert isinstance(result.root, types.ListToolsResult)
+        assert {"start_kernel", "execute_code"} <= {t.name for t in tools.root.tools}
+        resources = self._call(
+            app.request_handlers[types.ListResourcesRequest],
+            types.ListResourcesRequest(method="resources/list"),
+        )
+        assert [str(r.uri) for r in resources.root.resources] == ["docs://index"]
 
     def test_call_tool_forwards_name_and_args(self):
         remote = _FakeRemote()
-        app = _shim.build_proxy(remote)
+        app = _shim.build_proxy(_connect_to(remote), mcp._mcp_server)
         req = types.CallToolRequest(
             method="tools/call",
             params=types.CallToolRequestParams(
@@ -420,7 +430,7 @@ class TestBuildProxy:
 
     def test_call_tool_failure_becomes_tool_error_not_bridge_death(self):
         remote = _FakeRemote()
-        app = _shim.build_proxy(remote)
+        app = _shim.build_proxy(_connect_to(remote), mcp._mcp_server)
         req = types.CallToolRequest(
             method="tools/call",
             params=types.CallToolRequestParams(name="explodes", arguments={}),
@@ -429,25 +439,112 @@ class TestBuildProxy:
         assert result.root.isError is True
         assert "kaboom" in result.root.content[0].text
 
+    def test_a_child_that_cannot_start_is_a_tool_error(self):
+        async def connect():
+            raise RuntimeError("the biopb-mcp session did not start: no port")
 
-class TestReplayInitOptions:
-    def test_instructions_and_identity_survive(self):
-        # The whole point of vendoring the bridge: nothing from the child's
-        # initialize result may be dropped on the floor (mcp-proxy loses
-        # `instructions`).
-        init = types.InitializeResult(
-            protocolVersion="2025-03-26",
-            capabilities=types.ServerCapabilities(
-                tools=types.ToolsCapability(listChanged=False)
-            ),
-            serverInfo=types.Implementation(name="biopb-mcp", version="9.9"),
-            instructions="guardrails live here",
+        app = _shim.build_proxy(connect, mcp._mcp_server)
+        req = types.CallToolRequest(
+            method="tools/call",
+            params=types.CallToolRequestParams(name="start_kernel", arguments={}),
         )
-        opts = _shim.replay_init_options(init)
-        assert opts.instructions == "guardrails live here"
-        assert opts.server_name == "biopb-mcp"
-        assert opts.server_version == "9.9"
-        assert opts.capabilities is init.capabilities
+        result = self._call(app.request_handlers[types.CallToolRequest], req)
+        assert result.root.isError is True
+        assert "did not start: no port" in result.root.content[0].text
+
+
+class TestLazySession:
+    """Drives the real ``get()``: the spawn and the connection are the fakes."""
+
+    def _lazy(self, monkeypatch, fail=0):
+        spawns, reaped = [], []
+
+        class _Child:
+            pid = 4242
+
+        def _spawn(config, on_spawned=None):
+            child = _Child()
+            spawns.append(child)
+            on_spawned(child, "sid")
+            if len(spawns) <= fail:
+                raise RuntimeError(f"spawn {len(spawns)} failed")
+            return child, "http://127.0.0.1:1/mcp", "sid"
+
+        @contextlib.asynccontextmanager
+        async def _client(url):
+            yield "READ", "WRITE", None
+
+        class _Session:
+            def __init__(self, read, write):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def initialize(self):
+                pass
+
+        monkeypatch.setattr(_shim, "spawn_session", _spawn)
+        monkeypatch.setattr(_shim, "streamablehttp_client", _client)
+        monkeypatch.setattr(_shim, "ClientSession", _Session)
+        monkeypatch.setattr(
+            _shim, "_reap_session", lambda child, sid: reaped.append(child)
+        )
+        monkeypatch.setattr(
+            _shim._control_client, "start_control_detached", lambda: True
+        )
+        return _shim._LazySession(config=object()), spawns, reaped
+
+    def _drive(self, lazy, *steps):
+        results = []
+
+        async def main():
+            async with anyio.create_task_group() as tg:
+                lazy.task_group = tg
+                for step in steps:
+                    try:
+                        results.append(await step())
+                    except RuntimeError as e:
+                        results.append(str(e))
+                tg.cancel_scope.cancel()
+
+        anyio.run(main)
+        return results
+
+    def test_nothing_spawns_until_asked(self, monkeypatch):
+        lazy, spawns, reaped = self._lazy(monkeypatch)
+        self._drive(lazy)
+        lazy.reap()  # no child: a no-op
+        assert spawns == [] and reaped == []
+
+    def test_concurrent_requests_share_one_child(self, monkeypatch):
+        lazy, spawns, _ = self._lazy(monkeypatch)
+
+        async def both():
+            out = []
+
+            async def one():
+                out.append(await lazy.get())
+
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(one)
+                tg.start_soon(one)
+            return out
+
+        [(first, second)] = self._drive(lazy, both)
+        assert first is second
+        assert len(spawns) == 1
+
+    def test_a_failed_start_is_reported_then_retried(self, monkeypatch):
+        lazy, spawns, reaped = self._lazy(monkeypatch, fail=1)
+        first, second = self._drive(lazy, lazy.get, lazy.get)
+        assert "did not start: spawn 1 failed" in first
+        assert not isinstance(second, str)
+        assert len(spawns) == 2
+        assert reaped == spawns[:1]  # the failed attempt's child
 
 
 # --------------------------------------------------------------------------- #
@@ -525,8 +622,9 @@ def _extract(pattern, text, what):
 
 
 class TestEndToEnd:
-    """The real thing (all OSes): the shim spawns its OWN session child, bridges
-    a full stdio session, and reaps that child when the client disconnects."""
+    """The real thing (all OSes): the shim answers the handshake alone, spawns its
+    OWN session child on the first tool call, bridges it, and reaps that child
+    when the client disconnects."""
 
     def test_session_is_private_and_reaped_on_disconnect(self, tmp_path):
         env = _home_env(tmp_path)  # isolate config + log dirs, per platform
@@ -558,7 +656,7 @@ class TestEndToEnd:
                 }
             )
             init = json.loads(shim.stdout.readline())["result"]
-            # Identity and instructions must round-trip through the bridge.
+            # Identity and instructions come from the shim itself.
             assert init["serverInfo"]["name"] == "biopb-mcp"
             assert "execute_code" in (init.get("instructions") or "")
 
@@ -567,11 +665,28 @@ class TestEndToEnd:
             tools = json.loads(shim.stdout.readline())["result"]["tools"]
             assert {"start_kernel", "execute_code"} <= {t["name"] for t in tools}
 
+            # Nothing has needed the child yet, so there is none.
+            sessions_dir = tmp_path / ".local/state/biopb/mcp/sessions"
+            reg_dir = tmp_path / ".local/state/biopb/sessions"
+            assert list(sessions_dir.glob("*.log")) == []
+            assert list(reg_dir.glob("*.json")) == []
+
+            # The first tool call starts it.
+            send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {"name": "server_status", "arguments": {}},
+                }
+            )
+            status = json.loads(shim.stdout.readline())["result"]
+            assert status.get("isError") is not True, status
+
             # The owned child logs its PID (uvicorn's "Started server process
             # [pid]") and its dynamic listen URL (_server.run) to its own
             # per-session logfile under log/sessions/ (NOT the shared
             # mcp-server.log — that separation is the session-log feature).
-            sessions_dir = tmp_path / ".local/state/biopb/mcp/sessions"
             session_logs = list(sessions_dir.glob("*.log"))
             assert len(session_logs) == 1, session_logs
             log = session_logs[0].read_bytes().decode(errors="replace")
@@ -580,30 +695,24 @@ class TestEndToEnd:
             )
             port = int(_extract(r"http://127\.0\.0\.1:(\d+)/mcp", log, "listen port"))
             assert _pid_alive(child_pid)  # up now
-            assert _shim._port_listening(port) is True
+            assert _port_listening(port) is True
 
-            # Self-registered for control discovery while up (the shared biopb
-            # data tree, isolated here via HOME).
-            reg_dir = tmp_path / ".local/state/biopb/sessions"
+            # The child registered itself for control discovery (the shared
+            # biopb state tree, isolated here via HOME), under its own pid.
             records = list(reg_dir.glob("*.json"))
             assert len(records) == 1, records
             rec = json.loads(records[0].read_text())
-            # The record carries the session's port and the pid the shim owns and
-            # reaps (spawn_session registers proc.pid). On POSIX that equals the
-            # uvicorn pid the log reports (child_pid); on Windows a Store-Python/uv
-            # launcher shim sits between them, so proc.pid is the launcher, not the
-            # inner child_pid. Assert the record is live and routable rather than
-            # pid-equal to the inner process.
             assert rec["port"] == port
-            assert isinstance(rec["pid"], int) and _pid_alive(rec["pid"])
+            assert rec["pid"] == child_pid
 
             # Client hangs up: the shim must exit AND reap its private child
             # (the shared daemon used to survive — that is exactly what changed).
             shim.stdin.close()
             assert shim.wait(timeout=40) == 0
             _await_dead(child_pid, timeout=20)
-            assert _shim._port_listening(port) is False  # server truly gone
-            # Reap de-registered it — no routing ghost left behind.
+            assert _port_listening(port) is False  # server truly gone
+            # No routing ghost, on every OS: the reap drops the record even
+            # where it kills the child outright (Windows).
             assert list(reg_dir.glob("*.json")) == []
         finally:
             if shim.poll() is None:
@@ -613,59 +722,21 @@ class TestEndToEnd:
 
 
 class TestServe:
-    def test_fires_control_start_before_spawning_child(self, monkeypatch):
-        """serve() kicks off the control (fire-and-forget) BEFORE spawning the
-        child, so the lean control boots in parallel with the child's import-
-        dominated startup and is up by the time the child needs the data plane."""
-        calls = []
+    def test_reaps_the_child_on_the_way_out(self, monkeypatch):
+        """The reaper and watchdog are armed before any child exists, over the
+        lazy session, and serve reaps whatever it holds when the bridge ends."""
+        armed, reaped = [], []
 
-        class _FakeProc:
-            pid = 4242
+        async def _fake_serve(lazy):
+            lazy._own("CHILD", "sid")
 
+        monkeypatch.setattr(_shim, "_install_shim_reaper", armed.append)
+        monkeypatch.setattr(_shim, "_install_client_death_watchdog", armed.append)
+        monkeypatch.setattr(_shim, "_serve_stdio", _fake_serve)
         monkeypatch.setattr(
-            _shim._control_client,
-            "start_control_detached",
-            lambda: calls.append("control"),
+            _shim, "_reap_session", lambda child, sid: reaped.append((child, sid))
         )
-
-        def _fake_spawn(config, *a, **k):
-            calls.append("spawn")
-            return _FakeProc(), "http://127.0.0.1:1/mcp", "sid"
-
-        monkeypatch.setattr(_shim, "spawn_session", _fake_spawn)
-        monkeypatch.setattr(_shim, "_install_shim_reaper", lambda *a, **k: None)
-        monkeypatch.setattr(
-            _shim, "_install_client_death_watchdog", lambda *a, **k: None
-        )
-        monkeypatch.setattr(_shim, "run_bridge", lambda url: calls.append("bridge"))
-        monkeypatch.setattr(_shim, "_reap_session", lambda *a, **k: None)
 
         _shim.serve(object())
-        assert calls == ["control", "spawn", "bridge"]
-
-    def test_control_start_failure_does_not_block_serve(self, monkeypatch):
-        """A control-start that raises must never abort the shim -- the bridge is
-        the priority; control errors surface later, from the session child."""
-
-        class _FakeProc:
-            pid = 4242
-
-        def _boom():
-            raise RuntimeError("control start blew up")
-
-        monkeypatch.setattr(_shim._control_client, "start_control_detached", _boom)
-        monkeypatch.setattr(
-            _shim,
-            "spawn_session",
-            lambda *a, **k: (_FakeProc(), "http://127.0.0.1:1/mcp", "sid"),
-        )
-        monkeypatch.setattr(_shim, "_install_shim_reaper", lambda *a, **k: None)
-        monkeypatch.setattr(
-            _shim, "_install_client_death_watchdog", lambda *a, **k: None
-        )
-        bridged = []
-        monkeypatch.setattr(_shim, "run_bridge", lambda url: bridged.append(url))
-        monkeypatch.setattr(_shim, "_reap_session", lambda *a, **k: None)
-
-        _shim.serve(object())
-        assert bridged == ["http://127.0.0.1:1/mcp"]
+        assert len(armed) == 2
+        assert reaped == [("CHILD", "sid")]

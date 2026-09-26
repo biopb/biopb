@@ -1015,21 +1015,10 @@ def _auth_method(init):
 
 
 def _own_mcp_url():
-    """This session's ``/mcp``, as the agent should dial it.
+    """This session's ``/mcp``, as the agent should dial it."""
+    from . import _app
 
-    Read from the registry record this session published rather than
-    reconstructed, so there is one answer to "where is this session" and the
-    agent gets the same one every other client does.
-    """
-    from biopb import _sessions
-
-    try:
-        for record in _sessions.list_sessions(prune=False):
-            if record.get("pid") == os.getpid():
-                return record.get("mcp_url")
-    except Exception:  # noqa: BLE001 - a missing registry is not fatal here
-        logger.debug("could not read the session registry", exc_info=True)
-    return None
+    return _app._mcp_url
 
 
 def _drop_session():

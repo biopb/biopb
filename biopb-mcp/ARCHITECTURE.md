@@ -91,12 +91,15 @@ contract; see [`../biopb-control/ARCHITECTURE.md`](../biopb-control/ARCHITECTURE
 
 Shim (`--transport stdio`) is the interface the mcp clients (claude code) see, which
 
-1. Start-and-forget the control plane; writes a session registry at the state dir,
-   so the control can see it.
-2. **spawns its own ephemeral session child** (FastMCP/uvicorn + the kernel host)
-   on a **dynamic OS-assigned port**,
-3. **bridges** stdio JSON-RPC ↔ that child's `/mcp` until the client closes stdin,
-   replaying the child's initialize result **verbatim** — including `instructions`.
+1. **answers the handshake and the list requests itself**, from the FastMCP
+   server the child runs (imported, never served), so a client that never calls
+   a tool costs no child,
+2. on the **first request that needs one**, start-and-forgets the control plane and
+   **spawns its own ephemeral session child** (FastMCP/uvicorn + the kernel host)
+   on a **dynamic OS-assigned port**; the child **registers itself** with the
+   control, under an id the shim mints,
+3. **bridges** stdio JSON-RPC ↔ that child's `/mcp` until the client closes stdin;
+   a child that fails to start is a tool error, retried by the next call,
 4. **reaps** the child and its kernel grandchild as a tree (POSIX process group +
    parent-death pipe; Windows Job Object, #403) on the way out.
 

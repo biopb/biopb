@@ -3,17 +3,20 @@
 ``biopb-mcp --transport stdio`` no longer serves MCP over fd 0/1 from the
 heavy launcher process. Instead the launcher runs this module, which
 
-1. spawns its **own** http session child — FastMCP/uvicorn + the kernel host —
-   on an OS-assigned port, inheriting this shim's live environment
-   (``spawn_session``), then
-2. bridges stdio JSON-RPC <-> that child's streamable-http endpoint
-   (``run_bridge``) until the client closes stdin, then
+1. answers ``initialize`` and the list requests itself, from the FastMCP
+   server the child runs (imported, never served), so a client that never
+   calls a tool costs no child;
+2. on the first request that needs one, spawns its **own** http session child —
+   FastMCP/uvicorn + the kernel host — on an OS-assigned port, inheriting this
+   shim's live environment (``spawn_session``, driven by ``_LazySession``), and
+   bridges requests to that child's streamable-http endpoint until the client
+   closes stdin; then
 3. reaps the child (and its kernel grandchild) on the way out (``_reap_session``).
 
 This is the de-daemonized, shim-owned session model (ARCHITECTURE.md, Lifecycle). It
 retains the shim/heavy *split* described there — the process that
 owns fd 1 as a protocol channel imports nothing that could write to stdout (no
-Qt, dask, uvicorn, or kernel — only the mcp SDK), so the fd-1 corruption class
+Qt, dask, uvicorn, or kernel — only the mcp SDK and the tool definitions), so the fd-1 corruption class
 is structurally impossible here — but undoes the daemon's *detachment* and its
 role as a shared, client-outliving lifecycle root:
 
@@ -40,16 +43,15 @@ role as a shared, client-outliving lifecycle root:
 The bridge itself is vendored rather than delegated to ``mcp-proxy``: mcp-proxy
 drops the initialize ``instructions`` field that carries biopb-mcp's operation
 guardrails, has no lifetime guard when the server dies, and floats its
-dependencies. Here the
-remote's initialize result — capabilities, serverInfo, and ``instructions`` —
-is replayed to the stdio client verbatim, and any bridge failure exits the
-shim so the client sees EOF instead of a hung proxy.
+dependencies. Here the handshake carries the child's own capabilities and
+``instructions``, a child that fails to start is a tool error the agent can read,
+and a child that dies after starting exits the shim so the client sees EOF
+instead of a hung proxy.
 """
 
 import logging
 import os
 import signal
-import socket
 import sys
 import tempfile
 import threading
@@ -63,7 +65,6 @@ from mcp import types
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 from mcp.server.lowlevel.server import Server, request_ctx
-from mcp.server.models import InitializationOptions
 from mcp.server.stdio import stdio_server
 
 from .. import _control_client
@@ -85,6 +86,10 @@ REAP_TIMEOUT = 10.0
 # this featherweight module from importing the heavy launcher).
 ENV_PORT_REPORT_FILE = "BIOPB_PORT_REPORT_FILE"
 
+# Env var carrying the session id this shim mints for its child, which registers
+# itself under it. Kept in sync with __main__.ENV_SESSION_ID.
+ENV_SESSION_ID = "BIOPB_MCP_SESSION_ID"
+
 # Env var telling the child the path of its own session logfile, so it can report
 # it (server_status) and the agent's execute_code can read it from os.environ.
 # The child inherits it, and so does the kernel it spawns. Bound from the core
@@ -92,15 +97,6 @@ ENV_PORT_REPORT_FILE = "BIOPB_PORT_REPORT_FILE"
 # the control sets it too, for the viewers it launches. `biopb._locations` is
 # stdlib-only, so this stays as featherweight as a literal.
 ENV_SESSION_LOG = _locations.MCP_SESSION_LOG_ENV
-
-
-def _port_listening(port, timeout=0.5):
-    """Whether something accepts TCP connections on 127.0.0.1:<port>."""
-    try:
-        with socket.create_connection(("127.0.0.1", port), timeout=timeout):
-            return True
-    except OSError:
-        return False
 
 
 def _session_command():
@@ -190,30 +186,7 @@ def _await_port(proc, port_file, timeout):
     )
 
 
-def _await_listening(proc, port, timeout):
-    """Block until the child accepts connections on ``port``.
-
-    The child publishes its port right after binding but before it listens, so
-    the bridge must wait for the listener to come up. Raises like ``_await_port``
-    on child death / timeout.
-    """
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if _port_listening(port):
-            return
-        if proc.poll() is not None:
-            raise RuntimeError(
-                f"biopb-mcp session child exited (status {proc.returncode}) "
-                f"before listening on 127.0.0.1:{port}; check the daemon log"
-            )
-        time.sleep(_PROBE_INTERVAL)
-    raise TimeoutError(
-        f"biopb-mcp session child did not start listening on 127.0.0.1:{port} "
-        f"within {timeout:.0f}s; check the daemon log"
-    )
-
-
-def spawn_session(config, timeout=SESSION_START_TIMEOUT):
+def spawn_session(config, timeout=SESSION_START_TIMEOUT, on_spawned=None):
     """Spawn a private http child this shim owns; return (child, url, session_id).
 
     ``child`` is an :class:`OwnedChild`. See the module docstring for the
@@ -221,7 +194,12 @@ def spawn_session(config, timeout=SESSION_START_TIMEOUT):
     dynamic port the child reports back, and ties the child's lifetime to this
     shim (POSIX process group; Windows Job Object). On any startup failure the
     child is reaped before the error propagates, so a failed bring-up never leaks
-    a process.
+    a process. *on_spawned* gets ``(child, session_id)`` as soon as the child
+    exists, so a reap that
+    fires during the bring-up can find it.
+
+    The child registers itself with the control under ``session_id``, minted
+    here because it also names the child's logfile.
 
     Raises TimeoutError / RuntimeError if the child never becomes reachable.
     """
@@ -246,6 +224,7 @@ def spawn_session(config, timeout=SESSION_START_TIMEOUT):
     # read it from os.environ — the session log path.
     env = os.environ.copy()
     env[ENV_PORT_REPORT_FILE] = port_file
+    env[ENV_SESSION_ID] = session_id
     if logged_to_file:
         env[ENV_SESSION_LOG] = log_path
 
@@ -260,10 +239,12 @@ def spawn_session(config, timeout=SESSION_START_TIMEOUT):
     finally:
         if logged_to_file:
             log.close()  # the child holds its own duplicate of the fd
+    if on_spawned is not None:
+        on_spawned(child, session_id)
 
     try:
+        # The child listens before it reports, so a reported port is ready.
         port = _await_port(child.proc, port_file, timeout)
-        _await_listening(child.proc, port, timeout)
     except BaseException:
         child.stop()
         raise
@@ -273,64 +254,38 @@ def spawn_session(config, timeout=SESSION_START_TIMEOUT):
         except OSError:
             pass
 
-    url = f"http://127.0.0.1:{port}/mcp"
-    # Publish the now-reachable session so the control can list it and proxy
-    # /session/<id>/* to it. Registered only after the child is fully up (a
-    # failed bring-up above reaps and never reaches here, so it leaves no
-    # record); the reap path unregisters. Best-effort — a registry write failure
-    # must not fail an otherwise-working session, only cost its discoverability.
-    # Catch broadly (not just OSError): a serialization TypeError/ValueError, or
-    # register()'s own unsafe-id ValueError, must not escape and break the session
-    # either (biopb/biopb#422).
-    try:
-        _sessions.register(session_id, port=port, pid=child.pid, mcp_url=url)
-    except Exception as e:
-        logger.warning("Could not register session %s: %s", session_id, e)
-
-    return child, url, session_id
+    return child, f"http://127.0.0.1:{port}/mcp", session_id
 
 
 def _reap_session(child, session_id=None):
-    """Tear down the owned child (and its kernel grandchild).
+    """Tear down the owned child and its kernel grandchild (idempotent).
 
-    The bridge-close / signal counterpart to the OS-level ties set at spawn.
-    Delegates the platform reap escalation to :meth:`OwnedChild.stop` (POSIX:
-    SIGTERM so the child's handler reaps the kernel gracefully, then SIGKILL;
-    Windows: TerminateJobObject force-reaps the whole tree, then releases the
-    handle). Idempotent and best-effort — safe to call more than once and on an
-    already-dead child.
-
-    ``session_id`` (when this reaps a registered session) is dropped from the
-    filesystem registry here so teardown and de-registration are one path — a
-    force-killed child leaves no routing ghost; the registry's own pid-liveness
-    prune (:func:`biopb._sessions.list_sessions`) is the backstop for the
-    case where even this reap is skipped.
+    Then drop *session_id*'s registry record: the child drops its own on
+    SIGTERM, but Windows kills it outright, and a dead child's record is anyone's
+    to prune.
     """
+    child.stop(timeout=REAP_TIMEOUT)
     if session_id is not None:
         _sessions.unregister(session_id)
-    child.stop(timeout=REAP_TIMEOUT)
 
 
-def _install_shim_reaper(child, session_id=None):
-    """POSIX: reap the child if this shim is signalled to exit.
+def _install_shim_reaper(reap):
+    """POSIX: run *reap* (tear down whatever child exists) if this shim is
+    signalled to exit.
 
     A SIGTERM/SIGHUP delivered to the shim *alone* (not its whole group) would
     otherwise orphan the child, since Python's default handler exits without
     running ``serve``'s ``finally``. SIGINT is left to its default: it raises
-    KeyboardInterrupt out of ``run_bridge`` and the ``finally`` reaps. On Windows
+    KeyboardInterrupt out of ``anyio.run`` and ``serve``'s ``finally`` reaps. On Windows
     there are no such signals — the Job Object reaps on any shim *death*, and
     ``_install_client_death_watchdog`` covers the shim being *orphaned* by its
     client — so this is a no-op there.
-
-    ``session_id`` is passed through so the signal path de-registers too (it
-    ``os._exit``s past ``serve``'s ``finally``, so it must clean the registry
-    itself).
     """
     if os.name == "nt":
         return
 
     def _on_signal(signum, frame):
-        _reap_session(child, session_id)
+        reap()
         os._exit(0)
 
     for sig in (signal.SIGTERM, getattr(signal, "SIGHUP", None)):
@@ -393,10 +348,10 @@ def _is_windows() -> bool:
     return os.name == "nt"
 
 
-def _install_client_death_watchdog(child, session_id=None):
-    """Windows: reap the owned child if the stdio *client* dies unseen by stdin.
+def _install_client_death_watchdog(reap):
+    """Windows: run *reap* if the stdio *client* dies unseen by stdin.
 
-    Normal teardown runs when ``run_bridge`` returns on stdin EOF (client hung
+    Normal teardown runs when the bridge returns on stdin EOF (client hung
     up) or, on POSIX, when the client's process-group teardown / a SIGTERM fires
     ``_install_shim_reaper``. Windows has neither group teardown nor those
     signals, and a multi-process client can keep a duplicate of the shim's stdin
@@ -404,7 +359,7 @@ def _install_client_death_watchdog(child, session_id=None):
     EOF never arrives — the shim blocks forever in the bridge and the child +
     kernel leak (they outlive every real client). This watchdog closes that gap:
     it blocks on the client's process handle and, when the client exits for any
-    reason, reaps the owned tree (de-registering ``session_id``) and exits.
+    reason, reaps the owned tree and exits.
 
     The client is found by :func:`_find_client_process` (walking past our own
     launcher stubs — see its docstring for why ``os.getppid()`` is not enough).
@@ -430,7 +385,7 @@ def _install_client_death_watchdog(child, session_id=None):
         return None
     thread = threading.Thread(
         target=_client_deathwatch,
-        args=(handle, client.pid, child, session_id),
+        args=(handle, client.pid, reap),
         name="biopb-client-deathwatch",
         daemon=True,
     )
@@ -439,7 +394,7 @@ def _install_client_death_watchdog(child, session_id=None):
     return thread
 
 
-def _client_deathwatch(handle, client_pid, child, session_id):
+def _client_deathwatch(handle, client_pid, reap):
     """Block on the client's ``handle``; on its exit, reap the tree and exit.
 
     A wait error is treated as *undecided* — we do not reap, since a spurious
@@ -448,31 +403,99 @@ def _client_deathwatch(handle, client_pid, child, session_id):
     """
     if not _winjob.wait_for_process(handle):
         return  # undecided (wait errored) — leave teardown to the other paths
-    logger.info(
-        "stdio client (pid %s) exited; reaping owned session %s", client_pid, session_id
-    )
-    _reap_session(child, session_id)
+    logger.info("stdio client (pid %s) exited; reaping the owned session", client_pid)
+    reap()
     os._exit(0)
 
 
-def build_proxy(remote):
-    """Build the stdio-facing MCP server that forwards every request to
-    ``remote`` (a ClientSession connected to the session child).
+class _LazySession:
+    """The session child and the client connection to it, started on first need.
 
-    Handlers are registered unconditionally and the *remote's* capabilities
-    are advertised verbatim (see ``run_bridge``), so the bridge never narrows
-    what the child offers; a client simply won't call what the capabilities
-    don't advertise. Server->client traffic other than tool-call progress
-    (sampling, elicitation, list_changed) is not forwarded — biopb-mcp emits
-    none of it (the on-demand kernel design avoids dynamic tool lists on
-    purpose), and a future feature that needs it must extend this bridge.
+    :meth:`get` starts it in ``task_group`` (set by ``_serve_stdio``), where the
+    connection's context lives for the shim's lifetime. A start that fails is
+    raised to the request that asked, and the next request tries again; a child
+    that dies after starting fails the task group, which ends the shim, so the
+    client sees EOF rather than a bridge to nothing.
+    """
+
+    def __init__(self, config):
+        self._config = config
+        self.child = None
+        self.session_id = None
+        self.task_group = None
+        self._session = None
+        self._lock = anyio.Lock()
+        self._control_started = False
+
+    def reap(self):
+        """Tear down the child, if one was spawned. Safe from any thread."""
+        if self.child is not None:
+            _reap_session(self.child, self.session_id)
+
+    def _own(self, child, session_id):
+        self.child, self.session_id = child, session_id
+
+    async def get(self):
+        """The connected ClientSession, starting the child if need be."""
+        async with self._lock:
+            if self._session is None:
+                try:
+                    self._session = await self.task_group.start(self._serve)
+                except Exception as e:
+                    logger.exception("biopb-mcp session failed to start")
+                    # Off the loop: the reap waits for the child to exit.
+                    await anyio.to_thread.run_sync(self.reap)
+                    self.child = self.session_id = None
+                    raise RuntimeError(
+                        f"the biopb-mcp session did not start: {e}"
+                    ) from e
+        return self._session
+
+    def _spawn(self):
+        # The durable control (which owns the data plane the kernel will talk
+        # to) boots in parallel with the child's import-dominated startup, not
+        # waited for: a child that needs it before it is up surfaces the error.
+        if not self._control_started:
+            self._control_started = True
+            try:
+                _control_client.start_control_detached()
+            except Exception:  # noqa: BLE001 - the child surfaces real errors
+                logger.info("control auto-start attempt failed", exc_info=True)
+        return spawn_session(self._config, on_spawned=self._own)
+
+    async def _serve(self, *, task_status):
+        child, url, _ = await anyio.to_thread.run_sync(self._spawn)
+        logger.info("Bridging stdio to %s (owned session pid %s)", url, child.pid)
+        async with (
+            streamablehttp_client(url=url) as (read, write, _),
+            ClientSession(read, write) as session,
+        ):
+            await session.initialize()
+            task_status.started(session)
+            await anyio.sleep_forever()
+
+
+def build_proxy(connect, server):
+    """Build the stdio-facing MCP server.
+
+    The list requests are answered by *server* -- the FastMCP low-level server
+    the child runs, imported here but never served -- so listing costs no
+    child. Every other request awaits ``connect()``, the ClientSession to the
+    session child, and is forwarded; a child that cannot start fails the
+    request, and a tool call as a tool error, so the agent reads why.
+
+    Server->client traffic other than tool-call progress (sampling, elicitation,
+    list_changed) is not forwarded -- biopb-mcp emits none of it, and a future
+    feature that needs it must extend this bridge.
     """
     app = Server(name="biopb-mcp")
-
-    async def _list_tools(_):
-        return types.ServerResult(await remote.list_tools())
-
-    app.request_handlers[types.ListToolsRequest] = _list_tools
+    for req in (
+        types.ListToolsRequest,
+        types.ListResourcesRequest,
+        types.ListResourceTemplatesRequest,
+        types.ListPromptsRequest,
+    ):
+        app.request_handlers[req] = server.request_handlers[req]
 
     async def _call_tool(req):
         meta = dict(req.params.meta) if req.params.meta else None
@@ -492,6 +515,7 @@ def build_proxy(remote):
 
             progress_callback = _forward_progress
         try:
+            remote = await connect()
             result = await remote.call_tool(
                 req.params.name,
                 req.params.arguments or {},
@@ -509,100 +533,43 @@ def build_proxy(remote):
 
     app.request_handlers[types.CallToolRequest] = _call_tool
 
-    async def _list_resources(_):
-        return types.ServerResult(await remote.list_resources())
+    def _forward(req_type, call):
+        async def handler(req):
+            result = await call(await connect(), req.params)
+            return types.ServerResult(result or types.EmptyResult())
 
-    app.request_handlers[types.ListResourcesRequest] = _list_resources
+        app.request_handlers[req_type] = handler
 
-    async def _list_resource_templates(_):
-        return types.ServerResult(await remote.list_resource_templates())
-
-    app.request_handlers[types.ListResourceTemplatesRequest] = _list_resource_templates
-
-    async def _read_resource(req):
-        return types.ServerResult(await remote.read_resource(req.params.uri))
-
-    app.request_handlers[types.ReadResourceRequest] = _read_resource
-
-    async def _list_prompts(_):
-        return types.ServerResult(await remote.list_prompts())
-
-    app.request_handlers[types.ListPromptsRequest] = _list_prompts
-
-    async def _get_prompt(req):
-        return types.ServerResult(
-            await remote.get_prompt(req.params.name, req.params.arguments)
-        )
-
-    app.request_handlers[types.GetPromptRequest] = _get_prompt
-
-    async def _complete(req):
-        return types.ServerResult(
-            await remote.complete(req.params.ref, req.params.argument.model_dump())
-        )
-
-    app.request_handlers[types.CompleteRequest] = _complete
-
-    async def _set_logging_level(req):
-        await remote.set_logging_level(req.params.level)
-        return types.ServerResult(types.EmptyResult())
-
-    app.request_handlers[types.SetLevelRequest] = _set_logging_level
-
-    async def _forward_progress_notification(req):
-        await remote.send_progress_notification(
-            req.params.progressToken, req.params.progress, req.params.total
-        )
-
-    app.notification_handlers[types.ProgressNotification] = (
-        _forward_progress_notification
+    _forward(types.ReadResourceRequest, lambda r, p: r.read_resource(p.uri))
+    _forward(types.GetPromptRequest, lambda r, p: r.get_prompt(p.name, p.arguments))
+    _forward(
+        types.CompleteRequest,
+        lambda r, p: r.complete(p.ref, p.argument.model_dump()),
     )
-
+    _forward(types.SetLevelRequest, lambda r, p: r.set_logging_level(p.level))
     return app
 
 
-def replay_init_options(init):
-    """Map the child's InitializeResult onto the options the bridge serves.
+async def _serve_stdio(lazy):
+    # The tool surface, and the instructions composed per session, are the
+    # child's own because they are its code: importing it costs ~15 ms here and
+    # starts nothing.
+    from . import _server  # noqa: F401 - registers the tools on _app.mcp
+    from ._app import mcp
 
-    Verbatim replay — most importantly ``instructions``, the handshake-time
-    carrier for the operation guardrails (the field
-    mcp-proxy drops), and the remote's capability
-    set rather than one recomputed from the bridge's own handlers.
-    """
-    return InitializationOptions(
-        server_name=init.serverInfo.name,
-        server_version=init.serverInfo.version,
-        capabilities=init.capabilities,
-        instructions=init.instructions,
-        website_url=init.serverInfo.websiteUrl,
-        icons=init.serverInfo.icons,
-    )
-
-
-async def _bridge(url):
-    async with (
-        streamablehttp_client(url=url) as (read, write, _),
-        ClientSession(read, write) as session,
-    ):
-        init = await session.initialize()
-        app = build_proxy(session)
-        options = replay_init_options(init)
+    server = mcp._mcp_server
+    app = build_proxy(lazy.get, server)
+    options = server.create_initialization_options()
+    async with anyio.create_task_group() as tg:
+        lazy.task_group = tg
         async with stdio_server() as (read_stream, write_stream):
             await app.run(read_stream, write_stream, options)
-
-
-def run_bridge(url):
-    """Bridge stdio <-> the session child at ``url`` until the client closes
-    stdin.
-
-    Any failure (child death mid-session included) propagates out, so the shim
-    process exits and the client sees EOF — never a hung bridge.
-    """
-    anyio.run(_bridge, url)
+        tg.cancel_scope.cancel()
 
 
 def serve(config, port=None):
-    """Launcher entry point for ``--transport stdio``: spawn, bridge, reap.
+    """Launcher entry point for ``--transport stdio``: bridge, spawn on first
+    use, reap.
 
     ``port`` (the configured ``transport.port``) is vestigial here — the
     owned child binds a dynamic port — and is accepted only for call-site
@@ -610,27 +577,16 @@ def serve(config, port=None):
     """
     logger.warning(
         "stdio is served by bridging to a private biopb-mcp http session this "
-        "shim spawns and owns (torn down when this client disconnects). Native "
-        "http is recommended where the client supports it: run a persistent "
-        "`biopb-mcp --transport http` server and attach with "
-        "`claude mcp add --transport http biopb http://127.0.0.1:<port>/mcp`."
+        "shim spawns on the first request that needs it and owns (torn down when "
+        "this client disconnects). Native http is recommended where the client "
+        "supports it: run a persistent `biopb-mcp --transport http` server and "
+        "attach with `claude mcp add --transport http biopb "
+        "http://127.0.0.1:<port>/mcp`."
     )
-    # Best-effort, non-blocking: get the durable control plane (which owns the data
-    # plane the kernel will talk to) coming up -- WITHOUT waiting for or verifying
-    # it, since the bridge below must be ready within the MCP client's handshake
-    # timeout. It boots in parallel with spawn_session's import-dominated child
-    # startup; if it is still not up when the child first needs the data plane, the
-    # child surfaces the error (see _control_client.start_control_detached). Fully
-    # guarded -- a control-start hiccup must never abort the shim's bridge.
+    lazy = _LazySession(config)
+    _install_shim_reaper(lazy.reap)
+    _install_client_death_watchdog(lazy.reap)
     try:
-        _control_client.start_control_detached()
-    except Exception:  # noqa: BLE001 - best-effort; the child surfaces real errors
-        logger.info("control auto-start attempt failed", exc_info=True)
-    child, url, session_id = spawn_session(config)
-    _install_shim_reaper(child, session_id)
-    _install_client_death_watchdog(child, session_id)
-    logger.info("Bridging stdio to %s (owned session pid %s)", url, child.pid)
-    try:
-        run_bridge(url)
+        anyio.run(_serve_stdio, lazy)
     finally:
-        _reap_session(child, session_id)
+        lazy.reap()

@@ -20,7 +20,7 @@ are its children, and MCP sessions are independent clients that merely register.
 Two rules keep that tree correct, and every change here must preserve them.
 
 - **I1 — the control never *owns* a session.** A session serving an MCP client is
-  spawned by that client's shim and only **registers**, so the control routes to
+  spawned by that client's shim and only **registers itself**, so the control routes to
   and lists it without holding it. The one session the control may *launch* is an
   agentless `biopb mcp view` viewer, whose only other spawner is a terminal; that
   child is detached and self-registering, so the registry still only observes and
@@ -132,11 +132,10 @@ once it is reachable, and removes it on reap; the control reads that dir. The
 contract is a stdlib-only core-SDK module (I2): the session side writes, the
 control reads, and neither imports the other.
 
-There are two writers, because there are two ways a session comes to exist. A
-shim-owned child is published by its **shim**, which owns its reap and so its
-de-registration. An agentless `biopb mcp view` session has no shim, so it
-**publishes itself** and drops its record on the way out. Either way the control
-only ever reads.
+Every session on a dynamic port **publishes itself** — a shim-owned child under
+the id its shim minted, an agentless `biopb mcp view` session under its own — and
+drops its record on the way out; a shim also drops its child's once it has reaped
+it, since Windows kills the child outright. The control only ever reads.
 
 Lookups **self-heal**, pruning records whose owning pid is dead — or alive on a
 recycled pid, caught by a create-time token — so a dead session expires to a clean
@@ -144,7 +143,7 @@ recycled pid, caught by a create-time token — so a dead session expires to a c
 
 `POST /api/sessions/new` is the third way a session comes to exist: the control
 spawns `biopb mcp view` and waits for it to appear in this registry, matched on
-the child's own pid. Registration is an exact readiness signal — `--view` opens
+a per-launch token it hands the child. Registration is an exact readiness signal — `--view` opens
 its window *before* it registers — so a record means a viewer really opened, and
 a child that dies first never registers and comes back with its own log tail.
 Each launch writes **its own** file under `state/biopb/mcp/viewers/` (pruned to
