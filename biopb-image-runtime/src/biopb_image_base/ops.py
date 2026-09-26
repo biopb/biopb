@@ -44,7 +44,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import inspect
-import ipaddress
 import logging
 import os
 import re
@@ -58,6 +57,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import biopb.image as proto
 import grpc
 import numpy as np
+from biopb._web_auth import host_is_public_bind
 from biopb.image.utils import (
     deserialize_image_data,
     normalize_array_dims,
@@ -728,15 +728,6 @@ class _OpsServicer(BiopbServicerBase, proto.OpsServicer):
 # =============================================================================
 
 
-def _is_loopback(host: str) -> bool:
-    if host == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(host.strip("[]")).is_loopback
-    except ValueError:
-        return False
-
-
 def build_server(
     definitions: Sequence[_OpDef],
     *,
@@ -753,7 +744,7 @@ def build_server(
     """
     from biopb_image_base.health import add_health_servicer
 
-    remote = not _is_loopback(host)
+    remote = host_is_public_bind(host)
     server = grpc.server(
         futures.ThreadPoolExecutor(max_workers=workers),
         compression=grpc.Compression.Gzip if remote else grpc.Compression.NoCompression,
@@ -780,7 +771,7 @@ def _sink_from(args) -> Any:
             args.cache_dir,
             args.cache_size,
             ip=args.host,
-            local=_is_loopback(args.host),
+            local=not host_is_public_bind(args.host),
             tensor_port=args.tensor_port,
             tensor_external_location=args.tensor_external_location,
         )
@@ -842,7 +833,7 @@ def serve(
 
     deathwatch.install()
     token = os.environ.get(TOKEN_ENV) or None
-    if token is None and not _is_loopback(args.host):
+    if token is None and host_is_public_bind(args.host):
         import secrets
 
         token = secrets.token_urlsafe(32)

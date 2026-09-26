@@ -298,7 +298,7 @@ def control(plane, tmp_path, monkeypatch):
         algorithms=plane,
     )
     monkeypatch.setattr(
-        "biopb.control._algorithms.control_base_url", lambda: f"http://127.0.0.1:{port}"
+        "biopb.control._client.control_base_url", lambda: f"http://127.0.0.1:{port}"
     )
     monkeypatch.delenv("BIOPB_TENSOR_TOKEN", raising=False)
     monkeypatch.setattr("biopb.control._data_plane.resolve_token", lambda: None)
@@ -338,7 +338,7 @@ def test_no_control_is_none(monkeypatch):
     from biopb import control as client
 
     monkeypatch.setattr(
-        "biopb.control._algorithms.control_base_url", lambda: "http://127.0.0.1:1"
+        "biopb.control._client.control_base_url", lambda: "http://127.0.0.1:1"
     )
     assert client.algorithms(timeout=1) is None
     with pytest.raises(RuntimeError, match="no control"):

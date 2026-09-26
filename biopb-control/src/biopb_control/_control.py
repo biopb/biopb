@@ -125,7 +125,7 @@ from starlette.routing import Mount, Route
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from ._algorithm_plane import INSTALL_TIMEOUT, AlgorithmPlane
-from ._supervisor import DataPlaneSupervisor
+from ._supervisor import DataPlaneSupervisor, tail_file as _tail_file
 
 logger = logging.getLogger(__name__)
 
@@ -224,35 +224,6 @@ _UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 _LOG_TAIL_DEFAULT_LINES = 200
 _LOG_TAIL_MAX_LINES = 2000
 _LOG_TAIL_MAX_BYTES = 512 * 1024
-
-
-def _tail_file(path: Path, max_lines: int, max_bytes: int) -> tuple[list[str], bool]:
-    """Return ``(lines, truncated)`` for the tail of *path*.
-
-    Reads at most the final *max_bytes* and returns at most *max_lines* lines from
-    the end. ``truncated`` is True when older content exists that was not returned
-    (the byte window didn't reach the file start, or the line cap trimmed more).
-
-    The child (tensor server) and its native libraries emit arbitrary bytes, so
-    decode UTF-8 with ``errors="replace"`` rather than risk a decode error. When
-    the byte window starts mid-file its first line is almost certainly a fragment,
-    so drop it.
-    """
-    size = path.stat().st_size
-    read_bytes = min(size, max_bytes)
-    with path.open("rb") as f:
-        if read_bytes < size:
-            f.seek(size - read_bytes)
-        data = f.read(read_bytes)
-    partial = read_bytes < size
-    lines = data.decode("utf-8", "replace").splitlines()
-    if partial and lines:
-        lines = lines[1:]  # drop the leading fragment
-    truncated = partial
-    if len(lines) > max_lines:
-        lines = lines[-max_lines:]
-        truncated = True
-    return lines, truncated
 
 
 def _is_proxied_session_path(path: str, roots=_SESSION_ALLOWED_ROOTS) -> bool:
