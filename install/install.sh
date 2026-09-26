@@ -12,8 +12,7 @@
 # seeds nothing. An existing config is always kept untouched on rerun.
 #
 # Unattended upgrades: set BIOPB_NONINTERACTIVE=1 to suppress every prompt (keeps
-# an existing config; leaves the remote algorithm plugins off unless
-# BIOPB_REMOTE_PLUGINS=1). Example:
+# an existing config). Example:
 #   curl -fsSL https://biopb.org/install.sh | BIOPB_NONINTERACTIVE=1 bash
 #
 # This installs prebuilt wheels from a biopb GitHub release-v* deployment (the
@@ -402,56 +401,7 @@ _setup_mcp() {
     local mcp_cmd
     mcp_cmd=$(command -v biopb-mcp 2>/dev/null || echo "biopb-mcp")
 
-    # Minimal biopb-mcp config, mainly to ship preconfigured biopb.image servicers.
-    # Preserved if it already exists so the user's tweaks survive a rerun.
-    # Co-located with the tensor config in ~/.config/biopb (distinct from the
-    # client-definition mcp.json written below); the schema is flat sections.
-    local mcp_config="$CONFIG_DIR/mcp-config.json"
     mkdir -p "$CONFIG_DIR"
-    if [ -f "$mcp_config" ]; then
-        _ok "biopb-mcp config exists at $mcp_config (preserved)"
-    else
-        # The default algorithm plugins point at remote, off-site servers (cell
-        # segmentation, etc.) hosted at UConn Health. Those servers log client
-        # IPs, so we ask for consent before enabling them by default rather than
-        # quietly shipping a third-party network dependency. Declining just
-        # leaves process_image_servers empty; the user can add servers later by
-        # editing the config. _confirm defaults to Yes (Enter = enable).
-        _info "BioPB ships with algorithm plugins that use remote servers for"
-        _info "certain computations, e.g. cell segmentation. The servers are"
-        _info "hosted at UConn Health and log client IP addresses."
-        _info ""
-        local process_image_servers='        "grpcs://cellpose.biopb.org:443"'
-        if [ "${NONINTERACTIVE:-0}" = "1" ]; then
-            # Consent can't be asked unattended: enable only on explicit opt-in,
-            # otherwise leave the IP-logging servers off.
-            if [ "${BIOPB_REMOTE_PLUGINS:-0}" = "1" ]; then
-                _ok "Remote algorithm plugins enabled (BIOPB_REMOTE_PLUGINS=1)"
-            else
-                process_image_servers=''
-                _ok "Remote algorithm plugins disabled (non-interactive; set BIOPB_REMOTE_PLUGINS=1 to enable)"
-            fi
-        elif _confirm "Enable the remote algorithm plugins?"; then
-            _ok "Remote algorithm plugins enabled"
-        else
-            process_image_servers=''
-            _ok "Remote algorithm plugins disabled (add servers later in $mcp_config)"
-        fi
-
-        # The tensor server's localhost fast path is now the file-cache mmap
-        # handoff (biopb/biopb#9), which beats the gRPC socket and is enabled by
-        # default, so no shm opt-out is seeded here anymore.
-        cat > "$mcp_config" << EOF
-{
-  "services": {
-    "process_image_servers": [
-$process_image_servers
-    ]
-  }
-}
-EOF
-        _ok "Created biopb-mcp config: $mcp_config"
-    fi
 
     # Seed the built-in example kernel plugin(s) into ~/.config/biopb/kernel/ so
     # they load into the agent kernel namespace at startup and are visible as a
@@ -1251,10 +1201,7 @@ install_biopb() {
     # same zero-question path as an interactive fresh install: it seeds the sample
     # bundle and points the config there (fail-soft — a fetch/checksum problem
     # just leaves an empty folder). Set BIOPB_DATA_DIR to index your own folder,
-    # or BIOPB_INSTALL_SAMPLES=0 to skip seeding and start empty. Either way the
-    # remote algorithm plugins stay DISABLED unless BIOPB_REMOTE_PLUGINS=1 —
-    # consent can't be asked unattended, so we never silently enable the off-site
-    # IP-logging servers.
+    # or BIOPB_INSTALL_SAMPLES=0 to skip seeding and start empty.
     if [ -n "${BIOPB_NONINTERACTIVE:-}" ] && [ "${BIOPB_NONINTERACTIVE}" != "0" ]; then
         NONINTERACTIVE=1
         _info "Non-interactive mode (BIOPB_NONINTERACTIVE=1): prompts suppressed"
@@ -1751,10 +1698,6 @@ install_biopb() {
         _info "  open it anytime with: ${CYAN}biopb dashboard${RESET} (or the Desktop shortcut)"
         echo ""
     fi
-
-    _info "biopb-mcp configuration file:"
-    _cmd "  $HOME/.config/biopb/mcp-config.json"
-    echo ""
 
     _info "Data server configuration file:"
     _cmd "  $ACTIVE_CONFIG"

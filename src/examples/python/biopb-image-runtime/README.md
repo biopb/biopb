@@ -1,15 +1,14 @@
-## Server implementation of biopb.image service
-This is a minimal server implementation of the biopb.image protocol based on the [cellpose](https://www.cellpose.org/) model.
+## An algorithm server
 
-### Steps to run this example
-Install dependencies
-```
-pip install biopb cellpose
-```
+A server file for the biopb.image `Ops` protocol, serving one op backed by the
+[cellpose](https://www.cellpose.org/) model. The header is uv's inline script
+metadata, so uv installs what it imports.
 
-Run server
+Run it
 ```
-python src/examples/python/biopb-image-runtime/minimal_cellpose_server.py
+uv run src/examples/python/biopb-image-runtime/cellpose_server.py
 ```
 
-> **_NOTE:_**  This server runs at `localhost:50051` on HTTP (unencrypted).
+It serves on `127.0.0.1:50051`; `--describe` prints its ops and exits. Copied
+to `~/.config/biopb/algorithms/cellpose.py`, the control runs it instead and the
+kernel's `ops.cellpose` calls it.

@@ -122,7 +122,7 @@ class TestSaveConfig:
         """Preserves all config values when saving."""
         config = get_default_config()
         config["memory"]["warn_threshold_mb"] = 100
-        config["timeout"]["detection_2d"] = 30
+        config["timeout"]["process_image"] = 30
 
         save_config(config)
 
@@ -130,7 +130,7 @@ class TestSaveConfig:
             saved = json.load(f)
 
         assert saved["memory"]["warn_threshold_mb"] == 100
-        assert saved["timeout"]["detection_2d"] == 30
+        assert saved["timeout"]["process_image"] == 30
 
 
 class TestDefaultConfig:
@@ -153,7 +153,7 @@ class TestDefaultConfig:
             assert key in DEFAULT_CONFIG
 
     def test_timeout_config_complete(self):
-        for key in ("health_check", "get_op_names", "detection_2d", "detection_3d"):
+        for key in ("health_check", "get_op_names", "process_image"):
             assert key in DEFAULT_CONFIG["timeout"]
 
     def test_docs_are_flat_scalars(self):

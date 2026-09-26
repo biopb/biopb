@@ -174,20 +174,16 @@ class _Ops(proto.OpsServicer):
         )
 
 
-class _OldServer(proto.ProcessImageServicer):
-    pass
-
-
 @pytest.fixture
 def serve():
     servers = []
 
-    def start(servicer) -> str:
+    def start(servicer=None) -> str:
+        # No servicer: a server that does not implement Ops, as an older
+        # ProcessImage server answers.
         server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
-        if isinstance(servicer, proto.OpsServicer):
+        if servicer is not None:
             proto.add_OpsServicer_to_server(servicer, server)
-        else:
-            proto.add_ProcessImageServicer_to_server(servicer, server)
         port = server.add_insecure_port("127.0.0.1:0")
         server.start()
         servers.append(server)
@@ -214,7 +210,7 @@ def test_probe_sends_the_token(serve):
 
 
 def test_probe_names_the_retired_protocol(serve):
-    result = _algorithms.probe(serve(_OldServer()), timeout=5.0)
+    result = _algorithms.probe(serve(), timeout=5.0)
     assert result["state"] == "error"
     assert "ProcessImage" in result["error"]
 
