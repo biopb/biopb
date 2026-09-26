@@ -7,9 +7,9 @@
 
     Idempotent: rerun to upgrade to latest version.
 
-    This is the INTERACTIVE CONSOLE front-end. It collects the user's choices
-    (data directory, remote-plugin consent) with friendly prompts, then hands them
-    to the headless install engine (biopb-engine.ps1), which does the real work.
+    This is the INTERACTIVE CONSOLE front-end. It resolves the user's choices
+    (env vars, an existing config), then hands them to the headless install
+    engine (biopb-engine.ps1), which does the real work.
     Component selection is no longer prompted -- the web interface installs by
     default and Bio-Formats is opt-in via $env:BIOPB_INSTALL_BIOFORMATS.
     The Inno Setup GUI wizard is a second front-end over the same engine -- one
@@ -29,8 +29,7 @@
     $env:BIOPB_INSTALL_RC = "1" tracks the latest release candidate.
 
     Unattended upgrades: set $env:BIOPB_NONINTERACTIVE = "1" to suppress every
-    prompt (keeps an existing config; leaves remote plugins off unless
-    $env:BIOPB_REMOTE_PLUGINS = "1"). It is an upgrade feature -- a FRESH unattended
+    prompt (keeps an existing config). It is an upgrade feature -- a FRESH unattended
     install must also set $env:BIOPB_DATA_DIR or it errors out.
 
     Requirements: PowerShell 5.1+, tar (bundled on Windows 10 1803+).
@@ -80,9 +79,7 @@ $ISSUE_URL = "https://github.com/biopb/biopb-mcp/issues/new"
 # Non-interactive / unmanned mode: $env:BIOPB_NONINTERACTIVE = "1" suppresses every
 # prompt so the installer can upgrade unattended (Task Scheduler, CI, image bakes).
 # The upgrade path is the common case: an existing config is kept untouched. A fresh
-# unattended install uses $env:BIOPB_DATA_DIR (else a default) and leaves the remote
-# algorithm plugins OFF unless $env:BIOPB_REMOTE_PLUGINS = "1" -- consent can't be
-# asked unattended, so the off-site IP-logging servers are never silently enabled.
+# unattended install uses $env:BIOPB_DATA_DIR (else a default).
 $script:NonInteractive = [bool]$env:BIOPB_NONINTERACTIVE -and ($env:BIOPB_NONINTERACTIVE -ne '0')
 
 # ----- Output helpers used by the front-end's own prompts/summary -------------
@@ -208,10 +205,6 @@ function Show-Summary {
         Write-Host ""
     }
 
-    Write-Inf "biopb-mcp configuration file:"
-    Write-Cmd "  $ConfigDir\mcp-config.json"
-    Write-Host ""
-
     Write-Inf "Data server configuration file:"
     Write-Cmd "  $configFile"
     Write-Host ""
@@ -309,39 +302,11 @@ try {
         }
     }
 
-    # Remote algorithm plugins consent. The default plugins point at off-site
-    # servers (cell segmentation, etc.) hosted at UConn Health that log client
-    # IPs, so ask before enabling them rather than quietly shipping a third-party
-    # network dependency. Only fires when no biopb-mcp config exists yet, so a
-    # prior choice survives a rerun. Default is Yes (Enter = enable).
-    $noRemotePlugins = $false
-    $mcpConfig = Join-Path (Get-BiopbTree "BIOPB_CONFIG_HOME" ".config") "mcp-config.json"
-    if (-not (Test-Path -LiteralPath $mcpConfig)) {
-        if ($script:NonInteractive) {
-            # Consent can't be asked unattended: enable only on explicit opt-in.
-            if ($env:BIOPB_REMOTE_PLUGINS -eq '1') {
-                Write-Ok "Remote algorithm plugins enabled (BIOPB_REMOTE_PLUGINS=1)"
-            } else {
-                $noRemotePlugins = $true
-                Write-Ok "Remote algorithm plugins disabled (non-interactive; set BIOPB_REMOTE_PLUGINS=1 to enable)"
-            }
-        } else {
-            Write-Host ""
-            Write-Inf "BioPB ships with algorithm plugins that use remote servers for"
-            Write-Inf "certain computations, e.g. cell segmentation. The servers are"
-            Write-Inf "hosted at UConn Health and log client IP addresses."
-            Write-Host ""
-            $plug = Read-Host "  Enable the remote algorithm plugins? [Y/n]"
-            if ($plug -match '^(n|no)$') { $noRemotePlugins = $true }
-        }
-    }
-
     # ----- Drive the engine in-process, rendering its progress in color (-Mode console) -----
     $result = Invoke-BiopbInstall `
         -DataDir $dataDir `
         -Bioformats:$installBioformats `
         -KeepConfig:$keepConfig `
-        -NoRemotePlugins:$noRemotePlugins `
         -Mode console
 
     Show-Summary -Result $result

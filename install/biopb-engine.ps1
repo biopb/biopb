@@ -85,10 +85,6 @@ param(
     # console output and the GUI wizard safely. Honors -Webapp for the result.
     [switch]$DryRun,
 
-    # Do NOT seed the off-site cellpose algorithm server into a fresh biopb-mcp
-    # config (those servers log client IPs). Absent = enabled (the default Yes).
-    [switch]$NoRemotePlugins,
-
     # Uninstall mode: remove the biopb stack instead of installing it. With
     # -Purge, also delete config and cached data (never the user's images).
     [switch]$Uninstall,
@@ -641,12 +637,8 @@ function Test-IsCloudPath {
 # (Test-IsCloudPath), which admits placeholders as unresolved sources instead. A
 # Microscopy subfolder under a cloud root is preferred over the whole synced root.
 # Detect installed agent systems and register the biopb MCP server with each.
-# -NoRemotePlugins leaves process_image_servers empty when creating a fresh
-# config (the default off-site cellpose server logs client IPs, so enabling it is
-# a consent decision the front-end collects). Existing configs are preserved
-# regardless, so a prior choice survives a rerun.
 function Set-McpClients {
-    param([string]$BiopbHome, [string]$ConfigDir, [switch]$NoRemotePlugins)
+    param([string]$BiopbHome, [string]$ConfigDir)
 
     # Best-effort agent wiring must never abort the install. Under the script's
     # ErrorActionPreference='Stop', a native CLI that writes to stderr -- e.g.
@@ -665,37 +657,7 @@ function Set-McpClients {
     # still find it.
     $mcpArgs = @("--transport", "stdio")
 
-    # Minimal biopb-mcp config (preconfigured biopb.image servicers). Preserved if
-    # it already exists so the user's tweaks survive a rerun. Co-located with the
-    # tensor config in ~/.config/biopb (distinct from the client-definition
-    # mcp.json below); the schema is flat sections.
-    $mcpConfig = Join-Path $ConfigDir "mcp-config.json"
     if (-not (Test-Path -LiteralPath $ConfigDir)) { New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null }
-    if (Test-Path -LiteralPath $mcpConfig) {
-        Report-Ok "biopb-mcp config exists at $mcpConfig (preserved)"
-    } else {
-        # Seed the off-site cellpose server only with consent (-NoRemotePlugins
-        # absent). Declining leaves process_image_servers empty; the user can add
-        # servers later by editing the config.
-        if ($NoRemotePlugins) {
-            $processImageServers = ''
-            Report-Ok "Remote algorithm plugins disabled (add servers later in $mcpConfig)"
-        } else {
-            $processImageServers = '        "grpcs://cellpose.biopb.org:443"'
-            Report-Ok "Remote algorithm plugins enabled"
-        }
-        $mcpConfigContent = @"
-{
-  "services": {
-    "process_image_servers": [
-$processImageServers
-    ]
-  }
-}
-"@
-        Set-FileUtf8NoBom -Path $mcpConfig -Content $mcpConfigContent
-        Report-Ok "Created biopb-mcp config: $mcpConfig"
-    }
 
     # Seed the built-in example kernel plugin(s) into ~/.config/biopb/kernel/ so
     # they load into the agent kernel namespace at startup and are visible as a
@@ -1164,7 +1126,6 @@ function Invoke-BiopbInstall {
         [switch]$KeepConfig,
         [switch]$Reset,
         [switch]$DryRun,
-        [switch]$NoRemotePlugins,
         [string]$LogFile = "",
         [ValidateSet('console', 'gui')][string]$Mode = 'gui'
     )
@@ -1820,7 +1781,7 @@ function Invoke-BiopbInstall {
     # interrupted -- and the control plane comes up on demand anyway when the agent
     # first launches biopb-mcp.
     Report-Step 6 "Configuring MCP client..."
-    Set-McpClients -BiopbHome $BiopbHome -ConfigDir $ConfigDir -NoRemotePlugins:$NoRemotePlugins
+    Set-McpClients -BiopbHome $BiopbHome -ConfigDir $ConfigDir
 
     # ===== 7. Start the control plane (which owns the data plane) =====
     Report-Step 7 "Starting control plane..."
@@ -2014,15 +1975,14 @@ if ($MyInvocation.InvocationName -ne '.') {
         # Out-Null: the returned object must not leak onto stdout and pollute the
         # tagged stream. Invoke-BiopbInstall emits RESULT/DONE itself.
         $invokeArgs = @{
-            DataDir         = $DataDir
-            Rc              = $Rc
-            NoServerStart   = $NoServerStart
-            KeepConfig      = $KeepConfig
-            Reset           = $Reset
-            DryRun          = $DryRun
-            NoRemotePlugins = $NoRemotePlugins
-            LogFile         = $LogFile
-            Mode            = $Mode
+            DataDir       = $DataDir
+            Rc            = $Rc
+            NoServerStart = $NoServerStart
+            KeepConfig    = $KeepConfig
+            Reset         = $Reset
+            DryRun        = $DryRun
+            LogFile       = $LogFile
+            Mode          = $Mode
         }
         # Forward -Webapp/-Bioformats only when explicitly passed to the script, so
         # an unset switch falls through to Invoke-BiopbInstall's env-var default
