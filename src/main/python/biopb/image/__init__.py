@@ -33,6 +33,13 @@ from biopb.image.rpc_object_detection_pb2_grpc import (
     ObjectDetectionStub,
     add_ObjectDetectionServicer_to_server,
 )
+from biopb.image.rpc_ops_pb2 import Arg, Call, Event, OpInfo, OpList, TensorArg
+from biopb.image.rpc_ops_pb2_grpc import (
+    Ops,
+    OpsServicer,
+    OpsStub,
+    add_OpsServicer_to_server,
+)
 from biopb.image.rpc_process_image_pb2 import ProcessRequest, ProcessResponse
 from biopb.image.rpc_process_image_pb2_grpc import (
     ProcessImage,

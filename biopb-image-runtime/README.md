@@ -2,6 +2,46 @@
 
 Base Docker image and utilities for implementing algorithm plugins using the `biopb.image` protocol.
 
+## Serve functions over `Ops`
+
+One file, no packaging. A parameter annotated `Tensor(axes)` is a tensor
+argument; every other parameter is a kwarg, advertised with its default.
+
+```python
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["biopb-image-base[lazy]", "scikit-image"]
+# ///
+from biopb_image_base import Tensor, op, serve
+
+@op(description="Mean intensity and area per label", labels=["measurement"])
+def label_stats(image: Tensor("YX"), labels: Tensor("YX")) -> dict:
+    from skimage.measure import regionprops_table
+    return regionprops_table(labels, image, properties=["label", "area", "mean_intensity"])
+
+@op(description="Gaussian denoise", labels=["denoising"], input="blocks", overlap=16)
+def gaussian(image: Tensor("YX"), sigma: float = 2.0):
+    from skimage.filters import gaussian as g
+    return g(image, sigma=sigma, preserve_range=True)
+
+if __name__ == "__main__":
+    serve()
+```
+
+`uv run server.py --port 50051` serves it; `--describe` prints the op list and
+exits.
+
+- `input="eager"` (default) hands the function numpy arrays, `"lazy"` dask
+  arrays, and `"blocks"` maps a pixelwise function over blocks with
+  `block_shape` and `overlap`, iterating the axes not in `axes`.
+- A single return value is the output `result`, a tuple `0`, `1`, .... Arrays
+  are tensors; anything else is JSON. A generator yields one event per item.
+- Large results go to the embedded tensor server under `--cache-dir`, else to
+  the plane named by `BIOPB_TENSOR_URL`/`BIOPB_TENSOR_TOKEN`, else inline.
+- The core install serves inline pixels only; `[lazy]` adds lazy input and the
+  plane sink. The server checks `$BIOPB_ALGORITHM_TOKEN` when set; bound off
+  loopback without one, it mints one and prints it.
+
 ## Build a custom algorithm plugin
 
 ### Overview
