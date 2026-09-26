@@ -1,6 +1,4 @@
 grpcio-health-checking
-imageio
-typer
 numpy
 # For the lazy flow-stitch utilities (biopb_image_base.dynamics_local uses scipy.ndimage)
 scipy

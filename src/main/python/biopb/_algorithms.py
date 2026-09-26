@@ -213,8 +213,8 @@ def probe(
 
     - ``up``: it answered.
     - ``unreachable``: nothing answered in time (down, bad host, TLS mismatch).
-    - ``error``: it answered with an error, including a server that speaks only
-      the retired ``ProcessImage`` protocol.
+    - ``error``: it answered with an error, including a server that does not
+      implement ``Ops`` (such as one of the retired ``ProcessImage`` protocol).
     - ``invalid``: the URL is not ``grpc://`` or ``grpcs://``.
 
     Never raises.
@@ -254,7 +254,7 @@ def probe(
             if code == grpc.StatusCode.UNIMPLEMENTED:
                 return _result(
                     "error",
-                    error="speaks the retired ProcessImage protocol, not Ops",
+                    error="does not implement Ops (a ProcessImage server must move to Ops)",
                 )
             if code in (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED):
                 return _result("unreachable", error=_rpc_message(exc))

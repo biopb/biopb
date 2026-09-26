@@ -24,7 +24,7 @@ def test_import():
 
     # The version lives on the distribution's top-level package, not here
     # (biopb/biopb#998), so this checks the package is populated instead.
-    assert proto.DetectionRequest is not None
+    assert proto.OpsStub is not None
 
 
 def test_canonicalize_dtype():

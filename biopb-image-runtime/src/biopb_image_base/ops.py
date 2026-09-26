@@ -68,9 +68,9 @@ from google.protobuf import json_format, struct_pb2
 from biopb_image_base.common import (
     _MAX_EAGER_SIZE,
     _MAX_MSG_SIZE,
-    BiopbServicerBase,
     TokenValidationInterceptor,
     _is_dask_array,
+    server_context,
 )
 
 logger = logging.getLogger(__name__)
@@ -579,11 +579,11 @@ def _blocks(definition: _OpDef, pixels: Dict[str, _Pixels], kwargs: Dict[str, An
     return normalize_array_dims(result, order, first.labels), first.labels
 
 
-class _OpsServicer(BiopbServicerBase, proto.OpsServicer):
+class _OpsServicer(proto.OpsServicer):
     """``Ops`` over a set of op definitions. Calls run one at a time."""
 
     def __init__(self, definitions: Sequence[_OpDef], sink, compress: bool):
-        super().__init__(use_lock=True)
+        self._lock = threading.Lock()
         self._ops = {d.name: d for d in definitions}
         self._oplist = describe(definitions)
         self._sink = sink
@@ -599,7 +599,7 @@ class _OpsServicer(BiopbServicerBase, proto.OpsServicer):
                 grpc.StatusCode.NOT_FOUND,
                 f"no op {request.op!r}; this server has {sorted(self._ops)}",
             )
-        with self._server_context(context):
+        with server_context(context, self._lock):
             yield from self._run(definition, request, context)
 
     def _arguments(self, definition: _OpDef, request) -> Tuple[Dict, Dict]:

@@ -10,7 +10,7 @@ plane implementations. Each top-level subdir is one component:
 | `proto/` | **The protocol** — `biopb.image` (compute plane) and `biopb.tensor` (data plane) `.proto` files. The single source of truth; stubs for Python, Java, and JS/TS are generated from it. |
 | `src/` | **The core `biopb` SDK** — the Python package (`src/main/python/biopb`: the `tensor` Flight client, the `biopb` CLI, and the stdlib-only cross-process seams) and the Java client (`src/main/java`), plus their tests under `src/test/`. |
 | `biopb-tensor-server/` | **The data plane** — the Arrow Flight server, its format adapters, catalog, cache, and HTTP sidecar. |
-| `biopb-image-runtime/` | **The compute-plane base** — `BiopbServicerBase` and the base Docker image that algorithm servers derive from. |
+| `biopb-image-runtime/` | **The compute-plane base** — `@op`/`serve()`, which turn functions into an `Ops` server, and the base Docker image. |
 | `biopb-mcp/` | **The agent client** — the MCP server that drives a live napari session. Its Tensor Browser comes from [biopb-napari-widget](https://github.com/biopb/biopb-napari-widget). |
 | `biopb-control/` | **The control plane** — the single web origin; supervises the data plane and serves the browser UI. |
 | `web/` | **The browser front end** — one Vite + React SPA (dataviewer, admin, dashboard, observe), served by the control. |
@@ -148,30 +148,20 @@ tools should re-implement. Adapters, cache, discovery, and the CLI launcher are 
 client-side localhost read path in
 [`docs/localhost-fast-path.md`](docs/localhost-fast-path.md).
 
-### The compute plane: stateless algorithm servers with an eager/lazy duality
+### The compute plane: algorithm servers behind the control
 
-The compute plane is a gRPC contract (`proto/biopb/image`) with two services:
+The compute plane is one gRPC service, `Ops` (`proto/biopb/image/rpc_ops.proto`):
+`Describe` lists a server's ops with their named arguments, and `Call` runs one,
+streaming progress and returning its outputs. A tensor argument travels either
+**eager** (pixels inline) or **lazy** (a reference to a tensor on a plane, which
+the server reads itself); a large result comes back the same way, as a reference.
+Every other argument and output is plain JSON.
 
-- **`ProcessImage`** — `Run`, `RunStream`, `GetOpNames`. General image→image
-  operations (segmentation, denoising, …), where a server may expose several
-  named *ops*.
-- **`ObjectDetection`** — `RunDetection`, `RunDetectionStream`,
-  `RunDetectionOnGrid`, `RunModelAdaptation`, `GetOpNames`. Detection/instance
-  outputs (ROIs, labels).
-
-The pivotal design point is that every request/response can carry image data in
-one of **two modes** (`return_lazy_or_eager` in the image runtime):
-
-- **Eager** — pixels are embedded inline in the message. Simple; fine for small
-  images.
-- **Lazy** — the message carries a **tensor source reference** instead of
-  pixels. The algorithm server pulls the input straight from the tensor server,
-  and writes its result back as a *new* source, returning that source id.
-
-Algorithm servers are otherwise **stateless and uniform**: `biopb-server`
-backends subclass a shared `BiopbServicerBase` from the image runtime and only
-provide the model-specific inference, so adding a new algorithm is "wrap a model
-+ point it at the protocol," not "build a server." See
+A server is one file: functions decorated with `@op` and a call to `serve()`
+(`biopb-image-runtime`), with its dependencies in a PEP 723 header. The control
+keeps the registry (`~/.config/biopb/algorithms/`): it installs, starts and
+supervises a script entry under uv, and probes a url entry that runs elsewhere.
+The kernel's `ops` reads that registry through the control. See
 [`biopb-image-runtime/README.md`](biopb-image-runtime/README.md).
 
 ### biopb-mcp
@@ -226,9 +216,9 @@ durable planes and the web origin in
 - **Data plane:** `biopb-tensor-server/biopb_tensor_server/` — `serving/server.py`,
   `adapters/`, `core/discovery.py`, the metadata DB.
 - **Compute base:** `biopb-image-runtime/src/biopb_image_base/` —
-  `BiopbServicerBase`, `return_lazy_or_eager`, the embedded cache.
-- **An example algorithm server:** `biopb-server/cellpose/cellpose_server.py`
-  (the only remaining separate repo).
+  `ops.py` (`@op`, `serve()`), the embedded cache.
+- **An example algorithm server:**
+  `src/examples/python/biopb-image-runtime/cellpose_server.py`.
 - **Client / agent:** `biopb-mcp/src/biopb_mcp/mcp/` (`_kernel.py`,
   `_bootstrap.py`, `_server.py`); the data-plane connection is the SDK's
   `biopb.tensor.Connection`, and the Tensor Browser is biopb-napari-widget's.

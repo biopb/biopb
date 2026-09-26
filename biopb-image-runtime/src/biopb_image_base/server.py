@@ -1,9 +1,5 @@
-"""Server creation helper for biopb services.
-
-Provides a simplified interface for creating gRPC servers with
-health checks, interceptors, and standard configuration.
-Optionally starts an embedded tensor cache server for lazy data handling.
-"""
+"""The embedded tensor cache: a server returns large results through its own
+TensorFlight server, from a file-based cache with a TTL."""
 
 import logging
 import os
@@ -11,25 +7,17 @@ import re
 import secrets
 import shutil
 import threading
-from concurrent import futures
 from itertools import product
 from pathlib import Path
 from typing import Iterator, Optional, Sequence, Union
 
-import biopb.image as proto
 import biopb.tensor as tensor_proto
 import dask.array as da
-import grpc
 import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.serialized_pb2 import SerializedTensor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 from dask.utils import parse_bytes
-
-from biopb_image_base.common import _MAX_MSG_SIZE, TokenValidationInterceptor
-from biopb_image_base.debug import get_system_info
-from biopb_image_base.health import HealthServicer, add_health_servicer
-from biopb_image_base.logging_config import LogLevel, setup_logging
 
 logger = logging.getLogger(__name__)
 
@@ -431,101 +419,6 @@ def _start_embedded_tensor_cache(
     return tensor_server, location
 
 
-def create_server(
-    servicer,
-    port: int = 50051,
-    workers: int = 10,
-    ip: str = "0.0.0.0",
-    local: bool = False,
-    token: Optional[bool] = None,
-    log_level: LogLevel = "INFO",
-    compression: bool = True,
-    health_check: bool = True,
-    readiness_check: Optional[callable] = None,
-    tensor_cache: Optional[EmbeddedTensorCache] = None,
-) -> tuple[grpc.Server, Optional[str], Optional[HealthServicer]]:
-    """Create a configured gRPC server with standard features.
-
-    This creates a gRPC server with:
-    - ObjectDetection and ProcessImage services registered
-    - Optional token authentication
-    - Health check service (standard grpc.health.v1.Health)
-    - Configurable compression
-    - Proper message size limits
-
-    Args:
-        servicer: The main servicer implementing ObjectDetection and ProcessImage
-        port: Port to listen on (default 50051)
-        workers: Thread pool size (default 10)
-        ip: IP to bind to (default "0.0.0.0")
-        local: Use local server credentials for secure local-only access
-        token: Enable token authentication (None = auto based on local flag)
-        log_level: Log level for server (DEBUG, INFO, WARNING, ERROR, CRITICAL)
-        compression: Enable gzip compression
-        health_check: Enable gRPC health check service
-        readiness_check: Optional callable for readiness probe
-        tensor_cache: Optional tensor cache for lazy data handling
-
-    Returns:
-        Tuple of (server, token_string, health_servicer)
-        - server: The configured gRPC server (not started)
-        - token_string: The auth token if enabled, None otherwise
-        - health_servicer: Health servicer for status updates, None if disabled
-    """
-    # Inject tensor_cache into servicer if provided
-    if tensor_cache is not None and hasattr(servicer, "_tensor_cache"):
-        servicer._tensor_cache = tensor_cache
-
-    # Determine token setting
-    if token is None:
-        token = not local
-
-    # Generate token if needed
-    token_str = None
-    if token:
-        token_str = secrets.token_urlsafe(64)
-        print()
-        print("COPY THE TOKEN BELOW FOR ACCESS.")
-        print("=======================================================================")
-        print(f"{token_str}")
-        print("=======================================================================")
-        print()
-
-    # Create server with interceptors
-    interceptors = [TokenValidationInterceptor(token_str)]
-
-    server = grpc.server(
-        futures.ThreadPoolExecutor(max_workers=workers),
-        compression=grpc.Compression.Gzip
-        if compression
-        else grpc.Compression.NoCompression,
-        interceptors=tuple(interceptors),
-        options=(
-            ("grpc.max_receive_message_length", _MAX_MSG_SIZE),
-            ("grpc.max_send_message_length", _MAX_MSG_SIZE),
-        ),
-    )
-
-    # Register main services
-    proto.add_ObjectDetectionServicer_to_server(servicer, server)
-    proto.add_ProcessImageServicer_to_server(servicer, server)
-
-    # Register health check service
-    health_servicer = None
-    if health_check:
-        health_servicer = add_health_servicer(server, readiness_check)
-
-    # Add port
-    if local:
-        server.add_secure_port(f"127.0.0.1:{port}", grpc.local_server_credentials())
-        logger.info(f"Server configured with local credentials on 127.0.0.1:{port}")
-    else:
-        server.add_insecure_port(f"{ip}:{port}")
-        logger.info(f"Server configured on {ip}:{port}")
-
-    return server, token_str, health_servicer
-
-
 def _pyarrow_available() -> bool:
     """True if pyarrow can be imported.
 
@@ -598,98 +491,3 @@ def start_embedded_cache(
         tensor_server=tensor_server,
         external_location=external_location,
     )
-
-
-def run_server(
-    servicer,
-    port: int = 50051,
-    workers: int = 10,
-    ip: str = "0.0.0.0",
-    local: bool = False,
-    token: Optional[bool] = None,
-    log_level: LogLevel = "INFO",
-    compression: bool = True,
-    health_check: bool = True,
-    readiness_check: Optional[callable] = None,
-    cache_dir: Optional[str] = None,
-    cache_size: str = "32GB",
-    tensor_port: int = 8817,
-    tensor_external_location: Optional[str] = None,
-) -> None:
-    """Create and run a gRPC server (blocking).
-
-    Optionally starts an embedded tensor cache server for lazy data handling.
-    When cache_dir is provided, creates an EmbeddedTensorCache wrapper and injects it
-    into the servicer for returning large/lazy results.
-
-    Args:
-        servicer: The main servicer implementing ObjectDetection and ProcessImage
-        port: Port to listen on (default 50051)
-        workers: Thread pool size (default 10)
-        ip: IP to bind to (default "0.0.0.0")
-        local: Use local server credentials for secure local-only access
-        token: Enable token authentication (None = auto based on local flag)
-        log_level: Log level for server (DEBUG, INFO, WARNING, ERROR, CRITICAL)
-        compression: Enable gzip compression
-        health_check: Enable gRPC health check service
-        readiness_check: Optional callable for readiness probe
-        cache_dir: Directory for tensor cache files (enables embedded tensor server)
-        cache_size: Maximum cache size (e.g., "32GB", "100GB")
-        tensor_port: Port for embedded tensor Flight server (default 8817)
-        tensor_external_location: External URL for tensor server in SerializedTensor
-            (e.g., "grpc://hostname:8817"). Defaults to "grpc://<ip>:<tensor_port>".
-            The tensor server binds to 0.0.0.0 for external access.
-    """
-    # Setup logging
-    setup_logging(log_level)
-
-    # Log system info
-    sys_info = get_system_info()
-    logger.info(
-        f"System: {sys_info.get('platform', 'unknown')}, "
-        f"Python {sys_info.get('python_version', 'unknown')}, "
-        f"CPU {sys_info.get('cpu_count', 'unknown')}"
-    )
-    if "memory_total_mb" in sys_info:
-        logger.info(
-            f"Memory: {sys_info['memory_total_mb']:.0f}MB total, "
-            f"{sys_info.get('memory_available_mb', 0):.0f}MB available"
-        )
-    if "gpu" in sys_info:
-        gpu = sys_info["gpu"]
-        logger.info(
-            f"GPU: {gpu['device']}, {gpu['total_mb']:.0f}MB total, "
-            f"{gpu['free_mb']:.0f}MB free"
-        )
-
-    tensor_cache = None
-    if cache_dir is not None:
-        tensor_cache = start_embedded_cache(
-            cache_dir,
-            cache_size,
-            ip=ip,
-            local=local,
-            tensor_port=tensor_port,
-            tensor_external_location=tensor_external_location,
-        )
-
-    logger.info("server starting ...")
-
-    server, token_str, health_servicer = create_server(
-        servicer=servicer,
-        port=port,
-        workers=workers,
-        ip=ip,
-        local=local,
-        token=token,
-        log_level=log_level,
-        compression=compression,
-        health_check=health_check,
-        readiness_check=readiness_check,
-        tensor_cache=tensor_cache,
-    )
-
-    logger.info("server ready")
-
-    server.start()
-    server.wait_for_termination()

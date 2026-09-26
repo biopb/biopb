@@ -12,11 +12,7 @@ from biopb.image.annotation_pb2 import (
     RoiUnseen,
 )
 from biopb.image.bindata_pb2 import BinData
-from biopb.image.detection_request_pb2 import DetectionRequest
-from biopb.image.detection_response_pb2 import DetectionResponse, ScoredROI
-from biopb.image.detection_settings_pb2 import DetectionSettings
 from biopb.image.image_data_pb2 import ImageAnnotation, ImageData, Pixels, Tensor
-from biopb.image.op_schema_pb2 import InputShapeHint, OpNames, OpSchema
 from biopb.image.roi_pb2 import (
     ROI,
     Ellipse,
@@ -27,25 +23,12 @@ from biopb.image.roi_pb2 import (
     Polyline,
     Rectangle,
 )
-from biopb.image.rpc_object_detection_pb2_grpc import (
-    ObjectDetection,
-    ObjectDetectionServicer,
-    ObjectDetectionStub,
-    add_ObjectDetectionServicer_to_server,
-)
 from biopb.image.rpc_ops_pb2 import Arg, Call, Event, OpInfo, OpList, TensorArg
 from biopb.image.rpc_ops_pb2_grpc import (
     Ops,
     OpsServicer,
     OpsStub,
     add_OpsServicer_to_server,
-)
-from biopb.image.rpc_process_image_pb2 import ProcessRequest, ProcessResponse
-from biopb.image.rpc_process_image_pb2_grpc import (
-    ProcessImage,
-    ProcessImageServicer,
-    ProcessImageStub,
-    add_ProcessImageServicer_to_server,
 )
 
 # Utility functions for image data serialization/deserialization

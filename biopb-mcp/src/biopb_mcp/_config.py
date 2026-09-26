@@ -85,8 +85,6 @@ class TimeoutConfig:
     get_op_names: float = _h(
         10.0, "Timeout for listing the algorithm servers and their ops."
     )
-    detection_2d: int = _h(15, "Timeout for a 2D detection call.")
-    detection_3d: int = _h(300, "Timeout for a 3D detection call.")
     process_image: int = _h(
         300, "How long an op call may go without a word from its server."
     )
@@ -482,8 +480,6 @@ _CONSTRAINTS = {
     "TimeoutConfig": {
         "health_check": Range(exclusive_min=0),
         "get_op_names": Range(exclusive_min=0),
-        "detection_2d": Range(exclusive_min=0),
-        "detection_3d": Range(exclusive_min=0),
         "process_image": Range(exclusive_min=0),
     },
     "GrpcConfig": {

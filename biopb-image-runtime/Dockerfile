@@ -3,7 +3,8 @@
 # Requires: wheels/biopb-*.whl and wheels/biopb_tensor_server-*.whl
 #   Build them with: biopb-image-runtime/scripts/build.sh (builds from latest git tags by default)
 #
-# The image is a base image for derived biopb.image services.
+# The image is a base image for derived biopb.image services: a derived image
+# adds its model's packages and a server file that ends in `serve()`.
 # It does not define a default entrypoint; derived images must provide one.
 #
 # Usage:
@@ -40,13 +41,8 @@ RUN pip install --no-cache-dir \
 
 WORKDIR /app
 
-# Copy base utilities (includes mock_servicer for tests and explicit dev use)
 COPY biopb-image-runtime/src/biopb_image_base /opt/biopb/biopb_image_base
 ENV PYTHONPATH="/opt/biopb"
-
-# Copy test client (for testing real servicers within Docker)
-COPY biopb-image-runtime/tests/client.py /opt/biopb/tests/client.py
-COPY biopb-image-runtime/tests/test_image.png /opt/biopb/tests/test_image.png
 
 WORKDIR $HOME
 

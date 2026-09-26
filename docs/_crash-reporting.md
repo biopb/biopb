@@ -80,7 +80,7 @@ nice-to-have: it is the only thing linking the user's "it broke" to our server's
 Server logging is already **systemd/journald**, and journald is not just a log
 file — it's an **indexed structured-field store you can query**. The image
 runtime already logs the traceback + an 8-hex error id at its one error
-chokepoint (`BiopbServicerBase._server_context`). The change is to emit
+chokepoint (`biopb_image_base.common.server_context`). The change is to emit
 **custom journal fields** alongside it:
 
 ```
@@ -221,7 +221,7 @@ traceback. (Add `BIOPB_BUILD_COMMIT` at container build; expose via the existing
 ## 7. Suggested sequencing
 
 1. **Schema + commit stamping + capture at the existing chokepoints** — no wire
-   changes. Server: journal fields at `_server_context`. Client: thin report +
+   changes. Server: journal fields at `server_context`. Client: thin report +
    the three kernel crash classes. Immediate value: structured, redacted,
    queryable records per component.
 2. **trace_id propagation** (`traceparent` over gRPC metadata + Flight headers +

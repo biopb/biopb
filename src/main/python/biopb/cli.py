@@ -121,8 +121,8 @@ _add_optional_typer(
     "Query a TensorFlight data plane (sources, tensors, stats, cache).",
 )
 
-# ProcessImage client operations
-_add_optional_typer("image", "biopb.image.cli", "Call ProcessImage algorithm servers.")
+# Ops client operations
+_add_optional_typer("image", "biopb.image.cli", "Call algorithm servers (Ops).")
 
 # The `biopb server` group is gone (biopb/biopb#615). Its lifecycle commands went
 # first, when the control plane took over the data-plane process; the one that

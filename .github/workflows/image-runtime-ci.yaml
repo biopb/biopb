@@ -42,8 +42,8 @@ permissions:
   contents: read
 
 jobs:
-  # Container-free unit + service tests. The server-backed tests launch the mock
-  # servicer as a local subprocess (no Docker, no GPU); the pure suites
+  # Container-free unit + service tests. The server-backed tests launch an Ops
+  # server file as a local subprocess (no Docker, no GPU); the pure suites
   # (stitch / dynamics_local) need only numpy + scipy.
   test:
     runs-on: ubuntu-latest
@@ -71,7 +71,7 @@ jobs:
       # biopb and biopb-tensor-server are NOT on PyPI. The biopb-image-base
       # [test] extra requires biopb-tensor-server, so install it (and biopb)
       # editable from source FIRST — that satisfies the requirement and stops
-      # pip from trying (and failing) to fetch it from PyPI. The mock servicer
+      # pip from trying (and failing) to fetch it from PyPI. The Ops server
       # the tests spawn as a subprocess needs biopb-tensor-server at runtime.
       - name: Install Python packages
         run: |

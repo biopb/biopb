@@ -1,3 +1,4 @@
 # Examples
 
-This directory contains some reference implementations of biopb server and clients.
+Reference implementations of a biopb algorithm server and client, over the
+biopb.image `Ops` protocol.
