@@ -478,6 +478,10 @@ class UploadManager:
         the single-array stores the removed ``ome_zarr:`` kind left directly
         under ``write_dir``. They differ in what the catalog owes them, which is
         why they are swept separately.
+
+        The per-source directories themselves are collected last
+        (:meth:`_prune_empty_source_dirs`), once every store that is going has
+        gone. They are not stores and are not counted.
         """
         write_dir = self._write_dir
         if write_dir is None or not write_dir.is_dir():
@@ -495,6 +499,8 @@ class UploadManager:
             # A sidecar has no row of its own either, for the same reason.
             removed += self._remove_unfinished(store)
         removed += self._drop_legacy_ome_zarr_stores(write_dir)
+        self._prune_empty_source_dirs(fields_root(write_dir))
+        self._prune_empty_source_dirs(labels_root(write_dir))
         return removed
 
     def _drop_legacy_ome_zarr_stores(self, write_dir: Path) -> int:
@@ -540,6 +546,38 @@ class UploadManager:
         shutil.rmtree(store, ignore_errors=True)
         logger.info(f"Removed {why} upload store {store}")
         return True
+
+    @staticmethod
+    def _prune_empty_source_dirs(root: Path) -> None:
+        """Drop the per-source directories under *root* that hold nothing.
+
+        ``fields/<source_id>/`` and ``labels/<source_id>/`` are minted
+        implicitly by ``store.mkdir(parents=True)`` and nothing removes them:
+        disposing an upload takes its store, and the last one out leaves the
+        directory behind. One empty directory per source that has ever held an
+        upload, never collected.
+
+        Here rather than at the disposal sites because this runs from the
+        constructor, before any source is registered, so it cannot race the
+        mkdir it undoes -- ``mkdir(parents=True)`` creates the parent and the
+        store separately, and a sweep landing between the two would leave the
+        upload creating them with nowhere to write. ``rmdir`` is the guard
+        itself: it refuses a directory that still holds a store, which is
+        exactly the directory to keep.
+        """
+        if not root.is_dir():
+            return
+        for source_dir in sorted(root.glob("*")):
+            if not source_dir.is_dir():
+                continue
+            try:
+                source_dir.rmdir()
+            except OSError:
+                # Still holds a store, or the OS would not part with it. Both
+                # are reasons to leave it alone; neither is worth a log line on
+                # every boot.
+                continue
+            logger.info(f"Removed the empty upload directory {source_dir}")
 
     # -- write path ------------------------------------------------------------
 

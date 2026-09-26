@@ -20,6 +20,7 @@ from biopb_tensor_server.adapters.fields import (
     fields_root,
     source_fields_dir,
 )
+from biopb_tensor_server.adapters.labels import labels_root
 from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
 from biopb_tensor_server.adapters.scratch import SCRATCH_SOURCE_ID
 from biopb_tensor_server.adapters.zarr import ZarrAdapter, upload_state
@@ -453,6 +454,72 @@ class TestTheBootSweepRemovesAPendingMember:
 
         manager = UploadManager(SourceRegistry(), None, None)
         assert manager.discard_unfinished_stores() == 0
+
+
+class TestTheBootSweepCollectsEmptySourceDirs:
+    """``fields/<source_id>/`` and ``labels/<source_id>/`` are minted by
+    ``mkdir(parents=True)`` and nothing removes them, so the last store out
+    leaves the directory behind -- one per source that ever held an upload."""
+
+    @staticmethod
+    def _manager(write_dir):
+        from biopb_tensor_server.core.source_registry import SourceRegistry
+        from biopb_tensor_server.serving.upload_manager import UploadManager
+
+        return UploadManager(SourceRegistry(), write_dir, None)
+
+    @staticmethod
+    def _store(parent: Path, name: str, state: str) -> Path:
+        store = parent / name
+        store.mkdir(parents=True)
+        (store / ".zattrs").write_text(
+            json.dumps({"biopb": {"upload": {"state": state}}})
+        )
+        return store
+
+    def test_the_directory_goes_with_the_last_store_in_it(self, tmp_path):
+        write_dir = tmp_path / "w"
+        source = fields_root(write_dir) / "ome-tiff_abc"
+        self._store(source, "crashed", "pending")
+
+        # One store swept, and directories are not stores, so the count is 1.
+        assert self._manager(write_dir).discard_unfinished_stores() == 1
+
+        assert not source.exists()
+        assert fields_root(write_dir).is_dir()
+
+    def test_one_that_still_holds_a_store_stays(self, tmp_path):
+        """``rmdir`` is the guard: a published field is the only copy of what
+        someone uploaded, and its directory is what holds it."""
+        write_dir = tmp_path / "w"
+        source = fields_root(write_dir) / "ome-tiff_abc"
+        self._store(source, "crashed", "pending")
+        kept = self._store(source, "done", "ready")
+
+        assert self._manager(write_dir).discard_unfinished_stores() == 1
+
+        assert kept.is_dir()
+        assert source.is_dir()
+
+    def test_a_label_sidecar_directory_is_collected_too(self, tmp_path):
+        write_dir = tmp_path / "w"
+        source = labels_root(write_dir) / "ome-tiff_abc"
+        self._store(source, "nuclei.zarr", "pending")
+
+        assert self._manager(write_dir).discard_unfinished_stores() == 1
+
+        assert not source.exists()
+
+    def test_a_directory_nobody_wrote_a_store_under_is_collected(self, tmp_path):
+        """Left by an upload whose store was disposed while the server ran --
+        the common case, and the one the sweep exists to mop up."""
+        write_dir = tmp_path / "w"
+        source = fields_root(write_dir) / "ome-tiff_abc"
+        source.mkdir(parents=True)
+
+        assert self._manager(write_dir).discard_unfinished_stores() == 0
+
+        assert not source.exists()
 
 
 def _restart_server(tmp_path):
