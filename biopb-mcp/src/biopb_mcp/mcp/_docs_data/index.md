@@ -15,6 +15,7 @@ plain prose instead.
 - web-viewer: show data in the browser — needs no window; send the link, or open it yourself
 - napari-viewer: the window, when there is one — reading a layer, layers, dims, mouse events
 - ops: the server-side image-processing ops in `ops`
+- algorithm-servers: add an op the kernel cannot import, as one server file
 - requirements: check what a procedure needs, and what to do when a piece is missing
 
 ## Procedures

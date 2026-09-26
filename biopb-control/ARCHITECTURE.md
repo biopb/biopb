@@ -5,8 +5,8 @@
 The control plane is the **durable root** of a biopb deployment — a small
 always-on Starlette/uvicorn app that does three things:
 
-- **supervises the durable planes** as subprocesses (the data plane today, the
-  algorithm plane pending),
+- **supervises the durable planes** as subprocesses: the data plane, and the
+  algorithm servers it runs from the registry (`~/.config/biopb/algorithms/`),
 - **is the single web origin** — it serves the browser SPA and reverse-proxies
   everything behind it,
 - **holds the session registry**, so ephemeral MCP sessions on dynamic ports are

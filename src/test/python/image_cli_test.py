@@ -44,18 +44,27 @@ _ROWS = [
 
 @pytest.fixture
 def stub_statuses(monkeypatch):
-    """Patch _algorithms.statuses; return a dict capturing the timeout it saw."""
+    """Answer for the control; return a dict capturing the timeout it saw.
+
+    ``rows`` None is no control, which falls back to probing the registry
+    (``_algorithms.statuses``, answering ``fallback``).
+    """
     # Widen the rich console so table cells (ops preview, error text) never wrap
     # mid-string under CliRunner's non-terminal default width of 80.
     monkeypatch.setenv("COLUMNS", "200")
     seen = {}
 
-    def _factory(rows):
-        def fake(*, timeout):
+    def _factory(rows, fallback=()):
+        def control(timeout):
             seen["timeout"] = timeout
             return rows
 
-        monkeypatch.setattr("biopb._algorithms.statuses", fake)
+        def probe(*, timeout):
+            seen["probed"] = timeout
+            return list(fallback)
+
+        monkeypatch.setattr("biopb.control.algorithms", control)
+        monkeypatch.setattr("biopb._algorithms.statuses", probe)
         return seen
 
     return _factory
@@ -90,4 +99,14 @@ def test_servers_threads_timeout_to_probe(stub_statuses):
     seen = stub_statuses(_ROWS)
     result = runner.invoke(app, ["servers", "--timeout", "1.5"])
     assert result.exit_code == 0
-    assert seen["timeout"] == 1.5
+    # The control probes url entries under the same deadline, then answers.
+    assert seen["timeout"] > 1.5
+
+
+def test_servers_without_a_control_probes_the_registry(stub_statuses):
+    seen = stub_statuses(None, fallback=_ROWS)
+    result = runner.invoke(app, ["servers", "--timeout", "1.5"])
+    assert result.exit_code == 0
+    assert seen["probed"] == 1.5
+    assert "No control answered" in result.stderr
+    assert "a:1" in result.stdout

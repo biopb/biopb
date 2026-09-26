@@ -49,9 +49,9 @@ def workflow_env(*, plugins=True, require_client=True):
     """Build a workflow's handles; return ``(conn, ops)``.
 
     *conn* is a connected ``biopb.tensor.Connection`` for this machine's data
-    plane and *ops* the ProcessImage callables the config names (an empty dict
-    when it names none). A document that wants the session's spelling for the client
-    takes it on the next line::
+    plane and *ops* the algorithm plane's ops, as the session's kernel binds
+    them (empty when this machine's control names none). A document that wants
+    the session's spelling for the client takes it on the next line::
 
         conn, ops = workflow_env()
         client = conn.client

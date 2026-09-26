@@ -34,7 +34,7 @@ A biopb deployment is a **tree rooted at a durable control plane**:
 ```
    control plane   (durable ROOT — lean: supervise + route + serve the web UI)
         ├── supervises ─► data plane      (tensor Flight server + HTTP sidecar)
-        ├── supervises ─► algorithm plane (algorithm servers)          [pending]
+        ├── supervises ─► algorithm plane (algorithm servers)
         └── observes   ◄─ MCP sessions    (ephemeral, SHIM-owned; self-register)
                             env inherited from the shim
                             USE the planes; never START them

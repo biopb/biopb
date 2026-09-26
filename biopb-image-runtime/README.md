@@ -101,21 +101,15 @@ docker run --rm -p 50051:50051 \
 
 ### Register the server with biopb-mcp
 
-Add your server's URL to the `services.process_image_servers` list in the
-biopb-mcp config (`~/.config/biopb/mcp-config.json`):
+Name the server in the algorithm registry, `~/.config/biopb/algorithms/`, with
+a `<name>.json` file:
 
 ``` json
-{
-    "services": {
-        "process_image_servers": ["grpc://your_ip_address:50051"]
-    }
-}
+{"url": "grpc://your_ip_address:50051"}
 ```
 
-Each URL is queried via `GetOpNames` and exposed as callables in the kernel's
-`ops` dict. You can also edit this without touching the file: the browser
-dashboard's **MCP Settings** page (served by the control) edits the same
-`mcp-config.json`.
+The control probes it and the kernel binds its ops into `ops`. A server
+speaking only `ProcessImage` is listed as an error: the kernel calls `Ops`.
 
 ## Architecture
 This subproject provides:

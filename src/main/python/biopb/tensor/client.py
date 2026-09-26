@@ -180,6 +180,12 @@ class TensorFlightClient:
         self._fetcher = ChunkFetcher(self._state, self._catalog)
         self._upload = UploadSession(self._state, self._catalog)
 
+    @property
+    def location(self) -> str:
+        """The server this client dials, as Arrow names it (``grpc+tls://``
+        for a TLS location)."""
+        return self._location
+
     # ---- Catalog / metadata / source lifecycle (delegated to CatalogClient) ----
 
     def list_sources(self) -> Dict[str, DataSourceDescriptor]:

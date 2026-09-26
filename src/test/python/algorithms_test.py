@@ -84,11 +84,23 @@ def test_servers_from_config_normalizes():
 def test_migration_writes_url_entries_once(home):
     _write_mcp_config(
         home,
-        {"services": {"process_image_servers": ["grpc://gpu:50051", "grpcs://b:2"]}},
+        {
+            "services": {
+                "process_image_servers": ["grpc://gpu:50051", "grpcs://b:2"],
+                "docs_local_dir": "/d",
+            },
+            "timeout": {"process_image": 60},
+        },
     )
     assert _algorithms.migrate_from_mcp_config() == ["gpu-50051", "b-2"]
     urls = {e["name"]: e["url"] for e in _algorithms.entries()}
     assert urls == {"gpu-50051": "grpc://gpu:50051", "b-2": "grpcs://b:2"}
+    # The key leaves the mcp config; the rest of it stays.
+    cfg = json.loads((home / ".config" / "biopb" / "mcp-config.json").read_text())
+    assert cfg == {
+        "services": {"docs_local_dir": "/d"},
+        "timeout": {"process_image": 60},
+    }
 
     # Once: an existing registry is the user's, even an emptied one.
     for path in _algorithms.registry_dir().iterdir():

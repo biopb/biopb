@@ -215,10 +215,13 @@ else:
 print("")
 print("## Ops")
 _ops = globals().get("ops")
-if _ops:
+if hasattr(_ops, "status"):
+    for _line in _ops.status().splitlines():
+        print("  " + _line)
+elif _ops:
     print("  " + ", ".join(sorted(_ops)))
 else:
-    print("  (none configured -- services.process_image_servers -- or unreachable)")
+    print("  (no ops)")
 
 print("")
 # What the plugin loader actually loaded, which neither the kernel dir (fail-open:
@@ -713,7 +716,7 @@ async def execute_code(
 
     The kernel is a full Jupyter/IPython kernel (imports allowed). Its namespace
     always holds the data plane -- client (image data access) -- and the
-    algorithm plane -- ops (a dict of server-side image-processing operations)
+    algorithm plane -- ops (server-side image-processing operations)
     and the user's kernel plugin modules; np and da are imported. A viewer (a
     napari viewer with add_tensor/tensor methods) is there only when the session
     has one: server_status's ## Viewer says. Variables persist across calls

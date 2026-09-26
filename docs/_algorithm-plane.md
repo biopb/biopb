@@ -1,8 +1,7 @@
 # The algorithm plane under the control
 
 Status: **in progress**. Steps 1 (protocol and runtime) and 2 (control) are
-implemented, except that the migration leaves the mcp key in place until the
-kernel reads the control (step 3).
+implemented, and step 3 (clients) except for the widget (biopb-napari-widget).
 
 **Components:** the image protocol (`proto/biopb/image/`, a new `Ops` service),
 `biopb-image-runtime` (a function-level API and a PyPI wheel), `biopb-control`

@@ -91,9 +91,9 @@ def test_every_constraint_reflected(schema):
 
 
 def test_list_fields_are_arrays(schema):
-    services = schema["properties"]["services"]["properties"]
-    assert services["process_image_servers"]["type"] == "array"
-    assert services["process_image_servers"]["items"]["type"] == "string"
+    transport = schema["properties"]["transport"]["properties"]
+    assert transport["allowed_origins"]["type"] == "array"
+    assert transport["allowed_origins"]["items"]["type"] == "string"
 
 
 @pytest.mark.parametrize(

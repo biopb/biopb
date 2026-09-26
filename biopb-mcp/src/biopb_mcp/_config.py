@@ -82,10 +82,14 @@ class TimeoutConfig:
     """Per-call gRPC timeouts (seconds) for the compute plane."""
 
     health_check: float = _h(5.0, "Timeout for a server health check.")
-    get_op_names: float = _h(10.0, "Timeout for listing a server's op names.")
+    get_op_names: float = _h(
+        10.0, "Timeout for listing the algorithm servers and their ops."
+    )
     detection_2d: int = _h(15, "Timeout for a 2D detection call.")
     detection_3d: int = _h(300, "Timeout for a 3D detection call.")
-    process_image: int = _h(300, "Timeout for a ProcessImage call.")
+    process_image: int = _h(
+        300, "How long an op call may go without a word from its server."
+    )
 
 
 @dataclass
@@ -220,13 +224,8 @@ class ViewerConfig:
 
 @dataclass
 class ServicesConfig:
-    """Compute-plane servers and the knowledge store wired into the kernel."""
+    """The knowledge store and the plugins wired into the kernel."""
 
-    process_image_servers: List[str] = _hlist(
-        [],
-        "biopb.image ProcessImage servicer URLs (grpc:// or grpcs://). Each is "
-        "queried via GetOpNames and exposed as callables in the kernel's `ops` dict.",
-    )
     docs_local_dir: str = _h(
         "",
         "Directory of the agent's own docs (*.md), written by write_doc and "
@@ -422,8 +421,8 @@ class McpConfig:
     services: ServicesConfig = _section(
         ServicesConfig,
         "Services",
-        "ProcessImage algorithm servers wired into the kernel as `ops`, and the "
-        "knowledge store.",
+        "The knowledge store and the kernel's plugins. The algorithm servers "
+        "behind `ops` are the control's: ~/.config/biopb/algorithms/.",
     )
     timeout: TimeoutConfig = _section(
         TimeoutConfig, "Timeouts", "Per-call gRPC timeouts for the compute plane."

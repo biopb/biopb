@@ -97,11 +97,10 @@ def configured() -> list[dict]:
 
 
 def servers_from_config(config) -> list[str]:
-    """The ProcessImage server URLs in a loaded biopb-mcp config mapping.
+    """The server URLs a biopb-mcp config listed, for the migration.
 
-    The kernel reads its servers from here until it reads the control, and the
-    registry's migration reads the same key. Any odd shape reads as an empty
-    list; non-string and blank entries are dropped. Never raises.
+    Any odd shape reads as an empty list; non-string and blank entries are
+    dropped. Never raises.
     """
     if not isinstance(config, dict):
         return []
@@ -124,16 +123,18 @@ def _name_for(url: str) -> str:
 
 
 def migrate_from_mcp_config(directory: Optional[Path] = None) -> list[str]:
-    """Write the mcp config's server URLs as url entries; answer the names.
+    """Move the mcp config's server URLs into url entries; answer the names.
 
     Runs once: only while the registry directory does not exist, and it creates
-    the directory whether or not there was anything to write.
+    the directory whether or not there was anything to write. The key leaves
+    the mcp config, which no longer reads it.
     """
     directory = directory or registry_dir()
     if directory.exists():
         return []
+    mcp_config = _locations.mcp_config_path()
     try:
-        config = json.loads(_locations.mcp_config_path().read_text(encoding="utf-8"))
+        config = json.loads(mcp_config.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         config = None
     directory.mkdir(parents=True, exist_ok=True)
@@ -146,6 +147,12 @@ def migrate_from_mcp_config(directory: Optional[Path] = None) -> list[str]:
             json.dumps({"url": url}) + "\n", encoding="utf-8"
         )
         written.append(name)
+    services = config.get("services") if isinstance(config, dict) else None
+    if isinstance(services, dict) and "process_image_servers" in services:
+        del services["process_image_servers"]
+        tmp = mcp_config.with_name(mcp_config.name + ".tmp")
+        tmp.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(mcp_config)
     if written:
         logger.info("algorithm registry: migrated %s from the mcp config", written)
     return written
