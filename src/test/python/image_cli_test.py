@@ -16,24 +16,28 @@ runner = CliRunner()
 
 _ROWS = [
     {
+        "name": "a",
+        "kind": "url",
         "url": "grpc://a:1",
         "target": "a:1",
         "scheme": "grpc",
-        "state": "serving",
-        "ops": ["threshold", "segment"],
+        "state": "up",
+        "ops": [{"name": "threshold"}, {"name": "segment"}],
         "op_count": 2,
+        "fingerprint": "f",
         "error": None,
-        "single_op": False,
     },
     {
+        "name": "b",
+        "kind": "url",
         "url": "grpcs://b:2",
         "target": "b:2",
         "scheme": "grpcs",
         "state": "unreachable",
         "ops": [],
         "op_count": 0,
+        "fingerprint": "",
         "error": "UNAVAILABLE: down",
-        "single_op": False,
     },
 ]
 
@@ -63,7 +67,7 @@ def test_servers_table_lists_configured_servers(stub_statuses):
     assert result.exit_code == 0
     out = result.stdout
     assert "a:1" in out and "b:2" in out
-    assert "threshold, segment" in out  # ops preview for the serving row
+    assert "threshold, segment" in out  # ops preview for the up row
     assert "UNAVAILABLE: down" in out  # error shown for the unreachable row
 
 
@@ -72,26 +76,6 @@ def test_servers_json_emits_the_rows(stub_statuses):
     result = runner.invoke(app, ["servers", "--json"])
     assert result.exit_code == 0
     assert json.loads(result.stdout) == {"servers": _ROWS}
-
-
-def test_servers_single_op_rendered(stub_statuses):
-    stub_statuses(
-        [
-            {
-                "url": "grpc://s:1",
-                "target": "s:1",
-                "scheme": "grpc",
-                "state": "serving",
-                "ops": [],
-                "op_count": 1,
-                "error": None,
-                "single_op": True,
-            }
-        ]
-    )
-    result = runner.invoke(app, ["servers"])
-    assert result.exit_code == 0
-    assert "(single-op)" in result.stdout
 
 
 def test_servers_empty_config_message(stub_statuses):

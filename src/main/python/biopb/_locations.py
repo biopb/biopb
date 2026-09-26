@@ -280,6 +280,24 @@ def mcp_docs_dir() -> Path:
     return config_dir() / "docs"
 
 
+def algorithms_dir() -> Path:
+    """The algorithm registry (``~/.config/biopb/algorithms``).
+
+    One entry per file, named by its stem: ``<name>.py`` is a server file the
+    control runs under uv, ``<name>.json`` (``{"url": ...}``) a server someone
+    else runs. Not created on access, like :func:`mcp_plugin_dir`.
+    """
+    return config_dir() / "algorithms"
+
+
+def algorithms_state_dir() -> Path:
+    """What the control keeps per algorithm entry: each script's cached op
+    list, and its log. Created on access."""
+    d = state_dir() / "algorithms"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def find_config(config_dir: Path = DEFAULT_CONFIG_DIR) -> Path:
     """Resolve the config file in *config_dir*: ``biopb.json``.
 

@@ -141,6 +141,13 @@ def _isolated_sessions(tmp_path, monkeypatch):
     """Point the session registry at a per-test dir (resolve() reads the env per
     request, so setting it here reaches the in-process uvicorn thread too)."""
     monkeypatch.setenv("BIOPB_SESSIONS_DIR", str(tmp_path / "sessions"))
+    # And the algorithm registry, so no test reads (or probes) the user's.
+    monkeypatch.setattr(
+        "biopb._locations.algorithms_dir", lambda: tmp_path / "algorithms"
+    )
+    state = tmp_path / "algorithm-state"
+    state.mkdir(exist_ok=True)
+    monkeypatch.setattr("biopb._locations.algorithms_state_dir", lambda: state)
 
 
 @pytest.fixture
@@ -873,9 +880,12 @@ def test_api_agents_is_token_gated(tokened_control, monkeypatch):
 # --------------------------------------------------------------------------- #
 # Algorithm-plane inspection API (/api/algorithms)
 # --------------------------------------------------------------------------- #
-# A thin, read-only front over biopb._algorithms; we stub that core so the tests
-# never dial a real gRPC server, and assert the wiring: GET returns the probed
-# server rows, a core error is a clean 500, and the surface is token-gated.
+# The rows come from the algorithm plane (stubbed here; see
+# test_algorithm_plane.py); these assert the wiring: GET returns them, a failure
+# is a clean 500, and the surface is token-gated.
+
+
+_ROWS = "biopb_control._algorithm_plane.AlgorithmPlane.rows"
 
 
 def test_api_algorithms_lists_probed_servers(control, monkeypatch):
@@ -884,14 +894,13 @@ def test_api_algorithms_lists_probed_servers(control, monkeypatch):
             "url": "grpc://localhost:50051",
             "target": "localhost:50051",
             "scheme": "grpc",
-            "state": "serving",
-            "ops": ["threshold", "segment"],
+            "state": "up",
+            "ops": [{"name": "threshold"}, {"name": "segment"}],
             "op_count": 2,
             "error": None,
-            "single_op": False,
         },
     ]
-    monkeypatch.setattr("biopb._algorithms.statuses", lambda: fake)
+    monkeypatch.setattr(_ROWS, lambda self, **kw: fake)
     status, _h, body = _get(f"{control}/api/algorithms")
     assert status == 200
     assert json.loads(body)["servers"] == fake
@@ -900,7 +909,7 @@ def test_api_algorithms_lists_probed_servers(control, monkeypatch):
 def test_api_algorithms_folds_in_kernel_plugins(control, monkeypatch):
     # The kernel-plugin "bring your own tool" listing (biopb-mcp#92) rides in the
     # same payload under `plugins`, from the stubbed core inspector.
-    monkeypatch.setattr("biopb._algorithms.statuses", list)
+    monkeypatch.setattr(_ROWS, lambda self, **kw: [])
     fake_plugins = {
         "dir": "/home/u/.config/biopb/kernel",
         "files": [{"name": "tool.py", "summary": "My tool."}],
@@ -915,7 +924,7 @@ def test_api_algorithms_folds_in_kernel_plugins(control, monkeypatch):
 def test_api_algorithms_plugin_error_degrades_not_500(control, monkeypatch):
     # A servers sweep succeeds but the plugin inspector blows up: the panel still
     # returns 200 with an empty plugin listing rather than 500-ing the whole card.
-    monkeypatch.setattr("biopb._algorithms.statuses", list)
+    monkeypatch.setattr(_ROWS, lambda self, **kw: [])
 
     def boom():
         raise RuntimeError("plugin dir unreadable")
@@ -927,17 +936,17 @@ def test_api_algorithms_plugin_error_degrades_not_500(control, monkeypatch):
 
 
 def test_api_algorithms_core_error_is_500(control, monkeypatch):
-    def boom():
+    def boom(self, **kw):
         raise RuntimeError("config unreadable")
 
-    monkeypatch.setattr("biopb._algorithms.statuses", boom)
+    monkeypatch.setattr(_ROWS, boom)
     with pytest.raises(urllib.error.HTTPError) as exc:
         _get(f"{control}/api/algorithms")
     assert exc.value.code == 500
 
 
 def test_api_algorithms_is_token_gated(tokened_control, monkeypatch):
-    monkeypatch.setattr("biopb._algorithms.statuses", list)
+    monkeypatch.setattr(_ROWS, lambda self, **kw: [])
     with pytest.raises(urllib.error.HTTPError) as exc:
         _get(f"{tokened_control}/api/algorithms")
     assert exc.value.code == 401

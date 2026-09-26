@@ -1,8 +1,9 @@
 # The algorithm plane under the control
 
-Status: **in progress**. Step 1 (protocol and runtime) is implemented, except
-that a streaming op still sends each yielded item through the sink on its own
-rather than into one tensor.
+Status: **in progress**. Steps 1 (protocol and runtime) and 2 (control) are
+implemented, except that a streaming op still sends each yielded item through
+the sink on its own rather than into one tensor, and the migration leaves the
+mcp key in place until the kernel reads the control (step 3).
 
 **Components:** the image protocol (`proto/biopb/image/`, a new `Ops` service),
 `biopb-image-runtime` (a function-level API and a PyPI wheel), `biopb-control`

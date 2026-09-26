@@ -53,12 +53,15 @@ interface AgentRec {
   drifted?: boolean;
 }
 interface AlgoRec {
+  name: string;
+  kind: string; // "script" | "url"
   target: string;
-  state: string; // "serving" | "down" | "unknown" | "invalid"
+  // new | installing | stopped | starting | up | failed (a script entry);
+  // up | unreachable | error | invalid (a url entry)
+  state: string;
   scheme?: string;
-  single_op?: boolean;
   op_count?: number;
-  ops?: string[];
+  ops?: { name: string }[];
   error?: string;
 }
 // The kernel-namespace "bring your own tool" plugins (biopb-mcp#92), folded into
@@ -477,9 +480,8 @@ export default function DashboardPage() {
             )}
           </ul>
           <p className="note">
-            Read-only view of the biopb.image ProcessImage servers configured for
-            agent kernels, with a live health + ops probe. Lifecycle control is
-            not offered here.
+            The entries in ~/.config/biopb/algorithms/: server files the control
+            runs on first use, and servers someone else runs, probed live.
           </p>
 
           <div className="subhead">Kernel plugins</div>
@@ -650,24 +652,25 @@ export default function DashboardPage() {
 // state + op count, and an ops preview (full list in the hover title). A
 // non-serving server shows its error message in the preview slot instead.
 function AlgoRow({ s }: { s: AlgoRec }) {
-  const serving = s.state === "serving";
-  const dotCls =
-    "dot " + (serving ? "serving" : s.state === "unknown" ? "" : "down");
+  const serving = s.state === "up";
+  // A script entry that is installed but not running is healthy: it starts
+  // on its first call.
+  const idle = ["new", "installing", "stopped", "starting"].includes(s.state);
+  const dotCls = "dot " + (serving ? "serving" : idle ? "" : "down");
   let stateLabel = s.state;
-  if (serving)
-    stateLabel = s.single_op
-      ? "serving · single-op"
-      : "serving · " + (s.op_count || 0) + " op" + (s.op_count === 1 ? "" : "s");
-  else if (s.state === "invalid") stateLabel = "invalid URL";
-  else if (s.state === "unknown") stateLabel = "gRPC unavailable";
-  const joined = s.ops ? s.ops.join(", ") : "";
+  if (serving || s.state === "stopped")
+    stateLabel =
+      s.state + " · " + (s.op_count || 0) + " op" + (s.op_count === 1 ? "" : "s");
+  else if (s.state === "invalid") stateLabel = "invalid entry";
+  const joined = s.ops ? s.ops.map((o) => o.name).join(", ") : "";
   return (
     <li>
       <span className={dotCls}></span>
-      <span className="sid">{s.target}</span>
+      <span className="sid">{s.name}</span>
+      {s.kind === "url" ? <span className="sid">{s.target}</span> : null}
       {s.scheme === "grpcs" ? <span className="tls">TLS</span> : null}
       <span className="state">{stateLabel}</span>
-      {serving && s.ops && s.ops.length ? (
+      {(serving || s.state === "stopped") && s.ops && s.ops.length ? (
         <span className="ops" title={joined}>
           {joined}
         </span>

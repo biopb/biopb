@@ -256,7 +256,7 @@ def _write_output(
 def _state_style(state: str) -> str:
     """Rich colour for a probe state, so the table reads at a glance."""
     return {
-        "serving": "green",
+        "up": "green",
         "unreachable": "red",
         "error": "red",
         "invalid": "yellow",
@@ -273,13 +273,10 @@ def servers(
         4.0, "--timeout", help="Per-server probe deadline in seconds"
     ),
 ) -> None:
-    """List the configured algorithm-plane servers with a health + ops probe.
+    """List the algorithm registry's entries, probing each url entry.
 
-    Reads the ProcessImage servers wired into the biopb-mcp config (under
-    services.process_image_servers) -- the same set an agent kernel exposes as
-    ops -- and probes each for liveness and its advertised operations. This is the
-    CLI face of the control dashboard's Algorithm plane section: read-only (no
-    lifecycle control), never writes config.
+    Reads ~/.config/biopb/algorithms/: a url entry is probed for its ops, and a
+    script entry is listed as the control runs it. Read-only.
 
     Examples:
         biopb image servers
@@ -293,32 +290,30 @@ def servers(
 
     if not rows:
         stderr_console.print(
-            "[yellow]No algorithm servers configured.[/yellow] Add ProcessImage "
-            "server URLs under [bold]services.process_image_servers[/bold] in "
-            "the biopb-mcp config."
+            "[yellow]No algorithm servers configured.[/yellow] Add a server file "
+            'or a {"url": ...} file to [bold]~/.config/biopb/algorithms/[/bold].'
         )
         raise typer.Exit(0)
 
     table = Table(title="Algorithm plane servers")
+    table.add_column("Name", style="cyan")
     table.add_column("Server", style="cyan")
     table.add_column("Scheme", style="blue")
     table.add_column("State", style="green")
     table.add_column("Ops", style="magenta")
 
     for r in rows:
-        if r["state"] == "serving":
-            ops_cell = (
-                "(single-op)" if r.get("single_op") else ", ".join(r["ops"]) or "-"
-            )
+        if r["state"] == "up":
+            ops_cell = ", ".join(o.get("name", "") for o in r["ops"]) or "-"
         else:
             ops_cell = r.get("error") or "-"
         state = f"[{_state_style(r['state'])}]{r['state']}[/]"
-        table.add_row(r["target"], r["scheme"], state, ops_cell)
+        table.add_row(r["name"], r["target"], r["scheme"], state, ops_cell)
 
     console.print(table)
-    n_serving = sum(1 for r in rows if r["state"] == "serving")
+    n_up = sum(1 for r in rows if r["state"] == "up")
     stderr_console.print(
-        f"\n[green]Servers:[/green] {len(rows)}  [green]serving:[/green] {n_serving}"
+        f"\n[green]Servers:[/green] {len(rows)}  [green]up:[/green] {n_up}"
     )
 
 

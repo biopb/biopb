@@ -21,9 +21,10 @@ import threading
 from pathlib import Path
 from typing import Optional
 
-from biopb import _credentials
+from biopb import _algorithms, _credentials
 from biopb.control import _endpoints
 
+from ._algorithm_plane import AlgorithmPlane
 from ._control import serve_control_api
 from ._supervisor import DataPlaneSpec, DataPlaneSupervisor
 
@@ -32,14 +33,13 @@ logger = logging.getLogger(__name__)
 _SUPERVISION_INTERVAL = 1.0  # seconds between liveness/restart checks
 
 
-def _supervision_loop(
-    supervisor: DataPlaneSupervisor, stop: threading.Event, interval: float
-) -> None:
+def _supervision_loop(supervisors, stop: threading.Event, interval: float) -> None:
     while not stop.is_set():
-        try:
-            supervisor.tick()
-        except Exception:  # noqa: BLE001 - a supervision tick must never die
-            logger.exception("supervision tick failed")
+        for supervisor in supervisors:
+            try:
+                supervisor.tick()
+            except Exception:  # noqa: BLE001 - a supervision tick must never die
+                logger.exception("supervision tick failed")
         stop.wait(interval)
 
 
@@ -89,11 +89,21 @@ def run_control(
     )
 
     supervisor = DataPlaneSupervisor(spec)
+    # A script entry's large results go to this control's plane.
+    algorithms = AlgorithmPlane(
+        data_plane=(lambda: (supervisor.grpc_url, spec.token))
+        if data_plane
+        else (lambda: None)
+    )
     stop = threading.Event()
 
     try:
         server, _api_thread = serve_control_api(
-            control_host, control_port, supervisor, ensure_timeout
+            control_host,
+            control_port,
+            supervisor,
+            ensure_timeout,
+            algorithms=algorithms,
         )
     except OSError as exc:
         logger.error(
@@ -142,9 +152,15 @@ def run_control(
         logger.info("Bringing up the data plane")
         supervisor.ensure()
 
+    # The algorithm servers the mcp config listed become url entries, once.
+    try:
+        _algorithms.migrate_from_mcp_config()
+    except OSError as exc:
+        logger.warning("could not migrate the algorithm servers: %s", exc)
+
     loop = threading.Thread(
         target=_supervision_loop,
-        args=(supervisor, stop, _SUPERVISION_INTERVAL),
+        args=((supervisor, algorithms), stop, _SUPERVISION_INTERVAL),
         name="control-supervision",
         daemon=True,
     )
@@ -178,6 +194,7 @@ def run_control(
 
     logger.info("shutting down")
     server.shutdown()
+    algorithms.stop_all()
     supervisor.stop()
     # Retract the credential we published so a stopped control leaves no readable
     # token behind (a crash can't run this; the next control start overwrites it).
