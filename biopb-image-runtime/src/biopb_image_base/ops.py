@@ -30,7 +30,9 @@ same rank.
 
 A single return value is the output ``result``; a tuple gives ``0``, ``1``,
 .... An array is a tensor output, inline or on the sink by size, and anything
-else is JSON. A function that yields is a streaming op: one event per item.
+else is JSON. A function that yields is a streaming op: a yielded string is a
+progress event, anything else one item's outputs, and a value it returns is
+the final event's outputs.
 
 Where large results go is the deployment's, not the call's: the embedded
 tensor server under ``--cache-dir``, else the plane named by
@@ -693,12 +695,28 @@ class _OpsServicer(BiopbServicerBase, proto.OpsServicer):
             yield self._event(definition, result, relabel, context)
             return
 
+        # A yielded string is progress; anything else is one item's outputs.
+        # The generator's return value, if any, is the final event's outputs.
         items = definition.fn(**inputs, **kwargs)
+        count = 0
         try:
-            for count, item in enumerate(items, start=1):
+            while True:
+                try:
+                    item = next(items)
+                except StopIteration as stop:
+                    result = stop.value
+                    break
+                if isinstance(item, str):
+                    if self._compress:
+                        context.disable_next_message_compression()
+                    yield proto.Event(progress=item)
+                    continue
+                count += 1
                 event = self._event(definition, item, relabel, context)
                 event.progress = str(count)
                 yield event
+            if result is not None:
+                yield self._event(definition, result, relabel, context)
         finally:
             items.close()
 

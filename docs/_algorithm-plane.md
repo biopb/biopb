@@ -1,9 +1,8 @@
 # The algorithm plane under the control
 
 Status: **in progress**. Steps 1 (protocol and runtime) and 2 (control) are
-implemented, except that a streaming op still sends each yielded item through
-the sink on its own rather than into one tensor, and the migration leaves the
-mcp key in place until the kernel reads the control (step 3).
+implemented, except that the migration leaves the mcp key in place until the
+kernel reads the control (step 3).
 
 **Components:** the image protocol (`proto/biopb/image/`, a new `Ops` service),
 `biopb-image-runtime` (a function-level API and a PyPI wheel), `biopb-control`
@@ -208,13 +207,15 @@ the servicer base with its error translation).
   rule, so an op can return a label image and a table together.
 - **A function that yields is a streaming op.** Tracking and SMLM carry state
   from frame to frame, which `blocks` cannot, and a generator holds it
-  between yields. The function takes its input `"lazy"` and yields one item
-  per step. With a plane as the sink, the server adds one tensor up front,
-  writes each yielded frame into it, and every event carries that one
-  reference and the progress, so the result is readable while the stream
-  runs. Without one, each event carries its item inline and the client
-  concatenates. A cancelled call closes the generator and keeps what was
-  written.
+  between yields. The function takes its input `"lazy"`. A yielded string
+  is a progress event; anything else is one item's outputs, by the same rule
+  as a return value, for an op whose items stand alone (a table of
+  localizations per frame). What it returns is the final event's outputs, for
+  an op that builds one result over the run (a tracker's label movie): the
+  function assembles it, as a dask array when it is large, since the output's
+  shape is not known before the first frame. Progress keeps the stream within
+  the client's inactivity timeout. A cancelled call closes the generator, and
+  a result it had not returned is lost.
 
 ### The runtime package
 

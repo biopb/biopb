@@ -66,6 +66,23 @@ def frames(movie: Tensor("TYX")):
 
 
 @op(input="lazy")
+def track(movie: Tensor("TYX")):
+    n = movie.shape[0]
+    out = []
+    for t in range(n):
+        out.append(movie[t].compute() + 1)
+        yield f"frame {t + 1}/{n}"
+    return np.stack(out)
+
+
+@op(input="lazy")
+def localize(movie: Tensor("TYX")):
+    for t in range(movie.shape[0]):
+        yield f"frame {t + 1}"
+        yield {"frame": t, "total": int(movie[t].sum().compute())}
+
+
+@op(input="lazy")
 def double(image: Tensor("YX")):
     return image * 2
 
@@ -80,7 +97,18 @@ def greet(name: str) -> str:
     return f"hello {name}"
 
 
-ALL = [label_stats, threshold, smooth, shrink, frames, double, total, greet]
+ALL = [
+    label_stats,
+    threshold,
+    smooth,
+    shrink,
+    frames,
+    track,
+    localize,
+    double,
+    total,
+    greet,
+]
 
 
 def _defs(functions=ALL):
@@ -243,6 +271,26 @@ def test_streaming_op_sends_an_event_per_item(server):
     assert [e.progress for e in events] == ["1", "2", "3"]
     for t, event in enumerate(events):
         np.testing.assert_array_equal(_value(event.outputs["result"]), movie[t] * 2)
+
+
+def test_progress_then_the_returned_tensor(server):
+    movie = np.arange(3 * 2 * 2, dtype=np.int32).reshape(3, 2, 2)
+    events = server.call("track", movie=_eager(movie, ["T", "Y", "X"]))
+    assert [e.progress for e in events[:-1]] == ["frame 1/3", "frame 2/3", "frame 3/3"]
+    assert all(not e.outputs for e in events[:-1])
+    out = events[-1].outputs["result"]
+    assert list(out.eager.dim_labels) == ["T", "Y", "X"]
+    np.testing.assert_array_equal(_value(out), movie + 1)
+
+
+def test_progress_between_items_and_no_final_event(server):
+    movie = np.ones((2, 2, 2), np.int32)
+    events = server.call("localize", movie=_eager(movie, ["T", "Y", "X"]))
+    assert [e.progress for e in events] == ["frame 1", "1", "frame 2", "2"]
+    assert [_value(e.outputs["result"]) for e in events if e.outputs] == [
+        {"frame": 0, "total": 4},
+        {"frame": 1, "total": 4},
+    ]
 
 
 def test_a_token_is_checked():

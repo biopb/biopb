@@ -35,7 +35,8 @@ exits.
   arrays, and `"blocks"` maps a pixelwise function over blocks with
   `block_shape` and `overlap`, iterating the axes not in `axes`.
 - A single return value is the output `result`, a tuple `0`, `1`, .... Arrays
-  are tensors; anything else is JSON. A generator yields one event per item.
+  are tensors; anything else is JSON. A generator yields progress strings
+  and per-item outputs, and what it returns is the final event's outputs.
 - Large results go to the embedded tensor server under `--cache-dir`, else to
   the plane named by `BIOPB_TENSOR_URL`/`BIOPB_TENSOR_TOKEN`, else inline.
 - The core install serves inline pixels only; `[lazy]` adds lazy input and the
