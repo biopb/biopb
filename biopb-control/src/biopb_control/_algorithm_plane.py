@@ -333,10 +333,11 @@ class ScriptEntry(ServiceProcess):
             cached = self.cached()
             if cached is None or cached["hash"] != _file_hash(self.path):
                 return  # the install failed: the row carries why
-            # A start that failed at this version is retried.
+            # A start that failed at this version is retried; reaping first
+            # lets that clear cover a child that died since the last tick.
+            self._reap_locked()
             self._error = None
             self._failed_hash = None
-            self._reap_locked()
             if self._proc is not None and self._running_hash != cached["hash"]:
                 self._stop_locked()
             self._want = True
