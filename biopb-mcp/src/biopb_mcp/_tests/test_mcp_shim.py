@@ -9,6 +9,7 @@ listings with no child, spawn its own http session child on the first tool
 call, and **reap** that child when the client hangs up.
 """
 
+import contextlib
 import json
 import os
 import re
@@ -23,7 +24,11 @@ import pytest
 from biopb._lifecycle.owned_child import OwnedChild
 from mcp import types
 
-from biopb_mcp.mcp import _shim, _surface
+from biopb_mcp.mcp import (
+    _server,  # noqa: F401 - registers the tools
+    _shim,
+)
+from biopb_mcp.mcp._app import mcp
 
 
 def _free_port():
@@ -32,27 +37,33 @@ def _free_port():
         return s.getsockname()[1]
 
 
+def _port_listening(port, timeout=0.5):
+    """Whether something accepts TCP connections on 127.0.0.1:<port>."""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 def _cfg(**transport):
     return {"transport": transport}
 
 
-# A stand-in session child: reads its port-report file from the env, binds a
-# dynamic port, publishes it atomically (temp + os.replace, as the real child
-# does), then accepts connections so the readiness probe succeeds. It must
-# accept, not merely listen(): the probe opens a fresh TCP connection on every
-# poll, and an un-drained backlog makes a later probe fail on macOS's stricter
-# socket stack (the real uvicorn child accepts, so this is a fixture artifact).
+# A stand-in session child: reads its port-report file from the env, binds and
+# listens on a dynamic port, publishes it atomically (temp + os.replace), as the
+# real child does, then accepts connections so a test's own probe succeeds.
 _FAKE_CHILD = (
     "import os, socket, sys, threading, time\n"
     "pf = os.environ['BIOPB_PORT_REPORT_FILE']\n"
     "s = socket.socket()\n"
     "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
     "s.bind(('127.0.0.1', 0))\n"
+    "s.listen(16)\n"
     "port = s.getsockname()[1]\n"
     "tmp = pf + '.tmp'\n"
     "open(tmp, 'w').write(str(port))\n"
     "os.replace(tmp, pf)\n"
-    "s.listen(16)\n"
     "def _serve():\n"
     "    while True:\n"
     "        try:\n"
@@ -62,17 +73,6 @@ _FAKE_CHILD = (
     "threading.Thread(target=_serve, daemon=True).start()\n"
     "time.sleep(30)\n"
 )
-
-
-class TestPortListening:
-    def test_true_for_listening_socket(self):
-        with socket.socket() as s:
-            s.bind(("127.0.0.1", 0))
-            s.listen(1)
-            assert _shim._port_listening(s.getsockname()[1]) is True
-
-    def test_false_for_closed_port(self):
-        assert _shim._port_listening(_free_port()) is False
 
 
 class TestSessionCommand:
@@ -158,7 +158,7 @@ class TestSpawnSession:
             m = re.match(r"http://127\.0\.0\.1:(\d+)/mcp$", url)
             assert m, url
             port = int(m.group(1))
-            assert _shim._port_listening(port) is True
+            assert _port_listening(port) is True
             assert child.poll() is None  # still running while we bridge
             if os.name == "nt":
                 assert child.job is not None  # Windows: a kill-on-close Job Object
@@ -192,7 +192,6 @@ class TestSpawnSession:
         from biopb._lifecycle import owned_child
 
         monkeypatch.setattr(owned_child.subprocess, "Popen", _fake_popen)
-        monkeypatch.setattr(_shim, "_await_listening", lambda *a, **k: None)
 
         spawned = []
         child, url, session_id = _shim.spawn_session(
@@ -393,23 +392,22 @@ class TestBuildProxy:
     def _call(self, handler, req):
         return anyio.run(lambda: handler(req))
 
-    def test_lists_come_from_the_surface_not_the_child(self):
-        surface = _surface.load()
-        app = _shim.build_proxy(_no_child, surface)
+    def test_lists_come_from_the_fastmcp_server_not_the_child(self):
+        app = _shim.build_proxy(_no_child, mcp._mcp_server)
         tools = self._call(
             app.request_handlers[types.ListToolsRequest],
             types.ListToolsRequest(method="tools/list"),
         )
-        assert tools.root.tools == surface.tools
+        assert {"start_kernel", "execute_code"} <= {t.name for t in tools.root.tools}
         resources = self._call(
             app.request_handlers[types.ListResourcesRequest],
             types.ListResourcesRequest(method="resources/list"),
         )
-        assert resources.root.resources == surface.resources
+        assert [str(r.uri) for r in resources.root.resources] == ["docs://index"]
 
     def test_call_tool_forwards_name_and_args(self):
         remote = _FakeRemote()
-        app = _shim.build_proxy(_connect_to(remote), _surface.load())
+        app = _shim.build_proxy(_connect_to(remote), mcp._mcp_server)
         req = types.CallToolRequest(
             method="tools/call",
             params=types.CallToolRequestParams(
@@ -422,7 +420,7 @@ class TestBuildProxy:
 
     def test_call_tool_failure_becomes_tool_error_not_bridge_death(self):
         remote = _FakeRemote()
-        app = _shim.build_proxy(_connect_to(remote), _surface.load())
+        app = _shim.build_proxy(_connect_to(remote), mcp._mcp_server)
         req = types.CallToolRequest(
             method="tools/call",
             params=types.CallToolRequestParams(name="explodes", arguments={}),
@@ -435,7 +433,7 @@ class TestBuildProxy:
         async def connect():
             raise RuntimeError("the biopb-mcp session did not start: no port")
 
-        app = _shim.build_proxy(connect, _surface.load())
+        app = _shim.build_proxy(connect, mcp._mcp_server)
         req = types.CallToolRequest(
             method="tools/call",
             params=types.CallToolRequestParams(name="start_kernel", arguments={}),
@@ -445,75 +443,55 @@ class TestBuildProxy:
         assert "did not start: no port" in result.root.content[0].text
 
 
-class TestInitOptions:
-    def test_carries_the_surface_capabilities_and_the_instructions(self):
-        from biopb_mcp.mcp import _instructions
-
-        surface = _surface.load()
-        app = _shim.build_proxy(_no_child, surface)
-        opts = _shim.init_options(app, surface)
-        assert opts.server_name == "biopb-mcp"
-        assert opts.capabilities == surface.capabilities
-        assert opts.instructions.startswith(_instructions.BASE_INSTRUCTIONS)
-
-
-class TestSurface:
-    def test_snapshot_matches_the_live_server(self):
-        # Regenerate with `python -m biopb_mcp.mcp._surface` when this fails.
-        from importlib import resources
-
-        shipped = (
-            resources.files("biopb_mcp.mcp")
-            .joinpath("_surface.json")
-            .read_text(encoding="utf-8")
-        )
-        assert shipped == _surface.render(_surface.build())
-
-
-class _FakeSession:
-    """What _LazySession connects to: counts spawns, fails the first *fail*."""
-
-    def __init__(self, fail=0):
-        self.spawns = 0
-        self.fail = fail
-        self.reaped = []
-
-
 class TestLazySession:
-    def _lazy(self, monkeypatch, fake):
-        lazy = _shim._LazySession(config=object())
-        monkeypatch.setattr(
-            _shim._control_client, "start_control_detached", lambda: True
-        )
+    """Drives the real ``get()``: the spawn and the connection are the fakes."""
+
+    def _lazy(self, monkeypatch, fail=0):
+        spawns, reaped = [], []
 
         class _Child:
             pid = 4242
 
         def _spawn(config, on_spawned=None):
-            fake.spawns += 1
-            on_spawned(_Child())
-            if fake.spawns <= fake.fail:
-                raise RuntimeError(f"spawn {fake.spawns} failed")
-            return _Child(), "http://127.0.0.1:1/mcp", "sid"
+            child = _Child()
+            spawns.append(child)
+            on_spawned(child)
+            if len(spawns) <= fail:
+                raise RuntimeError(f"spawn {len(spawns)} failed")
+            return child, "http://127.0.0.1:1/mcp", "sid"
 
-        async def _serve(self_):
-            await anyio.to_thread.run_sync(
-                lambda: _spawn(self_._config, on_spawned=self_._own)
-            )
-            self_._session = "SESSION"
-            self_._done.set()
-            await anyio.sleep_forever()
+        @contextlib.asynccontextmanager
+        async def _client(url):
+            yield "READ", "WRITE", None
 
-        monkeypatch.setattr(_shim._LazySession, "_start_and_serve", _serve)
-        monkeypatch.setattr(_shim, "_reap_session", fake.reaped.append)
-        return lazy
+        class _Session:
+            def __init__(self, read, write):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def initialize(self):
+                pass
+
+        monkeypatch.setattr(_shim, "spawn_session", _spawn)
+        monkeypatch.setattr(_shim, "streamablehttp_client", _client)
+        monkeypatch.setattr(_shim, "ClientSession", _Session)
+        monkeypatch.setattr(_shim, "_reap_session", reaped.append)
+        monkeypatch.setattr(
+            _shim._control_client, "start_control_detached", lambda: True
+        )
+        return _shim._LazySession(config=object()), spawns, reaped
 
     def _drive(self, lazy, *steps):
         results = []
 
         async def main():
             async with anyio.create_task_group() as tg:
-                tg.start_soon(lazy.run)
+                lazy.task_group = tg
                 for step in steps:
                     try:
                         results.append(await step())
@@ -525,38 +503,36 @@ class TestLazySession:
         return results
 
     def test_nothing_spawns_until_asked(self, monkeypatch):
-        fake = _FakeSession()
-        lazy = self._lazy(monkeypatch, fake)
+        lazy, spawns, reaped = self._lazy(monkeypatch)
         self._drive(lazy)
-        assert fake.spawns == 0
         lazy.reap()  # no child: a no-op
-        assert fake.reaped == []
+        assert spawns == [] and reaped == []
 
     def test_concurrent_requests_share_one_child(self, monkeypatch):
-        fake = _FakeSession()
-        lazy = self._lazy(monkeypatch, fake)
+        lazy, spawns, _ = self._lazy(monkeypatch)
 
         async def both():
             out = []
+
+            async def one():
+                out.append(await lazy.get())
+
             async with anyio.create_task_group() as tg:
-                for _ in range(2):
-                    tg.start_soon(lambda: _append(out, lazy.get()))
+                tg.start_soon(one)
+                tg.start_soon(one)
             return out
 
-        async def _append(out, aw):
-            out.append(await aw)
-
-        assert self._drive(lazy, both) == [["SESSION", "SESSION"]]
-        assert fake.spawns == 1
+        [(first, second)] = self._drive(lazy, both)
+        assert first is second
+        assert len(spawns) == 1
 
     def test_a_failed_start_is_reported_then_retried(self, monkeypatch):
-        fake = _FakeSession(fail=1)
-        lazy = self._lazy(monkeypatch, fake)
+        lazy, spawns, reaped = self._lazy(monkeypatch, fail=1)
         first, second = self._drive(lazy, lazy.get, lazy.get)
         assert "did not start: spawn 1 failed" in first
-        assert second == "SESSION"
-        assert fake.spawns == 2
-        assert len(fake.reaped) == 1  # the failed attempt's child
+        assert not isinstance(second, str)
+        assert len(spawns) == 2
+        assert reaped == spawns[:1]  # the failed attempt's child
 
 
 # --------------------------------------------------------------------------- #
@@ -707,7 +683,7 @@ class TestEndToEnd:
             )
             port = int(_extract(r"http://127\.0\.0\.1:(\d+)/mcp", log, "listen port"))
             assert _pid_alive(child_pid)  # up now
-            assert _shim._port_listening(port) is True
+            assert _port_listening(port) is True
 
             # The child registered itself for control discovery (the shared
             # biopb state tree, isolated here via HOME), under its own pid.
@@ -722,7 +698,7 @@ class TestEndToEnd:
             shim.stdin.close()
             assert shim.wait(timeout=40) == 0
             _await_dead(child_pid, timeout=20)
-            assert _shim._port_listening(port) is False  # server truly gone
+            assert _port_listening(port) is False  # server truly gone
             # No routing ghost: POSIX reaps with SIGTERM, and the child drops
             # its own record; Windows force-kills the tree, leaving a record
             # whose dead pid the registry prunes on the next read.

@@ -17,7 +17,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from biopb_mcp._tests.conftest import ScriptedJobs, call_tool as _tool, rpc_reply
-from biopb_mcp.mcp import _app, _instructions, _kernel_rpc, _server, _writers
+from biopb_mcp.mcp import _app, _kernel_rpc, _server, _writers
 
 
 def _result(stdout="", result_text="", error_text="", status="ok"):
@@ -307,7 +307,7 @@ class TestInstructions:
     def test_base_instructions_carry_guardrails(self):
         # The operation guardrails must be delivered up front via the handshake
         # instructions (not left to a pull-on-demand resource).
-        base = _instructions.BASE_INSTRUCTIONS
+        base = _app._BASE_INSTRUCTIONS
         assert "guardrails" in base.lower()
         assert "query_sources" in base
         assert "filesystem" in base.lower()
@@ -325,7 +325,7 @@ class TestInstructions:
         so the always-on guidance must not be written as though it does -- an
         agent that believes there is a window reports a visual check nobody
         could see."""
-        base = _instructions.BASE_INSTRUCTIONS
+        base = _app._BASE_INSTRUCTIONS
         assert "server_status" in base
         # The guardrail names the route that works either way.
         assert "web-viewer" in base
@@ -337,10 +337,10 @@ class TestInstructions:
         # loses agents (#894).
         _app._recompose_instructions()
         instr = _app.mcp._mcp_server.instructions
-        assert instr.startswith(_instructions.BASE_INSTRUCTIONS)
-        assert _instructions.INDEX_HEADER in instr
+        assert instr.startswith(_app._BASE_INSTRUCTIONS)
+        assert _app._INDEX_HEADER in instr
         assert "- kernel:" in instr
-        assert "write_doc" in instr.split(_instructions.INDEX_HEADER)[1]
+        assert "write_doc" in instr.split(_app._INDEX_HEADER)[1]
 
     def test_the_instructions_are_recomposed_per_session(self):
         """A long-lived HTTP server outlives many sessions, and the index is a

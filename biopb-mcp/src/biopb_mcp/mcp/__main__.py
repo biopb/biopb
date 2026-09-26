@@ -28,14 +28,10 @@ from biopb._locations import (
     MCP_SESSION_LOG_ENV,
 )
 
+from ._shim import ENV_PORT_REPORT_FILE, ENV_SESSION_ID
+
 logger = logging.getLogger(__name__)
 
-
-# Env var carrying the path of the file a shim-owned child publishes its
-# OS-assigned port to (the shim-owned session model). Presence of this var is also
-# how _serve_http tells a shim-owned child (dynamic port, reported back) from a
-# direct `--transport http` launch (fixed port). Kept in sync with _shim.
-ENV_PORT_REPORT_FILE = "BIOPB_PORT_REPORT_FILE"
 
 # Env var naming this process's own logfile, so it can report it (server_status)
 # and the agent's execute_code can read it from os.environ. Set by whoever
@@ -43,11 +39,6 @@ ENV_PORT_REPORT_FILE = "BIOPB_PORT_REPORT_FILE"
 # a viewer it launches. Bound from the core SDK rather than repeated, since it is
 # now three processes across two packages that must agree on one string.
 ENV_SESSION_LOG = MCP_SESSION_LOG_ENV
-
-# Env var carrying the id the stdio shim minted for this session (it names the
-# session's logfile, so the shim needs it before we exist). Kept in sync with
-# _shim.ENV_SESSION_ID. Absent for a `biopb mcp view` session, which mints its own.
-ENV_SESSION_ID = "BIOPB_MCP_SESSION_ID"
 
 # Env var naming the launch this viewer belongs to, set by the control when it
 # spawns one from the dashboard. Echoed into our registry record so that
@@ -80,7 +71,7 @@ def _report_port(path, port):
         logger.warning("Could not write port report file %s", path, exc_info=True)
 
 
-def _register_session(port, session_id=None):
+def _register_session(port, mcp_url, session_id=None, launched_by=None):
     """Publish this session in the session registry; return its id.
 
     The control lists live sessions and proxies ``/session/<id>/*`` from this
@@ -88,6 +79,8 @@ def _register_session(port, session_id=None):
     and no dashboard entry. Every session on a dynamic port publishes itself --
     a shim-owned child under *session_id*, the id its shim minted, a `biopb mcp
     view` session under a fresh one -- and drops the record in ``_shutdown``.
+    *launched_by* is the control's launch token, echoed so that launcher can
+    recognise *this* session (see MCP_LAUNCH_TOKEN_ENV).
 
     Best-effort, and broadly caught (biopb/biopb#422): a registry write failure
     -- a serialization error, an unwritable state dir -- must cost the session
@@ -96,11 +89,6 @@ def _register_session(port, session_id=None):
     """
     from biopb import _sessions
 
-    # Whoever launched us gets their token back on the record, so they can
-    # recognise *this* session rather than guessing from a pid they may not even
-    # hold (see MCP_LAUNCH_TOKEN_ENV). Nothing else reads it, and a session
-    # started any other way carries none.
-    launched_by = os.environ.get(ENV_LAUNCH_TOKEN)
     extra = {LAUNCH_TOKEN_FIELD: launched_by} if launched_by else {}
 
     try:
@@ -109,7 +97,7 @@ def _register_session(port, session_id=None):
             session_id,
             port=port,
             pid=os.getpid(),
-            mcp_url=f"http://127.0.0.1:{port}/mcp",
+            mcp_url=mcp_url,
             **extra,
         )
     except Exception:
@@ -378,9 +366,12 @@ def _serve_http(config, port, view=False):
     from . import _app, _scratch, _server, _xvfb
     from ._kernel import ENV_NO_VIEWER, ENV_SCRATCH, KernelHost
 
-    # Taken out of the environment the kernel inherits: a session started from a
-    # cell must mint its own id, not overwrite this one's record.
+    # What our launcher handed *this* process, taken out of the environment the
+    # kernel inherits so a session started from a cell is not mistaken for us.
+    # (The session log path stays: the kernel reports it too.)
+    report_file = os.environ.pop(ENV_PORT_REPORT_FILE, None)
     minted_id = os.environ.pop(ENV_SESSION_ID, None)
+    launched_by = os.environ.pop(ENV_LAUNCH_TOKEN, None)
 
     # Windows: serve on the Selector event loop, not the default Proactor one
     # (biopb/biopb#383). The Proactor accept loop treats *any* OSError from
@@ -539,7 +530,6 @@ def _serve_http(config, port, view=False):
     #     prints its URL instead.
     # A direct `--transport http` binds the configured port. The POSIX signal
     # handlers below reap our kernel gracefully in every mode.
-    report_file = os.environ.get(ENV_PORT_REPORT_FILE)
     shim_owned = bool(report_file)
     dynamic_port = shim_owned or view
     listen_sock = None
@@ -552,12 +542,13 @@ def _serve_http(config, port, view=False):
         # refused.
         listen_sock.listen()
         port = listen_sock.getsockname()[1]
-        _app.set_mcp_url(f"http://127.0.0.1:{port}/mcp")
+        mcp_url = f"http://127.0.0.1:{port}/mcp"
+        _app.set_mcp_url(mcp_url)
         if shim_owned:
             _report_port(report_file, port)
         else:  # view
             print(
-                f"biopb-mcp viewer serving on http://127.0.0.1:{port}/mcp "
+                f"biopb-mcp viewer serving on {mcp_url} "
                 "(Ctrl-C to stop; an agent may attach at this URL).",
                 flush=True,
             )
@@ -653,7 +644,7 @@ def _serve_http(config, port, view=False):
     # last, with a `--view` window up and the serve loop the next statement, so
     # a record implies a session that is all but answering.
     if dynamic_port:
-        session_id = _register_session(port, minted_id)
+        session_id = _register_session(port, mcp_url, minted_id, launched_by)
 
     _server.run(
         port,

@@ -410,6 +410,9 @@ class TestAgentlessViewer:
         assert _is_agentless_viewer(view, shim_owned) is expected
 
 
+_URL = "http://127.0.0.1:45678/mcp"
+
+
 class TestSessionRegistration:
     """Every session on a dynamic port publishes itself into the shared registry
     the control reads (`biopb._sessions`). Without this a session is invisible:
@@ -422,7 +425,7 @@ class TestSessionRegistration:
     def test_registers_a_routable_record(self):
         from biopb import _sessions
 
-        session_id = _register_session(45678)
+        session_id = _register_session(45678, _URL)
         assert session_id is not None
         rec = _sessions.read_session(session_id)
         # Everything the control needs to route /session/<id>/* here.
@@ -437,23 +440,26 @@ class TestSessionRegistration:
         # The shim names the session's logfile with it, so the record must match.
         from biopb import _sessions
 
-        assert _register_session(45678, "20260101-000000-7") == "20260101-000000-7"
+        assert (
+            _register_session(45678, _URL, "20260101-000000-7") == "20260101-000000-7"
+        )
         assert _sessions.read_session("20260101-000000-7")["port"] == 45678
 
     def test_a_launchers_token_is_echoed_onto_the_record(self, monkeypatch):
         # How the control recognises the viewer it just spawned. It cannot use
         # the pid it holds: behind a Windows trampoline (uv / pip console-script
         # launchers) that is the stub's, not ours (biopb#1084).
-        from biopb import _locations, _sessions
+        from biopb import _sessions
 
-        monkeypatch.setenv(_locations.MCP_LAUNCH_TOKEN_ENV, "tok-abc123")
-        rec = _sessions.read_session(_register_session(45678))
+        rec = _sessions.read_session(
+            _register_session(45678, _URL, launched_by="tok-abc123")
+        )
         assert rec["launch_token"] == "tok-abc123"
 
     def test_registered_session_is_listed_as_live(self):
         from biopb import _sessions
 
-        session_id = _register_session(45678)
+        session_id = _register_session(45678, _URL)
         # Our own pid owns the record, so the liveness prune must keep it --
         # this is what makes the session show up on the dashboard at all.
         assert session_id in [r["session_id"] for r in _sessions.list_sessions()]
@@ -461,7 +467,7 @@ class TestSessionRegistration:
     def test_unregister_removes_the_record(self):
         from biopb import _sessions
 
-        session_id = _register_session(45678)
+        session_id = _register_session(45678, _URL)
         _unregister_session(session_id)
         assert _sessions.read_session(session_id) is None
 
@@ -478,7 +484,7 @@ class TestSessionRegistration:
 
         monkeypatch.setattr(_sessions, "register", _boom)
         # No exception out of the launcher, and nothing to de-register.
-        assert _register_session(45678) is None
+        assert _register_session(45678, _URL) is None
 
     def test_unregister_failure_does_not_break_teardown(self, monkeypatch):
         from biopb import _sessions

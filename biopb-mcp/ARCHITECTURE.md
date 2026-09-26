@@ -91,9 +91,9 @@ contract; see [`../biopb-control/ARCHITECTURE.md`](../biopb-control/ARCHITECTURE
 
 Shim (`--transport stdio`) is the interface the mcp clients (claude code) see, which
 
-1. **answers the handshake itself** — `instructions` composed as the child would,
-   and the tool/resource lists from a shipped snapshot of the child's (a test
-   pins the two together) — so a client that never calls a tool costs no child,
+1. **answers the handshake and the list requests itself**, from the FastMCP
+   server the child runs (imported, never served), so a client that never calls
+   a tool costs no child,
 2. on the **first request that needs one**, start-and-forgets the control plane and
    **spawns its own ephemeral session child** (FastMCP/uvicorn + the kernel host)
    on a **dynamic OS-assigned port**; the child **registers itself** with the
