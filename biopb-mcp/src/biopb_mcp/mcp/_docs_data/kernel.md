@@ -12,14 +12,8 @@ like a notebook cell. Run a long compute you want to watch with `run_async(fn)`.
 
 ## Namespace
 
-Every session's namespace holds two planes:
-
-- **The data plane** — `client`, the tensor server: browse the catalog, read tensors, upload
-  results.
-- **The algorithm plane** — `ops`, the server-side image-processing operations, and the user's
-  **kernel plugin** modules (below).
-
-A napari `viewer` is **optional**: it is there only when the user has configured one and this
+Every session's namespace holds the **data plane** (`client`) and the **algorithm plane** (`ops`
+and the user's kernel plugin modules). A napari `viewer` is **optional**: it is there only when the user has configured one and this
 machine can show it (the napari extra installed, a display). `server_status`'s `## Viewer` says
 whether this session has one, and why not when it does not. Do not assume it. The browser page
 the control serves ([[web-viewer]]) shows the user an image either way; the napari window

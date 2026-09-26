@@ -47,6 +47,12 @@ from ._app import mcp
 
 logger = logging.getLogger(__name__)
 
+#: What a session without a viewer loses, and the route that replaces it.
+_NO_VIEWER_HINT = (
+    "there is no `viewer` and no take_screenshot, so show results through the "
+    'web viewer (read_doc("web-viewer"))'
+)
+
 _SCREENSHOT_SNIPPET = (
     "import base64 as _b64, cv2 as _cv2\n"
     "if not _viewer_window_alive():\n"
@@ -167,11 +173,11 @@ print("")
 print("## Viewer")
 import os as _os
 import sys as _sys
-_no_viewer = _os.environ.get("BIOPB_NO_VIEWER")
+from biopb_mcp.mcp._bootstrap import no_viewer_reason as _no_viewer_reason
+_no_viewer = _no_viewer_reason()
 if _no_viewer:
     print("  none -- " + _no_viewer)
-    print("    There is no `viewer` and no take_screenshot; show results through")
-    print("    the web viewer (## Web viewer above).")
+    print("    " + __NO_VIEWER_HINT__)
 else:
     if _sys.platform == "darwin" or _os.name == "nt":
         # Mirrors _has_display(): the native window server is ambient, so $DISPLAY
@@ -227,7 +233,7 @@ try:
         print(_line)
 except Exception as _e:
     print("  error: " + str(_e))
-"""
+""".replace("__NO_VIEWER_HINT__", repr(_NO_VIEWER_HINT))
 
 
 # Whether psutil's CPU counter has a previous reading to measure against.
@@ -637,9 +643,8 @@ async def take_screenshot(canvas_only: bool = True) -> list:
             TextContent(
                 type="text",
                 text=(
-                    "No screenshot: this session has no napari viewer -- "
-                    f"{host.no_viewer_reason}. Show the result through the web "
-                    'viewer instead (read_doc("web-viewer")).'
+                    "No screenshot: this session has no napari viewer "
+                    f"({host.no_viewer_reason}): {_NO_VIEWER_HINT}."
                 ),
             )
         ]
@@ -1200,9 +1205,7 @@ async def start_kernel() -> str:
             return (
                 "Kernel ready: the tensor client (`client`), `ops` and the kernel "
                 "plugins are up; use execute_code now. This session has no napari "
-                f"viewer ({host.no_viewer_reason}): there is no `viewer` and no "
-                "take_screenshot, so show results through the web viewer "
-                '(read_doc("web-viewer")).'
+                f"viewer ({host.no_viewer_reason}): {_NO_VIEWER_HINT}."
             )
         ready = (
             "Kernel ready. The tensor client, `ops`, the kernel plugins and the "

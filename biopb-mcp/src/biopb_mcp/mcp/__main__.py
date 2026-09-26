@@ -391,12 +391,9 @@ def _serve_http(config, port, view=False):
 
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-    # Decide whether the kernel gets a viewer and where it renders. With no
-    # display a Qt viewer hard-aborts the kernel (SIGABRT, not a catchable
-    # error), so a display-less host runs without one unless the config opts
-    # into a launcher-owned Xvfb (a real viewer and working screenshots, no
-    # human-visible window; #90) -- which then fails fast when the binary is
-    # missing, since it was asked for.
+    # Decided here, before the kernel exists: with no display a Qt viewer
+    # hard-aborts the kernel (SIGABRT, not a catchable error). An Xvfb the
+    # config asked for fails fast when the binary is missing.
     try:
         no_viewer, virtual = _decide_viewer(config, view)
     except RuntimeError as exc:
@@ -473,6 +470,7 @@ def _serve_http(config, port, view=False):
     def _scratch_host():
         scratch_env = dict(kernel_env or os.environ)
         scratch_env[ENV_SCRATCH] = "1"
+        scratch_env[ENV_NO_VIEWER] = "a scratch kernel verifies a workflow"
         return KernelHost(
             extra_arguments=extra_arguments,
             kernel_name=get_setting(config, "kernel.name"),

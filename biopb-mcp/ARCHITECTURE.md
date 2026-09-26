@@ -111,8 +111,7 @@ message to the call it answers, and the kernel runs requests in arrival order.
 
 The kernel is **launched lazily, not at boot**, so a long-running server binds
 cheaply and never pops a napari viewer until user requested it; kernel-dependent
-tools return a structured not-ready status until then. The health probe waits for
-the bootstrap's `_jobs`, not for `viewer`. **Closing the napari window tears the
+tools return a structured not-ready status until then. **Closing the napari window tears the
 kernel back down to idle**, and `start_kernel` rebuilds it.
 
 An agent's code runs as a cell on the kernel's main thread, like a notebook user's,

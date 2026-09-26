@@ -307,10 +307,8 @@ jobs:
           echo "sdk=$sdk" >> "$GITHUB_OUTPUT"
           # versions.json — the installer-readable release-attribute manifest. The
           # installer reads `napari` (pins the tested Qt binding), `biopb` (the
-          # SDK pin), `install_schema` (the installer layout this release fits,
-          # read from install.sh's INSTALL_SCHEMA; an installer refuses a
-          # release that declares another) and `release` (the update
-          # baseline); `tensor_server` reports the shipped wheel's
+          # SDK pin), `install_schema` (copied from install.sh's INSTALL_SCHEMA)
+          # and `release` (the update baseline); `tensor_server` reports the shipped wheel's
           # version (now the same `release-v*` line, so == release on a real tag).
           # Docker versions are NOT here — the tensor-server image ships on this
           # same `release-v*` tag (tensor-server-ci), image-base on the SDK `v*`.

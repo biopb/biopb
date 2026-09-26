@@ -107,12 +107,13 @@ now the same `release-v*` line, so equal to `release` on a real tag), `napari`
 (the pinned Qt binding), `biopb` (the SDK pin) and `install_schema`. Docker
 versions are **not** in it.
 
-`install_schema` is the installer's floor. `install.sh`'s `INSTALL_SCHEMA` (and the
-engine's `$script:InstallSchema`, kept equal by a test) is the only number an
-installer accepts, and `release.yaml` copies it into each release's manifest. A
-release that declares another, or none (every release before the napari plugin
-split), is refused with a pointer to the installer published alongside it, so an
-installer carries no compatibility code for older releases. Bump it when a change
+`install_schema` pairs an installer with the releases it can install.
+`install.sh`'s `INSTALL_SCHEMA` (and the engine's `$script:InstallSchema`, kept
+equal by a test) is the only number an installer accepts, and `release.yaml`
+copies it into each release's manifest. A release that declares another, or none
+(every release before the napari plugin split), is refused with a pointer to the
+installer published alongside it, so an installer carries no compatibility code
+for older releases. Bump it when a change
 to the release makes an earlier installer wrong for it.
 
 ### `v*` → PyPI/Maven + the image-base image (`image-runtime-ci`)
@@ -192,7 +193,7 @@ release and pulls the engine **and** wheels from it, exactly like `install.sh`
 (no separate engine download — which is why `biopb-engine.ps1` is also a release
 asset). A sibling `biopb-engine.ps1` on disk (a checkout) still wins. Overrides
 (all paths): `BIOPB_INSTALL_VERSION=X.Y.Z` installs/downgrades to an exact
-release at or above the installer's `install_schema` floor; `BIOPB_INSTALL_RC=1` tracks the latest candidate (ignores the pin, since
+release that declares the installer's `install_schema`; `BIOPB_INSTALL_RC=1` tracks the latest candidate (ignores the pin, since
 rc builds are not published to `biopb.org`).
 
 **Canonical location: the repo-root `install/`** — this is the copy users track.

@@ -23,7 +23,7 @@
 # to a newer version. A raw / git-checkout copy has no pin and tracks the latest
 # STABLE release. Overrides:
 #   BIOPB_INSTALL_VERSION=X.Y.Z  install/downgrade to an exact release (one that
-#                                declares INSTALL_SCHEMA; see below)
+#                                declares this INSTALL_SCHEMA; see below)
 #   BIOPB_INSTALL_RC=1           track the latest release candidate (a/b/rc,
 #                                typically cut off dev) — the fast path for
 #                                testing an upcoming release before it lands.
@@ -51,11 +51,10 @@ fi
 # anchors on it.
 BIOPB_PINNED_RELEASE=""
 
-# The release layout this installer is written for: release.yaml writes the same
-# number into each release's versions.json as `install_schema`, and a release that
-# declares another (or none, i.e. one from before the napari plugin split) is
-# refused with a pointer to the installer shipped alongside it. Bump both together
-# when a change to the release makes an earlier installer wrong for it.
+# The release layout this installer is written for. release.yaml copies it into
+# each release's versions.json as `install_schema`; a release declaring another,
+# or none, is refused with a pointer to the installer shipped alongside it. Bump
+# it when a change to the release makes an earlier installer wrong for it.
 INSTALL_SCHEMA=1
 
 _step() { printf "\n${BOLD}%s${RESET}\n" "$*"; }
@@ -1392,9 +1391,7 @@ install_biopb() {
     # binding) and the `biopb` SDK, installed from PyPI, to the versions the
     # release was built and tested with, and carries the deployment `release`
     # version, recorded post-install as the auto-updater's baseline (issue #87).
-    # Its `install_schema` is the floor: this installer supports only releases
-    # that declare the schema it was written for, and names the installer that
-    # does fit an older one. RELEASE_VERSION is read here but written only after
+    # Its `install_schema` must equal INSTALL_SCHEMA. RELEASE_VERSION is read here but written only after
     # a clean install.
     local versions_url versions_json="" release_schema napari_pin sdk_pin
     versions_url=$(_release_asset_url 'versions\.json')

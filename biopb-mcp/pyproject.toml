@@ -27,17 +27,10 @@ classifiers = [
 # matches the classifiers above (3.10-3.12 only).
 requires-python = ">=3.10,<3.13"
 dependencies = [
-    # mcp <2: the 2.0 SDK is a breaking rewrite. It deleted `mcp.server.fastmcp`
-    # outright -- `mcp/_server.py` builds the whole server on `FastMCP` -- and it
-    # added a module-scope `cryptography` import (`mcp/server/request_state.py`, the
-    # 2026-07-28 sealed-`requestState` codec) on the path `import mcp` itself walks,
-    # while still declaring that dep only as `pyjwt[crypto]`. Our pyjwt override
-    # (root pyproject / install.sh) un-requests that extra, so 2.x dies at
-    # `from mcp import types` with ModuleNotFoundError: cryptography before it ever
-    # reaches the FastMCP breakage. The floor alone let install.sh -- which resolves
-    # fresh from PyPI, not from uv.lock -- swallow the new major, so every release
-    # back to 0.8.0 installs a server that cannot start. Lift the cap only together
-    # with the FastMCP port and a re-examined override.
+    # mcp <2: 2.x deleted `mcp.server.fastmcp`, which `mcp/_server.py` is built
+    # on, and imports cryptography at module scope, which our pyjwt override
+    # (root pyproject / install.sh) drops. Lift the cap only together with the
+    # FastMCP port and a re-examined override.
     "mcp >= 1.20, < 2",
     "uvicorn >= 0.29",
     "jupyter_client",

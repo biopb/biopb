@@ -44,13 +44,16 @@ def is_scratch_kernel():
 
 
 def no_viewer_reason():
-    """Why this session has no napari viewer, or None when it has one.
+    """Why this kernel has no napari viewer, or None when it has one.
 
-    The launcher decides (config, whether napari is installed, whether there is
-    a display) and hands the kernel its reason in ``BIOPB_NO_VIEWER``; the
-    literal mirrors ``_kernel.ENV_NO_VIEWER``. A scratch kernel has none either,
-    but by policy (``is_scratch_kernel``), not by this.
+    A scratch kernel never has one: the viewer is how an agent shows something
+    to a person, and a verification has no person in it. Any other kernel has
+    none when the launcher says so -- it decides (config, whether napari is
+    installed, whether there is a display) and hands the kernel its reason in
+    ``BIOPB_NO_VIEWER``; the literal mirrors ``_kernel.ENV_NO_VIEWER``.
     """
+    if is_scratch_kernel():
+        return "a scratch kernel verifies a workflow and has no viewer"
     return os.environ.get("BIOPB_NO_VIEWER") or None
 
 
@@ -496,12 +499,9 @@ def _bootstrap_impl():
     #    fails open to _NullSplash when Qt is unavailable.
     from ._splash import _NullSplash, show_splash
 
-    # A session without a viewer skips Qt entirely: no event loop, no GL, no
-    # display, and none of napari's ~330 MiB. A scratch kernel is one *by
-    # policy*: the viewer exists so an agent can show something to a person,
-    # and a verification has no person in it. Any other kernel is one because
-    # the launcher said so (no_viewer_reason).
-    want_viewer = not is_scratch_kernel() and no_viewer_reason() is None
+    # A kernel without a viewer skips Qt entirely: no event loop, no GL, no
+    # display, and none of napari's ~330 MiB.
+    want_viewer = no_viewer_reason() is None
     if want_viewer:
         ip.enable_gui("qt")
         splash = show_splash()
@@ -524,17 +524,7 @@ def _bootstrap_impl():
     #    namespace: the widget connects it, and each agent cell reads its client.
     conn = Connection()
 
-    # 3. napari viewer + Tensor Browser -- when the session has one.
-    #
-    # **A scratch kernel is headless by policy.** The viewer is how an agent
-    # shows something to a person; a verification has no person in it, so a
-    # workflow that reaches for `viewer` is a workflow that will not run as the
-    # document it is about to become. It is the sharpest case of the wider rule
-    # below: the reader of a saved workflow gets a bare kernel, so the run that
-    # verifies it gets one too.
-    #
-    # It also costs nothing to enforce: no Qt, no GL, no display, and ~330 MiB
-    # and ~1.7 s of napari.Viewer() that nobody was going to look at.
+    # 3. napari viewer + Tensor Browser -- when the kernel has one.
     viewer = None
     if want_viewer:
         #    The browser auto-connects on its own tick. compute_scheduler pins
@@ -648,8 +638,8 @@ def _bootstrap_impl():
         ns["viewer"] = make_viewer_proxy(viewer)
         ns["_viewer_window_alive"] = lambda: viewer_window_alive(viewer)
         ns["_resync_view"] = lambda: resync_view_for_capture(viewer)
-    # `viewer` is simply absent in a scratch kernel -- a workflow that uses it
-    # raises NameError, which is the verdict. The job-status snippet already
+    # `viewer` is simply absent without one -- in a scratch kernel a workflow
+    # that uses it raises NameError, which is the verdict. The job-status snippet already
     # reads _viewer_window_alive with a default, so its absence is expected.
     ip.user_ns.update(ns)
 

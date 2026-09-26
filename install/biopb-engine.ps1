@@ -121,10 +121,7 @@ $ProgressPreference = 'SilentlyContinue'  # speeds up Invoke-WebRequest
 # LHS verbatim -- the stamp anchors on it.
 $script:BiopbPinnedRelease = ''
 
-# The release layout this engine is written for; must equal install.sh's
-# INSTALL_SCHEMA, which release.yaml writes into versions.json as
-# `install_schema`. A release that declares another (or none, i.e. one from
-# before the napari plugin split) is refused.
+# Must equal install.sh's INSTALL_SCHEMA (a test enforces it).
 $script:InstallSchema = 1
 
 # Install the uv tool environment under %LOCALAPPDATA%, not uv's Roaming default
@@ -1413,8 +1410,7 @@ function Invoke-BiopbInstall {
     }
     # versions.json pins the SDK and napari to the versions this release was
     # built and tested with, and carries the `release` version recorded below.
-    # Its `install_schema` is the floor: only a release declaring this engine's
-    # schema is installed.
+    # Its `install_schema` must equal this engine's.
     $versions = $null
     $verAsset = $release.assets | Where-Object { $_.name -eq 'versions.json' } | Select-Object -First 1
     if ($verAsset) {
