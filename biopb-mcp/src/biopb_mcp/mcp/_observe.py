@@ -7,7 +7,7 @@ a notebook, and — where this session owns its own reap — end it. On by defau
 (opt-out via ``observe.enabled``).
 
 **Stopping the session** (``/api/shutdown``) exists only for an agentless
-``biopb mcp view`` viewer, and runs the launcher's own ``_shutdown``: the same
+session (``biopb mcp view``, or the dashboard's new session), and runs the launcher's own ``_shutdown``: the same
 single path Ctrl-C and SIGTERM take, injected at wiring time
 (:func:`set_session_owns_its_reap`) rather than reimplemented. That is what
 keeps the control out of the ownership question — it proxies a session ending
@@ -74,13 +74,13 @@ _USER_INTERRUPT_MSG = "Interrupted by user via the observe web UI."
 _max_output_chars = 20000
 _poll_interval_ms = 3000
 # Whether the built-in chat client is actually mounted on this session. Not a
-# config mirror: chat is served only on an agentless `biopb mcp view` session
+# config mirror: chat is served only on an agentless session
 # and only when enabled, so `_setup_chat`'s verdict is the one truth. Set by
 # set_chat_enabled() rather than configure(), which resets its extras on every
 # call and so cannot be called twice.
 _chat_enabled = False
-# Whether this session owns its own reap -- an agentless `biopb mcp view`
-# viewer, as opposed to a child a stdio shim spawned and will reap. The stop
+# Whether this session owns its own reap -- an agentless session a human
+# opened, as opposed to a child a stdio shim spawned and will reap. The stop
 # route exists only for the former: ending a shim's child would leave the shim
 # bridging to a dead process and its MCP client reading errors instead of a
 # clean close. Deliberately NOT keyed off _chat_enabled, which is a config
@@ -324,7 +324,7 @@ async def _api_status(request):
     # of hardcoding it — the page is now static and can't be server-templated.
     # chat_enabled rides here for the control's dashboard, which probes this
     # endpoint per session anyway and needs it to label the session's link -- a
-    # `biopb mcp view` session leads with chat, an MCP client's child with the
+    # agentless session leads with chat, an MCP client's child with the
     # job list -- so that one probe is the whole answer.
     return JSONResponse(
         {

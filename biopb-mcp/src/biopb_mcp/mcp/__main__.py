@@ -155,6 +155,12 @@ def _parse_args(argv, default_transport, default_port):
         "still serves /mcp on a dynamic port for optional agent attach. A "
         "user-owned foreground session. Fronted by `biopb mcp view`.",
     )
+    parser.add_argument(
+        "--start-kernel",
+        action="store_true",
+        help="Start the kernel (and any viewer) before serving rather than on "
+        "the first start_kernel tool call. Implied by --view.",
+    )
     return parser.parse_args(argv)
 
 
@@ -242,16 +248,17 @@ def _setup_observe(config, agentless=False, on_shutdown=None):
         return False
 
 
-def _is_agentless_viewer(view, shim_owned):
-    """Whether this session is a viewer a human opened, not a harness's child.
+def _is_agentless(view, shim_owned, port):
+    """Whether this session is one a human opened, not a harness's child.
 
-    Two things follow from it and must not drift apart: such a session owns its
-    own reap (it serves the stop route), and it is the only kind that gets the
-    built-in chat loop. A shim-owned child is serving an MCP client; a direct
-    ``--transport http`` launch is neither, and publishes no session at all, so
-    it has no observe page for a pane to live on.
+    That is `biopb mcp view`, or a ``--port 0`` http session nobody reaps for
+    it (the dashboard's "new session"). Two things follow from it and must not
+    drift apart: such a session owns its own reap (it serves the stop route),
+    and it is the only kind that gets the built-in chat loop. A shim-owned child
+    is serving an MCP client; a direct ``--transport http`` launch on a fixed
+    port is neither, and publishes no session, so it has no observe page.
     """
-    return bool(view and not shim_owned)
+    return bool(not shim_owned and (view or port == 0))
 
 
 def _setup_chat(config, agentless):
@@ -264,8 +271,8 @@ def _setup_chat(config, agentless):
     than blocking the MCP server, which is the surface an already-working
     harness depends on. Returns True if mounted.
 
-    *agentless* says whether this session is a `biopb mcp view` viewer rather
-    than a child some MCP client is driving; chat is served only on the former.
+    *agentless* says whether a human opened this session (:func:`_is_agentless`)
+    rather than some MCP client driving it; chat is served only on the former.
 
     The verdict is also published on ``/api/status``
     (:func:`_observe.set_chat_enabled`), so the control's dashboard can label
@@ -335,7 +342,7 @@ def main(argv=None):
         # Agentless foreground viewer (fronted by `biopb mcp view`): serve http
         # with a visible, eagerly-started viewer, regardless of the configured
         # transport. Blocks until Ctrl-C.
-        return _serve_http(config, opts.port, view=True)
+        return _serve_http(config, opts.port, view=True, start_kernel=True)
 
     if opts.transport == "stdio":
         # Bridge mode: keep this process featherweight — the heavy stack
@@ -351,16 +358,18 @@ def main(argv=None):
             return 1
         return 0
 
-    return _serve_http(config, opts.port)
+    return _serve_http(config, opts.port, start_kernel=opts.start_kernel)
 
 
-def _serve_http(config, port, view=False):
+def _serve_http(config, port, view=False, start_kernel=False):
     """Run the real MCP server (streamable-http) in the foreground.
 
     ``view`` selects the agentless-viewer mode (`biopb mcp view`): force a
     visible display, bind a dynamic port and print its URL, and start the
     kernel/viewer eagerly so the window opens immediately instead of on the
-    first ``start_kernel`` tool call.
+    first ``start_kernel`` tool call. ``start_kernel`` does only the last of
+    those, for a session that is to be usable -- attachable from Jupyter, say --
+    the moment it is published.
     """
     from .._config import get_setting
     from . import _app, _scratch, _server, _xvfb
@@ -506,32 +515,36 @@ def _serve_http(config, port, view=False):
         session_log = None
     _app.set_session_log_path(session_log)
 
-    # On-demand start: the kernel is NOT launched here. The server stays cheap
-    # and idle (no viewer window pops, no Qt abort on a display-less server)
-    # until an agent calls the `start_kernel` tool, which drives
+    # On-demand start (unless `start_kernel`, below): the kernel is NOT
+    # launched here. The server stays cheap and idle (no viewer window pops, no
+    # Qt abort on a display-less server) until an agent calls the
+    # `start_kernel` tool, which drives
     # host.ensure_started() — a synchronous bring-up that blocks that one tool
     # call until the kernel is ready. Other tool calls landing before then get a
     # structured "not started" status (see KernelHost.execute).
-    logger.info(
-        "Ready. The kernel (and any viewer window) starts on the first "
-        "start_kernel call."
-    )
+    if not start_kernel:
+        logger.info(
+            "Ready. The kernel (and any viewer window) starts on the first "
+            "start_kernel call."
+        )
 
     # Reap the kernel on exit even if it is still mid-bringup when we stop
     # (a no-op safe on an idle, never-started host).
     atexit.register(host.shutdown)
 
-    # Two foreground modes bind a *dynamic* port and report it back rather than
-    # binding the configured fixed port:
+    # Three modes bind their own socket and publish the session:
     #   * the de-daemonized shim-owned child — the shim set
     #     BIOPB_PORT_REPORT_FILE and passed --port 0; it reaps us directly (own
     #     process group / Job Object) and we report the OS-assigned port back;
     #   * the agentless `biopb mcp view` viewer — a user-owned Ctrl-C session; it
-    #     prints its URL instead.
+    #     prints its URL instead;
+    #   * an agentless ``--port 0`` http session (the dashboard's "new
+    #     session"), which prints its URL like the viewer.
     # A direct `--transport http` binds the configured port. The POSIX signal
     # handlers below reap our kernel gracefully in every mode.
     shim_owned = bool(report_file)
-    dynamic_port = shim_owned or view
+    agentless = _is_agentless(view, shim_owned, port)
+    dynamic_port = shim_owned or agentless
     listen_sock = None
     if dynamic_port:
         listen_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -546,9 +559,9 @@ def _serve_http(config, port, view=False):
         _app.set_mcp_url(mcp_url)
         if shim_owned:
             _report_port(report_file, port)
-        else:  # view
+        else:
             print(
-                f"biopb-mcp viewer serving on {mcp_url} "
+                f"biopb-mcp session serving on {mcp_url} "
                 "(Ctrl-C to stop; an agent may attach at this URL).",
                 flush=True,
             )
@@ -610,12 +623,6 @@ def _serve_http(config, port, view=False):
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
-    # Whether this session owns its own reap. Two things hang off it, and the
-    # single expression keeps them from drifting: the built-in chat loop, and
-    # the stop route (a shim-owned child is reaped by its shim, so ending it
-    # here would leave that shim bridging to a dead process).
-    agentless = _is_agentless_viewer(view, shim_owned)
-
     # Opt-in web "observe" UI. Set up before the (blocking) transport run:
     # custom routes are read when the streamable-http app is built. `_shutdown`
     # goes with it, so a stop from the web takes the same path Ctrl-C does.
@@ -628,20 +635,22 @@ def _serve_http(config, port, view=False):
     # built-in loop is not for.
     _setup_chat(config, agentless=agentless)
 
-    if view:
-        # Agentless viewer: bring the window up now (the human wants it
-        # immediately) rather than waiting for a start_kernel tool call. Same
-        # synchronous bring-up the start_kernel tool drives.
-        logger.info("Opening the napari viewer (Ctrl-C to stop)...")
-        try:
-            host.ensure_started()
-        except Exception:
-            logger.exception("Failed to open the viewer; exiting")
+    if start_kernel:
+        # Wanted usable now -- the window up, a kernel a Jupyter client can
+        # attach to -- rather than on a start_kernel tool call. Same synchronous
+        # bring-up that tool drives.
+        logger.info("Starting the kernel (Ctrl-C to stop)...")
+        state = host.ensure_started()
+        if state["state"] == "error":
+            # Exit rather than serve a broken kernel: no client is attached yet
+            # to retry it, and a launcher that sees us die unregistered reports
+            # our log instead of a session that cannot run anything.
+            logger.error("The kernel did not start: %s", state["error"])
             return 1  # atexit reaps the kernel/cluster and cleans the spill dir
 
     # A session on a dynamic port publishes itself; a direct `--transport http`
     # launch binds the configured fixed port its operator already knows. Done
-    # last, with a `--view` window up and the serve loop the next statement, so
+    # last, with any eager kernel up and the serve loop the next statement, so
     # a record implies a session that is all but answering.
     if dynamic_port:
         session_id = _register_session(port, mcp_url, minted_id, launched_by)

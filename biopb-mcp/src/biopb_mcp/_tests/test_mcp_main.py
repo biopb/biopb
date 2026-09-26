@@ -16,7 +16,7 @@ from biopb_mcp.mcp.__main__ import (
     _config_defaults,
     _decide_viewer,
     _has_display,
-    _is_agentless_viewer,
+    _is_agentless,
     _parse_args,
     _register_session,
     _setup_chat,
@@ -63,6 +63,10 @@ class TestParseArgs:
     def test_view_flag_sets_true(self):
         opts = _parse_args(["--view"], default_transport="http", default_port=8765)
         assert opts.view is True
+
+    def test_start_kernel_flag(self):
+        assert _parse_args([], "http", 8765).start_kernel is False
+        assert _parse_args(["--start-kernel"], "http", 8765).start_kernel is True
 
 
 def _cfg(**transport):
@@ -128,10 +132,24 @@ class TestMainDispatch:
         monkeypatch.setattr(
             launcher,
             "_serve_http",
-            lambda config, port, view=False: calls.append((port, view)) or 0,
+            lambda config, port, view=False, start_kernel=False: (
+                calls.append((port, view, start_kernel)) or 0
+            ),
         )
         assert main(["--view", "--port", "0"]) == 0
-        assert calls == [(0, True)]
+        assert calls == [(0, True, True)]
+
+    def test_http_passes_start_kernel(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            launcher,
+            "_serve_http",
+            lambda config, port, view=False, start_kernel=False: (
+                calls.append((port, view, start_kernel)) or 0
+            ),
+        )
+        assert main(["--transport", "http", "--port", "0", "--start-kernel"]) == 0
+        assert calls == [(0, False, True)]
 
     def test_view_takes_precedence_over_stdio_default(self, monkeypatch):
         # empty config -> default transport stdio, but --view wins (viewer path).
@@ -139,7 +157,9 @@ class TestMainDispatch:
         monkeypatch.setattr(
             launcher,
             "_serve_http",
-            lambda config, port, view=False: calls.append(view) or 0,
+            lambda config, port, view=False, start_kernel=False: (
+                calls.append(view) or 0
+            ),
         )
         assert main(["--view"]) == 0
         assert calls == [True]
@@ -382,32 +402,32 @@ class TestSetupChat:
         assert _observe._chat_enabled is False
 
 
-class TestAgentlessViewer:
-    """Which sessions count as a viewer a human opened.
+class TestAgentless:
+    """Which sessions count as one a human opened.
 
-    Two things hang off this and must not drift apart: such a session publishes
-    itself to the registry, and it is the only kind served the built-in chat
-    loop. Pinned as a truth table rather than trusted to two inline expressions,
-    which is what they were.
+    Two things hang off this and must not drift apart: such a session owns its
+    reap (the stop route), and it is the only kind served the built-in chat
+    loop. Pinned as a truth table rather than trusted to two inline expressions.
     """
 
     @pytest.mark.parametrize(
-        "view,shim_owned,expected",
+        "view,shim_owned,port,expected",
         [
-            # `biopb mcp view`: a human opened a window; no agent is attached.
-            (True, False, True),
-            # A shim-owned child is serving an MCP client. It cannot reach here
-            # with view=True today, and must answer False if it ever does.
-            (True, True, False),
-            # The stdio shim's ordinary child.
-            (False, True, False),
-            # A direct `--transport http` launch: wired to something by its
-            # operator, and publishes no session, so it has no observe page.
-            (False, False, False),
+            # `biopb mcp view`, on a dynamic or a chosen port.
+            (True, False, 0, True),
+            (True, False, 9000, True),
+            # The dashboard's new session: a plain http session on port 0.
+            (False, False, 0, True),
+            # A shim-owned child is serving an MCP client, whatever its port.
+            (False, True, 0, False),
+            (True, True, 0, False),
+            # A direct `--transport http` launch on a fixed port: wired to
+            # something by its operator, and publishes no session.
+            (False, False, 8765, False),
         ],
     )
-    def test_only_a_shimless_viewer_counts(self, view, shim_owned, expected):
-        assert _is_agentless_viewer(view, shim_owned) is expected
+    def test_truth_table(self, view, shim_owned, port, expected):
+        assert _is_agentless(view, shim_owned, port) is expected
 
 
 _URL = "http://127.0.0.1:45678/mcp"
