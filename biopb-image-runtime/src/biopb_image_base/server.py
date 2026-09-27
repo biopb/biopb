@@ -19,6 +19,8 @@ from biopb.tensor.serialized_pb2 import SerializedTensor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 from dask.utils import parse_bytes
 
+from biopb_image_base.common import _pyarrow_available
+
 logger = logging.getLogger(__name__)
 
 _NON_UNIFORM_CHUNKS_ERROR = "Non-uniform dask chunks are not supported; rechunk to a regular grid before uploading."
@@ -417,20 +419,6 @@ def _start_embedded_tensor_cache(
     thread.start()
 
     return tensor_server, location
-
-
-def _pyarrow_available() -> bool:
-    """True if pyarrow can be imported.
-
-    The tensor cache (lazy data side channel) is built on Arrow Flight and needs
-    pyarrow. On builds for old CPUs without SSE4.2/AVX, pyarrow is removed (its
-    wheels SIGILL on import there -- see cellpose/BUILD_NO_SSE42.md), so the side
-    channel must not be started. find_spec only locates the module; it does not
-    import it, so this is safe even on a CPU that cannot run pyarrow.
-    """
-    import importlib.util
-
-    return importlib.util.find_spec("pyarrow") is not None
 
 
 def start_embedded_cache(

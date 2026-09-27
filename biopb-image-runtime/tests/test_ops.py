@@ -201,6 +201,17 @@ def test_describe_advertises_signature(server):
     assert ops["track"].streaming
 
 
+def test_a_lazy_op_is_advertised_eager_without_pyarrow(monkeypatch):
+    # No pyarrow (the no-SSE4.2 build): no array_id decodes, so advertising
+    # lazy would steer callers to a reference that always fails.
+    import biopb_image_base.ops as ops
+
+    monkeypatch.setattr(ops, "_pyarrow_available", lambda: False)
+    infos = {o.name: o for o in describe(_defs([double, smooth])).ops}
+    assert infos["double"].input == proto.OpInfo.EAGER
+    assert infos["smooth"].input == proto.OpInfo.BLOCKS
+
+
 def test_fingerprint_changes_with_the_ops():
     one = describe(_defs([greet, total])).fingerprint
     assert describe(_defs([total, greet])).fingerprint == one

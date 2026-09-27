@@ -30,7 +30,8 @@ same rank.
 
 Both are advertised so a caller can decide how to call the op before trying
 it: ``input`` as ``OpInfo.input``, and whether the function is a generator as
-``OpInfo.streaming``.
+``OpInfo.streaming``. A process without pyarrow advertises a ``"lazy"`` op as
+``"eager"``: it can decode no ``array_id``, so the op takes inline input only.
 
 A single return value is the output ``result``; a tuple gives ``0``, ``1``,
 .... An array is a tensor output, inline or on the sink by size, and anything
@@ -75,6 +76,7 @@ from biopb_image_base.common import (
     _MAX_MSG_SIZE,
     TokenValidationInterceptor,
     _is_dask_array,
+    _pyarrow_available,
     server_context,
 )
 
@@ -151,12 +153,17 @@ class _OpDef:
         )
 
     def info(self) -> proto.OpInfo:
+        # What this process can serve, not what the op declares: without
+        # pyarrow no array_id decodes, so a lazy op takes inline input only.
+        advertised = self.input
+        if advertised == "lazy" and not _pyarrow_available():
+            advertised = "eager"
         info = proto.OpInfo(
             name=self.name,
             description=self.description,
             labels=self.labels,
             kwargs=self._kwargs_text(),
-            input=proto.OpInfo.InputMode.Value(self.input.upper()),
+            input=proto.OpInfo.InputMode.Value(advertised.upper()),
             streaming=self.streaming,
         )
         for name, axes in self.tensors.items():
