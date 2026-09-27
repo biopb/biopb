@@ -891,11 +891,45 @@ export const useAppStore = create<AppState>((set, get) => ({
   setTileInfo(value, forArrayId) {
     // The grid is the first thing that can say what an index may be, so the
     // slice is bounded here rather than where it was read -- see clampSliceTo.
-    set((s) => ({
-      tileInfo: value,
-      tileInfoFor: forArrayId,
-      slice: clampSliceTo(s.slice, value),
-    }));
+    set((s) => {
+      const patch: Partial<AppState> = {
+        tileInfo: value,
+        tileInfoFor: forArrayId,
+        slice: clampSliceTo(s.slice, value),
+      };
+      if (!value) return patch;
+      const { arrayId: bare, token } = splitArrayVersion(forArrayId);
+      // Both sides stripped of any token before comparing: only the stable
+      // half says whether the source resolved to a different field, and a
+      // token on either one must not read as a resolution by itself.
+      const resolved = splitArrayVersion(value.array_id).arrayId;
+      if (resolved === bare) return patch;
+      // `forArrayId` was a bare source_id (or one pinned to a token); the
+      // Flight server just named the specific field it binds as that
+      // source's default. Every piece of state still holding the address
+      // this fetch was issued for adopts the resolved one, rather than
+      // leaving each reader to re-derive it through `currentArrayId`.
+      // Guarded by equality to the id each field was actually set from, so a
+      // selection that has moved on since this fetch was issued (a click
+      // while a slow resolve was in flight) is left alone rather than
+      // stomped by a stale answer.
+      //
+      // `activeTensorId` is never pinned -- a link lands it on `stable`, a
+      // click on `forArrayId` itself, which for a click *is* `bare` -- so it
+      // is compared against `bare`, not `forArrayId`, to catch both.
+      if (s.activeTensorId === bare) patch.activeTensorId = resolved;
+      // `requestedArrayId` and `visibleSetsFor` both take the pin back, from
+      // the same computation: `currentArrayId` (via `requestedArrayId`)
+      // keeps whatever token a link asked for, so a field this snap left
+      // stripped would agree with it only until resolution lands, then
+      // silently mismatch.
+      if (s.requestedArrayId === forArrayId || s.visibleSetsFor === forArrayId) {
+        const pinned = withVersion(resolved, token);
+        if (s.requestedArrayId === forArrayId) patch.requestedArrayId = pinned;
+        if (s.visibleSetsFor === forArrayId) patch.visibleSetsFor = pinned;
+      }
+      return patch;
+    });
   },
 
   async loadRois(arrayId) {
@@ -1539,6 +1573,18 @@ async function onJobSettled(get: Get, job: SourceJobStatus): Promise<void> {
   await Promise.all([get().loadSources(), get().startWarm(job.source_id)]);
 }
 
+/** `splitArrayVersion` in reverse: reattaches *token* to *arrayId* right
+ * after its source_id, ahead of the field, per the
+ * `source_id "@" token [ "/" field ]` form. A null *token* passes *arrayId*
+ * through unchanged. */
+function withVersion(arrayId: string, token: string | null): string {
+  if (!token) return arrayId;
+  const slash = arrayId.indexOf("/");
+  return slash === -1
+    ? `${arrayId}@${token}`
+    : `${arrayId.slice(0, slash)}@${token}${arrayId.slice(slash)}`;
+}
+
 /**
  * The address the viewer is actually rendering: the exact one a link asked for,
  * which may be content-pinned, else the selection.
@@ -1554,17 +1600,27 @@ function requestedTensorId(s: AppState): string | null {
 /**
  * `requestedTensorId` may be a bare source_id -- a link, or a source clicked
  * rather than one of its tensors -- which the Flight server resolves to a
- * specific field. Once `tile_info` answers for exactly that id, its own
- * `array_id` names the specific tensor being rendered, and every write scoped
- * by this function (ROI create/delete/list, draft, broadcast axes) has to
- * follow that resolution or it addresses a different tensor than the one on
- * screen.
+ * specific field. `setTileInfo` snaps `activeTensorId`/`requestedArrayId`
+ * themselves to that resolution as soon as it lands, so in steady state this
+ * already equals `requestedTensorId(s)`; the `tileInfo` branch below only
+ * still matters for the one render between a fetch landing and that snap
+ * taking effect.
+ *
+ * A pinned link's own token survives (`loadRois` scopes to the exact pinned
+ * address a link named, not the live one -- see its own test), but a token
+ * `tile_info` answered with that the request itself did not carry does not:
+ * `/api/tile_info` splices the tensor's *current* content-version token into
+ * `array_id` unconditionally, even for a request that named none
+ * (biopb/biopb#780 -- the versioned form is how a tile URL becomes
+ * immutable), and that one is not a pin -- keeping it would make an ordinary,
+ * unpinned view disagree with itself the moment this branch, rather than the
+ * fallback, is what answers.
  */
 export function currentArrayId(s: AppState): string | null {
   const requested = requestedTensorId(s);
-  return requested && s.tileInfoFor === requested && s.tileInfo
-    ? s.tileInfo.array_id
-    : requested;
+  if (!requested || s.tileInfoFor !== requested || !s.tileInfo) return requested;
+  const { token } = splitArrayVersion(s.tileInfoFor);
+  return token ? s.tileInfo.array_id : splitArrayVersion(s.tileInfo.array_id).arrayId;
 }
 
 /**

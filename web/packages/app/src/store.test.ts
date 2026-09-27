@@ -314,6 +314,154 @@ describe("currentArrayId", () => {
 
     expect(currentArrayId(useAppStore.getState())).toBe("other");
   });
+
+  // biopb/biopb#780: /api/tile_info splices the tensor's *current*
+  // content-version token into `array_id` unconditionally, even when the
+  // request named none -- it is how a tile URL becomes safely cacheable, not
+  // a sign the request was pinned. `setTileInfo`'s own snap is deliberately
+  // token-free (`activeTensorId` never carries one), so if this branch kept
+  // the server's token, the two would disagree the moment this branch -- not
+  // the fallback -- is what answers.
+  it("strips the server's own content-version token, request unpinned or not", () => {
+    useAppStore.setState({ activeTensorId: "scratch/tensorA", requestedArrayId: null });
+    useAppStore
+      .getState()
+      .setTileInfo({ ...TILE_INFO, array_id: "scratch@srvtok1/tensorA" }, "scratch/tensorA");
+
+    expect(currentArrayId(useAppStore.getState())).toBe("scratch/tensorA");
+  });
+
+  // The fallback branch answers straight from `requestedArrayId`, which
+  // legitimately keeps a *link's* pin (its own doc comment, and what
+  // `loadRois`'s own "follows the pinned address" test relies on) -- this is
+  // the fallback branch's `token` case, not the tileInfo branch's.
+  it("keeps a link's own pin token in the fallback branch", () => {
+    useAppStore.setState({
+      activeTensorId: "scratch/tensorA",
+      requestedArrayId: "scratch@abcd1234/tensorA",
+      tileInfoFor: null,
+      tileInfo: null,
+    });
+
+    expect(currentArrayId(useAppStore.getState())).toBe("scratch@abcd1234/tensorA");
+  });
+
+  // Once resolution settles (`tileInfoFor` catches up to the snapped,
+  // still-pinned `requestedArrayId`), the tileInfo branch takes over -- and
+  // the server echoes a pinned request's own token back unchanged, so this
+  // branch has to keep it too, not just the fallback above.
+  it("keeps a link's own pin token once the tileInfo branch takes over too", () => {
+    useAppStore.setState({ activeTensorId: "scratch/tensorA", requestedArrayId: "scratch@abcd1234/tensorA" });
+    useAppStore
+      .getState()
+      .setTileInfo(
+        { ...TILE_INFO, array_id: "scratch@abcd1234/tensorA" },
+        "scratch@abcd1234/tensorA",
+      );
+
+    expect(currentArrayId(useAppStore.getState())).toBe("scratch@abcd1234/tensorA");
+  });
+});
+
+// biopb/biopb#1156 fixed ROI/draft/broadcast-axis state reading a bare id
+// tile_info had already resolved; those all read through `currentArrayId`.
+// Anything that instead compares its own copy of the id -- a URL param
+// written at link-landing, before resolution, or a contrast-window write
+// keyed to the raw viewer prop -- needed the actual selection to adopt the
+// resolution too, not just `currentArrayId`'s read of it. That is what
+// `setTileInfo` does below.
+describe("setTileInfo resolves the selection in place", () => {
+  it("snaps a clicked bare source_id to the tensor it resolved to", () => {
+    useAppStore.setState({ activeTensorId: "scratch", requestedArrayId: null });
+
+    useAppStore.getState().setTileInfo({ ...TILE_INFO, array_id: "scratch/tensorA" }, "scratch");
+
+    expect(useAppStore.getState().activeTensorId).toBe("scratch/tensorA");
+  });
+
+  it("snaps a pinned link's requested id too, keeping its token", () => {
+    useAppStore.setState({ activeTensorId: "scratch", requestedArrayId: "scratch@abcd1234" });
+
+    useAppStore
+      .getState()
+      .setTileInfo({ ...TILE_INFO, array_id: "scratch/tensorA" }, "scratch@abcd1234");
+
+    expect(useAppStore.getState().requestedArrayId).toBe("scratch@abcd1234/tensorA");
+    expect(useAppStore.getState().activeTensorId).toBe("scratch/tensorA");
+  });
+
+  it("carries a set list written at link-landing forward through resolution", () => {
+    useAppStore.setState({
+      activeTensorId: "scratch",
+      requestedArrayId: null,
+      visibleSets: ["nuclei"],
+      visibleSetsFor: "scratch",
+    });
+
+    useAppStore.getState().setTileInfo({ ...TILE_INFO, array_id: "scratch/tensorA" }, "scratch");
+
+    expect(selectVisibleSets(useAppStore.getState())).toEqual(["nuclei"]);
+  });
+
+  it("carries a pinned link's set list forward with its token", () => {
+    // `visibleSetsFor` has to keep the same pin `requestedArrayId` does:
+    // `currentArrayId` (via `requestedArrayId`'s fallback branch) still
+    // answers with the token here, and a stripped `visibleSetsFor` would
+    // mismatch it the instant resolution lands.
+    useAppStore.setState({
+      activeTensorId: "scratch",
+      requestedArrayId: "scratch@abcd1234",
+      visibleSets: ["nuclei"],
+      visibleSetsFor: "scratch@abcd1234",
+    });
+
+    useAppStore
+      .getState()
+      .setTileInfo({ ...TILE_INFO, array_id: "scratch/tensorA" }, "scratch@abcd1234");
+
+    expect(useAppStore.getState().requestedArrayId).toBe("scratch@abcd1234/tensorA");
+    expect(useAppStore.getState().visibleSetsFor).toBe("scratch@abcd1234/tensorA");
+    expect(selectVisibleSets(useAppStore.getState())).toEqual(["nuclei"]);
+  });
+
+  it("does not stomp a selection made after this fetch was issued", () => {
+    useAppStore.setState({ activeTensorId: "other", requestedArrayId: null });
+
+    // A slow resolve for "scratch" lands after the user already clicked "other".
+    useAppStore.getState().setTileInfo({ ...TILE_INFO, array_id: "scratch/tensorA" }, "scratch");
+
+    expect(useAppStore.getState().activeTensorId).toBe("other");
+  });
+
+  it("does nothing when the id asked for already names the resolved tensor", () => {
+    useAppStore.setState({ activeTensorId: "scratch/tensorA", requestedArrayId: null });
+
+    useAppStore
+      .getState()
+      .setTileInfo({ ...TILE_INFO, array_id: "scratch/tensorA" }, "scratch/tensorA");
+
+    expect(useAppStore.getState().activeTensorId).toBe("scratch/tensorA");
+  });
+
+  // The viewer publishes the contrast window keyed to its own `arrayId` prop --
+  // bare on first render, then whatever this snap resolves the selection to on
+  // the next one. Without the snap, that second write never happens and the
+  // window is stuck hidden behind the bare key forever.
+  it("un-hides a contrast window a viewer published before resolution landed", () => {
+    useAppStore.setState({ activeTensorId: "scratch", requestedArrayId: null });
+    useAppStore.getState().noteObservedLimits([10, 900], "scratch", 0);
+
+    useAppStore.getState().setTileInfo({ ...TILE_INFO, array_id: "scratch/tensorA" }, "scratch");
+    // Without a second write, the window this viewer already published is
+    // hidden the moment resolution lands: `observedLimitsFor` is still
+    // "scratch", but the tensor in view just became "scratch/tensorA".
+    expect(selectObservedLimits(useAppStore.getState())).toBeNull();
+
+    // The viewer's own effect re-runs against the now-resolved `arrayId` prop.
+    useAppStore.getState().noteObservedLimits([10, 900], "scratch/tensorA", 0);
+
+    expect(selectObservedLimits(useAppStore.getState())).toEqual([10, 900]);
+  });
 });
 
 // ---------------------------------------------------------------------------

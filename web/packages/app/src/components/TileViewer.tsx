@@ -42,6 +42,7 @@ import {
   selectVisibleSets,
   useAppStore,
 } from "../store";
+import { sameStableAddress } from "../utils/tensorIdentity";
 import {
   closeDraft,
   closesOnFirstVertex,
@@ -218,11 +219,26 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
   // re-render (i.e. on every slider move).
   const onUnsupportedRef = useRef(onUnsupported);
   onUnsupportedRef.current = onUnsupported;
+  // Read inside the fetch effect below without putting `loaded` itself in its
+  // deps -- that effect is what sets `loaded`, so depending on it would loop.
+  const loadedRef = useRef(loaded);
+  loadedRef.current = loaded;
 
   // --- pixel sources ------------------------------------------------------
   const [retrying, setRetrying] = useState(false);
   useEffect(() => {
     if (!client) return;
+    // `arrayId` can change to the exact tensor already loaded: `setTileInfo`
+    // upgrades a bare or content-pinned prop to what the server resolved it
+    // to, which re-renders this component with the resolved spelling of the
+    // *same* tensor. Re-fetching would flash the canvas blank for pixels
+    // already on screen; nothing here changes across that upgrade. Compared
+    // stripped of any token -- `info.array_id` always carries the server's own
+    // one (`currentArrayId`'s doc comment), which would otherwise never match
+    // a prop that upgrade left pinned, or bare.
+    if (loadedRef.current && sameStableAddress(loadedRef.current.info.array_id, arrayId)) {
+      return;
+    }
     const controller = new AbortController();
     let live = true;
     let timer: ReturnType<typeof setTimeout> | undefined;

@@ -21,9 +21,10 @@
  * about whether the tensor can be tiled, so it is offered again.
  */
 
-import { Component, Suspense, lazy, useCallback, useEffect, useState } from "react";
+import { Component, Suspense, lazy, useCallback, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { useAppStore } from "../store";
+import { advanceViewerKey, type ViewerKeyState } from "../utils/tensorIdentity";
 
 // deck.gl + luma.gl are the app's largest dependency by a wide margin, and only
 // this pane uses them. Splitting them out keeps them off the admin and observe
@@ -115,6 +116,12 @@ export function ViewerPane({ sourceId, tensorId }: ViewerPaneProps) {
   // Bumped to remount the viewer on a manual retry. The tensor has not
   // changed, so `key={tensorId}` alone would hand back the same instance.
   const [attempt, setAttempt] = useState(0);
+  // The tensor this pane is keyed on -- see `advanceViewerKey` -- ahead of
+  // the early return so the hook itself is called on every render.
+  const viewerKey = useRef<ViewerKeyState>({
+    keyedTensorId: tensorId,
+    lastTensorId: tensorId,
+  });
 
   // A new tensor, or a new render mode, gets a fresh verdict: the last one may
   // have failed for a reason specific to it.
@@ -160,10 +167,18 @@ export function ViewerPane({ sourceId, tensorId }: ViewerPaneProps) {
     );
   }
 
+  // A bare source_id upgrades in place to the specific field the server
+  // resolved once tile_info answers it (`currentArrayId` in the store snaps
+  // the selection the moment that lands), and that is still the same image:
+  // remounting on it would throw away the camera, the contrast samples and
+  // the tile cache the remount-per-tensor key below exists to *protect*, for
+  // a switch that never happened.
+  viewerKey.current = advanceViewerKey(viewerKey.current, tensorId);
+
   // Keyed on the mode as well as the tensor: the two viewers hold different
   // state (a tile cache and a camera vs. a volume and an orbit), so switching
   // mounts a fresh one rather than handing the old one different props.
-  const key = `${tensorId}#${render3d ? "3d" : "2d"}#${attempt}`;
+  const key = `${viewerKey.current.keyedTensorId}#${render3d ? "3d" : "2d"}#${attempt}`;
 
   return (
     <TileViewerBoundary key={key} onError={onUnsupported}>

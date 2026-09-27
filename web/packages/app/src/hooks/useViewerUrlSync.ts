@@ -59,8 +59,13 @@ export function useViewerUrlSync() {
     // someone just pasted into an empty `/viewer` before hydration can use it.
     if (!activeTensorId) return;
     // The pinned address, so a link names the content it was made from -- and
-    // an unpinned link is upgraded in place once the grid answers, which is the
-    // rewrite that makes a hand-written id legal input.
+    // an unpinned link is upgraded in place once the grid answers, which is
+    // the rewrite that makes a hand-written id legal input. Not from
+    // `requestedArrayId`/`activeTensorId` themselves: `setTileInfo` snaps
+    // those to the resolved *field* only, deliberately stripped of the
+    // server's own content-version token (`currentArrayId`'s doc comment), so
+    // `tileInfo.array_id` -- the server's answer, token and all -- is the only
+    // copy that still has it.
     //
     // `requestedArrayId` sits between the two so a link whose version is gone
     // keeps its token in the bar: the viewer's 404 is the answer, and quietly
