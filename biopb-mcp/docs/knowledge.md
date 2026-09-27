@@ -207,9 +207,12 @@ version this ran under and the current one, so it clears itself at the next
 version bump regardless of whether the agent acted on it. A first-ever run
 has no prior manifest to diff against and reports nothing changed.
 
-Still no seen-list, no merge step of the file-format kind — the manifest is
-extra state on the *shipped* side only, so the local index's ownership model
-(§2) is unchanged.
+Still no seen-list, no merge step of the file-format kind for the *index*: the
+manifest tracks the shipped set, not the local one, and sits beside the local
+tier's files on disk without being one of them — not `.md`, not counted in
+`local_ids()`, not reachable through `read_doc`/`write_doc`. The agent's
+ownership of the index and its docs (§2) is unchanged; this is the loader's
+own bookkeeping, the same way `describe()`'s frontmatter parsing is.
 
 ## 5. Writing discipline
 

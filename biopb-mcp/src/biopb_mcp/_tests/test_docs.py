@@ -184,6 +184,23 @@ def bump_version(monkeypatch, version: str):
     monkeypatch.setattr(_docs, "_installed_version", lambda: version)
 
 
+def seed_manifest(store, monkeypatch, doc_id="one", body="# Old\n"):
+    """Ship *doc_id* at version 1.0 and seed the manifest against it."""
+    bump_version(monkeypatch, "1.0")
+    path = ship(store, doc_id, body)
+    _docs.changed_shipped_ids()
+    return path
+
+
+def seed_then_change(store, monkeypatch, doc_id="one"):
+    """:func:`seed_manifest`, then edit the shipped text and bump to 1.1 --
+    the setup most manifest tests below need before their own assertion."""
+    path = seed_manifest(store, monkeypatch, doc_id)
+    path.write_text("# New\n", encoding="utf-8")
+    bump_version(monkeypatch, "1.1")
+    return path
+
+
 # --------------------------------------------------------------------------- #
 # The shipped-doc change manifest
 # --------------------------------------------------------------------------- #
@@ -194,43 +211,25 @@ def test_a_first_run_has_nothing_to_compare_against(store, monkeypatch):
 
 
 def test_a_content_change_is_flagged_after_a_version_bump(store, monkeypatch):
-    bump_version(monkeypatch, "1.0")
-    path = ship(store, "one", "# Old\n")
-    _docs.changed_shipped_ids()  # seeds the manifest at 1.0
-
-    path.write_text("# New\n", encoding="utf-8")
-    bump_version(monkeypatch, "1.1")
+    seed_then_change(store, monkeypatch)
     assert _docs.changed_shipped_ids() == ["one"]
 
 
 def test_no_version_bump_means_no_rehash(store, monkeypatch):
-    bump_version(monkeypatch, "1.0")
-    path = ship(store, "one", "# Old\n")
-    _docs.changed_shipped_ids()
-
+    path = seed_manifest(store, monkeypatch)
     path.write_text("# New\n", encoding="utf-8")
     # Still version 1.0: the change is real but unseen until the next bump.
     assert _docs.changed_shipped_ids() == []
 
 
 def test_a_cached_change_survives_repeat_calls_at_the_same_version(store, monkeypatch):
-    bump_version(monkeypatch, "1.0")
-    path = ship(store, "one", "# Old\n")
-    _docs.changed_shipped_ids()
-
-    path.write_text("# New\n", encoding="utf-8")
-    bump_version(monkeypatch, "1.1")
+    seed_then_change(store, monkeypatch)
     assert _docs.changed_shipped_ids() == ["one"]
     assert _docs.changed_shipped_ids() == ["one"]
 
 
 def test_an_id_no_longer_shipped_drops_out_of_the_cached_change_set(store, monkeypatch):
-    bump_version(monkeypatch, "1.0")
-    path = ship(store, "one", "# Old\n")
-    _docs.changed_shipped_ids()
-
-    path.write_text("# New\n", encoding="utf-8")
-    bump_version(monkeypatch, "1.1")
+    path = seed_then_change(store, monkeypatch)
     _docs.changed_shipped_ids()
 
     path.unlink()
@@ -238,9 +237,7 @@ def test_an_id_no_longer_shipped_drops_out_of_the_cached_change_set(store, monke
 
 
 def test_a_matching_version_never_hashes_the_shipped_set(store, monkeypatch):
-    bump_version(monkeypatch, "1.0")
-    ship(store, "one")
-    _docs.changed_shipped_ids()  # seeds the manifest at 1.0, hashing once
+    seed_manifest(store, monkeypatch)  # hashes once, at 1.0
 
     def boom():
         raise AssertionError("hashing should not run once the version matches")
@@ -280,37 +277,22 @@ def test_a_non_list_changed_field_is_ignored_in_the_fast_path(store, monkeypatch
 def test_a_shadowed_doc_whose_shipped_text_changed_is_flagged_in_the_index(
     store, monkeypatch
 ):
-    bump_version(monkeypatch, "1.0")
     ship(store, "index", "- one: hook\n")
-    path = ship(store, "one", "# Old\n")
+    seed_then_change(store, monkeypatch)
     _docs.write_doc("one", body="# Mine\n")
-    _docs.changed_shipped_ids()
-
-    path.write_text("# New\n", encoding="utf-8")
-    bump_version(monkeypatch, "1.1")
     rendered = _docs.render_index()
     assert "Shipped docs your local copy may be behind on: one" in rendered
 
 
 def test_an_unshadowed_changed_doc_gets_no_stale_flag(store, monkeypatch):
-    bump_version(monkeypatch, "1.0")
     ship(store, "index", "- one: hook\n")
-    path = ship(store, "one", "# Old\n")
-    _docs.changed_shipped_ids()
-
-    path.write_text("# New\n", encoding="utf-8")
-    bump_version(monkeypatch, "1.1")
+    seed_then_change(store, monkeypatch)
     assert "behind on" not in _docs.render_index()
 
 
 def test_a_changed_but_unlisted_doc_is_only_in_the_new_tail(store, monkeypatch):
-    bump_version(monkeypatch, "1.0")
     ship(store, "index", "# docs\n")
-    path = ship(store, "one", "# Old\n")
-    _docs.changed_shipped_ids()
-
-    path.write_text("# New\n", encoding="utf-8")
-    bump_version(monkeypatch, "1.1")
+    seed_then_change(store, monkeypatch)
     rendered = _docs.render_index()
     assert "New shipped docs: one" in rendered
     assert "behind on" not in rendered

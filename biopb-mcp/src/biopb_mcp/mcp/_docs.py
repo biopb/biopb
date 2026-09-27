@@ -331,9 +331,9 @@ _MANIFEST_NAME = ".shipped-manifest.json"
 
 
 def _installed_version() -> str:
-    from biopb_mcp import __version__
+    from ._update import _running_library_version
 
-    return __version__
+    return _running_library_version()
 
 
 def _manifest_path() -> Path | None:
@@ -382,7 +382,7 @@ def _save_manifest(data: dict) -> None:
         logger.debug("docs: could not save the shipped-doc manifest", exc_info=True)
 
 
-def changed_shipped_ids() -> list[str]:
+def changed_shipped_ids(current_ids: list[str] | None = None) -> list[str]:
     """Shipped ids added or edited since this install last looked.
 
     Compares against the manifest from the last time this ran, keyed by
@@ -390,19 +390,23 @@ def changed_shipped_ids() -> list[str]:
     two versions share one answer, and a session that reruns under the same
     version gets the same answer back without rehashing anything -- checked
     before any hashing happens, so the common case (no upgrade since last
-    look) costs one small file read and an id listing, never a hash pass over
-    the whole shipped set. A first-ever run, or a manifest whose ``hashes``
-    isn't the mapping this expects, has nothing trustworthy to compare
-    against, so it seeds fresh and reports nothing changed -- there is no
-    "before" for it to differ from.
+    look) costs one id listing, never a hash pass over the whole shipped set.
+    A first-ever run, or a manifest whose ``hashes`` isn't the mapping this
+    expects, has nothing trustworthy to compare against, so it seeds fresh and
+    reports nothing changed -- there is no "before" for it to differ from.
+
+    *current_ids* lets a caller that already has :func:`shipped_ids` (as
+    :func:`render_index` does, for its own *New shipped docs* tail) pass it
+    through rather than walking the shipped tree a second time in the same
+    render.
     """
     manifest = _load_manifest()
     version = _installed_version()
     if manifest.get("version") == version:
         cached = manifest.get("changed")
-        current_ids = set(shipped_ids())
+        ids = set(current_ids) if current_ids is not None else set(shipped_ids())
         if isinstance(cached, list):
-            return [i for i in cached if isinstance(i, str) and i in current_ids]
+            return [i for i in cached if isinstance(i, str) and i in ids]
         return []
 
     current = _shipped_hashes()
@@ -573,12 +577,13 @@ def render_index(text: str | None = None) -> str:
         else:
             out.append(line)
 
-    new = [i for i in shipped_ids() if i not in named]
+    ids = shipped_ids()
+    new = [i for i in ids if i not in named]
     if new:
         out.append("")
         out.append(f"New shipped docs: {', '.join(new)}")
 
-    stale = [i for i in changed_shipped_ids() if i in shadowed]
+    stale = [i for i in changed_shipped_ids(ids) if i in shadowed]
     if stale:
         out.append("")
         out.append(f"Shipped docs your local copy may be behind on: {', '.join(stale)}")
