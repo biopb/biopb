@@ -17,6 +17,7 @@ import pytest
 from biopb.image.utils import deserialize_image_data, serialize_from_numpy_to_image_data
 from biopb_image_base import Tensor, op
 from biopb_image_base.ops import (
+    _ambient_scheduler_configured,
     _EmbeddedSink,
     _InlineSink,
     _PlaneSink,
@@ -62,6 +63,13 @@ def shrink(image: Tensor("YX")):
 @op(input="blocks", block_shape=16, dtype=np.uint8)
 def masked(image: Tensor("YX"), level: float, labels: Tensor("YX")):
     return ((image > level) & (labels > 0)).astype(np.uint8)
+
+
+@op(input="blocks", block_shape=16)
+def widen(image: Tensor("YX")):
+    """Undeclared dtype, changed anyway: exercises the peek-block guess
+    (input dtype) turning out wrong, without declaring one up front."""
+    return image.astype(np.float32) * 0.5
 
 
 @op(input="lazy")
@@ -118,6 +126,7 @@ ALL = [
     smooth,
     shrink,
     masked,
+    widen,
     frames,
     track,
     localize,
@@ -320,6 +329,20 @@ def test_blocks_matches_the_whole_image(server):
     np.testing.assert_allclose(_value(event.outputs["result"]), expected, rtol=1e-6)
 
 
+def test_blocks_with_an_undeclared_dtype_change_is_correct(server):
+    """biopb/biopb#1148: the peek block that learns an undeclared dtype used
+    to be thrown away and the whole map_overlap graph rebuilt from scratch
+    under the real dtype. Rebuilt as a cast over the same graph instead --
+    this only proves the result is still correct under a real dtype change,
+    not the graph is built once (that's a code-reading fact, not a
+    black-box-observable one)."""
+    image = np.arange(40 * 37, dtype=np.uint8).reshape(40, 37)
+    (event,) = server.call("widen", image=_eager(image))
+    out = _value(event.outputs["result"])
+    assert out.dtype == np.float32
+    np.testing.assert_allclose(out, image.astype(np.float32) * 0.5)
+
+
 def test_blocks_passes_tensors_by_name(server):
     image = np.random.rand(40, 37).astype(np.float32)
     labels = np.zeros((40, 37), np.uint16)
@@ -499,6 +522,36 @@ def test_small_results_stay_inline_with_a_plane(plane):
         assert event.outputs["0"].WhichOneof("kind") == "eager"
     finally:
         s.close()
+
+
+def _assert_toggles_ambient_scheduler(make_ctx):
+    """*make_ctx* is a zero-arg factory, not a context manager: both
+    dask.config.set and distributed.Client take effect at construction, not
+    at __enter__, so building one before this runs its first assert would
+    activate it too early."""
+    assert not _ambient_scheduler_configured()
+    with make_ctx():
+        assert _ambient_scheduler_configured()
+    assert not _ambient_scheduler_configured()
+
+
+def test_ambient_scheduler_detects_a_dask_config_override():
+    """biopb/biopb#1148: the upload's own num_workers cap must not clobber a
+    scheduler the deployment already configured -- dask.config.set outranks
+    an active dask.distributed Client (dask.base.get_scheduler's own
+    precedence), so setting one unconditionally would silently pull uploads
+    off a configured cluster and onto local threads instead."""
+    import dask
+
+    _assert_toggles_ambient_scheduler(lambda: dask.config.set(scheduler="synchronous"))
+
+
+def test_ambient_scheduler_detects_a_distributed_client():
+    distributed = pytest.importorskip("distributed")
+
+    _assert_toggles_ambient_scheduler(
+        lambda: distributed.Client(processes=False, n_workers=1, threads_per_worker=1)
+    )
 
 
 def test_embedded_sink(tmp_path: Path, monkeypatch):
