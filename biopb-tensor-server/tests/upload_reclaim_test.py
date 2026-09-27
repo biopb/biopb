@@ -20,6 +20,8 @@ import time
 
 import numpy as np
 import pytest
+from biopb.image import ROI, Point, Polygon
+from biopb.image.annotation_pb2 import RoiAnnotation
 from biopb.tensor import UploadRefused
 from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server.adapters.fields import (
@@ -38,6 +40,13 @@ def _make(client, source, field="reclaim", shape=(4, 4), chunk=(2, 2)):
         np.empty(shape, dtype=np.uint16),
         chunk_shape=chunk,
     )
+
+
+def _annotation():
+    roi = ROI(
+        polygon=Polygon(points=[Point(x=1, y=2), Point(x=10, y=2), Point(x=5, y=9)])
+    )
+    return RoiAnnotation(roi=roi)
 
 
 def _put(client, desc, start=(0, 0), stop=(2, 2), fill=7):
@@ -72,6 +81,20 @@ class TestAQuietUploadExpires:
         status = client.get_upload_status(desc.array_id)
         assert status["state"] == "DISCARDED"
         assert "expired" in status["reason"]
+
+    def test_expiring_it_forgets_annotations_drawn_against_it(
+        self, uploads, client, writable_server, source
+    ):
+        """biopb/biopb#1155: the reaper used to discard the tensor but leave
+        its rois rows behind -- an orphan the sweep never revisits, since the
+        scratch source itself is never removed."""
+        desc = _make(client, source)
+        writable_server.metadata_db.put_rois(desc.array_id, [_annotation()])
+        assert len(writable_server.metadata_db.list_rois(desc.array_id)[0]) == 1
+
+        uploads.reap(now=_past_ttl())
+
+        assert writable_server.metadata_db.list_rois(desc.array_id)[0] == []
 
     def test_a_late_write_is_refused_with_the_expiry_reason(
         self, uploads, client, source

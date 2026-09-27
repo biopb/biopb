@@ -93,6 +93,27 @@ class TestDiscardReleasesTheStore:
         assert status["state"] == "DISCARDED"
         assert status["reason"] == "operator said so"
 
+    def test_it_forgets_annotations_drawn_against_the_array_id(
+        self, writable_server, client, source
+    ):
+        """biopb/biopb#1155: an explicit discard used to leave rois rows
+        behind, orphaned once the array_id's name is free for reuse."""
+        from biopb.image import ROI, Point, Polygon
+        from biopb.image.annotation_pb2 import RoiAnnotation
+
+        desc = _create(client, source)
+        _put(client, desc)
+        client.set_upload_status(desc, "READY")
+        roi = ROI(
+            polygon=Polygon(points=[Point(x=1, y=2), Point(x=3, y=4), Point(x=5, y=1)])
+        )
+        writable_server.metadata_db.put_rois(desc.array_id, [RoiAnnotation(roi=roi)])
+        assert len(writable_server.metadata_db.list_rois(desc.array_id)[0]) == 1
+
+        writable_server.uploads.discard(desc.array_id, "operator said so")
+
+        assert writable_server.metadata_db.list_rois(desc.array_id)[0] == []
+
     def test_a_late_write_is_refused_and_does_not_recreate_the_store(
         self, writable_server, client, source
     ):

@@ -2023,6 +2023,26 @@ class MetadataDatabase:
         logger.debug("delete_rois: removed %s from %s", len(deleted), array_id)
         return deleted
 
+    def discard_array_rois(self, array_id: str) -> int:
+        """Delete every annotation on array_id, reserved sets included.
+
+        For an array_id that is gone for good -- a discarded or expired
+        upload -- rather than merely unseen in the current catalog scan.
+        :meth:`sync_source_removed` deliberately lets hand-drawn annotations
+        outlive a *source* going offline, since it may come back
+        (biopb/biopb#951); a reclaimed upload's array_id does not come back,
+        and its name may be handed to an unrelated tensor next, so nothing
+        here should survive to be misread as that tensor's own (#1155).
+        """
+        _require_bare_array_id(array_id)
+        conn = self._get_connection()
+        with self._write_lock:
+            deleted = conn.execute(
+                "DELETE FROM rois WHERE array_id = ? RETURNING roi_id", [array_id]
+            ).fetchall()
+        logger.debug("discard_array_rois: removed %s from %s", len(deleted), array_id)
+        return len(deleted)
+
     def load_decode_rates(self) -> Dict[str, Tuple[float, int]]:
         """Every persisted decode rate, as ``array_id -> (mbps, samples)``.
 

@@ -323,6 +323,43 @@ class TestDiscardAndDelete:
         finally:
             second.shutdown()
 
+    def test_an_adopted_field_s_delete_forgets_its_annotations(
+        self, writable_server, client, tmp_path
+    ):
+        """biopb/biopb#1155: an adopted field holds no upload record, so its
+        delete is a different code path than a regular discard -- one that
+        used to leave the rois rows behind too."""
+        from biopb.image import ROI, Point, Polygon
+        from biopb.image.annotation_pb2 import RoiAnnotation
+
+        register_and_catalog(writable_server, "theirs", _their_file(tmp_path))
+        desc = _add(client, "theirs", "raw")
+        client.upload_array(desc, _arr())
+        writable_server.shutdown()
+        client.close()
+
+        second = _serve(tmp_path)
+        try:
+            register_and_catalog(second, "theirs", _their_file(tmp_path))
+            # The annotations DB does not itself survive the restart in this
+            # test's in-memory setup; what matters is that discard forgets
+            # whatever is there for the array_id at the time it runs.
+            roi = ROI(
+                polygon=Polygon(
+                    points=[Point(x=1, y=2), Point(x=3, y=4), Point(x=5, y=1)]
+                )
+            )
+            second.metadata_db.put_rois(desc.array_id, [RoiAnnotation(roi=roi)])
+            assert len(second.metadata_db.list_rois(desc.array_id)[0]) == 1
+            again = TensorFlightClient(f"grpc://localhost:{second.port}")
+            try:
+                again.set_upload_status("theirs/@fields/raw", "DISCARDED")
+            finally:
+                again.close()
+            assert second.metadata_db.list_rois(desc.array_id)[0] == []
+        finally:
+            second.shutdown()
+
 
 class TestScanSourceFields:
     def test_it_skips_a_pending_store(self, tmp_path):

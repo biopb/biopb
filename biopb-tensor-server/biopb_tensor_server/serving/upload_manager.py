@@ -283,7 +283,10 @@ class UploadManager:
         the one way a published upload is ever removed, and why there is no
         second verb for deleting one. A durable kind's store goes with the
         discard (the adapter's own), and its listing here: the catalog row for
-        the registered kinds, the parent's attachment for a label set.
+        the registered kinds, the parent's attachment for a label set, and any
+        annotations drawn against the array_id (biopb/biopb#1155) -- the name
+        is free after this and must not hand a later tensor another one's
+        rows.
 
         Total, and a statement about the end state rather than a receipt: an
         id that is not tracking an upload -- never was, has since been
@@ -299,6 +302,7 @@ class UploadManager:
             self._drop_catalog_row(adapter, array_id)
         else:
             self._unlist(parent, field)
+        self._forget_rois(array_id)
         return status
 
     def set_status(
@@ -367,6 +371,7 @@ class UploadManager:
             return unknown_upload_status(array_id)
         adapter.delete_store()
         self._sync_parent_row(parent)
+        self._forget_rois(array_id)
         logger.info(f"Deleted tensor {array_id}")
         return unknown_upload_status(array_id)
 
@@ -462,6 +467,22 @@ class UploadManager:
             self._metadata_db.sync_source_removed(source_id)
         except Exception as e:
             logger.warning(f"Failed to drop upload {source_id} from the catalog: {e}")
+
+    def _forget_rois(self, array_id: str) -> None:
+        """Drop annotations on a discarded array_id; best-effort, like the row.
+
+        Called wherever an upload's data is actually disposed of -- explicit
+        discard, either half of the reap sweep, or deleting an adopted
+        tensor -- so a name the reaper frees is never handed to a later,
+        unrelated tensor with another one's annotations still attached
+        (biopb/biopb#1155).
+        """
+        if self._metadata_db is None:
+            return
+        try:
+            self._metadata_db.discard_array_rois(array_id)
+        except Exception as e:
+            logger.warning(f"Failed to drop annotations for {array_id}: {e}")
 
     def discard_unfinished_stores(self) -> int:
         """Delete the stores of uploads a previous server never finished.
@@ -859,6 +880,7 @@ class UploadManager:
                 expired_now, stale = _reap_step(adapter, now, ttl, wall_now)
                 if expired_now:
                     self._drop_catalog_row(adapter, source_id)
+                    self._forget_rois(source_id)
                     expired += 1
                 if stale:
                     # Safe without a compare-and-remove: a tombstone is
@@ -902,6 +924,7 @@ class UploadManager:
             expired_now, stale = _reap_step(tensor, now, ttl, wall_now)
             if expired_now:
                 self._unlist(adapter, field)
+                self._forget_rois(tensor.array_id)
                 expired += 1
             if stale:
                 detach(field)
