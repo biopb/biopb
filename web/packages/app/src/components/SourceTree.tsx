@@ -13,6 +13,7 @@ import {
   UNRESOLVED_TOOLTIP,
   getPathParts,
   groupTensors,
+  isEmptySource,
   isUnresolved,
   matchesQuery,
   recentNode,
@@ -311,7 +312,13 @@ export function TreeRow({
   // Source node
   const src = node.source!;
   const isActive = src.source_id === activeSourceId;
-  const hasMultipleTensors = src.tensors.length > 1;
+  // Grouped, not the raw tensor count: a label set files under the image it
+  // annotates (see `groups` above), so one image plus its label set is still
+  // one tensor as far as expanding into a per-image list is concerned. Label
+  // toggle rows render regardless (below) -- they're the only place to reach
+  // the overlay -- but the redundant image row is skipped when there's only
+  // one to pick from.
+  const showImageRows = groups.length > 1;
   const firstTensor = src.tensors[0];
   // An unresolved source has no tensor to read, so selecting it would send the
   // viewer after a tile that cannot exist.
@@ -403,31 +410,34 @@ export function TreeRow({
         ) : null}
       </button>
 
-      {/* Nested tensors when source is active and has more than one. A label
-          set counts: its row is the only place the set is offered at all. */}
-      {isActive && hasMultipleTensors &&
+      {/* Nested rows when the source is active. The per-image row only earns
+          its place when there's an actual choice between images; a label set's
+          toggle row renders regardless, since it's the only place to reach it. */}
+      {isActive &&
         groups.map(({ image, labelSets }) => {
           const tActive = image.array_id === activeTensorId;
           return (
             <Fragment key={`tensor:${src.source_id}:${image.array_id}`}>
-              <button
-                className={`tree-item tensor-item ${tActive ? "active" : ""}`}
-                style={{
-                  width: "100%",
-                  textAlign: "left",
-                  paddingLeft: indent + 12,
-                  display: "flex",
-                  alignItems: "center",
-                  fontSize: 12,
-                }}
-                onClick={() => selectSource(src.source_id, image.array_id)}
-                title={`${image.array_id}\nShape: ${formatShape(image.shape)}\nDtype: ${image.dtype}`}
-              >
-                <ChevronSlot />
-                <span style={{ flex: 1, marginLeft: 4 }}>
-                  {tensorShortName(image.array_id)}
-                </span>
-              </button>
+              {showImageRows && (
+                <button
+                  className={`tree-item tensor-item ${tActive ? "active" : ""}`}
+                  style={{
+                    width: "100%",
+                    textAlign: "left",
+                    paddingLeft: indent + 12,
+                    display: "flex",
+                    alignItems: "center",
+                    fontSize: 12,
+                  }}
+                  onClick={() => selectSource(src.source_id, image.array_id)}
+                  title={`${image.array_id}\nShape: ${formatShape(image.shape)}\nDtype: ${image.dtype}`}
+                >
+                  <ChevronSlot />
+                  <span style={{ flex: 1, marginLeft: 4 }}>
+                    {tensorShortName(image.array_id)}
+                  </span>
+                </button>
+              )}
               {labelSets.map((set) => {
                 const on = set.array_id === labelOverlay;
                 return (
@@ -437,7 +447,7 @@ export function TreeRow({
                     style={{
                       width: "100%",
                       textAlign: "left",
-                      paddingLeft: indent + 24,
+                      paddingLeft: indent + (showImageRows ? 24 : 12),
                       display: "flex",
                       alignItems: "center",
                       fontSize: 12,
@@ -576,16 +586,19 @@ export function SourceTree() {
       });
   }, [debouncedQuery, useServerQuery, querySources]);
 
-  // Client-side filter
+  // Client-side filter. Empty sources are dropped unconditionally, before the
+  // search query narrows further -- a source with nothing on it is never
+  // worth a row, matching or not.
   const filteredSources = useMemo(() => {
+    const visible = sources.filter((s) => !isEmptySource(s));
     const q = query.trim().toLowerCase();
-    if (!q) return sources;
+    if (!q) return visible;
 
     if (serverFilteredIds) {
-      return sources.filter((s) => serverFilteredIds.has(s.source_id));
+      return visible.filter((s) => serverFilteredIds.has(s.source_id));
     }
 
-    return sources.filter((s) => matchesQuery(s, q));
+    return visible.filter((s) => matchesQuery(s, q));
   }, [query, sources, serverFilteredIds]);
 
   // Build tree from filtered sources
@@ -596,7 +609,8 @@ export function SourceTree() {
   // construction does not hold the uploads this node exists to show.
   const recent = useMemo(() => {
     const q = query.trim().toLowerCase();
-    const matching = q ? recentSources.filter((s) => matchesQuery(s, q)) : recentSources;
+    const visible = recentSources.filter((s) => !isEmptySource(s));
+    const matching = q ? visible.filter((s) => matchesQuery(s, q)) : visible;
     return recentNode(matching);
   }, [recentSources, query]);
 

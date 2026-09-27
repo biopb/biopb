@@ -3,6 +3,7 @@ import type { DataSourceDescriptor, TensorDescriptor } from "@biopb/tensor-fligh
 import {
   getPathParts,
   groupTensors,
+  isEmptySource,
   isUnresolved,
   recentNode,
   sourceLabel,
@@ -146,6 +147,32 @@ describe("isUnresolved", () => {
     const legacy = source();
     delete (legacy as Partial<DataSourceDescriptor>).is_resolved;
     expect(isUnresolved(legacy)).toBe(false);
+  });
+});
+
+describe("isEmptySource", () => {
+  const tensor = {
+    array_id: "a",
+    dim_labels: ["y", "x"],
+    shape: [4, 4],
+    chunk_shape: [],
+    dtype: "uint16",
+  };
+
+  it("is a resolved source with nothing on it", () => {
+    expect(isEmptySource(source({ is_resolved: true, tensors: [] }))).toBe(true);
+  });
+
+  it("is not empty once it lists a tensor", () => {
+    expect(isEmptySource(source({ is_resolved: true, tensors: [tensor] }))).toBe(
+      false,
+    );
+  });
+
+  it("is never empty while unresolved, even with no tensors listed yet", () => {
+    // An unresolved source's empty list means "unknown", not "nothing" -- it
+    // still needs its row so a viewer can resolve it.
+    expect(isEmptySource(source({ is_resolved: false, tensors: [] }))).toBe(false);
   });
 });
 

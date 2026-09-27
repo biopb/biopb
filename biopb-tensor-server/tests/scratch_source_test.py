@@ -91,6 +91,15 @@ class TestItIsThereBeforeAnythingAsks:
         assert desc.array_id == f"{SCRATCH_SOURCE_ID}/@fields/straight-in"
         assert client.get_upload_status(desc.array_id)["state"] == "READY"
 
+    def test_its_source_url_is_a_clean_alias_not_a_filesystem_path(
+        self, writable_server
+    ):
+        """A UI showing ``source_url`` gets ``scratch://scratch``, not the
+        ``write_dir``-rooted fields directory it happens to be backed by."""
+        adapter = writable_server.sources.get(SCRATCH_SOURCE_ID)
+
+        assert adapter._source_url == f"scratch://{SCRATCH_SOURCE_ID}"
+
 
 class TestItIsEmptyByDefault:
     def test_an_empty_one_is_a_source_with_no_tensors(self, writable_server):

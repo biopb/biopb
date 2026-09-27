@@ -14,12 +14,10 @@ accumulating forever.
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any, List, Optional
 
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
-from biopb_tensor_server.adapters.fields import fields_root, source_fields_dir
 from biopb_tensor_server.core.adapter_base import SourceAdapter, TensorAdapter
 from biopb_tensor_server.core.errors import TensorNotFound
 
@@ -52,13 +50,12 @@ class ScratchSource(SourceAdapter):
 
     _source_type = "scratch"
 
-    def __init__(self, write_dir: Path, max_upload_ttl: Optional[float] = None) -> None:
+    def __init__(self, max_upload_ttl: Optional[float] = None) -> None:
         self.source_id = SCRATCH_SOURCE_ID
-        #: Where its tensors are, which is what the catalog groups by. There
-        #: is no container directory -- this one holds the fields.
-        self._source_url = str(
-            source_fields_dir(fields_root(Path(write_dir)), SCRATCH_SOURCE_ID)
-        )
+        #: A synthetic source like ``cache://``, not a filesystem path -- the
+        #: on-disk fields directory (``source_fields_dir``) is an implementation
+        #: detail clients have no use for.
+        self._source_url = f"scratch://{SCRATCH_SOURCE_ID}"
         #: Ceiling, in seconds, on every upload added here, applied by
         #: ``UploadManager._deadline_for`` including to a request that named no
         #: lifetime. None leaves them undated, as a discovered source does.

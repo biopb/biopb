@@ -116,6 +116,23 @@ export function isUnresolved(src: DataSourceDescriptor): boolean {
 }
 
 /**
+ * A resolved source with nothing on it -- browsing into it would open an
+ * empty list, so the tree leaves it out rather than rendering a dead end.
+ *
+ * Gated on {@link isUnresolved} rather than `tensors.length` alone: an
+ * unresolved source also lists no tensors, but for the opposite reason --
+ * they are unknown, not absent -- and it still needs its row so a viewer can
+ * resolve it.
+ *
+ * `tensors.length` is the raw catalog count, label sets included (biopb/biopb#1059);
+ * that is fine here, since zero of that raw count means there is truly
+ * nothing, image or label, to show.
+ */
+export function isEmptySource(src: DataSourceDescriptor): boolean {
+  return !isUnresolved(src) && src.tensors.length === 0;
+}
+
+/**
  * The "Recent" folder, or null when nothing is in it.
  *
  * Built beside `buildTree` and prepended rather than merged into it because a

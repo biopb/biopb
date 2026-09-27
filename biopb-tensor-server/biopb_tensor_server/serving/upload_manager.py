@@ -724,7 +724,7 @@ class UploadManager:
         """
         if self._write_dir is None:
             return None
-        adapter = ScratchSource(self._write_dir, max_ttl)
+        adapter = ScratchSource(max_ttl)
         registered = self._registry.register(SCRATCH_SOURCE_ID, adapter)
         self._sync_row(SCRATCH_SOURCE_ID, registered)
         logger.info(f"Serving the scratch source as {SCRATCH_SOURCE_ID}")
