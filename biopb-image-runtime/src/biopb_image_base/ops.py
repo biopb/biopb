@@ -525,6 +525,29 @@ class _InlineSink:
 _UPLOAD_WORKERS = 4
 
 
+def _ambient_scheduler_configured() -> bool:
+    """Whether dask would already resolve to something other than its bare
+    local default: a scheduler the deployment set itself
+    (``dask.config.set``), or an active ``dask.distributed`` cluster.
+
+    ``dask.config.set(scheduler=...)`` outranks an active distributed
+    ``Client`` (``dask.base.get_scheduler``'s own precedence), so blindly
+    setting one to bound upload concurrency would silently pull every upload
+    off a configured cluster and onto local threads instead.
+    """
+    import dask
+
+    if dask.config.get("scheduler", None) is not None:
+        return True
+    try:
+        from distributed import get_client
+
+        get_client()
+        return True
+    except (ImportError, ValueError):
+        return False
+
+
 class _PlaneSink(_InlineSink):
     """Small arrays inline; dask and large arrays to the data plane named by
     ``BIOPB_TENSOR_URL``, as tensors of its scratch source."""
@@ -549,6 +572,8 @@ class _PlaneSink(_InlineSink):
         return proto.Arg(lazy=self._upload(_regular_chunks(array), labels, op_name))
 
     def _upload(self, array, labels, op_name):
+        import contextlib
+
         import dask
 
         client = self._connect()
@@ -557,7 +582,12 @@ class _PlaneSink(_InlineSink):
             array,
             dim_labels=labels,
         )
-        with dask.config.set(scheduler="threads", num_workers=_UPLOAD_WORKERS):
+        bound = (
+            contextlib.nullcontext()
+            if _ambient_scheduler_configured()
+            else dask.config.set(scheduler="threads", num_workers=_UPLOAD_WORKERS)
+        )
+        with bound:
             client.upload_array(desc, array)
         return client.get_tensor_pb(desc.array_id)
 

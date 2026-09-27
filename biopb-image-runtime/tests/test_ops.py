@@ -523,6 +523,31 @@ def test_small_results_stay_inline_with_a_plane(plane):
         s.close()
 
 
+def test_ambient_scheduler_detects_a_dask_config_override():
+    """biopb/biopb#1148: the upload's own num_workers cap must not clobber a
+    scheduler the deployment already configured -- dask.config.set outranks
+    an active dask.distributed Client (dask.base.get_scheduler's own
+    precedence), so setting one unconditionally would silently pull uploads
+    off a configured cluster and onto local threads instead."""
+    import dask
+    from biopb_image_base.ops import _ambient_scheduler_configured
+
+    assert not _ambient_scheduler_configured()
+    with dask.config.set(scheduler="synchronous"):
+        assert _ambient_scheduler_configured()
+    assert not _ambient_scheduler_configured()
+
+
+def test_ambient_scheduler_detects_a_distributed_client():
+    distributed = pytest.importorskip("distributed")
+    from biopb_image_base.ops import _ambient_scheduler_configured
+
+    assert not _ambient_scheduler_configured()
+    with distributed.Client(processes=False, n_workers=1, threads_per_worker=1):
+        assert _ambient_scheduler_configured()
+    assert not _ambient_scheduler_configured()
+
+
 def test_embedded_sink(tmp_path: Path, monkeypatch):
     import biopb_image_base.ops as ops
     from biopb_image_base.server import start_embedded_cache
