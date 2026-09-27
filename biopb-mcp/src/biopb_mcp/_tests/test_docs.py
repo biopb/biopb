@@ -7,6 +7,8 @@ question: whether what ships is coherent.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from biopb_mcp.mcp import _docs
@@ -232,6 +234,46 @@ def test_an_id_no_longer_shipped_drops_out_of_the_cached_change_set(store, monke
     _docs.changed_shipped_ids()
 
     path.unlink()
+    assert _docs.changed_shipped_ids() == []
+
+
+def test_a_matching_version_never_hashes_the_shipped_set(store, monkeypatch):
+    bump_version(monkeypatch, "1.0")
+    ship(store, "one")
+    _docs.changed_shipped_ids()  # seeds the manifest at 1.0, hashing once
+
+    def boom():
+        raise AssertionError("hashing should not run once the version matches")
+
+    monkeypatch.setattr(_docs, "_shipped_hashes", boom)
+    assert _docs.changed_shipped_ids() == []
+
+
+def write_manifest(store, data):
+    _, local = store
+    path = local / _docs._MANIFEST_NAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def test_a_manifest_that_is_not_a_mapping_is_treated_as_absent(store, monkeypatch):
+    write_manifest(store, ["not", "a", "mapping"])
+    bump_version(monkeypatch, "1.0")
+    ship(store, "one")
+    assert _docs.changed_shipped_ids() == []
+
+
+def test_a_non_mapping_hashes_field_reports_nothing_changed(store, monkeypatch):
+    write_manifest(store, {"version": "1.0", "hashes": "garbage", "changed": []})
+    ship(store, "one")
+    bump_version(monkeypatch, "1.1")  # version differs, so the hashes field is read
+    assert _docs.changed_shipped_ids() == []
+
+
+def test_a_non_list_changed_field_is_ignored_in_the_fast_path(store, monkeypatch):
+    write_manifest(store, {"version": "1.0", "hashes": {}, "changed": "garbage"})
+    ship(store, "one")
+    bump_version(monkeypatch, "1.0")  # version matches, so the fast path reads it
     assert _docs.changed_shipped_ids() == []
 
 

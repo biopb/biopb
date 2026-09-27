@@ -39,7 +39,7 @@ from datetime import date
 from importlib import resources
 from pathlib import Path
 
-from biopb._config_io import atomic_write_text
+from biopb._config_io import atomic_write_json, atomic_write_text
 
 logger = logging.getLogger(__name__)
 
@@ -356,13 +356,20 @@ def _shipped_hashes() -> dict[str, str]:
 
 
 def _load_manifest() -> dict:
+    """The manifest dict, or ``{}`` for anything that isn't one.
+
+    A hand-edited or truncated file could hold any JSON value; only a mapping
+    is a manifest, so anything else is treated the same as absent rather than
+    trusted into a ``.get`` call downstream that assumes dict shape.
+    """
     path = _manifest_path()
     if path is None:
         return {}
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, ValueError):
         return {}
+    return data if isinstance(data, dict) else {}
 
 
 def _save_manifest(data: dict) -> None:
@@ -370,9 +377,7 @@ def _save_manifest(data: dict) -> None:
     if path is None:
         return
     try:
-        atomic_write_text(
-            path, json.dumps(data, indent=2, sort_keys=True) + "\n", raise_on_error=True
-        )
+        atomic_write_json(path, data, raise_on_error=True)
     except OSError:
         logger.debug("docs: could not save the shipped-doc manifest", exc_info=True)
 
@@ -383,21 +388,29 @@ def changed_shipped_ids() -> list[str]:
     Compares against the manifest from the last time this ran, keyed by
     installed version rather than a session or a clock: many sessions between
     two versions share one answer, and a session that reruns under the same
-    version gets the same answer back without rehashing anything. A first-ever
-    run has nothing to compare against, so it seeds the manifest and reports
-    nothing changed -- there is no "before" for it to differ from.
+    version gets the same answer back without rehashing anything -- checked
+    before any hashing happens, so the common case (no upgrade since last
+    look) costs one small file read and an id listing, never a hash pass over
+    the whole shipped set. A first-ever run, or a manifest whose ``hashes``
+    isn't the mapping this expects, has nothing trustworthy to compare
+    against, so it seeds fresh and reports nothing changed -- there is no
+    "before" for it to differ from.
     """
     manifest = _load_manifest()
-    current = _shipped_hashes()
     version = _installed_version()
     if manifest.get("version") == version:
-        return [i for i in manifest.get("changed", []) if i in current]
+        cached = manifest.get("changed")
+        current_ids = set(shipped_ids())
+        if isinstance(cached, list):
+            return [i for i in cached if isinstance(i, str) and i in current_ids]
+        return []
 
+    current = _shipped_hashes()
     old_hashes = manifest.get("hashes")
-    if old_hashes is None:
-        changed: list[str] = []  # first run ever: no "before" to differ from
-    else:
+    if isinstance(old_hashes, dict):
         changed = sorted(i for i, h in current.items() if old_hashes.get(i) != h)
+    else:
+        changed = []  # no trustworthy "before" to diff against
     _save_manifest({"version": version, "hashes": current, "changed": changed})
     return changed
 
