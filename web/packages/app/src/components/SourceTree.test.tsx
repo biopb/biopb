@@ -241,6 +241,13 @@ describe("TreeRow with label sets", () => {
     expect(open()).not.toContain("tensor-pill");
   });
 
+  it("skips the redundant per-image row when there's only one image", () => {
+    // One image plus its label set is still one tensor as far as expanding
+    // into a per-image list goes; the label row is the only nested row this
+    // source needs, since the source row above already opens the image.
+    expect(open()).not.toContain("tensor-item");
+  });
+
   it("renders standalone, without the overlay props", () => {
     // `TreeRow` is a props component, and the row must not require the store.
     expect(() =>
@@ -255,5 +262,56 @@ describe("TreeRow with label sets", () => {
         />,
       ),
     ).not.toThrow();
+  });
+});
+
+describe("TreeRow with more than one image", () => {
+  const MULTI_IMAGE: DataSourceDescriptor = {
+    source_id: "zarr_c2",
+    source_url: "file:///data/experiment/wells.zarr",
+    source_type: "zarr",
+    metadata_json: null,
+    is_resolved: true,
+    tensors: [
+      {
+        array_id: "zarr_c2/well1",
+        dim_labels: ["y", "x"],
+        shape: [512, 512],
+        chunk_shape: [],
+        dtype: "uint16",
+      },
+      {
+        array_id: "zarr_c2/well2",
+        dim_labels: ["y", "x"],
+        shape: [512, 512],
+        chunk_shape: [],
+        dtype: "uint16",
+      },
+    ],
+  };
+
+  const node: TreeNode = {
+    id: MULTI_IMAGE.source_id,
+    name: "wells.zarr",
+    type: "source",
+    children: [],
+    source: MULTI_IMAGE,
+    depth: 1,
+  };
+
+  it("does list a per-image row when there's an actual choice", () => {
+    const html = renderToStaticMarkup(
+      <TreeRow
+        node={node}
+        activeSourceId={MULTI_IMAGE.source_id}
+        activeTensorId={null}
+        expandedFolders={new Set()}
+        toggleFolder={() => {}}
+        selectSource={() => {}}
+      />,
+    );
+    expect(html).toContain("tensor-item");
+    expect(html).toContain("well1");
+    expect(html).toContain("well2");
   });
 });
