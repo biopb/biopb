@@ -158,10 +158,8 @@ def _first_prose(body: str) -> str:
     return ""
 
 
-def _description(text: str, doc_id: str) -> str:
+def _description(front: dict, body: str, doc_id: str) -> str:
     """``description:`` if the author wrote one, else the first prose line."""
-    front = parse_frontmatter(text)
-    body = strip_frontmatter(text)
     return str(front.get("description") or _first_prose(body) or doc_id).strip()
 
 
@@ -480,7 +478,7 @@ def describe(doc_id: str) -> dict | None:
         "text": text,
         "body": body,
         "title": str(front.get("title") or _first_h1(body) or doc_id).strip(),
-        "description": _description(text, doc_id),
+        "description": _description(front, body, doc_id),
         "packages": [str(p) for p in packages],
         "updated": _updated(text, _local_path(doc_id) if local is not None else None),
         "origin": origin,
@@ -590,20 +588,25 @@ def render_index(text: str | None = None) -> str:
 
     ids = shipped_ids()
     new = [i for i in ids if i not in named]
-    if new:
-        out.append("")
-        out.append(_NEW_TAIL)
-        out.extend(f"- {i}: {_shipped_description(i)}" for i in new)
+    _append_tail(out, _NEW_TAIL, new, lambda i: f"- {i}: {_shipped_description(i)}")
 
     stale = [i for i in changed_shipped_ids(ids) if i in shadowed]
-    if stale:
-        out.append("")
-        out.append(_STALE_TAIL)
-        out.extend(
-            f'- {i}: {_shipped_description(i)} — read_doc("{i}{DIFF_SUFFIX}")'
-            for i in stale
-        )
+    _append_tail(
+        out,
+        _STALE_TAIL,
+        stale,
+        lambda i: f'- {i}: {_shipped_description(i)} — read_doc("{i}{DIFF_SUFFIX}")',
+    )
     return "\n".join(out).rstrip() + "\n"
+
+
+def _append_tail(out: list[str], header: str, ids: list[str], line) -> None:
+    """Append a blank line, *header*, then one *line(id)* bullet per id."""
+    if not ids:
+        return
+    out.append("")
+    out.append(header)
+    out.extend(line(i) for i in ids)
 
 
 # Each tail says what to do with it: the agent reads the handshake copy of the
@@ -623,7 +626,9 @@ _STALE_TAIL = (
 
 def _shipped_description(doc_id: str) -> str:
     text = _shipped_text(doc_id)
-    return doc_id if text is None else _description(text, doc_id)
+    if text is None:
+        return doc_id
+    return _description(parse_frontmatter(text), strip_frontmatter(text), doc_id)
 
 
 def _append_entry(text: str, doc_id: str, hook: str) -> str:
