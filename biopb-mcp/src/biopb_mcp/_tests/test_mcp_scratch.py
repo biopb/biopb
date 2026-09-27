@@ -56,7 +56,7 @@ def _scratch_host(job_status="ok", on_start=None, hold=None, interrupt_lands=Tru
             log.on_iopub(_msg("error", request, ename=ename, traceback=[ename]))
         log.on_iopub(_msg("status", request, execution_state="idle"))
 
-    def run_cell(code, job_id, origin, intent="", bare=False):
+    def run_cell(code, job_id, origin, intent=""):
         request = f"req-{job_id}"
         log.start_cell(job_id, request, code, origin, intent)
         log.on_iopub(_msg("execute_input", request, session="host", code=code))
@@ -155,10 +155,10 @@ class TestRunningAVerification:
         _settle(job_id)
         assert _scratch.verified()["cells"][0]["stdout"] == "full output"
 
-    def test_each_cell_is_its_own_request_sent_bare_as_its_writer(self):
-        # Bare: a document that never builds its own `client` must fail here,
-        # as it would for its reader. The origin is the asker's, which the
-        # stop rules read.
+    def test_each_cell_is_its_own_request_sent_verbatim_as_its_writer(self):
+        # Verbatim: a document that never builds its own `client` must fail
+        # here, as it would for its reader. The origin is the asker's, which
+        # the stop rules read.
         host = _scratch_host()
         _scratch.set_host_factory(lambda: host)
         _settle(
@@ -168,7 +168,7 @@ class TestRunningAVerification:
         )
         calls = host.run_cell.call_args_list
         assert [c.args[0] for c in calls] == ["a = 2", "print(a)"]
-        assert all(c.args[2] == "chat" and c.kwargs["bare"] for c in calls)
+        assert all(c.args[2] == "chat" for c in calls)
 
     def test_the_cells_after_a_failure_are_skipped_not_sent(self):
         host = _scratch_host(job_status="error")

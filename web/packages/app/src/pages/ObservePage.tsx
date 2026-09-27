@@ -50,7 +50,7 @@ const CHAT_WIDTH_KEY = "biopb.observe.chatWidth";
 
 interface JobSummary {
   job_id: string;
-  status: string; // running | ok | error | interrupted
+  status: string; // running | ok | error | interrupted | kernel_lost
   origin?: string; // mcp | user | chat — which surface submitted the cell
   elapsed: number;
   code_preview?: string;
@@ -900,6 +900,7 @@ const OBS_CSS = `
   .obs-page .ok { background: #234; color: #8bf; }
   .obs-page .error { background: #422; color: #f99; }
   .obs-page .interrupted { background: #324; color: #c9f; }
+  .obs-page .kernel_lost { background: #431; color: #fb7; }
   .obs-page .preview { color: #8a8; font-family: ui-monospace, Menlo, monospace; font-size: 12px;
              white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; min-width: 0; }
   .obs-page .intent { color: #bcd; flex: 1; min-width: 0;

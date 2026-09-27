@@ -297,7 +297,7 @@ class TestLostAndGone:
         _print(log, "partial\n")
         log.kernel_gone("the user closed the window")
         snap = log.poll("job-1")
-        assert snap["status"] == "interrupted"
+        assert snap["status"] == "kernel_lost"
         assert "the user closed the window" in snap["error_text"]
         # Kept: the record outlives its kernel.
         assert snap["stdout"] == "partial\n"
@@ -307,7 +307,7 @@ class TestLostAndGone:
         _start(log)
         log.kernel_gone()
         _end(log, status="ok")
-        assert log.poll("job-1")["status"] == "interrupted"
+        assert log.poll("job-1")["status"] == "kernel_lost"
 
     def test_ids_are_the_hosts_and_never_repeat(self):
         log = JobLog(host_session="host")

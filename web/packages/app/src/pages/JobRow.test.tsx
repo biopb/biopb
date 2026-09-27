@@ -77,7 +77,7 @@ describe("JobRow", () => {
     // The kernel runs one cell at a time, so a row that is not running has
     // nothing to interrupt -- and a button that cannot act is how the old
     // header placement earned its "No running job." dialog.
-    for (const status of ["ok", "error", "interrupted"]) {
+    for (const status of ["ok", "error", "interrupted", "kernel_lost"]) {
       expect(render(job({ status }))).not.toContain("job-stop");
     }
   });

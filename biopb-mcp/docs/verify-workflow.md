@@ -48,7 +48,7 @@ nothing. It is not `restart_kernel` — the live session is untouched.
 
 **The scratch kernel is given nothing**: no napari viewer, no
 `np`/`da`/`client`/`ops`, no user plugins pre-bound, no
-`client = _conn.client` refresh prefix. What a document needs, it builds
+per-cell `client` refresh. What a document needs, it builds
 itself via `biopb_mcp.workflow_env()` (the same code the session bootstrap
 uses) — so anything handed to the run for free is something the document
 could lean on and fail on later, one level up from variable hygiene.
@@ -108,8 +108,7 @@ would silently re-run it several times on a machine already under
 pressure. The scratch host reports the death as the result rather than
 recovering from it.
 
-Each cell is its own execute request (`KernelHost.run_cell`, sent bare: no
-`client` refresh), recorded by the scratch host from the protocol like any
+Each cell is its own execute request (`KernelHost.run_cell`), recorded by the scratch host from the protocol like any
 cell, and the next is sent only once it ended `ok`. So the run **stops at the
 first failure** — later cells were written against state the failed one was
 supposed to produce, so they're marked `skipped` rather than reported as

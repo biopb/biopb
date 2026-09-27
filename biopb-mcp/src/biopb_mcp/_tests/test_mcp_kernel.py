@@ -286,6 +286,13 @@ def _wait_until(predicate, timeout=15.0, interval=0.2):
     return predicate()
 
 
+def _submit(host, code):
+    """Run *code* as the agent's cell; its job id."""
+    job_id = host.jobs.new_id()
+    host.run_cell(code, job_id, "mcp")
+    return job_id
+
+
 # pgid / killpg / SIGKILL are POSIX-only; the hardening they test degrades to a
 # no-op on Windows (guarded by os.name == "posix" / hasattr(os, "killpg")).
 posix_only = pytest.mark.skipif(
@@ -754,6 +761,24 @@ class TestViewerlessBootstrap:
 
     def test_the_host_reports_why(self, viewerless_kernel):
         assert viewerless_kernel.no_viewer_reason == "the viewer is off in the config"
+
+    def test_client_tracks_the_connection_before_each_cell(self, viewerless_kernel):
+        # The connection lands asynchronously; the next cell sees it.
+        viewerless_kernel.execute("_saved = _conn.client; _conn.client = 'landed'")
+        try:
+            res = viewerless_kernel.execute("print(client)")
+            assert res["stdout"].strip() == "landed"
+        finally:
+            viewerless_kernel.execute("_conn.client = _saved")
+
+    def test_a_tracebacks_line_numbers_are_the_submitted_codes(self, viewerless_kernel):
+        # #1140: the refresh adds no source line to the agent's cell.
+        host = viewerless_kernel
+        job_id = _submit(host, "x = 1\ny = 2\n1 / 0")
+        assert _wait_until(lambda: host.jobs.poll(job_id)["status"] == "error")
+        tb = host.jobs.poll(job_id)["error_text"]
+        assert "----> 3 1 / 0" in tb
+        assert "_conn" not in tb
 
 
 # ---------------------------------------------------------------------------
@@ -1474,15 +1499,8 @@ class TestHostRecords:
         yield host
         host.shutdown()
 
-    @staticmethod
-    def _submit(host, code):
-        """Run *code* as the agent's cell; its job id."""
-        job_id = host.jobs.new_id()
-        host.run_cell(code, job_id, "mcp")
-        return job_id
-
     def test_a_jobs_output_streams_in_while_it_runs(self, host):
-        jid = self._submit(
+        jid = _submit(
             host,
             "import time\nprint('first', flush=True)\ntime.sleep(1.5)\nprint('second')\n6 * 7",
         )
@@ -1495,23 +1513,23 @@ class TestHostRecords:
 
     def test_the_window_probe_is_not_the_cells_output(self, host):
         # It rides a user_expression, so nothing of it lands in the record.
-        jid = self._submit(host, "print('x', end='')")
+        jid = _submit(host, "print('x', end='')")
         assert _wait_until(lambda: host.jobs.poll(jid)["status"] == "ok", timeout=5)
         assert host.jobs.poll(jid)["stdout"] == "x"
 
     def test_a_failing_job(self, host):
-        jid = self._submit(host, "1 / 0")
+        jid = _submit(host, "1 / 0")
         assert _wait_until(lambda: host.jobs.poll(jid)["status"] == "error", timeout=5)
         assert "ZeroDivisionError" in host.jobs.poll(jid)["error_text"]
 
     def test_records_survive_a_restart_and_ids_continue(self, host):
-        done = self._submit(host, "print('kept')")
+        done = _submit(host, "print('kept')")
         assert _wait_until(lambda: host.jobs.poll(done)["status"] == "ok", timeout=5)
-        running = self._submit(host, "import time\ntime.sleep(30)")
+        running = _submit(host, "import time\ntime.sleep(30)")
         host.restart()
         assert host.jobs.poll(done)["stdout"] == "kept\n"
         snap = host.jobs.poll(running)
-        assert snap["status"] == "interrupted"
+        assert snap["status"] == "kernel_lost"
         assert "kernel stopped" in snap["error_text"]
-        after = self._submit(host, "1")
+        after = _submit(host, "1")
         assert int(after.split("-")[1]) > int(running.split("-")[1])
