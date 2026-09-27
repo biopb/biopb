@@ -643,12 +643,11 @@ class _FakeControlAlgorithms:
     """
 
     def __init__(self, names: Sequence[str]):
-        from biopb_image_base.ops import build_server, describe
+        from biopb_image_base.ops import build_server
 
         self._defs = _op_defs_for(names)
         self._grpc_server, self._grpc_port = build_server(self._defs)
         self._grpc_server.start()
-        self._oplist = describe(self._defs)
         self._http = self._make_http_server()
 
     def _make_http_server(self):

@@ -24,6 +24,16 @@ def _boxes(shape, boxes, start=1):
     return lab
 
 
+def _load_seeded(dest, filename):
+    """Import a just-seeded op file as its own module, the way the control does."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(filename, dest / filename)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 class TestIoUAndCounts:
     def test_identical_labels_score_perfectly(self):
         gt = _boxes((40, 40), [((2, 10), (2, 10)), ((20, 30), (20, 30))])
@@ -243,33 +253,21 @@ class TestSeeding:
     def test_seeded_file_declares_exactly_its_two_ops(self, tmp_path):
         # The production path: the control runs the seeded file under uv and
         # discovers its ops by importing it, which registers each `@op`.
-        import importlib.util
-
         from biopb_mcp.algorithms._seed import seed_algorithms
 
         dest = tmp_path / "algorithms"
         seed_algorithms(dest)
-        spec = importlib.util.spec_from_file_location(
-            "seeded_segmentation_qc", dest / "segmentation_qc.py"
-        )
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
+        mod = _load_seeded(dest, "segmentation_qc.py")
         assert mod.match_labels.__biopb_op__.name == "match_labels"
         assert set(mod.match_labels.__biopb_op__.tensors) == {"gt", "pred"}
         assert mod.f1_at_thresholds.__biopb_op__.name == "f1_at_thresholds"
         assert set(mod.f1_at_thresholds.__biopb_op__.tensors) == {"gt", "pred"}
 
     def test_seeded_op_is_callable(self, tmp_path):
-        import importlib.util
-
         from biopb_mcp.algorithms._seed import seed_algorithms
 
         dest = tmp_path / "algorithms"
         seed_algorithms(dest)
-        spec = importlib.util.spec_from_file_location(
-            "seeded_segmentation_qc_2", dest / "segmentation_qc.py"
-        )
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
+        mod = _load_seeded(dest, "segmentation_qc.py")
         gt = _boxes((20, 20), [((2, 10), (2, 10))])
         assert mod.match_labels(gt, gt.copy()).f1 == pytest.approx(1.0)

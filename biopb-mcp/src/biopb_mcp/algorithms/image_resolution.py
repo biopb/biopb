@@ -121,7 +121,7 @@ class FRCResult:
     ring_counts: np.ndarray = field(repr=False)
     shape: tuple = ()
     split: str = ""
-    label_nyquist: float = 0.0
+    label_nyquist: float = float("nan")
     warnings: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -327,7 +327,7 @@ def frc(
     smooth: int = 0,
     apodize: float = 0.25,
     split: str = "",
-    label_nyquist: float = 0.0,
+    label_nyquist: float = float("nan"),
 ) -> FRCResult:
     """Fourier ring correlation between two independent images of the same field.
 
@@ -354,7 +354,7 @@ def frc(
         split: Free-text label recorded in the result, used by
             ``frc_from_localizations`` to record how the halves were made.
         label_nyquist: Optional density-imposed resolution floor to check against;
-            0 (default) to skip the check.
+            ``nan`` (default) to skip the check.
 
     Returns:
         A dict (``FRCResult.to_dict()``). Read ``warnings`` before ``resolution``
@@ -469,7 +469,7 @@ def frc(
             "was used. More than one crossing means the tail is noise -- raise "
             "`smooth`, or measure a larger field, before quoting this"
         )
-    if label_nyquist > 0 and resolution < label_nyquist:
+    if not np.isnan(label_nyquist) and resolution < label_nyquist:
         notes.append(
             f"reported resolution {resolution:.4g} is finer than the "
             f"{label_nyquist:.4g} set by emitter density averaged over the whole "
@@ -710,7 +710,9 @@ def frc_from_localizations(
     area = (ymax - ymin) * (xmax - xmin)
     n_independent = x.size if not n_emitters else int(n_emitters)
     label_nyquist = (
-        2.0 * np.sqrt(area / n_independent) if area > 0 and n_independent > 0 else 0.0
+        2.0 * np.sqrt(area / n_independent)
+        if area > 0 and n_independent > 0
+        else float("nan")
     )
     if not n_emitters:
         notes.append(

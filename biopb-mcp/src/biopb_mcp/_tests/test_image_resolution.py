@@ -77,6 +77,16 @@ def smlm(per_seg=160, mean_blinks=12, precision=15.0, seed=0):
     return x, y, frames, n_mol
 
 
+def _load_seeded(dest, filename):
+    """Import a just-seeded op file as its own module, the way the control does."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(filename, dest / filename)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 class TestRecoversAKnownBandLimit:
     """The measurement itself: does the number match a truth it cannot see?"""
 
@@ -443,17 +453,11 @@ class TestSeeding:
     def test_seeded_file_declares_all_four_ops(self, tmp_path):
         # The production path: the control runs the seeded file under uv and
         # discovers its ops by importing it, which registers each `@op`.
-        import importlib.util
-
         from biopb_mcp.algorithms._seed import seed_algorithms
 
         dest = tmp_path / "algorithms"
         seed_algorithms(dest)
-        spec = importlib.util.spec_from_file_location(
-            "seeded_image_resolution", dest / "image_resolution.py"
-        )
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
+        mod = _load_seeded(dest, "image_resolution.py")
         names = {
             f.__biopb_op__.name
             for f in (
@@ -471,17 +475,11 @@ class TestSeeding:
         }
 
     def test_seeded_op_is_callable(self, tmp_path):
-        import importlib.util
-
         from biopb_mcp.algorithms._seed import seed_algorithms
 
         dest = tmp_path / "algorithms"
         seed_algorithms(dest)
-        spec = importlib.util.spec_from_file_location(
-            "seeded_image_resolution_2", dest / "image_resolution.py"
-        )
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
+        mod = _load_seeded(dest, "image_resolution.py")
         a, b = noisy_pair(0.25)
         got = mod.frc(a, b)
         assert got.resolution == pytest.approx(4.0, rel=0.15)

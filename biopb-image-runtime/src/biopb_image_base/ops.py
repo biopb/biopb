@@ -341,6 +341,13 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, np.generic):
         return _jsonable(value.item())
     if isinstance(value, np.ndarray):
+        # Only a float array can hold a non-finite value; skip the per-element
+        # walk below unless one is actually there. Complex still falls
+        # through it, since a bare complex scalar isn't JSON either.
+        if value.dtype.kind == "f" and np.isfinite(value).all():
+            return value.tolist()
+        if value.dtype.kind not in "fc":
+            return value.tolist()
         return _jsonable(value.tolist())
     if isinstance(value, dict):
         return {str(k): _jsonable(v) for k, v in value.items()}
