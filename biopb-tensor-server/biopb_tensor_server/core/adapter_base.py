@@ -267,13 +267,6 @@ class SourceAdapter(ABC):
     _source_type: Optional[str] = None  # Source type identifier
     _tensor_name: Optional[str] = None  # Tensor name (for multi-tensor)
 
-    # Override for :attr:`local_root` on an adapter whose ``_source_url`` is a
-    # virtual/catalog-only identity (``cache://``, ``scratch://``) rather than a
-    # real path. None means "no override" -- :attr:`local_root` then falls back
-    # to ``_source_url`` itself, which is correct for the common case where the
-    # two coincide (an on-disk format's ``_source_url`` already is its path).
-    _local_root: Optional[str] = None
-
     # Optional content-version token (biopb/biopb#178), folded into every
     # chunk_id this adapter mints and hence into the cache key, so a
     # re-registered source with new bytes gets a fresh cache namespace instead
@@ -315,39 +308,18 @@ class SourceAdapter(ABC):
 
     @property
     def source_url(self) -> Optional[str]:
-        """The source's raw backing URL/path: identity and catalog-derivation
-        input (:attr:`catalog_url`), and what a caller checks for a remote
-        scheme (``is_remote_url``).
+        """The source's real, addressable URL/path: a filesystem path this
+        adapter reads bytes from, or the dial address of an upstream it
+        proxies. Every filesystem op (warm's recall walk, residency checks)
+        and the remote check (``is_remote_url``) trust this to be genuine.
 
         Wraps the backing ``_source_url``; None when the adapter never set one.
-        Not necessarily a real filesystem path -- a synthetic source
-        (``cache://``, ``scratch://``) sets this to a display identity with
-        nothing on disk at that address. Use :attr:`local_root` for filesystem
-        ops (warm/recall/residency).
+        An adapter that wants a different, cosmetic identity in the catalog
+        (grouping, a cleaner display name) sets :attr:`_catalog_url` instead --
+        never repurpose this field for display, or every filesystem consumer
+        silently breaks (biopb/biopb#1139).
         """
         return self._source_url
-
-    @property
-    def local_root(self) -> Optional[str]:
-        """The local filesystem file or directory backing this source, for
-        operations that actually touch disk (warm's recall walk, residency
-        checks) -- as opposed to :attr:`source_url`, which is a display/catalog
-        identity that need not exist on disk at all.
-
-        ``_local_root`` when an adapter set one explicitly (a synthetic source
-        whose real bytes live elsewhere, e.g. :class:`ScratchSource`'s uploaded
-        fields directory); otherwise ``_source_url`` itself, which already is
-        the path for every format that reads its own bytes directly. None when
-        neither is set, or when ``_source_url`` carries a non-``file`` scheme
-        (remote or synthetic) and no override was given -- there is nothing
-        local to walk.
-        """
-        if self._local_root is not None:
-            return self._local_root
-        url = self._source_url
-        if not url or _URL_SCHEME_RE.match(url):
-            return None
-        return url
 
     @property
     def source_type(self) -> Optional[str]:
@@ -992,12 +964,7 @@ class SourceAdapter(ABC):
 
         if is_remote_url(self._source_url):
             return False
-        root = self.local_root
-        if root is None:
-            # A synthetic source with no local tree of its own (cache://,
-            # scratch://) has nothing to fetch -- trivially resident.
-            return True
-        path = Path(root)
+        path = Path(self._source_url)
         # The offline-placeholder signal (st_blocks == 0) is a per-*file* concept
         # -- discovery only consults it for files (see should_skip_walk_entry,
         # which gates it on `not is_dir`). A directory-based source (zarr,
@@ -2093,7 +2060,6 @@ _SOURCE_SCOPED_API = frozenset(
     {
         "array_id",
         "source_url",
-        "local_root",
         "source_type",
         "tensor_capability_token",
         "content_version",
