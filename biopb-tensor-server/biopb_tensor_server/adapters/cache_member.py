@@ -122,7 +122,17 @@ class CacheMember(CachedSourceAdapter):
         self._tensor_name = field
         self.store = Path(store)
         self._chunks = chunks
-        self._source_url = f"cache://{self.array_id}"
+        #: The real segment directory -- the adapter contract's addressable
+        #: path (``SourceAdapter.source_url``), same value as ``self.store``.
+        #: Not currently reachable through the source-level warm/residency
+        #: paths (a member is always attached to a parent, never registered
+        #: as a source of its own), but the contract holds regardless: never
+        #: repurpose this for display (biopb/biopb#1139).
+        self._source_url = str(self.store)
+        #: The display identity instead: a UI showing this tensor's
+        #: ``catalog_url`` gets ``cache://<array_id>``, not the ``write_dir``
+        #: path above.
+        self._catalog_url = f"cache://{self.array_id}"
 
     # -- where the bytes are ---------------------------------------------------
 

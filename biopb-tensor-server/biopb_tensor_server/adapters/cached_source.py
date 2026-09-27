@@ -205,7 +205,11 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
         # same token into minted endpoints, so reads and writes agree.
         self._content_version = content_version
 
-        # Required fields for the adapter interface
+        # Required fields for the adapter interface. `cache://` is the real
+        # identity here, not a display alias standing in for one -- this base
+        # class has no filesystem backing at all (the chunk cache is the
+        # upload's only copy; see `_decode_time_is_rebuild_cost`). `CacheMember`
+        # overrides this once it has one (biopb/biopb#1139).
         self._source_url = f"cache://{source_id}"
         self._source_type = "cache"
 
