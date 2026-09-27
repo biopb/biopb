@@ -55,6 +55,36 @@ def no_viewer_reason():
     return os.environ.get("BIOPB_NO_VIEWER") or None
 
 
+def _set_windows_app_id():
+    """Set the taskbar grouping/icon id before any ``QApplication`` exists.
+
+    Windows keys a taskbar button's identity (and icon) off the process's
+    AppUserModelID, and it only takes effect for windows created *after* it is
+    set. ``_bootstrap_impl`` calls ``ip.enable_gui("qt")`` before
+    ``napari.Viewer()``, which makes IPython create the ``QApplication`` first;
+    napari's own ``get_qapp()`` then takes its "QApplication already existed"
+    branch and never calls its ``set_app_id`` (issue #1143), so the taskbar
+    groups the window under the kernel's ``python.exe`` with no icon instead.
+    A biopb-specific id groups the window separately from a standalone napari.
+
+    Inlined rather than importing ``napari._qt.qt_event_loop.set_app_id``,
+    which would pull in Qt and much of napari before the splash the
+    enable_gui-first ordering exists to cover. No-op off Windows.
+    """
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "biopb.biopb-mcp.viewer"
+        )
+    except Exception:
+        logger.debug(
+            "failed to set the Windows AppUserModelID (fail-open)", exc_info=True
+        )
+
+
 def _install_window_close_hook(viewer):
     """Signal the launcher when the user closes the napari window.
 
@@ -174,6 +204,7 @@ def _bootstrap_impl():
     # display, and none of napari's ~330 MiB.
     want_viewer = no_viewer_reason() is None
     if want_viewer:
+        _set_windows_app_id()
         ip.enable_gui("qt")
         splash = show_splash()
     else:
