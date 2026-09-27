@@ -32,6 +32,7 @@ import {
   type TileInfo,
 } from "@biopb/tensor-flight-client";
 import {
+  currentArrayId,
   selectBroadcastAxes,
   selectDraft,
   selectLabelOverlay,
@@ -193,6 +194,10 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
   const visibleSets = useAppStore(selectVisibleSets);
   const roiScopes = useAppStore(selectRoiScopes);
   const loadRois = useAppStore((s) => s.loadRois);
+  // Not `arrayId` (the prop): once `tile_info` resolves it, ROIs belong to the
+  // specific tensor the pixels came from, not the bare source_id the viewer
+  // may have been asked to render (see `currentArrayId`'s doc comment).
+  const roiArrayId = useAppStore(currentArrayId);
   const tool = useAppStore((s) => s.tool);
   const draft = useAppStore(selectDraft);
   const selectedRoiId = useAppStore(selectSelectedRoiId);
@@ -477,9 +482,9 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
   // what tells `loadRois` which named sets exist -- and a landing can also
   // un-land a scope whose rows went stale, which is fetched again from here.
   useEffect(() => {
-    if (!client) return;
-    void loadRois(arrayId);
-  }, [client, arrayId, loadRois, visibleSets, roiScopes]);
+    if (!client || !roiArrayId) return;
+    void loadRois(roiArrayId);
+  }, [client, roiArrayId, loadRois, visibleSets, roiScopes]);
 
   // The plane the overlay is drawn for is the one ON SCREEN, not the one asked
   // for. They are the same except while a read is outstanding -- and during
