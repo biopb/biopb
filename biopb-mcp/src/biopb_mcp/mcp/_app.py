@@ -43,7 +43,7 @@ _session_log_path: str | None = None
 # guardrails.
 _BASE_INSTRUCTIONS = (
     "First action of every session: call `start_kernel`. It brings up the kernel "
-    "-- the tensor client, `ops` and the kernel plugins, and a napari window where "
+    "-- the tensor client, `ops`, and a napari window where "
     "the session has one -- and blocks until they are ready; nothing "
     "auto-starts, and every other kernel tool fails until it returns. It also "
     "rebuilds a kernel that never started, died, or was torn down by the user "
@@ -55,8 +55,8 @@ _BASE_INSTRUCTIONS = (
     "This biopb-mcp session drives a child IPython kernel over bioimage data; "
     "`execute_code` runs arbitrary Python in it. Its namespace always holds the "
     "data plane -- `client`, the tensor server -- and the algorithm plane -- "
-    "`ops`, the server-side image-processing operations, and the user's kernel "
-    "plugin modules. A napari `viewer` is there only when the user has configured "
+    "`ops`, the server-side image-processing operations. A napari `viewer` is "
+    "there only when the user has configured "
     "one and this machine can show it: `server_status`'s `## Viewer` says whether "
     "this session has one, and nothing should assume it. The browser page the "
     "control serves (the web viewer) shows the user an image either way. "

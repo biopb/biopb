@@ -42,9 +42,9 @@ dependencies = [
     "numpy",
     "pandas",
     "scikit-image",
-    # scipy: arrives transitively via scikit-image, but the built-in rolling-ball
-    # kernel plugin (biopb_mcp/plugins/) hard-imports scipy.ndimage, so make the
-    # requirement explicit.
+    # scipy: arrives transitively via scikit-image, but the bundled algorithm-plane
+    # ops (biopb_mcp/algorithms/) hard-import scipy.ndimage / scipy.optimize, so
+    # make the requirement explicit.
     #
     # !=1.15.*: the whole 1.15 series raises `AttributeError: 'coo_matrix'
     # object has no attribute 'indices'` from
@@ -126,6 +126,10 @@ integration = [
     "biopb-mcp[napari]",  # the viewer: napari, pyqt6, biopb-napari-widget
     "biopb[tensor]",
     "biopb-tensor-server[web]",
+    # @op/serve, imported directly by biopb_mcp/algorithms/*.py -- and by the
+    # agentbench harness (_FakeControlAlgorithms), which runs a real Ops server
+    # for them in-process rather than through uv's script isolation.
+    "biopb-image-base",
 ]
 # Full stack + test tooling. = integration plus pytest.
 testing = [
@@ -150,10 +154,9 @@ testing = [
 [project.scripts]
 biopb-mcp = "biopb_mcp.mcp.__main__:main"
 # Light console entry (stdlib + biopb._locations only, no kernel/napari
-# import) the installer calls to seed the built-in example kernel plugins
-# (biopb_mcp/plugins/) into ~/.config/biopb/kernel/ — the #92 "bring your own
-# tool" example, delivered as a visible file rather than a buried entry point.
-biopb-mcp-seed-plugins = "biopb_mcp.plugins._seed:_cli"
+# import) the installer calls to seed the bundled correctness-critical
+# algorithm-plane ops (biopb_mcp/algorithms/) into ~/.config/biopb/algorithms/.
+biopb-mcp-seed-algorithms = "biopb_mcp.algorithms._seed:_cli"
 
 [project.urls]
 "Bug Tracker" = "https://github.com/biopb/biopb/issues"

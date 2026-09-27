@@ -253,29 +253,14 @@ def mcp_config_path() -> Path:
     return config_dir() / MCP_CONFIG_NAME
 
 
-def mcp_plugin_dir() -> Path:
-    """User kernel-plugin dir (``~/.config/biopb/kernel``).
-
-    ``*.py`` files here are loaded into the biopb-mcp agent kernel's namespace at
-    bootstrap -- the low-friction "bring your own tool" path (biopb/biopb-mcp#92),
-    beside the installed ``biopb_mcp.namespace`` entry-point packages. Config-tree
-    (user-authored), co-located with ``mcp-config.json``. Resolved at call time for
-    test isolation and **not created on access**: absence is the normal no-plugins
-    case and the loader / the dashboard inspector simply find nothing, so a bare
-    read must not materialize an empty dir.
-    """
-    return config_dir() / "kernel"
-
-
 def mcp_docs_dir() -> Path:
     """The agent's own docs (``~/.config/biopb/docs``).
 
     The local tier of biopb-mcp's knowledge store: ``*.md`` files the agent
     writes with ``write_doc``, plus the index it edits. A doc here shadows a
-    shipped one of the same id. The personal tier of the same "drop a file in a
-    config dir" path as :func:`mcp_plugin_dir`. Config-tree (user-authored),
-    resolved at call time for test isolation and **not created on access** --
-    the store creates it when it seeds the index or writes the first doc.
+    shipped one of the same id. Config-tree (user-authored), resolved at call
+    time for test isolation and **not created on access** -- the store creates
+    it when it seeds the index or writes the first doc.
     """
     return config_dir() / "docs"
 
@@ -285,7 +270,7 @@ def algorithms_dir() -> Path:
 
     One entry per file, named by its stem: ``<name>.py`` is a server file the
     control runs under uv, ``<name>.json`` (``{"url": ...}``) a server someone
-    else runs. Not created on access, like :func:`mcp_plugin_dir`.
+    else runs. Resolved at call time for test isolation; not created on access.
     """
     return config_dir() / "algorithms"
 

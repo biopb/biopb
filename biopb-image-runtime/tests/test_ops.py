@@ -102,6 +102,16 @@ def greet(name: str) -> str:
     return f"hello {name}"
 
 
+@op
+def non_finite_result() -> dict:
+    return {"a_nan": float("nan"), "an_inf": float("inf"), "a_neg_inf": float("-inf")}
+
+
+@op
+def echo_kwarg(value: float = float("nan")):
+    return {"got": value}
+
+
 ALL = [
     label_stats,
     threshold,
@@ -114,6 +124,8 @@ ALL = [
     double,
     total,
     greet,
+    non_finite_result,
+    echo_kwarg,
 ]
 
 
@@ -176,16 +188,49 @@ def test_describe_advertises_signature(server):
         "image": ("YX", False),
         "labels": ("YX", False),
     }
-    assert dict(ops["threshold"].kwargs) == {"level": 0.5, "count": 1}
+    assert ops["threshold"].kwargs == "level=0.5, count=1"
     assert ops["threshold"].description == "Foreground mask."
     assert ops["smooth"].tensors["image"].mapped
-    assert ops["greet"].kwargs.fields["name"].HasField("null_value")
+    assert ops["greet"].kwargs == "name"  # no default -> bare name, required
+
+    # input mode and streaming are advertised, not just discoverable by calling.
+    assert ops["label_stats"].input == proto.OpInfo.EAGER  # the zero value
+    assert ops["double"].input == proto.OpInfo.LAZY
+    assert ops["smooth"].input == proto.OpInfo.BLOCKS
+    assert not ops["label_stats"].streaming
+    assert ops["track"].streaming
 
 
 def test_fingerprint_changes_with_the_ops():
     one = describe(_defs([greet, total])).fingerprint
     assert describe(_defs([total, greet])).fingerprint == one
     assert describe(_defs([greet])).fingerprint != one
+
+
+def test_non_finite_default_is_just_text_in_the_schema():
+    # OpInfo.kwargs is plain text for a caller to read (`name=repr(default)`),
+    # not a typed value anything decodes -- so a nan/inf default is exactly as
+    # unremarkable here as any other repr, with no sentinel needed.
+    info = describe(_defs([echo_kwarg])).ops[0]
+    assert info.kwargs == "value=nan"
+
+
+def test_non_finite_result_round_trips(server):
+    from biopb_image_base.ops import _undo_non_finite
+
+    (event,) = server.call("non_finite_result")
+    restored = _undo_non_finite(_value(event.outputs["result"]))
+    assert restored["a_nan"] != restored["a_nan"]  # nan != nan
+    assert restored["an_inf"] == float("inf")
+    assert restored["a_neg_inf"] == float("-inf")
+
+
+def test_non_finite_kwarg_is_restored_server_side(server):
+    from biopb_image_base.ops import NON_FINITE_FLOAT_KEY, _undo_non_finite
+
+    (event,) = server.call("echo_kwarg", value=_json({NON_FINITE_FLOAT_KEY: "inf"}))
+    restored = _undo_non_finite(_value(event.outputs["result"]))
+    assert restored["got"] == float("inf")
 
 
 def test_two_tensor_arguments_and_json_result(server):
@@ -357,7 +402,7 @@ def test_describe_flag_prints_json_without_serving(tmp_path: Path):
     )
     listing = json.loads(done.stdout)
     assert listing["ops"][0]["name"] == "denoise"
-    assert listing["ops"][0]["kwargs"] == {"sigma": 2.0}
+    assert listing["ops"][0]["kwargs"] == "sigma=2.0"
     assert listing["fingerprint"]
 
 

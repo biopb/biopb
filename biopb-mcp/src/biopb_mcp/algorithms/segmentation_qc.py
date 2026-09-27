@@ -1,3 +1,7 @@
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["biopb-image-base", "scipy", "pandas"]
+# ///
 """Instance-segmentation QC: IoU matching, F1 at threshold, splits and merges.
 
 Scores a predicted label image against a ground-truth one the way the
@@ -8,8 +12,9 @@ Two segmentations with identical pixel Dice can differ completely in F1 once a
 merge across touching nuclei is charged as one false positive plus two false
 negatives.
 
-Delivered as a kernel plugin rather than as a snippet in the doc body because
-the matching is the part that is easy to get subtly wrong and cheap to unit-test:
+Served as an algorithm-plane op rather than left as a snippet in a doc body
+because the matching is the part that is easy to get subtly wrong and cheap to
+unit-test:
 
 - **Objects are matched one-to-one by maximum total IoU** (``linear_sum_assignment``),
   not greedily nearest. Greedy and optimal agree above IoU 0.5 -- where a match is
@@ -33,22 +38,17 @@ the matching is the part that is easy to get subtly wrong and cheap to unit-test
 prediction too, and excluding one side only is the most common way these numbers
 end up not comparable to a published figure.
 
-Three public callables, reached through the module the agent gets bound
-(``segmentation_qc``): ``match_labels`` (one operating point),
-``f1_at_thresholds`` (the sweep, as a DataFrame), and the ``SegQCResult`` record
-they return.
+Two ops: ``match_labels`` (one operating point) and ``f1_at_thresholds`` (the
+sweep). Both take 2-D integer label images (``gt``, ``pred``); results come back
+as a plain dict / list of dicts, since a call crosses a process boundary.
 """
 
-# Private aliases keep the module's own surface to its public API, so
-# `inspect_object("segmentation_qc")` shows the agent the three callables rather
-# than every pandas/scipy handle this file imported. Style, not protection: as a
-# kernel plugin this module is bound under one name.
-import warnings as _warnings
-from dataclasses import dataclass as _dataclass, field as _dc_field
+from dataclasses import dataclass, field
 
 import numpy as np
-import pandas as _pd
-from scipy.optimize import linear_sum_assignment as _lsa
+import pandas as pd
+from biopb_image_base import Tensor, op, serve
+from scipy.optimize import linear_sum_assignment
 
 __all__ = ["match_labels", "f1_at_thresholds", "SegQCResult", "DEFAULT_THRESHOLDS"]
 
@@ -62,7 +62,7 @@ DEFAULT_THRESHOLDS = (0.5, 0.6, 0.7, 0.8, 0.9)
 _DENSE_CAP = 4_000_000
 
 
-@_dataclass
+@dataclass
 class SegQCResult:
     """One operating point's scores. ``pairs`` holds ``(gt_id, pred_id, iou)``."""
 
@@ -80,7 +80,7 @@ class SegQCResult:
     merges: int
     iou_threshold: float
     exclude_border: bool
-    pairs: list = _dc_field(default_factory=list, repr=False)
+    pairs: list = field(default_factory=list, repr=False)
 
     def to_dict(self) -> dict:
         """Flat dict of the scalar fields, for logging or a results table."""
@@ -130,7 +130,7 @@ def _index_of(lab):
     return ids, lut
 
 
-@_dataclass
+@dataclass
 class _Overlaps:
     """Sparse per-pair overlap: only label pairs that actually intersect."""
 
@@ -193,11 +193,13 @@ def _match(ov, threshold):
     if n_gt * n_pred <= _DENSE_CAP:
         cost = np.zeros((n_gt, n_pred), dtype=np.float64)
         cost[gi, pi] = iou
-        rows, cols = _lsa(cost, maximize=True)
+        rows, cols = linear_sum_assignment(cost, maximize=True)
         sel = cost[rows, cols] >= threshold
         return rows[sel], cols[sel], cost[rows[sel], cols[sel]]
 
-    _warnings.warn(
+    import warnings
+
+    warnings.warn(
         f"{n_gt}x{n_pred} objects exceeds the dense-assignment cap "
         f"({_DENSE_CAP}); matching greedily by descending IoU. Exact above "
         "IoU 0.5, approximate at this threshold.",
@@ -285,9 +287,14 @@ def _prepare(gt, pred, exclude_border):
     return gt, pred
 
 
+@op(
+    description="Score a predicted instance segmentation against ground truth "
+    "at one IoU threshold",
+    labels=["measurement", "segmentation"],
+)
 def match_labels(
-    gt,
-    pred,
+    gt: Tensor("YX"),
+    pred: Tensor("YX"),
     iou_threshold: float = 0.5,
     exclude_border: bool = False,
     fragment_fraction: float = 0.1,
@@ -309,24 +316,29 @@ def match_labels(
             count toward the split/merge tallies.
 
     Returns:
-        :class:`SegQCResult`. Read ``precision``/``recall`` as a diagnosis (low
-        precision = over-segmenting, low recall = missing objects) and
-        ``splits``/``merges`` as which of the two it is. Rates are ``nan``, not
-        0.0, when their denominator is empty.
+        A dict (``SegQCResult.to_dict()``): read ``precision``/``recall`` as a
+        diagnosis (low precision = over-segmenting, low recall = missing objects)
+        and ``splits``/``merges`` as which of the two it is. Rates are ``nan``,
+        not 0.0, when their denominator is empty. ``pairs`` is dropped crossing
+        the call boundary; call this op directly if you need the per-object list.
     """
     gt, pred = _prepare(gt, pred, exclude_border)
     ov = _overlaps(gt, pred)
     return _score(ov, iou_threshold, exclude_border, fragment_fraction, True)
 
 
+@op(
+    description="Sweep match_labels over IoU thresholds",
+    labels=["measurement", "segmentation"],
+)
 def f1_at_thresholds(
-    gt,
-    pred,
+    gt: Tensor("YX"),
+    pred: Tensor("YX"),
     thresholds=DEFAULT_THRESHOLDS,
     exclude_border: bool = False,
     fragment_fraction: float = 0.1,
 ):
-    """Sweep :func:`match_labels` over IoU thresholds, as a DataFrame.
+    """Sweep :func:`match_labels` over IoU thresholds, as a table.
 
     F1 holding up across the sweep means the boundaries are good, not just the
     detections; a steep fall from 0.5 to 0.8 means objects were found but their
@@ -342,7 +354,9 @@ def f1_at_thresholds(
         fragment_fraction: As in :func:`match_labels`.
 
     Returns:
-        ``pandas.DataFrame``, one row per threshold, ordered as given.
+        A dict of columns (one entry per threshold, ordered as given) -- a
+        ``pandas.DataFrame`` is JSON-encoded ``orient="list"`` crossing the call
+        boundary; call this op directly for the DataFrame itself.
     """
     gt, pred = _prepare(gt, pred, exclude_border)
     ov = _overlaps(gt, pred)
@@ -361,4 +375,8 @@ def f1_at_thresholds(
         "pq",
         "mean_iou",
     ]
-    return _pd.DataFrame(rows, columns=columns)
+    return pd.DataFrame(rows, columns=columns)
+
+
+if __name__ == "__main__":
+    serve()

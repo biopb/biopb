@@ -239,5 +239,5 @@ sweep found does not move the placement (step 3).
 ## Next steps
 
 - Segment the mosaic as one image, then score that with the `segmentation_qc`
-  kernel plugin and report sizes from it in physical units, carrying the spacing
+  op and report sizes from it in physical units, carrying the spacing
   across (step 7).

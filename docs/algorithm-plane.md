@@ -33,8 +33,11 @@ message Event { map<string, Arg> outputs = 1; string progress = 2; }
 message TensorArg { string axes = 1; bool mapped = 2; }
 message OpInfo {
   string name = 1; string description = 2; repeated string labels = 3;
-  google.protobuf.Struct kwargs = 4;         // non-tensor args and their defaults
+  string kwargs = 4;                         // "name=default, ..."; text, not typed
   map<string, TensorArg> tensors = 5;        // which args are tensors
+  enum InputMode { EAGER = 0; LAZY = 1; BLOCKS = 2; }
+  InputMode input = 6;
+  bool streaming = 7;
 }
 message OpList { repeated OpInfo ops = 1; string fingerprint = 2; }
 
@@ -55,6 +58,14 @@ service Ops {
   tell an `array_id` from a string and check a fit before calling.
   `TensorArg.mapped` is set for a `"blocks"` op, whose server iterates the axes
   outside `axes`; otherwise those axes must be singleton.
+- **`OpInfo.kwargs` is documentation, not a value.** It is the non-tensor
+  arguments written as they'd appear in a call (`"name=default, ..."`, a bare
+  name when required) -- nothing decodes it back, so a default with no JSON
+  shape (`nan`) is exactly as fine here as any other repr.
+- **`OpInfo.input`/`streaming`** say how tensor arguments arrive (`EAGER`
+  reads a lazy input whole, capped; `LAZY` may stay out-of-core; `BLOCKS` maps
+  over blocks) and whether the call yields more than one event -- known ahead
+  of the call, not just by making one.
 - **`fingerprint`** changes when any op changes; the control caches op lists by
   it.
 - **Compression is gRPC's.** A server bound off loopback gzips integer (label)

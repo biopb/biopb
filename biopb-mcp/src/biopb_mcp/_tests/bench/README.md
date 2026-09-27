@@ -286,7 +286,7 @@ CASE = Case(
     collect={"volumes_um3": "volumes_um3", "spacing_um": "spacing_um"},
     score=verify,                     # (fixture, attempt) -> Outcome
     save_artifacts=save_artifacts,
-    plugins=("segmentation_qc",),     # kernel plugins this work needs
+    algorithms=("segmentation_qc",),  # bundled algorithm-plane ops this work needs
     persona_must_know=(...), persona_must_not_know=(...),   # if it withholds
 )
 ```
@@ -548,12 +548,14 @@ case brought a plane up. The isolation does not weaken as the run goes on.
 reads neither the developer's `mcp-config.json` nor their personal
 `~/.config/biopb/docs/*.md`. The catalog under test is the shipped one.
 
-**Only the kernel plugins a case asks for.** That same temp tree means an empty
-`~/.config/biopb/kernel/`, so a doc requiring the `segmentation_qc` plugin would
-be scored in a session where its own Requirements line cannot be met.
-`Case.plugins` seeds the ones it names, from the copies biopb-mcp ships, through
-the real loader — and nothing else, because a plugin no doc required is an
-environment difference nobody chose.
+**Only the ops a case asks for.** There is no control process in a bench
+session, so a doc requiring the `segmentation_qc` op would otherwise be scored
+in a session where `ops` never binds it — its own Requirements line unmeetable.
+`Case.algorithms` names bundled algorithm files (`biopb_mcp.algorithms.<name>`);
+`_FakeControlAlgorithms` starts a real op server for exactly those and
+publishes it the way a real control would, so `build_ops_from_config` finds it
+over the wire like it would in production — and nothing else, because an op no
+doc required is an environment difference nobody chose.
 
 ## Arrays cross by file, not by literal
 

@@ -103,7 +103,6 @@ import httpx
 import uvicorn
 from biopb import (
     _agents,
-    _kernel_plugins,
     _locations,
     _sessions,
     _web_auth,
@@ -1217,24 +1216,12 @@ def build_app(
         # the algorithm plane supervises it, a url entry probed live (so this
         # is polled on demand, not on the interval). Sync: it hashes files and
         # makes blocking gRPC calls, so Starlette runs it in the threadpool.
-        #
-        # `plugins` folds in the kernel-namespace "bring your own tool" surface
-        # (biopb/biopb-mcp#92) -- a static, stdlib-only listing of the ~/.config/
-        # biopb/kernel/ files and biopb_mcp.namespace packages, read (never
-        # executed, invariant I2) via _kernel_plugins. It renders in the same
-        # algorithm-plane card; a summary read failure degrades to empty rather
-        # than 500-ing the servers view alongside it.
         try:
             servers = algorithms.rows()
         except Exception as exc:  # noqa: BLE001 - report, never crash the handler
             logger.exception("api/algorithms failed")
             return JSONResponse({"error": str(exc)}, status_code=500)
-        try:
-            plugins = _kernel_plugins.summary()
-        except Exception:  # noqa: BLE001 - inspector is never-raise; belt-and-braces
-            logger.exception("api/algorithms plugin summary failed")
-            plugins = {"dir": "", "files": [], "entry_points": []}
-        return JSONResponse({"servers": servers, "plugins": plugins})
+        return JSONResponse({"servers": servers})
 
     def _algorithm_verb(request: Request, verb) -> JSONResponse:
         # One entry's verb, by ?name=. An unknown name is 404; a verb a url

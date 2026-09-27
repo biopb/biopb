@@ -301,7 +301,7 @@ def verify(fixture: Fixture, attempt: Attempt) -> Outcome:
     `segmentation_qc` is the same matcher — so a number here is comparable to the
     table on that page rather than merely internally consistent.
     """
-    from biopb_mcp.plugins import segmentation_qc
+    from biopb_mcp.algorithms import segmentation_qc
 
     limits = {**TOLERANCE, **fixture.tolerance}
     metrics: list[Metric] = []
@@ -458,7 +458,7 @@ CASE = Case(
     collect={"labels_a": "labels_a", "labels_b": "labels_b"},
     score=verify,
     save_artifacts=save_artifacts,
-    # No `plugins`: the verifier imports `segmentation_qc` itself, and the
-    # session needs nothing seeded into it. The matcher is the one the dropped
+    # No `algorithms`: the verifier imports `segmentation_qc` itself, and the
+    # session needs nothing published to it. The matcher is the one the dropped
     # entry was screened with, so a number here is comparable to that page.
 )

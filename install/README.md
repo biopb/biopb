@@ -91,13 +91,12 @@ are produced.
 ## Config & data locations
 
 - Data-server config: `~/.config/biopb/biopb.json` (preserved on rerun)
-- Algorithm registry: `~/.config/biopb/algorithms/`, one file per server. With
-  consent, a fresh install adds `cellpose.json`, the cellpose server at
-  `cellpose.biopb.org` (off-site; it logs client IPs)
+- Algorithm registry: `~/.config/biopb/algorithms/`, one file per server. The
+  installer seeds two bundled ops (segmentation QC, image resolution) here,
+  never clobbering your edits. With consent, a fresh install also adds
+  `cellpose.json`, the cellpose server at `cellpose.biopb.org` (off-site; it
+  logs client IPs)
 - MCP client definition: `~/.config/biopb/mcp.json`
-- Agent kernel plugins: `~/.config/biopb/kernel/` (drop a `*.py` here to add tools
-  to the agent's namespace; the installer seeds a `rolling_ball.py` example there,
-  never clobbering your edits)
 - Extra Python packages: `~/.config/biopb/extra-packages.txt` (see below)
 - Webapp: `~/.local/share/biopb/webapp`
 

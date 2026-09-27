@@ -9,7 +9,6 @@ under test is the handoff, not the data plane.
 """
 
 import pytest
-from biopb import _locations
 
 from biopb_mcp import workflow_env as we
 
@@ -27,7 +26,7 @@ class _Conn:
 
 @pytest.fixture
 def env(tmp_path, monkeypatch):
-    """A stubbed data plane and an empty plugin dir of our own."""
+    """A stubbed data plane."""
     import biopb.tensor
 
     from biopb_mcp.mcp import _process_ops
@@ -39,7 +38,6 @@ def env(tmp_path, monkeypatch):
         # Keeps the getter so a test can watch ops follow a reconnect.
         lambda config, getter: {"segment": getter},
     )
-    monkeypatch.setattr(_locations, "mcp_plugin_dir", lambda: tmp_path)
     return tmp_path
 
 
@@ -53,41 +51,6 @@ def _run(source="conn, ops = workflow_env()", **kwargs):
     ns = {"workflow_env": we.workflow_env, **kwargs}
     exec(source, ns)  # noqa: S102 - that is the thing being tested
     return ns
-
-
-class TestPlugins:
-    def test_a_plugin_binds_into_the_callers_namespace(self, env):
-        # Under its file's stem, as the session kernel binds it -- so a document
-        # rewritten from a session keeps calling it the way it was called there.
-        (env / "rolling_ball.py").write_text(
-            "def subtract_background(x):\n    return x\n", encoding="utf-8"
-        )
-        ns = _run()
-        assert ns["rolling_ball"].subtract_background(1) == 1
-
-    def test_what_bound_is_printed(self, env, capsys):
-        # The answer to the NameError that follows when it did not bind.
-        (env / "rolling_ball.py").write_text("x = 1\n", encoding="utf-8")
-        _run()
-        assert "kernel plugins: rolling_ball" in capsys.readouterr().out
-
-    def test_nothing_to_load_says_so_rather_than_staying_quiet(self, env, capsys):
-        _run()
-        assert "kernel plugins: (none)" in capsys.readouterr().out
-
-    def test_plugins_false_binds_nothing(self, env):
-        (env / "rolling_ball.py").write_text("x = 1\n", encoding="utf-8")
-        ns = _run("conn, ops = workflow_env(plugins=False)")
-        assert "rolling_ball" not in ns
-
-    def test_a_broken_plugin_is_not_a_broken_workflow(self, env):
-        # Fail-open per unit, as in the kernel: the workflow that does not use it
-        # must not fail, and the one that does fails where it uses it.
-        (env / "bad.py").write_text('raise RuntimeError("boom")\n', encoding="utf-8")
-        (env / "good.py").write_text("x = 1\n", encoding="utf-8")
-        ns = _run()
-        assert "good" in ns and "bad" not in ns
-        assert ns["conn"].client == "a-client"
 
 
 class TestHandles:

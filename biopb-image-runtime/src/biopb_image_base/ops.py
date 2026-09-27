@@ -28,6 +28,10 @@ same rank.
   only: the output at a pixel may depend on a neighbourhood the overlap
   covers, and nothing else.
 
+Both are advertised so a caller can decide how to call the op before trying
+it: ``input`` as ``OpInfo.input``, and whether the function is a generator as
+``OpInfo.streaming``.
+
 A single return value is the output ``result``; a tuple gives ``0``, ``1``,
 .... An array is a tensor output, inline or on the sink by size, and anything
 else is JSON. A function that yields is a streaming op: a yielded string is a
@@ -45,6 +49,7 @@ import argparse
 import hashlib
 import inspect
 import logging
+import math
 import os
 import re
 import sys
@@ -134,11 +139,26 @@ class _OpDef:
     int_kwargs: List[str] = field(default_factory=list)
     streaming: bool = False
 
+    def _kwargs_text(self) -> str:
+        """The non-tensor arguments as they'd appear in a call: a comma-separated
+        ``name=default`` per argument, bare ``name`` when required. Documentation
+        for a caller -- nothing decodes this back, so a default that has no JSON
+        shape (e.g. ``nan``) is exactly as fine here as any other repr."""
+        required = set(self.required)
+        return ", ".join(
+            name if name in required else f"{name}={self.kwargs[name]!r}"
+            for name in self.kwargs
+        )
+
     def info(self) -> proto.OpInfo:
         info = proto.OpInfo(
-            name=self.name, description=self.description, labels=self.labels
+            name=self.name,
+            description=self.description,
+            labels=self.labels,
+            kwargs=self._kwargs_text(),
+            input=proto.OpInfo.InputMode.Value(self.input.upper()),
+            streaming=self.streaming,
         )
-        info.kwargs.update(self.kwargs)
         for name, axes in self.tensors.items():
             info.tensors[name].axes = axes
             info.tensors[name].mapped = self.input == "blocks"
@@ -227,7 +247,7 @@ def _define(
             definition.kwargs[param.name] = None
             definition.required.append(param.name)
         else:
-            definition.kwargs[param.name] = _jsonable(param.default)
+            definition.kwargs[param.name] = param.default
         if ann is int or (
             isinstance(param.default, int) and not isinstance(param.default, bool)
         ):
@@ -317,16 +337,37 @@ def describe(definitions: Sequence[_OpDef]) -> proto.OpList:
 # =============================================================================
 
 
+#: The key `_jsonable` carries a non-finite float under, and `_from_json` (the
+#: kernel's `ops` client, `_process_ops.py`) reads it back from. JSON has no
+#: literal for nan/inf/-inf, and `google.protobuf.Value` refuses to serialize
+#: one to JSON text (`MessageToDict` raises) -- so a measurement that
+#: legitimately returns nan (an empty-input rate, "undefined" not "zero") or
+#: inf (an unbounded resolution) would otherwise crash decoding the result,
+#: not just lose precision.
+NON_FINITE_FLOAT_KEY = "__float__"
+
+
 def _jsonable(value: Any) -> Any:
-    """*value* as plain JSON types: numpy values converted, tables as columns."""
+    """*value* as plain JSON types: numpy values converted, tables as columns,
+    a non-finite float carried as ``{"__float__": "nan"}`` (see
+    :data:`NON_FINITE_FLOAT_KEY`)."""
     if value is None or isinstance(value, (bool, str)):
         return value
+    if isinstance(value, float) and not math.isfinite(value):
+        return {NON_FINITE_FLOAT_KEY: str(value)}
     if isinstance(value, (int, float)):
         return value
     if isinstance(value, np.generic):
-        return value.item()
+        return _jsonable(value.item())
     if isinstance(value, np.ndarray):
-        return value.tolist()
+        # Only a float array can hold a non-finite value; skip the per-element
+        # walk below unless one is actually there. Complex still falls
+        # through it, since a bare complex scalar isn't JSON either.
+        if value.dtype.kind == "f" and np.isfinite(value).all():
+            return value.tolist()
+        if value.dtype.kind not in "fc":
+            return value.tolist()
+        return _jsonable(value.tolist())
     if isinstance(value, dict):
         return {str(k): _jsonable(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
@@ -380,10 +421,21 @@ def _decode_pixels(name: str, arg: proto.Arg) -> _Pixels:
     return _Pixels(array, list(labels))
 
 
+def _undo_non_finite(value: Any) -> Any:
+    """Restore a `NON_FINITE_FLOAT_KEY`-carried nan/inf/-inf to a real float."""
+    if isinstance(value, dict) and set(value) == {NON_FINITE_FLOAT_KEY}:
+        return float(value[NON_FINITE_FLOAT_KEY])
+    if isinstance(value, list):
+        return [_undo_non_finite(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _undo_non_finite(v) for k, v in value.items()}
+    return value
+
+
 def _decode_kwarg(definition: _OpDef, name: str, arg: proto.Arg) -> Any:
     if arg.WhichOneof("kind") != "json":
         raise ValueError(f"{name} is not a tensor argument of {definition.name}")
-    value = json_format.MessageToDict(arg.json)
+    value = _undo_non_finite(json_format.MessageToDict(arg.json))
     if (
         name in definition.int_kwargs
         and isinstance(value, float)

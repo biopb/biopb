@@ -165,7 +165,6 @@ class TestTheReferenceDocs:
             "## Tensor Server",
             "## Dask",
             "## Ops",
-            "## Kernel\nplugins",
         ):
             assert where in section
 
@@ -192,16 +191,6 @@ class TestTheReferenceDocs:
         (line,) = [ln for ln in section.splitlines() if "extra-packages.txt" in ln]
         assert not line.startswith(" "), line
 
-    def test_the_three_missing_plugin_causes_stay_separate(self):
-        # Seeding cannot fix an install that predates the plugin, and a file that
-        # failed to load is not a file that is absent -- different fixes, so the
-        # doc must not collapse them into "run the seeder".
-        doc = _tool(_server.read_doc, "requirements")
-        section = doc[doc.index("## When something is missing") :]
-        assert "predates it" in section
-        assert "failed to load" in section
-        assert "biopb-mcp-seed-plugins" in section
-
     def test_the_kernel_doc_tells_the_agent_it_shares_the_namespace(self):
         # The runtime note ("the user ran job-N") says a change happened; this
         # section is what makes that legible -- without it the agent has no model
@@ -217,15 +206,6 @@ class TestTheReferenceDocs:
         assert "theirs waits for it" in section
         assert "refuses a user job" in section
         assert "restart_kernel" in section
-
-    def test_the_kernel_doc_points_at_server_status_for_plugins(self):
-        # The loader is fail-open, so "file on disk" != "plugin loaded"; the
-        # report is the only place that distinction is readable.
-        content = _tool(_server.read_doc, "kernel")
-        assert "## Kernel plugins" in content
-        assert "services.namespace_enabled" in content
-        # ...and introspection remains the answer to the other question.
-        assert "inspect_object" in content
 
     def test_the_viewer_doc_mentions_layers(self):
         assert "viewer.layers" in _tool(_server.read_doc, "napari-viewer")
@@ -1350,16 +1330,13 @@ class TestServerStatus:
         assert "starting" in result.lower()
         server_with_host.execute.assert_not_called()
 
-    def test_kernel_snippet_reports_ops_and_plugins(self):
+    def test_kernel_snippet_reports_ops_and_versions(self):
         # The snippet runs *in* the kernel, so run it against a stand-in namespace:
-        # it is what an agent resolves a doc's ops / plugin requirements against,
+        # it is what an agent resolves a doc's ops requirements against, and
         # every section has to survive the same exec.
         import contextlib
         import io
 
-        from biopb_mcp.mcp import _requires
-
-        _requires.record_loaded_plugins(["rolling_ball"], ["labshop_tools"])
         ns = {
             "_conn": MagicMock(client=None, last_status="", last_message=""),
             "viewer": MagicMock(layers=[]),
@@ -1375,10 +1352,7 @@ class TestServerStatus:
         assert "## Ops\n  restoration, segmentation" in report
         # No Client built: dask's own default, read without _dask_ctl.
         assert "## Dask\n  mode: in-process" in report
-        assert "## Kernel plugins" in report
-        assert "files: rolling_ball" in report
-        assert "packages: labshop_tools" in report
-        # A `biopb-mcp>=X` requirement (a doc needing a release-carried plugin)
+        # A `biopb-mcp>=X` requirement (a doc needing a release-carried feature)
         # is answered here, from the kernel's own interpreter, not by an import.
         import biopb_mcp
 

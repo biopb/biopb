@@ -16,7 +16,12 @@ from biopb.tensor import SerializedTensor, TensorDescriptor
 from google.protobuf import json_format, struct_pb2
 
 from biopb_mcp.mcp import _process_ops
-from biopb_mcp.mcp._process_ops import Ops, _make_channel, _same_plane
+from biopb_mcp.mcp._process_ops import (
+    _NON_FINITE_FLOAT_KEY,
+    Ops,
+    _make_channel,
+    _same_plane,
+)
 
 PLANE = "grpc://127.0.0.1:8815"
 
@@ -96,6 +101,21 @@ class _Servicer(proto.OpsServicer):
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, "three channels expected")
         elif op == "count":
             yield proto.Event(outputs={"result": _json({"n": 6, "xs": [1, 2.5]})})
+        elif op == "nonfinite":
+            # What a real biopb_image_base server sends for a nan/inf result --
+            # JSON has no literal for one, so it is carried sentinel-encoded.
+            yield proto.Event(
+                outputs={
+                    "result": _json({"x": {_NON_FINITE_FLOAT_KEY: "nan"}, "ok": 1.5})
+                }
+            )
+        elif op == "echo_kwarg":
+            kwargs = {
+                k: json_format.MessageToDict(v.json)
+                for k, v in args.items()
+                if v.WhichOneof("kind") == "json"
+            }
+            yield proto.Event(outputs={"result": _json(kwargs)})
         elif op == "slow":
             context.add_callback(self.cancelled.set)
             while context.is_active():
@@ -121,13 +141,18 @@ def serve():
         server.stop(None)
 
 
-def _info(name, tensors=("image",), **kwargs):
-    return {
+def _info(name, tensors=("image",), input=None, streaming=False, **kwargs):  # noqa: A002
+    info = {
         "name": name,
         "description": f"does {name}",
         "tensors": {t: {"axes": "YX"} for t in tensors},
-        "kwargs": kwargs,
+        "kwargs": ", ".join(f"{k}={v!r}" for k, v in kwargs.items()),
     }
+    if input:  # MessageToDict omits the zero-valued (EAGER) enum, same as here
+        info["input"] = input
+    if streaming:
+        info["streaming"] = streaming
+    return info
 
 
 OPS = [
@@ -139,6 +164,8 @@ OPS = [
     _info("slow", tensors=()),
     _info("refuse", tensors=()),
     _info("count", tensors=()),
+    _info("nonfinite", tensors=()),
+    _info("echo_kwarg", tensors=()),
 ]
 
 
@@ -189,9 +216,34 @@ def test_bind_is_a_mapping_and_attributes(url_ops):
     assert url_ops.double is url_ops["double"]
     assert "double" in dir(url_ops)
     assert "does double" in url_ops.double.__doc__
-    assert url_ops.stats.default_kwargs == {"level": 0.5}
+    assert url_ops.stats.kwargs_text == "level=0.5"
     with pytest.raises(AttributeError, match="ops.refresh"):
         url_ops.nope  # noqa: B018 - the attribute access is the test
+
+
+def test_input_mode_and_streaming_are_advertised_before_any_call():
+    rows = [
+        {
+            "name": "a",
+            "kind": "url",
+            "url": "grpc://x:1",
+            "state": "up",
+            "ops": [
+                _info("plain"),
+                _info("lazy_op", input="LAZY"),
+                _info("blocky", input="BLOCKS"),
+                _info("track", streaming=True),
+            ],
+        }
+    ]
+    ops = _ops(rows)
+    assert ops.plain.input_mode == "eager" and not ops.plain.streaming
+    assert "Input: eager" in ops.plain.__doc__
+    assert ops.lazy_op.input_mode == "lazy"
+    assert "out-of-core" in ops.lazy_op.__doc__
+    assert ops.blocky.input_mode == "blocks"
+    assert ops.track.streaming
+    assert "Streaming:" in ops.track.__doc__
 
 
 def test_a_shared_op_name_is_qualified():
@@ -295,6 +347,24 @@ def test_integral_json_numbers_are_ints(url_ops):
     result = url_ops.count()
     assert result == {"n": 6, "xs": [1, 2.5]}
     assert type(result["n"]) is int
+
+
+def test_non_finite_result_is_restored_not_left_sentinel_encoded(url_ops):
+    # JSON has no literal for nan, so the server carries it sentinel-encoded
+    # (see `_NON_FINITE_FLOAT_KEY`); the client must undo that, not hand the
+    # agent a `{"__float__": "nan"}` dict where it expected a float.
+    result = url_ops.nonfinite()
+    assert result["x"] != result["x"]  # nan
+    assert result["ok"] == 1.5
+
+
+def test_non_finite_kwarg_survives_the_round_trip(url_ops):
+    # The reverse leg: an agent passing nan/inf as an argument must not crash
+    # `json_format.ParseDict` building the call. `echo_kwarg` sends back
+    # whatever it decoded, sentinel-encoded again, which `_from_json` restores
+    # on the way back in -- so the value survives a full round trip unchanged.
+    result = url_ops.echo_kwarg(value=float("inf"))
+    assert result == {"value": float("inf")}
 
 
 def test_silence_times_out_and_cancels(serve):

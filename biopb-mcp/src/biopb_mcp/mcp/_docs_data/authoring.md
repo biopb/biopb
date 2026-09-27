@@ -80,8 +80,8 @@ interrupting a running job, overwriting a layer, writing files.
 
 | Amount | Ships as | The doc carries |
 |---|---|---|
-| ≲ 30 lines | Inline code fences | The code |
-| 30–150 lines | A kernel plugin (`server_status` reports the dir under `## Kernel plugins`) | The call signature, qualified by the plugin's module name, and what the parameters mean |
+| ≲ 30 lines, and an agent reliably gets it right cold | Inline code fences | The code |
+| Longer, or correctness-critical (easy to get subtly wrong, cheap to unit-test) | An algorithm-plane op ([[algorithm-servers]]; `server_status`'s `## Ops` reports it) | The op's name and what its parameters mean |
 | A published algorithm | A `pip install` pointer | Which package, and the degraded path when it is absent |
 
 Step 1 of any doc with a requirement is the requirement check, before the

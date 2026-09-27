@@ -186,7 +186,10 @@ generated from a previous step. Read [[tensor-server-client]] and [[napari-viewe
   by a per-block `scipy.ndimage.label` are not: each half of an object that
   straddles a chunk face gets its own number, so it is measured as two objects,
   each too small. Nothing in the table says so — check how `LABELS` was made, and
-  if it came from a mask, relabel with the `chunked_label` kernel plugin first.
+  if it came from a mask, relabel it first: rechunk to a single chunk before
+  `scipy.ndimage.label` if the mask fits in memory, or reconcile block-local
+  labels across each shared chunk face (`dask_image.ndmeasure.label`, or the
+  same by hand) if it does not.
 - **5b costs one task per object** — roughly 3 ms each, so ~10⁵ objects is minutes
   and ~10⁶ is impractical. Above that, only the properties that decompose into
   per-pixel sums are affordable: `area`, `intensity_mean`, and `centroid` come

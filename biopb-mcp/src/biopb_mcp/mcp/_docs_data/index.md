@@ -9,7 +9,7 @@ plain prose instead.
 
 ## References
 
-- kernel: the namespace, kernel plugins, long-running jobs, where a compute runs
+- kernel: the namespace, long-running jobs, where a compute runs
 - tensor-server-client: browse the catalog, load a tensor, and what lazy costs
 - upload: put a result on the server — tensors, label sets, ROI annotations
 - web-viewer: show data in the browser — needs no window; send the link, or open it yourself

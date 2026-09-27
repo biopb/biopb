@@ -4,7 +4,7 @@ description: Run single molecule localization on an SMLM/STORM/PALM blinking sta
 
 # Localize an SMLM stack and measure a resolution you can quote
 
-**Requirements:** somewhere to show the user an image ([[napari-viewer]] or [[web-viewer]]), an image from `client`, dask, the `image_resolution` kernel plugin.
+**Requirements:** somewhere to show the user an image ([[napari-viewer]] or [[web-viewer]]), an image from `client`, dask, the `image_resolution` op.
 
 Numbers below are measured and marked. **PAINT** is a real 40 000-frame
 acquisition from the catalog (364x500, ~100 spots/frame, ~4 million fits).
@@ -55,8 +55,8 @@ may claim for it.
 ## Steps
 
 1. **Check the requirements** *(blocking)*. Resolve the Requirements line against
-   `server_status`; `## Kernel plugins` answers for `plugin:image_resolution`,
-   and [[requirements]] covers a gap. Without the plugin, FRC is perhaps thirty
+   `server_status`; `## Ops` answers for `op:image_resolution`,
+   and [[requirements]] covers a gap. Without the op, FRC is perhaps thirty
    lines to write by hand and the *split* below is still the part that decides
    the answer — write the split correctly and a hand-rolled FRC is fine. Without
    `dask` everything still works serially; step 3 says what that costs.
@@ -111,13 +111,21 @@ may claim for it.
    reconstruction as 2x better where the truth is 3x worse**.
 
    ```python
-   res = image_resolution.frc_from_localizations(
-       x_nm, y_nm, frames,               # frames is what makes a safe split possible
+   # A call crosses a process boundary, so every tensor argument goes by name
+   # (more than one tensor argument means no positional shorthand); a 1-D
+   # tensor also needs its axis named explicitly (dim_labels), since there is
+   # no default axis convention for a plain list of numbers the way there is
+   # for a 2-D image. The result comes back as a dict, not an object.
+   res = ops.frc_from_localizations(
+       x=x_nm, y=y_nm, frames=frames,    # frames is what makes a safe split possible
        render_pixel_size=RENDER_NM,
        split="blocks", block_frames=BLOCK_FRAMES,
        n_emitters=N_EMITTERS,            # molecules, not localizations
+       dim_labels={"x": "N", "y": "N", "frames": "N"},
    )
-   print(res.summary())                  # carries the criterion and every warning
+   print(f"resolution {res['resolution']:.4g} nm (threshold {res['threshold_name']})")
+   for w in res["warnings"]:             # carries the criterion and every warning
+       print("  !", w)
    ```
 
    `split="blocks"` is the default and the one to quote. Its cost is that slow
@@ -132,7 +140,7 @@ may claim for it.
    that waves it through. Merge blinks that persist across consecutive frames
    within roughly one localization precision, and pass the merged count.
 
-   Read `res.nyquist_limited` and the warnings before quoting anything. If FRC
+   Read `res["nyquist_limited"]` and the warnings before quoting anything. If FRC
    comes back finer than the density floor, the label density is the limit and no
    amount of precision moves it (Shroff 2008). On filaments or any sparse
    structure the areal floor is pessimistic — the spacing that limits a filament

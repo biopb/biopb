@@ -64,16 +64,6 @@ interface AlgoRec {
   ops?: { name: string }[];
   error?: string;
 }
-// The kernel-namespace "bring your own tool" plugins (biopb-mcp#92), folded into
-// /api/algorithms. A static listing (files + installed packages), NOT the live
-// set of names a running kernel bound — the control reads it without executing
-// user code (invariant I2).
-interface PluginsRec {
-  dir: string;
-  files: { name: string; summary: string }[];
-  entry_points: { name: string; dist: string }[];
-}
-
 // The control's /api/* is token-gated at this single origin. Attach the stored
 // token ('biopb_token') as a Bearer header via the shared auth helper; in the
 // common local deployment there is no token and the header is simply absent. A
@@ -114,7 +104,6 @@ export default function DashboardPage() {
   const [sessions, setSessions] = useState<SessionRec[] | null>(null);
   const [agents, setAgents] = useState<AgentRec[] | null>(null);
   const [algos, setAlgos] = useState<AlgoRec[] | null>(null);
-  const [plugins, setPlugins] = useState<PluginsRec | null>(null);
   const [verbBusy, setVerbBusy] = useState(false);
   const [agentsBusy, setAgentsBusy] = useState(false);
   const [starting, setStarting] = useState(false);
@@ -188,7 +177,6 @@ export default function DashboardPage() {
     try {
       const data = await (await fetchAuth(withBase("/api/algorithms"))).json();
       setAlgos((data && data.servers) || []);
-      setPlugins((data && data.plugins) || null);
     } catch {
       /* keep last */
     }
@@ -482,48 +470,6 @@ export default function DashboardPage() {
           <p className="note">
             The entries in ~/.config/biopb/algorithms/: server files the control
             runs on first use, and servers someone else runs, probed live.
-          </p>
-
-          <div className="subhead">Kernel plugins</div>
-          <ul>
-            {plugins == null ? (
-              <li className="empty">loading…</li>
-            ) : plugins.files.length === 0 && plugins.entry_points.length === 0 ? (
-              <li className="empty">no kernel plugins</li>
-            ) : (
-              <>
-                {plugins.files.map((f) => (
-                  <li key={"f:" + f.name}>
-                    <span className="dot serving"></span>
-                    <span className="sid">{f.name}</span>
-                    {f.summary ? (
-                      <span className="ops" title={f.summary}>
-                        {f.summary}
-                      </span>
-                    ) : null}
-                  </li>
-                ))}
-                {plugins.entry_points.map((e) => (
-                  <li key={"e:" + e.name}>
-                    <span className="dot serving"></span>
-                    <span className="sid">{e.name}</span>
-                    <span className="tls">pkg</span>
-                    {e.dist ? (
-                      <span className="ops" title={e.dist}>
-                        {e.dist}
-                      </span>
-                    ) : null}
-                  </li>
-                ))}
-              </>
-            )}
-          </ul>
-          <p className="note">
-            User "bring your own tool" helpers loaded into agent kernels:{" "}
-            <code>*.py</code> files in{" "}
-            <code>{plugins?.dir || "~/.config/biopb/kernel/"}</code> and installed{" "}
-            <code>biopb_mcp.namespace</code> packages. Static listing — the live set
-            depends on each plugin.
           </p>
         </div>
 

@@ -170,10 +170,11 @@ class Case:
 
     #: Optional ``(outcome, dir) -> None`` — the before/after images.
     save_artifacts: Callable[[Outcome, Path], None] | None = None
-    #: Kernel plugins this case's work needs, seeded into the session's own
-    #: config tree. Without this a `plugin:` token is unresolvable and the run
-    #: is scoring an environment the work cannot be done in.
-    plugins: Sequence[str] = ()
+    #: Bundled algorithm-plane ops (`biopb_mcp.algorithms.<name>`) this case's
+    #: work needs, published for the session via `_FakeControlAlgorithms`.
+    #: Without this an `op:` token is unresolvable and the run is scoring an
+    #: environment the work cannot be done in.
+    algorithms: Sequence[str] = ()
     #: Case-folded substrings that must appear in the persona's rendered
     #: prompt: the fact the fixture strips, so the run is answerable at all.
     #: Checked wherever it is declared; a case that withholds nothing leaves it
