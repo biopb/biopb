@@ -7,7 +7,6 @@ import { splitArrayVersion } from "@biopb/tensor-flight-client";
 import { readRecents, subscribeRecents } from "../utils/recentSources";
 import { WarmTray } from "./WarmTray";
 import {
-  RECENT_FOLDER_ID,
   type TreeNode,
   UNRESOLVED_GLYPH,
   UNRESOLVED_TOOLTIP,
@@ -524,10 +523,8 @@ export function SourceTree() {
   const [query, setQuery] = useState("");
   const [serverFilteredIds, setServerFilteredIds] = useState<Set<string> | null>(null);
   const [serverQueryLoading, setServerQueryLoading] = useState(false);
-  // "Recent" starts open: a node nobody opens is a node nobody finds, and it is
-  // the one place an uploaded source can be reached at all.
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(
-    () => new Set([RECENT_FOLDER_ID]),
+    () => new Set(),
   );
 
   // Another tab's writes. localStorage is shared but does not re-render, so
