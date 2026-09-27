@@ -99,10 +99,15 @@ plus what the loader knows and the file cannot:
 1. an entry whose file does not exist gets the suffix `(missing)`; one that
    shadows a shipped doc gets `(local copy)`;
 2. a tail, `New shipped docs: id, id, …`, listing shipped docs with neither
-   an entry nor an `ignored:` mention — not truncated, since it's bounded by
-   what one release adds.
+   an entry nor an `ignored:` mention;
+3. a second tail, `Shipped docs your local copy may be behind on: id, …`,
+   naming shadowed ids whose shipped text changed since this install last
+   looked (§4) — the one shadowed-doc case with something to act on, since an
+   unshadowed entry is simply read fresh and needs no flag.
 
-The agent cleans up both by editing the file.
+Neither tail is truncated, since both are bounded by what one release adds.
+The agent cleans up either by editing the file (filing/ignoring a new id;
+re-shadowing, or leaving it, for a stale one).
 
 **Kernel plugins are not docs.** They are modules already bound in the
 namespace: `server_status` lists which ones loaded and `inspect_object`
@@ -181,10 +186,30 @@ reconciles on every render:
   *New shipped docs* tail; the agent files it or ignores it, once;
 - a **removed shipped doc** leaves its entry marked `(missing)`; the agent
   deletes the line;
-- a **changed shipped doc** is simply read fresh; if the user had shadowed
-  it, the shadow wins and the index says so.
+- a **changed shipped doc, unshadowed**, is simply read fresh: the index
+  entry (if any) still resolves, now to the new text, no action needed;
+- a **changed shipped doc, shadowed**: the shadow keeps winning (§1, §3),
+  which means the release's fix or improvement is invisible to this install
+  until the agent notices and re-shadows. This is the one case that does need
+  a merge step, and it is what the change manifest (below) exists to flag.
 
-No seen-list, no version stamp, no merge step.
+**The change manifest**, `.shipped-manifest.json` in the local tier
+(`mcp/_docs.py`, `changed_shipped_ids`), is a sha256 per shipped id plus the
+installed package version, refreshed once per version bump rather than on
+every render — a session that never upgrades pays nothing past reading one
+small file. On a version bump it diffs the new hashes against the stored
+ones, records which ids changed, and `render_index` intersects that set with
+the ids the local index currently shadows for the *Shipped docs your local
+copy may be behind on* tail (§2) — an unshadowed change needs no flag, since
+reading it already returns the new text. There is no per-item
+acknowledgment: the flagged set is simply whatever changed between the last
+version this ran under and the current one, so it clears itself at the next
+version bump regardless of whether the agent acted on it. A first-ever run
+has no prior manifest to diff against and reports nothing changed.
+
+Still no seen-list, no merge step of the file-format kind — the manifest is
+extra state on the *shipped* side only, so the local index's ownership model
+(§2) is unchanged.
 
 ## 5. Writing discipline
 
