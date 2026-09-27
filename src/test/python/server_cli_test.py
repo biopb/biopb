@@ -802,10 +802,9 @@ class TestPlaneBind:
 class TestControlTlsMaterial:
     """`--tls-cert` / `--tls-key` / `--san`, forwarded to the data plane.
 
-    `serve` and `launch` have taken all three since TLS landed; `control start` /
-    `control run` -- the entry point a deployment actually invokes -- took only
-    `--tls`, so an operator with a certificate of their own had to pre-seed the
-    state tree behind the control's back (biopb/biopb#913).
+    `serve` and `launch` have taken all three since TLS landed; `control start`
+    took only `--tls`, so an operator with a certificate of their own had to
+    pre-seed the state tree behind the control's back (biopb/biopb#913).
     """
 
     @pytest.fixture(autouse=True)
@@ -887,46 +886,16 @@ class TestControlTlsMaterial:
         finally:
             key.chmod(0o600)
 
-    def test_control_run_puts_the_material_on_the_spec(self, tmp_path, monkeypatch):
-        """`control run`'s hop -- the foreground command an Open OnDemand app
-        invokes builds the spec itself, with no argv in between.
-
-        Needs biopb-control installed, which the core CI job (`.[test,tensor]`)
-        deliberately does not do; control-ci runs this file with `-k Control` and
-        the package present, which is what this class is named to match.
-        """
-        pytest.importorskip("biopb_control")
-        import biopb_control
-
-        cert, key = self._pair(tmp_path)
-        captured = {}
-        monkeypatch.setattr(
-            biopb_control,
-            "run_control",
-            lambda spec, **_k: captured.setdefault("spec", spec) and 0,
-        )
-        monkeypatch.setattr(cli, "_guard_ports_free", lambda *_a, **_k: None)
-        monkeypatch.setattr(cli, "_ensure_dirs", lambda: None)
-
-        with pytest.raises(typer.Exit):
-            cli.control_run(
-                config=tmp_path / "biopb.json",
-                static_dir=None,
-                base_port=8810,
-                log_level="INFO",
-                grpc_bind="127.0.0.1",
-                tls=None,
-                tls_cert=cert,
-                tls_key=key,
-                san=["gpu-051.hpc.example"],
-                token=None,
-                data_plane=True,
-                url_prefix=None,
-                remote=False,
-            )
-        spec = captured["spec"]
-        assert (spec.tls, spec.tls_cert, spec.tls_key) == (True, cert, key)
-        assert spec.sans == ("gpu-051.hpc.example",)
+    def test_control_run_is_removed(self):
+        """biopb/biopb#736: this command used to build the spec itself,
+        in-process, with no argv round trip -- and no fail-closed guard on a
+        public --control-host either. Retired in favor of
+        `python -m biopb_control run`, which already has both the flags (see
+        biopb_control's own test_main.py for the TLS-material coverage this
+        class used to duplicate here) and the guard."""
+        with pytest.raises(typer.Exit) as exc:
+            cli.control_run()
+        assert exc.value.exit_code == 2
 
 
 class TestBasePort:
