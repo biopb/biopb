@@ -31,13 +31,15 @@ explains itself.
 from __future__ import annotations
 
 import difflib
+import hashlib
+import json
 import logging
 import re
 from datetime import date
 from importlib import resources
 from pathlib import Path
 
-from biopb._config_io import atomic_write_text
+from biopb._config_io import atomic_write_json, atomic_write_text
 
 logger = logging.getLogger(__name__)
 
@@ -316,6 +318,108 @@ def local_dir_status() -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Shipped-doc change manifest
+# --------------------------------------------------------------------------- #
+# A local record of the last shipped set this install observed (per-doc hash +
+# the package version), so an upgrade's *content* changes -- not just its new
+# ids, already caught by the `New shipped docs` tail -- can be told apart from
+# a shipped doc that has sat unchanged for years. Recomputed once per version
+# bump rather than every render: a session that never upgrades pays nothing
+# past reading a small file, and a run that does upgrade pays one hash pass
+# over the shipped set, not one per read_doc('index') call.
+_MANIFEST_NAME = ".shipped-manifest.json"
+
+
+def _installed_version() -> str:
+    from ._update import _running_library_version
+
+    return _running_library_version()
+
+
+def _manifest_path() -> Path | None:
+    root = local_dir()
+    return None if root is None else root / _MANIFEST_NAME
+
+
+def _shipped_hashes() -> dict[str, str]:
+    """sha256 of each listed shipped doc's raw text, banked ones excluded.
+
+    A banked doc is invisible to every session (module docstring, §shipped
+    tier), so a change to one must stay invisible here too.
+    """
+    out = {}
+    for doc_id in shipped_ids():
+        text = _shipped_text(doc_id)
+        if text is not None:
+            out[doc_id] = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return out
+
+
+def _load_manifest() -> dict:
+    """The manifest dict, or ``{}`` for anything that isn't one.
+
+    A hand-edited or truncated file could hold any JSON value; only a mapping
+    is a manifest, so anything else is treated the same as absent rather than
+    trusted into a ``.get`` call downstream that assumes dict shape.
+    """
+    path = _manifest_path()
+    if path is None:
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_manifest(data: dict) -> None:
+    path = _manifest_path()
+    if path is None:
+        return
+    try:
+        atomic_write_json(path, data, raise_on_error=True)
+    except OSError:
+        logger.debug("docs: could not save the shipped-doc manifest", exc_info=True)
+
+
+def changed_shipped_ids(current_ids: list[str] | None = None) -> list[str]:
+    """Shipped ids added or edited since this install last looked.
+
+    Compares against the manifest from the last time this ran, keyed by
+    installed version rather than a session or a clock: many sessions between
+    two versions share one answer, and a session that reruns under the same
+    version gets the same answer back without rehashing anything -- checked
+    before any hashing happens, so the common case (no upgrade since last
+    look) costs one id listing, never a hash pass over the whole shipped set.
+    A first-ever run, or a manifest whose ``hashes`` isn't the mapping this
+    expects, has nothing trustworthy to compare against, so it seeds fresh and
+    reports nothing changed -- there is no "before" for it to differ from.
+
+    *current_ids* lets a caller that already has :func:`shipped_ids` (as
+    :func:`render_index` does, for its own *New shipped docs* tail) pass it
+    through rather than walking the shipped tree a second time in the same
+    render.
+    """
+    manifest = _load_manifest()
+    version = _installed_version()
+    if manifest.get("version") == version:
+        cached = manifest.get("changed")
+        ids = set(current_ids) if current_ids is not None else set(shipped_ids())
+        if isinstance(cached, list):
+            return [i for i in cached if isinstance(i, str) and i in ids]
+        return []
+
+    current = _shipped_hashes()
+    old_hashes = manifest.get("hashes")
+    if isinstance(old_hashes, dict):
+        changed = sorted(i for i, h in current.items() if old_hashes.get(i) != h)
+    else:
+        changed = []  # no trustworthy "before" to diff against
+    _save_manifest({"version": version, "hashes": current, "changed": changed})
+    return changed
+
+
+# --------------------------------------------------------------------------- #
 # Metadata
 # --------------------------------------------------------------------------- #
 def _updated(text: str, path: Path | None) -> str:
@@ -440,14 +544,19 @@ def render_index(text: str | None = None) -> str:
 
     Entry lines gain ``(missing)`` where no tier holds the id and ``(local
     copy)`` where a local doc shadows a shipped one; a trailing *New shipped
-    docs* line names the shipped docs this index neither lists nor ignores. The
-    tail is not truncated -- it is bounded by what one release adds, and
-    truncating it would hide the upgrade it exists to report.
+    docs* line names the shipped docs this index neither lists nor ignores,
+    and a *Shipped docs your local copy may be behind on* line names shadowed
+    ids whose shipped text changed since this install last looked (§ shipped-
+    doc change manifest) -- the only shadowed-doc case with anything to act
+    on, since an unshadowed one is simply read fresh. Neither tail is
+    truncated -- both are bounded by what one release adds, and truncating
+    would hide the upgrade they exist to report.
     """
     if text is None:
         text = index_text()
 
     named: set[str] = set(_ignored_ids(text))
+    shadowed: set[str] = set()
     out: list[str] = []
     for line in text.splitlines():
         doc_id = _entry_id(line)
@@ -462,12 +571,22 @@ def render_index(text: str | None = None) -> str:
         if meta is None:
             out.append(f"{line} (missing)")
             continue
-        out.append(f"{line} (local copy)" if meta["shadows_shipped"] else line)
+        if meta["shadows_shipped"]:
+            shadowed.add(doc_id)
+            out.append(f"{line} (local copy)")
+        else:
+            out.append(line)
 
-    new = [i for i in shipped_ids() if i not in named]
+    ids = shipped_ids()
+    new = [i for i in ids if i not in named]
     if new:
         out.append("")
         out.append(f"New shipped docs: {', '.join(new)}")
+
+    stale = [i for i in changed_shipped_ids(ids) if i in shadowed]
+    if stale:
+        out.append("")
+        out.append(f"Shipped docs your local copy may be behind on: {', '.join(stale)}")
     return "\n".join(out).rstrip() + "\n"
 
 
