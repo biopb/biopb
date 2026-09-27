@@ -588,8 +588,9 @@ def _run_cells(run, host):
     are marked ``skipped`` (:func:`_record`), so the report says how far the
     workflow got.
 
-    Bare cells (``run_cell(bare=True)``): a verification runs the document and
-    nothing else, so the document's own first cell builds its ``client``.
+    A verification runs the document and nothing else: a scratch kernel binds
+    and refreshes no ``client`` (``_bootstrap``), so the document's own first
+    cell builds it.
     """
     n = len(run["cells"])
     for i, code in enumerate(run["cells"]):
@@ -604,7 +605,7 @@ def _run_cells(run, host):
             job_id = host.jobs.new_id()
             run["cell_jobs"][i] = job_id
             run["note"] = f"Running cell {i + 1} of {n}…\n"
-            host.run_cell(code, job_id, run["origin"], bare=True)
+            host.run_cell(code, job_id, run["origin"])
         out = _await_cell(run, host, job_id)
         if out is None:
             return  # discarded

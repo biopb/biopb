@@ -48,7 +48,7 @@ nothing. It is not `restart_kernel` — the live session is untouched.
 
 **The scratch kernel is given nothing**: no napari viewer, no
 `np`/`da`/`client`/`ops`, no user plugins pre-bound, no
-`client = _conn.client` refresh prefix. What a document needs, it builds
+per-cell `client` refresh. What a document needs, it builds
 itself via `biopb_mcp.workflow_env()` (the same code the session bootstrap
 uses) — so anything handed to the run for free is something the document
 could lean on and fail on later, one level up from variable hygiene.

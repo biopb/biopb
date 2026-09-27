@@ -265,8 +265,8 @@ def _bootstrap_impl():
     # 5. The kernel's side of the jobs: cells held for Stop, run_async tasks.
     #    install() stores the shell and clears any prior job state.
     _jobs.install(ip)
-    # 6. Namespace for execute_code.  client is refreshed before each agent
-    #    cell (the connection service connects asynchronously).
+    # 6. Namespace for execute_code.  client is refreshed before each cell
+    #    (the connection service connects asynchronously; see below).
     #    _viewer_window_alive lets the tools detect a user-closed window (the
     #    Python `viewer` survives a window close, so mutations silently no-op).
     ns = {
@@ -294,6 +294,14 @@ def _bootstrap_impl():
                 "run_async": _jobs.run_async,
             }
         )
+
+        # `client` tracks the connection, which connects asynchronously.
+        # Refreshed from an event hook rather than a line prepended to the
+        # cell, which would shift every traceback line number by one.
+        def _refresh_client(_info):
+            ip.user_ns["client"] = conn.client
+
+        ip.events.register("pre_run_cell", _refresh_client)
     if viewer is not None:
         # The agent-facing `viewer` is a main-thread marshaling proxy so
         # arbitrary job-thread code (viewer/layers/dims/camera mutations) can't

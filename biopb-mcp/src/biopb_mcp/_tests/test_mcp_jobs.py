@@ -540,4 +540,4 @@ class TestNapariJobs:
             time.sleep(0.05)
         napari_kernel.restart()  # respawns + re-bootstraps
         # The host's record outlives the kernel.
-        assert napari_kernel.jobs.poll(job_id)["status"] == "interrupted"
+        assert napari_kernel.jobs.poll(job_id)["status"] == "kernel_lost"

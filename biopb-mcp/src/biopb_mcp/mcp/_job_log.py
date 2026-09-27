@@ -141,7 +141,7 @@ class _Record:
         self.origin = event.get("origin", "mcp")
         # Why, in the words of whoever asked; free text, provenance only.
         self.intent = event.get("intent", "")
-        # running | ok | error | interrupted
+        # running | ok | error | interrupted | kernel_lost
         self.status = "running"
         self.error_text = ""
         # A cell's traceback: from its iopub error, or its shell reply.
@@ -487,7 +487,9 @@ class JobLog:
             for rec in self._records.values():
                 if rec.status != "running":
                     continue
-                rec.end("interrupted", text)
+                # Not "interrupted": an interrupt leaves the namespace intact,
+                # a lost kernel takes it with it.
+                rec.end("kernel_lost", text)
             self._by_request.clear()
             self._cells.clear()
 

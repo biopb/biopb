@@ -140,10 +140,6 @@ _DEATHWATCH_ARG = (
     "--IPKernelApp.exec_lines=import biopb._lifecycle.deathwatch as _dw; _dw.install()"
 )
 
-# Prepended to an agent's cell so ``client`` tracks the tensor connection, which
-# connects asynchronously.
-_CELL_PREFIX = "client = _conn.client\n"
-
 # Whether the viewer window is still open, evaluated after an agent's cell: a
 # user-closed window turns viewer mutations into silent no-ops. None where the
 # bootstrap bound no probe.
@@ -670,7 +666,7 @@ class KernelHost:
             raise RuntimeError(reply.get("evalue") or "control op failed")
         return reply.get("r")
 
-    def run_cell(self, code, job_id, origin, intent="", bare=False):
+    def run_cell(self, code, job_id, origin, intent=""):
         """Send *code* as a cell, recorded as *job_id*; return at once.
 
         The cell runs on the kernel's main thread like any client's, queued
@@ -678,10 +674,6 @@ class KernelHost:
         and ends on its request's idle, or -- if that is lost -- on its shell
         reply, which cannot be. Raises ``RuntimeError`` carrying what to do
         when the kernel is not ready (:meth:`_not_ready_result`).
-
-        *bare* sends the code alone, without the ``client`` refresh: a
-        verification runs the document and nothing else, so a workflow that
-        never builds its own ``client`` fails there, as it would for its reader.
         """
         io = self._io
         if not self._ready.is_set() or io is None:
@@ -701,7 +693,7 @@ class KernelHost:
             timer.start()
 
         return io.send_execute(
-            code if bare else _CELL_PREFIX + code,
+            code,
             on_reply,
             before_send,
             user_expressions={"w": _WINDOW_ALIVE_EXPR},

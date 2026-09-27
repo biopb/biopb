@@ -755,6 +755,25 @@ class TestViewerlessBootstrap:
     def test_the_host_reports_why(self, viewerless_kernel):
         assert viewerless_kernel.no_viewer_reason == "the viewer is off in the config"
 
+    def test_client_tracks_the_connection_before_each_cell(self, viewerless_kernel):
+        # The connection lands asynchronously; the next cell sees it.
+        viewerless_kernel.execute("_saved = _conn.client; _conn.client = 'landed'")
+        try:
+            res = viewerless_kernel.execute("print(client)")
+            assert res["stdout"].strip() == "landed"
+        finally:
+            viewerless_kernel.execute("_conn.client = _saved")
+
+    def test_a_tracebacks_line_numbers_are_the_submitted_codes(self, viewerless_kernel):
+        # #1140: the refresh adds no source line to the agent's cell.
+        host = viewerless_kernel
+        job_id = host.jobs.new_id()
+        host.run_cell("x = 1\ny = 2\n1 / 0", job_id, "mcp")
+        assert _wait_until(lambda: host.jobs.poll(job_id)["status"] == "error")
+        tb = host.jobs.poll(job_id)["error_text"]
+        assert "----> 3 1 / 0" in tb
+        assert "_conn" not in tb
+
 
 # ---------------------------------------------------------------------------
 # Full napari bootstrap — only in a real desktop session.
@@ -1511,7 +1530,7 @@ class TestHostRecords:
         host.restart()
         assert host.jobs.poll(done)["stdout"] == "kept\n"
         snap = host.jobs.poll(running)
-        assert snap["status"] == "interrupted"
+        assert snap["status"] == "kernel_lost"
         assert "kernel stopped" in snap["error_text"]
         after = self._submit(host, "1")
         assert int(after.split("-")[1]) > int(running.split("-")[1])
