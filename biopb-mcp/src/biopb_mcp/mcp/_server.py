@@ -996,12 +996,10 @@ async def poll_job(
     """Get the status and output of a job started by execute_code.
 
     Returns the job's status (running/ok/error/interrupted/kernel_lost),
-    elapsed time, and output so far (full output once terminal). `interrupted`
-    means the job was stopped and the kernel's namespace is intact;
-    `kernel_lost` means the kernel was restarted or died under it, taking every
-    variable with it. Job records outlive kernel restarts and ids are never
-    reused (older terminal jobs are eventually evicted), so a job from before a
-    restart can still be polled, but its variables are gone.
+    elapsed time, and output so far (full output once terminal). `kernel_lost`:
+    the kernel restarted or died under the job, and its variables are gone.
+    Records outlive restarts and ids are never reused (older terminal jobs are
+    eventually evicted), so a job from before a restart can still be polled.
 
     **This call already waits, so do not poll it in a loop.** A running job is
     watched here for up to `wait` seconds and answered the instant it ends;

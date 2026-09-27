@@ -265,8 +265,7 @@ def _bootstrap_impl():
     # 5. The kernel's side of the jobs: cells held for Stop, run_async tasks.
     #    install() stores the shell and clears any prior job state.
     _jobs.install(ip)
-    # 6. Namespace for execute_code.  client is refreshed before each cell
-    #    (the connection service connects asynchronously; see below).
+    # 6. Namespace for execute_code.
     #    _viewer_window_alive lets the tools detect a user-closed window (the
     #    Python `viewer` survives a window close, so mutations silently no-op).
     ns = {
