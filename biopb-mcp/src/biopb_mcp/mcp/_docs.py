@@ -680,7 +680,6 @@ def read_doc(doc_id: str) -> str:
     return f"{_header(meta)}\n\n{meta['body']}"
 
 
-
 def read_diff(doc_id: str) -> str:
     """The local copy of *doc_id* against its shipped text, as a unified diff.
 
