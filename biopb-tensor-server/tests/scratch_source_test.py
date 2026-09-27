@@ -95,10 +95,33 @@ class TestItIsThereBeforeAnythingAsks:
         self, writable_server
     ):
         """A UI showing ``source_url`` gets ``scratch://scratch``, not the
-        ``write_dir``-rooted fields directory it happens to be backed by."""
+        ``write_dir``-rooted fields directory it happens to be backed by --
+        that directory is still there, at ``local_root``, for warm/recall
+        (biopb/biopb#1139)."""
         adapter = writable_server.sources.get(SCRATCH_SOURCE_ID)
 
         assert adapter._source_url == f"scratch://{SCRATCH_SOURCE_ID}"
+        assert adapter.local_root == str(
+            Path(writable_server.uploads.write_dir) / "fields" / SCRATCH_SOURCE_ID
+        )
+
+
+class TestItCanBeWarmed:
+    def test_a_published_field_is_warmable_through_the_source_url_alias(
+        self, writable_server, client
+    ):
+        """biopb/biopb#1139: warming used ``adapter.source_url`` as the recall
+        root, which #1138 turned into the display alias ``scratch://scratch``
+        -- a URL with nothing on disk at that address, so warm silently
+        reported ``files_total == 0`` instead of walking the real
+        ``<write_dir>/fields/scratch`` where the published bytes actually
+        live."""
+        _publish(client, _add(client, "warmed"))
+
+        result = client.warm(SCRATCH_SOURCE_ID)
+
+        assert result.files_total >= 1
+        assert result.files_done == result.files_total
 
 
 class TestItIsEmptyByDefault:

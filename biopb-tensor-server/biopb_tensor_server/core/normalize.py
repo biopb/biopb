@@ -255,6 +255,10 @@ class NormalizingAdapter(TensorAdapter):
         return self._inner.source_url
 
     @property
+    def local_root(self) -> Optional[str]:
+        return self._inner.local_root
+
+    @property
     def source_type(self) -> Optional[str]:
         return self._inner.source_type
 

@@ -14,7 +14,8 @@ accumulating forever.
 
 from __future__ import annotations
 
-from typing import Any, List, Optional
+from pathlib import Path
+from typing import Any, List, Optional, Union
 
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
@@ -50,12 +51,21 @@ class ScratchSource(SourceAdapter):
 
     _source_type = "scratch"
 
-    def __init__(self, max_upload_ttl: Optional[float] = None) -> None:
+    def __init__(
+        self,
+        max_upload_ttl: Optional[float] = None,
+        fields_dir: Optional[Union[str, Path]] = None,
+    ) -> None:
         self.source_id = SCRATCH_SOURCE_ID
         #: A synthetic source like ``cache://``, not a filesystem path -- the
-        #: on-disk fields directory (``source_fields_dir``) is an implementation
-        #: detail clients have no use for.
+        #: on-disk fields directory (below) is an implementation detail
+        #: clients have no use for.
         self._source_url = f"scratch://{SCRATCH_SOURCE_ID}"
+        #: The real backing tree (``<write_dir>/fields/scratch``), for
+        #: filesystem ops only (``local_root`` -- warm's recall walk). None on
+        #: a server with no ``write_dir``, where nothing can be uploaded here
+        #: anyway (see ``UploadManager.install_scratch``).
+        self._local_root = str(fields_dir) if fields_dir is not None else None
         #: Ceiling, in seconds, on every upload added here, applied by
         #: ``UploadManager._deadline_for`` including to a request that named no
         #: lifetime. None leaves them undated, as a discovered source does.

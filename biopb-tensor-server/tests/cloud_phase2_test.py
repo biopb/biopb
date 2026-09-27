@@ -624,6 +624,10 @@ class _ResidencyAdapter:
     def __init__(self, source_url):
         self._source_url = str(source_url)
 
+    @property
+    def local_root(self):
+        return self._source_url
+
     def is_resident(self):
         return SourceAdapter.is_resident(self)
 
@@ -1256,7 +1260,12 @@ class _SlowSentinel:
 
 class _DirAdapter:
     """Minimal registered adapter exposing only ``_source_url`` -- all `warm`
-    needs (it walks that directory and reads files; format-agnostic)."""
+    needs (it walks that directory and reads files; format-agnostic).
+
+    ``local_root`` mirrors ``source_url`` here: every real adapter this stub
+    stands in for has its actual path at ``_source_url``. The
+    ``_NoLocalRootAdapter`` below is the one that exercises them diverging.
+    """
 
     capability_token = None
 
@@ -1266,6 +1275,30 @@ class _DirAdapter:
     @property
     def source_url(self):
         return self._source_url
+
+    @property
+    def local_root(self):
+        return self._source_url
+
+
+class _NoLocalRootAdapter:
+    """A registered adapter whose ``source_url`` is a catalog-only identity
+    with nothing on disk at that address (``cache://``, ``scratch://``) -- the
+    shape biopb/biopb#1139 fixed: ``local_root`` has no default to fall back
+    to, unlike ``_DirAdapter``."""
+
+    capability_token = None
+
+    def __init__(self, source_url):
+        self._source_url = source_url
+
+    @property
+    def source_url(self):
+        return self._source_url
+
+    @property
+    def local_root(self):
+        return None
 
 
 class _Ctx:
@@ -1529,6 +1562,17 @@ class TestWarmAction:
         assert "s10" in message
         assert "s3" in message
         assert "server that holds the data" in message
+
+    def test_warm_refuses_a_source_with_no_local_backing_tree(self):
+        """A synthetic ``source_url`` (cache://, scratch://) names a catalog
+        identity, not a path -- it must not fall into the single-file no-op,
+        which would silently report `files_total == 0` as if warm had already
+        succeeded (biopb/biopb#1139)."""
+        import pyarrow.flight as flight
+
+        server = self._server("s12", _NoLocalRootAdapter("scratch://scratch"))
+        with pytest.raises(flight.FlightServerError, match="no local filesystem tree"):
+            list(server.do_action(_Ctx(), flight.Action("warm", b"s12")))
 
     def test_warm_still_no_ops_on_a_local_single_file_source(self, tmp_path):
         # The refusal must not swallow this: `files_total == 0` is how a client

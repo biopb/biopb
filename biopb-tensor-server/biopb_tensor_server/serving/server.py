@@ -1364,6 +1364,11 @@ class TensorFlightServer(flight.FlightServerBase):
           recalled by resolve, so this emits one terminal ``done`` with
           ``files_total == 0`` and returns. A *remote* source raises instead;
           nothing here can be made resident.
+        - **Rejects a source with no local backing tree at all** -- distinct
+          from the single-file no-op above: ``files_total == 0`` must keep
+          meaning "already resident", never "not applicable" (biopb/biopb#1035
+          and, for a synthetic ``source_url`` that never named an operational
+          path to begin with, biopb/biopb#1139).
         - **Read every file unconditionally** -- residency is volatile (eviction /
           re-dehydration can flip it underneath us), so a "skip already-resident"
           check would be a TOCTOU trap; an unconditional read is idempotent
@@ -1378,23 +1383,33 @@ class TensorFlightServer(flight.FlightServerBase):
         if adapter is None:
             raise flight.FlightServerError(f"Source not found: {source_id}")
 
-        root = adapter.source_url
-        # A remote source has no local tree to walk, so refuse rather than fall
-        # into the no-op below: `files_total == 0` is how a client learns a
-        # source is single-file, and must not also mean "not applicable"
-        # (biopb/biopb#1035). Scheme only, so a mirror's aliased `source_url`
-        # (display authority, never the dial address) is still sound to ask.
-        if root and is_remote_url(root):
-            scheme = root.split("://", 1)[0]
+        # The remote check reads `source_url` (the display/dial identity), not
+        # `local_root`: a mirror's aliased `source_url` is still the right thing
+        # to ask about a remote scheme, and a synthetic local source's
+        # `source_url` never carries one anyway.
+        catalog_url = adapter.source_url
+        if catalog_url and is_remote_url(catalog_url):
+            scheme = catalog_url.split("://", 1)[0]
             raise flight.FlightServerError(
                 f"Cannot warm {source_id!r}: it is a remote ({scheme}) source, "
                 "and warm recalls member files onto the serving machine's own "
                 "filesystem. Nothing here can be made resident. Warm it on the "
                 "server that holds the data."
             )
+
+        root = adapter.local_root
+        # No operational path at all -- e.g. a synthetic source_url (cache://,
+        # scratch://) with no override. Unlike the single-file no-op below,
+        # this is not "nothing left to do"; it is "warm cannot act here".
+        if not root:
+            raise flight.FlightServerError(
+                f"Cannot warm {source_id!r}: it has no local filesystem tree to "
+                "recall (its source_url is a catalog identity, not an "
+                "operational path)."
+            )
         # Single-file / non-directory source: nothing to warm beyond what
         # resolve already recalled. One terminal `done`, files_total == 0.
-        if not root or not os.path.isdir(root):
+        if not os.path.isdir(root):
             yield WarmStreamMessage(done=WarmProgress()).SerializeToString()
             return
 
