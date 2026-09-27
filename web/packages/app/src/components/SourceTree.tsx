@@ -1,7 +1,7 @@
 "use client";
 
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { selectTileInfo, useAppStore } from "../store";
+import { currentArrayId, useAppStore } from "../store";
 import type { DataSourceDescriptor } from "@biopb/tensor-flight-client";
 import { splitArrayVersion } from "@biopb/tensor-flight-client";
 import { readRecents, subscribeRecents } from "../utils/recentSources";
@@ -487,15 +487,12 @@ export function SourceTree() {
   const sourcesLoading = useAppStore((s) => s.sourcesLoading);
   const scanning = useAppStore((s) => s.scanning);
   const activeSourceId = useAppStore((s) => s.activeSourceId);
-  // Which tensor row to mark, in the catalog's own spelling. `activeTensorId`
-  // may be a bare source_id -- from a link, or from clicking a source rather
-  // than one of its tensors -- and no row is named that way. Only the Flight
-  // server knows which field it binds as a source's default, and `tile_info` is
-  // where it says so, so the grid the render path already fetched is what
-  // resolves it; until that lands there is nothing better than the id itself.
+  // Which tensor row to mark, in the catalog's own spelling: `currentArrayId`
+  // is the same resolution ROI/draft/broadcast state reads through, stripped
+  // of a content-pin token (no row is named that way).
   const activeTensorId = useAppStore((s) => {
-    const info = selectTileInfo(s);
-    return info ? splitArrayVersion(info.array_id).arrayId : s.activeTensorId;
+    const id = currentArrayId(s);
+    return id ? splitArrayVersion(id).arrayId : null;
   });
   const selectSource = useAppStore((s) => s.selectSource);
   const querySources = useAppStore((s) => s.querySources);

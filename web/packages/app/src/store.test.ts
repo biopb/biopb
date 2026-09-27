@@ -22,6 +22,7 @@ import {
   selectTileInfo,
   selectLabelOverlay,
   catalogFingerprint,
+  currentArrayId,
   useAppStore,
 } from "./store";
 import { DEFAULT_LABEL_OPACITY } from "./utils/vivUtils";
@@ -52,6 +53,12 @@ const TILE_INFO = {
   dim_labels: ["T", "C", "Z", "Y", "X"],
   shape: [1, 1, 1, 8, 8],
 } as unknown as TileInfo;
+
+/** Selects a bare id, then answers tile_info's resolution of it, as `currentArrayId` reads it. */
+function selectAndResolve(bareId: string, resolvedArrayId: string) {
+  useAppStore.setState({ activeTensorId: bareId, requestedArrayId: null });
+  useAppStore.getState().setTileInfo({ ...TILE_INFO, array_id: resolvedArrayId }, bareId);
+}
 
 const client = (sources: DataSourceDescriptor[]) =>
   ({
@@ -285,6 +292,27 @@ describe("the grid in view", () => {
     useAppStore.setState({ activeTensorId: "first", requestedArrayId: "first@abcd1234" });
 
     expect(selectTileInfo(useAppStore.getState())).toBe(TILE_INFO);
+  });
+});
+
+describe("currentArrayId", () => {
+  it("stays at the bare id until tile_info answers for it", () => {
+    useAppStore.setState({ activeTensorId: "scratch", requestedArrayId: null });
+
+    expect(currentArrayId(useAppStore.getState())).toBe("scratch");
+  });
+
+  it("adopts the specific tensor tile_info resolved a bare source_id to", () => {
+    selectAndResolve("scratch", "scratch/tensorA");
+
+    expect(currentArrayId(useAppStore.getState())).toBe("scratch/tensorA");
+  });
+
+  it("ignores a grid answering for a different id than the one now in view", () => {
+    useAppStore.getState().setTileInfo({ ...TILE_INFO, array_id: "scratch/tensorA" }, "scratch");
+    useAppStore.setState({ activeTensorId: "other", requestedArrayId: null });
+
+    expect(currentArrayId(useAppStore.getState())).toBe("other");
   });
 });
 
@@ -724,6 +752,27 @@ describe("authoring state", () => {
     // the shape that was sent.
     expect(useAppStore.getState().rois.map((r) => r.roiId)).toEqual(["srv1"]);
     expect(useAppStore.getState().selectedRoiId).toBe("srv1");
+  });
+
+  it("targets the tensor tile_info resolved a bare source_id to, not the bare id", async () => {
+    // biopb/biopb#1155: clicking a multi-tensor source's row (rather than one
+    // of its tensors) selects the bare source_id, which the Flight server
+    // resolves once tile_info answers. Annotations have to follow that
+    // resolution or they land on a different tensor than the one on screen.
+    const calls: unknown[] = [];
+    seedFor({
+      http: {
+        putRois: (arrayId: string, rois: unknown[], opts: unknown) => {
+          calls.push({ arrayId, rois, opts });
+          return Promise.resolve({ stored: [stored()], conflicts: [], skipped: 0 });
+        },
+      },
+    });
+    selectAndResolve("scratch", "scratch/tensorA");
+
+    await useAppStore.getState().createRoi(GEOM, {});
+
+    expect((calls[0] as { arrayId: string }).arrayId).toBe("scratch/tensorA");
   });
 
   it("draws the annotation before the server has stored it", async () => {

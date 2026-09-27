@@ -1540,6 +1540,34 @@ async function onJobSettled(get: Get, job: SourceJobStatus): Promise<void> {
 }
 
 /**
+ * The address the viewer is actually rendering: the exact one a link asked for,
+ * which may be content-pinned, else the selection.
+ *
+ * Single-sourced because every "is this state about the tensor in view?" guard
+ * has to agree, and two spellings of that question would disagree exactly when
+ * a pinned link is open.
+ */
+function requestedTensorId(s: AppState): string | null {
+  return s.requestedArrayId ?? s.activeTensorId;
+}
+
+/**
+ * `requestedTensorId` may be a bare source_id -- a link, or a source clicked
+ * rather than one of its tensors -- which the Flight server resolves to a
+ * specific field. Once `tile_info` answers for exactly that id, its own
+ * `array_id` names the specific tensor being rendered, and every write scoped
+ * by this function (ROI create/delete/list, draft, broadcast axes) has to
+ * follow that resolution or it addresses a different tensor than the one on
+ * screen.
+ */
+export function currentArrayId(s: AppState): string | null {
+  const requested = requestedTensorId(s);
+  return requested && s.tileInfoFor === requested && s.tileInfo
+    ? s.tileInfo.array_id
+    : requested;
+}
+
+/**
  * The grid for what is currently addressed, or null while none has landed.
  *
  * `tileInfo` is whichever viewer last published one, and a viewer holds its
@@ -1549,25 +1577,13 @@ async function onJobSettled(get: Get, job: SourceJobStatus): Promise<void> {
  * sliders fall back to the catalog, and the URL write-back falls back to the id
  * it was asked for rather than stamping the previous tensor's into the bar.
  *
- * The comparison is safe where the one in `applyViewerState` was not, and for a
- * concrete reason: both sides are copies of a single string -- the `arrayId`
- * prop the viewer was mounted with -- rather than two spellings of one
- * identity, so no canonicalization only the server can do is involved.
+ * Paired against `requestedTensorId`, the id it was fetched for, not against
+ * `currentArrayId`'s resolved answer -- both sides here are copies of a
+ * single string, the `arrayId` prop the viewer was mounted with, rather than
+ * two spellings of one identity.
  */
-/**
- * The address the viewer is actually rendering: the exact one a link asked for,
- * which may be content-pinned, else the selection.
- *
- * Single-sourced because every "is this state about the tensor in view?" guard
- * has to agree, and two spellings of that question would disagree exactly when
- * a pinned link is open.
- */
-export function currentArrayId(s: AppState): string | null {
-  return s.requestedArrayId ?? s.activeTensorId;
-}
-
 export function selectTileInfo(s: AppState): TileInfo | null {
-  return s.tileInfoFor === currentArrayId(s) ? s.tileInfo : null;
+  return s.tileInfoFor === requestedTensorId(s) ? s.tileInfo : null;
 }
 
 /**
