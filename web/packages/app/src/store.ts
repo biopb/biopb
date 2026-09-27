@@ -1577,13 +1577,10 @@ export function currentArrayId(s: AppState): string | null {
  * sliders fall back to the catalog, and the URL write-back falls back to the id
  * it was asked for rather than stamping the previous tensor's into the bar.
  *
- * The comparison is against `requestedTensorId`, not `currentArrayId`: this
- * *is* the resolution `currentArrayId` reads, so comparing against its own
- * output would ask "is tileInfo for what tileInfo says it's for" -- always
- * true once anything has landed. Both sides here are instead copies of a
- * single string -- the `arrayId` prop the viewer was mounted with -- rather
- * than two spellings of one identity, so no canonicalization only the server
- * can do is involved.
+ * Paired against `requestedTensorId`, the id it was fetched for, not against
+ * `currentArrayId`'s resolved answer -- both sides here are copies of a
+ * single string, the `arrayId` prop the viewer was mounted with, rather than
+ * two spellings of one identity.
  */
 export function selectTileInfo(s: AppState): TileInfo | null {
   return s.tileInfoFor === requestedTensorId(s) ? s.tileInfo : null;

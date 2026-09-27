@@ -54,6 +54,12 @@ const TILE_INFO = {
   shape: [1, 1, 1, 8, 8],
 } as unknown as TileInfo;
 
+/** Selects a bare id, then answers tile_info's resolution of it, as `currentArrayId` reads it. */
+function selectAndResolve(bareId: string, resolvedArrayId: string) {
+  useAppStore.setState({ activeTensorId: bareId, requestedArrayId: null });
+  useAppStore.getState().setTileInfo({ ...TILE_INFO, array_id: resolvedArrayId }, bareId);
+}
+
 const client = (sources: DataSourceDescriptor[]) =>
   ({
     listSources: vi.fn().mockResolvedValue(sources),
@@ -297,8 +303,7 @@ describe("currentArrayId", () => {
   });
 
   it("adopts the specific tensor tile_info resolved a bare source_id to", () => {
-    useAppStore.setState({ activeTensorId: "scratch", requestedArrayId: null });
-    useAppStore.getState().setTileInfo({ ...TILE_INFO, array_id: "scratch/tensorA" }, "scratch");
+    selectAndResolve("scratch", "scratch/tensorA");
 
     expect(currentArrayId(useAppStore.getState())).toBe("scratch/tensorA");
   });
@@ -763,8 +768,7 @@ describe("authoring state", () => {
         },
       },
     });
-    useAppStore.setState({ activeTensorId: "scratch", requestedArrayId: null });
-    useAppStore.getState().setTileInfo({ ...TILE_INFO, array_id: "scratch/tensorA" }, "scratch");
+    selectAndResolve("scratch", "scratch/tensorA");
 
     await useAppStore.getState().createRoi(GEOM, {});
 
