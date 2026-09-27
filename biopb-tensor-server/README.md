@@ -181,8 +181,11 @@ biopb-tensor-server diagnose ...  Diagnostic commands for a running server
 # Local mode (the default loopback bind — no token required)
 biopb-tensor-server launch --config biopb.json
 
-# Remote mode (a public bind — token required, auto-generated if omitted)
-biopb-tensor-server launch --config biopb.json --host 0.0.0.0 --token mytoken...
+# Remote mode (a public bind — token required, auto-generated if omitted;
+# --external-location is also required, since a wildcard bind is not itself
+# a reachable address — set it to the address a remote client should dial)
+biopb-tensor-server launch --config biopb.json --host 0.0.0.0 \
+  --external-location grpc://my-hostname:8815 --token mytoken...
 
 # Over TLS (clients dial grpcs:// and pin the cert on first connect)
 biopb-tensor-server launch --config biopb.json --tls

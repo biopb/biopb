@@ -119,6 +119,10 @@ class _ClientState:
     # Set once the server's Flight protocol shape has been checked (or when
     # the check is bypassed, e.g. for a test double).
     protocol_checked: bool = False
+    # The server's own ``health.external_location`` (biopb/biopb#1158), read
+    # the same time as ``protocol``. None if the server didn't advertise one
+    # (an old server, a loopback deployment, or the check was bypassed).
+    advertised_location: Optional[str] = None
 
     @property
     def client(self) -> flight.FlightClient:
@@ -128,10 +132,14 @@ class _ClientState:
         server's ``protocol``. A server that speaks another shape (or none --
         a pre-v2 server has no key) is refused here with an actionable message
         rather than letting a ``FlightRequest`` reach a server that will parse
-        it as something else and answer with a confusing error.
+        it as something else and answer with a confusing error. The same
+        ``health`` body's ``external_location`` (if any) is captured into
+        ``advertised_location``.
         """
         if not self.protocol_checked:
-            _check_flight_protocol(self.raw_client, self.call_options, self.location)
+            self.advertised_location = _check_flight_protocol(
+                self.raw_client, self.call_options, self.location
+            )
             self.protocol_checked = True
         return self.raw_client
 
@@ -141,6 +149,19 @@ class _ClientState:
         is how tests inject a double, and a double has no health to probe."""
         self.raw_client = value
         self.protocol_checked = True
+
+    @property
+    def export_location(self) -> str:
+        """The address to bake into anything handed to a different process.
+
+        The server's advertised address if it published one, else this
+        connection's own dial address (today's behavior, unchanged for a
+        server that hasn't upgraded). Use this -- never ``location`` directly
+        -- at any point that mints an address for a *different* consumer:
+        ``SerializedTensor.location``, or a dask chunk-fetch graph handed to a
+        distributed cluster (biopb/biopb#1158).
+        """
+        return self.advertised_location or self.location
 
 
 class ResolveCancelled(Exception):
@@ -323,13 +344,17 @@ def _dask_from_flight_info(
 
 def _check_flight_protocol(
     client: flight.FlightClient, call_options: flight.FlightCallOptions, location: str
-) -> None:
+) -> Optional[str]:
     """Refuse a server whose Flight protocol shape is not this SDK's.
 
     Reads the ``protocol`` key the ``health`` action reports. A server without
     the key predates it and speaks v1 (sentinel-routed descriptors,
     prefix-sniffed tickets), which this SDK no longer does. An unreachable
     server is not this check's concern: its error propagates as it always did.
+
+    Returns the server's advertised ``external_location`` (biopb/biopb#1158),
+    or None if it published none, could not be reached, or isn't a biopb
+    server at all -- the caller falls back to its own dial address either way.
     """
     from biopb.tensor._wire_version import FLIGHT_PROTOCOL_VERSION
 
@@ -339,12 +364,16 @@ def _check_flight_protocol(
     except flight.FlightUnauthenticatedError:
         # A server that gates health, which this one need not do -- the private
         # call this client is about to make authorizes itself either way.
-        return
+        return None
     if body is None:
-        return  # not a biopb server at all; let the first real call say so
+        return None  # not a biopb server at all; let the first real call say so
     try:
-        server_ver = int(json.loads(body.body.to_pybytes()).get("protocol", 1))
+        health = json.loads(body.body.to_pybytes())
     except (ValueError, TypeError, AttributeError):
+        health = {}
+    try:
+        server_ver = int(health.get("protocol", 1))
+    except (ValueError, TypeError):
         server_ver = 1
     if server_ver != FLIGHT_PROTOCOL_VERSION:
         stale = "server" if server_ver < FLIGHT_PROTOCOL_VERSION else "client"
@@ -353,6 +382,7 @@ def _check_flight_protocol(
             f"v{server_ver}, this client speaks v{FLIGHT_PROTOCOL_VERSION}. "
             f"Upgrade the {stale} so both sides match."
         )
+    return health.get("external_location") or None
 
 
 def _check_wire_protocol(schema: pa.Schema) -> None:
@@ -1303,7 +1333,7 @@ class ChunkFetcher:
         info = self._plan_read(array_id, slice_hint, scale_hint, reduction_method)
         return _dask_from_flight_info(
             info,
-            self._state.location,
+            self._state.export_location,
             self._state.token,
             self._state.cache_bytes,
             self._state.tls_trust,
@@ -1320,7 +1350,7 @@ class ChunkFetcher:
         documentation."""
         info = self._plan_read(array_id, slice_hint, scale_hint, reduction_method)
         return SerializedTensor(
-            location=self._state.location,
+            location=self._state.export_location,
             auth_token=self._state.token or "",
             flight_info=info.serialize(),
         )

@@ -228,6 +228,42 @@ def _resolve_launch_token(
     return effective_token
 
 
+def _resolve_external_location(
+    host: str,
+    port: int,
+    tls_cert_chain: Optional[bytes],
+    external_location: Optional[str],
+) -> Optional[str]:
+    """Resolve the address advertised via ``health`` (biopb/biopb#1158).
+
+    Required/fail-loud on a public bind, mirroring the embedded cache's own
+    rule (``_resolve_tensor_external_location`` in
+    ``biopb_image_base/server.py``) -- there is no way to guess a reachable
+    address for a wildcard bind. A loopback bind advertises nothing: the
+    fallback (a client uses whatever address it dialed) is already correct
+    for local mode, where every consumer is on this machine.
+
+    ``port``/``tls_cert_chain`` are for the error message's example address
+    alone (the actual bind location) -- this is the one place that string is
+    built for that purpose, rather than each caller (``serve``/``launch``)
+    rebuilding it just to hand it here.
+    """
+    if external_location:
+        return external_location
+    if not _host_is_public(host):
+        return None
+    example = _grpc_location(host, port)
+    if tls_cert_chain is not None:
+        example = example.replace("grpc://", "grpcs://", 1)
+    console.print(
+        f"[red]--external-location is required when --host is a public bind "
+        f"({host!r}). Set it to the externally reachable address a remote "
+        f"client should dial, e.g. '{example}' rewritten with this host's "
+        "real hostname/IP.[/red]"
+    )
+    raise typer.Exit(2)
+
+
 def _install_sigterm_handler() -> None:
     """Make SIGTERM behave like Ctrl+C (KeyboardInterrupt).
 
@@ -765,6 +801,7 @@ def _setup_flight_server(
     tls_cert_chain: Optional[bytes] = None,
     tls_private_key: Optional[bytes] = None,
     config_path: Optional[Path] = None,
+    external_location: Optional[str] = None,
 ) -> Tuple[
     TensorFlightServer, Optional[object], Optional[object], Optional[PrecacheWorker]
 ]:
@@ -780,6 +817,8 @@ def _setup_flight_server(
         tls_private_key: PEM private key paired with ``tls_cert_chain``.
         config_path: The config file this server was started from. Names the
             persistent catalog, so two servers on two configs get two files.
+        external_location: The address advertised via ``health`` for a client
+            other than the one dialing this process (biopb/biopb#1158).
 
     Returns:
         Tuple of (flight_server, source_manager, precache_worker)
@@ -910,6 +949,7 @@ def _setup_flight_server(
         tls_private_key=tls_private_key,
         upload_ttl=server_config.upload_ttl,
         scratch_ttl=server_config.scratch_ttl,
+        external_location=external_location,
     )
 
     if tls_cert_chain is not None:
@@ -1132,6 +1172,16 @@ def serve(
         "auto-generated if blank on a public bind)",
         hide_input=True,
     ),
+    external_location: Optional[str] = typer.Option(
+        None,
+        "--external-location",
+        help="The address a remote client should dial to reach this server, "
+        "advertised via the `health` action (biopb/biopb#1158) -- e.g. "
+        "'grpc://hostname:8815'. Required when --host is a public bind: there "
+        "is no way to guess a reachable address for a wildcard bind. Ignored "
+        "(nothing is advertised) on a loopback bind, where a client's own "
+        "dial address is already correct.",
+    ),
     tls: bool = typer.Option(
         False,
         "--tls",
@@ -1225,6 +1275,10 @@ def serve(
     # an early exit no longer orphans the lock as a stale lock (biopb/biopb#515).
     tls_cert_chain, tls_private_key = _resolve_tls_material(tls, tls_cert, tls_key, san)
 
+    effective_external_location = _resolve_external_location(
+        effective_host, port, tls_cert_chain, external_location
+    )
+
     server = source_manager = precache_worker = None
     try:
         server, source_manager, precache_worker = _setup_flight_server(
@@ -1236,6 +1290,7 @@ def serve(
             tls_cert_chain=tls_cert_chain,
             tls_private_key=tls_private_key,
             config_path=config,
+            external_location=effective_external_location,
         )
 
         location = _grpc_location(effective_host, port)
@@ -1644,6 +1699,16 @@ def launch(
         "auto-generated if blank on a public bind)",
         hide_input=True,
     ),
+    external_location: Optional[str] = typer.Option(
+        None,
+        "--external-location",
+        help="The address a remote client should dial to reach this server, "
+        "advertised via the `health` action (biopb/biopb#1158) -- e.g. "
+        "'grpc://hostname:8815'. Required when --host is a public bind: there "
+        "is no way to guess a reachable address for a wildcard bind. Ignored "
+        "(nothing is advertised) on a loopback bind, where a client's own "
+        "dial address is already correct.",
+    ),
     tls: bool = typer.Option(
         False,
         "--tls",
@@ -1792,6 +1857,10 @@ def launch(
     # `finally` rather than an except block regardless.
     tls_cert_chain, tls_private_key = _resolve_tls_material(tls, tls_cert, tls_key, san)
 
+    effective_external_location = _resolve_external_location(
+        effective_host, port, tls_cert_chain, external_location
+    )
+
     flight_server = source_manager = precache_worker = None
     try:
         flight_server, source_manager, precache_worker = _setup_flight_server(
@@ -1803,6 +1872,7 @@ def launch(
             tls_cert_chain=tls_cert_chain,
             tls_private_key=tls_private_key,
             config_path=config,
+            external_location=effective_external_location,
         )
 
         # The HTTP sidecar is co-located with the Flight server and reaches it over

@@ -407,6 +407,12 @@ class DataPlaneSpec:
     # Open OnDemand `/node/<host>/<port>` route, biopb/biopb#728). Consumed only
     # by the web front (_control.build_app normalizes it); None = root origin.
     url_prefix: Optional[str] = None
+    # The address a remote client should dial to reach the data plane, forwarded
+    # verbatim to `launch --external-location` (biopb/biopb#1158). The plane
+    # itself is the single place this is validated (required on a public
+    # `grpc_host`) and enforced (advertised via `health`); the control does
+    # neither -- same relationship it already has to `grpc_host`/`tls`.
+    external_location: Optional[str] = None
 
 
 @dataclass
@@ -490,6 +496,8 @@ class DataPlaneSupervisor(ServiceProcess):
             argv += ["--tls-cert", str(s.tls_cert), "--tls-key", str(s.tls_key)]
         for san in s.sans:
             argv += ["--san", san]
+        if s.external_location:
+            argv += ["--external-location", s.external_location]
         return argv
 
     def _child_env(self) -> dict:

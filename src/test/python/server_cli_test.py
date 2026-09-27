@@ -294,6 +294,25 @@ class TestControlRunArgv:
         )
         assert argv[argv.index("--url-prefix") + 1] == "/node/mantis-051/29847"
 
+    def test_grpc_external_location_is_forwarded_only_when_set(self, tmp_path):
+        # Also not a secret -- an address, not a credential (biopb/biopb#1158).
+        assert "--grpc-external-location" not in self._argv(
+            tmp_path, grpc_bind="0.0.0.0"
+        )
+        argv = cli._control_run_argv(
+            config=tmp_path / "biopb.json",
+            static_dir=None,
+            web_host="127.0.0.1",
+            base_port=8810,
+            log_level="INFO",
+            data_plane=True,
+            grpc_bind="0.0.0.0",
+            grpc_external_location="grpc://real-host:8815",
+        )
+        assert (
+            argv[argv.index("--grpc-external-location") + 1] == "grpc://real-host:8815"
+        )
+
 
 class TestUiTunnelHint:
     """With the UI off the network, the SSH tunnel is the supported way to reach

@@ -7,6 +7,7 @@ job installs no server (biopb/biopb#579).
 """
 
 import pickle
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -485,3 +486,79 @@ class TestCreateTensorGrid:
 
         arr = da.zeros((10,), chunks=((3, 5, 2),))
         assert _uniform_chunk_shape(arr) == (5,)
+
+
+class TestExportLocation:
+    """biopb/biopb#1158: anything minted for a *different* consumer -- a
+    forwarded SerializedTensor, or a dask chunk-fetch graph handed to a
+    distributed cluster -- must carry the server's advertised address (if it
+    published one), never just the address this client happened to dial."""
+
+    def test_falls_back_to_the_dial_address_when_nothing_advertised(self):
+        from biopb.tensor._session import _ClientState
+
+        state = _ClientState(
+            raw_client=None,
+            call_options=None,
+            location="grpc://localhost:8815",
+            token=None,
+            cache_bytes=0,
+        )
+        assert state.export_location == "grpc://localhost:8815"
+
+    def test_prefers_the_advertised_address(self):
+        from biopb.tensor._session import _ClientState
+
+        state = _ClientState(
+            raw_client=None,
+            call_options=None,
+            location="grpc://localhost:8815",
+            token=None,
+            cache_bytes=0,
+            advertised_location="grpc://real-host:8815",
+        )
+        assert state.export_location == "grpc://real-host:8815"
+
+    def test_get_tensor_pb_mints_the_export_location(self):
+        # get_tensor_pb bakes an address into SerializedTensor.location for a
+        # different process to dial later -- it must be the export_location,
+        # not the raw dial address, or a lazy remote op forwards a private
+        # loopback address off-box.
+        client = _offline_client(raw_client=Mock())
+        client._state.advertised_location = "grpc://real-host:8815"
+        client._fetcher._plan_read = Mock(
+            return_value=SimpleNamespace(serialize=lambda: b"fake-flight-info")
+        )
+
+        pb = client._fetcher.get_tensor_pb("test-tensor")
+
+        assert pb.location == "grpc://real-host:8815"
+
+    def test_get_tensor_builds_its_dask_graph_from_the_export_location(
+        self, monkeypatch
+    ):
+        # get_tensor's dask graph embeds the fetch address in every chunk task
+        # (biopb.tensor._pool); a graph handed to dask.distributed only works
+        # if that address is reachable from wherever the scheduler runs it.
+        from biopb.tensor import _session
+
+        client = _offline_client(raw_client=Mock())
+        client._state.advertised_location = "grpc://real-host:8815"
+        client._fetcher._plan_read = Mock(return_value=object())
+
+        captured = {}
+
+        def fake_dask_from_flight_info(
+            info, location, token, cache_bytes, tls_trust, requested=None
+        ):
+            captured["location"] = location
+            return "fake-array"
+
+        monkeypatch.setattr(
+            _session, "_dask_from_flight_info", fake_dask_from_flight_info
+        )
+
+        result = client._fetcher.get_tensor("test-tensor")
+
+        assert result == "fake-array"
+        assert captured["location"] == "grpc://real-host:8815"

@@ -63,6 +63,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "/node/$host/$port for an Open OnDemand app (or BIOPB_URL_PREFIX). "
         "Configuration only -- never inferred from a request header.",
     )
+    run.add_argument(
+        "--grpc-external-location",
+        default=None,
+        help="address a remote client should dial to reach the data plane, "
+        "advertised via its `health` action (or BIOPB_GRPC_EXTERNAL_LOCATION; "
+        "biopb/biopb#1158). Required when --grpc-host is a public address -- "
+        "enforced by the data plane itself, not here.",
+    )
     run.add_argument("--log-level", default="INFO")
     run.add_argument("--server-log", default=None, help="data-plane stdout/stderr log")
     run.add_argument(
@@ -192,6 +200,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"biopb-control: {exc}", file=sys.stderr)
         return 2
 
+    grpc_external_location = (
+        args.grpc_external_location
+        or os.environ.get("BIOPB_GRPC_EXTERNAL_LOCATION")
+        or None
+    )
+
     spec = DataPlaneSpec(
         config=Path(args.config),
         grpc_host=args.grpc_host,
@@ -212,6 +226,7 @@ def main(argv: list[str] | None = None) -> int:
         # Env fallback for a direct `python -m biopb_control run`; `biopb control
         # start` passes it explicitly (and inherits the env anyway).
         url_prefix=url_prefix,
+        external_location=grpc_external_location,
     )
     return run_control(
         spec,

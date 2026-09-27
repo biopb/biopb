@@ -473,6 +473,22 @@ def test_no_tls_material_emits_no_flags(tmp_path):
     assert "--tls-cert" not in argv and "--san" not in argv
 
 
+def test_external_location_is_passed_down_when_set(tmp_path):
+    """biopb/biopb#1158: forwarded verbatim to `launch --external-location` --
+    the supervisor validates and enforces nothing here, same relationship it
+    already has to `grpc_host`/`tls`."""
+    spec = DataPlaneSpec(
+        config=tmp_path / "c.json", external_location="grpc://real-host:8815"
+    )
+    argv = DataPlaneSupervisor(spec)._build_argv()
+    assert argv[argv.index("--external-location") + 1] == "grpc://real-host:8815"
+
+
+def test_no_external_location_emits_no_flag(tmp_path):
+    argv = DataPlaneSupervisor(DataPlaneSpec(config=tmp_path / "c.json"))._build_argv()
+    assert "--external-location" not in argv
+
+
 def test_a_wildcard_bind_is_probed_over_loopback(tmp_path):
     """A wildcard is a bind target, not a connect target -- and the address
     family has to match, or a `::`-bound server with IPV6_V6ONLY refuses an
