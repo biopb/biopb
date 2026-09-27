@@ -53,10 +53,26 @@ message OpInfo {
   string description = 2;
   // For grouping, e.g. ["segmentation"] or ["denoising", "pretrained"].
   repeated string labels = 3;
-  // The non-tensor arguments with their defaults; null when required.
-  google.protobuf.Struct kwargs = 4;
+  // The non-tensor arguments, written as they'd appear in a call: "name=default"
+  // per argument, comma-separated, bare "name" when there is no default. This
+  // is documentation for whoever calls the op, not a value any client parses
+  // back -- nothing here is typed.
+  string kwargs = 4;
   // The tensor arguments.
   map<string, TensorArg> tensors = 5;
+  // How the tensor arguments arrive: EAGER (numpy, fully materialized), LAZY
+  // (dask, may stay out-of-core), or BLOCKS (mapped over blocks -- see
+  // TensorArg.mapped). EAGER is the zero value because it is also `@op`'s own
+  // default, so an OpInfo from before this field existed still reads right.
+  enum InputMode {
+    EAGER = 0;
+    LAZY = 1;
+    BLOCKS = 2;
+  }
+  InputMode input = 6;
+  // A streaming op sends more than one Event per call (see Event); a plain
+  // op sends exactly one. Known ahead of the call, not just by making one.
+  bool streaming = 7;
 }
 
 message OpList {

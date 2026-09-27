@@ -19,7 +19,7 @@ from rich.console import Console
 from rich.table import Table
 
 from biopb import _algorithms
-from biopb.image import Arg, Call, ImageData, OpList, OpsStub
+from biopb.image import Arg, Call, ImageData, OpInfo, OpList, OpsStub
 from biopb.image.utils import (
     deserialize_image_data,
     serialize_from_numpy_to_image_data,
@@ -339,6 +339,7 @@ def ops(server: str = _SERVER_OPTION, token: Optional[str] = _TOKEN_OPTION) -> N
         table.add_column("Name", style="cyan")
         table.add_column("Description", style="green")
         table.add_column("Labels", style="magenta")
+        table.add_column("Mode", style="white")
         table.add_column("Tensors", style="blue")
         table.add_column("Arguments", style="yellow")
         for info in listing.ops:
@@ -346,13 +347,16 @@ def ops(server: str = _SERVER_OPTION, token: Optional[str] = _TOKEN_OPTION) -> N
                 f"{name}: {t.axes}" + (" (mapped)" if t.mapped else "")
                 for name, t in sorted(info.tensors.items())
             )
-            kwargs = json.dumps(json_format.MessageToDict(info.kwargs))
+            mode = OpInfo.InputMode.Name(info.input).lower()
+            if info.streaming:
+                mode += ", streaming"
             table.add_row(
                 info.name,
                 info.description or "-",
                 ", ".join(info.labels) or "-",
+                mode,
                 tensors or "-",
-                kwargs if info.kwargs.fields else "-",
+                info.kwargs or "-",
             )
         console.print(table)
         stderr_console.print(

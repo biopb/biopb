@@ -28,6 +28,10 @@ same rank.
   only: the output at a pixel may depend on a neighbourhood the overlap
   covers, and nothing else.
 
+Both are advertised so a caller can decide how to call the op before trying
+it: ``input`` as ``OpInfo.input``, and whether the function is a generator as
+``OpInfo.streaming``.
+
 A single return value is the output ``result``; a tuple gives ``0``, ``1``,
 .... An array is a tensor output, inline or on the sink by size, and anything
 else is JSON. A function that yields is a streaming op: a yielded string is a
@@ -135,11 +139,26 @@ class _OpDef:
     int_kwargs: List[str] = field(default_factory=list)
     streaming: bool = False
 
+    def _kwargs_text(self) -> str:
+        """The non-tensor arguments as they'd appear in a call: a comma-separated
+        ``name=default`` per argument, bare ``name`` when required. Documentation
+        for a caller -- nothing decodes this back, so a default that has no JSON
+        shape (e.g. ``nan``) is exactly as fine here as any other repr."""
+        required = set(self.required)
+        return ", ".join(
+            name if name in required else f"{name}={self.kwargs[name]!r}"
+            for name in self.kwargs
+        )
+
     def info(self) -> proto.OpInfo:
         info = proto.OpInfo(
-            name=self.name, description=self.description, labels=self.labels
+            name=self.name,
+            description=self.description,
+            labels=self.labels,
+            kwargs=self._kwargs_text(),
+            input=proto.OpInfo.InputMode.Value(self.input.upper()),
+            streaming=self.streaming,
         )
-        info.kwargs.update(self.kwargs)
         for name, axes in self.tensors.items():
             info.tensors[name].axes = axes
             info.tensors[name].mapped = self.input == "blocks"
@@ -228,7 +247,7 @@ def _define(
             definition.kwargs[param.name] = None
             definition.required.append(param.name)
         else:
-            definition.kwargs[param.name] = _jsonable(param.default)
+            definition.kwargs[param.name] = param.default
         if ann is int or (
             isinstance(param.default, int) and not isinstance(param.default, bool)
         ):

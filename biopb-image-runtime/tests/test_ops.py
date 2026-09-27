@@ -188,10 +188,17 @@ def test_describe_advertises_signature(server):
         "image": ("YX", False),
         "labels": ("YX", False),
     }
-    assert dict(ops["threshold"].kwargs) == {"level": 0.5, "count": 1}
+    assert ops["threshold"].kwargs == "level=0.5, count=1"
     assert ops["threshold"].description == "Foreground mask."
     assert ops["smooth"].tensors["image"].mapped
-    assert ops["greet"].kwargs.fields["name"].HasField("null_value")
+    assert ops["greet"].kwargs == "name"  # no default -> bare name, required
+
+    # input mode and streaming are advertised, not just discoverable by calling.
+    assert ops["label_stats"].input == proto.OpInfo.EAGER  # the zero value
+    assert ops["double"].input == proto.OpInfo.LAZY
+    assert ops["smooth"].input == proto.OpInfo.BLOCKS
+    assert not ops["label_stats"].streaming
+    assert ops["track"].streaming
 
 
 def test_fingerprint_changes_with_the_ops():
@@ -200,15 +207,12 @@ def test_fingerprint_changes_with_the_ops():
     assert describe(_defs([greet])).fingerprint != one
 
 
-def test_non_finite_default_does_not_crash_describe():
-    # JSON has no literal for nan; `google.protobuf.Value` refuses to
-    # serialize one to JSON text at all, and `describe()`'s OpList is exactly
-    # what the control caches to disk as JSON -- so a nan/inf default must not
-    # raise building the schema.
-    from biopb_image_base.ops import NON_FINITE_FLOAT_KEY
-
+def test_non_finite_default_is_just_text_in_the_schema():
+    # OpInfo.kwargs is plain text for a caller to read (`name=repr(default)`),
+    # not a typed value anything decodes -- so a nan/inf default is exactly as
+    # unremarkable here as any other repr, with no sentinel needed.
     info = describe(_defs([echo_kwarg])).ops[0]
-    assert dict(info.kwargs)["value"] == {NON_FINITE_FLOAT_KEY: "nan"}
+    assert info.kwargs == "value=nan"
 
 
 def test_non_finite_result_round_trips(server):
@@ -398,7 +402,7 @@ def test_describe_flag_prints_json_without_serving(tmp_path: Path):
     )
     listing = json.loads(done.stdout)
     assert listing["ops"][0]["name"] == "denoise"
-    assert listing["ops"][0]["kwargs"] == {"sigma": 2.0}
+    assert listing["ops"][0]["kwargs"] == "sigma=2.0"
     assert listing["fingerprint"]
 
 

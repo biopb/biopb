@@ -222,10 +222,11 @@ class _OpCall:
     def arguments(self, args, kwargs, dim_labels) -> tuple[Dict[str, proto.Arg], bool]:
         if args:
             if len(args) > 1 or len(self.tensors) != 1:
-                raise TypeError(
-                    f"{self.name} takes its arguments by name: "
-                    f"{sorted(self.tensors) + sorted(self.info.get('kwargs') or {})}"
-                )
+                names = ", ".join(sorted(self.tensors))
+                kwargs_text = self.info.get("kwargs") or ""
+                if kwargs_text:
+                    names = f"{names}, {kwargs_text}" if names else kwargs_text
+                raise TypeError(f"{self.name} takes its arguments by name: {names}")
             kwargs = {next(iter(self.tensors)): args[0], **kwargs}
         client = self.client_getter()
         encoded, by_id = {}, False
@@ -366,9 +367,21 @@ def _build_op(call: _OpCall) -> Callable:
     if info.get("labels"):
         doc.append(f"Labels: {', '.join(info['labels'])}")
     if info.get("kwargs"):
+        doc.append(f"Other arguments (a bare name is required): {info['kwargs']}")
+    mode = info.get("input", "EAGER")
+    if mode == "LAZY":
         doc.append(
-            f"Other arguments, with defaults (null = required): {info['kwargs']}"
+            "Input: lazy -- a large array_id is accepted without a size cap; "
+            "the op itself may stay out-of-core."
         )
+    elif mode == "BLOCKS":
+        doc.append("Input: computed over blocks internally; call it like any other op.")
+    else:
+        doc.append(
+            "Input: eager -- a lazy array_id over ~2GiB is refused, not pulled whole."
+        )
+    if info.get("streaming"):
+        doc.append("Streaming: this call yields more than one result; expect a list.")
     doc += [
         "",
         "Arguments go by name; one tensor argument may also go first.",
@@ -385,8 +398,10 @@ def _build_op(call: _OpCall) -> Callable:
     op.server = call.server.name
     op.labels = list(info.get("labels") or [])
     op.description = info.get("description", "")
-    op.default_kwargs = dict(info.get("kwargs") or {})
+    op.kwargs_text = info.get("kwargs") or ""
     op.tensors = dict(call.tensors)
+    op.input_mode = mode.lower()
+    op.streaming = bool(info.get("streaming"))
     return op
 
 

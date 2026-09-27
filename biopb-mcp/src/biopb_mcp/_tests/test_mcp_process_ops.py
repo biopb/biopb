@@ -141,13 +141,18 @@ def serve():
         server.stop(None)
 
 
-def _info(name, tensors=("image",), **kwargs):
-    return {
+def _info(name, tensors=("image",), input=None, streaming=False, **kwargs):  # noqa: A002
+    info = {
         "name": name,
         "description": f"does {name}",
         "tensors": {t: {"axes": "YX"} for t in tensors},
-        "kwargs": kwargs,
+        "kwargs": ", ".join(f"{k}={v!r}" for k, v in kwargs.items()),
     }
+    if input:  # MessageToDict omits the zero-valued (EAGER) enum, same as here
+        info["input"] = input
+    if streaming:
+        info["streaming"] = streaming
+    return info
 
 
 OPS = [
@@ -211,9 +216,34 @@ def test_bind_is_a_mapping_and_attributes(url_ops):
     assert url_ops.double is url_ops["double"]
     assert "double" in dir(url_ops)
     assert "does double" in url_ops.double.__doc__
-    assert url_ops.stats.default_kwargs == {"level": 0.5}
+    assert url_ops.stats.kwargs_text == "level=0.5"
     with pytest.raises(AttributeError, match="ops.refresh"):
         url_ops.nope  # noqa: B018 - the attribute access is the test
+
+
+def test_input_mode_and_streaming_are_advertised_before_any_call():
+    rows = [
+        {
+            "name": "a",
+            "kind": "url",
+            "url": "grpc://x:1",
+            "state": "up",
+            "ops": [
+                _info("plain"),
+                _info("lazy_op", input="LAZY"),
+                _info("blocky", input="BLOCKS"),
+                _info("track", streaming=True),
+            ],
+        }
+    ]
+    ops = _ops(rows)
+    assert ops.plain.input_mode == "eager" and not ops.plain.streaming
+    assert "Input: eager" in ops.plain.__doc__
+    assert ops.lazy_op.input_mode == "lazy"
+    assert "out-of-core" in ops.lazy_op.__doc__
+    assert ops.blocky.input_mode == "blocks"
+    assert ops.track.streaming
+    assert "Streaming:" in ops.track.__doc__
 
 
 def test_a_shared_op_name_is_qualified():

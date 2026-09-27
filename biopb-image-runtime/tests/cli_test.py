@@ -26,7 +26,7 @@ class TestImageCliOps:
         assert "mock_echo" in result.stdout
         assert "mock_random" in result.stdout
         assert "image: YX" in result.stdout
-        assert '"seed": 0' in result.stdout
+        assert "seed=0" in result.stdout
 
     def test_ops_connection_error(self):
         result = _biopb("ops", "--server", "grpc://invalid:9999", timeout=30)
