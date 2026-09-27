@@ -275,6 +275,42 @@ class TestStore:
         (a,), _ = db.put_rois(ARRAY_ID, [_annotation()])
         assert db.delete_rois(ARRAY_ID, [a.roi_id, "not-a-real-id"]) == [a.roi_id]
 
+    def test_discard_array_rois_removes_reserved_rows_too(self):
+        """Unlike delete_rois(), this is the array itself going away for good
+        (biopb/biopb#1155) -- a reserved set is the file's own copy, but there
+        is no file left to re-import it from, so it goes with the rest."""
+        db = MetadataDatabase()
+        db.put_rois(ARRAY_ID, [_annotation(set_name="nuclei")])
+        now = datetime.now()
+        db._get_connection().execute(
+            "INSERT INTO rois (roi_id, array_id, source_id, set_name, label, "
+            "shape_kind, geometry, rev, created_at, updated_at) "
+            "VALUES ('ROI:0', ?, ?, ?, '', 'polygon', '{}', 1, ?, ?)",
+            [
+                ARRAY_ID,
+                ARRAY_ID.split("/")[0],
+                f"{metadata_db.RESERVED_SET_PREFIX}ome",
+                now,
+                now,
+            ],
+        )
+
+        removed = db.discard_array_rois(ARRAY_ID)
+
+        assert removed == 2
+        assert db.list_rois(ARRAY_ID)[0] == []
+
+    def test_discard_array_rois_leaves_other_tensors_alone(self):
+        db = MetadataDatabase()
+        db.put_rois(ARRAY_ID, [_annotation()])
+        other = "zarr_deadbeef/Image:0"
+        db.put_rois(other, [_annotation()])
+
+        db.discard_array_rois(ARRAY_ID)
+
+        assert db.list_rois(ARRAY_ID)[0] == []
+        assert len(db.list_rois(other)[0]) == 1
+
     def test_a_client_id_reused_on_another_tensor_does_not_clobber_it(self):
         """roi_id is unique per tensor, not globally.
 
