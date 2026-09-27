@@ -29,6 +29,21 @@ def _is_dask_array(arr) -> bool:
     return da_mod is not None and isinstance(arr, da_mod.Array)
 
 
+def _pyarrow_available() -> bool:
+    """True if pyarrow can be imported.
+
+    By-reference (``array_id``) input and the embedded tensor cache are built on
+    Arrow Flight and need pyarrow. On builds for old CPUs without SSE4.2/AVX,
+    pyarrow is removed (its wheels SIGILL on import there -- see
+    cellpose/BUILD_NO_SSE42.md in biopb-server). find_spec only locates the
+    module; it does not import it, so this is safe even on a CPU that cannot run
+    pyarrow.
+    """
+    import importlib.util
+
+    return importlib.util.find_spec("pyarrow") is not None
+
+
 # =============================================================================
 # Authentication
 # =============================================================================
