@@ -91,14 +91,37 @@ class TestItIsThereBeforeAnythingAsks:
         assert desc.array_id == f"{SCRATCH_SOURCE_ID}/@fields/straight-in"
         assert client.get_upload_status(desc.array_id)["state"] == "READY"
 
-    def test_its_source_url_is_a_clean_alias_not_a_filesystem_path(
+    def test_its_catalog_url_is_a_clean_alias_not_a_filesystem_path(
         self, writable_server
     ):
-        """A UI showing ``source_url`` gets ``scratch://scratch``, not the
-        ``write_dir``-rooted fields directory it happens to be backed by."""
+        """A UI grouping by ``catalog_url`` (what the catalog row actually
+        carries -- ``metadata_db``'s ``sync_source_added``) gets
+        ``scratch://scratch``, not the ``write_dir``-rooted fields directory.
+
+        That directory is still ``source_url`` itself, the adapter contract's
+        addressable path: warm/recall/residency all read it directly. #1138
+        instead overwrote ``_source_url`` with this alias, which broke every
+        one of them (biopb/biopb#1139)."""
         adapter = writable_server.sources.get(SCRATCH_SOURCE_ID)
 
-        assert adapter._source_url == f"scratch://{SCRATCH_SOURCE_ID}"
+        assert adapter.catalog_url == f"scratch://{SCRATCH_SOURCE_ID}"
+        assert adapter.source_url == str(
+            Path(writable_server.uploads.write_dir) / "fields" / SCRATCH_SOURCE_ID
+        )
+
+
+class TestItCanBeWarmed:
+    def test_a_published_field_is_warmable(self, writable_server, client):
+        """biopb/biopb#1139: warming reads ``adapter.source_url`` as the
+        recall root, so it must stay the real ``<write_dir>/fields/scratch``
+        directory the published bytes live in, not the catalog's display
+        alias -- #1138 briefly conflated the two."""
+        _publish(client, _add(client, "warmed"))
+
+        result = client.warm(SCRATCH_SOURCE_ID)
+
+        assert result.files_total >= 1
+        assert result.files_done == result.files_total
 
 
 class TestItIsEmptyByDefault:

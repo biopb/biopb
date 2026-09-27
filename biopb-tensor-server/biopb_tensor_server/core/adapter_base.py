@@ -308,9 +308,16 @@ class SourceAdapter(ABC):
 
     @property
     def source_url(self) -> Optional[str]:
-        """The source's URL/path, used for filesystem ops (warm/recall).
+        """The source's real, addressable URL/path: a filesystem path this
+        adapter reads bytes from, or the dial address of an upstream it
+        proxies. Every filesystem op (warm's recall walk, residency checks)
+        and the remote check (``is_remote_url``) trust this to be genuine.
 
         Wraps the backing ``_source_url``; None when the adapter never set one.
+        An adapter that wants a different, cosmetic identity in the catalog
+        (grouping, a cleaner display name) sets :attr:`_catalog_url` instead --
+        never repurpose this field for display, or every filesystem consumer
+        silently breaks (biopb/biopb#1139).
         """
         return self._source_url
 

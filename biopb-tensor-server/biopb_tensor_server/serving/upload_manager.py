@@ -62,6 +62,7 @@ from biopb_tensor_server.adapters._writable import (
 from biopb_tensor_server.adapters.fields import (
     create_field_upload,
     fields_root,
+    source_fields_dir,
 )
 from biopb_tensor_server.adapters.labels import create_label_upload, labels_root
 from biopb_tensor_server.adapters.members import member_marker
@@ -724,7 +725,8 @@ class UploadManager:
         """
         if self._write_dir is None:
             return None
-        adapter = ScratchSource(max_ttl)
+        fields_dir = source_fields_dir(fields_root(self._write_dir), SCRATCH_SOURCE_ID)
+        adapter = ScratchSource(max_ttl, fields_dir=fields_dir)
         registered = self._registry.register(SCRATCH_SOURCE_ID, adapter)
         self._sync_row(SCRATCH_SOURCE_ID, registered)
         logger.info(f"Serving the scratch source as {SCRATCH_SOURCE_ID}")

@@ -75,6 +75,22 @@ class TestTheBytesAreItsOwn:
         assert MEMBER_DESCRIPTOR in names
         assert any(n.endswith(".arrow") for n in names)
 
+    def test_source_url_is_the_real_store_not_the_cache_alias(
+        self, writable_server, client, source, tmp_path
+    ):
+        """``source_url`` (the adapter contract's addressable path, what warm
+        and residency checks would trust) is the real segment directory;
+        ``cache://<array_id>`` is only the display identity, at
+        ``catalog_url``. #1138/#1139 made exactly the opposite mistake for the
+        scratch source."""
+        desc = _add(client, source, "img")
+        client.upload_array(desc, _arr())
+
+        member = _member(writable_server, source, "img")
+        store = source_fields_dir(fields_root(tmp_path), source) / "img"
+        assert member.source_url == str(store)
+        assert member.catalog_url == f"cache://{member.array_id}"
+
     def test_the_chunks_are_not_on_the_caches_budget(
         self, writable_server, client, source
     ):

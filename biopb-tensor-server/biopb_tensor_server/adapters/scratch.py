@@ -14,7 +14,8 @@ accumulating forever.
 
 from __future__ import annotations
 
-from typing import Any, List, Optional
+from pathlib import Path
+from typing import Any, List, Optional, Union
 
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
@@ -50,12 +51,25 @@ class ScratchSource(SourceAdapter):
 
     _source_type = "scratch"
 
-    def __init__(self, max_upload_ttl: Optional[float] = None) -> None:
+    def __init__(
+        self,
+        max_upload_ttl: Optional[float] = None,
+        fields_dir: Optional[Union[str, Path]] = None,
+    ) -> None:
         self.source_id = SCRATCH_SOURCE_ID
-        #: A synthetic source like ``cache://``, not a filesystem path -- the
-        #: on-disk fields directory (``source_fields_dir``) is an implementation
-        #: detail clients have no use for.
-        self._source_url = f"scratch://{SCRATCH_SOURCE_ID}"
+        #: The real backing tree (``<write_dir>/fields/scratch``) -- the
+        #: adapter contract's addressable url, which warm/recall/residency all
+        #: trust to be genuine (``SourceAdapter.source_url``). None on a server
+        #: with no ``write_dir``, where nothing can be uploaded here anyway
+        #: (see ``UploadManager.install_scratch``).
+        self._source_url = str(fields_dir) if fields_dir is not None else None
+        #: The display identity instead: a UI grouping by ``source_url`` gets
+        #: ``scratch://scratch``, not the ``write_dir``-rooted path above --
+        #: an implementation detail clients have no use for. This is what the
+        #: catalog row actually carries (``catalog_url`` reads ``_catalog_url``
+        #: first); repurposing ``_source_url`` itself for this broke every
+        #: filesystem consumer (biopb/biopb#1139).
+        self._catalog_url = f"scratch://{SCRATCH_SOURCE_ID}"
         #: Ceiling, in seconds, on every upload added here, applied by
         #: ``UploadManager._deadline_for`` including to a request that named no
         #: lifetime. None leaves them undated, as a discovered source does.
