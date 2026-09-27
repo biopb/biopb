@@ -1598,8 +1598,8 @@ def control_logs(
 
 @control_app.command(
     "run",
-    help="Removed -- run the control plane in the foreground with "
-    "`biopb-control run` instead.",
+    help="Removed -- use `biopb control start`, or `biopb-control run` for a "
+    "true foreground process.",
 )
 def control_run() -> None:
     """Removed (biopb/biopb#736).
@@ -1613,20 +1613,23 @@ def control_run() -> None:
     gap for good rather than keeping a second copy of the same check in sync
     by hand.
 
-    Foreground use (a systemd/launchd unit, an Open OnDemand app, debugging
-    supervision) now runs that entry point directly. It takes the same
-    settings individually rather than deriving them from ``--base-port``; see
-    `biopb-control run --help`.
+    For the same deployment with the same defaults, use `biopb control start`.
+    A true foreground process (a systemd/launchd unit, an Open OnDemand app,
+    debugging supervision) runs `biopb-control run` directly -- but unlike this
+    command, it fills in none of the defaults `--config`/`--static-dir` used to
+    resolve on their own, and every other setting individually rather than
+    deriving them from ``--base-port``; see `biopb-control run --help`.
     """
     console.print(
         "[red]`biopb control run` has been removed (biopb/biopb#736).[/red]\n"
-        "Use [bold]biopb-control run[/bold] instead (or `python -m "
-        "biopb_control run` if that script isn't on PATH) -- see `biopb-control "
-        "run --help`. It takes the same settings individually "
-        "(--control-host/--control-port, --grpc-host/--grpc-port, "
-        "--web-host/--web-port, --tls/--tls-cert/--tls-key/--san, --config, "
-        "--static-dir, --url-prefix, --token) rather than deriving them from "
-        "--base-port."
+        "For the same deployment with the same defaults, use [bold]biopb "
+        "control start[/bold].\n"
+        "For a true foreground process, use [bold]biopb-control run[/bold] "
+        "(or `python -m biopb_control run` if that script isn't on PATH) -- "
+        "but note it fills in none of this command's defaults: `--config` and "
+        "`--static-dir` must both be passed explicitly, and every other "
+        "setting individually rather than derived from --base-port. See "
+        "`biopb-control run --help`."
     )
     raise typer.Exit(2)
 
