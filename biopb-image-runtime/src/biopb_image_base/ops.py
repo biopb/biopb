@@ -530,22 +530,17 @@ def _ambient_scheduler_configured() -> bool:
     local default: a scheduler the deployment set itself
     (``dask.config.set``), or an active ``dask.distributed`` cluster.
 
-    ``dask.config.set(scheduler=...)`` outranks an active distributed
-    ``Client`` (``dask.base.get_scheduler``'s own precedence), so blindly
-    setting one to bound upload concurrency would silently pull every upload
-    off a configured cluster and onto local threads instead.
+    Deferred to ``dask.base.get_scheduler`` itself (with no explicit
+    scheduler or collection, it checks exactly those two things and nothing
+    else) rather than re-checked by hand, so this never drifts from what
+    dask actually does. Blindly setting our own scheduler to bound upload
+    concurrency would otherwise silently pull every upload off a configured
+    cluster and onto local threads instead: ``dask.config.set(scheduler=...)``
+    outranks an active distributed ``Client`` in dask's own precedence.
     """
-    import dask
+    from dask.base import get_scheduler
 
-    if dask.config.get("scheduler", None) is not None:
-        return True
-    try:
-        from distributed import get_client
-
-        get_client()
-        return True
-    except (ImportError, ValueError):
-        return False
+    return get_scheduler() is not None
 
 
 class _PlaneSink(_InlineSink):
@@ -572,8 +567,6 @@ class _PlaneSink(_InlineSink):
         return proto.Arg(lazy=self._upload(_regular_chunks(array), labels, op_name))
 
     def _upload(self, array, labels, op_name):
-        import contextlib
-
         import dask
 
         client = self._connect()
@@ -582,13 +575,11 @@ class _PlaneSink(_InlineSink):
             array,
             dim_labels=labels,
         )
-        bound = (
-            contextlib.nullcontext()
-            if _ambient_scheduler_configured()
-            else dask.config.set(scheduler="threads", num_workers=_UPLOAD_WORKERS)
-        )
-        with bound:
+        if _ambient_scheduler_configured():
             client.upload_array(desc, array)
+        else:
+            with dask.config.set(scheduler="threads", num_workers=_UPLOAD_WORKERS):
+                client.upload_array(desc, array)
         return client.get_tensor_pb(desc.array_id)
 
 
@@ -681,9 +672,24 @@ def _blocks(definition: _OpDef, pixels: Dict[str, _Pixels], kwargs: Dict[str, An
         # arbitrary op. Reused as the graph itself when the guess held, rather
         # than building the whole map_overlap a second time: at ~18k blocks
         # for a fine block_shape, that graph is not free (biopb/biopb#1148).
+        # A wrong guess relabels the same graph rather than casting it: every
+        # block's real bytes are already the true dtype (apply() returns
+        # whatever the op actually produces, regardless of the guess passed
+        # to build the graph) -- only the graph's own dtype/meta bookkeeping
+        # was wrong, so .astype() would pay a real copy of the whole array to
+        # fix a label, not a value.
         guess = mapped(arrays[0].dtype)
         dtype = guess.blocks[lead + (0,) * len(axes)].compute().dtype
-        result = guess if dtype == guess.dtype else guess.astype(dtype)
+        result = (
+            guess
+            if dtype == guess.dtype
+            else da.Array(
+                guess.dask,
+                guess.name,
+                guess.chunks,
+                meta=np.empty((0,) * len(order), dtype=dtype),
+            )
+        )
     return normalize_array_dims(result, order, first.labels), first.labels
 
 

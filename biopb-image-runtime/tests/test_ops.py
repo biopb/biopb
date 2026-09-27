@@ -17,6 +17,7 @@ import pytest
 from biopb.image.utils import deserialize_image_data, serialize_from_numpy_to_image_data
 from biopb_image_base import Tensor, op
 from biopb_image_base.ops import (
+    _ambient_scheduler_configured,
     _EmbeddedSink,
     _InlineSink,
     _PlaneSink,
@@ -523,6 +524,17 @@ def test_small_results_stay_inline_with_a_plane(plane):
         s.close()
 
 
+def _assert_toggles_ambient_scheduler(make_ctx):
+    """*make_ctx* is a zero-arg factory, not a context manager: both
+    dask.config.set and distributed.Client take effect at construction, not
+    at __enter__, so building one before this runs its first assert would
+    activate it too early."""
+    assert not _ambient_scheduler_configured()
+    with make_ctx():
+        assert _ambient_scheduler_configured()
+    assert not _ambient_scheduler_configured()
+
+
 def test_ambient_scheduler_detects_a_dask_config_override():
     """biopb/biopb#1148: the upload's own num_workers cap must not clobber a
     scheduler the deployment already configured -- dask.config.set outranks
@@ -530,22 +542,16 @@ def test_ambient_scheduler_detects_a_dask_config_override():
     precedence), so setting one unconditionally would silently pull uploads
     off a configured cluster and onto local threads instead."""
     import dask
-    from biopb_image_base.ops import _ambient_scheduler_configured
 
-    assert not _ambient_scheduler_configured()
-    with dask.config.set(scheduler="synchronous"):
-        assert _ambient_scheduler_configured()
-    assert not _ambient_scheduler_configured()
+    _assert_toggles_ambient_scheduler(lambda: dask.config.set(scheduler="synchronous"))
 
 
 def test_ambient_scheduler_detects_a_distributed_client():
     distributed = pytest.importorskip("distributed")
-    from biopb_image_base.ops import _ambient_scheduler_configured
 
-    assert not _ambient_scheduler_configured()
-    with distributed.Client(processes=False, n_workers=1, threads_per_worker=1):
-        assert _ambient_scheduler_configured()
-    assert not _ambient_scheduler_configured()
+    _assert_toggles_ambient_scheduler(
+        lambda: distributed.Client(processes=False, n_workers=1, threads_per_worker=1)
+    )
 
 
 def test_embedded_sink(tmp_path: Path, monkeypatch):
