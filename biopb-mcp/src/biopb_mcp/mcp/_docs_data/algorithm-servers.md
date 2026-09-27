@@ -73,9 +73,11 @@ function or at the top; either way they load in the server, never the kernel.
 
 ## Input modes
 
-* `"eager"` (default): numpy arrays. The input's other axes must be size 1 —
-  slice before calling, or use one of the others. A large reference is
-  refused rather than pulled whole.
+With `"eager"` and `"lazy"`, the input's axes outside the op's `Tensor(...)`
+must be size 1 — slice before calling. Only `"blocks"` maps over them.
+
+* `"eager"` (default): numpy arrays. A large reference is refused rather
+  than pulled whole.
 * `"lazy"`: dask arrays; the function may return one, which is written to the
   plane chunk by chunk.
 * `"blocks"`: the function is mapped over blocks, and over every axis not in

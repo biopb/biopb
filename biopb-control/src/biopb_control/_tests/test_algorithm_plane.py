@@ -167,6 +167,36 @@ def test_an_edit_takes_effect_on_ensure(plane, registry):
     assert [o["name"] for o in answer["ops"]] == ["alpha", "gamma"]
 
 
+def test_an_edit_is_stale_until_refresh_ensures_it(plane, registry):
+    """biopb/biopb#1149: refresh() installs and re-describes an edited file
+    but never restarts the running server, so its old process is still what
+    answers a call. The row must say so (``stale``, no url/token) rather than
+    ``up``, or a caller that trusts ``state == "up"`` (as the mcp kernel's
+    ``_Server`` does) keeps calling the outdated process indefinitely."""
+    path = registry / "seg.py"
+    path.write_text(_server(["alpha"]))
+    first = plane.ensure("seg", wait=30.0)
+    assert first["state"] == "up", first["error"]
+
+    path.write_text(_server(["alpha", "gamma"]))
+    plane.refresh()
+    row = _wait_for(plane, "seg", {"stale", "failed"})
+    assert row["state"] == "stale", row["error"]
+    assert row["url"] is None and row["token"] is None
+    assert [o["name"] for o in row["ops"]] == ["alpha", "gamma"]
+    # The old process is untouched and still answering.
+    assert (
+        _algorithms.probe(first["url"], token=first["token"], timeout=5)["state"]
+        == "up"
+    )
+
+    row = plane.ensure("seg", wait=30.0)
+    assert row["state"] == "up", row["error"]
+    assert _algorithms.probe(first["url"], timeout=2)["state"] == "unreachable"
+    answer = _algorithms.probe(row["url"], token=row["token"], timeout=5)
+    assert [o["name"] for o in answer["ops"]] == ["alpha", "gamma"]
+
+
 def test_an_import_error_fails_without_a_restart_loop(plane, registry):
     (registry / "bad.py").write_text(
         _server(

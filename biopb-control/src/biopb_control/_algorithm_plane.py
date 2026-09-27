@@ -15,7 +15,11 @@ new        never installed at this file's hash; no cached ops
 installing ``uv lock`` + ``uv sync`` + ``--describe`` are running
 stopped    installed and described, ops cached, no process
 starting   spawned, waiting for its port
-up         serving
+up         serving the file's current hash
+stale      serving, but the file changed since this process started;
+           ``refresh()`` picks up the new op list without restarting it,
+           so its row withholds the url/token, forcing the next call
+           through :meth:`AlgorithmPlane.ensure`, which restarts it
 failed     install, describe or start failed; ``error`` holds the log tail
 ========== =========================================================
 
@@ -405,7 +409,11 @@ class ScriptEntry(ServiceProcess):
             if self._error:
                 return "failed"
             if self._child_alive():
-                return "up" if self._was_up else "starting"
+                if not self._was_up:
+                    return "starting"
+                if file_hash is None:
+                    file_hash = _file_hash(self.path)
+                return "up" if self._running_hash == file_hash else "stale"
             if self._want:
                 return "starting"  # between a crash and its restart
             if cached is None:
