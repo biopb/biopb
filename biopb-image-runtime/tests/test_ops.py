@@ -64,6 +64,13 @@ def masked(image: Tensor("YX"), level: float, labels: Tensor("YX")):
     return ((image > level) & (labels > 0)).astype(np.uint8)
 
 
+@op(input="blocks", block_shape=16)
+def widen(image: Tensor("YX")):
+    """Undeclared dtype, changed anyway: exercises the peek-block guess
+    (input dtype) turning out wrong, without declaring one up front."""
+    return image.astype(np.float32) * 0.5
+
+
 @op(input="lazy")
 def frames(movie: Tensor("TYX")):
     for t in range(movie.shape[0]):
@@ -118,6 +125,7 @@ ALL = [
     smooth,
     shrink,
     masked,
+    widen,
     frames,
     track,
     localize,
@@ -318,6 +326,20 @@ def test_blocks_matches_the_whole_image(server):
     assert list(out.dim_labels) == ["T", "Y", "X"]
     expected = np.stack([uniform_filter(f, size=3, mode="nearest") for f in movie])
     np.testing.assert_allclose(_value(event.outputs["result"]), expected, rtol=1e-6)
+
+
+def test_blocks_with_an_undeclared_dtype_change_is_correct(server):
+    """biopb/biopb#1148: the peek block that learns an undeclared dtype used
+    to be thrown away and the whole map_overlap graph rebuilt from scratch
+    under the real dtype. Rebuilt as a cast over the same graph instead --
+    this only proves the result is still correct under a real dtype change,
+    not the graph is built once (that's a code-reading fact, not a
+    black-box-observable one)."""
+    image = np.arange(40 * 37, dtype=np.uint8).reshape(40, 37)
+    (event,) = server.call("widen", image=_eager(image))
+    out = _value(event.outputs["result"])
+    assert out.dtype == np.float32
+    np.testing.assert_allclose(out, image.astype(np.float32) * 0.5)
 
 
 def test_blocks_passes_tensors_by_name(server):

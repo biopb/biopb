@@ -515,6 +515,16 @@ class _InlineSink:
         return proto.Arg(eager=image_data.eager_data)
 
 
+#: How many blocks ``upload_array``'s ``da.store`` may compute and hold in
+#: flight at once. Left unset, dask's default threaded scheduler races ahead
+#: of the network sink -- unbounded, and with no relation to how many CPUs
+#: are free -- so a fine-grained result (``input="blocks"`` at a small
+#: ``block_shape``) can pile up many more decoded, overlap-concatenated
+#: blocks than the whole array's own size before the slow per-chunk upload
+#: drains them (biopb/biopb#1148).
+_UPLOAD_WORKERS = 4
+
+
 class _PlaneSink(_InlineSink):
     """Small arrays inline; dask and large arrays to the data plane named by
     ``BIOPB_TENSOR_URL``, as tensors of its scratch source."""
@@ -539,13 +549,16 @@ class _PlaneSink(_InlineSink):
         return proto.Arg(lazy=self._upload(_regular_chunks(array), labels, op_name))
 
     def _upload(self, array, labels, op_name):
+        import dask
+
         client = self._connect()
         desc = client.add_tensor(
             f"cache://scratch/@fields/{_field_name(op_name)}",
             array,
             dim_labels=labels,
         )
-        client.upload_array(desc, array)
+        with dask.config.set(scheduler="threads", num_workers=_UPLOAD_WORKERS):
+            client.upload_array(desc, array)
         return client.get_tensor_pb(desc.array_id)
 
 
@@ -630,11 +643,17 @@ def _blocks(definition: _OpDef, pixels: Dict[str, _Pixels], kwargs: Dict[str, An
             meta=np.empty((0,) * len(order), dtype=dtype),
         )
 
-    dtype = definition.dtype
-    if dtype is None:
-        # One block, computed to learn what the function returns.
-        dtype = mapped(arrays[0].dtype).blocks[lead + (0,) * len(axes)].compute().dtype
-    result = mapped(dtype)
+    if definition.dtype is not None:
+        result = mapped(definition.dtype)
+    else:
+        # One block, computed to learn what the function returns -- an
+        # empty-array probe (map_overlap's own default) is not safe for an
+        # arbitrary op. Reused as the graph itself when the guess held, rather
+        # than building the whole map_overlap a second time: at ~18k blocks
+        # for a fine block_shape, that graph is not free (biopb/biopb#1148).
+        guess = mapped(arrays[0].dtype)
+        dtype = guess.blocks[lead + (0,) * len(axes)].compute().dtype
+        result = guess if dtype == guess.dtype else guess.astype(dtype)
     return normalize_array_dims(result, order, first.labels), first.labels
 
 
