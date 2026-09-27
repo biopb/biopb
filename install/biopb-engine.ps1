@@ -690,19 +690,18 @@ function Set-McpClients {
 
     Set-AlgorithmRegistry -ConfigDir $ConfigDir -NoRemotePlugins:$NoRemotePlugins
 
-    # Seed the built-in example kernel plugin(s) into ~/.config/biopb/kernel/ so
-    # they load into the agent kernel namespace at startup and are visible as a
-    # "bring your own tool" example (biopb/biopb-mcp#92). Delivered as a file
-    # there (not only an installed module) so it is user-visible/editable and
-    # loads via the robust startup-file path. Idempotent (never clobbers a
-    # user-edited file); best-effort so a failure never aborts the install.
-    $seedCmd = (Get-Command biopb-mcp-seed-plugins -ErrorAction SilentlyContinue).Source
+    # Seed the bundled correctness-critical algorithm-plane ops (segmentation
+    # QC, image resolution) into ~/.config/biopb/algorithms/ as script entries,
+    # so a procedure doc's op requirement is met without the agent re-deriving
+    # them. Idempotent (never clobbers a user-edited file); best-effort so a
+    # failure never aborts the install.
+    $seedCmd = (Get-Command biopb-mcp-seed-algorithms -ErrorAction SilentlyContinue).Source
     if ($seedCmd) {
         try {
             & $seedCmd | Out-Null
-            Report-Ok "Seeded example kernel plugins: $ConfigDir\kernel"
+            Report-Ok "Seeded bundled algorithm ops: $ConfigDir\algorithms"
         } catch {
-            Report-Info "Skipped seeding example kernel plugins (add later: biopb-mcp-seed-plugins)"
+            Report-Info "Skipped seeding bundled algorithm ops (add later: biopb-mcp-seed-algorithms)"
         }
     }
 

@@ -613,9 +613,104 @@ def ablated_index(seed: str) -> str:
     return "\n".join(out).rstrip() + "\n"
 
 
-def _write_config(
-    root: Path, *, docs_enabled: bool = True, plugins: Sequence[str] = ()
-) -> None:
+def _op_defs_for(names: Sequence[str]) -> list:
+    """Every ``@op``-decorated top-level callable in each named bundled
+    algorithm file (``biopb_mcp.algorithms.<name>``), as ``_OpDef``s."""
+    import importlib
+
+    defs = []
+    for name in names:
+        mod = importlib.import_module(f"biopb_mcp.algorithms.{name}")
+        for attr in vars(mod).values():
+            info = getattr(attr, "__biopb_op__", None)
+            if info is not None:
+                defs.append(info)
+    return defs
+
+
+class _FakeControlAlgorithms:
+    """A real op gRPC server for the requested bundled ops, discoverable the
+    normal way (the control's runtime record + ``GET /api/algorithms``).
+
+    There is no control process in a bench session (`live_session`'s own
+    docstring: "the control plane is bypassed entirely"), so
+    ``build_ops_from_config`` -- which the *child* calls, over the wire, from
+    the real ``biopb.control`` client -- would otherwise see an empty
+    registry regardless of what a case declares. This starts the real
+    ``Ops`` server the bundled algorithm file would run under ``uv``, and
+    answers the one HTTP call the client makes as if a control were up, so
+    the loader that runs is the real one on both sides of the wire.
+    """
+
+    def __init__(self, names: Sequence[str]):
+        from biopb_image_base.ops import build_server, describe
+
+        self._defs = _op_defs_for(names)
+        self._grpc_server, self._grpc_port = build_server(self._defs)
+        self._grpc_server.start()
+        self._oplist = describe(self._defs)
+        self._http = self._make_http_server()
+
+    def _make_http_server(self):
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        from google.protobuf import json_format
+
+        body = json.dumps(
+            {
+                "servers": [
+                    {
+                        "name": "bench",
+                        "kind": "url",
+                        "state": "up",
+                        "url": f"grpc://127.0.0.1:{self._grpc_port}",
+                        "token": None,
+                        "ops": [
+                            json_format.MessageToDict(d.info()) for d in self._defs
+                        ],
+                    }
+                ]
+            }
+        ).encode("utf-8")
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802 - stdlib's naming
+                if self.path.startswith("/api/algorithms"):
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+            def log_message(self, *a):  # noqa: A003 - silence stdlib's access log
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return server
+
+    def publish(self) -> None:
+        """Write the control runtime record so ``biopb.control.algorithms()``
+        finds this fake control the same way it would a real one."""
+        from biopb.control._endpoints import write_runtime_record
+
+        host, port = self._http.server_address
+        write_runtime_record(host, port, os.getpid())
+
+    def close(self) -> None:
+        from biopb.control._endpoints import remove_runtime_record
+
+        remove_runtime_record()
+        self._http.shutdown()
+        self._http.server_close()
+        self._grpc_server.stop(grace=1).wait()
+
+
+def _write_config(root: Path, *, docs_enabled: bool = True) -> None:
     """A config tree of our own, so neither the developer's settings nor their
     personal docs reach the child.
 
@@ -626,22 +721,8 @@ def _write_config(
     exactly as they were. That is §5's rule — disclose the environment,
     withhold only the procedure — done with the same file an agent would edit
     rather than a switch cut into the store for the test.
-
-    ``plugins`` names kernel plugins the case's procedure names in its
-    Requirements line. They are seeded into this tree's own ``biopb/kernel/``
-    from the ones biopb-mcp ships, so the loader that runs is the real one — and
-    only what a case asks for is present, since a plugin the procedure never
-    named is an environment difference nobody chose.
     """
     (root / "biopb").mkdir(parents=True, exist_ok=True)
-    if plugins:
-        from biopb_mcp import plugins as bundled
-
-        kernel_dir = root / "biopb" / "kernel"
-        kernel_dir.mkdir(exist_ok=True)
-        source = Path(bundled.__file__).parent
-        for name in plugins:
-            shutil.copyfile(source / f"{name}.py", kernel_dir / f"{name}.py")
     (root / "biopb" / "mcp-config.json").write_text(
         json.dumps(
             {
@@ -672,19 +753,21 @@ def _write_config(
 def live_session(
     *,
     docs_enabled: bool = True,
-    plugins: Sequence[str] = (),
+    algorithms: Sequence[str] = (),
     tensor_url: str = "",
 ) -> Iterator[LiveSession]:
     """Bring a session up, hand back a driver, and reap it on the way out.
 
     ``docs_enabled=False`` unlists the curated procedure docs and nothing
     else -- the ablated half of a doc's delta, `--bench-docs=false`. The
-    reference docs stay. ``plugins`` seeds the kernel plugins a case declares.
+    reference docs stay. ``algorithms`` names bundled algorithm-plane files
+    (``biopb_mcp.algorithms.<name>``) the case's procedure needs; see
+    :class:`_FakeControlAlgorithms`.
 
     ``tensor_url`` is the run's data plane, for a case presented on one. Empty
     -- the usual state -- points the child at an address nothing answers, so
     ``client is None`` and the agent meets the environment every `array` case's
-    task prompt describes. Either way the *control* plane is bypassed
+    task prompt describes. Either way the *real* control plane is bypassed
     entirely: ``$BIOPB_TENSOR_URL`` is read before it is consulted, which is
     what keeps a benchmark run from touching the developer's own deployment.
     """
@@ -695,12 +778,13 @@ def live_session(
     from biopb_mcp.mcp import _shim
 
     scratch = Path(tempfile.mkdtemp(prefix="biopb-skill-session-"))
-    _write_config(scratch / "config", docs_enabled=docs_enabled, plugins=plugins)
+    _write_config(scratch / "config", docs_enabled=docs_enabled)
 
     saved = {
         k: os.environ.get(k)
         for k in (
             "BIOPB_CONFIG_HOME",
+            "BIOPB_STATE_HOME",
             "BIOPB_TENSOR_URL",
             "QT_QPA_PLATFORM",
             "PYTHONPATH",
@@ -709,6 +793,10 @@ def live_session(
         )
     }
     os.environ["BIOPB_CONFIG_HOME"] = str(scratch / "config")
+    # Isolates the control's runtime-record discovery too: a real control
+    # left running on the developer's machine must never shadow (or be
+    # shadowed by) the fake one `_FakeControlAlgorithms` may publish below.
+    os.environ["BIOPB_STATE_HOME"] = str(scratch / "state")
     os.environ["BIOPB_TENSOR_URL"] = tensor_url or UNREACHABLE_TENSOR_URL
     os.environ.pop("QT_QPA_PLATFORM", None)  # a real GL platform, not offscreen
 
@@ -727,6 +815,7 @@ def live_session(
 
     child = session_id = loop = None
     stop = None
+    fake_control = None
     try:
         # Inside the try, because building the wheel can fail and everything
         # above has already redirected `BIOPB_CONFIG_HOME` and the tensor URL for
@@ -745,6 +834,12 @@ def live_session(
                 *([saved["PYTHONPATH"]] if saved["PYTHONPATH"] else []),
             ]
         )
+        if algorithms:
+            # Published before spawn: the child's own bootstrap calls
+            # `build_ops_from_config` once, at start_kernel, so the record has
+            # to be discoverable from the first `GET /api/algorithms`.
+            fake_control = _FakeControlAlgorithms(algorithms)
+            fake_control.publish()
         child, url, session_id = _shim.spawn_session(
             load_config(), timeout=SPAWN_TIMEOUT
         )
@@ -786,6 +881,8 @@ def live_session(
                 pass
         if child is not None:
             _shim._reap_session(child, session_id)
+        if fake_control is not None:
+            fake_control.close()
         for key, value in saved.items():
             if value is None:
                 os.environ.pop(key, None)

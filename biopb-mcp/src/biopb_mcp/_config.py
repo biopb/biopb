@@ -222,7 +222,7 @@ class ViewerConfig:
 
 @dataclass
 class ServicesConfig:
-    """The knowledge store and the plugins wired into the kernel."""
+    """The knowledge store wired into the kernel."""
 
     docs_local_dir: str = _h(
         "",
@@ -230,13 +230,6 @@ class ServicesConfig:
         "shadowing a shipped doc of the same id; empty -> ~/.config/biopb/docs. "
         "Holds the index the agent edits, and is re-read on every access so a "
         "hand edit is live without a restart.",
-    )
-    namespace_enabled: bool = _h(
-        True,
-        "Load user 'bring your own tool' plugins into the agent kernel namespace at "
-        "start: *.py files in ~/.config/biopb/kernel/ and installed "
-        "biopb_mcp.namespace packages (biopb/biopb-mcp#92). Off -> a clean "
-        "built-in-only namespace.",
     )
 
 

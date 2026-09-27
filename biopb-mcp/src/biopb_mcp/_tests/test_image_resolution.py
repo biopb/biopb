@@ -1,6 +1,6 @@
-"""Unit tests for the resolution plugin (biopb_mcp.plugins.image_resolution).
+"""Unit tests for the resolution op (biopb_mcp.algorithms.image_resolution).
 
-The point of this plugin is that its output is a single plausible-looking number,
+The point of this op is that its output is a single plausible-looking number,
 so these tests are mostly about **whether the number is right** rather than about
 whether the code runs. The fixture is a field with a hard band limit at a known
 cutoff: past that cutoff two noisy copies share nothing, so the FRC curve must
@@ -16,13 +16,15 @@ therefore one-sided and stated in rings, not percent.
 Also pins the two regressions that cost the most to rediscover: the count-
 dependent thresholds snapping to a fixed low ring for every input, and ring 0's
 forced 1.0 leaking through the smoother into the rings that decide the crossing.
-And the delivery path, as the other plugin suites do. No kernel or display needed.
+And the delivery path, as the other op suites do. No kernel or display needed;
+`@op` leaves a function directly callable, so calling these here is the same
+call the server makes.
 """
 
 import numpy as np
 import pytest
 
-from biopb_mcp.plugins import image_resolution as ir
+from biopb_mcp.algorithms import image_resolution as ir
 
 N = 256
 FIELD, N_SEG, N_FRAMES = 4000.0, 25, 4000
@@ -265,7 +267,9 @@ class TestSplittingALocalizationList:
         assert mask.all()
 
     def test_random_split_warns_that_it_is_not_quotable(self):
-        _, notes = ir.split_localizations(100, split="random")
+        # frames is unused by split="random" but still required (a Tensor
+        # argument cannot be optional once the function is served as an op).
+        _, notes = ir.split_localizations(100, np.zeros(100), split="random")
         assert any("better than the truth" in n for n in notes)
 
     def test_halves_warns_about_drift(self):
@@ -278,9 +282,7 @@ class TestSplittingALocalizationList:
         )
         assert any("effectively split='halves'" in n for n in notes)
 
-    def test_a_time_split_without_frames_is_refused(self):
-        with pytest.raises(ValueError, match="needs a per-localization frame index"):
-            ir.split_localizations(10, None, split="blocks")
+    def test_a_mismatched_frames_length_is_refused(self):
         with pytest.raises(ValueError, match="one entry per localization"):
             ir.split_localizations(10, np.arange(4), split="blocks")
 
@@ -428,56 +430,58 @@ class TestDecorrelation:
 
 
 class TestSeeding:
-    """The delivery path: the installer seeds the plugin into the kernel dir."""
+    """The delivery path: the installer seeds the op file into the algorithm registry."""
 
-    def test_seed_includes_the_resolution_plugin(self, tmp_path):
-        from biopb_mcp.plugins._seed import SEED_FILES, seed_kernel_plugins
+    def test_seed_includes_the_resolution_op(self, tmp_path):
+        from biopb_mcp.algorithms._seed import SEED_FILES, seed_algorithms
 
         assert "image_resolution.py" in SEED_FILES
-        dest = tmp_path / "kernel"
-        seed_kernel_plugins(dest)
+        dest = tmp_path / "algorithms"
+        seed_algorithms(dest)
         assert (dest / "image_resolution.py").exists()
 
-    def test_seeded_file_loads_with_a_clean_namespace_surface(self, tmp_path):
-        from biopb_mcp.mcp import _bootstrap
-        from biopb_mcp.plugins._seed import seed_kernel_plugins
+    def test_seeded_file_declares_all_four_ops(self, tmp_path):
+        # The production path: the control runs the seeded file under uv and
+        # discovers its ops by importing it, which registers each `@op`.
+        import importlib.util
 
-        dest = tmp_path / "kernel"
-        seed_kernel_plugins(dest)
-        # Other seeded plugins have their own surface tests; drop them so this
-        # assertion stays an exact set for *this* file rather than a superset.
-        for other in dest.glob("*.py"):
-            if other.name not in ("__init__.py", "image_resolution.py"):
-                other.unlink()
+        from biopb_mcp.algorithms._seed import seed_algorithms
 
-        class IP:
-            def __init__(self):
-                self.user_ns = {"viewer": 1, "client": 1, "np": np, "da": 1, "ops": {}}
-
-        ip = IP()
-        _bootstrap._load_plugin_files(ip, dest)
-        builtins_ = {"viewer", "client", "np", "da", "ops"}
-        contributed = {
-            n for n in ip.user_ns if not n.startswith("_") and n not in builtins_
+        dest = tmp_path / "algorithms"
+        seed_algorithms(dest)
+        spec = importlib.util.spec_from_file_location(
+            "seeded_image_resolution", dest / "image_resolution.py"
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        names = {
+            f.__biopb_op__.name
+            for f in (
+                mod.frc,
+                mod.decorrelation_resolution,
+                mod.split_localizations,
+                mod.frc_from_localizations,
+            )
         }
-        assert contributed == {"image_resolution"}
-        plug = ip.user_ns["image_resolution"]
-        assert set(ir.__all__) <= set(dir(plug))
-        assert ip.user_ns["np"] is np  # reserved handle untouched
+        assert names == {
+            "frc",
+            "decorrelation_resolution",
+            "split_localizations",
+            "frc_from_localizations",
+        }
 
-    def test_seeded_plugin_is_callable_from_the_namespace(self, tmp_path):
-        from biopb_mcp.mcp import _bootstrap
-        from biopb_mcp.plugins._seed import seed_kernel_plugins
+    def test_seeded_op_is_callable(self, tmp_path):
+        import importlib.util
 
-        dest = tmp_path / "kernel"
-        seed_kernel_plugins(dest)
+        from biopb_mcp.algorithms._seed import seed_algorithms
 
-        class IP:
-            def __init__(self):
-                self.user_ns = {"viewer": 1, "client": 1, "np": np, "da": 1, "ops": {}}
-
-        ip = IP()
-        _bootstrap._load_plugin_files(ip, dest)
+        dest = tmp_path / "algorithms"
+        seed_algorithms(dest)
+        spec = importlib.util.spec_from_file_location(
+            "seeded_image_resolution_2", dest / "image_resolution.py"
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
         a, b = noisy_pair(0.25)
-        got = ip.user_ns["image_resolution"].frc(a, b)
+        got = mod.frc(a, b)
         assert got.resolution == pytest.approx(4.0, rel=0.15)

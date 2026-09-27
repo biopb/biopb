@@ -5,7 +5,7 @@ description: What a procedure's Requirements line names, where to check each, an
 # Checking what a procedure needs
 
 A procedure doc opens with a **Requirements** line naming what its steps touch.
-Resolve it before you start: one that assumes a plugin or package it does not
+Resolve it before you start: one that assumes an op or package it does not
 have fails partway through, after the user has already waited.
 
 **It informs; it does not gate.** A gap is a fact to tell the user and work
@@ -20,10 +20,7 @@ they were never told changed.
 
 One `server_status` call answers everything but a third-party package: the
 viewer under `## Viewer`, the data plane under `## Tensor Server`, dask under
-`## Dask`, the ops under `## Ops`, and a kernel plugin under `## Kernel
-plugins` — the only place a plugin can be read, since a plugin contributes its
-*function* names and not its own, so `dir()` cannot answer it, and a file that
-failed to load is still on disk, so a listing cannot either.
+`## Dask`, and the ops under `## Ops`.
 
 A third-party package you resolve here, in two steps: `import <name>` answers
 whether it is present, and `importlib.metadata.version("<name>")` answers
@@ -36,18 +33,6 @@ too, and the fix is not another install: say so and offer the degraded path.
 
 Diagnose, tell the user, let them choose. Installing, seeding and restarting are
 all theirs to authorize — but a named gap usually beats abandoning the doc.
-
-**A kernel plugin — three causes, in this order:**
-1. **This install predates it.** Seeding cannot conjure a plugin that does not
-   ship in the installed version; point at upgrading biopb (rerun the
-   installer), and stop there.
-2. **Else check the file:** `ls ~/.config/biopb/kernel/<name>.py`. Present, but
-   absent from the report → it **failed to load**. The traceback is in the
-   session log (`log_file:` under `## System`). Show the user the error; this is
-   a bug to report, not something to retry.
-3. **Absent → never seeded.** `biopb-mcp-seed-plugins` installs the built-ins,
-   then the kernel must restart to load them. **Ask before restarting** — it
-   takes the namespace and every layer with it.
 
 **A package — offer three options and let the user pick:**
 1. **They install it** — quote the exact command `## Versions` prints (it names
@@ -89,6 +74,6 @@ can write one, with the user's consent to its dependencies), or a
 
 ## Related
 
-- [[kernel]] — the namespace these resolve against, and how plugins get loaded.
+- [[kernel]] — the namespace these resolve against.
 - [[napari-viewer]] and [[web-viewer]] — the two display surfaces, either of
   which satisfies "somewhere to show the user an image".

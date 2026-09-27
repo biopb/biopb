@@ -22,9 +22,8 @@ top-to-bottom works only for self-contained, in-namespace computation: external
 state is *not* captured — tensor-server source ids and napari viewer layers from
 the live session do not exist on a fresh kernel, so source-chaining / viewer
 cells need the same live server (or hand edits). The bootstrap cell rebuilds
-``np``/``da``/``client``/``ops``, an empty viewer (via the ``%gui qt`` magic),
-and the user's kernel plugins, on a best-effort basis — the plugins from *this*
-machine's `~/.config/biopb/kernel`, which need not be the ones the session had.
+``np``/``da``/``client``/``ops`` and an empty viewer (via the ``%gui qt`` magic)
+on a best-effort basis.
 ``nbformat`` is intentionally not a dependency — the v4 schema is small and
 hand-built here.
 """
@@ -76,26 +75,8 @@ except Exception as _exc:  # noqa: BLE001 - audit notebook tolerates no display
     print("napari viewer unavailable (audit notebook):", _exc)
 """
 
-_BOOTSTRAP_PLUGINS = """
-# User kernel plugins (~/.config/biopb/kernel/*.py and biopb_mcp.namespace entry
-# points), loaded by the kernel's own loader so a cell calling one of them --
-# `rolling_ball.subtract_background(...)` -- resolves the same name it did in the
-# session. Last, like the kernel's step 7, so a plugin can reference the handles
-# above. Fail-open per plugin, as in the kernel; a plugin this machine does not
-# have simply does not bind, and the cell using it fails where it is used.
-try:
-    from biopb_mcp.mcp import _requires
-    from biopb_mcp.mcp._bootstrap import _load_namespace_plugins
-
-    _load_namespace_plugins(get_ipython(), config)
-    _bound = _requires._LOADED_FILES + _requires._LOADED_ENTRY_POINTS
-    print("kernel plugins:", ", ".join(_bound) if _bound else "(none)")
-except Exception as _exc:  # noqa: BLE001 - a plugin gap must not stop the rebuild
-    print("kernel plugins not loaded:", _exc)
-"""
-
 #: The audit export: everything the session had, viewer included.
-BOOTSTRAP_SRC = _BOOTSTRAP_HEAD + _BOOTSTRAP_VIEWER + _BOOTSTRAP_PLUGINS
+BOOTSTRAP_SRC = _BOOTSTRAP_HEAD + _BOOTSTRAP_VIEWER
 
 
 def _lines(text):
@@ -254,7 +235,7 @@ _WORKFLOW_INTRO = (
     "Verified {ts}{ncells}.\n\n"
     "Every cell below ran, in this order, in a **scratch kernel** — a second "
     "process spawned for the verification and discarded after it. It was given "
-    "nothing: no `client`, no `ops`, no `np`, no plugins, and no napari viewer. "
+    "nothing: no `client`, no `ops`, no `np`, and no napari viewer. "
     "Whatever this notebook needs, the cells below build, which is why running "
     "them here proves they run for you.\n\n"
     "**What the run proves.** Every cell executed without raising, on a bare "
@@ -265,10 +246,6 @@ _WORKFLOW_INTRO = (
     "outputs are kept below so there is something to check against.\n\n"
     "**The prose is the author's, and unverified.** Running a cell checks the "
     "code; nothing checks the sentence above it.\n\n"
-    "**Plugins are yours, not the session's.** `workflow_env()` loads them from "
-    "*your* `~/.config/biopb/kernel`, so a workflow calling a plugin this "
-    "machine does not have binds nothing and the cell using it raises "
-    "`NameError`.\n\n"
     "**What it does not prove.** A scratch *process* is not a scratch *world*. "
     "The run used the same tensor server and the same filesystem as the "
     "session, so anything the workflow uploaded or wrote is really there. And "
@@ -283,8 +260,8 @@ _TITLE = "# biopb-mcp session — audit export\n"
 _INTRO = (
     "Exported {ts} · {n} job(s).\n\n"
     "This notebook is an **audit record** of an `execute_code` session. The "
-    "first code cell rebuilds the namespace (`np`, `da`, `client`, `ops`, an "
-    "empty `viewer`, and this machine's kernel plugins) on a best-effort basis; "
+    "first code cell rebuilds the namespace (`np`, `da`, `client`, `ops`, and an "
+    "empty `viewer`) on a best-effort basis; "
     "each cell below is one job, with its "
     "recorded output. A job that was submitted with a stated intent carries it "
     "as the markdown note above the code — the only record of *why* a cell was "

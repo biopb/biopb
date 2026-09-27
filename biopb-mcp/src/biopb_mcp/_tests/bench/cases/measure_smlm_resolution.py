@@ -195,7 +195,7 @@ def _localize(pos: np.ndarray, rng) -> np.ndarray:
 
 
 def _measure(table: np.ndarray, split: str) -> float:
-    from ....plugins import image_resolution as ir
+    from ....algorithms import image_resolution as ir
 
     return float(
         ir.frc_from_localizations(
@@ -380,7 +380,7 @@ CASE = Case(
     },
     score=verify,
     save_artifacts=save_artifacts,
-    plugins=("image_resolution",),
+    algorithms=("image_resolution",),
     # It must be able to say the molecules repeat, which is what makes the split
     # a choice at all, and that the structure fills the field, which is what
     # makes the areal density floor the right one to compare against.

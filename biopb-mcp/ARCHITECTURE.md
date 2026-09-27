@@ -4,7 +4,7 @@
 
 `biopb-mcp` is an **MCP server** that connects [napari](https://napari.org) and AI
 agents to biopb servers. It gives an agent a live Python kernel holding the data
-plane (`client`) and the algorithm plane (`ops` and plugin modules), plus a napari
+plane (`client`) and the algorithm plane (`ops`), plus a napari
 viewer where the session has one. Thesis: *"agent first; provide tools only if they
 help."* Image results go to the viewer or the control's web viewer, other results to
 the agent's chat.
@@ -106,7 +106,7 @@ Shim (`--transport stdio`) is the interface the mcp clients (claude code) see, w
 ### The kernel
 
 The session owns a **single child Jupyter kernel** hosting the tensor client, dask,
-`ops`, the plugin modules and, where there is one, the napari viewer. Agent code runs *in that kernel*, not on the MCP
+`ops` and, where there is one, the napari viewer. Agent code runs *in that kernel*, not on the MCP
 thread or napari's Qt loop — so a runaway execution can be interrupted or
 hard-restarted without killing the MCP server. The host's round trips are quick
 snippets that may overlap: one threaded client routes each reply and iopub
@@ -181,16 +181,11 @@ shows the cause inline; the full server output is in
 ### Extending the kernel namespace
 
 The agent's capability surface **is** the kernel namespace (`client`, `ops`,
-`np`/`da`, and `viewer` where there is one), so a user adds capability by simply *putting objects in scope*.
-Two paths feed it: `*.py` files in a user kernel dir, and `biopb_mcp.namespace` entry
-points for published plugin packages. Either way a plugin is loaded as a **module and
-bound under one name** — its file stem or entry-point name (#664) — so its helpers and
-imports stay off the namespace, and the **reserved-name guard** is one check per
-plugin. Both paths are **fail-open per unit** (one bad plugin is skipped without
-aborting the bootstrap). Plugin modules are registered for by-value pickling, so their
-functions still run on a dask worker that cannot import them. The agent discovers
-plugins with `dir()`/`inspect_object`, not from a "generated enumeration", so code and
-doc cannot drift.
+`np`/`da`, and `viewer` where there is one). Anything beyond that goes through the
+**algorithm plane**: a self-contained `@op`-decorated server file dropped in
+`~/.config/biopb/algorithms/`, which the control runs under `uv` and the kernel's
+`ops` calls — see `docs/algorithm-plane.md`. That is now cheap enough (one file, no
+packaging) that the kernel namespace itself stays fixed rather than pluggable.
 
 ---
 

@@ -109,7 +109,7 @@ _STATUS_SNIPPET = """
 # This kernel's interpreter -- the one a doc's package requirement is about, and
 # not necessarily the server process's env (the kernelspec need not be it). The
 # most common such requirement is `biopb-mcp>=X`, how a doc says it needs a release
-# that carries some plugin, so report that one instead of making the agent import.
+# that carries some feature, so report that one instead of making the agent import.
 # The interpreter, and how to install into it, come from _requires (which decides
 # the command from the env's shape) rather than being composed here.
 print("## Versions")
@@ -223,19 +223,6 @@ elif _ops:
 else:
     print("  (no ops)")
 
-print("")
-# What the plugin loader actually loaded, which neither the kernel dir (fail-open:
-# a file that raised is on disk and not loaded) nor dir() (a file contributes its
-# function names, not its own name) can tell the agent. It reads this to resolve a
-# doc's kernel-plugin requirement.
-print("## Kernel plugins")
-try:
-    from biopb_mcp.mcp import _requires as _req
-
-    for _line in _req.plugin_status_lines():
-        print(_line)
-except Exception as _e:
-    print("  error: " + str(_e))
 """.replace("__NO_VIEWER_HINT__", repr(_NO_VIEWER_HINT))
 
 
@@ -716,8 +703,8 @@ async def execute_code(
 
     The kernel is a full Jupyter/IPython kernel (imports allowed). Its namespace
     always holds the data plane -- client (image data access) -- and the
-    algorithm plane -- ops (server-side image-processing operations)
-    and the user's kernel plugin modules; np and da are imported. A viewer (a
+    algorithm plane -- ops (server-side image-processing operations);
+    np and da are imported. A viewer (a
     napari viewer with add_tensor/tensor methods) is there only when the session
     has one: server_status's ## Viewer says. Variables persist across calls
     until the kernel is restarted.
@@ -833,7 +820,7 @@ async def verify_workflow(document: str, title: str = "") -> str:
     months later, and you are the only one who knows it.
 
     **It starts with its own setup cell.** The scratch kernel is given nothing —
-    no ``client``, no ``ops``, no ``np``, no plugins, no ``viewer`` — because
+    no ``client``, no ``ops``, no ``np``, no ``viewer`` — because
     the reader's kernel will have nothing either. So the first cell is the
     document's own environment:
 
@@ -1180,8 +1167,8 @@ def _stop_refused_message(data, job_id):
 
 @mcp.tool()
 async def start_kernel() -> str:
-    """Start biopb: bring up the kernel with the tensor client, ops and kernel
-    plugins -- and the napari viewer, where the session has one.
+    """Start biopb: bring up the kernel with the tensor client and ops -- and
+    the napari viewer, where the session has one.
 
     Call this as the first action of every session, and whenever the user asks
     to start, open, or launch biopb, napari, or the viewer. Nothing auto-starts
@@ -1206,12 +1193,12 @@ async def start_kernel() -> str:
     if result.get("state") == "ready":
         if host.no_viewer_reason:
             return (
-                "Kernel ready: the tensor client (`client`), `ops` and the kernel "
-                "plugins are up; use execute_code now. This session has no napari "
+                "Kernel ready: the tensor client (`client`) and `ops` are up; "
+                "use execute_code now. This session has no napari "
                 f"viewer ({host.no_viewer_reason}): {_NO_VIEWER_HINT}."
             )
         ready = (
-            "Kernel ready. The tensor client, `ops`, the kernel plugins and the "
+            "Kernel ready. The tensor client, `ops` and the "
             "napari viewer are up; use execute_code / take_screenshot now."
         )
         # A virtual display is a silent degradation: screenshots still work, so
@@ -1246,7 +1233,7 @@ async def restart_kernel() -> str:
     """Hard-restart the kernel: the guaranteed stop for runaway execution.
 
     Kills the kernel process group (reaping any dask child processes) and
-    respawns a fresh kernel, rebuilding the tensor client, ops and plugins, and
+    respawns a fresh kernel, rebuilding the tensor client and ops, and
     the napari viewer where the session has one. All variables defined in
     previous execute_code calls are lost; a new viewer window replaces the old
     one.
@@ -1297,9 +1284,8 @@ async def server_status() -> str:
 
     Returns CPU/memory usage (this MCP process / host), kernel liveness, and —
     queried from the kernel — its biopb-mcp/python versions, dask scheduler info,
-    tensor server connectivity, viewer layer count, the available `ops`, and which
-    kernel plugins loaded. Use before heavy computation, and to resolve a
-    procedure doc's Requirements line.
+    tensor server connectivity, viewer layer count, and the available `ops`. Use
+    before heavy computation, and to resolve a procedure doc's Requirements line.
     """
     import psutil
 

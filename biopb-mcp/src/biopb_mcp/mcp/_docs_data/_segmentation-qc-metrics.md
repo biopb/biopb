@@ -4,13 +4,13 @@ description: Compare a segmentation to ground truth and report F1 at matched IoU
 
 # Score an instance segmentation against ground truth
 
-**Requirements:** somewhere to show the user an image ([[napari-viewer]] or [[web-viewer]]), an image from `client`, the `segmentation_qc` kernel plugin.
+**Requirements:** somewhere to show the user an image ([[napari-viewer]] or [[web-viewer]]), an image from `client`, the `segmentation_qc` op.
 
 > **Not listed by default.** Eight benchmark arms have run this subject and all
 > eight passed — three that read this body and used `segmentation_qc`, five that
 > never saw it and hand-rolled a matcher, agreeing to machine epsilon
 > (`f1_err` 1.1e-16 against a 0.01 limit). The only function it was demonstrably
-> performing was making the plugin discoverable, which `server_status` and
+> performing was making the op discoverable, which `server_status` and
 > `inspect_object` already do.
 >
 > **What that evidence does not cover**, and what would justify promoting this
@@ -70,12 +70,11 @@ measurement made from it.
    `server_status` — [[requirements]] covers a gap.
 
    `GT` and `PRED` come from either `viewer` or `client`. We need at least one of
-   the two. `plugin:segmentation_qc` is a kernel plugin, so `## Kernel plugins`
-   is what answers for it, and there is no degraded path. It is bound in the
-   namespace as the module `segmentation_qc`; its functions are called through
-   it.
+   the two. `segmentation_qc` is a bundled algorithm-plane op, so `## Ops` is
+   what answers for it, and there is no degraded path. It is called as
+   `ops.match_labels(...)` / `ops.f1_at_thresholds(...)`.
 
-   Do not reimplement the plugin:segmentation_qc unless directly requested by
+   Do not reimplement op:segmentation_qc unless directly requested by
    the user: greedy nearest-IoU matching disagrees with optimal assignment on
    exactly the crowded fields where the score matters.
 
@@ -89,7 +88,7 @@ measurement made from it.
    docstring is the documentation, and the parameters are not guessable:
 
    ```python
-   inspect_object("segmentation_qc")  # every callable, its signature, what each field means
+   inspect_object("ops.match_labels")  # signature, description, what each argument means
    ```
 
    Resolve `GT` and `PRED` the way [[napari-viewer]] describes. Both must come from
@@ -98,11 +97,13 @@ measurement made from it.
    which happened.
 
    ```python
-   m = segmentation_qc.match_labels(GT, PRED, iou_threshold=IOU_THRESHOLD,
-                                    exclude_border=EXCLUDE_BORDER)
-   print(f"F1={m.f1:.3f}  precision={m.precision:.3f}  recall={m.recall:.3f}")
-   print(f"TP={m.tp} FP={m.fp} FN={m.fn}  mean IoU over matches={m.mean_iou:.3f}")
-   print(f"splits={m.splits}  merges={m.merges}")
+   # More than one tensor argument means no positional shorthand -- gt/pred go
+   # by name too. The result is a dict, since a call crosses a process boundary.
+   m = ops.match_labels(gt=GT, pred=PRED, iou_threshold=IOU_THRESHOLD,
+                        exclude_border=EXCLUDE_BORDER)
+   print(f"F1={m['f1']:.3f}  precision={m['precision']:.3f}  recall={m['recall']:.3f}")
+   print(f"TP={m['tp']} FP={m['fp']} FN={m['fn']}  mean IoU over matches={m['mean_iou']:.3f}")
+   print(f"splits={m['splits']}  merges={m['merges']}")
    ```
 
    Read the three numbers as a diagnosis, and say which it is:
@@ -118,9 +119,10 @@ measurement made from it.
 4. **Sweep the threshold.**
 
    ```python
-   sweep = segmentation_qc.f1_at_thresholds(GT, PRED, thresholds=THRESHOLDS,
-                                            exclude_border=EXCLUDE_BORDER)
-   print(sweep.to_string(index=False))
+   import pandas as pd
+   sweep = ops.f1_at_thresholds(gt=GT, pred=PRED, thresholds=THRESHOLDS,
+                                exclude_border=EXCLUDE_BORDER)  # a dict of columns
+   print(pd.DataFrame(sweep).to_string(index=False))
    ```
 
 5. **Visual check** *(non-blocking)*. Put the disagreement on screen, not just
@@ -146,8 +148,8 @@ measurement made from it.
    ```python
    # layer names, or array_ids when the run came off the tensor server
    print({"gt": GT_REF, "pred": PRED_REF, "iou_threshold": IOU_THRESHOLD,
-          "exclude_border": EXCLUDE_BORDER, "n_gt": m.n_gt, "n_pred": m.n_pred,
-          "f1": round(m.f1, 4), "splits": m.splits, "merges": m.merges})
+          "exclude_border": EXCLUDE_BORDER, "n_gt": m["n_gt"], "n_pred": m["n_pred"],
+          "f1": round(m["f1"], 4), "splits": m["splits"], "merges": m["merges"]})
    ```
 
 ## Failure modes
@@ -156,7 +158,7 @@ measurement made from it.
 |---|---|---|
 | A verdict like "excellent, production-ready", or one model winning by "a decisive margin" | Quality bands invented to bridge the gap between a number and a decision | Quote F1@0.5, F1@0.8 and the split/merge counts; *good enough* is the user's call, not the scorer's (step 7). Expect the pull: 3 of 3 models asked this cold invented a band |
 | Precision and recall swapped versus expectation, while F1 looks right | `GT` and `PRED` passed in the wrong order. F1 is symmetric under the swap, so the headline number does not move and the split/merge diagnosis inverts silently | Step 2 exists to prevent this; re-run with them swapped and see if it resolves. Measured: precision and recall trade 0.80 ↔ 0.94 while F1 stays exact |
-| Metrics undefined / `nan` | One layer has no objects after border exclusion | Report "no objects to match" — not a score of 0, which reads as a bad model rather than an empty field. This is what the plugin returns by design, so the `nan` is the answer rather than a bug |
+| Metrics undefined / `nan` | One layer has no objects after border exclusion | Report "no objects to match" — not a score of 0, which reads as a bad model rather than an empty field. This is what the op returns by design, so the `nan` is the answer rather than a bug |
 
 ## Next steps
 

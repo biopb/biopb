@@ -317,7 +317,7 @@ def test_this_cases_fixture_reaches_a_viewer_and_its_results_come_back(bench_cas
     plane = _plane.running_plane() if ids else None
     with live_session(
         docs_enabled=True,
-        plugins=bench_case.plugins,
+        algorithms=bench_case.algorithms,
         tensor_url=plane.url if plane is not None else "",
     ) as session:
         load_fixture(session, bench_case, fixture, ids)

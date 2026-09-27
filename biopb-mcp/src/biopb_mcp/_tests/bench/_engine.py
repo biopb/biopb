@@ -688,7 +688,7 @@ def run_one(
     where = where_for(case) / result.name
     with live_session(
         docs_enabled=options.docs,
-        plugins=case.plugins,
+        algorithms=case.algorithms,
         tensor_url=plane.url if plane is not None else "",
     ) as session:
         # Read here rather than inferred from behaviour: `read_doc` stays

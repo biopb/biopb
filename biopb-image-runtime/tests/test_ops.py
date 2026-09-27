@@ -102,6 +102,16 @@ def greet(name: str) -> str:
     return f"hello {name}"
 
 
+@op
+def non_finite_result() -> dict:
+    return {"a_nan": float("nan"), "an_inf": float("inf"), "a_neg_inf": float("-inf")}
+
+
+@op
+def echo_kwarg(value: float = float("nan")):
+    return {"got": value}
+
+
 ALL = [
     label_stats,
     threshold,
@@ -114,6 +124,8 @@ ALL = [
     double,
     total,
     greet,
+    non_finite_result,
+    echo_kwarg,
 ]
 
 
@@ -186,6 +198,35 @@ def test_fingerprint_changes_with_the_ops():
     one = describe(_defs([greet, total])).fingerprint
     assert describe(_defs([total, greet])).fingerprint == one
     assert describe(_defs([greet])).fingerprint != one
+
+
+def test_non_finite_default_does_not_crash_describe():
+    # JSON has no literal for nan; `google.protobuf.Value` refuses to
+    # serialize one to JSON text at all, and `describe()`'s OpList is exactly
+    # what the control caches to disk as JSON -- so a nan/inf default must not
+    # raise building the schema.
+    from biopb_image_base.ops import NON_FINITE_FLOAT_KEY
+
+    info = describe(_defs([echo_kwarg])).ops[0]
+    assert dict(info.kwargs)["value"] == {NON_FINITE_FLOAT_KEY: "nan"}
+
+
+def test_non_finite_result_round_trips(server):
+    from biopb_image_base.ops import _undo_non_finite
+
+    (event,) = server.call("non_finite_result")
+    restored = _undo_non_finite(_value(event.outputs["result"]))
+    assert restored["a_nan"] != restored["a_nan"]  # nan != nan
+    assert restored["an_inf"] == float("inf")
+    assert restored["a_neg_inf"] == float("-inf")
+
+
+def test_non_finite_kwarg_is_restored_server_side(server):
+    from biopb_image_base.ops import NON_FINITE_FLOAT_KEY, _undo_non_finite
+
+    (event,) = server.call("echo_kwarg", value=_json({NON_FINITE_FLOAT_KEY: "inf"}))
+    restored = _undo_non_finite(_value(event.outputs["result"]))
+    assert restored["got"] == float("inf")
 
 
 def test_two_tensor_arguments_and_json_result(server):

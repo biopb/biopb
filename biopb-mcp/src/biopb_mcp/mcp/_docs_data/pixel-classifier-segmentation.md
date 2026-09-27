@@ -27,7 +27,7 @@ scribbles on one field. The output is a class per pixel.
 - **The user needs objects, not classes.** This labels pixels; touching cells
   come back as one component. Counting, per-object measurements and identity all
   need an instance step afterwards, measured in physical units and scored
-  against a hand-drawn truth with the `segmentation_qc` kernel plugin.
+  against a hand-drawn truth with the `segmentation_qc` op.
 - **The structures are what a published model was trained on** — nuclei, whole
   cells in a standard stain. A pretrained segmenter behind the algorithm plane
   will beat scribbles and needs no training data.
@@ -232,7 +232,7 @@ scribbles on one field. The output is a class per pixel.
 
 - Objects, counts and per-object measurements need an instance step on top of
   the class map, reported in physical units and scored against a hand-drawn
-  truth with the `segmentation_qc` kernel plugin.
+  truth with the `segmentation_qc` op.
 - More scribbles are worth more than more trees. The ceiling here is the
   annotation: with every true pixel of the field as training data the same
   features reach macro IoU **1.000** on it, and **0.818** on the second

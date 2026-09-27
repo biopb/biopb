@@ -1,5 +1,5 @@
 ---
-description: The kernel: namespace, plugins, long-running jobs, where computes run.
+description: The kernel: namespace, long-running jobs, where computes run.
 ---
 
 # biopb-mcp IPython Kernel Guide
@@ -12,8 +12,8 @@ like a notebook cell. Run a long compute you want to watch with `run_async(fn)`.
 
 ## Namespace
 
-Every session's namespace holds the **data plane** (`client`) and the **algorithm plane** (`ops`
-and the user's kernel plugin modules). A napari `viewer` is **optional**: it is there only when the user has configured one and this
+Every session's namespace holds the **data plane** (`client`) and the **algorithm plane** (`ops`).
+A napari `viewer` is **optional**: it is there only when the user has configured one and this
 machine can show it (the napari extra installed, a display). `server_status`'s `## Viewer` says
 whether this session has one, and why not when it does not. Do not assume it. The browser page
 the control serves ([[web-viewer]]) shows the user an image either way; the napari window
@@ -23,7 +23,6 @@ the control serves ([[web-viewer]]) shows the user an image either way; the napa
 |------|------|-------------|
 | `client` | TensorFlightClient or None | The data plane: browse and retrieve image data from the tensor server. Marshaled and thread-safe. |
 | `ops` | Ops | The algorithm plane: the ops of the algorithm servers this machine's control knows, by name or attribute (may be empty) |
-| *plugin modules* | module | The algorithm plane: the user's kernel plugins, one module each (see below) |
 | `np/da` | module | imported packages: numpy and dask.array |
 | `viewer` | napari.Viewer | **Only where the session has one.** `viewer.add_tensor(array_id)` puts a tensor on it; `viewer.tensor(layer)` reads one back as a plain dask array. Check `## Viewer` in `server_status` before relying on anything being *seen* — the object is bound even when its window is closed |
 
@@ -49,33 +48,6 @@ the control serves ([[web-viewer]]) shows the user an image either way; the napa
   `sklearn`, `matplotlib`, `cv2` (opencv-headless), `ome_zarr`. `napari` is
   installed where the session can have a viewer. The kernel is stateful, so one
   import per session is enough.
-
-## Kernel plugins
-
-**User plugins are the rest of the algorithm plane**: each `*.py` file in
-`~/.config/biopb/kernel/`, and each installed `biopb_mcp.namespace` package, is
-loaded at kernel start and bound as **one module, named after the file** —
-`rolling_ball.py` becomes `rolling_ball`, and its functions are called as
-`rolling_ball.subtract_background(...)`. They're lab-specific helpers, not
-built-ins, so an unfamiliar module is likely one of these.
-
-- **Which plugins loaded** — `server_status`, section `## Kernel plugins`. It
-  lists the files and the packages that actually loaded; the loader is fail-open
-  per unit, so a `*.py` sitting in that directory but missing from the report
-  failed on load and the session log says why. The section reads
-  `(disabled — services.namespace_enabled)` where plugins are switched off. The
-  name it reports is the name bound in the namespace.
-- **What a plugin offers** — introspection. `inspect_object` on the module prints
-  its docstring plus every public callable with its signature and summary line:
-
-```python
-[n for n in dir() if not n.startswith("_")]   # everything actually in scope
-inspect_object("rolling_ball")                 # the module: docstring + callables
-```
-
-A plugin function works inside `da.map_blocks` / `client.submit` like any other —
-plugin modules are registered for by-value pickling, so a dask worker does not
-need the plugin dir.
 
 ## Long-running jobs
 A slow `execute_code` call returns a `job-N` handle while the cell keeps running on the main

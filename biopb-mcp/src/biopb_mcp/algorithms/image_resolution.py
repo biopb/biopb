@@ -1,3 +1,7 @@
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["biopb-image-base", "scipy"]
+# ///
 """Image resolution in physical units: Fourier ring correlation (FRC) and decorrelation.
 
 Answers "how good is this image, in nanometres" — which is **not** the question a
@@ -29,10 +33,10 @@ decorrelation reports **0.11x**, worse than the 0.52x a naive random FRC split
 gives. Merging repeat blinks first does not rescue it (0.08x). Use ``frc`` on
 localizations, always.
 
-Delivered as a kernel plugin rather than as a snippet in a doc body for the same
-reason ``segmentation_qc`` is: the arithmetic is short but wrong in ways that are
-invisible in the output. Every one of these changes the reported number by tens of
-percent and none of them changes how the answer *looks*:
+Served as algorithm-plane ops rather than left as a snippet in a doc body for the
+same reason ``segmentation_qc`` is: the arithmetic is short but wrong in ways that
+are invisible in the output. Every one of these changes the reported number by
+tens of percent and none of them changes how the answer *looks*:
 
 - **Apodization is not cosmetic.** An unwindowed FFT sees the wrap-around edge
   discontinuity as a cross of power along the axes, and that cross is *identical*
@@ -40,7 +44,7 @@ percent and none of them changes how the answer *looks*:
   curve. Both estimators taper the edges before transforming.
 - **The threshold is part of the answer.** 1/7, the ½-bit curve and 3σ do not
   agree, so a resolution quoted without its criterion is not comparable to
-  anything. ``FRCResult`` carries ``threshold_name``; ``summary()`` prints it.
+  anything. The result carries ``threshold_name``.
 - **The sampling is a floor.** No method reports below twice the pixel (or render)
   size. A localization list rendered at 20 nm/px cannot resolve better than 40 nm
   no matter how precise the localizations are, and a run that renders coarsely
@@ -54,20 +58,16 @@ percent and none of them changes how the answer *looks*:
   density or anisotropic structure the number describes nowhere in particular.
   Tile the field and call this per tile if that is a risk.
 
-Four public callables plus their result records, reached through the module the
-agent gets bound (``image_resolution``): ``frc``, ``frc_from_localizations``,
-``split_localizations``, ``decorrelation_resolution``, and the ``FRCResult`` /
-``DecorrelationResult`` records they return.
+Four ops: ``frc``, ``decorrelation_resolution`` take 2-D images; ``split_localizations``
+and ``frc_from_localizations`` take 1-D localization lists (``Tensor("N")``).
+Results come back as a plain dict, since a call crosses a process boundary.
 """
 
-# Private aliases keep the module's own surface to its public API, so
-# `inspect_object("image_resolution")` shows the agent the callables rather than
-# every scipy handle this file imported. Style, not protection: as a kernel plugin
-# this module is bound under one name.
-from dataclasses import dataclass as _dataclass, field as _dc_field
+from dataclasses import dataclass, field
 
 import numpy as np
-import scipy.ndimage as _ndi
+import scipy.ndimage as ndi
+from biopb_image_base import Tensor, op, serve
 
 __all__ = [
     "frc",
@@ -103,7 +103,7 @@ _MIN_RING_SAMPLES = 64
 _HP_A = np.pi**2 / 2.0
 
 
-@_dataclass
+@dataclass
 class FRCResult:
     """One FRC measurement. Curves are indexed by ring, ring 0 being DC."""
 
@@ -114,15 +114,15 @@ class FRCResult:
     nyquist_resolution: float
     nyquist_limited: bool
     n_crossings: int
-    frequency: np.ndarray = _dc_field(repr=False)  # cycles per unit length
-    curve: np.ndarray = _dc_field(repr=False)  # raw FRC per ring
-    curve_smoothed: np.ndarray = _dc_field(repr=False)
-    threshold_curve: np.ndarray = _dc_field(repr=False)
-    ring_counts: np.ndarray = _dc_field(repr=False)
+    frequency: np.ndarray = field(repr=False)  # cycles per unit length
+    curve: np.ndarray = field(repr=False)  # raw FRC per ring
+    curve_smoothed: np.ndarray = field(repr=False)
+    threshold_curve: np.ndarray = field(repr=False)
+    ring_counts: np.ndarray = field(repr=False)
     shape: tuple = ()
     split: str = ""
-    label_nyquist: float = float("nan")
-    warnings: list = _dc_field(default_factory=list)
+    label_nyquist: float = 0.0
+    warnings: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         """Flat dict of the scalar fields, for logging or a results table."""
@@ -145,7 +145,7 @@ class FRCResult:
         return "\n".join([head] + [f"  ! {w}" for w in self.warnings])
 
 
-@_dataclass
+@dataclass
 class DecorrelationResult:
     """One decorrelation measurement (Descloux et al. 2019)."""
 
@@ -155,13 +155,13 @@ class DecorrelationResult:
     pixel_size: float
     nyquist_resolution: float
     nyquist_limited: bool
-    radii: np.ndarray = _dc_field(repr=False)  # normalized frequency grid
-    curves: np.ndarray = _dc_field(repr=False)  # (n_filters + 1, n_r)
-    filter_sigmas: np.ndarray = _dc_field(repr=False)  # real-space pixels; 0 == none
-    kc_per_filter: np.ndarray = _dc_field(repr=False)
-    amplitude_per_filter: np.ndarray = _dc_field(repr=False)
+    radii: np.ndarray = field(repr=False)  # normalized frequency grid
+    curves: np.ndarray = field(repr=False)  # (n_filters + 1, n_r)
+    filter_sigmas: np.ndarray = field(repr=False)  # real-space pixels; 0 == none
+    kc_per_filter: np.ndarray = field(repr=False)
+    amplitude_per_filter: np.ndarray = field(repr=False)
     shape: tuple = ()
-    warnings: list = _dc_field(default_factory=list)
+    warnings: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         """Flat dict of the scalar fields, for logging or a results table."""
@@ -314,16 +314,20 @@ def _first_crossing(curve: np.ndarray, thr: np.ndarray) -> tuple[float, int]:
     return float(r_u[j - 1] + t * (r_u[j] - r_u[j - 1])), n_cross, False
 
 
+@op(
+    description="Fourier ring correlation between two independent images of "
+    "the same field",
+    labels=["measurement"],
+)
 def frc(
-    image_a,
-    image_b,
-    *,
+    image_a: Tensor("YX"),
+    image_b: Tensor("YX"),
     pixel_size: float = 1.0,
     threshold: str = "1/7",
-    smooth: int | None = None,
+    smooth: int = 0,
     apodize: float = 0.25,
     split: str = "",
-    label_nyquist: float = float("nan"),
+    label_nyquist: float = 0.0,
 ) -> FRCResult:
     """Fourier ring correlation between two independent images of the same field.
 
@@ -343,16 +347,18 @@ def frc(
             convention; ``"half-bit"`` and ``"3sigma"`` tighten where rings are
             sparse. **Report which one you used** -- they do not agree.
         smooth: Boxcar width in rings applied before the crossing search (forced
-            odd; default ``max(3, n_rings // 20)``). The raw curve is returned too.
+            odd; 0 means ``max(3, min(9, n_rings // 40))``). The raw curve is
+            returned too.
         apodize: Tukey taper fraction (default 0.25). Set 0 only if the input is
             already windowed; an unwindowed FFT lifts the whole curve.
         split: Free-text label recorded in the result, used by
             ``frc_from_localizations`` to record how the halves were made.
-        label_nyquist: Optional density-imposed resolution floor to check against.
+        label_nyquist: Optional density-imposed resolution floor to check against;
+            0 (default) to skip the check.
 
     Returns:
-        An :class:`FRCResult`. Read ``.summary()`` before ``.resolution`` -- the
-        warnings are where a plausible-looking number turns out not to be one.
+        A dict (``FRCResult.to_dict()``). Read ``warnings`` before ``resolution``
+        -- that is where a plausible-looking number turns out not to be one.
     """
     a = _as_plane(image_a, "image_a")
     b = _as_plane(image_b, "image_b")
@@ -394,7 +400,7 @@ def frc(
     curve = np.nan_to_num(curve, nan=0.0, posinf=0.0, neginf=0.0)
     curve[0] = 1.0  # DC is zero by construction after mean subtraction
 
-    if smooth is None:
+    if not smooth:
         # Measured on a hard band limit: widths up to 5 move the crossing by under
         # 1%, 13 costs 3-9% and 21 costs 4-40%, worst where the crossing is at a
         # low ring and the boxcar spans a large fraction of the way to it. Cheap
@@ -407,7 +413,7 @@ def frc(
         # from ring 1 on, or that forced 1.0 leaks into the rings that decide the
         # crossing and holds the curve up over exactly the range it matters most.
         smoothed = curve.copy()
-        smoothed[1:] = _ndi.uniform_filter1d(curve[1:], smooth, mode="nearest")
+        smoothed[1:] = ndi.uniform_filter1d(curve[1:], smooth, mode="nearest")
     else:
         smoothed = curve.copy()
 
@@ -463,7 +469,7 @@ def frc(
             "was used. More than one crossing means the tail is noise -- raise "
             "`smooth`, or measure a larger field, before quoting this"
         )
-    if not np.isnan(label_nyquist) and resolution < label_nyquist:
+    if label_nyquist > 0 and resolution < label_nyquist:
         notes.append(
             f"reported resolution {resolution:.4g} is finer than the "
             f"{label_nyquist:.4g} set by emitter density averaged over the whole "
@@ -499,10 +505,13 @@ def frc(
 # --------------------------------------------------------------------------- #
 
 
+@op(
+    description="Boolean mask selecting the first of two halves of a localization list",
+    labels=["measurement"],
+)
 def split_localizations(
     n_loc: int,
-    frames=None,
-    *,
+    frames: Tensor("N"),
     split: str = "blocks",
     block_frames: int = 500,
     seed: int = 0,
@@ -526,11 +535,13 @@ def split_localizations(
     - ``"random"`` -- every localization independently to A or B. Best matched for
       drift and density, and **wrong for resolution**: repeated blinks of one
       molecule are split across the halves and correlate them. Offered for
-      comparison, not for reporting; it warns.
+      comparison, not for reporting; it warns. ``frames`` is unused in this mode
+      but still required -- pass the real frame index anyway.
 
     Args:
-        n_loc: Number of localizations.
-        frames: Per-localization frame index. Required for ``"blocks"``/``"halves"``.
+        n_loc: Number of localizations; must match ``frames``'s length.
+        frames: Per-localization frame index. Called as an op, a 1-D tensor
+            needs its axis named explicitly: ``dim_labels={"frames": "N"}``.
         split: One of ``"blocks"``, ``"halves"``, ``"random"``.
         block_frames: Frames per block for ``"blocks"``. Set it to a few times the
             typical molecular on-time, not to 1.
@@ -541,6 +552,12 @@ def split_localizations(
         warnings to carry into the result.
     """
     notes: list[str] = []
+    fr = np.asarray(frames, dtype=np.float64).ravel()
+    if fr.shape != (n_loc,):
+        raise ValueError(
+            f"frames must have one entry per localization; got {fr.shape} for "
+            f"{n_loc} localizations"
+        )
     if split == "random":
         rng = np.random.default_rng(seed)
         notes.append(
@@ -549,17 +566,6 @@ def split_localizations(
             "truth. Use split='blocks' for a number you intend to quote"
         )
         return rng.random(n_loc) < 0.5, notes
-    if frames is None:
-        raise ValueError(
-            f"split={split!r} needs a per-localization frame index; pass `frames`, "
-            "or use split='random' (not safe to quote -- see the docstring)"
-        )
-    fr = np.asarray(frames).ravel()
-    if fr.shape != (n_loc,):
-        raise ValueError(
-            f"frames must have one entry per localization; got {fr.shape} for "
-            f"{n_loc} localizations"
-        )
     if split == "halves":
         mid = 0.5 * (float(fr.min()) + float(fr.max()))
         notes.append(
@@ -583,18 +589,23 @@ def split_localizations(
     )
 
 
+@op(
+    description="Resolution of an SMLM reconstruction, from the localization list",
+    labels=["measurement"],
+)
 def frc_from_localizations(
-    x,
-    y,
-    frames=None,
-    *,
+    x: Tensor("N"),
+    y: Tensor("N"),
+    frames: Tensor("N"),
     render_pixel_size: float,
     split: str = "blocks",
     block_frames: int = 500,
     seed: int = 0,
-    n_emitters: int | None = None,
+    n_emitters: int = 0,
     extent=None,
-    **frc_kwargs,
+    threshold: str = "1/7",
+    smooth: int = 0,
+    apodize: float = 0.25,
 ) -> FRCResult:
     """Resolution of an SMLM reconstruction, from the localization list.
 
@@ -627,26 +638,29 @@ def frc_from_localizations(
     without ``n_emitters`` understates the floor by the square root of the mean
     blink count -- 3.5x at twelve blinks, which is the difference between a floor
     that catches an overclaim and one that waves it through. Pass ``n_emitters`` if
-    you have merged or linked the list; otherwise the result says the figure is
-    optimistic.
+    you have merged or linked the list; otherwise (0, the default) the result says
+    the figure is optimistic.
 
     Args:
         x, y: Localization coordinates, in physical units.
-        frames: Per-localization frame index. Required unless ``split="random"``.
+        frames: Per-localization frame index. Called as an op, each of these
+            1-D tensors needs its axis named explicitly:
+            ``dim_labels={"x": "N", "y": "N", "frames": "N"}``.
         render_pixel_size: Render bin size, in the units of ``x``/``y``. It sets a
             hard floor of twice itself on the answer -- pick it well below the
             resolution you expect, typically 5-10x finer.
         split, block_frames, seed: Passed to :func:`split_localizations`.
-        n_emitters: Number of distinct molecules, for the density floor. Defaults
-            to the localization count, which is optimistic for blinking data.
-        extent: ``(ymin, ymax, xmin, xmax)`` to render; default is a square
-            bounding box of the localizations. Squared by expanding the shorter
-            axis, so ``frc`` never has to centre-crop and discard data.
-        **frc_kwargs: Forwarded to :func:`frc` (``threshold``, ``smooth``,
-            ``apodize``).
+        n_emitters: Number of distinct molecules, for the density floor. 0 (the
+            default) falls back to the localization count, which is optimistic for
+            blinking data.
+        extent: ``[ymin, ymax, xmin, xmax]`` to render; ``None`` (default) is a
+            square bounding box of the localizations. Squared by expanding the
+            shorter axis, so ``frc`` never has to centre-crop and discard data.
+        threshold, smooth, apodize: Forwarded to :func:`frc`.
 
     Returns:
-        An :class:`FRCResult` with ``split`` and ``label_nyquist`` filled in.
+        A dict (``FRCResult.to_dict()``) with ``split`` and ``label_nyquist``
+        filled in.
     """
     x = np.asarray(x, dtype=np.float64).ravel()
     y = np.asarray(y, dtype=np.float64).ravel()
@@ -694,13 +708,11 @@ def frc_from_localizations(
     img_b, _, _ = np.histogram2d(y[~mask], x[~mask], bins=(yedges, xedges))
 
     area = (ymax - ymin) * (xmax - xmin)
-    n_independent = x.size if n_emitters is None else int(n_emitters)
+    n_independent = x.size if not n_emitters else int(n_emitters)
     label_nyquist = (
-        2.0 * np.sqrt(area / n_independent)
-        if area > 0 and n_independent > 0
-        else float("nan")
+        2.0 * np.sqrt(area / n_independent) if area > 0 and n_independent > 0 else 0.0
     )
-    if n_emitters is None:
+    if not n_emitters:
         notes.append(
             f"the {label_nyquist:.4g} density floor counts localizations, not "
             "molecules. If this list is un-merged blinking data the true floor is "
@@ -713,9 +725,11 @@ def frc_from_localizations(
         img_a,
         img_b,
         pixel_size=render_pixel_size,
+        threshold=threshold,
+        smooth=smooth,
+        apodize=apodize,
         split=split,
         label_nyquist=label_nyquist,
-        **frc_kwargs,
     )
     result.warnings = notes + result.warnings
     return result
@@ -766,9 +780,13 @@ def _local_max(d: np.ndarray) -> tuple[int, float]:
     return 0, float(d[0])
 
 
+@op(
+    description="Single-image resolution by decorrelation analysis "
+    "(Descloux et al. 2019)",
+    labels=["measurement"],
+)
 def decorrelation_resolution(
-    image,
-    *,
+    image: Tensor("YX"),
     pixel_size: float = 1.0,
     n_r: int = 50,
     n_filters: int = 10,
@@ -806,7 +824,7 @@ def decorrelation_resolution(
             and without this floor that peak would set the answer.
 
     Returns:
-        A :class:`DecorrelationResult`.
+        A dict (``DecorrelationResult.to_dict()``).
     """
     arr = _center_crop_square(_as_plane(image, "image"))
     n = arr.shape[0]
@@ -891,3 +909,7 @@ def decorrelation_resolution(
         shape=(n, n),
         warnings=notes,
     )
+
+
+if __name__ == "__main__":
+    serve()

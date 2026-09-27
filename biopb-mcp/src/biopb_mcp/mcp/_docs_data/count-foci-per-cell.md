@@ -218,5 +218,5 @@ Every row below was hit while measuring this; `scikit-image` 0.26, on fields of
   obtained.
 - If the parent labels came from a segmentation nobody has checked, the counts
   inherit its splits and merges directly: one merged pair of nuclei reads as one
-  cell with twice the foci. The `segmentation_qc` kernel plugin is how that gets
+  cell with twice the foci. The `segmentation_qc` op is how that gets
   scored — F1 at a matched IoU, with splits and merges counted separately.

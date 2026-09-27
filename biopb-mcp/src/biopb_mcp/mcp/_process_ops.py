@@ -19,6 +19,7 @@ without an event, and a Stop cancels it on the server.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import queue
 import re
@@ -83,11 +84,22 @@ def _sanitize_name(name: str) -> str:
     return re.sub(r"\W", "_", name) or "op"
 
 
+# The sentinel a non-finite float (nan/inf/-inf) is carried under -- JSON has
+# no literal for one, and `google.protobuf.Value` refuses to serialize one to
+# JSON text at all (`MessageToDict` raises), so an argument or a result that
+# legitimately is one would otherwise crash rather than lose precision. Mirrors
+# `biopb_image_base.ops.NON_FINITE_FLOAT_KEY`, on the server side of this same
+# wire protocol; not imported from there; the two sides share no Python code.
+_NON_FINITE_FLOAT_KEY = "__float__"
+
+
 def _jsonable(value: Any) -> Any:
+    if isinstance(value, float) and not math.isfinite(value):
+        return {_NON_FINITE_FLOAT_KEY: str(value)}
     if isinstance(value, np.generic):
-        return value.item()
+        return _jsonable(value.item())
     if isinstance(value, np.ndarray):
-        return value.tolist()
+        return _jsonable(value.tolist())
     if isinstance(value, dict):
         return {str(k): _jsonable(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
@@ -97,7 +109,10 @@ def _jsonable(value: Any) -> Any:
 
 def _from_json(value: Any) -> Any:
     """A JSON result with its integral numbers as ints: JSON has only doubles,
-    so a count the server sent as 6 arrives as 6.0."""
+    so a count the server sent as 6 arrives as 6.0. Also restores a
+    `_NON_FINITE_FLOAT_KEY`-carried nan/inf/-inf to a real float."""
+    if isinstance(value, dict) and set(value) == {_NON_FINITE_FLOAT_KEY}:
+        return float(value[_NON_FINITE_FLOAT_KEY])
     if isinstance(value, float) and value.is_integer():
         return int(value)
     if isinstance(value, list):

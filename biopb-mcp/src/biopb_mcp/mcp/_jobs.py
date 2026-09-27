@@ -58,26 +58,6 @@ _ip = None
 _jobs = {}  # a cell's request id, or a task's id -> _Job
 _lock = threading.RLock()
 
-# What the bootstrap binds into the kernel namespace. `_bootstrap` refuses to
-# let a user plugin shadow any of it (#92), and names it from here rather than
-# writing the list out twice. `_bootstrap` is the one that binds them, but
-# `_jobs` is the module it already imports, and a set defined in the importer
-# would make the dependency point the wrong way.
-KERNEL_HANDLE_NAMES = frozenset(
-    {
-        "viewer",
-        "client",
-        "np",
-        "da",
-        "ops",
-        "run_async",
-        "_conn",
-        "_jobs",
-        "_viewer_window_alive",
-        "_resync_view",
-    }
-)
-
 
 class _Cell:
     """A cell held for Stop (:func:`hold_cell`): all the kernel needs of it is

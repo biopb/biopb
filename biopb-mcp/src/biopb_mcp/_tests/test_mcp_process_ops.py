@@ -16,7 +16,12 @@ from biopb.tensor import SerializedTensor, TensorDescriptor
 from google.protobuf import json_format, struct_pb2
 
 from biopb_mcp.mcp import _process_ops
-from biopb_mcp.mcp._process_ops import Ops, _make_channel, _same_plane
+from biopb_mcp.mcp._process_ops import (
+    _NON_FINITE_FLOAT_KEY,
+    Ops,
+    _make_channel,
+    _same_plane,
+)
 
 PLANE = "grpc://127.0.0.1:8815"
 
@@ -96,6 +101,21 @@ class _Servicer(proto.OpsServicer):
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, "three channels expected")
         elif op == "count":
             yield proto.Event(outputs={"result": _json({"n": 6, "xs": [1, 2.5]})})
+        elif op == "nonfinite":
+            # What a real biopb_image_base server sends for a nan/inf result --
+            # JSON has no literal for one, so it is carried sentinel-encoded.
+            yield proto.Event(
+                outputs={
+                    "result": _json({"x": {_NON_FINITE_FLOAT_KEY: "nan"}, "ok": 1.5})
+                }
+            )
+        elif op == "echo_kwarg":
+            kwargs = {
+                k: json_format.MessageToDict(v.json)
+                for k, v in args.items()
+                if v.WhichOneof("kind") == "json"
+            }
+            yield proto.Event(outputs={"result": _json(kwargs)})
         elif op == "slow":
             context.add_callback(self.cancelled.set)
             while context.is_active():
@@ -139,6 +159,8 @@ OPS = [
     _info("slow", tensors=()),
     _info("refuse", tensors=()),
     _info("count", tensors=()),
+    _info("nonfinite", tensors=()),
+    _info("echo_kwarg", tensors=()),
 ]
 
 
@@ -295,6 +317,24 @@ def test_integral_json_numbers_are_ints(url_ops):
     result = url_ops.count()
     assert result == {"n": 6, "xs": [1, 2.5]}
     assert type(result["n"]) is int
+
+
+def test_non_finite_result_is_restored_not_left_sentinel_encoded(url_ops):
+    # JSON has no literal for nan, so the server carries it sentinel-encoded
+    # (see `_NON_FINITE_FLOAT_KEY`); the client must undo that, not hand the
+    # agent a `{"__float__": "nan"}` dict where it expected a float.
+    result = url_ops.nonfinite()
+    assert result["x"] != result["x"]  # nan
+    assert result["ok"] == 1.5
+
+
+def test_non_finite_kwarg_survives_the_round_trip(url_ops):
+    # The reverse leg: an agent passing nan/inf as an argument must not crash
+    # `json_format.ParseDict` building the call. `echo_kwarg` sends back
+    # whatever it decoded, sentinel-encoded again, which `_from_json` restores
+    # on the way back in -- so the value survives a full round trip unchanged.
+    result = url_ops.echo_kwarg(value=float("inf"))
+    assert result == {"value": float("inf")}
 
 
 def test_silence_times_out_and_cancels(serve):

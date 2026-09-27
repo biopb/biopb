@@ -443,18 +443,17 @@ _setup_mcp() {
 
     _seed_algorithm_registry "$CONFIG_DIR"
 
-    # Seed the built-in example kernel plugin(s) into ~/.config/biopb/kernel/ so
-    # they load into the agent kernel namespace at startup and are visible as a
-    # "bring your own tool" example (biopb/biopb-mcp#92). Delivered as a file
-    # there (not only an installed module) so it is user-visible/editable and
-    # loads via the robust startup-file path. Idempotent (never clobbers a
-    # user-edited file); best-effort so a failure never aborts the install.
+    # Seed the bundled correctness-critical algorithm-plane ops (segmentation
+    # QC, image resolution) into ~/.config/biopb/algorithms/ as script entries,
+    # so a procedure doc's op requirement is met without the agent re-deriving
+    # them. Idempotent (never clobbers a user-edited file); best-effort so a
+    # failure never aborts the install.
     local seed_cmd
-    seed_cmd=$(command -v biopb-mcp-seed-plugins 2>/dev/null || true)
+    seed_cmd=$(command -v biopb-mcp-seed-algorithms 2>/dev/null || true)
     if [ -n "$seed_cmd" ] && "$seed_cmd" >/dev/null 2>&1; then
-        _ok "Seeded example kernel plugins: $CONFIG_DIR/kernel/"
+        _ok "Seeded bundled algorithm ops: $CONFIG_DIR/algorithms/"
     else
-        _note "Skipped seeding example kernel plugins (add later: biopb-mcp-seed-plugins)"
+        _note "Skipped seeding bundled algorithm ops (add later: biopb-mcp-seed-algorithms)"
     fi
 
     # Canonical standalone definition (standard mcpServers JSON; most clients
