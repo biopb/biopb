@@ -11,8 +11,7 @@ vite build-time `--base`; the SPA learns it at runtime.
 
 ```
 biopb control start --url-prefix /node/$host/$port     # or BIOPB_URL_PREFIX
-biopb control run   --url-prefix /node/$host/$port
-python -m biopb_control run --url-prefix /node/$host/$port ...
+biopb-control run --url-prefix /node/$host/$port ...
 ```
 
 `normalize_url_prefix` normalizes: one leading slash, no trailing slash, empty
@@ -24,8 +23,8 @@ URL on the page.
 
 It must be a path: `normalize_url_prefix` rejects a segment containing `\`,
 tab, newline, space, `?`, `#`, `%`, `:`, or equal to `.`/`..`, and every entry
-point (`biopb control start`/`run`, `python -m biopb_control run`) exits 2
-naming the offending segment. This matters because a `<base href>` is HTML: a
+point (`biopb control start`, `biopb-control run`) exits 2 naming the offending
+segment. This matters because a `<base href>` is HTML: a
 stray backslash after the leading slash parses into the authority
 (`<base href="/\evil.com/">` resolves to `http://evil.com/`), and
 `%`/`:`/`.`/`..` would each let the served page and the path the middleware

@@ -1597,93 +1597,41 @@ def control_logs(
 
 
 @control_app.command(
-    "run", help="Run the control plane in the foreground (Ctrl-C to stop)."
+    "run",
+    help="Removed -- use `biopb control start`, or `biopb-control run` for a "
+    "true foreground process.",
 )
-def control_run(
-    config: Path = _OPT_CONFIG,
-    static_dir: Optional[Path] = _OPT_STATIC_DIR,
-    base_port: int = _OPT_BASE_PORT,
-    log_level: str = _OPT_LOG_LEVEL,
-    grpc_bind: Optional[str] = _OPT_GRPC_BIND,
-    tls: Optional[bool] = _OPT_TLS,
-    tls_cert: Optional[Path] = _OPT_TLS_CERT,
-    tls_key: Optional[Path] = _OPT_TLS_KEY,
-    san: Optional[List[str]] = _OPT_SAN,
-    token: Optional[str] = _OPT_TOKEN,
-    data_plane: bool = _OPT_DATA_PLANE,
-    url_prefix: Optional[str] = _OPT_URL_PREFIX,
-    remote: bool = typer.Option(
-        False,
-        "--remote",
-        hidden=True,
-        help="Deprecated alias for --grpc-bind 0.0.0.0.",
-    ),
-):
-    """Run the control plane in the foreground (Ctrl-C to stop).
+def control_run() -> None:
+    """Removed (biopb/biopb#736).
 
-    The foreground counterpart of `biopb control start`, and the *same*
-    deployment: identical flags, identical binds, identical port derivation from
-    ``--base-port``. Only process ownership differs — no PID file, blocks this
-    terminal, tears everything down on Ctrl-C. Useful for a systemd/launchd unit
-    (let the service manager own the process) or for debugging supervision.
+    This command built a ``DataPlaneSpec`` and called ``run_control()``
+    in-process, which bypassed the fail-closed guard on a public
+    ``--control-host`` that ``biopb-control run``/``python -m biopb_control
+    run`` (``biopb_control/__main__.py``) already enforces -- the same guard
+    `biopb control start` goes through as a matter of course, since it spawns
+    exactly that entry point as its child. Retiring the duplicate closes the
+    gap for good rather than keeping a second copy of the same check in sync
+    by hand.
 
-    It still publishes where it listens, so `status` / `logs` and biopb-mcp find
-    a foreground control exactly as they find a daemonized one. `biopb control
-    stop` does not reach it, by design: the pid file is the daemon's lifecycle
-    record and this process belongs to your terminal or your service manager.
-    See `biopb control start` for the bind / token / TLS model.
+    For the same deployment with the same defaults, use `biopb control start`.
+    A true foreground process (a systemd/launchd unit, an Open OnDemand app,
+    debugging supervision) runs `biopb-control run` directly -- but unlike this
+    command, it fills in none of the defaults `--config`/`--static-dir` used to
+    resolve on their own, and every other setting individually rather than
+    deriving them from ``--base-port``; see `biopb-control run --help`.
     """
-    _require_biopb_control()
-    grpc_bind = _resolve_grpc_bind(grpc_bind, remote)
-    url_prefix = _resolve_url_prefix(url_prefix)
-    tls = _resolve_tls_material(_resolve_tls(tls, grpc_bind), tls_cert, tls_key)
-    # A BYO cert is read straight off disk, so it is the escape hatch when the
-    # extra is not installed -- only a cert the plane has to *mint* needs it.
-    if tls and tls_cert is None:
-        _require_tls_extra()
-    _warn_public_plaintext(grpc_bind, tls)
-    _ensure_dirs()
-    from biopb_control import run_control
-    from biopb_control._supervisor import DataPlaneSpec
-
-    grpc_host, grpc_port = _plane_bind(grpc_bind, base_port)
-    control_host, control_port = _control_bind_endpoint(base_port)
-    # The same pre-flight `start` does. It used to be missing here, so a busy port
-    # surfaced as uvicorn's bind traceback instead of a message naming the port.
-    _guard_ports_free(base_port, grpc_bind, data_plane)
-    resolved_token = _resolve_mode(grpc_bind, token)
-    console.print(f"  Control: http://{control_host}:{control_port}")
-    if data_plane:
-        console.print(f"  Data plane: {_flight_location(grpc_bind, base_port, tls)}")
-    # Only the flight plane is ever published; the control and the sidecar stay on
-    # loopback either way (biopb/biopb#614), so point the user at the tunnel.
-    if _web_auth.host_is_public_bind(grpc_bind):
-        _print_ui_tunnel_hint(control_port)
-    spec = DataPlaneSpec(
-        config=config,
-        grpc_host=grpc_host,
-        grpc_port=grpc_port,
-        tls=tls,
-        tls_cert=tls_cert,
-        tls_key=tls_key,
-        sans=tuple(san or ()),
-        web_host="127.0.0.1",
-        web_port=_sidecar_port(base_port),
-        static_dir=static_dir if (static_dir and static_dir.exists()) else None,
-        log_level=log_level,
-        server_log=_get_log_file(),
-        token=resolved_token,
-        url_prefix=url_prefix,
+    console.print(
+        "[red]`biopb control run` has been removed (biopb/biopb#736).[/red]\n"
+        "For the same deployment with the same defaults, use [bold]biopb "
+        "control start[/bold].\n"
+        "For a true foreground process, use [bold]biopb-control run[/bold] "
+        "(or `python -m biopb_control run` if that script isn't on PATH) -- "
+        "but note it fills in none of this command's defaults: `--config` and "
+        "`--static-dir` must both be passed explicitly, and every other "
+        "setting individually rather than derived from --base-port. See "
+        "`biopb-control run --help`."
     )
-    code = run_control(
-        spec,
-        control_host=control_host,
-        control_port=control_port,
-        data_plane=data_plane,
-        win_sentinel=_control_shutdown_sentinel(),
-        log_level=log_level,
-    )
-    raise typer.Exit(code)
+    raise typer.Exit(2)
 
 
 app.add_typer(control_app, name="control")

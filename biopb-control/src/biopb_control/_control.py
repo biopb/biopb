@@ -299,7 +299,7 @@ def normalize_url_prefix(value: str | None) -> str | None:
     One leading slash, no trailing slash, empty segments dropped; ``None``,
     ``""`` and ``"/"`` all mean "serve at the root". Applied by
     :func:`build_app` — the single consumer — so every entry point (``python -m
-    biopb_control run``, the foreground CLI, tests) normalizes by the same rule.
+    biopb_control run``, tests) normalizes by the same rule.
 
     Raises :class:`ValueError` for anything that is not a plain same-origin path
     (see :data:`_SAFE_PREFIX_SEGMENT`, and ``.``/``..``, which would make the
