@@ -361,11 +361,11 @@ def _dask_from_flight_info(
 def _explain_handshake_failure(
     exc: flight.FlightUnavailableError, location: str, trust: Optional[TlsTrust]
 ) -> flight.FlightUnavailableError:
-    """*exc*, with the reason gRPC keeps to its own log added when it is a TLS
-    handshake failure that does not already carry one (biopb/biopb#1116; some
-    gRPC builds put ``SSL_ERROR_SSL: ... certificate verify failed`` in the
-    message, others only in the log). The same type, so a caller catching
-    ``FlightUnavailableError`` still does."""
+    """*exc* with the TLS reason added, for a handshake failure that lacks one.
+
+    Some gRPC builds keep the reason to their own log. The same exception type,
+    so a caller catching ``FlightUnavailableError`` still does.
+    """
     message = str(exc).lower()
     if trust is None or "handshake" not in message or "ssl_error_ssl" in message:
         return exc

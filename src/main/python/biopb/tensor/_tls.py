@@ -253,10 +253,9 @@ _fingerprint = _tls_material.fingerprint
 
 
 def _probe_peer(
-    host: str, port: int, pem: Optional[bytes], *, check_hostname: bool
+    host: str, port: int, pem: bytes, *, check_hostname: bool
 ) -> Tuple[dict, bytes]:
-    """Handshake against *host:port* trusting only *pem* (the system store when
-    ``None``); return the peer cert.
+    """Handshake against *host:port* trusting only *pem*; return the peer cert.
 
     Returns ``(getpeercert() dict, DER bytes)``. The chain is always verified
     (``CERT_REQUIRED`` against *pem* alone); *check_hostname* selects whether the
@@ -267,10 +266,7 @@ def _probe_peer(
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.check_hostname = check_hostname
     ctx.verify_mode = ssl.CERT_REQUIRED
-    if pem:
-        ctx.load_verify_locations(cadata=pem.decode("ascii"))
-    else:
-        ctx.load_default_certs()
+    ctx.load_verify_locations(cadata=pem.decode("ascii"))
     with socket.create_connection((host, port), timeout=_FETCH_TIMEOUT_S) as sock:
         with ctx.wrap_socket(sock, server_hostname=host) as ssock:
             return ssock.getpeercert() or {}, ssock.getpeercert(binary_form=True) or b""
@@ -320,6 +316,14 @@ def _remediation(host: str, port: int, mode: str) -> str:
     return "then replace the configured CA certificate"
 
 
+def _expired_message(host: str, port: int, mode: str) -> str:
+    return (
+        f"The TLS certificate for {host}:{port} has expired. Re-mint the server's "
+        f"certificate (`biopb-tensor-server cert init --force`) and "
+        f"{_remediation(host, port, mode)}."
+    )
+
+
 def _raise_if_expired(host: str, port: int, exc: Exception, *, tofu: bool) -> None:
     """Re-raise an OpenSSL "certificate has expired" verdict as an actionable error.
 
@@ -331,12 +335,8 @@ def _raise_if_expired(host: str, port: int, exc: Exception, *, tofu: bool) -> No
     """
     if getattr(exc, "verify_code", None) != _VERIFY_CODE_EXPIRED:
         return
-    remediation = _remediation(host, port, "tofu" if tofu else "fingerprint")
     raise TlsCertExpiredError(
-        f"The TLS certificate for {host}:{port} has expired. Pinning it does not "
-        f"exempt it from expiry -- the handshake is refused, and the transport "
-        f"reports only a generic connection failure. Re-mint the server's "
-        f"certificate (`biopb-tensor-server cert init --force`) and {remediation}."
+        _expired_message(host, port, "tofu" if tofu else "fingerprint")
     ) from exc
 
 
@@ -386,7 +386,7 @@ def _cert_not_after(der: bytes) -> Optional[float]:
         return None
 
 
-def _not_after(pem: bytes) -> Optional[float]:
+def cert_not_after(pem: bytes) -> Optional[float]:
     """The earliest ``notAfter`` among the certificates in *pem* (a bundle is
     only as good as its first member to expire), or ``None`` if none reads."""
     dates = []
@@ -399,6 +399,11 @@ def _not_after(pem: bytes) -> Optional[float]:
         if not_after is not None:
             dates.append(not_after)
     return min(dates) if dates else None
+
+
+def format_expiry_date(not_after: float) -> str:
+    """*not_after* (epoch seconds) as a UTC day, for a message a person reads."""
+    return time.strftime("%Y-%m-%d", time.gmtime(not_after))
 
 
 def _check_anchor_expiry(
@@ -416,17 +421,12 @@ def _check_anchor_expiry(
     """
     if mode == "ca" and len(_PEM_CERT.findall(pem)) != 1:
         return
-    not_after = _not_after(pem)
+    not_after = cert_not_after(pem)
     if not_after is None:
         return
     remaining = not_after - (time.time() if now is None else now)
-    remediation = _remediation(host, port, mode)
     if remaining <= 0:
-        raise TlsCertExpiredError(
-            f"The TLS certificate for {host}:{port} has expired. Re-mint the "
-            f"server's certificate (`biopb-tensor-server cert init --force`) "
-            f"and {remediation}."
-        )
+        raise TlsCertExpiredError(_expired_message(host, port, mode))
     if remaining < _EXPIRY_WARN_S:
         logger.warning(
             "The TLS certificate for %s:%s expires in %d days (%s). It will need "
@@ -434,8 +434,8 @@ def _check_anchor_expiry(
             host,
             port,
             remaining // 86400,
-            time.strftime("%Y-%m-%d", time.gmtime(not_after)),
-            remediation,
+            format_expiry_date(not_after),
+            _remediation(host, port, mode),
         )
 
 
@@ -450,7 +450,7 @@ def handshake_failure_reason(location: str, trust: TlsTrust) -> Optional[str]:
     and this would report a mismatch it does not have.
     """
     hp = _host_port(location)
-    if hp is None:
+    if hp is None or not trust.root_certs:
         return None
     host, port = hp
     try:
@@ -708,21 +708,18 @@ def resolve_tls_trust(
 
     override: Optional[str] = None
     if ca_pem:
-        resolved = ca_pem
+        mode, resolved = "ca", ca_pem
     else:
         if fingerprint:
+            mode = "fingerprint"
             resolved = _resolve_against_fingerprint(host, port, fingerprint)
         else:
+            mode = "tofu"
             resolved = _resolve_uncached(host, port, key)
         override = _resolve_hostname_override(
             host, port, resolved, tofu=not fingerprint
         )
-    _check_anchor_expiry(
-        host,
-        port,
-        resolved,
-        "ca" if ca_pem else "fingerprint" if fingerprint else "tofu",
-    )
+    _check_anchor_expiry(host, port, resolved, mode)
 
     trust = TlsTrust(resolved, override, key_id)
     with _memo_lock:

@@ -46,7 +46,7 @@ from biopb.tensor._roi_rows import (
     table_to_rois,
 )
 from biopb.tensor._session import split_array_id
-from biopb.tensor._tls import _not_after as _cert_not_after
+from biopb.tensor._tls import cert_not_after
 from biopb.tensor._wire_version import FLIGHT_PROTOCOL_VERSION
 from biopb.tensor.descriptor_pb2 import (
     AddSourceProgress,
@@ -503,7 +503,7 @@ class TensorFlightServer(flight.FlightServerBase):
         if tls_cert_chain is not None:
             location = _ensure_tls_scheme(location)
             kwargs["tls_certificates"] = [(tls_cert_chain, tls_private_key)]
-            self._tls_not_after = _cert_not_after(tls_cert_chain)
+            self._tls_not_after = cert_not_after(tls_cert_chain)
 
         # Apply gRPC max message size via URL query parameter
         if grpc_max_message_size:

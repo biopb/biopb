@@ -381,10 +381,9 @@ class _SidecarContext:
             return self._client_holder["client"]
 
     def reset_client(self) -> None:
-        """Forget the cached client, so the next ``get_client()`` builds a new one.
+        """Forget the cached client so the next ``get_client()`` builds a new one.
 
-        The reference is dropped, not the client closed: another request may be
-        mid-call on it, and it goes away with its last user.
+        Dropped, not closed: another request may be mid-call on it.
         """
         with self._client_lock:
             self._client_holder["client"] = None
@@ -420,10 +419,8 @@ class _SidecarContext:
             return client.health_check(), None
         except Exception as exc:
             logger.warning(f"Backend health check failed: {exc}")
-            # A client that has failed a health check may be holding what made it
-            # fail (an anchor for a certificate since replaced, a wedged channel);
-            # the next probe starts clean, so recovery needs no restart
-            # (biopb/biopb#1116).
+            # Retry on a fresh client. A rotated TOFU/CA anchor still needs its
+            # re-pin: trust resolution is memoized per process.
             self.reset_client()
             return None, f"health check failed: {exc}"
 

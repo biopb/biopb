@@ -564,14 +564,10 @@ def _grpc_location(host: str, port: int) -> str:
 
 def _cert_expiry_date(cert_pem: bytes) -> str:
     """The day the certificate runs out (UTC), for the rows a cert command prints."""
-    import time
+    from biopb.tensor._tls import cert_not_after, format_expiry_date
 
-    from biopb.tensor._tls import _not_after
-
-    not_after = _not_after(cert_pem)
-    if not_after is None:
-        return "unknown"
-    return time.strftime("%Y-%m-%d", time.gmtime(not_after))
+    not_after = cert_not_after(cert_pem)
+    return "unknown" if not_after is None else format_expiry_date(not_after)
 
 
 def _warn_if_expiring(cert_pem: bytes) -> None:

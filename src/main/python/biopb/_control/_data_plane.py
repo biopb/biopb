@@ -17,11 +17,9 @@ deliberately routed around the control, and quietly attaching this machine's
 credential to that dial would send a local secret somewhere it was never issued
 for. Those endpoints carry an explicit token or none.
 
-**So does the TLS anchor.** A plane the control named is identified by the
-certificate record it published; an address that bypassed the control is trusted
-as ``$BIOPB_TENSOR_TLS_CA`` or ``$BIOPB_TENSOR_TLS_FINGERPRINT`` say, else on
-first use. This module and :class:`biopb.tensor.Connection` are the two places a
-plane is dialed, and both ask :func:`data_plane_trust`.
+**So does the TLS anchor**: a control-named plane is trusted by the certificate
+record it published, any other address as ``$BIOPB_TENSOR_TLS_CA`` /
+``$BIOPB_TENSOR_TLS_FINGERPRINT`` say, else on first use (:func:`data_plane_trust`).
 """
 
 from __future__ import annotations
@@ -303,6 +301,9 @@ class TlsAnchor:
     ca_pem: Optional[bytes] = None
     fingerprint: Optional[str] = None
 
+    def __bool__(self) -> bool:
+        return bool(self.ca_pem or self.fingerprint)
+
 
 def configured_tls_anchor() -> TlsAnchor:
     """The anchor the environment names: ``$BIOPB_TENSOR_TLS_CA`` (a PEM file) or
@@ -347,7 +348,7 @@ def data_plane_trust(url: str, origin: str) -> TlsAnchor:
     """
     if origin != "control":
         configured = configured_tls_anchor()
-        if configured.ca_pem or configured.fingerprint:
+        if configured:
             return configured
     return TlsAnchor(fingerprint=local_data_plane_fingerprint(url))
 

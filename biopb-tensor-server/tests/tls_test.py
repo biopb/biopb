@@ -269,7 +269,9 @@ def test_health_reports_when_the_certificate_expires():
         expires = datetime.datetime.strptime(
             health["tls_not_after"], "%Y-%m-%dT%H:%M:%SZ"
         )
-        remaining = expires - datetime.datetime.utcnow()
+        remaining = expires - datetime.datetime.now(datetime.timezone.utc).replace(
+            tzinfo=None
+        )
         assert datetime.timedelta(days=89) < remaining < datetime.timedelta(days=91)
         assert "tls_not_after" not in _health(location=f"grpc://localhost:{plain.port}")
     finally:

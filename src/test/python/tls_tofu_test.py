@@ -15,10 +15,13 @@ collects it, so the two certs below are static fixtures instead: throwaway
 self-signed leaves generated once, valid 2020-2120, never used by anything real.
 """
 
+import calendar
 import ssl
 
+import pyarrow.flight as flight
 import pytest
-from biopb.tensor import _tls
+from biopb.tensor import _session, _tls
+from biopb.tensor.client import TensorFlightClient
 
 # Two distinct self-signed certs. Only their *bytes* matter to these tests -- the
 # code under test fingerprints the DER and compares, and never validates a chain.
@@ -558,13 +561,11 @@ def _cert_ending(tag: int, text: str, *, versioned: bool = True) -> bytes:
 
 
 def _epoch(*ymdhms: int) -> float:
-    import calendar
-
     return float(calendar.timegm(ymdhms))
 
 
 def test_not_after_reads_a_generalized_time():
-    assert _tls._not_after(CERT_A) == _epoch(2120, 1, 1, 0, 0, 0)
+    assert _tls.cert_not_after(CERT_A) == _epoch(2120, 1, 1, 0, 0, 0)
 
 
 @pytest.mark.parametrize(
@@ -577,12 +578,12 @@ def test_not_after_reads_a_generalized_time():
     ],
 )
 def test_not_after_reads_both_time_encodings(tag, text, versioned, expected):
-    assert _tls._not_after(_cert_ending(tag, text, versioned=versioned)) == expected
+    assert _tls.cert_not_after(_cert_ending(tag, text, versioned=versioned)) == expected
 
 
 def test_not_after_of_a_bundle_is_its_earliest():
     soon = _cert_ending(0x17, "300615120000Z")
-    assert _tls._not_after(CERT_A + soon) == _epoch(2030, 6, 15, 12, 0, 0)
+    assert _tls.cert_not_after(CERT_A + soon) == _epoch(2030, 6, 15, 12, 0, 0)
 
 
 @pytest.mark.parametrize(
@@ -594,7 +595,7 @@ def test_not_after_of_a_bundle_is_its_earliest():
     ],
 )
 def test_not_after_of_unreadable_input_is_none(junk):
-    assert _tls._not_after(junk) is None
+    assert _tls.cert_not_after(junk) is None
 
 
 def test_an_anchor_near_expiry_warns_once_per_connection(monkeypatch, caplog):
@@ -617,20 +618,23 @@ def test_an_anchor_with_time_to_spare_is_silent(monkeypatch, caplog):
     assert not [r for r in caplog.records if "expires" in r.getMessage()]
 
 
-def test_an_expired_pinned_anchor_is_refused(monkeypatch):
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({}, "clear the"),  # TOFU
+        ({"fingerprint": True}, "configured TLS fingerprint"),
+    ],
+)
+def test_an_expired_fetched_anchor_is_refused(monkeypatch, kwargs, match):
     expired = _cert_ending(0x17, "200101000000Z")
     monkeypatch.setattr(_tls, "_fetch_server_cert", lambda host, port: expired)
-    with pytest.raises(_tls.TlsCertExpiredError, match="has expired"):
-        _tls.resolve_tls_trust("grpc+tls://host:8815")
-
-
-def test_an_expired_fingerprint_anchor_is_refused(monkeypatch):
-    expired = _cert_ending(0x17, "200101000000Z")
-    monkeypatch.setattr(_tls, "_fetch_server_cert", lambda host, port: expired)
-    with pytest.raises(_tls.TlsCertExpiredError, match="configured TLS fingerprint"):
-        _tls.resolve_tls_trust(
-            "grpc+tls://host:8815", expected_fingerprint=_tls._fingerprint(expired)
-        )
+    extra = (
+        {"expected_fingerprint": _tls._fingerprint(expired)}
+        if kwargs.get("fingerprint")
+        else {}
+    )
+    with pytest.raises(_tls.TlsCertExpiredError, match=match):
+        _tls.resolve_tls_trust("grpc+tls://host:8815", **extra)
 
 
 def test_an_expired_configured_ca_is_refused_offline(monkeypatch):
@@ -709,20 +713,10 @@ class TestExplainHandshakeFailure:
     OPAQUE = "failed to connect to all addresses; last error: Ssl handshake failed"
 
     def _explain(self, message, trust):
-        import pyarrow.flight as flight
-        from biopb.tensor import _session
-
         exc = flight.FlightUnavailableError(message)
         return exc, _session._explain_handshake_failure(exc, self.LOC, trust)
 
     def test_a_handshake_failure_gets_the_reason(self, monkeypatch):
-        import pyarrow.flight as flight
-
-        monkeypatch.setattr(
-            _tls, "handshake_failure_reason", lambda loc, trust: "expired, sorry"
-        )
-        from biopb.tensor import _session
-
         monkeypatch.setattr(
             _session, "handshake_failure_reason", lambda loc, trust: "expired, sorry"
         )
@@ -735,10 +729,6 @@ class TestExplainHandshakeFailure:
     def test_health_check_explains_an_opaque_failure(self, monkeypatch):
         # health_check is what Connection and the sidecar call first, and it
         # talks to the raw client, so it needs the explanation itself.
-        import pyarrow.flight as flight
-        from biopb.tensor import _session
-        from biopb.tensor.client import TensorFlightClient
-
         class Refusing:
             def do_action(self, action, options=None):
                 raise flight.FlightUnavailableError(TestExplainHandshakeFailure.OPAQUE)
@@ -756,8 +746,6 @@ class TestExplainHandshakeFailure:
             client.health_check()
 
     def test_another_unavailable_error_is_left_alone(self, monkeypatch):
-        from biopb.tensor import _session
-
         def boom(loc, trust):
             raise AssertionError("no handshake was involved")
 
@@ -766,8 +754,6 @@ class TestExplainHandshakeFailure:
         assert explained is original
 
     def test_a_message_that_already_says_why_is_left_alone(self, monkeypatch):
-        from biopb.tensor import _session
-
         def boom(loc, trust):
             raise AssertionError("the reason is already in the message")
 
@@ -780,8 +766,6 @@ class TestExplainHandshakeFailure:
         assert explained is original
 
     def test_no_reason_means_the_original_error(self, monkeypatch):
-        from biopb.tensor import _session
-
         monkeypatch.setattr(
             _session, "handshake_failure_reason", lambda loc, trust: None
         )

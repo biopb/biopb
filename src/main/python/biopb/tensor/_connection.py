@@ -28,7 +28,7 @@ from biopb import (
     ensure_data_plane,
     resolve_data_plane_token,
 )
-from biopb._control._data_plane import data_plane_trust
+from biopb._control import data_plane_trust
 
 from .client import TensorFlightClient
 
