@@ -139,6 +139,8 @@ model are in `README.md`; the architectural notes that aren't there:
   wrong picture that looks like a right one. Play paces on both layers for the
   same reason: on the image alone, a set whose read is slower never catches up. See
   `../biopb-tensor-server/docs/label-tensors.md`.
+- **Image viewer.** Component ownership, store lifetimes, tensor identity and the
+  viewer → store publish-back channels: `docs/viewer-architecture.md`.
 - **Pages** (`packages/app/src/pages/`): `DashboardPage`, the dataviewer
   (`HomePage` / `ViewerLayout`), `AdminPage`, `McpAdminPage`, `UnlockPage`,
   `ObservePage` — wired to routes in `main.tsx` (see `README.md` for the
