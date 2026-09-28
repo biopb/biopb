@@ -63,10 +63,11 @@ def _run_serve(config, **overrides):
         "config": config,
         "log_level": None,
         "log_scope_biopb": None,
-        "host": None,
-        "port": None,
+        "host": cli.DEFAULT_FLIGHT_HOST,
+        "port": cli.DEFAULT_FLIGHT_PORT,
         "writable": None,
         "token": None,
+        "external_location": None,
         "tls": None,
         "tls_cert": None,
         "tls_key": None,
@@ -87,12 +88,13 @@ def _run_launch(config, **overrides):
         "config": config,
         "log_level": None,
         "log_scope_biopb": None,
-        "host": None,
-        "port": None,
+        "host": cli.DEFAULT_FLIGHT_HOST,
+        "port": cli.DEFAULT_FLIGHT_PORT,
         "writable": None,
         "web_port": 8816,
         "web_host": "127.0.0.1",
         "token": None,
+        "external_location": None,
         "tls": None,
         "tls_cert": None,
         "tls_key": None,
@@ -317,7 +319,13 @@ def test_launch_forwards_flight_overrides_and_resolves_token_against_host(
         lambda **kwargs: captured.update(sidecar_token=kwargs.get("token")),
     )
 
-    _run_launch(Path("unused.json"), host="0.0.0.0", port=9001, writable=True)
+    _run_launch(
+        Path("unused.json"),
+        host="0.0.0.0",
+        port=9001,
+        writable=True,
+        external_location="grpc://real-host:9001",
+    )
 
     # Overrides reached the flight server...
     assert captured["host"] == "0.0.0.0"
@@ -328,6 +336,26 @@ def test_launch_forwards_flight_overrides_and_resolves_token_against_host(
     tok = captured["token"]
     assert tok and cli._web_auth.valid_token(tok)
     assert captured["sidecar_token"] == tok
+
+
+def test_launch_forwards_external_location_to_the_flight_server(monkeypatch):
+    """biopb/biopb#1158: a supplied --external-location reaches
+    _setup_flight_server (and from there TensorFlightServer) unchanged."""
+    captured = _patched_launch_internals(monkeypatch)
+
+    _run_launch(Path("unused.json"), external_location="grpc://real-host:8815")
+
+    assert captured["external_location"] == "grpc://real-host:8815"
+
+
+def test_launch_refuses_a_public_bind_with_no_external_location(monkeypatch):
+    """biopb/biopb#1158: mirrors the embedded cache's own required-on-public-bind
+    rule -- there is no way to guess a reachable address for a wildcard bind."""
+    _patched_launch_internals(monkeypatch)
+
+    with pytest.raises(typer.Exit) as exc:
+        _run_launch(Path("unused.json"), host="0.0.0.0")
+    assert exc.value.exit_code == 2
 
 
 def test_graceful_shutdown_releases_file_cache_lock(tmp_path):
@@ -748,6 +776,63 @@ class TestResolveFlightToken:
         assert (
             cli._resolve_flight_token("0.0.0.0", _VALID_TOKEN, "", True) == _VALID_TOKEN
         )
+
+
+class TestResolveExternalLocation:
+    """biopb/biopb#1158: the `health`-advertised address, required/fail-loud
+    on a public bind -- mirroring the embedded cache's own
+    ``_resolve_tensor_external_location`` rule."""
+
+    @pytest.mark.parametrize(
+        "host, external_location, expected",
+        [
+            # No opinion on a loopback bind -> advertise nothing; a client's
+            # own dial address is already correct for local mode.
+            ("127.0.0.1", None, None),
+            # Not refused, not silently dropped -- an operator can advertise a
+            # tunnel/NAT address even off a loopback bind.
+            ("127.0.0.1", "grpc://tunnel:8815", "grpc://tunnel:8815"),
+            ("0.0.0.0", "grpc://real-host:8815", "grpc://real-host:8815"),
+            # The advertised scheme follows the actual listener transport, so
+            # a shorthand supplied by control cannot make workers dial the
+            # wrong transport.
+            ("0.0.0.0", "grpc://real-host:8815", "grpc+tls://real-host:8815"),
+            ("0.0.0.0", "grpcs://real-host:8815", "grpc://real-host:8815"),
+        ],
+    )
+    def test_resolution(self, host, external_location, expected):
+        tls_cert_chain = (
+            b"cert"
+            if isinstance(expected, str) and expected.startswith("grpc+tls://")
+            else None
+        )
+        assert (
+            cli._resolve_external_location(
+                host, 8815, tls_cert_chain, external_location
+            )
+            == expected
+        )
+
+    def test_public_bind_with_nothing_supplied_is_refused(self):
+        with pytest.raises(typer.Exit) as exc:
+            cli._resolve_external_location("0.0.0.0", 8815, None, None)
+        assert exc.value.exit_code == 2
+
+    @pytest.mark.parametrize(
+        "external_location",
+        [
+            "real-host:8815",  # bare host:port, no scheme
+            "real-host",  # no scheme, no port
+            "http://real-host:8815",  # a scheme, but not one Flight speaks
+        ],
+    )
+    def test_a_schemeless_or_unrecognized_value_is_refused(self, external_location):
+        # A malformed value advertised verbatim via `health` would fail every
+        # downstream client with a confusing parse/connect error instead of
+        # being caught here, at the one place that could name the problem.
+        with pytest.raises(typer.Exit) as exc:
+            cli._resolve_external_location("0.0.0.0", 8815, None, external_location)
+        assert exc.value.exit_code == 2
 
 
 def test_setup_static_only_serves_immediately_with_freshness(tmp_path):

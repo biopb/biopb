@@ -7,6 +7,7 @@ job installs no server (biopb/biopb#579).
 """
 
 import pickle
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -485,3 +486,138 @@ class TestCreateTensorGrid:
 
         arr = da.zeros((10,), chunks=((3, 5, 2),))
         assert _uniform_chunk_shape(arr) == (5,)
+
+
+class TestExportLocation:
+    """biopb/biopb#1158: anything minted for a *different* consumer -- a
+    forwarded SerializedTensor, or a dask chunk-fetch graph handed to a
+    distributed cluster -- must carry the server's advertised address (if it
+    published one), never just the address this client happened to dial."""
+
+    @pytest.mark.parametrize(
+        "location, advertised_location, expected",
+        [
+            # Nothing advertised -> fall back to the dial address verbatim.
+            ("grpc://localhost:8815", None, "grpc://localhost:8815"),
+            ("grpc://localhost:8815", "grpc://real-host:8815", "grpc://real-host:8815"),
+            # The server advertises the public grpcs:// spelling; a dask
+            # worker's FlightClient needs Arrow's own grpc+tls:// scheme.
+            (
+                "grpc+tls://localhost:8815",
+                "grpcs://real-host:8815",
+                "grpc+tls://real-host:8815",
+            ),
+        ],
+    )
+    def test_export_location_resolution(self, location, advertised_location, expected):
+        from biopb.tensor._session import _ClientState
+
+        state = _ClientState(
+            raw_client=None,
+            call_options=None,
+            location=location,
+            token=None,
+            cache_bytes=0,
+            advertised_location=advertised_location,
+        )
+        assert state.export_location == expected
+
+    def test_get_tensor_pb_mints_the_export_location(self):
+        # get_tensor_pb bakes an address into SerializedTensor.location for a
+        # different process to dial later -- it must be the export_location,
+        # not the raw dial address, or a lazy remote op forwards a private
+        # loopback address off-box.
+        client = _offline_client(raw_client=Mock())
+        client._state.advertised_location = "grpc://real-host:8815"
+        client._fetcher._plan_read = Mock(
+            return_value=SimpleNamespace(serialize=lambda: b"fake-flight-info")
+        )
+
+        pb = client._fetcher.get_tensor_pb("test-tensor")
+
+        assert pb.location == "grpc://real-host:8815"
+
+    def test_get_tensor_builds_its_dask_graph_from_the_export_location(
+        self, monkeypatch
+    ):
+        # get_tensor's dask graph embeds the fetch address in every chunk task
+        # (biopb.tensor._pool); a graph handed to dask.distributed only works
+        # if that address is reachable from wherever the scheduler runs it.
+        from biopb.tensor import _session
+
+        client = _offline_client(raw_client=Mock())
+        client._state.advertised_location = "grpc://real-host:8815"
+        client._fetcher._plan_read = Mock(return_value=object())
+
+        captured = {}
+
+        def fake_dask_from_flight_info(
+            info, location, token, cache_bytes, tls_trust, requested=None
+        ):
+            captured["location"] = location
+            return "fake-array"
+
+        monkeypatch.setattr(
+            _session, "_dask_from_flight_info", fake_dask_from_flight_info
+        )
+
+        result = client._fetcher.get_tensor("test-tensor")
+
+        assert result == "fake-array"
+        assert captured["location"] == "grpc://real-host:8815"
+
+    def test_upload_graph_uses_the_export_location(self, monkeypatch):
+        from biopb.tensor import _upload
+        from biopb.tensor._upload import UploadSession
+
+        client = _offline_client(raw_client=Mock())
+        client._state.advertised_location = "grpc://real-host:8815"
+        captured = {}
+
+        class FakeTarget:
+            def __init__(self, location, *args, **kwargs):
+                captured["location"] = location
+
+        monkeypatch.setattr(_upload, "_UploadTarget", FakeTarget)
+        monkeypatch.setattr(_upload.da, "store", lambda *args, **kwargs: None)
+
+        UploadSession(client._state, client._catalog)._store_chunks(
+            "test-tensor",
+            SimpleNamespace(shape=(1,), dtype="float32"),
+            [],
+            (0,),
+        )
+
+        assert captured["location"] == "grpc://real-host:8815"
+
+
+class TestCheckFlightProtocolMalformedHealth:
+    """A non-biopb (or misbehaving) Flight server can answer `health` with
+    valid JSON that isn't an object -- a bare string, list, number, or null.
+    That must fall back to the same "server predates this SDK" refusal as an
+    object with no "protocol" key, not an unhandled AttributeError out of a
+    dict-only `.get()` call chain (regression: biopb/biopb#1158's parsing
+    split narrowed the second try/except's caught exceptions)."""
+
+    @staticmethod
+    def _client_answering(body_bytes: bytes):
+        class _FakeBody:
+            def to_pybytes(self):
+                return body_bytes
+
+        class _FakeResult:
+            body = _FakeBody()
+
+        class _FakeClient:
+            def do_action(self, action, options=None):
+                return [_FakeResult()]
+
+        return _FakeClient()
+
+    @pytest.mark.parametrize("payload", [b'"ok"', b"[]", b"null", b"42"])
+    def test_non_dict_json_health_is_treated_as_a_stale_v1_server(self, payload):
+        from biopb.tensor._session import _check_flight_protocol
+
+        client = self._client_answering(payload)
+        with pytest.raises(RuntimeError, match="Incompatible biopb Flight protocol"):
+            _check_flight_protocol(client, None, "grpc://x:1")

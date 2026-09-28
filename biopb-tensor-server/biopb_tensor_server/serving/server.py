@@ -440,6 +440,7 @@ class TensorFlightServer(flight.FlightServerBase):
         tls_private_key: Optional[bytes] = None,
         upload_ttl: float = DEFAULT_UPLOAD_TTL,
         scratch_ttl: float = DEFAULT_SCRATCH_TTL,
+        external_location: Optional[str] = None,
         **kwargs,
     ):
         """Initialize the Flight server.
@@ -449,6 +450,13 @@ class TensorFlightServer(flight.FlightServerBase):
             token: The server-wide Bearer token (the catalog tier, and the
                 fallback for every source without a capability token of its
                 own). ``None`` disables it.
+            external_location: The address a client *other than the one that
+                dialed this server* should use to reach it -- advertised on
+                the ``health`` action (biopb/biopb#1158). ``None`` (the
+                default) advertises nothing, so a client falls back to
+                whatever address it dialed. Required by the CLI on a public
+                bind (mirroring ``--tensor-external-location`` on the
+                embedded cache); this class itself does no such validation.
             writable: Serve the Flight write path -- ``add_tensor``,
                 ``set_upload_status`` and DoPut. Independent of *write_dir*: an
                 in-process producer uploads through ``self.uploads`` directly
@@ -510,6 +518,10 @@ class TensorFlightServer(flight.FlightServerBase):
         # what a private source without a capability token of its own falls
         # back to. None disables it (local mode).
         self._server_token: Optional[str] = token or None
+
+        # The address advertised on ``health`` for a client that isn't the one
+        # that dialed us (biopb/biopb#1158). None means advertise nothing.
+        self._external_location: Optional[str] = external_location or None
 
         # The source registry is the single chokepoint for adapter lifecycle.
         # Sever with a write_dir set gets an on_register hook for attaching
@@ -1167,6 +1179,11 @@ class TensorFlightServer(flight.FlightServerBase):
                 # already on the wire and means what it says.
                 "catalog_persisted": db is not None and db.store_path is not None,
             }
+            if self._external_location:
+                # Omitted rather than null when unset, so an old client -- which
+                # never looks for this key -- and a new one against an old
+                # server -- which finds no key at all -- see the same shape.
+                health_status["external_location"] = self._external_location
             yield json.dumps(health_status).encode("utf-8")
         elif action.type == "add_tensor":
             self._authorize(context)

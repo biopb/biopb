@@ -63,5 +63,11 @@ whenever the plane goes public. To publish it anyway (behind your own TLS proxy)
 pass an explicit `--control-host 0.0.0.0` to `biopb-control run`; that bind is
 fail-closed and refuses to come up without a token.
 
+A public `--grpc-bind` also requires `--grpc-external-location` — the address a
+*different* machine dials to reach the plane (e.g. an HPC scheduler's assigned
+FQDN), since a wildcard bind is not itself dialable. Forwarded to the data
+plane, which aligns its transport scheme with the listener before advertising
+it to clients and is where it is actually enforced.
+
 Clients use the API to ask "is the data plane up, and bring it up if not" — this
 is what replaced `biopb-mcp` shelling out `biopb server start`.

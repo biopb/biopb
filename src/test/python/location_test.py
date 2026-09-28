@@ -6,7 +6,49 @@ land on the same string. These are the vectors.
 """
 
 import pytest
-from biopb.tensor._location import canonical_location, location_host
+from biopb.tensor._location import (
+    canonical_location,
+    location_host,
+    normalize_flight_location,
+    realign_transport_scheme,
+)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expect"),
+    [
+        ("grpcs://h:8815", "grpc+tls://h:8815"),
+        ("GRPCS://h:8815", "grpc+tls://h:8815"),
+        ("grpc://h:8815", "grpc://h:8815"),
+    ],
+)
+def test_flight_location_uses_arrow_tls_scheme(raw, expect):
+    assert normalize_flight_location(raw) == expect
+
+
+@pytest.mark.parametrize(
+    ("raw", "tls", "expect"),
+    [
+        # Every recognized scheme, forced to whichever transport is actually
+        # in play -- regardless of which shorthand was supplied.
+        ("grpc://h:8815", True, "grpc+tls://h:8815"),
+        ("grpcs://h:8815", True, "grpc+tls://h:8815"),
+        ("grpc+tcp://h:8815", True, "grpc+tls://h:8815"),
+        ("grpc+tls://h:8815", True, "grpc+tls://h:8815"),
+        ("grpc://h:8815", False, "grpc://h:8815"),
+        ("grpcs://h:8815", False, "grpc://h:8815"),
+        ("grpc+tcp://h:8815", False, "grpc://h:8815"),
+        ("grpc+tls://h:8815", False, "grpc://h:8815"),
+        ("GRPCS://h:8815", True, "grpc+tls://h:8815"),
+    ],
+)
+def test_realign_transport_scheme(raw, tls, expect):
+    assert realign_transport_scheme(raw, tls=tls) == expect
+
+
+@pytest.mark.parametrize("raw", ["h:8815", "http://h:8815", ""])
+def test_realign_transport_scheme_refuses_the_unrecognized(raw):
+    assert realign_transport_scheme(raw, tls=False) is None
 
 
 @pytest.mark.parametrize(

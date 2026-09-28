@@ -545,7 +545,7 @@ class UploadSession:
         is how a link that wants exactly N in flight -- or one -- says so.
         """
         target = _UploadTarget(
-            self._state.location,
+            self._state.export_location,
             self._state.token,
             self._state.tls_trust,
             array_id,

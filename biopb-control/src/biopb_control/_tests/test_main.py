@@ -233,6 +233,40 @@ def test_url_prefix_reaches_the_spec_normalized():
     assert spec.url_prefix == "/node/h/29847"
 
 
+def test_grpc_external_location_flag_reaches_the_spec():
+    rc, spec, _ = _capture(
+        _BASE_ARGV + ["--grpc-external-location", "grpc://real-host:8815"], {}
+    )
+    assert rc == 0
+    assert spec.external_location == "grpc://real-host:8815"
+
+
+def test_grpc_external_location_falls_back_to_the_env():
+    # `biopb control start` passes --grpc-external-location explicitly, but a
+    # direct `python -m biopb_control run` reads BIOPB_GRPC_EXTERNAL_LOCATION
+    # (biopb/biopb#1158, mirroring --url-prefix's own env fallback).
+    rc, spec, _ = _capture(
+        _BASE_ARGV, {"BIOPB_GRPC_EXTERNAL_LOCATION": "grpc://real-host:8815"}
+    )
+    assert rc == 0
+    assert spec.external_location == "grpc://real-host:8815"
+
+
+def test_grpc_external_location_flag_wins_over_env():
+    rc, spec, _ = _capture(
+        _BASE_ARGV + ["--grpc-external-location", "grpc://from-flag:8815"],
+        {"BIOPB_GRPC_EXTERNAL_LOCATION": "grpc://from-env:8815"},
+    )
+    assert rc == 0
+    assert spec.external_location == "grpc://from-flag:8815"
+
+
+def test_no_grpc_external_location_anywhere_is_none():
+    rc, spec, _ = _capture(_BASE_ARGV, {})
+    assert rc == 0
+    assert spec.external_location is None
+
+
 # --- BYO TLS material (biopb/biopb#913) ------------------------------------
 # `serve` and `launch` have taken --tls-cert/--tls-key/--san all along; the one
 # entry point a deployment actually invokes did not, so the only way to hand the

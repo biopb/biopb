@@ -127,3 +127,23 @@ def test_health_starting_over_the_wire_before_ready():
             assert json.loads(raw.body.to_pybytes())["status"] == "SERVING"
     finally:
         server.shutdown()
+
+
+def test_external_location_omitted_when_unset():
+    """biopb/biopb#1158: no key at all, not a null, when nothing was configured
+    -- an old client that never looks for it and a new one against an old
+    server both see the same shape."""
+    server = TensorFlightServer("grpc://localhost:0")
+    server.mark_ready()
+
+    assert "external_location" not in _health(server)
+
+
+def test_external_location_advertised_when_set():
+    """biopb/biopb#1158: whatever the caller configured comes back verbatim."""
+    server = TensorFlightServer(
+        "grpc://localhost:0", external_location="grpc://real-host:8815"
+    )
+    server.mark_ready()
+
+    assert _health(server)["external_location"] == "grpc://real-host:8815"

@@ -1061,6 +1061,7 @@ def _control_run_argv(
     tls_key: Optional[Path] = None,
     san: Optional[List[str]] = None,
     url_prefix: Optional[str] = None,
+    grpc_external_location: Optional[str] = None,
 ) -> List[str]:
     """Build the `python -m biopb_control run ...` argv `control start` spawns.
 
@@ -1115,6 +1116,9 @@ def _control_run_argv(
     if url_prefix:
         # Not secret (it is a hostname and a port), unlike the token above.
         argv += ["--url-prefix", url_prefix]
+    if grpc_external_location:
+        # Not secret either -- an address, not a credential.
+        argv += ["--grpc-external-location", grpc_external_location]
     if not data_plane:
         argv.append("--no-data-plane")
     if tls:
@@ -1233,6 +1237,17 @@ _OPT_DATA_PLANE = typer.Option(
     "control plane starts without it; a client brings it up on demand via the "
     "control API.",
 )
+_OPT_GRPC_EXTERNAL_LOCATION = typer.Option(
+    None,
+    "--grpc-external-location",
+    envvar="BIOPB_GRPC_EXTERNAL_LOCATION",
+    help="The address a remote client should dial to reach the data plane, "
+    "advertised via its `health` action (biopb/biopb#1158) -- e.g. "
+    "'grpc://hostname:8815', or a scheduler-assigned FQDN on an HPC job. "
+    "Required when --grpc-bind is a public address: nothing here can guess a "
+    "reachable address for a wildcard bind. Pure passthrough -- the data "
+    "plane is the single place this is validated and enforced.",
+)
 
 
 @control_app.command(
@@ -1251,6 +1266,7 @@ def control_start(
     token: Optional[str] = _OPT_TOKEN,
     data_plane: bool = _OPT_DATA_PLANE,
     url_prefix: Optional[str] = _OPT_URL_PREFIX,
+    grpc_external_location: Optional[str] = _OPT_GRPC_EXTERNAL_LOCATION,
     remote: bool = typer.Option(
         False,
         "--remote",
@@ -1280,6 +1296,12 @@ def control_start(
     the bind is read once, through the predicate the tensor `launch` and the
     control's own guard share, so "public but unauthenticated" is unrepresentable
     rather than something to validate against (biopb/biopb#604).
+
+    A public ``--grpc-bind`` also requires ``--grpc-external-location`` -- the
+    address a *different* machine dials to reach the plane, since a wildcard
+    bind is not itself a dialable address (e.g. an HPC scheduler's assigned
+    FQDN). Forwarded verbatim to the data plane, which is where it is both
+    required and enforced.
 
     **A certificate that outlives one launch.** ``--tls`` alone mints a
     self-signed cert into the state tree and clients pin it on first connect, so
@@ -1353,6 +1375,7 @@ def control_start(
                 tls_key=tls_key,
                 san=san,
                 url_prefix=url_prefix,
+                grpc_external_location=grpc_external_location,
             )
 
             log_file = _control_log_file()
@@ -1396,6 +1419,8 @@ def control_start(
                 console.print(
                     f"  Data plane: starting on {_flight_location(grpc_bind, base_port, tls)}"
                 )
+                if grpc_external_location:
+                    console.print(f"  Data plane advertises: {grpc_external_location}")
             else:
                 console.print("  Data plane: not started (--no-data-plane; on-demand)")
             console.print(f"  Logs: {log_file}")
@@ -1643,6 +1668,7 @@ app.add_typer(control_app, name="control")
 def dashboard(
     base_port: int = _OPT_BASE_PORT,
     grpc_bind: Optional[str] = _OPT_GRPC_BIND,
+    grpc_external_location: Optional[str] = _OPT_GRPC_EXTERNAL_LOCATION,
     no_browser: bool = typer.Option(
         False,
         "--no-browser",
@@ -1663,8 +1689,9 @@ def dashboard(
     at the dashboard. Idempotent -- if the control plane is already up it just
     opens the page. This is what the desktop shortcut the installer creates runs.
 
-    ``--base-port`` / ``--grpc-bind`` are forwarded to `biopb control start` and
-    only matter when there is nothing running to open.
+    ``--base-port`` / ``--grpc-bind`` / ``--grpc-external-location`` are
+    forwarded to `biopb control start` and only matter when there is nothing
+    running to open.
     """
     # Prefer a control that is already serving -- it publishes its endpoint, so
     # this finds one that `--base-port` moved. Fall back to where we *would* start
@@ -1701,6 +1728,7 @@ def dashboard(
                 data_plane=True,
                 remote=remote,
                 url_prefix=None,
+                grpc_external_location=grpc_external_location,
             )
         except typer.Exit as started:
             if started.exit_code:
