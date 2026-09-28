@@ -4,7 +4,7 @@ Extracted from :mod:`biopb.tensor.client` (issue #278 item C). The two
 collaborators share the connection via :class:`_ClientState`:
 
 - :class:`CatalogClient` -- discovery / metadata / resolve / warm / source
-  registration (``list_sources`` / ``query_sources`` / ``resolve`` / ... RPCs).
+  registration (``list_sources`` / ``query`` / ``resolve`` / ... RPCs).
 - :class:`ChunkFetcher` -- tensor reads: plan a read with GetFlightInfo and
   build the lazy dask chunk-fetching array.
 
@@ -613,7 +613,7 @@ def do_action_one_result(
 class CatalogClient:
     """Catalog, metadata, and source-lifecycle RPCs over one Flight connection.
 
-    Owns discovery (``list_sources`` / ``query_sources``), per-tensor metadata
+    Owns discovery (``list_sources`` / ``query``), per-tensor metadata
     probes, the experimental cloud ``resolve`` / ``warm`` streams, and runtime
     source registration. Reads and writes the shared ``_ClientState`` caches.
     """
@@ -644,12 +644,12 @@ class CatalogClient:
             return _descriptor_from_row(row)
         return None
 
-    def query_sources(self, sql: str, *, format: str = "arrow") -> Any:  # noqa: A002 - public, documented keyword API (mirrors DuckDB/pandas `format`)
-        """Backs TensorFlightClient.query_sources; see that method for the full
+    def query(self, sql: str, *, format: str = "arrow") -> Any:  # noqa: A002 - public, documented keyword API (mirrors DuckDB/pandas `format`)
+        """Backs TensorFlightClient.query; see that method for the full
         documentation."""
         if format not in ("pandas", "arrow", "records"):
             raise ValueError(
-                f"query_sources: unknown format {format!r}; "
+                f"query: unknown format {format!r}; "
                 "expected 'pandas', 'arrow', or 'records'"
             )
 
@@ -674,12 +674,12 @@ class CatalogClient:
             if metadata.get(b"truncated", b"").decode() == "True":
                 total = metadata.get(b"total_rows")
                 logger.info(
-                    "query_sources: returned %s of %s rows (truncated)",
+                    "query: returned %s of %s rows (truncated)",
                     returned_count,
                     int(total.decode()) if total else "?",
                 )
             else:
-                logger.debug("query_sources: returned %s rows", returned_count)
+                logger.debug("query: returned %s rows", returned_count)
         return table
 
     @staticmethod
@@ -700,7 +700,7 @@ class CatalogClient:
             import pandas  # noqa: F401
         except ImportError as exc:
             raise ImportError(
-                "query_sources(format='pandas') requires pandas; install "
+                "query(format='pandas') requires pandas; install "
                 "pandas, or call with format='arrow' / format='records'."
             ) from exc
         df = table.to_pandas()
@@ -945,7 +945,7 @@ class CatalogClient:
         """Iterate a streaming ``do_action``, yielding ``(which, msg, body)`` per
         non-empty message.
 
-        The loop shared by :meth:`resolve` / :meth:`warm` / :meth:`add_source`:
+        The loop shared by :meth:`resolve` / :meth:`warm` / :meth:`register_local_path`:
         the ``do_action`` call, the empty-body heartbeat skip, the envelope parse
         into ``msg_cls`` (a bad parse yields ``which=None``, which every caller
         ignores -- the SDK refuses a pre-v2 server at connect), and the old-server
@@ -954,7 +954,7 @@ class CatalogClient:
         propagates unchanged.
 
         Cancellation is deliberately NOT handled here: its semantics differ per
-        caller (resolve/warm raise, add_source returns what it has), and the poll
+        caller (resolve/warm raise, register_local_path returns what it has), and the poll
         must run *after* a message is consumed so a terminal already in hand is
         never discarded by a cancel landing on it (issue #4). Each caller polls
         ``should_cancel`` around its own dispatch.
@@ -1083,7 +1083,7 @@ class CatalogClient:
             return _unknown_upload_status(source_id)
         return _upload_status_dict(source_id, desc.upload_status)
 
-    def add_source(
+    def register_local_path(
         self,
         url: str,
         *,
@@ -1091,8 +1091,8 @@ class CatalogClient:
         on_progress: Optional[Callable[["AddSourceProgress"], None]] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
     ) -> "AddSourceResult":
-        """Backs TensorFlightClient.add_source; see that method for the full
-        documentation."""
+        """Backs TensorFlightClient.register_local_path; see that method for
+        the full documentation."""
         req = AddSourceRequest(
             url=url,
             source_type=source_type,
@@ -1125,8 +1125,8 @@ class CatalogClient:
             if should_cancel is not None and should_cancel():
                 return AddSourceResult()
             raise RuntimeError(
-                f"add_source('{url}') returned no terminal result "
-                "(server closed the stream without a result)"
+                f"register_local_path('{url}') returned no terminal result "
+                "(server closed the 'add_source' stream without a result)"
             )
         return result
 
@@ -1137,9 +1137,9 @@ class CatalogClient:
             self._state, action, unavailable_hint=unavailable_hint
         )
 
-    def remove_source(self, root_url: str) -> "RemoveSourceResult":
-        """Backs TensorFlightClient.remove_source; see that method for the full
-        documentation."""
+    def deregister_local_path(self, root_url: str) -> "RemoveSourceResult":
+        """Backs TensorFlightClient.deregister_local_path; see that method for
+        the full documentation."""
         req = RemoveSourceRequest(root_url=root_url)
         action = flight.Action("remove_source", req.SerializeToString())
         result_bytes = self._do_action_one_result(

@@ -289,7 +289,7 @@ class TestInstructions:
         # instructions (not left to a pull-on-demand resource).
         base = _app._BASE_INSTRUCTIONS
         assert "guardrails" in base.lower()
-        assert "query_sources" in base
+        assert "client.query(" in base
         assert "filesystem" in base.lower()
         # The catalog contract agents most often get wrong must be pushed up
         # front (return type + the real column name), not left to a pull-only

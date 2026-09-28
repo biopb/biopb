@@ -118,7 +118,7 @@ def test_metadata_db_enabled_false_warns_now_on_anyway(caplog):
     assert not hasattr(cfg.metadata_db, "enabled")
     msgs = [r.message for r in caplog.records if "metadata_db.enabled" in r.message]
     assert msgs and any("no longer honored" in m.lower() for m in msgs)
-    assert any("query_sources" in m for m in msgs)
+    assert any("client.query(" in m for m in msgs)
 
 
 def test_metadata_db_absent_does_not_warn(caplog):

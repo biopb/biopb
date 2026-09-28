@@ -202,7 +202,7 @@ class Connection:
             if health.get("status", "SERVING") != "SERVING":
                 raise _Starting(_starting_message(health))
             # health answers anyone; this is the call that checks the token.
-            client.query_sources("SELECT 1 FROM sources LIMIT 0")
+            client.query("SELECT 1 FROM sources LIMIT 0")
         except BaseException:
             client.close()
             raise

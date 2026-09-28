@@ -357,7 +357,7 @@ class TestMultifieldServerClient:
                 16,
                 16,
             ]
-            (row,) = client.query_sources(
+            (row,) = client.query(
                 "SELECT tensors FROM sources WHERE source_id = 'multi'",
                 format="records",
             )

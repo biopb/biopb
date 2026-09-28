@@ -92,7 +92,7 @@ one field emitted as its own `TensorDescriptor`.
 Stacking N fields into one viewable/analysable array becomes an explicit,
 context-aware action above the data plane:
 
-- **Agent:** enumerates fields with `UNNEST(tensors)` in a `query_sources` SQL,
+- **Agent:** enumerates fields with `UNNEST(tensors)` in a `query` SQL,
   reads the ones it wants, and combines them with `da.stack` — assigning axis
   semantics itself.
 - **Human, in napari:** the layer-list context action `napari.layer.merge_stack`
@@ -368,7 +368,7 @@ all. So capability must be a **positive signal**, two ways:
 - **Option B (recommended) — capability bit.** Add `supports_aggregate` (bool) to
   `DataSourceDescriptor`, set by a group adapter that can stack, carried on the
   `ListFlights` / `GetFlightInfo` the client already fetches. The browser enables
-  "View all stacked" only when set; the agent reads it via `query_sources`. The
+  "View all stacked" only when set; the agent reads it via `query`. The
   client never sends a doomed `@all`, so the fragile error semantics never enter the
   picture. Cost: one additive proto *field* (minor buf-regen) — far less than a new
   message, and a clean positive signal instead of inferring capability from whether

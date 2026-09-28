@@ -325,7 +325,7 @@ def test_the_catalog_is_structural_and_get_flight_info_carries_the_grid(
 
 
 def test_catalog_round_trip_never_reintroduces_a_grid(multires_ome_zarr):
-    """query_sources answers structure, nothing more."""
+    """query answers structure, nothing more."""
     adapter = OmeZarrAdapter.create_from_config(
         SourceConfig(url=multires_ome_zarr[0], type="ome-zarr", source_id="oz")
     )

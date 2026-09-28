@@ -75,12 +75,12 @@ _OPT_SLICE = typer.Option(
 def _browse(client) -> dict:
     """The catalog as ``{source_id: row}``.
 
-    ``query_sources`` rather than the deprecated ``list_sources``: same rows
+    ``query`` rather than the deprecated ``list_sources``: same rows
     and the same server-side cap, but a row carries ``is_resolved``, which the
     listing needs to tell "not resolved yet" from "nothing readable in it"
     (biopb/biopb#1032).
     """
-    rows = client.query_sources(
+    rows = client.query(
         f"SELECT {SOURCE_ROW_COLUMNS} FROM sources ORDER BY source_id",
         format="records",
     )
@@ -813,11 +813,11 @@ def decode_rates(
 
     This is a preset over the catalog's `decode_rates` table; anything else you
     want to ask of it -- a join against `sources`, a filter, a different order
-    -- is a `client.query_sources` call.
+    -- is a `client.query` call.
     """
     client, endpoint = _connect(server, token, cache_bytes=0)
     try:
-        rows = client.query_sources(
+        rows = client.query(
             "SELECT array_id, mbps, samples, updated_at FROM decode_rates "
             "ORDER BY mbps DESC",
             format="records",

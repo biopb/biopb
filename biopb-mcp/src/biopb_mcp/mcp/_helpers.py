@@ -147,7 +147,7 @@ def _source_row(client, source_id: str) -> dict | None:
     """The catalog row of *source_id* (``source_url``, ``tensors``), or None."""
     from biopb.tensor._catalog_rows import sql_literal
 
-    rows = client.query_sources(
+    rows = client.query(
         "SELECT source_url, tensors FROM sources "
         f"WHERE source_id = {sql_literal(source_id)}",
         format="records",

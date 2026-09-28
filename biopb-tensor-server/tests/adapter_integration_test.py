@@ -343,7 +343,7 @@ class TestOmeZarrIntegration:
             )
 
             # The catalog stays lean: a row carries the structural fields only.
-            row = client.query_sources(
+            row = client.query(
                 "SELECT is_resolved, tensors FROM sources WHERE source_id = 'phys'",
                 format="records",
             )[0]
@@ -358,7 +358,7 @@ class TestOmeZarrIntegration:
             # Asked again after a catalog browse, which is the shape resolve()
             # hands back. A row carries no scale, and nothing stores it, so it
             # cannot shadow the answer.
-            client.query_sources("SELECT * FROM sources")
+            client.query("SELECT * FROM sources")
             scale, _ = client.get_physical_scale("phys")
             assert list(scale) == [0.5, 0.25]
 

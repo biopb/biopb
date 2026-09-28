@@ -511,7 +511,7 @@ def _resolve_serve_sources(
         # server STARTING until it finishes (observed ~1h / 900s+ stuck registering
         # hundreds of hpc__* proxies -- each descriptor an expensive OME-TIFF open
         # on the upstream) and bypasses the bulk-seed fast path. The re-list instead
-        # seeds the entire catalog in ONE upstream query_sources (no per-source RPC,
+        # seeds the entire catalog in ONE upstream query (no per-source RPC,
         # biopb/biopb#266) and runs in the background, so the server reaches SERVING
         # immediately and the mirror fills progressively -- exactly like a monitored
         # local directory. `monitor=false` on a bare-host upstream is not "static":
@@ -929,7 +929,7 @@ def _setup_flight_server(
         )
 
     # The metadata database is mandatory (biopb/biopb#225): always constructed --
-    # it is the canonical source-browsing surface (`client.query_sources`).
+    # it is the canonical source-browsing surface (`client.query`).
     metadata_db = _open_catalog(
         server_config, _catalog_store_path(server_config, config_path)
     )

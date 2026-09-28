@@ -2,7 +2,7 @@
 
 A row is the only representation of a source that crosses the wire -- the
 ``catalog`` flight streams them (SQL over DoGet) and ``resolve`` returns the one
-it just wrote. **The SDK does not impose a structure on it.** ``query_sources``
+it just wrote. **The SDK does not impose a structure on it.** ``query``
 hands rows back in whichever form you ask for (``records`` / ``arrow`` /
 ``pandas``), ``resolve`` returns the single row it just wrote in the same
 ``records`` shape, and what you decode them into is yours: a dict, a DataFrame,
@@ -44,7 +44,7 @@ _DEPRECATION = (
     "biopb.tensor.{name}() is deprecated. DataSourceDescriptor is a generated "
     "message, so a catalog column it has no field for (`is_resolved`) cannot "
     "reach you without a proto change regenerated in every language. There is "
-    "no replacement decoder: read the row directly, or ask query_sources() for "
+    "no replacement decoder: read the row directly, or ask query() for "
     "the format you want (records / arrow / pandas) -- the structure is yours "
     "to choose (biopb/biopb#1032)."
 )

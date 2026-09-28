@@ -44,9 +44,9 @@ def _build_mock_client() -> MagicMock:
     """Build a mock TensorFlightClient for testing."""
     mock_client = MagicMock()
 
-    # The CLI browses with query_sources + sources_from_rows, so the mock
+    # The CLI browses with query + sources_from_rows, so the mock
     # answers with catalog rows rather than a descriptor map.
-    mock_client.query_sources.return_value = [
+    mock_client.query.return_value = [
         {
             "source_id": "my-source",
             "source_url": "/data/my-source.zarr",
@@ -152,7 +152,7 @@ class TestQueryCommand:
         """Test that query handles empty source list gracefully."""
         with patch("biopb.tensor.cli.TensorFlightClient") as mock_fc_class:
             mock_client = _build_mock_client()
-            mock_client.query_sources.return_value = []
+            mock_client.query.return_value = []
             mock_fc_class.return_value = mock_client
 
             result = runner.invoke(app, ["query"])
@@ -598,8 +598,8 @@ class TestEveryCommandClassifiesItsFailures:
 
     # (argv, the client method whose call is the command's first RPC)
     CASES = [
-        (["query"], "query_sources"),
-        (["metadata", "my-source"], "query_sources"),
+        (["query"], "query"),
+        (["metadata", "my-source"], "query"),
         (["get", "my-source", "-o", "-"], "get_tensor_pb"),
         (["stats", "my-source"], "get_tensor"),
         (["cache-stats"], "cache_stats"),
@@ -762,7 +762,7 @@ class TestDecodeRatesCommand:
     def _run(self, *args, rows=None):
         with patch("biopb.tensor.cli.TensorFlightClient") as mock_fc_class:
             client = MagicMock()
-            client.query_sources.return_value = self._ROWS if rows is None else rows
+            client.query.return_value = self._ROWS if rows is None else rows
             mock_fc_class.return_value = client
             result = runner.invoke(app, ["decode-rates", *args])
         return result, mock_fc_class, client
@@ -772,7 +772,7 @@ class TestDecodeRatesCommand:
         # the server's, not a client-side sort of whatever arrived.
         result, _, client = self._run()
         assert result.exit_code == 0, result.output
-        sql = client.query_sources.call_args.args[0]
+        sql = client.query.call_args.args[0]
         assert "FROM decode_rates" in sql
         assert "ORDER BY mbps DESC" in sql
         client.close.assert_called_once()

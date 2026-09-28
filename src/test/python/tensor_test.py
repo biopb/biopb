@@ -42,7 +42,7 @@ def _offline_client(raw_client=None):
 
 
 class TestQuerySourcesFormat:
-    """query_sources output-format conversion (server-free).
+    """query output-format conversion (server-free).
 
     Exercises TensorFlightClient._format_query_result directly. The default
     stays 'arrow' (pyarrow.Table) for backward compatibility; 'pandas' and
@@ -70,9 +70,7 @@ class TestQuerySourcesFormat:
         import inspect
 
         default = (
-            inspect.signature(TensorFlightClient.query_sources)
-            .parameters["format"]
-            .default
+            inspect.signature(TensorFlightClient.query).parameters["format"].default
         )
         assert default == "arrow"
 
@@ -138,11 +136,17 @@ class TestQuerySourcesFormat:
         ]
 
     def test_unknown_format_rejected_before_network(self):
-        # Validated at the top of query_sources (now on CatalogClient, #278 item
+        # Validated at the top of query (now on CatalogClient, #278 item
         # C), so a bad format fails fast without a server / connection.
         client = _offline_client()
         with pytest.raises(ValueError, match="unknown format"):
-            client.query_sources("SELECT 1", format="polars")
+            client.query("SELECT 1", format="polars")
+
+    def test_query_sources_is_a_deprecated_alias_for_query(self):
+        client = _offline_client()
+        with pytest.warns(DeprecationWarning, match="query_sources"):
+            with pytest.raises(ValueError, match="unknown format"):
+                client.query_sources("SELECT 1", format="polars")
 
 
 class TestGetPhysicalScale:

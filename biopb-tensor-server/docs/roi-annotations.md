@@ -91,7 +91,7 @@ length-bounded (128 bytes) and comma-free, since the sidecar's delete route
 addresses ids by a comma-separated list.
 
 `rois` is in `MetadataDatabase.ALLOWED_TABLES`, SELECT-only like every other
-allowed table -- `client.query_sources(...)` and the MCP catalog surface can
+allowed table -- `client.query(...)` and the MCP catalog surface can
 read it for analysis, but the viewer always uses the typed read below.
 `sync_source_removed()` does not cascade into `rois`, since a rescan or a
 transient unregister must not destroy a user's work: orphaned rows re-attach

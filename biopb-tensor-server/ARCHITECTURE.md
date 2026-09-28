@@ -368,7 +368,7 @@ and *where to expose it* is the launch command.
    cannot be mmapped safely (network mount, cloud-synced folder) or isn't
    writable — the on-disk cache is required infrastructure, not optional.
 5. Resolve config sources into *static* and *monitored* sets, and build the
-   metadata DB (mandatory — it backs `query_sources`). An empty catalog is a
+   metadata DB (mandatory — it backs `query`). An empty catalog is a
    valid state and boots: sources can still arrive via `add_source`, DoPut, or a
    monitored dir that fills later. The cache's measured per-tensor decode
    throughput is attached to the catalog here too, as a `decode_rates` table —

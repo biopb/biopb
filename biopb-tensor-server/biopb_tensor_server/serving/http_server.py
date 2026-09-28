@@ -868,7 +868,7 @@ def _tensor_candidates(client: TensorFlightClient, array_id: str) -> List[str]:
     ``immutable``). The canonical versioned form comes from ``tile_info``.
     """
     source_id = _split_array_version(array_id)[0].split("/", 1)[0]
-    rows = client.query_sources(
+    rows = client.query(
         f"SELECT tensors FROM sources WHERE source_id = {sql_literal(source_id)}",
         format="records",
     )
@@ -1891,9 +1891,7 @@ async def list_sources(request: Request) -> JSONResponse:
     t0 = time.monotonic()
     try:
         client = ctx.get_client()
-        rows = client.query_sources(
-            _SOURCE_LIST_SQL + " ORDER BY source_id", format="records"
-        )
+        rows = client.query(_SOURCE_LIST_SQL + " ORDER BY source_id", format="records")
         result = [_source_row_to_dict(row) for row in rows]
         elapsed = (time.monotonic() - t0) * 1000
         ctx.diag.latency.record(elapsed)
@@ -1926,7 +1924,7 @@ async def query_sources(req: QuerySourcesRequest, request: Request) -> Response:
 
     try:
         client = ctx.get_client()
-        arrow_table = client.query_sources(req.sql)
+        arrow_table = client.query(req.sql)
 
         # Convert Arrow Table to JSON
         result = arrow_table.to_pylist()
@@ -2284,7 +2282,7 @@ async def get_source(source_id: str, request: Request) -> JSONResponse:
         # already in hand -- so streaming every source to look one up cost
         # O(catalog) per call and, worse, inherited the listing's safety cap:
         # a source past it answered 404 while being perfectly readable.
-        rows = client.query_sources(
+        rows = client.query(
             f"{_SOURCE_LIST_SQL} WHERE source_id = {sql_literal(source_id)}",
             format="records",
         )

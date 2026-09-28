@@ -164,7 +164,7 @@ carrying.
 
 **Enumeration and seeding are one bulk query.** `fetch_upstream_catalog` reads
 every upstream source's id, tensors, metadata, `is_resolved` and `indexed_at`
-in a single server-side `query_sources`, which is not truncated (unlike
+in a single server-side `query`, which is not truncated (unlike
 `list_sources()`), so mirroring costs one upstream RPC regardless of catalog
 size and a re-list can safely remove sources that disappeared. An upstream
 with no SQL catalog falls back to id-only enumeration, and removals are then
