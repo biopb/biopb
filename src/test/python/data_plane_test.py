@@ -589,6 +589,13 @@ class TestConfiguredTlsAnchor:
         monkeypatch.setenv("BIOPB_TENSOR_TLS_CA", str(path))
         assert _data_plane.configured_tls_anchor().ca_pem == path.read_bytes()
 
+    def test_a_tilde_in_the_ca_path_is_the_home_directory(self, monkeypatch, tmp_path):
+        path = self._ca(tmp_path)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))  # Windows' spelling
+        monkeypatch.setenv("BIOPB_TENSOR_TLS_CA", f"~/{path.name}")
+        assert _data_plane.configured_tls_anchor().ca_pem == path.read_bytes()
+
     def test_a_fingerprint_is_taken_stripped(self, monkeypatch):
         monkeypatch.setenv("BIOPB_TENSOR_TLS_FINGERPRINT", f"  {self.FP}  ")
         assert _data_plane.configured_tls_anchor().fingerprint == self.FP
@@ -600,7 +607,7 @@ class TestConfiguredTlsAnchor:
         with caplog.at_level("WARNING"):
             anchor = _data_plane.configured_tls_anchor()
         assert anchor == _data_plane.TlsAnchor(ca_pem=path.read_bytes())
-        assert "ignoring the fingerprint" in caplog.text
+        assert "fingerprint is ignored" in caplog.text
 
     def test_a_missing_ca_file_names_the_variable(self, monkeypatch, tmp_path):
         monkeypatch.setenv("BIOPB_TENSOR_TLS_CA", str(tmp_path / "nope.pem"))

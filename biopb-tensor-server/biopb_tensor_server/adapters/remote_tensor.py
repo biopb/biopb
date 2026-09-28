@@ -33,13 +33,18 @@ import logging
 import os
 import threading
 from dataclasses import dataclass
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.flight as flight
+from biopb._tls_material import (
+    TlsMaterialError,
+    choose_anchor,
+    expand_user_path,
+    read_pem,
+)
 from biopb.tensor._catalog_rows import sql_literal
 from biopb.tensor.descriptor_pb2 import (
     FlightRequest,
@@ -1091,21 +1096,13 @@ def resolve_upstream_credentials(
     if not token:
         token = os.environ.get(_UPSTREAM_TOKEN_ENV) or None
 
-    ca_pem = _read_upstream_ca(profile, profile_name)
-    fingerprint = getattr(profile, "tls_fingerprint", None) if profile else None
-    if ca_pem and fingerprint:
-        # Both name a trust anchor and the CA wins in the SDK; say so rather than
-        # let an operator believe a fingerprint is being enforced when it is not.
-        logger.warning(
-            "credentials profile %r sets both tls_ca_file and tls_fingerprint; "
-            "the CA file is used and the fingerprint is ignored.",
-            profile_name,
-        )
-
+    anchor = choose_anchor(
+        _read_upstream_ca(profile, profile_name),
+        getattr(profile, "tls_fingerprint", None) if profile else None,
+        source=f"credentials profile {profile_name!r}",
+    )
     return UpstreamCredentials(
-        token=token,
-        tls_ca_pem=ca_pem,
-        tls_fingerprint=(fingerprint or None) if not ca_pem else None,
+        token=token, tls_ca_pem=anchor.ca_pem, tls_fingerprint=anchor.fingerprint
     )
 
 
@@ -1125,15 +1122,9 @@ def _read_upstream_ca(profile: Any, profile_name: Optional[str]) -> Optional[byt
     if not ca_file:
         return None
     try:
-        pem = Path(ca_file).expanduser().read_bytes()
-    except OSError as exc:
-        raise UpstreamConfigError(
-            f"credentials profile {profile_name!r} sets tls_ca_file={ca_file!r}, "
-            f"which could not be read: {exc}"
-        ) from exc
-    if not pem.strip():
-        raise UpstreamConfigError(
-            f"credentials profile {profile_name!r} sets tls_ca_file={ca_file!r}, "
-            f"which is empty"
+        return read_pem(
+            expand_user_path(ca_file),
+            f"credentials profile {profile_name!r} tls_ca_file",
         )
-    return pem
+    except TlsMaterialError as exc:
+        raise UpstreamConfigError(str(exc)) from exc

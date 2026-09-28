@@ -29,10 +29,16 @@ import logging
 import os
 import urllib.request
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
+from .._tls_material import (
+    TlsAnchor,
+    TlsMaterialError,
+    choose_anchor,
+    expand_user_path,
+    read_pem,
+)
 from ._endpoints import BASE_DEFAULT_PORT, control_base_url, flight_port_for
 
 logger = logging.getLogger(__name__)
@@ -291,49 +297,27 @@ def resolve_data_plane(
     )
 
 
-@dataclass(frozen=True)
-class TlsAnchor:
-    """What to trust of a TLS data plane: a CA/leaf PEM, or a leaf's SHA-256.
-
-    At most one is set; neither leaves the client to trust on first use.
-    """
-
-    ca_pem: Optional[bytes] = None
-    fingerprint: Optional[str] = None
-
-    def __bool__(self) -> bool:
-        return bool(self.ca_pem or self.fingerprint)
-
-
 def configured_tls_anchor() -> TlsAnchor:
     """The anchor the environment names: ``$BIOPB_TENSOR_TLS_CA`` (a PEM file) or
     ``$BIOPB_TENSOR_TLS_FINGERPRINT``, else none.
 
     For a plane whose certificate this machine cannot see -- a remote one --
     where trust-on-first-use is only as good as a pin store that outlives the
-    process, which a container or a scheduler job does not have. When both are
-    set the CA wins, as it does for the constructor and a server's upstream
-    profile, and the fingerprint is reported as ignored. Raises
+    process, which a container or a scheduler job does not have. Raises
     :class:`TlsConfigError` when the CA file is unusable.
     """
     ca_path = os.environ.get(ENV_TENSOR_TLS_CA, "").strip()
-    fingerprint = os.environ.get(ENV_TENSOR_TLS_FINGERPRINT, "").strip()
-    if ca_path and fingerprint:
-        logger.warning(
-            "Both $%s and $%s are set; using the CA and ignoring the fingerprint.",
-            ENV_TENSOR_TLS_CA,
-            ENV_TENSOR_TLS_FINGERPRINT,
+    try:
+        ca_pem = (
+            read_pem(expand_user_path(ca_path), f"${ENV_TENSOR_TLS_CA}")
+            if ca_path
+            else None
         )
-    if ca_path:
-        from .. import _tls_material
-
-        try:
-            return TlsAnchor(
-                ca_pem=_tls_material.read_pem(Path(ca_path), f"${ENV_TENSOR_TLS_CA}")
-            )
-        except _tls_material.TlsMaterialError as exc:
-            raise TlsConfigError(str(exc)) from exc
-    return TlsAnchor(fingerprint=fingerprint or None)
+    except TlsMaterialError as exc:
+        raise TlsConfigError(str(exc)) from exc
+    return choose_anchor(
+        ca_pem, os.environ.get(ENV_TENSOR_TLS_FINGERPRINT), source="The environment"
+    )
 
 
 def data_plane_trust(url: str, origin: str) -> TlsAnchor:

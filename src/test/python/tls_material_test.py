@@ -12,9 +12,16 @@ stats fine and reads not at all.
 
 import os
 import sys
+from pathlib import Path
 
 import pytest
-from biopb._tls_material import TlsMaterialError, read_pem
+from biopb._tls_material import (
+    TlsAnchor,
+    TlsMaterialError,
+    choose_anchor,
+    expand_user_path,
+    read_pem,
+)
 
 CERT = b"-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END CERTIFICATE-----\n"
 KEY = b"-----BEGIN PRIVATE KEY-----\nZmFrZQ==\n-----END PRIVATE KEY-----\n"
@@ -93,3 +100,49 @@ def test_a_passphrase_protected_key_is_refused(tmp_path, body):
     """Both spellings: PKCS#8 renames the block, OpenSSL adds a header."""
     with pytest.raises(TlsMaterialError, match="passphrase-protected"):
         read_pem(_write(tmp_path, "k.pem", body), "--tls-key")
+
+
+class TestExpandUserPath:
+    """``~`` means the home directory on POSIX (``HOME``) and Windows
+    (``USERPROFILE``); both are set here so either platform's rule is met."""
+
+    def test_a_leading_tilde_is_the_home_directory(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        assert expand_user_path("~/ca.pem") == tmp_path / "ca.pem"
+
+    def test_a_path_without_one_is_unchanged(self):
+        assert expand_user_path("relative/ca.pem") == Path("relative/ca.pem")
+
+    def test_no_home_leaves_the_path_as_given(self, monkeypatch):
+        # Windows with USERPROFILE unset raises; the caller should get the
+        # ordinary "not found" naming this path instead.
+        def no_home(self):
+            raise RuntimeError("Could not determine home directory.")
+
+        monkeypatch.setattr(Path, "expanduser", no_home)
+        assert expand_user_path("~/ca.pem") == Path("~/ca.pem")
+
+
+class TestChooseAnchor:
+    """One CA-or-fingerprint rule for every config that may name both."""
+
+    PEM = b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n"
+
+    def test_neither_is_no_anchor(self):
+        assert not choose_anchor(None, None, source="x")
+        assert not choose_anchor(b"", "  ", source="x")
+
+    def test_a_ca_alone(self):
+        assert choose_anchor(self.PEM, None, source="x") == TlsAnchor(ca_pem=self.PEM)
+
+    def test_a_fingerprint_alone_is_stripped(self):
+        anchor = choose_anchor(None, "  ab:cd  ", source="x")
+        assert anchor == TlsAnchor(fingerprint="ab:cd")
+
+    def test_the_ca_wins_and_the_source_is_named(self, caplog):
+        with caplog.at_level("WARNING"):
+            anchor = choose_anchor(self.PEM, "ab:cd", source="credentials profile 'p'")
+        assert anchor == TlsAnchor(ca_pem=self.PEM)
+        assert "credentials profile 'p' sets both" in caplog.text
+        assert "fingerprint is ignored" in caplog.text
