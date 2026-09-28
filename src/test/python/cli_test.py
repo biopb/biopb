@@ -44,9 +44,9 @@ def _build_mock_client() -> MagicMock:
     """Build a mock TensorFlightClient for testing."""
     mock_client = MagicMock()
 
-    # The CLI browses with query_sources + sources_from_rows, so the mock
+    # The CLI browses with query + sources_from_rows, so the mock
     # answers with catalog rows rather than a descriptor map.
-    mock_client.query_sources.return_value = [
+    mock_client.query.return_value = [
         {
             "source_id": "my-source",
             "source_url": "/data/my-source.zarr",
@@ -152,7 +152,7 @@ class TestQueryCommand:
         """Test that query handles empty source list gracefully."""
         with patch("biopb.tensor.cli.TensorFlightClient") as mock_fc_class:
             mock_client = _build_mock_client()
-            mock_client.query_sources.return_value = []
+            mock_client.query.return_value = []
             mock_fc_class.return_value = mock_client
 
             result = runner.invoke(app, ["query"])
@@ -493,15 +493,15 @@ class TestCacheStatsCommand:
         kwargs = mock_fc_class.call_args.kwargs
         # No control answered (see the autouse fixture), so this is the default
         # endpoint -- base+5, derived, not the literal 8815 spelled in a command.
-        from biopb.control import _data_plane
+        from biopb._control import _data_plane
 
-        assert kwargs["location"] == _data_plane.default_url()
+        assert kwargs["location"] == _data_plane.default_data_plane_url()
         assert kwargs["token"] is None
 
     def test_the_control_plane_decides_the_endpoint(self, monkeypatch):
         """A published endpoint wins over the default — #615's central claim."""
         monkeypatch.setattr(
-            "biopb.control._data_plane.control_grpc_url",
+            "biopb._control._data_plane.control_grpc_url",
             lambda timeout=1.0: "grpc://127.0.0.1:9915",
         )
         with patch("biopb.tensor.cli.TensorFlightClient") as mock_fc_class:
@@ -571,10 +571,10 @@ class TestCacheStatsCommand:
 
         Classified by type, so it names the certificate rather than a token.
         """
-        from biopb.control import _data_plane
+        from biopb._control import _data_plane
 
         monkeypatch.setattr(
-            "biopb.control._data_plane.control_grpc_url",
+            "biopb._control._data_plane.control_grpc_url",
             lambda timeout=1.0: "grpcs://127.0.0.1:8815",
         )
         result = runner.invoke(app, ["cache-stats"])  # no cert in the state dir
@@ -598,9 +598,9 @@ class TestEveryCommandClassifiesItsFailures:
 
     # (argv, the client method whose call is the command's first RPC)
     CASES = [
-        (["query"], "query_sources"),
-        (["metadata", "my-source"], "query_sources"),
-        (["get", "my-source", "-o", "-"], "get_tensor_pb"),
+        (["query"], "query"),
+        (["metadata", "my-source"], "query"),
+        (["get", "my-source", "-o", "-"], "get_tensor"),
         (["stats", "my-source"], "get_tensor"),
         (["cache-stats"], "cache_stats"),
     ]
@@ -624,7 +624,7 @@ class TestEveryCommandClassifiesItsFailures:
     @pytest.mark.parametrize("argv,method", CASES)
     def test_an_unreachable_plane_says_so_and_names_the_endpoint(self, argv, method):
         import pyarrow.flight as flight
-        from biopb.control import _data_plane
+        from biopb._control import _data_plane
 
         result = self._run(argv, method, flight.FlightUnavailableError("refused"))
 
@@ -632,7 +632,7 @@ class TestEveryCommandClassifiesItsFailures:
         assert "Cannot reach the data plane" in result.stderr
         # The origin is part of the message: a guessed default is not the same
         # failure as an endpoint the control published.
-        assert _data_plane.default_url() in result.stderr
+        assert _data_plane.default_data_plane_url() in result.stderr
 
     def test_a_local_failure_keeps_the_command_s_own_words(self):
         """Not everything that goes wrong in a command body is the plane's doing.
@@ -762,7 +762,7 @@ class TestDecodeRatesCommand:
     def _run(self, *args, rows=None):
         with patch("biopb.tensor.cli.TensorFlightClient") as mock_fc_class:
             client = MagicMock()
-            client.query_sources.return_value = self._ROWS if rows is None else rows
+            client.query.return_value = self._ROWS if rows is None else rows
             mock_fc_class.return_value = client
             result = runner.invoke(app, ["decode-rates", *args])
         return result, mock_fc_class, client
@@ -772,7 +772,7 @@ class TestDecodeRatesCommand:
         # the server's, not a client-side sort of whatever arrived.
         result, _, client = self._run()
         assert result.exit_code == 0, result.output
-        sql = client.query_sources.call_args.args[0]
+        sql = client.query.call_args.args[0]
         assert "FROM decode_rates" in sql
         assert "ORDER BY mbps DESC" in sql
         client.close.assert_called_once()

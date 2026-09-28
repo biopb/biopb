@@ -279,7 +279,7 @@ def main() -> None:
 
     url = ""
     try:
-        rows = client.query_sources(
+        rows = client.query(
             f"SELECT source_url FROM sources WHERE source_id = '{args.source_id}'",
             format="pandas",
         )

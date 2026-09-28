@@ -26,21 +26,21 @@ else:
 # no source-wide answer to ask for.
 # The catalog is structural: the transfer grid a tensor is delivered on is not
 # stored here -- `client.get_descriptor(array_id).chunk_shape` answers it.
-df = client.query_sources("SELECT source_id FROM sources WHERE source_type='ome-zarr'", format="pandas")
+df = client.query("SELECT source_id FROM sources WHERE source_type='ome-zarr'", format="pandas")
 print(df)
 
 # Per-tensor queries (multi-field / HCS sources): use the nested `tensors`
 # column with UNNEST or list_filter. `tensors[1]` is the source's first tensor,
 # which for an image source is its picture (DuckDB lists are 1-indexed).
-client.query_sources(  # every tensor, one row each
+client.query(  # every tensor, one row each
     "SELECT source_id, t.array_id, t.shape, t.dtype "
     "FROM sources, UNNEST(tensors) AS u(t)", format="pandas")
-client.query_sources(  # sources having ANY uint16 tensor
+client.query(  # sources having ANY uint16 tensor
     "SELECT source_id FROM sources "
     "WHERE len(list_filter(tensors, t -> t.dtype = 'uint16')) > 0", format="pandas")
 
-# One row per source, with its tensors (query_sources is the only browse)
-for row in client.query_sources(
+# One row per source, with its tensors (query is the only browse)
+for row in client.query(
     "SELECT source_id, source_url, source_type, tensors FROM sources",
     format="records"):
     tensors = [(t["array_id"], t["shape"], t["dtype"]) for t in row["tensors"]]
@@ -62,12 +62,12 @@ read. They list with `is_resolved == False` and an empty `tensors`, and
 `get_tensor` on one raises.
 
 ```python
-client.resolve("source_id")     # downloads the whole thing; minutes, disk, needs network
+client.resolve_source("source_id")     # downloads the whole thing; minutes, disk, needs network
 ```
 
 Resolving is deliberately explicit — browsing never triggers it — because it is
 a full download. It returns the source's `sources` row, now populated. For a
-multi-file source it fetches metadata only; `client.warm(source_id)` pulls the
+multi-file source it fetches metadata only; `client.warm_source(source_id)` pulls the
 member files resident up front, server-side, if you are about to read all of it.
 
 **Resolved is not the same as local.** `is_resolved` says the server has read
@@ -78,7 +78,7 @@ for it: warn the user before a long read rather than after it, and crop or warm
 rather than reaching for the whole thing.
 
 **Filter footgun:** an unresolved source has an empty `tensors`, so
-`query_sources("... WHERE tensors[1].dtype = 'uint8'")` silently drops it —
+`query("... WHERE tensors[1].dtype = 'uint8'")` silently drops it —
 hidden for being unresolved, not for failing to match. `WHERE NOT is_resolved`
 is how you ask for them on purpose.
 
@@ -116,7 +116,7 @@ The write side is [[upload]] — tensors, label sets and ROI annotations, and wh
 each refuses. The short form:
 
 ```python
-desc = client.add_tensor("zarr://scratch/@fields/my_result", arr)
+desc = client.setup_array_upload("zarr://scratch/@fields/my_result", arr)
 client.upload_array(desc, arr)
 ```
 

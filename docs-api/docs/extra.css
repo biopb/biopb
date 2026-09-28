@@ -1,0 +1,19 @@
+/* navigation.sections bolds a top-level nav group's title (Development, API
+   reference, ...) but leaves it the same font-size as its children -- make it
+   actually read as a section header. */
+.md-nav__item--section > .md-nav__link {
+  font-size: .85rem;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  opacity: .85;
+}
+
+/* mkdocstrings gives each documented function/attribute/class its own
+   .doc-object block but no visual break between them; a rule above every one
+   but the first in its group (module members, or one class's own methods)
+   marks where one item's doc ends and the next begins. */
+.doc-object + .doc-object {
+  border-top: 1px solid var(--md-default-fg-color--lightest);
+  margin-top: 2rem;
+  padding-top: 1.5rem;
+}

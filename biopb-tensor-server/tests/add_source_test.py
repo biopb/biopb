@@ -388,7 +388,7 @@ class TestAddSourceRoundtrip:
         try:
             client = TensorFlightClient(f"grpc://localhost:{server.port}")
 
-            result = client.add_source(zpath)
+            result = client.register_local_path(zpath)
             assert len(result.added) == 1
             sid = result.added[0]
             assert not result.failed
@@ -399,14 +399,14 @@ class TestAddSourceRoundtrip:
             assert darr.compute().shape == (4, 8, 8)
 
             # Re-add over the wire -> already_present, no duplicate.
-            again = client.add_source(zpath)
+            again = client.register_local_path(zpath)
             assert again.added == [] and list(again.already_present) == [sid]
 
             # A bogus path is a whole-request failure surfaced as a server error.
             import pyarrow.flight as flight
 
             with pytest.raises(flight.FlightServerError):
-                client.add_source(str(tmp_path / "nope"))
+                client.register_local_path(str(tmp_path / "nope"))
 
             client.close()
         finally:
@@ -431,7 +431,7 @@ class TestAddSourceRoundtrip:
         )
         try:
             client = TensorFlightClient(f"grpc://localhost:{server.port}")
-            result = client.add_source(folder)
+            result = client.register_local_path(folder)
 
             assert not result.failed
             assert len(result.added) == 1
@@ -539,13 +539,15 @@ class TestRemoveSourceRoundtrip:
         try:
             client = TensorFlightClient(f"grpc://localhost:{server.port}")
 
-            added = client.add_source(str(root))
+            added = client.register_local_path(str(root))
             assert len(added.added) == 2
             sids = set(added.added)
             assert sids <= set(client.list_sources())
 
-            # Remove the whole dropped branch by its dnd:// root.
-            result = client.remove_source("dnd://exp")
+            # Remove the whole dropped branch by its dnd:// root, through the
+            # deprecated alias -- same RPC, so this doubles as its coverage.
+            with pytest.warns(DeprecationWarning, match="remove_source"):
+                result = client.remove_source("dnd://exp")
             assert set(result.removed) == sids and not result.failed
             assert not (sids & set(client.list_sources()))
 
@@ -553,7 +555,7 @@ class TestRemoveSourceRoundtrip:
             import pyarrow.flight as flight
 
             with pytest.raises(flight.FlightServerError):
-                client.remove_source("file:///data/x.zarr")
+                client.deregister_local_path("file:///data/x.zarr")
 
             client.close()
         finally:

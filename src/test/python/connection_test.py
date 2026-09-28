@@ -160,7 +160,7 @@ class TestWaiting:
             dials.append(url)
             client = MagicMock()
             client.health_check.return_value = SERVING
-            client.query_sources.side_effect = RuntimeError("Unauthenticated")
+            client.query.side_effect = RuntimeError("Unauthenticated")
             return client
 
         monkeypatch.setattr(_connection, "TensorFlightClient", factory)

@@ -1,4 +1,4 @@
-"""Unit tests for the SDK ``TensorFlightClient.resolve()`` and the directive
+"""Unit tests for the SDK ``TensorFlightClient.resolve_source()`` and the directive
 error that steers callers to it (cloud-storage phase 2, agent-facing API).
 
 These exercise the resolve trigger and its caches without a live Flight server:
@@ -62,7 +62,7 @@ def _result_body(source_id, array_ids=(), is_resolved=True):
 def _bare_client():
     from biopb.tensor._session import CatalogClient, ChunkFetcher, _ClientState
 
-    # add_source / resolve / warm now live on CatalogClient (#278 item C); build
+    # register_local_path / resolve_source / warm_source now live on CatalogClient (#278 item C); build
     # the shared state + collaborators (no connection) and inject the fake flight
     # at ``client._state.client`` where the catalog reads it.
     client = object.__new__(TensorFlightClient)
@@ -113,7 +113,7 @@ class _FakeFlight:
 
 class TestResolve:
     def test_returns_the_full_row_from_resolve_action(self):
-        # resolve() makes a single streaming `resolve` do_action and returns the
+        # resolve_source() makes a single streaming `resolve` do_action and returns the
         # terminal row directly -- ALL fields, no list_sources, no cap.
         #
         # A row, not a progress snapshot: resolving is defined by what it
@@ -125,7 +125,7 @@ class TestResolve:
             [_FakeResult(_result_body("cloud_x", ["cloud_x/f0", "cloud_x/f1"]))]
         )
 
-        out = client.resolve("cloud_x")
+        out = client.resolve_source("cloud_x")
 
         assert client._state.client.action.type == "resolve"
         assert bytes(client._state.client.action.body) == b"cloud_x"
@@ -151,7 +151,7 @@ class TestResolve:
         )
         seen = []
 
-        out = client.resolve("cloud_x", on_progress=seen.append)
+        out = client.resolve_source("cloud_x", on_progress=seen.append)
 
         assert [t["array_id"] for t in out["tensors"]] == ["cloud_x"]
         assert [round(p.elapsed_seconds, 1) for p in seen] == [0.0, 0.5]
@@ -168,7 +168,7 @@ class TestResolve:
             ]
         )
 
-        out = client.resolve("cloud_x")
+        out = client.resolve_source("cloud_x")
 
         assert [t["array_id"] for t in out["tensors"]] == ["cloud_x"]
 
@@ -183,7 +183,7 @@ class TestResolve:
             ]
         )
         with pytest.raises(ResolveCancelled):
-            client.resolve("cloud_x", should_cancel=lambda: True)
+            client.resolve_source("cloud_x", should_cancel=lambda: True)
 
     def test_no_terminal_result_raises(self):
         # A stream of only heartbeats (server closed without a row) is an error,
@@ -193,7 +193,7 @@ class TestResolve:
             [_FakeResult(_progress_body(0.0)), _FakeResult(_progress_body(0.1))]
         )
         with pytest.raises(RuntimeError, match="no catalog row"):
-            client.resolve("cloud_x")
+            client.resolve_source("cloud_x")
 
 
 def _unresolved_row_table():
@@ -210,9 +210,9 @@ def _unresolved_row_table():
 
 
 class TestUnresolvedDirectiveError:
-    def test_get_tensor_points_at_resolve(self):
+    def test_get_tensor_points_at_resolve_source(self):
         # A bare get_tensor() on an unresolved source must fail with a directive
-        # message naming client.resolve(), not a bare "no tensors". The refusal
+        # message naming client.resolve_source(), not a bare "no tensors". The refusal
         # is the server's, restated: taken from the GetFlightInfo that plans the
         # read, so it holds even for a capability-token holder who cannot browse
         # the catalog.
@@ -230,7 +230,7 @@ class TestUnresolvedDirectiveError:
             client.get_tensor("cloud_x")
         msg = str(exc.value)
         assert "unresolved" in msg
-        assert "client.resolve('cloud_x')" in msg
+        assert "client.resolve_source('cloud_x')" in msg
 
     def test_an_open_ended_slice_refuses_from_the_catalog(self, monkeypatch):
         # The one read shape that resolves before the RPC: an open-ended stop is
@@ -243,11 +243,11 @@ class TestUnresolvedDirectiveError:
         )
         with pytest.raises(ValueError) as exc:
             client.get_tensor("cloud_x", slice_hint=(slice(0, None), slice(0, None)))
-        assert "client.resolve('cloud_x')" in str(exc.value)
+        assert "client.resolve_source('cloud_x')" in str(exc.value)
 
 
 class TestSourceMetadataUnresolvedGuard:
-    """F2 (#108): get_source_metadata must steer to resolve(), not return {}."""
+    """F2 (#108): get_source_metadata must steer to resolve_source(), not return {}."""
 
     def test_unresolved_source_raises_instead_of_returning_empty(self, monkeypatch):
         # An unresolved source's row says so; the old behavior returned {},
@@ -271,7 +271,7 @@ class TestSourceMetadataUnresolvedGuard:
             client.get_source_metadata("cloud_x")
         msg = str(exc.value)
         assert "unresolved" in msg
-        assert "client.resolve('cloud_x')" in msg
+        assert "client.resolve_source('cloud_x')" in msg
         assert recalled == []  # no GetFlightInfo / download was triggered
 
     def test_resolved_source_with_no_metadata_returns_empty(self, monkeypatch):
@@ -309,7 +309,7 @@ class TestPhysicalScaleUnresolvedGuard:
         client._state.client = type(
             "FakeFlight", (), {"get_flight_info": staticmethod(_refuse)}
         )()
-        with pytest.raises(ValueError, match="client.resolve"):
+        with pytest.raises(ValueError, match="client.resolve_source"):
             client.get_physical_scale("cloud_x")
 
     def test_resolved_source_still_fetches_scale(self, monkeypatch):

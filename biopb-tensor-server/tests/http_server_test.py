@@ -114,7 +114,7 @@ def _make_source_desc(
 
 
 def _source_row(desc) -> dict:
-    """The `sources` catalog row a real ``query_sources`` would hand back."""
+    """The `sources` catalog row a real ``query`` would hand back."""
     return {
         "source_id": desc.source_id,
         "source_url": desc.source_url,
@@ -146,9 +146,9 @@ def _build_mock_client(src_desc=None) -> MagicMock:
     src = src_desc or _make_source_desc()
 
     # The sidecar browses the catalog with SQL: every source route is a
-    # query_sources() over `sources`. The fake answers the two shapes the
+    # query() over `sources`. The fake answers the two shapes the
     # routes ask for -- the whole listing, and one `WHERE source_id = '...'`.
-    def query_sources(sql, format="arrow"):  # noqa: A002 - mirrors the real kwarg
+    def query(sql, format="arrow"):  # noqa: A002 - mirrors the real kwarg
         assert format == "records", sql
         rows = [_source_row(src)]
         if "WHERE source_id = " in sql:
@@ -158,7 +158,7 @@ def _build_mock_client(src_desc=None) -> MagicMock:
             return [{"tensors": r["tensors"]} for r in rows]
         return rows
 
-    mc.query_sources.side_effect = query_sources
+    mc.query.side_effect = query
 
     def get_descriptor(array_id, **_kwargs):
         """What GetFlightInfo actually does, including the parts that bite.
@@ -471,7 +471,7 @@ class TestSourcesEndpoints:
     def test_list_sources_calls_flight_client(self, auth_client):
         tc, mock_fc = auth_client
         tc.get("/api/sources", headers=_bearer(_TOKEN))
-        mock_fc.query_sources.assert_called()
+        mock_fc.query.assert_called()
 
     def test_list_sources_is_resolved_field(self):
         unresolved = _make_source_desc(tensors=[], is_resolved=False)
@@ -492,7 +492,7 @@ class TestSourcesEndpoints:
         # all; the default reads as resolved, the correct answer for every
         # pre-existing source.
         tc, mock_fc = auth_client
-        mock_fc.query_sources.side_effect = lambda sql, format="arrow": [  # noqa: A006
+        mock_fc.query.side_effect = lambda sql, format="arrow": [  # noqa: A006
             {
                 "source_id": "src0",
                 "source_url": "/data/src0",
@@ -801,11 +801,11 @@ class TestRedact:
     def test_redact_path_in_error(self, auth_client):
         tc, mock_fc = auth_client
         # Trigger an error containing a file path
-        mock_fc.query_sources.side_effect = RuntimeError(
+        mock_fc.query.side_effect = RuntimeError(
             "failed to open /home/user/secret/data.zarr"
         )
         tc.get("/api/sources", headers=_bearer(_TOKEN))
-        mock_fc.query_sources.side_effect = None
+        mock_fc.query.side_effect = None
 
         # The error should be recorded and redacted in diagnostics
         # (reset rate limit by using different session key)
@@ -1024,7 +1024,7 @@ class TestQuerySourcesEndpoint:
         assert mock_table.schema.metadata is None
         # Replaces the fixture's catalog-row fake: this route is the raw
         # passthrough, so it wants the arrow table back untouched.
-        mock_fc.query_sources.side_effect = lambda sql, **kw: mock_table
+        mock_fc.query.side_effect = lambda sql, **kw: mock_table
 
         r = tc.post(
             "/api/sources/query",
@@ -1057,7 +1057,7 @@ class TestQuerySourcesEndpoint:
                 b"returned_sources": "2",
             }
         )
-        mock_fc.query_sources.side_effect = lambda sql, **kw: mock_table
+        mock_fc.query.side_effect = lambda sql, **kw: mock_table
 
         r = tc.post(
             "/api/sources/query",
@@ -1071,7 +1071,7 @@ class TestQuerySourcesEndpoint:
 
     def test_query_sources_validation_error(self, auth_client):
         tc, mock_fc = auth_client
-        mock_fc.query_sources.side_effect = ValueError("forbidden keyword: INSERT")
+        mock_fc.query.side_effect = ValueError("forbidden keyword: INSERT")
 
         r = tc.post(
             "/api/sources/query",
@@ -1083,7 +1083,7 @@ class TestQuerySourcesEndpoint:
 
     def test_query_sources_flight_error(self, auth_client):
         tc, mock_fc = auth_client
-        mock_fc.query_sources.side_effect = RuntimeError("Flight connection lost")
+        mock_fc.query.side_effect = RuntimeError("Flight connection lost")
 
         r = tc.post(
             "/api/sources/query",
@@ -2729,7 +2729,7 @@ class TestTileResolutionCostsOneFetch:
         with _multi_tensor_client() as (tc, mock_fc):
             mock_fc.reset_mock()
             assert tc.get("/api/tile/multi/Image:1").status_code == 200
-            mock_fc.query_sources.assert_not_called()
+            mock_fc.query.assert_not_called()
             # Two describes, no listing: the structural fetch this route makes
             # per request by contract, and the pyramid ladder -- which this
             # source pays for on every tile because it publishes no content
@@ -2747,7 +2747,7 @@ class TestTileResolutionCostsOneFetch:
             mock_fc.reset_mock()
             body = tc.get("/api/tile_info/tiled").json()
             assert body["array_id"].startswith("tiled@")
-            mock_fc.query_sources.assert_not_called()
+            mock_fc.query.assert_not_called()
 
     def test_the_published_id_carries_the_qualified_tensor(self):
         # First contact ends the ambiguity: tile_info hands back the qualified
@@ -2756,7 +2756,7 @@ class TestTileResolutionCostsOneFetch:
             array_id = _published_array_id(tc)
             mock_fc.reset_mock()
             assert tc.get(f"/api/tile/{array_id}").status_code == 200
-            mock_fc.query_sources.assert_not_called()
+            mock_fc.query.assert_not_called()
 
     def test_a_dead_backend_is_a_502_not_a_404(self):
         # The fetch now owns the 404, so its except clause must not swallow a
@@ -3581,7 +3581,7 @@ class TestResolveWarmJobs:
         assert r.status_code == 202
         assert r.json()["started"] is True
         assert _await_state(tc, "resolve", "cloud0", "done")["error"] is None
-        mock_fc.resolve.assert_called_once()
+        mock_fc.resolve_source.assert_called_once()
 
     def test_status_route_is_not_swallowed_by_the_source_catch_all(self, auth_client):
         # /api/sources/{source_id:path} is greedy: without this route ordering
@@ -3602,7 +3602,7 @@ class TestResolveWarmJobs:
         # must not start a second download of the same bytes.
         tc, mock_fc = auth_client
         release = threading.Event()
-        mock_fc.resolve.side_effect = lambda *a, **k: release.wait(5)
+        mock_fc.resolve_source.side_effect = lambda *a, **k: release.wait(5)
 
         first = tc.post("/api/sources/cloud0/resolve", headers=_bearer(_TOKEN))
         second = tc.post("/api/sources/cloud0/resolve", headers=_bearer(_TOKEN))
@@ -3610,7 +3610,7 @@ class TestResolveWarmJobs:
         assert second.json()["started"] is False
         release.set()
         _await_state(tc, "resolve", "cloud0", "done")
-        assert mock_fc.resolve.call_count == 1
+        assert mock_fc.resolve_source.call_count == 1
 
     def test_progress_heartbeats_reach_the_status_body(self, auth_client):
         tc, mock_fc = auth_client
@@ -3624,7 +3624,7 @@ class TestResolveWarmJobs:
             )
             seen.wait(5)
 
-        mock_fc.resolve.side_effect = _resolve
+        mock_fc.resolve_source.side_effect = _resolve
         tc.post("/api/sources/cloud0/resolve", headers=_bearer(_TOKEN))
         body = _await_state(tc, "resolve", "cloud0", "running")
         assert body["progress"]["target_name"] == "big.zarr"
@@ -3642,7 +3642,7 @@ class TestResolveWarmJobs:
             observed["cancelled"] = should_cancel()
             raise ResolveCancelled("stopped")
 
-        mock_fc.resolve.side_effect = _resolve
+        mock_fc.resolve_source.side_effect = _resolve
         tc.post("/api/sources/cloud0/resolve", headers=_bearer(_TOKEN))
         r = tc.post("/api/sources/cloud0/resolve/cancel", headers=_bearer(_TOKEN))
         # Flag first, state later: the UI needs the flag to stop offering a
@@ -3664,14 +3664,14 @@ class TestResolveWarmJobs:
 
     def test_a_failed_resolve_surfaces_its_reason(self, auth_client):
         tc, mock_fc = auth_client
-        mock_fc.resolve.side_effect = RuntimeError("offline")
+        mock_fc.resolve_source.side_effect = RuntimeError("offline")
         tc.post("/api/sources/cloud0/resolve", headers=_bearer(_TOKEN))
         body = _await_state(tc, "resolve", "cloud0", "error")
         assert "offline" in body["error"]
 
     def test_warm_reports_the_terminal_counts_not_the_last_heartbeat(self, auth_client):
         tc, mock_fc = auth_client
-        mock_fc.warm.return_value = SimpleNamespace(
+        mock_fc.warm_source.return_value = SimpleNamespace(
             files_total=12,
             files_done=12,
             bytes_total=2048,
@@ -3688,7 +3688,7 @@ class TestResolveWarmJobs:
         # files_total == 0 is how a client tells single-file from multi-file
         # without keeping its own list of source types.
         tc, mock_fc = auth_client
-        mock_fc.warm.return_value = SimpleNamespace(
+        mock_fc.warm_source.return_value = SimpleNamespace(
             files_total=0,
             files_done=0,
             bytes_total=0,
@@ -3702,7 +3702,7 @@ class TestResolveWarmJobs:
 
     def test_resolve_and_warm_are_separate_jobs_on_one_source(self, auth_client):
         tc, mock_fc = auth_client
-        mock_fc.warm.return_value = SimpleNamespace(
+        mock_fc.warm_source.return_value = SimpleNamespace(
             files_total=1,
             files_done=1,
             bytes_total=8,

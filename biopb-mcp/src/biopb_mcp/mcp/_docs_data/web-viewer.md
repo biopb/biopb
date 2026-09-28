@@ -25,7 +25,7 @@ both:
 ## Building the link
 
 ```python
-from biopb.control import base_url
+from biopb import base_url
 url = f"{base_url()}/viewer?id={array_id}"
 ```
 
@@ -85,7 +85,7 @@ each has a parameter that draws it:
 | points, boxes, polygons written with `put_rois` | `rs=<set_name>` |
 
 ```python
-desc = client.add_tensor(f"zarr://{image_id}/@labels/nuclei", labels)
+desc = client.setup_array_upload(f"zarr://{image_id}/@labels/nuclei", labels)
 client.upload_array(desc, labels)
 url = f"{control_base_url()}/viewer?id={image_id}&lb={desc.array_id}&lo=0.5"
 ```

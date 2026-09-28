@@ -12,7 +12,7 @@ import time
 from unittest.mock import MagicMock
 
 import pytest
-from biopb._lifecycle import deathwatch as _deathwatch
+from biopb.lifecycle import deathwatch as _deathwatch
 
 from biopb_control._control import serve_control_api
 from biopb_control._supervisor import DataPlaneSpec, DataPlaneSupervisor

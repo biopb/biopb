@@ -20,7 +20,7 @@ from rich.table import Table
 
 from biopb import _algorithms
 from biopb.image import Arg, Call, ImageData, OpInfo, OpList, OpsStub
-from biopb.image.utils import (
+from biopb.image._utils import (
     deserialize_image_data,
     serialize_from_numpy_to_image_data,
 )
@@ -255,7 +255,7 @@ def servers(
         biopb image servers
         biopb image servers --json --timeout 2
     """
-    from biopb.control import algorithms
+    from biopb import algorithms
 
     rows = algorithms(timeout=timeout + 6)
     if rows is None:

@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Optional
 
 from biopb import _algorithms, _credentials
-from biopb.control import _endpoints
+from biopb._control import _endpoints
 
 from ._algorithm_plane import AlgorithmPlane
 from ._control import serve_control_api

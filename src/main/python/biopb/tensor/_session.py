@@ -4,7 +4,7 @@ Extracted from :mod:`biopb.tensor.client` (issue #278 item C). The two
 collaborators share the connection via :class:`_ClientState`:
 
 - :class:`CatalogClient` -- discovery / metadata / resolve / warm / source
-  registration (``list_sources`` / ``query_sources`` / ``resolve`` / ... RPCs).
+  registration (``list_sources`` / ``query`` / ``resolve`` / ... RPCs).
 - :class:`ChunkFetcher` -- tensor reads: plan a read with GetFlightInfo and
   build the lazy dask chunk-fetching array.
 
@@ -28,6 +28,7 @@ from typing import (
     Optional,
     Sequence,
     Tuple,
+    Union,
 )
 
 import dask.array as da
@@ -35,13 +36,6 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.flight as flight
 
-from biopb.image._roi_rows import (
-    ROI_ID_SCHEMA,
-    ROI_ROW_SCHEMA,
-    roi_ids_to_table,
-    rois_to_table,
-    table_to_rois,
-)
 from biopb.image.annotation_pb2 import (
     RoiAnnotation,
     RoiDeleteResult,
@@ -64,6 +58,13 @@ from biopb.tensor._pool import (
     _chunk_map_from_endpoints,
     _get_shared_call_options,
     _get_thread_client,
+)
+from biopb.tensor._roi_rows import (
+    ROI_ID_SCHEMA,
+    ROI_ROW_SCHEMA,
+    roi_ids_to_table,
+    rois_to_table,
+    table_to_rois,
 )
 from biopb.tensor._tls import TlsTrust, resolve_tls_trust
 from biopb.tensor.descriptor_pb2 import (
@@ -173,15 +174,21 @@ class ResolveCancelled(Exception):
 
     The client stops consuming the resolve stream and unwinds; the server's
     recall daemon thread runs to completion and caches its result, so a later
-    :meth:`resolve` coalesces onto the finished work rather than re-downloading.
+    :meth:`resolve_source` coalesces onto the finished work rather than re-downloading.
     """
 
 
-def _upload_status_dict(source_id: str, status: UploadStatusPb) -> Dict[str, Any]:
+def _upload_status_dict(array_id: str, status: UploadStatusPb) -> Dict[str, Any]:
     """The one shape an upload status takes on the SDK, for the poll and for
-    ``set_upload_status`` alike."""
+    ``set_upload_status`` alike.
+
+    The dict key stays ``source_id`` (not ``array_id``) to mirror the server's
+    own ``as_status_dict`` / ``unknown_upload_status`` shape, which
+    ``biopb_image_base``'s embedded, client-free cache also matches -- see
+    ``upload_status_flight_info_test.py::test_the_dict_keeps_its_shape``.
+    """
     return {
-        "source_id": source_id,
+        "source_id": array_id,
         "state": UploadStatusPb.State.Name(status.state),
         "expected_chunks": status.expected_chunks,
         "uploaded_chunks": status.uploaded_chunks,
@@ -189,15 +196,16 @@ def _upload_status_dict(source_id: str, status: UploadStatusPb) -> Dict[str, Any
     }
 
 
-def _unknown_upload_status(source_id: str) -> Dict[str, Any]:
-    """The answer for a source the server tracks no upload for.
+def _unknown_upload_status(array_id: str) -> Dict[str, Any]:
+    """The answer for a tensor the server tracks no upload for.
 
     Mirrors the server's own ``unknown_upload_status`` so the two ends agree on
-    the shape, and never means "not started yet": the record exists from the
-    moment ``add_tensor`` hands out the id.
+    the shape (dict key ``source_id``, see :func:`_upload_status_dict`), and
+    never means "not started yet": the record exists from the moment
+    ``setup_array_upload`` hands out the id.
     """
     return {
-        "source_id": source_id,
+        "source_id": array_id,
         "state": "UNKNOWN",
         "expected_chunks": 0,
         "uploaded_chunks": 0,
@@ -500,15 +508,16 @@ def _unresolved_source_error(source_id: str) -> ValueError:
     """Directive error for reading an *unresolved* (cloud / synced-folder) source.
 
     Shared by every read entry point so the guidance is uniform: name the cure
-    (``client.resolve``) instead of leaking a bare internal "no tensors", and --
-    critically for methods like ``get_physical_scale`` -- raise this rather than
-    silently recalling (downloading) the whole file just to answer a metadata
-    query. Resolving is the heavyweight, *consenting* act; reads must not trigger
-    it implicitly."""
+    (``client.resolve_source``) instead of leaking a bare internal "no tensors",
+    and -- critically for methods like ``get_physical_scale`` -- raise this
+    rather than silently recalling (downloading) the whole file just to answer
+    a metadata query. Resolving is the heavyweight, *consenting* act; reads
+    must not trigger it implicitly."""
     return ValueError(
         f"Source '{source_id}' is unresolved (no tensors listed yet). If this "
-        f"is a cloud / synced-folder source, call client.resolve('{source_id}') "
-        f"first to download and resolve it, then read it."
+        f"is a cloud / synced-folder source, call "
+        f"client.resolve_source('{source_id}') first to download and resolve "
+        f"it, then read it."
     )
 
 
@@ -613,7 +622,7 @@ def do_action_one_result(
 class CatalogClient:
     """Catalog, metadata, and source-lifecycle RPCs over one Flight connection.
 
-    Owns discovery (``list_sources`` / ``query_sources``), per-tensor metadata
+    Owns discovery (``list_sources`` / ``query``), per-tensor metadata
     probes, the experimental cloud ``resolve`` / ``warm`` streams, and runtime
     source registration. Reads and writes the shared ``_ClientState`` caches.
     """
@@ -644,12 +653,12 @@ class CatalogClient:
             return _descriptor_from_row(row)
         return None
 
-    def query_sources(self, sql: str, *, format: str = "arrow") -> Any:  # noqa: A002 - public, documented keyword API (mirrors DuckDB/pandas `format`)
-        """Backs TensorFlightClient.query_sources; see that method for the full
+    def query(self, sql: str, *, format: str = "arrow") -> Any:  # noqa: A002 - public, documented keyword API (mirrors DuckDB/pandas `format`)
+        """Backs TensorFlightClient.query; see that method for the full
         documentation."""
         if format not in ("pandas", "arrow", "records"):
             raise ValueError(
-                f"query_sources: unknown format {format!r}; "
+                f"query: unknown format {format!r}; "
                 "expected 'pandas', 'arrow', or 'records'"
             )
 
@@ -674,12 +683,12 @@ class CatalogClient:
             if metadata.get(b"truncated", b"").decode() == "True":
                 total = metadata.get(b"total_rows")
                 logger.info(
-                    "query_sources: returned %s of %s rows (truncated)",
+                    "query: returned %s of %s rows (truncated)",
                     returned_count,
                     int(total.decode()) if total else "?",
                 )
             else:
-                logger.debug("query_sources: returned %s rows", returned_count)
+                logger.debug("query: returned %s rows", returned_count)
         return table
 
     @staticmethod
@@ -700,7 +709,7 @@ class CatalogClient:
             import pandas  # noqa: F401
         except ImportError as exc:
             raise ImportError(
-                "query_sources(format='pandas') requires pandas; install "
+                "query(format='pandas') requires pandas; install "
                 "pandas, or call with format='arrow' / format='records'."
             ) from exc
         df = table.to_pandas()
@@ -782,7 +791,7 @@ class CatalogClient:
         the source's default (first) tensor (#44). This is a CHEAP probe: it
         does NOT resolve. An unresolved (cloud / synced-folder) source raises
         the directive ``_unresolved_source_error`` steering the caller to
-        :meth:`resolve`, rather than triggering a download.
+        :meth:`resolve_source`, rather than triggering a download.
 
         The three ``with_*`` flags are the ``GetFlightInfo`` response field masks
         (biopb/biopb#563); each selects one optional part of the response:
@@ -945,7 +954,7 @@ class CatalogClient:
         """Iterate a streaming ``do_action``, yielding ``(which, msg, body)`` per
         non-empty message.
 
-        The loop shared by :meth:`resolve` / :meth:`warm` / :meth:`add_source`:
+        The loop shared by :meth:`resolve_source` / :meth:`warm_source` / :meth:`register_local_path`:
         the ``do_action`` call, the empty-body heartbeat skip, the envelope parse
         into ``msg_cls`` (a bad parse yields ``which=None``, which every caller
         ignores -- the SDK refuses a pre-v2 server at connect), and the old-server
@@ -954,7 +963,7 @@ class CatalogClient:
         propagates unchanged.
 
         Cancellation is deliberately NOT handled here: its semantics differ per
-        caller (resolve/warm raise, add_source returns what it has), and the poll
+        caller (resolve/warm raise, register_local_path returns what it has), and the poll
         must run *after* a message is consumed so a terminal already in hand is
         never discarded by a cancel landing on it (issue #4). Each caller polls
         ``should_cancel`` around its own dispatch.
@@ -978,14 +987,14 @@ class CatalogClient:
                 raise RuntimeError(unknown_action_msg) from exc
             raise
 
-    def resolve(
+    def resolve_source(
         self,
         source_id: str,
         *,
         on_progress: Optional[Callable[["ResolveProgress"], None]] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
     ) -> Dict[str, Any]:
-        """Backs TensorFlightClient.resolve; see that method for the full
+        """Backs TensorFlightClient.resolve_source; see that method for the full
         documentation."""
         # One dedicated, streaming ``resolve`` action: it is the SINGLE server
         # entry point that performs the (possibly minutes-long) recall, and its
@@ -1000,7 +1009,9 @@ class CatalogClient:
         row: Optional[Mapping[str, Any]] = None
         for which, msg, _ in self._iter_action_messages(action, ResolveStreamMessage):
             if should_cancel is not None and should_cancel():
-                raise ResolveCancelled(f"resolve('{source_id}') cancelled by caller")
+                raise ResolveCancelled(
+                    f"resolve_source('{source_id}') cancelled by caller"
+                )
             if which == "progress":
                 if on_progress is not None:
                     on_progress(msg.progress)
@@ -1013,19 +1024,19 @@ class CatalogClient:
                     row = rows[0]
         if row is None:
             raise RuntimeError(
-                f"resolve('{source_id}') returned no catalog row "
+                f"resolve_source('{source_id}') returned no catalog row "
                 "(server closed the stream without a result)"
             )
         return dict(row)
 
-    def warm(
+    def warm_source(
         self,
         source_id: str,
         *,
         on_progress: Optional[Callable[["WarmProgress"], None]] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
     ) -> "WarmProgress":
-        """Backs TensorFlightClient.warm; see that method for the full
+        """Backs TensorFlightClient.warm_source; see that method for the full
         documentation."""
         action = flight.Action("warm", source_id.encode("utf-8"))
         done: Optional[WarmProgress] = None
@@ -1038,7 +1049,9 @@ class CatalogClient:
             action, WarmStreamMessage, unknown_action_msg=unknown
         ):
             if should_cancel is not None and should_cancel():
-                raise ResolveCancelled(f"warm('{source_id}') cancelled by caller")
+                raise ResolveCancelled(
+                    f"warm_source('{source_id}') cancelled by caller"
+                )
             if which == "progress":
                 if on_progress is not None:
                     on_progress(msg.progress)
@@ -1047,12 +1060,12 @@ class CatalogClient:
                 done.CopyFrom(msg.done)
         if done is None:
             raise RuntimeError(
-                f"warm('{source_id}') returned no terminal status "
+                f"warm_source('{source_id}') returned no terminal status "
                 "(server closed the stream without a 'done')"
             )
         return done
 
-    def get_upload_status(self, source_id: str) -> Dict[str, Any]:
+    def get_upload_status(self, array_id: str) -> Dict[str, Any]:
         """Backs TensorFlightClient.get_upload_status; see that method for the full
         documentation.
 
@@ -1070,20 +1083,20 @@ class CatalogClient:
         the state it came to replace.
         """
         try:
-            desc = self._fetch_tensor_descriptor(source_id, with_upload_status=True)
+            desc = self._fetch_tensor_descriptor(array_id, with_upload_status=True)
         except (flight.FlightError, _AddressingError):
             # UNKNOWN means "no upload record here", and an id the server does
             # not serve at all is the strongest form of that. `describe` raises;
             # this caller asked a narrower question.
-            return _unknown_upload_status(source_id)
+            return _unknown_upload_status(array_id)
         if not desc.HasField("upload_status"):
             # Registered, but not an upload -- an ordinary catalog source.
             # Distinct from PENDING, and no amount of polling moves it
             # (biopb/biopb#109).
-            return _unknown_upload_status(source_id)
-        return _upload_status_dict(source_id, desc.upload_status)
+            return _unknown_upload_status(array_id)
+        return _upload_status_dict(array_id, desc.upload_status)
 
-    def add_source(
+    def register_local_path(
         self,
         url: str,
         *,
@@ -1091,8 +1104,8 @@ class CatalogClient:
         on_progress: Optional[Callable[["AddSourceProgress"], None]] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
     ) -> "AddSourceResult":
-        """Backs TensorFlightClient.add_source; see that method for the full
-        documentation."""
+        """Backs TensorFlightClient.register_local_path; see that method for
+        the full documentation."""
         req = AddSourceRequest(
             url=url,
             source_type=source_type,
@@ -1125,8 +1138,8 @@ class CatalogClient:
             if should_cancel is not None and should_cancel():
                 return AddSourceResult()
             raise RuntimeError(
-                f"add_source('{url}') returned no terminal result "
-                "(server closed the stream without a result)"
+                f"register_local_path('{url}') returned no terminal result "
+                "(server closed the 'add_source' stream without a result)"
             )
         return result
 
@@ -1137,9 +1150,9 @@ class CatalogClient:
             self._state, action, unavailable_hint=unavailable_hint
         )
 
-    def remove_source(self, root_url: str) -> "RemoveSourceResult":
-        """Backs TensorFlightClient.remove_source; see that method for the full
-        documentation."""
+    def deregister_local_path(self, root_url: str) -> "RemoveSourceResult":
+        """Backs TensorFlightClient.deregister_local_path; see that method for
+        the full documentation."""
         req = RemoveSourceRequest(root_url=root_url)
         action = flight.Action("remove_source", req.SerializeToString())
         result_bytes = self._do_action_one_result(
@@ -1149,8 +1162,8 @@ class CatalogClient:
 
     # ---- label sets ----
 
-    def label_sets(self, image_array_id: str) -> List[str]:
-        """Backs TensorFlightClient.label_sets; see that method."""
+    def get_label_sets(self, image_array_id: str) -> List[str]:
+        """Backs TensorFlightClient.get_label_sets; see that method."""
         prefix = sql_literal(f"{image_array_id}/{LABELS_SEGMENT}/")
         table = self._query_table(
             "SELECT t.array_id FROM sources, UNNEST(tensors) AS u(t) "
@@ -1252,8 +1265,8 @@ class ChunkFetcher:
     ) -> "flight.FlightInfo":
         """Plan one read: GetFlightInfo the tensor's endpoints.
 
-        The shared body of :meth:`get_tensor` and :meth:`get_tensor_pb`: one
-        builds the array from the returned FlightInfo, the other hands the
+        Shared by both of :meth:`get_tensor`'s ``output`` forms: ``"da"``
+        builds the array from the returned FlightInfo, ``"pb"`` hands the
         FlightInfo on.
 
         **One RPC for a qualified id with bounded slice bounds** -- the shape
@@ -1333,30 +1346,28 @@ class ChunkFetcher:
         slice_hint: Optional[Tuple[slice, ...]] = None,
         scale_hint: Optional[Sequence[int]] = None,
         reduction_method: Optional[str] = None,
-    ) -> da.Array:
+        *,
+        output: str = "da",
+        export_location: Optional[str] = None,
+    ) -> Union[da.Array, SerializedTensor]:
         """Backs TensorFlightClient.get_tensor; see that method for the full
         documentation."""
         info = self._plan_read(array_id, slice_hint, scale_hint, reduction_method)
+        location = (
+            normalize_flight_location(export_location)
+            if export_location
+            else self._state.export_location
+        )
+        if output == "pb":
+            return SerializedTensor(
+                location=location,
+                auth_token=self._state.token or "",
+                flight_info=info.serialize(),
+            )
         return _dask_from_flight_info(
             info,
-            self._state.export_location,
+            location,
             self._state.token,
             self._state.cache_bytes,
             self._state.tls_trust,
-        )
-
-    def get_tensor_pb(
-        self,
-        array_id: str,
-        slice_hint: Optional[Tuple[slice, ...]] = None,
-        scale_hint: Optional[Sequence[int]] = None,
-        reduction_method: Optional[str] = None,
-    ) -> SerializedTensor:
-        """Backs TensorFlightClient.get_tensor_pb; see that method for the full
-        documentation."""
-        info = self._plan_read(array_id, slice_hint, scale_hint, reduction_method)
-        return SerializedTensor(
-            location=self._state.export_location,
-            auth_token=self._state.token or "",
-            flight_info=info.serialize(),
         )

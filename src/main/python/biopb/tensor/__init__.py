@@ -7,7 +7,7 @@ Key components:
 - TensorFlightClient: Client for accessing tensors from a TensorFlightServer
 - Connection: the data plane this machine's control names, dialed and shared
 - Proto messages: TensorTicket, ChunkBounds, TensorDescriptor, SliceHint
-- query_sources / resolve hand back `sources` catalog rows; what you decode
+- query / resolve hand back `sources` catalog rows; what you decode
   them into is yours (descriptors_from_rows is the deprecated proto form)
 - CLI diagnostics: `biopb tensor` command for inspecting sources and tensors
 

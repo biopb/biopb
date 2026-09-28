@@ -466,9 +466,9 @@ def _viewer_base_url() -> str:
     the *user's* browser reaches it by, which nothing in this process can know.
     """
     try:
-        from biopb.control._endpoints import control_base_url
+        from biopb import base_url
 
-        return control_base_url()
+        return base_url()
     except Exception:  # pragma: no cover - core SDK always present in practice
         logger.debug("status: control base url unresolvable", exc_info=True)
         return "http://127.0.0.1:8813"
@@ -740,7 +740,7 @@ async def execute_code(
     (viewer.window) belong in a cell.
 
     * data access (read_doc("tensor-server-client") has more):
-    - client.query_sources(sql, format="pandas") runs server-side DuckDB and
+    - client.query(sql, format="pandas") runs server-side DuckDB and
       returns a DataFrame. The `sources` table columns are: source_id,
       source_url, source_type, indexed_at, metadata_json, is_resolved, and
       `tensors`, a LIST of STRUCT(array_id, dim_labels, shape, dtype) with one
@@ -866,7 +866,7 @@ async def verify_workflow(document: str, title: str = "") -> str:
 
     **What it does not.** The numbers are right: check them. And a scratch
     *process* is not a scratch *world* — it talks to the same tensor server and
-    the same filesystem, so `client.upload_array` / `add_source`,
+    the same filesystem, so `client.upload_array` / `register_local_path`,
     and any cell that writes a file, write through for real. Verify a workflow
     three times and you have three uploaded arrays. **Say so before running one
     that writes.**

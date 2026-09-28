@@ -7,7 +7,7 @@ Measures performance for end-to-end query path through TensorFlightClient:
 
 Unlike metadata_db_test.py which tests MetadataDatabase directly,
 these tests measure full request path:
-  TensorFlightClient.query_sources(sql)
+  TensorFlightClient.query(sql)
     -> FlightClient.do_get(TensorTicket.catalog_query with the SQL)
       -> TensorFlightServer.do_get()
         -> MetadataDatabase.query(sql)
@@ -200,7 +200,7 @@ class TestConcurrentAccess:
                 else:
                     sql = "SELECT COUNT(*) FROM sources"
 
-                result = client.query_sources(sql)
+                result = client.query(sql)
                 return result.num_rows
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
@@ -251,7 +251,7 @@ class TestConcurrentAccess:
                 try:
                     client = query_clients[thread_id % 8]  # reuse pooled client
                     sql = "SELECT COUNT(*) FROM sources"
-                    client.query_sources(sql)
+                    client.query(sql)
                 except Exception as e:
                     errors.append(str(e))
 
@@ -325,7 +325,7 @@ class TestLargeScale:
 
         def query_all():
             sql = "SELECT source_id FROM sources"
-            result = client.query_sources(sql)
+            result = client.query(sql)
             return result.num_rows
 
         n_rows = benchmark(query_all)
@@ -342,7 +342,7 @@ class TestLargeScale:
 
         def query_all():
             sql = "SELECT source_id FROM sources"
-            result = client.query_sources(sql)
+            result = client.query(sql)
             return result.num_rows
 
         n_rows = benchmark(query_all)
@@ -359,7 +359,7 @@ class TestLargeScale:
 
         def query_all():
             sql = "SELECT source_id FROM sources"
-            result = client.query_sources(sql)
+            result = client.query(sql)
             return result.num_rows
 
         n_rows = benchmark(query_all)
@@ -380,7 +380,7 @@ class TestLargeScale:
 
         def query_all():
             sql = "SELECT source_id FROM sources"
-            result = client.query_sources(sql)
+            result = client.query(sql)
             return result.num_rows
 
         n_rows = benchmark(query_all)
@@ -401,7 +401,7 @@ class TestQueryComplexity:
 
         def count_query():
             sql = "SELECT COUNT(*) FROM sources"
-            result = client.query_sources(sql)
+            result = client.query(sql)
             return result.column(0).to_pylist()[0]
 
         count = benchmark(count_query)
@@ -422,7 +422,7 @@ class TestQueryComplexity:
                 "WHERE source_url LIKE '%experiment-0000%' "
                 "OR source_url LIKE '%experiment-0001%'"
             )
-            result = client.query_sources(sql)
+            result = client.query(sql)
             return result.num_rows
 
         n_rows = benchmark(filtered_query)
@@ -438,7 +438,7 @@ class TestQueryComplexity:
 
         def json_query():
             sql = "SELECT source_id, metadata_json->>'plate_id' as plate FROM sources LIMIT 1000"
-            result = client.query_sources(sql)
+            result = client.query(sql)
             return result.num_rows
 
         n_rows = benchmark(json_query)
@@ -461,7 +461,7 @@ class TestQueryComplexity:
                   AND list_contains(tensors[1].shape, 512)
                 LIMIT 500
             """
-            result = client.query_sources(sql)
+            result = client.query(sql)
             return result.num_rows
 
         n_rows = benchmark(complex_query)

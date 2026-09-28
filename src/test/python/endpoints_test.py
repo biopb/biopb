@@ -1,4 +1,4 @@
-"""Tests for `biopb.control._endpoints` — the base-port convention and control discovery.
+"""Tests for `biopb._control._endpoints` — the base-port convention and control discovery.
 
 Two things live here, and they are load-bearing for anything that has to *find*
 the control rather than start it:
@@ -20,7 +20,7 @@ the control rather than start it:
 import json
 
 import pytest
-from biopb.control import _endpoints
+from biopb._control import _endpoints
 
 
 @pytest.fixture(autouse=True)
@@ -92,7 +92,7 @@ class TestRuntimeRecord:
         """
         import os
 
-        from biopb._lifecycle.proc import process_create_time
+        from biopb.lifecycle.proc import process_create_time
 
         _endpoints.write_runtime_record("127.0.0.1", 9003, os.getpid())
         record = _endpoints.read_runtime_record()

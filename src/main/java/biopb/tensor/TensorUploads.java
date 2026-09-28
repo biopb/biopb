@@ -51,7 +51,7 @@ import static biopb.tensor.TensorChunkCodec.toLongArray;
  * <p><b>Experimental</b>, with the rest of the upload API.
  *
  * <p><b>An upload adds a tensor to a source that already exists</b> and
- * creates none. {@link #addTensor} returns the server's descriptor for the new
+ * creates none. {@link #setupArrayUpload} returns the server's descriptor for the new
  * tensor, and that descriptor is what every write takes. The scheme on an {@code array_id} names the store format and nothing
  * else; the answered id carries none. The Java
  * twin of {@code biopb.tensor._upload}, minus its dask graph -- an imglib2
@@ -95,19 +95,19 @@ final class TensorUploads {
         return results.next().getBody();
     }
 
-    /** Backs {@link TensorFlightClient#addTensor}; see that method. */
-    TensorDescriptor addTensor(
+    /** Backs {@link TensorFlightClient#setupArrayUpload}; see that method. */
+    TensorDescriptor setupArrayUpload(
             String arrayId,
             long[] shape,
             String dtype,
             long[] chunkShape,
             List<String> dimLabels,
             String metadataJson) {
-        return addTensor(arrayId, shape, dtype, chunkShape, dimLabels, metadataJson, null);
+        return setupArrayUpload(arrayId, shape, dtype, chunkShape, dimLabels, metadataJson, null);
     }
 
-    /** Backs {@link TensorFlightClient#addTensor}; see that method. */
-    TensorDescriptor addTensor(
+    /** Backs {@link TensorFlightClient#setupArrayUpload}; see that method. */
+    TensorDescriptor setupArrayUpload(
             String arrayId,
             long[] shape,
             String dtype,
@@ -139,7 +139,7 @@ final class TensorUploads {
 
         TensorDescriptor created = TensorChunkCodec.parseDescriptor(
                 actionOneResult("add_tensor", request.build().toByteArray()));
-        LOGGER.info("addTensor: added " + created.getArrayId());
+        LOGGER.info("setupArrayUpload: added " + created.getArrayId());
         return created;
     }
 
@@ -356,10 +356,15 @@ final class TensorUploads {
         return statusMap(arrayId, status);
     }
 
-    /** The {@code get_upload_status} shape, so a seal and a poll agree. */
-    static Map<String, Object> statusMap(String sourceId, UploadStatus status) {
+    /**
+     * The {@code get_upload_status} shape, so a seal and a poll agree.
+     *
+     * <p>The map key stays {@code source_id} (not {@code array_id}) to mirror
+     * the server's own status map shape.
+     */
+    static Map<String, Object> statusMap(String arrayId, UploadStatus status) {
         Map<String, Object> out = new HashMap<>();
-        out.put("source_id", sourceId);
+        out.put("source_id", arrayId);
         out.put("state", status.getState().name());
         out.put("expected_chunks", (double) status.getExpectedChunks());
         out.put("uploaded_chunks", (double) status.getUploadedChunks());

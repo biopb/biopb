@@ -5,7 +5,7 @@ import sys
 import biopb.image as proto
 import grpc
 import imageio.v2 as imageio
-from biopb.image.utils import deserialize_image_data, serialize_from_numpy_to_image_data
+from biopb.image import deserialize_image_data, serialize_from_numpy_to_image_data
 from google.protobuf import empty_pb2
 
 

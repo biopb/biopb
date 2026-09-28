@@ -7,8 +7,9 @@ entry, named by its stem; a stem starting with ``_`` is skipped:
 - ``<name>.json``, ``{"url": "grpc://host:port"}``: a server someone else runs.
   The control probes it and passes it along; it never starts or stops it.
 
-Reading the registry is stdlib only, so the lean control and ``biopb.control``
-can call it; the gRPC probe imports gRPC on first use.
+Reading the registry is stdlib only, so the lean control and ``biopb`` (via
+the private ``biopb._control``) can call it; the gRPC probe imports gRPC on
+first use.
 """
 
 from __future__ import annotations

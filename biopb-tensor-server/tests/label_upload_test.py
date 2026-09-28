@@ -5,7 +5,7 @@ and a ``/@labels/`` segment, it creates a tensor of a source that already
 exists rather than a source. What that costs the boundary is a second place to
 look an upload up (the parent's ``label_uploads``, not the registry) and a
 catalog row that is the parent's; what it buys the client is the ordinary
-``add_tensor`` / ``upload_array`` / ``set_upload_status`` round trip, with
+``setup_array_upload`` / ``upload_array`` / ``set_upload_status`` round trip, with
 a discard to free the name again.
 """
 
@@ -64,9 +64,9 @@ def _labels(shape=SHAPE, dtype="uint32"):
 
 def _create(client, array_id, arr=None, **kw):
     """A label set on a source the server already serves; the one form of
-    ``add_tensor`` whose parent may be a discovered file."""
+    ``setup_array_upload`` whose parent may be a discovered file."""
     arr = _labels() if arr is None else arr
-    return client.add_tensor(f"zarr://{array_id}", arr, chunk_shape=CHUNK, **kw)
+    return client.setup_array_upload(f"zarr://{array_id}", arr, chunk_shape=CHUNK, **kw)
 
 
 def _tensor_ids(server, source_id="oz1"):
@@ -105,7 +105,7 @@ class TestTheRoundTrip:
         ids = _tensor_ids(served)
         assert ids[0] == "oz1"  # the image is still tensors[0]
         assert ids[-1] == "oz1/@labels/nuclei"
-        assert client.label_sets("oz1") == ["oz1/@labels/nuclei"]
+        assert client.get_label_sets("oz1") == ["oz1/@labels/nuclei"]
 
     def test_the_descriptor_names_its_image(self, served, client):
         desc = _create(client, "oz1/@labels/nuclei")
@@ -122,7 +122,10 @@ class TestTheRoundTrip:
     def test_two_sets_coexist_under_one_image(self, served, client):
         for name in ("nuclei", "cells"):
             client.upload_array(_create(client, f"oz1/@labels/{name}"), _labels())
-        assert client.label_sets("oz1") == ["oz1/@labels/cells", "oz1/@labels/nuclei"]
+        assert client.get_label_sets("oz1") == [
+            "oz1/@labels/cells",
+            "oz1/@labels/nuclei",
+        ]
 
     def test_client_metadata_supplies_the_colours(self, served, client):
         colors = [{"label-value": 3, "rgba": [255, 0, 0, 255]}]
@@ -251,7 +254,7 @@ class TestTheSidecar:
         sparse = np.zeros(SHAPE, "uint32")
         sparse[:8, :8] = 1
         source = SCRATCH_SOURCE_ID
-        desc = client.add_tensor(
+        desc = client.setup_array_upload(
             f"cache://{source}/@fields/sparse", sparse, chunk_shape=CHUNK
         )
         status = client.upload_array(desc, sparse)
@@ -294,7 +297,7 @@ class TestDiscard:
 
         assert self._gone(client, "oz1/@labels/nuclei")["state"] == "DISCARDED"
         assert not store.exists()
-        assert client.label_sets("oz1") == []
+        assert client.get_label_sets("oz1") == []
 
     def test_a_pending_set_is_discardable_too(self, served, client, tmp_path):
         """It was never listed, so only the store goes."""
@@ -347,11 +350,11 @@ class TestDiscard:
         register_and_catalog(
             writable_server, "oz2", _adapter(Path(zarr_path), source_id="oz2")
         )
-        assert client.label_sets("oz2") == ["oz2/@labels/own"]
+        assert client.get_label_sets("oz2") == ["oz2/@labels/own"]
 
         assert self._gone(client, "oz2/@labels/own")["state"] == "UNKNOWN"
         assert group.exists()
-        assert client.label_sets("oz2") == ["oz2/@labels/own"]
+        assert client.get_label_sets("oz2") == ["oz2/@labels/own"]
 
 
 class TestTheSweep:
@@ -380,7 +383,7 @@ class TestTheSweep:
 
         client.upload_array(_create(client, "oz1/@labels/nuclei"), _labels())
         assert served.uploads.reap(now=time.monotonic() + 10_000) == (0, 0)
-        assert client.label_sets("oz1") == ["oz1/@labels/nuclei"]
+        assert client.get_label_sets("oz1") == ["oz1/@labels/nuclei"]
 
     def test_a_crashed_upload_is_removed_at_boot(self, served, client, tmp_path):
         store = sidecar_dir(labels_root(Path(tmp_path)), "oz1") / "crashed.zarr"
@@ -408,7 +411,9 @@ class TestContentVersion:
     """
 
     def _chunk_ids(self, client, array_id):
-        info = flight.FlightInfo.deserialize(client.get_tensor_pb(array_id).flight_info)
+        info = flight.FlightInfo.deserialize(
+            client.get_tensor(array_id, output="pb").flight_info
+        )
         return set(_parse_flight_endpoints(info)[0])
 
     def _minted(self, client, array_id):

@@ -3,7 +3,7 @@
 Covers the daemon liveness/health probe, the `control status` / `control run`
 argv wiring, mode resolution, and the bind/TLS/token derivations. The lower-level
 detached-daemon lifecycle helpers those commands call live in
-:mod:`biopb._lifecycle.daemon` (``daemon_test.py``); the data-plane commands that
+:mod:`biopb.lifecycle.daemon` (``daemon_test.py``); the data-plane commands that
 used to live under `biopb server` moved with biopb/biopb#615 -- cache-stats to
 ``cli_test.py`` (it is a `biopb tensor` command now). OS calls are mocked so the tests are
 deterministic and fast on any platform; time.sleep is neutralized.
@@ -19,7 +19,7 @@ import biopb.cli as cli
 import pytest
 import typer
 from biopb import _locations
-from biopb._lifecycle import daemon as _daemon
+from biopb.lifecycle import daemon as _daemon
 from typer.testing import CliRunner
 
 
@@ -176,7 +176,7 @@ class TestControlStatus:
         monkeypatch.setattr(cli, "_require_biopb_control", lambda: None)
         monkeypatch.setattr(cli, "_read_pid_record", lambda *_a: (pid, None))
         # `control status` decides liveness via _is_our_daemon (now backed by
-        # _lifecycle.daemon); stub the verdict directly.
+        # lifecycle.daemon); stub the verdict directly.
         monkeypatch.setattr(cli, "_is_our_daemon", lambda *_a: running)
         monkeypatch.setattr(cli, "_control_endpoint", lambda: ("127.0.0.1", 8813))
         monkeypatch.setattr(cli, "_query_control_health", lambda *_a, **_k: health)

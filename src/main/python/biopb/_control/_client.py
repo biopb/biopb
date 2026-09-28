@@ -23,7 +23,7 @@ def _request(method: str, path: str, params: dict, timeout: float) -> dict:
     """The control's JSON answer to *method* ``path`` with *params* as its query
     string; raises ``OSError`` when no control answers and
     ``urllib.error.HTTPError`` when it refuses."""
-    token = _data_plane.resolve_token()
+    token = _data_plane.resolve_data_plane_token()
     query = f"?{urlencode(params)}" if params else ""
     req = urllib.request.Request(
         f"{base_url()}{path}{query}",
@@ -46,10 +46,10 @@ def _answer(url: Optional[str]) -> Optional[dict]:
     """
     if not url:
         return None
-    return {"url": url, "token": _data_plane.resolve_token()}
+    return {"url": url, "token": _data_plane.resolve_data_plane_token()}
 
 
-def data_plane(timeout: float = 1.0) -> Optional[dict]:
+def find_data_plane(timeout: float = 1.0) -> Optional[dict]:
     """The plane the control names, ``{"url", "token"}``, or ``None``.
 
     A plain read of ``GET /health``: ``None`` when no control answers or it

@@ -14,7 +14,7 @@ import biopb.image as proto
 import grpc
 import numpy as np
 import pytest
-from biopb.image.utils import deserialize_image_data, serialize_from_numpy_to_image_data
+from biopb.image import deserialize_image_data, serialize_from_numpy_to_image_data
 from biopb_image_base import Tensor, op
 from biopb_image_base.ops import (
     _ambient_scheduler_configured,

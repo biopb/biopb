@@ -7,8 +7,8 @@ Commands:
     stats        Compute statistics (min, max, mean) for a tensor
     cache-stats  Show the server's cache hit/miss diagnostics
 
-Every command dials the *same* plane through the one resolver in
-``biopb.control._data_plane`` (biopb/biopb#615): ``--server`` -> ``BIOPB_TENSOR_URL`` ->
+Every command dials the *same* plane through the one resolver,
+:func:`biopb.resolve_data_plane` (biopb/biopb#615): ``--server`` -> ``BIOPB_TENSOR_URL`` ->
 the control plane's published endpoint -> the default. ``--server`` stays because
 a plane launched directly on a custom port is recorded nowhere and so cannot be
 discovered; everything else is asked for rather than reconstructed.
@@ -27,7 +27,12 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from biopb.control import _data_plane
+from biopb import (
+    ENV_TENSOR_TOKEN,
+    DataPlaneEndpoint,
+    LocalTrustError,
+    resolve_data_plane,
+)
 from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS
 from biopb.tensor.client import TensorFlightClient
 
@@ -70,12 +75,12 @@ _OPT_SLICE = typer.Option(
 def _browse(client) -> dict:
     """The catalog as ``{source_id: row}``.
 
-    ``query_sources`` rather than the deprecated ``list_sources``: same rows
+    ``query`` rather than the deprecated ``list_sources``: same rows
     and the same server-side cap, but a row carries ``is_resolved``, which the
     listing needs to tell "not resolved yet" from "nothing readable in it"
     (biopb/biopb#1032).
     """
-    rows = client.query_sources(
+    rows = client.query(
         f"SELECT {SOURCE_ROW_COLUMNS} FROM sources ORDER BY source_id",
         format="records",
     )
@@ -88,7 +93,7 @@ def _log_timing(start_time: float) -> None:
     stderr_console.print(f"[dim]Completed in {elapsed:.2f}s[/dim]")
 
 
-def _dial_error(exc: Exception, endpoint: _data_plane.Endpoint) -> str:
+def _dial_error(exc: Exception, endpoint: DataPlaneEndpoint) -> str:
     """Why a dial failed, classified by exception *type*.
 
     Every failure used to render as "server unreachable or cache not initialized"
@@ -105,7 +110,7 @@ def _dial_error(exc: Exception, endpoint: _data_plane.Endpoint) -> str:
     import pyarrow.flight as flight
 
     where = f"{endpoint.url} ({endpoint.origin_note})"
-    if isinstance(exc, _data_plane.LocalTrustError):
+    if isinstance(exc, LocalTrustError):
         return str(exc)
     if isinstance(
         exc, (flight.FlightUnauthenticatedError, flight.FlightUnauthorizedError)
@@ -119,11 +124,11 @@ def _dial_error(exc: Exception, endpoint: _data_plane.Endpoint) -> str:
             return (
                 f"The data plane at {where} requires an access token. An endpoint "
                 "named explicitly is not dialed with the control plane's credential "
-                f"file, so pass --token or set ${_data_plane.ENV_TOKEN}."
+                f"file, so pass --token or set ${ENV_TENSOR_TOKEN}."
             )
         return (
             f"The data plane at {where} requires an access token. Pass --token, set "
-            f"${_data_plane.ENV_TOKEN}, or start it through `biopb control start` "
+            f"${ENV_TENSOR_TOKEN}, or start it through `biopb control start` "
             "(which writes the credential file local clients read)."
         )
     if isinstance(exc, (flight.FlightUnavailableError, flight.FlightTimedOutError)):
@@ -137,9 +142,7 @@ def _dial_error(exc: Exception, endpoint: _data_plane.Endpoint) -> str:
     return f"{type(exc).__name__} from the data plane at {where}: {exc}"
 
 
-def _operation_error(
-    exc: Exception, endpoint: _data_plane.Endpoint, context: str
-) -> str:
+def _operation_error(exc: Exception, endpoint: DataPlaneEndpoint, context: str) -> str:
     """Classify a failure raised *after* the client was built.
 
     ``TensorFlightClient`` opens its socket lazily, so the connect-time failures
@@ -157,25 +160,23 @@ def _operation_error(
     """
     import pyarrow.flight as flight
 
-    if isinstance(exc, (_data_plane.LocalTrustError, flight.FlightError)):
+    if isinstance(exc, (LocalTrustError, flight.FlightError)):
         return _dial_error(exc, endpoint)
     return f"{context}: {exc}"
 
 
-def _resolve_endpoint(
-    server: Optional[str], token: Optional[str]
-) -> _data_plane.Endpoint:
+def _resolve_endpoint(server: Optional[str], token: Optional[str]) -> DataPlaneEndpoint:
     """Resolve the endpoint every command dials, exiting 1 with the reason on failure."""
     try:
-        return _data_plane.resolve(server, token)
-    except _data_plane.LocalTrustError as exc:
+        return resolve_data_plane(server, token)
+    except LocalTrustError as exc:
         stderr_console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1)
 
 
 def _connect(
     server: Optional[str], token: Optional[str], cache_bytes: int
-) -> Tuple[TensorFlightClient, _data_plane.Endpoint]:
+) -> Tuple[TensorFlightClient, DataPlaneEndpoint]:
     """Resolve the endpoint and open a client to it, or exit 1 saying why not."""
     endpoint = _resolve_endpoint(server, token)
     try:
@@ -542,7 +543,7 @@ def get(
 
         if fmt == "pb":
             # Protobuf format: lazy SerializedTensor
-            serialized = client.get_tensor_pb(array_id, slice_hint=selection)
+            serialized = client.get_tensor(array_id, slice_hint=selection, output="pb")
             pb_bytes = serialized.SerializeToString()
 
             if output == "-":
@@ -812,11 +813,11 @@ def decode_rates(
 
     This is a preset over the catalog's `decode_rates` table; anything else you
     want to ask of it -- a join against `sources`, a filter, a different order
-    -- is a `client.query_sources` call.
+    -- is a `client.query` call.
     """
     client, endpoint = _connect(server, token, cache_bytes=0)
     try:
-        rows = client.query_sources(
+        rows = client.query(
             "SELECT array_id, mbps, samples, updated_at FROM decode_rates "
             "ORDER BY mbps DESC",
             format="records",

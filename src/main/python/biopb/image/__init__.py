@@ -1,5 +1,15 @@
 # No `__version__` here: one distribution, one version, published as
 # `biopb.__version__` (biopb/biopb#998). `biopb.tensor` has never had one.
+# Utility functions for image data serialization/deserialization
+from biopb.image._utils import (
+    deserialize_image_data,
+    get_image_data_dim_labels,
+    get_image_data_shape,
+    mask_to_roi,
+    normalize_array_dims,
+    roi_to_mask,
+    serialize_from_numpy_to_image_data,
+)
 from biopb.image.annotation_pb2 import (
     RoiAnnotation,
     RoiConflict,
@@ -31,13 +41,48 @@ from biopb.image.rpc_ops_pb2_grpc import (
     add_OpsServicer_to_server,
 )
 
-# Utility functions for image data serialization/deserialization
-from biopb.image.utils import (
-    deserialize_image_data,
-    deserialize_to_numpy,  # deprecated, use deserialize_image_data_to_numpy instead
-    get_image_data_dim_labels,
-    get_image_data_shape,
-    normalize_array_dims,
-    serialize_from_numpy,  # deprecated, use serialize_from_numpy_to_image_data instead
-    serialize_from_numpy_to_image_data,
-)
+# mkdocstrings only documents a module's re-exports when __all__ names them
+# explicitly (see biopb/__init__.py, biopb/tensor/__init__.py) -- without it
+# this page rendered as an empty stub despite every name below being the
+# actual public surface.
+__all__ = [
+    "Arg",
+    "BinData",
+    "Call",
+    "Ellipse",
+    "Event",
+    "ImageAnnotation",
+    "ImageData",
+    "Mask",
+    "Mesh",
+    "OpInfo",
+    "OpList",
+    "Ops",
+    "OpsServicer",
+    "OpsStub",
+    "Pixels",
+    "Point",
+    "Polygon",
+    "Polyline",
+    "ROI",
+    "Rectangle",
+    "RoiAnnotation",
+    "RoiConflict",
+    "RoiDeleteResult",
+    "RoiListResult",
+    "RoiPruneRequest",
+    "RoiPruneResult",
+    "RoiPutResult",
+    "RoiSetInfo",
+    "RoiUnseen",
+    "Tensor",
+    "TensorArg",
+    "add_OpsServicer_to_server",
+    "deserialize_image_data",
+    "get_image_data_dim_labels",
+    "get_image_data_shape",
+    "mask_to_roi",
+    "normalize_array_dims",
+    "roi_to_mask",
+    "serialize_from_numpy_to_image_data",
+]

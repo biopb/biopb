@@ -15,7 +15,13 @@ from rich.console import Console
 from rich.table import Table
 
 from . import _agents, _locations, _tls_material, _web_auth
-from ._lifecycle.daemon import (
+from ._control import _endpoints
+from ._control._endpoints import (
+    flight_port_for as _flight_port,
+    sidecar_port_for as _sidecar_port,
+)
+from ._locations import find_config
+from .lifecycle.daemon import (
     detach_kwargs as _detach_kwargs,
     is_our_daemon as _is_our_daemon,
     read_pid_record as _read_pid_record,
@@ -23,16 +29,10 @@ from ._lifecycle.daemon import (
     stop_daemon as _stop_daemon,
     write_pid_file as _write_pid_file,
 )
-from ._lifecycle.file_lock import LockTimeout, file_lock
-from ._lifecycle.proc import (
+from .lifecycle.file_lock import LockTimeout, file_lock
+from .lifecycle.proc import (
     is_process_running as _is_process_running,
     process_create_time as _process_create_time,
-)
-from ._locations import find_config
-from .control import _endpoints
-from .control._endpoints import (
-    flight_port_for as _flight_port,
-    sidecar_port_for as _sidecar_port,
 )
 
 console = Console()
@@ -552,9 +552,9 @@ def _require_control_for_view() -> None:
     so a control busy in an ``ensure`` answers late — and here a false negative is
     a hard exit, not a degraded reading.
     """
-    from .control import _data_plane
+    from . import ENV_TENSOR_URL
 
-    if os.environ.get(_data_plane.ENV_URL, "").strip():
+    if os.environ.get(ENV_TENSOR_URL, "").strip():
         return
     if _query_control_health(*_control_endpoint()) is not None:
         return
@@ -751,7 +751,7 @@ def _control_endpoint() -> Tuple[str, int]:
     Binding to a discovered value would mean a crashed control's stale record
     dictates where the next one listens.
     """
-    from .control._endpoints import control_host, control_port
+    from ._control._endpoints import control_host, control_port
 
     return control_host(), control_port()
 
@@ -765,7 +765,7 @@ def _control_bind_endpoint(base_port: int) -> Tuple[str, int]:
     nowhere else -- notably *not* from the published record, which describes some
     other (possibly dead) control.
     """
-    from .control._endpoints import CONTROL_DEFAULT_HOST, control_port_for
+    from ._control._endpoints import CONTROL_DEFAULT_HOST, control_port_for
 
     host = os.environ.get("BIOPB_CONTROL_HOST") or CONTROL_DEFAULT_HOST
     raw = os.environ.get("BIOPB_CONTROL_PORT")
@@ -830,7 +830,7 @@ def _control_start_lock() -> Path:
     lock across the check-then-spawn below makes it atomic between processes:
     without it two starters can both see "no pidfile", both spawn a control, and
     the bind-loser's parent overwrite/remove the live winner's pidfile, orphaning a
-    control that `control stop` can no longer reach. See biopb._lifecycle.file_lock.
+    control that `control stop` can no longer reach. See biopb.lifecycle.file_lock.
     """
     return CONTROL_PID_FILE.parent / "control.start.lock"
 
@@ -1337,7 +1337,7 @@ def control_start(
     _ensure_dirs()
 
     # Serialize concurrent starts so the check-then-spawn below is atomic across
-    # processes (see _control_start_lock / biopb._lifecycle.file_lock). Held through the
+    # processes (see _control_start_lock / biopb.lifecycle.file_lock). Held through the
     # readiness wait too, so a second starter that was blocked wakes to a fully
     # started control (pidfile written, port listening) and reports the idempotent
     # "already running" rather than racing a half-up one. The lock auto-releases if

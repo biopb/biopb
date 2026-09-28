@@ -5,7 +5,7 @@ dials and, when it has none, why. It caches nothing else: the catalog, health
 and sources are the plane's to answer, asked on the client.
 
 Where the plane is comes from, in order: ``$BIOPB_TENSOR_URL``, then the
-control (:func:`biopb.control.ensure_data_plane`), which also brings the plane
+control (:func:`biopb.ensure_data_plane`), which also brings the plane
 up. An address from anywhere but the control is dialed with an explicit token
 or ``$BIOPB_TENSOR_TOKEN``, never with the control's credential file.
 
@@ -21,7 +21,14 @@ import os
 import time
 from typing import Optional
 
-from biopb.control import _data_plane, ensure_data_plane
+from biopb import (
+    ENV_TENSOR_TOKEN,
+    ENV_TENSOR_URL,
+    LocalTrustError,
+    ensure_data_plane,
+    local_data_plane_fingerprint,
+    resolve_data_plane_token,
+)
 
 from .client import TensorFlightClient
 
@@ -83,7 +90,7 @@ def connect_error_message(
     """
     # By type first: an unreadable cert says "Permission denied", which the auth
     # markers below would otherwise claim.
-    if isinstance(exc, _data_plane.LocalTrustError):
+    if isinstance(exc, LocalTrustError):
         return str(exc)
 
     text = f"{type(exc).__name__}: {exc}".strip()
@@ -96,8 +103,8 @@ def connect_error_message(
         if origin == "env":
             return (
                 f"Authentication required: the tensor server at {url} needs a token. "
-                f"Set ${_data_plane.ENV_TOKEN}. This endpoint came from "
-                f"${_data_plane.ENV_URL}, so it bypassed the control plane and the "
+                f"Set ${ENV_TENSOR_TOKEN}. This endpoint came from "
+                f"${ENV_TENSOR_URL}, so it bypassed the control plane and the "
                 "control's local credential file was not used for it."
             )
         if origin == "manual":
@@ -105,7 +112,7 @@ def connect_error_message(
         return (
             f"Authentication required: the tensor server at {url} needs a token, "
             "but the control plane's credential file held none. Restart the "
-            f"control (`biopb control start`), or set ${_data_plane.ENV_TOKEN}."
+            f"control (`biopb control start`), or set ${ENV_TENSOR_TOKEN}."
         )
     if any(m in low for m in _UNREACHABLE_MARKERS):
         return f"Cannot reach the tensor server at {url} — is it running?"
@@ -142,9 +149,9 @@ class Connection:
         """
         if url is not None:
             return self._dial(url, token, origin="manual", timeout=timeout)
-        env = os.environ.get(_data_plane.ENV_URL, "").strip()
+        env = os.environ.get(ENV_TENSOR_URL, "").strip()
         if env:
-            token = _data_plane.resolve_token(allow_credential_file=False)
+            token = resolve_data_plane_token(allow_credential_file=False)
             return self._dial(env, token, origin="env", timeout=timeout)
         plane = ensure_data_plane(timeout=timeout)
         if plane is None:
@@ -188,14 +195,14 @@ class Connection:
     def _open(url: str, token: Optional[str]) -> TensorFlightClient:
         """A client for *url* that the plane has answered, and accepted."""
         client = TensorFlightClient(
-            url, token=token, tls_fingerprint=_data_plane.local_fingerprint(url)
+            url, token=token, tls_fingerprint=local_data_plane_fingerprint(url)
         )
         try:
             health = client.health_check()
             if health.get("status", "SERVING") != "SERVING":
                 raise _Starting(_starting_message(health))
             # health answers anyone; this is the call that checks the token.
-            client.query_sources("SELECT 1 FROM sources LIMIT 0")
+            client.query("SELECT 1 FROM sources LIMIT 0")
         except BaseException:
             client.close()
             raise

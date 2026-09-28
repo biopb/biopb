@@ -67,7 +67,7 @@ _BASE_INSTRUCTIONS = (
     "Operation guardrails (apply on every turn):\n"
     "- Use data from `client`, or from `viewer`'s layers where the session has a "
     "window; avoid the filesystem unless the user explicitly asks.\n"
-    '- Browse the catalog with `client.query_sources(sql, format="pandas")` '
+    '- Browse the catalog with `client.query(sql, format="pandas")` '
     "(server-side DuckDB, the only browse surface); the `sources` columns are source_id, "
     "source_url, source_type, indexed_at, metadata_json, is_resolved, and "
     "`tensors` (a LIST of STRUCT(array_id, dim_labels, shape, dtype), one per "

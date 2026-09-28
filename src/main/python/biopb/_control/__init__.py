@@ -9,6 +9,12 @@ same way: which servers there are, and to start or stop the ones it runs.
 
 It never starts a process and imports nothing beyond the standard library, so
 it can be imported where ``biopb.tensor`` (pyarrow) cannot.
+
+Private (leading underscore): its names are not meant to be reached at
+``biopb._control.x``. The root package re-exports every name below directly
+as ``biopb.x``, which is the supported way in -- kept off ``biopb.control``
+so that dotted path is never mistaken for ``biopb-control``, the separate
+control-plane server distribution this package is a client *of*.
 """
 
 from ._algorithms import (
@@ -19,18 +25,40 @@ from ._algorithms import (
     restart_algorithm,
     stop_algorithm,
 )
-from ._client import base_url, data_plane, ensure_data_plane
-from ._data_plane import is_local_url
+from ._client import base_url, ensure_data_plane, find_data_plane
+from ._data_plane import (
+    ENV_TENSOR_TOKEN,
+    ENV_TENSOR_URL,
+    DataPlaneEndpoint,
+    LocalTrustError,
+    control_grpc_url,
+    default_data_plane_url,
+    is_local_url,
+    local_data_plane_fingerprint,
+    probe_data_plane_scheme,
+    resolve_data_plane,
+    resolve_data_plane_token,
+)
 
 __all__ = [
+    "ENV_TENSOR_TOKEN",
+    "ENV_TENSOR_URL",
+    "DataPlaneEndpoint",
+    "LocalTrustError",
     "algorithm_logs",
     "algorithms",
     "base_url",
-    "data_plane",
+    "control_grpc_url",
+    "default_data_plane_url",
     "ensure_algorithm",
     "ensure_data_plane",
+    "find_data_plane",
     "is_local_url",
+    "local_data_plane_fingerprint",
+    "probe_data_plane_scheme",
     "refresh_algorithms",
+    "resolve_data_plane",
+    "resolve_data_plane_token",
     "restart_algorithm",
     "stop_algorithm",
 ]

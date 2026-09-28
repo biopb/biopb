@@ -19,7 +19,7 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 
 
 def _make(client, source, field="status", shape=(4, 4), chunk=(2, 2)):
-    return client.add_tensor(
+    return client.setup_array_upload(
         f"cache://{source}/@fields/{field}",
         np.empty(shape, dtype=np.uint16),
         chunk_shape=chunk,

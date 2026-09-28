@@ -91,7 +91,7 @@ length-bounded (128 bytes) and comma-free, since the sidecar's delete route
 addresses ids by a comma-separated list.
 
 `rois` is in `MetadataDatabase.ALLOWED_TABLES`, SELECT-only like every other
-allowed table -- `client.query_sources(...)` and the MCP catalog surface can
+allowed table -- `client.query(...)` and the MCP catalog surface can
 read it for analysis, but the viewer always uses the typed read below.
 `sync_source_removed()` does not cascade into `rois`, since a rescan or a
 transient unregister must not destroy a user's work: orphaned rows re-attach
@@ -141,7 +141,7 @@ DuckDB catalog directly:
 | DoPut | `PutCommand.roi_put {array_id, check_rev}` | ROI rows | `RoiPutResult` in the put's app_metadata |
 | DoPut | `PutCommand.roi_delete {array_id, set_name}` | one `roi_id` column, or empty | `RoiDeleteResult` in the put's app_metadata |
 
-One row schema serves both directions (`biopb.image._roi_rows.ROI_ROW_SCHEMA`)
+One row schema serves both directions (`biopb.tensor._roi_rows.ROI_ROW_SCHEMA`)
 -- what the server streams on a read is what it accepts on a write, and
 `TensorFlightClient.put_rois()` / `list_rois()` / `delete_rois()` rebuild the
 result messages from that row stream, which is also what gives

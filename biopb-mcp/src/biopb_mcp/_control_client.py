@@ -1,8 +1,9 @@
 """Start the biopb control for the stdio shim.
 
-Asking a running control anything is :mod:`biopb.control`'s job. This is the
-one thing that is not: launching one, which only the shim does, because it is
-the one entry point with no human to ask.
+Asking a running control anything is the core ``biopb`` SDK's job (its
+top-level ``ensure_data_plane``/``algorithms``/etc., backed by the private
+``biopb._control``). This is the one thing that is not: launching one, which
+only the shim does, because it is the one entry point with no human to ask.
 """
 
 from __future__ import annotations
@@ -51,14 +52,14 @@ def start_control_detached() -> bool:
     return immediately; the control boots in the background, in parallel with the
     session child's own (import-dominated) startup, which normally more than covers
     the control's boot. If the control still isn't reachable when the child first
-    needs the data plane, :func:`biopb.control.ensure_data_plane` returns ``None``
+    needs the data plane, :func:`biopb.ensure_data_plane` returns ``None``
     and the connection surfaces the actionable "Run ``biopb control start``" status --
     the mcp server, not the shim, is where a control-interaction failure belongs.
 
     The launched process is detached from the caller's process group / console, so
     it (and the durable control it spawns) survives a client that disconnects during
     the first seconds. Idempotent: ``biopb control start`` no-ops when a control is
-    already running and serializes concurrent starts (``biopb._lifecycle.file_lock``), so racing
+    already running and serializes concurrent starts (``biopb.lifecycle.file_lock``), so racing
     shims are safe. ``--no-data-plane`` keeps the footprint minimal -- the data plane
     comes up on demand when a session actually asks for it.
     """

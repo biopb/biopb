@@ -33,17 +33,17 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 import pyarrow as pa
 import pyarrow.flight as flight
-from biopb.image._roi_rows import (
-    rois_to_table,
-    table_to_roi_ids,
-    table_to_rois,
-)
 from biopb.image.annotation_pb2 import (
     RoiDeleteResult,
     RoiPruneRequest,
     RoiPruneResult,
     RoiPutResult,
     RoiUnseen,
+)
+from biopb.tensor._roi_rows import (
+    rois_to_table,
+    table_to_roi_ids,
+    table_to_rois,
 )
 from biopb.tensor._session import split_array_id
 from biopb.tensor._wire_version import FLIGHT_PROTOCOL_VERSION

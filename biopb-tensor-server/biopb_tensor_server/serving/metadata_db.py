@@ -589,7 +589,7 @@ class MetadataDatabase:
     Lazy initialization: Database created on first access.
 
     The metadata DB is mandatory (biopb/biopb#225): it is the canonical
-    source-browsing surface (``client.query_sources``), so there is no
+    source-browsing surface (``client.query``), so there is no
     off switch -- constructing this object means the catalog is live.
 
     Args:

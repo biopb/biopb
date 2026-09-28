@@ -396,13 +396,13 @@ class _UploadTarget:
 class UploadSession:
     """Tensor declaration and chunk upload over one Flight connection.
 
-    .. note:: Experimental. This whole API -- ``add_tensor`` /
+    .. note:: Experimental. This whole API -- ``setup_array_upload`` /
        ``upload_array`` / ``upload_chunk`` / ``set_upload_status`` -- is
        experimental and its behavior may change.
 
-    Declare, then fill: ``add_tensor`` returns the server's descriptor for the
-    new tensor, and that descriptor is what every write takes. Nothing here
-    creates a source; an upload names one the server already serves.
+    Declare, then fill: ``setup_array_upload`` returns the server's descriptor
+    for the new tensor, and that descriptor is what every write takes. Nothing
+    here creates a source; an upload names one the server already serves.
 
     Takes the shared ``_ClientState`` its two sibling collaborators take
     (``CatalogClient``, ``ChunkFetcher``). ``TensorFlightClient`` constructs one
@@ -415,7 +415,7 @@ class UploadSession:
         # where it stands, and that read lives on the catalog client.
         self._catalog = catalog
 
-    def add_tensor(
+    def setup_array_upload(
         self,
         array_id: str,
         template: Any,
@@ -425,8 +425,8 @@ class UploadSession:
         ome_metadata: Optional[dict] = None,
         ttl_seconds: Optional[int] = None,
     ) -> TensorDescriptor:
-        """Backs TensorFlightClient.add_tensor; see that method for the full
-        documentation."""
+        """Backs TensorFlightClient.setup_array_upload; see that method for the
+        full documentation."""
         shape = tuple(int(n) for n in template.shape)
         dtype = np.dtype(template.dtype)
         if chunk_shape is None:
@@ -454,10 +454,10 @@ class UploadSession:
         try:
             result = next(results)
         except StopIteration as exc:
-            raise RuntimeError("add_tensor: server returned no result") from exc
+            raise RuntimeError("setup_array_upload: server returned no result") from exc
 
         desc = TensorDescriptor.FromString(result.body.to_pybytes())
-        logger.info(f"add_tensor: added {desc.array_id}")
+        logger.info(f"setup_array_upload: added {desc.array_id}")
         return desc
 
     def upload_array(

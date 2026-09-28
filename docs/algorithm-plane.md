@@ -10,7 +10,7 @@ control or by someone else.
 | `op` / `serve`, the server side | `biopb-image-runtime` (`biopb_image_base.ops`), a wheel on PyPI and a Docker base image |
 | the registry and the probe | `biopb._algorithms` (core SDK) |
 | supervision and `/api/algorithms` | `biopb-control` (`_algorithm_plane.py`, `_control.py`) |
-| clients | `biopb.control.algorithms()`, the kernel's `ops` (biopb-mcp `_process_ops.py`), `biopb image`, the dashboard's algorithm card |
+| clients | `biopb.algorithms()`, the kernel's `ops` (biopb-mcp `_process_ops.py`), `biopb image`, the dashboard's algorithm card |
 
 Most algorithms cannot run in the kernel: they pin a torch that conflicts with
 the session, want another Python, or are not Python at all. So each runs in its
@@ -221,9 +221,9 @@ the control, as `failed` and the log tail.
 The routes sit behind the control's token like the rest of `/api`. A verb
 waits at most `?client_timeout` less five seconds (at most the install bound,
 60 s without the hint), so a slow install answers before the caller gives up.
-`biopb.control` wraps them stdlib-only: `algorithms()`,
-`refresh_algorithms()`, `ensure_algorithm()`, `stop_algorithm()`,
-`restart_algorithm()`, `algorithm_logs()`.
+`biopb` wraps them stdlib-only (backed by the private `biopb._control`):
+`algorithms()`, `refresh_algorithms()`, `ensure_algorithm()`,
+`stop_algorithm()`, `restart_algorithm()`, `algorithm_logs()`.
 
 ## Clients
 

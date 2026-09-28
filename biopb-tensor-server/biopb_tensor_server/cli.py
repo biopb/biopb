@@ -19,8 +19,8 @@ from typing import List, Optional, Tuple
 import typer
 from biopb import _tls_material, _tls_record, _web_auth
 from biopb._fs_detect import unsafe_cache_dir_reason
-from biopb._lifecycle import deathwatch as _deathwatch
 from biopb._locations import tensor_catalog_path, tls_server_cert
+from biopb.lifecycle import deathwatch as _deathwatch
 from biopb.tensor._location import realign_transport_scheme
 from rich.console import Console
 from rich.markup import escape as _rich_escape
@@ -511,7 +511,7 @@ def _resolve_serve_sources(
         # server STARTING until it finishes (observed ~1h / 900s+ stuck registering
         # hundreds of hpc__* proxies -- each descriptor an expensive OME-TIFF open
         # on the upstream) and bypasses the bulk-seed fast path. The re-list instead
-        # seeds the entire catalog in ONE upstream query_sources (no per-source RPC,
+        # seeds the entire catalog in ONE upstream query (no per-source RPC,
         # biopb/biopb#266) and runs in the background, so the server reaches SERVING
         # immediately and the mirror fills progressively -- exactly like a monitored
         # local directory. `monitor=false` on a bare-host upstream is not "static":
@@ -929,7 +929,7 @@ def _setup_flight_server(
         )
 
     # The metadata database is mandatory (biopb/biopb#225): always constructed --
-    # it is the canonical source-browsing surface (`client.query_sources`).
+    # it is the canonical source-browsing surface (`client.query`).
     metadata_db = _open_catalog(
         server_config, _catalog_store_path(server_config, config_path)
     )
@@ -1316,7 +1316,7 @@ def serve(
         # so shutdown is clean.
         _install_sigterm_handler()
         # If launched under the control supervisor, self-terminate when it dies
-        # uncatchably (no-op when run standalone; see biopb._lifecycle.deathwatch).
+        # uncatchably (no-op when run standalone; see biopb.lifecycle.deathwatch).
         _deathwatch.install()
 
         server.serve()
@@ -1812,7 +1812,7 @@ def launch(
     _install_sigterm_handler()
     # If launched under the control supervisor, self-terminate when it dies
     # uncatchably so a crashed/killed control never orphans this plane into a
-    # port-holding conflict (no-op standalone; see biopb._lifecycle.deathwatch).
+    # port-holding conflict (no-op standalone; see biopb.lifecycle.deathwatch).
     _deathwatch.install()
 
     # --- Token management ---

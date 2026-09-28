@@ -1,4 +1,4 @@
-"""A tensor's lifetime: what ``add_tensor``'s ``ttl_seconds`` buys.
+"""A tensor's lifetime: what ``setup_array_upload``'s ``ttl_seconds`` buys.
 
 How long an intermediate result is worth keeping is the producer's to say.
 What that means here:
@@ -39,7 +39,7 @@ CHUNK = (2, 2)
 
 
 def _add(client, source, field="temp", ttl=None, scheme="cache"):
-    return client.add_tensor(
+    return client.setup_array_upload(
         f"{scheme}://{source}/@fields/{field}",
         np.empty(SHAPE, dtype=np.uint16),
         chunk_shape=CHUNK,
@@ -186,7 +186,7 @@ class TestALabelSetIsAnUploadedTensorToo:
     def _labels(client, image, name="nuclei", ttl=None):
         arr = np.zeros(SHAPE, dtype=np.uint32)
         arr[:2, :2] = 3
-        return client.add_tensor(
+        return client.setup_array_upload(
             f"zarr://{image.array_id}/@labels/{name}",
             arr,
             chunk_shape=CHUNK,

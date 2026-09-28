@@ -18,7 +18,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
-from biopb.control import _data_plane
+from biopb._control import _data_plane
 
 # A throwaway self-signed leaf + its key, generated once and valid 2026-2126.
 # Static rather than minted at runtime because `cryptography` is deliberately not
@@ -196,36 +196,36 @@ class TestResolutionOrder:
 
     def test_control_is_asked_when_nothing_is_explicit(self, control):
         control({"data_plane": {"grpc_url": "grpc://127.0.0.1:9915"}})
-        endpoint = _data_plane.resolve()
+        endpoint = _data_plane.resolve_data_plane()
         assert endpoint.url == "grpc://127.0.0.1:9915"
         assert endpoint.origin == "control"
 
     def test_env_beats_the_control(self, control, monkeypatch):
         control({"data_plane": {"grpc_url": "grpc://127.0.0.1:9915"}})
         monkeypatch.setenv("BIOPB_TENSOR_URL", "grpc://elsewhere:1234")
-        endpoint = _data_plane.resolve()
+        endpoint = _data_plane.resolve_data_plane()
         assert endpoint.url == "grpc://elsewhere:1234"
         assert endpoint.origin == "env"
 
     def test_override_beats_everything(self, control, monkeypatch):
         control({"data_plane": {"grpc_url": "grpc://127.0.0.1:9915"}})
         monkeypatch.setenv("BIOPB_TENSOR_URL", "grpc://elsewhere:1234")
-        endpoint = _data_plane.resolve("grpc://flag:5555")
+        endpoint = _data_plane.resolve_data_plane("grpc://flag:5555")
         assert endpoint.url == "grpc://flag:5555"
         assert endpoint.origin == "flag"
 
     def test_falls_back_to_the_default_when_no_control_answers(self):
         # No control fixture here: BIOPB_CONTROL_PORT points at a free port.
-        endpoint = _data_plane.resolve(probe=False)
-        assert endpoint.url == _data_plane.default_url()
+        endpoint = _data_plane.resolve_data_plane(probe=False)
+        assert endpoint.url == _data_plane.default_data_plane_url()
         assert endpoint.url.endswith(":8815")  # base 8810 + the flight offset
         assert endpoint.origin == "default"
 
     def test_the_default_port_is_derived_not_hardcoded(self):
-        from biopb.control import _endpoints
+        from biopb._control import _endpoints
 
         expected = _endpoints.flight_port_for(_endpoints.BASE_DEFAULT_PORT)
-        assert _data_plane.default_url().endswith(f":{expected}")
+        assert _data_plane.default_data_plane_url().endswith(f":{expected}")
 
     def test_the_fallback_scheme_comes_from_the_probe(self, monkeypatch):
         # #615 fault 1: the scheme was hardcoded `grpc://`, so a --tls plane was
@@ -238,21 +238,25 @@ class TestResolutionOrder:
         cert = tls_server_cert()
         cert.parent.mkdir(parents=True, exist_ok=True)
         cert.write_bytes(TestLocalTrustAnchor.CERT)
-        monkeypatch.setattr(_data_plane, "probe_scheme", lambda *_a, **_k: "grpcs")
-        assert _data_plane.resolve().url.startswith("grpcs://")
+        monkeypatch.setattr(
+            _data_plane, "probe_data_plane_scheme", lambda *_a, **_k: "grpcs"
+        )
+        assert _data_plane.resolve_data_plane().url.startswith("grpcs://")
 
     def test_a_control_without_a_data_plane_url_is_no_answer(self, control):
         control({"control": "ok"})  # control up, plane never started
-        assert _data_plane.resolve(probe=False).origin == "default"
+        assert _data_plane.resolve_data_plane(probe=False).origin == "default"
 
     def test_a_failing_control_is_no_answer(self, control):
         control({"data_plane": {"grpc_url": "grpc://x:1"}}, status=500)
-        assert _data_plane.resolve(probe=False).origin == "default"
+        assert _data_plane.resolve_data_plane(probe=False).origin == "default"
 
     def test_every_origin_carries_a_readable_note(self, control):
         control({"data_plane": {"grpc_url": "grpc://127.0.0.1:9915"}})
-        assert "control" in _data_plane.resolve().origin_note
-        assert "command line" in _data_plane.resolve("grpc://x:1").origin_note
+        assert "control" in _data_plane.resolve_data_plane().origin_note
+        assert (
+            "command line" in _data_plane.resolve_data_plane("grpc://x:1").origin_note
+        )
 
 
 class TestControlDiscovery:
@@ -276,19 +280,28 @@ class TestProbeScheme:
     def test_a_tls_listener_answers_grpcs(self, tmp_path):
         sock, port = _tls_listener(tmp_path)
         try:
-            assert _data_plane.probe_scheme("127.0.0.1", port, timeout=5) == "grpcs"
+            assert (
+                _data_plane.probe_data_plane_scheme("127.0.0.1", port, timeout=5)
+                == "grpcs"
+            )
         finally:
             sock.close()
 
     def test_a_plaintext_listener_answers_grpc(self):
         sock, port = _plaintext_listener()
         try:
-            assert _data_plane.probe_scheme("127.0.0.1", port, timeout=5) == "grpc"
+            assert (
+                _data_plane.probe_data_plane_scheme("127.0.0.1", port, timeout=5)
+                == "grpc"
+            )
         finally:
             sock.close()
 
     def test_nothing_listening_answers_none(self):
-        assert _data_plane.probe_scheme("127.0.0.1", _free_port(), timeout=0.5) is None
+        assert (
+            _data_plane.probe_data_plane_scheme("127.0.0.1", _free_port(), timeout=0.5)
+            is None
+        )
 
 
 class TestTokenResolution:
@@ -306,42 +319,47 @@ class TestTokenResolution:
 
     def test_credential_file_is_read(self):
         self._write_credential("file-token")
-        assert _data_plane.resolve_token() == "file-token"
+        assert _data_plane.resolve_data_plane_token() == "file-token"
 
     def test_env_beats_the_file(self, monkeypatch):
         self._write_credential("file-token")
         monkeypatch.setenv("BIOPB_TENSOR_TOKEN", "env-token")
-        assert _data_plane.resolve_token() == "env-token"
+        assert _data_plane.resolve_data_plane_token() == "env-token"
 
     def test_explicit_beats_everything(self, monkeypatch):
         self._write_credential("file-token")
         monkeypatch.setenv("BIOPB_TENSOR_TOKEN", "env-token")
-        assert _data_plane.resolve_token("flag-token") == "flag-token"
+        assert _data_plane.resolve_data_plane_token("flag-token") == "flag-token"
 
     def test_nothing_anywhere_is_none(self):
         # A tokenless local plane: unauthenticated is the correct answer.
-        assert _data_plane.resolve_token() is None
+        assert _data_plane.resolve_data_plane_token() is None
 
     def test_blank_values_are_none_not_empty_string(self, monkeypatch):
         # "" would be sent as an empty Bearer header rather than omitted.
         monkeypatch.setenv("BIOPB_TENSOR_TOKEN", "   ")
-        assert _data_plane.resolve_token("") is None
+        assert _data_plane.resolve_data_plane_token("") is None
 
     def test_the_endpoint_carries_the_resolved_token(self, control):
         self._write_credential("file-token")
         control({"data_plane": {"grpc_url": "grpc://127.0.0.1:9915"}})
-        assert _data_plane.resolve(probe=False).token == "file-token"
+        assert _data_plane.resolve_data_plane(probe=False).token == "file-token"
 
     def test_the_file_is_not_read_when_it_is_not_allowed(self):
         self._write_credential("file-token")
-        assert _data_plane.resolve_token(allow_credential_file=False) is None
+        assert _data_plane.resolve_data_plane_token(allow_credential_file=False) is None
 
     def test_an_explicit_token_still_applies_without_the_file(self, monkeypatch):
         # Naming a server does not stop you naming its token.
         monkeypatch.setenv("BIOPB_TENSOR_TOKEN", "env-token")
-        assert _data_plane.resolve_token(allow_credential_file=False) == "env-token"
         assert (
-            _data_plane.resolve_token("flag-token", allow_credential_file=False)
+            _data_plane.resolve_data_plane_token(allow_credential_file=False)
+            == "env-token"
+        )
+        assert (
+            _data_plane.resolve_data_plane_token(
+                "flag-token", allow_credential_file=False
+            )
             == "flag-token"
         )
 
@@ -364,7 +382,7 @@ class TestTheCredentialFollowsTheAddress:
         self._write_credential()
         control({"data_plane": {"grpc_url": "grpc://127.0.0.1:9915"}})
 
-        endpoint = _data_plane.resolve(probe=False)
+        endpoint = _data_plane.resolve_data_plane(probe=False)
 
         assert endpoint.origin == "control"
         assert endpoint.token == "file-token"
@@ -374,7 +392,9 @@ class TestTheCredentialFollowsTheAddress:
         self._write_credential()
         control({"data_plane": {"grpc_url": "grpc://127.0.0.1:9915"}})
 
-        endpoint = _data_plane.resolve("grpc://data.mylab.example:8815", probe=False)
+        endpoint = _data_plane.resolve_data_plane(
+            "grpc://data.mylab.example:8815", probe=False
+        )
 
         assert endpoint.origin == "flag"
         assert endpoint.token is None
@@ -384,7 +404,7 @@ class TestTheCredentialFollowsTheAddress:
         control({"data_plane": {"grpc_url": "grpc://127.0.0.1:9915"}})
         monkeypatch.setenv("BIOPB_TENSOR_URL", "grpc://data.mylab.example:8815")
 
-        endpoint = _data_plane.resolve(probe=False)
+        endpoint = _data_plane.resolve_data_plane(probe=False)
 
         assert endpoint.origin == "env"
         assert endpoint.token is None
@@ -398,13 +418,16 @@ class TestTheCredentialFollowsTheAddress:
         self._write_credential()
         control({"data_plane": {"grpc_url": "grpc://127.0.0.1:9915"}})
 
-        assert _data_plane.resolve("grpc://127.0.0.1:9915", probe=False).token is None
+        assert (
+            _data_plane.resolve_data_plane("grpc://127.0.0.1:9915", probe=False).token
+            is None
+        )
 
     def test_the_guessed_default_does_not_get_it(self):
         """No control answered, so nothing vouches for what is on that port."""
         self._write_credential()
 
-        endpoint = _data_plane.resolve(probe=False)
+        endpoint = _data_plane.resolve_data_plane(probe=False)
 
         assert endpoint.origin == "default"
         assert endpoint.token is None
@@ -412,14 +435,16 @@ class TestTheCredentialFollowsTheAddress:
     def test_an_explicit_token_reaches_a_flagged_endpoint(self):
         # The user names the server *and* its token -- the supported way to dial
         # something the control does not own.
-        endpoint = _data_plane.resolve(
+        endpoint = _data_plane.resolve_data_plane(
             "grpc://data.mylab.example:8815", "their-token", probe=False
         )
         assert endpoint.token == "their-token"
 
     def test_the_env_token_reaches_it_too(self, monkeypatch):
         monkeypatch.setenv("BIOPB_TENSOR_TOKEN", "env-token")
-        endpoint = _data_plane.resolve("grpc://data.mylab.example:8815", probe=False)
+        endpoint = _data_plane.resolve_data_plane(
+            "grpc://data.mylab.example:8815", probe=False
+        )
         assert endpoint.token == "env-token"
 
 
@@ -451,9 +476,12 @@ class TestLocalTrustAnchor:
 
     def test_plaintext_and_remote_planes_get_no_anchor(self):
         self._seed_cert()
-        assert _data_plane.local_fingerprint("grpc://localhost:8815") is None
+        assert _data_plane.local_data_plane_fingerprint("grpc://localhost:8815") is None
         # A remote plane's cert is not on this disk and cannot be -- TOFU stays.
-        assert _data_plane.local_fingerprint("grpcs://data.mylab.example:8815") is None
+        assert (
+            _data_plane.local_data_plane_fingerprint("grpcs://data.mylab.example:8815")
+            is None
+        )
 
     def test_a_published_record_names_the_certificate_actually_served(self):
         """The only source that knows about a --tls-cert: the plane says so."""
@@ -461,7 +489,10 @@ class TestLocalTrustAnchor:
 
         self._seed_cert()  # a minted cert that is NOT what the plane serves
         _tls_record.publish(8815, "deadbeef")
-        assert _data_plane.local_fingerprint("grpcs://127.0.0.1:8815") == "deadbeef"
+        assert (
+            _data_plane.local_data_plane_fingerprint("grpcs://127.0.0.1:8815")
+            == "deadbeef"
+        )
 
     def test_the_record_is_keyed_by_port(self):
         """Nothing guarantees one plane per state tree: the cache lock that would
@@ -470,8 +501,12 @@ class TestLocalTrustAnchor:
 
         _tls_record.publish(8815, "aaaa")
         _tls_record.publish(9815, "bbbb")
-        assert _data_plane.local_fingerprint("grpcs://127.0.0.1:8815") == "aaaa"
-        assert _data_plane.local_fingerprint("grpcs://127.0.0.1:9815") == "bbbb"
+        assert (
+            _data_plane.local_data_plane_fingerprint("grpcs://127.0.0.1:8815") == "aaaa"
+        )
+        assert (
+            _data_plane.local_data_plane_fingerprint("grpcs://127.0.0.1:9815") == "bbbb"
+        )
 
     def test_a_retracted_record_falls_back_rather_than_lying(self):
         from biopb import _tls_record
@@ -479,34 +514,38 @@ class TestLocalTrustAnchor:
         self._seed_cert()
         _tls_record.publish(8815, "deadbeef")
         _tls_record.retract(8815)
-        assert _data_plane.local_fingerprint("grpcs://127.0.0.1:8815") == self._digest(
-            self.CERT
-        )
+        assert _data_plane.local_data_plane_fingerprint(
+            "grpcs://127.0.0.1:8815"
+        ) == self._digest(self.CERT)
 
     def test_a_plane_that_published_nothing_falls_back_to_the_minted_cert(self):
         """What a plane too old to publish a record serves -- and the common case."""
         self._seed_cert()
         for url in ("grpcs://localhost:8815", "grpcs://127.0.0.1:8815"):
-            assert _data_plane.local_fingerprint(url) == self._digest(self.CERT)
+            assert _data_plane.local_data_plane_fingerprint(url) == self._digest(
+                self.CERT
+            )
 
     def test_neither_source_errors_rather_than_falling_back_to_tofu(self):
         with pytest.raises(_data_plane.LocalTrustError, match="no record"):
-            _data_plane.local_fingerprint("grpcs://127.0.0.1:8815")
+            _data_plane.local_data_plane_fingerprint("grpcs://127.0.0.1:8815")
 
     def test_an_empty_cert_errors(self):
         self._seed_cert(b"  \n")
         with pytest.raises(_data_plane.LocalTrustError, match="empty"):
-            _data_plane.local_fingerprint("grpcs://127.0.0.1:8815")
+            _data_plane.local_data_plane_fingerprint("grpcs://127.0.0.1:8815")
 
     def test_unparseable_material_errors(self):
         self._seed_cert(b"not a certificate")
         with pytest.raises(_data_plane.LocalTrustError, match="readable as PEM"):
-            _data_plane.local_fingerprint("grpcs://127.0.0.1:8815")
+            _data_plane.local_data_plane_fingerprint("grpcs://127.0.0.1:8815")
 
     def test_resolve_attaches_the_anchor(self, control):
         self._seed_cert()
         control({"data_plane": {"grpc_url": "grpcs://127.0.0.1:8815"}})
-        assert _data_plane.resolve().tls_fingerprint == self._digest(self.CERT)
+        assert _data_plane.resolve_data_plane().tls_fingerprint == self._digest(
+            self.CERT
+        )
 
     @pytest.mark.skipif(
         os.name != "posix" or os.geteuid() == 0,
@@ -517,7 +556,7 @@ class TestLocalTrustAnchor:
         cert.chmod(0o000)
         try:
             with pytest.raises(_data_plane.LocalTrustError) as exc:
-                _data_plane.local_fingerprint("grpcs://127.0.0.1:8815")
+                _data_plane.local_data_plane_fingerprint("grpcs://127.0.0.1:8815")
         finally:
             cert.chmod(0o600)
         assert str(cert) in str(exc.value)

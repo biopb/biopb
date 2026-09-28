@@ -2,7 +2,7 @@
 
 Three rules (biopb/biopb#1048 steps 4 and 5):
 
-- a field is **single-use** while its tensor is served: ``add_tensor``
+- a field is **single-use** while its tensor is served: ``setup_array_upload``
   refuses a collision -- at any state alike -- so ``array_id`` alone names an
   attempt, and a writer's chunks can only land in the tensor it created
   (the reclaim sweep, ``upload_reclaim_test.py``, is what frees a discarded
@@ -23,7 +23,7 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 
 def _make(client, source, field="lifecycle", shape=(4, 4), chunk=(2, 2)):
     """Declare a tensor on *source*; the descriptor is what every write takes."""
-    return client.add_tensor(
+    return client.setup_array_upload(
         f"cache://{source}/@fields/{field}",
         np.empty(shape, dtype=np.uint16),
         chunk_shape=chunk,

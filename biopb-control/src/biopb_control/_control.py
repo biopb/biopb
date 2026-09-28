@@ -107,7 +107,7 @@ from biopb import (
     _sessions,
     _web_auth,
 )
-from biopb._lifecycle.daemon import detach_kwargs
+from biopb.lifecycle.daemon import detach_kwargs
 from starlette.applications import Starlette
 from starlette.background import BackgroundTask
 from starlette.datastructures import Headers

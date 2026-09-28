@@ -64,7 +64,7 @@ import biopb.image as proto
 import grpc
 import numpy as np
 from biopb._web_auth import host_is_public_bind
-from biopb.image.utils import (
+from biopb.image import (
     deserialize_image_data,
     normalize_array_dims,
     serialize_from_numpy_to_image_data,
@@ -91,7 +91,7 @@ TOKEN_ENV = "BIOPB_ALGORITHM_TOKEN"
 _INPUT_MODES = ("eager", "lazy", "blocks")
 _SPATIAL_AXES = frozenset("ZYX")
 
-# biopb's ndim -> axis-label convention (see biopb.image.utils).
+# biopb's ndim -> axis-label convention (see biopb.image._utils).
 _NDIM_LABELS = {
     2: ["Y", "X"],
     3: ["Y", "X", "C"],
@@ -570,7 +570,7 @@ class _PlaneSink(_InlineSink):
         import dask
 
         client = self._connect()
-        desc = client.add_tensor(
+        desc = client.setup_array_upload(
             f"cache://scratch/@fields/{_field_name(op_name)}",
             array,
             dim_labels=labels,
@@ -580,7 +580,7 @@ class _PlaneSink(_InlineSink):
         else:
             with dask.config.set(scheduler="threads", num_workers=_UPLOAD_WORKERS):
                 client.upload_array(desc, array)
-        return client.get_tensor_pb(desc.array_id)
+        return client.get_tensor(desc.array_id, output="pb")
 
 
 class _EmbeddedSink(_PlaneSink):
@@ -943,7 +943,7 @@ def serve(
     setup_logging(get_log_level_from_env())
     # Under the control, die with it: it passes a parent-death pipe, so a
     # control that dies uncatchably leaves no server holding a GPU.
-    from biopb._lifecycle import deathwatch
+    from biopb.lifecycle import deathwatch
 
     deathwatch.install()
     token = os.environ.get(TOKEN_ENV) or None

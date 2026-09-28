@@ -103,7 +103,7 @@ id or a byte-prefix sniff -- and the arm names the flight:
 |---|---|---|---|---|
 | `catalog` | public: the DuckDB tables (`sources`, `decode_rates`) | path descriptor (`for_path("sources")`) -> the table's schema + a ticket that reads it | `TensorTicket.catalog_query` -- runs the SQL, truncation flags on the stream's schema metadata | -- |
 | `data` | private: pixels | `FlightRequest.tensor_read` -> chunk endpoints; fills `pyramid` / `metadata_json` on request | `TensorTicket.chunk_id` (opaque, server-minted) | `PutCommand.chunk` (writable servers) |
-| `roi` | private: annotations | -- | `TensorTicket.roi_read` -> ROI rows (`biopb.image._roi_rows`), `sets` + `truncated` in schema metadata | `PutCommand.roi_put` / `roi_delete`, reply in the put's app_metadata |
+| `roi` | private: annotations | -- | `TensorTicket.roi_read` -> ROI rows (`biopb.tensor._roi_rows`), `sets` + `truncated` in schema metadata | `PutCommand.roi_put` / `roi_delete`, reply in the put's app_metadata |
 
 `ListFlights` advertises the catalog only: one flight per table by path, with
 its real Arrow schema and a `SELECT * FROM <table>` ticket, so a stock Flight
@@ -368,7 +368,7 @@ and *where to expose it* is the launch command.
    cannot be mmapped safely (network mount, cloud-synced folder) or isn't
    writable — the on-disk cache is required infrastructure, not optional.
 5. Resolve config sources into *static* and *monitored* sets, and build the
-   metadata DB (mandatory — it backs `query_sources`). An empty catalog is a
+   metadata DB (mandatory — it backs `query`). An empty catalog is a
    valid state and boots: sources can still arrive via `add_source`, DoPut, or a
    monitored dir that fills later. The cache's measured per-tensor decode
    throughput is attached to the catalog here too, as a `decode_rates` table —

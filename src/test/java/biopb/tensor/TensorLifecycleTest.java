@@ -64,11 +64,11 @@ public class TensorLifecycleTest {
     // ---- source lifecycle -------------------------------------------------
 
     @Test
-    public void testAddSourceReportsProgressThenTheTally() throws Exception {
+    public void testRegisterLocalPathReportsProgressThenTheTally() throws Exception {
         try (TestServer server = new TestServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
                 List<AddSourceProgress> progress = new ArrayList<>();
-                AddSourceResult result = client.addSource(
+                AddSourceResult result = client.registerLocalPath(
                         "/data/plate", "ome-zarr", progress::add, () -> false);
 
                 Assert.assertEquals(Arrays.asList("plate_a", "plate_b"), result.getAddedList());
@@ -83,26 +83,26 @@ public class TensorLifecycleTest {
     }
 
     @Test
-    public void testAddSourceCancelKeepsWhatRegistered() throws Exception {
+    public void testRegisterLocalPathCancelKeepsWhatRegistered() throws Exception {
         // A cancel is intentional, so it reports an empty tally rather than an
         // error -- and the sources already registered stay registered.
         try (TestServer server = new TestServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
-                AddSourceResult result = client.addSource("/data/plate", "", null, () -> true);
+                AddSourceResult result = client.registerLocalPath("/data/plate", "", null, () -> true);
                 Assert.assertEquals(0, result.getAddedCount());
             }
         }
     }
 
     @Test
-    public void testAddSourceCancelOnTheTerminalKeepsTheTally() throws Exception {
+    public void testRegisterLocalPathCancelOnTheTerminalKeepsTheTally() throws Exception {
         // The poll runs AFTER a message is consumed, so a cancel landing exactly
         // on the terminal result must not discard a tally already in hand.
         try (TestServer server = new TestServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
                 // False for the two heartbeats, true once the result has landed.
                 int[] calls = { 0 };
-                AddSourceResult result = client.addSource(
+                AddSourceResult result = client.registerLocalPath(
                         "/data/plate", "", null, () -> ++calls[0] >= 3);
                 Assert.assertEquals(Arrays.asList("plate_a", "plate_b"), result.getAddedList());
             }
@@ -120,7 +120,7 @@ public class TensorLifecycleTest {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
                 java.util.concurrent.atomic.AtomicInteger seen =
                         new java.util.concurrent.atomic.AtomicInteger();
-                AddSourceResult result = client.addSource("/data/plate", "",
+                AddSourceResult result = client.registerLocalPath("/data/plate", "",
                         ignored -> seen.incrementAndGet(), () -> seen.get() >= 3);
 
                 Assert.assertEquals(0, result.getAddedCount());
@@ -139,19 +139,19 @@ public class TensorLifecycleTest {
     }
 
     @Test
-    public void testAddSourceWithoutTerminalResultFails() throws Exception {
+    public void testRegisterLocalPathWithoutTerminalResultFails() throws Exception {
         try (TestServer server = new TestServer()) {
             server.producer.addSourceSendsResult = false;
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
                 IOException error = Assert.assertThrows(IOException.class,
-                        () -> client.addSource("/data/plate"));
+                        () -> client.registerLocalPath("/data/plate"));
                 Assert.assertTrue(error.getMessage().contains("no terminal result"));
             }
         }
     }
 
     @Test
-    public void testAddSourceOnAnOldServerNamesTheFeature() throws Exception {
+    public void testRegisterLocalPathOnAnOldServerNamesTheFeature() throws Exception {
         // "Unknown action" is how a server that predates the action answers;
         // the client says which feature is missing, not which RPC failed.
         try (TestServer server = new TestServer()) {
@@ -159,7 +159,7 @@ public class TensorLifecycleTest {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
                 UnsupportedOperationException error = Assert.assertThrows(
                         UnsupportedOperationException.class,
-                        () -> client.addSource("/data/plate"));
+                        () -> client.registerLocalPath("/data/plate"));
                 Assert.assertTrue(error.getMessage().contains("Runtime source registration is unavailable"));
                 Assert.assertTrue(error.getMessage().contains("add_source"));
             }
@@ -167,10 +167,10 @@ public class TensorLifecycleTest {
     }
 
     @Test
-    public void testRemoveSourceTakesADndBranch() throws Exception {
+    public void testDeregisterLocalPathTakesADndBranch() throws Exception {
         try (TestServer server = new TestServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
-                RemoveSourceResult result = client.removeSource("dnd://drop-1");
+                RemoveSourceResult result = client.deregisterLocalPath("dnd://drop-1");
                 Assert.assertEquals(Arrays.asList("plate_a", "plate_b"), result.getRemovedList());
                 Assert.assertEquals("dnd://drop-1", server.producer.lastRemoveSource.getRootUrl());
             }
@@ -178,13 +178,13 @@ public class TensorLifecycleTest {
     }
 
     @Test
-    public void testRemoveSourceOnAnOldServerNamesTheFeature() throws Exception {
+    public void testDeregisterLocalPathOnAnOldServerNamesTheFeature() throws Exception {
         try (TestServer server = new TestServer()) {
             server.producer.knownActions = Collections.emptySet();
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
                 UnsupportedOperationException error = Assert.assertThrows(
                         UnsupportedOperationException.class,
-                        () -> client.removeSource("dnd://drop-1"));
+                        () -> client.deregisterLocalPath("dnd://drop-1"));
                 Assert.assertTrue(error.getMessage().contains("Source removal is unavailable"));
             }
         }
@@ -193,12 +193,12 @@ public class TensorLifecycleTest {
     // ---- label sets -------------------------------------------------------
 
     @Test
-    public void testLabelSetsIsACatalogQueryOverThePath() throws Exception {
+    public void testGetLabelSetsIsACatalogQueryOverThePath() throws Exception {
         try (TestServer server = new TestServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
                 Assert.assertEquals(
                         Arrays.asList("src_ab12/@labels/@ome", "src_ab12/@labels/nuclei"),
-                        client.labelSets("src_ab12"));
+                        client.getLabelSets("src_ab12"));
                 // The prefix is the image's own path, quoted for the SQL surface.
                 Assert.assertTrue(server.producer.lastSql.contains("'src_ab12/@labels/'"));
             }
@@ -347,10 +347,10 @@ public class TensorLifecycleTest {
     // ---- uploads ----------------------------------------------------------
 
     @Test
-    public void testAddTensorEchoesTheServersDescriptor() throws Exception {
+    public void testSetupArrayUploadEchoesTheServersDescriptor() throws Exception {
         try (TestServer server = new TestServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
-                TensorDescriptor descriptor = client.addTensor(
+                TensorDescriptor descriptor = client.setupArrayUpload(
                         "cache://registered_abc123/mine", new long[] {4, 6}, "<u2", new long[] {2, 3},
                         Arrays.asList("y", "x"), "{\"ome\":true}");
 
@@ -365,12 +365,12 @@ public class TensorLifecycleTest {
     }
 
     @Test
-    public void testAddTensorTakesShapeAndDtypeFromATemplate() throws Exception {
+    public void testSetupArrayUploadTakesShapeAndDtypeFromATemplate() throws Exception {
         try (TestServer server = new TestServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
                 RandomAccessibleInterval<UnsignedShortType> template =
                         ArrayImgs.unsignedShorts(new short[24], 4, 6);
-                TensorDescriptor descriptor = client.addTensor(
+                TensorDescriptor descriptor = client.setupArrayUpload(
                         "cache://registered_abc123/mine", template, new long[] {2, 3}, null, null);
 
                 Assert.assertEquals(Arrays.asList(4L, 6L), descriptor.getShapeList());

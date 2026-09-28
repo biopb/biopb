@@ -62,7 +62,11 @@ jobs:
 
       - name: Build Python API docs
         run: |
-          uv sync --extra doc
+          # `tensor` is needed alongside `doc`: the CLI reference (mkdocs-typer2)
+          # walks the Typer app's real command tree, which imports
+          # biopb.tensor.cli (pyarrow/dask/zarr) -- unlike mkdocstrings, which
+          # analyzes the rest of the reference statically and needs no imports.
+          uv sync --extra doc --extra tensor
           uv run mkdocs build -f docs-api/mkdocs.yml
           test -f docs-api/site/index.html
 

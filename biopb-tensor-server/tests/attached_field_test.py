@@ -44,7 +44,7 @@ def _their_file(tmp_path, name="theirs", shape=SHAPE):
 
 def _add(client, source, name, scheme="zarr", arr=None, **kw):
     arr = _arr() if arr is None else arr
-    return client.add_tensor(
+    return client.setup_array_upload(
         f"{scheme}://{source}/@fields/{name}", arr, chunk_shape=CHUNK, **kw
     )
 
@@ -113,7 +113,7 @@ class TestWhereTheBytesGo:
     def test_a_bare_field_is_refused(self, client, source):
         """The upload path mints no native tensor id (``core.attached``)."""
         with pytest.raises(flight.FlightServerError, match="does not name an"):
-            client.add_tensor(f"zarr://{source}/raw", _arr(), chunk_shape=CHUNK)
+            client.setup_array_upload(f"zarr://{source}/raw", _arr(), chunk_shape=CHUNK)
 
 
 class TestItCannotShadowTheFilesOwnTensors:
@@ -180,7 +180,7 @@ class TestListingAndReading:
         desc = _add(client, discovered, "raw")
         client.upload_array(desc, _arr())
 
-        labels = client.add_tensor(
+        labels = client.setup_array_upload(
             "zarr://theirs/@fields/raw/@labels/nuclei",
             np.zeros(SHAPE, dtype=np.uint32),
             chunk_shape=CHUNK,

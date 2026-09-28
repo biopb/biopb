@@ -642,7 +642,7 @@ class Reconciler:
             tls_fingerprint=credentials.tls_fingerprint,
         )
         try:
-            # ONE bulk query_sources fetches every upstream source's id AND its
+            # ONE bulk query fetches every upstream source's id AND its
             # seed data (tensors + metadata), so mirroring is O(1) upstream RPCs
             # instead of one per added source at registration (biopb/biopb#266).
             # Complete: the server-side DuckDB catalog is not truncated like
@@ -967,7 +967,7 @@ class Reconciler:
 
         ``catalog_seed`` (biopb/biopb#266) is an optional
         ``(tensors, metadata, is_resolved, source_url)`` tuple from a bulk upstream
-        ``query_sources``; when the adapter supports it (the remote proxy), it is
+        ``query``; when the adapter supports it (the remote proxy), it is
         applied before ``sync_source_added`` so registration needs no per-source
         upstream RPC. ``catalog_url`` (drag-drop re-rooting) overrides the display
         ``source_url`` on the adapter *before* register/sync so both ListFlights

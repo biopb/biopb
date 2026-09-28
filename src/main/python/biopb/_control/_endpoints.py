@@ -4,7 +4,8 @@ The control (control plane) exposes a small loopback HTTP control API. Two
 independent processes need to agree on where it listens:
 
 - the control itself (``biopb-control``, a separate workspace package), and
-- its clients (:mod:`biopb.control`), which ask it where the data plane is and
+- its clients (top-level ``biopb`` attributes, backed by this private
+  :mod:`biopb._control` package), which ask it where the data plane is and
   to bring it up.
 
 A client cannot import ``biopb-control``, so the endpoint lives here in the
@@ -81,8 +82,8 @@ def write_runtime_record(host: str, port: int, pid: int) -> None:
     platform has no cheap create-time -- readers degrade to liveness there, as
     they do for a legacy bare-pid file.
     """
-    from .._lifecycle.proc import process_create_time
     from .._locations import control_runtime_file
+    from ..lifecycle.proc import process_create_time
 
     path = control_runtime_file()
     path.parent.mkdir(parents=True, exist_ok=True)

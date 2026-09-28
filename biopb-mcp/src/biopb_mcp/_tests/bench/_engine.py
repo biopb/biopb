@@ -647,7 +647,7 @@ def load_fixture(session, case: Case, fixture: Fixture, ids: Mapping[str, str]) 
     A `tensor` layer is added by id through `viewer.add_tensor`, which is the
     same call the agent would make. Note the array is addressable but **not
     discoverable**: an uploaded source is deliberately not synced to the
-    catalog, so `query_sources()` will not find it. The ids therefore arrive in
+    catalog, so `query()` will not find it. The ids therefore arrive in
     the namespace under :data:`TENSOR_HANDLE` — a harness convention, exactly
     like the `collect` names, and `test_cases.py` asserts the task says so.
     """

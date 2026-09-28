@@ -35,7 +35,7 @@ TTL = 10.0
 
 
 def _make(client, source, field="reclaim", shape=(4, 4), chunk=(2, 2)):
-    return client.add_tensor(
+    return client.setup_array_upload(
         f"cache://{source}/@fields/{field}",
         np.empty(shape, dtype=np.uint16),
         chunk_shape=chunk,
@@ -129,7 +129,7 @@ class TestAQuietUploadExpires:
     ):
         """A member's store was the server's own, so the sweep disposes of it
         and takes the tensor out of its source's listing (biopb/biopb#1059)."""
-        desc = client.add_tensor(
+        desc = client.setup_array_upload(
             f"zarr://{source}/@fields/quiet",
             np.empty((4, 4), dtype=np.uint16),
             chunk_shape=(2, 2),

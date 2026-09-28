@@ -55,7 +55,7 @@ def test_health_payload_shape_unchanged():
 def test_metadata_db_enabled_tracks_whether_there_is_a_catalog():
     """It is a real signal, not the constant True it was while every server
     made itself a catalog: it is what a client reads to know that
-    list_sources / query_sources / resolve / annotations will answer at all,
+    list_sources / query / resolve / annotations will answer at all,
     rather than calling one and eating the Unavailable.
     """
     from biopb_tensor_server.serving.metadata_db import MetadataDatabase

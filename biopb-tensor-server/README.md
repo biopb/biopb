@@ -59,8 +59,7 @@ from biopb.tensor import TensorFlightClient
 client = TensorFlightClient("grpc://localhost:8815", token="your-token")
 
 # Browse the catalog (SQL, server-side)
-sources = client.query_sources("SELECT source_id, source_url FROM sources",
-                               format="records")
+sources = client.query("SELECT source_id, source_url FROM sources", format="records")
 
 # Get a lazy dask array for a specific tensor, by its globally-unique array_id:
 # "source_id/field" for a multi-tensor source, or "source_id" for a single one.

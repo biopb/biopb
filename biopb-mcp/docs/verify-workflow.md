@@ -155,7 +155,7 @@ a person can interrupt a verification they didn't start.
 
 "Discarded afterwards" describes the process, not its side effects. The
 scratch kernel talks to the same tensor server and filesystem as the
-session: `client.upload_array`, `client.add_source`, and any cell that
+session: `client.upload_array`, `client.register_local_path`, and any cell that
 writes a file all go through for real. Verifying a workflow three times
 leaves three uploaded arrays and three catalog entries behind — a
 disposable kernel doesn't undo that. The `verify_workflow` docstring and

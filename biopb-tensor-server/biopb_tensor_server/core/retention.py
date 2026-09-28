@@ -163,7 +163,7 @@ class DecodeRates:
 
     Once attached to a store the table both survives a restart and *is* the
     client surface: it is a `decode_rates` table in the catalog database, read
-    with ``client.query_sources``. It is deliberately not kept beside the cache
+    with ``client.query``. It is deliberately not kept beside the cache
     segments -- the cache directory is the operator's to delete, and clearing it
     should cost the bytes, not a run's worth of measurement.
     """

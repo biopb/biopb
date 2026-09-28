@@ -228,7 +228,7 @@ def list_upstream_source_ids(client, location: str) -> List[str]:
     another package's private state to recover a value that was in scope
     (biopb/biopb#529).
 
-    Queries the ids alone (``query_sources`` on one narrow column, the
+    Queries the ids alone (``query`` on one narrow column, the
     canonical browse surface, biopb/biopb#225) -- an untruncated read, so the
     result is always complete and a caller (e.g. the monitor re-list) may
     reconcile destructively against it.
@@ -237,7 +237,7 @@ def list_upstream_source_ids(client, location: str) -> List[str]:
     fallback there ever was is ``list_sources()``, which in protocol v2 runs
     this same query and so fails identically.
     """
-    rows = client.query_sources("SELECT source_id FROM sources", format="records")
+    rows = client.query("SELECT source_id FROM sources", format="records")
     return [
         row["source_id"] for row in rows if mirrorable_upstream_id(row["source_id"])
     ]
@@ -256,7 +256,7 @@ _UNREACHABLE_ERRORS = (
 
 
 def fetch_upstream_catalog(client, location: str) -> tuple[Optional[List[dict]], bool]:
-    """Bulk-fetch an upstream's full catalog rows in ONE ``query_sources``.
+    """Bulk-fetch an upstream's full catalog rows in ONE ``query``.
 
     Returns ``(rows, complete)``. Each row is a dict with ``source_id``,
     ``source_url``, ``source_type``, ``metadata_json``, ``is_resolved``, the
@@ -276,7 +276,7 @@ def fetch_upstream_catalog(client, location: str) -> tuple[Optional[List[dict]],
     The upstream's scratch source is left out, as it is from
     :func:`list_upstream_source_ids`; see :func:`mirrorable_upstream_id`.
 
-    ``rows`` is ``None`` when the upstream has no SQL catalog (``query_sources``
+    ``rows`` is ``None`` when the upstream has no SQL catalog (``query``
     errors) -- the caller then falls back to id-only enumeration
     (``list_upstream_source_ids``) and the per-source live sync path.
 
@@ -284,7 +284,7 @@ def fetch_upstream_catalog(client, location: str) -> tuple[Optional[List[dict]],
     :func:`list_upstream_source_ids` for why it is a parameter.
     """
     try:
-        rows = client.query_sources(
+        rows = client.query(
             "SELECT source_id, source_url, source_type, metadata_json, "
             "is_resolved, tensors, indexed_at FROM sources",
             format="records",
@@ -384,7 +384,7 @@ class RemoteTensorAdapter(TensorAdapter):
         self._client = None  # lazy TensorFlightClient to the upstream
 
         # Bulk-seeded catalog surface (biopb/biopb#266). When the reconcile fetches
-        # the whole upstream catalog in one query_sources, it seeds these so
+        # the whole upstream catalog in one query, it seeds these so
         # registration (sync_source_added -> list_tensor_descriptors/get_metadata)
         # needs no per-source upstream RPC. None = not seeded (fall back to a live
         # per-source fetch). See seed_catalog().
@@ -534,7 +534,7 @@ class RemoteTensorAdapter(TensorAdapter):
         source_url: Optional[str] = None,
         indexed_at: object = None,
     ) -> bool:
-        """(Re)populate the catalog surface from a bulk upstream ``query_sources``.
+        """(Re)populate the catalog surface from a bulk upstream ``query``.
 
         Called by the reconcile (biopb/biopb#266) with this source's row from a
         single upstream catalog fetch, so ``sync_source_added``
@@ -641,7 +641,7 @@ class RemoteTensorAdapter(TensorAdapter):
             f"{sql_literal(self._upstream_source_id)}"
         )
         try:
-            rows = self.client.query_sources(sql, format="records")
+            rows = self.client.query(sql, format="records")
         except Exception as exc:
             logger.debug(
                 "upstream metadata query failed for %s: %s", self.source_id, exc
@@ -804,7 +804,7 @@ class RemoteTensorAdapter(TensorAdapter):
 
         Structure comes from the bulk-seeded cache when available
         (biopb/biopb#266 B2): ``seed_catalog`` already localized every tensor's
-        shape/dtype/dim_labels from a single upstream ``query_sources``, so the
+        shape/dtype/dim_labels from a single upstream ``query``, so the
         serve path reads them locally instead of a per-open ``get_descriptor``
         RPC. Together with metadata served from the local catalog (#253 core)
         that leaves ``do_get`` as very nearly the only upstream contact.

@@ -1,4 +1,4 @@
-"""Unit tests for the SDK ``TensorFlightClient.add_source()`` streaming parse.
+"""Unit tests for the SDK ``TensorFlightClient.register_local_path()`` streaming parse.
 
 Exercise the client's parse of the streaming ``add_source`` do_action without a
 live server: ``do_action`` is stubbed to replay a fixed stream of
@@ -34,7 +34,7 @@ def _result_body(added=(), already=(), failed=()):
 def _bare_client():
     from biopb.tensor._session import CatalogClient, ChunkFetcher, _ClientState
 
-    # add_source / resolve / warm now live on CatalogClient (#278 item C); build
+    # register_local_path / resolve_source / warm_source now live on CatalogClient (#278 item C); build
     # the shared state + collaborators (no connection) and inject the fake flight
     # at ``client._state.client`` where the catalog reads it.
     client = object.__new__(TensorFlightClient)
@@ -102,7 +102,7 @@ class TestAddSource:
             [_FakeResult(_result_body(added=["s1"], already=["s0"]))]
         )
 
-        out = client.add_source("/drop")
+        out = client.register_local_path("/drop")
 
         assert client._state.client.action.type == "add_source"
         assert list(out.added) == ["s1"]
@@ -119,7 +119,7 @@ class TestAddSource:
             ]
         )
 
-        client.add_source("/drop", on_progress=seen.append)
+        client.register_local_path("/drop", on_progress=seen.append)
 
         assert [p.added_count for p in seen] == [1, 2]
         assert seen[0].current_path == "/d/a.zarr"
@@ -130,7 +130,16 @@ class TestAddSource:
             raise_exc=flight.FlightServerError("Unknown action 'add_source'")
         )
         with pytest.raises(RuntimeError, match="too old"):
-            client.add_source("/drop")
+            client.register_local_path("/drop")
+
+    def test_add_source_is_a_deprecated_alias_for_register_local_path(self):
+        client = _bare_client()
+        client._state.client = _FakeFlight([_FakeResult(_result_body(added=["s1"]))])
+
+        with pytest.warns(DeprecationWarning, match="add_source"):
+            out = client.add_source("/drop")
+
+        assert list(out.added) == ["s1"]
 
     def test_no_terminal_result_raises(self):
         client = _bare_client()
@@ -138,7 +147,7 @@ class TestAddSource:
             [_FakeResult(_progress_body(1, "/d/a.zarr"))]
         )
         with pytest.raises(RuntimeError, match="no terminal result"):
-            client.add_source("/drop")
+            client.register_local_path("/drop")
 
     def test_cancel_on_terminal_still_returns_tally(self):
         # #4: a cancel landing exactly on the terminal ``result`` must NOT discard
@@ -153,7 +162,7 @@ class TestAddSource:
             ]
         )
 
-        out = client.add_source("/drop", should_cancel=_flip_after(1))
+        out = client.register_local_path("/drop", should_cancel=_flip_after(1))
 
         assert list(out.added) == ["s1"]
         assert list(out.already_present) == ["s0"]
@@ -170,6 +179,6 @@ class TestAddSource:
             ]
         )
 
-        out = client.add_source("/drop", should_cancel=_flip_after(1))
+        out = client.register_local_path("/drop", should_cancel=_flip_after(1))
 
         assert list(out.added) == [] and list(out.already_present) == []

@@ -258,7 +258,7 @@ never reaches the plane.
 
 ### The ids arrive in the namespace, sessions isolated by the id
 
-An uploaded source is not synced to the catalog: `query_sources()` cannot
+An uploaded source is not synced to the catalog: `query()` cannot
 find it and a task prompt cannot name its id, since it's minted at run
 time. The harness binds `fixture_tensors = {layer name: array_id}` in the
 kernel namespace as setup, and a `tensor`-presenting case says so in its

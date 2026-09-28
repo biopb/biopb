@@ -391,7 +391,7 @@ class TestTensorFlightClientRoundTrip:
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_get_tensor_pb(self, server_client, transfer_target):
-        """Test get_tensor_pb returns SerializedTensor protobuf."""
+        """Test get_tensor(output="pb") returns SerializedTensor protobuf."""
         from biopb.tensor.serialized_pb2 import SerializedTensor
 
         # Four endpoints over the 128x128 uint8 fixture; at the default target
@@ -402,7 +402,7 @@ class TestTensorFlightClientRoundTrip:
         import pyarrow.flight as flight
         from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
-        pb = server_client.get_tensor_pb("test-tensor")
+        pb = server_client.get_tensor("test-tensor", output="pb")
 
         # Verify it's a SerializedTensor
         assert isinstance(pb, SerializedTensor)
@@ -423,7 +423,7 @@ class TestTensorFlightClientRoundTrip:
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_tensor_from_pb(self, server_client):
         """Test tensor_from_pb reconstructs dask array."""
-        pb = server_client.get_tensor_pb("test-tensor")
+        pb = server_client.get_tensor("test-tensor", output="pb")
 
         # Reconstruct array
         darr = TensorFlightClient.tensor_from_pb(pb)
@@ -450,7 +450,7 @@ class TestTensorFlightClientRoundTrip:
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_tensor_pb_serialization(self, server_client):
         """Test SerializedTensor can be serialized to bytes and reconstructed."""
-        pb = server_client.get_tensor_pb("test-tensor")
+        pb = server_client.get_tensor("test-tensor", output="pb")
 
         # Serialize to bytes
         serialized_bytes = pb.SerializeToString()
@@ -469,10 +469,11 @@ class TestTensorFlightClientRoundTrip:
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_get_tensor_pb_with_slice_hint(self, server_client):
-        """Test get_tensor_pb with slice_hint cropping."""
-        pb = server_client.get_tensor_pb(
+        """Test get_tensor(output="pb") with slice_hint cropping."""
+        pb = server_client.get_tensor(
             "test-tensor",
             slice_hint=(slice(0, 64), slice(0, 64)),  # Top-left quadrant
+            output="pb",
         )
 
         import pyarrow.flight as flight
@@ -491,11 +492,12 @@ class TestTensorFlightClientRoundTrip:
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_get_tensor_pb_with_scale_hint(self, server_client):
-        """Test get_tensor_pb with scale_hint."""
-        pb = server_client.get_tensor_pb(
+        """Test get_tensor(output="pb") with scale_hint."""
+        pb = server_client.get_tensor(
             "test-tensor",
             scale_hint=[2, 2],
             reduction_method="nearest",
+            output="pb",
         )
 
         import pyarrow.flight as flight
@@ -514,3 +516,12 @@ class TestTensorFlightClientRoundTrip:
         # Verify data values
         assert darr[:32, :32].compute().mean() == 10.0
         assert darr[32:, 32:].compute().mean() == 40.0
+
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_get_tensor_pb_is_a_deprecated_alias(self, server_client):
+        from biopb.tensor.serialized_pb2 import SerializedTensor
+
+        with pytest.warns(DeprecationWarning, match="get_tensor_pb"):
+            pb = server_client.get_tensor_pb("test-tensor")
+
+        assert isinstance(pb, SerializedTensor)

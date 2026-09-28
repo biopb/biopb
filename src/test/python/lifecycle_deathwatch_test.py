@@ -1,4 +1,4 @@
-"""Cross-process test for biopb._lifecycle.deathwatch (the parent-death pipe).
+"""Cross-process test for biopb.lifecycle.deathwatch (the parent-death pipe).
 
 Proves the Pattern-O invariant the control relies on: a child that installs the
 watcher self-terminates when its parent process dies *uncatchably* (SIGKILL), so
@@ -26,7 +26,7 @@ pytestmark = pytest.mark.skipif(
 # forever. When the parent dies the pipe EOFs and the watcher group-kills us.
 _CHILD = (
     "import os, sys, time\n"
-    "from biopb._lifecycle import deathwatch\n"
+    "from biopb.lifecycle import deathwatch\n"
     "assert deathwatch.install() is True\n"
     "open(sys.argv[1], 'w').write(str(os.getpid()))\n"
     "time.sleep(300)\n"

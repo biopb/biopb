@@ -453,7 +453,7 @@ def _serve_http(config, port, view=False, start_kernel=False):
     # The kernel inherits this process' fds. fd 1 is not a protocol channel
     # under http, so native Qt/GL/dask/gRPC output is harmless: it lands on
     # the launcher's stdout/stderr — which, for a shim-spawned session child, is
-    # that session's log file (biopb._lifecycle.owned_child.open_child_log).
+    # that session's log file (biopb.lifecycle.owned_child.open_child_log).
 
     host = KernelHost(
         extra_arguments=extra_arguments,

@@ -407,8 +407,12 @@ def test_a_local_sdk_client_reads_a_plane_serving_a_byo_cert(
     """
     import numpy as np
     import zarr
-    from biopb import _tls_material, _tls_record
-    from biopb.control import _data_plane
+    from biopb import (
+        LocalTrustError,
+        _tls_material,
+        _tls_record,
+        local_data_plane_fingerprint,
+    )
     from biopb.tensor import TensorFlightClient
     from biopb_tensor_server import ZarrAdapter
 
@@ -432,14 +436,14 @@ def test_a_local_sdk_client_reads_a_plane_serving_a_byo_cert(
         url = f"grpcs://127.0.0.1:{server.port}"
         # Without the record there is nothing on this disk that identifies the
         # plane, and that is an error rather than a silent fall back to TOFU.
-        with pytest.raises(_data_plane.LocalTrustError):
-            _data_plane.local_fingerprint(url)
+        with pytest.raises(LocalTrustError):
+            local_data_plane_fingerprint(url)
 
         _tls_record.publish(
             server.port, _tls_material.fingerprint(_tls_material.leaf_pem(cert_pem))
         )
         client = TensorFlightClient(
-            url, tls_fingerprint=_data_plane.local_fingerprint(url)
+            url, tls_fingerprint=local_data_plane_fingerprint(url)
         )
         np.testing.assert_array_equal(client.get_tensor("img").compute(), arr[:])
         client.close()

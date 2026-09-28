@@ -6,7 +6,13 @@ DoPut -- so a client that can read a set can write one back. The geometry is
 the ``biopb.image.ROI`` proto as canonical proto3 JSON text, which is also
 how the server's catalog stores it, so a browser can hand it on verbatim.
 
-Shared by the SDK and the tensor server (which imports ``biopb``).
+Lives under ``biopb.tensor`` (not ``biopb.image``) because it needs pyarrow
+at module load: ``biopb.tensor`` already hard-requires it, while
+``biopb.image`` deliberately stays importable without the ``tensor`` extra
+(see ``biopb.image._utils``'s lazy ``TensorFlightClient`` imports). Private --
+the tensor server (a separate distribution, which imports ``biopb``) reaches
+into this module directly, same as it does for the rest of the Flight wire
+format it shares with the SDK.
 """
 
 from __future__ import annotations

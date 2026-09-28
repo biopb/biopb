@@ -39,7 +39,7 @@ def _serve(tmp_path, **kwargs):
 
 
 def _add(client, field, ttl=None, scheme="cache"):
-    return client.add_tensor(
+    return client.setup_array_upload(
         f"{scheme}://{SCRATCH_SOURCE_ID}/@fields/{field}",
         np.empty(SHAPE, dtype=np.uint16),
         chunk_shape=CHUNK,
@@ -118,7 +118,7 @@ class TestItCanBeWarmed:
         alias -- #1138 briefly conflated the two."""
         _publish(client, _add(client, "warmed"))
 
-        result = client.warm(SCRATCH_SOURCE_ID)
+        result = client.warm_source(SCRATCH_SOURCE_ID)
 
         assert result.files_total >= 1
         assert result.files_done == result.files_total

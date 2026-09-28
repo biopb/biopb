@@ -102,10 +102,10 @@ def _serve(server):
 
 
 def _db_upstream(zarr_path, source_ids):
-    """An upstream with a populated metadata DB (so query_sources is complete).
+    """An upstream with a populated metadata DB (so query is complete).
 
     Returns ``(upstream, register, unregister)``; register/unregister keep the
-    DuckDB catalog in sync so a re-list's ``query_sources`` reflects the change.
+    DuckDB catalog in sync so a re-list's ``query`` reflects the change.
     Not yet served -- the caller decides when (e.g. after configuring a cap).
     """
     import zarr
@@ -1311,7 +1311,7 @@ def test_monitored_upstream_relist_adds_and_removes(simple_zarr_array):
     appear/disappear on the upstream are mirrored/dropped on the proxy (§3 refresh).
 
     The upstream has a metadata DB so the re-list enumerates via the complete
-    query_sources catalog -- removals are only applied on a complete list."""
+    query catalog -- removals are only applied on a complete list."""
     from biopb.tensor import TensorFlightClient
     from biopb_tensor_server.adapters import get_default_registry
     from biopb_tensor_server.core.config import SourceConfig
@@ -1899,7 +1899,7 @@ def test_unreachable_bulk_fetch_does_not_duplicate_the_outage_warning(caplog):
     from pyarrow import flight
 
     class _DeadClient:
-        def query_sources(self, sql, format="records"):  # noqa: A002 - fakes the real client's public `format` signature
+        def query(self, sql, format="records"):  # noqa: A002 - fakes the real client's public `format` signature
             raise flight.FlightUnavailableError("failed to connect to all addresses")
 
     with caplog.at_level(logging.WARNING):
@@ -2435,7 +2435,7 @@ def test_fetch_upstream_catalog_returns_rows_and_complete():
     from biopb_tensor_server.adapters.remote_tensor import fetch_upstream_catalog
 
     class _FakeClient:
-        def query_sources(self, sql, format="records"):  # noqa: A002 - fakes the real client's public `format` signature
+        def query(self, sql, format="records"):  # noqa: A002 - fakes the real client's public `format` signature
             # source_url is now fetched so the mirror can be treed by path (#297).
             assert "tensors" in sql and "source_url" in sql and format == "records"
             return [
@@ -2456,7 +2456,7 @@ def test_fetch_upstream_catalog_none_on_no_sql_catalog():
     from biopb_tensor_server.adapters.remote_tensor import fetch_upstream_catalog
 
     class _FakeClient:
-        def query_sources(self, sql, format="records"):  # noqa: A002 - fakes the real client's public `format` signature
+        def query(self, sql, format="records"):  # noqa: A002 - fakes the real client's public `format` signature
             raise RuntimeError("no metadata DB")
 
     rows, complete = fetch_upstream_catalog(_FakeClient(), "grpc://fake")
@@ -2488,7 +2488,7 @@ class TestAnUpstreamScratchIsNotMirrored:
         def __init__(self, rows):
             self._rows = rows
 
-        def query_sources(self, sql, format="records"):  # noqa: A002 - fakes the real client's public `format` signature
+        def query(self, sql, format="records"):  # noqa: A002 - fakes the real client's public `format` signature
             if "source_url" in sql:
                 return [dict(r) for r in self._rows]
             return [{"source_id": r["source_id"]} for r in self._rows]
@@ -2545,7 +2545,7 @@ def test_id_enumeration_raises_rather_than_degrading():
     from biopb_tensor_server.adapters.remote_tensor import list_upstream_source_ids
 
     class _FakeClient:
-        def query_sources(self, sql, format="records"):  # noqa: A002 - fakes the real client's public `format` signature
+        def query(self, sql, format="records"):  # noqa: A002 - fakes the real client's public `format` signature
             raise RuntimeError("no metadata DB")
 
     with pytest.raises(RuntimeError, match="no metadata DB"):
@@ -2568,7 +2568,7 @@ def test_upstream_expansion_does_not_mask_its_error_with_a_failing_close(monkeyp
         def __init__(self, *_a, **_k):
             pass
 
-        def query_sources(self, *_a, **_k):
+        def query(self, *_a, **_k):
             raise RuntimeError("upstream unreachable")
 
         def close(self):
@@ -2584,7 +2584,7 @@ def test_upstream_expansion_does_not_mask_its_error_with_a_failing_close(monkeyp
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
 def test_reconcile_bulk_seeds_adapters_without_per_source_rpc(simple_zarr_array):
-    """A re-list mirrors every upstream source from ONE query_sources: the
+    """A re-list mirrors every upstream source from ONE query: the
     adapters are bulk-seeded (their live per-source fetch never runs) and the
     local catalog is populated from the same result."""
     from biopb_tensor_server import TensorFlightServer

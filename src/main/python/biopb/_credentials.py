@@ -88,7 +88,7 @@ def _harden_windows(path: Path) -> bool:
 
     Raw ``ctypes`` with explicit ``argtypes``/``restype`` on every call — on
     64-bit Windows an unannotated handle/pointer is truncated to ``c_int``,
-    corrupting the SID and SD pointers — mirroring ``biopb._lifecycle`` proc/job.
+    corrupting the SID and SD pointers — mirroring ``biopb.lifecycle`` proc/job.
     """
     import ctypes
     from ctypes import wintypes

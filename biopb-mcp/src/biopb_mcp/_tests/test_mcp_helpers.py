@@ -26,7 +26,7 @@ def connection():
 
 
 def _row(source_url, array_ids):
-    """A `sources` row as ``query_sources(format="records")`` returns it."""
+    """A `sources` row as ``query(format="records")`` returns it."""
     return {"source_url": source_url, "tensors": [{"array_id": a} for a in array_ids]}
 
 
@@ -40,7 +40,7 @@ def _serve(connection, rows, descriptors=()):
     """Connect *connection* to a fake server holding *rows* and *descriptors*."""
     by_id = {d.array_id: d for d in descriptors}
 
-    def query_sources(sql, format=None):  # noqa: A002 - mirrors the client
+    def query(sql, format=None):  # noqa: A002 - mirrors the client
         return [row for sid, row in rows.items() if f"'{sid}'" in sql]
 
     def get_descriptor(array_id):
@@ -49,7 +49,7 @@ def _serve(connection, rows, descriptors=()):
         return by_id[array_id]
 
     client = MagicMock()
-    client.query_sources.side_effect = query_sources
+    client.query.side_effect = query
     client.get_descriptor.side_effect = get_descriptor
     client.get_physical_scale.return_value = None
     connection.client = client
@@ -123,7 +123,7 @@ class TestPatchViewerAddTensor:
         patch_viewer_tensor_methods(viewer, connection)
         with pytest.raises(ValueError):
             viewer.add_tensor("it's")
-        (sql,), _ = client.query_sources.call_args
+        (sql,), _ = client.query.call_args
         assert "source_id = 'it''s'" in sql
 
     def test_auto_selects_single_tensor(self, viewer, connection):

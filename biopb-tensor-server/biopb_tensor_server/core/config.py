@@ -710,7 +710,7 @@ class MetadataDbConfig:
     Replaces O(n) in-memory scans with indexed DuckDB queries.
 
     The metadata database is **mandatory** (biopb/biopb#225): it is the canonical
-    source-browsing surface (``client.query_sources``), so there is no ``enabled``
+    source-browsing surface (``client.query``), so there is no ``enabled``
     flag -- the DB is always constructed. A lingering ``metadata_db.enabled`` key
     in an old config is ignored with a warning (see ``parse_config``).
 
@@ -1442,7 +1442,7 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
     metadata_db_data = data.get("metadata_db", {})
     # `metadata_db.enabled` was removed (biopb/biopb#225): the metadata DB is now
     # mandatory (always on) because it is the canonical source-browsing surface --
-    # the biopb-mcp guide steers agents to `client.query_sources(sql, ...)`
+    # the biopb-mcp guide steers agents to `client.query(sql, ...)`
     # (complete, server-side) over the capped `list_sources()`, and that SQL path
     # only exists when the DB is present. A lingering flag in an old config is
     # ignored (not honored) with a warning; `enabled = false` gets the stronger
@@ -1459,7 +1459,7 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
             logger.warning(
                 "Config option `metadata_db.enabled = false` is no longer honored: "
                 "the metadata database is now mandatory (always on), so the server "
-                "starts WITH the SQL catalog (`client.query_sources(...)`) despite "
+                "starts WITH the SQL catalog (`client.query(...)`) despite "
                 "this setting. Drop the flag from your config. See biopb/biopb#225."
             )
     metadata_db_kwargs: Dict[str, Any] = {}

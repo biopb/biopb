@@ -29,7 +29,7 @@ the **scratch source** — one per writable server, at the fixed id `scratch`,
 always there:
 
 ```python
-desc = client.add_tensor("zarr://scratch/@fields/my_result", arr)  # shape, dtype, grid from arr
+desc = client.setup_array_upload("zarr://scratch/@fields/my_result", arr)  # shape, dtype, grid from arr
 client.upload_array(desc, arr)                        # writes every chunk, seals it
 array_id = desc.array_id                              # "scratch/@fields/my_result"
 ```
@@ -45,7 +45,7 @@ user comes back to next week.
 what a *format* calls its own tensors, so the upload path refuses it — that is
 what keeps your result's id from colliding with one of a file's own.
 
-`add_tensor` takes anything with `.shape` and `.dtype` as the template; a dask
+`setup_array_upload` takes anything with `.shape` and `.dtype` as the template; a dask
 array also supplies the chunk grid, and `chunk_shape=` overrides it — which you
 need to get more than one chunk out of a numpy template. The grid is a request,
 not a promise: the returned descriptor is the server's echo, and the grid on it
@@ -61,7 +61,7 @@ one to reach for when the result is written once and read hot. The answered
 not of its name.
 
 **Metadata is the source's, not a tensor's.** Axis labels ride on
-`add_tensor` (`dim_labels=`), but the pixel size, units and channel names are
+`setup_array_upload` (`dim_labels=`), but the pixel size, units and channel names are
 the source's and a tensor inherits them — a tensor that carries its own is
 refused rather than silently stripped. The scratch source has none to give,
 so anything whose scale matters goes onto the image's own source, or into a
@@ -125,7 +125,7 @@ result at once, so this works on data far larger than memory:
 arr = client.get_tensor("raw_data_id")   # lazy, nothing read yet
 mask = arr > 0.5                         # still lazy, still nothing read
 
-desc = client.add_tensor("zarr://scratch/@fields/thresholded_v1", mask)
+desc = client.setup_array_upload("zarr://scratch/@fields/thresholded_v1", mask)
 client.upload_array(desc, mask)          # the eager step: chunk by chunk
 ```
 
@@ -134,7 +134,7 @@ client.upload_array(desc, mask)          # the eager step: chunk by chunk
 Same two calls, a different name:
 
 ```python
-desc = client.add_tensor(f"zarr://{image_id}/@labels/nuclei", labels)
+desc = client.setup_array_upload(f"zarr://{image_id}/@labels/nuclei", labels)
 client.upload_array(desc, labels)
 ```
 
@@ -149,7 +149,7 @@ is cheap to send.
 Its `array_id` is the request's own minus the scheme, and its descriptor
 carries an NGFF `image-label` block naming the image it belongs to.
 
-- `client.label_sets(image_array_id)` lists what an image has, sorted.
+- `client.get_label_sets(image_array_id)` lists what an image has, sorted.
 - `client.get_tensor(set_id)` reads one back like any other tensor.
 - `client.set_upload_status(set_id, "DISCARDED", "replaced")` removes an
   *uploaded* set and its sidecar. It leaves alone a set the image's own file
