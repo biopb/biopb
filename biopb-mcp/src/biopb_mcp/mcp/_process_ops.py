@@ -7,8 +7,10 @@ binding starts nothing; a script entry's server starts on the first call to
 one of its ops.
 
 A call is one ``Ops.Call`` stream. Arguments go by name; a tensor argument
-takes an ``np.ndarray`` (sent inline) or a tensor-server ``array_id`` (sent as
-a reference, which the server reads from the plane itself). A tensor result
+takes an ``np.ndarray`` (sent inline) or a tensor-server ``array_id``. An
+``array_id`` goes as a reference, which the server reads from the plane itself,
+only to a ``lazy`` or ``blocks`` op; an ``eager`` op is read here and sent
+inline, so its server never needs a route to the plane. A tensor result
 comes back as an ``np.ndarray``, or as an ``array_id`` when any input was one
 or the server returned it by reference: a result already on the kernel's plane
 keeps its id, and any other is copied into the plane's scratch source. There
@@ -56,6 +58,12 @@ _NDIM_LABELS = {
 #: this fixed id. An upload adds a tensor to a source that already exists, and
 #: an op result belongs to no source of the user's, so this is where it goes.
 SCRATCH_SOURCE_ID = "scratch"
+
+#: The largest reference an ``eager`` op is read whole for. Mirrors
+#: ``biopb_image_base.ops.EAGER_INPUT_CAP``, on the server side of this same
+#: wire protocol; not imported from there, since the two sides share no Python
+#: code.
+_EAGER_INPUT_CAP = 2 * 1024**3
 
 #: How often a long call prints its progress.
 _PROGRESS_EVERY_S = 5.0
@@ -197,6 +205,8 @@ class _OpCall:
         self.server = server
         self.info = info
         self.name = info["name"]
+        # MessageToDict omits the zero-valued (EAGER) enum, so absent is eager.
+        self.mode = info.get("input", "EAGER")
         self.tensors = {
             k: v.get("axes", "") for k, v in (info.get("tensors") or {}).items()
         }
@@ -211,12 +221,31 @@ class _OpCall:
                 raise RuntimeError(
                     f"No tensor server connected; cannot resolve array_id {value!r}."
                 )
+            if self.mode == "EAGER":
+                return self._read_whole(name, value, client)
             return proto.Arg(lazy=client.get_tensor(value, output="pb"))
         arr = np.asarray(value)
         if isinstance(labels, dict):
             labels = labels.get(name)
         labels = list(labels) if labels is not None else _NDIM_LABELS.get(arr.ndim)
         image_data = serialize_from_numpy_to_image_data(arr, dim_labels=labels)
+        return proto.Arg(eager=image_data.eager_data)
+
+    def _read_whole(self, name, array_id, client) -> proto.Arg:
+        """An ``eager`` op's reference, read here and sent inline: the server
+        may have no tensor client at all, and can't reach a plane that is only
+        routable from the kernel."""
+        array = client.get_tensor(array_id)
+        if array.nbytes > _EAGER_INPUT_CAP:
+            raise ValueError(
+                f"{self.name}: {name} is {array.nbytes} bytes, more than the "
+                f"{_EAGER_INPUT_CAP} an input='eager' op reads whole; slice the "
+                "input first, or use an op that takes input='lazy' or 'blocks'"
+            )
+        labels = list(client.get_descriptor(array_id, with_pyramid=False).dim_labels)
+        image_data = serialize_from_numpy_to_image_data(
+            array.compute(), dim_labels=labels or None
+        )
         return proto.Arg(eager=image_data.eager_data)
 
     def arguments(self, args, kwargs, dim_labels) -> tuple[Dict[str, proto.Arg], bool]:
@@ -370,7 +399,7 @@ def _build_op(call: _OpCall) -> Callable:
         doc.append(f"Labels: {', '.join(info['labels'])}")
     if info.get("kwargs"):
         doc.append(f"Other arguments (a bare name is required): {info['kwargs']}")
-    mode = info.get("input", "EAGER")
+    mode = call.mode
     if mode == "LAZY":
         doc.append(
             "Input: lazy -- a large array_id is accepted without a size cap; "
@@ -380,7 +409,8 @@ def _build_op(call: _OpCall) -> Callable:
         doc.append("Input: computed over blocks internally; call it like any other op.")
     else:
         doc.append(
-            "Input: eager -- a lazy array_id over ~2GiB is refused, not pulled whole."
+            "Input: eager -- an array_id is read here and sent inline; one over "
+            "~2GiB is refused, not pulled whole."
         )
     if info.get("streaming"):
         doc.append("Streaming: this call yields more than one result; expect a list.")
@@ -389,7 +419,8 @@ def _build_op(call: _OpCall) -> Callable:
         "Arguments go by name; one tensor argument may also go first.",
         "  A tensor is an np.ndarray (sent inline; axes by ndim: 2D=YX, 3D=YXC,",
         "  4D=ZYXC, 5D=TZYXC, or dim_labels='ZYX' / {name: axes}) or an array_id",
-        "  str (the server reads it from the tensor server).",
+        "  str (a lazy or blocks op's server reads it from the tensor server; an",
+        "  eager op gets it inline, read here).",
         "Tensor results are np.ndarray, or array_id str when an input was one or",
         "the server returned a reference. A tuple for several outputs; a list",
         "when a streaming op sent several events.",
