@@ -11,7 +11,7 @@ The scheme is **two version lines, two tags**:
 
 | | Audience | Mechanism | Tag | Members |
 |---|---|---|---|---|
-| **SDK / library** | developers / integrators | **PyPI + Maven Central** + a Docker base image | `v*` | `biopb` (Python → PyPI, Java → Maven Central) and `biopb-image-base` (Docker base image) |
+| **SDK / library** | developers / integrators | **PyPI + Maven Central** + a Docker base image | `v*` | `biopb` (Python → PyPI, Java → Maven Central) and `biopb-image-base` (Python → PyPI, plus a Docker base image) |
 | **Product / deployment** | end users (`install.sh`), operators | **GitHub release** + Docker | `release-v*` | `biopb-tensor-server` (wheel **and** Docker image), `biopb-mcp`, `biopb-control`, and the `web/` bundle |
 
 Each package reads exactly one tag prefix (setuptools_scm `tag_regex` +
@@ -31,9 +31,10 @@ PyPI is deliberately **excluded** from the `release-v*` deployment: `biopb`
 publishes to PyPI (and Maven Central) on its own `v*` tag, on its own cadence.
 `biopb-mcp`, `biopb-tensor-server`, and `biopb-control` are **not** on PyPI — they
 only reach end users as the `release-v*` wheel bundle the installer
-`file://`-installs. `biopb-image-base` is not on PyPI either; it ships **only** as
-a Docker base image, versioned off the SDK `v*` line (it's the foundation others
-build compute servers on).
+`file://`-installs. `biopb-image-base` rides the SDK's `v*` tag too: `python-ci`'s
+`deploy` job publishes it to PyPI alongside `biopb`, and `image-runtime-ci`
+separately builds its Docker base image (it's the foundation others build
+compute servers on).
 
 ## Cutting a release: up to two tags
 
@@ -41,7 +42,7 @@ Put whichever of the two tags apply on the release commit:
 
 | Tag | Cut it when | Drives |
 |---|---|---|
-| `v<A>` | the SDK changed (or you want image-base rebuilt) | `python-ci` → PyPI (`biopb`), `java-ci` → Maven Central, **`image-runtime-ci` → `biopb-image-base:<A>` Docker** |
+| `v<A>` | the SDK changed (or you want image-base rebuilt) | `python-ci` → PyPI (`biopb` + `biopb-image-base`), `java-ci` → Maven Central, **`image-runtime-ci` → `biopb-image-base:<A>` Docker** |
 | `release-v<R>` | the product bundle or the tensor-server image changed | `release.yaml` → the GitHub release bundle (below) **and** `tensor-server-ci` → `biopb-tensor-server:<R>` Docker |
 
 The tags are independent: an SDK-only change is just `v<A>`; a product change
@@ -206,7 +207,7 @@ single source of truth.
 
 | Tag | Workflow | Publishes |
 |---|---|---|
-| `v*` | `python-ci`, `java-ci`, `image-runtime-ci` | PyPI (`biopb`) + Maven Central (`biopb` Java) — **and**, for a stable tag only, Docker `biopb-image-base:A` + `:latest` |
+| `v*` | `python-ci`, `java-ci`, `image-runtime-ci` | PyPI (`biopb` + `biopb-image-base`) + Maven Central (`biopb` Java) — **and**, for a stable tag only, Docker `biopb-image-base:A` + `:latest` |
 | `release-v*` | `release.yaml`, `tensor-server-ci` | GitHub release (wheel set + sdist + webapp + samples + installers) — **and**, for a stable tag only, Docker `biopb-tensor-server:R` + `:latest` and the canonical `biopb.org/{install.sh,install.ps1,biopb-engine.ps1}` |
 
 The canonical install scripts are published by a **step inside `release.yaml`**,
@@ -221,7 +222,8 @@ candidates on demand).
 
 `mcp-ci` and `control-ci` keep their PR test/build jobs but **do not publish**.
 `tensor-server-ci` publishes its Docker image on the product `release-v*` tag;
-`image-runtime-ci` publishes `biopb-image-base` on the SDK `v*` tag. There are no
+`image-runtime-ci` publishes `biopb-image-base`'s Docker image on the SDK `v*`
+tag (its PyPI wheel ships from `python-ci`, alongside `biopb`). There are no
 `server-v*` / `mcp-v*` / `control-v*` tags — the tensor server, mcp, control, and
 web all ship together on `release-v*`.
 
