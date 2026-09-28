@@ -793,11 +793,23 @@ class TestResolveExternalLocation:
             # tunnel/NAT address even off a loopback bind.
             ("127.0.0.1", "grpc://tunnel:8815", "grpc://tunnel:8815"),
             ("0.0.0.0", "grpc://real-host:8815", "grpc://real-host:8815"),
+            # The advertised scheme follows the actual listener transport, so
+            # a shorthand supplied by control cannot make workers dial the
+            # wrong transport.
+            ("0.0.0.0", "grpc://real-host:8815", "grpc+tls://real-host:8815"),
+            ("0.0.0.0", "grpcs://real-host:8815", "grpc://real-host:8815"),
         ],
     )
     def test_resolution(self, host, external_location, expected):
+        tls_cert_chain = (
+            b"cert"
+            if isinstance(expected, str) and expected.startswith("grpc+tls://")
+            else None
+        )
         assert (
-            cli._resolve_external_location(host, 8815, None, external_location)
+            cli._resolve_external_location(
+                host, 8815, tls_cert_chain, external_location
+            )
             == expected
         )
 

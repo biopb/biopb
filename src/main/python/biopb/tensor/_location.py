@@ -34,6 +34,13 @@ _SCHEME_ALIASES = {"grpc": "grpc+tcp", "grpcs": "grpc+tls"}
 _LOOPBACK_ALIASES = frozenset({"localhost", "::1", "0.0.0.0"})
 
 
+def normalize_flight_location(location: str) -> str:
+    """Normalize the public TLS spelling to Arrow Flight's URI scheme."""
+    if location[:8].lower() == "grpcs://":
+        return "grpc+tls://" + location[8:]
+    return location
+
+
 def canonical_location(location: str) -> str:
     """The canonical spelling of *location*.
 

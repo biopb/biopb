@@ -36,6 +36,7 @@ from biopb.image.annotation_pb2 import (
     RoiPruneResult,
     RoiPutResult,
 )
+from biopb.tensor._location import normalize_flight_location
 from biopb.tensor._pool import (
     _CACHE_POOL,
     _VIEW_CACHE,
@@ -70,16 +71,6 @@ from biopb.tensor.serialized_pb2 import SerializedTensor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
 logger = logging.getLogger(__name__)
-
-
-def _normalize_location(location: str) -> str:
-    """Normalize location URI for Arrow Flight.
-
-    Converts grpcs:// to grpc+tls:// (Arrow Flight's TLS scheme).
-    """
-    if location.startswith("grpcs://"):
-        return "grpc+tls://" + location[8:]
-    return location
 
 
 class TensorFlightClient:
@@ -149,7 +140,7 @@ class TensorFlightClient:
             f"Connecting to Flight server at {location}, cache={cache_bytes}B, auth={token is not None}"
         )
         # Normalize location for Arrow Flight (grpcs:// -> grpc+tls://)
-        normalized = _normalize_location(location)
+        normalized = normalize_flight_location(location)
         # For a TLS location, resolve the trust -- a caller-supplied CA or
         # fingerprint, else TOFU (once per process, memoized in _tls) -- and carry
         # it through the connection so every dask worker trusts the same root
@@ -848,19 +839,20 @@ class TensorFlightClient:
         if cache_bytes is None:
             cache_bytes = _default_cache_bytes()
         token = pb.auth_token or None
+        location = normalize_flight_location(pb.location)
         info = flight.FlightInfo.deserialize(pb.flight_info)
         requested = _requested_slice(info)
         if not info.endpoints:
             logger.debug("tensor_from_pb: no endpoints, calling GetFlightInfo")
             info = _refetch_flight_info(
-                TensorDescriptor.FromString(info.descriptor.command), pb.location, token
+                TensorDescriptor.FromString(info.descriptor.command), location, token
             )
         return _dask_from_flight_info(
             info,
-            pb.location,
+            location,
             token,
             cache_bytes,
-            resolve_tls_trust(pb.location),
+            resolve_tls_trust(location),
             requested,
         )
 

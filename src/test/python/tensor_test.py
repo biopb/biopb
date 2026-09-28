@@ -519,6 +519,19 @@ class TestExportLocation:
         )
         assert state.export_location == "grpc://real-host:8815"
 
+    def test_normalizes_an_advertised_tls_address_for_workers(self):
+        from biopb.tensor._session import _ClientState
+
+        state = _ClientState(
+            raw_client=None,
+            call_options=None,
+            location="grpc+tls://localhost:8815",
+            token=None,
+            cache_bytes=0,
+            advertised_location="grpcs://real-host:8815",
+        )
+        assert state.export_location == "grpc+tls://real-host:8815"
+
     def test_get_tensor_pb_mints_the_export_location(self):
         # get_tensor_pb bakes an address into SerializedTensor.location for a
         # different process to dial later -- it must be the export_location,
@@ -561,6 +574,30 @@ class TestExportLocation:
         result = client._fetcher.get_tensor("test-tensor")
 
         assert result == "fake-array"
+        assert captured["location"] == "grpc://real-host:8815"
+
+    def test_upload_graph_uses_the_export_location(self, monkeypatch):
+        from biopb.tensor import _upload
+        from biopb.tensor._upload import UploadSession
+
+        client = _offline_client(raw_client=Mock())
+        client._state.advertised_location = "grpc://real-host:8815"
+        captured = {}
+
+        class FakeTarget:
+            def __init__(self, location, *args, **kwargs):
+                captured["location"] = location
+
+        monkeypatch.setattr(_upload, "_UploadTarget", FakeTarget)
+        monkeypatch.setattr(_upload.da, "store", lambda *args, **kwargs: None)
+
+        UploadSession(client._state, client._catalog)._store_chunks(
+            "test-tensor",
+            SimpleNamespace(shape=(1,), dtype="float32"),
+            [],
+            (0,),
+        )
+
         assert captured["location"] == "grpc://real-host:8815"
 
 

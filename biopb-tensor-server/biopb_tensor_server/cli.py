@@ -243,12 +243,21 @@ def _resolve_external_location(
     fallback (a client uses whatever address it dialed) is already correct
     for local mode, where every consumer is on this machine.
 
-    ``port``/``tls_cert_chain`` are for the error message's example address
-    alone (the actual bind location) -- this is the one place that string is
-    built for that purpose, rather than each caller (``serve``/``launch``)
-    rebuilding it just to hand it here.
+    ``port`` is for the error message's example address (the actual bind
+    location). ``tls_cert_chain`` also keeps a supplied shorthand scheme aligned
+    with the transport the server actually serves. This is the one place those
+    details are resolved rather than each caller (``serve``/``launch``)
+    rebuilding them.
     """
     if external_location:
+        lower = external_location.lower()
+        if tls_cert_chain is not None:
+            for prefix in ("grpc://", "grpcs://", "grpc+tcp://", "grpc+tls://"):
+                if lower.startswith(prefix):
+                    return "grpc+tls://" + external_location[len(prefix) :]
+        elif lower.startswith(("grpcs://", "grpc+tls://")):
+            prefix = "grpcs://" if lower.startswith("grpcs://") else "grpc+tls://"
+            return "grpc://" + external_location[len(prefix) :]
         return external_location
     if not _host_is_public(host):
         return None

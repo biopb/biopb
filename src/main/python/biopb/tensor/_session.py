@@ -58,6 +58,7 @@ from biopb.tensor._catalog_rows import (
     tensor_descriptors_from_row,
 )
 from biopb.tensor._labels import LABELS_SEGMENT
+from biopb.tensor._location import normalize_flight_location
 from biopb.tensor._pool import (
     _build_dask_array_from_chunk_map,
     _chunk_map_from_endpoints,
@@ -161,7 +162,9 @@ class _ClientState:
         ``SerializedTensor.location``, or a dask chunk-fetch graph handed to a
         distributed cluster (biopb/biopb#1158).
         """
-        return self.advertised_location or self.location
+        if self.advertised_location:
+            return normalize_flight_location(self.advertised_location)
+        return self.location
 
 
 class ResolveCancelled(Exception):
@@ -371,6 +374,8 @@ def _check_flight_protocol(
         health = json.loads(body.body.to_pybytes())
     except (ValueError, TypeError, AttributeError):
         health = {}
+    if not isinstance(health, Mapping):
+        health = {}
     try:
         server_ver = int(health.get("protocol", 1))
     except (ValueError, TypeError, AttributeError):
@@ -382,7 +387,8 @@ def _check_flight_protocol(
             f"v{server_ver}, this client speaks v{FLIGHT_PROTOCOL_VERSION}. "
             f"Upgrade the {stale} so both sides match."
         )
-    return health.get("external_location") or None
+    advertised = health.get("external_location")
+    return advertised if isinstance(advertised, str) and advertised else None
 
 
 def _check_wire_protocol(schema: pa.Schema) -> None:

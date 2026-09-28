@@ -6,7 +6,23 @@ land on the same string. These are the vectors.
 """
 
 import pytest
-from biopb.tensor._location import canonical_location, location_host
+from biopb.tensor._location import (
+    canonical_location,
+    location_host,
+    normalize_flight_location,
+)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expect"),
+    [
+        ("grpcs://h:8815", "grpc+tls://h:8815"),
+        ("GRPCS://h:8815", "grpc+tls://h:8815"),
+        ("grpc://h:8815", "grpc://h:8815"),
+    ],
+)
+def test_flight_location_uses_arrow_tls_scheme(raw, expect):
+    assert normalize_flight_location(raw) == expect
 
 
 @pytest.mark.parametrize(
