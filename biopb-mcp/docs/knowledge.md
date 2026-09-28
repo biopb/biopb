@@ -98,16 +98,25 @@ plus what the loader knows and the file cannot:
 
 1. an entry whose file does not exist gets the suffix `(missing)`; one that
    shadows a shipped doc gets `(local copy)`;
-2. a tail, `New shipped docs: id, id, …`, listing shipped docs with neither
-   an entry nor an `ignored:` mention;
-3. a second tail, `Shipped docs your local copy may be behind on: id, …`,
-   naming shadowed ids whose shipped text changed since this install last
-   looked (§4) — the one shadowed-doc case with something to act on, since an
-   unshadowed entry is simply read fresh and needs no flag.
+2. a tail, *New shipped docs*, listing shipped docs with neither an entry
+   nor an `ignored:` mention, one `- id: description` line each — already
+   in entry shape, so filing one is moving the line;
+3. a second tail, *Shipped docs your local copy may be behind on*, naming
+   shadowed ids whose shipped text changed since this install last looked
+   (§4) — the one shadowed-doc case with something to act on, since an
+   unshadowed entry is simply read fresh and needs no flag. Each line ends
+   with the `read_doc("<id>@diff")` call (§3) that shows what changed.
+
+Each tail opens with a sentence saying what to do with it, and each item
+carries the **shipped** doc's description: for a new doc it is the agent's
+only hint of relevance, and for a stale one the copy's own description would
+say nothing about the release. The instruction is inline because the agent
+meets the tail cold in the handshake, and a tail whose action has to be
+looked up elsewhere is a tail it skips.
 
 Neither tail is truncated, since both are bounded by what one release adds.
 The agent cleans up either by editing the file (filing/ignoring a new id;
-re-shadowing, or leaving it, for a stale one).
+merging the release's changes into its copy, or leaving it, for a stale one).
 
 **Kernel plugins are not docs.** They are modules already bound in the
 namespace: `server_status` lists which ones loaded and `inspect_object`
@@ -125,7 +134,12 @@ resources. Tools rather than resources because every host has tools.
 
 **`read_doc(id)`** returns the body under a one-line header (origin,
 updated, and `shadows shipped` when it does). `read_doc("index")` returns
-the rendered index (§2).
+the rendered index (§2). `read_doc("<id>@diff")` returns a unified diff of a
+shadowed doc's local copy against its shipped text — the only way to see a
+release's change the shadow hides. The manifest (§4) keeps hashes, not old
+text, so the diff is copy-vs-shipped and mixes the agent's edits with the
+release's; its header says so. `@` is outside the id charset, so the suffix
+can never name a real doc.
 
 **`write_doc(id, body=None, old=None, new=None)`** — `body` alone, or the
 `old`/`new` pair.

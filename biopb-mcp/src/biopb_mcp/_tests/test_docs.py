@@ -168,7 +168,9 @@ def test_a_shipped_doc_the_index_never_mentions_reaches_the_tail(store):
     ship(store, "index", "- one: hook\n")
     ship(store, "one")
     ship(store, "two")
-    assert "New shipped docs: two" in _docs.render_index()
+    rendered = _docs.render_index()
+    assert _docs._NEW_TAIL in rendered
+    assert "- two: Prose." in rendered
 
 
 def test_an_ignored_doc_is_not_in_the_tail_and_is_still_readable(store):
@@ -281,7 +283,8 @@ def test_a_shadowed_doc_whose_shipped_text_changed_is_flagged_in_the_index(
     seed_then_change(store, monkeypatch)
     _docs.write_doc("one", body="# Mine\n")
     rendered = _docs.render_index()
-    assert "Shipped docs your local copy may be behind on: one" in rendered
+    assert _docs._STALE_TAIL in rendered
+    assert '- one: one — read_doc("one@diff")' in rendered
 
 
 def test_an_unshadowed_changed_doc_gets_no_stale_flag(store, monkeypatch):
@@ -294,7 +297,7 @@ def test_a_changed_but_unlisted_doc_is_only_in_the_new_tail(store, monkeypatch):
     ship(store, "index", "# docs\n")
     seed_then_change(store, monkeypatch)
     rendered = _docs.render_index()
-    assert "New shipped docs: one" in rendered
+    assert "- one: one" in rendered
     assert "behind on" not in rendered
 
 
@@ -432,3 +435,54 @@ def test_the_status_line_names_a_legacy_skills_dir(store):
     legacy.mkdir()
     (legacy / "old.md").write_text("# old\n", encoding="utf-8")
     assert "legacy skills dir" in _docs.local_dir_status()
+
+
+def test_a_new_doc_is_listed_with_its_shipped_description(store):
+    """The description is the agent's only hint whether a new doc is relevant."""
+    ship(store, "index", "# docs\n")
+    ship(store, "two", description="stitch a grid of tiles")
+    assert "- two: stitch a grid of tiles" in _docs.render_index()
+
+
+def test_a_stale_doc_is_listed_with_the_shipped_description_not_the_copys(
+    store, monkeypatch
+):
+    ship(store, "index", "- one: hook\n")
+    seed_then_change(store, monkeypatch)
+    ship(store, "one", "# New\n", description="the release's text")
+    _docs.write_doc("one", body="---\ndescription: my text\n---\n\n# Mine\n")
+    rendered = _docs.render_index()
+    assert "- one: the release's text" in rendered
+    assert "my text" not in rendered
+
+
+# --------------------------------------------------------------------------- #
+# Diffing a shadow against the shipped text
+# --------------------------------------------------------------------------- #
+def test_diff_shows_the_copy_against_the_shipped_text(store):
+    ship(store, "one", "# Title\n\nShipped line.\n")
+    _docs.write_doc("one", old="Shipped line.", new="My line.")
+    text = _docs.read_doc("one@diff")
+    assert text.startswith("one@diff — ")
+    assert "-My line." in text and "+Shipped line." in text
+    assert "one (your copy)" in text and "one (shipped)" in text
+
+
+def test_diff_of_an_identical_copy_says_so(store):
+    ship(store, "one", "# Title\n")
+    _docs.write_doc("one", body="# Title\n")
+    assert "identical" in _docs.read_doc("one@diff")
+
+
+def test_diff_without_a_local_copy_points_at_the_plain_read(store):
+    ship(store, "one")
+    assert "no local copy" in _docs.read_doc("one@diff")
+
+
+def test_diff_of_a_local_only_doc_has_nothing_to_compare(store):
+    _docs.write_doc("mine", body="# Mine\n")
+    assert "No shipped doc 'mine'" in _docs.read_doc("mine@diff")
+
+
+def test_the_diff_suffix_cannot_name_a_real_doc():
+    assert not _docs.valid_id("one@diff")

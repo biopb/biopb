@@ -52,6 +52,10 @@ _SUFFIX = ".md"
 #: The index is a doc, under this reserved id.
 INDEX_ID = "index"
 
+#: ``read_doc("<id>@diff")``: a shadowed doc's local copy against the shipped
+#: text. ``@`` is outside the id charset, so the suffix cannot name a real doc.
+DIFF_SUFFIX = "@diff"
+
 #: Index entries the write tool will accept. At the cap the rendered index is
 #: roughly 25 KB, paid once per session in the handshake; past it the agent has
 #: to condense rather than keep appending.
@@ -152,6 +156,11 @@ def _first_prose(body: str) -> str:
         if line and not line.startswith(("#", ">", "-", "*", "|", "`")):
             return line[:300]
     return ""
+
+
+def _description(front: dict, body: str, doc_id: str) -> str:
+    """``description:`` if the author wrote one, else the first prose line."""
+    return str(front.get("description") or _first_prose(body) or doc_id).strip()
 
 
 # --------------------------------------------------------------------------- #
@@ -469,9 +478,7 @@ def describe(doc_id: str) -> dict | None:
         "text": text,
         "body": body,
         "title": str(front.get("title") or _first_h1(body) or doc_id).strip(),
-        "description": str(
-            front.get("description") or _first_prose(body) or doc_id
-        ).strip(),
+        "description": _description(front, body, doc_id),
         "packages": [str(p) for p in packages],
         "updated": _updated(text, _local_path(doc_id) if local is not None else None),
         "origin": origin,
@@ -544,13 +551,15 @@ def render_index(text: str | None = None) -> str:
 
     Entry lines gain ``(missing)`` where no tier holds the id and ``(local
     copy)`` where a local doc shadows a shipped one; a trailing *New shipped
-    docs* line names the shipped docs this index neither lists nor ignores,
-    and a *Shipped docs your local copy may be behind on* line names shadowed
+    docs* list names the shipped docs this index neither lists nor ignores,
+    and a *Shipped docs your local copy may be behind on* list names shadowed
     ids whose shipped text changed since this install last looked (§ shipped-
     doc change manifest) -- the only shadowed-doc case with anything to act
-    on, since an unshadowed one is simply read fresh. Neither tail is
-    truncated -- both are bounded by what one release adds, and truncating
-    would hide the upgrade they exist to report.
+    on, since an unshadowed one is simply read fresh. Each item carries the
+    shipped doc's description, and each stale item the ``<id>@diff`` read that
+    shows what changed. Neither tail is truncated -- both are bounded by what
+    one release adds, and truncating would hide the upgrade they exist to
+    report.
     """
     if text is None:
         text = index_text()
@@ -579,15 +588,47 @@ def render_index(text: str | None = None) -> str:
 
     ids = shipped_ids()
     new = [i for i in ids if i not in named]
-    if new:
-        out.append("")
-        out.append(f"New shipped docs: {', '.join(new)}")
+    _append_tail(out, _NEW_TAIL, new, lambda i: f"- {i}: {_shipped_description(i)}")
 
     stale = [i for i in changed_shipped_ids(ids) if i in shadowed]
-    if stale:
-        out.append("")
-        out.append(f"Shipped docs your local copy may be behind on: {', '.join(stale)}")
+    _append_tail(
+        out,
+        _STALE_TAIL,
+        stale,
+        lambda i: f'- {i}: {_shipped_description(i)} — read_doc("{i}{DIFF_SUFFIX}")',
+    )
     return "\n".join(out).rstrip() + "\n"
+
+
+def _append_tail(out: list[str], header: str, ids: list[str], line) -> None:
+    """Append a blank line, *header*, then one *line(id)* bullet per id."""
+    if not ids:
+        return
+    out.append("")
+    out.append(header)
+    out.extend(line(i) for i in ids)
+
+
+# Each tail says what to do with it: the agent reads the handshake copy of the
+# index cold, and a tail it has to look up elsewhere to act on is one it skips.
+# The items carry the *shipped* description -- for a new doc it is the only
+# hint of relevance, for a stale one it is the release's text, not the copy's.
+_NEW_TAIL = (
+    "New shipped docs — file each line under a heading above, or add its id to "
+    "`ignored:` to stop listing it:"
+)
+_STALE_TAIL = (
+    "Shipped docs your local copy may be behind on — the release changed their "
+    "shipped text, which your copy hides; the read_doc call on each line shows "
+    "your copy against it:"
+)
+
+
+def _shipped_description(doc_id: str) -> str:
+    text = _shipped_text(doc_id)
+    if text is None:
+        return doc_id
+    return _description(parse_frontmatter(text), strip_frontmatter(text), doc_id)
 
 
 def _append_entry(text: str, doc_id: str, hook: str) -> str:
@@ -633,6 +674,8 @@ def read_doc(doc_id: str) -> str:
     doc_id = (doc_id or "").strip()
     if doc_id == INDEX_ID:
         return render_index()
+    if doc_id.endswith(DIFF_SUFFIX):
+        return read_diff(doc_id[: -len(DIFF_SUFFIX)])
     meta = describe(doc_id)
     if meta is None:
         return (
@@ -642,10 +685,44 @@ def read_doc(doc_id: str) -> str:
     return f"{_header(meta)}\n\n{meta['body']}"
 
 
+def read_diff(doc_id: str) -> str:
+    """The local copy of *doc_id* against its shipped text, as a unified diff.
+
+    The one way to see what a release changed in a doc the agent has shadowed:
+    a plain read returns the copy, since the shadow wins. The manifest keeps
+    hashes, not old text, so the diff is copy-vs-shipped and mixes the agent's
+    own edits with the release's -- the header says so, and how to merge.
+    """
+    local = _local_text(doc_id)
+    shipped = _shipped_text(doc_id)
+    if shipped is None:
+        return f"No shipped doc '{doc_id}', so there is nothing to diff against."
+    if local is None:
+        return (
+            f"'{doc_id}' has no local copy: read_doc('{doc_id}') already returns "
+            "the shipped text."
+        )
+    diff = _diff(local, shipped, doc_id, labels=("your copy", "shipped"), context=3)
+    if diff == "(no change)":
+        return f"{doc_id}{DIFF_SUFFIX} — your copy is identical to the shipped text."
+    return (
+        f"{doc_id}{DIFF_SUFFIX} — `-` lines are only in your copy, `+` lines only "
+        "in the shipped text. This mixes your own edits with the release's "
+        f'changes: carry over the release\'s with write_doc("{doc_id}", old=…, '
+        "new=…) and leave yours.\n\n" + diff
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Writing
 # --------------------------------------------------------------------------- #
-def _diff(before: str, after: str, doc_id: str) -> str:
+def _diff(
+    before: str,
+    after: str,
+    doc_id: str,
+    labels: tuple[str, str] = ("before", "after"),
+    context: int = 2,
+) -> str:
     """What the write actually changed.
 
     Returned whichever form was used, so a replace that landed somewhere
@@ -655,10 +732,10 @@ def _diff(before: str, after: str, doc_id: str) -> str:
         difflib.unified_diff(
             before.splitlines(),
             after.splitlines(),
-            fromfile=f"{doc_id} (before)",
-            tofile=f"{doc_id} (after)",
+            fromfile=f"{doc_id} ({labels[0]})",
+            tofile=f"{doc_id} ({labels[1]})",
             lineterm="",
-            n=2,
+            n=context,
         )
     )
     return "\n".join(lines) if lines else "(no change)"
