@@ -1,17 +1,19 @@
-# API-reference build for the biopb Python SDK.
+# API-reference + development-docs build for biopb.
 #
-# This is a SEPARATE mkdocs project from biopb-site: it renders only the
-# auto-generated API reference (mkdocstrings) and is published by the release
-# workflow to https://biopb.org/docs/api/python/ — a namespace the main site's
-# deploy excludes from its --delete (see biopb-site/.github/workflows/deploy.yml).
+# This is a SEPARATE mkdocs project from biopb-site: it renders the
+# auto-generated Python API/CLI reference (mkdocstrings, mkdocs-typer2) plus
+# the project's own development docs (gen_dev_docs.py, pulled from docs/ and
+# each sibling package's docs/), and is published by the release workflow to
+# https://biopb.org/docs/api/python/ — a namespace the main site's deploy
+# excludes from its --delete (see biopb-site/.github/workflows/deploy.yml).
 #
 # Build locally (from repo root):
 #   uv sync --extra doc --extra tensor
 #   uv run mkdocs build -f docs-api/mkdocs.yml      # -> docs-api/site/
 #   uv run mkdocs serve  -f docs-api/mkdocs.yml     # live preview
 
-site_name: biopb Python SDK
-site_description: API reference for the biopb Python SDK (biopb.image, biopb.tensor).
+site_name: biopb
+site_description: API reference for the biopb Python SDK (biopb.image, biopb.tensor), plus the project's development docs.
 site_url: https://biopb.org/docs/api/python/
 repo_url: https://github.com/biopb/biopb
 repo_name: biopb/biopb
@@ -45,11 +47,14 @@ markdown_extensions:
 
 plugins:
   - search
-  # gen-files + literate-nav build one reference page per public module at build
-  # time (see gen_ref_pages.py); nothing under docs/reference/ is checked in.
+  # gen-files + literate-nav build the reference (gen_ref_pages.py, one page per
+  # public module) and the development docs (gen_dev_docs.py, pulled from docs/
+  # and each sibling package's docs/) at build time; nothing under
+  # docs/reference/ or docs/development/ is checked in.
   - gen-files:
       scripts:
         - gen_ref_pages.py
+        - gen_dev_docs.py
   - literate-nav:
       nav_file: SUMMARY.md
   # Renders the biopb CLI's own command tree (see docs/cli.md) by importing
@@ -85,3 +90,4 @@ nav:
   - Overview: index.md
   - CLI reference: cli.md
   - API reference: reference/
+  - Development: development/
