@@ -30,7 +30,6 @@ import {
 export function useContrastWindow(
   info: TileInfo | null,
   samples: Float64Array | null,
-  arrayId: string,
   slice: SliceState,
 ): [number, number] {
   // The plane's own extremes, which the window no longer reports once it is
@@ -46,8 +45,11 @@ export function useContrastWindow(
   useEffect(() => {
     if (!planeLimits) return;
     setPlaneLimits(planeLimits);
-    noteObservedLimits(planeLimits, arrayId, slice.c);
-  }, [planeLimits, arrayId, slice.c, setPlaneLimits, noteObservedLimits]);
+    // Keyed by the store to the tensor in view, not by this viewer's `arrayId`
+    // prop: that prop is the address asked for, which the store's key only
+    // matches once the grid has resolved it.
+    noteObservedLimits(planeLimits, slice.c);
+  }, [planeLimits, slice.c, setPlaneLimits, noteObservedLimits]);
 
   // Every level the tensor has shown, which is what a float track is drawn on:
   // a window fixed against a bright plane has to stay reachable from a dim one.
@@ -67,8 +69,8 @@ export function useContrastWindow(
     // 0-1 fallback, and the panel's own dtype -- which it can get from the
     // catalog without waiting for a read -- gives a better one.
     if (!info) return;
-    setContrastTrack(track, arrayId);
-  }, [info, track, arrayId, setContrastTrack]);
+    setContrastTrack(track);
+  }, [info, track, setContrastTrack]);
 
   const contrastLimits = useMemo<[number, number]>(() => {
     if (!info) return [0, 1];

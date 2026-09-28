@@ -209,7 +209,7 @@ export interface AppState {
    */
   roiSets: RoiSetInfo[];
   /**
-   * The `array_id` the rows and sets belong to, as `tileInfoFor` is for the grid.
+   * The tensor the rows and sets belong to, as its `viewKey`.
    *
    * The unit of eviction is the tensor: the next tensor's first landing replaces
    * everything below, and until then the selectors hide it.
@@ -373,7 +373,7 @@ export interface AppState {
    * there; see `selectContrastTrack`.
    */
   contrastTrack: [number, number] | null;
-  /** The `array_id` the track above was derived for. See `selectContrastTrack`. */
+  /** The tensor (`viewKey`) the track above was derived for. See `selectContrastTrack`. */
   contrastTrackFor: string | null;
   /**
    * Whether what is on the canvas is the slice that was last asked for.
@@ -469,12 +469,10 @@ export interface AppState {
   setPlayAxis: (key: string | null) => void;
   setAppliedLimits: (value: [number, number]) => void;
   setPlaneLimits: (value: [number, number]) => void;
-  setContrastTrack: (value: [number, number], forArrayId: string) => void;
-  noteObservedLimits: (
-    value: [number, number],
-    forArrayId: string,
-    channel: number,
-  ) => void;
+  /** Publish the viewer's contrast track, for the tensor in view (`viewKey`). */
+  setContrastTrack: (value: [number, number]) => void;
+  /** Widen the tensor in view's observed levels on `channel`. */
+  noteObservedLimits: (value: [number, number], channel: number) => void;
   setPlaneReady: (value: boolean) => void;
   setShowAdvancedOptions: (value: boolean) => void;
   setRender3d: (value: boolean) => void;
@@ -851,7 +849,8 @@ export const useAppStore = create<AppState>((set, get) => ({
     );
   },
 
-  setContrastTrack(value, forArrayId) {
+  setContrastTrack(value) {
+    const forArrayId = viewKey(get());
     // Compared by content for the reason `setAppliedLimits` is: the viewer
     // recomputes the track every render and a fresh identity each time would
     // loop through its effect.
@@ -865,7 +864,8 @@ export const useAppStore = create<AppState>((set, get) => ({
     );
   },
 
-  noteObservedLimits(value, forArrayId, channel) {
+  noteObservedLimits(value, channel) {
+    const forArrayId = viewKey(get());
     set((s) => {
       // A union carried over from another tensor is not narrowed back by a
       // union, so the switch starts one rather than widening the old one.
@@ -895,6 +895,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       tileInfo: value,
       tileInfoFor: forArrayId,
       slice: clampSliceTo(s.slice, value),
+      ...(value ? adoptResolution(s, forArrayId, value.array_id) : {}),
     }));
   },
 
@@ -907,11 +908,15 @@ export const useAppStore = create<AppState>((set, get) => ({
     // same way the reads are guarded rather than the writers.
     if (currentArrayId(get()) !== arrayId) return;
     if (get().roisUnavailable) return;
+    // Held under the token-free key, fetched under the exact address: the
+    // version token changes as the grid lands, and a fetch for either
+    // spelling fills the same slot.
+    const key = splitArrayVersion(arrayId).arrayId;
 
     const { roisFor, roiScopes, roiSets, roisPendingFor, roisPending } = get();
-    const listed = roisFor === arrayId;
+    const listed = roisFor === key;
     const landed = listed ? roiScopes : {};
-    const pending = roisPendingFor === arrayId ? roisPending : [];
+    const pending = roisPendingFor === key ? roisPending : [];
     // The unqualified listing always; a server-owned set only while it is on
     // screen, which is what makes a set that can reach megabytes lazy. Once a
     // listing has landed it says which names are server-owned, so a link
@@ -928,18 +933,18 @@ export const useAppStore = create<AppState>((set, get) => ({
     // mount effect, and the 2-D subtree remounts on every render-mode flip.
     const scopes = wanted.filter((scope) => !(scope in landed) && !pending.includes(scope));
     if (scopes.length === 0) return;
-    set({ roisPendingFor: arrayId, roisPending: [...pending, ...scopes], roisError: null });
+    set({ roisPendingFor: key, roisPending: [...pending, ...scopes], roisError: null });
 
     /** Still the fetch being waited for, i.e. not superseded by a tensor change. */
     const stillPending = (scope: string) => {
       const now = get();
-      return now.roisPendingFor === arrayId && now.roisPending.includes(scope);
+      return now.roisPendingFor === key && now.roisPending.includes(scope);
     };
     const fetchScope = async (scope: string) => {
       try {
         const result = await client.http.listRois(arrayId, scope || undefined);
         if (!stillPending(scope)) return;
-        set((s) => landRoiScope(s, arrayId, scope, result));
+        set((s) => landRoiScope(s, key, scope, result));
       } catch (err) {
         if (!stillPending(scope)) return;
         // 501 is the server saying it does not do annotations. Latched for the
@@ -953,7 +958,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         // loop.
         set((s) => ({
           roisPending: s.roisPending.filter((p) => p !== scope),
-          roisErrorFor: arrayId,
+          roisErrorFor: key,
           roisError: err instanceof Error ? err.message : String(err),
         }));
       }
@@ -972,7 +977,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   setDraft(draft) {
     set({
       draft,
-      draftFor: draft ? currentArrayId(get()) : null,
+      draftFor: draft ? viewKey(get()) : null,
       draftSliceKey: draft ? sliceKey(get().slice) : null,
     });
   },
@@ -995,7 +1000,7 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   toggleBroadcastAxis(axis, defaults) {
     set((s) => {
-      const arrayId = currentArrayId(s);
+      const arrayId = viewKey(s);
       // `null` means "this tensor's default", so materialise that before
       // editing -- otherwise the first toggle would silently also pin whatever
       // the default was broadcasting.
@@ -1013,6 +1018,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   async createRoi(geometry, plane) {
     const { client, newLabel, newSetName } = get();
     const arrayId = currentArrayId(get());
+    const key = viewKey(get());
     if (!client || !arrayId) return;
 
     // Drawn before it is stored. The click that finishes a shape also clears
@@ -1037,7 +1043,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     };
     set((s) => ({
       roiWriteError: null,
-      rois: s.roisFor === arrayId ? [...s.rois, provisional] : s.rois,
+      rois: s.roisFor === key ? [...s.rois, provisional] : s.rois,
     }));
 
     /** Take the provisional row back out, wherever the list has moved on to. */
@@ -1053,7 +1059,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       // Dropped if the tensor moved on mid-write: the annotation is stored, and
       // appending it to a list that now describes another tensor would put it
       // on screen over the wrong image. The provisional row goes with it.
-      if (currentArrayId(get()) !== arrayId || get().roisFor !== arrayId) {
+      if (viewKey(get()) !== key || get().roisFor !== key) {
         set((s) => ({ rois: withoutProvisional(s.rois) }));
         return;
       }
@@ -1079,7 +1085,7 @@ export const useAppStore = create<AppState>((set, get) => ({
           // the sets shown, so a new name -- or one switched off -- would
           // otherwise swallow the shape the user just traced.
           ...(visible !== null && !visible.includes(stored.setName)
-            ? { visibleSets: [...visible, stored.setName], visibleSetsFor: arrayId }
+            ? { visibleSets: [...visible, stored.setName], visibleSetsFor: key }
             : {}),
         };
       });
@@ -1094,6 +1100,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   async deleteRoi(roiId) {
     const { client } = get();
     const arrayId = currentArrayId(get());
+    const key = viewKey(get());
     if (!client || !arrayId) return;
     // Nothing to ask the server about: this row is a local placeholder for a
     // write still in flight, and its id is one this client invented. Left for
@@ -1124,7 +1131,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         // Only back into the list it came out of. After a tensor change the
         // list describes another image, and restoring there would draw this
         // annotation over it.
-        if (!removed || currentArrayId(get()) !== arrayId || s.roisFor !== arrayId) return failed;
+        if (!removed || viewKey(get()) !== key || s.roisFor !== key) return failed;
         const rois = [...s.rois];
         rois.splice(Math.min(index, rois.length), 0, removed);
         return { ...failed, rois, roiSets: withSetCount(s.roiSets, removed.setName, 1) };
@@ -1135,13 +1142,14 @@ export const useAppStore = create<AppState>((set, get) => ({
   async clearRoiSet(setName) {
     const { client } = get();
     const arrayId = currentArrayId(get());
+    const key = viewKey(get());
     if (!client || !arrayId) return;
     set({ roiWriteError: null });
     try {
       // No ids: the server drops the whole set in one transaction, so this is
       // not limited to the rows the cap let this client see.
       await client.http.deleteRois(arrayId, undefined, { setName });
-      if (currentArrayId(get()) !== arrayId || get().roisFor !== arrayId) return;
+      if (viewKey(get()) !== key || get().roisFor !== key) return;
       // Filtered by name rather than by the ids that came back, for the same
       // reason: what was deleted is the set, and the response enumerates only
       // what the server chose to list.
@@ -1189,7 +1197,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       // here. `null` means the default, so materialise that before editing --
       // otherwise the first toggle would silently also hide every other
       // client-owned set.
-      const arrayId = currentArrayId(s);
+      const arrayId = viewKey(s);
       const current = selectVisibleSets(s) ?? defaultVisibleSets(s);
       return {
         visibleSetsFor: arrayId,
@@ -1267,7 +1275,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       // Set names belong to the tensor, like the indices: a link that names
       // none opens on the tensor's default rather than on the last choice.
       visibleSets: next.visibleSets,
-      visibleSetsFor: requested,
+      visibleSetsFor: stable,
       // No `...For` companion: the set's own id names its image, so
       // `selectLabelOverlay` decides whether it is about the tensor this link
       // opened. A link that names no set clears any overlay left from the
@@ -1568,6 +1576,55 @@ export function currentArrayId(s: AppState): string | null {
 }
 
 /**
+ * `currentArrayId` without its version token: what every `...For` field is
+ * stamped with and compared against.
+ *
+ * The token is not identity. `/api/tile_info` puts the tensor's current one
+ * into `array_id` for any versioned source, so `currentArrayId` reads
+ * `src/field` until the grid lands and `src@tok/field` after it; a key that
+ * kept the token would hide everything written before the landing. A link's
+ * pin says which bytes to render, not whose annotations or contrast to show.
+ */
+export function viewKey(s: AppState): string | null {
+  const id = currentArrayId(s);
+  return id === null ? null : splitArrayVersion(id).arrayId;
+}
+
+/**
+ * The `...For` fields keyed to a bare `source_id`, moved to the field it just
+ * resolved to.
+ *
+ * A bare `source_id` and the field the server binds as its default are one
+ * tensor under two keys, and only `tile_info` says which field. State written
+ * before it answered -- a link's `rs=` sets, a listing that landed first -- is
+ * keyed bare and would be hidden the moment `viewKey` resolves.
+ *
+ * `roisPendingFor` is left alone: the fetch in flight checks it against the
+ * key it was issued under, and moving it would drop that response while
+ * telling the next `loadRois` it is still coming. The bare fetch is abandoned
+ * and the resolved key fetches afresh.
+ */
+function adoptResolution(
+  s: AppState,
+  requested: string,
+  resolvedArrayId: string,
+): Partial<AppState> {
+  const from = splitArrayVersion(requested).arrayId;
+  const to = splitArrayVersion(resolvedArrayId).arrayId;
+  if (from === to) return {};
+  const move = (key: string | null) => (key === from ? to : key);
+  return {
+    roisFor: move(s.roisFor),
+    roisErrorFor: move(s.roisErrorFor),
+    visibleSetsFor: move(s.visibleSetsFor),
+    draftFor: move(s.draftFor),
+    broadcastAxesFor: move(s.broadcastAxesFor),
+    observedLimitsFor: move(s.observedLimitsFor),
+    contrastTrackFor: move(s.contrastTrackFor),
+  };
+}
+
+/**
  * The grid for what is currently addressed, or null while none has landed.
  *
  * `tileInfo` is whichever viewer last published one, and a viewer holds its
@@ -1597,16 +1654,16 @@ export function selectTileInfo(s: AppState): TileInfo | null {
  * (`id@token`) is the same tensor as the id the tree offered sets for.
  */
 export function selectLabelOverlay(s: AppState): string | null {
-  const shown = currentArrayId(s);
+  const shown = viewKey(s);
   if (!shown || !s.labelOverlay) return null;
   const address = splitLabelArrayId(s.labelOverlay);
   if (!address) return null;
-  return address.imageArrayId === splitArrayVersion(shown).arrayId ? s.labelOverlay : null;
+  return address.imageArrayId === shown ? s.labelOverlay : null;
 }
 
 /** The levels this tensor's current channel has shown, or null if none yet. */
 export function selectObservedLimits(s: AppState): [number, number] | null {
-  if (s.observedLimitsFor !== currentArrayId(s)) return null;
+  if (s.observedLimitsFor !== viewKey(s)) return null;
   return s.observedLimits[s.slice.c] ?? null;
 }
 
@@ -1621,7 +1678,7 @@ export function selectObservedLimits(s: AppState): [number, number] | null {
  * tensor nothing has read yet.
  */
 export function selectContrastTrack(s: AppState): [number, number] | null {
-  if (s.contrastTrackFor !== currentArrayId(s)) return null;
+  if (s.contrastTrackFor !== viewKey(s)) return null;
   return s.contrastTrack;
 }
 
@@ -1673,28 +1730,28 @@ const NO_SCOPES: Record<string, RoiScopeState> = {};
 
 /** This tensor's annotations, or none while another tensor's are still held. */
 export function selectRois(s: AppState): RoiAnnotation[] {
-  return s.roisFor === currentArrayId(s) ? s.rois : NO_ROIS;
+  return s.roisFor === viewKey(s) ? s.rois : NO_ROIS;
 }
 
 const NO_ROI_SETS: RoiSetInfo[] = [];
 
 /** Every set on the tensor in view, server-owned ones included. */
 export function selectRoiSets(s: AppState): RoiSetInfo[] {
-  return s.roisFor === currentArrayId(s) ? s.roiSets : NO_ROI_SETS;
+  return s.roisFor === viewKey(s) ? s.roiSets : NO_ROI_SETS;
 }
 
 /** The scopes landed for the tensor in view, with what each fetch said. */
 export function selectRoiScopes(s: AppState): Record<string, RoiScopeState> {
-  return s.roisFor === currentArrayId(s) ? s.roiScopes : NO_SCOPES;
+  return s.roisFor === viewKey(s) ? s.roiScopes : NO_SCOPES;
 }
 
 /** The scopes in flight for the tensor in view -- not one looked at earlier. */
 export function selectRoisPending(s: AppState): string[] {
-  return s.roisPendingFor === currentArrayId(s) ? s.roisPending : NO_SETS;
+  return s.roisPendingFor === viewKey(s) ? s.roisPending : NO_SETS;
 }
 
 export function selectRoisError(s: AppState): string | null {
-  return s.roisErrorFor === currentArrayId(s) ? s.roisError : null;
+  return s.roisErrorFor === viewKey(s) ? s.roisError : null;
 }
 
 /**
@@ -1805,7 +1862,7 @@ export function sliceKey(slice: SliceState): string {
  * carry across tensors.
  */
 export function selectVisibleSets(s: AppState): string[] | null {
-  return s.visibleSetsFor === currentArrayId(s) ? s.visibleSets : null;
+  return s.visibleSetsFor === viewKey(s) ? s.visibleSets : null;
 }
 
 /**
@@ -1822,7 +1879,7 @@ export function selectDraft(s: AppState): RoiDraft | null {
   // clutter while drawing, hide the noisy set instead; that is what the per-set
   // toggles are for.
   if (!s.showRois) return null;
-  if (s.draftFor !== currentArrayId(s) || s.render3d) return null;
+  if (s.draftFor !== viewKey(s) || s.render3d) return null;
   // Vertices were traced against the pixels of one plane. Navigating away --
   // the slider, a keyboard scroll, or play stepping an axis -- makes them a
   // shape drawn on an image nobody is looking at any more, and finishing there
@@ -1860,7 +1917,7 @@ export function selectSelectedRoiId(s: AppState): string | null {
  * `defaultBroadcastAxes`), because the store does not read `TileInfo`.
  */
 export function selectBroadcastAxes(s: AppState, defaults: number[]): number[] {
-  return s.broadcastAxesFor === currentArrayId(s) && s.broadcastAxes !== null
+  return s.broadcastAxesFor === viewKey(s) && s.broadcastAxes !== null
     ? s.broadcastAxes
     : defaults;
 }

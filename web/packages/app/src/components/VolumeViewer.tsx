@@ -209,7 +209,7 @@ export default function VolumeViewer({ sourceId, arrayId, onUnsupported }: Volum
 
   // Not only a derivation: this also publishes the plane limits, the track and
   // the applied window that SliceControls reads.
-  const contrastLimits = useContrastWindow(info, samples, arrayId, slice);
+  const contrastLimits = useContrastWindow(info, samples, slice);
 
   const color = useMemo(() => {
     const stored = channelColors[sourceId]?.[slice.c] ?? "auto";

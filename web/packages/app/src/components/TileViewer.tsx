@@ -368,7 +368,7 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
 
   // Not only a derivation: this also publishes the plane limits, the track and
   // the applied window that SliceControls reads.
-  const contrastLimits = useContrastWindow(info, samples?.values ?? null, arrayId, slice);
+  const contrastLimits = useContrastWindow(info, samples?.values ?? null, slice);
 
   // Never trusted straight from the store: a persisted or hand-edited value of 0
   // or below is a uniform white plane, not a dim one.
