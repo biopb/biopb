@@ -21,7 +21,7 @@ import time
 
 import anyio
 import pytest
-from biopb._lifecycle.owned_child import OwnedChild
+from biopb.lifecycle.owned_child import OwnedChild
 from mcp import types
 
 from biopb_mcp.mcp import (
@@ -189,7 +189,7 @@ class TestSpawnSession:
                 f.write("54321")
             return _FakeProc()
 
-        from biopb._lifecycle import owned_child
+        from biopb.lifecycle import owned_child
 
         monkeypatch.setattr(owned_child.subprocess, "Popen", _fake_popen)
 

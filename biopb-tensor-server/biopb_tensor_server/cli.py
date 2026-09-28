@@ -19,8 +19,8 @@ from typing import List, Optional, Tuple
 import typer
 from biopb import _tls_material, _tls_record, _web_auth
 from biopb._fs_detect import unsafe_cache_dir_reason
-from biopb._lifecycle import deathwatch as _deathwatch
 from biopb._locations import tensor_catalog_path, tls_server_cert
+from biopb.lifecycle import deathwatch as _deathwatch
 from biopb.tensor._location import realign_transport_scheme
 from rich.console import Console
 from rich.markup import escape as _rich_escape
@@ -1316,7 +1316,7 @@ def serve(
         # so shutdown is clean.
         _install_sigterm_handler()
         # If launched under the control supervisor, self-terminate when it dies
-        # uncatchably (no-op when run standalone; see biopb._lifecycle.deathwatch).
+        # uncatchably (no-op when run standalone; see biopb.lifecycle.deathwatch).
         _deathwatch.install()
 
         server.serve()
@@ -1812,7 +1812,7 @@ def launch(
     _install_sigterm_handler()
     # If launched under the control supervisor, self-terminate when it dies
     # uncatchably so a crashed/killed control never orphans this plane into a
-    # port-holding conflict (no-op standalone; see biopb._lifecycle.deathwatch).
+    # port-holding conflict (no-op standalone; see biopb.lifecycle.deathwatch).
     _deathwatch.install()
 
     # --- Token management ---

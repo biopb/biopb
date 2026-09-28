@@ -4,7 +4,7 @@ or something -- network, cloud-synced, or RAM -- that an mmap cache can't use.
 Lives in the core ``biopb`` SDK rather than the tensor server because it has two
 tenants that may not import each other: the server's Arrow file cache, and the
 SDK's own on-disk chunk cache (``biopb.tensor._diskcache``, which cannot import
-the server -- it isn't on PyPI). Same reasoning that put ``_lifecycle.file_lock``
+the server -- it isn't on PyPI). Same reasoning that put ``lifecycle.file_lock``
 and the ``_config_*`` modules here. Stdlib-only, so it costs an importer nothing.
 
 The file cache mmaps its segment files -- both the server (segment reads, boot

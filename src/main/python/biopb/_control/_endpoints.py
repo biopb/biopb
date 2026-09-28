@@ -82,8 +82,8 @@ def write_runtime_record(host: str, port: int, pid: int) -> None:
     platform has no cheap create-time -- readers degrade to liveness there, as
     they do for a legacy bare-pid file.
     """
-    from .._lifecycle.proc import process_create_time
     from .._locations import control_runtime_file
+    from ..lifecycle.proc import process_create_time
 
     path = control_runtime_file()
     path.parent.mkdir(parents=True, exist_ok=True)

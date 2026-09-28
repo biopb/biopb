@@ -46,7 +46,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from biopb import _algorithms, _locations
-from biopb._lifecycle import winjob as _winjob
+from biopb.lifecycle import winjob as _winjob
 
 from ._supervisor import (
     _BACKOFF_SCHEDULE,

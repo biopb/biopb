@@ -20,7 +20,8 @@ from ._control._endpoints import (
     flight_port_for as _flight_port,
     sidecar_port_for as _sidecar_port,
 )
-from ._lifecycle.daemon import (
+from ._locations import find_config
+from .lifecycle.daemon import (
     detach_kwargs as _detach_kwargs,
     is_our_daemon as _is_our_daemon,
     read_pid_record as _read_pid_record,
@@ -28,12 +29,11 @@ from ._lifecycle.daemon import (
     stop_daemon as _stop_daemon,
     write_pid_file as _write_pid_file,
 )
-from ._lifecycle.file_lock import LockTimeout, file_lock
-from ._lifecycle.proc import (
+from .lifecycle.file_lock import LockTimeout, file_lock
+from .lifecycle.proc import (
     is_process_running as _is_process_running,
     process_create_time as _process_create_time,
 )
-from ._locations import find_config
 
 console = Console()
 
@@ -830,7 +830,7 @@ def _control_start_lock() -> Path:
     lock across the check-then-spawn below makes it atomic between processes:
     without it two starters can both see "no pidfile", both spawn a control, and
     the bind-loser's parent overwrite/remove the live winner's pidfile, orphaning a
-    control that `control stop` can no longer reach. See biopb._lifecycle.file_lock.
+    control that `control stop` can no longer reach. See biopb.lifecycle.file_lock.
     """
     return CONTROL_PID_FILE.parent / "control.start.lock"
 
@@ -1337,7 +1337,7 @@ def control_start(
     _ensure_dirs()
 
     # Serialize concurrent starts so the check-then-spawn below is atomic across
-    # processes (see _control_start_lock / biopb._lifecycle.file_lock). Held through the
+    # processes (see _control_start_lock / biopb.lifecycle.file_lock). Held through the
     # readiness wait too, so a second starter that was blocked wakes to a fully
     # started control (pidfile written, port listening) and reports the idempotent
     # "already running" rather than racing a half-up one. The lock auto-releases if

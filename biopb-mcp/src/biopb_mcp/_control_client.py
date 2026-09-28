@@ -59,7 +59,7 @@ def start_control_detached() -> bool:
     The launched process is detached from the caller's process group / console, so
     it (and the durable control it spawns) survives a client that disconnects during
     the first seconds. Idempotent: ``biopb control start`` no-ops when a control is
-    already running and serializes concurrent starts (``biopb._lifecycle.file_lock``), so racing
+    already running and serializes concurrent starts (``biopb.lifecycle.file_lock``), so racing
     shims are safe. ``--no-data-plane`` keeps the footprint minimal -- the data plane
     comes up on demand when a session actually asks for it.
     """

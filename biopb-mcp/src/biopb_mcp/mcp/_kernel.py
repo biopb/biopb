@@ -19,7 +19,7 @@ import threading
 import time
 from typing import List, Optional
 
-from biopb._lifecycle import deathwatch as _deathwatch, winjob as _winjob
+from biopb.lifecycle import deathwatch as _deathwatch, winjob as _winjob
 
 from ._job_log import JobLog
 from ._kernel_io import _IDLE_GRACE, KernelChannels, KernelGone
@@ -137,7 +137,7 @@ def _status_result(status: str, error_text: str) -> dict:
 # Repeated --IPKernelApp.exec_lines args append, so this composes with the
 # bootstrap line the launcher already passes.
 _DEATHWATCH_ARG = (
-    "--IPKernelApp.exec_lines=import biopb._lifecycle.deathwatch as _dw; _dw.install()"
+    "--IPKernelApp.exec_lines=import biopb.lifecycle.deathwatch as _dw; _dw.install()"
 )
 
 # Whether the viewer window is still open, evaluated after an agent's cell: a

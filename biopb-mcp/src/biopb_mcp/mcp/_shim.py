@@ -59,8 +59,8 @@ import time
 
 import anyio
 from biopb import _locations, _sessions
-from biopb._lifecycle import winjob as _winjob
-from biopb._lifecycle.owned_child import OwnedChild, open_child_log
+from biopb.lifecycle import winjob as _winjob
+from biopb.lifecycle.owned_child import OwnedChild, open_child_log
 from mcp import types
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
@@ -231,7 +231,7 @@ def spawn_session(config, timeout=SESSION_START_TIMEOUT, on_spawned=None):
     # OwnedChild applies the owned-child spawn conventions and the Windows Job
     # Object bind (CREATE_NO_WINDOW, no new process group; POSIX shares this
     # shim's group so the client's teardown reaps it — and its kernel, via the
-    # kernel's parent-death pipe). See biopb._lifecycle.owned_child.
+    # kernel's parent-death pipe). See biopb.lifecycle.owned_child.
     logger.info("Spawning owned biopb-mcp session: %s", cmd)
     child = OwnedChild(cmd, log=log, env=env)
     try:
