@@ -646,6 +646,17 @@ def test_an_expired_configured_ca_is_refused_offline(monkeypatch):
         _tls.resolve_tls_trust("grpc+tls://host:8815", ca_pem=expired)
 
 
+def test_a_ca_bundle_is_not_judged_by_one_of_its_roots(monkeypatch, caplog):
+    # A bundle holds roots the server may never chain to; a system one carries
+    # expired ones, and refusing the connection over them would break a
+    # configuration that works.
+    expired = _cert_ending(0x17, "200101000000Z")
+    with caplog.at_level("WARNING", logger=_tls.logger.name):
+        trust = _tls.resolve_tls_trust("grpc+tls://host:8815", ca_pem=expired + CERT_A)
+    assert trust.root_certs == expired + CERT_A
+    assert not [r for r in caplog.records if "expire" in r.getMessage()]
+
+
 def test_handshake_failure_reason_names_the_verify_error(monkeypatch):
     seen = {}
 
@@ -720,6 +731,29 @@ class TestExplainHandshakeFailure:
         assert isinstance(explained, flight.FlightUnavailableError)
         assert self.OPAQUE in str(explained) and "expired, sorry" in str(explained)
         assert explained is not original
+
+    def test_health_check_explains_an_opaque_failure(self, monkeypatch):
+        # health_check is what Connection and the sidecar call first, and it
+        # talks to the raw client, so it needs the explanation itself.
+        import pyarrow.flight as flight
+        from biopb.tensor import _session
+        from biopb.tensor.client import TensorFlightClient
+
+        class Refusing:
+            def do_action(self, action, options=None):
+                raise flight.FlightUnavailableError(TestExplainHandshakeFailure.OPAQUE)
+
+        monkeypatch.setattr(
+            _session, "handshake_failure_reason", lambda loc, trust: "expired, sorry"
+        )
+        client = TensorFlightClient.__new__(TensorFlightClient)
+        client._client = Refusing()
+        client._call_options = None
+        client._location = self.LOC
+        client._tls_trust = _tls.TlsTrust(CERT_A)
+
+        with pytest.raises(flight.FlightUnavailableError, match="expired, sorry"):
+            client.health_check()
 
     def test_another_unavailable_error_is_left_alone(self, monkeypatch):
         from biopb.tensor import _session

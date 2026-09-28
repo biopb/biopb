@@ -409,7 +409,13 @@ def _check_anchor_expiry(
     Offline: the anchor is already in hand, so this costs no handshake and
     covers the one mode the probe never reaches (a configured CA). Runs once per
     connection, since resolution is memoized (biopb/biopb#1117).
+
+    A configured CA is checked only when it is a single certificate. A bundle
+    holds roots the server may never chain to (a system bundle carries expired
+    ones), so its earliest date says nothing about this connection.
     """
+    if mode == "ca" and len(_PEM_CERT.findall(pem)) != 1:
+        return
     not_after = _not_after(pem)
     if not_after is None:
         return
@@ -671,9 +677,10 @@ def resolve_tls_trust(
     contradicts the pin or the configured fingerprint, and
     :class:`TlsCertExpiredError` when the anchor it resolved has expired — which
     a pin does not excuse, so the handshake would fail anyway with a far less
-    legible error. A configured *ca_pem* stays offline, so it is checked only
-    against the anchor itself. Whatever the mode, an anchor within 30 days of its
-    ``notAfter`` logs a warning, once per connection (biopb/biopb#1117).
+    legible error. A configured *ca_pem* stays offline, so only a
+    single-certificate one is checked, against the anchor itself. Whatever the
+    mode, an anchor within 30 days of its ``notAfter`` logs a warning, once per
+    connection (biopb/biopb#1117).
 
     ``root_certs`` is handed to ``pyarrow.flight.FlightClient(...,
     tls_root_certs=...)`` — with a leaf anchor, verification succeeds iff the

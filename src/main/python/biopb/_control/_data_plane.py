@@ -239,8 +239,8 @@ class DataPlaneEndpoint:
     url: str
     token: Optional[str] = None
     tls_fingerprint: Optional[str] = None
-    tls_ca_pem: Optional[bytes] = None
     origin: str = "default"
+    tls_ca_pem: Optional[bytes] = None
 
     @property
     def origin_note(self) -> str:

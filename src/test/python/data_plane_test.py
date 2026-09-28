@@ -607,6 +607,16 @@ class TestConfiguredTlsAnchor:
         with pytest.raises(_data_plane.TlsConfigError, match="BIOPB_TENSOR_TLS_CA"):
             _data_plane.configured_tls_anchor()
 
+    def test_the_endpoints_positional_order_is_unchanged(self):
+        # It is exported, so a caller may construct it positionally.
+        endpoint = _data_plane.DataPlaneEndpoint("grpc://h:1", "tok", "fp", "env")
+        assert (endpoint.token, endpoint.tls_fingerprint, endpoint.origin) == (
+            "tok",
+            "fp",
+            "env",
+        )
+        assert endpoint.tls_ca_pem is None
+
     def test_a_config_error_is_a_local_trust_error(self):
         # So the CLI and Connection report it by type, not by errno substring.
         assert issubclass(_data_plane.TlsConfigError, _data_plane.LocalTrustError)
