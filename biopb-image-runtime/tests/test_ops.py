@@ -210,15 +210,28 @@ def test_describe_advertises_signature(server):
     assert ops["track"].streaming
 
 
-def test_a_lazy_op_is_advertised_eager_without_pyarrow(monkeypatch):
-    # No pyarrow (the no-SSE4.2 build): no array_id decodes, so advertising
-    # lazy would steer callers to a reference that always fails.
+def test_every_op_is_advertised_eager_where_no_array_id_decodes(monkeypatch):
+    # No way to resolve a reference (no pyarrow, or no [lazy] extra): advertising
+    # lazy or blocks would steer callers to a reference that always fails.
     import biopb_image_base.ops as ops
 
-    monkeypatch.setattr(ops, "_pyarrow_available", lambda: False)
-    infos = {o.name: o for o in describe(_defs([double, smooth])).ops}
-    assert infos["double"].input == proto.OpInfo.EAGER
-    assert infos["smooth"].input == proto.OpInfo.BLOCKS
+    monkeypatch.setattr(ops, "_can_decode_references", lambda: False)
+    infos = {o.name: o for o in describe(_defs([double, smooth, label_stats])).ops}
+    assert {i.input for i in infos.values()} == {proto.OpInfo.EAGER}
+
+
+def test_references_need_the_tensor_client_not_just_pyarrow(monkeypatch):
+    # pyarrow importable, the rest of [lazy] not: the client import fails.
+    from biopb_image_base.common import _can_decode_references
+
+    _can_decode_references.cache_clear()
+    try:
+        assert _can_decode_references()
+        _can_decode_references.cache_clear()
+        monkeypatch.setitem(sys.modules, "biopb.tensor.client", None)
+        assert not _can_decode_references()
+    finally:
+        _can_decode_references.cache_clear()
 
 
 def test_fingerprint_changes_with_the_ops():
