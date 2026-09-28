@@ -221,7 +221,7 @@ single source of truth.
 | Tag | Workflow | Publishes |
 |---|---|---|
 | `v*` | `python-ci`, `java-ci`, `image-runtime-ci` | PyPI (`biopb` + `biopb-image-base`) + Maven Central (`biopb` Java) — **and**, for a stable tag only, Docker `biopb-image-base:A` + `:latest` |
-| `release-v*` | `release.yaml`, `tensor-server-ci` | GitHub release (wheel set + sdist + webapp + samples + installers) — **and**, for a stable tag only, Docker `biopb-tensor-server:R` + `:latest` and the canonical `biopb.org/{install.sh,install.ps1,biopb-engine.ps1}` |
+| `release-v*` | `release.yaml`, `tensor-server-ci` | GitHub release (wheel set + sdist + webapp + samples + installers) — **and**, for a stable tag only, Docker `biopb-tensor-server:R` + `:latest` |
 
 The canonical install scripts are published by a **step inside `release.yaml`**,
 after the GitHub release is created (formerly a standalone push-to-main

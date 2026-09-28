@@ -445,38 +445,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
 
-      # Publish the canonical bootstrap install scripts to biopb.org, PAIRED WITH
-      # this release. Folded in here (was a standalone push-to-main workflow,
-      # install-scripts.yaml) so it runs ONLY after "Create GitHub release" above
-      # succeeds -- a failed release can no longer leave a live installer at
-      # biopb.org that is newer than any release it can install. Gated to a STABLE
-      # release: `is_tag` skips dry runs, `!prerelease` keeps the canonical URL on
-      # the latest stable release (install.sh defaults to stable; BIOPB_INSTALL_RC=1
-      # opts into candidates on demand). The guard job already blocks an off-main
-      # final tag, so no on-main recheck is needed here. Served from a reserved
-      # /install/ subtree that biopb-site's deploy excludes from its --delete
-      # (mirrors api-docs.yaml's /docs/api/). The scripts were already pinned and
-      # parse-checked by "Pin installers to this release" above (same job, same
-      # tree, nothing touches install/ in between), so this step just mirrors them.
-      - name: Publish install scripts to biopb.org
-        if: steps.ver.outputs.is_tag == 'true' && steps.ver.outputs.prerelease != 'true'
-        run: |
-          set -euo pipefail
-          # Only the engine: biopb.org's install.sh and install.ps1 are the
-          # release-independent bootstraps (install/bootstrap.*), uploaded by hand
-          # when they change, so no --delete here.
-          mkdir -p _install_publish
-          cp install/biopb-engine.ps1 _install_publish/
-
-          mkdir -p ~/.ssh
-          echo "${{ secrets.BIOPB_ORG_SSH_KEY }}" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -H biopb.org >> ~/.ssh/known_hosts
-
-          ssh -i ~/.ssh/id_ed25519 jyu@biopb.org 'mkdir -p /var/www/biopb.org/install'
-          rsync -avz -e "ssh -i ~/.ssh/id_ed25519" \
-            _install_publish/ jyu@biopb.org:/var/www/biopb.org/install/
-
       # Feedback gate for the sample bundle. The build above fails SOFT so a flaky
       # third-party fetch never blocks shipping the real product (wheels/webapp),
       # and the release publishes above regardless. But a MISSING bundle

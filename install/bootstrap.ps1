@@ -16,7 +16,7 @@
     $env:BIOPB_INSTALL_RC = "1"           the latest release candidate
     otherwise                             the latest stable release
 
-    The environment reaches the installer as it is.
+    The environment reaches the installer as it is, plus the release picked.
 
     Requirements: PowerShell 5.1+, tar (bundled on Windows 10 1803+).
 #>
@@ -73,6 +73,9 @@ function Invoke-BiopbBootstrap {
     } catch {
         throw "The downloaded installer is not a valid script."
     }
+    # The release's install.ps1 fetches its engine from the release it is told to
+    # install; without this, a candidate (BIOPB_INSTALL_RC) leaves it unpinned.
+    $env:BIOPB_INSTALL_VERSION = $tag
     & $installer
 }
 

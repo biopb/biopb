@@ -87,6 +87,18 @@ def test_runs_the_release_installer_with_the_environment():
 
 
 @requires_pwsh
+def test_the_installer_is_told_which_release_was_picked():
+    body = (
+        "function Invoke-WebRequest { param($Uri, [switch]$UseBasicParsing)\n"
+        "  [pscustomobject]@{ Content = 'Write-Output \"picked=[$env:BIOPB_INSTALL_VERSION]\"' } }\n"
+        "Invoke-BiopbBootstrap"
+    )
+    proc = run(body, {"BIOPB_INSTALL_RC": "1"})
+    assert proc.returncode == 0, proc.stderr
+    assert "picked=[release-v0.16.0rc1]" in proc.stdout
+
+
+@requires_pwsh
 def test_a_release_without_an_installer_fails_clearly():
     proc = run("Invoke-BiopbBootstrap", {"STUB_INSTALLER": "missing"})
     assert proc.returncode != 0

@@ -1,17 +1,7 @@
-# Check the installer on every PR that touches it, and publish the bootstrap
-# scripts to biopb.org when they land on main. These are served at the canonical
-# one-liner URLs:
-#   - install/biopb-engine.ps1 -> biopb.org/biopb-engine.ps1
-# biopb.org/install.sh and install.ps1 are install/bootstrap.sh and bootstrap.ps1,
-# uploaded by hand: they carry no release logic and rarely change. They fetch the
-# installer attached to the release they pick; the full install.sh / install.ps1
-# ship as release assets.
-#
-# They land in a reserved /install/ subtree of the webroot that biopb-site's
-# deploy excludes from its --delete (see biopb-site/.github/workflows/deploy.yml),
-# so a push-to-main site deploy never wipes them -- exactly the arrangement the
-# SDK API docs use for /docs/api/ (see api-docs.yaml). This replaced an nginx
-# proxy_pass to raw.githubusercontent.com, which was hitting HTTP 429.
+# Check the installer on every PR that touches it. Nothing is published from
+# here: biopb.org/install.sh and install.ps1 are install/bootstrap.sh and
+# bootstrap.ps1, uploaded by hand (they carry no release logic and rarely change),
+# and they fetch the installer and engine attached to the release they pick.
 #
 # The checks exist because until #648 NOTHING ran on a PR touching install/: the
 # lint workflow is filtered to '**/*.py', and the only verification here fired on
@@ -24,9 +14,6 @@
 #   gui    ISCC compile      does the Windows wizard still build
 # The layer above these -- installing for real, in a container -- costs minutes
 # and lives in installer-scenarios.yaml, on dispatch.
-#
-# workflow_dispatch is a dry run: it checks everything but never touches SSH or
-# the server.
 name: Install scripts
 
 on:
@@ -37,17 +24,10 @@ on:
     paths:
       - 'install/**'
       - '.github/workflows/install-scripts.yaml'
-  # Publish. Narrow to the one file this publishes -- a change to the .iss or
-  # the README is not a reason to rsync.
-  push:
-    branches: [main]
-    paths:
-      - 'install/biopb-engine.ps1'
   workflow_dispatch:
 
 concurrency:
-  # Keyed by ref so PRs never queue behind each other; two pushes to main still
-  # share a group, which is what keeps concurrent rsyncs from interleaving.
+  # Keyed by ref so PRs never queue behind each other.
   group: install-scripts-${{ github.ref }}
   cancel-in-progress: false
 
@@ -193,9 +173,6 @@ jobs:
 
   gui:
     name: GUI installer compiles
-    # Skipped on the push-to-main publish run, whose paths cannot include the
-    # .iss anyway. Dispatch runs it so the dry run stays a full check.
-    if: github.event_name != 'push'
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
@@ -214,34 +191,3 @@ jobs:
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
           & $iscc /O"$env:RUNNER_TEMP" install\gui\biopb-setup.iss
           if ($LASTEXITCODE -ne 0) { throw "iscc failed with exit code $LASTEXITCODE" }
-
-  publish:
-    name: Publish to biopb.org
-    # Both gates, not just `check`: what gets rsynced here is the very file the
-    # unit tests exercise, and biopb.org/install.sh is what every new user pipes
-    # into bash. Neither job is filtered by event, so both run on this push.
-    needs: [check, unit]
-    if: github.event_name == 'push'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Set up SSH key
-        run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.BIOPB_ORG_SSH_KEY }}" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -H biopb.org >> ~/.ssh/known_hosts
-
-      - name: Publish install scripts with rsync
-        run: |
-          # The engine only, and no --delete: the bootstraps beside it in the
-          # reserved /install/ subtree are uploaded by hand.
-          mkdir -p _install_publish
-          cp install/biopb-engine.ps1 _install_publish/
-          ssh -i ~/.ssh/id_ed25519 jyu@biopb.org \
-            'mkdir -p /var/www/biopb.org/install'
-          rsync -avz \
-            -e "ssh -i ~/.ssh/id_ed25519" \
-            _install_publish/ jyu@biopb.org:/var/www/biopb.org/install/
