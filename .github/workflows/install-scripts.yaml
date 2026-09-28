@@ -1,9 +1,11 @@
 # Check the installer on every PR that touches it, and publish the bootstrap
 # scripts to biopb.org when they land on main. These are served at the canonical
 # one-liner URLs:
-#   - install/install.sh       -> biopb.org/install.sh
-#   - install/install.ps1      -> biopb.org/install.ps1
+#   - install/bootstrap.sh     -> biopb.org/install.sh
+#   - install/bootstrap.ps1    -> biopb.org/install.ps1
 #   - install/biopb-engine.ps1 -> biopb.org/biopb-engine.ps1
+# The bootstraps fetch the installer attached to the release they pick; the full
+# install.sh / install.ps1 ship as release assets, not from here.
 #
 # They land in a reserved /install/ subtree of the webroot that biopb-site's
 # deploy excludes from its --delete (see biopb-site/.github/workflows/deploy.yml),
@@ -40,8 +42,8 @@ on:
   push:
     branches: [main]
     paths:
-      - 'install/install.sh'
-      - 'install/install.ps1'
+      - 'install/bootstrap.sh'
+      - 'install/bootstrap.ps1'
       - 'install/biopb-engine.ps1'
   workflow_dispatch:
 
@@ -63,7 +65,9 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Parse install.sh
-        run: bash -n install/install.sh
+        run: |
+          bash -n install/install.sh
+          bash -n install/bootstrap.sh
 
       - name: Parse the test harness
         run: bash -n install/test/run.sh install/test/assert.sh
@@ -78,7 +82,7 @@ jobs:
           # on dispatch, so a mistake in it would otherwise sit undiscovered
           # until someone reached for it -- which is always the moment they are
           # trying to debug something else.
-          shellcheck install/install.sh install/test/run.sh install/test/assert.sh
+          shellcheck install/install.sh install/bootstrap.sh install/test/run.sh install/test/assert.sh
 
       - name: Parse the PowerShell scripts
         shell: pwsh
@@ -88,7 +92,7 @@ jobs:
           # here for free. This is the only check the two .ps1 files get -- the
           # engine is 1700 lines that no test executes.
           $bad = $false
-          foreach ($f in 'install/install.ps1', 'install/uninstall.ps1', 'install/biopb-engine.ps1') {
+          foreach ($f in 'install/install.ps1', 'install/bootstrap.ps1', 'install/uninstall.ps1', 'install/biopb-engine.ps1') {
               $errors = $null
               [System.Management.Automation.Language.Parser]::ParseFile(
                   (Resolve-Path $f), [ref]$null, [ref]$errors) | Out-Null
@@ -238,7 +242,9 @@ jobs:
           # the reserved /install/ subtree holds only these (and drops any file
           # that was renamed/removed upstream) -- mirrors api-docs.yaml.
           mkdir -p _install_publish
-          cp install/install.sh install/install.ps1 install/biopb-engine.ps1 _install_publish/
+          cp install/bootstrap.sh _install_publish/install.sh
+          cp install/bootstrap.ps1 _install_publish/install.ps1
+          cp install/biopb-engine.ps1 _install_publish/
           ssh -i ~/.ssh/id_ed25519 jyu@biopb.org \
             'mkdir -p /var/www/biopb.org/install'
           rsync -avz --delete \

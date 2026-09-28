@@ -465,11 +465,12 @@ jobs:
           # Stage exactly the three served scripts, then mirror with --delete so
           # the reserved /install/ subtree holds only these (and drops any file
           # renamed/removed upstream) -- mirrors api-docs.yaml. biopb.org's
-          # install.sh is the release-independent bootstrap, which fetches the
-          # pinned install.sh attached to the release it picks.
+          # install.sh and install.ps1 are the release-independent bootstraps, which
+          # fetch the pinned installer attached to the release they pick.
           mkdir -p _install_publish
           cp install/bootstrap.sh _install_publish/install.sh
-          cp install/install.ps1 install/biopb-engine.ps1 _install_publish/
+          cp install/bootstrap.ps1 _install_publish/install.ps1
+          cp install/biopb-engine.ps1 _install_publish/
           bash -n _install_publish/install.sh
 
           mkdir -p ~/.ssh

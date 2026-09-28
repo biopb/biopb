@@ -12,10 +12,12 @@ config, and wire biopb-mcp into any detected AI agent.
 
 Both are **idempotent** — rerun to upgrade or to add components you skipped.
 
-The `install.sh` served at biopb.org is a short bootstrap (`bootstrap.sh`): it
-checks for `curl` and `tar`, then downloads the chosen release's own `install.sh`
-and runs it, passing along your arguments and environment. The full installer is
-`install.sh` in this directory, and is what each release carries.
+The scripts served at biopb.org are short bootstraps (`bootstrap.sh`,
+`bootstrap.ps1`): each checks for `tar` (and `curl`), then downloads the chosen
+release's own `install.sh` / `install.ps1` and runs it, passing along your
+environment (and, for `install.sh`, arguments). The full installers are
+`install.sh` and `install.ps1` in this directory, and are what each release
+carries.
 
 ## Release channels
 
