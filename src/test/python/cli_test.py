@@ -600,7 +600,7 @@ class TestEveryCommandClassifiesItsFailures:
     CASES = [
         (["query"], "query"),
         (["metadata", "my-source"], "query"),
-        (["get", "my-source", "-o", "-"], "get_tensor_pb"),
+        (["get", "my-source", "-o", "-"], "get_tensor"),
         (["stats", "my-source"], "get_tensor"),
         (["cache-stats"], "cache_stats"),
     ]

@@ -527,19 +527,49 @@ class TestExportLocation:
         assert state.export_location == expected
 
     def test_get_tensor_pb_mints_the_export_location(self):
-        # get_tensor_pb bakes an address into SerializedTensor.location for a
-        # different process to dial later -- it must be the export_location,
-        # not the raw dial address, or a lazy remote op forwards a private
-        # loopback address off-box.
+        # get_tensor(output="pb") bakes an address into SerializedTensor.location
+        # for a different process to dial later -- it must be the
+        # export_location, not the raw dial address, or a lazy remote op
+        # forwards a private loopback address off-box.
         client = _offline_client(raw_client=Mock())
         client._state.advertised_location = "grpc://real-host:8815"
         client._fetcher._plan_read = Mock(
             return_value=SimpleNamespace(serialize=lambda: b"fake-flight-info")
         )
 
-        pb = client._fetcher.get_tensor_pb("test-tensor")
+        pb = client._fetcher.get_tensor("test-tensor", output="pb")
 
         assert pb.location == "grpc://real-host:8815"
+
+    def test_get_tensor_pb_export_location_override_wins_over_advertised(self):
+        # A caller-supplied export_location beats both the server's advertised
+        # address and the dial address -- for the case where neither is
+        # reachable from wherever tensor_from_pb() will actually run.
+        client = _offline_client(raw_client=Mock())
+        client._state.advertised_location = "grpc://real-host:8815"
+        client._fetcher._plan_read = Mock(
+            return_value=SimpleNamespace(serialize=lambda: b"fake-flight-info")
+        )
+
+        pb = client._fetcher.get_tensor(
+            "test-tensor", output="pb", export_location="grpc://override-host:9999"
+        )
+
+        assert pb.location == "grpc://override-host:9999"
+
+    def test_get_tensor_pb_export_location_override_is_normalized(self):
+        # The override goes through the same grpcs:// -> grpc+tls:// scheme
+        # normalization as the dial address and the advertised address.
+        client = _offline_client(raw_client=Mock())
+        client._fetcher._plan_read = Mock(
+            return_value=SimpleNamespace(serialize=lambda: b"fake-flight-info")
+        )
+
+        pb = client._fetcher.get_tensor(
+            "test-tensor", output="pb", export_location="grpcs://override-host:9999"
+        )
+
+        assert pb.location == "grpc+tls://override-host:9999"
 
     def test_get_tensor_builds_its_dask_graph_from_the_export_location(
         self, monkeypatch
@@ -570,6 +600,34 @@ class TestExportLocation:
         assert result == "fake-array"
         assert captured["location"] == "grpc://real-host:8815"
 
+    def test_get_tensor_export_location_override_wins_over_advertised(
+        self, monkeypatch
+    ):
+        from biopb.tensor import _session
+
+        client = _offline_client(raw_client=Mock())
+        client._state.advertised_location = "grpc://real-host:8815"
+        client._fetcher._plan_read = Mock(return_value=object())
+
+        captured = {}
+
+        def fake_dask_from_flight_info(
+            info, location, token, cache_bytes, tls_trust, requested=None
+        ):
+            captured["location"] = location
+            return "fake-array"
+
+        monkeypatch.setattr(
+            _session, "_dask_from_flight_info", fake_dask_from_flight_info
+        )
+
+        result = client._fetcher.get_tensor(
+            "test-tensor", export_location="grpc://override-host:9999"
+        )
+
+        assert result == "fake-array"
+        assert captured["location"] == "grpc://override-host:9999"
+
     def test_upload_graph_uses_the_export_location(self, monkeypatch):
         from biopb.tensor import _upload
         from biopb.tensor._upload import UploadSession
@@ -593,6 +651,42 @@ class TestExportLocation:
         )
 
         assert captured["location"] == "grpc://real-host:8815"
+
+
+class TestGetTensorOutputSwitch:
+    """get_tensor's output="da"/"pb" switch replaces the separate get_tensor_pb
+    method, so both forms share one signature and cannot drift apart."""
+
+    def test_unknown_output_rejected_before_network(self):
+        client = _offline_client()
+        with pytest.raises(ValueError, match="unknown output"):
+            client.get_tensor("test-tensor", output="numpy")
+
+    def test_get_tensor_pb_is_a_deprecated_alias(self):
+        client = _offline_client(raw_client=Mock())
+        client._fetcher._plan_read = Mock(
+            return_value=SimpleNamespace(serialize=lambda: b"fake-flight-info")
+        )
+
+        with pytest.warns(DeprecationWarning, match="get_tensor_pb"):
+            pb = client.get_tensor_pb("test-tensor")
+
+        from biopb.tensor.serialized_pb2 import SerializedTensor
+
+        assert isinstance(pb, SerializedTensor)
+
+    def test_get_tensor_pb_forwards_export_location(self):
+        client = _offline_client(raw_client=Mock())
+        client._fetcher._plan_read = Mock(
+            return_value=SimpleNamespace(serialize=lambda: b"fake-flight-info")
+        )
+
+        with pytest.warns(DeprecationWarning):
+            pb = client.get_tensor_pb(
+                "test-tensor", export_location="grpc://override-host:9999"
+            )
+
+        assert pb.location == "grpc://override-host:9999"
 
 
 class TestCheckFlightProtocolMalformedHealth:

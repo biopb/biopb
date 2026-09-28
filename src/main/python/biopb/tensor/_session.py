@@ -28,6 +28,7 @@ from typing import (
     Optional,
     Sequence,
     Tuple,
+    Union,
 )
 
 import dask.array as da
@@ -1264,8 +1265,8 @@ class ChunkFetcher:
     ) -> "flight.FlightInfo":
         """Plan one read: GetFlightInfo the tensor's endpoints.
 
-        The shared body of :meth:`get_tensor` and :meth:`get_tensor_pb`: one
-        builds the array from the returned FlightInfo, the other hands the
+        Shared by both of :meth:`get_tensor`'s ``output`` forms: ``"da"``
+        builds the array from the returned FlightInfo, ``"pb"`` hands the
         FlightInfo on.
 
         **One RPC for a qualified id with bounded slice bounds** -- the shape
@@ -1345,30 +1346,28 @@ class ChunkFetcher:
         slice_hint: Optional[Tuple[slice, ...]] = None,
         scale_hint: Optional[Sequence[int]] = None,
         reduction_method: Optional[str] = None,
-    ) -> da.Array:
+        *,
+        output: str = "da",
+        export_location: Optional[str] = None,
+    ) -> Union[da.Array, SerializedTensor]:
         """Backs TensorFlightClient.get_tensor; see that method for the full
         documentation."""
         info = self._plan_read(array_id, slice_hint, scale_hint, reduction_method)
+        location = (
+            normalize_flight_location(export_location)
+            if export_location
+            else self._state.export_location
+        )
+        if output == "pb":
+            return SerializedTensor(
+                location=location,
+                auth_token=self._state.token or "",
+                flight_info=info.serialize(),
+            )
         return _dask_from_flight_info(
             info,
-            self._state.export_location,
+            location,
             self._state.token,
             self._state.cache_bytes,
             self._state.tls_trust,
-        )
-
-    def get_tensor_pb(
-        self,
-        array_id: str,
-        slice_hint: Optional[Tuple[slice, ...]] = None,
-        scale_hint: Optional[Sequence[int]] = None,
-        reduction_method: Optional[str] = None,
-    ) -> SerializedTensor:
-        """Backs TensorFlightClient.get_tensor_pb; see that method for the full
-        documentation."""
-        info = self._plan_read(array_id, slice_hint, scale_hint, reduction_method)
-        return SerializedTensor(
-            location=self._state.export_location,
-            auth_token=self._state.token or "",
-            flight_info=info.serialize(),
         )

@@ -211,7 +211,7 @@ class _OpCall:
                 raise RuntimeError(
                     f"No tensor server connected; cannot resolve array_id {value!r}."
                 )
-            return proto.Arg(lazy=client.get_tensor_pb(value))
+            return proto.Arg(lazy=client.get_tensor(value, output="pb"))
         arr = np.asarray(value)
         if isinstance(labels, dict):
             labels = labels.get(name)

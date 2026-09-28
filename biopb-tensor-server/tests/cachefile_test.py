@@ -93,7 +93,9 @@ def _first_chunk(client, array_id: str):
     """(chunk_id, start, stop) of a tensor's first chunk, from its endpoint list."""
     from biopb.tensor._session import _parse_flight_endpoints
 
-    info = flight.FlightInfo.deserialize(client.get_tensor_pb(array_id).flight_info)
+    info = flight.FlightInfo.deserialize(
+        client.get_tensor(array_id, output="pb").flight_info
+    )
     chunk_ids, bounds = _parse_flight_endpoints(info)
     b = bounds[0]
     return chunk_ids[0], tuple(b.start), tuple(b.stop)

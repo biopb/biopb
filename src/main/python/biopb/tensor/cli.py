@@ -543,7 +543,7 @@ def get(
 
         if fmt == "pb":
             # Protobuf format: lazy SerializedTensor
-            serialized = client.get_tensor_pb(array_id, slice_hint=selection)
+            serialized = client.get_tensor(array_id, slice_hint=selection, output="pb")
             pb_bytes = serialized.SerializeToString()
 
             if output == "-":

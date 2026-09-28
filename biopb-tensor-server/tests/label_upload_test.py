@@ -411,7 +411,9 @@ class TestContentVersion:
     """
 
     def _chunk_ids(self, client, array_id):
-        info = flight.FlightInfo.deserialize(client.get_tensor_pb(array_id).flight_info)
+        info = flight.FlightInfo.deserialize(
+            client.get_tensor(array_id, output="pb").flight_info
+        )
         return set(_parse_flight_endpoints(info)[0])
 
     def _minted(self, client, array_id):

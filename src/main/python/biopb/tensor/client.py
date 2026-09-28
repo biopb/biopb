@@ -777,8 +777,16 @@ class TensorFlightClient:
         slice_hint: Optional[Tuple[slice, ...]] = None,
         scale_hint: Optional[Sequence[int]] = None,
         reduction_method: Optional[str] = None,
-    ) -> da.Array:
-        """Get a lazy dask array for a tensor, addressed by its array_id.
+        *,
+        output: str = "da",  # noqa: A002 - public, documented keyword API (mirrors `query`'s `format`)
+        export_location: Optional[str] = None,
+    ) -> Union[da.Array, SerializedTensor]:
+        """Plan a read of a tensor, addressed by its array_id.
+
+        One ``GetFlightInfo`` either way; ``output`` picks what you get back,
+        so the two forms can never drift apart on ``array_id`` /
+        ``slice_hint`` / ``scale_hint`` / ``reduction_method`` semantics the
+        way two separate methods eventually would.
 
         Args:
             array_id: Globally-unique tensor id (identity policy) -- e.g.
@@ -787,16 +795,47 @@ class TensorFlightClient:
             slice_hint: Optional slice tuple to filter chunks
             scale_hint: Optional per-dimension integer downsampling factors
             reduction_method: Optional dynamic reduction method for scaled reads
+            output: Shape of the returned result:
+
+                - ``"da"`` (default) -- a lazy ``dask.array``, read in this
+                  process.
+                - ``"pb"`` -- a ``SerializedTensor`` protobuf: the same planned
+                  read (a serialized Arrow ``FlightInfo``) plus this
+                  connection's location and token, for a *different* process.
+                  Serialize it to bytes and broadcast it to worker processes,
+                  where each worker calls ``tensor_from_pb()`` to reconstruct
+                  the lazy dask array.
+            export_location: Address to bake into the result -- the array's
+                per-chunk fetch closures for ``output="da"``, the message's
+                ``location`` for ``output="pb"`` -- instead of the server's
+                advertised ``health.external_location`` (biopb/biopb#1158) or,
+                absent that, this connection's own dial address. A
+                ``"da"`` array is pickle-safe and reconnects lazily wherever
+                it is computed, so this is what a dask worker actually dials
+                too. Set it when neither the server's guess nor your own dial
+                address is reachable from there (e.g. a worker pool behind a
+                second NAT layer the server has no way to know about).
 
         Returns:
-            dask.array with lazy chunk loading
+            A ``dask.array`` (``output="da"``) or a ``SerializedTensor``
+            (``output="pb"``).
 
         Raises:
-            ValueError: If source not found, tensor not found, or a bare
-                multi-tensor source id is given without a within-source field
+            ValueError: If *output* is not one of the supported values, or if
+                source not found, tensor not found, or a bare multi-tensor
+                source id is given without a within-source field.
         """
+        if output not in ("da", "pb"):
+            raise ValueError(
+                f"get_tensor: unknown output {output!r}; expected 'da' or 'pb'"
+            )
         return self._fetcher.get_tensor(
-            array_id, slice_hint, scale_hint, reduction_method
+            array_id,
+            slice_hint,
+            scale_hint,
+            reduction_method,
+            output=output,
+            export_location=export_location,
         )
 
     def get_tensor_pb(
@@ -805,26 +844,29 @@ class TensorFlightClient:
         slice_hint: Optional[Tuple[slice, ...]] = None,
         scale_hint: Optional[Sequence[int]] = None,
         reduction_method: Optional[str] = None,
+        *,
+        export_location: Optional[str] = None,
     ) -> SerializedTensor:
-        """Get a SerializedTensor protobuf for cross-process transfer.
+        """Deprecated alias for :meth:`get_tensor` with ``output="pb"``.
 
-        The planned read (a serialized Arrow ``FlightInfo``) plus this
-        connection's location and token. It can be serialized to bytes and
-        broadcast to worker processes, where each worker calls
-        ``tensor_from_pb()`` to reconstruct the lazy dask array.
-
-        Args:
-            array_id: Globally-unique tensor id (identity policy) -- e.g.
-                ``"zarr_a3f2"`` or ``"aics_7f3/Image:0"``.
-            slice_hint: Optional slice tuple to filter chunks
-            scale_hint: Optional per-dimension integer downsampling factors
-            reduction_method: Optional dynamic reduction method for scaled reads
-
-        Returns:
-            SerializedTensor protobuf object
+        .. deprecated::
+            Use ``get_tensor(..., output="pb")``. Same planned read, same
+            ``SerializedTensor`` result -- a separate method just meant the
+            two could (and did) drift on every other parameter.
         """
-        return self._fetcher.get_tensor_pb(
-            array_id, slice_hint, scale_hint, reduction_method
+        warnings.warn(
+            "TensorFlightClient.get_tensor_pb() is deprecated; use "
+            "get_tensor(..., output='pb') instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.get_tensor(
+            array_id,
+            slice_hint,
+            scale_hint,
+            reduction_method,
+            output="pb",
+            export_location=export_location,
         )
 
     @staticmethod
@@ -1051,6 +1093,23 @@ class TensorFlightClient:
         """
         self._upload.upload_chunk(desc, bounds, data)
 
+    def get_upload_status(self, array_id: str) -> Dict[str, Any]:
+        """Get upload status for a writable tensor.
+
+        Note:
+            Experimental. The upload / writable-source API (source creation, chunk
+            upload, and upload-status polling) is experimental and may change.
+
+        Args:
+            array_id: The ``array_id`` of the descriptor ``setup_array_upload`` returned
+
+        Returns:
+            Dictionary with ``source_id`` (the ``array_id`` passed in -- the key
+            name mirrors the server's own status dict shape), ``state``,
+            ``expected_chunks``, and ``uploaded_chunks``.
+        """
+        return self._catalog.get_upload_status(array_id)
+
     def set_upload_status(
         self,
         target: Union[TensorDescriptor, str],
@@ -1099,6 +1158,8 @@ class TensorFlightClient:
                 names no upload in progress.
         """
         return self._upload.set_upload_status(target, state, reason)
+
+    # ====================
 
     def close(self):
         """Close the Flight client."""
@@ -1155,23 +1216,6 @@ class TensorFlightClient:
         for result in results:
             return json.loads(result.body.to_pybytes())
         return {}
-
-    def get_upload_status(self, array_id: str) -> Dict[str, Any]:
-        """Get upload status for a writable tensor.
-
-        Note:
-            Experimental. The upload / writable-source API (source creation, chunk
-            upload, and upload-status polling) is experimental and may change.
-
-        Args:
-            array_id: The ``array_id`` of the descriptor ``setup_array_upload`` returned
-
-        Returns:
-            Dictionary with ``source_id`` (the ``array_id`` passed in -- the key
-            name mirrors the server's own status dict shape), ``state``,
-            ``expected_chunks``, and ``uploaded_chunks``.
-        """
-        return self._catalog.get_upload_status(array_id)
 
     def cache_info(self) -> Dict:
         """Return cache statistics for this connection.

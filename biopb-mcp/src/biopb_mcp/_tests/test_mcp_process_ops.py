@@ -177,7 +177,7 @@ class _Client:
     def __init__(self):
         self.uploads = []
 
-    def get_tensor_pb(self, array_id):
+    def get_tensor(self, array_id, output="da"):
         return _reference(array_id, PLANE).lazy
 
     def setup_array_upload(self, array_id, template):

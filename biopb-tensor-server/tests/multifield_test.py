@@ -401,8 +401,9 @@ class TestMultifieldServerClient:
             server.shutdown()
 
     def test_get_tensor_array_id_addressing(self):
-        """get_tensor/get_tensor_pb take a single array_id (identity policy); a
-        bare multi-tensor source id is ambiguous and must be qualified."""
+        """get_tensor (its output="pb" form too) takes a single array_id
+        (identity policy); a bare multi-tensor source id is ambiguous and must
+        be qualified."""
         tensor_specs = [
             ("pos_0", (32, 32), "uint8"),
             ("pos_1", (64, 64), "uint8"),
@@ -421,7 +422,7 @@ class TestMultifieldServerClient:
 
             # Canonical single-arg form: a qualified array_id reaches the scene.
             assert client.get_tensor("mf/pos_1").shape == (64, 64)
-            assert client.get_tensor_pb("mf/pos_1") is not None
+            assert client.get_tensor("mf/pos_1", output="pb") is not None
 
             # A bare multi-tensor source id is ambiguous -> must specify (never a
             # silent default; the #75 lesson).
