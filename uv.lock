@@ -724,7 +724,7 @@ testing = [
 [package.metadata]
 requires-dist = [
     { name = "biopb", extras = ["tensor"], editable = "." },
-    { name = "biopb-napari-widget", marker = "extra == 'napari'", specifier = ">=0.1.0rc2" },
+    { name = "biopb-napari-widget", marker = "extra == 'napari'", specifier = ">=0.1.0" },
     { name = "distributed", specifier = ">=2023.9.0" },
     { name = "ipykernel" },
     { name = "jupyter-client" },
@@ -765,7 +765,7 @@ testing = [
 
 [[package]]
 name = "biopb-napari-widget"
-version = "0.1.0rc2"
+version = "0.1.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "biopb", extra = ["tensor"] },
@@ -779,14 +779,13 @@ dependencies = [
     { name = "opencv-python-headless" },
     { name = "pandas", version = "2.3.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "pandas", version = "3.0.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-    { name = "platformdirs" },
     { name = "qtpy" },
     { name = "zarr", version = "2.18.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "zarr", version = "2.18.7", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/56/76/fbf424fe65edac883e6d39ae33af2c91693150e9908b3d83a3c08ea1d739/biopb_napari_widget-0.1.0rc2.tar.gz", hash = "sha256:2d0be52339749cca64e217b832636ea54ffe01718e1a62958495f31621beadca", size = 122512, upload-time = "2026-09-24T22:25:50.349Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/fc/75/b2d84b2eaec821b1e95c2ed0fddc969d7bf18c0be71eb5586de917a9e60c/biopb_napari_widget-0.1.0.tar.gz", hash = "sha256:f99ab968737e062d31073f4f140a83ebb1ff0079085eec719c6af0bbff6de8fd", size = 116330, upload-time = "2026-09-28T20:59:15.565Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/da/4c/72aca8c623df607d8c49eadb8f6d950c65b08592892f6124b70755cac2d1/biopb_napari_widget-0.1.0rc2-py3-none-any.whl", hash = "sha256:1328a0c8204022540eea3a19ed0db7dba9d157dd5a881c85190c492dd58e73b7", size = 84274, upload-time = "2026-09-24T22:25:49.074Z" },
+    { url = "https://files.pythonhosted.org/packages/1d/5e/6653db8d24a4987843eab77523b20661e1578dc5e4f15b90df3cf1f815ef/biopb_napari_widget-0.1.0-py3-none-any.whl", hash = "sha256:0cf69672cd616f6b97984afccbf421c0f75898ac61dcf99792d20978dc1e2b90", size = 78993, upload-time = "2026-09-28T20:59:14.175Z" },
 ]
 
 [[package]]
