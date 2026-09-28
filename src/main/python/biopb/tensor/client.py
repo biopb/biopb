@@ -2,11 +2,6 @@
 
 This module provides a lazy numpy-like array interface using dask.array
 for accessing tensors stored in a Flight server.
-
-Features:
-- Lazy chunk loading via dask.array
-- LRU caching via cachey
-- Numpy-compatible slicing and operations
 """
 
 import json
