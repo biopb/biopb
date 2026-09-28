@@ -57,8 +57,10 @@ Smaller issues found on the way:
   and gamma sliders. Moving a second slider within 150 ms drops the first
   one's commit.
 - `channelColors` and `channelNames` are keyed by `source_id`, so every
-  tensor of a multi-tensor source shares one colour per channel index.
-  (Might be intended; nothing states it.)
+  tensor of a multi-tensor source shares one colour per channel index. The
+  names are wrong too: `extractChannelNames(metadata, sceneId?)` can read a
+  given scene, but `loadChannelNames` never passes one, so every scene of a
+  multi-scene file is labelled with scene 0's channels.
 - `applyViewerState` does not reset `playAxis`, `planeReady`,
   `appliedLimits` or `planeLimits`, which `selectSource` does. This is latent
   only because hydration runs once.
@@ -182,6 +184,25 @@ action with its own timer. It paces on `runtime.planeReady` for the current
 panel staying mounted, and the "sets `planeReady=false` itself" handshake
 becomes an epoch/selection comparison.
 
+### H. Channel colour and names are per tensor
+
+Colour is a property of the tensor being viewed, so `channelColors` is keyed
+by `TensorKey` (persisted as it is today). Channel names are what auto-colour
+resolves from. The backend keeps one metadata dict per source and is unlikely
+to change that, so the per-tensor names are a **client-side derivation behind
+one seam**:
+
+```ts
+channelNamesFor(target: ViewTarget, sourceMetadata: Metadata | null): string[]
+```
+
+Today it runs `extractChannelNames` on the source's metadata, picking the
+tensor's scene where the format has scenes. If the server later publishes
+channel info per tensor as its own field (as `physical_size` / `spacing`
+already are), the seam reads that instead, and nothing downstream changes.
+The source metadata fetch stays per source (one request, cached on
+`sourceId`); only the derived names and the colours move to the tensor.
+
 ## Migration
 
 Each step ships on its own and passes the existing test suite (adapted).
@@ -195,6 +216,7 @@ Steps 1–2 are the keystone. 3–5 are independent afterwards.
 | 3 | Derived contrast selectors + `runtime` slice; split `SliceState` | `contrastTrack`, `appliedLimits`, content-compare setters, JSON selection keys |
 | 4 | TileViewer hooks, shared hooks with VolumeViewer, `usePlayback`; one debounce per slider | TileViewer to ~400 lines; the debounce bug |
 | 5 | Store slice files | `store.ts` to about 6 × 300 lines |
+| 6 (any time after 1) | Colours keyed by `TensorKey`; `channelNamesFor` seam | multi-scene names bug; colours shared across tensors |
 
 **Recommendation on #1163:** don't merge its viewer-key machinery. Step 1
 supersedes it, and `advanceViewerKey`/`sameStableAddress` would be deleted
@@ -205,8 +227,10 @@ lands, step 0 is the smaller patch.
 
 ## Open questions
 
-1. **Channel colours:** per source (today) or per tensor? The keyed-by-source
-   behaviour looks accidental, but a source's tensors often do share channels.
+1. *(resolved: colour is per tensor, names are derived from per-source
+   metadata behind a seam; see H.)* How does a tensor map to its scene in
+   the source metadata? The client has no such mapping today. A per-tensor
+   channel field on the server would make the question go away.
 2. **ROI cache across navigation:** keep an LRU of `TensorView`s (proposed),
    or clear on every `openTensor` (today's effective behaviour)?
 3. **Failure presentation:** once `tile_info` is fetched in the store,
