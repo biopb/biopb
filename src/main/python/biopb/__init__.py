@@ -31,6 +31,8 @@ except ImportError:
         __version__ = "0.0.0"
 
 from ._control import (
+    ENV_TENSOR_TLS_CA,
+    ENV_TENSOR_TLS_FINGERPRINT,
     ENV_TENSOR_TOKEN,
     ENV_TENSOR_URL,
     DataPlaneEndpoint,
@@ -54,6 +56,8 @@ from ._control import (
 )
 
 __all__ = [
+    "ENV_TENSOR_TLS_CA",
+    "ENV_TENSOR_TLS_FINGERPRINT",
     "ENV_TENSOR_TOKEN",
     "ENV_TENSOR_URL",
     "DataPlaneEndpoint",

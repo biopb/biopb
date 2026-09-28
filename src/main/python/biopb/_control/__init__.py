@@ -27,6 +27,8 @@ from ._algorithms import (
 )
 from ._client import base_url, ensure_data_plane, find_data_plane
 from ._data_plane import (
+    ENV_TENSOR_TLS_CA,
+    ENV_TENSOR_TLS_FINGERPRINT,
     ENV_TENSOR_TOKEN,
     ENV_TENSOR_URL,
     DataPlaneEndpoint,
@@ -41,6 +43,8 @@ from ._data_plane import (
 )
 
 __all__ = [
+    "ENV_TENSOR_TLS_CA",
+    "ENV_TENSOR_TLS_FINGERPRINT",
     "ENV_TENSOR_TOKEN",
     "ENV_TENSOR_URL",
     "DataPlaneEndpoint",

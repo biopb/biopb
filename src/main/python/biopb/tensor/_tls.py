@@ -60,14 +60,17 @@ this per upstream):
 
 from __future__ import annotations
 
+import calendar
 import hashlib
 import json
 import logging
 import os
+import re
 import socket
 import ssl
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Dict, NamedTuple, Optional, Sequence, Tuple
 from urllib.parse import urlsplit
@@ -96,6 +99,11 @@ _VERIFY_CODE_EXPIRED = 10
 # address mismatch" — so a check for the string "hostname mismatch" silently
 # declined to help exactly the caller that needed it most (biopb/biopb#916).
 _VERIFY_CODES_NAME_MISMATCH = (62, 64)
+
+# A certificate inside this window of its notAfter is warned about on connect
+# (biopb/biopb#1117): long enough to rotate deliberately, short enough that the
+# warning is not background noise for a healthy deployment.
+_EXPIRY_WARN_S = 30 * 86400
 
 # Per-process memo. Resolution is called on paths that can hit a pooled,
 # already-open connection (``_get_thread_client``'s fast path) and is evaluated
@@ -245,9 +253,10 @@ _fingerprint = _tls_material.fingerprint
 
 
 def _probe_peer(
-    host: str, port: int, pem: bytes, *, check_hostname: bool
+    host: str, port: int, pem: Optional[bytes], *, check_hostname: bool
 ) -> Tuple[dict, bytes]:
-    """Handshake against *host:port* trusting only *pem*; return the peer cert.
+    """Handshake against *host:port* trusting only *pem* (the system store when
+    ``None``); return the peer cert.
 
     Returns ``(getpeercert() dict, DER bytes)``. The chain is always verified
     (``CERT_REQUIRED`` against *pem* alone); *check_hostname* selects whether the
@@ -258,7 +267,10 @@ def _probe_peer(
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.check_hostname = check_hostname
     ctx.verify_mode = ssl.CERT_REQUIRED
-    ctx.load_verify_locations(cadata=pem.decode("ascii"))
+    if pem:
+        ctx.load_verify_locations(cadata=pem.decode("ascii"))
+    else:
+        ctx.load_default_certs()
     with socket.create_connection((host, port), timeout=_FETCH_TIMEOUT_S) as sock:
         with ctx.wrap_socket(sock, server_hostname=host) as ssock:
             return ssock.getpeercert() or {}, ssock.getpeercert(binary_form=True) or b""
@@ -297,6 +309,17 @@ def _pick_override(san_entries: Sequence[Tuple[str, str]]) -> Optional[str]:
     return ips[0] if ips else None
 
 
+def _remediation(host: str, port: int, mode: str) -> str:
+    """What to do about a certificate that has expired or is about to. Both
+    sides are required: the server re-mints and the client drops the anchor it
+    recorded for the old one."""
+    if mode == "tofu":
+        return f"then clear the '{host}:{port}' entry from {tls_known_hosts()}"
+    if mode == "fingerprint":
+        return "then update the configured TLS fingerprint to the new certificate"
+    return "then replace the configured CA certificate"
+
+
 def _raise_if_expired(host: str, port: int, exc: Exception, *, tofu: bool) -> None:
     """Re-raise an OpenSSL "certificate has expired" verdict as an actionable error.
 
@@ -305,23 +328,147 @@ def _raise_if_expired(host: str, port: int, exc: Exception, *, tofu: bool) -> No
     and leaves ``certificate has expired`` in its stderr log. Expiry is not
     recoverable here the way a name mismatch is — there is no substitution that
     makes an expired cert verify — so this raises rather than warns.
-
-    The remediation is two-sided, and both sides are required: the server re-mints
-    and the client drops the anchor it recorded for the old one.
     """
     if getattr(exc, "verify_code", None) != _VERIFY_CODE_EXPIRED:
         return
-    remediation = (
-        f"then clear the '{host}:{port}' entry from {tls_known_hosts()}"
-        if tofu
-        else "then update the configured TLS fingerprint to the new certificate"
-    )
+    remediation = _remediation(host, port, "tofu" if tofu else "fingerprint")
     raise TlsCertExpiredError(
         f"The TLS certificate for {host}:{port} has expired. Pinning it does not "
         f"exempt it from expiry -- the handshake is refused, and the transport "
         f"reports only a generic connection failure. Re-mint the server's "
         f"certificate (`biopb-tensor-server cert init --force`) and {remediation}."
     ) from exc
+
+
+_PEM_CERT = re.compile(
+    rb"-----BEGIN CERTIFICATE-----.+?-----END CERTIFICATE-----", re.S
+)
+
+
+def _der_item(buf: bytes, pos: int) -> Tuple[int, int, int]:
+    """The DER element at *pos*: ``(tag, content start, content end)``."""
+    tag, length = buf[pos], buf[pos + 1]
+    pos += 2
+    if length & 0x80:
+        count = length & 0x7F
+        length = int.from_bytes(buf[pos : pos + count], "big")
+        pos += count
+    return tag, pos, pos + length
+
+
+def _cert_not_after(der: bytes) -> Optional[float]:
+    """A certificate's ``notAfter`` as epoch seconds, or ``None`` if unreadable.
+
+    Read off the DER by hand because the SDK is stdlib-only here (no
+    ``cryptography``, biopb/biopb#355) and ``ssl`` decodes a certificate only
+    from a peer or a private helper.
+    """
+    try:
+        _, pos, _ = _der_item(der, 0)  # Certificate
+        _, pos, _ = _der_item(der, pos)  # TBSCertificate
+        tag, _, end = _der_item(der, pos)
+        if tag == 0xA0:  # the optional version
+            pos = end
+        for _ in range(3):  # serial, signature algorithm, issuer
+            _, _, pos = _der_item(der, pos)
+        _, pos, _ = _der_item(der, pos)  # Validity
+        _, _, pos = _der_item(der, pos)  # notBefore
+        tag, start, end = _der_item(der, pos)
+        text = der[start:end].decode("ascii")
+        if tag == 0x17:  # UTCTime: YYMMDDHHMMSSZ, 1950-2049
+            year = int(text[:2])
+            text = f"{2000 + year if year < 50 else 1900 + year}{text[2:]}"
+        elif tag != 0x18:  # GeneralizedTime: YYYYMMDDHHMMSSZ
+            return None
+        fields = [int(text[i : i + 2]) for i in (4, 6, 8, 10, 12)]
+        return float(calendar.timegm((int(text[:4]), *fields)))
+    except (IndexError, ValueError, UnicodeDecodeError):
+        return None
+
+
+def _not_after(pem: bytes) -> Optional[float]:
+    """The earliest ``notAfter`` among the certificates in *pem* (a bundle is
+    only as good as its first member to expire), or ``None`` if none reads."""
+    dates = []
+    for block in _PEM_CERT.findall(pem):
+        try:
+            der = ssl.PEM_cert_to_DER_cert(block.decode("ascii"))
+        except (ValueError, UnicodeDecodeError):
+            continue
+        not_after = _cert_not_after(der)
+        if not_after is not None:
+            dates.append(not_after)
+    return min(dates) if dates else None
+
+
+def _check_anchor_expiry(
+    host: str, port: int, pem: bytes, mode: str, *, now: Optional[float] = None
+) -> None:
+    """Warn that the anchor is near its ``notAfter``, or raise that it has passed.
+
+    Offline: the anchor is already in hand, so this costs no handshake and
+    covers the one mode the probe never reaches (a configured CA). Runs once per
+    connection, since resolution is memoized (biopb/biopb#1117).
+    """
+    not_after = _not_after(pem)
+    if not_after is None:
+        return
+    remaining = not_after - (time.time() if now is None else now)
+    remediation = _remediation(host, port, mode)
+    if remaining <= 0:
+        raise TlsCertExpiredError(
+            f"The TLS certificate for {host}:{port} has expired. Re-mint the "
+            f"server's certificate (`biopb-tensor-server cert init --force`) "
+            f"and {remediation}."
+        )
+    if remaining < _EXPIRY_WARN_S:
+        logger.warning(
+            "The TLS certificate for %s:%s expires in %d days (%s). It will need "
+            "to be re-minted on the server, %s.",
+            host,
+            port,
+            remaining // 86400,
+            time.strftime("%Y-%m-%d", time.gmtime(not_after)),
+            remediation,
+        )
+
+
+def handshake_failure_reason(location: str, trust: TlsTrust) -> Optional[str]:
+    """Why a TLS handshake with *location* fails, or ``None`` if not knowable.
+
+    gRPC reports every handshake failure as "Ssl handshake failed" and keeps the
+    reason in its own stderr log (biopb/biopb#1116). Repeat the handshake with
+    Python's ``ssl`` against the same anchor to read the reason -- only on a
+    failure that already happened, so it costs nothing on a healthy connection.
+    The name is not checked when an override is in force: gRPC matches that one,
+    and this would report a mismatch it does not have.
+    """
+    hp = _host_port(location)
+    if hp is None:
+        return None
+    host, port = hp
+    try:
+        _probe_peer(
+            host,
+            port,
+            trust.root_certs,
+            check_hostname=not trust.override_hostname,
+        )
+    except ssl.SSLCertVerificationError as exc:
+        detail = getattr(exc, "verify_message", None) or exc.reason or str(exc)
+        reason = f"TLS handshake with {host}:{port} failed: {detail}."
+        if getattr(exc, "verify_code", None) == _VERIFY_CODE_EXPIRED:
+            reason += (
+                " Re-mint the server's certificate "
+                "(`biopb-tensor-server cert init --force`) and update every client "
+                "anchored on the old one."
+            )
+        return reason
+    except ssl.SSLError as exc:
+        return f"TLS handshake with {host}:{port} failed: {exc.reason or exc}."
+    except OSError:
+        return None
+    return None
 
 
 def _resolve_hostname_override(
@@ -524,8 +671,9 @@ def resolve_tls_trust(
     contradicts the pin or the configured fingerprint, and
     :class:`TlsCertExpiredError` when the anchor it resolved has expired — which
     a pin does not excuse, so the handshake would fail anyway with a far less
-    legible error. A configured *ca_pem* stays offline and is therefore not
-    checked for either.
+    legible error. A configured *ca_pem* stays offline, so it is checked only
+    against the anchor itself. Whatever the mode, an anchor within 30 days of its
+    ``notAfter`` logs a warning, once per connection (biopb/biopb#1117).
 
     ``root_certs`` is handed to ``pyarrow.flight.FlightClient(...,
     tls_root_certs=...)`` — with a leaf anchor, verification succeeds iff the
@@ -562,6 +710,12 @@ def resolve_tls_trust(
         override = _resolve_hostname_override(
             host, port, resolved, tofu=not fingerprint
         )
+    _check_anchor_expiry(
+        host,
+        port,
+        resolved,
+        "ca" if ca_pem else "fingerprint" if fingerprint else "tofu",
+    )
 
     trust = TlsTrust(resolved, override, key_id)
     with _memo_lock:

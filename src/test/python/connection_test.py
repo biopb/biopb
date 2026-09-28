@@ -38,7 +38,7 @@ def _clients(monkeypatch, *behaviours):
     """
     dials = []
 
-    def factory(url, token=None, tls_fingerprint=None):
+    def factory(url, token=None, tls_fingerprint=None, tls_ca_pem=None):
         dials.append((url, token))
         b = behaviours[min(len(dials), len(behaviours)) - 1]
         if isinstance(b, Exception):
@@ -156,7 +156,7 @@ class TestWaiting:
         """health is ungated, so a connect has to make one call that is not."""
         dials = []
 
-        def factory(url, token=None, tls_fingerprint=None):
+        def factory(url, token=None, tls_fingerprint=None, tls_ca_pem=None):
             dials.append(url)
             client = MagicMock()
             client.health_check.return_value = SERVING
@@ -222,7 +222,7 @@ def test_a_local_tls_plane_is_dialed_with_its_own_anchor(monkeypatch, tmp_path):
     _seed_cert(monkeypatch, tmp_path)
     seen = {}
 
-    def factory(url, token=None, tls_fingerprint=None):
+    def factory(url, token=None, tls_fingerprint=None, tls_ca_pem=None):
         seen["fp"] = tls_fingerprint
         client = MagicMock()
         client.health_check.return_value = SERVING

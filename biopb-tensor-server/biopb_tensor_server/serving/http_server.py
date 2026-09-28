@@ -380,6 +380,15 @@ class _SidecarContext:
                     raise
             return self._client_holder["client"]
 
+    def reset_client(self) -> None:
+        """Forget the cached client, so the next ``get_client()`` builds a new one.
+
+        The reference is dropped, not the client closed: another request may be
+        mid-call on it, and it goes away with its last user.
+        """
+        with self._client_lock:
+            self._client_holder["client"] = None
+
     def peek_client(self) -> Optional[TensorFlightClient]:
         """Return the client only if already connected (never forces a connect)."""
         with self._client_lock:
@@ -411,6 +420,11 @@ class _SidecarContext:
             return client.health_check(), None
         except Exception as exc:
             logger.warning(f"Backend health check failed: {exc}")
+            # A client that has failed a health check may be holding what made it
+            # fail (an anchor for a certificate since replaced, a wedged channel);
+            # the next probe starts clean, so recovery needs no restart
+            # (biopb/biopb#1116).
+            self.reset_client()
             return None, f"health check failed: {exc}"
 
     def check_token(self, request: Request) -> None:

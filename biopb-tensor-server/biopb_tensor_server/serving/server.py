@@ -46,6 +46,7 @@ from biopb.tensor._roi_rows import (
     table_to_rois,
 )
 from biopb.tensor._session import split_array_id
+from biopb.tensor._tls import _not_after as _cert_not_after
 from biopb.tensor._wire_version import FLIGHT_PROTOCOL_VERSION
 from biopb.tensor.descriptor_pb2 import (
     AddSourceProgress,
@@ -496,9 +497,13 @@ class TensorFlightServer(flight.FlightServerBase):
             raise ValueError(
                 "tls_cert_chain and tls_private_key must be provided together"
             )
+        # When the served certificate runs out, reported on ``health`` so a
+        # caller can poll it (biopb/biopb#1117). None without TLS.
+        self._tls_not_after: Optional[float] = None
         if tls_cert_chain is not None:
             location = _ensure_tls_scheme(location)
             kwargs["tls_certificates"] = [(tls_cert_chain, tls_private_key)]
+            self._tls_not_after = _cert_not_after(tls_cert_chain)
 
         # Apply gRPC max message size via URL query parameter
         if grpc_max_message_size:
@@ -1184,6 +1189,10 @@ class TensorFlightServer(flight.FlightServerBase):
                 # never looks for this key -- and a new one against an old
                 # server -- which finds no key at all -- see the same shape.
                 health_status["external_location"] = self._external_location
+            if self._tls_not_after is not None:
+                health_status["tls_not_after"] = datetime.fromtimestamp(
+                    self._tls_not_after, timezone.utc
+                ).strftime("%Y-%m-%dT%H:%M:%SZ")
             yield json.dumps(health_status).encode("utf-8")
         elif action.type == "add_tensor":
             self._authorize(context)

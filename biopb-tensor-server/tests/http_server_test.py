@@ -305,6 +305,26 @@ class TestReadyzTracksBackend:
         # It asked Flight rather than reporting from a cached connection state.
         assert mock_fc.health_check.called
 
+    def test_readyz_recovers_after_a_failed_health_check(self):
+        """A client that failed a health check is not kept (biopb/biopb#1116):
+        the next probe builds a new one, so fixing the cause needs no restart."""
+        broken = _build_mock_client()
+        broken.health_check.side_effect = RuntimeError("Ssl handshake failed")
+        healthy = _build_mock_client()
+        with patch(
+            "biopb_tensor_server.serving.http_server.TensorFlightClient",
+            side_effect=[broken, healthy],
+        ) as make:
+            app = create_app(token=_TOKEN)
+            with TestClient(app, raise_server_exceptions=True) as tc:
+                first = tc.get("/readyz")
+                second = tc.get("/readyz")
+
+        assert first.status_code == 503
+        assert "health check failed" in first.json()["backend_error"]
+        assert second.status_code == 200
+        assert make.call_count == 2
+
     def test_readyz_503_when_backend_not_serving(self, auth_client):
         tc, mock_fc = auth_client
         mock_fc.health_check.return_value = {"status": "NOT_SERVING"}

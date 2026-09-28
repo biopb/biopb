@@ -26,9 +26,9 @@ from biopb import (
     ENV_TENSOR_URL,
     LocalTrustError,
     ensure_data_plane,
-    local_data_plane_fingerprint,
     resolve_data_plane_token,
 )
+from biopb._control._data_plane import data_plane_trust
 
 from .client import TensorFlightClient
 
@@ -171,7 +171,7 @@ class Connection:
         interval = 0.5
         while True:
             try:
-                self.client = self._open(url, token)
+                self.client = self._open(url, token, origin)
                 self.last_message = ""
                 return True
             except _Starting as exc:
@@ -192,10 +192,14 @@ class Connection:
         return False
 
     @staticmethod
-    def _open(url: str, token: Optional[str]) -> TensorFlightClient:
+    def _open(url: str, token: Optional[str], origin: str) -> TensorFlightClient:
         """A client for *url* that the plane has answered, and accepted."""
+        anchor = data_plane_trust(url, origin)
         client = TensorFlightClient(
-            url, token=token, tls_fingerprint=local_data_plane_fingerprint(url)
+            url,
+            token=token,
+            tls_ca_pem=anchor.ca_pem,
+            tls_fingerprint=anchor.fingerprint,
         )
         try:
             health = client.health_check()
