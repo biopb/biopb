@@ -184,6 +184,16 @@ came from, not "whatever is newest at run time"; re-fetching is how you move
 forward. A **raw / git-checkout** copy has an empty pin and tracks the **latest
 stable** release (prereleases skipped).
 
+**`biopb.org/install.sh` is not the installer but a bootstrap**
+(`install/bootstrap.sh`, published in place of `install.sh` on a stable release).
+It checks for `curl`/`tar`, picks the release the way the installer does
+(`BIOPB_INSTALL_VERSION`, `BIOPB_INSTALL_RC`, else the latest stable), downloads
+that release's pinned `install.sh` asset and runs it with the caller's arguments
+and environment. It carries no release logic, so it does not change per release
+and never meets a release it cannot install; `INSTALL_SCHEMA` now only guards a
+raw or checked-out `install.sh`. It does not verify the asset: `SHA256SUMS` does
+not cover the install scripts, which are stamped after it is written.
+
 `install.ps1` is a thin bootstrapper that loads the install *engine*
 (`biopb-engine.ps1`) and drives it. When it is pinned (or `BIOPB_INSTALL_VERSION`
 is set) it fetches the engine **from that release's GitHub assets** — a versioned

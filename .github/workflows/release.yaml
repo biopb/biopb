@@ -464,9 +464,13 @@ jobs:
           set -euo pipefail
           # Stage exactly the three served scripts, then mirror with --delete so
           # the reserved /install/ subtree holds only these (and drops any file
-          # renamed/removed upstream) -- mirrors api-docs.yaml.
+          # renamed/removed upstream) -- mirrors api-docs.yaml. biopb.org's
+          # install.sh is the release-independent bootstrap, which fetches the
+          # pinned install.sh attached to the release it picks.
           mkdir -p _install_publish
-          cp install/install.sh install/install.ps1 install/biopb-engine.ps1 _install_publish/
+          cp install/bootstrap.sh _install_publish/install.sh
+          cp install/install.ps1 install/biopb-engine.ps1 _install_publish/
+          bash -n _install_publish/install.sh
 
           mkdir -p ~/.ssh
           echo "${{ secrets.BIOPB_ORG_SSH_KEY }}" > ~/.ssh/id_ed25519
