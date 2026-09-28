@@ -4,7 +4,10 @@ Walks ONLY the ``biopb.image`` and ``biopb.tensor`` packages and emits one
 mkdocstrings page per public module. Skipped:
 
 - generated protobuf stubs (``*_pb2`` / ``*_pb2_grpc``),
-- private modules (leading underscore, e.g. ``_version``, ``__main__``).
+- private modules (leading underscore, e.g. ``_version``, ``__main__``),
+- ``cli.py`` modules -- a Typer app documents far better as a rendered
+  command tree (see ``docs/cli.md``, mkdocs-typer2) than as mkdocstrings'
+  dump of the module's functions and decorators.
 
 Private *members* within each module are filtered by the mkdocstrings
 ``filters: ["!^_"]`` option in mkdocs.yml. Nothing this script writes is checked
@@ -38,6 +41,9 @@ for pkg in PACKAGES:
             doc_path = Path(*parts, "index.md")
         elif parts[-1].startswith("_"):
             # private module, __main__, _version, etc.
+            continue
+        elif parts[-1] == "cli":
+            # rendered separately as a command tree; see docs/cli.md
             continue
         elif _is_proto(parts):
             continue

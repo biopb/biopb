@@ -47,17 +47,21 @@ dependencies = [
   # SDK API-reference toolchain (mkdocstrings). Builds the static HTML that the
   # release publishes to biopb.org/docs/api/python/ — see docs-api/ and
   # .github/workflows/api-docs.yaml. For local testing:
-  #   uv sync --extra doc
+  #   uv sync --extra doc --extra tensor
   #   uv run mkdocs build -f docs-api/mkdocs.yml     # output: docs-api/site/
   #   uv run mkdocs serve  -f docs-api/mkdocs.yml    # live preview
   # mkdocs-material is pinned to the same version biopb-site uses so the
   # rendered theme matches the rest of the docs site. mkdocstrings analyzes the
-  # source statically (griffe), so no heavy runtime deps are needed to build.
+  # source statically (griffe), so it alone needs no heavy runtime deps to
+  # build -- but mkdocs-typer2 (the CLI reference, see docs/cli.md) walks the
+  # Typer app's actual command tree, which imports biopb.tensor.cli and so
+  # needs the `tensor` extra (pyarrow/dask/zarr) at doc-build time too.
   doc = [
     "mkdocs-material==9.5.49",
     "mkdocstrings[python]>=0.27,<0.30",
     "mkdocs-gen-files>=0.5",
     "mkdocs-literate-nav>=0.6",
+    "mkdocs-typer2[mkdocs]>=0.4,<0.5",
     # mkdocstrings uses black, when present, to pretty-print separated
     # signatures; without it signatures still render, just unformatted.
     "black",

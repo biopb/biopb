@@ -6,7 +6,7 @@
 # deploy excludes from its --delete (see biopb-site/.github/workflows/deploy.yml).
 #
 # Build locally (from repo root):
-#   uv sync --extra doc
+#   uv sync --extra doc --extra tensor
 #   uv run mkdocs build -f docs-api/mkdocs.yml      # -> docs-api/site/
 #   uv run mkdocs serve  -f docs-api/mkdocs.yml     # live preview
 
@@ -52,6 +52,12 @@ plugins:
         - gen_ref_pages.py
   - literate-nav:
       nav_file: SUMMARY.md
+  # Renders the biopb CLI's own command tree (see docs/cli.md) by importing
+  # the Typer app and walking it -- unlike mkdocstrings, this needs the
+  # `tensor` extra installed (biopb.tensor.cli imports pyarrow/dask).
+  - mkdocs-typer2:
+      pretty: true
+      engine: native
   - mkdocstrings:
       default_handler: python
       handlers:
@@ -77,4 +83,5 @@ plugins:
 
 nav:
   - Overview: index.md
+  - CLI reference: cli.md
   - API reference: reference/

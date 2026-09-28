@@ -11,6 +11,9 @@ the public SDK surface:
 - **[`biopb.tensor`](reference/biopb/tensor/index.md)** — the Arrow Flight
   tensor framework: `TensorFlightClient` for lazy, larger-than-memory tensor
   access, plus the associated descriptor / ticket messages.
+- **[`biopb` CLI](cli.md)** — the `biopb` console script's full command tree
+  (`biopb tensor ...`, `biopb image ...`, and the rest), rendered from the
+  actual Typer app rather than its source.
 
 !!! note "Protocol definitions"
     The `.proto` definitions themselves (field-level documentation for every
