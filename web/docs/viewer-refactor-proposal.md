@@ -1,6 +1,6 @@
 # Image viewer — refactor proposal
 
-Status: proposal (2026-09-28). Current structure: [viewer-architecture.md](viewer-architecture.md).
+Status: proposal (2026-09-28); step 0 done. Current structure: [viewer-architecture.md](viewer-architecture.md).
 
 ## Why
 
@@ -32,7 +32,7 @@ run of bad luck.
 - **R5: god objects.** One 1870-line store spans six lifetimes. One
   1200-line component does roughly eight jobs.
 
-### Defects on `dev` today (reproduced with store-level tests)
+### Defects found by the audit (fixed by step 0)
 
 All three come from `tile_info` returning `src@tok/field` (#780) for a
 request of `src/field`. That happens on an **ordinary click of a specific
@@ -209,19 +209,18 @@ Steps 1–2 are the keystone. 3–5 are independent afterwards.
 
 | Step | Scope | Fixes / deletes |
 |------|-------|-----------------|
-| 0 (optional stopgap) | Stamp every `…For` from the store's `currentArrayId` inside the action, never from a viewer prop. Compare with the token stripped on both sides. Migrate `visibleSetsFor` when resolution lands. About 40 lines, no remount changes. | Defects 1–2 |
-| 1 | `ViewTarget` + `openTensor` + epoch; viewers take `info`; single entry path | Defect 3; `currentArrayId`, `tileInfoFor`, #1163's machinery; the second reset list |
+| 0 (**done**) | `viewKey` (token-free `currentArrayId`) stamps and scopes every `…For` field; contrast setters take the key from the store; `adoptResolution` moves bare-keyed state to the resolved field. No remount changes. | Defects 1–3 (3 only for the token; a bare source still fetches its listing twice) |
+| 1 | `ViewTarget` + `openTensor` + epoch; viewers take `info`; single entry path | the bare-source double fetch; `currentArrayId`, `viewKey`, `adoptResolution`, `tileInfoFor`, #1163's machinery; the second reset list |
 | 2 | `views: Record<TensorKey, TensorView>` + `useView` | 10 `…For` fields, `stillPending` checks, most of the lint list |
 | 3 | Derived contrast selectors + `runtime` slice; split `SliceState` | `contrastTrack`, `appliedLimits`, content-compare setters, JSON selection keys |
 | 4 | TileViewer hooks, shared hooks with VolumeViewer, `usePlayback`; one debounce per slider | TileViewer to ~400 lines; the debounce bug |
 | 5 | Store slice files | `store.ts` to about 6 × 300 lines |
 
-**Recommendation on #1163:** don't merge its viewer-key machinery. Step 1
-supersedes it, and `advanceViewerKey`/`sameStableAddress` would be deleted
-again right away. Its tests describe the right behaviour (race guard, pin
-preservation, no remount on resolution), so keep them as the acceptance tests
-for step 1. If the float-contrast and `rs=` defects need a fix before step 1
-lands, step 0 is the smaller patch.
+**On #1163:** step 0 covers its store-level fix, and step 1 supersedes its
+viewer-key machinery (`advanceViewerKey`/`sameStableAddress`), which would
+otherwise be deleted again right away. Its tests describe the right behaviour
+(race guard, pin preservation, no remount on resolution), so keep them as the
+acceptance tests for step 1.
 
 ## Decisions
 

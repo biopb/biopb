@@ -46,7 +46,7 @@ HomePage                          useViewerUrlSync()  (URL ⇄ store)
 The viewer and the panel get **different ids for the same view**. The viewer
 gets `requestedArrayId ?? activeTensorId`, which may be pinned. The panel gets
 `activeTensorId`, which never is. And neither id is the one most selectors
-compare against (`currentArrayId`, below).
+compare against (`viewKey`, below).
 
 ## Store state, by lifetime
 
@@ -62,7 +62,7 @@ source of bugs (see *Scoping mechanisms*).
 | Per source | `channelNames` (keyed by source_id), `MetaPanel` state | map key; component `key` |
 | Selection | `activeSourceId`, `activeTensorId`, `requestedArrayId` | — |
 | Per tensor, **reset** on change | `slice.t/z/c/axes`, `slice.fixedLimits`, `render3d`, `camera2d`, `camera3d`, `playAxis`, `planeReady`, `appliedLimits`, `planeLimits`, `tileInfo` | written out in `selectSource`; `applyViewerState` overwrites a *different* subset |
-| Per tensor, **guarded** at read | `tileInfo`/`tileInfoFor`; `rois`, `roiSets`, `roiScopes`, `roisPending`, `roisError` (`roisFor`, `roisPendingFor`, `roisErrorFor`); `visibleSets`/`visibleSetsFor`; `draft`/`draftFor`; `broadcastAxes`/`broadcastAxesFor`; `observedLimits`/`observedLimitsFor`; `contrastTrack`/`contrastTrackFor` | `select*` compares the `…For` field to an identity function |
+| Per tensor, **guarded** at read | `tileInfo`/`tileInfoFor`; `rois`, `roiSets`, `roiScopes`, `roisPending`, `roisError` (`roisFor`, `roisPendingFor`, `roisErrorFor`); `visibleSets`/`visibleSetsFor`; `draft`/`draftFor`; `broadcastAxes`/`broadcastAxesFor`; `observedLimits`/`observedLimitsFor`; `contrastTrack`/`contrastTrackFor` | `select*` compares the `…For` field to `viewKey` (`tileInfo`: to the requested id) |
 | Per tensor, scoped by id content | `labelOverlay` (the set's id names its image) | `selectLabelOverlay` |
 | Per plane | `draftSliceKey`, and in `TileViewer` local state: `loadedKey`, `samples.key`, `labelLoadedKey` | key comparison |
 | Per mount (viewer-local) | pixel sources, samples, hover, draft cursor, tile error | `ViewerPane` remount key |
@@ -75,15 +75,16 @@ in TileViewer, `requestKey` in VolumeViewer, `sliceKey` for drafts).
 
 ## Tensor identity
 
-One view has up to five spellings, and different code compares different ones:
+One view has up to six spellings, and different code compares different ones:
 
 | Spelling | Example (versioned source, click on `src/field`) | Who uses it |
 |----------|--------------------------------|-------------|
 | `activeTensorId` | `src/field`, or bare `src` on a source click | SliceControls `sliderGrid`, MetaPanel, URL fallback |
-| `requestedArrayId` | `null`, or a link's `src@pin/field` / `src` | ViewerPane prop (via `??`), `visibleSetsFor` at link landing |
-| viewer `arrayId` prop, `= tileInfoFor` | `src/field` | tile_info fetch, `observedLimitsFor`, `contrastTrackFor`, `selectTileInfo` |
+| `requestedArrayId` | `null`, or a link's `src@pin/field` / `src` | ViewerPane prop (via `??`) |
+| viewer `arrayId` prop, `= tileInfoFor` | `src/field` | tile_info fetch, `selectTileInfo` |
 | `tileInfo.array_id` | `src@tok/field`: resolved field **plus the server's current version token**, always, for any versioned source (`_versioned_array_id`, #780) | URL write-back |
-| `currentArrayId(s)` | `tileInfo.array_id` once `tileInfoFor` matches the request, else the request, so it **changes spelling mid-view** | ROI fetch/write keys, draft, broadcast, visible sets, label overlay (token-stripped), tree highlight (token-stripped) |
+| `currentArrayId(s)` | `tileInfo.array_id` once `tileInfoFor` matches the request, else the request, so it **changes spelling mid-view** | address of ROI server calls; `loadRois`'s exact-match guard |
+| `viewKey(s)` | `currentArrayId` without its token: `src/field` before and after the grid lands. Bare `src` until it resolves, then `src/field` | every `…For` field and its selector, label overlay, tree highlight |
 
 Resolution happens **inside the viewer**. The store cannot say which tensor
 is on screen until a React component has mounted, fetched `tile_info`, and
@@ -97,13 +98,13 @@ sequenceDiagram
   participant H as tensor server
   T->>S: selectSource(src, src/field)  |  applyViewerState(id=…)
   S-->>V: re-render, mount (key = tensorId)
-  V->>S: loadRois(currentArrayId = "src/field")      [fetch #1]
+  V->>S: loadRois(currentArrayId = "src/field")      [fetch, keyed viewKey "src/field"]
   V->>H: GET tile_info/src/field
   H-->>V: array_id "src@tok/field"
-  V->>S: setTileInfo(info, "src/field")  → currentArrayId becomes "src@tok/field"
-  V->>S: loadRois("src@tok/field")                   [fetch #2; #1 discarded]
-  V->>S: noteObservedLimits(…, "src/field"), setContrastTrack(…, "src/field")
-  Note over S: selectObservedLimits / selectContrastTrack compare to<br/>"src@tok/field" → null
+  V->>S: setTileInfo(info, "src/field")  → currentArrayId "src@tok/field", viewKey unchanged
+  V->>S: loadRois("src@tok/field")                   [same key, already pending: no fetch]
+  V->>S: noteObservedLimits(…), setContrastTrack(…)  [store stamps viewKey]
+  Note over S: for a bare "src", setTileInfo moves state keyed "src"<br/>to "src/field" (adoptResolution)
 ```
 
 ## Scoping mechanisms
@@ -113,13 +114,14 @@ sequenceDiagram
 1. **Explicit reset** in `selectSource`, listed field by field.
 2. **Explicit overwrite** in `applyViewerState`, which carries a different list.
    Today it runs only once, at hydration, so the difference is latent.
-3. **Read guard**: a `…For` companion field plus a selector. The field is
-   written with *whatever id the writer had on hand*, and selectors compare
-   against **two different identity functions**: `selectTileInfo` against
-   `requestedTensorId`, everything else against `currentArrayId`. The
-   `SELECTOR_ONLY_FIELDS` lint rule forces reads through the selectors. It
-   cannot check that writer and selector agree on which id to use, and that
-   disagreement is the bug class of #1156/#1163.
+3. **Read guard**: a `…For` companion field plus a selector. The store's
+   actions stamp every field with `viewKey` and every selector compares
+   against it, except `selectTileInfo`, which pairs with the requested id.
+   `adoptResolution` (in `setTileInfo`) moves fields keyed to a bare
+   `source_id` onto the field it resolves to, because the key changes at that
+   moment. The `SELECTOR_ONLY_FIELDS` lint rule forces reads through the
+   selectors, but nothing checks that a new writer uses `viewKey`. Writers
+   stamping whatever id they had on hand is the bug class of #1156/#1163.
 4. **Id content**: `labelOverlay`.
 5. **Remount**: `ViewerPane`'s key drops all viewer-local state. #1163 had to
    add `advanceViewerKey` because the key changes when the id changes
@@ -135,7 +137,7 @@ commit behind the viewer. Setters compare content so the effect doesn't loop.
 
 | Published by | Field | Read by |
 |--------------|-------|---------|
-| Tile/VolumeViewer | `tileInfo` (+`For`) via `setTileInfo`, which also clamps `slice` | SliceControls (slider bounds, 3-D offer, dtype), RoiPanel, MetaPanel, URL sync, `currentArrayId` → every ROI selector |
+| Tile/VolumeViewer | `tileInfo` (+`For`) via `setTileInfo`, which also clamps `slice` | SliceControls (slider bounds, 3-D offer, dtype), RoiPanel, MetaPanel, URL sync, `viewKey` → every scoped selector |
 | both, via `useContrastWindow` | `planeLimits`, `observedLimits` (+`For`), `contrastTrack` (+`For`), `appliedLimits` | SliceControls (fixed-window bar, Min/Max, seeding Fixed) |
 | both | `planeReady` | play driver in SliceControls (polls `getState()`) |
 | VivStage / VolumeStage | `camera2d` / `camera3d` (150 ms trailing) | URL sync; seeds the next mount |
@@ -144,8 +146,9 @@ commit behind the viewer. Setters compare content so the effect doesn't loop.
 
 The contrast track is a derived value: a function of dtype, observed levels,
 plane limits and the fixed window. It is stored anyway, so that panel and
-shader agree (#955). That makes it identity-scoped state, and the scoping
-went wrong (above).
+shader agree (#955). That makes it identity-scoped state, which is why its
+setter takes the key from the store rather than from the viewer's `arrayId`
+prop: the prop is the address asked for, not the tensor it resolved to.
 
 ## Inside TileViewer
 
