@@ -293,8 +293,9 @@ def resolve_data_plane_token(
     The credential file is what closes the gap for a *local plane behind a token*
     (biopb/biopb#470): the control writes the resolved token to an owner-only file
     in the user's state dir, so a client that never inherited the control's
-    environment can still authenticate. The core CLI read only the env var until
-    #615, which is why a token-gated local plane reported itself as unreachable.
+    environment can still authenticate. The core CLI read only the env var
+    until #615, which is why a token-gated local plane reported itself as
+    unreachable.
 
     ``allow_credential_file=False`` drops that last step, for a caller dialing an
     endpoint the control did not name: the file holds *this machine's* credential
