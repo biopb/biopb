@@ -6,6 +6,7 @@ import time
 from concurrent import futures
 
 import biopb.image as proto
+import dask.array as da
 import grpc
 import numpy as np
 import pyarrow as pa
@@ -56,6 +57,7 @@ class _Servicer(proto.OpsServicer):
         self.token = token
         self.cancelled = threading.Event()
         self.seen = {}
+        self.labels = None
 
     def Call(self, request, context):  # noqa: N802 - gRPC method name
         if self.token and (
@@ -66,10 +68,13 @@ class _Servicer(proto.OpsServicer):
         args = request.args
         self.seen = {k: v.WhichOneof("kind") for k, v in args.items()}
         op = request.op
-        if op == "double" and args["image"].WhichOneof("kind") == "lazy":
+        if op in ("double", "lazy_double") and (
+            args["image"].WhichOneof("kind") == "lazy"
+        ):
             yield proto.Event(outputs={"result": _eager(np.ones((2, 2), np.uint8))})
-        elif op == "double":
+        elif op in ("double", "lazy_double"):
             image = args["image"].eager
+            self.labels = list(image.dim_labels)
             arr = deserialize_image_data(proto.ImageData(eager_data=image))
             yield proto.Event(
                 outputs={"result": _eager(arr * 2, list(image.dim_labels))}
@@ -157,6 +162,7 @@ def _info(name, tensors=("image",), input=None, streaming=False, **kwargs):  # n
 
 OPS = [
     _info("double"),
+    _info("lazy_double", input="LAZY"),
     _info("stats", level=0.5),
     _info("track", tensors=()),
     _info("items", tensors=()),
@@ -176,9 +182,18 @@ class _Client:
 
     def __init__(self):
         self.uploads = []
+        self.arrays = {}
+        self.labels = {}
 
     def get_tensor(self, array_id, output="da"):
-        return _reference(array_id, PLANE).lazy
+        if output == "pb":
+            return _reference(array_id, PLANE).lazy
+        return self.arrays.get(array_id, da.ones((2, 2), np.uint8, chunks=2))
+
+    def get_descriptor(self, array_id, **_):
+        return TensorDescriptor(
+            array_id=array_id, dim_labels=self.labels.get(array_id, ["Y", "X"])
+        )
 
     def setup_array_upload(self, array_id, template):
         return TensorDescriptor(array_id=array_id)
@@ -311,16 +326,50 @@ def test_positional_needs_a_single_tensor_argument(url_ops):
         url_ops.track(np.zeros((2, 2)))
 
 
-def test_an_array_id_in_uploads_the_result(url_ops, client, serve):
+def _served(serve, client):
     servicer = _Servicer()
     url, _ = serve(servicer)
     ops = _ops(
         [{"name": "s", "kind": "url", "url": url, "state": "up", "ops": OPS}], client
     )
-    result = ops.double("src/@fields/x")
+    return ops, servicer
+
+
+def test_an_array_id_to_a_lazy_op_goes_as_a_reference(client, serve):
+    ops, servicer = _served(serve, client)
+    result = ops.lazy_double("src/@fields/x")
     assert servicer.seen == {"image": "lazy"}
-    assert result.startswith("cache://scratch/@fields/double-")
+    assert result.startswith("cache://scratch/@fields/lazy_double-")
     assert client.uploads[0][0] == result
+
+
+def test_an_array_id_to_an_eager_op_is_read_here_and_sent_inline(client, serve):
+    client.arrays["src/x"] = da.arange(6, dtype=np.uint8, chunks=3).reshape(2, 3)
+    client.labels["src/x"] = ["Y", "X"]
+    ops, servicer = _served(serve, client)
+    result = ops.double("src/x")
+    assert servicer.seen == {"image": "eager"}
+    assert result.startswith("cache://scratch/@fields/double-")
+    np.testing.assert_array_equal(
+        client.uploads[0][1], np.arange(6, dtype=np.uint8).reshape(2, 3) * 2
+    )
+
+
+def test_an_inline_reference_keeps_the_tensors_own_axis_labels(client, serve):
+    client.arrays["src/z"] = da.ones((2, 3, 4), np.uint8, chunks=2)
+    client.labels["src/z"] = ["Z", "Y", "X"]
+    ops, servicer = _served(serve, client)
+    ops.double("src/z")
+    assert servicer.labels == ["Z", "Y", "X"]
+
+
+def test_an_eager_reference_over_the_cap_is_refused_before_any_read(client, serve):
+    big = da.zeros((2**16, 2**16), dtype=np.uint8, chunks=(2**10, 2**10))
+    client.arrays["src/big"] = big
+    ops, servicer = _served(serve, client)
+    with pytest.raises(ValueError, match=f"{big.nbytes} bytes.*input='eager'"):
+        ops.double("src/big")
+    assert servicer.seen == {}
 
 
 def test_a_reference_on_the_kernels_plane_keeps_its_id(url_ops, client):

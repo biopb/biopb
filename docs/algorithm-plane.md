@@ -106,8 +106,11 @@ if __name__ == "__main__":
   input's other axes back on a result of the same rank, so the output carries
   the input's `dim_labels`.
 - **`input` says how pixels arrive**, a resource decision the file declares:
-  - `"eager"` (default): numpy. The other axes must be singleton, and a lazy
-    input over `EAGER_INPUT_CAP` (2 GiB) is refused rather than pulled whole.
+  - `"eager"` (default): numpy. The other axes must be singleton. The
+    kernel reads an `array_id` itself and sends it inline, so the server needs
+    no route to the plane (nor `[lazy]`); one over `EAGER_INPUT_CAP` (2 GiB)
+    is refused rather than pulled whole. A server still accepts a reference
+    from another client and applies the same cap.
   - `"lazy"`: dask; an inline input arrives as a one-chunk dask array. The
     function may return dask.
   - `"blocks"`: the function is mapped over the tensor arguments with
