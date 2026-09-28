@@ -480,3 +480,103 @@ class TestContentVersion:
             # Still recoverable from the re-keyed ids: the epoch moved, the
             # content claim did not.
             assert self._minted(client, array_id) == {published[array_id]}
+
+
+class TestWireCompression:
+    """A label set crosses a real network as zstd-compressed Arrow IPC
+    (biopb/biopb#1111); a loopback client, and any pixel tensor, stays raw."""
+
+    @staticmethod
+    def _spy_streams(monkeypatch):
+        from biopb.tensor import _pool
+        from biopb_tensor_server.serving import server as srv
+
+        # A loopback client reads through the shared cache file, which never
+        # touches DoGet; a remote one has no such path.
+        monkeypatch.setattr(_pool, "_should_try_cachefile", lambda location: False)
+        seen = []
+        real = flight.RecordBatchStream
+
+        def spy(data, options=None):
+            seen.append(getattr(options, "compression", None))
+            return real(data, options=options)
+
+        monkeypatch.setattr(srv.flight, "RecordBatchStream", spy)
+        return srv, seen
+
+    def test_a_remote_peer_reads_a_label_set_compressed(
+        self, served, client, monkeypatch
+    ):
+        labels = _labels()
+        client.upload_array(_create(client, "oz1/@labels/nuclei"), labels)
+        srv, seen = self._spy_streams(monkeypatch)
+        monkeypatch.setattr(srv, "_peer_is_remote", lambda peer: True)
+
+        read = client.get_tensor("oz1/@labels/nuclei").compute()
+
+        np.testing.assert_array_equal(read, labels)
+        assert seen and set(seen) == {"zstd"}
+
+    def test_a_remote_peer_reads_pixels_raw(self, served, client, monkeypatch):
+        srv, seen = self._spy_streams(monkeypatch)
+        monkeypatch.setattr(srv, "_peer_is_remote", lambda peer: True)
+
+        client.get_tensor("oz1").compute()
+
+        assert seen and set(seen) == {None}
+
+    def test_a_loopback_peer_reads_a_label_set_raw(self, served, client, monkeypatch):
+        client.upload_array(_create(client, "oz1/@labels/nuclei"), _labels())
+        _, seen = self._spy_streams(monkeypatch)
+
+        client.get_tensor("oz1/@labels/nuclei").compute()
+
+        assert seen and set(seen) == {None}
+
+    def test_a_label_upload_to_a_remote_server_is_written_compressed(
+        self, served, client, monkeypatch
+    ):
+        from biopb.tensor import _pool, _upload
+
+        labels = _labels()
+        monkeypatch.setattr(_upload, "wants_wire_compression", lambda *_: True)
+        used = []
+        real_put = _upload._put_chunk
+
+        def spy(client_, call_options, *args):
+            used.append(call_options)
+            return real_put(client_, call_options, *args)
+
+        monkeypatch.setattr(_upload, "_put_chunk", spy)
+
+        desc = _create(client, "oz1/@labels/nuclei")
+        assert client.upload_array(desc, labels)["state"] == "READY"
+
+        np.testing.assert_array_equal(
+            client.get_tensor("oz1/@labels/nuclei").compute(), labels
+        )
+        loc, token = client._state.location, client._state.token
+        assert used and all(
+            o is _pool._get_shared_call_options(loc, token, True) for o in used
+        )
+
+
+@pytest.mark.parametrize(
+    ("peer", "remote"),
+    [
+        ("ipv4:10.1.2.3:51000", True),
+        ("ipv6:[2001:db8::1]:51000", True),
+        ("ipv6:%5B2001%3Adb8%3A%3A1%5D:51000", True),
+        ("ipv4:127.0.0.1:51000", False),
+        ("ipv6:[::1]:51000", False),
+        ("ipv6:[::ffff:127.0.0.1]:51000", False),
+        ("ipv6:[::ffff:10.1.2.3]:51000", True),
+        ("unix:/tmp/flight.sock", False),
+        ("", False),
+        ("ipv4:not-an-address:1", False),
+    ],
+)
+def test_peer_is_remote(peer, remote):
+    from biopb_tensor_server.serving.server import _peer_is_remote
+
+    assert _peer_is_remote(peer) is remote

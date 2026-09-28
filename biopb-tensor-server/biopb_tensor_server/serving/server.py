@@ -21,6 +21,7 @@ resolve / warm, runtime source add / remove, and annotation pruning.
 """
 
 import hmac
+import ipaddress
 import json
 import logging
 import os
@@ -30,6 +31,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+from urllib.parse import unquote
 
 import pyarrow as pa
 import pyarrow.flight as flight
@@ -40,6 +42,8 @@ from biopb.image.annotation_pb2 import (
     RoiPutResult,
     RoiUnseen,
 )
+from biopb.tensor._labels import split_label_array_id
+from biopb.tensor._pool import WIRE_WRITE_OPTIONS
 from biopb.tensor._roi_rows import (
     rois_to_table,
     table_to_roi_ids,
@@ -134,6 +138,22 @@ logger = logging.getLogger(__name__)
 READ_PIXELS = "read:pixels"
 READ_ANNOTATIONS = "read:annotations"
 _CAPABILITY_ACTIONS = frozenset({READ_PIXELS, READ_ANNOTATIONS})
+
+
+def _peer_is_remote(peer: str) -> bool:
+    """Whether a gRPC peer string (``ipv4:1.2.3.4:5``, ``ipv6:[::1]:5``) names a
+    client on another machine. A unix socket, or anything not read as a TCP
+    address, counts as local: compression only pays over a real network."""
+    scheme, _, rest = unquote(peer).partition(":")
+    if scheme not in ("ipv4", "ipv6"):
+        return False
+    try:
+        addr = ipaddress.ip_address(rest.rsplit(":", 1)[0].strip("[]"))
+    except ValueError:
+        return False
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped:
+        addr = addr.ipv4_mapped
+    return not addr.is_loopback
 
 
 def _ensure_tls_scheme(location: str) -> str:
@@ -1974,11 +1994,10 @@ class TensorFlightServer(flight.FlightServerBase):
         with self.activity.serving_request():
             logger.debug(f"do_get: chunk_id={tensor_ticket.chunk_id[:16]}...")
 
-            self._authorize_read(
-                context, routing_array_id(tensor_ticket.chunk_id), READ_PIXELS
-            )
+            array_id = routing_array_id(tensor_ticket.chunk_id)
+            self._authorize_read(context, array_id, READ_PIXELS)
 
-            adapter = self._get_adapter_for_chunk(tensor_ticket.chunk_id)
+            adapter = self._get_adapter_for_chunk(tensor_ticket.chunk_id, array_id)
 
             # Get cache manager singleton (if initialized)
             cache_manager = CacheManager.get_instance()
@@ -2008,7 +2027,14 @@ class TensorFlightServer(flight.FlightServerBase):
             reader = pa.RecordBatchReader.from_batches(
                 record_batch.schema, [record_batch]
             )
-            return flight.RecordBatchStream(reader)
+            # A label set over a real network compresses 25-50x (biopb#1111);
+            # anything else goes raw, keeping the zero-copy path.
+            compressed = split_label_array_id(array_id) is not None and _peer_is_remote(
+                context.peer()
+            )
+            return flight.RecordBatchStream(
+                reader, options=WIRE_WRITE_OPTIONS if compressed else None
+            )
 
     def _roi_read_stream(
         self, context: flight.ServerCallContext, req
