@@ -635,7 +635,7 @@ class _FakeControlAlgorithms:
     There is no control process in a bench session (`live_session`'s own
     docstring: "the control plane is bypassed entirely"), so
     ``build_ops_from_config`` -- which the *child* calls, over the wire, from
-    the real ``biopb.control`` client -- would otherwise see an empty
+    the real ``biopb`` control client -- would otherwise see an empty
     registry regardless of what a case declares. This starts the real
     ``Ops`` server the bundled algorithm file would run under ``uv``, and
     answers the one HTTP call the client makes as if a control were up, so
@@ -693,15 +693,15 @@ class _FakeControlAlgorithms:
         return server
 
     def publish(self) -> None:
-        """Write the control runtime record so ``biopb.control.algorithms()``
+        """Write the control runtime record so ``biopb.algorithms()``
         finds this fake control the same way it would a real one."""
-        from biopb.control._endpoints import write_runtime_record
+        from biopb._control._endpoints import write_runtime_record
 
         host, port = self._http.server_address
         write_runtime_record(host, port, os.getpid())
 
     def close(self) -> None:
-        from biopb.control._endpoints import remove_runtime_record
+        from biopb._control._endpoints import remove_runtime_record
 
         remove_runtime_record()
         self._http.shutdown()

@@ -149,8 +149,8 @@ the agent's next `client`. It caches nothing; the catalog the tree is drawn from
 is the widget's own (biopb-napari-widget's `SourceList`), re-listed when the server's
 `source_count` moves.
 
-Where the plane is comes from `biopb.control`, the SDK's client of the control
-(#628): one `ensure_data_plane` call brings the plane up if it is down and returns
+Where the plane is comes from `biopb`'s control client (backed by the private
+`biopb._control`) (#628): one `ensure_data_plane` call brings the plane up if it is down and returns
 its endpoint and credential. `$BIOPB_TENSOR_URL` is the one escape hatch, for a
 data server the control does not supervise; it bypasses the control completely,
 and the control's credential is **never** sent to it — authenticate it with

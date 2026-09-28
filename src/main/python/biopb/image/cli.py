@@ -255,7 +255,7 @@ def servers(
         biopb image servers
         biopb image servers --json --timeout 2
     """
-    from biopb.control import algorithms
+    from biopb import algorithms
 
     rows = algorithms(timeout=timeout + 6)
     if rows is None:

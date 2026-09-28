@@ -466,9 +466,9 @@ def _viewer_base_url() -> str:
     the *user's* browser reaches it by, which nothing in this process can know.
     """
     try:
-        from biopb.control._endpoints import control_base_url
+        from biopb import base_url
 
-        return control_base_url()
+        return base_url()
     except Exception:  # pragma: no cover - core SDK always present in practice
         logger.debug("status: control base url unresolvable", exc_info=True)
         return "http://127.0.0.1:8813"

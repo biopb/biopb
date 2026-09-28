@@ -63,7 +63,7 @@ def stub_statuses(monkeypatch):
             seen["probed"] = timeout
             return list(fallback)
 
-        monkeypatch.setattr("biopb.control.algorithms", control)
+        monkeypatch.setattr("biopb.algorithms", control)
         monkeypatch.setattr("biopb._algorithms.statuses", probe)
         return seen
 

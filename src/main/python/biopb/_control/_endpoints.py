@@ -4,7 +4,8 @@ The control (control plane) exposes a small loopback HTTP control API. Two
 independent processes need to agree on where it listens:
 
 - the control itself (``biopb-control``, a separate workspace package), and
-- its clients (:mod:`biopb.control`), which ask it where the data plane is and
+- its clients (top-level ``biopb`` attributes, backed by this private
+  :mod:`biopb._control` package), which ask it where the data plane is and
   to bring it up.
 
 A client cannot import ``biopb-control``, so the endpoint lives here in the

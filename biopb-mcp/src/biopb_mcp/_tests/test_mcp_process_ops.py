@@ -282,10 +282,10 @@ def test_build_ops_from_config_reads_the_control(monkeypatch):
             "ops": [_info("seg")],
         }
     ]
-    monkeypatch.setattr("biopb.control.algorithms", lambda timeout: rows)
+    monkeypatch.setattr("biopb.algorithms", lambda timeout: rows)
     ops = _process_ops.build_ops_from_config({}, lambda: None)
     assert list(ops) == ["seg"]
-    monkeypatch.setattr("biopb.control.algorithms", lambda timeout: None)
+    monkeypatch.setattr("biopb.algorithms", lambda timeout: None)
     assert len(_process_ops.build_ops_from_config({}, lambda: None)) == 0
 
 
@@ -394,7 +394,7 @@ def test_a_script_entry_is_ensured_and_found_again(serve, monkeypatch):
         ensured.append(name)
         return next(answers)
 
-    monkeypatch.setattr("biopb.control.ensure_algorithm", ensure)
+    monkeypatch.setattr("biopb.ensure_algorithm", ensure)
     ops = _ops([{"name": "seg", "kind": "script", "state": "stopped", "ops": OPS}])
     assert ops.track() == "done"
     assert ensured == ["seg"]
@@ -406,7 +406,7 @@ def test_a_script_entry_is_ensured_and_found_again(serve, monkeypatch):
 
 def test_a_script_entry_that_fails_says_where_to_look(monkeypatch):
     monkeypatch.setattr(
-        "biopb.control.ensure_algorithm",
+        "biopb.ensure_algorithm",
         lambda name, timeout: {"state": "failed", "error": "ImportError: torch"},
     )
     ops = _ops([{"name": "seg", "kind": "script", "state": "stopped", "ops": OPS}])
@@ -426,7 +426,7 @@ def test_refresh_rebinds_and_reports(monkeypatch):
         {"name": "b", "kind": "script", "state": "installing", "ops": []},
         {"name": "c", "kind": "script", "state": "failed", "ops": [], "error": "x"},
     ]
-    monkeypatch.setattr("biopb.control.refresh_algorithms", lambda: rows)
+    monkeypatch.setattr("biopb.refresh_algorithms", lambda: rows)
     ops = _ops(None)
     report = ops.refresh()
     assert list(ops) == ["seg"]
@@ -445,12 +445,10 @@ def test_status_logs_restart(monkeypatch):
             "error": "exited before serving\nTraceback...",
         }
     ]
-    monkeypatch.setattr("biopb.control.algorithms", lambda: rows)
+    monkeypatch.setattr("biopb.algorithms", lambda: rows)
+    monkeypatch.setattr("biopb.algorithm_logs", lambda name, lines: ["l1", "l2"])
     monkeypatch.setattr(
-        "biopb.control.algorithm_logs", lambda name, lines: ["l1", "l2"]
-    )
-    monkeypatch.setattr(
-        "biopb.control.restart_algorithm",
+        "biopb.restart_algorithm",
         lambda name, timeout: {"state": "up", "error": None},
     )
     ops = _ops(None)

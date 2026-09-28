@@ -29,8 +29,8 @@ from urllib.parse import urlparse
 
 from ._endpoints import BASE_DEFAULT_PORT, control_base_url, flight_port_for
 
-ENV_URL = "BIOPB_TENSOR_URL"
-ENV_TOKEN = "BIOPB_TENSOR_TOKEN"
+ENV_TENSOR_URL = "BIOPB_TENSOR_URL"
+ENV_TENSOR_TOKEN = "BIOPB_TENSOR_TOKEN"
 
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
@@ -47,7 +47,7 @@ class LocalTrustError(RuntimeError):
     """
 
 
-def default_url() -> str:
+def default_data_plane_url() -> str:
     """The endpoint a default deployment puts the data plane on (``grpc://…:8815``)."""
     return f"grpc://127.0.0.1:{flight_port_for(BASE_DEFAULT_PORT)}"
 
@@ -61,7 +61,9 @@ def is_local_url(url: str) -> bool:
     return host is None or host in _LOCAL_HOSTS
 
 
-def probe_scheme(host: str, port: int, timeout: float = 0.5) -> Optional[str]:
+def probe_data_plane_scheme(
+    host: str, port: int, timeout: float = 0.5
+) -> Optional[str]:
     """``"grpcs"`` / ``"grpc"`` by asking the listener, or ``None`` if nothing is there.
 
     The scheme is the one thing a directly-launched plane still tells you for
@@ -73,7 +75,7 @@ def probe_scheme(host: str, port: int, timeout: float = 0.5) -> Optional[str]:
 
     Certificate validation is deliberately off: this asks a yes/no question about
     the wire protocol, and the answer decides which scheme to dial. Trust is
-    established afterwards, on the real connection, by :func:`local_fingerprint`
+    established afterwards, on the real connection, by :func:`local_data_plane_fingerprint`
     or TOFU.
     """
     import socket
@@ -96,7 +98,7 @@ def probe_scheme(host: str, port: int, timeout: float = 0.5) -> Optional[str]:
         return None
 
 
-def local_fingerprint(url: str) -> Optional[str]:
+def local_data_plane_fingerprint(url: str) -> Optional[str]:
     """Identity of the certificate a *local* plane serves, as a SHA-256 digest.
 
     A loopback ``grpcs://`` plane is this machine's own, so what it serves is
@@ -204,14 +206,14 @@ def control_grpc_url(timeout: float = 1.0) -> Optional[str]:
 # different for an address the control published than for a guessed default.
 _ORIGINS = {
     "flag": "given on the command line",
-    "env": f"from ${ENV_URL}",
+    "env": f"from ${ENV_TENSOR_URL}",
     "control": "from the control plane",
     "default": "the default endpoint — no control plane answered",
 }
 
 
 @dataclass(frozen=True)
-class Endpoint:
+class DataPlaneEndpoint:
     """A resolved data-plane dial: where, with what credential, on what anchor."""
 
     url: str
@@ -225,13 +227,13 @@ class Endpoint:
         return _ORIGINS.get(self.origin, self.origin)
 
 
-def resolve(
+def resolve_data_plane(
     override: Optional[str] = None,
     token: Optional[str] = None,
     *,
     timeout: float = 1.0,
     probe: bool = True,
-) -> Endpoint:
+) -> DataPlaneEndpoint:
     """Resolve the data-plane endpoint: override -> env -> control -> default.
 
     *override* is an explicit ``--server``-style address and wins over everything;
@@ -247,10 +249,10 @@ def resolve(
     (a caller that only wants to *name* the endpoint, not dial it).
 
     Raises :class:`LocalTrustError` when the resolved plane is local TLS but
-    nothing on this machine says what it serves — see :func:`local_fingerprint`.
+    nothing on this machine says what it serves — see :func:`local_data_plane_fingerprint`.
     """
     url, origin = _resolve_url(override, timeout=timeout, probe=probe)
-    return Endpoint(
+    return DataPlaneEndpoint(
         url=url,
         # The credential file is the control's handoff for the plane IT owns, so
         # it travels only with an endpoint the control named. An address given on
@@ -259,8 +261,10 @@ def resolve(
         # machine's token to that dial would hand a local credential to a host the
         # user never authorized it for. Those endpoints authenticate explicitly or
         # not at all.
-        token=resolve_token(token, allow_credential_file=origin == "control"),
-        tls_fingerprint=local_fingerprint(url),
+        token=resolve_data_plane_token(
+            token, allow_credential_file=origin == "control"
+        ),
+        tls_fingerprint=local_data_plane_fingerprint(url),
         origin=origin,
     )
 
@@ -270,18 +274,18 @@ def _resolve_url(
 ) -> tuple[str, str]:
     if override:
         return override, "flag"
-    env = os.environ.get(ENV_URL)
+    env = os.environ.get(ENV_TENSOR_URL)
     if env:
         return env, "env"
     published = control_grpc_url(timeout=timeout)
     if published:
         return published, "control"
     port = flight_port_for(BASE_DEFAULT_PORT)
-    scheme = probe_scheme("127.0.0.1", port) if probe else None
+    scheme = probe_data_plane_scheme("127.0.0.1", port) if probe else None
     return f"{scheme or 'grpc'}://127.0.0.1:{port}", "default"
 
 
-def resolve_token(
+def resolve_data_plane_token(
     explicit: Optional[str] = None, *, allow_credential_file: bool = True
 ) -> Optional[str]:
     """The data-plane token: explicit -> ``BIOPB_TENSOR_TOKEN`` -> credential file.
@@ -302,7 +306,7 @@ def resolve_token(
     yields one. A blank value is ``None``, never ``""``: an empty string would be
     sent as an empty ``Bearer`` header rather than omitted.
     """
-    given = (explicit or "").strip() or os.environ.get(ENV_TOKEN, "").strip()
+    given = (explicit or "").strip() or os.environ.get(ENV_TENSOR_TOKEN, "").strip()
     if given:
         return given
     if not allow_credential_file:

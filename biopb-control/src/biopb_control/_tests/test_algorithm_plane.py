@@ -297,7 +297,7 @@ def test_no_uv_is_failed(tmp_path, registry):
 
 
 # --------------------------------------------------------------------------- #
-# Over HTTP: the control's routes and biopb.control's verbs
+# Over HTTP: the control's routes and biopb's verbs (via the private biopb._control)
 # --------------------------------------------------------------------------- #
 
 
@@ -328,10 +328,12 @@ def control(plane, tmp_path, monkeypatch):
         algorithms=plane,
     )
     monkeypatch.setattr(
-        "biopb.control._client.control_base_url", lambda: f"http://127.0.0.1:{port}"
+        "biopb._control._client.control_base_url", lambda: f"http://127.0.0.1:{port}"
     )
     monkeypatch.delenv("BIOPB_TENSOR_TOKEN", raising=False)
-    monkeypatch.setattr("biopb.control._data_plane.resolve_token", lambda: None)
+    monkeypatch.setattr(
+        "biopb._control._data_plane.resolve_data_plane_token", lambda: None
+    )
     for _ in range(50):
         try:
             socket.create_connection(("127.0.0.1", port), timeout=0.2).close()
@@ -343,7 +345,7 @@ def control(plane, tmp_path, monkeypatch):
 
 
 def test_client_verbs_over_http(control, registry):
-    from biopb import control as client
+    import biopb as client
 
     (registry / "seg.py").write_text(_server())
     (registry / "remote.json").write_text(json.dumps({"url": "grpc://127.0.0.1:1"}))
@@ -365,10 +367,10 @@ def test_client_verbs_over_http(control, registry):
 
 
 def test_no_control_is_none(monkeypatch):
-    from biopb import control as client
+    import biopb as client
 
     monkeypatch.setattr(
-        "biopb.control._client.control_base_url", lambda: "http://127.0.0.1:1"
+        "biopb._control._client.control_base_url", lambda: "http://127.0.0.1:1"
     )
     assert client.algorithms(timeout=1) is None
     with pytest.raises(RuntimeError, match="no control"):

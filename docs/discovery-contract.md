@@ -2,7 +2,8 @@
 
 How a client on this machine finds the tensor (data) plane and the token for
 it. It is files, environment variables and two HTTP calls, so any language can
-implement it; `biopb.control` is the Python one, and `biopb.tensor.Connection`
+implement it; `biopb`'s top-level control-client functions (backed by the
+private `biopb._control`) are the Python one, and `biopb.tensor.Connection`
 dials what it returns.
 
 ## State directory

@@ -1,6 +1,6 @@
 """The kernel's ``ops``: the algorithm plane's ops as callables.
 
-The control names the servers (``biopb.control.algorithms()``): script entries
+The control names the servers (``biopb.algorithms()``): script entries
 it runs under uv, and url entries someone else runs. Every op they advertise
 becomes a callable in ``ops``, bound from the op lists the control cached, so
 binding starts nothing; a script entry's server starts on the first call to
@@ -162,7 +162,7 @@ class _Server:
         """The stub and call metadata, starting a script entry if needed."""
         with self._lock:
             if self._url is None:
-                from biopb.control import ensure_algorithm
+                from biopb import ensure_algorithm
 
                 row = ensure_algorithm(self.name, timeout=_ENSURE_TIMEOUT)
                 if row["state"] != "up":
@@ -485,7 +485,7 @@ class Ops:
         """Have the control install and describe new or edited server files,
         rebind, and say what changed. An entry still installing binds on a
         later refresh."""
-        from biopb.control import refresh_algorithms
+        from biopb import refresh_algorithms
 
         before = set(self._ops)
         rows = refresh_algorithms()
@@ -511,7 +511,7 @@ class Ops:
 
     def status(self) -> str:
         """Each server: its kind, state, ops, and the first line of any error."""
-        from biopb.control import algorithms
+        from biopb import algorithms
 
         rows = algorithms()
         if rows is None:
@@ -531,13 +531,13 @@ class Ops:
 
     def logs(self, name: str, lines: int = 50) -> str:
         """The tail of a server file's log: its install and its server's output."""
-        from biopb.control import algorithm_logs
+        from biopb import algorithm_logs
 
         return "\n".join(algorithm_logs(name, lines=lines))
 
     def restart(self, name: str) -> str:
         """Restart a server file's server (picking up an edit), and rebind."""
-        from biopb.control import algorithms, restart_algorithm
+        from biopb import algorithms, restart_algorithm
 
         row = restart_algorithm(name, timeout=_ENSURE_TIMEOUT)
         self.bind(algorithms())
@@ -554,7 +554,7 @@ def build_ops_from_config(config: dict, client_getter: Callable[[], object]) -> 
     connecting tensor client is picked up live. With no control, ``ops`` is
     empty and ``ops.status()`` says why.
     """
-    from biopb.control import algorithms
+    from biopb import algorithms
 
     max_msg_bytes = get_setting(config, "grpc.max_message_size_mb") * 1024 * 1024
     ops = Ops(
