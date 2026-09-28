@@ -30,8 +30,9 @@ same rank.
 
 Both are advertised so a caller can decide how to call the op before trying
 it: ``input`` as ``OpInfo.input``, and whether the function is a generator as
-``OpInfo.streaming``. A process without pyarrow advertises a ``"lazy"`` op as
-``"eager"``: it can decode no ``array_id``, so the op takes inline input only.
+``OpInfo.streaming``. A process that can resolve no ``array_id`` (no
+``biopb-image-base[lazy]``, or no pyarrow) advertises every op as ``"eager"``:
+it takes inline input only.
 
 A single return value is the output ``result``; a tuple gives ``0``, ``1``,
 .... An array is a tensor output, inline or on the sink by size, and anything
@@ -75,8 +76,8 @@ from biopb_image_base.common import (
     _MAX_EAGER_SIZE,
     _MAX_MSG_SIZE,
     TokenValidationInterceptor,
+    _can_decode_references,
     _is_dask_array,
-    _pyarrow_available,
     server_context,
 )
 
@@ -153,11 +154,10 @@ class _OpDef:
         )
 
     def info(self) -> proto.OpInfo:
-        # What this process can serve, not what the op declares: without
-        # pyarrow no array_id decodes, so a lazy op takes inline input only.
-        advertised = self.input
-        if advertised == "lazy" and not _pyarrow_available():
-            advertised = "eager"
+        # What this process can serve, not what the op declares: where no
+        # array_id decodes, every op takes inline input only, which a caller
+        # reads as "eager".
+        advertised = self.input if _can_decode_references() else "eager"
         info = proto.OpInfo(
             name=self.name,
             description=self.description,
@@ -410,7 +410,8 @@ def _decode_pixels(name: str, arg: proto.Arg) -> _Pixels:
             from biopb.tensor.client import TensorFlightClient
         except ImportError as exc:
             raise ValueError(
-                f"{name}: a lazy input needs biopb-image-base[lazy] on the server"
+                f"{name}: a lazy input needs biopb-image-base[lazy] on the server "
+                f"({exc})"
             ) from exc
         array = TensorFlightClient.tensor_from_pb(arg.lazy)
         descriptor = TensorFlightClient.descriptor_from_pb(arg.lazy)

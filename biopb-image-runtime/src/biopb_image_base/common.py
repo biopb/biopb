@@ -3,6 +3,7 @@ and the translation of a handler's exceptions into gRPC status codes."""
 
 from __future__ import annotations
 
+import functools
 import logging
 import sys
 import traceback
@@ -42,6 +43,26 @@ def _pyarrow_available() -> bool:
     import importlib.util
 
     return importlib.util.find_spec("pyarrow") is not None
+
+
+@functools.lru_cache(maxsize=1)
+def _can_decode_references() -> bool:
+    """True if this process can resolve a by-reference (``array_id``) input.
+
+    That takes the whole ``[lazy]`` extra, not pyarrow alone: the tensor client
+    imports dask, ``pyarrow.flight`` and the cachey pool at module level, so a
+    process with pyarrow but not the rest cannot resolve one. The import is only
+    attempted once pyarrow is known to be installed, since a build for a CPU
+    without SSE4.2/AVX removes it rather than leaving it to crash on import.
+    """
+    if not _pyarrow_available():
+        return False
+    try:
+        import biopb.tensor.client  # noqa: F401
+    except Exception:  # noqa: BLE001 - any failure to import means it cannot decode
+        logger.debug("no tensor client; array_id input is not decodable", exc_info=True)
+        return False
+    return True
 
 
 # =============================================================================
