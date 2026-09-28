@@ -818,6 +818,22 @@ class TestResolveExternalLocation:
             cli._resolve_external_location("0.0.0.0", 8815, None, None)
         assert exc.value.exit_code == 2
 
+    @pytest.mark.parametrize(
+        "external_location",
+        [
+            "real-host:8815",  # bare host:port, no scheme
+            "real-host",  # no scheme, no port
+            "http://real-host:8815",  # a scheme, but not one Flight speaks
+        ],
+    )
+    def test_a_schemeless_or_unrecognized_value_is_refused(self, external_location):
+        # A malformed value advertised verbatim via `health` would fail every
+        # downstream client with a confusing parse/connect error instead of
+        # being caught here, at the one place that could name the problem.
+        with pytest.raises(typer.Exit) as exc:
+            cli._resolve_external_location("0.0.0.0", 8815, None, external_location)
+        assert exc.value.exit_code == 2
+
 
 def test_setup_static_only_serves_immediately_with_freshness(tmp_path):
     """A static-only config reaches SERVING and reports a freshness timestamp.

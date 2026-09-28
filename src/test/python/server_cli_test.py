@@ -517,6 +517,28 @@ class TestDashboardCommand:
         assert res.exit_code == 0, res.output
         assert start.call_args.kwargs["remote"] is True
 
+    def test_grpc_external_location_flag_forwarded_to_control_start(self, monkeypatch):
+        # biopb/biopb#1158: `dashboard --remote` needs a way to supply the flag
+        # `control_start` now requires on a public bind, or the data plane can
+        # never come up through this command at all.
+        monkeypatch.setattr(cli, "_port_listening", lambda *_a, **_k: False)
+        start = MagicMock(side_effect=typer.Exit(0))
+        monkeypatch.setattr(cli, "control_start", start)
+        with patch("webbrowser.open", lambda url: True):
+            res = CliRunner().invoke(
+                cli.app,
+                [
+                    "dashboard",
+                    "--remote",
+                    "--grpc-external-location",
+                    "grpc://real-host:8815",
+                ],
+            )
+        assert res.exit_code == 0, res.output
+        assert (
+            start.call_args.kwargs["grpc_external_location"] == "grpc://real-host:8815"
+        )
+
     def test_ui_passes_every_control_start_parameter(self, monkeypatch):
         """`dashboard` calls `control_start` as a plain function, so typer applies
         no defaults: a parameter it forgets arrives as the `OptionInfo` sentinel

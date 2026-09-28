@@ -251,8 +251,16 @@ def _resolve_external_location(
     """
     if external_location:
         lower = external_location.lower()
+        known_schemes = ("grpc://", "grpcs://", "grpc+tcp://", "grpc+tls://")
+        if not lower.startswith(known_schemes):
+            console.print(
+                f"[red]--external-location {external_location!r} has no "
+                "recognized scheme. Use 'grpc://host:port' (or 'grpcs://' for "
+                "TLS).[/red]"
+            )
+            raise typer.Exit(2)
         if tls_cert_chain is not None:
-            for prefix in ("grpc://", "grpcs://", "grpc+tcp://", "grpc+tls://"):
+            for prefix in known_schemes:
                 if lower.startswith(prefix):
                     return "grpc+tls://" + external_location[len(prefix) :]
         elif lower.startswith(("grpcs://", "grpc+tls://")):

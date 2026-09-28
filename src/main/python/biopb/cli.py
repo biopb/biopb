@@ -1668,6 +1668,7 @@ app.add_typer(control_app, name="control")
 def dashboard(
     base_port: int = _OPT_BASE_PORT,
     grpc_bind: Optional[str] = _OPT_GRPC_BIND,
+    grpc_external_location: Optional[str] = _OPT_GRPC_EXTERNAL_LOCATION,
     no_browser: bool = typer.Option(
         False,
         "--no-browser",
@@ -1688,8 +1689,9 @@ def dashboard(
     at the dashboard. Idempotent -- if the control plane is already up it just
     opens the page. This is what the desktop shortcut the installer creates runs.
 
-    ``--base-port`` / ``--grpc-bind`` are forwarded to `biopb control start` and
-    only matter when there is nothing running to open.
+    ``--base-port`` / ``--grpc-bind`` / ``--grpc-external-location`` are
+    forwarded to `biopb control start` and only matter when there is nothing
+    running to open.
     """
     # Prefer a control that is already serving -- it publishes its endpoint, so
     # this finds one that `--base-port` moved. Fall back to where we *would* start
@@ -1726,7 +1728,7 @@ def dashboard(
                 data_plane=True,
                 remote=remote,
                 url_prefix=None,
-                grpc_external_location=None,
+                grpc_external_location=grpc_external_location,
             )
         except typer.Exit as started:
             if started.exit_code:
