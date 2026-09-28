@@ -5,7 +5,7 @@ import dask.array as da
 import numpy as np
 import pytest
 from biopb.image import BinData, ImageData, Pixels
-from biopb.image.utils import (
+from biopb.image._utils import (
     _canonicalize_dtype,
     _deserialize_to_numpy,
     _np_from_pb,
@@ -156,7 +156,7 @@ def test_endianness_conflict_warning():
 
 def test_utils():
     import numpy as np
-    from biopb.image.utils import _deserialize_to_numpy, _serialize_from_numpy
+    from biopb.image._utils import _deserialize_to_numpy, _serialize_from_numpy
 
     img = np.random.random(size=[64, 64, 3])
     img = (img * 65536).astype("<u2")
@@ -460,7 +460,7 @@ def test_deserialize_image_data_no_data_raises():
 
 def test_serialize_from_numpy_to_image_data():
     """Test serialize_from_numpy_to_image_data."""
-    from biopb.image.utils import serialize_from_numpy_to_image_data
+    from biopb.image._utils import serialize_from_numpy_to_image_data
 
     img = np.random.randint(0, 256, size=(32, 32, 3), dtype=np.uint8)
 
@@ -476,7 +476,7 @@ def test_serialize_from_numpy_to_image_data():
 
 def test_serialize_from_numpy_to_image_data_with_dim_labels():
     """Test serialize_from_numpy_to_image_data with dim_labels."""
-    from biopb.image.utils import serialize_from_numpy_to_image_data
+    from biopb.image._utils import serialize_from_numpy_to_image_data
 
     img = np.random.randint(0, 256, size=(32, 32, 3), dtype=np.uint8)
 

@@ -6,8 +6,8 @@ This reference is generated from the source of the released version and covers
 the public SDK surface:
 
 - **[`biopb.image`](reference/biopb/image/index.md)** — the `biopb.image`
-  protocol: the `Ops` gRPC service stubs and messages, ROI types, and the
-  image-data serialization helpers in `biopb.image.utils`.
+  protocol: the `Ops` gRPC service stubs and messages, ROI types, and its
+  image-data serialization helpers.
 - **[`biopb.tensor`](reference/biopb/tensor/index.md)** — the Arrow Flight
   tensor framework: `TensorFlightClient` for lazy, larger-than-memory tensor
   access, plus the associated descriptor / ticket messages.

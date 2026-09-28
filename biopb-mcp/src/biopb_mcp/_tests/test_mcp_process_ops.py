@@ -11,7 +11,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.flight as flight
 import pytest
-from biopb.image.utils import deserialize_image_data, serialize_from_numpy_to_image_data
+from biopb.image import deserialize_image_data, serialize_from_numpy_to_image_data
 from biopb.tensor import SerializedTensor, TensorDescriptor
 from google.protobuf import json_format, struct_pb2
 

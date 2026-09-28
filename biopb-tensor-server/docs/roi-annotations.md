@@ -141,7 +141,7 @@ DuckDB catalog directly:
 | DoPut | `PutCommand.roi_put {array_id, check_rev}` | ROI rows | `RoiPutResult` in the put's app_metadata |
 | DoPut | `PutCommand.roi_delete {array_id, set_name}` | one `roi_id` column, or empty | `RoiDeleteResult` in the put's app_metadata |
 
-One row schema serves both directions (`biopb.image._roi_rows.ROI_ROW_SCHEMA`)
+One row schema serves both directions (`biopb.tensor._roi_rows.ROI_ROW_SCHEMA`)
 -- what the server streams on a read is what it accepts on a write, and
 `TensorFlightClient.put_rois()` / `list_rois()` / `delete_rois()` rebuild the
 result messages from that row stream, which is also what gives

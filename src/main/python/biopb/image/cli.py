@@ -20,7 +20,7 @@ from rich.table import Table
 
 from biopb import _algorithms
 from biopb.image import Arg, Call, ImageData, OpInfo, OpList, OpsStub
-from biopb.image.utils import (
+from biopb.image._utils import (
     deserialize_image_data,
     serialize_from_numpy_to_image_data,
 )

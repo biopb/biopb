@@ -64,7 +64,7 @@ import biopb.image as proto
 import grpc
 import numpy as np
 from biopb._web_auth import host_is_public_bind
-from biopb.image.utils import (
+from biopb.image import (
     deserialize_image_data,
     normalize_array_dims,
     serialize_from_numpy_to_image_data,
@@ -91,7 +91,7 @@ TOKEN_ENV = "BIOPB_ALGORITHM_TOKEN"
 _INPUT_MODES = ("eager", "lazy", "blocks")
 _SPATIAL_AXES = frozenset("ZYX")
 
-# biopb's ndim -> axis-label convention (see biopb.image.utils).
+# biopb's ndim -> axis-label convention (see biopb.image._utils).
 _NDIM_LABELS = {
     2: ["Y", "X"],
     3: ["Y", "X", "C"],

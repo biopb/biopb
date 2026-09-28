@@ -33,7 +33,7 @@ import biopb.image as proto
 import dask.array as da
 import grpc
 import numpy as np
-from biopb.image.utils import (
+from biopb.image import (
     deserialize_image_data,
     serialize_from_numpy_to_image_data,
 )
@@ -44,7 +44,7 @@ from .._config import get_setting
 
 logger = logging.getLogger(__name__)
 
-# biopb's ndim -> axis-label convention (see biopb.image.utils).
+# biopb's ndim -> axis-label convention (see biopb.image._utils).
 _NDIM_LABELS = {
     2: ["Y", "X"],
     3: ["Y", "X", "C"],

@@ -1,5 +1,15 @@
 # No `__version__` here: one distribution, one version, published as
 # `biopb.__version__` (biopb/biopb#998). `biopb.tensor` has never had one.
+# Utility functions for image data serialization/deserialization
+from biopb.image._utils import (
+    deserialize_image_data,
+    get_image_data_dim_labels,
+    get_image_data_shape,
+    mask_to_roi,
+    normalize_array_dims,
+    roi_to_mask,
+    serialize_from_numpy_to_image_data,
+)
 from biopb.image.annotation_pb2 import (
     RoiAnnotation,
     RoiConflict,
@@ -29,13 +39,4 @@ from biopb.image.rpc_ops_pb2_grpc import (
     OpsServicer,
     OpsStub,
     add_OpsServicer_to_server,
-)
-
-# Utility functions for image data serialization/deserialization
-from biopb.image.utils import (
-    deserialize_image_data,
-    get_image_data_dim_labels,
-    get_image_data_shape,
-    normalize_array_dims,
-    serialize_from_numpy_to_image_data,
 )

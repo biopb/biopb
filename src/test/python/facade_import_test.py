@@ -4,7 +4,7 @@ A module doing `from <pkg> import X` at module scope, where `X` is a name that
 `<pkg>/__init__.py` *binds* rather than a submodule of `<pkg>`, loads only while
 `__init__` binds `X` before it imports that module. Swapping two statements in
 `__init__` -- a plausible tidy-up -- turns it into an ImportError at import
-time. `biopb/image/utils.py` sat in that state until #621, and
+time. `biopb/image/_utils.py` sat in that state until #621, and
 `biopb_control/_control.py` until #619.
 
 `from <pkg> import <submodule>` is a different thing and is safe: importing a
@@ -93,7 +93,7 @@ def test_image_utils_loads_against_a_half_initialized_package():
         stub.__spec__ = spec
         sys.modules["biopb.image"] = stub
 
-        importlib.import_module("biopb.image.utils")
+        importlib.import_module("biopb.image._utils")
         print("OK")
     """)
 
@@ -104,7 +104,7 @@ def test_image_utils_loads_against_a_half_initialized_package():
     )
 
     assert proc.returncode == 0, (
-        "biopb.image.utils reads a name off its own package at module scope, so "
+        "biopb.image._utils reads a name off its own package at module scope, so "
         "it only imports after biopb/image/__init__.py has bound that name. "
         "Import from the defining module instead.\n\n" + proc.stderr
     )

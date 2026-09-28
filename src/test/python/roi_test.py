@@ -4,7 +4,7 @@ import pytest
 
 def test_roi_to_mask_2d():
     import biopb.image as proto
-    from biopb.image.utils import roi_to_mask
+    from biopb.image import roi_to_mask
 
     template = np.zeros([8, 8], dtype="uint8")
 
@@ -49,7 +49,7 @@ def test_roi_to_mask_2d():
 
 
 def test_mask_to_roi_2d():
-    from biopb.image.utils import mask_to_roi, roi_to_mask
+    from biopb.image import mask_to_roi, roi_to_mask
 
     mask = np.array(
         [
@@ -85,7 +85,7 @@ def test_mask_to_roi_2d():
 def test_roi_to_mask_3d_point():
     """Test 3D ROI to mask conversion with point."""
     import biopb.image as proto
-    from biopb.image.utils import roi_to_mask
+    from biopb.image import roi_to_mask
 
     template = np.zeros([4, 8, 8], dtype="uint8")  # Z, Y, X
 
@@ -99,7 +99,7 @@ def test_roi_to_mask_3d_point():
 def test_roi_to_mask_3d_rectangle():
     """Test 3D ROI to mask conversion with rectangle."""
     import biopb.image as proto
-    from biopb.image.utils import roi_to_mask
+    from biopb.image import roi_to_mask
 
     template = np.zeros([4, 8, 8], dtype="uint8")
 
@@ -125,7 +125,7 @@ def test_roi_to_mask_3d_rectangle():
 def test_roi_to_mask_3d_mask_roi():
     """Test 3D ROI to mask conversion with mask type ROI."""
     import biopb.image as proto
-    from biopb.image.utils import roi_to_mask
+    from biopb.image import roi_to_mask
 
     template = np.zeros([2, 4, 4], dtype="uint8")
 
@@ -164,7 +164,7 @@ def test_roi_to_mask_3d_mask_roi():
 
 def test_mask_to_roi_3d():
     """Test 3D mask to ROI conversion."""
-    from biopb.image.utils import mask_to_roi, roi_to_mask
+    from biopb.image import mask_to_roi, roi_to_mask
 
     mask = np.zeros([4, 6, 6], dtype="uint8")
     # Create a simple pattern
@@ -188,7 +188,7 @@ def test_mask_to_roi_3d():
 def test_roi_to_mask_invalid_dimension():
     """Test that invalid mask dimension raises ValueError."""
     import biopb.image as proto
-    from biopb.image.utils import roi_to_mask
+    from biopb.image import roi_to_mask
 
     # 1D array - invalid
     template_1d = np.zeros([10], dtype="uint8")
@@ -207,7 +207,7 @@ def test_roi_to_mask_invalid_dimension():
 def test_roi_to_mask_polygon_3d_raises():
     """Test that 3D polygon ROI raises NotImplementedError."""
     import biopb.image as proto
-    from biopb.image.utils import roi_to_mask
+    from biopb.image import roi_to_mask
 
     template = np.zeros([4, 8, 8], dtype="uint8")
 
@@ -225,7 +225,7 @@ def test_roi_to_mask_polygon_3d_raises():
 def test_roi_to_mask_unsupported_type():
     """Test that unsupported ROI type raises NotImplementedError."""
     import biopb.image as proto
-    from biopb.image.utils import roi_to_mask
+    from biopb.image import roi_to_mask
 
     template = np.zeros([8, 8], dtype="uint8")
 
@@ -255,7 +255,7 @@ def test_roi_to_mask_cv2_import_error():
         # cv2 is not available, verify the ImportError message
         import biopb.image as proto
         import numpy as np
-        from biopb.image.utils import roi_to_mask
+        from biopb.image import roi_to_mask
 
         template = np.zeros([8, 8], dtype="uint8")
 
@@ -273,7 +273,7 @@ def test_roi_to_mask_cv2_import_error():
 def test_roi_to_mask_polygon_2d_various_shapes():
     """Test polygon ROI with various 2D shapes."""
     import biopb.image as proto
-    from biopb.image.utils import roi_to_mask
+    from biopb.image import roi_to_mask
 
     template = np.zeros([20, 20], dtype="uint8")
 
@@ -302,7 +302,7 @@ def test_roi_to_mask_polygon_2d_various_shapes():
 
 def test_mask_to_roi_bitorder_little_endian():
     """Test mask_to_roi with little endian bitorder."""
-    from biopb.image.utils import mask_to_roi, roi_to_mask
+    from biopb.image import mask_to_roi, roi_to_mask
 
     mask = np.array(
         [

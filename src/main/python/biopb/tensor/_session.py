@@ -35,13 +35,6 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.flight as flight
 
-from biopb.image._roi_rows import (
-    ROI_ID_SCHEMA,
-    ROI_ROW_SCHEMA,
-    roi_ids_to_table,
-    rois_to_table,
-    table_to_rois,
-)
 from biopb.image.annotation_pb2 import (
     RoiAnnotation,
     RoiDeleteResult,
@@ -64,6 +57,13 @@ from biopb.tensor._pool import (
     _chunk_map_from_endpoints,
     _get_shared_call_options,
     _get_thread_client,
+)
+from biopb.tensor._roi_rows import (
+    ROI_ID_SCHEMA,
+    ROI_ROW_SCHEMA,
+    roi_ids_to_table,
+    rois_to_table,
+    table_to_rois,
 )
 from biopb.tensor._tls import TlsTrust, resolve_tls_trust
 from biopb.tensor.descriptor_pb2 import (
