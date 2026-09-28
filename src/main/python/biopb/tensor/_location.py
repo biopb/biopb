@@ -24,6 +24,7 @@ resolving would put a DNS lookup on the chunk-fetch path to merge two spellings
 of a server the disk cache skips anyway (it is remote-only).
 """
 
+from typing import Optional
 from urllib.parse import urlsplit
 
 _DEFAULT_SCHEME = "grpc+tcp"
@@ -39,6 +40,27 @@ def normalize_flight_location(location: str) -> str:
     if location[:8].lower() == "grpcs://":
         return "grpc+tls://" + location[8:]
     return location
+
+
+_GRPC_SCHEMES = frozenset({"grpc", "grpcs", "grpc+tcp", "grpc+tls"})
+
+
+def realign_transport_scheme(location: str, *, tls: bool) -> Optional[str]:
+    """Rewrite *location*'s scheme to match an actual transport decision.
+
+    Every gRPC-shaped scheme this SDK or Arrow speaks (``grpc``, ``grpcs``,
+    ``grpc+tcp``, ``grpc+tls``) is accepted and rewritten to the one the
+    transport is actually using -- ``grpc+tls://`` for TLS, ``grpc://``
+    otherwise -- regardless of which shorthand was supplied (an operator
+    typing the public ``grpcs://`` spelling for a server that turns out to
+    serve plaintext, or vice versa). Returns ``None`` for anything else (no
+    scheme at all, or one this isn't), so a caller can refuse it rather than
+    advertise a nonsense address.
+    """
+    prefix_end = location.find("://")
+    if prefix_end == -1 or location[:prefix_end].lower() not in _GRPC_SCHEMES:
+        return None
+    return ("grpc+tls://" if tls else "grpc://") + location[prefix_end + 3 :]
 
 
 def canonical_location(location: str) -> str:

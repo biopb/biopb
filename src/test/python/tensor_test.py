@@ -494,43 +494,33 @@ class TestExportLocation:
     distributed cluster -- must carry the server's advertised address (if it
     published one), never just the address this client happened to dial."""
 
-    def test_falls_back_to_the_dial_address_when_nothing_advertised(self):
+    @pytest.mark.parametrize(
+        "location, advertised_location, expected",
+        [
+            # Nothing advertised -> fall back to the dial address verbatim.
+            ("grpc://localhost:8815", None, "grpc://localhost:8815"),
+            ("grpc://localhost:8815", "grpc://real-host:8815", "grpc://real-host:8815"),
+            # The server advertises the public grpcs:// spelling; a dask
+            # worker's FlightClient needs Arrow's own grpc+tls:// scheme.
+            (
+                "grpc+tls://localhost:8815",
+                "grpcs://real-host:8815",
+                "grpc+tls://real-host:8815",
+            ),
+        ],
+    )
+    def test_export_location_resolution(self, location, advertised_location, expected):
         from biopb.tensor._session import _ClientState
 
         state = _ClientState(
             raw_client=None,
             call_options=None,
-            location="grpc://localhost:8815",
+            location=location,
             token=None,
             cache_bytes=0,
+            advertised_location=advertised_location,
         )
-        assert state.export_location == "grpc://localhost:8815"
-
-    def test_prefers_the_advertised_address(self):
-        from biopb.tensor._session import _ClientState
-
-        state = _ClientState(
-            raw_client=None,
-            call_options=None,
-            location="grpc://localhost:8815",
-            token=None,
-            cache_bytes=0,
-            advertised_location="grpc://real-host:8815",
-        )
-        assert state.export_location == "grpc://real-host:8815"
-
-    def test_normalizes_an_advertised_tls_address_for_workers(self):
-        from biopb.tensor._session import _ClientState
-
-        state = _ClientState(
-            raw_client=None,
-            call_options=None,
-            location="grpc+tls://localhost:8815",
-            token=None,
-            cache_bytes=0,
-            advertised_location="grpcs://real-host:8815",
-        )
-        assert state.export_location == "grpc+tls://real-host:8815"
+        assert state.export_location == expected
 
     def test_get_tensor_pb_mints_the_export_location(self):
         # get_tensor_pb bakes an address into SerializedTensor.location for a

@@ -21,6 +21,7 @@ from biopb import _tls_material, _tls_record, _web_auth
 from biopb._fs_detect import unsafe_cache_dir_reason
 from biopb._lifecycle import deathwatch as _deathwatch
 from biopb._locations import tensor_catalog_path, tls_server_cert
+from biopb.tensor._location import realign_transport_scheme
 from rich.console import Console
 from rich.markup import escape as _rich_escape
 from rich.table import Table
@@ -250,23 +251,17 @@ def _resolve_external_location(
     rebuilding them.
     """
     if external_location:
-        lower = external_location.lower()
-        known_schemes = ("grpc://", "grpcs://", "grpc+tcp://", "grpc+tls://")
-        if not lower.startswith(known_schemes):
+        aligned = realign_transport_scheme(
+            external_location, tls=tls_cert_chain is not None
+        )
+        if aligned is None:
             console.print(
                 f"[red]--external-location {external_location!r} has no "
                 "recognized scheme. Use 'grpc://host:port' (or 'grpcs://' for "
                 "TLS).[/red]"
             )
             raise typer.Exit(2)
-        if tls_cert_chain is not None:
-            for prefix in known_schemes:
-                if lower.startswith(prefix):
-                    return "grpc+tls://" + external_location[len(prefix) :]
-        elif lower.startswith(("grpcs://", "grpc+tls://")):
-            prefix = "grpcs://" if lower.startswith("grpcs://") else "grpc+tls://"
-            return "grpc://" + external_location[len(prefix) :]
-        return external_location
+        return aligned
     if not _host_is_public(host):
         return None
     example = _grpc_location(host, port)
