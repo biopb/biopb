@@ -703,11 +703,13 @@ napari = [
 [package.dev-dependencies]
 integration = [
     { name = "biopb", extra = ["tensor"] },
+    { name = "biopb-image-base" },
     { name = "biopb-mcp", extra = ["napari"] },
     { name = "biopb-tensor-server", extra = ["web"] },
 ]
 testing = [
     { name = "biopb", extra = ["tensor"] },
+    { name = "biopb-image-base" },
     { name = "biopb-mcp", extra = ["napari"] },
     { name = "biopb-tensor-server", extra = ["web"] },
     { name = "pytest" },
@@ -743,11 +745,13 @@ provides-extras = ["napari"]
 [package.metadata.requires-dev]
 integration = [
     { name = "biopb", extras = ["tensor"], editable = "." },
+    { name = "biopb-image-base", editable = "biopb-image-runtime" },
     { name = "biopb-mcp", extras = ["napari"], editable = "biopb-mcp" },
     { name = "biopb-tensor-server", extras = ["web"], editable = "biopb-tensor-server" },
 ]
 testing = [
     { name = "biopb", extras = ["tensor"], editable = "." },
+    { name = "biopb-image-base", editable = "biopb-image-runtime" },
     { name = "biopb-mcp", extras = ["napari"], editable = "biopb-mcp" },
     { name = "biopb-tensor-server", extras = ["web"], editable = "biopb-tensor-server" },
     { name = "pytest" },
