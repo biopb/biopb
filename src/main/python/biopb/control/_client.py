@@ -49,7 +49,7 @@ def _answer(url: Optional[str]) -> Optional[dict]:
     return {"url": url, "token": _data_plane.resolve_token()}
 
 
-def data_plane(timeout: float = 1.0) -> Optional[dict]:
+def find_data_plane(timeout: float = 1.0) -> Optional[dict]:
     """The plane the control names, ``{"url", "token"}``, or ``None``.
 
     A plain read of ``GET /health``: ``None`` when no control answers or it

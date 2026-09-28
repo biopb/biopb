@@ -19,16 +19,16 @@ from ._algorithms import (
     restart_algorithm,
     stop_algorithm,
 )
-from ._client import base_url, data_plane, ensure_data_plane
+from ._client import base_url, ensure_data_plane, find_data_plane
 from ._data_plane import is_local_url
 
 __all__ = [
     "algorithm_logs",
     "algorithms",
     "base_url",
-    "data_plane",
     "ensure_algorithm",
     "ensure_data_plane",
+    "find_data_plane",
     "is_local_url",
     "refresh_algorithms",
     "restart_algorithm",
