@@ -1,11 +1,11 @@
 # Check the installer on every PR that touches it, and publish the bootstrap
 # scripts to biopb.org when they land on main. These are served at the canonical
 # one-liner URLs:
-#   - install/bootstrap.sh     -> biopb.org/install.sh
-#   - install/bootstrap.ps1    -> biopb.org/install.ps1
 #   - install/biopb-engine.ps1 -> biopb.org/biopb-engine.ps1
-# The bootstraps fetch the installer attached to the release they pick; the full
-# install.sh / install.ps1 ship as release assets, not from here.
+# biopb.org/install.sh and install.ps1 are install/bootstrap.sh and bootstrap.ps1,
+# uploaded by hand: they carry no release logic and rarely change. They fetch the
+# installer attached to the release they pick; the full install.sh / install.ps1
+# ship as release assets.
 #
 # They land in a reserved /install/ subtree of the webroot that biopb-site's
 # deploy excludes from its --delete (see biopb-site/.github/workflows/deploy.yml),
@@ -37,13 +37,11 @@ on:
     paths:
       - 'install/**'
       - '.github/workflows/install-scripts.yaml'
-  # Publish. Narrow to exactly the three served files -- a change to the .iss or
+  # Publish. Narrow to the one file this publishes -- a change to the .iss or
   # the README is not a reason to rsync.
   push:
     branches: [main]
     paths:
-      - 'install/bootstrap.sh'
-      - 'install/bootstrap.ps1'
       - 'install/biopb-engine.ps1'
   workflow_dispatch:
 
@@ -238,15 +236,12 @@ jobs:
 
       - name: Publish install scripts with rsync
         run: |
-          # Stage exactly the three served scripts, then mirror with --delete so
-          # the reserved /install/ subtree holds only these (and drops any file
-          # that was renamed/removed upstream) -- mirrors api-docs.yaml.
+          # The engine only, and no --delete: the bootstraps beside it in the
+          # reserved /install/ subtree are uploaded by hand.
           mkdir -p _install_publish
-          cp install/bootstrap.sh _install_publish/install.sh
-          cp install/bootstrap.ps1 _install_publish/install.ps1
           cp install/biopb-engine.ps1 _install_publish/
           ssh -i ~/.ssh/id_ed25519 jyu@biopb.org \
             'mkdir -p /var/www/biopb.org/install'
-          rsync -avz --delete \
+          rsync -avz \
             -e "ssh -i ~/.ssh/id_ed25519" \
             _install_publish/ jyu@biopb.org:/var/www/biopb.org/install/

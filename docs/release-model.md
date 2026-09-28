@@ -185,8 +185,9 @@ forward. A **raw / git-checkout** copy has an empty pin and tracks the **latest
 stable** release (prereleases skipped).
 
 **`biopb.org/install.sh` and `install.ps1` are not the installers but
-bootstraps** (`install/bootstrap.sh`, `install/bootstrap.ps1`, published in their
-place). Each checks for `curl`/`tar` (`tar` on Windows), picks the release the way the installer does
+bootstraps** (`install/bootstrap.sh`, `install/bootstrap.ps1`, uploaded by hand to
+`/var/www/biopb.org/install/` when they change, which is rare; no workflow
+publishes them). Each checks for `curl`/`tar` (`tar` on Windows), picks the release the way the installer does
 (`BIOPB_INSTALL_VERSION`, `BIOPB_INSTALL_RC`, else the latest stable), downloads
 that release's pinned `install.sh` / `install.ps1` asset and runs it with the
 caller's arguments and environment (the Windows one, in memory, so a Restricted

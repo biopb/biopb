@@ -462,16 +462,11 @@ jobs:
         if: steps.ver.outputs.is_tag == 'true' && steps.ver.outputs.prerelease != 'true'
         run: |
           set -euo pipefail
-          # Stage exactly the three served scripts, then mirror with --delete so
-          # the reserved /install/ subtree holds only these (and drops any file
-          # renamed/removed upstream) -- mirrors api-docs.yaml. biopb.org's
-          # install.sh and install.ps1 are the release-independent bootstraps, which
-          # fetch the pinned installer attached to the release they pick.
+          # Only the engine: biopb.org's install.sh and install.ps1 are the
+          # release-independent bootstraps (install/bootstrap.*), uploaded by hand
+          # when they change, so no --delete here.
           mkdir -p _install_publish
-          cp install/bootstrap.sh _install_publish/install.sh
-          cp install/bootstrap.ps1 _install_publish/install.ps1
           cp install/biopb-engine.ps1 _install_publish/
-          bash -n _install_publish/install.sh
 
           mkdir -p ~/.ssh
           echo "${{ secrets.BIOPB_ORG_SSH_KEY }}" > ~/.ssh/id_ed25519
@@ -479,7 +474,7 @@ jobs:
           ssh-keyscan -H biopb.org >> ~/.ssh/known_hosts
 
           ssh -i ~/.ssh/id_ed25519 jyu@biopb.org 'mkdir -p /var/www/biopb.org/install'
-          rsync -avz --delete -e "ssh -i ~/.ssh/id_ed25519" \
+          rsync -avz -e "ssh -i ~/.ssh/id_ed25519" \
             _install_publish/ jyu@biopb.org:/var/www/biopb.org/install/
 
       # Feedback gate for the sample bundle. The build above fails SOFT so a flaky
