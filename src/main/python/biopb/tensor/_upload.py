@@ -30,7 +30,11 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.flight as flight
 
-from biopb.tensor._pool import _get_shared_call_options, _get_thread_client
+from biopb.tensor._pool import (
+    _get_shared_call_options,
+    _get_thread_client,
+    wants_wire_compression,
+)
 from biopb.tensor._session import (
     _read_option,
     _tensor_read_cmd,
@@ -389,7 +393,11 @@ class _UploadTarget:
                 f"of {self._array_id}"
             )
         client = _get_thread_client(self._location, self._token, self._trust)
-        call_options = _get_shared_call_options(self._location, self._token)
+        call_options = _get_shared_call_options(
+            self._location,
+            self._token,
+            wants_wire_compression(self._location, self._array_id),
+        )
         _put_chunk(client, call_options, self._array_id, ticket, value)
 
 
@@ -621,7 +629,11 @@ class UploadSession:
             )
         _put_chunk(
             self._state.client,
-            self._state.call_options,
+            _get_shared_call_options(
+                self._state.location,
+                self._state.token,
+                wants_wire_compression(self._state.location, desc.array_id),
+            ),
             desc.array_id,
             plan[0].ticket,
             data,

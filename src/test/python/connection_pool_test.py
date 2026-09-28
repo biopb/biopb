@@ -467,6 +467,40 @@ class TestCallOptionsPool:
         # which creates: headers=[(b"authorization", f"Bearer {token}".encode())]
 
 
+class TestWireCompression:
+    """Label sets sent to a server that is not this machine go zstd-compressed
+    (biopb/biopb#1111); everything else is written raw."""
+
+    @pytest.mark.parametrize(
+        ("array_id", "local", "expected"),
+        [
+            ("src/@labels/nuclei", False, True),
+            ("plate/A/1/@labels/nuclei/2", False, True),
+            ("src/@labels/nuclei", True, False),  # loopback: keep zero-copy
+            ("src", False, False),  # pixels barely compress
+            ("scratch/@fields/result", False, False),
+            ("src/@labels", False, False),  # a bare marker names no set
+        ],
+    )
+    def test_the_decision(self, array_id, local, expected):
+        with patch.object(pool_module, "_is_localhost_location", return_value=local):
+            assert (
+                pool_module.wants_wire_compression("grpc://h:8815", array_id)
+                is expected
+            )
+
+    def test_compressed_options_are_a_separate_shared_entry(self):
+        plain = pool_module._get_shared_call_options("grpc://h:1", "t")
+        packed = pool_module._get_shared_call_options("grpc://h:1", "t", True)
+
+        assert packed is not plain
+        assert pool_module._get_shared_call_options("grpc://h:1", "t") is plain
+        assert pool_module._get_shared_call_options("grpc://h:1", "t", True) is packed
+
+    def test_wire_options_compress_with_zstd(self):
+        assert pool_module.WIRE_WRITE_OPTIONS.compression == "zstd"
+
+
 class TestPoolLocks:
     """Tests for pool locking behavior."""
 

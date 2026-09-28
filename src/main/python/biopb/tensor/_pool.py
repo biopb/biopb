@@ -43,6 +43,7 @@ from dask.highlevelgraph import HighLevelGraph
 from dask.utils import parse_bytes
 
 from biopb.tensor import _diskcache
+from biopb.tensor._labels import split_label_array_id
 from biopb.tensor._location import location_host
 from biopb.tensor._tls import NO_TLS, TlsTrust
 from biopb.tensor.ticket_pb2 import TensorTicket
@@ -601,7 +602,7 @@ _REGISTRY_LOCK = threading.Lock()
 #   - None            -> deliberately pinned OFF by configure_cache(); a later
 #                        fetch must honor this and NOT recreate a cache.
 _CACHE_POOL: Dict[Tuple[str, Optional[str]], Optional[Cache]] = {}
-_CALL_OPTS_POOL: Dict[Tuple[str, Optional[str]], flight.FlightCallOptions] = {}
+_CALL_OPTS_POOL: Dict[Tuple[str, Optional[str], bool], flight.FlightCallOptions] = {}
 _POOL_LOCK = threading.Lock()
 
 
@@ -793,37 +794,59 @@ def _get_shared_cache(
         return _CACHE_POOL[key]
 
 
-def _build_call_options(token: Optional[str]) -> flight.FlightCallOptions:
-    """Build FlightCallOptions carrying the bearer token (or none for no auth).
+#: Arrow IPC buffer compression for a label tensor sent to or from a remote
+#: server (biopb/biopb#1111). zstd at its default level compresses an integer
+#: label image 25-50x at GiB/s; readers decompress without being told, so no
+#: message changes. Local reads stay raw, to keep the zero-copy mmap path.
+WIRE_WRITE_OPTIONS = pa.ipc.IpcWriteOptions(compression="zstd")
+
+
+def wants_wire_compression(location: str, array_id: str) -> bool:
+    """Whether a write of *array_id* to *location* goes compressed: a label set,
+    on a server that is not this machine. Pixel data barely compresses, and
+    compressing it costs the zero-copy path for nothing."""
+    return split_label_array_id(array_id) is not None and not _is_localhost_location(
+        location
+    )
+
+
+def _build_call_options(
+    token: Optional[str], compress: bool = False
+) -> flight.FlightCallOptions:
+    """Build FlightCallOptions carrying the bearer token (or none for no auth),
+    and ``compress`` the IPC buffers this call writes.
 
     The single place the ``authorization: Bearer <token>`` header is assembled,
     so the auth scheme lives in exactly one spot rather than being re-derived at
     every connection site.
     """
+    write_options = WIRE_WRITE_OPTIONS if compress else None
     if token:
         return flight.FlightCallOptions(
-            headers=[(b"authorization", f"Bearer {token}".encode())]
+            headers=[(b"authorization", f"Bearer {token}".encode())],
+            write_options=write_options,
         )
-    return flight.FlightCallOptions()
+    return flight.FlightCallOptions(write_options=write_options)
 
 
 def _get_shared_call_options(
-    location: str, token: Optional[str]
+    location: str, token: Optional[str], compress: bool = False
 ) -> flight.FlightCallOptions:
     """Get shared FlightCallOptions.
 
     Args:
         location: Flight server location string
         token: Bearer token (or None for no auth)
+        compress: compress the IPC buffers a write through these options sends
 
     Returns:
         FlightCallOptions for this connection
     """
-    key = (location, token)
+    key = (location, token, compress)
 
     with _POOL_LOCK:
         if key not in _CALL_OPTS_POOL:
-            _CALL_OPTS_POOL[key] = _build_call_options(token)
+            _CALL_OPTS_POOL[key] = _build_call_options(token, compress)
 
     return _CALL_OPTS_POOL[key]
 
