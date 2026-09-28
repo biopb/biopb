@@ -55,7 +55,7 @@ public class TensorFlightClientTest {
         // DataSourceDescriptor has no field for it.
         try (TestFlightServer server = new TestFlightServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
-                try (VectorSchemaRoot root = client.querySources(
+                try (VectorSchemaRoot root = client.query(
                         "SELECT " + TensorFlightClient.SOURCE_ROW_COLUMNS + " FROM sources")) {
                     Assert.assertEquals(1, root.getRowCount());
                     Assert.assertEquals("test-source",
@@ -552,13 +552,13 @@ public class TensorFlightClientTest {
     // compiled but never executed here.
 
     @Test
-    public void testResolveReturnsTheCatalogRow() throws Exception {
+    public void testResolveSourceReturnsTheCatalogRow() throws Exception {
         try (TestFlightServer server = new TestFlightServer()) {
             server.setSourceResolved(false);
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
                 // A row, not a struct this SDK picked: the caller decodes it the
-                // same way it decodes a querySources result (biopb/biopb#1032).
-                try (VectorSchemaRoot row = client.resolve("test-source")) {
+                // same way it decodes a query result (biopb/biopb#1032).
+                try (VectorSchemaRoot row = client.resolveSource("test-source")) {
                     Assert.assertEquals(1, row.getRowCount());
                     Assert.assertEquals("test-source",
                             String.valueOf(row.getVector("source_id").getObject(0)));
@@ -580,7 +580,7 @@ public class TensorFlightClientTest {
         // (biopb/biopb#1035).
         try (TestFlightServer server = new TestFlightServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
-                try (VectorSchemaRoot root = client.querySources(
+                try (VectorSchemaRoot root = client.query(
                         "SELECT " + TensorFlightClient.SOURCE_ROW_COLUMNS + " FROM sources")) {
                     Assert.assertNull(root.getVector("data_resident"));
                 }
@@ -589,13 +589,13 @@ public class TensorFlightClientTest {
     }
 
     @Test
-    public void testResolveOutlivesTheStreamItArrivedOn() throws Exception {
+    public void testResolveSourceOutlivesTheStreamItArrivedOn() throws Exception {
         // The row rides an ArrowStreamReader that frees its buffers on close, so
         // resolve() has to hand back a copy. Reading after the call is what would
         // catch a returned view into freed memory.
         try (TestFlightServer server = new TestFlightServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
-                VectorSchemaRoot row = client.resolve("test-source");
+                VectorSchemaRoot row = client.resolveSource("test-source");
                 try {
                     Assert.assertEquals("test-source",
                             String.valueOf(row.getVector("source_id").getObject(0)));
@@ -609,13 +609,13 @@ public class TensorFlightClientTest {
     }
 
     @Test
-    public void testResolveSkipsProgressHeartbeats() throws Exception {
+    public void testResolveSourceSkipsProgressHeartbeats() throws Exception {
         // Heartbeats keep the connection warm under proxy idle timeouts; only the
         // terminal message carries the row.
         try (TestFlightServer server = new TestFlightServer()) {
             server.setResolveHeartbeats(3);
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
-                try (VectorSchemaRoot row = client.resolve("test-source")) {
+                try (VectorSchemaRoot row = client.resolveSource("test-source")) {
                     Assert.assertEquals(1, row.getRowCount());
                 }
             }
@@ -623,12 +623,12 @@ public class TensorFlightClientTest {
     }
 
     @Test
-    public void testResolveReportsProgressAndHonorsCancellation() throws Exception {
+    public void testResolveSourceReportsProgressAndHonorsCancellation() throws Exception {
         try (TestFlightServer server = new TestFlightServer()) {
             server.setResolveHeartbeats(3);
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
                 List<ResolveProgress> progress = new ArrayList<>();
-                try (VectorSchemaRoot row = client.resolve("test-source", progress::add, () -> false)) {
+                try (VectorSchemaRoot row = client.resolveSource("test-source", progress::add, () -> false)) {
                     Assert.assertEquals(1, row.getRowCount());
                 }
                 Assert.assertEquals(3, progress.size());
@@ -636,16 +636,16 @@ public class TensorFlightClientTest {
 
                 TensorOperationCancelledException error = Assert.assertThrows(
                         TensorOperationCancelledException.class,
-                        () -> client.resolve("test-source", ignored -> Assert.fail("must not report after cancellation"),
+                        () -> client.resolveSource("test-source", ignored -> Assert.fail("must not report after cancellation"),
                                 () -> true));
-                Assert.assertEquals("resolve", error.getOperation());
+                Assert.assertEquals("resolveSource", error.getOperation());
                 Assert.assertEquals("test-source", error.getSourceId());
             }
         }
     }
 
     @Test
-    public void testResolveWithoutTerminalRowFails() throws Exception {
+    public void testResolveSourceWithoutTerminalRowFails() throws Exception {
         // Heartbeats and nothing else: the server closed without a row. That is an
         // error, not an empty result.
         try (TestFlightServer server = new TestFlightServer()) {
@@ -654,14 +654,14 @@ public class TensorFlightClientTest {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
                 IOException error = Assert.assertThrows(
                         IOException.class,
-                        () -> client.resolve("test-source"));
+                        () -> client.resolveSource("test-source"));
                 Assert.assertTrue(error.getMessage().contains("no catalog row"));
             }
         }
     }
 
     @Test
-    public void testGetTensorOnUnresolvedSourceSteersToResolve() throws Exception {
+    public void testGetTensorOnUnresolvedSourceSteersToResolveSource() throws Exception {
         // The Java twin of napari's `_is_unresolved`: a source with no tensors
         // and is_resolved false needs the consented resolve, and the error says
         // so (biopb/biopb#1032).
@@ -695,12 +695,12 @@ public class TensorFlightClientTest {
     }
 
     @Test
-    public void testWarmReturnsTheTerminalCounts() throws Exception {
+    public void testWarmSourceReturnsTheTerminalCounts() throws Exception {
         // warm returns a status, not a row: residency is not a durable catalog
         // fact, so these counts exist nowhere else (biopb/biopb#1035).
         try (TestFlightServer server = new TestFlightServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
-                WarmProgress done = client.warm("test-source");
+                WarmProgress done = client.warmSource("test-source");
                 Assert.assertEquals(2, done.getFilesTotal());
                 Assert.assertEquals(2, done.getFilesDone());
                 Assert.assertEquals(2048L, done.getBytesDone());
@@ -709,33 +709,33 @@ public class TensorFlightClientTest {
     }
 
     @Test
-    public void testWarmWithoutTerminalStatusFails() throws Exception {
+    public void testWarmSourceWithoutTerminalStatusFails() throws Exception {
         try (TestFlightServer server = new TestFlightServer()) {
             server.setWarmSendsDone(false);
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
                 IOException error = Assert.assertThrows(
                         IOException.class,
-                        () -> client.warm("test-source"));
+                        () -> client.warmSource("test-source"));
                 Assert.assertTrue(error.getMessage().contains("no terminal status"));
             }
         }
     }
 
     @Test
-    public void testWarmReportsProgressAndHonorsCancellation() throws Exception {
+    public void testWarmSourceReportsProgressAndHonorsCancellation() throws Exception {
         try (TestFlightServer server = new TestFlightServer()) {
             try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
                 List<WarmProgress> progress = new ArrayList<>();
-                WarmProgress done = client.warm("test-source", progress::add, () -> false);
+                WarmProgress done = client.warmSource("test-source", progress::add, () -> false);
                 Assert.assertEquals(1, progress.size());
                 Assert.assertEquals(1, progress.get(0).getFilesDone());
                 Assert.assertEquals(2, done.getFilesDone());
 
                 TensorOperationCancelledException error = Assert.assertThrows(
                         TensorOperationCancelledException.class,
-                        () -> client.warm("test-source", ignored -> Assert.fail("must not report after cancellation"),
+                        () -> client.warmSource("test-source", ignored -> Assert.fail("must not report after cancellation"),
                                 () -> true));
-                Assert.assertEquals("warm", error.getOperation());
+                Assert.assertEquals("warmSource", error.getOperation());
             }
         }
     }
@@ -753,7 +753,7 @@ public class TensorFlightClientTest {
     }
 
     @Test
-    public void testGetSourceMetadataOnUnresolvedSourceSteersToResolve() throws Exception {
+    public void testGetSourceMetadataOnUnresolvedSourceSteersToResolveSource() throws Exception {
         // The flag, not an empty tensor list: a source can resolve cleanly and
         // hold nothing readable, and telling *that* caller to resolve sends them
         // at an operation that can only succeed and change nothing
@@ -765,7 +765,7 @@ public class TensorFlightClientTest {
                         IllegalStateException.class,
                         () -> client.getSourceMetadata("test-source"));
                 Assert.assertTrue(error.getMessage().contains("is unresolved"));
-                Assert.assertTrue(error.getMessage().contains("resolve('test-source')"));
+                Assert.assertTrue(error.getMessage().contains("resolveSource('test-source')"));
             }
         }
     }
