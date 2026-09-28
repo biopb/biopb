@@ -310,7 +310,9 @@ class _OpCall:
         if not isinstance(array, da.Array):
             array = da.from_array(array, chunks=array.shape)
         field = f"{_sanitize_name(self.name)}-{os.urandom(4).hex()}"
-        desc = client.add_tensor(f"cache://{SCRATCH_SOURCE_ID}/@fields/{field}", array)
+        desc = client.setup_array_upload(
+            f"cache://{SCRATCH_SOURCE_ID}/@fields/{field}", array
+        )
         client.upload_array(desc, array)
         return desc.array_id
 

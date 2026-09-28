@@ -570,7 +570,7 @@ class _PlaneSink(_InlineSink):
         import dask
 
         client = self._connect()
-        desc = client.add_tensor(
+        desc = client.setup_array_upload(
             f"cache://scratch/@fields/{_field_name(op_name)}",
             array,
             dim_labels=labels,

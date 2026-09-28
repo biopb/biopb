@@ -37,7 +37,7 @@ from tests import catalog_server
 
 
 def _create(client, source, field="durable"):
-    return client.add_tensor(
+    return client.setup_array_upload(
         f"zarr://{source}/@fields/{field}",
         np.empty((4, 4), dtype=np.uint16),
         chunk_shape=(2, 2),
@@ -225,7 +225,7 @@ class TestTheFieldCannotEscapeItsSource:
         """write_dir is the whole of tmp_path, so an escape would land under
         it -- one glob then covers the whole surface."""
         with pytest.raises(flight.FlightServerError):
-            client.add_tensor(
+            client.setup_array_upload(
                 f"zarr://{source}/@fields/{field}",
                 np.empty((4, 4), np.uint16),
                 chunk_shape=(2, 2),
@@ -234,7 +234,7 @@ class TestTheFieldCannotEscapeItsSource:
 
     def test_the_refusal_names_the_field(self, writable_server, client, source):
         with pytest.raises(flight.FlightServerError, match="the field's name"):
-            client.add_tensor(
+            client.setup_array_upload(
                 f"zarr://{source}/@fields/..",
                 np.empty((4, 4), np.uint16),
                 chunk_shape=(2, 2),
@@ -299,7 +299,7 @@ class TestANameIsAPathOnEveryPlatform:
 
     def test_the_refusal_reaches_the_client(self, writable_server, client, source):
         with pytest.raises(flight.FlightServerError, match="the field's name"):
-            client.add_tensor(
+            client.setup_array_upload(
                 f"zarr://{source}/@fields/CON",
                 np.empty((4, 4), np.uint16),
                 chunk_shape=(2, 2),

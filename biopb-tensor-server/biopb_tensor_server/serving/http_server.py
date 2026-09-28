@@ -2126,7 +2126,7 @@ def _resolve_worker(ctx: _SidecarContext, job: _SourceJob) -> None:
     """Body of a resolve job. Runs on the registry's daemon thread."""
 
     def _call() -> None:
-        ctx.get_client().resolve(
+        ctx.get_client().resolve_source(
             job.source_id,
             on_progress=lambda p: job.set_progress(
                 {
@@ -2158,7 +2158,7 @@ def _warm_worker(ctx: _SidecarContext, job: _SourceJob) -> None:
         }
 
     def _call() -> Any:
-        return ctx.get_client().warm(
+        return ctx.get_client().warm_source(
             job.source_id,
             on_progress=lambda p: job.set_progress(_snapshot(p)),
             should_cancel=job.cancel_requested,

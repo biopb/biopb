@@ -180,7 +180,7 @@ class _Client:
     def get_tensor_pb(self, array_id):
         return _reference(array_id, PLANE).lazy
 
-    def add_tensor(self, array_id, template):
+    def setup_array_upload(self, array_id, template):
         return TensorDescriptor(array_id=array_id)
 
     def upload_array(self, desc, array):

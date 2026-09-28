@@ -1,6 +1,6 @@
 """An upload adds a tensor to a source that already exists (step 5).
 
-``add_tensor`` puts ``<scheme>://<source_id>/@fields/<name>`` on a source the
+``setup_array_upload`` puts ``<scheme>://<source_id>/@fields/<name>`` on a source the
 server already serves -- for an intermediate result, the scratch source. The
 scheme names the store format and nothing else, so the answered ``array_id``
 carries none and the format is read back off the directory at the next
@@ -40,7 +40,7 @@ def _arr(fill=1, shape=SHAPE):
 
 def _add(client, source, field, scheme="zarr", arr=None, **kw):
     arr = _arr() if arr is None else arr
-    return client.add_tensor(
+    return client.setup_array_upload(
         f"{scheme}://{source}/@fields/{field}", arr, chunk_shape=CHUNK, **kw
     )
 
@@ -210,7 +210,7 @@ class TestWhatItRefuses:
         """A set is NGFF, so it has one format and the scheme has to say so."""
         client.upload_array(_add(client, source, "img"), _arr())
         with pytest.raises(flight.FlightServerError, match="a label set is NGFF"):
-            client.add_tensor(
+            client.setup_array_upload(
                 f"cache://{source}/img/@labels/nuclei",
                 np.zeros(SHAPE, np.uint32),
                 chunk_shape=CHUNK,
@@ -238,7 +238,7 @@ class TestWhatItRefuses:
         with pytest.raises(
             flight.FlightServerError, match=r"<source_id>/@fields/<name>"
         ):
-            client.add_tensor(
+            client.setup_array_upload(
                 "zarr://theirs/img", np.zeros(SHAPE, np.uint16), chunk_shape=CHUNK
             )
 
@@ -252,13 +252,13 @@ class TestALabelSetOnAMember:
 
         labels = np.zeros(SHAPE, np.uint32)
         labels[:2, :3] = 4
-        desc = client.add_tensor(
+        desc = client.setup_array_upload(
             f"zarr://{image.array_id}/@labels/nuclei", labels, chunk_shape=CHUNK
         )
         client.upload_array(desc, labels)
 
         assert desc.array_id == f"{source}/@fields/img/@labels/nuclei"
-        assert client.label_sets(image.array_id) == [desc.array_id]
+        assert client.get_label_sets(image.array_id) == [desc.array_id]
         np.testing.assert_array_equal(
             client.get_tensor(desc.array_id).compute(), labels
         )
@@ -269,7 +269,7 @@ class TestALabelSetOnAMember:
         image = _add(client, source, "img")  # never published
 
         with pytest.raises(flight.FlightServerError):
-            client.add_tensor(
+            client.setup_array_upload(
                 f"zarr://{image.array_id}/@labels/nuclei",
                 np.zeros(SHAPE, np.uint32),
                 chunk_shape=CHUNK,

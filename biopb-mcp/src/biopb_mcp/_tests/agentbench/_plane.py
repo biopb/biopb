@@ -150,7 +150,7 @@ class TensorPlane:
         array = np.asarray(array)
         chunk_shape = tuple(chunks) if chunks else array.shape
         lazy = da.from_array(array, chunks=chunk_shape)
-        desc = self.client.add_tensor(
+        desc = self.client.setup_array_upload(
             f"cache://{SCRATCH_SOURCE_ID}/@fields/{self.secret}-{key}",
             lazy,
             chunk_shape=list(chunk_shape),

@@ -388,7 +388,7 @@ class TestResolveDescriptorAddressing:
     def test_unresolved_steers_to_resolve(self):
         client = self._client(self._row(is_resolved=False))
 
-        with pytest.raises(ValueError, match=r"call client\.resolve"):
+        with pytest.raises(ValueError, match=r"call client\.resolve_source"):
             client._catalog._resolve_descriptor("cloud_x")
 
     def test_resolved_but_empty_does_not_steer_to_resolve(self):
@@ -398,7 +398,7 @@ class TestResolveDescriptorAddressing:
 
         with pytest.raises(ValueError, match="no readable tensors") as exc:
             client._catalog._resolve_descriptor("empty_x")
-        assert "client.resolve(" not in str(exc.value)
+        assert "client.resolve_source(" not in str(exc.value)
 
     def test_bare_id_on_a_multi_tensor_source_is_refused(self):
         client = self._client(self._row("m/f0", "m/f1"))

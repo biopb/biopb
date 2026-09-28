@@ -875,7 +875,7 @@ class TestAddTensor:
         client = TensorFlightClient(f"grpc://127.0.0.1:{server.port}")
         try:
             source = SCRATCH_SOURCE_ID
-            array_id = client.add_tensor(
+            array_id = client.setup_array_upload(
                 f"cache://{source}/@fields/test-action",
                 np.empty((10, 10), np.uint8),
                 chunk_shape=(5, 5),
@@ -1474,7 +1474,7 @@ class TestCachedSourceContentVersion:
 
 def _upload_whole(client, arr, array_id):
     """Declare from the array, fill it, seal it; the id for reading back."""
-    desc = client.add_tensor(array_id, arr)
+    desc = client.setup_array_upload(array_id, arr)
     client.upload_array(desc, arr)
     return desc.array_id
 
@@ -1603,7 +1603,7 @@ class TestConcurrentChunkUpload:
         """
         session = client._upload
         expected = np.arange(5 * 20 * 20, dtype=np.uint16).reshape(5, 20, 20)
-        desc = session.add_tensor(
+        desc = session.setup_array_upload(
             f"cache://{source}/@fields/backwards",
             expected,
             chunk_shape=(1, 20, 20),
@@ -1667,7 +1667,7 @@ class TestConcurrentChunkUpload:
         """
         session = client._upload
         expected = np.arange(4 * 8 * 8, dtype=np.uint16).reshape(4, 8, 8)
-        desc = session.add_tensor(
+        desc = session.setup_array_upload(
             f"cache://{source}/@fields/revived",
             expected,
             chunk_shape=(1, 8, 8),
@@ -1716,7 +1716,7 @@ class TestDiscard:
 
     @staticmethod
     def _make_source(client, source, field="discard-me", shape=(4, 4), chunk=(2, 2)):
-        return client.add_tensor(
+        return client.setup_array_upload(
             f"cache://{source}/@fields/{field}",
             np.empty(shape, dtype=np.uint16),
             chunk_shape=chunk,
@@ -1913,7 +1913,7 @@ class TestDiscard:
         """The store was minted under write_dir, so it is the server's own to
         release (biopb/biopb#1059). The *source's* row stays: it is still there
         to add another tensor to."""
-        array_id = client.add_tensor(
+        array_id = client.setup_array_upload(
             f"zarr://{source}/@fields/letgo",
             np.empty((4, 4), np.uint16),
             chunk_shape=(2, 2),

@@ -331,7 +331,7 @@ class TensorFlightClient:
 
         Raises:
             ValueError: If the source is unknown, or unresolved (cloud /
-                synced-folder) -- call `resolve` first.
+                synced-folder) -- call `resolve_source` first.
         """
         return self._catalog.get_source_metadata(source_id)
 
@@ -378,7 +378,7 @@ class TensorFlightClient:
         field masks (biopb/biopb#563).
 
         On an unresolved (cloud / synced-folder) source it raises an error pointing
-        at `resolve`. Call `resolve` first to read such a source.
+        at `resolve_source`. Call `resolve_source` first to read such a source.
 
         Args:
             array_id: Globally-unique tensor id, e.g. ``"zarr_a3f2"`` (single-
@@ -410,7 +410,7 @@ class TensorFlightClient:
             with_upload_status=with_upload_status,
         )
 
-    def resolve(
+    def resolve_source(
         self,
         source_id: str,
         *,
@@ -421,7 +421,7 @@ class TensorFlightClient:
 
         Note:
             Experimental. Cloud / remote source support (unresolved sources,
-            resolve, and `warm`) is experimental and its behavior may change.
+            resolve_source, and `warm_source`) is experimental and its behavior may change.
             This returned a ``DataSourceDescriptor`` before biopb/biopb#1032
             and now returns the row itself -- the same information, without
             the SDK picking a structure for it.
@@ -448,28 +448,28 @@ class TensorFlightClient:
             should_cancel: Optional predicate polled on each heartbeat; when it
                 returns True the client stops consuming the stream and raises
                 `ResolveCancelled`. The server-side recall continues to
-                completion and is cached, so a later ``resolve`` reuses it.
+                completion and is cached, so a later ``resolve_source`` reuses it.
 
         Returns:
             The source's ``sources`` row, shaped exactly like one element of
             ``query(..., format="records")`` -- ``SOURCE_ROW_COLUMNS``,
             with every tensor enumerated under ``tensors``.
 
-            Unlike `warm`, which returns a *status* because residency is not a
-            durable catalog fact (biopb/biopb#1035) and its file counts exist
-            nowhere else, this returns the *result*: resolving is defined by
-            what it writes to the row. The recall's elapsed time and target
+            Unlike `warm_source`, which returns a *status* because residency is
+            not a durable catalog fact (biopb/biopb#1035) and its file counts
+            exist nowhere else, this returns the *result*: resolving is defined
+            by what it writes to the row. The recall's elapsed time and target
             size ride ``on_progress`` instead -- both are things a caller can
-            already measure or derive, where `warm`'s counts are not.
+            already measure or derive, where `warm_source`'s counts are not.
 
         Raises:
             ResolveCancelled: if ``should_cancel`` asked to stop mid-resolve.
         """
-        return self._catalog.resolve(
+        return self._catalog.resolve_source(
             source_id, on_progress=on_progress, should_cancel=should_cancel
         )
 
-    def warm(
+    def warm_source(
         self,
         source_id: str,
         *,
@@ -479,21 +479,21 @@ class TensorFlightClient:
         """Hydrate-ahead: recall a resolved source's member files on the server.
 
         Note:
-            Experimental. Cloud / remote source support (`resolve` and this hydrate-
-            ahead path) is experimental and its behavior may change.
+            Experimental. Cloud / remote source support (`resolve_source` and
+            this hydrate-ahead path) is experimental and its behavior may change.
 
-        `resolve` populates a source's *metadata* but, for a multi-file
+        `resolve_source` populates a source's *metadata* but, for a multi-file
         cloud source (zarr / ome-zarr / ndtiff / tiff-sequence / micromanager),
         leaves the bulk pixel data dehydrated -- each member file then recalls
         one-at-a-time, slowly, the first time a read touches it (the viewer
-        scrubbing planes is the worst case). ``warm`` opts into pulling them all
-        resident up front so later reads never stall.
+        scrubbing planes is the worst case). ``warm_source`` opts into pulling
+        them all resident up front so later reads never stall.
 
         The recall happens **entirely server-side** (the server walks the source
         directory and reads each file to force the sync engine's recall); no
         pixels cross the wire, only progress. It is idempotent -- already-resident
-        files are cheap local reads -- so a ``warm`` re-run after a cancel simply
-        finishes the remainder. Only meaningful for multi-file sources; a
+        files are cheap local reads -- so a ``warm_source`` re-run after a cancel
+        simply finishes the remainder. Only meaningful for multi-file sources; a
         single-file source returns immediately (resolve already recalled it), and
         a remote-url source (an object store, or a ``grpc://`` mirror) raises --
         nothing on the serving machine can be made resident.
@@ -522,7 +522,7 @@ class TensorFlightClient:
             FlightServerError: if the source's url is remote. Warm it on the
                 server that holds the data.
         """
-        return self._catalog.warm(
+        return self._catalog.warm_source(
             source_id, on_progress=on_progress, should_cancel=should_cancel
         )
 
@@ -659,7 +659,7 @@ class TensorFlightClient:
 
     # ---- label sets ----
 
-    def label_sets(self, image_array_id: str) -> List[str]:
+    def get_label_sets(self, image_array_id: str) -> List[str]:
         """The ``array_id``s of the label sets served under an image.
 
         A label set is an ordinary tensor of its image, named
@@ -676,7 +676,7 @@ class TensorFlightClient:
         Returns:
             The sets' ``array_id``s, sorted. Empty when the image has none.
         """
-        return self._catalog.label_sets(image_array_id)
+        return self._catalog.get_label_sets(image_array_id)
 
     # ---- ROI annotations ----
 
@@ -887,7 +887,7 @@ class TensorFlightClient:
     # collaborator (see biopb.tensor._upload); #278 item C.
     # ====================
 
-    def add_tensor(
+    def setup_array_upload(
         self,
         array_id: str,
         template: Any,
@@ -965,7 +965,7 @@ class TensorFlightClient:
                 the field is taken, or the name cannot be a directory on some
                 platform this store may be served from.
         """
-        return self._upload.add_tensor(
+        return self._upload.setup_array_upload(
             array_id,
             template,
             chunk_shape=chunk_shape,
@@ -1002,7 +1002,7 @@ class TensorFlightClient:
         may be written.
 
         Args:
-            desc: The descriptor ``add_tensor`` returned
+            desc: The descriptor ``setup_array_upload`` returned
             arr: The array to upload (dask or numpy)
             slice_hint: Optional region to upload, as a slice per axis. An
                 open-ended ``stop`` is filled from the declared shape.
@@ -1041,7 +1041,7 @@ class TensorFlightClient:
         rather than written somewhere no read asks for.
 
         Args:
-            desc: The descriptor ``add_tensor`` returned
+            desc: The descriptor ``setup_array_upload`` returned
             bounds: Chunk start/stop coordinates
             data: Numpy array with chunk data
 
@@ -1081,7 +1081,7 @@ class TensorFlightClient:
         the ladder is refused.
 
         Args:
-            target: The descriptor ``add_tensor`` returned, or an
+            target: The descriptor ``setup_array_upload`` returned, or an
                 ``array_id`` -- a label set's, as ``label_sets`` reports it.
             state: ``"READY"`` or ``"DISCARDED"``.
             reason: Why, for ``"DISCARDED"``. It is what a poller waiting on
@@ -1119,7 +1119,7 @@ class TensorFlightClient:
             - `source_count`: Number of registered sources
             - `metadata_db_enabled`: Whether the server offers a catalog.
                 False means it serves its sources by id alone and every
-                catalog surface (list_sources, query, resolve,
+                catalog surface (list_sources, query, resolve_source,
                 annotations) refuses
             - `writable`: Whether server accepts uploads
             - `uptime_seconds`: Server uptime in seconds
@@ -1156,20 +1156,22 @@ class TensorFlightClient:
             return json.loads(result.body.to_pybytes())
         return {}
 
-    def get_upload_status(self, source_id: str) -> Dict[str, Any]:
-        """Get upload status for a writable source.
+    def get_upload_status(self, array_id: str) -> Dict[str, Any]:
+        """Get upload status for a writable tensor.
 
         Note:
             Experimental. The upload / writable-source API (source creation, chunk
             upload, and upload-status polling) is experimental and may change.
 
         Args:
-            source_id: The ``array_id`` of the descriptor ``add_tensor`` returned
+            array_id: The ``array_id`` of the descriptor ``setup_array_upload`` returned
 
         Returns:
-            Dictionary with source_id, state, expected_chunks, and uploaded_chunks.
+            Dictionary with ``source_id`` (the ``array_id`` passed in -- the key
+            name mirrors the server's own status dict shape), ``state``,
+            ``expected_chunks``, and ``uploaded_chunks``.
         """
-        return self._catalog.get_upload_status(source_id)
+        return self._catalog.get_upload_status(array_id)
 
     def cache_info(self) -> Dict:
         """Return cache statistics for this connection.

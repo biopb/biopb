@@ -44,7 +44,7 @@ def _arr(fill=1, shape=SHAPE):
 
 def _add(client, source, field, arr=None, chunk_shape=CHUNK):
     arr = _arr() if arr is None else arr
-    return client.add_tensor(
+    return client.setup_array_upload(
         f"cache://{source}/@fields/{field}", arr, chunk_shape=chunk_shape
     )
 

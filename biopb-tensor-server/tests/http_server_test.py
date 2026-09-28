@@ -3581,7 +3581,7 @@ class TestResolveWarmJobs:
         assert r.status_code == 202
         assert r.json()["started"] is True
         assert _await_state(tc, "resolve", "cloud0", "done")["error"] is None
-        mock_fc.resolve.assert_called_once()
+        mock_fc.resolve_source.assert_called_once()
 
     def test_status_route_is_not_swallowed_by_the_source_catch_all(self, auth_client):
         # /api/sources/{source_id:path} is greedy: without this route ordering
@@ -3602,7 +3602,7 @@ class TestResolveWarmJobs:
         # must not start a second download of the same bytes.
         tc, mock_fc = auth_client
         release = threading.Event()
-        mock_fc.resolve.side_effect = lambda *a, **k: release.wait(5)
+        mock_fc.resolve_source.side_effect = lambda *a, **k: release.wait(5)
 
         first = tc.post("/api/sources/cloud0/resolve", headers=_bearer(_TOKEN))
         second = tc.post("/api/sources/cloud0/resolve", headers=_bearer(_TOKEN))
@@ -3610,7 +3610,7 @@ class TestResolveWarmJobs:
         assert second.json()["started"] is False
         release.set()
         _await_state(tc, "resolve", "cloud0", "done")
-        assert mock_fc.resolve.call_count == 1
+        assert mock_fc.resolve_source.call_count == 1
 
     def test_progress_heartbeats_reach_the_status_body(self, auth_client):
         tc, mock_fc = auth_client
@@ -3624,7 +3624,7 @@ class TestResolveWarmJobs:
             )
             seen.wait(5)
 
-        mock_fc.resolve.side_effect = _resolve
+        mock_fc.resolve_source.side_effect = _resolve
         tc.post("/api/sources/cloud0/resolve", headers=_bearer(_TOKEN))
         body = _await_state(tc, "resolve", "cloud0", "running")
         assert body["progress"]["target_name"] == "big.zarr"
@@ -3642,7 +3642,7 @@ class TestResolveWarmJobs:
             observed["cancelled"] = should_cancel()
             raise ResolveCancelled("stopped")
 
-        mock_fc.resolve.side_effect = _resolve
+        mock_fc.resolve_source.side_effect = _resolve
         tc.post("/api/sources/cloud0/resolve", headers=_bearer(_TOKEN))
         r = tc.post("/api/sources/cloud0/resolve/cancel", headers=_bearer(_TOKEN))
         # Flag first, state later: the UI needs the flag to stop offering a
@@ -3664,14 +3664,14 @@ class TestResolveWarmJobs:
 
     def test_a_failed_resolve_surfaces_its_reason(self, auth_client):
         tc, mock_fc = auth_client
-        mock_fc.resolve.side_effect = RuntimeError("offline")
+        mock_fc.resolve_source.side_effect = RuntimeError("offline")
         tc.post("/api/sources/cloud0/resolve", headers=_bearer(_TOKEN))
         body = _await_state(tc, "resolve", "cloud0", "error")
         assert "offline" in body["error"]
 
     def test_warm_reports_the_terminal_counts_not_the_last_heartbeat(self, auth_client):
         tc, mock_fc = auth_client
-        mock_fc.warm.return_value = SimpleNamespace(
+        mock_fc.warm_source.return_value = SimpleNamespace(
             files_total=12,
             files_done=12,
             bytes_total=2048,
@@ -3688,7 +3688,7 @@ class TestResolveWarmJobs:
         # files_total == 0 is how a client tells single-file from multi-file
         # without keeping its own list of source types.
         tc, mock_fc = auth_client
-        mock_fc.warm.return_value = SimpleNamespace(
+        mock_fc.warm_source.return_value = SimpleNamespace(
             files_total=0,
             files_done=0,
             bytes_total=0,
@@ -3702,7 +3702,7 @@ class TestResolveWarmJobs:
 
     def test_resolve_and_warm_are_separate_jobs_on_one_source(self, auth_client):
         tc, mock_fc = auth_client
-        mock_fc.warm.return_value = SimpleNamespace(
+        mock_fc.warm_source.return_value = SimpleNamespace(
             files_total=1,
             files_done=1,
             bytes_total=8,

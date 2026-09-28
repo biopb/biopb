@@ -62,12 +62,12 @@ read. They list with `is_resolved == False` and an empty `tensors`, and
 `get_tensor` on one raises.
 
 ```python
-client.resolve("source_id")     # downloads the whole thing; minutes, disk, needs network
+client.resolve_source("source_id")     # downloads the whole thing; minutes, disk, needs network
 ```
 
 Resolving is deliberately explicit — browsing never triggers it — because it is
 a full download. It returns the source's `sources` row, now populated. For a
-multi-file source it fetches metadata only; `client.warm(source_id)` pulls the
+multi-file source it fetches metadata only; `client.warm_source(source_id)` pulls the
 member files resident up front, server-side, if you are about to read all of it.
 
 **Resolved is not the same as local.** `is_resolved` says the server has read
@@ -116,7 +116,7 @@ The write side is [[upload]] — tensors, label sets and ROI annotations, and wh
 each refuses. The short form:
 
 ```python
-desc = client.add_tensor("zarr://scratch/@fields/my_result", arr)
+desc = client.setup_array_upload("zarr://scratch/@fields/my_result", arr)
 client.upload_array(desc, arr)
 ```
 
