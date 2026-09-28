@@ -23,7 +23,7 @@ dependencies = [
   # Keep it that way: the SDK `v*` tag and the product `release-v*` tag must sit
   # on one commit, or the biopb wheel release.yaml bundles (and install.sh
   # file://-installs) derives a .devN+gSHA version instead of the released one.
-  "biopb >= 0.11.1",
+  "biopb >= 0.11.2.dev0",
   # Floor verified for the file cache's Windows zero-copy segment read (#572):
   # the cache hands out batches that alias the segment mmap and unlinks the file
   # (on eviction) while a caller still holds one. That is safe only if
