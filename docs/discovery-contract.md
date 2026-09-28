@@ -50,6 +50,15 @@ presents against a SHA-256 fingerprint it reads locally: `tls-served.json` in
 the state directory, keyed by port, else the digest of `tls/server-cert.pem`. A
 local TLS plane with neither is an error, not a fallback to trust-on-first-use.
 
+## A remote TLS plane
+
+An address that bypassed the control (`$BIOPB_TENSOR_URL`, a flag) is trusted as
+`$BIOPB_TENSOR_TLS_CA` (a PEM file: a private CA, or the server's own
+certificate) or `$BIOPB_TENSOR_TLS_FINGERPRINT` (its SHA-256, as `cert init`
+prints it) say, else on first use. Both check every connect and skip the pin
+store; with both set the CA wins. A configured anchor also wins over the local
+record for a loopback address, but never applies to a plane the control named.
+
 ## Stability
 
 The files, variables, header, query parameter and the `data_plane.grpc_url`

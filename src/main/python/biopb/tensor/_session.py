@@ -66,7 +66,7 @@ from biopb.tensor._roi_rows import (
     rois_to_table,
     table_to_rois,
 )
-from biopb.tensor._tls import TlsTrust, resolve_tls_trust
+from biopb.tensor._tls import TlsTrust, handshake_failure_reason, resolve_tls_trust
 from biopb.tensor.descriptor_pb2 import (
     AddSourceProgress,
     AddSourceRequest,
@@ -139,9 +139,14 @@ class _ClientState:
         ``advertised_location``.
         """
         if not self.protocol_checked:
-            self.advertised_location = _check_flight_protocol(
-                self.raw_client, self.call_options, self.location
-            )
+            try:
+                self.advertised_location = _check_flight_protocol(
+                    self.raw_client, self.call_options, self.location
+                )
+            except flight.FlightUnavailableError as exc:
+                raise _explain_handshake_failure(
+                    exc, self.location, self.tls_trust
+                ) from exc
             self.protocol_checked = True
         return self.raw_client
 
@@ -351,6 +356,21 @@ def _dask_from_flight_info(
             )
         ]
     return dask_arr
+
+
+def _explain_handshake_failure(
+    exc: flight.FlightUnavailableError, location: str, trust: Optional[TlsTrust]
+) -> flight.FlightUnavailableError:
+    """*exc* with the TLS reason added, for a handshake failure that lacks one.
+
+    Some gRPC builds keep the reason to their own log. The same exception type,
+    so a caller catching ``FlightUnavailableError`` still does.
+    """
+    message = str(exc).lower()
+    if trust is None or "handshake" not in message or "ssl_error_ssl" in message:
+        return exc
+    reason = handshake_failure_reason(location, trust)
+    return flight.FlightUnavailableError(f"{exc}\n{reason}") if reason else exc
 
 
 def _check_flight_protocol(

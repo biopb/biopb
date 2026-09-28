@@ -239,6 +239,89 @@ def test_expired_cert_fails_with_its_actual_reason(tmp_path, monkeypatch):
         server.shutdown()
 
 
+def _health(**client_kwargs):
+    import json
+
+    client = flight.FlightClient(**client_kwargs)
+    (result,) = client.do_action(flight.Action("health", b""))
+    return json.loads(result.body.to_pybytes())
+
+
+@pytest.mark.skipif(not _crypto_available(), reason="cryptography not available")
+def test_health_reports_when_the_certificate_expires():
+    """A poller can read the expiry without holding the certificate
+    (biopb/biopb#1117); a plaintext server has none to report."""
+    from biopb_tensor_server import TensorFlightServer
+
+    cert_pem, key_pem = _self_signed_cert(valid_days=90)
+    tls = TensorFlightServer(
+        "grpc://localhost:0", tls_cert_chain=cert_pem, tls_private_key=key_pem
+    )
+    plain = TensorFlightServer("grpc://localhost:0")
+    for server in (tls, plain):
+        server.mark_ready()
+        _serve(server)
+    try:
+        health = _health(
+            location=f"grpc+tls://localhost:{tls.port}",
+            tls_root_certs=cert_pem,
+        )
+        expires = datetime.datetime.strptime(
+            health["tls_not_after"], "%Y-%m-%dT%H:%M:%SZ"
+        )
+        remaining = expires - datetime.datetime.now(datetime.timezone.utc).replace(
+            tzinfo=None
+        )
+        assert datetime.timedelta(days=89) < remaining < datetime.timedelta(days=91)
+        assert "tls_not_after" not in _health(location=f"grpc://localhost:{plain.port}")
+    finally:
+        tls.shutdown()
+        plain.shutdown()
+
+
+@pytest.mark.skipif(not _crypto_available(), reason="cryptography not available")
+def test_an_expired_configured_ca_is_refused_without_dialing():
+    """A configured CA resolves offline, so the probe that names expiry for a
+    pin never runs; the anchor's own date is checked instead."""
+    from biopb.tensor import TensorFlightClient
+    from biopb.tensor._tls import TlsCertExpiredError
+
+    cert_pem, _ = _self_signed_cert(valid_days=-30)
+    with pytest.raises(TlsCertExpiredError, match="replace the configured CA"):
+        TensorFlightClient("grpcs://localhost:1", tls_ca_pem=cert_pem)
+
+
+@pytest.mark.skipif(not _crypto_available(), reason="cryptography not available")
+def test_a_handshake_failure_names_its_reason():
+    """The error a caller catches says why the handshake failed, not only that it
+    did (biopb/biopb#1116)."""
+    from biopb.tensor import TensorFlightClient
+    from biopb_tensor_server import TensorFlightServer
+
+    served, key_pem = _self_signed_cert()
+    stranger, _ = _self_signed_cert()
+    server = TensorFlightServer(
+        "grpc://localhost:0", tls_cert_chain=served, tls_private_key=key_pem
+    )
+    server.mark_ready()
+    _serve(server)
+    try:
+        client = TensorFlightClient(
+            f"grpcs://localhost:{server.port}", tls_ca_pem=stranger
+        )
+        with pytest.raises(flight.FlightUnavailableError) as excinfo:
+            client.health_check()
+        # Whichever layer supplies it: gRPC's own message on builds that carry
+        # the verify error, else the SDK's re-probe (see TestExplainHandshakeFailure).
+        message = str(excinfo.value)
+        assert (
+            "self-signed certificate" in message
+            or f"TLS handshake with localhost:{server.port} failed" in message
+        )
+    finally:
+        server.shutdown()
+
+
 # --- the co-located HTTP sidecar over a TLS flight plane --------------------
 # `launch` runs the Flight server and the FastAPI sidecar in one process, and the
 # sidecar reaches Flight over loopback as an ordinary TensorFlightClient. That

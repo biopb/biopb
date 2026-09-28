@@ -47,6 +47,7 @@ from biopb.tensor._session import (
     ResolveCancelled as ResolveCancelled,
     _ClientState,
     _dask_from_flight_info,
+    _explain_handshake_failure,
     _refetch_flight_info,
     _requested_slice,
     split_array_id as split_array_id,
@@ -1189,7 +1190,14 @@ class TensorFlightClient:
             FlightError: If server is unreachable or action fails
         """
         action = flight.Action("health", b"")
-        results = self._client.do_action(action, options=self._call_options)
+        try:
+            results = self._client.do_action(action, options=self._call_options)
+        except flight.FlightUnavailableError as exc:
+            # The reachability probe every caller starts from, so the one place
+            # an opaque handshake failure most needs its reason (biopb#1116).
+            raise _explain_handshake_failure(
+                exc, self._location, self._tls_trust
+            ) from exc
         for result in results:
             return json.loads(result.body.to_pybytes())
         return {"status": "UNKNOWN"}

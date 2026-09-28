@@ -798,6 +798,20 @@ def test_profile_ca_file_is_read_into_pem_bytes(tmp_path):
     assert creds.tls_ca_pem == ca.read_bytes()
 
 
+def test_profile_ca_file_tilde_is_the_home_directory(tmp_path, monkeypatch):
+    from biopb_tensor_server.adapters.remote_tensor import resolve_upstream_credentials
+
+    ca = tmp_path / "lab-ca.pem"
+    ca.write_bytes(b"-----BEGIN CERTIFICATE-----\nabc\n-----END CERTIFICATE-----\n")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))  # Windows' spelling
+    creds = resolve_upstream_credentials(
+        _upstream_source(credentials_profile="lab-store"),
+        _creds(tls_ca_file="~/lab-ca.pem"),
+    )
+    assert creds.tls_ca_pem == ca.read_bytes()
+
+
 def test_profile_fingerprint_is_passed_through_normalized():
     """The configured fingerprint reaches the credentials, canonicalized so the
     pool key is stable across spellings (see UpstreamCredentials.__post_init__)."""
@@ -858,13 +872,14 @@ def test_ca_and_fingerprint_together_warns_and_keeps_only_the_ca(tmp_path, caplo
     from biopb_tensor_server.adapters.remote_tensor import resolve_upstream_credentials
 
     ca = tmp_path / "ca.pem"
-    ca.write_bytes(b"pem")
+    pem = b"-----BEGIN CERTIFICATE-----\nabc\n-----END CERTIFICATE-----\n"
+    ca.write_bytes(pem)
     with caplog.at_level("WARNING"):
         creds = resolve_upstream_credentials(
             _upstream_source(credentials_profile="lab-store"),
             _creds(tls_ca_file=str(ca), tls_fingerprint="AB:CD"),
         )
-    assert creds.tls_ca_pem == b"pem"
+    assert creds.tls_ca_pem == pem
     assert creds.tls_fingerprint is None
     assert "ignored" in caplog.text
 
@@ -1727,7 +1742,7 @@ class TestMisconfiguredUpstreamIsNotUnreachable:
             proxy.shutdown()
 
         assert first == 1
-        assert "which is empty" in caplog.text
+        assert "is empty" in caplog.text
 
     def test_registering_a_single_source_entry_names_the_config_error(
         self, tmp_path, caplog

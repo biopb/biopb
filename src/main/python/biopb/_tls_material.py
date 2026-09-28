@@ -24,8 +24,13 @@ matches the cert) to whoever does have a parser.
 from __future__ import annotations
 
 import hashlib
+import logging
 import ssl
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 #: Every PEM object starts with this, whatever it holds.
 _PEM_PREAMBLE = b"-----BEGIN"
@@ -43,6 +48,20 @@ class TlsMaterialError(Exception):
     prints it and exits 2), so the message is written for the operator rather
     than for a traceback.
     """
+
+
+def expand_user_path(value: str | Path) -> Path:
+    """*value* with a leading ``~`` expanded, or as given when there is no home.
+
+    ``~`` reaches us literally from a JSON profile, a ``.env`` or a scheduler
+    script. Windows reads ``USERPROFILE``, and with none set ``expanduser``
+    raises, which would hide the missing file this is about to name.
+    """
+    path = Path(value)
+    try:
+        return path.expanduser()
+    except RuntimeError:
+        return path
 
 
 def read_pem(path: Path, label: str) -> bytes:
@@ -86,6 +105,40 @@ def read_pem(path: Path, label: str) -> bytes:
             f"pkey -in {path.name} -out <plaintext>` — kept mode 0600."
         )
     return data
+
+
+@dataclass(frozen=True)
+class TlsAnchor:
+    """What a client trusts of a TLS server: a CA/leaf PEM, or a leaf's SHA-256.
+
+    At most one is set; neither leaves the client to trust on first use.
+    """
+
+    ca_pem: Optional[bytes] = None
+    fingerprint: Optional[str] = None
+
+    def __bool__(self) -> bool:
+        return bool(self.ca_pem or self.fingerprint)
+
+
+def choose_anchor(
+    ca_pem: Optional[bytes], fingerprint: Optional[str], *, source: str
+) -> TlsAnchor:
+    """The one anchor to trust when a config may name both: the CA wins.
+
+    The same rule as ``TensorFlightClient``'s constructor, said aloud: *source*
+    (who set them) is named in the warning, so nobody believes a fingerprint is
+    enforced when it is not.
+    """
+    fingerprint = (fingerprint or "").strip() or None
+    if ca_pem and fingerprint:
+        logger.warning(
+            "%s sets both a CA and a fingerprint; the CA is used and the "
+            "fingerprint is ignored.",
+            source,
+        )
+        fingerprint = None
+    return TlsAnchor(ca_pem=ca_pem or None, fingerprint=fingerprint)
 
 
 def leaf_pem(bundle_pem: bytes) -> bytes:

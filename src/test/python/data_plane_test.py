@@ -560,3 +560,126 @@ class TestLocalTrustAnchor:
         finally:
             cert.chmod(0o600)
         assert str(cert) in str(exc.value)
+
+
+class TestConfiguredTlsAnchor:
+    """A remote plane's certificate is named by the environment, not learned on
+    first use (biopb/biopb#919); a plane the control named ignores it."""
+
+    URL = "grpcs://data.mylab.example:8815"
+    FP = "ab" * 32
+
+    @pytest.fixture(autouse=True)
+    def _clean_env(self, monkeypatch):
+        monkeypatch.delenv("BIOPB_TENSOR_TLS_CA", raising=False)
+        monkeypatch.delenv("BIOPB_TENSOR_TLS_FINGERPRINT", raising=False)
+
+    def _ca(self, tmp_path):
+        path = tmp_path / "ca.pem"
+        path.write_bytes(
+            b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n"
+        )
+        return path
+
+    def test_nothing_configured_is_no_anchor(self):
+        assert _data_plane.configured_tls_anchor() == _data_plane.TlsAnchor()
+
+    def test_a_ca_file_is_read(self, monkeypatch, tmp_path):
+        path = self._ca(tmp_path)
+        monkeypatch.setenv("BIOPB_TENSOR_TLS_CA", str(path))
+        assert _data_plane.configured_tls_anchor().ca_pem == path.read_bytes()
+
+    def test_a_tilde_in_the_ca_path_is_the_home_directory(self, monkeypatch, tmp_path):
+        path = self._ca(tmp_path)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))  # Windows' spelling
+        monkeypatch.setenv("BIOPB_TENSOR_TLS_CA", f"~/{path.name}")
+        assert _data_plane.configured_tls_anchor().ca_pem == path.read_bytes()
+
+    def test_a_fingerprint_is_taken_stripped(self, monkeypatch):
+        monkeypatch.setenv("BIOPB_TENSOR_TLS_FINGERPRINT", f"  {self.FP}  ")
+        assert _data_plane.configured_tls_anchor().fingerprint == self.FP
+
+    def test_the_ca_wins_when_both_are_set(self, monkeypatch, tmp_path, caplog):
+        path = self._ca(tmp_path)
+        monkeypatch.setenv("BIOPB_TENSOR_TLS_CA", str(path))
+        monkeypatch.setenv("BIOPB_TENSOR_TLS_FINGERPRINT", self.FP)
+        with caplog.at_level("WARNING"):
+            anchor = _data_plane.configured_tls_anchor()
+        assert anchor == _data_plane.TlsAnchor(ca_pem=path.read_bytes())
+        assert "fingerprint is ignored" in caplog.text
+
+    def test_a_missing_ca_file_names_the_variable(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("BIOPB_TENSOR_TLS_CA", str(tmp_path / "nope.pem"))
+        with pytest.raises(_data_plane.TlsConfigError, match="BIOPB_TENSOR_TLS_CA"):
+            _data_plane.configured_tls_anchor()
+
+    def test_the_endpoints_positional_order_is_unchanged(self):
+        # It is exported, so a caller may construct it positionally.
+        endpoint = _data_plane.DataPlaneEndpoint("grpc://h:1", "tok", "fp", "env")
+        assert (endpoint.token, endpoint.tls_fingerprint, endpoint.origin) == (
+            "tok",
+            "fp",
+            "env",
+        )
+        assert endpoint.tls_ca_pem is None
+
+    def test_a_config_error_is_a_local_trust_error(self):
+        # So the CLI and Connection report it by type, not by errno substring.
+        assert issubclass(_data_plane.TlsConfigError, _data_plane.LocalTrustError)
+
+    def test_a_configured_anchor_beats_the_local_record(self, monkeypatch):
+        monkeypatch.setenv("BIOPB_TENSOR_TLS_FINGERPRINT", self.FP)
+        # A local TLS plane with no published record raises without this.
+        trust = _data_plane.data_plane_trust("grpcs://127.0.0.1:8815", "env")
+        assert trust == _data_plane.TlsAnchor(fingerprint=self.FP)
+
+    def test_a_control_named_plane_ignores_it(self, monkeypatch):
+        monkeypatch.setenv("BIOPB_TENSOR_TLS_FINGERPRINT", self.FP)
+        monkeypatch.setattr(
+            _data_plane, "local_data_plane_fingerprint", lambda url: "cc" * 32
+        )
+        trust = _data_plane.data_plane_trust("grpcs://127.0.0.1:8815", "control")
+        assert trust == _data_plane.TlsAnchor(fingerprint="cc" * 32)
+
+    def test_without_one_the_local_record_decides(self, monkeypatch):
+        monkeypatch.setattr(
+            _data_plane, "local_data_plane_fingerprint", lambda url: "dd" * 32
+        )
+        assert _data_plane.data_plane_trust(self.URL, "env").fingerprint == "dd" * 32
+
+    def test_resolve_carries_the_configured_ca(self, monkeypatch, tmp_path):
+        path = self._ca(tmp_path)
+        monkeypatch.setenv("BIOPB_TENSOR_URL", self.URL)
+        monkeypatch.setenv("BIOPB_TENSOR_TLS_CA", str(path))
+        endpoint = _data_plane.resolve_data_plane()
+        assert endpoint.tls_ca_pem == path.read_bytes()
+        assert endpoint.tls_fingerprint is None
+
+    def test_resolve_carries_the_configured_fingerprint(self, monkeypatch):
+        monkeypatch.setenv("BIOPB_TENSOR_URL", self.URL)
+        monkeypatch.setenv("BIOPB_TENSOR_TLS_FINGERPRINT", self.FP)
+        endpoint = _data_plane.resolve_data_plane()
+        assert endpoint.tls_fingerprint == self.FP
+        assert endpoint.tls_ca_pem is None
+
+    def test_connection_dials_with_the_configured_anchor(self, monkeypatch, tmp_path):
+        from unittest.mock import MagicMock
+
+        from biopb.tensor import _connection
+
+        path = self._ca(tmp_path)
+        monkeypatch.setenv("BIOPB_TENSOR_TLS_CA", str(path))
+        built = []
+
+        def fake(url, **kwargs):
+            built.append(kwargs)
+            client = MagicMock()
+            client.health_check.return_value = {"status": "SERVING"}
+            return client
+
+        monkeypatch.setattr(_connection, "TensorFlightClient", fake)
+        _connection.Connection._open(self.URL, "tok", "env")
+
+        assert built[0]["tls_ca_pem"] == path.read_bytes()
+        assert built[0]["tls_fingerprint"] is None

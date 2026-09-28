@@ -562,6 +562,14 @@ def _grpc_location(host: str, port: int) -> str:
     return f"grpc://{authority}:{port}"
 
 
+def _cert_expiry_date(cert_pem: bytes) -> str:
+    """The day the certificate runs out (UTC), for the rows a cert command prints."""
+    from biopb.tensor._tls import cert_not_after, format_expiry_date
+
+    not_after = cert_not_after(cert_pem)
+    return "unknown" if not_after is None else format_expiry_date(not_after)
+
+
 def _warn_if_expiring(cert_pem: bytes) -> None:
     """Say so when the cert about to be served is past or near its expiry.
 
@@ -645,6 +653,7 @@ def _resolve_tls_material(
     _print_verbatim(
         ("cert:", tls_server_cert()),
         ("fingerprint:", format_fingerprint(cert_fingerprint(cert_pem))),
+        ("expires:", _cert_expiry_date(cert_pem)),
     )
     return cert_pem, key_pem
 
@@ -708,6 +717,7 @@ def cert_init(
         ("cert:", tls_server_cert()),
         ("key:", tls_server_key()),
         ("fingerprint:", format_fingerprint(cert_fingerprint(cert_pem))),
+        ("expires:", _cert_expiry_date(cert_pem)),
     )
 
 

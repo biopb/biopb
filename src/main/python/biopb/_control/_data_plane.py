@@ -16,21 +16,37 @@ Step 3 covers the case of a plane launched directly, outside any control.
 deliberately routed around the control, and quietly attaching this machine's
 credential to that dial would send a local secret somewhere it was never issued
 for. Those endpoints carry an explicit token or none.
+
+**So does the TLS anchor**: a control-named plane is trusted by the certificate
+record it published, any other address as ``$BIOPB_TENSOR_TLS_CA`` /
+``$BIOPB_TENSOR_TLS_FINGERPRINT`` say, else on first use (:func:`data_plane_trust`).
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 import urllib.request
 from dataclasses import dataclass
 from typing import Optional
 from urllib.parse import urlparse
 
+from .._tls_material import (
+    TlsAnchor,
+    TlsMaterialError,
+    choose_anchor,
+    expand_user_path,
+    read_pem,
+)
 from ._endpoints import BASE_DEFAULT_PORT, control_base_url, flight_port_for
+
+logger = logging.getLogger(__name__)
 
 ENV_TENSOR_URL = "BIOPB_TENSOR_URL"
 ENV_TENSOR_TOKEN = "BIOPB_TENSOR_TOKEN"
+ENV_TENSOR_TLS_CA = "BIOPB_TENSOR_TLS_CA"
+ENV_TENSOR_TLS_FINGERPRINT = "BIOPB_TENSOR_TLS_FINGERPRINT"
 
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
@@ -44,6 +60,14 @@ class LocalTrustError(RuntimeError):
     authentication marker, so a file-permission problem would be reported as "the
     server needs a token" and send the reader after a credential that has nothing
     to do with it. Matching on the type is exact, and no errno wording can break it.
+    """
+
+
+class TlsConfigError(LocalTrustError):
+    """A trust anchor set in the environment cannot be used.
+
+    A :class:`LocalTrustError` so every layer that already reports those by type
+    reports this one the same way, rather than by substring.
     """
 
 
@@ -220,6 +244,7 @@ class DataPlaneEndpoint:
     token: Optional[str] = None
     tls_fingerprint: Optional[str] = None
     origin: str = "default"
+    tls_ca_pem: Optional[bytes] = None
 
     @property
     def origin_note(self) -> str:
@@ -250,8 +275,10 @@ def resolve_data_plane(
 
     Raises :class:`LocalTrustError` when the resolved plane is local TLS but
     nothing on this machine says what it serves — see :func:`local_data_plane_fingerprint`.
+    The TLS anchor is :func:`data_plane_trust`'s.
     """
     url, origin = _resolve_url(override, timeout=timeout, probe=probe)
+    trust = data_plane_trust(url, origin)
     return DataPlaneEndpoint(
         url=url,
         # The credential file is the control's handoff for the plane IT owns, so
@@ -264,9 +291,50 @@ def resolve_data_plane(
         token=resolve_data_plane_token(
             token, allow_credential_file=origin == "control"
         ),
-        tls_fingerprint=local_data_plane_fingerprint(url),
+        tls_fingerprint=trust.fingerprint,
+        tls_ca_pem=trust.ca_pem,
         origin=origin,
     )
+
+
+def configured_tls_anchor() -> TlsAnchor:
+    """The anchor the environment names: ``$BIOPB_TENSOR_TLS_CA`` (a PEM file) or
+    ``$BIOPB_TENSOR_TLS_FINGERPRINT``, else none.
+
+    For a plane whose certificate this machine cannot see -- a remote one --
+    where trust-on-first-use is only as good as a pin store that outlives the
+    process, which a container or a scheduler job does not have. Raises
+    :class:`TlsConfigError` when the CA file is unusable.
+    """
+    ca_path = os.environ.get(ENV_TENSOR_TLS_CA, "").strip()
+    try:
+        ca_pem = (
+            read_pem(expand_user_path(ca_path), f"${ENV_TENSOR_TLS_CA}")
+            if ca_path
+            else None
+        )
+    except TlsMaterialError as exc:
+        raise TlsConfigError(str(exc)) from exc
+    return choose_anchor(
+        ca_pem, os.environ.get(ENV_TENSOR_TLS_FINGERPRINT), source="The environment"
+    )
+
+
+def data_plane_trust(url: str, origin: str) -> TlsAnchor:
+    """The TLS anchor to dial *url* with, given where its address came from.
+
+    A plane the control named is this machine's own and is identified by the
+    record it published (:func:`local_data_plane_fingerprint`); nothing in the
+    environment overrides that, so a stale variable cannot point a local client
+    at an old certificate. Any other address routed around the control, so an
+    anchor the environment configures wins, and without one the local record
+    (loopback ``grpcs://``) or trust on first use decides.
+    """
+    if origin != "control":
+        configured = configured_tls_anchor()
+        if configured:
+            return configured
+    return TlsAnchor(fingerprint=local_data_plane_fingerprint(url))
 
 
 def _resolve_url(
