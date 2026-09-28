@@ -562,3 +562,35 @@ class TestExportLocation:
 
         assert result == "fake-array"
         assert captured["location"] == "grpc://real-host:8815"
+
+
+class TestCheckFlightProtocolMalformedHealth:
+    """A non-biopb (or misbehaving) Flight server can answer `health` with
+    valid JSON that isn't an object -- a bare string, list, number, or null.
+    That must fall back to the same "server predates this SDK" refusal as an
+    object with no "protocol" key, not an unhandled AttributeError out of a
+    dict-only `.get()` call chain (regression: biopb/biopb#1158's parsing
+    split narrowed the second try/except's caught exceptions)."""
+
+    @staticmethod
+    def _client_answering(body_bytes: bytes):
+        class _FakeBody:
+            def to_pybytes(self):
+                return body_bytes
+
+        class _FakeResult:
+            body = _FakeBody()
+
+        class _FakeClient:
+            def do_action(self, action, options=None):
+                return [_FakeResult()]
+
+        return _FakeClient()
+
+    @pytest.mark.parametrize("payload", [b'"ok"', b"[]", b"null", b"42"])
+    def test_non_dict_json_health_is_treated_as_a_stale_v1_server(self, payload):
+        from biopb.tensor._session import _check_flight_protocol
+
+        client = self._client_answering(payload)
+        with pytest.raises(RuntimeError, match="Incompatible biopb Flight protocol"):
+            _check_flight_protocol(client, None, "grpc://x:1")

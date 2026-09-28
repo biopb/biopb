@@ -373,7 +373,7 @@ def _check_flight_protocol(
         health = {}
     try:
         server_ver = int(health.get("protocol", 1))
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, AttributeError):
         server_ver = 1
     if server_ver != FLIGHT_PROTOCOL_VERSION:
         stale = "server" if server_ver < FLIGHT_PROTOCOL_VERSION else "client"
