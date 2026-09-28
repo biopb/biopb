@@ -125,8 +125,11 @@ tensor's own record. So the ten `…For` fields, the `stillPending` identity
 checks, and most of `SELECTOR_ONLY_FIELDS` all go away. The lint rule shrinks
 to "don't read `s.views` directly." Link-seeded state (`rs=`) goes into
 `init` and is written under the resolved key, so it can't be keyed wrong.
-One behaviour change, which is a win: coming back to a tensor finds its ROI
-cache warm, still subject to the count-mismatch refetch.
+The ROI cache persists across navigation: coming back to a tensor finds its
+rows warm, still subject to the count-mismatch refetch. Today it is a single
+slot tagged with `currentArrayId`'s spelling, token included, so A → B → A
+refetches A and a re-index looks like a new tensor. Keyed by `TensorKey`
+(token-free) it survives both, bounded by the LRU.
 
 ### C. Derive, don't publish
 
@@ -223,8 +226,7 @@ lands, step 0 is the smaller patch.
 ## Open questions
 
 1. *(resolved: colour and names stay per source for now; see H.)*
-2. **ROI cache across navigation:** keep an LRU of `TensorView`s (proposed),
-   or clear on every `openTensor` (today's effective behaviour)?
+2. *(resolved: the ROI cache persists, keyed by `TensorKey` in the LRU of `TensorView`s; see B.)*
 3. **Failure presentation:** once `tile_info` is fetched in the store,
    `ViewerPane` reads `target.error` instead of the viewer's `onUnsupported`
    for resolution failures. The viewer keeps `onUnsupported` only for
