@@ -223,11 +223,8 @@ preservation, no remount on resolution), so keep them as the acceptance tests
 for step 1. If the float-contrast and `rs=` defects need a fix before step 1
 lands, step 0 is the smaller patch.
 
-## Open questions
+## Decisions
 
 1. *(resolved: colour and names stay per source for now; see H.)*
 2. *(resolved: the ROI cache persists, keyed by `TensorKey` in the LRU of `TensorView`s; see B.)*
-3. **Failure presentation:** once `tile_info` is fetched in the store,
-   `ViewerPane` reads `target.error` instead of the viewer's `onUnsupported`
-   for resolution failures. The viewer keeps `onUnsupported` only for
-   render-time refusals (dtype, WebGL, `volumeRefusal`). Acceptable?
+3. *(resolved: `ViewerPane` reads resolution failures from `target.error`; the viewer's `onUnsupported` stays only for render-time refusals: dtype, WebGL, `volumeRefusal`.)*
