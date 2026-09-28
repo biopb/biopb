@@ -33,7 +33,7 @@ classifiers = [
 requires-python = ">=3.10,<3.13"
 dependencies = [
     # The algorithm registry (biopb._algorithms); .dev0 admits a pre-tag dev build.
-    "biopb >= 0.11.0rc4.dev0",
+    "biopb >= 0.11.1",
     "starlette>=0.37",
     # No websockets extra: the control proxies HTTP only and runs uvicorn with
     # ws="none", so neither a server impl nor a client library is pulled in.

@@ -72,7 +72,7 @@ dependencies = [
     "matplotlib",
     "scikit-learn",
     # biopb.control, biopb.tensor.Connection and the Ops protocol (.dev0: a pre-tag dev build).
-    "biopb[tensor] >= 0.11.0rc4.dev0",
+    "biopb[tensor] >= 0.11.1",
 ]
 
 [project.optional-dependencies]
