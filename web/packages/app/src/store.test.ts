@@ -24,6 +24,7 @@ import {
   catalogFingerprint,
   currentArrayId,
   useAppStore,
+  viewKey,
 } from "./store";
 import { DEFAULT_LABEL_OPACITY } from "./utils/vivUtils";
 
@@ -176,12 +177,14 @@ describe("viewer URL state", () => {
 
 describe("the levels the data has shown", () => {
   const at = (channel: number) =>
-    useAppStore.setState({ slice: { ...BASE_SLICE, c: channel } });
+    useAppStore.setState((s) => ({ slice: { ...s.slice, c: channel } }));
+  const view = (id: string) =>
+    useAppStore.setState({ activeTensorId: id, requestedArrayId: null, tileInfo: null, tileInfoFor: null });
 
   it("widens to cover every plane sampled, not just the last one", () => {
-    useAppStore.setState({ activeTensorId: "first", requestedArrayId: null });
-    useAppStore.getState().noteObservedLimits([12, 4000], "first", 0);
-    useAppStore.getState().noteObservedLimits([0, 3], "first", 0);
+    view("first");
+    useAppStore.getState().noteObservedLimits([12, 4000], 0);
+    useAppStore.getState().noteObservedLimits([0, 3], 0);
     at(0);
 
     // Without the union a fixed window chosen on the bright plane could not be
@@ -190,36 +193,38 @@ describe("the levels the data has shown", () => {
   });
 
   it("keeps each channel on its own scale", () => {
-    useAppStore.setState({ activeTensorId: "first", requestedArrayId: null });
-    useAppStore.getState().noteObservedLimits([12, 4000], "first", 0);
-    useAppStore.getState().noteObservedLimits([0, 1], "first", 1);
+    view("first");
+    useAppStore.getState().noteObservedLimits([12, 4000], 0);
+    useAppStore.getState().noteObservedLimits([0, 1], 1);
     at(1);
 
     expect(selectObservedLimits(useAppStore.getState())).toEqual([0, 1]);
   });
 
   it("starts over on another tensor rather than widening across two", () => {
-    useAppStore.getState().noteObservedLimits([12, 4000], "first", 0);
-    useAppStore.getState().noteObservedLimits([0, 1], "second", 0);
-    useAppStore.setState({ activeTensorId: "second", requestedArrayId: null });
+    view("first");
+    useAppStore.getState().noteObservedLimits([12, 4000], 0);
+    view("second");
+    useAppStore.getState().noteObservedLimits([0, 1], 0);
     at(0);
 
     expect(selectObservedLimits(useAppStore.getState())).toEqual([0, 1]);
   });
 
   it("hides a union sampled from another tensor", () => {
-    useAppStore.getState().noteObservedLimits([12, 4000], "first", 0);
-    useAppStore.setState({ activeTensorId: "second", requestedArrayId: null });
+    view("first");
+    useAppStore.getState().noteObservedLimits([12, 4000], 0);
+    view("second");
     at(0);
 
     expect(selectObservedLimits(useAppStore.getState())).toBeNull();
   });
 
   it("does not write when the plane adds nothing", () => {
-    useAppStore.setState({ activeTensorId: "first", requestedArrayId: null });
-    useAppStore.getState().noteObservedLimits([0, 4000], "first", 0);
+    view("first");
+    useAppStore.getState().noteObservedLimits([0, 4000], 0);
     const before = useAppStore.getState().observedLimits;
-    useAppStore.getState().noteObservedLimits([10, 900], "first", 0);
+    useAppStore.getState().noteObservedLimits([10, 900], 0);
 
     // The viewers publish this from a memo on every render; a fresh identity
     // each time would loop through the effect that writes it.
@@ -228,12 +233,16 @@ describe("the levels the data has shown", () => {
 });
 
 describe("the contrast track", () => {
+  const view = (id: string) =>
+    useAppStore.setState({ activeTensorId: id, requestedArrayId: null, tileInfo: null, tileInfoFor: null });
+
   it("hides a track published for another tensor", () => {
     // The reason it is guarded rather than reset: a viewer that errored out
     // after publishing leaves its track behind, and a stale one would draw the
     // panel's bar on the previous tensor's grey levels.
-    useAppStore.getState().setContrastTrack([0, 4000], "first");
-    useAppStore.setState({ activeTensorId: "second", requestedArrayId: null });
+    view("first");
+    useAppStore.getState().setContrastTrack([0, 4000]);
+    view("second");
 
     expect(selectContrastTrack(useAppStore.getState())).toBeNull();
   });
@@ -241,17 +250,17 @@ describe("the contrast track", () => {
   it("hands the panel the track the viewer derived", () => {
     // The whole point of publishing it (biopb/biopb#955): one deriver, so the
     // bar cannot be drawn on a track the shader is not clamping into.
-    useAppStore.setState({ activeTensorId: "first", requestedArrayId: null });
-    useAppStore.getState().setContrastTrack([12.5, 4000], "first");
+    view("first");
+    useAppStore.getState().setContrastTrack([12.5, 4000]);
 
     expect(selectContrastTrack(useAppStore.getState())).toEqual([12.5, 4000]);
   });
 
   it("does not write when the track is unchanged", () => {
-    useAppStore.setState({ activeTensorId: "first", requestedArrayId: null });
-    useAppStore.getState().setContrastTrack([0, 4000], "first");
+    view("first");
+    useAppStore.getState().setContrastTrack([0, 4000]);
     const before = useAppStore.getState().contrastTrack;
-    useAppStore.getState().setContrastTrack([0, 4000], "first");
+    useAppStore.getState().setContrastTrack([0, 4000]);
 
     // The viewer derives this in a memo on every render; a fresh identity each
     // time would loop through the effect that publishes it.
@@ -261,11 +270,123 @@ describe("the contrast track", () => {
   it("writes an equal track published for a different tensor", () => {
     // Two tensors can share a dtype and so a track. The id has to move anyway,
     // or the selector would go on hiding it.
-    useAppStore.getState().setContrastTrack([0, 65535], "first");
-    useAppStore.getState().setContrastTrack([0, 65535], "second");
-    useAppStore.setState({ activeTensorId: "second", requestedArrayId: null });
+    view("first");
+    useAppStore.getState().setContrastTrack([0, 65535]);
+    view("second");
+    useAppStore.getState().setContrastTrack([0, 65535]);
 
     expect(selectContrastTrack(useAppStore.getState())).toEqual([0, 65535]);
+  });
+});
+
+// A versioned source answers tile_info for `src/field` with `src@tok/field`
+// (biopb/biopb#780), and a bare `src` with the field it binds by default.
+// Everything below is state a viewer or a link wrote before that answer, and
+// must still be visible after it.
+describe("tensor-scoped state survives the grid landing", () => {
+  const VERSIONED = { ...TILE_INFO, array_id: "src@tok/field" } as TileInfo;
+
+  function open(id: string) {
+    useAppStore.setState({
+      activeSourceId: "src",
+      activeTensorId: id,
+      requestedArrayId: null,
+      tileInfo: null,
+      tileInfoFor: null,
+      slice: BASE_SLICE,
+    });
+  }
+
+  it("keys on the tensor, not on the version token tile_info adds", () => {
+    open("src/field");
+    useAppStore.getState().setTileInfo(VERSIONED, "src/field");
+
+    expect(currentArrayId(useAppStore.getState())).toBe("src@tok/field");
+    expect(viewKey(useAppStore.getState())).toBe("src/field");
+  });
+
+  it("shows the contrast state a viewer published for an ordinary click", () => {
+    // TileViewer's order: the grid is published, then the contrast hook's
+    // effects run in the same commit.
+    open("src/field");
+    useAppStore.getState().setTileInfo(VERSIONED, "src/field");
+    useAppStore.getState().noteObservedLimits([0, 5000], 0);
+    useAppStore.getState().setContrastTrack([0, 5000]);
+
+    expect(selectObservedLimits(useAppStore.getState())).toEqual([0, 5000]);
+    expect(selectContrastTrack(useAppStore.getState())).toEqual([0, 5000]);
+  });
+
+  it("keeps an unpinned link's sets once the grid lands", () => {
+    useAppStore.setState({ tileInfo: null, tileInfoFor: null });
+    useAppStore.getState().applyViewerState(new URLSearchParams("id=src/field&rs=nuclei"));
+    useAppStore.getState().setTileInfo(VERSIONED, "src/field");
+
+    expect(selectVisibleSets(useAppStore.getState())).toEqual(["nuclei"]);
+  });
+
+  it("keeps a pinned link's sets once the grid lands", () => {
+    useAppStore.setState({ tileInfo: null, tileInfoFor: null });
+    useAppStore.getState().applyViewerState(new URLSearchParams("id=src@pin/field&rs=nuclei"));
+    useAppStore
+      .getState()
+      .setTileInfo({ ...TILE_INFO, array_id: "src@pin/field" } as TileInfo, "src@pin/field");
+
+    expect(selectVisibleSets(useAppStore.getState())).toEqual(["nuclei"]);
+  });
+
+  it("carries a bare source_id's sets to the field it resolves to", () => {
+    useAppStore.setState({ tileInfo: null, tileInfoFor: null });
+    useAppStore.getState().applyViewerState(new URLSearchParams("id=src&rs=nuclei"));
+    useAppStore.getState().setTileInfo(VERSIONED, "src");
+
+    expect(viewKey(useAppStore.getState())).toBe("src/field");
+    expect(selectVisibleSets(useAppStore.getState())).toEqual(["nuclei"]);
+    expect(useAppStore.getState().visibleSetsFor).toBe("src/field");
+  });
+
+  it("leaves another tensor's state keyed where it was", () => {
+    open("src");
+    useAppStore.setState({ visibleSets: ["other"], visibleSetsFor: "elsewhere" });
+    useAppStore.getState().setTileInfo(VERSIONED, "src");
+
+    expect(useAppStore.getState().visibleSetsFor).toBe("elsewhere");
+  });
+
+  it("fetches the ROI listing once when the grid only adds a token", async () => {
+    const asked: string[] = [];
+    const client = {
+      http: {
+        listRois: (arrayId: string) => {
+          asked.push(arrayId);
+          return new Promise((resolve) =>
+            setTimeout(() => resolve({ rois: [], sets: [], truncated: false, skipped: 0 }), 5),
+          );
+        },
+      },
+    } as unknown as TensorFlightClient;
+    useAppStore.setState({
+      client,
+      rois: [],
+      roiSets: [],
+      roisFor: null,
+      roiScopes: {},
+      roisPending: [],
+      roisPendingFor: null,
+      roisUnavailable: false,
+      visibleSets: null,
+      visibleSetsFor: null,
+    });
+    open("src/field");
+    // TileViewer's effect fires on mount, and again when `currentArrayId`
+    // gains the token.
+    const first = useAppStore.getState().loadRois("src/field");
+    useAppStore.getState().setTileInfo(VERSIONED, "src/field");
+    const second = useAppStore.getState().loadRois("src@tok/field");
+    await Promise.all([first, second]);
+
+    expect(asked).toEqual(["src/field"]);
+    expect(selectRoiScopes(useAppStore.getState())).toEqual({ "": { truncated: false, skipped: 0 } });
   });
 });
 
@@ -399,14 +520,18 @@ describe("ROI state across a tensor change", () => {
     expect(selectRoisError(s)).toBeNull();
   });
 
-  it("follows a content-pinned link to the same source", () => {
-    // `requestedArrayId` is the address in view when a link pins one, so the
-    // guard has to use it -- not `activeTensorId`.
+  it("keeps a tensor's annotations under a content-pinned link to it", () => {
+    // A pin names which bytes to render, not a different tensor: annotations
+    // carry no version, so the rows already held are this tensor's.
     seedAnnotated();
     useAppStore.getState().applyViewerState(new URLSearchParams({ id: "first@9f1c4e2b" }));
-    expect(selectRois(useAppStore.getState())).toEqual([]);
-    useAppStore.setState({ rois: ROI_FIXTURE, roisFor: "first@9f1c4e2b" });
     expect(selectRois(useAppStore.getState())).toHaveLength(1);
+  });
+
+  it("hides annotations held for another tensor under a pinned link", () => {
+    seedAnnotated();
+    useAppStore.getState().applyViewerState(new URLSearchParams({ id: "second@9f1c4e2b" }));
+    expect(selectRois(useAppStore.getState())).toEqual([]);
   });
 
   it("starts from the new tensor's default rather than editing another tensor's list", () => {
