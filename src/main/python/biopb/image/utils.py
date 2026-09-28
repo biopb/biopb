@@ -152,7 +152,7 @@ def _serialize_from_numpy(
 
 
 def _deserialize_to_numpy(
-    pixels: Pixels, *, singleton_t: bool = True, np_index_order: str = "ZYXC"
+    pixels: Pixels, *, np_index_order: str = "ZYXC"
 ) -> np.ndarray:
     # Check for endianness conflict between dtype prefix and BinData field
     dtype_str = pixels.dtype
@@ -254,81 +254,6 @@ def _deserialize_to_numpy(
             np_img = np_img.squeeze(axis=idx)
 
     return np_img
-
-
-def deserialize_to_numpy(
-    pixels: Pixels, *, singleton_t: bool = True, np_index_order: str = "ZYXC"
-) -> np.ndarray:
-    """Convert protobuf Pixels to a numpy array.
-
-    Args:
-        pixels: protobuf data
-    Keyword Args:
-        singleton_t: DEPRECATED. Use np_index_order to control output dimensions.
-        np_index_order: Numpy index order string describing which axis corresponds to which dimension.
-            First letter corresponds to numpy axis 0, second to axis 1, etc.
-            Must be 2-5 characters (a permutation of subset of "ZYXCT").
-            Dimensions not in np_index_order are squeezed (must be singleton).
-            Defaults to "ZYXC" (4D output, T squeezed for backward compatibility).
-
-    Returns:
-        Numpy array (C-contiguous) with shape matching np_index_order.
-        The dtype and byteorder matches the input.
-    """
-    # Deprecation warning for singleton_t
-    if singleton_t is not True:
-        warnings.warn(
-            "singleton_t parameter is deprecated. Use np_index_order to control "
-            "output dimensions (include T to preserve, exclude to squeeze).",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-
-    return _deserialize_to_numpy(
-        pixels,
-        singleton_t=singleton_t,
-        np_index_order=np_index_order,
-    )
-
-
-def serialize_from_numpy(
-    np_img: np.ndarray,
-    dimension_order: str = "CXYZT",
-    np_index_order: str = None,
-    **kwargs,
-) -> Pixels:
-    """Convert numpy array representation of image to protobuf representation.
-
-    Args:
-        np_img: image as numpy array (any memory order is accepted)
-        dimension_order: F-order string describing dimension order in the output protobuf.
-            Must be exactly 5 characters (a permutation of "XYZCT").
-            First letter varies fastest in the serialized bytes.
-            Default is "CXYZT".
-        np_index_order: Numpy index order string describing which axis corresponds to which dimension.
-            First letter corresponds to numpy axis 0, second to axis 1, etc.
-            Must be 2-5 characters (a permutation of subset of "XYZCT").
-            If None (default), inferred from np_img.ndim:
-            - 2D -> "YX"
-            - 3D -> "YXC"
-            - 4D -> "ZYXC"
-            - 5D -> "TZYXC"
-        **kwargs: additional metadata, e.g. physical_size_x etc (pixel size)
-
-    Returns:
-        protobuf Pixels
-    """
-    warnings.warn(
-        "serialize_from_numpy is deprecated. Use serialize_from_numpy_to_image_data instead to get ImageData protobuf.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    return _serialize_from_numpy(
-        np_img,
-        dimension_order=dimension_order,
-        np_index_order=np_index_order,
-        **kwargs,
-    )
 
 
 def roi_to_mask(roi: ROI, mask: np.ndarray) -> np.ndarray:
@@ -621,7 +546,7 @@ def deserialize_image_data(
         # Legacy fallback: check deprecated pixels field
         if image_data.HasField("pixels"):
             dim_order = image_data.pixels.dimension_order
-            return deserialize_to_numpy(
+            return _deserialize_to_numpy(
                 image_data.pixels,
                 np_index_order=dim_order[
                     ::-1

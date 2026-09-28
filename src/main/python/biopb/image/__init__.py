@@ -34,10 +34,8 @@ from biopb.image.rpc_ops_pb2_grpc import (
 # Utility functions for image data serialization/deserialization
 from biopb.image.utils import (
     deserialize_image_data,
-    deserialize_to_numpy,  # deprecated, use deserialize_image_data_to_numpy instead
     get_image_data_dim_labels,
     get_image_data_shape,
     normalize_array_dims,
-    serialize_from_numpy,  # deprecated, use serialize_from_numpy_to_image_data instead
     serialize_from_numpy_to_image_data,
 )
