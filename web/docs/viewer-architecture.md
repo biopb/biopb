@@ -23,6 +23,7 @@ own design see [roi-annotations-ui.md](roi-annotations-ui.md).
 | `components/ViewerPane.tsx` | Waits for the target, picks 2-D/3-D viewer, error boundary, remount key |
 | `hooks/usePixelSources.ts` | Viv sources from the resolved grid, tile errors |
 | `hooks/usePlaneGate.ts` | `selection`, `loadedSelection`, `dataValid`, `onViewportLoad` |
+| `hooks/useLoadedPlane.ts` | Which request a layer's viewport last finished loading; shared by the image (`usePlaneGate`) and the label overlay |
 | `hooks/useContrastSamples.ts` | Overview raster → `notePlaneSamples`; uniform-plane value |
 | `hooks/useRoiOverlay.ts`, `useRoiAuthoring.ts` | Stored annotations over the plane on screen; drawing, selecting, deleting |
 | `hooks/useLabelOverlayLayers.ts`, `useLabelOverlay.ts` | Label overlay layers and gate; loads a set's pixel sources |
