@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import { useSearchParams } from "react-router-dom";
 import {
   selectTileInfo,
@@ -26,7 +26,9 @@ export function useViewerUrlSync() {
   const client = useAppStore((s) => s.client);
   const applyViewerState = useAppStore((s) => s.applyViewerState);
   const activeTensorId = useAppStore((s) => s.activeTensorId);
-  const slice = useAppStore((s) => s.slice);
+  const position = useAppStore((s) => s.position);
+  const display = useAppStore((s) => s.display);
+  const slice = useMemo(() => ({ ...position, ...display }), [position, display]);
   const render3d = useAppStore((s) => s.render3d);
   const volumeRenderMode = useAppStore((s) => s.volumeRenderMode);
   const tileInfo = useAppStore(selectTileInfo);

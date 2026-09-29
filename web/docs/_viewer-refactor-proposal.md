@@ -1,6 +1,6 @@
 # Image viewer — refactor proposal
 
-Status: proposal (2026-09-28); steps 0–2 done. Current structure: [viewer-architecture.md](viewer-architecture.md).
+Status: proposal (2026-09-28); steps 0–3 done. Current structure: [viewer-architecture.md](viewer-architecture.md).
 
 ## Why
 
@@ -214,7 +214,7 @@ Steps 1–2 are the keystone. 3–5 are independent afterwards.
 | 0 (**done**) | `viewKey` (token-free `currentArrayId`) stamps and scopes every `…For` field; contrast setters take the key from the store; `adoptResolution` moves bare-keyed state to the resolved field. No remount changes. | Defects 1–3 (3 only for the token; a bare source still fetches its listing twice) |
 | 1 (**done**) | `ViewTarget` + `openTensor` + epoch; viewers take `info`; single entry path | the bare-source double fetch; `currentArrayId`, `viewKey`, `adoptResolution`, `tileInfoFor`, #1163's machinery; the second reset list |
 | 2 (**done**) | `views: Record<TensorKey, TensorView>` + `selectView` (the existing named selectors read through it; a `useView(pick)` hook would trip the lint rule against computed selector args) | 9 `…For` fields (`contrastTrackFor` stays for step 3), `stillPending` checks, most of the lint list |
-| 3 | Derived contrast selectors + `runtime` slice; split `SliceState` | `contrastTrack`, `appliedLimits`, content-compare setters, JSON selection keys |
+| 3 (**done**; `runtime` holds `epoch`, `planeReady` and the plane's `samples`, with `planeLimits` derived from them; `shownSelection` waits for step 4's plane gate) | Derived contrast selectors + `runtime` slice; split `SliceState` | `contrastTrack`, `appliedLimits`, content-compare setters, JSON selection keys |
 | 4 | TileViewer hooks, shared hooks with VolumeViewer, `usePlayback`; one debounce per slider | TileViewer to ~400 lines; the debounce bug |
 | 5 | Store slice files | `store.ts` to about 6 × 300 lines |
 

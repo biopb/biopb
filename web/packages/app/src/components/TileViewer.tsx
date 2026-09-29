@@ -37,6 +37,7 @@ import {
   selectRois,
   selectSelectedRoiId,
   selectVisibleSets,
+  selectContrastWindow,
   useAppStore,
 } from "../store";
 import {
@@ -61,9 +62,9 @@ import {
   type XY,
 } from "../utils/roiLayers";
 import type { ViewerErrorKind } from "../store";
+import { useShallow } from "zustand/react/shallow";
 import { GammaExtension } from "../utils/vivGamma";
 import { buildLabelLayers } from "../utils/labelLayers";
-import { useContrastWindow } from "../hooks/useContrastWindow";
 import { useLabelOverlay } from "../hooks/useLabelOverlay";
 import {
   clampGamma,
@@ -168,9 +169,16 @@ class BiopbDetailView extends DetailView {
  */
 const VIV_EXTENSIONS = [new ColorPaletteExtension(), new GammaExtension()];
 
+/** The window before there is a grid to derive one from. */
+const FALLBACK_WINDOW: [number, number] = [0, 1];
+
 export default function TileViewer({ sourceId, info, onUnsupported }: TileViewerProps) {
   const client = useAppStore((s) => s.client);
-  const slice = useAppStore((s) => s.slice);
+  const position = useAppStore((s) => s.position);
+  const display = useAppStore((s) => s.display);
+  // The epoch this viewer was mounted under: what it tags its publications with.
+  // A viewer lives for exactly one epoch (`ViewerPane` keys on it).
+  const [epoch] = useState(() => useAppStore.getState().target.epoch);
   const channelNames = useAppStore((s) => s.channelNames);
   const channelColors = useAppStore((s) => s.channelColors);
   // Scoped selectors, not raw fields: a set fetched for another tensor is held
@@ -227,17 +235,13 @@ export default function TileViewer({ sourceId, info, onUnsupported }: TileViewer
     };
   }, [client, info]);
 
-  // Identity has to follow content, not the store write that produced it. Viv's
-  // ImageLayer refetches whenever `selections` is a new *reference*, and zustand
-  // hands out a fresh slice object on every `setSlice` — so deriving the
-  // selection straight from `slice` makes a contrast drag refetch the overview.
-  const selectionKey = useMemo(
-    () => (info ? JSON.stringify(vivSelection(info, slice)) : ""),
-    [info, slice],
-  );
-  const selection = useMemo<Record<string, number> | null>(
-    () => (selectionKey ? (JSON.parse(selectionKey) as Record<string, number>) : null),
-    [selectionKey],
+  // Viv's ImageLayer refetches whenever `selections` is a new *reference*. It
+  // is derived from `position` alone, which only a move within the grid
+  // replaces (`setPosition` keeps the object when nothing changed), so a
+  // contrast drag or a colour change leaves this the same object.
+  const selection = useMemo<Record<string, number>>(
+    () => vivSelection(info, position),
+    [info, position],
   );
 
   // --- is what is on screen the plane that was asked for? ------------------
@@ -251,11 +255,11 @@ export default function TileViewer({ sourceId, info, onUnsupported }: TileViewer
   // Reached through Viv, which forwards unknown props down to it and pins the
   // background ImageLayer's own callback to null, so this fires once per
   // completed viewport and not twice.
-  const [loadedKey, setLoadedKey] = useState<string | null>(null);
+  const [loadedSelection, setLoadedSelection] = useState<Record<string, number> | null>(null);
   // Read through a ref: the callback's identity has to stay stable or every
   // layerProps rebuild would look like a prop change to deck.gl.
-  const selectionKeyRef = useRef(selectionKey);
-  selectionKeyRef.current = selectionKey;
+  const selectionRef = useRef(selection);
+  selectionRef.current = selection;
   const onViewportLoad = useCallback((loaded?: unknown) => {
     // Two different things call this. A pyramid gets Viv's MultiscaleImageLayer
     // and deck.gl's TileLayer under it, which reports the array of tiles; an
@@ -273,11 +277,11 @@ export default function TileViewer({ sourceId, info, onUnsupported }: TileViewer
     }
     // The ImageLayer branch needs no such check: a raster that failed rejects,
     // and it only calls this on the resolved path.
-    setLoadedKey(selectionKeyRef.current);
+    setLoadedSelection(selectionRef.current);
   }, []);
   // Zoom and pan never invalidate: they change which tiles are wanted, not
   // which plane, so their partial state is legitimate progressive refinement.
-  const dataValid = loadedKey !== null && loadedKey === selectionKey;
+  const dataValid = loadedSelection !== null && loadedSelection === selection;
 
   // Under play the cover is dropped: at 10 frames a second it would be on
   // screen for most of every frame, which is a flicker rather than a warning,
@@ -287,14 +291,18 @@ export default function TileViewer({ sourceId, info, onUnsupported }: TileViewer
 
   // Scoped to the plane that produced it, so a failed read cannot go on
   // labelling later planes that loaded perfectly well.
-  useEffect(() => setTileError(null), [selectionKey]);
+  useEffect(() => setTileError(null), [selection]);
 
   // --- contrast limits ----------------------------------------------------
   // Read the coarsest level once per selection and keep the sorted samples, so
-  // the intensity slider re-derives limits locally instead of refetching.
-  const [samples, setSamples] = useState<{ key: string; values: Float64Array } | null>(null);
+  // the intensity slider re-derives limits locally instead of refetching. The
+  // store holds them (`runtime.samples`), and the window and the track are
+  // selectors over that: sampling a plane and noting its levels is one action.
+  const samples = useAppStore((s) => s.runtime.samples);
+  const notePlaneSamples = useAppStore((s) => s.notePlaneSamples);
+  const channel = position.c;
   useEffect(() => {
-    if (!sources || !selection) return;
+    if (!sources) return;
     // Interleaved RGB is rendered as colour, not through a contrast ramp.
     if (info.plane.s !== null) return;
     const overview = sources[sources.length - 1];
@@ -304,7 +312,9 @@ export default function TileViewer({ sourceId, info, onUnsupported }: TileViewer
     overview
       .getRaster({ selection, signal: controller.signal })
       .then((raster) => {
-        if (live) setSamples({ key: selectionKey, values: contrastSamples(raster.data) });
+        if (live) {
+          notePlaneSamples({ plane: selection, values: contrastSamples(raster.data) }, channel, epoch);
+        }
       })
       .catch(() => {
         // Keep the previous limits: a failed histogram is a worse reason to
@@ -314,15 +324,14 @@ export default function TileViewer({ sourceId, info, onUnsupported }: TileViewer
       live = false;
       controller.abort();
     };
-  }, [sources, info, selection, selectionKey]);
+  }, [sources, info, selection, channel, epoch, notePlaneSamples]);
 
-  // Not only a derivation: this also publishes the plane limits, the track and
-  // the applied window that SliceControls reads.
-  const contrastLimits = useContrastWindow(info, samples?.values ?? null, slice);
+  // The same selector the panel's bar reads (biopb/biopb#955).
+  const contrastLimits = useAppStore(useShallow(selectContrastWindow)) ?? FALLBACK_WINDOW;
 
   // Never trusted straight from the store: a persisted or hand-edited value of 0
   // or below is a uniform white plane, not a dim one.
-  const gamma = clampGamma(slice.gamma);
+  const gamma = clampGamma(display.gamma);
 
   // --- is there anything in this plane? ------------------------------------
   // A featureless plane renders black, and so does one whose tiles have not
@@ -333,22 +342,22 @@ export default function TileViewer({ sourceId, info, onUnsupported }: TileViewer
   // plane change so the contrast does not flash: unkeyed, this label would
   // describe the plane before last.
   const uniformValue = useMemo(() => {
-    if (!samples || samples.key !== selectionKey) return null;
+    if (!samples || samples.plane !== selection) return null;
     const v = samples.values;
     if (v.length === 0) return null;
     const first = v[0];
     return first !== undefined && first === v[v.length - 1] ? first : null;
-  }, [samples, selectionKey]);
+  }, [samples, selection]);
 
   // --- colour -------------------------------------------------------------
   const color = useMemo(() => {
-    const stored = channelColors[sourceId]?.[slice.c] ?? "auto";
+    const stored = channelColors[sourceId]?.[position.c] ?? "auto";
     // `channelNames` is filled asynchronously, so this runs at least once with
     // the name still unknown. `resolveAutoColor` answers grey then and grey
     // again once an unrecognised name lands, which is what keeps the first
     // frames from being a different colour than the settled one.
-    return vivColor(stored, channelNames[sourceId]?.[slice.c]);
-  }, [channelColors, channelNames, sourceId, slice.c]);
+    return vivColor(stored, channelNames[sourceId]?.[position.c]);
+  }, [channelColors, channelNames, sourceId, position.c]);
 
   const maxCacheSize = useMemo(
     () =>
@@ -439,16 +448,16 @@ export default function TileViewer({ sourceId, info, onUnsupported }: TileViewer
   // The plane the overlay is drawn for is the one ON SCREEN, not the one asked
   // for. They are the same except while a read is outstanding -- and during
   // play the cover is deliberately dropped, so the stale plane stays visible
-  // while `slice` has already moved on. Driving the overlay from `slice` there
+  // while `position` has already moved on. Driving the overlay from `position` there
   // would put plane N+1's annotations over plane N's pixels for the whole of
   // playback: a systematic off-by-one, not a flicker.
   //
   // Gating on `dataValid` instead would strobe: the play driver paces on
   // exactly that flag, so it toggles ~10 times a second while playing.
   const shownPlane = useMemo(() => {
-    if (!info || loadedKey === null) return null;
-    return planeFromSelection(info, JSON.parse(loadedKey) as Record<string, number>);
-  }, [info, loadedKey]);
+    if (loadedSelection === null) return null;
+    return planeFromSelection(info, loadedSelection);
+  }, [info, loadedSelection]);
 
   // Selection is deliberately not a dependency: it would change this memo's
   // output identity, and deck.gl answers a changed `data` by regenerating every
@@ -649,28 +658,26 @@ export default function TileViewer({ sourceId, info, onUnsupported }: TileViewer
   // except that a set has to fetch its plane, so "cannot" means hidden rather
   // than merely different.
   //
-  // Both go through JSON keys for the reason `selectionKey` does: deck.gl
-  // refetches on a changed *reference*, and memos keyed on objects would
-  // refetch every frame.
+  // Both go through JSON keys: deck.gl refetches on a changed *reference*, and
+  // `labelSelection` builds a new object per call, so a memo keyed on that
+  // object would refetch every frame.
   // `useCallback`, not a plain function: the two memos below take it as a
   // dependency, and a fresh identity every render would rebuild them every
   // render -- which is the refetch they exist to avoid.
   const deriveLabelKey = useCallback(
-    (key: string | null) => {
-      if (!info || !overlay || !key) return "";
-      return JSON.stringify(
-        labelSelection(info, overlay.info, JSON.parse(key) as Record<string, number>),
-      );
+    (sel: Record<string, number> | null) => {
+      if (!overlay || !sel) return "";
+      return JSON.stringify(labelSelection(info, overlay.info, sel));
     },
     [info, overlay],
   );
   const labelSelectionKey = useMemo(
-    () => deriveLabelKey(selectionKey),
-    [deriveLabelKey, selectionKey],
+    () => deriveLabelKey(selection),
+    [deriveLabelKey, selection],
   );
   const labelShownKey = useMemo(
-    () => deriveLabelKey(loadedKey),
-    [deriveLabelKey, loadedKey],
+    () => deriveLabelKey(loadedSelection),
+    [deriveLabelKey, loadedSelection],
   );
 
   // "Which plane of which set". The set has to be in the key: two sets of one
@@ -679,7 +686,7 @@ export default function TileViewer({ sourceId, info, onUnsupported }: TileViewer
   const labelPlaneKey = (selection: string) =>
     overlay && selection ? `${overlay.arrayId}|${selection}` : "";
   const [labelLoadedKey, setLabelLoadedKey] = useState<string | null>(null);
-  // Read through a ref for the reason `selectionKeyRef` is: the callback's
+  // Read through a ref for the reason `selectionRef` is: the callback's
   // identity has to stay stable or every rebuild would look like a prop change.
   const labelRequestedRef = useRef("");
   labelRequestedRef.current = labelPlaneKey(labelSelectionKey);
@@ -712,8 +719,8 @@ export default function TileViewer({ sourceId, info, onUnsupported }: TileViewer
   const labelReady = overlayId === null || labelError !== null || labelShowing;
   const setPlaneReady = useAppStore((s) => s.setPlaneReady);
   useEffect(() => {
-    setPlaneReady(dataValid && labelReady);
-  }, [dataValid, labelReady, setPlaneReady]);
+    setPlaneReady(dataValid && labelReady, epoch);
+  }, [dataValid, labelReady, epoch, setPlaneReady]);
 
   const labelLayers = useMemo(() => {
     // Keyed on the id it was loaded for: `useLabelOverlay` clears its state on a
@@ -1085,10 +1092,10 @@ function useSliceWheelNavigation(
       const wireAxis = axis === null ? null : info.selectable[axis];
       if (axis === null || wireAxis === null || steps === 0) return;
       const max = Math.max(0, (info.shape[wireAxis] ?? 1) - 1);
-      const current = useAppStore.getState().slice[axis];
+      const current = useAppStore.getState().position[axis];
       useAppStore
         .getState()
-        .setSlice({ [axis]: Math.min(max, Math.max(0, current + steps)) });
+        .setPosition({ [axis]: Math.min(max, Math.max(0, current + steps)) });
     };
 
     const onWheel = (e: WheelEvent) => {

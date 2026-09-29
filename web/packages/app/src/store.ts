@@ -18,12 +18,21 @@ import {
   TensorApiError,
   isReservedSetName,
   isTransportError,
+  vivDtype,
 } from "@biopb/tensor-flight-client";
 import { withBase } from "./base";
 import { DEFAULT_VIEWER_URL_STATE, decodeViewerState } from "./utils/viewerUrl";
 import type { ViewerUrlState } from "./utils/viewerUrl";
 import { type ColorValue, extractChannelNames } from "./utils/colorUtils";
-import { DEFAULT_LABEL_OPACITY, clampLabelOpacity, clampSliceTo } from "./utils/vivUtils";
+import {
+  DEFAULT_LABEL_OPACITY,
+  clampContrastLimits,
+  clampLabelOpacity,
+  clampSliceTo,
+  contrastLimitsFrom,
+  contrastTrack,
+  percentileBounds,
+} from "./utils/vivUtils";
 import {
   descriptorFromTileInfo,
   forget as forgetRecents,
@@ -39,7 +48,18 @@ import {
 
 export type ConnectionState = "idle" | "connecting" | "connected" | "error";
 
-export interface SliceState {
+/**
+ * Where in the tensor's grid the view is. Per tensor: an index means "index of
+ * the tensor in view", so `openTensor` resets it.
+ *
+ * Separate from {@link DisplayState} because the two change for different
+ * reasons and cost differently: a new position asks the server for other
+ * pixels, a new display setting re-shades the same ones. Keeping the objects
+ * apart is what lets a contrast drag leave `position` -- and everything keyed
+ * on its identity: the Viv selection, the volume request, a draft's plane --
+ * untouched.
+ */
+export interface PositionState {
   t: number;
   z: number;
   c: number;
@@ -49,10 +69,17 @@ export interface SliceState {
    *
    * A TIFF sequence's `i`, a plate's `POS`, the second of two axes sharing a
    * label: navigable, but with no semantic name to hold them under. Reset with
-   * t/z/c on a source change, and for the same reason — a key means "axis 0 of
+   * t/z/c on a source change, and for the same reason -- a key means "axis 0 of
    * the tensor in view", so it does not survive one.
    */
   axes: Record<string, number>;
+}
+
+/**
+ * How the image is shaded. A preference that outlives a tensor, except
+ * `fixedLimits`, which is a value of one tensor's dtype.
+ */
+export interface DisplayState {
   /**
    * How the contrast window is chosen: from the plane's own histogram, or from
    * two grey levels the user fixed.
@@ -76,6 +103,32 @@ export interface SliceState {
   // contrast window and before the channel color. 1 leaves the ramp linear;
   // below 1 lifts the dim end, above 1 pushes it down.
   gamma: number;
+}
+
+/**
+ * Position and display as one record. Only the URL codec uses it: a link names
+ * both in one flat set of parameters.
+ */
+export type SliceState = PositionState & DisplayState;
+
+const pickPosition = ({ t, z, c, axes }: SliceState): PositionState => ({ t, z, c, axes });
+const pickDisplay = ({ contrastMode, percentileScale, fixedLimits, gamma }: SliceState): DisplayState => ({
+  contrastMode,
+  percentileScale,
+  fixedLimits,
+  gamma,
+});
+
+/** `next`, unless it holds the same indices as `current`, in which case `current`. */
+function samePositionOr(current: PositionState, next: PositionState): PositionState {
+  return samePosition(current, next) ? current : next;
+}
+
+/** Same indices, so a write that changes nothing can keep the object. */
+function samePosition(a: PositionState, b: PositionState): boolean {
+  if (a.t !== b.t || a.z !== b.z || a.c !== b.c) return false;
+  const keys = Object.keys(a.axes);
+  return keys.length === Object.keys(b.axes).length && keys.every((k) => a.axes[k] === b.axes[k]);
 }
 
 /**
@@ -117,6 +170,31 @@ export interface ViewTarget {
   error: { reason: string; kind: ViewerErrorKind } | null;
   /** A link's `rs=` names, written under `key` when the target lands. */
   seedSets: string[] | null;
+}
+
+/** The sampled grey levels of one plane. */
+export interface PlaneSamples {
+  /** The plane they were read for, by identity: the Viv selection, or the volume. */
+  plane: object;
+  /** Sorted ascending, as `contrastSamples` returns them. */
+  values: Float64Array;
+}
+
+/** Facts only a mounted viewer can observe. See {@link AppState.runtime}. */
+export interface Runtime {
+  epoch: number;
+  /**
+   * Whether what is on the canvas is the plane that was last asked for. Play
+   * reads it to pace itself to the data plane rather than to a timer, and the
+   * tiled viewer reads its own copy of the same fact to cover a stale plane.
+   */
+  planeReady: boolean;
+  /**
+   * The last plane sampled, deliberately kept across a plane change so the
+   * contrast does not flash while the next read is in flight. Null before the
+   * first.
+   */
+  samples: PlaneSamples | null;
 }
 
 /**
@@ -319,7 +397,8 @@ export interface AppState {
   target: ViewTarget;
 
   // Slice controls
-  slice: SliceState;
+  position: PositionState;
+  display: DisplayState;
 
   // --- per-tensor state ---------------------------------------------------
   /**
@@ -390,51 +469,17 @@ export interface AppState {
    */
   playAxis: string | null;
   /**
-   * The contrast window actually in use, published by whichever viewer is
-   * mounted -- automatic or fixed, whichever the slice asked for.
+   * What only the mounted viewer can observe, tagged with the `target.epoch` it
+   * was observed under. A write carrying another epoch is dropped, so a viewer
+   * that outlives its tensor for a commit cannot leak into the next one.
    *
-   * Read only to seed `fixedLimits` when the user turns fixed on: without it
-   * the panel would have to re-derive the histogram the viewer already has,
-   * and the image would jump the moment the mode changed.
+   * Everything else the contrast controls need is derived from this and from
+   * `target.info`, `views[key].observedLimits` and `display`, by
+   * {@link selectContrastTrack} and {@link selectContrastWindow}: the shader and
+   * the panel call the same selectors (biopb/biopb#955), so they cannot disagree
+   * and nothing derived is stored.
    */
-  appliedLimits: [number, number] | null;
-  /**
-   * The sampled min and max grey level of the plane on screen, or null before
-   * one has been sampled.
-   *
-   * What the automatic window would be with neither tail trimmed, published
-   * separately because in fixed mode `appliedLimits` is the user's window and
-   * no longer says anything about the data. Read to reset a fixed window onto
-   * the image actually in view.
-   */
-  planeLimits: [number, number] | null;
-  /**
-   * The track a contrast window is chosen on -- the dtype's own range, or on a
-   * float tensor the levels the data has shown -- published by whichever viewer
-   * is mounted.
-   *
-   * Published rather than re-derived by the panel (biopb/biopb#955). The
-   * derivation takes the viewer's *local* plane limits, which reach this store
-   * one effect later, so a panel deriving its own drew the bar on a different
-   * track than the shader was clamping into for a render after every plane
-   * change. Publishing makes the viewer the single deriver, which is what the
-   * viewer already is for `appliedLimits`.
-   *
-   * Null while no viewer is mounted -- a WebGL failure, an unsupported tensor,
-   * the lazy chunk still loading. The panel falls back to the dtype's own range
-   * there; see `selectContrastTrack`.
-   */
-  contrastTrack: [number, number] | null;
-  /** The tensor (`target.key`) the track above was derived for. See `selectContrastTrack`. */
-  contrastTrackFor: string | null;
-  /**
-   * Whether what is on the canvas is the slice that was last asked for.
-   *
-   * Published by whichever viewer is mounted. Play reads it to pace itself to
-   * the data plane rather than to a timer, and the tiled viewer reads its own
-   * copy of the same fact to cover a stale plane.
-   */
-  planeReady: boolean;
+  runtime: Runtime;
 
   // UI options
   showAdvancedOptions: boolean;
@@ -495,7 +540,9 @@ export interface AppState {
   syncRecents: (ids: readonly string[]) => void;
   /** Resolve `recentIds` into `recentSources`, dropping ids the server 404s. */
   hydrateRecents: () => Promise<void>;
-  setSlice: (partial: Partial<SliceState>) => void;
+  /** Move within the grid. A move to where the view already is keeps the object. */
+  setPosition: (partial: Partial<PositionState>) => void;
+  setDisplay: (partial: Partial<DisplayState>) => void;
   /**
    * Fetch what the tensor in view should hold and does not yet: the client-owned
    * sets, and every server-owned set that is visible. Idempotent on what has
@@ -524,13 +571,14 @@ export interface AppState {
    */
   applyViewerState: (params: URLSearchParams) => boolean;
   setPlayAxis: (key: string | null) => void;
-  setAppliedLimits: (value: [number, number]) => void;
-  setPlaneLimits: (value: [number, number]) => void;
-  /** Publish the viewer's contrast track, for the tensor in view. */
-  setContrastTrack: (value: [number, number]) => void;
   /** Widen the tensor in view's observed levels on `channel`. */
   noteObservedLimits: (value: [number, number], channel: number) => void;
-  setPlaneReady: (value: boolean) => void;
+  /**
+   * A viewer sampled a plane: keep its values for the contrast window, and note
+   * their extremes as levels the tensor has shown, on `channel`.
+   */
+  notePlaneSamples: (samples: PlaneSamples, channel: number, epoch: number) => void;
+  setPlaneReady: (value: boolean, epoch: number) => void;
   setShowAdvancedOptions: (value: boolean) => void;
   setRender3d: (value: boolean) => void;
   setVolumeRenderMode: (value: VolumeRenderMode) => void;
@@ -683,13 +731,10 @@ export const useAppStore = create<AppState>((set, get) => ({
   activeTensorId: null,
   target: IDLE_TARGET,
 
-  slice: {
-    t: 0,
-    z: 0,
-    c: 0,
-    axes: {},
+  position: { t: 0, z: 0, c: 0, axes: {} },
+  display: {
     contrastMode: "auto",
-    percentileScale: 1,  // Default 1-99 percentile
+    percentileScale: 1, // Default 1-99 percentile
     fixedLimits: null,
     gamma: 1,
   },
@@ -709,11 +754,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   labelOpacity: DEFAULT_LABEL_OPACITY,
 
   playAxis: null,
-  planeReady: false,
-  appliedLimits: null,
-  planeLimits: null,
-  contrastTrack: null,
-  contrastTrackFor: null,
+  runtime: { epoch: 0, planeReady: false, samples: null },
 
   showAdvancedOptions: false,
   render3d: false,
@@ -868,7 +909,8 @@ export const useAppStore = create<AppState>((set, get) => ({
         status: "resolving",
         seedSets: init?.visibleSets ?? null,
       },
-      slice: init?.slice ?? { ...s.slice, t: 0, z: 0, c: 0, axes: {}, fixedLimits: null },
+      position: init ? pickPosition(init.slice) : { t: 0, z: 0, c: 0, axes: {} },
+      display: init ? pickDisplay(init.slice) : { ...s.display, fixedLimits: null },
       render3d: init?.render3d ?? false,
       volumeRenderMode: init?.volumeRenderMode ?? s.volumeRenderMode,
       camera3d: init?.camera3d ?? null,
@@ -887,9 +929,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       // An axis key means "axis of the tensor in view", so a play in progress
       // does not survive one either.
       playAxis: null,
-      planeReady: false,
-      appliedLimits: null,
-      planeLimits: null,
+      runtime: { epoch, planeReady: false, samples: null },
     }));
     void resolveTarget(get, set, epoch);
   },
@@ -902,64 +942,46 @@ export const useAppStore = create<AppState>((set, get) => ({
     void resolveTarget(get, set, epoch);
   },
 
-  setSlice(partial) {
-    set((s) => ({ slice: { ...s.slice, ...partial } }));
+  setPosition(partial) {
+    set((s) => {
+      const next = { ...s.position, ...partial };
+      return samePosition(s.position, next) ? s : { position: next };
+    });
+  },
+
+  setDisplay(partial) {
+    set((s) => ({ display: { ...s.display, ...partial } }));
   },
 
   setPlayAxis(key) {
     set({ playAxis: key });
   },
 
-  setAppliedLimits(value) {
-    // Compared by content: the viewers recompute this array every render, and
-    // storing a fresh identity each time would loop through their effect.
-    set((s) =>
-      s.appliedLimits && s.appliedLimits[0] === value[0] && s.appliedLimits[1] === value[1]
-        ? s
-        : { appliedLimits: value },
-    );
-  },
-
-  setPlaneLimits(value) {
-    set((s) =>
-      s.planeLimits && s.planeLimits[0] === value[0] && s.planeLimits[1] === value[1]
-        ? s
-        : { planeLimits: value },
-    );
-  },
-
-  setContrastTrack(value) {
-    const forArrayId = get().target.key;
-    // Compared by content for the reason `setAppliedLimits` is: the viewer
-    // recomputes the track every render and a fresh identity each time would
-    // loop through its effect.
-    set((s) =>
-      s.contrastTrackFor === forArrayId &&
-      s.contrastTrack &&
-      s.contrastTrack[0] === value[0] &&
-      s.contrastTrack[1] === value[1]
-        ? s
-        : { contrastTrack: value, contrastTrackFor: forArrayId },
-    );
-  },
-
   noteObservedLimits(value, channel) {
     const key = get().target.key;
+    set((s) => widenObserved(s, key, value, channel));
+  },
+
+  notePlaneSamples(samples, channel, epoch) {
+    const key = get().target.key;
     set((s) => {
-      const v = key ? s.views[key] : undefined;
-      const prev = v?.observedLimits[channel];
-      if (prev && prev[0] <= value[0] && prev[1] >= value[1]) return s;
-      const next: [number, number] = prev
-        ? [Math.min(prev[0], value[0]), Math.max(prev[1], value[1])]
-        : [value[0], value[1]];
-      return withView(s, key, (cur) => ({
-        observedLimits: { ...cur.observedLimits, [channel]: next },
-      }));
+      if (s.runtime.epoch !== epoch) return s;
+      const { values } = samples;
+      return {
+        runtime: { ...s.runtime, samples },
+        ...(values.length > 0
+          ? widenObserved(s, key, [values[0] as number, values[values.length - 1] as number], channel)
+          : {}),
+      };
     });
   },
 
-  setPlaneReady(value) {
-    set((s) => (s.planeReady === value ? s : { planeReady: value }));
+  setPlaneReady(value, epoch) {
+    set((s) =>
+      s.runtime.epoch !== epoch || s.runtime.planeReady === value
+        ? s
+        : { runtime: { ...s.runtime, planeReady: value } },
+    );
   },
 
   async loadRois() {
@@ -1037,7 +1059,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   setDraft(draft) {
     set((s) =>
       withView(s, s.target.key, {
-        draft: draft ? { shape: draft, sliceKey: sliceKey(s.slice) } : null,
+        draft: draft ? { shape: draft, sliceKey: sliceKey(s.position) } : null,
       }),
     );
   },
@@ -1282,9 +1304,9 @@ export const useAppStore = create<AppState>((set, get) => ({
       arrayId: requested,
       slice: {
         ...DEFAULT_VIEWER_URL_STATE.slice,
-        contrastMode: s.slice.contrastMode,
-        percentileScale: s.slice.percentileScale,
-        gamma: s.slice.gamma,
+        contrastMode: s.display.contrastMode,
+        percentileScale: s.display.percentileScale,
+        gamma: s.display.gamma,
       },
       volumeRenderMode: s.volumeRenderMode,
       labelOpacity: s.labelOpacity,
@@ -1600,7 +1622,7 @@ async function resolveTarget(
         },
         // The grid is the first thing that can say what an index may be, so the
         // slice is bounded here rather than where it was read -- see clampSliceTo.
-        slice: clampSliceTo(s.slice, info),
+        position: samePositionOr(s.position, clampSliceTo(s.position, info)),
         // A link's set names belong to the tensor it resolved to, so they are
         // written under its key rather than under whatever the link spelled.
         ...withView(s, key, {
@@ -1655,6 +1677,23 @@ export function selectLabelOverlay(s: AppState): string | null {
   return address.imageArrayId === shown ? s.labelOverlay : null;
 }
 
+/** A patch widening `key`'s observed union on `channel` to cover `value`, or none. */
+function widenObserved(
+  s: AppState,
+  key: string | null,
+  value: [number, number],
+  channel: number,
+): Partial<AppState> {
+  const prev = key ? s.views[key]?.observedLimits[channel] : undefined;
+  if (prev && prev[0] <= value[0] && prev[1] >= value[1]) return {};
+  const next: [number, number] = prev
+    ? [Math.min(prev[0], value[0]), Math.max(prev[1], value[1])]
+    : [value[0], value[1]];
+  return withView(s, key, (cur) => ({
+    observedLimits: { ...cur.observedLimits, [channel]: next },
+  }));
+}
+
 /**
  * The record of the tensor in view, or an empty one while none has resolved.
  *
@@ -1667,20 +1706,62 @@ export function selectView(s: AppState): TensorView {
 
 /** The levels this tensor's current channel has shown, or null if none yet. */
 export function selectObservedLimits(s: AppState): [number, number] | null {
-  return selectView(s).observedLimits[s.slice.c] ?? null;
+  return selectView(s).observedLimits[s.position.c] ?? null;
 }
 
 /**
- * The published contrast track, or null when none belongs to the tensor in view.
+ * The sampled min and max grey level of the plane last sampled, or null before
+ * one has been. What the automatic window would be with neither tail trimmed;
+ * in fixed mode the window no longer says anything about the data, so this is
+ * what a fixed window is reset onto.
  *
- * Guarded rather than reset, for the reason `selectObservedLimits` is: a viewer
- * that errored out after publishing leaves its track behind. A caller treats null as "derive the dtype's own range" -- which is
- * exact for every dtype that has one, and the only honest answer for a float
- * tensor nothing has read yet.
+ * Returns a fresh array: read it with `useShallow`.
+ */
+export function selectPlaneLimits(s: AppState): [number, number] | null {
+  const samples = s.runtime.samples;
+  return samples ? contrastLimitsFrom(samples.values, 0, 100) : null;
+}
+
+/**
+ * The track a contrast window is chosen on: the dtype's own range, or on a
+ * float tensor the levels the data has shown. Null until the grid is there --
+ * the panel then falls back to what the catalog says of the dtype.
+ *
+ * Derived, not published (biopb/biopb#955): the viewer's shader and the panel's
+ * bar both call this, so a plane change cannot leave the bar on a track the
+ * shader is not clamping into. Returns a fresh array: read it with `useShallow`.
  */
 export function selectContrastTrack(s: AppState): [number, number] | null {
-  if (s.contrastTrackFor !== s.target.key) return null;
-  return s.contrastTrack;
+  const info = s.target.info;
+  if (!info) return null;
+  return contrastTrack(
+    vivDtype(info.dtype),
+    selectObservedLimits(s),
+    selectPlaneLimits(s),
+    s.display.fixedLimits,
+  );
+}
+
+/**
+ * The contrast window the shader uses, and the panel seeds a fixed window from:
+ * the user's fixed levels brought inside the track, or the percentile window of
+ * the plane last sampled -- or the whole track while none has been. Null until
+ * the grid is there. Returns a fresh array: read it with `useShallow`.
+ */
+export function selectContrastWindow(s: AppState): [number, number] | null {
+  const info = s.target.info;
+  const track = selectContrastTrack(s);
+  if (!info || !track) return null;
+  const { contrastMode, fixedLimits, percentileScale } = s.display;
+  // A fixed window is the user's, not the plane's: it is not re-derived per
+  // plane, only brought inside the track it is being applied to.
+  if (contrastMode === "fixed") {
+    return fixedLimits ? clampContrastLimits(fixedLimits, track, vivDtype(info.dtype)) : track;
+  }
+  const samples = s.runtime.samples;
+  if (!samples) return track;
+  const [lo, hi] = percentileBounds(percentileScale);
+  return contrastLimitsFrom(samples.values, lo, hi);
 }
 
 // --- ROI annotations -------------------------------------------------------
@@ -1835,7 +1916,7 @@ function landRoiScope(
  * Only the indices: contrast, gamma and the percentile window ride `SliceState`
  * too, and none of them invalidate a shape being drawn.
  */
-export function sliceKey(slice: SliceState): string {
+export function sliceKey(slice: PositionState): string {
   return `${slice.t}|${slice.z}|${slice.c}|${JSON.stringify(slice.axes)}`;
 }
 
@@ -1889,7 +1970,7 @@ export function selectDraft(s: AppState): RoiDraft | null {
   // shape drawn on an image nobody is looking at any more, and finishing there
   // would pin it to the plane it was NOT drawn on. Answered at the read, so
   // every route that moves the slice is covered without naming any of them.
-  return draft && draft.sliceKey === sliceKey(s.slice) ? draft.shape : null;
+  return draft && draft.sliceKey === sliceKey(s.position) ? draft.shape : null;
 }
 
 /**

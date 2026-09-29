@@ -18,6 +18,8 @@ import {
   selectDraft,
   selectSelectedRoi,
   selectContrastTrack,
+  selectContrastWindow,
+  selectPlaneLimits,
   selectObservedLimits,
   selectTileInfo,
   selectLabelOverlay,
@@ -39,11 +41,9 @@ const SOURCE: DataSourceDescriptor = {
   tensors: [],
 };
 
-const BASE_SLICE = {
-  t: 0,
-  z: 0,
-  c: 0,
-  axes: {},
+const BASE_POSITION = { t: 0, z: 0, c: 0, axes: {} };
+
+const BASE_DISPLAY = {
   contrastMode: "auto" as const,
   percentileScale: 1,
   fixedLimits: null,
@@ -53,6 +53,7 @@ const BASE_SLICE = {
 /** Only its identity is under test here; the extents just have to be readable. */
 const TILE_INFO = {
   array_id: "first@abcd1234",
+  dtype: "<f4",
   dim_labels: ["T", "C", "Z", "Y", "X"],
   shape: [1, 1, 1, 8, 8],
 } as unknown as TileInfo;
@@ -205,30 +206,31 @@ describe("viewer URL state", () => {
     useAppStore.setState({
       activeTensorId: "first",
       render3d: true,
-      slice: { ...BASE_SLICE, t: 5, z: 6, c: 1, axes: { a3: 2 }, percentileScale: 2, gamma: 1.6 },
+      position: { ...BASE_POSITION, t: 5, z: 6, c: 1, axes: { a3: 2 } },
+      display: { ...BASE_DISPLAY, percentileScale: 2, gamma: 1.6 },
     });
 
     expect(useAppStore.getState().applyViewerState(new URLSearchParams("id=second"))).toBe(true);
     const s = useAppStore.getState();
     expect(s.render3d).toBe(false);
-    expect(s.slice).toMatchObject({ t: 0, z: 0, c: 0, axes: {} });
+    expect(s.position).toMatchObject({ t: 0, z: 0, c: 0, axes: {} });
     // Preferences, not properties of the tensor -- openTensor carries these
     // across a change too.
-    expect(s.slice).toMatchObject({ percentileScale: 2, gamma: 1.6 });
+    expect(s.display).toMatchObject({ percentileScale: 2, gamma: 1.6 });
   });
 
   it("keeps what the link names", () => {
-    useAppStore.setState({ activeTensorId: "first", render3d: false, slice: { ...BASE_SLICE, t: 5 } });
+    useAppStore.setState({ activeTensorId: "first", render3d: false, position: { ...BASE_POSITION, t: 5 } });
 
     expect(useAppStore.getState().applyViewerState(new URLSearchParams("id=second&t=9&v=1"))).toBe(true);
-    expect(useAppStore.getState().slice.t).toBe(9);
+    expect(useAppStore.getState().position.t).toBe(9);
     expect(useAppStore.getState().render3d).toBe(true);
   });
 });
 
 describe("the levels the data has shown", () => {
   const at = (channel: number) =>
-    useAppStore.setState((s) => ({ slice: { ...s.slice, c: channel } }));
+    useAppStore.setState((s) => ({ position: { ...s.position, c: channel } }));
   it("widens to cover every plane sampled, not just the last one", () => {
     view("first");
     useAppStore.getState().noteObservedLimits([12, 4000], 0);
@@ -280,47 +282,153 @@ describe("the levels the data has shown", () => {
   });
 });
 
-describe("the contrast track", () => {
-  it("hides a track published for another tensor", () => {
-    // The reason it is guarded rather than reset: a viewer that errored out
-    // after publishing leaves its track behind, and a stale one would draw the
-    // panel's bar on the previous tensor's grey levels.
-    view("first");
-    useAppStore.getState().setContrastTrack([0, 4000]);
-    view("second");
-
-    expect(selectContrastTrack(useAppStore.getState())).toBeNull();
+/** Put `key` in view with a grid of this dtype. */
+function viewWithDtype(key: string, dtype: string) {
+  useAppStore.setState({
+    ...viewOf(key, { info: { ...TILE_INFO, array_id: key, dtype } as TileInfo }),
+    position: BASE_POSITION,
+    display: BASE_DISPLAY,
+    runtime: { epoch: 100, planeReady: false, samples: null },
   });
+}
 
-  it("hands the panel the track the viewer derived", () => {
-    // The whole point of publishing it (biopb/biopb#955): one deriver, so the
-    // bar cannot be drawn on a track the shader is not clamping into.
-    view("first");
-    useAppStore.getState().setContrastTrack([12.5, 4000]);
+/** Sorted samples, as `contrastSamples` returns them. */
+const samplesOf = (...values: number[]) => ({
+  plane: {},
+  values: Float64Array.from(values).sort(),
+});
 
-    expect(selectContrastTrack(useAppStore.getState())).toEqual([12.5, 4000]);
-  });
-
-  it("does not write when the track is unchanged", () => {
-    view("first");
-    useAppStore.getState().setContrastTrack([0, 4000]);
-    const before = useAppStore.getState().contrastTrack;
-    useAppStore.getState().setContrastTrack([0, 4000]);
-
-    // The viewer derives this in a memo on every render; a fresh identity each
-    // time would loop through the effect that publishes it.
-    expect(useAppStore.getState().contrastTrack).toBe(before);
-  });
-
-  it("writes an equal track published for a different tensor", () => {
-    // Two tensors can share a dtype and so a track. The id has to move anyway,
-    // or the selector would go on hiding it.
-    view("first");
-    useAppStore.getState().setContrastTrack([0, 65535]);
-    view("second");
-    useAppStore.getState().setContrastTrack([0, 65535]);
+describe("the contrast track and window", () => {
+  it("is the dtype's own range for an integer tensor, whatever was observed", () => {
+    viewWithDtype("first", "<u2");
+    useAppStore.getState().noteObservedLimits([10, 20], 0);
 
     expect(selectContrastTrack(useAppStore.getState())).toEqual([0, 65535]);
+  });
+
+  it("follows the levels the data has shown on a float tensor", () => {
+    // Which is why it is derived from everything a plane has shown, not from
+    // the plane in view: a window fixed on a bright plane has to stay reachable
+    // from a dim one.
+    viewWithDtype("first", "<f4");
+    useAppStore.getState().notePlaneSamples(samplesOf(12, 4000), 0, 100);
+    useAppStore.getState().notePlaneSamples(samplesOf(0, 3), 0, 100);
+
+    expect(selectContrastTrack(useAppStore.getState())).toEqual([0, 4000]);
+    expect(selectPlaneLimits(useAppStore.getState())).toEqual([0, 3]);
+  });
+
+  it("is the same answer for the shader and the panel, and needs nothing published", () => {
+    // biopb/biopb#955: one derivation, so the bar cannot be drawn on a track the
+    // shader is not clamping into. A window and its track come from one state.
+    viewWithDtype("first", "<f4");
+    useAppStore.getState().notePlaneSamples(samplesOf(0, 100, 200, 300, 400), 0, 100);
+    useAppStore.setState((s) => ({ display: { ...s.display, contrastMode: "fixed", fixedLimits: [50, 9000] } }));
+
+    const s = useAppStore.getState();
+    expect(selectContrastTrack(s)).toEqual([0, 9000]);
+    expect(selectContrastWindow(s)).toEqual([50, 9000]);
+  });
+
+  it("is null until the grid has landed", () => {
+    useAppStore.setState({ target: targetFor(null) });
+
+    expect(selectContrastTrack(useAppStore.getState())).toBeNull();
+    expect(selectContrastWindow(useAppStore.getState())).toBeNull();
+  });
+
+  it("windows the plane's percentiles in auto mode, the whole track before a plane", () => {
+    viewWithDtype("first", "<u2");
+    expect(selectContrastWindow(useAppStore.getState())).toEqual([0, 65535]);
+
+    const values = Array.from({ length: 101 }, (_, i) => i * 10);
+    useAppStore.getState().notePlaneSamples(samplesOf(...values), 0, 100);
+    // percentileScale 1 is the 1st-99th.
+    expect(selectContrastWindow(useAppStore.getState())).toEqual([10, 990]);
+  });
+
+  it("brings a fixed window inside the track", () => {
+    viewWithDtype("first", "<u2");
+    useAppStore.setState((s) => ({ display: { ...s.display, contrastMode: "fixed", fixedLimits: [-5, 70000] } }));
+
+    expect(selectContrastWindow(useAppStore.getState())).toEqual([0, 65535]);
+  });
+
+  it("drops what a viewer publishes under another epoch", () => {
+    // A viewer that outlives its tensor for a commit must not leak into the next.
+    viewWithDtype("first", "<f4");
+    useAppStore.getState().notePlaneSamples(samplesOf(1, 2), 0, 99);
+    useAppStore.getState().setPlaneReady(true, 99);
+
+    const s = useAppStore.getState();
+    expect(s.runtime.samples).toBeNull();
+    expect(s.runtime.planeReady).toBe(false);
+    expect(held().observedLimits).toEqual({});
+  });
+
+  it("notes a plane's extremes as levels the tensor has shown, on its channel", () => {
+    viewWithDtype("first", "<f4");
+    useAppStore.getState().notePlaneSamples(samplesOf(5, 9), 2, 100);
+
+    expect(held().observedLimits[2]).toEqual([5, 9]);
+    expect(held().observedLimits[0]).toBeUndefined();
+  });
+
+  it("starts a new epoch with no plane and nothing ready", () => {
+    viewWithDtype("first", "<f4");
+    useAppStore.getState().notePlaneSamples(samplesOf(1, 2), 0, 100);
+    useAppStore.getState().setPlaneReady(true, 100);
+    useAppStore.setState({ client: null });
+    useAppStore.getState().openTensor("second");
+
+    const { runtime, target } = useAppStore.getState();
+    expect(runtime).toEqual({ epoch: target.epoch, planeReady: false, samples: null });
+  });
+
+  it("does not write when the plane is unchanged", () => {
+    viewWithDtype("first", "<f4");
+    useAppStore.getState().setPlaneReady(true, 100);
+    const before = useAppStore.getState().runtime;
+    useAppStore.getState().setPlaneReady(true, 100);
+
+    expect(useAppStore.getState().runtime).toBe(before);
+  });
+});
+
+describe("position and display", () => {
+  it("keeps the position object when a write changes nothing", () => {
+    // What a Viv selection is derived from: a fresh object refetches the plane.
+    useAppStore.setState({ position: { ...BASE_POSITION, z: 3, axes: { a0: 1 } } });
+    const before = useAppStore.getState().position;
+    useAppStore.getState().setPosition({ z: 3 });
+    useAppStore.getState().setPosition({ axes: { a0: 1 } });
+
+    expect(useAppStore.getState().position).toBe(before);
+  });
+
+  it("leaves the position object alone when the display changes", () => {
+    useAppStore.setState({ position: BASE_POSITION });
+    const before = useAppStore.getState().position;
+    useAppStore.getState().setDisplay({ gamma: 2 });
+    useAppStore.getState().setDisplay({ contrastMode: "fixed", fixedLimits: [1, 2] });
+
+    expect(useAppStore.getState().position).toBe(before);
+    expect(useAppStore.getState().display).toMatchObject({ gamma: 2, fixedLimits: [1, 2] });
+  });
+
+  it("drops a fixed window with the tensor, and keeps the other display settings", () => {
+    useAppStore.setState({
+      display: { contrastMode: "fixed", percentileScale: 2, fixedLimits: [1, 2], gamma: 1.5 },
+      client: null,
+    });
+    useAppStore.getState().openTensor("other");
+
+    expect(useAppStore.getState().display).toEqual({
+      contrastMode: "fixed",
+      percentileScale: 2,
+      fixedLimits: null,
+      gamma: 1.5,
+    });
   });
 });
 
@@ -351,10 +459,10 @@ describe("opening a tensor", () => {
     useAppStore.setState({
       client,
       target: targetFor(null),
-      slice: BASE_SLICE,
+      position: BASE_POSITION,
+      display: BASE_DISPLAY,
       views: {},
-      contrastTrack: null,
-      contrastTrackFor: null,
+      runtime: { epoch: 0, planeReady: false, samples: null },
     });
   }
 
@@ -405,7 +513,6 @@ describe("opening a tensor", () => {
     useAppStore.getState().openTensor("src/field");
     await settle();
     useAppStore.getState().noteObservedLimits([0, 5000], 0);
-    useAppStore.getState().setContrastTrack([0, 5000]);
 
     expect(selectObservedLimits(useAppStore.getState())).toEqual([0, 5000]);
     expect(selectContrastTrack(useAppStore.getState())).toEqual([0, 5000]);
@@ -450,7 +557,7 @@ describe("opening a tensor", () => {
     await settle();
 
     // TILE_INFO is 1 x 1 x 1 x 8 x 8.
-    expect(useAppStore.getState().slice).toMatchObject({ t: 0, z: 0 });
+    expect(useAppStore.getState().position).toMatchObject({ t: 0, z: 0 });
   });
 
   it("fetches the ROI listing once, under the address tile_info resolved", async () => {
@@ -1438,7 +1545,7 @@ describe("a draft does not survive a plane change", () => {
     useAppStore.setState({
       ...viewOf("first"),
       render3d: false,
-      slice: { ...BASE_SLICE, z: 12 },
+      position: { ...BASE_POSITION, z: 12 },
     });
     useAppStore.getState().setDraft({ tool: "polygon", points: [[0, 0], [4, 0]] });
   }
@@ -1452,36 +1559,36 @@ describe("a draft does not survive a plane change", () => {
     // The vertices were traced against another plane's pixels; finishing here
     // would pin the shape to a plane it was not drawn on.
     startDraft();
-    useAppStore.getState().setSlice({ z: 13 });
+    useAppStore.getState().setPosition({ z: 13 });
     expect(selectDraft(useAppStore.getState())).toBeNull();
   });
 
   it("goes when play steps any axis", () => {
     startDraft();
-    useAppStore.getState().setSlice({ t: 1 });
+    useAppStore.getState().setPosition({ t: 1 });
     expect(selectDraft(useAppStore.getState())).toBeNull();
   });
 
   it("goes when an unnamed axis moves", () => {
     startDraft();
-    useAppStore.getState().setSlice({ axes: { a0: 2 } });
+    useAppStore.getState().setPosition({ axes: { a0: 2 } });
     expect(selectDraft(useAppStore.getState())).toBeNull();
   });
 
   it("survives a contrast or gamma change", () => {
-    // Those ride SliceState too, and neither invalidates a shape being drawn.
+    // Display settings do not move the plane, so they do not invalidate a shape.
     startDraft();
-    useAppStore.getState().setSlice({ gamma: 2.2 });
-    useAppStore.getState().setSlice({ contrastMode: "fixed" });
-    useAppStore.getState().setSlice({ percentileScale: 2 });
+    useAppStore.getState().setDisplay({ gamma: 2.2 });
+    useAppStore.getState().setDisplay({ contrastMode: "fixed" });
+    useAppStore.getState().setDisplay({ percentileScale: 2 });
     expect(selectDraft(useAppStore.getState())).not.toBeNull();
   });
 
   it("comes back if the plane comes back", () => {
     // A stray scroll costs nothing; the draft is hidden, not destroyed.
     startDraft();
-    useAppStore.getState().setSlice({ z: 13 });
-    useAppStore.getState().setSlice({ z: 12 });
+    useAppStore.getState().setPosition({ z: 13 });
+    useAppStore.getState().setPosition({ z: 12 });
     expect(selectDraft(useAppStore.getState())).not.toBeNull();
   });
 
@@ -1489,7 +1596,7 @@ describe("a draft does not survive a plane change", () => {
     // TileViewer places through `selectDraft`, so the stale vertices are not
     // extended -- this is the behaviour the hidden-not-destroyed choice rests on.
     startDraft();
-    useAppStore.getState().setSlice({ z: 13 });
+    useAppStore.getState().setPosition({ z: 13 });
     const seen = selectDraft(useAppStore.getState());
     expect(seen).toBeNull();
   });
@@ -1501,7 +1608,7 @@ describe("the overlay toggle governs the whole annotation surface", () => {
       ...viewOf("first"),
       render3d: false,
       showRois: true,
-      slice: { ...BASE_SLICE, z: 12 },
+      position: { ...BASE_POSITION, z: 12 },
     });
     useAppStore.getState().setDraft({ tool: "polygon", points: [[0, 0], [4, 0]] });
   }

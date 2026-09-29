@@ -3,7 +3,14 @@
 import { sliderAxes, vivDtype, type SliderAxis } from "@biopb/tensor-flight-client";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
-import { selectContrastTrack, selectTileInfo, useAppStore } from "../store";
+import { useShallow } from "zustand/react/shallow";
+import {
+  selectContrastTrack,
+  selectContrastWindow,
+  selectPlaneLimits,
+  selectTileInfo,
+  useAppStore,
+} from "../store";
 import {
   PRESET_COLORS,
   type ColorValue,
@@ -48,8 +55,8 @@ function clamp(value: number, min: number, max: number): number {
 
 /** This axis's index in the live store, whatever it is keyed under. */
 function axisIndex(axis: SliderAxis): number {
-  const { slice } = useAppStore.getState();
-  return axis.named ? slice[axis.named] : (slice.axes[axis.key] ?? 0);
+  const { position } = useAppStore.getState();
+  return axis.named ? position[axis.named] : (position.axes[axis.key] ?? 0);
 }
 
 /**
@@ -61,12 +68,12 @@ function axisIndex(axis: SliderAxis): number {
  * have their own store fields and cannot collide this way.
  */
 function commitAxis(axis: SliderAxis, value: number) {
-  const { setSlice, slice } = useAppStore.getState();
+  const { setPosition, position } = useAppStore.getState();
   if (axis.named) {
-    setSlice({ [axis.named]: value });
+    setPosition({ [axis.named]: value });
     return;
   }
-  setSlice({ axes: { ...slice.axes, [axis.key]: value } });
+  setPosition({ axes: { ...position.axes, [axis.key]: value } });
 }
 
 const CONTRAST_MODES = [
@@ -105,8 +112,9 @@ const VALUE_READOUT: CSSProperties = {
 export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
   const sources = useAppStore((s) => s.sources);
   const tileInfo = useAppStore(selectTileInfo);
-  const slice = useAppStore((s) => s.slice);
-  const setSlice = useAppStore((s) => s.setSlice);
+  const position = useAppStore((s) => s.position);
+  const display = useAppStore((s) => s.display);
+  const setDisplay = useAppStore((s) => s.setDisplay);
   const channelNames = useAppStore((s) => s.channelNames);
   const channelColors = useAppStore((s) => s.channelColors);
   const getChannelColor = useAppStore((s) => s.getChannelColor);
@@ -116,8 +124,10 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
   const setRender3d = useAppStore((s) => s.setRender3d);
   const volumeRenderMode = useAppStore((s) => s.volumeRenderMode);
   const setVolumeRenderMode = useAppStore((s) => s.setVolumeRenderMode);
-  const appliedLimits = useAppStore((s) => s.appliedLimits);
-  const planeLimits = useAppStore((s) => s.planeLimits);
+  // What the shader is applying, and the plane's own extremes: derived from the
+  // store, by the selectors the viewers call.
+  const appliedLimits = useAppStore(useShallow(selectContrastWindow));
+  const planeLimits = useAppStore(useShallow(selectPlaneLimits));
   const playAxis = useAppStore((s) => s.playAxis);
   const setPlayAxis = useAppStore((s) => s.setPlayAxis);
 
@@ -130,28 +140,28 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
   // Local state for slider values (for immediate visual feedback), keyed by
   // SliderAxis.key so an axis with no name is held the same way as T/Z/C.
   const [localAxes, setLocalAxes] = useState<Record<string, number>>({});
-  const [localPercentile, setLocalPercentile] = useState(slice.percentileScale);
+  const [localPercentile, setLocalPercentile] = useState(display.percentileScale);
   // The fixed window mid-drag, in grey levels; null when nothing is being
   // dragged and the store's own value is what to show.
   const [localFixed, setLocalFixed] = useState<[number, number] | null>(null);
   // Held in octaves, the units of the slider, so a drag does not round-trip
   // through log2/exp and drift off the position the user put it at.
-  const [localOctaves, setLocalOctaves] = useState(() => octavesFromGamma(slice.gamma));
+  const [localOctaves, setLocalOctaves] = useState(() => octavesFromGamma(display.gamma));
 
   // Sync local state when store slice changes (e.g., from wheel navigation in the viewer)
   useEffect(() => {
-    setLocalAxes({ t: slice.t, z: slice.z, c: slice.c, ...slice.axes });
-    setLocalPercentile(slice.percentileScale);
+    setLocalAxes({ t: position.t, z: position.z, c: position.c, ...position.axes });
+    setLocalPercentile(display.percentileScale);
     setLocalFixed(null);
-    setLocalOctaves(octavesFromGamma(slice.gamma));
+    setLocalOctaves(octavesFromGamma(display.gamma));
   }, [
-    slice.t,
-    slice.z,
-    slice.c,
-    slice.axes,
-    slice.percentileScale,
-    slice.fixedLimits,
-    slice.gamma,
+    position.t,
+    position.z,
+    position.c,
+    position.axes,
+    display.percentileScale,
+    display.fixedLimits,
+    display.gamma,
   ]);
 
   // Cleanup debounce timer on unmount
@@ -231,14 +241,14 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
 
     const step = () => {
       const store = useAppStore.getState();
-      if (!store.planeReady && Date.now() - asked < PLAY_STALL_MS) {
+      if (!store.runtime.planeReady && Date.now() - asked < PLAY_STALL_MS) {
         timer = setTimeout(step, PLAY_READY_POLL_MS);
         return;
       }
       commitAxis(axis, nextPlayIndex(axisIndex(axis), axis.extent));
       // Said here rather than waited for: the viewer publishes the same fact
       // from an effect, and this timer is armed before that effect runs.
-      store.setPlaneReady(false);
+      store.setPlaneReady(false, store.runtime.epoch);
       asked = Date.now();
       timer = setTimeout(step, PLAY_FRAME_MS);
     };
@@ -268,17 +278,14 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
   // the data has shown -- not just this plane's, or a window chosen against a
   // bright plane could not be widened from a dim one.
   //
-  // Taken from the viewer rather than re-derived here (biopb/biopb#955): the
-  // viewer derives it from plane limits that reach the store one effect later,
-  // so a copy of the derivation drew this bar on a different track than the
-  // shader was clamping into for a render after every plane change.
+  // The same selector the viewers' shader reads (biopb/biopb#955), so the bar
+  // and the window it is drawn for cannot disagree.
   //
-  // The fallback is reached whenever no viewer is publishing -- a WebGL
-  // failure, an unsupported tensor, the lazy chunk still loading. Dtype alone
+  // The fallback is reached while the grid has not landed. Dtype alone
   // is exact for every dtype with an intrinsic range, and for a float tensor
   // nothing has read yet there is nothing better to say. `sliderGrid` supplies
   // the dtype from the live grid or the catalog, so this needs no read.
-  const published = useAppStore(selectContrastTrack);
+  const published = useAppStore(useShallow(selectContrastTrack));
   const track = useMemo<[number, number]>(
     () => published ?? contrastTrack(dtype),
     [published, dtype],
@@ -289,29 +296,29 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
   const fixedWindow = useMemo<[number, number]>(
     () =>
       clampContrastLimits(
-        localFixed ?? slice.fixedLimits ?? appliedLimits ?? track,
+        localFixed ?? display.fixedLimits ?? appliedLimits ?? track,
         track,
         dtype,
       ),
-    [localFixed, slice.fixedLimits, appliedLimits, track, dtype],
+    [localFixed, display.fixedLimits, appliedLimits, track, dtype],
   );
 
   // Get channel name for current channel index
   const currentChannelName = useMemo(() => {
     const names = channelNames[sourceId];
-    if (names && names[slice.c]) {
-      return names[slice.c];
+    if (names && names[position.c]) {
+      return names[position.c];
     }
     return null;
-  }, [channelNames, sourceId, slice.c]);
+  }, [channelNames, sourceId, position.c]);
 
   // Get current color for the channel
   const currentColor = useMemo(() => {
-    return getChannelColor(sourceId, slice.c);
+    return getChannelColor(sourceId, position.c);
     // getChannelColor is a stable store method that reads channelColors via get();
     // list channelColors so the memo recomputes when a color is edited.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [getChannelColor, sourceId, slice.c, channelColors]);
+  }, [getChannelColor, sourceId, position.c, channelColors]);
 
   // Determine if current color is a custom hex color
   const isCustomColor = useMemo(() => {
@@ -344,8 +351,8 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
   // already sitting on the plane's extremes. With nothing sampled yet there is
   // no image min/max to reset onto, so there is nothing for the button to do.
   const minMaxActive =
-    slice.contrastMode === "auto"
-      ? slice.percentileScale === 0
+    display.contrastMode === "auto"
+      ? display.percentileScale === 0
       : planeLimits === null ||
         (fixedWindow[0] === planeLimits[0] && fixedWindow[1] === planeLimits[1]);
 
@@ -355,13 +362,13 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
       setUseCustomColor(true);
     } else {
       setUseCustomColor(false);
-      setChannelColor(sourceId, slice.c, value as ColorValue);
+      setChannelColor(sourceId, position.c, value as ColorValue);
     }
   };
 
   // Handle custom color picker change
   const handleCustomColorChange = (hex: string) => {
-    setChannelColor(sourceId, slice.c, hex);
+    setChannelColor(sourceId, position.c, hex);
   };
 
   return (
@@ -527,7 +534,7 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
                 if (mode.key === "fixed") {
                   // Seeded from what is on screen, so turning the mode on does
                   // not change the image -- it stops it from changing.
-                  setSlice({
+                  setDisplay({
                     contrastMode: "fixed",
                     fixedLimits: clampContrastLimits(appliedLimits ?? track, track, dtype),
                   });
@@ -535,15 +542,15 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
                 }
                 // `fixedLimits` is kept: toggling back must return to the
                 // window the user chose, not to the whole track.
-                setSlice({ contrastMode: "auto" });
+                setDisplay({ contrastMode: "auto" });
               }}
-              disabled={slice.contrastMode === mode.key}
+              disabled={display.contrastMode === mode.key}
               title={mode.title}
               style={{
                 padding: "2px 8px",
                 fontSize: 10,
-                cursor: slice.contrastMode === mode.key ? "default" : "pointer",
-                background: slice.contrastMode === mode.key ? "#4a5568" : "#2d3748",
+                cursor: display.contrastMode === mode.key ? "default" : "pointer",
+                background: display.contrastMode === mode.key ? "#4a5568" : "#2d3748",
                 border: "1px solid #4a5568",
                 borderRadius: 4,
                 color: "#e2e8f0",
@@ -557,18 +564,18 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
               onto the extremes of the plane in view. */}
           <button
             onClick={() => {
-              if (slice.contrastMode === "fixed") {
+              if (display.contrastMode === "fixed") {
                 if (!planeLimits) return;
                 setLocalFixed(null);
-                setSlice({ fixedLimits: clampContrastLimits(planeLimits, track, dtype) });
+                setDisplay({ fixedLimits: clampContrastLimits(planeLimits, track, dtype) });
                 return;
               }
               setLocalPercentile(0);
-              setSlice({ percentileScale: 0 });
+              setDisplay({ percentileScale: 0 });
             }}
             disabled={minMaxActive}
             title={
-              slice.contrastMode === "fixed"
+              display.contrastMode === "fixed"
                 ? "Set the window to this image's own min and max grey level"
                 : "Automatic window with neither tail trimmed"
             }
@@ -588,7 +595,7 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
 
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           <span style={{ width: 20 }} />
-          {slice.contrastMode === "auto" ? (
+          {display.contrastMode === "auto" ? (
             <input
               type="range"
               min={0}
@@ -602,7 +609,7 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
                 setLocalPercentile(val);
                 if (debounceRef.current) clearTimeout(debounceRef.current);
                 debounceRef.current = setTimeout(() => {
-                  setSlice({ percentileScale: val });
+                  setDisplay({ percentileScale: val });
                 }, SLIDER_DEBOUNCE_MS);
               }}
               style={{ flex: 1 }}
@@ -649,7 +656,7 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
                     setLocalFixed(next);
                     if (debounceRef.current) clearTimeout(debounceRef.current);
                     debounceRef.current = setTimeout(() => {
-                      setSlice({ contrastMode: "fixed", fixedLimits: next });
+                      setDisplay({ contrastMode: "fixed", fixedLimits: next });
                     }, SLIDER_DEBOUNCE_MS);
                   }}
                 />
@@ -657,7 +664,7 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
             </div>
           )}
           <span style={VALUE_READOUT}>
-            {slice.contrastMode === "auto"
+            {display.contrastMode === "auto"
               ? percentileLabel(localPercentile)
               : contrastLabel(fixedWindow, fixedStep)}
           </span>
@@ -674,14 +681,14 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
           <button
             onClick={() => {
               setLocalOctaves(0);
-              setSlice({ gamma: 1 });
+              setDisplay({ gamma: 1 });
             }}
-            disabled={slice.gamma === 1}
+            disabled={display.gamma === 1}
             style={{
               padding: "2px 6px",
               fontSize: 10,
-              cursor: slice.gamma === 1 ? "default" : "pointer",
-              background: slice.gamma === 1 ? "#4a5568" : "#2d3748",
+              cursor: display.gamma === 1 ? "default" : "pointer",
+              background: display.gamma === 1 ? "#4a5568" : "#2d3748",
               border: "1px solid #4a5568",
               borderRadius: 4,
               color: "#e2e8f0",
@@ -704,7 +711,7 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
               setLocalOctaves(val);
               if (debounceRef.current) clearTimeout(debounceRef.current);
               debounceRef.current = setTimeout(() => {
-                setSlice({ gamma: gammaFromOctaves(val) });
+                setDisplay({ gamma: gammaFromOctaves(val) });
               }, SLIDER_DEBOUNCE_MS);
             }}
             style={{ flex: 1 }}

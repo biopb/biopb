@@ -32,8 +32,8 @@ import {
   type TileInfo,
   type VolumeAvailable,
 } from "@biopb/tensor-flight-client";
-import { useAppStore } from "../store";
-import { useContrastWindow } from "../hooks/useContrastWindow";
+import { useShallow } from "zustand/react/shallow";
+import { selectContrastWindow, useAppStore } from "../store";
 import type { ViewerErrorKind } from "../store";
 import {
   contrastSamples,
@@ -82,11 +82,16 @@ const ONE_CHANNEL = [{}];
 
 const VOLUME_VIEW_ID = "volume";
 
+/** The window before there is a grid to derive one from. */
+const FALLBACK_WINDOW: [number, number] = [0, 1];
+
 type XR3DLayerProps = ConstructorParameters<typeof XR3DLayer>[0];
 
 export default function VolumeViewer({ sourceId, info: tileInfo, onUnsupported }: VolumeViewerProps) {
   const client = useAppStore((s) => s.client);
-  const slice = useAppStore((s) => s.slice);
+  const position = useAppStore((s) => s.position);
+  const [epoch] = useState(() => useAppStore.getState().target.epoch);
+  const notePlaneSamples = useAppStore((s) => s.notePlaneSamples);
   const channelNames = useAppStore((s) => s.channelNames);
   const channelColors = useAppStore((s) => s.channelColors);
   const renderMode = useAppStore((s) => s.volumeRenderMode);
@@ -118,8 +123,8 @@ export default function VolumeViewer({ sourceId, info: tileInfo, onUnsupported }
   // Keyed on the *request*, so a contrast drag or a colour change — neither of
   // which alters a byte of it — cannot re-issue a read of hundreds of MB.
   const request = useMemo(
-    () => (info && plan ? volumeRequest(info, plan, slice) : null),
-    [info, plan, slice],
+    () => (info && plan ? volumeRequest(info, plan, position) : null),
+    [info, plan, position],
   );
   const requestKey = request ? volumeKey(request) : "";
 
@@ -141,7 +146,14 @@ export default function VolumeViewer({ sourceId, info: tileInfo, onUnsupported }
       })
       .then((arr) => {
         if (!live) return;
-        setVolume({ key: requestKey, data: asTypedArray(arr.buffer, vivDtype(arr.dtype)) });
+        const data = asTypedArray(arr.buffer, vivDtype(arr.dtype));
+        // Sampled from the volume itself: there is no coarser level to sample
+        // here the way the tiled viewer samples its overview -- this *is* the
+        // coarsest -- and the whole volume is already in memory, so a strided
+        // subsample of it costs nothing beyond the sort. Noted in the same
+        // batch as the volume, so the window and the pixels land together.
+        notePlaneSamples({ plane: data, values: contrastSamples(data) }, position.c, epoch);
+        setVolume({ key: requestKey, data });
       })
       .catch((err: unknown) => {
         if (!live || err instanceof TensorAbortError) return;
@@ -154,7 +166,7 @@ export default function VolumeViewer({ sourceId, info: tileInfo, onUnsupported }
     // `requestKey` and not `request`: the object identity changes on every
     // store write, its content only when the pixels would.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [client, info, requestKey]);
+  }, [client, info, requestKey, epoch, notePlaneSamples]);
 
   const current = volume && volume.key === requestKey ? volume.data : null;
 
@@ -162,8 +174,8 @@ export default function VolumeViewer({ sourceId, info: tileInfo, onUnsupported }
   const playing = useAppStore((s) => s.playAxis !== null);
   const setPlaneReady = useAppStore((s) => s.setPlaneReady);
   useEffect(() => {
-    setPlaneReady(current !== null);
-  }, [current, setPlaneReady]);
+    setPlaneReady(current !== null, epoch);
+  }, [current, epoch, setPlaneReady]);
 
   // Under play, keep the last volume on the canvas while the next read is in
   // flight. Unmounting the stage between frames -- which is what a null here
@@ -171,20 +183,13 @@ export default function VolumeViewer({ sourceId, info: tileInfo, onUnsupported }
   const shown = current ?? (playing ? (volume?.data ?? null) : null);
 
   // --- contrast ------------------------------------------------------------
-  // Sampled from the volume itself. There is no coarser level to sample here
-  // the way the tiled viewer samples its overview — this *is* the coarsest —
-  // and the whole volume is already in memory, so a strided subsample of it
-  // costs nothing beyond the sort.
-  const samples = useMemo(() => (current ? contrastSamples(current) : null), [current]);
-
-  // Not only a derivation: this also publishes the plane limits, the track and
-  // the applied window that SliceControls reads.
-  const contrastLimits = useContrastWindow(info, samples, slice);
+  // The same selector the panel's bar reads (biopb/biopb#955).
+  const contrastLimits = useAppStore(useShallow(selectContrastWindow)) ?? FALLBACK_WINDOW;
 
   const color = useMemo(() => {
-    const stored = channelColors[sourceId]?.[slice.c] ?? "auto";
-    return vivColor(stored, channelNames[sourceId]?.[slice.c]);
-  }, [channelColors, channelNames, sourceId, slice.c]);
+    const stored = channelColors[sourceId]?.[position.c] ?? "auto";
+    return vivColor(stored, channelNames[sourceId]?.[position.c]);
+  }, [channelColors, channelNames, sourceId, position.c]);
 
   return (
     <div ref={hostRef} style={HOST}>
