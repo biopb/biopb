@@ -29,6 +29,7 @@ echo "Using interpreter: $TOOL_PY"
 
 cat > /tmp/verify_bioformats.py << 'PYEOF'
 import glob
+import os
 import sys
 
 failures = []
@@ -75,23 +76,61 @@ except Exception as e:
     print("       -> if this says no JVM was found, scyjava did not auto-fetch "
           "a JDK; the install may need cjdk fetch enabled.")
 
-# 4. Read a real ZVI if one is present under /data (true end-to-end).
-zvis = sorted(glob.glob("/data/**/*.zvi", recursive=True))
-if zvis:
-    path = zvis[0]
+# 3b. Which Bio-Formats the JVM loaded is the one the server pins. Unpinned, the
+#    plugin asks Maven for RELEASE, which has been a release candidate. The
+#    server sets BIOFORMATS_VERSION when its adapters are imported (check 1).
+#    A release built before the pin has no such constant; that is reported, not
+#    failed, since this scenario installs whatever release it is pointed at.
+try:
+    from biopb_tensor_server.adapters import bioio as _bioio
+    pinned = getattr(_bioio, "BIOFORMATS_VERSION", None)
+    loaded = str(scyjava.jimport("loci.formats.FormatTools").VERSION)
+    if pinned is None:
+        print("[SKIP] this release does not pin Bio-Formats; loaded", loaded)
+    elif loaded == pinned:
+        print("[PASS] Bio-Formats %s loaded, as pinned" % loaded)
+    else:
+        failures.append("Bio-Formats %s loaded, %s pinned" % (loaded, pinned))
+        print("[FAIL] Bio-Formats %s loaded, %s pinned" % (loaded, pinned))
+except Exception as e:
+    failures.append("Bio-Formats version: %r" % (e,))
+    print("[FAIL] Bio-Formats version:", repr(e))
+
+# 4. Read a real file through Bio-Formats, under /data. A ZVI is what this
+#    extra exists for, but any format Bio-Formats reads exercises the same path
+#    -- the resolved jar, the JVM, and the reader -- and a small CZI is what CI
+#    can fetch (there is no public ZVI). The reader is named explicitly: bioio
+#    would otherwise pick its own CZI reader and never touch Java.
+#
+#    BIOPB_REQUIRE_SAMPLE=1 (CI) turns "no file" into a failure, so a fetch that
+#    quietly did not happen cannot read as a pass.
+samples = sorted(
+    p
+    for ext in ("zvi", "czi")
+    for p in glob.glob("/data/**/*." + ext, recursive=True)
+)
+if samples:
+    path = samples[0]
     try:
-        from aicsimageio import AICSImage
-        from aicsimageio.readers.bioformats_reader import BioformatsReader
-        img = AICSImage(path, reader=BioformatsReader)
-        arr = img.dask_data
-        print("[PASS] read %s: shape=%s dtype=%s dims=%s"
-              % (path, arr.shape, arr.dtype, img.dims.order))
+        import numpy as np
+        from bioio import BioImage
+
+        import bioio_bioformats
+
+        img = BioImage(path, reader=bioio_bioformats.Reader)
+        plane = np.asarray(img.get_image_dask_data("YX", T=0, C=0, Z=0).compute())
+        assert plane.size > 0 and plane.any(), "the plane read back empty"
+        print("[PASS] read %s through Bio-Formats: shape=%s dtype=%s dims=%s"
+              % (path, img.shape, img.dtype, img.dims.order))
     except Exception as e:
-        failures.append("ZVI read (%s): %r" % (path, e))
-        print("[FAIL] ZVI read (%s):" % path, repr(e))
+        failures.append("Bio-Formats read (%s): %r" % (path, e))
+        print("[FAIL] Bio-Formats read (%s):" % path, repr(e))
+elif os.environ.get("BIOPB_REQUIRE_SAMPLE"):
+    failures.append("no .zvi/.czi under /data, and BIOPB_REQUIRE_SAMPLE is set")
+    print("[FAIL] no .zvi/.czi under /data, and BIOPB_REQUIRE_SAMPLE is set")
 else:
-    print("[SKIP] no .zvi under /data -- mount one "
-          "(BIOPB_TEST_DATA=/dir ./run.sh bioformats) to test the read.")
+    print("[SKIP] no .zvi/.czi under /data -- mount one "
+          "(BIOPB_TEST_DATA=/dir ./run.sh bioformats) to test the read; the bioformats image bakes one in.")
 
 print()
 if failures:
