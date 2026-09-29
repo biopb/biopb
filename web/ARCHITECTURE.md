@@ -113,7 +113,7 @@ model are in `README.md`; the architectural notes that aren't there:
   validate the *same* token. The unlock step is skipped only when no token is
   enforced (driven by `/health` → `auth_required`) — which is the default locally,
   though a local deployment may opt into a token and then gates like a remote one.
-- **Store (Zustand, `store.ts`).** Holds the `TensorHttpClient` + connection state,
+- **Store (Zustand, `store/`, one slice file per lifetime).** Holds the `TensorHttpClient` + connection state,
   the source list (plus a `scanning` flag seeded from `/readyz` `backend_health` so
   the UI can distinguish "indexing" from "empty" during progressive discovery — see
   `../biopb-tensor-server/docs/progressive-discovery.md`), the active source/tensor,
