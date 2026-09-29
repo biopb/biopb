@@ -1284,6 +1284,22 @@ class OlympusAdapter(_BioioAdapterBase):
         return None
 
 
+# The Bio-Formats release bioio-bioformats fetches from Maven on first read.
+# Unpinned it asks for ``RELEASE``, whatever the repository last marked, which has
+# been a release candidate (9.0.0-rc1): every install then reads with a moving
+# target. ``BIOFORMATS_VERSION`` in the environment wins, and is how a site moves
+# to another release.
+BIOFORMATS_VERSION = "8.5.0"
+
+
+def _pin_bioformats_version() -> None:
+    """Default ``BIOFORMATS_VERSION``, which bffile reads once, when it is imported."""
+    os.environ.setdefault("BIOFORMATS_VERSION", BIOFORMATS_VERSION)
+
+
+_pin_bioformats_version()
+
+
 class BioformatsAdapter(_BioioAdapterBase):
     """Bio-Formats fallback for legacy formats with no pure-Python reader.
 

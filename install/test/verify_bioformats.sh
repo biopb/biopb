@@ -76,6 +76,26 @@ except Exception as e:
     print("       -> if this says no JVM was found, scyjava did not auto-fetch "
           "a JDK; the install may need cjdk fetch enabled.")
 
+# 3b. Which Bio-Formats the JVM loaded is the one the server pins. Unpinned, the
+#    plugin asks Maven for RELEASE, which has been a release candidate. The
+#    server sets BIOFORMATS_VERSION when its adapters are imported (check 1).
+#    A release built before the pin has no such constant; that is reported, not
+#    failed, since this scenario installs whatever release it is pointed at.
+try:
+    from biopb_tensor_server.adapters import bioio as _bioio
+    pinned = getattr(_bioio, "BIOFORMATS_VERSION", None)
+    loaded = str(scyjava.jimport("loci.formats.FormatTools").VERSION)
+    if pinned is None:
+        print("[SKIP] this release does not pin Bio-Formats; loaded", loaded)
+    elif loaded == pinned:
+        print("[PASS] Bio-Formats %s loaded, as pinned" % loaded)
+    else:
+        failures.append("Bio-Formats %s loaded, %s pinned" % (loaded, pinned))
+        print("[FAIL] Bio-Formats %s loaded, %s pinned" % (loaded, pinned))
+except Exception as e:
+    failures.append("Bio-Formats version: %r" % (e,))
+    print("[FAIL] Bio-Formats version:", repr(e))
+
 # 4. Read a real file through Bio-Formats, under /data. A ZVI is what this
 #    extra exists for, but any format Bio-Formats reads exercises the same path
 #    -- the resolved jar, the JVM, and the reader -- and a small CZI is what CI
