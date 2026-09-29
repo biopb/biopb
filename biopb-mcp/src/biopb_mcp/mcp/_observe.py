@@ -175,8 +175,13 @@ async def _api_jobs(request):
     # The host's records: this poll runs about once a second for the life of
     # the session and never enters the kernel.
     # `generation` changes when the kernel restarts: the ids start over, so a
-    # page holding rows by id must drop them.
-    result = {"jobs": host.jobs.summary(), "generation": host.generation}
+    # page holding rows by id must drop them. Read before the rows, since the
+    # two are not one atomic read: a launch empties the records and only then
+    # bumps the generation, so a restart in between leaves new rows under the
+    # old generation, which the next poll corrects, and never old rows under the
+    # new one.
+    generation = host.generation
+    result = {"jobs": host.jobs.summary(), "generation": generation}
     # The scratch kernel's runs and its verified workflow are the session
     # child's to report: both live here, and the session kernel cannot see
     # either. Its runs are a *separate* list rather than rows merged into
@@ -273,6 +278,12 @@ async def _api_interrupt(request):
     # The row's job, which the kernel stops only if it is still the one
     # running; without one, the job the records say is running.
     job_id = request.query_params.get("job_id")
+    # The generation the row was drawn from: ids restart with the kernel, so a
+    # click on a row that outlived a restart must not stop the new kernel's job
+    # of the same name.
+    drawn = request.query_params.get("generation")
+    if drawn is not None and drawn != str(host.generation):
+        return JSONResponse({"interrupted": False, "status": "restarted"})
     if job_id is None:
         running = host.jobs.running()
         if running is None:

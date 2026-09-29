@@ -796,9 +796,12 @@ async def execute_code(
 
     snap = await _await_job(host, job_id, submitted=True)
     if snap.get("status") != "running":
+        # A restart's lost snapshot names an id the records no longer hold as
+        # this job; what they say of that id now is another kernel's.
+        window = None if snap.get("restarted") else host.jobs.window_alive(job_id)
         return (
             _kernel_rpc._format_execute_result(snap)
-            + _kernel_rpc._window_note(host.jobs.window_alive(job_id))
+            + _kernel_rpc._window_note(window)
             + foreign_note
         )
 

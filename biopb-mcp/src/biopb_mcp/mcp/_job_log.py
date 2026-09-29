@@ -278,7 +278,12 @@ def _verdict(rec):
 def lost_snapshot(job_id):
     """The answer for a job whose kernel restarted under a caller that waited on
     it: its record is gone, and the id may by now name another kernel's job."""
-    return {"job_id": job_id, "status": "kernel_lost", "error_text": _KERNEL_GONE + "."}
+    return {
+        "job_id": job_id,
+        "status": "kernel_lost",
+        "error_text": _KERNEL_GONE + ".",
+        "restarted": True,
+    }
 
 
 class JobLog:

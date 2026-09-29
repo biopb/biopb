@@ -1552,3 +1552,19 @@ class TestHostRecords:
         assert host.jobs.poll(done)["status"] == "unknown"
         assert host.jobs.poll(running)["status"] == "unknown"
         assert _submit(host, "1") == "job-1"
+
+
+class TestReplyAcrossARestart:
+    def test_a_late_reply_does_not_touch_the_new_kernels_job(self):
+        from unittest.mock import MagicMock
+
+        host = KernelHost(health_probe_code=None)
+        host._ready.set()
+        host._io = MagicMock()
+        host.jobs = MagicMock()
+        host.run_cell("1", "job-1", "mcp")
+        on_reply = host._io.send_execute.call_args.args[1]
+
+        host.generation += 1  # a restart: ids start over
+        on_reply({"status": "ok"})
+        host.jobs.note_reply.assert_not_called()

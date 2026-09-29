@@ -1989,6 +1989,11 @@ class TestAwaitAcrossARestart:
         assert snap["status"] == "kernel_lost"
         assert snap["job_id"] == "job-1"
 
+    def test_the_lost_snapshot_says_it_is_a_restarts(self):
+        from biopb_mcp.mcp._job_log import lost_snapshot
+
+        assert lost_snapshot("job-1")["restarted"] is True
+
     def test_the_chat_loops_poll_of_a_submitted_job_is_lost_too(self):
         host = self._host()
         generation = host.generation

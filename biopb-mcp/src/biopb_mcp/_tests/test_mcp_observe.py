@@ -297,6 +297,21 @@ class TestTheTwoKernels:
         host.execute.assert_not_called()
 
 
+def test_api_interrupt_of_a_row_from_before_a_restart_stops_nothing(client, host):
+    # Ids restart with the kernel: `job-1` from the old one is not the new one's.
+    host.generation = 2
+    r = client.post("/api/kernel/interrupt?job_id=job-1&generation=1")
+    assert r.json() == {"interrupted": False, "status": "restarted"}
+    host.interrupt_job.assert_not_called()
+
+
+def test_api_interrupt_of_a_current_row_goes_through(client, host):
+    host.generation = 2
+    host.interrupt_job.return_value = {"job_id": "job-1", "interrupted": True}
+    r = client.post("/api/kernel/interrupt?job_id=job-1&generation=2")
+    assert r.json()["interrupted"] is True
+
+
 def test_api_interrupt_stops_the_rows_job(client, host):
     host.interrupt_job.return_value = {"job_id": "job-1", "interrupted": True}
     r = client.post("/api/kernel/interrupt?job_id=job-1")

@@ -682,18 +682,20 @@ class KernelHost:
         if not self._ready.is_set() or io is None:
             raise RuntimeError(self._not_ready_result()["error_text"])
 
+        # Ids restart with the kernel, so what runs later for this cell (its
+        # reply, and the timer that reply starts) must not touch a new kernel's
+        # job of the same name.
+        generation = self.generation
+
         def before_send(request):
             self.jobs.start_cell(job_id, request, code, origin, intent)
 
         def on_reply(reply):
-            if reply is None:
+            if reply is None or self.generation != generation:
                 return  # the kernel went away; its records say so
             self.jobs.note_reply(job_id, reply)
             # The idle marks the output complete and normally ends the record
             # first; the reply ends it only if that idle never comes.
-            # Ids restart with the kernel: a timer that outlives a restart must
-            # not end the new kernel's job of the same name.
-            generation = self.generation
             timer = threading.Timer(
                 _IDLE_GRACE,
                 lambda: (

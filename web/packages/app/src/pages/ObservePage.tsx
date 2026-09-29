@@ -479,7 +479,12 @@ export default function ObservePage() {
   const interrupt = useCallback(
     async (jobId: string) => {
       await jpost(
-        base + "/api/kernel/interrupt?job_id=" + encodeURIComponent(jobId),
+        base +
+          "/api/kernel/interrupt?job_id=" +
+          encodeURIComponent(jobId) +
+          (generationRef.current === null
+            ? ""
+            : "&generation=" + generationRef.current),
       );
       poll();
     },
