@@ -11,7 +11,11 @@ import ChatPane from "../components/ChatPane";
 import { Modal } from "../components/Modal";
 import { fetchChatStatus, type ChatStatus } from "../utils/chatClient";
 import { arrivals } from "../utils/jobArrivals";
-import { sessionFetch, sessionVerdict } from "../utils/sessionFetch";
+import {
+  SessionLocked,
+  sessionFetch,
+  sessionVerdict,
+} from "../utils/sessionFetch";
 import {
   clampChatWidth,
   defaultChatWidth,
@@ -100,11 +104,14 @@ interface JobDetail {
   error_text?: string;
 }
 
-async function jpost(url: string): Promise<{ [k: string]: unknown }> {
+// `null` when the session is locked: the page is already on its way to the
+// unlock page, and there is nothing to report or carry on with.
+async function jpost(url: string): Promise<{ [k: string]: unknown } | null> {
   try {
     const r = await sessionFetch(url, { method: "POST" });
     return await r.json().catch(() => ({}));
   } catch (e) {
+    if (e instanceof SessionLocked) return null;
     return { error: String(e) };
   }
 }
@@ -230,8 +237,8 @@ export default function ObservePage() {
     let r: Response;
     try {
       r = await sessionFetch(base + "/api/jobs");
-    } catch {
-      setStatus("unreachable");
+    } catch (e) {
+      if (!(e instanceof SessionLocked)) setStatus("unreachable");
       return;
     }
     // pollStatus below owns the diagnosis; all this has to do is not overwrite
@@ -284,8 +291,8 @@ export default function ObservePage() {
     let r: Response;
     try {
       r = await sessionFetch(base + "/api/status");
-    } catch {
-      setStatus("unreachable");
+    } catch (e) {
+      if (!(e instanceof SessionLocked)) setStatus("unreachable");
       return;
     }
     const verdict = sessionVerdict(r.status);
@@ -373,7 +380,7 @@ export default function ObservePage() {
         base + "/api/notebook" + (kind === "workflow" ? "?workflow=1" : ""),
       );
     } catch (e) {
-      alert("Save failed: " + e);
+      if (!(e instanceof SessionLocked)) alert("Save failed: " + e);
       return;
     }
     if (!r.ok) {
@@ -456,7 +463,7 @@ export default function ObservePage() {
   const restart = useCallback(async () => {
     if (!confirm("Hard-restart the kernel? All variables and layers are lost."))
       return;
-    await jpost(base + "/api/kernel/restart");
+    if ((await jpost(base + "/api/kernel/restart")) === null) return;
     setJobs([]);
     setDetails({});
     setExpanded(new Set());
