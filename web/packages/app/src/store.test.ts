@@ -158,6 +158,31 @@ describe("catalog polling", () => {
 
     expect(useAppStore.getState().activeSourceId).toBeNull();
   });
+
+  it("judges the source in view when the listing lands, not when it was asked for", async () => {
+    vi.useFakeTimers();
+    const other = { ...SOURCE, source_id: "other-source" };
+    let land: (sources: DataSourceDescriptor[]) => void = () => {};
+    const slow = {
+      listSources: vi.fn().mockReturnValue(new Promise((resolve) => (land = resolve))),
+      http: { readyz: vi.fn().mockResolvedValue({ backend_health: {} }) },
+    } as unknown as TensorFlightClient;
+    useAppStore.setState({
+      client: slow,
+      connectionState: "connected",
+      sources: [SOURCE],
+      ...viewOf(SOURCE.source_id),
+    });
+
+    useAppStore.getState().startCatalogPolling();
+    await vi.advanceTimersByTimeAsync(60000);
+    // The user opens another source while the listing is in flight.
+    useAppStore.setState(viewOf(other.source_id));
+    land([other]);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(useAppStore.getState().activeSourceId).toBe("other-source");
+  });
 });
 
 describe("viewer URL state", () => {

@@ -118,7 +118,7 @@ export const createConnectionSlice: StateCreator<AppState, [], [], ConnectionSli
 
   startCatalogPolling() {
     const pollingTimerId = setInterval(async () => {
-      const { client, sources, activeSourceId, target, openTensor } = get();
+      const { client } = get();
       if (!client || get().connectionState !== "connected") return;
 
       try {
@@ -135,6 +135,9 @@ export const createConnectionSlice: StateCreator<AppState, [], [], ConnectionSli
           // ignore transient readyz errors
         }
 
+        // Read after the awaits: a tensor opened while the listing was in
+        // flight is the one to protect, not the one that was open when it began.
+        const { sources, activeSourceId, target, openTensor } = get();
         if (catalogFingerprint(sources) !== catalogFingerprint(sorted)) {
           set({ sources: sorted });
 
