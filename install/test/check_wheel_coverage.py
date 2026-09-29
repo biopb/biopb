@@ -47,10 +47,11 @@ from concurrent.futures import ThreadPoolExecutor
 # The format extras install.sh always installs (see install_biopb(): TENSOR_EXTRAS).
 _BASE_TENSOR_EXTRAS = ["web", "vendor", "qptiff", "medical", "ndtiff"]
 
-# install.sh adds the Zeiss CZI reader (the [czi] extra -> bioio-czi -> pylibczirw)
-# on every platform EXCEPT Intel macOS, where pylibczirw ships no wheel. Mirror that
-# so the check reflects the set install.sh actually installs per target.
-_CZI_UNAVAILABLE_TARGETS = {"x86_64-apple-darwin"}
+# install.sh adds the Zeiss CZI reader ([czi] -> bioio-czi -> pylibczirw) and TLS
+# cert generation ([tls] -> cryptography) on every platform EXCEPT Intel macOS,
+# where neither ships a wheel. Mirror that so the check reflects the set install.sh
+# actually installs per target.
+_CZI_TLS_UNAVAILABLE_TARGETS = {"x86_64-apple-darwin"}
 
 
 def installer_requirements(target: str) -> list[str]:
@@ -60,8 +61,8 @@ def installer_requirements(target: str) -> list[str]:
     from this checkout rather than from a published release.
     """
     extras = list(_BASE_TENSOR_EXTRAS)
-    if target not in _CZI_UNAVAILABLE_TARGETS:
-        extras.append("czi")
+    if target not in _CZI_TLS_UNAVAILABLE_TARGETS:
+        extras += ["czi", "tls"]
     return [
         ".[tensor]",
         f"./biopb-tensor-server[{','.join(extras)}]",

@@ -1384,14 +1384,15 @@ install_biopb() {
         TENSOR_EXTRAS="$TENSOR_EXTRAS,bioformats"
         _info "  including Bio-Formats (Java fetched on first use, not now)"
     fi
-    # The Zeiss CZI reader (the [czi] extra -> bioio-czi -> pylibczirw) ships no
-    # Intel-macOS wheel, so including it there would source-build libCZI and fail.
-    # Add it everywhere except Intel macOS (arm64 macOS, Linux, and Windows all
-    # have a wheel).
+    # Two extras have no Intel-macOS wheel: [czi] (bioio-czi -> pylibczirw, which
+    # would source-build libCZI) and [tls] (cryptography>=49 is arm64-only there,
+    # #355). [tls] enables `serve --tls` / `cert init`; without it a BYO cert
+    # (--tls-cert/--tls-key) still works. Add both everywhere except Intel macOS
+    # (arm64 macOS, Linux and Windows all have wheels).
     if [ "$PLATFORM" = "macOS" ] && { [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "amd64" ]; }; then
-        _info "  skipping CZI reader on Intel macOS (bioio-czi has no Intel-mac wheel)"
+        _info "  skipping CZI reader and TLS cert generation on Intel macOS (no Intel-mac wheels)"
     else
-        TENSOR_EXTRAS="$TENSOR_EXTRAS,czi"
+        TENSOR_EXTRAS="$TENSOR_EXTRAS,czi,tls"
     fi
 
     # Resolve where the packages come from. biopb-tensor-server, biopb-mcp and

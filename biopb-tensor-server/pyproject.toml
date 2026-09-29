@@ -77,11 +77,9 @@ dependencies = [
     "uvicorn[standard] >= 0.30.0",
   ]
   # Self-signed TLS cert generation for `serve --tls` / `cert init` (#604).
-  # Kept OUT of the default install closure on purpose: `cryptography` pulls a
-  # Rust/OpenSSL build surface that has no Intel-macOS wheel on recent releases
-  # and broke `curl install.sh | bash` there (#355, fixed by dropping the dep).
-  # TLS *serving* is a server-deployment choice, so it opts in via this extra;
-  # the SDK client's TOFU pinning is stdlib-`ssl` only and needs nothing here.
+  # install.sh ships it everywhere except Intel macOS, where `cryptography` has no
+  # wheel on recent releases (#355); there a BYO cert (--tls-cert/--tls-key) still
+  # works. The SDK client's TOFU pinning is stdlib-`ssl` only and needs nothing here.
   tls = [
     "cryptography >= 41.0.0",
   ]
