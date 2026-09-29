@@ -110,7 +110,7 @@ elif os.environ.get("BIOPB_REQUIRE_SAMPLE"):
     print("[FAIL] no .zvi/.czi under /data, and BIOPB_REQUIRE_SAMPLE is set")
 else:
     print("[SKIP] no .zvi/.czi under /data -- mount one "
-          "(BIOPB_TEST_DATA=/dir ./run.sh bioformats) to test the read.")
+          "(BIOPB_TEST_DATA=/dir ./run.sh bioformats) to test the read; the bioformats image bakes one in.")
 
 print()
 if failures:

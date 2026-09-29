@@ -66,30 +66,10 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      # The bioformats scenario reads a real file through Bio-Formats. There is no
-      # public ZVI, so it is a small CZI from OME's sample set (CC BY 4.0, see
-      # the COPYING next to it), cached so the 43 MB is fetched once. The read
-      # is required: without the file the check fails instead of skipping.
-      - name: Cache the Bio-Formats sample
-        if: matrix.scenario == 'bioformats'
-        id: sample-cache
-        uses: actions/cache@v4
-        with:
-          path: ${{ runner.temp }}/biopb-test-data
-          key: bioformats-sample-idr0011-czi-v1
-      - name: Fetch the Bio-Formats sample
-        if: matrix.scenario == 'bioformats' && steps.sample-cache.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p "$RUNNER_TEMP/biopb-test-data"
-          curl -fsSL --retry 3 -o "$RUNNER_TEMP/biopb-test-data/sample.czi" \
-            "https://downloads.openmicroscopy.org/images/Zeiss-CZI/idr0011/Plate1-Blue-A_TS-Stinger/Plate1-Blue-A-02-Scene-1-P2-E1-01.czi"
-
       # Docker is preinstalled on ubuntu-latest, so there is nothing to set up:
       # run.sh builds the image and runs assert.sh in it, exiting nonzero on the
       # first failed post-condition.
       - name: Assert ${{ matrix.scenario }}
         env:
           BIOPB_INSTALL_VERSION: ${{ inputs.version }}
-          BIOPB_TEST_DATA: ${{ matrix.scenario == 'bioformats' && format('{0}/biopb-test-data', runner.temp) || '' }}
-          BIOPB_REQUIRE_SAMPLE: ${{ matrix.scenario == 'bioformats' && '1' || '' }}
         run: install/test/run.sh --assert ${{ inputs.via == 'bootstrap' && '--bootstrap' || '' }} ${{ matrix.scenario }}
