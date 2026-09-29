@@ -174,9 +174,9 @@ async def _api_jobs(request):
         return err
     # The host's records: this poll runs about once a second for the life of
     # the session and never enters the kernel.
-    # `epoch` changes when the kernel restarts: the ids start over, so a page
-    # holding rows by id must drop them.
-    result = {"jobs": host.jobs.summary(), "epoch": host.jobs.epoch}
+    # `generation` changes when the kernel restarts: the ids start over, so a
+    # page holding rows by id must drop them.
+    result = {"jobs": host.jobs.summary(), "generation": host.generation}
     # The scratch kernel's runs and its verified workflow are the session
     # child's to report: both live here, and the session kernel cannot see
     # either. Its runs are a *separate* list rather than rows merged into

@@ -70,7 +70,6 @@ class ScriptedJobs:
         self._summary = list(summary)
         self._export = list(export)
         self.polled = 0
-        self.epoch = 0
         self._digest = list(digest)
         self.acked = []
         self.digest_origins = []

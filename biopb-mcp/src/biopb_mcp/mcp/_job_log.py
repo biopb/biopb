@@ -275,6 +275,12 @@ def _verdict(rec):
     return status, error_text
 
 
+def lost_snapshot(job_id):
+    """The answer for a job whose kernel restarted under a caller that waited on
+    it: its record is gone, and the id may by now name another kernel's job."""
+    return {"job_id": job_id, "status": "kernel_lost", "error_text": _KERNEL_GONE + "."}
+
+
 class JobLog:
     """Every job the kernels of one host have announced, oldest first."""
 
@@ -288,10 +294,6 @@ class JobLog:
         # The last job number issued (_next_id). Restarts with the kernel, as a
         # notebook's execution count does (reset).
         self._seq = 0
-        # Which kernel's records these are, counted per reset. A caller that
-        # waits on a job across a restart reads it to tell its job is gone,
-        # since the id may by then name another kernel's job.
-        self.epoch = 0
         # The host's client session: its requests are the host's own snippets,
         # never a cell to record. Set per kernel (KernelHost._launch).
         self.host_session = host_session
@@ -498,7 +500,6 @@ class JobLog:
             self._by_request.clear()
             self._cells.clear()
             self._seq = 0
-            self.epoch += 1
 
     def kernel_gone(self, why=""):
         """End every running record: its kernel is going away."""

@@ -1544,11 +1544,11 @@ class TestHostRecords:
         done = _submit(host, "print('kept')")
         assert _wait_until(lambda: host.jobs.poll(done)["status"] == "ok", timeout=5)
         running = _submit(host, "import time\ntime.sleep(30)")
-        epoch = host.jobs.epoch
+        generation = host.generation
         host.restart()
         # They described a namespace that is gone, so they go with it, and the
         # numbering starts over as a notebook's execution count does.
-        assert host.jobs.epoch == epoch + 1
+        assert host.generation == generation + 1
         assert host.jobs.poll(done)["status"] == "unknown"
         assert host.jobs.poll(running)["status"] == "unknown"
         assert _submit(host, "1") == "job-1"

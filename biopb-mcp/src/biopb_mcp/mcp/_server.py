@@ -356,13 +356,17 @@ def _submit_job(host, code, digest, busy_message, intent=""):
     return job_id, None, False, None
 
 
-def _poll_submitted(host, job_id):
+def _poll_submitted(host, job_id, generation):
     """*job_id*'s snapshot, for a job this caller has just submitted.
 
     Its start travels on iopub and the submit's reply on the shell socket, so
     the reply can arrive first: until the record appears, the job is running as
-    far as the caller knows, not unknown.
+    far as the caller knows, not unknown. *generation* is ``host.generation``
+    read at the submit: a restart since then emptied the records, so the job is
+    lost whatever the id names now.
     """
+    if host.generation != generation:
+        return _job_log.lost_snapshot(job_id)
     snap = host.jobs.poll(job_id)
     if snap.get("status") == "unknown":
         return {"job_id": job_id, "status": "running", "stdout": ""}
@@ -381,21 +385,20 @@ async def _await_job(host, job_id, budget=None, submitted=False):
     loop sleep, so waiting costs the kernel nothing and leaves this process's
     loop free for every other caller.
     """
-    look = _poll_submitted if submitted else (lambda h, j: h.jobs.poll(j))
+    generation = host.generation
+
+    def look():
+        if submitted:
+            return _poll_submitted(host, job_id, generation)
+        if host.generation != generation:  # see _poll_submitted
+            return _job_log.lost_snapshot(job_id)
+        return host.jobs.poll(job_id)
+
     deadline = time.monotonic() + (_app._promote_after if budget is None else budget)
-    epoch = host.jobs.epoch
-    snap = look(host, job_id)
+    snap = look()
     while snap.get("status") == "running" and time.monotonic() < deadline:
         await asyncio.sleep(0.2)
-        # A restart empties the records, and the id may already name another
-        # kernel's job: the one waited on is gone with the namespace it ran in.
-        if host.jobs.epoch != epoch:
-            return {
-                "job_id": job_id,
-                "status": "kernel_lost",
-                "error_text": _job_log._KERNEL_GONE + ".",
-            }
-        snap = look(host, job_id)
+        snap = look()
     return snap
 
 

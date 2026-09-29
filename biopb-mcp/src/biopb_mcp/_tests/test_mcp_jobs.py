@@ -538,9 +538,9 @@ class TestNapariJobs:
         while napari_kernel.jobs.stop_key(job_id) is None:
             assert time.monotonic() < deadline
             time.sleep(0.05)
-        epoch = napari_kernel.jobs.epoch
+        generation = napari_kernel.generation
         napari_kernel.restart()  # respawns + re-bootstraps
         # The records went with the namespace they described.
-        assert napari_kernel.jobs.epoch == epoch + 1
+        assert napari_kernel.generation == generation + 1
         assert napari_kernel.jobs.poll(job_id)["status"] == "unknown"
         assert napari_kernel.jobs.new_id() == "job-1"

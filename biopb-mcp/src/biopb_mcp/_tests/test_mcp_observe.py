@@ -50,6 +50,7 @@ def host():
         "watchdog_running": True,
     }
     h.jobs = ScriptedJobs()
+    h.generation = 0
     return h
 
 
@@ -102,7 +103,7 @@ def test_api_jobs_lists_summary(client, host):
     assert body["jobs"][0]["job_id"] == "job-1"
     assert body["jobs"][0]["code_preview"] == "print('hi')"
     # Changes on a kernel restart, when the ids start over.
-    assert body["epoch"] == 0
+    assert body["generation"] == 0
     # The host's records: the poll never enters the kernel.
     host.execute.assert_not_called()
 

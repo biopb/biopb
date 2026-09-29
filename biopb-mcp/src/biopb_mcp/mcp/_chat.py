@@ -450,11 +450,12 @@ async def _run_code(arguments, on_progress):
     # means "the cell being polled right now", and every way of ceasing to poll
     # clears it except the one where the statement stays true.
     _running_job_id = job_id
+    generation = host.generation
     seen = 0
     try:
         while True:
             await asyncio.sleep(_POLL_INTERVAL)
-            snap = _server._poll_submitted(host, job_id)
+            snap = _server._poll_submitted(host, job_id, generation)
             out = snap.get("stdout") or ""
             # Diffed against the job's monotonic total, not against `len(out)`:
             # the output cap compacts the buffer from the front mid-cell, so a

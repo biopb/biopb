@@ -322,12 +322,10 @@ class TestReset:
         _start(log)
         _end(log)
         log.new_id()
-        before = log.epoch
         log.reset()
         assert log.poll("job-1")["status"] == "unknown"
         assert log.summary() == []
         assert log.new_id() == "job-1"
-        assert log.epoch == before + 1
 
     def test_a_late_event_of_the_old_kernel_starts_no_record(self):
         log = JobLog()

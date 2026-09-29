@@ -760,7 +760,9 @@ class TestJobTools:
     ):
         # The submit's reply can beat the job's start announcement here.
         _install_replies(server_with_host)
-        assert _server._poll_submitted(server_with_host, "job-1")["status"] == "running"
+        generation = server_with_host.generation
+        snap = _server._poll_submitted(server_with_host, "job-1", generation)
+        assert snap["status"] == "running"
 
     def test_job_tools_no_host(self):
         _app._kernel_host = None
@@ -1948,32 +1950,54 @@ class TestPollJobWaits:
 
 
 class TestAwaitAcrossARestart:
-    def test_a_wait_learns_its_job_was_lost_not_another_kernels(self):
-        """A restart empties the records and numbers again from job-1, so the id
-        a caller waits on can name a different kernel's job: it is told the job
-        is lost instead of reading that one."""
-        import asyncio
+    """A restart empties the records and numbers again from job-1, so the id a
+    caller waits on can name a different kernel's job: it is told the job is
+    lost instead of reading that one."""
+
+    @staticmethod
+    def _host():
         import types
 
         from biopb_mcp.mcp._job_log import JobLog
 
         log = JobLog()
-        host = types.SimpleNamespace(jobs=log)
         log.on_iopub(_start_event("job-1"))
+        return types.SimpleNamespace(jobs=log, generation=1)
+
+    @staticmethod
+    def _restart(host):
+        host.jobs.kernel_gone()
+        host.jobs.reset()
+        host.generation += 1
+        host.jobs.on_iopub(_start_event("job-1", request="req-2"))  # the new one
+
+    @pytest.mark.parametrize("submitted", [False, True])
+    def test_a_wait_learns_its_job_was_lost_not_another_kernels(self, submitted):
+        import asyncio
+
+        host = self._host()
 
         async def go():
             waiter = asyncio.ensure_future(
-                _server._await_job(host, "job-1", budget=10.0)
+                _server._await_job(host, "job-1", budget=10.0, submitted=submitted)
             )
             await asyncio.sleep(0.3)
-            log.kernel_gone()
-            log.reset()
-            log.on_iopub(_start_event("job-1", request="req-2"))  # the new kernel's
+            self._restart(host)
             return await asyncio.wait_for(waiter, timeout=3.0)
 
         snap = asyncio.run(go())
         assert snap["status"] == "kernel_lost"
         assert snap["job_id"] == "job-1"
+
+    def test_the_chat_loops_poll_of_a_submitted_job_is_lost_too(self):
+        host = self._host()
+        generation = host.generation
+        assert _server._poll_submitted(host, "job-1", generation)["status"] == "running"
+        self._restart(host)
+        assert (
+            _server._poll_submitted(host, "job-1", generation)["status"]
+            == "kernel_lost"
+        )
 
 
 def _start_event(job_id, request="req-1"):

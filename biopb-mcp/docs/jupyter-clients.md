@@ -76,7 +76,7 @@ The host names every job — `job-N`, counted per kernel — and every `stream`,
 `execute_result` and `error` under a job's request is that job's. A restart
 empties the records and numbers from `job-1` again, as a notebook's execution
 count starts over: they describe a namespace that is gone. A caller waiting on a
-job across the restart is told it was lost (`JobLog.epoch` changed), not left to
+job across the restart is told it was lost (`KernelHost.generation` changed), not left to
 read another kernel's `job-N`.
 
 - **A cell** starts at its `execute_input` (a foreign cell), or when the host

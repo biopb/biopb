@@ -691,7 +691,15 @@ class KernelHost:
             self.jobs.note_reply(job_id, reply)
             # The idle marks the output complete and normally ends the record
             # first; the reply ends it only if that idle never comes.
-            timer = threading.Timer(_IDLE_GRACE, self.jobs.cell_replied, (job_id,))
+            # Ids restart with the kernel: a timer that outlives a restart must
+            # not end the new kernel's job of the same name.
+            generation = self.generation
+            timer = threading.Timer(
+                _IDLE_GRACE,
+                lambda: (
+                    self.generation == generation and self.jobs.cell_replied(job_id)
+                ),
+            )
             timer.daemon = True
             timer.start()
 
