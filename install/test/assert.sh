@@ -144,6 +144,13 @@ fi
 
 _phase "2/5  Post-conditions"
 
+# Under --bootstrap the install log is the only evidence the bootstrap ran, and
+# that it handed over to a release's own installer rather than being skipped.
+if [ "$(basename "$INSTALL_SH")" = "bootstrap.sh" ]; then
+    check "the install went through the bootstrap, to a release's installer" \
+        grep -q '^Fetching the release-v.* installer' /tmp/install-1.log
+fi
+
 for shim in biopb biopb-mcp biopb-tensor-server biopb-control; do
     # The shim file, not `command -v`: whether a FUTURE shell finds it depends on
     # uv's rc-file editing, which correctly does nothing in the uv-preinstalled
