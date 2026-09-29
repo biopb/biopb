@@ -164,6 +164,13 @@ class ArrowFileBackend:
         # can never outlive the mapping it describes (segment ids are reused
         # after ``clear()`` resets the counter).
         self._segment_mmaps: Dict[int, pa.MemoryMappedFile] = {}
+        # Each mapping as one zero-copy buffer. A ``MemoryMappedFile`` has a
+        # single read position, so two threads that ``seek`` + ``read`` it
+        # interleave and one decodes from the other's offset -- which can fault
+        # the process, not just return the wrong batch. Reads go through
+        # ``_segment_reader``, a fresh cursor over this buffer, and never touch
+        # the shared file's position.
+        self._segment_views: Dict[int, pa.Buffer] = {}
         self._segment_schemas: Dict[int, pa.Schema] = {}
 
         # Multiple active writers for pooling: segment_id -> writer
@@ -385,11 +392,24 @@ class ArrowFileBackend:
 
     def _open_segment_mmap(self, segment_id: int, path) -> None:
         """Map a sealed segment read-only so its entries can be served."""
-        self._segment_mmaps[segment_id] = pa.memory_map(str(path), "r")
+        mapping = pa.memory_map(str(path), "r")
+        mapping.seek(0)
+        self._segment_views[segment_id] = mapping.read_buffer()
+        self._segment_mmaps[segment_id] = mapping
         self._segment_schemas.pop(segment_id, None)
+
+    def _segment_reader(self, segment_id: int) -> Optional[pa.BufferReader]:
+        """A private read cursor over a mapped segment, or None if not mapped.
+
+        Cheap (no syscall, no copy) and safe to use from any thread: the cursor
+        is this caller's own, and the bytes are the shared, read-only mapping.
+        """
+        view = self._segment_views.get(segment_id)
+        return None if view is None else pa.BufferReader(view)
 
     def _forget_segment_mmap(self, segment_id: int) -> None:
         """Close and drop a segment's read mapping, and its cached schema."""
+        self._segment_views.pop(segment_id, None)
         mmap = self._segment_mmaps.pop(segment_id, None)
         if mmap is not None:
             mmap.close()
@@ -827,7 +847,7 @@ class ArrowFileBackend:
         if touch:
             self._update_segment_frequency(segment_id)
 
-        mmap = self._segment_mmaps.get(segment_id)
+        mmap = self._segment_reader(segment_id)
         if mmap is None:
             return None
 
@@ -967,7 +987,7 @@ class ArrowFileBackend:
         Uses the live mapping when there is one. An open write segment has none
         and gets a short-lived map of its own. Never called under ``_lock``.
         """
-        mmap = self._segment_mmaps.get(entry_info.segment_id)
+        mmap = self._segment_reader(entry_info.segment_id)
         if mmap is not None:
             return (
                 self._batch_at_offset(entry_info.segment_id, mmap, entry_info, key)
