@@ -1989,6 +1989,52 @@ class TestSegmentSidecarIndex:
         b2.close()
         shutil.rmtree(cache_dir)
 
+    def test_concurrent_locates_and_reads_do_not_share_a_file_position(self):
+        """Threads locating and reading across sealed segments each decode their
+        own entry.
+
+        A segment's mapping has one read position; a locate that seeks it while
+        another thread does the same used to decode from the other's offset --
+        a wrong batch at best (reported as an index/body mismatch), a fault of
+        the whole process at worst.
+        """
+        cache_dir = self._make_temp_cache_dir()
+        config = self._rotating_config(cache_dir)
+        b1 = ArrowFileBackend(config)
+        n = 40
+        self._write_entries(b1, n)
+
+        backend = ArrowFileBackend(config)
+        assert len(self._seg_files(cache_dir)) > 1
+        failures = []
+
+        def hammer(seed):
+            try:
+                for step in range(300):
+                    i = (seed * 7 + step * 3) % n
+                    key = f"key{i}".encode()
+                    if backend.locate_entry(key) is None:
+                        failures.append(f"locate {key!r} returned None")
+                        return
+                    batch = backend._read_batch_from_segment(key, touch=False)
+                    if batch is None or batch.column("data").to_pylist() != [
+                        [i, i + 1, i + 2]
+                    ]:
+                        failures.append(f"read {key!r} decoded another entry")
+                        return
+            except Exception as e:  # noqa: BLE001
+                failures.append(repr(e))
+
+        threads = [threading.Thread(target=hammer, args=(t,)) for t in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert failures == []
+        backend.close()
+        shutil.rmtree(cache_dir)
+
     def test_missing_sidecar_walks_that_segment_and_backfills(self):
         """A deleted sidecar makes only its own segment fall back to the walk; a
         fresh sidecar is backfilled, so the next boot is fully fast."""
