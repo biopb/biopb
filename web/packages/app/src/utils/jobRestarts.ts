@@ -19,7 +19,7 @@ export interface Restart {
 
 export type Entry<T> =
   | { kind: "row"; job: T }
-  | { kind: "restart"; at: number };
+  | { kind: "restart"; at: number; after: number };
 
 /** *rowsNewestFirst* with a `restart` entry after every row newer than it (so
  * below the jobs that ran after the restart, above those before). A restart
@@ -33,11 +33,11 @@ export function withRestarts<T extends { seq?: number }>(
   let m = 0;
   for (const job of rowsNewestFirst) {
     while (m < marks.length && marks[m]!.after >= (job.seq ?? 0)) {
-      out.push({ kind: "restart", at: marks[m]!.at });
+      out.push({ kind: "restart", ...marks[m]! });
       m++;
     }
     out.push({ kind: "row", job });
   }
-  for (; m < marks.length; m++) out.push({ kind: "restart", at: marks[m]!.at });
+  for (; m < marks.length; m++) out.push({ kind: "restart", ...marks[m]! });
   return out;
 }

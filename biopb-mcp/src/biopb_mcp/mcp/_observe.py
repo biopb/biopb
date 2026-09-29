@@ -173,10 +173,9 @@ async def _api_jobs(request):
     if err is not None:
         return err
     # The host's records: this poll runs about once a second for the life of
-    # the session and never enters the kernel.
-    # `restarts` says where the kernel restarted in that history, so the page
-    # can draw the line between jobs whose variables are gone and those whose
-    # are not.
+    # the session and never enters the kernel. `restarts` says where the kernel
+    # restarted in that history, so the page can draw the line between jobs
+    # whose variables are gone and those whose are not.
     result = {"jobs": host.jobs.summary(), "restarts": host.jobs.restarts()}
     # The scratch kernel's runs and its verified workflow are the session
     # child's to report: both live here, and the session kernel cannot see

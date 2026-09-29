@@ -483,6 +483,8 @@ export default function ObservePage() {
   // `jobs` is null until the first poll lands; the verification list is not,
   // because "none" is its ordinary state and is worth saying at once.
   const rows: JobSummary[] | null = pane === "session" ? jobs : verifyJobs;
+  // The session's only: a verification's kernel is always fresh.
+  const marks = pane === "session" ? restarts : [];
 
   // Ways to attach a client to the session kernel; the child supplies the
   // command for each it can offer.
@@ -678,14 +680,10 @@ export default function ObservePage() {
                   : "nothing verified in this session yet"}
               </div>
             ) : (
-              // newest-first, with a line where the kernel restarted (the
-              // session's only: a verification's kernel is always fresh)
-              withRestarts(
-                [...rows].reverse(),
-                pane === "session" ? restarts : [],
-              ).map((e) =>
+              // newest-first, with a line where the kernel restarted
+              withRestarts([...rows].reverse(), marks).map((e) =>
                 e.kind === "restart" ? (
-                  <div key={"restart-" + e.at} className="restart-mark">
+                  <div key={"restart-" + e.after} className="restart-mark">
                     kernel restarted · {new Date(e.at * 1000).toLocaleTimeString()}
                     {" "}— jobs below ran in a namespace that is gone
                   </div>
@@ -964,9 +962,9 @@ const OBS_CSS = `
      anything louder would be in the way by the third cell. */
   .obs-page .job.enter { animation: obs-row-in .3s ease-out; }
   @keyframes obs-row-in { from { opacity: 0; transform: translateY(-6px); } }
-  /* The card the kernel is busy with, findable without reading any of them. */
   .obs-page .restart-mark { text-align: center; font-size: 11px; color: #9a9a9a;
     border-top: 1px dashed #555; margin: 4px 0 12px; padding-top: 4px; }
+  /* The card the kernel is busy with, findable without reading any of them. */
   .obs-page .job.busy { border-color: #2a5; }
   .obs-page .row { display: flex; gap: 10px; align-items: center; padding: 8px 12px; cursor: pointer; }
   .obs-page .row:hover { background: #1a1a1a; }

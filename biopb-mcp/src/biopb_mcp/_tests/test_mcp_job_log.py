@@ -375,6 +375,33 @@ class TestRestartMarkers:
             "job-2",
         ]
 
+    def test_no_marker_without_a_job_before_it_or_since_the_last(self):
+        # A launch that never produced a kernel, or a crash loop's failed
+        # respawns, would otherwise stack dividers over jobs that never had one.
+        log = JobLog()
+        log.mark_restart()
+        assert log.restarts() == []
+        self._run(log, "job-1")
+        log.mark_restart()
+        log.mark_restart()
+        assert [m["after"] for m in log.restarts()] == [1]
+        self._run(log, "job-2")
+        log.mark_restart()
+        assert [m["after"] for m in log.restarts()] == [1, 2]
+
+    def test_history_is_the_summary_with_the_marker_between(self):
+        log = JobLog()
+        self._run(log, "job-1")
+        log.mark_restart()
+        self._run(log, "task-3fa2c1")
+        rows = log.history()
+        assert [r.get("job_id", "restart") for r in rows] == [
+            "job-1",
+            "restart",
+            "task-3fa2c1",
+        ]
+        assert "status" in rows[0]  # a summary row, not a snapshot
+
     def test_a_marker_outlives_the_pruning_of_the_jobs_around_it(self):
         log = JobLog()
         self._run(log, "job-1")

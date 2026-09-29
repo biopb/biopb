@@ -292,9 +292,9 @@ _RESTART_NOTE = (
 def build_notebook(jobs):
     """Build an nbformat-v4 notebook dict from a list of job snapshots.
 
-    *jobs* is the oldest-first list returned by ``JobLog.export()`` (each a
-    job snapshot dict, or a ``{"restart": True, "at": time}`` marker). The result is a plain dict ready to
-    ``json.dumps`` into a ``.ipynb`` file.
+    *jobs* is the oldest-first list returned by ``JobLog.export()``: each a job
+    snapshot dict, or a ``{"restart": True, "at": time}`` marker. The result is
+    a plain dict ready to ``json.dumps`` into a ``.ipynb`` file.
     """
     jobs = jobs or []
     ran = [s for s in jobs if not s.get("restart")]

@@ -116,6 +116,9 @@ class ScriptedJobs:
     def restarts(self):
         return list(self._restarts)
 
+    def history(self):
+        return list(self._summary)
+
     def export(self):
         return list(self._export)
 

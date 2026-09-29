@@ -128,9 +128,17 @@ class TestKernelControl:
     def test_restart_leaves_a_marker_and_ids_keep_counting(self, kernel):
         assert kernel.jobs.restarts() == []  # the first start is not a restart
         before = kernel.jobs.new_id()
+        kernel.run_cell("x = 1", before, "mcp")
+        assert _wait_until(lambda: kernel.jobs.poll(before)["status"] == "ok")
         kernel.restart()
-        assert len(kernel.jobs.restarts()) == 1
+        assert [m["after"] for m in kernel.jobs.restarts()] == [1]  # after that job
         assert int(kernel.jobs.new_id().split("-")[1]) > int(before.split("-")[1])
+
+    def test_a_restart_with_no_job_before_it_leaves_no_marker(self, kernel):
+        # Nothing ran in the kernel that went away, so nothing above the line
+        # would be in a namespace that is gone.
+        kernel.restart()
+        assert kernel.jobs.restarts() == []
 
     def test_restart_clears_namespace(self, kernel):
         kernel.execute("survivor = 1")

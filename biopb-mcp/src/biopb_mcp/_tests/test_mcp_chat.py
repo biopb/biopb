@@ -82,6 +82,9 @@ class _Jobs:
     def summary(self):
         return []
 
+    def history(self):
+        return []
+
 
 @pytest.fixture
 def chat_host():
