@@ -85,6 +85,62 @@ def _set_windows_app_id():
         )
 
 
+def _set_windows_class_icon(qt_window):
+    """Put the window's own icon on its Win32 window class, before it is shown.
+
+    The AppUserModelID (:func:`_set_windows_app_id`) is necessary but not
+    enough: the taskbar asks a newly shown window for its icon with a timed
+    ``WM_GETICON``, and the bootstrap holds the main thread for seconds after
+    ``napari.Viewer()`` (the Tensor Browser, the ops, the namespace). The
+    request times out and the taskbar falls back to the *class* icon, which Qt
+    loads from the executable -- the kernel's ``python.exe``, which has none --
+    so the button shows the generic icon until the event loop runs (#1143).
+
+    Call it on the created-but-hidden window: ``winId()`` makes the native
+    window, whose ``WM_GETICON`` then answers with the icon napari set; that
+    icon is copied (so its lifetime is not tied to the window's) onto the
+    class. Every Qt window of that class in the process gets it, which is the
+    intent. No-op off Windows; fails open.
+    """
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        user32.SendMessageW.restype = ctypes.c_void_p
+        user32.SendMessageW.argtypes = [
+            wintypes.HWND,
+            wintypes.UINT,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        user32.CopyIcon.restype = ctypes.c_void_p
+        user32.CopyIcon.argtypes = [ctypes.c_void_p]
+        user32.SetClassLongPtrW.restype = ctypes.c_void_p
+        user32.SetClassLongPtrW.argtypes = [
+            wintypes.HWND,
+            ctypes.c_int,
+            ctypes.c_void_p,
+        ]
+
+        hwnd = int(qt_window.winId())
+        for which, index in ((_ICON_BIG, _GCLP_HICON), (_ICON_SMALL, _GCLP_HICONSM)):
+            icon = user32.SendMessageW(hwnd, _WM_GETICON, which, 0)
+            if icon:
+                user32.SetClassLongPtrW(hwnd, index, user32.CopyIcon(icon))
+    except Exception:
+        logger.debug(
+            "failed to set the Windows window-class icon (fail-open)", exc_info=True
+        )
+
+
+_WM_GETICON = 0x007F
+_ICON_SMALL, _ICON_BIG = 0, 1
+_GCLP_HICON, _GCLP_HICONSM = -14, -34
+
+
 def _install_window_close_hook(viewer):
     """Signal the launcher when the user closes the napari window.
 
@@ -257,7 +313,12 @@ def _bootstrap_impl():
             from biopb_napari_widget import TensorBrowserWidget
 
             splash.message("Opening viewer…")  # the slow step
-            viewer = napari.Viewer()
+            # Hidden until its window class carries the icon: the thread stays
+            # busy after show, so the taskbar's icon request falls back to the
+            # class (#1143).
+            viewer = napari.Viewer(show=False)
+            _set_windows_class_icon(viewer.window._qt_window)
+            viewer.window.show()
             tbw = TensorBrowserWidget(
                 viewer, connection=conn, compute_scheduler=compute_scheduler
             )
