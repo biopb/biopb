@@ -118,7 +118,7 @@ model are in `README.md`; the architectural notes that aren't there:
   the UI can distinguish "indexing" from "empty" during progressive discovery — see
   `../biopb-tensor-server/docs/progressive-discovery.md`), the active source/tensor,
   and the slice selection (`t`/`z`/`c`, `scaleFactors`, `reductionMethod`). Actions:
-  `initClient` / `loadSources` / `selectSource` / `setSlice` / `clearSession`.
+  `initClient` / `loadSources` / `openTensor` / `setSlice` / `clearSession`.
 - **Label overlays** (`labelLayers.ts`, `labelPalette.ts`, `useLabelOverlay.ts`).
   A label set is an ordinary tensor at `<image array_id>/@labels/<name>`, so the
   path is the only thing that marks one — `splitLabelArrayId` is the single

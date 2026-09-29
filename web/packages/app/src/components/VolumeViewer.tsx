@@ -28,14 +28,13 @@ import { ColorPalette3DExtensions, XR3DLayer } from "@hms-dbmi/viv";
 import {
   TensorAbortError,
   asTypedArray,
-  isTransportError,
   vivDtype,
   type TileInfo,
   type VolumeAvailable,
 } from "@biopb/tensor-flight-client";
 import { useAppStore } from "../store";
 import { useContrastWindow } from "../hooks/useContrastWindow";
-import type { ViewerErrorKind } from "./ViewerPane";
+import type { ViewerErrorKind } from "../store";
 import {
   contrastSamples,
   vivColor,
@@ -53,7 +52,8 @@ import {
 
 interface VolumeViewerProps {
   sourceId: string;
-  arrayId: string;
+  /** The resolved `tile_info`, fetched once by `openTensor`. */
+  info: TileInfo;
   /** Same contract as {@link TileViewer}: a settled fact vs. a bad moment. */
   onUnsupported: (reason: string, kind: ViewerErrorKind) => void;
 }
@@ -84,7 +84,7 @@ const VOLUME_VIEW_ID = "volume";
 
 type XR3DLayerProps = ConstructorParameters<typeof XR3DLayer>[0];
 
-export default function VolumeViewer({ sourceId, arrayId, onUnsupported }: VolumeViewerProps) {
+export default function VolumeViewer({ sourceId, info: tileInfo, onUnsupported }: VolumeViewerProps) {
   const client = useAppStore((s) => s.client);
   const slice = useAppStore((s) => s.slice);
   const channelNames = useAppStore((s) => s.channelNames);
@@ -94,51 +94,21 @@ export default function VolumeViewer({ sourceId, arrayId, onUnsupported }: Volum
   const hostRef = useRef<HTMLDivElement | null>(null);
   const size = useElementSize(hostRef);
 
-  const [info, setInfo] = useState<TileInfo | null>(null);
-
   // Reported through a ref for the reason TileViewer does it: this comes from
-  // the parent's render, and depending on it would re-run the load on every
+  // the parent's render, and depending on it would re-run the check on every
   // slider move.
   const onUnsupportedRef = useRef(onUnsupported);
   onUnsupportedRef.current = onUnsupported;
 
   // --- the tensor's volume plan -------------------------------------------
+  // A fact about the tensor, not a bad moment: no z axis and an oversized
+  // volume both fail the same way on a retry. A refused volume is not drawn,
+  // but its grid stays in the store for the sliders.
+  const refusal = useMemo(() => volumeRefusal(tileInfo), [tileInfo]);
   useEffect(() => {
-    if (!client) return;
-    const controller = new AbortController();
-    let live = true;
-    setInfo(null);
-    client.http
-      .tileInfo(arrayId, { signal: controller.signal })
-      .then((loaded) => {
-        if (!live) return;
-        const refusal = volumeRefusal(loaded);
-        if (refusal !== null) {
-          // A fact about the tensor, not a bad moment: no z axis and an
-          // oversized volume both fail the same way on a retry.
-          onUnsupportedRef.current(refusal, "capability");
-          return;
-        }
-        setInfo(loaded);
-      })
-      .catch((err: unknown) => {
-        if (!live || err instanceof TensorAbortError) return;
-        const message = err instanceof Error ? err.message : String(err);
-        onUnsupportedRef.current(message, isTransportError(err) ? "transport" : "capability");
-      });
-    return () => {
-      live = false;
-      controller.abort();
-    };
-  }, [client, arrayId]);
-
-  // Published for SliceControls, as in TileViewer. A refused volume never sets
-  // `info`, so the sliders fall back to the catalog rather than being bounded by
-  // a grid this viewer could not use.
-  const setTileInfo = useAppStore((s) => s.setTileInfo);
-  useEffect(() => {
-    setTileInfo(info, arrayId);
-  }, [info, arrayId, setTileInfo]);
+    if (refusal !== null) onUnsupportedRef.current(refusal, "capability");
+  }, [refusal]);
+  const info = refusal === null ? tileInfo : null;
 
   // `volumeRefusal` already established this is the available branch; the cast
   // is what lets the rest of the component read the plan without re-narrowing.

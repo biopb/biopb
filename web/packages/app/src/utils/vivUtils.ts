@@ -441,8 +441,8 @@ export interface SliderGrid {
  * form -- see the identity policy in descriptor.proto) and resolves a bare
  * source_id to the field it binds as that source's default, so an equality test
  * would silently never hold. Whether the grid belongs to the tensor in view is
- * settled before this, by `selectTileInfo`, which compares the id the grid was
- * *fetched for* rather than the id it came back naming.
+ * settled before this: `selectTileInfo` is the open target's own grid, reset on
+ * every open.
  */
 export function sliderGrid(
   tileInfo: TileInfo | null,

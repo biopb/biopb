@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { TensorApiError } from "@biopb/tensor-flight-client";
+import { TensorApiError, TensorNetworkError } from "@biopb/tensor-flight-client";
 import type {
   DataSourceDescriptor,
   RoiAnnotation,
@@ -22,10 +22,9 @@ import {
   selectTileInfo,
   selectLabelOverlay,
   catalogFingerprint,
-  currentArrayId,
   useAppStore,
-  viewKey,
 } from "./store";
+import type { ViewTarget } from "./store";
 import { DEFAULT_LABEL_OPACITY } from "./utils/vivUtils";
 
 const SOURCE: DataSourceDescriptor = {
@@ -55,10 +54,52 @@ const TILE_INFO = {
   shape: [1, 1, 1, 8, 8],
 } as unknown as TileInfo;
 
-/** Selects a bare id, then answers tile_info's resolution of it, as `currentArrayId` reads it. */
-function selectAndResolve(bareId: string, resolvedArrayId: string) {
-  useAppStore.setState({ activeTensorId: bareId, requestedArrayId: null });
-  useAppStore.getState().setTileInfo({ ...TILE_INFO, array_id: resolvedArrayId }, bareId);
+/** A `target` as `openTensor` leaves it: ready when given a key, idle otherwise. */
+function targetFor(key: string | null, over: Partial<ViewTarget> = {}): ViewTarget {
+  return {
+    epoch: 100,
+    requested: key,
+    linked: false,
+    status: key ? "ready" : "idle",
+    key,
+    info: key ? ({ ...TILE_INFO, array_id: key } as TileInfo) : null,
+    retrying: false,
+    error: null,
+    seedSets: null,
+    ...over,
+  };
+}
+
+/** The selection fields for `key` in view, resolved. Spread into a `setState`. */
+function viewOf(key: string, over: Partial<ViewTarget> = {}) {
+  return {
+    activeSourceId: key.split("/", 1)[0] ?? key,
+    activeTensorId: key,
+    target: targetFor(key, over),
+  };
+}
+
+/** Put `key` in view, resolved. */
+function view(key: string) {
+  useAppStore.setState(viewOf(key));
+}
+
+const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+/** A client whose tile_info answers every address with itself, minus a pin. */
+const echoClient = () =>
+  ({
+    http: {
+      tileInfo: (id: string) =>
+        Promise.resolve({ ...TILE_INFO, array_id: id.replace(/@[^/]*/, "") } as TileInfo),
+    },
+  }) as unknown as TensorFlightClient;
+
+/** Open a link and wait for its target to resolve. */
+async function openLink(query: string) {
+  useAppStore.setState({ client: echoClient() });
+  useAppStore.getState().applyViewerState(new URLSearchParams(query));
+  await settle();
 }
 
 const client = (sources: DataSourceDescriptor[]) =>
@@ -79,9 +120,7 @@ describe("catalog polling", () => {
       client: client([]),
       connectionState: "connected",
       sources: [SOURCE],
-      activeSourceId: "shared-source",
-      activeTensorId: "shared-source/Image:0",
-      requestedArrayId: "shared-source/Image:0",
+      ...viewOf("shared-source/Image:0", { linked: true }),
     });
 
     useAppStore.getState().startCatalogPolling();
@@ -96,9 +135,7 @@ describe("catalog polling", () => {
       client: client([]),
       connectionState: "connected",
       sources: [SOURCE],
-      activeSourceId: SOURCE.source_id,
-      activeTensorId: SOURCE.source_id,
-      requestedArrayId: null,
+      ...viewOf(SOURCE.source_id),
     });
 
     useAppStore.getState().startCatalogPolling();
@@ -161,7 +198,7 @@ describe("viewer URL state", () => {
     const s = useAppStore.getState();
     expect(s.render3d).toBe(false);
     expect(s.slice).toMatchObject({ t: 0, z: 0, c: 0, axes: {} });
-    // Preferences, not properties of the tensor -- selectSource carries these
+    // Preferences, not properties of the tensor -- openTensor carries these
     // across a change too.
     expect(s.slice).toMatchObject({ percentileScale: 2, gamma: 1.6 });
   });
@@ -178,9 +215,6 @@ describe("viewer URL state", () => {
 describe("the levels the data has shown", () => {
   const at = (channel: number) =>
     useAppStore.setState((s) => ({ slice: { ...s.slice, c: channel } }));
-  const view = (id: string) =>
-    useAppStore.setState({ activeTensorId: id, requestedArrayId: null, tileInfo: null, tileInfoFor: null });
-
   it("widens to cover every plane sampled, not just the last one", () => {
     view("first");
     useAppStore.getState().noteObservedLimits([12, 4000], 0);
@@ -233,9 +267,6 @@ describe("the levels the data has shown", () => {
 });
 
 describe("the contrast track", () => {
-  const view = (id: string) =>
-    useAppStore.setState({ activeTensorId: id, requestedArrayId: null, tileInfo: null, tileInfoFor: null });
-
   it("hides a track published for another tensor", () => {
     // The reason it is guarded rather than reset: a viewer that errored out
     // after publishing leaves its track behind, and a stale one would draw the
@@ -281,35 +312,87 @@ describe("the contrast track", () => {
 
 // A versioned source answers tile_info for `src/field` with `src@tok/field`
 // (biopb/biopb#780), and a bare `src` with the field it binds by default.
-// Everything below is state a viewer or a link wrote before that answer, and
-// must still be visible after it.
-describe("tensor-scoped state survives the grid landing", () => {
+// `openTensor` resolves that before any viewer mounts, so everything keyed to
+// the tensor is keyed to the resolved `src/field`, whatever the request said.
+describe("opening a tensor", () => {
   const VERSIONED = { ...TILE_INFO, array_id: "src@tok/field" } as TileInfo;
 
-  function open(id: string) {
+  /** A client whose tile_info answers `answer(id)`, recording what it was asked. */
+  function resolver(answer: (id: string) => TileInfo | Promise<TileInfo>, asked: string[] = []) {
+    return {
+      http: {
+        tileInfo: (id: string) => {
+          asked.push(id);
+          try {
+            return Promise.resolve(answer(id));
+          } catch (err) {
+            return Promise.reject(err);
+          }
+        },
+      },
+    } as unknown as TensorFlightClient;
+  }
+
+  function fresh(client: TensorFlightClient) {
     useAppStore.setState({
-      activeSourceId: "src",
-      activeTensorId: id,
-      requestedArrayId: null,
-      tileInfo: null,
-      tileInfoFor: null,
+      client,
+      target: targetFor(null),
       slice: BASE_SLICE,
+      visibleSets: null,
+      visibleSetsFor: null,
+      observedLimits: {},
+      observedLimitsFor: null,
+      contrastTrack: null,
+      contrastTrackFor: null,
     });
   }
 
-  it("keys on the tensor, not on the version token tile_info adds", () => {
-    open("src/field");
-    useAppStore.getState().setTileInfo(VERSIONED, "src/field");
+  it("is resolving, with no grid and no key, until tile_info answers", async () => {
+    fresh(resolver(() => VERSIONED));
+    useAppStore.getState().openTensor("src/field");
 
-    expect(currentArrayId(useAppStore.getState())).toBe("src@tok/field");
-    expect(viewKey(useAppStore.getState())).toBe("src/field");
+    const before = useAppStore.getState().target;
+    expect(before).toMatchObject({ status: "resolving", requested: "src/field", key: null, info: null });
+    expect(selectTileInfo(useAppStore.getState())).toBeNull();
+
+    await settle();
+    expect(useAppStore.getState().target).toMatchObject({ status: "ready", key: "src/field", info: VERSIONED });
   });
 
-  it("shows the contrast state a viewer published for an ordinary click", () => {
-    // TileViewer's order: the grid is published, then the contrast hook's
-    // effects run in the same commit.
-    open("src/field");
-    useAppStore.getState().setTileInfo(VERSIONED, "src/field");
+  it("keys on the tensor, not on the version token tile_info adds", async () => {
+    fresh(resolver(() => VERSIONED));
+    useAppStore.getState().openTensor("src/field");
+    await settle();
+
+    expect(useAppStore.getState().target.key).toBe("src/field");
+    expect(useAppStore.getState().target.info?.array_id).toBe("src@tok/field");
+  });
+
+  it("resolves a bare source_id to the field the server binds", async () => {
+    fresh(resolver(() => VERSIONED));
+    useAppStore.getState().openTensor("src");
+    await settle();
+
+    expect(useAppStore.getState().activeTensorId).toBe("src");
+    expect(useAppStore.getState().target.key).toBe("src/field");
+  });
+
+  it("asks for the address it was given, pin included", async () => {
+    const asked: string[] = [];
+    fresh(resolver(() => VERSIONED, asked));
+    useAppStore.getState().openTensor("src@pin/field");
+    await settle();
+
+    expect(asked).toEqual(["src@pin/field"]);
+    expect(useAppStore.getState().target.requested).toBe("src@pin/field");
+    expect(useAppStore.getState().activeTensorId).toBe("src/field");
+    expect(useAppStore.getState().target.key).toBe("src/field");
+  });
+
+  it("shows the contrast state a viewer published once the grid has landed", async () => {
+    fresh(resolver(() => VERSIONED));
+    useAppStore.getState().openTensor("src/field");
+    await settle();
     useAppStore.getState().noteObservedLimits([0, 5000], 0);
     useAppStore.getState().setContrastTrack([0, 5000]);
 
@@ -317,133 +400,176 @@ describe("tensor-scoped state survives the grid landing", () => {
     expect(selectContrastTrack(useAppStore.getState())).toEqual([0, 5000]);
   });
 
-  it("keeps an unpinned link's sets once the grid lands", () => {
-    useAppStore.setState({ tileInfo: null, tileInfoFor: null });
+  it("keeps an unpinned link's sets once the grid lands", async () => {
+    fresh(resolver(() => VERSIONED));
     useAppStore.getState().applyViewerState(new URLSearchParams("id=src/field&rs=nuclei"));
-    useAppStore.getState().setTileInfo(VERSIONED, "src/field");
+    await settle();
 
     expect(selectVisibleSets(useAppStore.getState())).toEqual(["nuclei"]);
   });
 
-  it("keeps a pinned link's sets once the grid lands", () => {
-    useAppStore.setState({ tileInfo: null, tileInfoFor: null });
+  it("keeps a pinned link's sets once the grid lands", async () => {
+    fresh(resolver(() => ({ ...TILE_INFO, array_id: "src@pin/field" }) as TileInfo));
     useAppStore.getState().applyViewerState(new URLSearchParams("id=src@pin/field&rs=nuclei"));
-    useAppStore
-      .getState()
-      .setTileInfo({ ...TILE_INFO, array_id: "src@pin/field" } as TileInfo, "src@pin/field");
+    await settle();
 
     expect(selectVisibleSets(useAppStore.getState())).toEqual(["nuclei"]);
   });
 
-  it("carries a bare source_id's sets to the field it resolves to", () => {
-    useAppStore.setState({ tileInfo: null, tileInfoFor: null });
+  it("writes a bare source_id's sets under the field it resolved to", async () => {
+    fresh(resolver(() => VERSIONED));
     useAppStore.getState().applyViewerState(new URLSearchParams("id=src&rs=nuclei"));
-    useAppStore.getState().setTileInfo(VERSIONED, "src");
+    await settle();
 
-    expect(viewKey(useAppStore.getState())).toBe("src/field");
+    expect(useAppStore.getState().target.key).toBe("src/field");
     expect(selectVisibleSets(useAppStore.getState())).toEqual(["nuclei"]);
     expect(useAppStore.getState().visibleSetsFor).toBe("src/field");
   });
 
-  it("leaves another tensor's state keyed where it was", () => {
-    open("src");
-    useAppStore.setState({ visibleSets: ["other"], visibleSetsFor: "elsewhere" });
-    useAppStore.getState().setTileInfo(VERSIONED, "src");
+  it("does not show a link's sets while the target is still resolving", () => {
+    fresh(resolver(() => new Promise<TileInfo>(() => {})));
+    useAppStore.getState().applyViewerState(new URLSearchParams("id=src&rs=nuclei"));
 
-    expect(useAppStore.getState().visibleSetsFor).toBe("elsewhere");
+    expect(selectVisibleSets(useAppStore.getState())).toBeNull();
   });
 
-  it("fetches the ROI listing once when the grid only adds a token", async () => {
+  it("bounds the slice by the grid it landed", async () => {
+    fresh(resolver(() => VERSIONED));
+    useAppStore.getState().applyViewerState(new URLSearchParams("id=src/field&t=9&z=4"));
+    await settle();
+
+    // TILE_INFO is 1 x 1 x 1 x 8 x 8.
+    expect(useAppStore.getState().slice).toMatchObject({ t: 0, z: 0 });
+  });
+
+  it("fetches the ROI listing once, under the address tile_info resolved", async () => {
     const asked: string[] = [];
     const client = {
       http: {
+        tileInfo: () => Promise.resolve(VERSIONED),
         listRois: (arrayId: string) => {
           asked.push(arrayId);
-          return new Promise((resolve) =>
-            setTimeout(() => resolve({ rois: [], sets: [], truncated: false, skipped: 0 }), 5),
-          );
+          return Promise.resolve({ rois: [], sets: [], truncated: false, skipped: 0 });
         },
       },
     } as unknown as TensorFlightClient;
-    useAppStore.setState({
-      client,
-      rois: [],
-      roiSets: [],
-      roisFor: null,
-      roiScopes: {},
-      roisPending: [],
-      roisPendingFor: null,
-      roisUnavailable: false,
-      visibleSets: null,
-      visibleSetsFor: null,
-    });
-    open("src/field");
-    // TileViewer's effect fires on mount, and again when `currentArrayId`
-    // gains the token.
-    const first = useAppStore.getState().loadRois("src/field");
-    useAppStore.getState().setTileInfo(VERSIONED, "src/field");
-    const second = useAppStore.getState().loadRois("src@tok/field");
-    await Promise.all([first, second]);
+    useAppStore.setState({ roisUnavailable: false, roisFor: null, roiScopes: {}, roisPending: [], roisPendingFor: null });
+    fresh(client);
+    useAppStore.getState().openTensor("src");
+    // TileViewer mounts only once the target is ready, so nothing asks earlier.
+    await useAppStore.getState().loadRois();
+    expect(asked).toEqual([]);
+    await settle();
+    await Promise.all([useAppStore.getState().loadRois(), useAppStore.getState().loadRois()]);
 
-    expect(asked).toEqual(["src/field"]);
+    expect(asked).toEqual(["src@tok/field"]);
     expect(selectRoiScopes(useAppStore.getState())).toEqual({ "": { truncated: false, skipped: 0 } });
+  });
+
+  it("drops a landing for a tensor the user has already left", async () => {
+    let answerFirst: (info: TileInfo) => void = () => {};
+    fresh(
+      resolver((id) =>
+        id === "first" ? new Promise<TileInfo>((r) => { answerFirst = r; }) : ({ ...TILE_INFO, array_id: id }) as TileInfo,
+      ),
+    );
+    useAppStore.getState().openTensor("first");
+    useAppStore.getState().openTensor("second");
+    await settle();
+    answerFirst({ ...TILE_INFO, array_id: "first" } as TileInfo);
+    await settle();
+
+    expect(useAppStore.getState().target).toMatchObject({ status: "ready", key: "second" });
+  });
+
+  it("does not let a stale landing bound the slice of the tensor now open", async () => {
+    let answerFirst: (info: TileInfo) => void = () => {};
+    fresh(
+      resolver((id) =>
+        id === "first" ? new Promise<TileInfo>((r) => { answerFirst = r; }) : new Promise<TileInfo>(() => {}),
+      ),
+    );
+    useAppStore.getState().openTensor("first");
+    useAppStore.getState().openTensor("second");
+    answerFirst({ ...TILE_INFO, array_id: "first" } as TileInfo);
+    await settle();
+
+    expect(useAppStore.getState().target).toMatchObject({ status: "resolving", requested: "second", info: null });
+  });
+
+  it("reports a refused tile_info as a settled fact, and lets it be retried", async () => {
+    let answer: () => TileInfo = () => {
+      throw new TensorApiError(404, "no such tensor");
+    };
+    fresh(resolver(() => answer()));
+    useAppStore.getState().openTensor("gone");
+    await settle();
+
+    expect(useAppStore.getState().target).toMatchObject({
+      status: "failed",
+      error: { kind: "capability" },
+    });
+
+    answer = () => ({ ...TILE_INFO, array_id: "gone" }) as TileInfo;
+    useAppStore.getState().retryTarget();
+    expect(useAppStore.getState().target).toMatchObject({ status: "resolving", error: null });
+    await settle();
+    expect(useAppStore.getState().target).toMatchObject({ status: "ready", key: "gone" });
+  });
+
+  it("re-asks once after a transport failure before giving up", async () => {
+    vi.useFakeTimers();
+    let calls = 0;
+    fresh(
+      resolver(() => {
+        calls += 1;
+        throw new TensorNetworkError("/api/tile_info");
+      }),
+    );
+    useAppStore.getState().openTensor("slow");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(useAppStore.getState().target).toMatchObject({ status: "resolving", retrying: true });
+
+    await vi.advanceTimersByTimeAsync(600);
+    expect(calls).toBe(2);
+    expect(useAppStore.getState().target).toMatchObject({
+      status: "failed",
+      retrying: false,
+      error: { kind: "transport" },
+    });
+  });
+
+  it("clears a link's state when nothing is opened", () => {
+    fresh(resolver(() => VERSIONED));
+    useAppStore.getState().openTensor("src");
+    useAppStore.getState().openTensor(null);
+
+    expect(useAppStore.getState()).toMatchObject({ activeSourceId: null, activeTensorId: null });
+    expect(useAppStore.getState().target).toMatchObject({ status: "idle", key: null, info: null });
   });
 });
 
 describe("the grid in view", () => {
-  it("hides a grid fetched for another id", () => {
-    useAppStore.getState().setTileInfo(TILE_INFO, "first");
-    useAppStore.setState({ activeTensorId: "second", requestedArrayId: null });
+  it("is the target's grid once it has landed", () => {
+    view("first");
+    expect(selectTileInfo(useAppStore.getState())).toMatchObject({ array_id: "first" });
+  });
+
+  it("is hidden the moment another tensor is opened, not when its own lands", () => {
+    view("first");
+    useAppStore.setState({ client: null });
+    useAppStore.getState().openTensor("second");
 
     expect(selectTileInfo(useAppStore.getState())).toBeNull();
-  });
-
-  // The point of pairing on the *requested* id rather than the one tile_info
-  // answers with: those differ by design (a version token, and the field a bare
-  // source_id resolves to), so comparing the answer would never match.
-  it("keeps a grid whose id was asked for, however it answers", () => {
-    useAppStore.getState().setTileInfo(TILE_INFO, "first");
-    useAppStore.setState({ activeTensorId: "first", requestedArrayId: null });
-
-    expect(selectTileInfo(useAppStore.getState())).toBe(TILE_INFO);
-  });
-
-  it("pairs against the requested address when a link pinned one", () => {
-    useAppStore.getState().setTileInfo(TILE_INFO, "first@abcd1234");
-    useAppStore.setState({ activeTensorId: "first", requestedArrayId: "first@abcd1234" });
-
-    expect(selectTileInfo(useAppStore.getState())).toBe(TILE_INFO);
-  });
-});
-
-describe("currentArrayId", () => {
-  it("stays at the bare id until tile_info answers for it", () => {
-    useAppStore.setState({ activeTensorId: "scratch", requestedArrayId: null });
-
-    expect(currentArrayId(useAppStore.getState())).toBe("scratch");
-  });
-
-  it("adopts the specific tensor tile_info resolved a bare source_id to", () => {
-    selectAndResolve("scratch", "scratch/tensorA");
-
-    expect(currentArrayId(useAppStore.getState())).toBe("scratch/tensorA");
-  });
-
-  it("ignores a grid answering for a different id than the one now in view", () => {
-    useAppStore.getState().setTileInfo({ ...TILE_INFO, array_id: "scratch/tensorA" }, "scratch");
-    useAppStore.setState({ activeTensorId: "other", requestedArrayId: null });
-
-    expect(currentArrayId(useAppStore.getState())).toBe("other");
   });
 });
 
 // ---------------------------------------------------------------------------
 // ROI annotation state is scoped to the tensor in view
 //
-// `selectSource` is not the only way that tensor changes -- `applyViewerState`
-// does it straight from a URL, without going through it -- so these are read
-// through selectors rather than reset at each writer. Everything below is a
-// leak that a reset written in `selectSource` alone would not have caught.
+// Every way the tensor changes -- a click, a link, a late landing -- has to
+// leave the previous tensor's state unreadable, so these are read through
+// selectors rather than reset at each writer.
 // ---------------------------------------------------------------------------
 
 const ROI_FIXTURE = [
@@ -464,9 +590,7 @@ const ROI_FIXTURE = [
 /** State as it stands after a set has been fetched and used on `first`. */
 function seedAnnotated() {
   useAppStore.setState({
-    activeSourceId: "first",
-    activeTensorId: "first",
-    requestedArrayId: null,
+    ...viewOf("first"),
     rois: ROI_FIXTURE,
     roisFor: "first",
     roiScopes: { "": { truncated: true, skipped: 3 } },
@@ -489,7 +613,7 @@ describe("ROI state across a tensor change", () => {
 
   it("hides all of it once another tensor is selected", () => {
     seedAnnotated();
-    useAppStore.getState().selectSource("second");
+    useAppStore.getState().openTensor("second");
     const s = useAppStore.getState();
     expect(selectRois(s)).toEqual([]);
     expect(selectRoiScopes(s)).toEqual({});
@@ -520,11 +644,11 @@ describe("ROI state across a tensor change", () => {
     expect(selectRoisError(s)).toBeNull();
   });
 
-  it("keeps a tensor's annotations under a content-pinned link to it", () => {
+  it("keeps a tensor's annotations under a content-pinned link to it", async () => {
     // A pin names which bytes to render, not a different tensor: annotations
     // carry no version, so the rows already held are this tensor's.
     seedAnnotated();
-    useAppStore.getState().applyViewerState(new URLSearchParams({ id: "first@9f1c4e2b" }));
+    await openLink("id=first@9f1c4e2b");
     expect(selectRois(useAppStore.getState())).toHaveLength(1);
   });
 
@@ -536,15 +660,14 @@ describe("ROI state across a tensor change", () => {
 
   it("starts from the new tensor's default rather than editing another tensor's list", () => {
     seedAnnotated();
-    useAppStore.getState().selectSource("second");
+    useAppStore.getState().openTensor("second");
     useAppStore.getState().toggleSetVisible("debris");
     expect(selectVisibleSets(useAppStore.getState())).toEqual(["debris"]);
   });
 
   it("reports loading only for the tensor in view", () => {
     useAppStore.setState({
-      activeTensorId: "first",
-      requestedArrayId: null,
+      ...viewOf("first"),
       roisPendingFor: "second",
       roisPending: [""],
     });
@@ -563,8 +686,7 @@ describe("the sets on screen", () => {
 
   function seedListed() {
     useAppStore.setState({
-      activeTensorId: "first",
-      requestedArrayId: null,
+      ...viewOf("first"),
       rois: ROI_FIXTURE,
       roiSets: SETS,
       roisFor: "first",
@@ -588,10 +710,10 @@ describe("the sets on screen", () => {
     expect(selectVisibleSets(useAppStore.getState())).toEqual(["nuclei", "cells", "@ome"]);
   });
 
-  it("adopts the sets a link names, and turns the overlay on for them", () => {
+  it("adopts the sets a link names, and turns the overlay on for them", async () => {
     seedListed();
     useAppStore.setState({ showRois: false });
-    useAppStore.getState().applyViewerState(new URLSearchParams("id=first&rs=@ome"));
+    await openLink("id=first&rs=@ome");
     const s = useAppStore.getState();
     expect(selectVisibleSets(s)).toEqual(["@ome"]);
     expect(s.showRois).toBe(true);
@@ -646,8 +768,7 @@ describe("loadRois", () => {
   function fresh(client: TensorFlightClient, over: Record<string, unknown> = {}) {
     useAppStore.setState({
       client,
-      activeTensorId: "first",
-      requestedArrayId: null,
+      ...viewOf("first"),
       rois: [],
       roiSets: [],
       roisFor: null,
@@ -664,35 +785,37 @@ describe("loadRois", () => {
   it("fetches the tensor in view", async () => {
     const asked: string[] = [];
     fresh(stubClient(asked));
-    await useAppStore.getState().loadRois("first");
+    await useAppStore.getState().loadRois();
     expect(asked).toEqual(["first"]);
     expect(useAppStore.getState().roisFor).toBe("first");
     expect(selectRoiScopes(useAppStore.getState())).toEqual({ "": { truncated: false, skipped: 0 } });
   });
 
-  it("refuses a tensor that is not in view", async () => {
-    // Nothing could display it: every selector hides a set whose tensor is not
-    // the current one, so the round trip would be pure waste.
+  it("waits for the target to resolve", async () => {
+    // Nothing could be shown yet, and there is no address to ask about.
     const asked: string[] = [];
-    fresh(stubClient(asked));
-    await useAppStore.getState().loadRois("second");
+    fresh(stubClient(asked), { target: targetFor(null) });
+    await useAppStore.getState().loadRois();
     expect(asked).toEqual([]);
   });
 
-  it("follows the pinned address when a link named one", async () => {
+  it("asks under the address tile_info gave, and holds the rows under the key", async () => {
     const asked: string[] = [];
-    fresh(stubClient(asked), { requestedArrayId: "first@9f1c4e2b" });
-    await useAppStore.getState().loadRois("first");
-    expect(asked).toEqual([]);
-    await useAppStore.getState().loadRois("first@9f1c4e2b");
+    fresh(stubClient(asked), {
+      target: targetFor("first", {
+        info: { ...TILE_INFO, array_id: "first@9f1c4e2b" } as TileInfo,
+      }),
+    });
+    await useAppStore.getState().loadRois();
     expect(asked).toEqual(["first@9f1c4e2b"]);
+    expect(useAppStore.getState().roisFor).toBe("first");
   });
 
   it("asks once for a set it already holds", async () => {
     const asked: string[] = [];
     fresh(stubClient(asked));
-    await useAppStore.getState().loadRois("first");
-    await useAppStore.getState().loadRois("first");
+    await useAppStore.getState().loadRois();
+    await useAppStore.getState().loadRois();
     expect(asked).toEqual(["first"]);
   });
 
@@ -700,10 +823,10 @@ describe("loadRois", () => {
     // The lazy half: the listing names it, the rows wait for the toggle.
     const asked: string[] = [];
     fresh(stubClient(asked, () => ({ sets: [{ setName: "@ome", count: 120, reserved: true }] })));
-    await useAppStore.getState().loadRois("first");
+    await useAppStore.getState().loadRois();
     expect(asked).toEqual(["first"]);
     useAppStore.getState().toggleSetVisible("@ome");
-    await useAppStore.getState().loadRois("first");
+    await useAppStore.getState().loadRois();
     expect(asked).toEqual(["first", "first?@ome"]);
     expect(Object.keys(selectRoiScopes(useAppStore.getState()))).toEqual(["", "@ome"]);
   });
@@ -713,16 +836,16 @@ describe("loadRois", () => {
     // fetch, so a link straight to it does not wait a round trip to find out.
     const asked: string[] = [];
     fresh(stubClient(asked), { visibleSets: ["@ome"], visibleSetsFor: "first" });
-    await useAppStore.getState().loadRois("first");
+    await useAppStore.getState().loadRois();
     expect(asked).toEqual(["first", "first?@ome"]);
   });
 
   it("does not fetch a named set the listing says is not there", async () => {
     const asked: string[] = [];
     fresh(stubClient(asked, () => ({ sets: [{ setName: "@ome", count: 1, reserved: true }] })));
-    await useAppStore.getState().loadRois("first");
+    await useAppStore.getState().loadRois();
     useAppStore.setState({ visibleSets: ["@gone"], visibleSetsFor: "first" });
-    await useAppStore.getState().loadRois("first");
+    await useAppStore.getState().loadRois();
     expect(asked).toEqual(["first"]);
   });
 
@@ -735,7 +858,7 @@ describe("loadRois", () => {
       ],
     }));
     fresh(client, { visibleSets: ["nuclei", "@ome"], visibleSetsFor: "first" });
-    await useAppStore.getState().loadRois("first");
+    await useAppStore.getState().loadRois();
     expect(useAppStore.getState().rois.map((r) => r.roiId).sort()).toEqual(["n1", "o1"]);
     expect(selectRoiSets(useAppStore.getState())).toHaveLength(2);
   });
@@ -751,16 +874,16 @@ describe("loadRois", () => {
       sets: [{ setName: "@ome", count: omeCount, reserved: true }],
     }));
     fresh(client, { visibleSets: ["@ome"], visibleSetsFor: "first" });
-    await useAppStore.getState().loadRois("first");
+    await useAppStore.getState().loadRois();
     expect(Object.keys(selectRoiScopes(useAppStore.getState())).sort()).toEqual(["", "@ome"]);
 
     // Something re-registered the source; the listing is fetched again for
     // whatever reason and now says two rows.
     omeCount = 2;
     unlandListing();
-    await useAppStore.getState().loadRois("first");
+    await useAppStore.getState().loadRois();
     expect(selectRoiScopes(useAppStore.getState())["@ome"]).toBeUndefined();
-    await useAppStore.getState().loadRois("first");
+    await useAppStore.getState().loadRois();
     expect(asked.filter((a) => a.endsWith("?@ome"))).toHaveLength(2);
   });
 
@@ -771,9 +894,9 @@ describe("loadRois", () => {
       skipped: setName ? 1 : 0,
     }));
     fresh(client, { visibleSets: ["@ome"], visibleSetsFor: "first" });
-    await useAppStore.getState().loadRois("first");
+    await useAppStore.getState().loadRois();
     unlandListing();
-    await useAppStore.getState().loadRois("first");
+    await useAppStore.getState().loadRois();
     expect(selectRoiScopes(useAppStore.getState())["@ome"]).toEqual({ truncated: false, skipped: 1 });
   });
 
@@ -784,9 +907,9 @@ describe("loadRois", () => {
       truncated: setName !== undefined,
     }));
     fresh(client, { visibleSets: ["@ome"], visibleSetsFor: "first" });
-    await useAppStore.getState().loadRois("first");
+    await useAppStore.getState().loadRois();
     unlandListing();
-    await useAppStore.getState().loadRois("first");
+    await useAppStore.getState().loadRois();
     expect(selectRoiScopes(useAppStore.getState())["@ome"]).toEqual({ truncated: true, skipped: 0 });
   });
 
@@ -800,13 +923,13 @@ describe("loadRois", () => {
       },
     } as unknown as TensorFlightClient;
     fresh(client);
-    const load = useAppStore.getState().loadRois("first");
-    useAppStore.getState().selectSource("second");
+    const load = useAppStore.getState().loadRois();
+    view("second");
     resolve({ rois: [ROI_FIXTURE[0]], sets: [], truncated: false, skipped: 0 });
     await load;
     expect(useAppStore.getState().roisFor).toBe("first");
     expect(selectRois(useAppStore.getState())).toEqual([]);
-    useAppStore.getState().selectSource("first");
+    view("first");
     expect(selectRois(useAppStore.getState())).toHaveLength(1);
   });
 });
@@ -837,8 +960,7 @@ describe("authoring state", () => {
   function seedFor(client: unknown) {
     useAppStore.setState({
       client: client as TensorFlightClient,
-      activeTensorId: "first",
-      requestedArrayId: null,
+      ...viewOf("first"),
       rois: [],
       roisFor: "first",
       selectedRoiId: null,
@@ -893,7 +1015,7 @@ describe("authoring state", () => {
         },
       },
     });
-    selectAndResolve("scratch", "scratch/tensorA");
+    view("scratch/tensorA");
 
     await useAppStore.getState().createRoi(GEOM, {});
 
@@ -998,7 +1120,7 @@ describe("authoring state", () => {
     seedFor({
       http: {
         deleteRois: () => {
-          useAppStore.setState({ activeTensorId: "second", roisFor: "second", rois: [] });
+          useAppStore.setState({ ...viewOf("second"), roisFor: "second", rois: [] });
           return Promise.reject(new Error("503 upstream"));
         },
       },
@@ -1013,7 +1135,7 @@ describe("authoring state", () => {
     seedFor({
       http: {
         putRois: () => {
-          useAppStore.setState({ activeTensorId: "second", roisFor: "second", rois: [] });
+          useAppStore.setState({ ...viewOf("second"), roisFor: "second", rois: [] });
           return Promise.resolve({ stored: [stored()], conflicts: [], skipped: 0 });
         },
       },
@@ -1143,7 +1265,7 @@ describe("authoring state", () => {
     seedFor({
       http: {
         deleteRois: () => {
-          useAppStore.setState({ activeTensorId: "second", roisFor: "second" });
+          useAppStore.setState({ ...viewOf("second"), roisFor: "second" });
           return Promise.resolve(["srv1"]);
         },
       },
@@ -1177,7 +1299,7 @@ describe("authoring state", () => {
     useAppStore.setState({ render3d: true });
     expect(selectDraft(useAppStore.getState())).toBeNull();
 
-    useAppStore.setState({ render3d: false, activeTensorId: "second" });
+    useAppStore.setState({ render3d: false, ...viewOf("second") });
     expect(selectDraft(useAppStore.getState())).toBeNull();
   });
 
@@ -1195,8 +1317,7 @@ describe("authoring state", () => {
 describe("a draft does not survive a plane change", () => {
   function startDraft() {
     useAppStore.setState({
-      activeTensorId: "first",
-      requestedArrayId: null,
+      ...viewOf("first"),
       render3d: false,
       slice: { ...BASE_SLICE, z: 12 },
     });
@@ -1258,8 +1379,7 @@ describe("a draft does not survive a plane change", () => {
 describe("the overlay toggle governs the whole annotation surface", () => {
   function drafting() {
     useAppStore.setState({
-      activeTensorId: "first",
-      requestedArrayId: null,
+      ...viewOf("first"),
       render3d: false,
       showRois: true,
       slice: { ...BASE_SLICE, z: 12 },
@@ -1624,30 +1744,31 @@ describe("resolve / warm jobs", () => {
 describe("the label overlay", () => {
   it("is drawn only when it belongs to the tensor in view", () => {
     useAppStore.setState({
-      activeTensorId: "src0",
-      requestedArrayId: null,
+      ...viewOf("src0"),
       labelOverlay: "src0/@labels/nuclei",
     });
     expect(selectLabelOverlay(useAppStore.getState())).toBe("src0/@labels/nuclei");
 
-    useAppStore.setState({ activeTensorId: "src1", labelOverlay: "src0/@labels/nuclei" });
+    useAppStore.setState({ ...viewOf("src1"), labelOverlay: "src0/@labels/nuclei" });
     expect(selectLabelOverlay(useAppStore.getState())).toBeNull();
   });
 
   it("survives a round trip through another tensor", () => {
     // Not reset on selection, for the reason the annotation state is not: the
     // id names its own image, so the scoping selector is enough.
-    useAppStore.setState({ activeTensorId: "src0", labelOverlay: "src0/@labels/nuclei" });
-    useAppStore.getState().selectSource("src1");
+    useAppStore.setState({ ...viewOf("src0"), labelOverlay: "src0/@labels/nuclei" });
+    useAppStore.setState({ client: null });
+    useAppStore.getState().openTensor("src1");
     expect(selectLabelOverlay(useAppStore.getState())).toBeNull();
-    useAppStore.getState().selectSource("src0");
+    // A click leaves the overlay's id alone; a link replaces it.
+    expect(useAppStore.getState().labelOverlay).toBe("src0/@labels/nuclei");
+    view("src0");
     expect(selectLabelOverlay(useAppStore.getState())).toBe("src0/@labels/nuclei");
   });
 
   it("matches a content-pinned link to the set of its stable id", () => {
     useAppStore.setState({
-      activeTensorId: "src0",
-      requestedArrayId: "src0@abcd1234",
+      ...viewOf("src0", { requested: "src0@abcd1234" }),
       labelOverlay: "src0/@labels/nuclei",
     });
     expect(selectLabelOverlay(useAppStore.getState())).toBe("src0/@labels/nuclei");
@@ -1655,8 +1776,7 @@ describe("the label overlay", () => {
 
   it("refuses an id that names no set at all", () => {
     useAppStore.setState({
-      activeTensorId: "src0",
-      requestedArrayId: null,
+      ...viewOf("src0"),
       labelOverlay: "src0",
     });
     expect(selectLabelOverlay(useAppStore.getState())).toBeNull();

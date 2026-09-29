@@ -24,15 +24,12 @@ import {
   getDefaultInitialViewState,
 } from "@hms-dbmi/viv";
 import {
-  TensorAbortError,
-  createTensorPixelSources,
-  isTransportError,
   labelSelection,
+  pixelSourcesFromInfo,
   vivDtype,
   type TileInfo,
 } from "@biopb/tensor-flight-client";
 import {
-  currentArrayId,
   selectBroadcastAxes,
   selectDraft,
   selectLabelOverlay,
@@ -63,7 +60,7 @@ import {
   visibleRois,
   type XY,
 } from "../utils/roiLayers";
-import type { ViewerErrorKind } from "./ViewerPane";
+import type { ViewerErrorKind } from "../store";
 import { GammaExtension } from "../utils/vivGamma";
 import { buildLabelLayers } from "../utils/labelLayers";
 import { useContrastWindow } from "../hooks/useContrastWindow";
@@ -78,12 +75,12 @@ import {
   CAMERA_MIRROR_MS,
 } from "../utils/vivUtils";
 
-type PixelSources = Awaited<ReturnType<typeof createTensorPixelSources>>["data"];
+type PixelSources = ReturnType<typeof pixelSourcesFromInfo>;
 
 interface TileViewerProps {
   sourceId: string;
-  /** The tensor's whole address; `source_id` for a single-tensor source. */
-  arrayId: string;
+  /** The resolved `tile_info`, fetched once by `openTensor`. */
+  info: TileInfo;
   /**
    * The tiled viewer gave up. `kind` separates a fact about the tensor
    * ("capability": no tile route, an unsupported dtype) from a bad moment
@@ -101,16 +98,6 @@ interface TileViewerProps {
  */
 const SLICE_KEYS = ["t", "z", "c"] as const;
 const SLICE_WHEEL_QUIET_MS = 120;
-
-/**
- * Backoff before re-asking for `tile_info` after a transport failure.
- *
- * One retry, not a storm: a server slow enough to blow an 8 s budget twice is
- * not going to be rescued by a third ask, and every attempt holds the pane
- * empty. What this buys is the common case -- one slow response, from a cold
- * catalog or a moment of load -- no longer costing the tensor its viewer.
- */
-const TILE_INFO_RETRY_MS = [500];
 
 /**
  * Stops deck.gl holding every click for a third of a second.
@@ -181,7 +168,7 @@ class BiopbDetailView extends DetailView {
  */
 const VIV_EXTENSIONS = [new ColorPaletteExtension(), new GammaExtension()];
 
-export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileViewerProps) {
+export default function TileViewer({ sourceId, info, onUnsupported }: TileViewerProps) {
   const client = useAppStore((s) => s.client);
   const slice = useAppStore((s) => s.slice);
   const channelNames = useAppStore((s) => s.channelNames);
@@ -194,10 +181,7 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
   const visibleSets = useAppStore(selectVisibleSets);
   const roiScopes = useAppStore(selectRoiScopes);
   const loadRois = useAppStore((s) => s.loadRois);
-  // Not `arrayId` (the prop): once `tile_info` resolves it, ROIs belong to the
-  // specific tensor the pixels came from, not the bare source_id the viewer
-  // may have been asked to render (see `currentArrayId`'s doc comment).
-  const roiArrayId = useAppStore(currentArrayId);
+  const roiKey = useAppStore((s) => s.target.key);
   const tool = useAppStore((s) => s.tool);
   const draft = useAppStore(selectDraft);
   const selectedRoiId = useAppStore(selectSelectedRoiId);
@@ -210,72 +194,39 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
   const hostRef = useRef<HTMLDivElement | null>(null);
   const size = useElementSize(hostRef);
 
-  const [loaded, setLoaded] = useState<{ sources: PixelSources; info: TileInfo } | null>(null);
+  const [sources, setSources] = useState<PixelSources | null>(null);
   const [tileError, setTileError] = useState<string | null>(null);
 
   // Report upward through a ref: onUnsupported comes from the parent's render,
-  // and listing it as a dependency would re-run the whole load on every parent
-  // re-render (i.e. on every slider move).
+  // and listing it as a dependency would re-run the source build on every
+  // parent re-render (i.e. on every slider move).
   const onUnsupportedRef = useRef(onUnsupported);
   onUnsupportedRef.current = onUnsupported;
 
   // --- pixel sources ------------------------------------------------------
-  const [retrying, setRetrying] = useState(false);
   useEffect(() => {
     if (!client) return;
-    const controller = new AbortController();
     let live = true;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    let attempt = 0;
-    setLoaded(null);
     setTileError(null);
-    setRetrying(false);
-
-    const load = () => {
-      createTensorPixelSources(client.http, arrayId, {
-        signal: controller.signal,
-        onTileError: (err) => {
-          if (live) setTileError(err.message);
-        },
-      })
-        .then(({ data, info }) => {
-          if (live) setLoaded({ sources: data, info });
-        })
-        .catch((err: unknown) => {
-          if (!live || err instanceof TensorAbortError) return;
-          const message = err instanceof Error ? err.message : String(err);
-          const transport = isTransportError(err);
-          // A slow server says nothing about whether this tensor can be tiled,
-          // so re-ask before giving up its viewer.
-          const delay = transport ? TILE_INFO_RETRY_MS[attempt] : undefined;
-          if (delay !== undefined) {
-            attempt += 1;
-            setRetrying(true);
-            timer = setTimeout(() => {
-              if (live) load();
-            }, delay);
-            return;
-          }
-          onUnsupportedRef.current(message, transport ? "transport" : "capability");
-        });
-    };
-    load();
-
+    try {
+      setSources(
+        pixelSourcesFromInfo(client.http, info, {
+          onTileError: (err) => {
+            if (live) setTileError(err.message);
+          },
+        }),
+      );
+    } catch (err) {
+      // A tensor whose axes this server's tile route cannot select: a fact
+      // about the tensor, not a bad moment.
+      setSources(null);
+      onUnsupportedRef.current(err instanceof Error ? err.message : String(err), "capability");
+    }
     return () => {
       live = false;
-      if (timer !== undefined) clearTimeout(timer);
-      controller.abort();
     };
-  }, [client, arrayId]);
+  }, [client, info]);
 
-  const info = loaded?.info ?? null;
-
-  // Published rather than fetched twice: SliceControls needs this tensor's real
-  // extents to bound its sliders, and this component already paid for them.
-  const setTileInfo = useAppStore((s) => s.setTileInfo);
-  useEffect(() => {
-    setTileInfo(info, arrayId);
-  }, [info, arrayId, setTileInfo]);
   // Identity has to follow content, not the store write that produced it. Viv's
   // ImageLayer refetches whenever `selections` is a new *reference*, and zustand
   // hands out a fresh slice object on every `setSlice` — so deriving the
@@ -343,10 +294,9 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
   // the intensity slider re-derives limits locally instead of refetching.
   const [samples, setSamples] = useState<{ key: string; values: Float64Array } | null>(null);
   useEffect(() => {
-    if (!loaded || !selection) return;
-    const { sources, info: grid } = loaded;
+    if (!sources || !selection) return;
     // Interleaved RGB is rendered as colour, not through a contrast ramp.
-    if (grid.plane.s !== null) return;
+    if (info.plane.s !== null) return;
     const overview = sources[sources.length - 1];
     if (!overview) return;
     const controller = new AbortController();
@@ -364,7 +314,7 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
       live = false;
       controller.abort();
     };
-  }, [loaded, selection, selectionKey]);
+  }, [sources, info, selection, selectionKey]);
 
   // Not only a derivation: this also publishes the plane limits, the track and
   // the applied window that SliceControls reads.
@@ -482,9 +432,9 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
   // what tells `loadRois` which named sets exist -- and a landing can also
   // un-land a scope whose rows went stale, which is fetched again from here.
   useEffect(() => {
-    if (!client || !roiArrayId) return;
-    void loadRois(roiArrayId);
-  }, [client, roiArrayId, loadRois, visibleSets, roiScopes]);
+    if (!client || !roiKey) return;
+    void loadRois();
+  }, [client, roiKey, loadRois, visibleSets, roiScopes]);
 
   // The plane the overlay is drawn for is the one ON SCREEN, not the one asked
   // for. They are the same except while a read is outstanding -- and during
@@ -800,9 +750,9 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
         background: "#1a1a2e",
       }}
     >
-      {loaded && selection && size ? (
+      {sources && selection && size ? (
         <VivStage
-          sources={loaded.sources}
+          sources={sources}
           selection={selection}
           contrastLimits={contrastLimits}
           gamma={gamma}
@@ -818,17 +768,17 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
         />
       ) : (
         <div style={OVERLAY_TEXT}>
-          {retrying ? "Server did not answer in time — retrying…" : "Loading tiles…"}
+          Loading tiles…
         </div>
       )}
-      {loaded && selection && size && !dataValid && !playing && (
+      {sources && selection && size && !dataValid && !playing && (
         // Opaque, not a scrim: the point is that the stale plane stops being
         // visible, which a translucent overlay would not achieve.
         <div style={{ ...OVERLAY_TEXT, background: "#1a1a2e", zIndex: 1 }}>
           {tileError ? "Plane unavailable" : "Reading plane…"}
         </div>
       )}
-      {loaded && selection && size && (dataValid || playing) && (
+      {sources && selection && size && (dataValid || playing) && (
         <div style={{ position: "absolute", bottom: 10, left: 10, display: "grid", gap: 4, zIndex: 2 }}>
           {dataValid && uniformValue !== null && (
             <div
@@ -843,7 +793,7 @@ export default function TileViewer({ sourceId, arrayId, onUnsupported }: TileVie
           <HoverReadout bind={bindHover} />
         </div>
       )}
-      {loaded && selection && size && showRois && (
+      {sources && selection && size && showRois && (
         // Over the canvas, and above the "Reading plane" cover: switching tool
         // is a per-gesture action, and it should not disappear while a read is
         // outstanding.

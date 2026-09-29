@@ -1,6 +1,6 @@
 # Image viewer — refactor proposal
 
-Status: proposal (2026-09-28); step 0 done. Current structure: [viewer-architecture.md](viewer-architecture.md).
+Status: proposal (2026-09-28); steps 0 and 1 done. Current structure: [viewer-architecture.md](viewer-architecture.md).
 
 ## Why
 
@@ -74,12 +74,14 @@ type TensorKey = string;              // resolved stable address: "src/field", n
 
 interface ViewTarget {
   epoch: number;                      // bumps on every open(); guards every async landing
-  requested: string;                  // what the click/link named (bare, pinned, whatever)
-  status: "resolving" | "ready" | "failed";
+  requested: string | null;           // what the click/link named (bare, pinned, whatever); its pin stays in here
+  linked: boolean;                    // opened from a link, so a catalog poll does not evict it
+  status: "idle" | "resolving" | "ready" | "failed";
   key: TensorKey | null;              // set when ready
-  pin: string | null;                 // a link's own version token, kept for the URL
   info: TileInfo | null;              // the one tile_info, shared by 2-D and 3-D
+  retrying: boolean;                  // the transport retry is in flight
   error: { reason: string; kind: ViewerErrorKind } | null;
+  seedSets: string[] | null;          // a link's rs=, written under `key` on landing
 }
 
 openTensor(address: string, init?: Partial<ViewInit>): void   // the only entry path
@@ -210,7 +212,7 @@ Steps 1–2 are the keystone. 3–5 are independent afterwards.
 | Step | Scope | Fixes / deletes |
 |------|-------|-----------------|
 | 0 (**done**) | `viewKey` (token-free `currentArrayId`) stamps and scopes every `…For` field; contrast setters take the key from the store; `adoptResolution` moves bare-keyed state to the resolved field. No remount changes. | Defects 1–3 (3 only for the token; a bare source still fetches its listing twice) |
-| 1 | `ViewTarget` + `openTensor` + epoch; viewers take `info`; single entry path | the bare-source double fetch; `currentArrayId`, `viewKey`, `adoptResolution`, `tileInfoFor`, #1163's machinery; the second reset list |
+| 1 (**done**) | `ViewTarget` + `openTensor` + epoch; viewers take `info`; single entry path | the bare-source double fetch; `currentArrayId`, `viewKey`, `adoptResolution`, `tileInfoFor`, #1163's machinery; the second reset list |
 | 2 | `views: Record<TensorKey, TensorView>` + `useView` | 10 `…For` fields, `stillPending` checks, most of the lint list |
 | 3 | Derived contrast selectors + `runtime` slice; split `SliceState` | `contrastTrack`, `appliedLimits`, content-compare setters, JSON selection keys |
 | 4 | TileViewer hooks, shared hooks with VolumeViewer, `usePlayback`; one debounce per slider | TileViewer to ~400 lines; the debounce bug |
