@@ -56,6 +56,9 @@ const CHAT_WIDTH_KEY = "biopb.observe.chatWidth";
 
 interface JobSummary {
   job_id: string;
+  /** Its place in the history, which the id does not give (a task's is random).
+   * Absent on a verification row, whose kernel is never restarted. */
+  seq?: number;
   status: string; // running | ok | error | interrupted | kernel_lost
   origin?: string; // mcp | user | chat — which surface submitted the cell
   elapsed: number;

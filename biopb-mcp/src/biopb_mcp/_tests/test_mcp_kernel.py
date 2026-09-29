@@ -129,9 +129,7 @@ class TestKernelControl:
         assert kernel.jobs.restarts() == []  # the first start is not a restart
         before = kernel.jobs.new_id()
         kernel.restart()
-        assert [m["after"] for m in kernel.jobs.restarts()] == [
-            int(before.split("-")[1])
-        ]
+        assert len(kernel.jobs.restarts()) == 1
         assert int(kernel.jobs.new_id().split("-")[1]) > int(before.split("-")[1])
 
     def test_restart_clears_namespace(self, kernel):

@@ -2,15 +2,16 @@
  *
  * A restart does not renumber jobs -- ids are never reused -- but the jobs above
  * it ran in a namespace that is gone, so the list draws a line there, as a
- * notebook prints "Kernel restarted". The server gives each restart as the last
- * job number issued before it (`after`), not as a place in the retained rows: a
- * job that has aged out of the list must not take the line with it.
+ * notebook prints "Kernel restarted". The server gives each restart as the `seq`
+ * of the last job admitted before it (`after`), not as a place in the retained
+ * rows: a job that has aged out of the list must not take the line with it.
+ * Placed by `seq`, never by parsing the id: a task's is `task-<random hex>`.
  *
  * Its own function because the placement is easy to get off by one, and the
  * poll it feeds is not reachable from a test without a DOM. */
 
 export interface Restart {
-  /** The last job number issued before the restart. */
+  /** The `seq` of the last job admitted before the restart. */
   after: number;
   /** Wall-clock seconds. */
   at: number;
@@ -20,16 +21,10 @@ export type Entry<T> =
   | { kind: "row"; job: T }
   | { kind: "restart"; at: number };
 
-/** The N of `job-N`; 0 for any other id. */
-export function jobNumber(id: string): number {
-  const n = Number.parseInt(id.slice(id.lastIndexOf("-") + 1), 10);
-  return Number.isNaN(n) ? 0 : n;
-}
-
 /** *rowsNewestFirst* with a `restart` entry after every row newer than it (so
  * below the jobs that ran after the restart, above those before). A restart
  * older than every row that is left goes last. */
-export function withRestarts<T extends { job_id: string }>(
+export function withRestarts<T extends { seq?: number }>(
   rowsNewestFirst: T[],
   restarts: Restart[],
 ): Entry<T>[] {
@@ -37,8 +32,7 @@ export function withRestarts<T extends { job_id: string }>(
   const out: Entry<T>[] = [];
   let m = 0;
   for (const job of rowsNewestFirst) {
-    const n = jobNumber(job.job_id);
-    while (m < marks.length && marks[m]!.after >= n) {
+    while (m < marks.length && marks[m]!.after >= (job.seq ?? 0)) {
       out.push({ kind: "restart", at: marks[m]!.at });
       m++;
     }
