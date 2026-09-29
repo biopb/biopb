@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { useDocumentTitle } from "../hooks/useDocumentTitle";
 import { withBase } from "../base";
+import { sessionFetch } from "../utils/sessionFetch";
 import {
-  authHeaders,
   authRequired,
   captureUrlToken,
   clearToken,
@@ -64,27 +64,9 @@ interface AlgoRec {
   ops?: { name: string }[];
   error?: string;
 }
-// The control's /api/* is token-gated at this single origin. Attach the stored
-// token ('biopb_token') as a Bearer header via the shared auth helper; in the
-// common local deployment there is no token and the header is simply absent. A
-// 401 means remote mode with a missing/stale token, so bounce to /unlock.
-async function fetchAuth(
-  url: string,
-  opts: RequestInit = {},
-): Promise<Response> {
-  const r = await fetch(url, {
-    ...opts,
-    headers: authHeaders(opts.headers as Record<string, string> | undefined),
-  });
-  if (r.status === 401) {
-    redirectToUnlock();
-  }
-  return r;
-}
-
 async function jpost(url: string): Promise<{ error?: string; data_plane?: DataPlane }> {
   try {
-    const r = await fetchAuth(url, { method: "POST" });
+    const r = await sessionFetch(url, { method: "POST" });
     return await r.json().catch(() => ({}));
   } catch (e) {
     return { error: String(e) };
@@ -130,7 +112,7 @@ export default function DashboardPage() {
 
   const pollStatus = useCallback(async () => {
     try {
-      const s = await (await fetchAuth(withBase("/api/status"))).json();
+      const s = await (await sessionFetch(withBase("/api/status"))).json();
       setConn("control: ok · " + (s.sessions || 0) + " session(s)");
       setConnOk(true);
       setDataPlane(s.data_plane || {});
@@ -143,10 +125,11 @@ export default function DashboardPage() {
 
   // Reverse-proxied to the data plane's own HTTP sidecar (unauthenticated,
   // see http_server.py:/readyz); a plain fetch, same as ClientBootstrap's
-  // startup wait, not fetchAuth -- the sidecar's health endpoints predate any
+  // startup wait, not sessionFetch -- the sidecar's health endpoints predate any
   // token gate. 503/unreachable both read as "not ready yet".
   const pollBackendReady = useCallback(async () => {
     try {
+      // eslint-disable-next-line no-restricted-globals -- unauthenticated by design
       const r = await fetch(withBase("/data_plane/readyz"));
       const j = await r.json().catch(() => null);
       setBackendReady(!!j && j.ready === true);
@@ -157,7 +140,7 @@ export default function DashboardPage() {
 
   const pollSessions = useCallback(async () => {
     try {
-      const data = await (await fetchAuth(withBase("/api/sessions"))).json();
+      const data = await (await sessionFetch(withBase("/api/sessions"))).json();
       setSessions((data && data.sessions) || []);
     } catch {
       /* keep last */
@@ -166,7 +149,7 @@ export default function DashboardPage() {
 
   const pollAgents = useCallback(async () => {
     try {
-      const data = await (await fetchAuth(withBase("/api/agents"))).json();
+      const data = await (await sessionFetch(withBase("/api/agents"))).json();
       setAgents((data && data.agents) || []);
     } catch {
       /* keep last */
@@ -175,7 +158,7 @@ export default function DashboardPage() {
 
   const pollAlgos = useCallback(async () => {
     try {
-      const data = await (await fetchAuth(withBase("/api/algorithms"))).json();
+      const data = await (await sessionFetch(withBase("/api/algorithms"))).json();
       setAlgos((data && data.servers) || []);
     } catch {
       /* keep last */
@@ -185,7 +168,7 @@ export default function DashboardPage() {
   // Token-driven unlock gate. Capture a ?token= handed over by the one-time
   // access URL, then — only where the control's /health advertises auth_required
   // — bounce to /unlock if we still have no token. A tokenless local deployment
-  // advertises auth_required=false, so this never redirects. The /api/* fetchAuth
+  // advertises auth_required=false, so this never redirects. The /api/* sessionFetch
   // 401 path is the backstop for a stale/invalid token.
   useEffect(() => {
     captureUrlToken();
@@ -232,7 +215,7 @@ export default function DashboardPage() {
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), START_TIMEOUT_MS);
     try {
-      const r = await fetchAuth(
+      const r = await sessionFetch(
         withBase("/api/sessions/new?client_timeout=" + START_TIMEOUT_MS / 1000),
         { method: "POST", signal: ctl.signal },
       );
@@ -282,7 +265,7 @@ export default function DashboardPage() {
       setStoppingId(id);
       setStartMsg(null);
       try {
-        const r = await fetchAuth(withBase(`/session/${id}/api/shutdown`), {
+        const r = await sessionFetch(withBase(`/session/${id}/api/shutdown`), {
           method: "POST",
         });
         const res = await r.json().catch(() => ({}));

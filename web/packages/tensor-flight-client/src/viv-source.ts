@@ -408,7 +408,7 @@ function makeSource(
     width: bufferShape[plane.x] ?? level.width,
   });
 
-  return {
+  const source: PixelSource<string[]> = {
     labels: labels as PixelSource<string[]>["labels"],
     shape,
     dtype,
@@ -536,6 +536,22 @@ function makeSource(
       else console.error(`tile error (${info.array_id})`, err);
     },
   };
+  return Object.setPrototypeOf(source, namedPrototype(`${info.array_id}@L${level.level}`));
+}
+
+/**
+ * A prototype whose constructor is called `name`.
+ *
+ * `@vivjs/views` builds a deck.gl layer id from `loader[0].constructor.name`,
+ * and a plain object literal is always "Object": every tensor would produce
+ * the same `Tiled-Image-Object-#detail#`, and deck.gl would then treat one
+ * tensor's layer as an update of another's, carrying its tile cache over. Naming
+ * the constructor after the tensor and level makes the id say which image it
+ * draws, so nothing depends on the viewer being remounted per tensor.
+ */
+function namedPrototype(name: string): object {
+  const named = { [name]: class {} }[name] as new () => object;
+  return named.prototype;
 }
 
 /**

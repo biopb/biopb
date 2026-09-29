@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { useDocumentTitle } from "../hooks/useDocumentTitle";
-import { authHeaders, captureUrlToken, redirectToUnlock } from "../auth";
+import { captureUrlToken } from "../auth";
+import { SessionLocked, sessionFetch } from "../utils/sessionFetch";
 import { withBase } from "../base";
 
 // A dedicated data-plane log monitor for the control dashboard. Polls the
@@ -51,14 +52,9 @@ export default function LogsPage() {
   const load = useCallback(async (n: number) => {
     setLoading(true);
     try {
-      const r = await fetch(withBase(`/api/data_plane/logs?lines=${n}`), {
-        headers: authHeaders(),
+      const r = await sessionFetch(withBase(`/api/data_plane/logs?lines=${n}`), {
         cache: "no-store",
       });
-      if (r.status === 401) {
-        redirectToUnlock();
-        return;
-      }
       if (!r.ok) {
         const body = (await r.json().catch(() => ({}))) as Partial<LogsResponse>;
         throw new Error(body?.error || `Could not load logs (HTTP ${r.status}).`);
@@ -67,6 +63,8 @@ export default function LogsPage() {
       setData(body);
       setError(null);
     } catch (err) {
+      // Already navigating to the unlock page: nothing to report.
+      if (err instanceof SessionLocked) return;
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setLoading(false);

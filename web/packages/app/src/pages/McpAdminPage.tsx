@@ -6,7 +6,7 @@ import {
   type ConfigError,
   type ConfigSchema,
 } from "@biopb/tensor-flight-client";
-import { authHeaders, redirectToUnlock } from "../auth";
+import { SessionLocked, sessionFetch } from "../utils/sessionFetch";
 import { SectionFields } from "../components/admin/SectionFields";
 import { RawJsonPanel } from "../components/admin/RawJsonPanel";
 import {
@@ -43,14 +43,9 @@ async function loadMcpConfig(): Promise<McpConfigResponse> {
   // response (e.g. an empty {} cached before the file was populated) would show
   // the wrong config and clobber it on save. The server also sends
   // Cache-Control: no-store, but this makes the client independent of that.
-  const r = await fetch(withBase("/api/mcp_config"), {
-    headers: authHeaders(),
+  const r = await sessionFetch(withBase("/api/mcp_config"), {
     cache: "no-store",
   });
-  if (r.status === 401) {
-    redirectToUnlock();
-    throw new Error("Session locked — re-enter the access token.");
-  }
   if (!r.ok) {
     const errBody = await r.json().catch(() => ({}));
     throw new Error(errBody?.error || `Could not load config (HTTP ${r.status}).`);
@@ -155,15 +150,11 @@ export default function McpAdminPage() {
     setSaveError(null);
     setServerErrors([]);
     try {
-      const r = await fetch(withBase("/api/mcp_config"), {
+      const r = await sessionFetch(withBase("/api/mcp_config"), {
         method: "PUT",
-        headers: authHeaders({ "Content-Type": "application/json" }),
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify(config),
       });
-      if (r.status === 401) {
-        redirectToUnlock();
-        return;
-      }
       const body = await r.json().catch(() => ({}));
       if (r.status === 422) {
         setServerErrors((body?.errors as ConfigError[]) ?? []);
@@ -175,6 +166,8 @@ export default function McpAdminPage() {
       setSaved(true);
       setDirty(false);
     } catch (err) {
+      // Already navigating to the unlock page: nothing to report.
+      if (err instanceof SessionLocked) return;
       setSaveError(err instanceof Error ? err.message : String(err));
     } finally {
       setSaving(false);
