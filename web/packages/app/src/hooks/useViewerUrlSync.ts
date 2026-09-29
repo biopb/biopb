@@ -1,6 +1,11 @@
 import { useEffect, useRef } from "react";
 import { useSearchParams } from "react-router-dom";
-import { selectLabelOverlay, selectTileInfo, selectVisibleSets, useAppStore } from "../store";
+import {
+  selectTileInfo,
+  selectUrlLabelOverlay,
+  selectUrlVisibleSets,
+  useAppStore,
+} from "../store";
 import { DEFAULT_VIEWER_URL_STATE, encodeViewerState } from "../utils/viewerUrl";
 
 /**
@@ -30,10 +35,10 @@ export function useViewerUrlSync() {
   const camera2d = useAppStore((s) => s.camera2d);
   // Scoped: a list chosen on the previous tensor must not be written into a
   // link to this one.
-  const visibleSets = useAppStore(selectVisibleSets);
+  const visibleSets = useAppStore(selectUrlVisibleSets);
   // Scoped for the same reason: a set chosen on the previous image must not be
   // written into a link to this one.
-  const labelOverlay = useAppStore(selectLabelOverlay);
+  const labelOverlay = useAppStore(selectUrlLabelOverlay);
   const labelOpacity = useAppStore((s) => s.labelOpacity);
 
   const hydrated = useRef(false);

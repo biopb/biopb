@@ -1840,6 +1840,27 @@ export function sliceKey(slice: SliceState): string {
 }
 
 /**
+ * A link's own set names while its target is not ready, or the resolved ones.
+ *
+ * For the URL writer. The scoped selectors answer null both for "the tensor's
+ * default" and for "no tensor resolved yet", and the writer reads null as
+ * "drop the param" -- so a link whose `tile_info` is slow or failed would have
+ * its `rs=` rewritten away, and a reload could no longer retry it. Until the
+ * target is ready, a linked open still says what the link named (`[]` being an
+ * explicit "none", null "no value").
+ */
+export function selectUrlVisibleSets(s: AppState): string[] | null {
+  const { target } = s;
+  return target.linked && target.status !== "ready" ? target.seedSets : selectVisibleSets(s);
+}
+
+/** A link's own label overlay while its target is not ready. See {@link selectUrlVisibleSets}. */
+export function selectUrlLabelOverlay(s: AppState): string | null {
+  const { target } = s;
+  return target.linked && target.status !== "ready" ? s.labelOverlay : selectLabelOverlay(s);
+}
+
+/**
  * The sets chosen for the tensor in view, or null for its default. Names do not
  * carry across tensors.
  */

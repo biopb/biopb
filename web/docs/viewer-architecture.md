@@ -187,6 +187,10 @@ then writes the URL back whenever state changes. It writes
 view gets the server's version token put into its URL, while a link whose
 version is gone keeps its token in the bar next to the error.
 
+While a linked target is unresolved or failed, `rs=` and `lb=` are the link's own
+values (`selectUrlVisibleSets`, `selectUrlLabelOverlay`), not the scoped
+selectors' null, so a slow or failed `tile_info` does not rewrite them away.
+
 ## Invariants worth keeping
 
 These are real, hard-won, and any refactor has to preserve them:

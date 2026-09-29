@@ -21,6 +21,8 @@ import {
   selectObservedLimits,
   selectTileInfo,
   selectLabelOverlay,
+  selectUrlLabelOverlay,
+  selectUrlVisibleSets,
   catalogFingerprint,
   useAppStore,
   EMPTY_VIEW,
@@ -555,6 +557,82 @@ describe("opening a tensor", () => {
 
     expect(useAppStore.getState()).toMatchObject({ activeSourceId: null, activeTensorId: null });
     expect(useAppStore.getState().target).toMatchObject({ status: "idle", key: null, info: null });
+  });
+});
+
+describe("what the URL carries while a link resolves", () => {
+  const LINK = "id=src/field&rs=nuclei&rs=cells&lb=src%2Ffield%2F%40labels%2Fmasks";
+
+  it("keeps a link's sets and overlay while tile_info is pending", () => {
+    useAppStore.setState({
+      client: {
+        http: { tileInfo: () => new Promise<TileInfo>(() => {}) },
+      } as unknown as TensorFlightClient,
+    });
+    useAppStore.getState().applyViewerState(new URLSearchParams(LINK));
+
+    const s = useAppStore.getState();
+    // The scoped selectors have nothing to say yet; the URL must not read that
+    // as "no sets" and drop the params.
+    expect(selectVisibleSets(s)).toBeNull();
+    expect(selectLabelOverlay(s)).toBeNull();
+    expect(selectUrlVisibleSets(s)).toEqual(["nuclei", "cells"]);
+    expect(selectUrlLabelOverlay(s)).toBe("src/field/@labels/masks");
+  });
+
+  it("keeps them when tile_info fails", async () => {
+    useAppStore.setState({
+      client: {
+        http: {
+          tileInfo: () => Promise.reject(new TensorApiError(404, "no such tensor")),
+        },
+      } as unknown as TensorFlightClient,
+    });
+    useAppStore.getState().applyViewerState(new URLSearchParams(LINK));
+    await settle();
+
+    const s = useAppStore.getState();
+    expect(s.target.status).toBe("failed");
+    expect(selectUrlVisibleSets(s)).toEqual(["nuclei", "cells"]);
+    expect(selectUrlLabelOverlay(s)).toBe("src/field/@labels/masks");
+  });
+
+  it("tells an explicit empty rs= from no rs at all", () => {
+    useAppStore.setState({
+      client: {
+        http: { tileInfo: () => new Promise<TileInfo>(() => {}) },
+      } as unknown as TensorFlightClient,
+    });
+    useAppStore.getState().applyViewerState(new URLSearchParams("id=src/field&rs="));
+    expect(selectUrlVisibleSets(useAppStore.getState())).toEqual([]);
+
+    useAppStore.getState().applyViewerState(new URLSearchParams("id=src/field"));
+    expect(selectUrlVisibleSets(useAppStore.getState())).toBeNull();
+    expect(selectUrlLabelOverlay(useAppStore.getState())).toBeNull();
+  });
+
+  it("does not carry a link's names onto a click that follows", () => {
+    useAppStore.setState({
+      client: {
+        http: { tileInfo: () => new Promise<TileInfo>(() => {}) },
+      } as unknown as TensorFlightClient,
+    });
+    useAppStore.getState().applyViewerState(new URLSearchParams(LINK));
+    useAppStore.getState().openTensor("other");
+
+    expect(selectUrlVisibleSets(useAppStore.getState())).toBeNull();
+  });
+
+  it("reads the resolved, scoped values once the target is ready", async () => {
+    useAppStore.setState({ client: echoClient() });
+    useAppStore.getState().applyViewerState(new URLSearchParams(LINK));
+    await settle();
+
+    const s = useAppStore.getState();
+    expect(s.target.status).toBe("ready");
+    expect(selectUrlVisibleSets(s)).toEqual(selectVisibleSets(s));
+    expect(selectUrlVisibleSets(s)).toEqual(["nuclei", "cells"]);
+    expect(selectUrlLabelOverlay(s)).toBe("src/field/@labels/masks");
   });
 });
 
