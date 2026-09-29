@@ -80,7 +80,7 @@ fi
 # The caller's release choice goes into the container for either installer (-e VAR
 # with no value copies it from this shell, and passes nothing if it is unset).
 # Installing through bootstrap.sh also mounts it and names it as the installer.
-install_via=(-e BIOPB_INSTALL_VERSION -e BIOPB_INSTALL_RC)
+install_via=(-e BIOPB_INSTALL_VERSION -e BIOPB_INSTALL_RC -e BIOPB_REQUIRE_SAMPLE)
 if [ "$BOOTSTRAP" = "1" ]; then
     install_via+=(
         -v "$SCRIPT_DIR/../bootstrap.sh:/bootstrap.sh:ro"
