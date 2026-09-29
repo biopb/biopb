@@ -70,7 +70,7 @@ source of bugs (see *Scoping mechanisms*).
 | Target | `target`: `epoch`, `requested`, `status`, `key`, `info` (the one `tile_info`), `error` | `openTensor`; landings are dropped when `epoch` moved on |
 | Per tensor, **reset** on open | `position` (`t/z/c/axes`), `display.fixedLimits`, `render3d`, `camera2d`, `camera3d`, `playAxis`, `runtime`; and from a link, `visibleSets` and `labelOverlay` | the one reset list in `openTensor` |
 | Per tensor, **one record each** | `views[key]`: `rois`, `roiSets`, `roiScopes`, `roisPending`, `roisError`, `visibleSets`, `broadcastAxes`, `draft` (with its slice key), `observedLimits`; a small LRU | the selectors read `views[target.key]`; writers capture the key and write into that record |
-| Runtime (what only a viewer can observe) | `runtime`: `epoch`, `planeReady`, `samples` (the last plane's sorted grey levels) | writes carry the epoch they were observed under; another epoch is dropped |
+| Runtime (what only a viewer can observe) | `runtime`: `planeReady`, `samples` (the last plane's sorted grey levels) | writes carry the `target.epoch` they were observed under; another epoch is dropped. A position change un-readies the plane in the same write |
 | Per tensor, scoped by id content | `labelOverlay` (the set's id names its image) | `selectLabelOverlay` |
 | Per plane | `views[key].draft.sliceKey`, and in `TileViewer` local state: `loadedSelection`, `labelLoadedKey` | key comparison; the selection by object identity |
 | Per mount (viewer-local) | pixel sources, samples, hover, draft cursor, tile error | `ViewerPane` remount key |
@@ -147,7 +147,7 @@ most one commit behind the viewer.
 | TileViewer | `loadRois`, `setDraft`, `createRoi`, `deleteRoi`, `setSelectedRoi` | RoiPanel, RoiToolStrip |
 | TileViewer wheel handler | `position` | everything |
 
-Every runtime write carries the epoch the viewer was mounted under.
+Every runtime write carries the `target.epoch` the viewer was mounted under.
 
 The contrast track, the applied window and the plane's own limits are **not**
 stored. `selectContrastTrack`, `selectContrastWindow` and `selectPlaneLimits`

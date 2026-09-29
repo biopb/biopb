@@ -34,6 +34,7 @@ import {
 } from "@biopb/tensor-flight-client";
 import { useShallow } from "zustand/react/shallow";
 import { useCameraMirror } from "../hooks/useCameraMirror";
+import { BADGE, OVERLAY_TEXT } from "./viewerStyles";
 import { useElementSize } from "../hooks/useElementSize";
 import { useMountEpoch, usePublishPlaneReady } from "../hooks/useMountEpoch";
 import { selectContrastWindow, useAppStore } from "../store";
@@ -213,7 +214,7 @@ export default function VolumeViewer({ sourceId, info: tileInfo, onUnsupported }
         </div>
       )}
       {plan && shown && size && (
-        <div style={BADGE} title="The scale the server keeps this volume warm at.">
+        <div style={{ ...BADGE, bottom: 10, left: 10 }} title="The scale the server keeps this volume warm at.">
           {plan.width}×{plan.height}×{plan.depth} at 1/{plan.scale_hint[plan.axes.x]}
           {plan.spacing === null && " · isotropic (no physical scale)"}
         </div>
@@ -371,27 +372,4 @@ const HOST: CSSProperties = {
   height: "100%",
   overflow: "hidden",
   background: "#000",
-};
-
-const OVERLAY_TEXT: CSSProperties = {
-  position: "absolute",
-  inset: 0,
-  display: "flex",
-  alignItems: "center",
-  justifyContent: "center",
-  color: "#94a3b8",
-  fontSize: 13,
-};
-
-const BADGE: CSSProperties = {
-  position: "absolute",
-  bottom: 10,
-  left: 10,
-  padding: "4px 8px",
-  borderRadius: 4,
-  background: "rgba(0, 0, 0, 0.65)",
-  color: "#cbd5e1",
-  fontSize: 11,
-  pointerEvents: "none",
-  zIndex: 2,
 };

@@ -25,7 +25,13 @@ export function HoverReadout({
 }) {
   const [sample, setSample] = useState<HoverSample | null>(null);
   useEffect(() => {
-    bind(setSample);
+    bind((next) =>
+      setSample((prev) =>
+        prev && next && prev.x === next.x && prev.y === next.y && prev.value === next.value && prev.scale === next.scale
+          ? prev
+          : next,
+      ),
+    );
     return () => bind(null);
   }, [bind]);
   if (!sample) return null;

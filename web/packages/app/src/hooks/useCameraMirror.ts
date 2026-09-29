@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback } from "react";
 import { useAppStore } from "../store";
 import type { Camera2DState, Camera3DState } from "../store";
 import { CAMERA_MIRROR_MS } from "../utils/vivUtils";
+import { useDebouncedCommit } from "./useDebouncedCommit";
 
 interface Cameras {
   "2d": Camera2DState;
@@ -20,21 +21,13 @@ interface Cameras {
 export function useCameraMirror<K extends keyof Cameras>(kind: K): (camera: Cameras[K]) => void {
   const setCamera2d = useAppStore((s) => s.setCamera2d);
   const setCamera3d = useAppStore((s) => s.setCamera3d);
-  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  useEffect(
-    () => () => {
-      if (timer.current) clearTimeout(timer.current);
-    },
-    [],
-  );
+  const schedule = useDebouncedCommit(CAMERA_MIRROR_MS);
   return useCallback(
-    (camera: Cameras[K]) => {
-      if (timer.current) clearTimeout(timer.current);
-      timer.current = setTimeout(() => {
+    (camera: Cameras[K]) =>
+      schedule("camera", () => {
         if (kind === "2d") setCamera2d(camera as Camera2DState);
         else setCamera3d(camera as Camera3DState);
-      }, CAMERA_MIRROR_MS);
-    },
-    [kind, setCamera2d, setCamera3d],
+      }),
+    [kind, schedule, setCamera2d, setCamera3d],
   );
 }

@@ -120,6 +120,17 @@ const pickDisplay = ({ contrastMode, percentileScale, fixedLimits, gamma }: Slic
   gamma,
 });
 
+/**
+ * The patch for moving to `next`: nothing when it is where the view already is,
+ * else the new position with the plane marked not ready -- a new position always
+ * means the canvas is no longer showing the plane asked for, and saying so in the
+ * same write is what keeps a play timer from racing the viewer's own effect.
+ */
+function moved(s: AppState, next: PositionState): Partial<AppState> {
+  if (samePosition(s.position, next)) return {};
+  return { position: next, runtime: { ...s.runtime, planeReady: false } };
+}
+
 /** `next`, unless it holds the same indices as `current`, in which case `current`. */
 function samePositionOr(current: PositionState, next: PositionState): PositionState {
   return samePosition(current, next) ? current : next;
@@ -183,7 +194,6 @@ export interface PlaneSamples {
 
 /** Facts only a mounted viewer can observe. See {@link AppState.runtime}. */
 export interface Runtime {
-  epoch: number;
   /**
    * Whether what is on the canvas is the plane that was last asked for. Play
    * reads it to pace itself to the data plane rather than to a timer, and the
@@ -309,13 +319,6 @@ function withView(
 }
 
 /**
- * The 3-D camera, in `OrbitView`'s own terms.
- *
- * A mirror, not the source of truth: deck.gl owns the camera while the volume
- * is mounted and this trails it on a debounce, which is what keeps an orbit
- * smooth. It is read back only to seed the next mount -- see `VolumeViewer`.
- */
-/**
  * The 2-D camera, in `DetailView`'s terms.
  *
  * A mirror of Viv's own view state, on the same terms as {@link Camera3DState}:
@@ -333,6 +336,13 @@ export interface Camera2DState {
   zoom: number;
 }
 
+/**
+ * The 3-D camera, in `OrbitView`'s own terms.
+ *
+ * A mirror, not the source of truth: deck.gl owns the camera while the volume
+ * is mounted and this trails it on a debounce, which is what keeps an orbit
+ * smooth. It is read back only to seed the next mount -- see `VolumeViewer`.
+ */
 export interface Camera3DState {
   /** Orbit centre, in the scaled world space `volumeCentre` computes. */
   target: [number, number, number];
@@ -763,7 +773,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   labelOpacity: DEFAULT_LABEL_OPACITY,
 
   playAxis: null,
-  runtime: { epoch: 0, planeReady: false, samples: null },
+  runtime: { planeReady: false, samples: null },
 
   showAdvancedOptions: false,
   render3d: false,
@@ -938,7 +948,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       // An axis key means "axis of the tensor in view", so a play in progress
       // does not survive one either.
       playAxis: null,
-      runtime: { epoch, planeReady: false, samples: null },
+      runtime: { planeReady: false, samples: null },
     }));
     void resolveTarget(get, set, epoch);
   },
@@ -954,7 +964,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   setPosition(partial) {
     set((s) => {
       const next = { ...s.position, ...partial };
-      return samePosition(s.position, next) ? s : { position: next };
+      return moved(s, next);
     });
   },
 
@@ -967,7 +977,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       const next: PositionState = axis.named
         ? { ...s.position, [axis.named]: value }
         : { ...s.position, axes: { ...s.position.axes, [axis.key]: value } };
-      return samePosition(s.position, next) ? s : { position: next };
+      return moved(s, next);
     });
   },
 
@@ -983,7 +993,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   notePlaneSamples(samples, channel, epoch) {
     const key = get().target.key;
     set((s) => {
-      if (s.runtime.epoch !== epoch) return s;
+      if (s.target.epoch !== epoch) return s;
       const { values } = samples;
       return {
         runtime: { ...s.runtime, samples },
@@ -996,7 +1006,7 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   setPlaneReady(value, epoch) {
     set((s) =>
-      s.runtime.epoch !== epoch || s.runtime.planeReady === value
+      s.target.epoch !== epoch || s.runtime.planeReady === value
         ? s
         : { runtime: { ...s.runtime, planeReady: value } },
     );

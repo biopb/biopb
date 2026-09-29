@@ -13,6 +13,7 @@
 
 import { sliderAxes } from "@biopb/tensor-flight-client";
 import type { SliceRequest, TileInfo, VolumeAvailable } from "@biopb/tensor-flight-client";
+import { axisIndexOf } from "./sliceUi";
 import type { SliceIndices } from "./vivUtils";
 
 /**
@@ -121,7 +122,7 @@ export function volumeRequest(
   const pinned = new Map<number, number>();
   for (const axis of sliderAxes(info.dim_labels, info.shape)) {
     if (whole.has(axis.axis)) continue;
-    const want = axis.named ? slice[axis.named] : slice.axes[axis.key] ?? 0;
+    const want = axisIndexOf(slice, axis);
     pinned.set(axis.axis, Math.min(Math.max(0, want), Math.max(0, axis.extent - 1)));
   }
   const slice_start: number[] = [];

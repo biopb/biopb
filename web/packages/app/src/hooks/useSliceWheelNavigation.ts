@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import type { RefObject } from "react";
 import type { TileInfo } from "@biopb/tensor-flight-client";
 import { useAppStore } from "../store";
+import { createDebouncer } from "./useDebouncedCommit";
 
 /**
  * Slice navigation: hold one of these and scroll.
@@ -31,10 +32,9 @@ export function useSliceWheelNavigation(
 
     const held = new Set<string>();
     const pending = { axis: null as (typeof SLICE_KEYS)[number] | null, steps: 0 };
-    let timer: ReturnType<typeof setTimeout> | null = null;
+    const debouncer = createDebouncer(SLICE_WHEEL_QUIET_MS);
 
     const flush = () => {
-      timer = null;
       const { axis, steps } = pending;
       pending.axis = null;
       pending.steps = 0;
@@ -57,8 +57,7 @@ export function useSliceWheelNavigation(
         pending.steps = 0;
       }
       pending.steps += e.deltaY > 0 ? -1 : 1;
-      if (timer) clearTimeout(timer);
-      timer = setTimeout(flush, SLICE_WHEEL_QUIET_MS);
+      debouncer.schedule("wheel", flush);
     };
     const onKeyDown = (e: KeyboardEvent) => {
       const key = e.key.toLowerCase();
@@ -76,7 +75,7 @@ export function useSliceWheelNavigation(
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
       window.removeEventListener("blur", onBlur);
-      if (timer) clearTimeout(timer);
+      debouncer.cancelAll();
     };
   }, [ref, info]);
 }

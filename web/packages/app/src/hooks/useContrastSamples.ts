@@ -1,9 +1,20 @@
-import { useEffect, useMemo } from "react";
+import { useEffect } from "react";
 import type { TileInfo } from "@biopb/tensor-flight-client";
 import { useAppStore } from "../store";
 import type { PixelSources } from "../components/VivStage";
 import { contrastSamples } from "../utils/vivUtils";
 import { useMountEpoch } from "./useMountEpoch";
+
+/** The single grey level a plane holds, when `samples` are its own and uniform. */
+function uniformValue(
+  samples: { plane: object; values: Float64Array } | null,
+  selection: object,
+): number | null {
+  if (!samples || samples.plane !== selection) return null;
+  const v = samples.values;
+  const first = v[0];
+  return first !== undefined && first === v[v.length - 1] ? first : null;
+}
 
 /**
  * Sample the plane asked for, and say whether it is featureless.
@@ -28,7 +39,6 @@ export function useContrastSamples(
   selection: Record<string, number>,
 ): number | null {
   const epoch = useMountEpoch();
-  const samples = useAppStore((s) => s.runtime.samples);
   const notePlaneSamples = useAppStore((s) => s.notePlaneSamples);
   const channel = useAppStore((s) => s.position.c);
 
@@ -61,11 +71,8 @@ export function useContrastSamples(
     };
   }, [sources, info, selection, channel, epoch, notePlaneSamples]);
 
-  return useMemo(() => {
-    if (!samples || samples.plane !== selection) return null;
-    const v = samples.values;
-    if (v.length === 0) return null;
-    const first = v[0];
-    return first !== undefined && first === v[v.length - 1] ? first : null;
-  }, [samples, selection]);
+  // A selector returning a number, so this re-renders when the answer changes
+  // and not on every sample landing (which is every plane, and every frame of a
+  // play).
+  return useAppStore((s) => uniformValue(s.runtime.samples, selection));
 }

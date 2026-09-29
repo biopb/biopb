@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useMemo } from "react";
 
 /**
  * Debounces commits per key.
@@ -34,11 +34,7 @@ export function createDebouncer(ms: number) {
  * unmount, so a torn-down panel writes nothing.
  */
 export function useDebouncedCommit(ms: number): (key: string, commit: () => void) => void {
-  const debouncer = useRef<ReturnType<typeof createDebouncer> | null>(null);
-  if (debouncer.current === null) debouncer.current = createDebouncer(ms);
-  useEffect(() => {
-    const current = debouncer.current;
-    return () => current?.cancelAll();
-  }, []);
-  return useCallback((key, commit) => debouncer.current?.schedule(key, commit), []);
+  const debouncer = useMemo(() => createDebouncer(ms), [ms]);
+  useEffect(() => () => debouncer.cancelAll(), [debouncer]);
+  return useCallback((key, commit) => debouncer.schedule(key, commit), [debouncer]);
 }

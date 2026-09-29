@@ -288,7 +288,7 @@ function viewWithDtype(key: string, dtype: string) {
     ...viewOf(key, { info: { ...TILE_INFO, array_id: key, dtype } as TileInfo }),
     position: BASE_POSITION,
     display: BASE_DISPLAY,
-    runtime: { epoch: 100, planeReady: false, samples: null },
+    runtime: { planeReady: false, samples: null },
   });
 }
 
@@ -381,8 +381,24 @@ describe("the contrast track and window", () => {
     useAppStore.setState({ client: null });
     useAppStore.getState().openTensor("second");
 
-    const { runtime, target } = useAppStore.getState();
-    expect(runtime).toEqual({ epoch: target.epoch, planeReady: false, samples: null });
+    expect(useAppStore.getState().runtime).toEqual({ planeReady: false, samples: null });
+  });
+
+  it("un-readies the plane in the same write that moves the position", () => {
+    // What play relies on: the next tick must not see the previous frame's
+    // readiness, whatever order the viewer's own effect runs in.
+    viewWithDtype("first", "<f4");
+    useAppStore.getState().setPlaneReady(true, 100);
+    useAppStore.getState().setPosition({ z: 3 });
+    expect(useAppStore.getState().runtime.planeReady).toBe(false);
+
+    useAppStore.getState().setPlaneReady(true, 100);
+    useAppStore.getState().setAxisIndex({ named: "z", key: "z" }, 4);
+    expect(useAppStore.getState().runtime.planeReady).toBe(false);
+
+    useAppStore.getState().setPlaneReady(true, 100);
+    useAppStore.getState().setPosition({ z: 4 });
+    expect(useAppStore.getState().runtime.planeReady).toBe(true);
   });
 
   it("does not write when the plane is unchanged", () => {
@@ -478,7 +494,7 @@ describe("opening a tensor", () => {
       position: BASE_POSITION,
       display: BASE_DISPLAY,
       views: {},
-      runtime: { epoch: 0, planeReady: false, samples: null },
+      runtime: { planeReady: false, samples: null },
     });
   }
 

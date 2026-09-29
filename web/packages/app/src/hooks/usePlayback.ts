@@ -62,10 +62,9 @@ export function usePlayback(): void {
         timer = setTimeout(step, PLAY_READY_POLL_MS);
         return;
       }
+      // Moving un-readies the plane in the same write, so the next tick cannot
+      // see the previous frame's readiness.
       store.setAxisIndex(axis, nextPlayIndex(axisIndexOf(store.position, axis), axis.extent));
-      // Said here rather than waited for: the viewer publishes the same fact
-      // from an effect, and this timer is armed before that effect runs.
-      store.setPlaneReady(false, store.runtime.epoch);
       asked = Date.now();
       timer = setTimeout(step, PLAY_FRAME_MS);
     };
