@@ -8,6 +8,7 @@ import {
 import { useParams } from "react-router-dom";
 import { chatProxied } from "../auth";
 import ChatPane from "../components/ChatPane";
+import { Modal } from "../components/Modal";
 import { fetchChatStatus, type ChatStatus } from "../utils/chatClient";
 import { arrivals } from "../utils/jobArrivals";
 import { sessionFetch, sessionVerdict } from "../utils/sessionFetch";
@@ -128,6 +129,9 @@ export default function ObservePage() {
   // How to attach a Jupyter client to the session kernel; null while it is not
   // running. Only works on the machine the session runs on.
   const [attachCmd, setAttachCmd] = useState<string | null>(null);
+  // The label of the attach option whose command dialog is open.
+  const [attachOpen, setAttachOpen] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
   const [pollMs, setPollMs] = useState(3000);
   // The control's half of the answer for the chat root: whether it will
   // proxy /chat/* at all.
@@ -466,6 +470,13 @@ export default function ObservePage() {
   // because "none" is its ordinary state and is worth saying at once.
   const rows: JobSummary[] | null = pane === "session" ? jobs : verifyJobs;
 
+  // Ways to attach a client to the session kernel; the child supplies the
+  // command for each it can offer.
+  const attachOptions = attachCmd
+    ? [{ label: "QtConsole", command: attachCmd }]
+    : [];
+  const openOption = attachOptions.find((o) => o.label === attachOpen);
+
   return (
     <div className="obs-page">
       <header>
@@ -477,14 +488,20 @@ export default function ObservePage() {
         />
         <h1>BioPB mcp - observe</h1>
         <span id="status">{status}</span>
-        {attachCmd && !ended ? (
-          <button
-            title={`Copy: ${attachCmd}\nRun it on this machine to work in the session's namespace. Cells are refused while a job runs.`}
-            onClick={() => void navigator.clipboard?.writeText(attachCmd)}
-          >
-            Copy attach command
-          </button>
-        ) : null}
+        {!ended
+          ? attachOptions.map((o) => (
+              <button
+                key={o.label}
+                title={`Attach ${o.label} to the session's kernel (on this machine)`}
+                onClick={() => {
+                  setCopied(false);
+                  setAttachOpen(o.label);
+                }}
+              >
+                {o.label}
+              </button>
+            ))
+          : null}
         {/* Both act on the child, so both 404 once it is gone. A dead button is
             how the page told the user nothing was wrong. */}
         {ended ? null : (
@@ -664,6 +681,46 @@ export default function ObservePage() {
         </div>
       </main>
       <style>{OBS_CSS}</style>
+      {openOption ? (
+        <Modal
+          title={`Attach ${openOption.label}`}
+          onClose={() => setAttachOpen(null)}
+          labelId="obs-attach-title"
+        >
+          <p>
+            Run this on the machine the session runs on to work in the session's
+            namespace. Cells are refused while a job runs.
+          </p>
+          <div className="attach-cmd">
+            <input
+              readOnly
+              value={openOption.command}
+              aria-label={`${openOption.label} attach command`}
+              onFocus={(e) => e.currentTarget.select()}
+            />
+            <button
+              type="button"
+              className="submit-btn"
+              onClick={() => {
+                void navigator.clipboard
+                  ?.writeText(openOption.command)
+                  .then(() => setCopied(true));
+              }}
+            >
+              {copied ? "Copied" : "Copy"}
+            </button>
+          </div>
+          <div className="admin-modal-actions">
+            <button
+              type="button"
+              className="icon-btn"
+              onClick={() => setAttachOpen(null)}
+            >
+              Close
+            </button>
+          </div>
+        </Modal>
+      ) : null}
     </div>
   );
 }

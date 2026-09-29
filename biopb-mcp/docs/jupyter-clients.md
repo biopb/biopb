@@ -178,7 +178,20 @@ works only on the session's machine; a frozen build reports none. A client
 from any other Jupyter install attaches with the connection file alone.
 
 **JupyterLab cannot attach**: its kernel picker lists only kernels its own
-server started.
+server started. It can start a *proxy*, though: a kernelspec whose `argv` is
+`<session python> -m biopb_mcp.mcp._session_proxy -f {connection_file}` (with
+`"interrupt_mode": "message"`) runs `_session_proxy`, a kernel that re-signs and
+forwards every message to the session. The spec runs in the session's
+environment, so nothing is installed into Lab's.
+
+- The session is the newest `kernel-biopb-*.json` whose shell port answers, or
+  the file named by `BIOPB_SESSION_CONNECTION_FILE`. The proxy keeps it until
+  it stops answering, then looks again; with none running it answers each
+  request with a "no running biopb session" error.
+- Closing or restarting the notebook's kernel stops only the proxy. The
+  session kernel also refuses a `shutdown_request` from any session but its
+  host's, for any other client that sends one.
+- The notebook's cells are foreign cells like any attached client's.
 
 ## Gotchas
 
