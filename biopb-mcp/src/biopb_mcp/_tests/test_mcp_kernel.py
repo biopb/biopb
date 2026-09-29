@@ -1313,6 +1313,16 @@ class TestJupyterClientGate:
             gated.interrupt_job(job_id)
             foreign.get_shell_msg(timeout=10)
 
+    def test_a_foreign_shutdown_leaves_the_kernel_running(self, gated, foreign):
+        # A notebook adopted into JupyterLab sends one when it is closed.
+        msg = foreign.session.msg("shutdown_request", {"restart": False})
+        foreign.control_channel.send(msg)
+        reply = foreign.control_channel.get_msg(timeout=10)["content"]
+        assert reply["status"] == "error"
+        assert gated.is_alive()
+        content, _ = self._run(foreign, "1 + 1")
+        assert content["status"] == "ok"
+
     def test_a_control_request_does_not_read_as_idle(self, gated, foreign):
         # The kernel publishes busy/idle around a control request too; the idle
         # after it says nothing about the main thread, still in the cell.

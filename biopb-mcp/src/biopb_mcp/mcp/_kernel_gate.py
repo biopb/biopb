@@ -121,6 +121,25 @@ class GatedKernel(IPythonKernel):
                 }
         return reply
 
+    async def shutdown_request(self, stream, ident, parent):
+        """Shut down for the host only.
+
+        A client attached by connection file (a notebook the provisioner
+        adopted into JupyterLab, say) sends one when the person closes it, and
+        that must detach, not end the agent's session. Refused with an error
+        reply; the host's own close goes through unchanged.
+        """
+        session = parent.get("header", {}).get("session")
+        if _host_session is not None and session != _host_session:
+            reply = {
+                "status": "error",
+                "evalue": "not the host's session",
+                "restart": False,
+            }
+            self.session.send(stream, "shutdown_reply", reply, parent, ident=ident)
+            return
+        await super().shutdown_request(stream, ident, parent)
+
     # -- the host's control requests -----------------------------------------
 
     control_msg_types = [*IPythonKernel.control_msg_types, CONTROL_REQUEST]
