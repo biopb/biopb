@@ -130,7 +130,6 @@ else
     "aggressive_dir_pruning": true
   },
   "cache": {
-    "backend": "file",
 ${SEGMENT_CFG}
     "file_max_total_gb": ${CACHE_MAX_TOTAL_GB:-16}
   },

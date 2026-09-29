@@ -8,10 +8,8 @@
 #   1. BIOPB_INSTALL_BIOFORMATS=1 bash /install.sh   # opt into Bio-Formats
 #   2. /verify_bioformats.sh   # checks adapter, jar, JVM auto-fetch, ZVI read
 #
-# A ZVI sample is optional: mount one with
-#   BIOPB_TEST_DATA=/path/with/file.zvi ./run.sh bioformats
-# or bake one in at build time with --build-arg ZVI_SAMPLE_URL=...
-# Without a sample the adapter/jar/JVM checks still run; only the read is skipped.
+# A real ZVI (test/fixtures/sample.zvi) is baked in at /data, and the scenario
+# requires the read: /verify_bioformats.sh fails without it rather than skipping.
 FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -22,25 +20,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Data dir + config so `biopb server start` would discover a ZVI under /data.
 RUN mkdir -p /data \
     && mkdir -p /root/.config/biopb && printf '%s\n' \
-    '[server]' \
-    'host = "127.0.0.1"' \
-    'port = 8815' \
-    '' \
-    '[cache]' \
-    'backend = "file"' \
-    '' \
-    '[[sources]]' \
-    'url = "/data"' \
-    'monitor = true' \
-    > /root/.config/biopb/biopb.toml
+    '{' \
+    '  "cache": { "backend": "file" },' \
+    '  "sources": [' \
+    '    { "url": "/data", "monitor": true }' \
+    '  ]' \
+    '}' \
+    > /root/.config/biopb/biopb.json
 
-# Optional: bake a ZVI sample into the image. Non-fatal if unset/unreachable
-# (offline builds, moved URL) -- mounting via BIOPB_TEST_DATA is preferred.
-ARG ZVI_SAMPLE_URL=""
-RUN if [ -n "$ZVI_SAMPLE_URL" ]; then \
-        curl -fsSL "$ZVI_SAMPLE_URL" -o /data/sample.zvi \
-        || echo "WARN: could not fetch ZVI sample from $ZVI_SAMPLE_URL"; \
-    fi
+# The sample the read check opens. The build context is install/.
+COPY test/fixtures/sample.zvi /data/sample.zvi
+ENV BIOPB_REQUIRE_SAMPLE=1
 
 # Verification script for the installed Bio-Formats extra.
 # Kept as a real file rather than a Dockerfile heredoc: heredoc support lives in

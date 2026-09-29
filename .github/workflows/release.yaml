@@ -1,10 +1,10 @@
 # Product deployment (the GitHub release bundle), triggered by a single
-# `release-v*` tag. See docs/release-model.md. Produces, from the tagged commit,
-# the GitHub release: wheel set + mcp sdist + webapp + samples + installers — the
-# installer's single source of truth.
+# `release-v*` tag. Produces, from the tagged commit, the GitHub release: wheel
+# set + mcp sdist + webapp + samples + installers — the installer's single
+# source of truth.
 # Docker images are NOT built here: biopb-tensor-server's image is built by
-# tensor-server-ci on this same `release-v*` tag, and biopb-image-base on the SDK
-# `v*` tag (image-runtime-ci). PyPI is likewise separate — biopb publishes to PyPI
+# tensor-server-ci on this same `release-v*` tag, and biopb-image-base by manual
+# dispatch of image-runtime-ci. PyPI is likewise separate — biopb publishes to PyPI
 # on its own `v*` tag (biopb-mcp is no longer on PyPI; it ships only as the wheel set here).
 name: Release (deployment)
 
@@ -29,10 +29,10 @@ jobs:
   # release moves Docker :latest and ships a non-prerelease GitHub release (the
   # installer's source of truth), so publishing it off unmerged code is a
   # mistake. RC/prerelease tags (…rc1/a1/b1) are EXEMPT: by design they are cut
-  # off dev to validate the deployment before it lands on main
-  # (docs/release-model.md). When a final tag points at an off-main commit we
-  # skip the whole run (a noop) rather than publish it. Manual workflow_dispatch
-  # is a dry run that never pushes, so it always proceeds.
+  # off dev to validate the deployment before it lands on main. When a final tag
+  # points at an off-main commit we skip the whole run (a noop) rather than
+  # publish it. Manual workflow_dispatch is a dry run that never pushes, so it
+  # always proceeds.
   guard:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -80,8 +80,7 @@ jobs:
   # so it needs nothing but the checkout — no wheels, no Docker. Compiled UNSIGNED
   # for now: no code-signing cert is provisioned yet, so the .exe trips a
   # SmartScreen "Unknown publisher" warning. Wire up signing later by registering
-  # an iscc sign tool and uncommenting `SignTool=biopbsign` in biopb-setup.iss
-  # (see install/docs/windows-installer.md "Code signing").
+  # an iscc sign tool and uncommenting `SignTool=biopbsign` in biopb-setup.iss.
   windows-installer:
     needs: guard
     if: needs.guard.outputs.proceed == 'true'
@@ -152,7 +151,7 @@ jobs:
     needs: [guard, windows-installer]
     if: needs.guard.outputs.proceed == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     permissions:
       contents: write   # create the GitHub release
     env:
@@ -192,10 +191,11 @@ jobs:
 
       # Build the wheel set the GitHub release ships (the installer file://-installs
       # these). release-wheels/ holds the GitHub-release assets; biopb-mcp also
-      # ships an sdist.
+      # ships an sdist. The SDK wheel is built only to check it against PyPI,
+      # which is where the installer takes it from.
       - name: Build wheels
         run: |
-          uv build --package biopb --wheel --out-dir release-wheels
+          uv build --package biopb --wheel --out-dir sdk-wheel
           uv build --package biopb-tensor-server --wheel --out-dir release-wheels
           uv build --package biopb-mcp --out-dir release-wheels
           uv build --package biopb-control --wheel --out-dir release-wheels
@@ -212,14 +212,14 @@ jobs:
           pnpm -C web --filter @biopb/web build
           tar -czf release-wheels/webapp.tar.gz -C web/packages/app dist
 
-      # Curated CC0 sample images (docs/release-model.md). A fresh, config-less
-      # install seeds these so the product opens onto real microscopy data instead
-      # of an empty catalog; drag-drop / the admin page are how users add their
-      # own. The bytes are fixed and checksummed into the release -- never fetched
-      # from a third party at install time. Isolated, pinned env: skimage/pooch/
-      # tifffile are build-only. The archive root holds the files directly
-      # (installer extracts with no strip). The default (lite) set omits the
-      # ~250 MB palisades_of_vogt sample.
+      # Curated CC0 sample images. A fresh, config-less install seeds these so the
+      # product opens onto real microscopy data instead of an empty catalog;
+      # drag-drop / the admin page are how users add their own. The bytes are
+      # fixed and checksummed into the release -- never fetched from a third party
+      # at install time. Isolated, pinned env: skimage/pooch/tifffile are
+      # build-only. The archive root holds the files directly (installer extracts
+      # with no strip). The default (lite) set omits the ~250 MB palisades_of_vogt
+      # sample.
       #
       # The bundle is STATIC -- it only changes when .github/scripts/build_samples.py (the
       # curated set) or the skimage pin change -- so cache it keyed on exactly
@@ -287,33 +287,56 @@ jobs:
           # gets a setuptools_scm dev version.
           tver=$(ls release-wheels/biopb_tensor_server-*.whl | sed -E 's#.*/biopb_tensor_server-([^-]+)-py3.*#\1#')
           echo "tensor=$tver" >> "$GITHUB_OUTPUT"
-          # napari is pinned exactly in biopb-mcp's [mcp] extra (the single source
+          # napari is pinned exactly in biopb-mcp's [napari] extra (the single source
           # of truth). Surface it as a release attribute so the installer pins the
           # same napari the wheel was built/tested against (see install/install.sh).
           # Read it from the PRISTINE committed blob, not the working tree: the
           # earlier `uv build --package biopb-mcp` step invokes setuptools, which
           # normalizes (rewrites) biopb-mcp/pyproject.toml in place and drops the
-          # `mcp = [... "napari[all]==…" …]` line, so a working-tree grep finds
+          # `"napari[all]==…"` line, so a working-tree grep finds
           # nothing and `set -e` aborts the step silently. `git show HEAD:` is
           # immune to that mutation. (Tag push & dry-run both checkout a commit, so
           # HEAD resolves to it.)
           nver=$(git show HEAD:biopb-mcp/pyproject.toml | grep -oE 'napari\[all\]==[0-9][^"]+' | head -1 | sed -E 's/.*==//')
           [ -n "$nver" ] || { echo "ERROR: no napari[all]== pin in biopb-mcp/pyproject.toml" >&2; exit 1; }
           echo "napari=$nver" >> "$GITHUB_OUTPUT"
+          # The SDK the installer takes from PyPI: the nearest v* tag. The next
+          # step checks it is the SDK this commit builds.
+          sdk=$(git describe --tags --match 'v[0-9]*' --abbrev=0 HEAD)
+          sdk="${sdk#v}"
+          echo "sdk=$sdk" >> "$GITHUB_OUTPUT"
           # versions.json — the installer-readable release-attribute manifest. The
-          # installer reads `napari` (pins the tested Qt binding) and `release`
-          # (the update baseline); `tensor_server` reports the shipped wheel's
+          # installer reads `napari` (pins the tested Qt binding), `biopb` (the
+          # SDK pin), `install_schema` (copied from install.sh's INSTALL_SCHEMA)
+          # and `release` (the update baseline); `tensor_server` reports the shipped wheel's
           # version (now the same `release-v*` line, so == release on a real tag).
           # Docker versions are NOT here — the tensor-server image ships on this
           # same `release-v*` tag (tensor-server-ci), image-base on the SDK `v*`.
+          schema=$(sed -n 's/^INSTALL_SCHEMA=\([0-9][0-9]*\)$/\1/p' install/install.sh)
+          [ -n "$schema" ] || { echo "ERROR: no INSTALL_SCHEMA= in install/install.sh" >&2; exit 1; }
           cat > release-wheels/versions.json <<EOF
-          { "release": "$REL", "tensor_server": "$tver", "napari": "$nver" }
+          { "release": "$REL", "tensor_server": "$tver", "napari": "$nver", "biopb": "$sdk", "install_schema": $schema }
           EOF
-          echo "tensor-server=$tver  napari=$nver  release=$REL  prerelease=$PRERELEASE"
+          echo "tensor-server=$tver  napari=$nver  biopb=$sdk  release=$REL  prerelease=$PRERELEASE"
+
+      # The installer takes the SDK from PyPI, so the SDK at this commit must be a
+      # published one: the nearest v* tag, byte-identical to its PyPI wheel. A v*
+      # tag on this same commit publishes concurrently (python-ci), hence the
+      # wait. A dry run reports a mismatch as a warning and carries on.
+      - name: Check the SDK is on PyPI
+        run: |
+          set -uo pipefail
+          if [ "${{ steps.ver.outputs.is_tag }}" = true ]; then
+            python3 .github/scripts/check_sdk_on_pypi.py \
+              sdk-wheel/biopb-*.whl "${{ steps.ver.outputs.sdk }}" --wait 1800
+          elif ! python3 .github/scripts/check_sdk_on_pypi.py \
+              sdk-wheel/biopb-*.whl "${{ steps.ver.outputs.sdk }}"; then
+            echo "::warning::The SDK differs from biopb ${{ steps.ver.outputs.sdk }} on PyPI; a release of this commit needs a new v* tag first."
+          fi
 
       # Pull the Windows installer built by the windows-installer job into the
       # release-asset dir so the glob below attaches it. The .exe is UNSIGNED for
-      # now (no cert yet — see install/docs/windows-installer.md).
+      # now (no cert yet).
       - name: Download Windows installer
         uses: actions/download-artifact@v4
         with:
@@ -366,8 +389,7 @@ jobs:
       # The GitHub release is the installer's source of truth. Explicit globs
       # (not release-wheels/*) so the .gitignore uv drops in the out-dir is not
       # uploaded. Installer scripts come from the repo-root install/ (the canonical
-      # copy users track — see docs/release-model.md), now pinned to this release
-      # by the step above.
+      # copy users track), now pinned to this release by the step above.
       - name: Create GitHub release
         if: steps.ver.outputs.is_tag == 'true'
         uses: softprops/action-gh-release@v2
@@ -383,6 +405,7 @@ jobs:
             release-wheels/biopb-setup-*.exe
             install/install.sh
             install/install.ps1
+            install/uninstall.ps1
             install/biopb-engine.ps1
           body: |
             ## biopb deployment ${{ github.ref_name }}
@@ -395,61 +418,32 @@ jobs:
             ```
 
             ### Assets
-            - `biopb-*.whl`, `biopb_tensor_server-*.whl`, `biopb_mcp-*.whl`,
+            - `biopb_tensor_server-*.whl`, `biopb_mcp-*.whl`,
               `biopb_control-*.whl` — the version-paired wheel set (installer
               `file://`-installs these)
             - `webapp.tar.gz` — the data-browser web UI
             - `biopb-samples.tar.gz` — curated CC0 sample images a fresh install
               seeds so the viewer opens onto real data (see `LICENSES.txt` inside)
-            - `versions.json` — release manifest (pins `napari`; carries the
-              `release` version the installer records as the update baseline)
+            - `versions.json` — release manifest (pins `napari` and the `biopb`
+              SDK, which the installer takes from PyPI; carries the `release`
+              version the installer records as the update baseline)
             - `SHA256SUMS` — digests of the assets above; the installer verifies
               the wheel set against it before installing
             - `install.sh` / `install.ps1` — bootstrap installers, pinned to this
               release; `biopb-engine.ps1` — the Windows install engine `install.ps1`
               fetches (so a lone `install.ps1` installs exactly this release)
+            - `uninstall.ps1` — the Windows uninstaller the installer saves beside
+              this release's engine
             - `biopb-setup-*.exe` — Windows GUI installer (unsigned; SmartScreen
               will warn "Unknown publisher" until a signing cert is provisioned)
 
             ### Docker
             The Docker images are built by their own CI workflows, not by this
             release job: `biopb-tensor-server` on this same `release-v*` tag
-            (tensor-server-ci) and `biopb-image-base` on the SDK `v*` tag
+            (tensor-server-ci) and `biopb-image-base` by manual dispatch
             (image-runtime-ci).
         env:
           GITHUB_TOKEN: ${{ github.token }}
-
-      # Publish the canonical bootstrap install scripts to biopb.org, PAIRED WITH
-      # this release. Folded in here (was a standalone push-to-main workflow,
-      # install-scripts.yaml) so it runs ONLY after "Create GitHub release" above
-      # succeeds -- a failed release can no longer leave a live installer at
-      # biopb.org that is newer than any release it can install. Gated to a STABLE
-      # release: `is_tag` skips dry runs, `!prerelease` keeps the canonical URL on
-      # the latest stable release (install.sh defaults to stable; BIOPB_INSTALL_RC=1
-      # opts into candidates on demand). The guard job already blocks an off-main
-      # final tag, so no on-main recheck is needed here. Served from a reserved
-      # /install/ subtree that biopb-site's deploy excludes from its --delete
-      # (mirrors api-docs.yaml's /docs/api/). The scripts were already pinned and
-      # parse-checked by "Pin installers to this release" above (same job, same
-      # tree, nothing touches install/ in between), so this step just mirrors them.
-      - name: Publish install scripts to biopb.org
-        if: steps.ver.outputs.is_tag == 'true' && steps.ver.outputs.prerelease != 'true'
-        run: |
-          set -euo pipefail
-          # Stage exactly the three served scripts, then mirror with --delete so
-          # the reserved /install/ subtree holds only these (and drops any file
-          # renamed/removed upstream) -- mirrors api-docs.yaml.
-          mkdir -p _install_publish
-          cp install/install.sh install/install.ps1 install/biopb-engine.ps1 _install_publish/
-
-          mkdir -p ~/.ssh
-          echo "${{ secrets.BIOPB_ORG_SSH_KEY }}" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -H biopb.org >> ~/.ssh/known_hosts
-
-          ssh -i ~/.ssh/id_ed25519 jyu@biopb.org 'mkdir -p /var/www/biopb.org/install'
-          rsync -avz --delete -e "ssh -i ~/.ssh/id_ed25519" \
-            _install_publish/ jyu@biopb.org:/var/www/biopb.org/install/
 
       # Feedback gate for the sample bundle. The build above fails SOFT so a flaky
       # third-party fetch never blocks shipping the real product (wheels/webapp),

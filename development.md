@@ -10,8 +10,8 @@ plane implementations. Each top-level subdir is one component:
 | `proto/` | **The protocol** — `biopb.image` (compute plane) and `biopb.tensor` (data plane) `.proto` files. The single source of truth; stubs for Python, Java, and JS/TS are generated from it. |
 | `src/` | **The core `biopb` SDK** — the Python package (`src/main/python/biopb`: the `tensor` Flight client, the `biopb` CLI, and the stdlib-only cross-process seams) and the Java client (`src/main/java`), plus their tests under `src/test/`. |
 | `biopb-tensor-server/` | **The data plane** — the Arrow Flight server, its format adapters, catalog, cache, and HTTP sidecar. |
-| `biopb-image-runtime/` | **The compute-plane base** — `BiopbServicerBase` and the base Docker image that algorithm servers derive from. |
-| `biopb-mcp/` | **The agent client** — the napari plugin (Tensor Browser + demo widgets) and the MCP server that drives a live napari session. |
+| `biopb-image-runtime/` | **The compute-plane base** — `@op`/`serve()`, which turn functions into an `Ops` server, and the base Docker image. |
+| `biopb-mcp/` | **The agent client** — the MCP server that drives a live napari session. Its Tensor Browser comes from [biopb-napari-widget](https://github.com/biopb/biopb-napari-widget). |
 | `biopb-control/` | **The control plane** — the single web origin; supervises the data plane and serves the browser UI. |
 | `web/` | **The browser front end** — one Vite + React SPA (dataviewer, admin, dashboard, observe), served by the control. |
 | `install/` | Installers (`install.sh` / `install.ps1`) and the GUI launcher. |
@@ -34,7 +34,7 @@ A biopb deployment is a **tree rooted at a durable control plane**:
 ```
    control plane   (durable ROOT — lean: supervise + route + serve the web UI)
         ├── supervises ─► data plane      (tensor Flight server + HTTP sidecar)
-        ├── supervises ─► algorithm plane (algorithm servers)          [pending]
+        ├── supervises ─► algorithm plane (algorithm servers)
         └── observes   ◄─ MCP sessions    (ephemeral, SHIM-owned; self-register)
                             env inherited from the shim
                             USE the planes; never START them
@@ -80,6 +80,12 @@ Generated, not committed. `buf generate` (config in `buf.gen.yaml`, protos under
 
 A source checkout needs `buf` on PATH (end users installing from release wheels do
 not; the wheels ship the generated stubs).
+
+Generation only ever *adds*: `clean: false` in `buf.gen.yaml`, because the output
+directories hold hand-written source too (`src/main/python/biopb` is the SDK).
+So when a `.proto` is deleted or renamed, its old stubs stay in your tree -- still
+importable locally, and packaged into any wheel you build from it. Delete them by
+hand after a protocol removal.
 
 ### Testing
 
@@ -148,30 +154,20 @@ tools should re-implement. Adapters, cache, discovery, and the CLI launcher are 
 client-side localhost read path in
 [`docs/localhost-fast-path.md`](docs/localhost-fast-path.md).
 
-### The compute plane: stateless algorithm servers with an eager/lazy duality
+### The compute plane: algorithm servers behind the control
 
-The compute plane is a gRPC contract (`proto/biopb/image`) with two services:
+The compute plane is one gRPC service, `Ops` (`proto/biopb/image/rpc_ops.proto`):
+`Describe` lists a server's ops with their named arguments, and `Call` runs one,
+streaming progress and returning its outputs. A tensor argument travels either
+**eager** (pixels inline) or **lazy** (a reference to a tensor on a plane, which
+the server reads itself); a large result comes back the same way, as a reference.
+Every other argument and output is plain JSON.
 
-- **`ProcessImage`** — `Run`, `RunStream`, `GetOpNames`. General image→image
-  operations (segmentation, denoising, …), where a server may expose several
-  named *ops*.
-- **`ObjectDetection`** — `RunDetection`, `RunDetectionStream`,
-  `RunDetectionOnGrid`, `RunModelAdaptation`, `GetOpNames`. Detection/instance
-  outputs (ROIs, labels).
-
-The pivotal design point is that every request/response can carry image data in
-one of **two modes** (`return_lazy_or_eager` in the image runtime):
-
-- **Eager** — pixels are embedded inline in the message. Simple; fine for small
-  images.
-- **Lazy** — the message carries a **tensor source reference** instead of
-  pixels. The algorithm server pulls the input straight from the tensor server,
-  and writes its result back as a *new* source, returning that source id.
-
-Algorithm servers are otherwise **stateless and uniform**: `biopb-server`
-backends subclass a shared `BiopbServicerBase` from the image runtime and only
-provide the model-specific inference, so adding a new algorithm is "wrap a model
-+ point it at the protocol," not "build a server." See
+A server is one file: functions decorated with `@op` and a call to `serve()`
+(`biopb-image-runtime`), with its dependencies in a PEP 723 header. The control
+keeps the registry (`~/.config/biopb/algorithms/`): it installs, starts and
+supervises a script entry under uv, and probes a url entry that runs elsewhere.
+The kernel's `ops` reads that registry through the control. See
 [`biopb-image-runtime/README.md`](biopb-image-runtime/README.md).
 
 ### biopb-mcp
@@ -207,9 +203,7 @@ control.
   artifact. Purpose-built tools are added **only where the agent cannot do the job
   in plain Python** — the canonical example being trained-model segmentation.
   Classical operations (filtering, regionprops, blob detection) are left to the
-  agent, because wrapping them would only constrain it. The `ProcessImage`
-  widgets in the napari plugin are **demos** of how to stand up an algorithm
-  server, not the primary interface.
+  agent, because wrapping them would only constrain it.
 
 Because the agent runs arbitrary code against a live session, the session must
 survive the agent doing something wrong — which is why the kernel is a separate,
@@ -228,12 +222,12 @@ durable planes and the web origin in
 - **Data plane:** `biopb-tensor-server/biopb_tensor_server/` — `serving/server.py`,
   `adapters/`, `core/discovery.py`, the metadata DB.
 - **Compute base:** `biopb-image-runtime/src/biopb_image_base/` —
-  `BiopbServicerBase`, `return_lazy_or_eager`, the embedded cache.
-- **An example algorithm server:** `biopb-server/cellpose/cellpose_server.py`
-  (the only remaining separate repo).
-- **Client / agent:** `biopb-mcp/src/biopb_mcp/` — `_connection.py` (data
-  service), `tensor_browser/`, and `mcp/` (`_kernel.py`, `_bootstrap.py`,
-  `_server.py`).
+  `ops.py` (`@op`, `serve()`), the embedded cache.
+- **An example algorithm server:**
+  `src/examples/python/biopb-image-runtime/cellpose_server.py`.
+- **Client / agent:** `biopb-mcp/src/biopb_mcp/mcp/` (`_kernel.py`,
+  `_bootstrap.py`, `_server.py`); the data-plane connection is the SDK's
+  `biopb.tensor.Connection`, and the Tensor Browser is biopb-napari-widget's.
 - **Control plane / web origin:** `biopb-control/src/biopb_control/` —
   `_control.py` (the ASGI app: serves the `web/` SPA + proxies the data plane and
   sessions), `_supervisor.py` (data-plane subprocess lifecycle).
@@ -242,15 +236,17 @@ durable planes and the web origin in
   `packages/tensor-flight-client/` (the TS data-plane SDK). See `web/README.md`
   and `web/ARCHITECTURE.md`.
 - **Release / build:** `docs/release-model.md`.
-- **The skills catalog:** `biopb-mcp/docs/skills.md` — what a skill is, how it
-  ships, and how it is checked: structure, retrieval and contract tests in CI;
-  simulated-user interaction runs against a real session locally, as a benchmark
-  rather than a gate.
-- **Workflow verification:** `docs/verification-scratch-kernel.md` — proposed:
-  why `verify_workflow` should run in a scratch *process* rather than a scratch
+- **The knowledge store:** `biopb-mcp/docs/knowledge.md` — one flat set of
+  markdown docs in two tiers, an index the agent edits, and two tools
+  (`read_doc` / `write_doc`). How it is checked is
+  `biopb-mcp/src/biopb_mcp/_tests/docs/README.md`: seed, packaging and contract
+  tests in CI; simulated-user interaction runs against a real session locally,
+  as a benchmark rather than a gate.
+- **Workflow verification:** `biopb-mcp/docs/verify-workflow.md` —
+  why `verify_workflow` runs in a scratch *process* rather than a scratch
   namespace, what a second kernel costs, and the one-slot admission rule that
   keeps two kernels from becoming two schedulers.
-- **Agent benchmarks:** `biopb-mcp/docs/fixtures.md` — what a run is given and
+- **Agent benchmarks:** `biopb-mcp/docs/agent-bench.md` — what a run is given and
   how it is scored. One runner over one case directory, whether the case is a
-  claim about a skill or about a piece of work (`_tests/agentbench/` for the
+  claim about a doc or about a piece of work (`_tests/agentbench/` for the
   machinery, `_tests/bench/` for the cases and the run).

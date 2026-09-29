@@ -6,8 +6,42 @@
  * tile-cache bound, and the axis/colour translations.
  */
 
-import { sliderAxes, type TileInfo } from "@biopb/tensor-flight-client";
+import { DETAIL_VIEW_ID } from "@hms-dbmi/viv";
+import {
+  sliderAxes,
+  type DataSourceDescriptor,
+  type TileInfo,
+} from "@biopb/tensor-flight-client";
 import { getColorMultipliers, type ColorValue } from "./colorUtils";
+import { axisIndexOf } from "./sliceUi";
+
+/**
+ * How long a camera must rest before it reaches the store.
+ *
+ * Shared by both viewers, and matching the slider debounce: all three exist so
+ * a continuous gesture writes once, at the value the user stopped on. Neither
+ * camera is *driven* from the store, so this delays only what a link records --
+ * never what is on screen.
+ */
+export const CAMERA_MIRROR_MS = 150;
+
+// ---------------------------------------------------------------------------
+// Layer ids
+// ---------------------------------------------------------------------------
+
+/**
+ * A deck.gl layer id `VivViewer`'s `layerFilter` will accept.
+ *
+ * `VivViewer` appends `deckProps.layers` to its own, then filters every layer
+ * through `layer.id.includes(getVivId(viewport.id))` -- so a layer id lacking
+ * `-#<view id>#` is never drawn and never picked, with no error anywhere. Viv
+ * does not export `getVivId`, so this rebuilds it from the exported
+ * `DETAIL_VIEW_ID` rather than hardcoding the string. Shared by `roiLayers.ts`
+ * and `labelLayers.ts`, which differ only in the id's prefix.
+ */
+export function vivLayerId(prefix: string, name: string, viewId: string = DETAIL_VIEW_ID): string {
+  return `${prefix}-${name}-#${viewId}#`;
+}
 
 // ---------------------------------------------------------------------------
 // Contrast limits
@@ -29,6 +63,11 @@ export const CONTRAST_SAMPLE_LIMIT = 65_536;
  * Sorting once is what makes the contrast slider free: dragging it re-reads this
  * array instead of asking the server to re-render, which is the whole point of
  * moving contrast into the shader.
+ *
+ * NaN and the infinities are dropped rather than sorted. A typed-array sort puts
+ * both at the end, so a single one -- a masked-out region of a float plane is
+ * the usual source -- becomes what every percentile taken at 100 reads back as
+ * the plane's maximum.
  */
 export function contrastSamples(
   data: ArrayLike<number>,
@@ -37,19 +76,38 @@ export function contrastSamples(
   const stride = Math.max(1, Math.ceil(data.length / limit));
   const count = Math.ceil(data.length / stride);
   const out = new Float64Array(count);
-  for (let i = 0, j = 0; j < count; i += stride, j++) out[j] = data[i] ?? 0;
-  out.sort(); // TypedArray sorts numerically, unlike Array
-  return out;
+  let kept = 0;
+  for (let i = 0; kept < count && i < data.length; i += stride) {
+    const value = data[i] ?? NaN;
+    if (Number.isFinite(value)) out[kept++] = value;
+  }
+  const sampled = out.subarray(0, kept);
+  sampled.sort(); // TypedArray sorts numerically, unlike Array
+  return sampled;
 }
 
-/** The [lo, hi] percentile pair the intensity control is asking for. */
-export function percentileBounds(
-  useMinMax: boolean,
-  percentileScale: number,
-): [number, number] {
-  if (useMinMax) return [0, 100];
+/**
+ * The [lo, hi] percentile pair the automatic intensity control is asking for.
+ *
+ * A scale of 0 is the full min-max window, which is why the old `useMinMax`
+ * flag is gone: it said the same thing a second way, and two encodings of one
+ * window can disagree.
+ */
+export function percentileBounds(percentileScale: number): [number, number] {
   const lo = Math.min(Math.max(percentileScale, 0), 50);
   return [lo, 100 - lo];
+}
+
+/**
+ * The percentile window as the panel prints it: `lo-hi`, one decimal each.
+ *
+ * Derived from {@link percentileBounds} rather than from the slider, so the
+ * readout cannot disagree with the window the shader is given.
+ */
+export function percentileLabel(percentileScale: number): string {
+  return percentileBounds(percentileScale)
+    .map((p) => p.toFixed(1))
+    .join("-");
 }
 
 /**
@@ -122,6 +180,26 @@ export function clampGamma(gamma: number): number {
   return Math.min(Math.max(gamma, GAMMA_MIN), GAMMA_MAX);
 }
 
+/**
+ * The label overlay's alpha when nobody has chosen one.
+ *
+ * Half: both pictures have to be legible at once -- the objects and the pixels
+ * they were drawn from -- and either extreme hides one of them.
+ */
+export const DEFAULT_LABEL_OPACITY = 0.5;
+
+/**
+ * An overlay alpha safe to hand the shader.
+ *
+ * Fully transparent is allowed, and is not the same as no overlay: the set is
+ * still loaded and still listed as on, which is what makes the slider a way to
+ * compare rather than a way to lose the overlay.
+ */
+export function clampLabelOpacity(opacity: number): number {
+  if (!Number.isFinite(opacity)) return DEFAULT_LABEL_OPACITY;
+  return Math.min(Math.max(opacity, 0), 1);
+}
+
 const RANGE_BY_DTYPE: Record<string, [number, number]> = {
   Uint8: [0, 255],
   Int8: [-128, 127],
@@ -129,13 +207,100 @@ const RANGE_BY_DTYPE: Record<string, [number, number]> = {
   Int16: [-32768, 32767],
   Uint32: [0, 4294967295],
   Int32: [-2147483648, 2147483647],
-  Float32: [0, 1],
-  Float64: [0, 1],
 };
 
-/** Full-range limits, used until the first sampled plane comes back. */
-export function dtypeContrastLimits(vivDtype: string): [number, number] {
-  return RANGE_BY_DTYPE[vivDtype] ?? [0, 1];
+/**
+ * The track when nothing names one: a float tensor with no plane sampled yet,
+ * and the case `vivDtype` would have thrown on before it ever reached here.
+ */
+const FALLBACK_RANGE: [number, number] = [0, 1];
+
+/**
+ * The track a contrast window is chosen on: full-range limits until the first
+ * sampled plane comes back, and the bar a fixed window is dragged along.
+ *
+ * An integer dtype names its own track, so the window's position on the bar
+ * says what part of the possible signal is in view. A float one names nothing
+ * -- "<f4" is 0-1 normalised, raw counts in the thousands and calibrated units
+ * alike -- so the values actually seen stand in for it: `observed` is any
+ * number of windows the track has to contain, typically the sampled extremes
+ * of the plane in view and the window already set. Passing the set window in
+ * is what keeps a track derived from one plane from clipping a window chosen
+ * on another.
+ */
+export function contrastTrack(
+  vivDtype: string | null,
+  ...observed: readonly ([number, number] | null | undefined)[]
+): [number, number] {
+  const intrinsic = vivDtype ? RANGE_BY_DTYPE[vivDtype] : undefined;
+  if (intrinsic) return intrinsic;
+  let lo = Infinity;
+  let hi = -Infinity;
+  for (const window of observed) {
+    if (!window) continue;
+    // A non-finite end is skipped, not taken: taken, it would put the track
+    // back on the 0-1 fallback below, which is the bug this function removes.
+    if (!Number.isFinite(window[0]) || !Number.isFinite(window[1])) continue;
+    lo = Math.min(lo, window[0]);
+    hi = Math.max(hi, window[1]);
+  }
+  if (lo === Infinity) return FALLBACK_RANGE;
+  // A uniform plane observes a single value, and a zero-width track divides by
+  // zero in every fraction taken of it.
+  return hi > lo ? [lo, hi] : [lo, lo + 1];
+}
+
+/**
+ * The step a fixed window moves in on a track spanning `range`.
+ *
+ * One grey level on an integer dtype, where a fraction of a level names
+ * nothing; a thousandth of the track on a float one. Keyed on the dtype rather
+ * than on the width, because a float track comes from the data: at whole units
+ * a tensor whose values span 20 would offer twenty positions on the whole bar,
+ * and `contrastLabel` would round the readout past what was chosen.
+ */
+export function contrastStep(range: [number, number], vivDtype: string | null): number {
+  if (vivDtype && RANGE_BY_DTYPE[vivDtype]) return 1;
+  return (range[1] - range[0]) / 1000;
+}
+
+/**
+ * `limits` with one end moved to `value`, kept inside `range` and in order.
+ *
+ * The ends may not meet: a zero-width window divides by zero in the shader, and
+ * two thumbs at the same position cannot be told apart by a pointer. So each
+ * end stops one step short of the other, which is also what keeps a drag of the
+ * low end from silently dragging the high one along.
+ */
+export function withContrastLimit(
+  limits: [number, number],
+  end: "lo" | "hi",
+  value: number,
+  range: [number, number],
+  step: number,
+): [number, number] {
+  const [min, max] = range;
+  const at = Math.min(Math.max(value, min), max);
+  if (end === "lo") return [Math.min(at, limits[1] - step), limits[1]];
+  return [limits[0], Math.max(at, limits[0] + step)];
+}
+
+/** A fixed window brought inside `range`, for a dtype it was not chosen on. */
+export function clampContrastLimits(
+  limits: [number, number],
+  range: [number, number],
+  vivDtype: string | null,
+): [number, number] {
+  const step = contrastStep(range, vivDtype);
+  const lo = Math.min(Math.max(limits[0], range[0]), range[1] - step);
+  const hi = Math.min(Math.max(limits[1], lo + step), range[1]);
+  return [lo, hi];
+}
+
+/** A fixed window as the panel prints it: whole grey levels, or two dp. */
+export function contrastLabel(limits: [number, number], step: number): string {
+  const fmt = (v: number) => (step >= 1 ? String(Math.round(v)) : v.toFixed(2));
+  return `${fmt(limits[0])}-${fmt(limits[1])}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -227,7 +392,7 @@ export function vivSelection(
 ): Record<string, number> {
   const selection: Record<string, number> = {};
   for (const axis of sliderAxes(info.dim_labels, info.shape)) {
-    const want = axis.named ? slice[axis.named] : slice.axes[axis.key] ?? 0;
+    const want = axisIndexOf(slice, axis);
     selection[axis.key] = Math.min(Math.max(0, want), Math.max(0, axis.extent - 1));
   }
   return selection;
@@ -249,4 +414,87 @@ export function vivColor(
 ): [number, number, number] {
   const [r, g, b] = getColorMultipliers(color, channelName);
   return [Math.round(r * 255), Math.round(g * 255), Math.round(b * 255)];
+}
+
+
+/** Just enough of a tensor to bound a slider. */
+export interface SliderGrid {
+  dim_labels: string[];
+  shape: number[];
+  /** NumPy-style, as both `tile_info` and the catalog report it. */
+  dtype: string;
+}
+
+/**
+ * The grid a slider should be bounded by, live grid first.
+ *
+ * `tile_info` is fetch-per-call, so it describes the tensor as it is now. The
+ * catalog listing is refreshed only when the set of source *urls* changes, so a
+ * source that gains a tensor or a timelapse whose `T` grows keeps its old shape
+ * there -- and a slider bounded on that cannot reach frames the tensor has.
+ *
+ * The catalog remains the fallback for the window before a viewer has loaded,
+ * and for a tensor whose viewer refused it: blanking the whole control column
+ * in that case would take the 2-D/3-D toggle with it.
+ *
+ * `tileInfo` is never matched against `tensorId` here, and must not be:
+ * `tile_info` answers with the *versioned* array_id (`id@token`, an HTTP-only
+ * form -- see the identity policy in descriptor.proto) and resolves a bare
+ * source_id to the field it binds as that source's default, so an equality test
+ * would silently never hold. Whether the grid belongs to the tensor in view is
+ * settled before this: `selectTileInfo` is the open target's own grid, reset on
+ * every open.
+ */
+export function sliderGrid(
+  tileInfo: TileInfo | null,
+  sources: DataSourceDescriptor[],
+  sourceId: string,
+  tensorId: string,
+): SliderGrid | null {
+  if (tileInfo) return tileInfo;
+  const src = sources.find((s) => s.source_id === sourceId);
+  return src?.tensors.find((t) => t.array_id === tensorId) ?? null;
+}
+
+
+/**
+ * `slice` with every index brought inside what `grid` actually has.
+ *
+ * Deferred rather than done while decoding a URL: once a link may carry a
+ * *pinned* address, the descriptor that bounds it does not exist until
+ * `tile_info` answers, so there is nothing to clamp against at decode time.
+ * Running it when the grid lands covers the same case and one the old placement
+ * could not -- a tensor that grew or shrank under a selection already made.
+ *
+ * Out-of-range clamps rather than resetting: a stale `z` should not also
+ * discard the `t` beside it. An axis key the grid does not have is dropped,
+ * since it names nothing here and would otherwise put a phantom entry in the
+ * selection the viewer builds.
+ */
+export function clampSliceTo<T extends SliceLike>(slice: T, grid: SliderGrid | null): T {
+  if (!grid) return slice;
+  const axes = sliderAxes(grid.dim_labels, grid.shape);
+  const extentOf = (key: string) => axes.find((a) => a.key === key)?.extent ?? 1;
+  const bound = (value: number, key: string) =>
+    Math.max(0, Math.min(Math.round(value), Math.max(0, extentOf(key) - 1)));
+
+  const nextAxes: Record<string, number> = {};
+  for (const [key, value] of Object.entries(slice.axes)) {
+    if (axes.some((a) => a.key === key)) nextAxes[key] = bound(value, key);
+  }
+  return {
+    ...slice,
+    t: bound(slice.t, "t"),
+    z: bound(slice.z, "z"),
+    c: bound(slice.c, "c"),
+    axes: nextAxes,
+  };
+}
+
+/** The part of the slice state this module bounds. */
+export interface SliceLike {
+  t: number;
+  z: number;
+  c: number;
+  axes: Record<string, number>;
 }

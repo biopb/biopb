@@ -1,76 +1,107 @@
-"""Inspect the algorithm plane — the configured ``biopb.image`` ProcessImage servers.
+"""The algorithm registry, and a probe of a server of the ``Ops`` protocol.
 
-The "algorithm plane" is the set of gRPC ``ProcessImage`` servicers an agent's
-kernel exposes as callable ``ops``. Their URLs live in the biopb-mcp config today
-(``services.process_image_servers``); each is queried via ``GetOpNames`` so its
-ops surface in the kernel. Moving that config under the control is the pending
-algorithm-plane supervision (``biopb-mcp/ARCHITECTURE.md``, Lifecycle),
-deliberately *later*.
+The registry is a directory, ``~/.config/biopb/algorithms/``. Each file is one
+entry, named by its stem; a stem starting with ``_`` is skipped:
 
-This module is a **read-only inspector** for the control dashboard: it lists the
-configured servers and probes each for liveness + advertised ops. It does **not**
-control their lifecycle (start/stop is the pending algorithm plane, out of scope) and it never writes
-the config. Mirrors ``biopb._agents`` in spirit — a small importable API the lean
-control plane can call.
+- ``<name>.py``, a script entry: a server file the control runs with uv.
+- ``<name>.json``, ``{"url": "grpc://host:port"}``: a server someone else runs.
+  The control probes it and passes it along; it never starts or stops it.
 
-Two layers, on purpose:
-
-- :func:`configured` reads the server URLs straight out of the biopb-mcp config
-  file with the stdlib ``json`` module. It reproduces the config *location* and
-  *key* rather than importing ``biopb_mcp`` — the control plane must not import the
-  mcp package (invariant I2), and this keeps the list cheap and dependency-free.
-- :func:`probe` / :func:`statuses` open a gRPC channel and call ``GetOpNames``.
-  gRPC and the ``biopb.image`` stubs are part of the base ``biopb`` SDK (already a
-  control dependency), so probing stays within the lean-control budget — it drags
-  in no napari / dask / Qt. The ``grpc`` import is lazy so a bare
-  :func:`configured` never pays for it.
+Reading the registry is stdlib only, so the lean control and ``biopb`` (via
+the private ``biopb._control``) can call it; the gRPC probe imports gRPC on
+first use.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 from pathlib import Path
+from typing import Optional
 from urllib.parse import urlparse
+
+from biopb import _locations
 
 logger = logging.getLogger(__name__)
 
-# Default per-probe deadline (seconds). The dashboard probes on demand (a button),
-# so a few seconds is fine; kept short so a dead server doesn't stall its row for
-# long. Probes run concurrently (see statuses), so this bounds the whole sweep too.
+# Default per-probe deadline (seconds). Kept short so a dead server does not
+# stall its row; statuses() probes concurrently, so this bounds the sweep too.
 _DEFAULT_TIMEOUT = 4.0
 
+_UNSAFE_IN_A_NAME = re.compile(r"[^A-Za-z0-9_-]+")
+
 
 # --------------------------------------------------------------------------- #
-# Reading the configured server list (stdlib only)
+# The registry (stdlib only)
 # --------------------------------------------------------------------------- #
 
 
-def _config_file() -> Path:
-    """The biopb-mcp config file location (``~/.config/biopb/mcp-config.json``).
+def registry_dir() -> Path:
+    """The registry directory; see :func:`biopb._locations.algorithms_dir`."""
+    return _locations.algorithms_dir()
 
-    Uses the shared ``biopb._locations.mcp_config_path`` -- the same location
-    ``biopb_mcp._config.get_config_path()`` returns -- rather than importing
-    ``biopb_mcp``: the control plane must not import the mcp package (invariant I2),
-    and the read is plain JSON. The helper resolves ``Path.home()`` at call time
-    (not cached) so a test that repoints it gets an isolated location.
+
+def _url_entry(name: str, path: Path) -> dict:
+    entry = {"name": name, "kind": "url", "path": str(path), "url": None, "error": None}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        entry["error"] = f"unreadable: {exc}"
+        return entry
+    url = data.get("url") if isinstance(data, dict) else None
+    if not isinstance(url, str) or not url.strip():
+        entry["error"] = 'expected {"url": "grpc://host:port"}'
+    else:
+        entry["url"] = url.strip()
+    return entry
+
+
+def entries(directory: Optional[Path] = None) -> list[dict]:
+    """The registry's entries, by name: ``{name, kind, path, url, error}``.
+
+    ``kind`` is ``"script"`` or ``"url"``. An entry that cannot be used (a
+    ``.json`` without a url, or a name taken by both a ``.py`` and a ``.json``)
+    carries an ``error`` rather than being dropped, so it shows up to be fixed.
+    A missing directory is an empty registry. Never raises.
     """
-    from biopb._locations import mcp_config_path
+    directory = directory or registry_dir()
+    try:
+        paths = sorted(p for p in directory.iterdir() if p.is_file())
+    except OSError:
+        return []
+    by_name: dict[str, dict] = {}
+    for path in paths:
+        if path.name.startswith("_") or path.suffix not in (".py", ".json"):
+            continue
+        name = path.stem
+        if path.suffix == ".py":
+            entry = {
+                "name": name,
+                "kind": "script",
+                "path": str(path),
+                "url": None,
+                "error": None,
+            }
+        else:
+            entry = _url_entry(name, path)
+        if name in by_name:
+            by_name[name]["error"] = f"both {name}.py and {name}.json exist"
+            continue
+        by_name[name] = entry
+    return list(by_name.values())
 
-    return mcp_config_path()
+
+def configured() -> list[dict]:
+    """The registry's entries; see :func:`entries`."""
+    return entries()
 
 
 def servers_from_config(config) -> list[str]:
-    """Extract the ProcessImage server URLs from an already-loaded config mapping.
+    """The server URLs a biopb-mcp config listed, for the migration.
 
-    The single normalization point for the list, shared by :func:`configured` (the
-    control plane, which reads the config file fresh) and the biopb-mcp kernel,
-    which passes its live ``CONFIG`` dict here instead of hand-reading the key — so
-    "where the algorithm-plane server list lives" is defined in exactly one place.
-
-    Reads the flat ``services.process_image_servers`` key. Any non-mapping /
-    missing / oddly-typed shape reads as an empty list; non-string and blank
-    entries are dropped. Never raises.
+    Any odd shape reads as an empty list; non-string and blank entries are
+    dropped. Never raises.
     """
     if not isinstance(config, dict):
         return []
@@ -83,19 +114,49 @@ def servers_from_config(config) -> list[str]:
     return [s for s in servers if isinstance(s, str) and s.strip()]
 
 
-def configured() -> list[str]:
-    """The configured ProcessImage server URLs, in config order.
-
-    Reads the biopb-mcp config file from disk (stdlib JSON) and normalizes it via
-    :func:`servers_from_config`. A missing / malformed / oddly-typed config reads as
-    an empty list and never raises: this feeds a status display, not a write.
-    """
-    path = _config_file()
+def _name_for(url: str) -> str:
+    """An entry name for a server URL: its host and port."""
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        target = urlparse(url).netloc or url
+    except ValueError:
+        target = url
+    return _UNSAFE_IN_A_NAME.sub("-", target).strip("-") or "server"
+
+
+def migrate_from_mcp_config(directory: Optional[Path] = None) -> list[str]:
+    """Move the mcp config's server URLs into url entries; answer the names.
+
+    Runs once: only while the registry directory does not exist, and it creates
+    the directory whether or not there was anything to write. The key leaves
+    the mcp config, which no longer reads it.
+    """
+    directory = directory or registry_dir()
+    if directory.exists():
         return []
-    return servers_from_config(data)
+    mcp_config = _locations.mcp_config_path()
+    try:
+        config = json.loads(mcp_config.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        config = None
+    directory.mkdir(parents=True, exist_ok=True)
+    written = []
+    for url in servers_from_config(config):
+        name = _name_for(url)
+        while name in written:
+            name += "-1"
+        (directory / f"{name}.json").write_text(
+            json.dumps({"url": url}) + "\n", encoding="utf-8"
+        )
+        written.append(name)
+    services = config.get("services") if isinstance(config, dict) else None
+    if isinstance(services, dict) and "process_image_servers" in services:
+        del services["process_image_servers"]
+        tmp = mcp_config.with_name(mcp_config.name + ".tmp")
+        tmp.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(mcp_config)
+    if written:
+        logger.info("algorithm registry: migrated %s from the mcp config", written)
+    return written
 
 
 # --------------------------------------------------------------------------- #
@@ -134,49 +195,40 @@ def _rpc_message(exc) -> str:
     return f"{code}: {detail}" if detail else code
 
 
-def _result(state: str, *, ops=None, op_count=None, error=None, single_op=False):
-    """A uniform probe result dict so every branch returns the same shape."""
-    ops = list(ops or [])
+def _result(state: str, *, ops=None, fingerprint="", error=None) -> dict:
     return {
         "state": state,
-        "ops": ops,
-        "op_count": op_count if op_count is not None else len(ops),
+        "ops": list(ops or []),
+        "fingerprint": fingerprint,
         "error": error,
-        "single_op": single_op,
     }
 
 
-def probe(url: str, *, timeout: float = _DEFAULT_TIMEOUT) -> dict:
-    """Open a gRPC channel to ``url`` and ask it for its ops.
+def probe(
+    url: str, *, token: Optional[str] = None, timeout: float = _DEFAULT_TIMEOUT
+) -> dict:
+    """Ask the server at ``url`` for its ops (``Ops.Describe``).
 
-    Returns ``{state, ops, op_count, error, single_op}``:
+    Returns ``{state, ops, fingerprint, error}``, where ``ops`` are the
+    ``OpInfo`` messages as JSON dicts:
 
-    - ``state="serving"`` — ``GetOpNames`` answered (``ops`` lists the names), or the
-      server is up but implements no ``GetOpNames`` (a single-op server:
-      ``single_op=True``, ``ops=[]``, ``op_count=1``).
-    - ``state="unreachable"`` — the channel/RPC could not connect (server down, bad
-      host, TLS mismatch, deadline).
-    - ``state="error"`` — the server answered but with an unexpected RPC error.
-    - ``state="invalid"`` — the URL is not a usable ``grpc://`` / ``grpcs://`` target.
-    - ``state="unknown"`` — gRPC support is unexpectedly unavailable in this env.
+    - ``up``: it answered.
+    - ``unreachable``: nothing answered in time (down, bad host, TLS mismatch).
+    - ``error``: it answered with an error, including a server that does not
+      implement ``Ops``, such as one still speaking the retired ``ProcessImage``
+      protocol.
+    - ``invalid``: the URL is not ``grpc://`` or ``grpcs://``.
 
-    Never raises: every failure is folded into the returned dict so one bad server
-    never breaks the sweep or the dashboard.
+    Never raises.
     """
     try:
-        # Lazy: grpc + the image stubs are hard biopb deps, but importing them only
-        # when a probe actually runs keeps `configured()` (the plain config read)
-        # import-light and lets it work even in a stripped env.
         import grpc
-        from google.protobuf import empty_pb2
+        from google.protobuf import empty_pb2, json_format
 
         import biopb.image as proto
-    except ImportError as exc:  # pragma: no cover - grpc is a base biopb dependency
-        return _result("unknown", error=f"gRPC support unavailable: {exc}")
+    except ImportError as exc:  # pragma: no cover - grpc is a base dependency
+        return _result("error", error=f"gRPC support unavailable: {exc}")
 
-    # urlparse raises ValueError on a malformed bracketed IPv6 literal
-    # (e.g. "grpc://[::1"), so the parse itself must be guarded, not just the
-    # scheme check.
     try:
         parsed = urlparse(url)
         scheme = (parsed.scheme or "").lower()
@@ -188,33 +240,29 @@ def probe(url: str, *, timeout: float = _DEFAULT_TIMEOUT) -> dict:
             "invalid", error="URL must be grpc://host:port or grpcs://host:port"
         )
 
-    # Channel creation can raise too (a bad target, or TLS credential init), and
-    # any non-RpcError raised during the probe must fold into a result as well —
-    # probe() never raises, so one bad server can't break the concurrent sweep in
-    # statuses() (pool.map re-raises) or 500 the dashboard endpoint.
     channel = None
     try:
         if scheme == "grpcs":
             channel = grpc.secure_channel(target, grpc.ssl_channel_credentials())
         else:
             channel = grpc.insecure_channel(target)
-        stub = proto.ProcessImageStub(channel)
+        metadata = [("authorization", f"Bearer {token}")] if token else None
         try:
-            response = stub.GetOpNames(empty_pb2.Empty(), timeout=timeout)
+            answer = proto.OpsStub(channel).Describe(
+                empty_pb2.Empty(), timeout=timeout, metadata=metadata
+            )
         except grpc.RpcError as exc:
             code = exc.code()
             if code == grpc.StatusCode.UNIMPLEMENTED:
-                # A single-op server (no GetOpNames) is still serving one nameless
-                # op — the same case biopb_mcp._process_ops treats as single-op mode.
-                return _result("serving", op_count=1, single_op=True)
-            if code in (
-                grpc.StatusCode.UNAVAILABLE,
-                grpc.StatusCode.DEADLINE_EXCEEDED,
-            ):
+                return _result(
+                    "error",
+                    error="does not implement Ops (a ProcessImage server must move to Ops)",
+                )
+            if code in (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED):
                 return _result("unreachable", error=_rpc_message(exc))
             return _result("error", error=_rpc_message(exc))
-        ops = [name for name in response.names if name]
-        return _result("serving", ops=ops)
+        listing = json_format.MessageToDict(answer)
+        return _result("up", ops=listing.get("ops", []), fingerprint=answer.fingerprint)
     except Exception as exc:  # noqa: BLE001 - probe() never raises; fold into a row
         return _result("error", error=str(exc))
     finally:
@@ -223,34 +271,53 @@ def probe(url: str, *, timeout: float = _DEFAULT_TIMEOUT) -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# Per-server status + the full sweep
+# Rows
 # --------------------------------------------------------------------------- #
 
 
-def status(url: str, *, timeout: float = _DEFAULT_TIMEOUT) -> dict:
-    """One server's row: its identity (``url`` / ``target`` / ``scheme``) plus the
-    :func:`probe` result (``state`` / ``ops`` / ``op_count`` / ``error`` /
-    ``single_op``)."""
-    return {
-        "url": url,
-        "target": _target(url),
+def row(entry: dict, **state) -> dict:
+    """One entry's row, as the control and ``biopb image servers`` list it:
+    ``{name, kind, url, target, scheme, state, ops, op_count, fingerprint,
+    error}``. *state* supplies or overrides the live fields."""
+    url = state.pop("url", None) or entry.get("url") or ""
+    out = {
+        "name": entry["name"],
+        "kind": entry["kind"],
+        "url": url or None,
+        "target": _target(url) if url else entry["name"],
         "scheme": _scheme(url) or "grpc",
-        **probe(url, timeout=timeout),
+        "state": "unknown",
+        "ops": [],
+        "fingerprint": "",
+        "error": entry.get("error"),
     }
+    out.update(state)
+    out["op_count"] = len(out["ops"])
+    return out
 
 
-def statuses(*, timeout: float = _DEFAULT_TIMEOUT) -> list[dict]:
-    """Status for every configured server, in config order.
+def status(entry: dict, *, timeout: float = _DEFAULT_TIMEOUT) -> dict:
+    """A url entry's row with a live probe; any other entry as listed."""
+    if entry["kind"] != "url" or entry.get("error"):
+        return row(entry, state="invalid" if entry.get("error") else "unknown")
+    return row(entry, **probe(entry["url"], timeout=timeout))
 
-    Probes run concurrently — each blocks up to ``timeout`` on a dead server — so
-    the sweep is bounded by the slowest single probe, not their sum. Called from the
-    control dashboard's threadpool handler.
-    """
-    urls = configured()
-    if not urls:
+
+def sweep(items: list, fn, *, max_workers: int = 8) -> list:
+    """Apply *fn* to every item in *items* concurrently, in a pool sized to the
+    batch (never more than *max_workers*). Empty *items* skips the pool."""
+    if not items:
         return []
     from concurrent.futures import ThreadPoolExecutor
 
-    with ThreadPoolExecutor(max_workers=min(8, len(urls))) as pool:
-        # map preserves input order, so rows stay in config order.
-        return list(pool.map(lambda u: status(u, timeout=timeout), urls))
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(items))) as pool:
+        return list(pool.map(fn, items))
+
+
+def statuses(*, timeout: float = _DEFAULT_TIMEOUT) -> list[dict]:
+    """A row for every registry entry, url entries probed concurrently.
+
+    A script entry reads ``unknown`` here: its state is the control's, which
+    runs it.
+    """
+    return sweep(entries(), lambda e: status(e, timeout=timeout))

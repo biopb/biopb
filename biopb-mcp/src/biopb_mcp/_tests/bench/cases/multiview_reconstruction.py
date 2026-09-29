@@ -1,8 +1,8 @@
 """Four light-sheet views of one bead field, and no correspondence between them.
 
-BigStitcher / multiview-reconstruction sits in the watch list
-(`docs/skill-candidates.md`) as **a new skill gated on a data modality we
-cannot assume**, and the entry is explicit about which half is the gap:
+BigStitcher / multiview-reconstruction sits in the skill-candidate watch list
+as **a new skill gated on a data modality we cannot assume**, and the
+entry is explicit about which half is the gap:
 
     What BigStitcher has that `stitch-tiles` does not is the multiview case: 3D
     tiles at multiple angles, registered on interest points (beads) under

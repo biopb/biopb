@@ -12,7 +12,7 @@ import time
 from unittest.mock import MagicMock
 
 import pytest
-from biopb._lifecycle import deathwatch as _deathwatch
+from biopb.lifecycle import deathwatch as _deathwatch
 
 from biopb_control._control import serve_control_api
 from biopb_control._supervisor import DataPlaneSpec, DataPlaneSupervisor
@@ -378,6 +378,20 @@ def test_bounded_ensure_wait():
     assert _bounded_ensure_wait(30, 0) == 30  # no hint -> configured value
 
 
+def test_algorithm_wait_follows_the_client_not_ensure_timeout():
+    from biopb_control._algorithm_plane import INSTALL_TIMEOUT
+    from biopb_control._control import (
+        _ALGORITHM_WAIT_DEFAULT,
+        _RESPONSE_MARGIN,
+        _algorithm_wait,
+    )
+
+    assert _algorithm_wait(900) == 900 - _RESPONSE_MARGIN
+    assert _algorithm_wait(10 * INSTALL_TIMEOUT) == INSTALL_TIMEOUT
+    assert _algorithm_wait(3) == 1.0
+    assert _algorithm_wait(0) == _ALGORITHM_WAIT_DEFAULT
+
+
 def test_control_api_health_and_ensure(spec, monkeypatch):
     import json
     import urllib.request
@@ -433,6 +447,46 @@ def test_the_bind_is_passed_down_to_the_child(spec):
 def test_tls_is_passed_down_when_asked(tmp_path):
     spec = DataPlaneSpec(config=tmp_path / "c.json", tls=True)
     assert "--tls" in DataPlaneSupervisor(spec)._build_argv()
+
+
+def test_byo_tls_material_is_passed_down_to_launch(tmp_path):
+    """A cert the operator supplied outlives the deployment; the minted one does
+    not (biopb/biopb#913)."""
+    spec = DataPlaneSpec(
+        config=tmp_path / "c.json",
+        tls=True,
+        tls_cert=tmp_path / "c.pem",
+        tls_key=tmp_path / "k.pem",
+        sans=("gpu-051.hpc.example", "10.0.0.5"),
+    )
+    argv = DataPlaneSupervisor(spec)._build_argv()
+    assert argv[argv.index("--tls-cert") + 1] == str(tmp_path / "c.pem")
+    assert argv[argv.index("--tls-key") + 1] == str(tmp_path / "k.pem")
+    assert [argv[i + 1] for i, a in enumerate(argv) if a == "--san"] == [
+        "gpu-051.hpc.example",
+        "10.0.0.5",
+    ]
+
+
+def test_no_tls_material_emits_no_flags(tmp_path):
+    argv = DataPlaneSupervisor(DataPlaneSpec(config=tmp_path / "c.json"))._build_argv()
+    assert "--tls-cert" not in argv and "--san" not in argv
+
+
+def test_external_location_is_passed_down_when_set(tmp_path):
+    """biopb/biopb#1158: forwarded verbatim to `launch --external-location` --
+    the supervisor validates and enforces nothing here, same relationship it
+    already has to `grpc_host`/`tls`."""
+    spec = DataPlaneSpec(
+        config=tmp_path / "c.json", external_location="grpc://real-host:8815"
+    )
+    argv = DataPlaneSupervisor(spec)._build_argv()
+    assert argv[argv.index("--external-location") + 1] == "grpc://real-host:8815"
+
+
+def test_no_external_location_emits_no_flag(tmp_path):
+    argv = DataPlaneSupervisor(DataPlaneSpec(config=tmp_path / "c.json"))._build_argv()
+    assert "--external-location" not in argv
 
 
 def test_a_wildcard_bind_is_probed_over_loopback(tmp_path):

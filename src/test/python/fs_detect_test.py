@@ -224,7 +224,7 @@ class TestUnsafeCacheDirReason:
 
 class TestMemoryFilesystem:
     """RAM-backed storage: mmap-safe, but the wrong place for a cache whose whole
-    job is keeping bytes out of RAM (biopb/biopb docs/client-disk-cache.md)."""
+    job is keeping bytes out of RAM."""
 
     def test_tmpfs_is_reported(self):
         with patch.object(fs_detect, "_raw_fstype", return_value="tmpfs"):

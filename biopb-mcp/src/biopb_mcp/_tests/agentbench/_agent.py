@@ -34,6 +34,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from ... import _endpoint
+from ..._message_shape import describe_messages
 from ..._provider_echo import echoed_fields
 from ._bridge import parse_arguments
 from ._models import ModelChoice, agent_choice
@@ -43,32 +44,18 @@ class RequestRejected(RuntimeError):
     """The provider refused the request, with the *shape* of what was sent.
 
     **A rejection names the message it dislikes; the harness has to name the
-    conversation it built.** `reasoning_content in the thinking mode must be
-    passed back` says a turn was missing something, not which turn or what the
-    surrounding messages looked like — and reproducing it costs a paid run,
-    because it depends on what the real tools returned. So the shape travels
-    with the error: roles, the keys on each message, and how many tool calls
-    it carried. Never the content, which is large and is already in the trace.
+    conversation it built.** Reproducing one costs a paid run, because it
+    depends on what the real tools returned, so the shape travels with the
+    error -- see :mod:`biopb_mcp._message_shape`, which the chat loop reports
+    from too. Never the content, which is large and is already in the trace.
     """
 
     def __init__(self, model: str, messages: list[dict], cause: Exception) -> None:
-        shape = "\n    ".join(_describe(m) for m in messages[-10:])
         super().__init__(
-            f"{model} rejected the request: {cause}\n"
-            f"  last {min(len(messages), 10)} of {len(messages)} messages sent:\n"
-            f"    {shape}"
+            f"{model} rejected the request: {cause}\n{describe_messages(messages)}"
         )
         self.messages = messages
         self.cause = cause
-
-
-def _describe(message: dict) -> str:
-    """One message as role + keys + tool-call count. No content."""
-    calls = len(message.get("tool_calls") or ())
-    keys = ",".join(sorted(k for k in message if k != "role"))
-    return f"{message.get('role'):<9} keys=[{keys}]" + (
-        f" tool_calls={calls}" if calls else ""
-    )
 
 
 @dataclass(frozen=True)

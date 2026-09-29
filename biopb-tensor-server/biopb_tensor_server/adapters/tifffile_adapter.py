@@ -106,11 +106,8 @@ class _TifffileAdapterBase(OmeTiffAdapter):
 
     _LSM = False
 
-    def __init__(self, *args, dim_labels=None, **kwargs):
-        # Empty is not an override: labels that came from an unset protobuf
-        # field would otherwise fail the rank check below for every series.
-        self._dim_labels_override = bool(dim_labels)
-        super().__init__(*args, dim_labels=dim_labels, **kwargs)
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         if self.scene_index is None and self._tifffile_descriptor is None:
             message = (
                 f"{self.__class__.__name__} cannot read TIFF source "
@@ -131,7 +128,7 @@ class _TifffileAdapterBase(OmeTiffAdapter):
         """Create a native adapter for a local TIFF-like file."""
         if source.is_remote:
             raise ValueError(f"{cls.__name__} only supports local files")
-        return cls(str(source.url), source.source_id, dim_labels=source.dim_labels)
+        return cls(str(source.url), source.source_id)
 
     @classmethod
     def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:
@@ -184,12 +181,7 @@ class _TifffileAdapterBase(OmeTiffAdapter):
 
         # The native store has one full plane per page.  Keep that native unit
         # in the read plan, including an interleaved RGB(A) samples axis.
-        if self._dim_labels_override:
-            if len(self.dim_labels) != len(mapped):
-                return None
-            labels = list(self.dim_labels)
-            shape = [int(size) for size in series.shape]
-        elif len(set(mapped)) != len(mapped):
+        if len(set(mapped)) != len(mapped):
             # Unknown axes may repeat (QQQQYX). They are valid descriptor labels,
             # but cannot be resolved through label-to-index dictionaries without
             # collapsing positions. Keep the native rank/order and use the
@@ -226,11 +218,7 @@ class _TifffileAdapterBase(OmeTiffAdapter):
         )
 
     def _tifffile_descriptors(self) -> Optional[List[TensorDescriptor]]:
-        """Build descriptors from tifffile without constructing a Dask graph.
-
-        Configured labels are applied positionally to the native series shape;
-        the normalization layer owns any subsequent axis reordering.
-        """
+        """Build descriptors from tifffile without constructing a Dask graph."""
         url = self._source_url or ""
         if "://" in url and not url.startswith("file://"):
             return None
@@ -262,7 +250,6 @@ class _TifffileAdapterBase(OmeTiffAdapter):
             self.source_id,
             scene_index=scene_index,
             tensor_descriptor=descriptors[scene_index],
-            dim_labels=self.dim_labels,
             io_lock=self._io_lock,
         )
         adapter._tensor_name = field
@@ -293,7 +280,7 @@ class _TifffileAdapterBase(OmeTiffAdapter):
                 raise ValueError("unsupported tifffile axis layout")
 
             descriptor = self._tifffile_descriptor
-            if self._dim_labels_override or len(set(axes)) != len(axes):
+            if len(set(axes)) != len(axes):
                 canonical = tuple(int(size) for size in zarr_array.shape)
             else:
                 by_axis = {
@@ -328,8 +315,8 @@ class _TifffileAdapterBase(OmeTiffAdapter):
         return getattr(self, "_tifffile_page_count", 0) >= _PERSISTENT_PAGE_THRESHOLD
 
     def _read_region(self, za, axes, slices):
-        """Read configured-label stores in their declared native order."""
-        if self._dim_labels_override or len(set(axes)) != len(axes):
+        """Read repeated-label stores positionally."""
+        if len(set(axes)) != len(axes):
             return np.asarray(za[slices])
         return super()._read_region(za, axes, slices)
 

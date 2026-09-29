@@ -6,8 +6,7 @@ every read re-optimizes the whole graph (so cost tracks the *file's* plane
 count, not the request), and the block is always a whole plane
 (``chunk_shape = shape[-2:]``), so a tile request materializes the plane and
 discards most of it.  A 256x256 tile out of a 4096x4096 plane costs 31.4 ms
-that way against 1.09 ms through ``pylibCZIrw.read(roi=...)``; see
-``docs/dask-bypass-benchmarks.md``.
+that way against 1.09 ms through ``pylibCZIrw.read(roi=...)``.
 
 This adapter reads through libCZI directly: ``read(plane=..., scene=...,
 roi=...)`` decodes only the subblocks the requested region covers.
@@ -60,6 +59,7 @@ from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import TensorNotFound
 
 if TYPE_CHECKING:
+    from biopb_tensor_server.cache.manager import CacheManager
     from biopb_tensor_server.core.config import SourceConfig
     from biopb_tensor_server.core.discovery import DiscoveryState
 
@@ -316,7 +316,6 @@ class CziAdapter(TensorAdapter):
             path,
             source.source_id,
             layout=read_layout(path),
-            dim_labels=source.dim_labels,
         )
 
     def __init__(
@@ -324,7 +323,6 @@ class CziAdapter(TensorAdapter):
         url: str,
         source_id: str,
         layout: _CziLayout,
-        dim_labels: Optional[List[str]] = None,
         scene_position: Optional[int] = None,
         io_lock: Optional[threading.Lock] = None,
     ):
@@ -340,17 +338,7 @@ class CziAdapter(TensorAdapter):
         native_labels = list(layout.plane_axes) + list(_SPATIAL_DIMS)
         if layout.samples > 1:
             native_labels.append(_SAMPLES_DIM)
-        if dim_labels and len(dim_labels) != len(native_labels):
-            logger.warning(
-                "czi: ignoring %d configured dim_labels for %s -- this document "
-                "reads as a %d-axis %s array",
-                len(dim_labels),
-                url,
-                len(native_labels),
-                "".join(native_labels),
-            )
-            dim_labels = None
-        self.dim_labels = list(dim_labels or native_labels)
+        self.dim_labels = native_labels
 
         # One lock per source, shared with its scene adapters: libCZI's reader
         # is not documented as thread-safe, and it also fences a reaper close
@@ -420,7 +408,6 @@ class CziAdapter(TensorAdapter):
             self._url,
             self.source_id,
             self._layout,
-            dim_labels=self.dim_labels,
             scene_position=position,
             io_lock=self._io_lock,
         )
@@ -465,6 +452,7 @@ class CziAdapter(TensorAdapter):
         bounds: ChunkBounds,
         scale_hint: Tuple[int, ...],
         reduction_method: str,
+        cache_manager: Optional["CacheManager"] = None,
     ) -> np.ndarray:
         """Serve ``nearest`` from libCZI's own ``zoom=``, where it is exact.
 
@@ -496,7 +484,9 @@ class CziAdapter(TensorAdapter):
                 # pixels at the default's cost beats failing the read, but it
                 # should be loud enough to find.
                 logger.warning("CZI zoom read declined for %s: %s", self.array_id, exc)
-        return super().get_scaled_data(bounds, scale_hint, reduction_method)
+        return super().get_scaled_data(
+            bounds, scale_hint, reduction_method, cache_manager
+        )
 
     def _zoom_factor(
         self,
@@ -514,10 +504,9 @@ class CziAdapter(TensorAdapter):
         4, 5, 6, 8, 16 and 17: bit-identical to ``downsample_block(..., 'nearest')``
         on every divisible extent and off by one on every indivisible one.
 
-        Note that makes divisibility the predicate, *not* powers of two. The
-        design doc inferred a power-of-two guard from a single 4096/3 case;
-        3 fails there because 4096 is not a multiple of 3, and 3x on a 510-wide
-        ROI is exact. Non-dyadic scales are in scope.
+        Divisibility is the predicate, *not* powers of two: 3x fails on 4096
+        only because 4096 is not a multiple of 3, and 3x on a 510-wide ROI is
+        exact. Non-dyadic scales are in scope.
         """
         if self.scene_position is None or reduction_method != "nearest":
             return None
@@ -562,9 +551,8 @@ class CziAdapter(TensorAdapter):
         starts = [int(value) for value in bounds.start]
         stops = [int(value) for value in bounds.stop]
 
-        # Positions, not labels: a configured dim_labels renames the axes but
-        # never reorders the array this adapter builds. The plane axes come
-        # first, then Y and X, then samples for an RGB document.
+        # Positions, not labels: the plane axes come first, then Y and X,
+        # then samples for an RGB document.
         n_plane = len(layout.plane_axes)
         y0, x0 = starts[n_plane], starts[n_plane + 1]
         y1, x1 = stops[n_plane], stops[n_plane + 1]

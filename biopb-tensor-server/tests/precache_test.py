@@ -13,6 +13,9 @@ from biopb_tensor_server.core.chunk import (
 from biopb_tensor_server.core.config import PrecacheConfig, PyramidConfig
 from biopb_tensor_server.serving.precache import PrecacheWorker
 from biopb_tensor_server.serving.server import TensorFlightServer
+from google.protobuf.field_mask_pb2 import FieldMask
+
+from tests import catalog_server, register_and_catalog
 
 
 def _zarr_available() -> bool:
@@ -209,9 +212,7 @@ class TestWarming:
         from biopb_tensor_server.core.config import CacheConfig
 
         CacheManager.reset()
-        CacheManager.initialize(
-            CacheConfig(backend="file", file_cache_dir=tmp_path / "cache")
-        )
+        CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
         try:
             # 8192 -> scale 4 in X/Y, so the warmed chunks are scaled chunks.
             server = self._make_server_with_zarr(tmp_path, (8192, 8192))
@@ -266,9 +267,7 @@ class TestWarming:
         from biopb_tensor_server.core.config import CacheConfig
 
         CacheManager.reset()
-        CacheManager.initialize(
-            CacheConfig(backend="file", file_cache_dir=tmp_path / "cache")
-        )
+        CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
         try:
             server = self._make_server_with_zarr(tmp_path, (8192, 8192))
             worker = PrecacheWorker(server, PrecacheConfig(idle_debounce_seconds=0.0))
@@ -303,9 +302,7 @@ class TestWarming:
         from biopb_tensor_server.core.config import CacheConfig
 
         CacheManager.reset()
-        CacheManager.initialize(
-            CacheConfig(backend="file", file_cache_dir=tmp_path / "cache")
-        )
+        CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
         try:
             server = self._make_server_with_zarr(tmp_path, (8192, 8192))
             worker = PrecacheWorker(server, PrecacheConfig(idle_debounce_seconds=0.0))
@@ -334,21 +331,17 @@ class TestWarming:
             CacheManager.get_instance().close()
             CacheManager.reset()
 
-    def test_memory_backend_is_noop(self, tmp_path):
+    def test_no_cache_manager_is_noop(self, tmp_path):
         from biopb_tensor_server.cache import CacheManager
-        from biopb_tensor_server.core.config import CacheConfig
 
         CacheManager.reset()
-        CacheManager.initialize(CacheConfig(backend="memory"))
         try:
             server = self._make_server_with_zarr(tmp_path, (8192, 8192))
             worker = PrecacheWorker(server, PrecacheConfig(idle_debounce_seconds=0.0))
-            worker._process_source("warm-src")
 
-            # File-backend gate: nothing computed on a memory backend.
-            stats = CacheManager.get_instance().stats()
-            assert stats.misses == 0
-            assert stats.total_entries == 0
+            # Cache gate: nothing to warm into without a configured CacheManager.
+            assert worker._process_source("warm-src") is False
+            assert CacheManager.get_instance() is None
         finally:
             server.shutdown()
             CacheManager.reset()
@@ -369,7 +362,6 @@ class TestRuntimePhaseGating:
             server=server,
             registry=AdapterRegistry(),
             discovery_state=DiscoveryState(),
-            watcher=None,
             monitored_dirs=set(),
         )
         return server, sm
@@ -379,8 +371,8 @@ class TestRuntimePhaseGating:
         try:
             assert sm._initial_scan_done is False
             # start() no longer flips the precache gate -- only the first full
-            # scan completing does. A static-only (watcher=None) start() is a
-            # no-op and leaves it False.
+            # scan completing does. With nothing to rescan, start() is a no-op
+            # and leaves it False.
             sm.start()
             assert sm._initial_scan_done is False
         finally:
@@ -514,9 +506,7 @@ class TestPreemptionAndLifecycle:
         from biopb_tensor_server.core.config import CacheConfig
 
         CacheManager.reset()
-        CacheManager.initialize(
-            CacheConfig(backend="file", file_cache_dir=tmp_path / "cache")
-        )
+        CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
         try:
             arr = zarr.open_array(
                 str(tmp_path / "a.zarr"),
@@ -634,7 +624,9 @@ def _located_all(server, cache_manager, source_ids):
     return True
 
 
-class _FakeBackend:
+class _FakeManager:
+    """Just the slice of CacheManager the headroom probe reads."""
+
     def __init__(self, total, mx):
         self._st = SimpleNamespace(total_bytes=total, max_bytes=mx)
 
@@ -647,16 +639,15 @@ class TestHeadroomProbe:
         from biopb_tensor_server.serving import precache as pc
 
         worker = PrecacheWorker(None, PrecacheConfig(backlog_high_water=0.8))
-        backend = _FakeBackend(total=0, mx=1000)
-        mgr = SimpleNamespace(backend=backend)
+        mgr = _FakeManager(total=0, mx=1000)
         monkeypatch.setattr(pc.CacheManager, "get_instance", lambda: mgr)
 
         assert worker._has_headroom() is True  # empty
-        backend._st.total_bytes = 700  # below 0.8 * 1000
+        mgr._st.total_bytes = 700  # below 0.8 * 1000
         assert worker._has_headroom() is True
-        backend._st.total_bytes = 800  # at the mark -> not below
+        mgr._st.total_bytes = 800  # at the mark -> not below
         assert worker._has_headroom() is False
-        backend._st.total_bytes = 900  # over
+        mgr._st.total_bytes = 900  # over
         assert worker._has_headroom() is False
 
     def test_no_headroom_when_unbounded_or_missing(self, monkeypatch):
@@ -664,7 +655,7 @@ class TestHeadroomProbe:
 
         worker = PrecacheWorker(None, PrecacheConfig())
         # max_bytes <= 0 -> can't reason about fill, treat as no headroom.
-        mgr = SimpleNamespace(backend=_FakeBackend(total=0, mx=0))
+        mgr = _FakeManager(total=0, mx=0)
         monkeypatch.setattr(pc.CacheManager, "get_instance", lambda: mgr)
         assert worker._has_headroom() is False
         # No cache at all.
@@ -717,7 +708,6 @@ class TestIterLocalSourceMtimes:
             server=server,
             registry=AdapterRegistry(),
             discovery_state=DiscoveryState(),
-            watcher=None,
             monitored_dirs=set(),
         )
         return server, sm
@@ -749,7 +739,7 @@ class TestIterLocalSourceMtimes:
     def test_snapshot_taken_under_lock(self):
         # The read must snapshot _state.claims under self._lock (the same lock
         # _commit_add_claim/_commit_remove_claim hold) so it can't iterate the
-        # dict while the watcher's event loop mutates it. Prove it by holding the
+        # dict while the rescan loop mutates it. Prove it by holding the
         # lock in another thread: the reader must block until it is released.
         server, sm = self._bare_sm()
         holder = None
@@ -794,9 +784,7 @@ class TestBacklogWarming:
         from biopb_tensor_server.core.config import CacheConfig
 
         CacheManager.reset()
-        CacheManager.initialize(
-            CacheConfig(backend="file", file_cache_dir=tmp_path / "cache")
-        )
+        CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
 
     def test_backlog_warms_existing_sources(self, tmp_path):
         from biopb_tensor_server.cache import CacheManager
@@ -975,9 +963,7 @@ class TestSkipNativePyramid:
         from biopb_tensor_server.core.config import CacheConfig
 
         CacheManager.reset()
-        CacheManager.initialize(
-            CacheConfig(backend="file", file_cache_dir=tmp_path / "cache")
-        )
+        CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
         server = TensorFlightServer("grpc://localhost:0")
         try:
             adapter = self._ome_adapter(multires_ome_zarr)
@@ -1010,9 +996,7 @@ class TestSkipUnscaledCoarsestLevel:
         from biopb_tensor_server.core.config import CacheConfig
 
         CacheManager.reset()
-        CacheManager.initialize(
-            CacheConfig(backend="file", file_cache_dir=tmp_path / "cache")
-        )
+        CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
 
     def _warm_one_tensor(self, tmp_path, shape, labels, chunks=None):
         """Run one tensor through the worker; return the cache's miss count."""
@@ -1078,9 +1062,9 @@ class TestSkipUnscaledCoarsestLevel:
 class TestSparsePlanAndIndependentGates:
     """The plan carries full resolution plus the levels precache warms, no more.
 
-    The two gates of docs/precache-policy.md §5.1 are not separate code: a target
-    is emitted only where it shrinks something, so the list length *is* the
-    verdict. These rows are that table.
+    The 2-D and 3-D warm-target gates are not separate code: a target is emitted
+    only where it shrinks something, so the list length *is* the verdict. These
+    rows are that table.
     """
 
     # (name, shape, labels, warmed scales)
@@ -1249,6 +1233,10 @@ class TestWarmSelection:
             compute_warm_selection,
             compute_warm_targets,
         )
+        from biopb_tensor_server.core.config import PrecacheConfig
+
+        # the shipped default, which is the bound this policy rests on
+        budget = PrecacheConfig().warm_budget_bytes
 
         shape, labels = [20, 8000, 8000], ["z", "y", "x"]
         targets = compute_warm_targets(shape, labels)
@@ -1259,12 +1247,11 @@ class TestWarmSelection:
             labels,
             targets[0].scale_hint,
             itemsize=4,
+            budget_bytes=budget,
             volumetric=targets[0].volumetric,
         )
         assert stop[0] - start[0] < 20  # Z narrowed rather than exempt
-        assert self._level_bytes(shape, targets[0].scale_hint, start, stop) <= (
-            256 * self.MIB
-        )
+        assert self._level_bytes(shape, targets[0].scale_hint, start, stop) <= budget
 
     def test_a_3d_target_is_volumetric_even_when_it_did_not_scale_z(self):
         """Provenance, not "did Z change" -- which is why the flag cannot be
@@ -1505,15 +1492,17 @@ class TestAdvertisedPyramidDescriptor:
 
     def _flight_info(self, server, source_id, tensor_id=""):
         import pyarrow.flight as flight
-        from biopb.tensor.descriptor_pb2 import FlightCmd, TensorReadOption
+        from biopb.tensor.descriptor_pb2 import FlightRequest, TensorReadOption
 
-        cmd = FlightCmd(
-            source_id=source_id,
+        req = FlightRequest(
             # Pyramid advertisement is opt-in (biopb/biopb#563); this class asserts
             # get_flight_info fills it, so request it.
-            tensor_read=TensorReadOption(tensor_id=tensor_id, with_pyramid=True),
+            tensor_read=TensorReadOption(
+                array_id=tensor_id or source_id,
+                fields=FieldMask(paths=["endpoints", "pyramid"]),
+            ),
         )
-        desc = flight.FlightDescriptor.for_command(cmd.SerializeToString())
+        desc = flight.FlightDescriptor.for_command(req.SerializeToString())
         return server.get_flight_info(None, desc)
 
     def _descriptor(self, info):
@@ -1587,16 +1576,19 @@ class TestAdvertisedPyramidDescriptor:
         finally:
             server.shutdown()
 
-    def test_list_flights_leaves_pyramid_empty(self, tmp_path):
-        from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
+    def test_the_catalog_leaves_pyramid_empty(self, tmp_path):
+        from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS
 
-        server = TensorFlightServer("grpc://localhost:0")
+        server = catalog_server("grpc://localhost:0")
         try:
-            server.register_source("big", self._big_zarr_adapter(tmp_path))
-            infos = list(server.list_flights(None, b""))
-            assert infos
-            src = DataSourceDescriptor.FromString(infos[0].descriptor.command)
-            assert all(len(t.pyramid) == 0 for t in src.tensors)
+            register_and_catalog(server, "big", self._big_zarr_adapter(tmp_path))
+            rows = server.metadata_db.query(
+                f"SELECT {SOURCE_ROW_COLUMNS} FROM sources"
+            ).to_pylist()
+            assert rows
+            # No pyramid column at all -- the catalog cannot carry one to be
+            # non-empty (biopb/biopb#812).
+            assert all("pyramid" not in t for r in rows for t in (r["tensors"] or []))
         finally:
             server.shutdown()
 
@@ -1607,13 +1599,10 @@ class TestAdvertisedPyramidDescriptor:
 
     def _flight_info_opt(self, server, read_opt):
         import pyarrow.flight as flight
-        from biopb.tensor.descriptor_pb2 import FlightCmd
+        from biopb.tensor.descriptor_pb2 import FlightRequest
 
-        cmd = FlightCmd(
-            source_id=read_opt.tensor_id.split("/", 1)[0],
-            tensor_read=read_opt,
-        )
-        desc = flight.FlightDescriptor.for_command(cmd.SerializeToString())
+        req = FlightRequest(tensor_read=read_opt)
+        desc = flight.FlightDescriptor.for_command(req.SerializeToString())
         return server.get_flight_info(None, desc)
 
     def test_pyramid_advertisement_is_opt_in(self, tmp_path):
@@ -1625,28 +1614,38 @@ class TestAdvertisedPyramidDescriptor:
         try:
             server.register_source("big", self._big_zarr_adapter(tmp_path))
             bare = self._descriptor(
-                self._flight_info_opt(server, TensorReadOption(tensor_id="big"))
+                self._flight_info_opt(server, TensorReadOption(array_id="big"))
             )
             assert len(bare.pyramid) == 0
             asked = self._descriptor(
                 self._flight_info_opt(
-                    server, TensorReadOption(tensor_id="big", with_pyramid=True)
+                    server,
+                    TensorReadOption(
+                        array_id="big", fields=FieldMask(paths=["endpoints", "pyramid"])
+                    ),
                 )
             )
             assert len(asked.pyramid) >= 2
         finally:
             server.shutdown()
 
-    def test_read_plan_defaults_on_when_unset(self, tmp_path):
-        # with_read_plan is optional/default-true: an unset field (old client or a
-        # plain read) still enumerates the chunk endpoints, exactly as before.
+    def test_an_empty_mask_enumerates_nothing(self, tmp_path):
+        # The inversion. `with_read_plan` unset used to mean *true*, so the
+        # O(chunks) enumeration was what a request got by saying nothing and a
+        # describe had to opt out. Under the mask nothing is implied, so the
+        # cheap call is the default and a read asks for "endpoints".
         from biopb.tensor.descriptor_pb2 import TensorReadOption
 
         server = TensorFlightServer("grpc://localhost:0")
         try:
             server.register_source("big", self._big_zarr_adapter(tmp_path))
-            info = self._flight_info_opt(server, TensorReadOption(tensor_id="big"))
-            assert len(info.endpoints) >= 1
+            info = self._flight_info_opt(server, TensorReadOption(array_id="big"))
+            assert len(info.endpoints) == 0
+            asked = self._flight_info_opt(
+                server,
+                TensorReadOption(array_id="big", fields=FieldMask(paths=["endpoints"])),
+            )
+            assert len(asked.endpoints) >= 1
         finally:
             server.shutdown()
 
@@ -1660,9 +1659,7 @@ class TestAdvertisedPyramidDescriptor:
             server.register_source("big", self._big_zarr_adapter(tmp_path))
             info = self._flight_info_opt(
                 server,
-                TensorReadOption(
-                    tensor_id="big", with_read_plan=False, with_pyramid=True
-                ),
+                TensorReadOption(array_id="big", fields=FieldMask(paths=["pyramid"])),
             )
             assert len(info.endpoints) == 0
             desc = self._descriptor(info)

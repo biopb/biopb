@@ -9,8 +9,13 @@ import net.imglib2.RandomAccess;
 import net.imglib2.img.array.ArrayImg;
 import net.imglib2.img.array.ArrayImgFactory;
 import net.imglib2.type.NativeType;
+import net.imglib2.type.numeric.integer.ByteType;
+import net.imglib2.type.numeric.integer.IntType;
+import net.imglib2.type.numeric.integer.LongType;
+import net.imglib2.type.numeric.integer.ShortType;
 import net.imglib2.type.numeric.integer.UnsignedByteType;
 import net.imglib2.type.numeric.integer.UnsignedIntType;
+import net.imglib2.type.numeric.integer.UnsignedLongType;
 import net.imglib2.type.numeric.integer.UnsignedShortType;
 import net.imglib2.type.numeric.real.DoubleType;
 import net.imglib2.type.numeric.real.FloatType;
@@ -133,5 +138,34 @@ public class TensorChunkCodecTest {
     private static float valueAt(RandomAccess<? extends NativeType<?>> access, long x, long y) {
         access.setPosition(new long[] {x, y});
         return ((FloatType) access.get()).get();
+    }
+
+    @Test
+    public void testNamesEveryDtypeAnUploadCanDeclare() {
+        // The two halves must stay in step: a tensor uploaded as one of these
+        // and read back as a FloatType loses every id above 2^24, silently --
+        // which is exactly what a label set is (biopb/biopb#1059).
+        Assert.assertEquals(UnsignedByteType.class, TensorChunkCodec.createType("|u1").getClass());
+        Assert.assertEquals(ByteType.class, TensorChunkCodec.createType("|i1").getClass());
+        Assert.assertEquals(UnsignedShortType.class, TensorChunkCodec.createType("<u2").getClass());
+        Assert.assertEquals(ShortType.class, TensorChunkCodec.createType("<i2").getClass());
+        Assert.assertEquals(UnsignedIntType.class, TensorChunkCodec.createType("<u4").getClass());
+        Assert.assertEquals(IntType.class, TensorChunkCodec.createType("<i4").getClass());
+        Assert.assertEquals(UnsignedLongType.class, TensorChunkCodec.createType("<u8").getClass());
+        Assert.assertEquals(LongType.class, TensorChunkCodec.createType("<i8").getClass());
+        Assert.assertEquals(FloatType.class, TensorChunkCodec.createType("<f4").getClass());
+        Assert.assertEquals(DoubleType.class, TensorChunkCodec.createType("<f8").getClass());
+    }
+
+    @Test
+    public void testSizesTheDtypesItNames() {
+        Assert.assertEquals(1, TensorChunkCodec.bytesPerElement("|i1"));
+        Assert.assertEquals(2, TensorChunkCodec.bytesPerElement("<i2"));
+        Assert.assertEquals(4, TensorChunkCodec.bytesPerElement("<i4"));
+        Assert.assertEquals(8, TensorChunkCodec.bytesPerElement("<i8"));
+        Assert.assertEquals(8, TensorChunkCodec.bytesPerElement("<u8"));
+        // Spelled-out aliases and the byte-order mark are the same dtype.
+        Assert.assertEquals(2, TensorChunkCodec.bytesPerElement("uint16"));
+        Assert.assertEquals("u2", TensorChunkCodec.normalizeDtype(">u2"));
     }
 }

@@ -43,6 +43,8 @@ from dask.highlevelgraph import HighLevelGraph
 from dask.utils import parse_bytes
 
 from biopb.tensor import _diskcache
+from biopb.tensor._labels import split_label_array_id
+from biopb.tensor._location import location_host
 from biopb.tensor._tls import NO_TLS, TlsTrust
 from biopb.tensor.ticket_pb2 import TensorTicket
 
@@ -75,20 +77,10 @@ logger = logging.getLogger(__name__)
 # mapped-segment size and copies the chunk out once over budget -- see the
 # pinned-segment accounting below (disk-leak workaround, biopb/biopb#571).
 
-# Highest on-disk segment format version this client can parse. The client
-# reads server-written segment bytes directly, so the layout is a cross-process
-# contract: chunk_locate reports the server's CACHE_FILE_FORMAT_VERSION, and we
-# decline the fast path (fall back to do_get) for anything newer than this
-# rather than risk misreading the mmap. Bump in lockstep with the server when
-# this client learns to parse a newer format.
-#
-# 2 (biopb/biopb#596): the server bumped its format because a non-canonical
-# source's cached bytes are now stored transposed into canonical axis order --
-# same segment layout, different content -- so nothing here had to learn a new
-# encoding. An older client sees 2 > 1, declines the fast path, and reads the
-# same normalized chunk over do_get, so the skew degrades to a slower read
-# rather than a wrong one.
-_CACHEFILE_SUPPORTED_FORMAT = 2
+# There is no segment-format version to negotiate. The server verifies that a
+# range it hands out really holds the entry that was asked for, so this read
+# cannot land on another chunk's bytes; a layout this client cannot parse raises
+# and falls back to do_get.
 
 # Per-location capability cache: dask workers are separate processes, so each
 # memoizes independently after its first probe. None = unknown, False = the
@@ -170,25 +162,19 @@ def _is_localhost_location(location: str) -> bool:
     Returns:
         True if location resolves to loopback address
     """
-    import re
     import socket
 
-    # Parse location URI - handle various formats
-    # grpc://hostname:port, grpc+tls://hostname:port, hostname:port
-    # IPv6 format: grpc://[::1]:port
-    match = re.match(
-        r"^(?:grpc(?:\+tls)?://)?(?:\[([^\]]+)\]|([^:]+))(?:\:\d+)?$", location
-    )
-    if not match:
+    # Shares ``_location``'s parser with the disk-cache key rather than matching
+    # schemes here: a second vocabulary would answer differently for the same
+    # server, and the two gates are mutually exclusive by this very result.
+    hostname = location_host(location)
+    if not hostname:
         return False
 
-    # IPv6 bracketed or regular hostname
-    hostname = match.group(1) or match.group(2)
-
-    # Direct localhost matches (the set is all-lowercase, so lowercasing the
-    # hostname is the only comparison needed).
+    # The set is all-lowercase and location_host lowercases, so no further
+    # normalization is needed.
     localhost_names = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
-    if hostname.lower() in localhost_names:
+    if hostname in localhost_names:
         return True
 
     # Resolve hostname via getaddrinfo
@@ -231,7 +217,7 @@ def _should_try_cachefile(location: str) -> bool:
 
 
 # ------------------------------------------------------------------------------
-# The remote counterpart: our own on-disk chunk cache (docs/client-disk-cache.md)
+# The remote counterpart: our own on-disk chunk cache
 # ------------------------------------------------------------------------------
 #
 # Same shape as the fast path above -- a chunk lives in a file we can mmap -- and
@@ -541,18 +527,6 @@ def _try_cachefile_transfer(
     if not info.get("available"):
         return None
 
-    # The segment layout is a cross-process contract; refuse to parse a format
-    # newer than we understand. The server's format won't change mid-session,
-    # so stop probing this location.
-    if int(info.get("format_version", 1)) > _CACHEFILE_SUPPORTED_FORMAT:
-        logger.debug(
-            "chunk_locate reports segment format %s > supported %s; using do_get",
-            info.get("format_version"),
-            _CACHEFILE_SUPPORTED_FORMAT,
-        )
-        _set_cachefile_supported(location, False)
-        return None
-
     try:
         segment_path = info["segment_path"]
         byte_offset = int(info["byte_offset"])
@@ -628,7 +602,7 @@ _REGISTRY_LOCK = threading.Lock()
 #   - None            -> deliberately pinned OFF by configure_cache(); a later
 #                        fetch must honor this and NOT recreate a cache.
 _CACHE_POOL: Dict[Tuple[str, Optional[str]], Optional[Cache]] = {}
-_CALL_OPTS_POOL: Dict[Tuple[str, Optional[str]], flight.FlightCallOptions] = {}
+_CALL_OPTS_POOL: Dict[Tuple[str, Optional[str], bool], flight.FlightCallOptions] = {}
 _POOL_LOCK = threading.Lock()
 
 
@@ -820,37 +794,59 @@ def _get_shared_cache(
         return _CACHE_POOL[key]
 
 
-def _build_call_options(token: Optional[str]) -> flight.FlightCallOptions:
-    """Build FlightCallOptions carrying the bearer token (or none for no auth).
+#: Arrow IPC buffer compression for a label tensor sent to or from a remote
+#: server (biopb/biopb#1111). zstd at its default level compresses an integer
+#: label image 25-50x at GiB/s; readers decompress without being told, so no
+#: message changes. Local reads stay raw, to keep the zero-copy mmap path.
+WIRE_WRITE_OPTIONS = pa.ipc.IpcWriteOptions(compression="zstd")
+
+
+def wants_wire_compression(location: str, array_id: str) -> bool:
+    """Whether a write of *array_id* to *location* goes compressed: a label set,
+    on a server that is not this machine. Pixel data barely compresses, and
+    compressing it costs the zero-copy path for nothing."""
+    return split_label_array_id(array_id) is not None and not _is_localhost_location(
+        location
+    )
+
+
+def _build_call_options(
+    token: Optional[str], compress: bool = False
+) -> flight.FlightCallOptions:
+    """Build FlightCallOptions carrying the bearer token (or none for no auth),
+    and ``compress`` the IPC buffers this call writes.
 
     The single place the ``authorization: Bearer <token>`` header is assembled,
     so the auth scheme lives in exactly one spot rather than being re-derived at
     every connection site.
     """
+    write_options = WIRE_WRITE_OPTIONS if compress else None
     if token:
         return flight.FlightCallOptions(
-            headers=[(b"authorization", f"Bearer {token}".encode())]
+            headers=[(b"authorization", f"Bearer {token}".encode())],
+            write_options=write_options,
         )
-    return flight.FlightCallOptions()
+    return flight.FlightCallOptions(write_options=write_options)
 
 
 def _get_shared_call_options(
-    location: str, token: Optional[str]
+    location: str, token: Optional[str], compress: bool = False
 ) -> flight.FlightCallOptions:
     """Get shared FlightCallOptions.
 
     Args:
         location: Flight server location string
         token: Bearer token (or None for no auth)
+        compress: compress the IPC buffers a write through these options sends
 
     Returns:
         FlightCallOptions for this connection
     """
-    key = (location, token)
+    key = (location, token, compress)
 
     with _POOL_LOCK:
         if key not in _CALL_OPTS_POOL:
-            _CALL_OPTS_POOL[key] = _build_call_options(token)
+            _CALL_OPTS_POOL[key] = _build_call_options(token, compress)
 
     return _CALL_OPTS_POOL[key]
 
@@ -940,7 +936,6 @@ def _fetch_chunk_distributed(
     bounds_start: Tuple[int, ...],
     bounds_stop: Tuple[int, ...],
     cache_bytes: int,
-    schema_metadata: Optional[Dict[str, str]] = None,
     tls_trust: Optional[TlsTrust] = None,
 ) -> np.ndarray:
     """Fetch a chunk from Flight server using worker-local resources.
@@ -959,9 +954,6 @@ def _fetch_chunk_distributed(
         bounds_start: Chunk start coordinates as tuple
         bounds_stop: Chunk stop coordinates as tuple
         cache_bytes: Cache size for worker-local cache
-        schema_metadata: Optional schema metadata dict. Not used by the
-            cache-file fast path (support is probed via chunk_locate); retained
-            for signature compatibility with the chunk-fetch call sites.
 
     Returns:
         numpy array with chunk data
@@ -1046,7 +1038,7 @@ def _fetch_chunk_distributed(
     # reaches the strong cache on a remote read, which is the point: holding a
     # private RAM copy of bytes already in the page cache is double-buffering,
     # N-fold across N workers. It stays as the fallback for when the disk cache
-    # is unavailable -- see docs/client-disk-cache.md.
+    # is unavailable.
     if is_view:
         _view_cache_put(location, token, cache_key, arr)
     elif cache is not None:
@@ -1060,7 +1052,6 @@ def _fetch_chunk_block(
     location: str,
     token: Optional[str],
     cache_bytes: int,
-    schema_metadata: Optional[Dict[str, str]] = None,
     tls_trust: Optional[TlsTrust] = None,
 ) -> np.ndarray:
     """Single-``Blockwise``-layer callback that fetches one block.
@@ -1082,7 +1073,6 @@ def _fetch_chunk_block(
         tuple(bounds_start),
         tuple(bounds_stop),
         cache_bytes,
-        schema_metadata,
         tls_trust,
     )
 
@@ -1148,9 +1138,9 @@ def _chunk_map_from_endpoints(
     ``block-index -> (chunk_id, bounds)`` map and grid shape the dask builder wants.
 
     The block index along each axis is the rank of a chunk's per-axis start among
-    the distinct starts on that axis, so the endpoint order does not matter. Shared
-    by both read entry points (``ChunkFetcher._build_dask_array`` and
-    ``tensor_from_pb``) so the endpoint->grid inversion lives in one place.
+    the distinct starts on that axis, so the endpoint order does not matter. Used
+    by the one FlightInfo->dask reconstruction (``_dask_from_flight_info``) so
+    the endpoint->grid inversion lives in one place.
     """
     ndim = len(shape)
     axis_index_maps = [
@@ -1178,12 +1168,11 @@ def _build_dask_array_from_chunk_map(
     location: str,
     token: Optional[str],
     cache_bytes: int,
-    schema_metadata: Optional[Dict[str, str]],
     tls_trust: Optional[TlsTrust] = None,
 ) -> da.Array:
     """Build the lazy chunk-fetching dask array from a chunk-index map.
 
-    Shared by ``tensor_from_pb`` and ``_build_dask_array``. For a regular chunk
+    Called from ``_dask_from_flight_info``. For a regular chunk
     grid (the common case) this emits a *single* ``Blockwise`` layer, so slicing
     one chunk culls to O(1) tasks and graph optimization is O(1) rather than
     O(n_chunks). Each block's ``chunk_id`` and bounds are delivered per block via
@@ -1221,7 +1210,7 @@ def _build_dask_array_from_chunk_map(
         # distinct name, and a false cache hit is impossible.
         chunk_ids = tuple(cid for cid, _start, _stop in dep_map.values())
         name = "biopb-tensor-chunk-" + tokenize(
-            chunk_ids, location, token, cache_bytes, schema_metadata, dtype, chunks
+            chunk_ids, location, token, cache_bytes, dtype, chunks
         )
         dep = BlockwiseDepDict(mapping=dep_map, numblocks=numblocks)
         return _regular_blockwise_array(
@@ -1232,7 +1221,6 @@ def _build_dask_array_from_chunk_map(
             location,
             token,
             cache_bytes,
-            schema_metadata,
             tls_trust,
         )
 
@@ -1250,7 +1238,6 @@ def _build_dask_array_from_chunk_map(
                 tuple(bounds.start),
                 tuple(bounds.stop),
                 cache_bytes,
-                schema_metadata,
                 tls_trust,
             ),
             shape=chunk_shape,
@@ -1267,7 +1254,6 @@ def _regular_blockwise_array(
     location: str,
     token: Optional[str],
     cache_bytes: int,
-    schema_metadata: Optional[Dict[str, str]],
     tls_trust: Optional[TlsTrust] = None,
 ) -> da.Array:
     """Wrap a per-block ``BlockwiseDep`` in a single ``Blockwise`` (map_blocks) layer.
@@ -1289,8 +1275,6 @@ def _regular_blockwise_array(
         token,
         None,
         cache_bytes,
-        None,
-        schema_metadata,
         None,
         tls_trust,
         None,

@@ -10,7 +10,7 @@ import dataclasses
 import pytest
 from jsonschema import Draft202012Validator
 
-from biopb_mcp._config import _CONSTRAINTS, _SECTION_CLASSES, DEFAULT_CONFIG
+from biopb_mcp._config import _CONSTRAINTS, _SECTION_CLASSES, DEFAULT_CONFIG, McpConfig
 from biopb_mcp._config_schema import build_mcp_config_schema
 
 
@@ -48,6 +48,21 @@ def test_every_scalar_field_is_a_property(schema):
             assert f.name in props, f"{section}.{f.name} missing from schema"
 
 
+def test_every_section_says_whether_it_is_on_the_settings_page():
+    # The settings nav is read off the schema, so a section added with a bare
+    # field() would be silently absent; `_section` makes the choice explicit.
+    for f in dataclasses.fields(McpConfig):
+        assert "title" in f.metadata, f"{f.name}: declare it with _section()"
+        if f.metadata["title"]:
+            assert f.metadata["summary"], f"{f.name} has a title but no summary"
+
+
+def test_titled_sections_carry_their_nav_prose(schema):
+    titled = {k: v for k, v in schema["properties"].items() if "title" in v}
+    assert {"timeout", "chat", "kernel"} <= set(titled)
+    assert all(v["description"] for v in titled.values())
+
+
 def test_scalar_defaults_and_help_emitted(schema):
     for section, cls in _SECTION_CLASSES.items():
         props = schema["properties"][section]["properties"]
@@ -76,12 +91,9 @@ def test_every_constraint_reflected(schema):
 
 
 def test_list_fields_are_arrays(schema):
-    grid = schema["properties"]["grid"]["properties"]
-    assert grid["size_2d"]["type"] == "array"
-    assert grid["size_2d"]["items"]["type"] == "integer"
-    services = schema["properties"]["services"]["properties"]
-    assert services["process_image_servers"]["type"] == "array"
-    assert services["process_image_servers"]["items"]["type"] == "string"
+    transport = schema["properties"]["transport"]["properties"]
+    assert transport["allowed_origins"]["type"] == "array"
+    assert transport["allowed_origins"]["items"]["type"] == "string"
 
 
 @pytest.mark.parametrize(
@@ -89,8 +101,8 @@ def test_list_fields_are_arrays(schema):
     [
         {"transport": {"port": 8080}},
         {"transport": {"kind": "http"}},
-        {"dask": {"scheduler": "threads"}},
-        {"pyramid": {"downscale_factor": 2}},
+        {"kernel": {"promote_after": 30.0}},
+        {"grpc": {"max_concurrent_calls": 2}},
         {"future_unknown": {"knob": 1}},  # additionalProperties: true
     ],
 )
@@ -104,8 +116,7 @@ def test_accepts_valid(validator, cfg):
         {"transport": {"port": 0}},
         {"transport": {"port": 70000}},
         {"transport": {"kind": "websocket"}},
-        {"dask": {"scheduler": "bogus"}},
-        {"pyramid": {"downscale_factor": 1}},
+        {"grpc": {"max_concurrent_calls": 0}},
     ],
 )
 def test_rejects_invalid(validator, cfg):

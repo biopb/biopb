@@ -8,12 +8,12 @@ asks. So a failure means the run neither looked nor asked. See "does not ask a
 run to pick the right thresholding method" below before reading a failure as a
 claim about method choice.
 
-A deferred-tier case (`docs/skill-candidates.md`). LUMoS was **prescreened and
-dropped** 2026-08-06 as a *decomposition* reject — five of six arms L2-normalised
-each pixel's spectrum unprompted, which is the one thing LUMoS is about, and the
-candidate decomposes into a generic auto-threshold plus a normalise-then-cluster
-the model does on its own. It is here anyway, for the reason the rejection gave
-rather than in spite of it.
+A deferred-tier case. LUMoS was **prescreened and dropped** 2026-08-06 as a
+*decomposition* reject — five of six arms L2-normalised each pixel's spectrum
+unprompted, which is the one thing LUMoS is about, and the candidate decomposes
+into a generic auto-threshold plus a normalise-then-cluster the model does on its
+own. It is here anyway, for the reason the rejection gave rather than in spite of
+it.
 
 **What the screen actually measured was the background cut.** Across six arms,
 ``corr(|background error|, dye accuracy) = -0.978``. The sonnet FAIL (M2)

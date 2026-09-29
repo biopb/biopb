@@ -23,7 +23,7 @@ import json
 import numpy as np
 import pyarrow.flight as flight
 import pytest
-from biopb.tensor.descriptor_pb2 import FlightCmd, TensorDescriptor
+from biopb.tensor.descriptor_pb2 import FlightRequest, TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server import TensorFlightServer
 from biopb_tensor_server.core.adapter_base import TensorAdapter
@@ -215,7 +215,7 @@ class TestAdapterLookupFallback:
         # legacy adapter (bare ValueError) must NOT read as a server bug -- do_get
         # coerces it the same way get_flight_info does (issue #378).
         from biopb.tensor.ticket_pb2 import TensorTicket
-        from biopb_tensor_server.core.adapter_base import encode_chunk_id
+        from biopb_tensor_server.core.chunk import encode_chunk_id
 
         server = TensorFlightServer("grpc://localhost:0")
         server.register_source("legacy", _LegacyMissAdapter("legacy"))
@@ -235,7 +235,7 @@ class TestAdapterLookupFallback:
         # a code*), matching get_flight_info's tensor_adapter-is-None sibling, rather
         # than a bare FlightServerError carrying no extra_info code (issue #378).
         from biopb.tensor.ticket_pb2 import TensorTicket
-        from biopb_tensor_server.core.adapter_base import encode_chunk_id
+        from biopb_tensor_server.core.chunk import encode_chunk_id
 
         server = TensorFlightServer("grpc://localhost:0")
         chunk_id = encode_chunk_id("ghost", ChunkBounds(start=[0, 0], stop=[4, 4]))
@@ -248,15 +248,15 @@ class TestAdapterLookupFallback:
             "reason": "unknown_source",
         }
 
-    def test_chunk_locate_unregistered_source_is_terminal_with_code(self):
+    def test_chunk_locate_unregistered_source_is_terminal_with_code(self, tmp_path):
         # Same fallthrough on the cache-file locate path (finding #3).
         from biopb_tensor_server.cache import CacheManager
-        from biopb_tensor_server.core.adapter_base import encode_chunk_id
+        from biopb_tensor_server.core.chunk import encode_chunk_id
         from biopb_tensor_server.core.config import CacheConfig
 
         # _handle_chunk_locate short-circuits to {"available": False} when no cache
         # manager exists, so give it one to reach the adapter-is-None fallthrough.
-        CacheManager.initialize(CacheConfig(backend="memory"))
+        CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
         try:
             server = TensorFlightServer("grpc://localhost:0")
             chunk_id = encode_chunk_id("ghost", ChunkBounds(start=[0, 0], stop=[4, 4]))
@@ -331,6 +331,7 @@ class TestHcsTotality:
         obj._hcs_well_metadata = {"A01": {"well": {"images": [{"path": "0"}]}}}
         # __init__ is bypassed here, so mirror the per-instance caches it sets.
         obj._field_adapters = {}
+        obj._group_root_path = None
         return obj
 
     def test_unknown_well_raises_not_found(self):
@@ -419,11 +420,11 @@ class TestEmdTotality:
 # 5. End-to-end at the Flight verb: get_flight_info maps the miss correctly
 # --------------------------------------------------------------------------- #
 def _flight_info_for(server, source_id, tensor_id):
-    cmd = FlightCmd(source_id=source_id)
-    cmd.tensor_read.tensor_id = tensor_id
-    descriptor = flight.FlightDescriptor.for_command(cmd.SerializeToString())
-    # Sources carry no capability token here, so _authorize_source never touches
-    # the (None) context -- call the verb directly, no socket needed.
+    req = FlightRequest()
+    req.tensor_read.array_id = tensor_id or source_id
+    descriptor = flight.FlightDescriptor.for_command(req.SerializeToString())
+    # No server token and no capability token here, so _authorize never
+    # touches the (None) context -- call the verb directly, no socket needed.
     return server.get_flight_info(None, descriptor)
 
 

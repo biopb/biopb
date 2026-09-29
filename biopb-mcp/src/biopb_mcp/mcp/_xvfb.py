@@ -1,11 +1,10 @@
 """Launcher-owned Xvfb: a virtual display for display-less Linux hosts (#90).
 
-When no ``$DISPLAY``/``$WAYLAND_DISPLAY`` is present the launcher spawns one
-``Xvfb`` as its own child and injects the allocated display into the kernel
-env, so the kernel runs a *real* napari viewer (and ``take_screenshot`` works)
-with no human-visible window. There is no compute-only fallback: if the binary
-is missing the launcher fails fast with the install hint instead of silently
-degrading to a viewer-less kernel.
+When ``viewer.virtual_display`` is on and no ``$DISPLAY``/``$WAYLAND_DISPLAY``
+is present, the launcher spawns one ``Xvfb`` as its own child and injects the
+allocated display into the kernel env, so the kernel runs a *real* napari
+viewer (and ``take_screenshot`` works) with no human-visible window. It was
+asked for, so a missing binary fails fast with the install hint.
 
 Why not wrap the kernel command with ``xvfb-run``: that puts Xvfb inside the
 kernel's process group, and ``interrupt_kernel`` signals that whole group

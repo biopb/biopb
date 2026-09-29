@@ -26,6 +26,9 @@ DECIMATING = {
     "MrcAdapter": "memmap indexing computes byte offsets; the copy shrinks",
     "NiftiAdapter": "nibabel fileslice plans the read from the slice itself",
     "NikonAdapter": "the step selects frames on T/Z and strides the mmap view",
+    "Nd2Adapter": "the step selects frames on P/T/Z and strides the mmap view",
+    "DeltaVisionAdapter": "memmap indexing (mrc.DVFile) computes byte offsets",
+    "LifAdapter": "the step skips whole planes on T/C/Z/M readlif would decode",
 }
 
 # Reads the extent and strides it -- the base's own path.
@@ -33,6 +36,9 @@ NOT_DECIMATING = {
     "ZarrAdapter": "a chunk decodes whole; a stride inside it saves no read",
     "OmeZarrAdapter": "inherits ZarrAdapter",
     "_HcsFieldAdapter": "inherits ZarrAdapter",
+    "LabelSetAdapter": "inherits ZarrAdapter (via OmeZarrAdapter)",
+    "ZarrMember": "inherits ZarrAdapter (via OmeZarrAdapter)",
+    "CacheMember": "inherits CachedSourceAdapter; chunks served as stored",
     "_QptiffLevelAdapter": "inherits ZarrAdapter",
     "Hdf5Adapter": "h5py hyperslab still reads whole chunks",
     "OmeTiffAdapter": "a page decodes whole (aszarr chunkmode='page')",
@@ -58,6 +64,7 @@ NOT_DECIMATING = {
     "CachedSourceAdapter": "get_data raises; served by chunk_id only",
     "QptiffAdapter": "source-level; serves levels through _QptiffLevelAdapter",
     "TensorAdapter": "the base class itself",
+    "RasterizedMaskAdapter": "computed on demand; a stride still paints the full extent first",
 }
 
 

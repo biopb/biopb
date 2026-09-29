@@ -1,7 +1,7 @@
 """Two transport speeds along a neurite the user already traced by hand.
 
-Kymograph was **dropped without screening** as a skill candidate on 2026-08-06
-(`docs/skill-candidates.md`), and the reason was structural: the resample is one
+Kymograph was **dropped without screening** as a skill candidate on 2026-08-06,
+and the reason was structural: the resample is one
 `skimage.measure.profile_line` call, so a straight-ROI kymograph is a
 comprehension over frames with no decisions between the steps. Nothing in that
 verdict says an agent gets the *number* right, and the entry records one live

@@ -480,7 +480,7 @@ class TestZeroCopyContract:
         what actually bounds a cached chunk's memory. Drop the contiguity pass in
         the packer and only this test notices.
         """
-        from biopb_tensor_server.core.adapter_base import pack_chunk_batch
+        from biopb_tensor_server.core.chunk_batch import pack_chunk_batch
 
         data = _sample("uint16", (8, 8), seed=13)
         view = _ds.downsample_block(data, (2, 2), "nearest")

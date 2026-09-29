@@ -30,11 +30,11 @@ client therefore sees a coherent normalized view: normalized bounds, a
 normalized descriptor, and a chunk whose axes match them.
 
 Because the id is unchanged but the *bytes it now resolves to* are transposed,
-cached segments written before this change would be served in the wrong order.
-``CACHE_FILE_FORMAT_VERSION`` is bumped for exactly that reason (see
-``cache.file_backend``); the transpose happens **inside** the cache's
-``compute_fn``, so what lands in a segment is the served representation and the
-localhost mmap fast path stays valid.
+cached segments written before this change would be served in the wrong order;
+a change of this shape bumps ``CHUNK_SEMANTICS_EPOCH`` (``core.chunk``). The
+transpose happens **inside** the cache's ``compute_fn``, so what lands in a
+segment is the served representation and the localhost mmap fast path stays
+valid.
 
 **Plans are delegated, not re-derived.** ``plan_flight_info`` / ``get_read_plan``
 call the wrapped adapter and permute its answer, rather than inheriting the base
@@ -52,7 +52,7 @@ do not, and both **validate** instead, reporting through the shared
 **Writes** (#596 Decision 3). A writable source carries the uploader's own
 declared order, with ``physical_scale`` and ``chunk_shape`` aligned to it;
 silently permuting reads would desynchronize them from what ``put_chunk`` wrote.
-``serving.upload_manager`` refuses the order at ``create_source``, so a
+``serving.upload_manager`` refuses the order at ``add_tensor``, so a
 non-canonical writable source never exists and this wrapper's ``put_chunk``
 branch is unreachable in practice.
 
@@ -73,28 +73,17 @@ order to fix -- which is the trade the write path already makes.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pyarrow as pa
-from biopb.tensor.descriptor_pb2 import (
-    DataSourceDescriptor,
-    TensorDescriptor,
-)
+from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.core.adapter_base import (
-    SourceAdapter,
-    TensorAdapter,
-    pack_chunk_batch,
-    unpack_chunk_array,
-)
+from biopb_tensor_server.core.adapter_base import SourceAdapter, TensorAdapter
 from biopb_tensor_server.core.axes import canonical_permutation
-from biopb_tensor_server.core.chunk import (
-    ChunkEndpoint,
-    cache_key_for_chunk_id,
-    is_scaled_chunk,
-)
+from biopb_tensor_server.core.chunk import ChunkEndpoint, cache_key_for_chunk_id
+from biopb_tensor_server.core.chunk_batch import pack_chunk_batch, unpack_chunk_array
 from biopb_tensor_server.core.errors import WriteNotSupportedError
 
 if TYPE_CHECKING:
@@ -285,6 +274,9 @@ class NormalizingAdapter(TensorAdapter):
     def capability_token(self, value: Optional[str]) -> None:
         self._inner.capability_token = value
 
+    def tensor_capability_token(self, array_id):
+        return self._inner.tensor_capability_token(array_id)
+
     # --- the permutation ------------------------------------------------------
 
     @property
@@ -331,25 +323,53 @@ class NormalizingAdapter(TensorAdapter):
         # is what carries the guarantee.
         return self._inner.get_metadata()
 
-    def get_source_descriptor(self) -> DataSourceDescriptor:
-        desc = self._inner.get_source_descriptor()
-        normalized = [_normalize_descriptor(t) for t in desc.tensors]
-        del desc.tensors[:]
-        desc.tensors.extend(normalized)
-        return desc
-
-    def resolve(self) -> DataSourceDescriptor:
-        desc = self._inner.resolve()
-        normalized = [_normalize_descriptor(t) for t in desc.tensors]
-        del desc.tensors[:]
-        desc.tensors.extend(normalized)
-        return desc
+    def resolve(self) -> None:
+        # Nothing to normalize: resolution hydrates, and the tensors the caller
+        # reads afterwards come back through list_tensor_descriptors above.
+        self._inner.resolve()
 
     def is_resident(self) -> bool:
         return self._inner.is_resident()
 
     def get_tensor_adapter(self, tensor_id: Optional[str]) -> TensorAdapter:
         return self._view(self._inner.get_tensor_adapter(tensor_id))
+
+    # Attached tensors live on the wrapped adapter, already normalized one by
+    # one when they were read or attached (SourceAdapter.label_sets); the base's
+    # resolve_* methods, inherited here, find them through these properties and
+    # route everything else through the normalizing get_tensor_adapter /
+    # get_level_adapter above and below. Declared rather than left to
+    # __getattr__, which the base's own declarations would shadow.
+    @property
+    def label_sets(self) -> Dict[str, TensorAdapter]:
+        return self._inner.label_sets
+
+    @property
+    def label_uploads(self) -> Dict[str, TensorAdapter]:
+        return self._inner.label_uploads
+
+    @property
+    def attached_fields(self) -> Dict[str, TensorAdapter]:
+        return self._inner.attached_fields
+
+    @property
+    def attached_tensors(self) -> Dict[str, TensorAdapter]:
+        return self._inner.attached_tensors
+
+    def attached_tensor(self, field: str) -> Optional[TensorAdapter]:
+        return self._inner.attached_tensor(field)
+
+    def get_embedded_labels(self) -> Dict[str, TensorAdapter]:
+        return self._inner.get_embedded_labels()
+
+    def attach_tensor(self, field: str, adapter: TensorAdapter) -> None:
+        self._inner.attach_tensor(field, adapter)
+
+    def detach_tensor(self, field: str) -> Optional[TensorAdapter]:
+        return self._inner.detach_tensor(field)
+
+    def attachment_changed(self) -> None:
+        self._inner.attachment_changed()
 
     def _view(self, inner: SourceAdapter) -> SourceAdapter:
         """Wrap a tensor-level view of this source, deciding nothing.
@@ -527,19 +547,13 @@ class NormalizingAdapter(TensorAdapter):
         is never wrapped. That ordering is the point: a cached segment must hold
         what the client is served, because the localhost fast path hands the
         client that segment's bytes directly, with the server no longer in the
-        loop to transpose them. Existing segments predate the transpose, which is
-        what ``CACHE_FILE_FORMAT_VERSION`` is bumped for.
+        loop to transpose them.
         """
-        from biopb_tensor_server.cache import ArrowFileBackend
-
         perm = self.perm
         if perm is None:
             return self._inner.resolve_chunk_data(chunk_id, cache_manager)
 
-        should_cache = cache_manager is not None and (
-            is_scaled_chunk(chunk_id)
-            or isinstance(cache_manager.backend, ArrowFileBackend)
-        )
+        should_cache = cache_manager is not None
 
         def compute_fn():
             batch = self._inner.resolve_chunk_data(chunk_id, None)
@@ -548,7 +562,11 @@ class NormalizingAdapter(TensorAdapter):
 
         if should_cache:
             cache_key = cache_key_for_chunk_id(chunk_id)
-            entry = cache_manager.get_or_acquire(cache_key, compute_fn)
+            # The delegate minted this chunk_id (``_permute_plan`` carries it
+            # verbatim) and owns the ladder it has to be classified against.
+            entry = cache_manager.get_or_acquire(
+                cache_key, compute_fn, self._inner._retention_for_chunk(chunk_id)
+            )
             data = entry.data
             cache_manager.release(cache_key)
             return data

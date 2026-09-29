@@ -1,6 +1,6 @@
 """Touching nuclei as benchmark data: how many are there, and where do they part?
 
-A deferred-tier case (`docs/skill-candidates.md`). Splitting touching objects was
+A deferred-tier case. Splitting touching objects was
 **ablated and dropped** 2026-08-03 — three cold arms all passed
 `sampling=spacing` to the distance transform, all used marker-controlled
 watershed masked to the input, and every one matched or beat the skill-informed
@@ -301,7 +301,7 @@ def verify(fixture: Fixture, attempt: Attempt) -> Outcome:
     `segmentation_qc` is the same matcher — so a number here is comparable to the
     table on that page rather than merely internally consistent.
     """
-    from biopb_mcp.plugins import segmentation_qc
+    from biopb_mcp.algorithms import segmentation_qc
 
     limits = {**TOLERANCE, **fixture.tolerance}
     metrics: list[Metric] = []
@@ -458,7 +458,7 @@ CASE = Case(
     collect={"labels_a": "labels_a", "labels_b": "labels_b"},
     score=verify,
     save_artifacts=save_artifacts,
-    # No `plugins`: the verifier imports `segmentation_qc` itself, and the
-    # session needs nothing seeded into it. The matcher is the one the dropped
+    # No `algorithms`: the verifier imports `segmentation_qc` itself, and the
+    # session needs nothing published to it. The matcher is the one the dropped
     # entry was screened with, so a number here is comparable to that page.
 )

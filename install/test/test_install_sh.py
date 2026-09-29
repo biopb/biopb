@@ -18,7 +18,7 @@ import json
 import subprocess
 
 import pytest
-from conftest import INSTALL_SH, bash, requires_posix, sh
+from conftest import ENGINE_PS1, INSTALL_SH, bash, requires_posix, sh
 
 # install.sh never runs on Windows -- that platform gets install.ps1 and the
 # engine, which test_python_probe.py and test_extras_contract.py cover there.
@@ -100,6 +100,44 @@ def test_urldecode(encoded, decoded):
 def test_urldecode_leaves_percent_encoded_percent_alone():
     """%25 is a literal '%', and decoding it must not start a second round."""
     assert bash("_urldecode '100%25done.whl'").stdout == "100%done.whl"
+
+
+# --- versions.json and the install_schema floor ------------------------------
+
+VERSIONS_JSON = (
+    '{ "release": "0.15.0", "tensor_server": "0.15.0", "napari": "0.7.0", '
+    '"biopb": "0.11.0", "install_schema": 1 }'
+)
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("release", "0.15.0"),
+        ("napari", "0.7.0"),
+        ("biopb", "0.11.0"),
+        ("install_schema", "1"),  # a bare number, not a string
+        ("missing", ""),  # absent
+    ],
+)
+def test_manifest_field(field, value):
+    out = bash(f"_manifest_field {sh(field)} {sh(VERSIONS_JSON)}").stdout
+    assert out.strip() == value
+
+
+def test_install_schema_is_the_same_in_both_installers():
+    """release.yaml writes install.sh's number into versions.json, and the
+    engine checks against its own: two numbers, one floor."""
+    import re
+
+    sh_schema = re.search(r"^INSTALL_SCHEMA=(\d+)$", INSTALL_SH.read_text(), re.M)
+    ps_schema = re.search(
+        r"^\$script:InstallSchema = (\d+)$",
+        ENGINE_PS1.read_text(encoding="utf-8"),
+        re.M,
+    )
+    assert sh_schema and ps_schema
+    assert sh_schema.group(1) == ps_schema.group(1)
 
 
 # --- _release_asset_url ------------------------------------------------------
@@ -349,7 +387,7 @@ def test_write_server_config_writes_installer_defaults(tmp_path):
     cfg = _write_config(tmp_path / "biopb.json", "/data")
     assert cfg["sources"] == [{"url": "/data", "monitor": True}]
     assert cfg["server"] == {"aggressive_dir_pruning": True}
-    assert cfg["cache"]["backend"] == "file"
+    assert cfg["cache"]["file_max_total_gb"] == 32
 
 
 def test_write_server_config_monitor_is_a_string_comparison(tmp_path):
@@ -386,7 +424,7 @@ def test_write_server_config_keeps_the_users_tuning(tmp_path):
         json.dumps(
             {
                 "server": {"aggressive_dir_pruning": False},
-                "cache": {"backend": "memory", "file_max_total_gb": 4},
+                "cache": {"file_max_segment_mb": 128, "file_max_total_gb": 4},
                 "something_custom": {"kept": True},
                 "sources": [{"url": "/old", "monitor": True}],
             }
@@ -395,7 +433,7 @@ def test_write_server_config_keeps_the_users_tuning(tmp_path):
     cfg = _write_config(tmp_path / "new.json", "/new", prior=str(prior))
     assert cfg["sources"] == [{"url": "/new", "monitor": True}]
     assert cfg["server"] == {"aggressive_dir_pruning": False}
-    assert cfg["cache"] == {"backend": "memory", "file_max_total_gb": 4}
+    assert cfg["cache"] == {"file_max_segment_mb": 128, "file_max_total_gb": 4}
     assert cfg["something_custom"] == {"kept": True}
 
 
@@ -498,3 +536,36 @@ def test_mcp_unmerge_ignores_a_missing_file(tmp_path):
     missing = tmp_path / "not-there.json"
     assert _unmerge(missing) == ""
     assert not missing.exists()
+
+
+def _unassigned_names(script: str) -> set[str]:
+    """UPPERCASE names the script reads that nothing in it assigns."""
+    import re
+
+    code = "\n".join(
+        line for line in script.splitlines() if not line.lstrip().startswith("#")
+    )
+    name = r"[A-Z][A-Z0-9_]{3,}"
+    read = set(re.findall(rf"\$\{{?({name})", code))
+    assigned = set(re.findall(rf"(?:^|[\s;(])(?:\w+\s+)?({name})\+?=", code, re.M))
+    assigned |= set(re.findall(rf"\bfor\s+({name})\s+in\b", code))
+    assigned |= set(re.findall(rf"\bread\s+(?:-\w+\s+)*({name})", code))
+    for declared in re.findall(r"\blocal\s+([^\n#]*)", code):
+        assigned |= set(re.findall(rf"\b({name})\b", declared))
+    # BIOPB_* are the caller's inputs, read with a default.
+    return {n for n in read - assigned if not n.startswith("BIOPB_")}
+
+
+def test_no_variable_is_read_that_nothing_assigns():
+    """The script runs under `set -u`, so reading a name nothing sets is fatal.
+
+    shellcheck cannot say so: it treats an UPPERCASE name as environment. #1047
+    deleted `LEGACY_CONFIG=` and left the block that read it, and every install
+    that wrote a config -- every fresh one -- died there.
+    """
+    assert _unassigned_names(INSTALL_SH.read_text()) <= {"BASH_REMATCH"}
+
+
+def test_the_unassigned_read_check_catches_a_deleted_assignment():
+    script = 'main() {\n  if [ "$A" = "$LEGACY_CONFIG" ]; then :; fi\n  A=1\n}\n'
+    assert _unassigned_names(script) == {"LEGACY_CONFIG"}

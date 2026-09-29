@@ -17,6 +17,8 @@ from biopb.tensor import (
 )
 from biopb_tensor_server import TensorFlightServer
 
+from tests import catalog_server, register_and_catalog
+
 
 def _zarr_available() -> bool:
     """Check if zarr is available with working numcodecs."""
@@ -77,8 +79,8 @@ class TestZarrIntegration:
         adapter = ZarrAdapter(arr, "zarr-integration", ["y", "x"])
 
         # Start server
-        server = TensorFlightServer("grpc://localhost:0")
-        server.register_source("zarr-integration", adapter)
+        server = catalog_server("grpc://localhost:0")
+        register_and_catalog(server, "zarr-integration", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
         server_thread.start()
@@ -328,8 +330,8 @@ class TestOmeZarrIntegration:
         root = zarr.open_group(zarr_path, mode="r")
         adapter = OmeZarrAdapter(root["0"], "phys")
 
-        server = TensorFlightServer("grpc://localhost:0")
-        server.register_source("phys", adapter)
+        server = catalog_server("grpc://localhost:0")
+        register_and_catalog(server, "phys", adapter)
         server.mark_ready()
         server_thread = threading.Thread(target=server.serve, daemon=True)
         server_thread.start()
@@ -340,18 +342,25 @@ class TestOmeZarrIntegration:
                 f"grpc://localhost:{server.port}", cache_bytes=10_000_000
             )
 
-            # list_flights stays lean: no physical scale advertised there.
-            sources = client.list_sources()
-            listed = sources["phys"].tensors[0]
-            assert not listed.physical_scale
+            # The catalog stays lean: a row carries the structural fields only.
+            row = client.query(
+                "SELECT is_resolved, tensors FROM sources WHERE source_id = 'phys'",
+                format="records",
+            )[0]
+            assert "physical_scale" not in row["tensors"][0]
 
-            # A normal get_tensor (with_metadata=False) populates the cached
-            # descriptor's summary; get_physical_scale reads it with no extra
-            # full-OME fetch.
-            client.get_tensor("phys")
+            # The summary rides the descriptor GetFlightInfo answers with, and
+            # get_physical_scale asks for it without the full OME tree.
             scale, unit = client.get_physical_scale("phys")
             assert list(scale) == [0.5, 0.25]
             assert list(unit) == ["micrometer", "micrometer"]
+
+            # Asked again after a catalog browse, which is the shape resolve()
+            # hands back. A row carries no scale, and nothing stores it, so it
+            # cannot shadow the answer.
+            client.query("SELECT * FROM sources")
+            scale, _ = client.get_physical_scale("phys")
+            assert list(scale) == [0.5, 0.25]
 
             client.close()
         finally:
@@ -586,8 +595,8 @@ class TestMultiSeriesOmeTiffIntegration:
 
         adapter = OmeTiffAdapter(tiff_path, "multi-series-server")
 
-        server = TensorFlightServer("grpc://localhost:0")
-        server.register_source("multi-series-server", adapter)
+        server = catalog_server("grpc://localhost:0")
+        register_and_catalog(server, "multi-series-server", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
         server_thread.start()
@@ -720,7 +729,7 @@ class TestHdf5Integration:
             dset.attrs["element_size_um"] = np.array([2.0, 0.25, 0.25])
 
         with h5py.File(h5_path, "r") as f:
-            adapter = Hdf5Adapter(f["data"], "cal", ["z", "y", "x"])
+            adapter = Hdf5Adapter(f["data"], "cal")
 
             server = TensorFlightServer("grpc://localhost:0")
             server.register_source("cal", adapter)
@@ -1016,12 +1025,20 @@ class TestBioioReadPath:
             # BioIO still serves the layouts that adapter declines, which is the
             # read path `source_type` exercises here.
             ("bioio_czi", ".czi", "zeiss", "czi"),
-            ("bioio_nd2", ".nd2", "nikon", "nikon"),
-            ("bioio_lif", ".lif", "leica", "leica"),
+            # A local .nd2/.lif is claimed by the native Nd2Adapter/LifAdapter
+            # instead (biopb/biopb#799 phase 3), with no decline case for a
+            # resident file -- unlike CZI, BioIO's NikonAdapter/LeicaAdapter
+            # never win the local claim, so `claim_type` differs from
+            # `source_type` here (what the directly-constructed BioIO class
+            # still reports) rather than matching it.
+            ("bioio_nd2", ".nd2", "nikon", "nd2"),
+            ("bioio_lif", ".lif", "leica", "lif"),
         ],
     )
     def test_vendor_fixture_read_via_bioio(self, plugin, ext, source_type, claim_type):
-        """A real CZI/ND2/LIF sample claims + reads through its adapter.
+        """A real CZI/ND2/LIF sample claims natively; BioIO still reads it when
+        constructed directly (the ``[aics]`` extra's read path, independent of
+        discovery routing).
 
         Skips cleanly when the plugin is absent (slim install) or no sample is
         provisioned, so it never fails spuriously -- but catches a dropped

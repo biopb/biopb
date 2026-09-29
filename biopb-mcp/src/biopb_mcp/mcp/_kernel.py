@@ -6,19 +6,23 @@ the napari viewer, dask, and the TensorFlightClient.  Running agent code there
 be interrupted (``SIGINT``) or hard-restarted (group ``SIGKILL`` + respawn)
 without taking down the MCP server process.
 
-A single ``threading.RLock`` serializes access to the one shared kernel.
+Round trips go through :class:`_kernel_io.KernelChannels` and may overlap; the
+kernel runs them one at a time. ``threading.RLock`` ``_lock`` serializes the
+lifecycle only (start, restart, shutdown, respawn).
 """
 
 import logging
 import os
-import queue
 import re
 import signal
 import threading
 import time
 from typing import List, Optional
 
-from biopb._lifecycle import deathwatch as _deathwatch, winjob as _winjob
+from biopb.lifecycle import deathwatch as _deathwatch, winjob as _winjob
+
+from ._job_log import JobLog
+from ._kernel_io import _IDLE_GRACE, KernelChannels, KernelGone
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +44,18 @@ ENV_WINDOW_CLOSE_FD = "BIOPB_WINDOW_CLOSE_FD"
 # ENV_WINDOW_CLOSE_FD above).
 ENV_SCRATCH = "BIOPB_SCRATCH_KERNEL"
 
+# Env var the launcher sets when the session has no viewer, carrying why (config
+# off, napari not installed, no display). Its presence makes the bootstrap skip
+# Qt and napari; its value is what the tools tell the agent. The literal is
+# mirrored in _bootstrap.no_viewer_reason (kept in sync by this comment).
+ENV_NO_VIEWER = "BIOPB_NO_VIEWER"
+
+# Env var handing the kernel the host client's session id, so its gate
+# (_kernel_gate) can tell this process's requests from another Jupyter
+# client's. The literal is mirrored in _kernel_gate.ENV_HOST_SESSION (kept in
+# sync by this comment).
+ENV_HOST_SESSION = "BIOPB_HOST_SESSION"
+
 # Windows window-close fallback (no inherited fd there): the launcher polls this
 # probe -- the zero-arg _viewer_window_alive() the bootstrap injects into the
 # kernel namespace (see _bootstrap, mirrored by this comment) -- and tears the
@@ -47,6 +63,54 @@ ENV_SCRATCH = "BIOPB_SCRATCH_KERNEL"
 # thread; the probe itself is instant.
 _WINDOW_ALIVE_PROBE = "print(_viewer_window_alive())"
 _WINDOW_PROBE_TIMEOUT = 10.0
+
+
+def _runtime_connection_file() -> str:
+    """A fresh connection-file path in Jupyter's runtime dir.
+
+    Left unset, jupyter_client writes a tempfile, which no Jupyter tool looks
+    for. The runtime dir is per-platform (``jupyter --runtime-dir``), private
+    to the user, and where ``jupyter qtconsole --existing`` resolves a bare
+    file name.
+    """
+    import uuid
+
+    from jupyter_core.paths import jupyter_runtime_dir
+    from jupyter_core.utils import ensure_dir_exists
+
+    runtime = jupyter_runtime_dir()
+    ensure_dir_exists(runtime, mode=0o700)
+    return os.path.join(runtime, f"kernel-biopb-{uuid.uuid4()}.json")
+
+
+def attach_command(
+    connection_file: Optional[str],
+    *,
+    python: Optional[str] = None,
+    windows: Optional[bool] = None,
+) -> Optional[str]:
+    """The shell command that attaches qtconsole to *connection_file*.
+
+    Run by this process's own interpreter (*python*, default
+    ``sys.executable``): biopb installs qtconsole (through napari) but puts no
+    ``jupyter`` on PATH, so a bare ``jupyter qtconsole`` finds nothing, or
+    another install's. Quoted for the platform's shell (*windows*, default
+    this one's), since a Windows profile path may contain spaces.
+    """
+    import sys
+
+    if not connection_file:
+        return None
+    argv = [python or sys.executable, "-m", "qtconsole", "--existing", connection_file]
+    if windows is None:
+        windows = os.name == "nt"
+    if windows:
+        import subprocess
+
+        return subprocess.list2cmdline(argv)
+    import shlex
+
+    return shlex.join(argv)
 
 
 def _status_result(status: str, error_text: str) -> dict:
@@ -73,41 +137,20 @@ def _status_result(status: str, error_text: str) -> dict:
 # Repeated --IPKernelApp.exec_lines args append, so this composes with the
 # bootstrap line the launcher already passes.
 _DEATHWATCH_ARG = (
-    "--IPKernelApp.exec_lines=import biopb._lifecycle.deathwatch as _dw; _dw.install()"
+    "--IPKernelApp.exec_lines=import biopb.lifecycle.deathwatch as _dw; _dw.install()"
 )
 
-# Best-effort dask release, the tail of _GRACEFUL_CLOSE_SNIPPET below (no
-# standalone caller).  ``_dask_client`` is set by the bootstrap (None for the
-# in-process scheduler; a real Client when attached to the session child's
-# distributed cluster). The kernel never owns the cluster, so closing the
-# client is all there is to release here.
-_DASK_RELEASE_SNIPPET = (
-    "try:\n"
-    "    _dc = globals().get('_dask_client')\n"
-    "    if _dc is not None:\n"
-    "        _dc.close()\n"
-    "except Exception:\n"
-    "    pass\n"
-)
+# Whether the viewer window is still open, evaluated after an agent's cell: a
+# user-closed window turns viewer mutations into silent no-ops. None where the
+# bootstrap bound no probe.
+_WINDOW_ALIVE_EXPR = "globals().get('_viewer_window_alive', lambda: None)()"
 
-# Best-effort snippet run *before* the group-kill on shutdown AND restart so the
-# tensor server sees a clean Flight GOAWAY (and cancels any in-flight do_get)
-# instead of discovering the dropped connection only via async socket teardown
-# after the kill. That teardown lag is what lets a `biopb server stop` issued
-# right after Ctrl-C block on its graceful drain (pyarrow FlightServerBase.
-# shutdown waits for in-flight requests to finish) — and a restart drops the
-# connection just as abruptly, so both teardown paths share this snippet.
-# Closes the tensor client, then releases dask. Bounded + best-effort: a
-# busy/wedged kernel just falls through to the kill, so this never holds up
-# Ctrl-C beyond the short timeout in shutdown().
-_GRACEFUL_CLOSE_SNIPPET = (
-    "try:\n"
-    "    _c = globals().get('_conn')\n"
-    "    if _c is not None and getattr(_c, 'client', None) is not None:\n"
-    "        _c.client.close()\n"
-    "except Exception:\n"
-    "    pass\n"
-) + _DASK_RELEASE_SNIPPET
+# The kernel class every host kernel runs: the host's control requests
+# (restart's graceful close, stopping a job) are its ops.
+_KERNEL_CLASS_ARG = "--IPKernelApp.kernel_class=biopb_mcp.mcp._kernel_gate.GatedKernel"
+
+# How long a control op may take in the kernel, unless its caller says.
+_CONTROL_TIMEOUT = 5.0
 
 
 def _strip_ansi(text: str) -> str:
@@ -123,8 +166,7 @@ class KernelHost:
         kernel_name: str = "python3",
         startup_timeout: float = 60.0,
         execute_timeout: float = 120.0,
-        busy_lock_timeout: float = 5.0,
-        health_probe_code: Optional[str] = "print('viewer' in dir())",
+        health_probe_code: Optional[str] = "print('_jobs' in dir())",
         health_probe_expect: str = "True",
         cwd: Optional[str] = None,
         env: Optional[dict] = None,
@@ -136,13 +178,11 @@ class KernelHost:
         parent_death_pipe: bool = True,
         window_close_pipe: bool = True,
         window_poll_interval: float = 2.0,
-        cluster_host=None,
     ):
         self._extra_arguments = list(extra_arguments or [])
         self._kernel_name = kernel_name
         self._startup_timeout = startup_timeout
         self._execute_timeout = execute_timeout
-        self._busy_lock_timeout = busy_lock_timeout
         self._health_probe_code = health_probe_code
         self._health_probe_expect = health_probe_expect
         self._cwd = cwd
@@ -154,7 +194,21 @@ class KernelHost:
         self._kernel_stdout = kernel_stdout
         self._kernel_stderr = kernel_stderr
         self._km = None
-        self._kc = None
+        self._io = None  # KernelChannels, one per launched kernel
+        # The job records, built from what each kernel publishes on iopub. One
+        # per host rather than per kernel, so they outlive a restart.
+        self.jobs = JobLog()
+        # Set once per _launch(), alongside self._km: the connection file (and
+        # so the attach command) is fixed for the kernel's lifetime, and
+        # health() is polled every few seconds, so it's cached rather than
+        # rebuilt on each call.
+        self._attach_command = None
+        # (path, info) of the connection file of the kernel last launched: a
+        # restart reuses both, as Jupyter's own does, so a client attached by
+        # file (qtconsole, a notebook through the session proxy) follows the
+        # restart instead of being left on a file that is gone. Dropped when a
+        # launch fails, so the retry picks fresh ports, and at shutdown.
+        self._connection = None
         self._lock = threading.RLock()
         # Set once the kernel has launched AND its bootstrap health probe has
         # passed. The kernel is started on demand (start_kernel -> ensure_started)
@@ -226,13 +280,10 @@ class KernelHost:
         self._respawn_times = []  # monotonic timestamps of recent respawns
         self._dead = False  # respawn budget exhausted -> manual restart needed
         self._stopping = False  # an intentional restart/shutdown is in flight
-
-        # Session-child-owned dask cluster (or None). _launch calls ensure() and
-        # injects the scheduler address so the kernel attaches to it instead of
-        # spinning its own; the session child owns its lifetime, so a kernel
-        # restart/reap here leaves the cluster (and its warm workers) untouched.
-        # See _cluster.py.
-        self._cluster_host = cluster_host
+        self._restarting = False  # restart() in flight: calls read "starting"
+        # Which kernel this is, counted per launch: a claim on the kernel lasts
+        # one generation (_writers).
+        self.generation = 0
 
     # -- lifecycle ------------------------------------------------------
 
@@ -243,7 +294,7 @@ class KernelHost:
         synchronous primitive: ensure_started() (start_kernel) and the tests call
         it. Taking the lock serializes it against a concurrent restart()/
         shutdown() (which take the same lock); without it both paths mutate the
-        shared _km/_kc/_pgid state concurrently and can leave the host attached to
+        shared _km/_io/_pgid state concurrently and can leave the host attached to
         the wrong kernel or leak an orphaned kernel process. The lock is
         reentrant, so the health probe's internal execute() — and ensure_started()
         calling start() while already holding the lock — re-enter without
@@ -299,22 +350,8 @@ class KernelHost:
         from jupyter_client import KernelManager
 
         env = self._env if self._env is not None else os.environ.copy()
-        extra_args = list(self._extra_arguments)
+        extra_args = [_KERNEL_CLASS_ARG, *self._extra_arguments]
         popen_kwargs = {}
-
-        # Attach this kernel to the session-child-owned dask cluster. ensure()
-        # spins it on the first launch (returning as soon as the scheduler is
-        # bound, so workers register while the kernel imports napari) and returns
-        # the cached address on later launches. None -> the session child owns no
-        # cluster (a non-distributed scheduler, an external address, or a spin
-        # failure); the kernel then resolves dask from its own config.
-        if self._cluster_host is not None:
-            from ._cluster import DASK_ADDRESS_ENV
-
-            address = self._cluster_host.ensure()
-            if address:
-                env = dict(env)
-                env[DASK_ADDRESS_ENV] = address
 
         # Redirect the kernel subprocess' native stdout/stderr fds. None ->
         # inherit the launcher's fds (http mode). In stdio mode the launcher
@@ -351,7 +388,21 @@ class KernelHost:
         if pass_fds:
             popen_kwargs["pass_fds"] = tuple(pass_fds)
 
-        self._km = KernelManager(kernel_name=self._kernel_name)
+        path, info = self._connection or (_runtime_connection_file(), None)
+        self._km = KernelManager(kernel_name=self._kernel_name, connection_file=path)
+        if info is not None:
+            self._km.load_connection_info(info)
+            # The provisioner would otherwise replace these with ports of its own.
+            self._km.cache_ports = False
+        self._attach_command = attach_command(self._km.connection_file)
+        # The client made below shares this session id, so the kernel knows
+        # its host before anything can connect.
+        env = dict(env)
+        env[ENV_HOST_SESSION] = self._km.session.session
+        self.jobs.host_session = self._km.session.session
+        if self.generation:  # not the first kernel: what ran before is gone
+            self.jobs.mark_restart()
+        self.generation += 1
         try:
             try:
                 self._km.start_kernel(
@@ -361,8 +412,7 @@ class KernelHost:
                     # Own session/process group so a hard restart — or the
                     # kernel's own parent-death watcher — can group-kill the
                     # kernel and any subprocess it spawned (arbitrary agent
-                    # code). The session child owns the dask cluster in *its*
-                    # group, so this group-kill never touches it.
+                    # code, a dask cluster a cell spun).
                     start_new_session=True,
                     **popen_kwargs,
                 )
@@ -377,13 +427,17 @@ class KernelHost:
                             os.close(_fd)
                         except OSError:
                             pass
+            self._connection = (
+                self._km.connection_file,
+                self._km.get_connection_info(),
+            )
             self._pgid = self._capture_pgid()
             self._assign_kernel_to_job()
-            self._kc = self._km.client()
-            self._kc.start_channels()
-            self._kc.wait_for_ready(timeout=self._startup_timeout)
+            self._io = KernelChannels(self._km, on_iopub=self.jobs.on_iopub)
+            self._io.start(self._startup_timeout, self._km.is_alive)
             self._start_window_watch()
         except Exception:
+            self._connection = None  # the retry picks fresh ports
             self._shutdown_current()
             raise
 
@@ -439,8 +493,8 @@ class KernelHost:
 
     def _bootstrap_error_detail(self) -> str:
         """Best-effort fetch of the traceback ``_bootstrap.bootstrap()`` stashes
-        in the kernel namespace, so a probe failure says *why* the viewer is
-        absent (a missing dep, a Qt/GL init error) instead of just ``False``.
+        in the kernel namespace, so a probe failure says *why* the bootstrap
+        failed (a missing dep, a Qt/GL init error) instead of just ``False``.
         """
         try:
             res = self._execute_internal(
@@ -454,14 +508,19 @@ class KernelHost:
 
     # -- execution ------------------------------------------------------
 
-    def execute(self, code: str, timeout: Optional[float] = None) -> dict:
+    def execute(
+        self,
+        code: str,
+        timeout: Optional[float] = None,
+        user_expressions: Optional[dict] = None,
+    ) -> dict:
         """Run *code* in the kernel and return a result dict.
 
         Returns ``{stdout, result_text, error_text, status}`` where ``status``
-        is one of ``ok``/``error`` (from the kernel reply), ``timeout`` (the
-        execution exceeded *timeout* and was interrupted), ``busy`` (the kernel
-        lock could not be acquired within ``busy_lock_timeout``), or
-        ``starting`` (the kernel is not ready yet — see below).
+        is one of ``ok``/``error`` (from the kernel reply), ``timeout`` (no
+        reply within *timeout*; nothing is interrupted, see :meth:`_run_once`),
+        or ``starting`` (the kernel is not ready yet — see below). Calls from
+        several threads overlap; the kernel runs them in arrival order.
 
         The kernel is started on demand (start_kernel -> ensure_started), so a
         tool call may land while it is not running — idle/never-started, a failed
@@ -472,9 +531,14 @@ class KernelHost:
         / retry). ``server_status`` is a cheap, non-blocking readiness probe meant
         for exactly this.
         """
+        # The channels are read *before* readiness: a restart clears _ready
+        # before it replaces them, so a call that sees _ready set holds either
+        # the ready kernel's or the outgoing one's (then failed by its close) --
+        # never the next kernel's before its bootstrap has run.
+        io = self._io
         if not self._ready.is_set():
             return self._not_ready_result()
-        return self._execute_internal(code, timeout)
+        return self._execute_internal(code, timeout, user_expressions, io=io)
 
     def _not_ready_result(self) -> dict:
         """Structured status for a tool call that landed while the kernel is not
@@ -506,12 +570,13 @@ class KernelHost:
                 "Kernel is dead (respawn budget exhausted). Call "
                 "start_kernel to launch a fresh kernel." + suffix,
             )
-        if self.is_alive():
+        if self.is_alive() or self._restarting:
             # A kernel exists but its bootstrap/health probe hasn't passed yet
-            # (e.g. a watchdog respawn in flight) — booting, not idle.
+            # (e.g. a watchdog respawn in flight), or a restart is between the
+            # kill and the relaunch — booting, not idle.
             return _status_result(
                 "starting",
-                "Kernel is still starting (napari viewer / dask bring-up). "
+                "Kernel is still starting. "
                 "Poll server_status or retry in a few seconds.",
             )
         return _status_result(
@@ -520,99 +585,173 @@ class KernelHost:
             "server_status until it reports ready." + suffix,
         )
 
-    def _execute_internal(self, code: str, timeout: Optional[float] = None) -> dict:
-        """Lock-guarded execution, bypassing the readiness wait.
+    def _execute_internal(
+        self,
+        code: str,
+        timeout: Optional[float] = None,
+        user_expressions: Optional[dict] = None,
+        io: Optional[KernelChannels] = None,
+    ) -> dict:
+        """Execution bypassing the readiness wait.
 
         Used by the startup health probe and bootstrap-error fetch, which run
         *before* the kernel is marked ready (so they must not wait on it).
+        With *user_expressions*, the result also carries their evaluated values
+        under ``user_expressions``.
         """
         if timeout is None:
             timeout = self._execute_timeout
-
-        acquired = self._lock.acquire(timeout=self._busy_lock_timeout)
-        if not acquired:
-            return _status_result(
-                "busy",
-                "Kernel is busy with another execution. Wait for it to "
-                "finish, or call restart_kernel to force-stop it.",
-            )
-        try:
-            return self._execute_locked(code, timeout)
-        finally:
-            self._lock.release()
-
-    def _execute_locked(self, code: str, timeout: float) -> dict:
-        if self._kc is None:
+        if io is None:
+            io = self._io
+        if io is None:
             return _status_result("error", "Kernel is not running.")
-        # Never wait on a kernel whose process is gone. Its zmq channels stay
-        # open (they reconnect to nothing), so execute_interactive would block
-        # for the full `timeout` -- 120s by default -- holding the lifecycle
-        # lock throughout. With a polling client (the observe page fetches
-        # /api/jobs every ~3s) those waits overlap end to end, the lock is never
-        # free, and the watchdog cannot get it to respawn: the kernel stays dead
-        # and every poll 502s until someone restarts by hand.
+        # Never wait on a kernel whose process is gone: its zmq channels stay
+        # open (they reconnect to nothing), so the call would wait out its whole
+        # timeout for a reply that cannot come.
         if not self.is_alive():
             return _status_result("error", "Kernel is not running.")
 
-        res = self._run_once(code, timeout)
+        res = self._run_once(io, code, timeout, user_expressions)
         # A preceding interrupt/error aborts requests already queued at the
         # kernel; "aborted" means our code never ran, so retry once.
         if res["status"] == "aborted":
-            import time
-
             time.sleep(0.2)
-            res = self._run_once(code, timeout)
+            res = self._run_once(io, code, timeout, user_expressions)
         return res
 
-    def _run_once(self, code: str, timeout: float) -> dict:
-        stdout_parts: List[str] = []
-        result_parts: List[str] = []
-        error_parts: List[str] = []
-
-        def output_hook(msg):
-            msg_type = msg["header"]["msg_type"]
-            content = msg["content"]
-            if msg_type == "stream":
-                stdout_parts.append(content.get("text", ""))
-            elif msg_type in ("execute_result", "display_data"):
-                text = content.get("data", {}).get("text/plain", "")
-                if text:
-                    result_parts.append(text)
-            elif msg_type == "error":
-                tb = "\n".join(content.get("traceback", []))
-                error_parts.append(_strip_ansi(tb))
-
+    def _run_once(
+        self,
+        io: KernelChannels,
+        code: str,
+        timeout: float,
+        user_expressions: Optional[dict] = None,
+    ) -> dict:
         try:
-            reply = self._kc.execute_interactive(
-                code,
-                store_history=False,
-                allow_stdin=False,
-                timeout=timeout,
-                output_hook=output_hook,
+            call = io.execute(code, timeout, user_expressions)
+        except KernelGone:
+            return _status_result(
+                "error", "The kernel was shut down or restarted during this call."
             )
-        except (queue.Empty, TimeoutError):
-            self.interrupt()
-            return {
-                "stdout": "".join(stdout_parts),
-                "result_text": "".join(result_parts),
-                "error_text": (
-                    f"Execution exceeded {timeout}s and was interrupted. "
-                    "Wait for the kernel to settle, or call restart_kernel if "
-                    "it stays unresponsive (a blocking C call ignores SIGINT)."
+        except TimeoutError:
+            # No interrupt. Everything sent here is a short snippet, so
+            # overrunning means the main thread is busy with something else --
+            # a cell, the agent's or an attached client's, or a task's
+            # marshaled viewer call -- and a SIGINT lands in *that*. The
+            # request stays queued and runs once the thread frees; its late
+            # reply is skipped by message id.
+            return _status_result(
+                "timeout",
+                (
+                    f"No reply within {timeout}s: the kernel's main thread is "
+                    "busy, most likely with a cell from a Jupyter client attached "
+                    "to this kernel, or with a viewer call. Nothing was "
+                    "interrupted, and this call will still run once it frees. "
+                    "Retry later. restart_kernel only if it never frees -- it "
+                    "destroys whatever the user is running, and their variables "
+                    "and layers."
                 ),
-                "status": "timeout",
-            }
+            )
 
-        return {
-            "stdout": "".join(stdout_parts),
-            "result_text": "".join(result_parts),
-            "error_text": "".join(error_parts),
-            "status": reply["content"].get("status", "unknown"),
+        res = {
+            "stdout": "".join(call.stdout),
+            "result_text": "".join(call.results),
+            "error_text": "".join(_strip_ansi("\n".join(tb)) for tb in call.errors),
+            "status": call.reply.get("status", "unknown"),
         }
+        if user_expressions:
+            res["user_expressions"] = call.reply.get("user_expressions") or {}
+        return res
+
+    def control(self, op, timeout=_CONTROL_TIMEOUT, **args):
+        """Run the kernel's control *op* (``_kernel_gate``) and return its result.
+
+        On the control channel, so it does not wait behind a cell on the main
+        thread. Needs no readiness: a restart's graceful close runs after
+        readiness is cleared. Raises ``RuntimeError`` when the kernel is down or
+        the op failed, ``TimeoutError`` when it took longer than *timeout*.
+        """
+        io = self._io
+        if io is None:
+            raise RuntimeError("kernel not running")
+        try:
+            reply = io.control(op, args, timeout)
+        except KernelGone as exc:
+            raise RuntimeError("the kernel went away") from exc
+        if reply.get("status") != "ok":
+            raise RuntimeError(reply.get("evalue") or "control op failed")
+        return reply.get("r")
+
+    def run_cell(self, code, job_id, origin, intent=""):
+        """Send *code* as a cell, recorded as *job_id*; return at once.
+
+        The cell runs on the kernel's main thread like any client's, queued
+        behind whatever runs there. Its record (``self.jobs``) fills from iopub
+        and ends on its request's idle, or -- if that is lost -- on its shell
+        reply, which cannot be. Raises ``RuntimeError`` carrying what to do
+        when the kernel is not ready (:meth:`_not_ready_result`).
+        """
+        io = self._io
+        if not self._ready.is_set() or io is None:
+            raise RuntimeError(self._not_ready_result()["error_text"])
+
+        def before_send(request):
+            self.jobs.start_cell(job_id, request, code, origin, intent)
+
+        def on_reply(reply):
+            if reply is None:
+                return  # the kernel went away; its records say so
+            self.jobs.note_reply(job_id, reply)
+            # The idle marks the output complete and normally ends the record
+            # first; the reply ends it only if that idle never comes.
+            timer = threading.Timer(_IDLE_GRACE, self.jobs.cell_replied, (job_id,))
+            timer.daemon = True
+            timer.start()
+
+        return io.send_execute(
+            code,
+            on_reply,
+            before_send,
+            user_expressions={"w": _WINDOW_ALIVE_EXPR},
+        )
+
+    def interrupt_job(self, job_id, reason=None):
+        """Stop *job_id* if it still runs (``_jobs.interrupt``), on the control
+        channel. Whether the caller may is decided before this; *reason* is a
+        person's, prefixed to the job's error.
+
+        The kernel knows a cell by its request -- a cell's id is this host's --
+        and a task by its own id, which is also what it is sent when the
+        records do not hold it as running (its start may be in flight). When
+        *job_id* no longer runs, ``running_job_id`` names what does.
+        """
+        key = self.jobs.stop_key(job_id) or job_id
+        # Before the stop, which a cell's end can follow at once; taken back
+        # if the stop does not happen.
+        self.jobs.note_cancel(job_id, reason)
+        reply = {}
+        try:
+            reply = self.control("interrupt", key=key, reason=reason)
+        finally:
+            if not reply.get("interrupted"):
+                self.jobs.note_cancel(job_id, None)
+        reply["job_id"] = job_id
+        if reply.get("refused") == "not_running":
+            running = self.jobs.running()
+            reply["running_job_id"] = running["job_id"] if running else None
+        return reply
+
+    def _close_session(self, timeout):
+        """Close the kernel's tensor client before a kill, bounded and
+        best-effort (``_kernel_gate._close_session``): a wedged kernel just
+        falls through to the kill."""
+        try:
+            self.control("close", timeout=timeout)
+        except Exception:  # noqa: BLE001
+            logger.debug("graceful close failed", exc_info=True)
 
     def interrupt(self):
-        """Send SIGINT to the kernel.  Does NOT take the lock so it can fire
-        while ``execute`` is blocked on a busy kernel."""
+        """Send SIGINT to the kernel. Takes no lock, so it can fire during a
+        restart's graceful close or any call waiting on a busy kernel."""
         if self._km is not None:
             try:
                 self._km.interrupt_kernel()
@@ -620,7 +759,7 @@ class KernelHost:
                 logger.debug("interrupt_kernel failed", exc_info=True)
 
     def restart(self):
-        """Hard-restart: graceful-close tensor/dask, group-kill, respawn.
+        """Hard-restart: graceful-close the tensor client, group-kill, respawn.
 
         Deliberately NOT ``shutdown()`` + ``start()``: shutdown() must join
         the watchdog *outside* the lock (the watchdog may hold the lock
@@ -632,17 +771,19 @@ class KernelHost:
         with self._lock:
             # Tell the watchdog this alive->dead transition is intentional.
             self._stopping = True
+            self._restarting = True
             # A restart is a recovery attempt: clear any stale failure / teardown
             # reason up front so a concurrent server_status/execute (which read
             # them without the lock) see "starting" (recovering) rather than the
             # old error while we rebuild. A fresh failure below records a new one.
             self._start_error = None
             self._teardown_reason = None
+            # Before the graceful close, not at the kill: calls do not take this
+            # lock, so only _ready keeps a submit from landing in the kernel
+            # being replaced, after the tensor client it would use is gone.
+            self._ready.clear()
             try:
-                try:
-                    self._execute_locked(_GRACEFUL_CLOSE_SNIPPET, timeout=5.0)
-                except Exception:
-                    logger.debug("graceful close failed on restart", exc_info=True)
+                self._close_session(timeout=5.0)
 
                 self._shutdown_current()
                 try:
@@ -656,6 +797,7 @@ class KernelHost:
                 self._respawn_times.clear()
             finally:
                 self._stopping = False
+                self._restarting = False
         # Re-arm the watchdog if it had stopped (e.g. respawn budget exhausted).
         self._start_watchdog()
 
@@ -667,17 +809,13 @@ class KernelHost:
         self._stopping = True
         self._stop_watchdog()
         with self._lock:
-            # Best-effort, bounded graceful close so the tensor server isn't left
-            # to discover SIGKILL'd connections via async socket teardown — which
-            # can make a `biopb server stop` right after Ctrl-C hang on its drain
-            # (see _GRACEFUL_CLOSE_SNIPPET). A busy/wedged kernel falls through to
-            # the SIGKILL below; the short timeout keeps this off the Ctrl-C path.
+            # The short timeout keeps the graceful close off the Ctrl-C path.
+            # Readiness goes first, as in restart().
+            self._ready.clear()
             if self.is_alive():
-                try:
-                    self._execute_locked(_GRACEFUL_CLOSE_SNIPPET, timeout=2.0)
-                except Exception:
-                    logger.debug("graceful close on shutdown failed", exc_info=True)
+                self._close_session(timeout=2.0)
             self._shutdown_current()
+            self._connection = None
             # Terminal path only (restart() drives _shutdown_current directly and
             # must keep the job): drop the job handle so it doesn't leak and its
             # closure fires kill-on-close as a final backstop (biopb/biopb#403).
@@ -690,10 +828,15 @@ class KernelHost:
         # health probe (restart/respawn) before dispatching again.
         self._ready.clear()
         try:
-            if self._kc is not None:
-                self._kc.stop_channels()
+            if self._io is not None:
+                # Fails any call still waiting, rather than leaving it to time
+                # out on a kernel that is going away.
+                self._io.close()
         except Exception:
             logger.debug("stop_channels failed", exc_info=True)
+        # A job still running dies with its kernel, which will never announce
+        # its end.
+        self.jobs.kernel_gone(self._teardown_reason or "")
 
         # Group-kill via the pgid captured at launch — not os.getpgid(pid) now:
         # the kernel may already be dead (raising), and a recycled pid could
@@ -724,7 +867,7 @@ class KernelHost:
         except Exception:
             logger.debug("cleanup_resources failed", exc_info=True)
 
-        self._kc = None
+        self._io = None
         self._pgid = None
         self._close_death_pipe()
         self._close_window_pipe()
@@ -836,13 +979,13 @@ class KernelHost:
 
         Acts only on a *positive* "window gone" reading from a healthy, idle
         kernel. Skipped (return False, retry next tick) when: an intentional
-        stop is in flight; the kernel isn't ready (mid (re)spawn); or the kernel
-        is busy -- a job holds the lock, the window is in use, and we must
-        neither contend with it nor abort it. A busy/timeout/error probe is
-        inconclusive and likewise retried; only a clean ``False`` reading (the
-        Qt window's C++ object is gone) triggers teardown. Unlike the POSIX byte
-        signal, this cannot fire mid-job (the probe can't run while the lock is
-        held) -- the close is detected on the next idle tick instead.
+        stop is in flight; the kernel isn't ready (mid (re)spawn); or its main
+        thread is busy -- a probe would only queue behind whatever holds it, one
+        more per tick. A timeout/error probe is inconclusive and likewise
+        retried; only a clean ``False`` reading (the Qt window's C++ object is
+        gone) triggers teardown. A ``run_async`` task does not hold the main
+        thread, so, like the POSIX byte signal, this can fire mid-task and stop
+        it.
         """
         if self._stopping or not self._ready.is_set() or self.is_busy():
             return False
@@ -900,10 +1043,9 @@ class KernelHost:
                     continue
                 death_seen = True
                 # Withdraw readiness *before* contending for the lock. execute()
-                # gates on _ready without taking the lock, so clearing it here
-                # turns in-flight tool calls into structured not-ready results
-                # rather than more lock acquisitions -- otherwise the respawn
-                # deadlocks against the very traffic it exists to rescue.
+                # gates on _ready, so clearing it here turns new tool calls
+                # into structured not-ready results instead of waits on a
+                # kernel that cannot answer.
                 self._ready.clear()
             # Confirm and act under the lock so we never race an in-flight
             # restart()/shutdown().
@@ -973,8 +1115,14 @@ class KernelHost:
         env = self._env or {}
         return env.get("DISPLAY") if env.get("BIOPB_VIRTUAL_DISPLAY") else None
 
+    @property
+    def no_viewer_reason(self):
+        """Why this session has no napari viewer, or None when it has one. Set by
+        the launcher in the kernel env it hands us (ENV_NO_VIEWER)."""
+        return (self._env or {}).get(ENV_NO_VIEWER) or None
+
     def health(self) -> dict:
-        """Liveness summary for server_status (cheap; takes no lock)."""
+        """Liveness summary for server_status (cheap; no kernel round trip)."""
         return {
             "alive": self.is_alive(),
             "ready": self._ready.is_set(),
@@ -986,7 +1134,17 @@ class KernelHost:
             "watchdog_running": (
                 self._watchdog_thread is not None and self._watchdog_thread.is_alive()
             ),
+            "connection_file": self.connection_file,
+            "attach_command": self._attach_command if self.is_alive() else None,
         }
+
+    @property
+    def connection_file(self):
+        """Where a Jupyter client attaches to this kernel, or None when it is
+        not running."""
+        if not self.is_alive():
+            return None
+        return self._km.connection_file or None
 
     def is_alive(self) -> bool:
         try:
@@ -995,11 +1153,12 @@ class KernelHost:
             return False
 
     def is_busy(self) -> bool:
-        acquired = self._lock.acquire(blocking=False)
-        if acquired:
-            self._lock.release()
-            return False
-        return True
+        """Whether the kernel's main thread is running something, by its own
+        last published status -- any client's request, not only ours. A
+        ``run_async`` task does not count: the cell that started it has
+        returned."""
+        io = self._io
+        return io is not None and io.execution_state == "busy"
 
     def _kernel_pid(self):
         try:

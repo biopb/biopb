@@ -22,7 +22,8 @@
 # into BIOPB_PINNED_RELEASE below), so re-fetching the one-liner is how you move
 # to a newer version. A raw / git-checkout copy has no pin and tracks the latest
 # STABLE release. Overrides:
-#   BIOPB_INSTALL_VERSION=X.Y.Z  install/downgrade to an exact release
+#   BIOPB_INSTALL_VERSION=X.Y.Z  install/downgrade to an exact release (one that
+#                                declares this INSTALL_SCHEMA; see below)
 #   BIOPB_INSTALL_RC=1           track the latest release candidate (a/b/rc,
 #                                typically cut off dev) — the fast path for
 #                                testing an upcoming release before it lands.
@@ -49,6 +50,12 @@ fi
 # BIOPB_INSTALL_VERSION. Keep the `BIOPB_PINNED_RELEASE=` LHS verbatim -- the stamp
 # anchors on it.
 BIOPB_PINNED_RELEASE=""
+
+# The release layout this installer is written for. release.yaml copies it into
+# each release's versions.json as `install_schema`; a release declaring another,
+# or none, is refused with a pointer to the installer shipped alongside it. Bump
+# it when a change to the release makes an earlier installer wrong for it.
+INSTALL_SCHEMA=1
 
 _step() { printf "\n${BOLD}%s${RESET}\n" "$*"; }
 _ok()   { printf "  ${GREEN}%s${RESET}\n" "$*"; }
@@ -158,10 +165,8 @@ PY
 # When <prior-config> exists, its settings (server/cache/...) are loaded and
 # *preserved*; only the `sources` list is replaced with the chosen data dir, so
 # re-running with a new folder no longer discards the user's tuning. A prior
-# JSON is read with the stdlib; a legacy TOML is read for migration when this
-# Python has a TOML parser (3.11+ stdlib `tomllib`, else `tomli`) and otherwise
-# falls back to fresh defaults. The caller retires the legacy TOML. Writes
-# atomically; returns non-zero on any error.
+# JSON is read with the stdlib; an unreadable one falls back to fresh defaults.
+# Writes atomically; returns non-zero on any error.
 _write_server_config() {
     local out="$1" data_dir="$2" monitor="$3" prior="${4:-}" alias="${5:-}"
     mkdir -p "$(dirname "$out")"
@@ -174,16 +179,8 @@ alias = sys.argv[5] if len(sys.argv) > 5 else ""
 data = {}
 if prior and os.path.exists(prior):
     try:
-        if prior.endswith(".toml"):
-            try:
-                import tomllib
-            except ModuleNotFoundError:
-                import tomli as tomllib  # 3.10 fallback
-            with open(prior, "rb") as fh:
-                data = tomllib.load(fh)
-        else:
-            with open(prior, encoding="utf-8") as fh:
-                data = json.load(fh)
+        with open(prior, encoding="utf-8") as fh:
+            data = json.load(fh)
     except Exception:
         # Unreadable/unparseable prior config: start clean rather than abort
         # the install. The new data dir is written either way.
@@ -203,7 +200,7 @@ if not isinstance(data, dict):
 # (biopb/biopb#604), and `biopb control start` passes it down. Writing it would
 # only earn a "no longer read" warning on every startup.
 data.setdefault("server", {"aggressive_dir_pruning": True})
-data.setdefault("cache", {"backend": "file", "file_max_total_gb": 32})
+data.setdefault("cache", {"file_max_total_gb": 32})
 md = data.pop("metadata_db", None)
 if isinstance(md, dict):
     if md.get("enabled", True):
@@ -393,6 +390,43 @@ _read_extra_packages() {
     done < "$EXTRA_PACKAGES_FILE"
 }
 
+# Seed the algorithm registry under config dir $1 on a fresh install. The
+# cellpose server on biopb.org is off-site and logs client IPs, so it is added
+# only with consent, asked once: when neither the registry nor an older
+# install's mcp-config.json exists (the control moves that file's servers into
+# the registry). Declining leaves the registry empty; _confirm defaults to Yes.
+_seed_algorithm_registry() {
+    local algorithms="$1/algorithms"
+    if [ -d "$algorithms" ] || [ -f "$1/mcp-config.json" ]; then
+        _ok "Algorithm registry kept ($algorithms)"
+    else
+        _info "BioPB ships with algorithm plugins that use remote servers for"
+        _info "certain computations, e.g. cell segmentation. The servers are"
+        _info "hosted at UConn Health and log client IP addresses."
+        _info ""
+        local remote=1
+        if [ "${NONINTERACTIVE:-0}" = "1" ]; then
+            # Consent can't be asked unattended: enable only on explicit opt-in.
+            if [ "${BIOPB_REMOTE_PLUGINS:-0}" = "1" ]; then
+                _ok "Remote algorithm plugins enabled (BIOPB_REMOTE_PLUGINS=1)"
+            else
+                remote=0
+                _ok "Remote algorithm plugins disabled (non-interactive; set BIOPB_REMOTE_PLUGINS=1 to enable)"
+            fi
+        elif _confirm "Enable the remote algorithm plugins?"; then
+            _ok "Remote algorithm plugins enabled"
+        else
+            remote=0
+            _ok "Remote algorithm plugins disabled (add servers later in $algorithms)"
+        fi
+        mkdir -p "$algorithms"
+        if [ "$remote" = "1" ]; then
+            printf '{"url": "grpcs://cellpose.biopb.org:443"}\n' > "$algorithms/cellpose.json"
+            _ok "Added the cellpose server: $algorithms/cellpose.json"
+        fi
+    fi
+}
+
 # Detect installed agent systems and register the biopb MCP server with each.
 # Always drops a canonical, client-agnostic definition at $CONFIG_DIR/mcp.json.
 # If nothing is detected, prints guidance so the user can wire it up themselves.
@@ -403,69 +437,21 @@ _setup_mcp() {
     local mcp_cmd
     mcp_cmd=$(command -v biopb-mcp 2>/dev/null || echo "biopb-mcp")
 
-    # Minimal biopb-mcp config, mainly to ship preconfigured biopb.image servicers.
-    # Preserved if it already exists so the user's tweaks survive a rerun.
-    # Co-located with the tensor config in ~/.config/biopb (distinct from the
-    # client-definition mcp.json written below); the schema is flat sections.
-    local mcp_config="$CONFIG_DIR/mcp-config.json"
     mkdir -p "$CONFIG_DIR"
-    if [ -f "$mcp_config" ]; then
-        _ok "biopb-mcp config exists at $mcp_config (preserved)"
-    else
-        # The default algorithm plugins point at remote, off-site servers (cell
-        # segmentation, etc.) hosted at UConn Health. Those servers log client
-        # IPs, so we ask for consent before enabling them by default rather than
-        # quietly shipping a third-party network dependency. Declining just
-        # leaves process_image_servers empty; the user can add servers later by
-        # editing the config. _confirm defaults to Yes (Enter = enable).
-        _info "BioPB ships with algorithm plugins that use remote servers for"
-        _info "certain computations, e.g. cell segmentation. The servers are"
-        _info "hosted at UConn Health and log client IP addresses."
-        _info ""
-        local process_image_servers='        "grpcs://cellpose.biopb.org:443"'
-        if [ "${NONINTERACTIVE:-0}" = "1" ]; then
-            # Consent can't be asked unattended: enable only on explicit opt-in,
-            # otherwise leave the IP-logging servers off.
-            if [ "${BIOPB_REMOTE_PLUGINS:-0}" = "1" ]; then
-                _ok "Remote algorithm plugins enabled (BIOPB_REMOTE_PLUGINS=1)"
-            else
-                process_image_servers=''
-                _ok "Remote algorithm plugins disabled (non-interactive; set BIOPB_REMOTE_PLUGINS=1 to enable)"
-            fi
-        elif _confirm "Enable the remote algorithm plugins?"; then
-            _ok "Remote algorithm plugins enabled"
-        else
-            process_image_servers=''
-            _ok "Remote algorithm plugins disabled (add servers later in $mcp_config)"
-        fi
 
-        # The tensor server's localhost fast path is now the file-cache mmap
-        # handoff (biopb/biopb#9), which beats the gRPC socket and is enabled by
-        # default, so no shm opt-out is seeded here anymore.
-        cat > "$mcp_config" << EOF
-{
-  "services": {
-    "process_image_servers": [
-$process_image_servers
-    ]
-  }
-}
-EOF
-        _ok "Created biopb-mcp config: $mcp_config"
-    fi
+    _seed_algorithm_registry "$CONFIG_DIR"
 
-    # Seed the built-in example kernel plugin(s) into ~/.config/biopb/kernel/ so
-    # they load into the agent kernel namespace at startup and are visible as a
-    # "bring your own tool" example (biopb/biopb-mcp#92). Delivered as a file
-    # there (not only an installed module) so it is user-visible/editable and
-    # loads via the robust startup-file path. Idempotent (never clobbers a
-    # user-edited file); best-effort so a failure never aborts the install.
+    # Seed the bundled correctness-critical algorithm-plane ops (segmentation
+    # QC, image resolution) into ~/.config/biopb/algorithms/ as script entries,
+    # so a procedure doc's op requirement is met without the agent re-deriving
+    # them. Idempotent (never clobbers a user-edited file); best-effort so a
+    # failure never aborts the install.
     local seed_cmd
-    seed_cmd=$(command -v biopb-mcp-seed-plugins 2>/dev/null || true)
+    seed_cmd=$(command -v biopb-mcp-seed-algorithms 2>/dev/null || true)
     if [ -n "$seed_cmd" ] && "$seed_cmd" >/dev/null 2>&1; then
-        _ok "Seeded example kernel plugins: $CONFIG_DIR/kernel/"
+        _ok "Seeded bundled algorithm ops: $CONFIG_DIR/algorithms/"
     else
-        _note "Skipped seeding example kernel plugins (add later: biopb-mcp-seed-plugins)"
+        _note "Skipped seeding bundled algorithm ops (add later: biopb-mcp-seed-algorithms)"
     fi
 
     # Canonical standalone definition (standard mcpServers JSON; most clients
@@ -613,6 +599,13 @@ _release_asset_url() {
         | grep -E "/$1\$" | head -1 || true
 }
 
+# Print string field $1 of the one-line versions.json manifest $2 (a bare number
+# too, e.g. install_schema), or nothing when absent.
+_manifest_field() {
+    printf '%s' "$2" \
+        | sed -n 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*"\{0,1\}\([^",}[:space:]]*\).*/\1/p'
+}
+
 # Print the SHA-256 hex digest of file $1, or nothing if no tool is available
 # (Linux ships GNU `sha256sum`; macOS ships `shasum`). The empty result lets the
 # caller skip the integrity check rather than abort on a toolless host.
@@ -626,20 +619,17 @@ _sha256() {
 
 # Verify each wheel path in "$@" against the release's SHA256SUMS asset before it
 # is file://-installed. Hard-fails (exits) on a checksum mismatch or a wheel with
-# no entry in a SHA256SUMS that exists. Fails OPEN (warns, returns 0) when the
-# release predates checksums or no sha256 tool is present, so installs of older
-# releases — and toolless hosts — still work. Requires _fetch_latest_release.
+# no entry in SHA256SUMS, and when SHA256SUMS itself cannot be fetched. Only a
+# host with no sha256 tool skips the check (with a warning). Requires
+# _fetch_latest_release.
 _verify_wheels() {
-    local sums_url sums
+    local sums_url sums=""
     sums_url=$(_release_asset_url 'SHA256SUMS')
-    if [ -z "$sums_url" ]; then
-        _warn "Release $RELEASE_TAG has no SHA256SUMS; skipping wheel integrity check"
-        return 0
+    [ -n "$sums_url" ] && sums=$(curl -fsSL "$sums_url" 2>/dev/null)
+    if [ -z "$sums" ]; then
+        _err "Could not fetch SHA256SUMS for release $RELEASE_TAG; refusing to install unverified wheels"
+        exit 1
     fi
-    sums=$(curl -fsSL "$sums_url" 2>/dev/null) || {
-        _warn "Could not fetch SHA256SUMS; skipping wheel integrity check"
-        return 0
-    }
 
     local f base expected actual
     for f in "$@"; do
@@ -939,6 +929,147 @@ _precompile_bytecode() {
     _ok "Bytecode precompiled (first viewer launch will be faster)"
 }
 
+# Keep the installed release's own installer (its install.sh asset, stamped with
+# its tag) in $1, with an uninstall.sh that runs it, so a later uninstall is the
+# code that installed this rather than whatever is newest. Best-effort; needs
+# _fetch_latest_release.
+_save_uninstaller() {
+    local dir="$1" url
+    url=$(_release_asset_url 'install\.sh')
+    if [ -z "$url" ] || ! mkdir -p "$dir" 2>/dev/null \
+        || ! curl -fsSL "$url" -o "$dir/install.sh.tmp" 2>/dev/null \
+        || ! mv -f "$dir/install.sh.tmp" "$dir/install.sh"; then
+        rm -f "$dir/install.sh.tmp" 2>/dev/null
+        _note "Could not save the uninstaller; uninstall with this release's install.sh --uninstall"
+        return 0
+    fi
+    cat > "$dir/uninstall.sh" <<'SH'
+#!/usr/bin/env bash
+# Uninstall biopb with the installer of the release that installed it.
+exec bash "$(dirname "$0")/install.sh" --uninstall "$@"
+SH
+    chmod +x "$dir/uninstall.sh" 2>/dev/null || true
+    _ok "Uninstaller saved: $dir/uninstall.sh"
+    return 0
+}
+
+# The biopb env's interpreter, or nothing (status 1) when there is no env.
+_tool_python() {
+    local tool_dir
+    tool_dir=$(uv tool dir 2>/dev/null) || return 1
+    [ -x "$tool_dir/biopb/bin/python" ] || return 1
+    printf '%s\n' "$tool_dir/biopb/bin/python"
+}
+
+# The two per-user kernel specs biopb registers, and the names a first-time user
+# sees in a Jupyter kernel picker. biopb-engine.ps1 carries the same texts.
+_KERNELSPEC_BIOPB_NAME="biopb"
+_KERNELSPEC_BIOPB_TITLE="biopb: start a new kernel in biopb's environment"
+_KERNELSPEC_SESSION_NAME="biopb-session"
+_KERNELSPEC_SESSION_TITLE="biopb: connect to the running biopb session"
+
+# Where the per-user kernel spec named $2 lives, and whose it is: prints a state
+# line (absent | ours | foreign) then the spec dir. Asks $1's own jupyter_core,
+# which resolves the same user dir any Jupyter of this user searches. "ours"
+# means the spec runs an interpreter inside $1's env; any other spec of that name
+# is the user's. biopb-engine.ps1 carries the same program.
+_kernelspec_state() {
+    "$1" - "$2" <<'PY'
+import json, os, sys
+from jupyter_core.paths import jupyter_data_dir
+
+spec = os.path.join(jupyter_data_dir(), "kernels", sys.argv[1])
+try:
+    with open(os.path.join(spec, "kernel.json")) as f:
+        argv0 = json.load(f)["argv"][0]
+except FileNotFoundError:
+    state = "absent"
+except Exception:
+    state = "foreign"
+else:
+    env = os.path.normcase(os.path.abspath(sys.prefix)) + os.sep
+    ours = os.path.normcase(os.path.abspath(argv0)).startswith(env)
+    state = "ours" if ours else "foreign"
+print(state)
+print(spec)
+PY
+}
+
+# Write the biopb-session kernel spec: a kernel that is a proxy to the running
+# session (biopb_mcp.mcp._session_proxy), run by the env's own interpreter so
+# nothing is installed into a Jupyter. $1 the env's interpreter, $2 the spec dir,
+# $3 the display name. biopb-engine.ps1 carries the same program.
+_write_session_kernelspec() {
+    "$1" - "$2" "$3" <<'PY'
+import json, os, sys
+
+spec, title = sys.argv[1], sys.argv[2]
+os.makedirs(spec, exist_ok=True)
+with open(os.path.join(spec, "kernel.json"), "w") as f:
+    json.dump(
+        {
+            "argv": [sys.executable, "-m", "biopb_mcp.mcp._session_proxy", "-f", "{connection_file}"],
+            "display_name": title,
+            "language": "python",
+            "interrupt_mode": "message",
+        },
+        f,
+        indent=1,
+    )
+PY
+}
+
+# Register the biopb env as two Jupyter kernels, so a Jupyter installed anywhere
+# else can run notebooks against it: "biopb" starts a standalone kernel in the
+# env (not the agent's session), "biopb-session" connects to the session
+# kernel that is running. Rewritten on every install (the env path survives an
+# upgrade); a user's own spec of either name is left alone. Best-effort; skip
+# with BIOPB_INSTALL_KERNELSPEC=0. $1 is the env's interpreter (_tool_python).
+_install_kernelspec() {
+    if [ "${BIOPB_INSTALL_KERNELSPEC:-1}" = "0" ]; then
+        _note "Jupyter kernel skipped (BIOPB_INSTALL_KERNELSPEC=0)"
+        return 0
+    fi
+    local py state spec name
+    py=${1:-}
+    [ -n "$py" ] || return 0
+    for name in "$_KERNELSPEC_BIOPB_NAME" "$_KERNELSPEC_SESSION_NAME"; do
+        { read -r state && read -r spec; } < <(_kernelspec_state "$py" "$name" 2>/dev/null) || continue
+        if [ "$state" = "foreign" ]; then
+            _note "Kept the existing Jupyter kernel spec at $spec"
+            continue
+        fi
+        if [ "$name" = "$_KERNELSPEC_BIOPB_NAME" ]; then
+            "$py" -m ipykernel install --user --name "$name" --display-name "$_KERNELSPEC_BIOPB_TITLE" >/dev/null 2>&1
+        else
+            _write_session_kernelspec "$py" "$spec" "$_KERNELSPEC_SESSION_TITLE" >/dev/null 2>&1
+        fi
+        # shellcheck disable=SC2181
+        if [ $? -eq 0 ]; then
+            _ok "Jupyter kernel \"$name\" registered"
+        else
+            _note "Could not register the Jupyter kernel \"$name\"; skipping"
+        fi
+    done
+    return 0
+}
+
+# Remove the kernel specs _install_kernelspec wrote; $1 as there, so the env
+# must still be present.
+_remove_kernelspec() {
+    local py state spec name
+    py=${1:-}
+    [ -n "$py" ] || return 0
+    for name in "$_KERNELSPEC_BIOPB_NAME" "$_KERNELSPEC_SESSION_NAME"; do
+        { read -r state && read -r spec; } < <(_kernelspec_state "$py" "$name" 2>/dev/null) || continue
+        [ "$state" = "ours" ] || continue
+        if rm -rf "$spec" 2>/dev/null; then
+            _ok "Removed the Jupyter kernel spec $spec"
+        fi
+    done
+    return 0
+}
+
 # Drop a double-clickable "biopb Dashboard" shortcut on the user's Desktop that
 # runs `biopb dashboard` (start the control plane if needed, then open the
 # browser). Best-effort: a failure only means no icon, never aborts the install.
@@ -1008,15 +1139,14 @@ EOF
 install_biopb() {
     set -euo pipefail
 
-    # All three wheels (+ webapp) are pulled from ONE biopb release-v*
-    # deployment — a mutually-paired set built from the tagged commit. All three
-    # packages live in the biopb monorepo (biopb-mcp and biopb-tensor-server are
-    # subdirectories of biopb/biopb).
+    # The product wheels (+ webapp) are pulled from ONE biopb release-v*
+    # deployment — a mutually-paired set built from the tagged commit; the SDK
+    # they pin comes from PyPI.
     BIOPB_REPO_URL="https://github.com/biopb/biopb"
     REPO_URL="$BIOPB_REPO_URL"        # webapp release-asset fallback URL
     RELEASE_REPO="biopb/biopb"        # owner/name for the GitHub Releases API
     # The monorepo hosts two release lines: the product `release-v*` and the SDK
-    # `v*` (see docs/release-model.md). The all-in-one deployment the installer
+    # `v*`. The all-in-one deployment the installer
     # wants is the `release-v*` one, so the release fetch filters by this prefix
     # instead of using /releases/latest (which is repo-wide).
     RELEASE_TAG_PREFIX="release-v"
@@ -1185,7 +1315,7 @@ install_biopb() {
 
     # Upper bound: two things cap Python at 3.12. (1) The biopb packages declare
     # requires-python ">=3.10,<3.13", so 3.13+ is refused at resolution. (2) The
-    # default `aics` extra pulls the CZI reader (pylibczirw / aicspylibczi), which
+    # default `czi` extra pulls the CZI reader (pylibczirw / aicspylibczi), which
     # ships no cp313 wheel yet — on 3.13+ pip would build it from source (cmake +
     # libCZI), which fails on a fresh machine without a C++ toolchain. If the
     # system Python is newer we fall back to a uv-managed 3.12 below.
@@ -1241,7 +1371,15 @@ install_biopb() {
     # source format here, and h5py is cleanly gated behind its own opt-in extra
     # (nothing else in this set pulls it), so a user who needs it installs
     # biopb-tensor-server[hdf5]. Kept out of the default to slim the install.
-    TENSOR_EXTRAS="web,aics,medical,ndtiff"
+    # [aics] (bioio + its plugins) is NOT in the default set: the native
+    # adapters own every local vendor format, so what bioio would still add is
+    # the Java bridge (its own [bioformats] opt-in) and remote vendor sources,
+    # which are reachable only from a hand-written config entry. [vendor] carries
+    # the readers those native adapters actually import. See biopb/biopb#799.
+    # [qptiff] (-> imagecodecs) is listed explicitly now: QPTIFF worked in the
+    # default install only because bioio-tifffile happened to pull imagecodecs,
+    # and that stops being true without [aics].
+    TENSOR_EXTRAS="web,vendor,qptiff,medical,ndtiff"
     if [ "$INSTALL_BIOFORMATS" = "1" ]; then
         TENSOR_EXTRAS="$TENSOR_EXTRAS,bioformats"
         _info "  including Bio-Formats (Java fetched on first use, not now)"
@@ -1256,20 +1394,12 @@ install_biopb() {
         TENSOR_EXTRAS="$TENSOR_EXTRAS,czi"
     fi
 
-    # Resolve where the three packages come from. They must be installed as a
-    # matched set from a single build: the tensor server is self-contained and
-    # may use proto fields newer than any biopb on PyPI, and biopb-mcp is tightly
-    # coupled to both — so all three are pinned to the sibling wheels from one
-    # release-v* deployment (release CI builds the mutually-paired set from
-    # the tagged commit) and the resolver is never allowed to pull biopb /
-    # biopb-tensor-server / biopb-mcp from PyPI. One download is one consistent
-    # set — no PyPI-vs-release version skew.
-    local biopb_req tensor_req mcp_req control_req
-    # napari is the one runtime dep resolved from PyPI. We pin it to the exact
-    # version this release was built/tested against (carried in its versions.json
-    # attribute, read below) so the deployed object graph matches the graph-walk
-    # thread-safety test — and so the napari[all] Qt binding is the tested one.
-    local napari_req="napari[all]"
+    # Resolve where the packages come from. biopb-tensor-server, biopb-mcp and
+    # biopb-control are installed as a matched set from one release-v*
+    # deployment (release CI builds them from the tagged commit), never from
+    # PyPI. The SDK they were built against is pinned exactly and comes from
+    # PyPI. napari is pinned to the tested version from the same manifest.
+    local biopb_req tensor_req mcp_req control_req napari_req
     if ! _fetch_latest_release; then
         if [ -n "${PIN_TAG:-}" ]; then
             _err "Could not fetch biopb release $PIN_TAG from $RELEASE_REPO."
@@ -1286,40 +1416,42 @@ install_biopb() {
         fi
         exit 1
     fi
-    local mcp_url sdk_url tensor_url control_url
+    # The release's versions.json pins napari (and so the napari[all] Qt
+    # binding) and the `biopb` SDK, installed from PyPI, to the versions the
+    # release was built and tested with, and carries the deployment `release`
+    # version, recorded post-install as the auto-updater's baseline (issue #87).
+    # Its `install_schema` must equal INSTALL_SCHEMA. RELEASE_VERSION is read here but written only after
+    # a clean install.
+    local versions_url versions_json="" release_schema napari_pin sdk_pin
+    versions_url=$(_release_asset_url 'versions\.json')
+    if [ -n "$versions_url" ]; then
+        versions_json=$(curl -fsSL "$versions_url" 2>/dev/null) || versions_json=""
+    fi
+    release_schema=$(_manifest_field install_schema "$versions_json")
+    if [ "$release_schema" != "$INSTALL_SCHEMA" ]; then
+        _err "Release $RELEASE_TAG is not supported by this installer."
+        _info "Install it with the installer published alongside it:"
+        _cmd "curl -fsSL https://github.com/$RELEASE_REPO/releases/download/$RELEASE_TAG/install.sh | bash"
+        exit 1
+    fi
+    napari_pin=$(_manifest_field napari "$versions_json")
+    sdk_pin=$(_manifest_field biopb "$versions_json")
+    RELEASE_VERSION=$(_manifest_field release "$versions_json")
+    if [ -z "$napari_pin" ] || [ -z "$sdk_pin" ] || [ -z "$RELEASE_VERSION" ]; then
+        _err "Release $RELEASE_TAG has an incomplete versions.json."
+        _info "Try again later, or report this against $RELEASE_REPO."
+        exit 1
+    fi
+    napari_req="napari[all]==$napari_pin"
+    local mcp_url tensor_url control_url
     mcp_url=$(_release_asset_url 'biopb_mcp-[^/]+\.whl')
-    sdk_url=$(_release_asset_url 'biopb-[^/]+\.whl')
     tensor_url=$(_release_asset_url 'biopb_tensor_server-[^/]+\.whl')
-    # biopb-control (control plane) wheel. Its filename uses an underscore
-    # (biopb_control-…), so the sdk regex `biopb-…` above never matches it.
     control_url=$(_release_asset_url 'biopb_control-[^/]+\.whl')
-    if [ -z "$mcp_url" ] || [ -z "$sdk_url" ] || [ -z "$tensor_url" ] || [ -z "$control_url" ]; then
+    if [ -z "$mcp_url" ] || [ -z "$tensor_url" ] || [ -z "$control_url" ]; then
         _err "Release $RELEASE_TAG is missing one of the biopb wheels."
         _info "Try again later, or report this against $RELEASE_REPO."
         exit 1
     fi
-    # Pin napari from the release's versions.json attribute so the installed
-    # napari is identical to the one this release was built/tested against
-    # (closes the last dev/deploy version-skew — and the napari[all] Qt
-    # binding, which is napari-version-dependent). The same manifest carries the
-    # deployment `release` version, which we record post-install as the
-    # auto-updater's baseline (issue #87). Tolerant: an older release without the
-    # manifest falls back to the unversioned napari spec and a tag-derived
-    # version. RELEASE_VERSION is read here but written only after a clean install.
-    local versions_url versions_json napari_pin
-    versions_url=$(_release_asset_url 'versions\.json')
-    if [ -n "$versions_url" ]; then
-        versions_json=$(curl -fsSL "$versions_url" 2>/dev/null) || versions_json=""
-        napari_pin=$(printf '%s' "$versions_json" \
-            | sed -n 's/.*"napari"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
-        [ -n "$napari_pin" ] && napari_req="napari[all]==$napari_pin"
-        RELEASE_VERSION=$(printf '%s' "$versions_json" \
-            | sed -n 's/.*"release"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
-    fi
-    # Fall back to the tag (release-vX.Y.Z -> X.Y.Z) when the manifest is absent
-    # or lacks `release`, so the recorded baseline is always a clean PEP 440
-    # version the update check can compare with packaging.version.
-    RELEASE_VERSION="${RELEASE_VERSION:-${RELEASE_TAG#"${RELEASE_TAG_PREFIX:-release-v}"}}"
     _info "Installing from release $RELEASE_TAG"
     WHEELS_DIR=$(mktemp -d)
     # Remove the wheel download dir on any exit (success, error, or set -e).
@@ -1327,24 +1459,22 @@ install_biopb() {
     # Declared first, assigned after: `local x=$(cmd)` takes local's own exit
     # status, so a failing _urldecode/basename would sail past `set -e` and leave
     # a truncated path to curl into.
-    local mcp_whl sdk_whl tensor_whl control_whl
+    local mcp_whl tensor_whl control_whl
     mcp_whl="$WHEELS_DIR/$(_urldecode "$(basename "$mcp_url")")"
-    sdk_whl="$WHEELS_DIR/$(_urldecode "$(basename "$sdk_url")")"
     tensor_whl="$WHEELS_DIR/$(_urldecode "$(basename "$tensor_url")")"
     control_whl="$WHEELS_DIR/$(_urldecode "$(basename "$control_url")")"
     curl -fsSL "$mcp_url" -o "$mcp_whl"
-    curl -fsSL "$sdk_url" -o "$sdk_whl"
     curl -fsSL "$tensor_url" -o "$tensor_whl"
     curl -fsSL "$control_url" -o "$control_whl"
     # Verify the downloaded wheels against the release's SHA256SUMS before they
-    # are file://-installed (aborts on a mismatch; fails open on an older release
-    # without the manifest). See the auto-updater trust item in issue #87.
-    _verify_wheels "$mcp_whl" "$sdk_whl" "$tensor_whl" "$control_whl"
+    # are file://-installed. See the auto-updater trust item in issue #87.
+    _verify_wheels "$mcp_whl" "$tensor_whl" "$control_whl"
     # Direct file:// references pin each package to this exact wheel, so uv
     # resolves their inter-dependencies (the server's `biopb`, biopb-mcp's
-    # `biopb[tensor]`, the control plane's `biopb`) to the downloaded set rather than PyPI.
-    mcp_req="biopb-mcp[mcp] @ file://$mcp_whl"
-    biopb_req="biopb[tensor] @ file://$sdk_whl"
+    # `biopb[tensor]`, the control plane's `biopb`) to the downloaded set; the
+    # SDK is pinned exactly to its PyPI release.
+    mcp_req="biopb-mcp[napari] @ file://$mcp_whl"
+    biopb_req="biopb[tensor]==$sdk_pin"
     tensor_req="biopb-tensor-server[$TENSOR_EXTRAS] @ file://$tensor_whl"
     control_req="biopb-control @ file://$control_whl"
 
@@ -1354,19 +1484,12 @@ install_biopb() {
     #     `sys.executable -m biopb_tensor_server.cli`, so the server must be
     #     importable from biopb's interpreter (this also restores
     #     `from biopb_tensor_server.config import load_config`);
-    #   - biopb-mcp is a napari plugin + MCP server that talks to the tensor
-    #     server and runs a napari viewer in this same env.
+    #   - biopb-mcp is the MCP server that talks to the tensor server and runs
+    #     a napari viewer in this same env (its widgets come from PyPI's
+    #     biopb-napari-widget).
     # biopb is the primary tool (exposes the `biopb` command); --with adds the
     # siblings to the same env and --with-executables-from also links their
     # console scripts onto PATH (plain --with does not expose executables).
-    #
-    # biopb-mcp requires the [mcp] extra (mcp, uvicorn, jupyter_client, ipykernel,
-    # psutil) — without it `import mcp` fails; the extra is applied to the pinned
-    # wheel/ref ($mcp_req) just like the others. It now ships in the biopb-mcp
-    # release alongside biopb + tensor-server (one matched set, now four wheels), so unlike the
-    # old layout it is no longer pulled from PyPI. napari[all] is the one runtime
-    # dep still resolved from PyPI, but pinned to the release's versions.json
-    # version ($napari_req, set above) so it matches the tested build.
     local install_args=(
         --upgrade
         --force
@@ -1400,21 +1523,12 @@ install_biopb() {
     # wheels, so an Intel Mac found no wheel and compiled the sdist -- failing on a
     # stock machine without OpenSSL dev headers. Supersedes the Intel-mac pin from
     # 024ca79 (biopb#355). Safe because pyjwt imports cryptography lazily, only for
-    # the asymmetric algorithms we never exercise; HS256 and `import mcp` are fine.
-    #
-    # `mcp<2` for the same reason, one layer up: "`import mcp` is fine" holds on
-    # 1.x only. The 2.0 SDK imports cryptography at module scope
-    # (`mcp/server/request_state.py`) on that very path, so the override above
-    # strips a dep it hard-needs -- and 2.0 also deleted `mcp.server.fastmcp`,
-    # which biopb-mcp's server is built on. The cap lives here as well as in
-    # biopb-mcp's `[mcp]` extra because THIS file is what fixes an already-
-    # published release: it is fetched fresh from biopb.org on every run and
-    # overrides whatever the downloaded wheels declare, so it covers every
-    # version back to 0.8.0, all of which carry an uncapped `mcp>=1.20` and
-    # would otherwise resolve 2.x and install a server that cannot start.
-    printf 'pyjwt>=2.10.1\nmcp<2\n' > "$WHEELS_DIR/overrides.txt"
+    # the asymmetric algorithms we never exercise; HS256 and `import mcp` are fine
+    # on mcp 1.x, which biopb-mcp caps at (2.0 imports cryptography at module
+    # scope).
+    printf 'pyjwt>=2.10.1\n' > "$WHEELS_DIR/overrides.txt"
     install_args+=(--overrides "$WHEELS_DIR/overrides.txt")
-    _info "  dropping transitive cryptography (pyjwt[crypto] -> pyjwt override); capping mcp<2"
+    _info "  dropping transitive cryptography (pyjwt[crypto] -> pyjwt override)"
 
     # No MCP server to stop before the new wheels land: each AI client's stdio
     # shim spawns and owns its own ephemeral session, reaped on disconnect, so
@@ -1475,6 +1589,8 @@ install_biopb() {
 
     # Warm the bytecode cache now (admin-free) so the first viewer launch is fast.
     _precompile_bytecode
+    _install_kernelspec "$(_tool_python)"
+    _save_uninstaller "${BIOPB_DATA_HOME:-$HOME/.local/share}/biopb/uninstall"
 
     # Record the installed deployment version as the kernel-start auto-updater's
     # baseline (issue #87): the check compares the latest release-v* deployment's
@@ -1535,16 +1651,11 @@ install_biopb() {
     _step "[5/7] Config..."
 
     mkdir -p "$CONFIG_DIR"
-    CONFIG_FILE="$CONFIG_DIR/biopb.json"        # canonical format (biopb/biopb#34)
-    LEGACY_CONFIG="$CONFIG_DIR/biopb.toml"      # pre-#34 installs
+    CONFIG_FILE="$CONFIG_DIR/biopb.json"        # the only config format (biopb/biopb#34)
 
-    # An existing config in either format counts for the keep-vs-rewrite decision.
-    # biopb.json wins when both are present (matches the server's find_config).
     local EXISTING_CONFIG=""
     if [ -f "$CONFIG_FILE" ]; then
         EXISTING_CONFIG="$CONFIG_FILE"
-    elif [ -f "$LEGACY_CONFIG" ]; then
-        EXISTING_CONFIG="$LEGACY_CONFIG"
     fi
 
     # No data-directory prompt: a fresh install seeds the sample-image bundle and
@@ -1592,23 +1703,7 @@ install_biopb() {
     # or the untouched existing file when the user keeps it (shown in the summary).
     local ACTIVE_CONFIG="$EXISTING_CONFIG"
     if [ -z "$DATA_DIR" ]; then
-        # Keeping the user's existing config. If it is a pre-#34 legacy TOML,
-        # convert it in place to the canonical JSON via `biopb-tensor-server
-        # migrate-config` (settings preserved verbatim, old file backed up to
-        # biopb.toml.bak) so an upgraded install stops warning about the
-        # deprecated format. A JSON config is already canonical -- nothing to do.
-        if [ "$EXISTING_CONFIG" = "$LEGACY_CONFIG" ] &&
-            command -v biopb-tensor-server >/dev/null 2>&1; then
-            _info "Migrating legacy TOML config to canonical JSON..."
-            if biopb-tensor-server migrate-config >/dev/null 2>&1; then
-                ACTIVE_CONFIG="$CONFIG_FILE"
-                _ok "Migrated config: $LEGACY_CONFIG -> $CONFIG_FILE (old file backed up)"
-            else
-                _warn "Could not migrate legacy config; keeping $LEGACY_CONFIG"
-            fi
-        else
-            _ok "Keeping current config: $EXISTING_CONFIG"
-        fi
+        _ok "Keeping current config: $EXISTING_CONFIG"
     else
         if [[ "$DATA_DIR" == *$'\n'* ]]; then
             _err "DATA_DIR path cannot contain newlines: $DATA_DIR"
@@ -1619,13 +1714,6 @@ install_biopb() {
             exit 1
         fi
         ACTIVE_CONFIG="$CONFIG_FILE"
-        # Retire a legacy TOML we just superseded so the server does not warn
-        # about both files shadowing (find_config prefers biopb.json). Its
-        # settings were carried into the new JSON above.
-        if [ "$EXISTING_CONFIG" = "$LEGACY_CONFIG" ] && [ -f "$LEGACY_CONFIG" ]; then
-            mv "$LEGACY_CONFIG" "$LEGACY_CONFIG.bak.$(date +%Y%m%d%H%M%S)"
-            _info "Migrated legacy TOML config to JSON (old file backed up)"
-        fi
         if [ -n "$EXISTING_CONFIG" ]; then
             _ok "Updated: $CONFIG_FILE"
         else
@@ -1686,8 +1774,8 @@ install_biopb() {
         echo ""
     fi
 
-    _info "biopb-mcp configuration file:"
-    _cmd "  $HOME/.config/biopb/mcp-config.json"
+    _info "Algorithm registry (one file per server):"
+    _cmd "  $CONFIG_DIR/algorithms/"
     echo ""
 
     _info "Data server configuration file:"
@@ -1863,6 +1951,21 @@ _unregister_agents() {
     return 0
 }
 
+# Remove the "biopb Dashboard" launchers _install_desktop_shortcut writes, on
+# whichever platform wrote them.
+_remove_desktop_shortcut() {
+    local f
+    for f in \
+        "$HOME/Desktop/biopb Dashboard.command" \
+        "$HOME/Desktop/biopb-dashboard.desktop" \
+        "$HOME/.local/share/applications/biopb-dashboard.desktop"; do
+        if [ -f "$f" ] && rm -f "$f" 2>/dev/null; then
+            _ok "Removed $f"
+        fi
+    done
+    return 0
+}
+
 # Print usage for the flag-driven entry point to stderr (help is diagnostic, and
 # stdout may be the curl|bash pipe).
 _usage() {
@@ -1918,6 +2021,8 @@ uninstall_biopb() {
     #    their console scripts: biopb, biopb-tensor-server, biopb-mcp).
     _step "[3/3] Removing biopb packages..."
     if command -v uv &>/dev/null; then
+        # The spec's owner is judged by the env's interpreter, so before it goes.
+        _remove_kernelspec "$(_tool_python)"
         if uv tool uninstall biopb &>/dev/null; then
             _ok "Removed the biopb tool environment (biopb, biopb-tensor-server, biopb-mcp)"
         else
@@ -1927,6 +2032,15 @@ uninstall_biopb() {
         _warn "uv not found; cannot remove the biopb tool environment"
         _info "  install uv and run: ${CYAN}uv tool uninstall biopb${RESET}"
     fi
+    # The web interface and the saved uninstaller are installed program files,
+    # not the user's data. Removing the uninstaller while it runs is safe: bash
+    # holds the open file.
+    local data_base="${BIOPB_DATA_HOME:-$HOME/.local/share}/biopb"
+    if [ -d "$data_base/webapp" ] && rm -rf "$data_base/webapp" 2>/dev/null; then
+        _ok "Removed the web interface ($data_base/webapp)"
+    fi
+    rm -rf "$data_base/uninstall" 2>/dev/null || true
+    _remove_desktop_shortcut
 
     # Optional purge of config + cached/state data. Never the user's images:
     # only biopb's own dotfile dirs are removed, never any configured data dir.

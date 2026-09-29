@@ -2,16 +2,12 @@
 
 This module provides a lazy numpy-like array interface using dask.array
 for accessing tensors stored in a Flight server.
-
-Features:
-- Lazy chunk loading via dask.array
-- LRU caching via cachey
-- Numpy-compatible slicing and operations
 """
 
 import json
 import logging
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+import warnings
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import dask.array as da
 import numpy as np
@@ -28,12 +24,18 @@ import pyarrow.flight as flight
 # locks (``_POOL_LOCK`` etc.), so a name bound here at import time goes stale after
 # a fork, and patching a re-export never lands on the binding _pool actually
 # resolves.
+from biopb.image.annotation_pb2 import (
+    RoiAnnotation,
+    RoiDeleteResult,
+    RoiListResult,
+    RoiPruneResult,
+    RoiPutResult,
+)
+from biopb.tensor._location import normalize_flight_location
 from biopb.tensor._pool import (
     _CACHE_POOL,
     _VIEW_CACHE,
     _build_call_options,
-    _build_dask_array_from_chunk_map,
-    _chunk_map_from_endpoints,
     _clear_view_cache,
     _default_cache_bytes,
     _resolve_cache_bytes,
@@ -43,17 +45,15 @@ from biopb.tensor._session import (
     CatalogClient,
     ChunkFetcher,
     ResolveCancelled as ResolveCancelled,
-    _check_wire_protocol as _check_wire_protocol,
     _ClientState,
-    _extract_schema_metadata as _extract_schema_metadata,
-    _fetch_endpoints_via_get_flight_info,
-    _parse_version as _parse_version,
-    _request_crop_slices,
-    _split_array_id as _split_array_id,
-    _TensorContext,
+    _dask_from_flight_info,
+    _explain_handshake_failure,
+    _refetch_flight_info,
+    _requested_slice,
+    split_array_id as split_array_id,
 )
 from biopb.tensor._tls import resolve_tls_trust
-from biopb.tensor._upload import UploadSession
+from biopb.tensor._upload import UploadRefused as UploadRefused, UploadSession
 from biopb.tensor.descriptor_pb2 import (
     AddSourceProgress,
     AddSourceResult,
@@ -69,53 +69,6 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 logger = logging.getLogger(__name__)
 
 
-def _normalize_location(location: str) -> str:
-    """Normalize location URI for Arrow Flight.
-
-    Converts grpcs:// to grpc+tls:// (Arrow Flight's TLS scheme).
-    """
-    if location.startswith("grpcs://"):
-        return "grpc+tls://" + location[8:]
-    return location
-
-
-def _make_debug_serialized_tensor(
-    arr: da.Array, array_id: str = "debug"
-) -> SerializedTensor:
-    """Create a SerializedTensor with debug_pickled_array for testing.
-
-    Eagerly computes the array and pickles it, bypassing Flight server.
-    Preserves original chunk structure for testing chunk-related behavior.
-    Populates inferable tensor_descriptor fields.
-
-    Args:
-        arr: Dask array to serialize
-        array_id: Optional array identifier
-
-    Returns:
-        SerializedTensor with debug_pickled_array populated
-    """
-    import pickle
-
-    # Eager compute
-    np_arr = arr.compute()
-
-    # Rechunk to original chunk structure (preserves chunk boundaries for testing)
-    computed_da = da.from_array(np_arr, chunks=arr.chunksize)
-
-    descriptor = TensorDescriptor(
-        array_id=array_id,
-        shape=list(arr.shape),
-        dtype=np.dtype(arr.dtype).str,
-        chunk_shape=list(arr.chunksize),
-    )
-
-    return SerializedTensor(
-        tensor_descriptor=descriptor,
-        debug_pickled_array=pickle.dumps(computed_da),
-    )
-
-
 class TensorFlightClient:
     """Client for accessing tensors from a TensorFlightServer.
 
@@ -127,8 +80,8 @@ class TensorFlightClient:
         ```python
         client = TensorFlightClient('grpc://localhost:8815')
 
-        # List data sources (each may contain multiple tensors)
-        sources = client.list_sources()
+        # Browse the catalog (SQL over the server's DuckDB)
+        rows = client.query("SELECT * FROM sources", format="records")
 
         # Get source-level metadata
         metadata = client.get_source_metadata('my-source')
@@ -183,7 +136,7 @@ class TensorFlightClient:
             f"Connecting to Flight server at {location}, cache={cache_bytes}B, auth={token is not None}"
         )
         # Normalize location for Arrow Flight (grpcs:// -> grpc+tls://)
-        normalized = _normalize_location(location)
+        normalized = normalize_flight_location(location)
         # For a TLS location, resolve the trust -- a caller-supplied CA or
         # fingerprint, else TOFU (once per process, memoized in _tls) -- and carry
         # it through the connection so every dask worker trusts the same root
@@ -199,11 +152,11 @@ class TensorFlightClient:
         self._tls_trust = tls_trust
         self._client = flight.FlightClient(normalized, **tls_trust.client_kwargs())
         self._call_options = _build_call_options(token)
-        # The connection + the two catalog caches live in one shared _ClientState.
-        # The collaborators (#278 item C) read/write it; this facade exposes the
-        # caches back-compatibly via the _sources/_descriptors properties below.
+        # One shared _ClientState holds the connection, and only the connection:
+        # the collaborators (#278 item C) cache no descriptors, so a caller that
+        # wants one memoized owns that policy.
         self._state = _ClientState(
-            client=self._client,
+            raw_client=self._client,
             call_options=self._call_options,
             location=self._location,
             token=self._token,
@@ -212,31 +165,26 @@ class TensorFlightClient:
         )
         self._catalog = CatalogClient(self._state)
         self._fetcher = ChunkFetcher(self._state, self._catalog)
-        self._upload = UploadSession(self._client, self._call_options)
-
-    # The catalog caches live on the shared _ClientState; expose them here so a
-    # caller's reads, in-place mutation, AND reassignment (client._sources = {})
-    # all reach the one shared dict the collaborators use (#278 item C).
-    @property
-    def _sources(self) -> Dict[str, DataSourceDescriptor]:
-        return self._state.sources
-
-    @_sources.setter
-    def _sources(self, value: Dict[str, DataSourceDescriptor]) -> None:
-        self._state.sources = value
+        self._upload = UploadSession(self._state, self._catalog)
 
     @property
-    def _descriptors(self) -> Dict[str, TensorDescriptor]:
-        return self._state.descriptors
-
-    @_descriptors.setter
-    def _descriptors(self, value: Dict[str, TensorDescriptor]) -> None:
-        self._state.descriptors = value
+    def location(self) -> str:
+        """The server this client dials, as Arrow names it (``grpc+tls://``
+        for a TLS location)."""
+        return self._location
 
     # ---- Catalog / metadata / source lifecycle (delegated to CatalogClient) ----
 
     def list_sources(self) -> Dict[str, DataSourceDescriptor]:
         """List available data sources.
+
+        Deprecated:
+            Use :meth:`query`, which hands back rows in the format
+            you ask for and leaves the structure to you. This is a thin
+            wrapper around
+            ``SELECT ... FROM sources`` that inherits the server's query row
+            cap, so a large catalog comes back silently truncated -- and a
+            browse is exactly where that matters.
 
         Returns:
             Dictionary mapping source_id to DataSourceDescriptor.
@@ -244,16 +192,47 @@ class TensorFlightClient:
             every tensor in that source -- array_id, dim_labels, shape, dtype.
             The transfer ``chunk_shape`` is empty here by contract; ask
             :meth:`get_descriptor` for the grid of a specific tensor
-            (biopb/biopb#812).
-
-        Note:
-            Results may be truncated if server has max_list_flights_results configured.
-            Check schema metadata for truncation info (truncated=True indicates
-            more sources exist on server than were returned).
+            (biopb/biopb#812). ``is_resolved`` is not carried at all -- the
+            message has no field for it (biopb/biopb#1032).
         """
+        warnings.warn(
+            "TensorFlightClient.list_sources() is deprecated and is capped by "
+            "the server's query row limit; use query(), which returns "
+            "rows in the format you ask for.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         return self._catalog.list_sources()
 
-    def query_sources(self, sql: str, *, format: str = "arrow") -> Any:  # noqa: A002 - public, documented keyword API (mirrors DuckDB/pandas `format`)
+    def get_source(self, source_id: str) -> Optional[DataSourceDescriptor]:
+        """One source's ``DataSourceDescriptor`` by id, or ``None``.
+
+        Deprecated:
+            Use :meth:`query` with a ``WHERE source_id = ...``.
+
+        The catalog is public: a source whose pixels need a capability token
+        still has its descriptor here. Knowing its id is not authority to read
+        it -- that is what the token gates, on :meth:`get_tensor` and
+        :meth:`list_rois`.
+
+        Args:
+            source_id: The source's id, e.g. ``"zarr_a3f2"``. This is a *source*
+                id, not an array_id: pass the routing prefix, not
+                ``"aics_7f3/Image:0"``.
+
+        Returns:
+            The ``DataSourceDescriptor``, or ``None`` when nothing answers to
+            that id.
+        """
+        warnings.warn(
+            "TensorFlightClient.get_source() is deprecated; use query() "
+            "with a WHERE source_id = ... instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self._catalog.get_source(source_id)
+
+    def query(self, sql: str, *, format: str = "arrow") -> Any:  # noqa: A002 - public, documented keyword API (mirrors DuckDB/pandas `format`)
         """Execute SQL query against server's source metadata database.
 
         The server-side metadata database is mandatory (biopb/biopb#225), so any
@@ -261,7 +240,8 @@ class TensorFlightClient:
         constructed without a metadata database rejects the query.
 
         Args:
-            sql: SQL query (e.g., "SELECT source_id, source_type FROM sources WHERE dtype='uint16'")
+            sql: SQL query (e.g., "SELECT source_id, source_type FROM sources
+                WHERE tensors[1].dtype = 'uint16'")
             format: Shape of the returned result:
 
                 - ``"arrow"`` (default) — a ``pyarrow.Table``. This is the
@@ -274,8 +254,8 @@ class TensorFlightClient:
         Returns:
             The query result in the requested ``format``; an empty query
             returns an empty object of that same type. For ``"pandas"`` and
-            ``"records"`` the usual Arrow->Python coercion applies (list
-            columns such as ``shape_summary`` become Python lists / object
+            ``"records"`` the usual Arrow->Python coercion applies (nested
+            columns such as ``tensors`` become Python lists of dicts / object
             dtype, and nullable integer columns may widen to float). For
             ``"pandas"``, NULLs in string columns (e.g. ``metadata_json``) are
             normalized to ``None`` rather than the truthy float ``NaN`` Arrow
@@ -301,11 +281,28 @@ class TensorFlightClient:
         Example:
             ```python
             >>> client = TensorFlightClient('grpc://localhost:8815')
-            >>> table = client.query_sources("SELECT source_id FROM sources WHERE source_type='ome-zarr'")
+            >>> table = client.query("SELECT source_id FROM sources WHERE source_type='ome-zarr'")
             >>> table.to_pandas()  # or pass format="pandas" to get a DataFrame
             ```
         """
-        return self._catalog.query_sources(sql, format=format)
+        return self._catalog.query(sql, format=format)
+
+    def query_sources(self, sql: str, *, format: str = "arrow") -> Any:  # noqa: A002 - public, documented keyword API (mirrors DuckDB/pandas `format`)
+        """Deprecated alias for :meth:`query`.
+
+        .. deprecated::
+            Use :meth:`query`. Same signature, same behavior -- ``query_sources``
+            just names it in terms of what it queries rather than what it does,
+            which stopped matching once other catalog tables (ROIs, uploads)
+            became queryable too.
+        """
+        warnings.warn(
+            "TensorFlightClient.query_sources() is deprecated; use query() "
+            "instead (same signature).",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.query(sql, format=format)
 
     @staticmethod
     def _format_query_result(table, format):  # noqa: A002 - public, documented keyword API (mirrors DuckDB/pandas `format`)
@@ -314,6 +311,12 @@ class TensorFlightClient:
 
     def get_source_metadata(self, source_id: str) -> dict:
         """Get source-level OME/vendor metadata as a dict.
+
+        Source-scoped, and read from the source's own catalog row: this is the
+        metadata the format carries for the whole container. A *field's* own
+        extras (an OME-Zarr HCS field's OME block, an EMD signal's
+        ``original_metadata``) are per-tensor and come back on a tensor-bound
+        :meth:`get_descriptor` with ``with_metadata=True``.
 
         Args:
             source_id: Source identifier
@@ -324,7 +327,7 @@ class TensorFlightClient:
 
         Raises:
             ValueError: If the source is unknown, or unresolved (cloud /
-                synced-folder) -- call `resolve` first.
+                synced-folder) -- call `resolve_source` first.
         """
         return self._catalog.get_source_metadata(source_id)
 
@@ -336,14 +339,6 @@ class TensorFlightClient:
         Returns ``(scale, unit)``: two lists aligned with the tensor's
         ``dim_labels`` (source axis order), or ``None`` when no physical sizes
         are known (an older server, or a format that carries none).
-
-        ``physical_scale``/``physical_unit`` are ``TensorDescriptor`` fields the
-        server fills on every ``GetFlightInfo`` (issue #31), so this reads the
-        descriptor a prior `get_tensor` already cached -- no extra RPC when
-        it is cached, and it never requests the opt-in ``metadata_json`` field on
-        that same descriptor. (Contrast `get_source_metadata`, which forces
-        ``with_metadata`` to ship the whole OME tree; do not dig physical sizes
-        out of that -- this is the compact projection meant for display scale.)
 
         Args:
             array_id: Globally-unique tensor id (identity policy) -- e.g.
@@ -364,39 +359,22 @@ class TensorFlightClient:
         with_metadata: bool = False,
         with_pyramid: bool = True,
         with_read_plan: bool = False,
+        with_residency: bool = False,
+        with_upload_status: bool = False,
     ) -> TensorDescriptor:
         """Fetch one tensor's ``TensorDescriptor`` by its globally-unique array_id.
 
-        A tensor is identified by its ``array_id`` alone (see the tensor identity
-        policy at the top of ``proto/biopb/tensor/descriptor.proto``), so this
-        takes that one identifier rather than a ``(source_id, tensor_id)`` pair.
-        Works even when the source is beyond the (truncatable) ``list_sources()``
-        cap. **This is the only call that answers the transfer ``chunk_shape``**:
-        the grid belongs to the tensor the server binds here, and ``list_sources``
-        entries carry it empty (biopb/biopb#812). Every call fetches -- the client
-        caches only the *structural* part of the answer (shape/dtype/dim_labels
-        plus physical scale) for its own addressing, never ``chunk_shape``,
-        ``metadata_json`` or ``pyramid``, so what you get back always reflects the
-        masks you passed. Passing a bare
-        ``source_id`` (single-tensor source, or to anchor on a multi-tensor
-        source's default/first tensor) is accepted. To enumerate ALL
-        tensors/scenes of a source, use ``list_sources()[source_id].tensors``
-        -- NOT this method.
+        **This is the only call that answers the transfer ``chunk_shape``**: the
+        grid belongs to the tensor the server binds here. Every call fetches and
+        nothing is stored. To enumerate ALL tensors/scenes of a source, read its
+        catalog row's ``tensors`` column -- NOT this method.
 
-        This is a cheap probe -- it does NOT resolve. On an unresolved (cloud /
-        synced-folder) source it raises an error pointing at `resolve`,
-        never triggering a download. Call `resolve` first to read such a
-        source.
+        Defaults to returning shape/dtype/dim_labels/chunk_shape and server advertised
+        pyramid structure. The ``with_*`` flags are the ``GetFlightInfo`` response
+        field masks (biopb/biopb#563).
 
-        The ``with_*`` flags are the ``GetFlightInfo`` response field masks
-        (biopb/biopb#563). This is a *describe* call -- the per-tensor facts, not
-        a read -- so it defaults to returning shape/dtype/dim_labels/chunk_shape,
-        the resolution **pyramid**, and physical_scale, while
-        **skipping the read plan** (``with_read_plan=False`` -- the endpoints are
-        the per-request O(chunks) half a describe discards) and the **heavy OME
-        metadata tree** (``with_metadata=False``, opt-in). Set ``with_metadata=True``
-        for ``metadata_json``; set ``with_pyramid=False`` to skip pyramid sizing
-        when only the bare structure is needed.
+        On an unresolved (cloud / synced-folder) source it raises an error pointing
+        at `resolve_source`. Call `resolve_source` first to read such a source.
 
         Args:
             array_id: Globally-unique tensor id, e.g. ``"zarr_a3f2"`` (single-
@@ -405,6 +383,14 @@ class TensorFlightClient:
                 ``False`` -- opt in when you need it.
             with_pyramid: advertise the resolution pyramid on the descriptor.
                 Default ``True`` (the primary describe consumer reads it).
+            with_upload_status: fill ``upload_status`` for a source backed by
+                an upload. Cheap (an in-memory record read), but off by default
+                like every other optional part.
+            with_residency: ask whether this source's bytes are local right
+                now, answered on ``is_resident``. Off by default: the answer is
+                a bounded stat walk of the source, so ask it for a source you
+                are about to read, never in a loop over a listing
+                (biopb/biopb#1048). Unset on the response means nobody asked.
             with_read_plan: enumerate the per-request chunk endpoints. Default
                 ``False``; a describe discards them, so the plan is skipped.
 
@@ -416,31 +402,34 @@ class TensorFlightClient:
             with_metadata=with_metadata,
             with_pyramid=with_pyramid,
             with_read_plan=with_read_plan,
+            with_residency=with_residency,
+            with_upload_status=with_upload_status,
         )
 
-    def resolve(
+    def resolve_source(
         self,
         source_id: str,
         *,
         on_progress: Optional[Callable[[ResolveProgress], None]] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
-    ) -> DataSourceDescriptor:
-        """Resolve an unresolved source and return its full ``DataSourceDescriptor``.
+    ) -> Dict[str, Any]:
+        """Resolve an unresolved source and return its ``sources`` catalog row.
 
         Note:
             Experimental. Cloud / remote source support (unresolved sources,
-            resolve, and `warm`) is experimental and its behavior may change.
+            resolve_source, and `warm_source`) is experimental and its behavior may change.
+            This returned a ``DataSourceDescriptor`` before biopb/biopb#1032
+            and now returns the row itself -- the same information, without
+            the SDK picking a structure for it.
 
         An *unresolved* source is catalogued by URL only -- its shape/dtype/field
-        list are unknown until first access (it lists with ``data_resident`` False
-        and an empty ``list_sources()[source_id].tensors``). The canonical case is
+        list are unknown until first access (its catalog row has
+        ``is_resolved`` false and an empty ``tensors``). The canonical case is
         a cloud / synced-folder ("Files-On-Demand") source.
 
-        Resolving asks the server to hydrate it. For a dehydrated placeholder this
-        **downloads the whole file** -- a recall that can take minutes, consume
-        local disk, and fail when offline -- then reads its real shape, dtype, and
-        field list. This is the heavyweight, *consenting* operation that catalog
-        browsing (`list_sources` / `query_sources`) deliberately
+        Resolving asks the server to hydrate the files needed to contrsuct a full
+        source -- its real shape, dtype, and field list. This is the heavyweight,
+        *consenting* operation that catalog browsing (`query`) deliberately
         avoids; call it only when you intend to read the data. After it returns,
         `get_tensor` and friends work normally.
 
@@ -455,20 +444,28 @@ class TensorFlightClient:
             should_cancel: Optional predicate polled on each heartbeat; when it
                 returns True the client stops consuming the stream and raises
                 `ResolveCancelled`. The server-side recall continues to
-                completion and is cached, so a later ``resolve`` reuses it.
+                completion and is cached, so a later ``resolve_source`` reuses it.
 
         Returns:
-            The full ``DataSourceDescriptor`` with every tensor/field enumerated
-            -- the complete field set in one call, regardless of catalog size.
+            The source's ``sources`` row, shaped exactly like one element of
+            ``query(..., format="records")`` -- ``SOURCE_ROW_COLUMNS``,
+            with every tensor enumerated under ``tensors``.
+
+            Unlike `warm_source`, which returns a *status* because residency is
+            not a durable catalog fact (biopb/biopb#1035) and its file counts
+            exist nowhere else, this returns the *result*: resolving is defined
+            by what it writes to the row. The recall's elapsed time and target
+            size ride ``on_progress`` instead -- both are things a caller can
+            already measure or derive, where `warm_source`'s counts are not.
 
         Raises:
             ResolveCancelled: if ``should_cancel`` asked to stop mid-resolve.
         """
-        return self._catalog.resolve(
+        return self._catalog.resolve_source(
             source_id, on_progress=on_progress, should_cancel=should_cancel
         )
 
-    def warm(
+    def warm_source(
         self,
         source_id: str,
         *,
@@ -478,22 +475,24 @@ class TensorFlightClient:
         """Hydrate-ahead: recall a resolved source's member files on the server.
 
         Note:
-            Experimental. Cloud / remote source support (`resolve` and this hydrate-
-            ahead path) is experimental and its behavior may change.
+            Experimental. Cloud / remote source support (`resolve_source` and
+            this hydrate-ahead path) is experimental and its behavior may change.
 
-        `resolve` populates a source's *metadata* but, for a multi-file
+        `resolve_source` populates a source's *metadata* but, for a multi-file
         cloud source (zarr / ome-zarr / ndtiff / tiff-sequence / micromanager),
         leaves the bulk pixel data dehydrated -- each member file then recalls
         one-at-a-time, slowly, the first time a read touches it (the viewer
-        scrubbing planes is the worst case). ``warm`` opts into pulling them all
-        resident up front so later reads never stall.
+        scrubbing planes is the worst case). ``warm_source`` opts into pulling
+        them all resident up front so later reads never stall.
 
         The recall happens **entirely server-side** (the server walks the source
         directory and reads each file to force the sync engine's recall); no
         pixels cross the wire, only progress. It is idempotent -- already-resident
-        files are cheap local reads -- so a ``warm`` re-run after a cancel simply
-        finishes the remainder. Only meaningful for multi-file sources; a
-        single-file source returns immediately (resolve already recalled it).
+        files are cheap local reads -- so a ``warm_source`` re-run after a cancel
+        simply finishes the remainder. Only meaningful for multi-file sources; a
+        single-file source returns immediately (resolve already recalled it), and
+        a remote-url source (an object store, or a ``grpc://`` mirror) raises --
+        nothing on the serving machine can be made resident.
 
         Args:
             source_id: The (already-resolved) source to warm.
@@ -507,24 +506,27 @@ class TensorFlightClient:
 
         Returns:
             The terminal ``WarmProgress`` snapshot (``files_done`` /
-            ``bytes_done`` reflect what was made resident; on a no-op source
-            ``files_total == 0``).
+            ``bytes_done`` reflect what was made resident). ``files_total == 0``
+            means the source was local and had nothing to warm -- how a client
+            learns it is single-file. It never means "not applicable"; that
+            case raises (biopb/biopb#1035).
 
         Raises:
             ResolveCancelled: if ``should_cancel`` asked to stop mid-warm.
             RuntimeError: if the server predates the ``warm`` action (too old for
                 hydrate-ahead), or closes the stream without a terminal status.
+            FlightServerError: if the source's url is remote. Warm it on the
+                server that holds the data.
         """
-        return self._catalog.warm(
+        return self._catalog.warm_source(
             source_id, on_progress=on_progress, should_cancel=should_cancel
         )
 
-    def add_source(
+    def register_local_path(
         self,
         url: str,
         *,
         source_type: str = "",
-        dim_labels: Optional[List[str]] = None,
         on_progress: Optional[Callable[[AddSourceProgress], None]] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
     ) -> AddSourceResult:
@@ -536,7 +538,7 @@ class TensorFlightClient:
         adapter -> catalog pipeline the directory watcher uses. A dropped
         directory that is not itself a dataset is walked recursively and may
         register several sources, so the action streams progress and a final
-        tally rather than returning a single descriptor.
+        tally rather than returning a single source.
 
         The path must exist on the server. Because a dropped directory's walk has
         no known size up front, there is no percentage -- progress is a running
@@ -546,19 +548,29 @@ class TensorFlightClient:
             url: Absolute path (or directory) on the server's filesystem.
             source_type: Explicit adapter type (e.g. ``"zarr"``, ``"ome-zarr"``);
                 empty means auto-detect via the adapters' claim protocol.
-            dim_labels: Optional dimension labels for the registered tensor(s).
             on_progress: Optional callback invoked with an ``AddSourceProgress``
-                (count + current path + last descriptor) per source as it
-                registers. Called on the calling thread; keep it cheap.
+                (count + current path) per source as it registers. Called on the
+                calling thread; keep it cheap.
             should_cancel: Optional predicate polled per message; when it returns
                 True the client closes the stream, which the server observes and
                 stops discovery -- sources already registered stay registered.
 
         Returns:
-            The terminal ``AddSourceResult`` (``added`` descriptors,
-            ``already_present`` source_ids, ``failed`` ``(path, reason)`` pairs).
-            A directory dropped above the large-scan threshold comes back as a
-            ``failed`` entry, not a special flag.
+            The terminal ``AddSourceResult``: ``added`` / ``already_present`` /
+            ``refreshed`` / ``removed`` source_ids, and ``failed``
+            ``(path, reason)`` pairs. A directory dropped above the large-scan
+            threshold comes back as a ``failed`` entry, not a special flag.
+            Registration wrote each source's catalog row, so anything beyond the
+            ids is one `query` away.
+
+            Re-adding a path that is already registered REBUILDS it against the
+            file as it is now -- that is what ``refreshed`` reports, and it is
+            how a source picks up an in-place edit, since both its descriptor
+            and the content_version that namespaces the chunk cache are sampled
+            when its adapter is built. ``refreshed`` is a subset of
+            ``already_present``, which keeps its original meaning. Registered
+            sources under the path whose files are gone are deregistered and
+            listed in ``removed``.
 
         Raises:
             flight.FlightServerError: whole-request failure (path not found /
@@ -566,18 +578,46 @@ class TensorFlightClient:
             RuntimeError: the server predates the ``add_source`` action, or
                 closed the stream without a terminal result.
         """
-        return self._catalog.add_source(
+        return self._catalog.register_local_path(
             url,
             source_type=source_type,
-            dim_labels=dim_labels,
             on_progress=on_progress,
             should_cancel=should_cancel,
         )
 
-    def remove_source(self, root_url: str) -> RemoveSourceResult:
+    def add_source(
+        self,
+        url: str,
+        *,
+        source_type: str = "",
+        on_progress: Optional[Callable[[AddSourceProgress], None]] = None,
+        should_cancel: Optional[Callable[[], bool]] = None,
+    ) -> AddSourceResult:
+        """Deprecated alias for :meth:`register_local_path`.
+
+        .. deprecated::
+            Use :meth:`register_local_path`. Same signature, same behavior --
+            ``add_source`` read fine before the client had other kinds of
+            sources to add (an upload, a resolved cloud source); it no longer
+            says what's actually being added.
+        """
+        warnings.warn(
+            "TensorFlightClient.add_source() is deprecated; use "
+            "register_local_path() instead (same signature).",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.register_local_path(
+            url,
+            source_type=source_type,
+            on_progress=on_progress,
+            should_cancel=should_cancel,
+        )
+
+    def deregister_local_path(self, root_url: str) -> RemoveSourceResult:
         """Deregister a drag-dropped source branch on the SERVER at runtime.
 
-        The narrow counterpart to `add_source`: it removes ONLY
+        The narrow counterpart to `register_local_path`: it removes ONLY
         drag-dropped sources, which the server identifies by the ``dnd://``
         origin scheme on their catalog ``source_url``. ``root_url`` is such a
         branch root (a ``dnd://...`` value); every source at or under it is
@@ -597,21 +637,135 @@ class TensorFlightClient:
             RuntimeError: the server predates the ``remove_source`` action, or
                 returned no result.
         """
-        return self._catalog.remove_source(root_url)
+        return self._catalog.deregister_local_path(root_url)
 
-    # ---- Reads (delegated to ChunkFetcher) ----
+    def remove_source(self, root_url: str) -> RemoveSourceResult:
+        """Deprecated alias for :meth:`deregister_local_path`.
 
-    def _get_tensor_context(
+        .. deprecated::
+            Use :meth:`deregister_local_path`. Same signature, same behavior.
+        """
+        warnings.warn(
+            "TensorFlightClient.remove_source() is deprecated; use "
+            "deregister_local_path() instead (same signature).",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.deregister_local_path(root_url)
+
+    # ---- label sets ----
+
+    def get_label_sets(self, image_array_id: str) -> List[str]:
+        """The ``array_id``s of the label sets served under an image.
+
+        A label set is an ordinary tensor of its image, named
+        ``<image array_id>/@labels/<name>``, so this is a catalog query over
+        the path and nothing more -- ``get_tensor`` / ``get_descriptor`` read
+        one like any other tensor. A set's descriptor carries an NGFF
+        ``image-label`` block in its ``metadata_json``, whose ``source.image``
+        names this image.
+
+        Args:
+            image_array_id: The image's ``array_id`` (``"src_ab12"``, or
+                ``"src_ab12/Image:0"`` on a multi-tensor source).
+
+        Returns:
+            The sets' ``array_id``s, sorted. Empty when the image has none.
+        """
+        return self._catalog.get_label_sets(image_array_id)
+
+    # ---- ROI annotations ----
+
+    def list_rois(self, array_id: str, set_name: str = "") -> RoiListResult:
+        """Fetch a tensor's ROI annotations.
+
+        There is no plane or bbox filter: a client hit-tests and re-renders
+        from the resident set. Annotations are private data, gated by the
+        tensor's source like its pixels, so they are not on the SQL surface.
+
+        Args:
+            array_id: Unversioned array_id of the tensor.
+            set_name: Restrict to one layer, and the only way to read a
+                reserved (``@``) set. Empty means the client-owned sets.
+
+        Returns:
+            ``RoiListResult`` with ``rois``, a ``truncated`` flag, and ``sets``
+            -- every set on the tensor with its stored row count, whatever
+            ``rois`` covers.
+
+        Raises:
+            flight.FlightUnavailableError: annotations disabled, or no metadata DB.
+        """
+        return self._catalog.list_rois(array_id, set_name)
+
+    def put_rois(
         self,
         array_id: str,
-        slice_hint: Optional[Tuple[slice, ...]] = None,
-        scale_hint: Optional[Sequence[int]] = None,
-        reduction_method: Optional[str] = None,
-    ) -> _TensorContext:
-        """See :meth:`ChunkFetcher._get_tensor_context`."""
-        return self._fetcher._get_tensor_context(
-            array_id, slice_hint, scale_hint, reduction_method
-        )
+        rois: Sequence[RoiAnnotation],
+        *,
+        check_rev: bool = False,
+    ) -> RoiPutResult:
+        """Create or update ROI annotations on a tensor, as one batch.
+
+        Geometry is ``biopb.image.ROI`` in LEVEL-0 pixel coordinates -- a shape
+        drawn on a downsampled level must be scaled up by the caller. Only the
+        2-D vector arms are accepted (point / rectangle / ellipse / polygon /
+        polyline -- the scribble stroke, whose ``width`` is geometry and widens
+        its bounding box); a mask or mesh is refused, because instance
+        segmentation belongs in a label tensor.
+
+        An annotation with an empty ``roi_id`` is created (the server mints a
+        uuid4); one that names an existing id is updated. The batch is applied
+        in a single transaction.
+
+        Args:
+            array_id: Unversioned array_id every annotation belongs to.
+            rois: The annotations to store.
+            check_rev: Make each write conditional on ``rev`` matching what is
+                stored. Mismatches come back in ``conflicts`` and are not
+                applied; the rest of the batch still lands. Default is last
+                writer wins.
+
+        Returns:
+            ``RoiPutResult`` with ``stored`` (server-assigned roi_id / rev /
+            timestamps) and ``conflicts``.
+
+        Raises:
+            flight.FlightServerError: rejected geometry, a mismatched array_id,
+                or the per-tensor cap would be breached.
+        """
+        return self._catalog.put_rois(array_id, rois, check_rev=check_rev)
+
+    def delete_rois(
+        self,
+        array_id: str,
+        roi_ids: Sequence[str] = (),
+        set_name: str = "",
+    ) -> RoiDeleteResult:
+        """Delete ROI annotations.
+
+        With ``roi_ids``, deletes exactly those. Without, deletes every
+        annotation on the tensor -- narrowed to ``set_name`` when given, which
+        is how a whole layer is dropped.
+
+        Returns:
+            ``RoiDeleteResult.deleted`` -- the ids actually removed.
+        """
+        return self._catalog.delete_rois(array_id, roi_ids, set_name)
+
+    def prune_rois(self, unseen_days: int, *, apply: bool = False) -> RoiPruneResult:
+        """Report, and with ``apply`` delete, annotations whose image is gone.
+
+        An annotation is unseen when the catalog has not held its source for
+        ``unseen_days`` (a row whose source never appeared counts from its
+        creation). Reserved, server-owned sets are never pruned. Grouped per
+        tensor in ``unseen``; ``deleted`` is the row count removed, 0 on a
+        report. Requires the server-wide token: orphans have no source to
+        authorize against.
+        """
+        return self._catalog.prune_rois(unseen_days, apply=apply)
+
+    # ---- Reads (delegated to ChunkFetcher) ----
 
     def get_tensor(
         self,
@@ -619,8 +773,16 @@ class TensorFlightClient:
         slice_hint: Optional[Tuple[slice, ...]] = None,
         scale_hint: Optional[Sequence[int]] = None,
         reduction_method: Optional[str] = None,
-    ) -> da.Array:
-        """Get a lazy dask array for a tensor, addressed by its array_id.
+        *,
+        output: str = "da",  # noqa: A002 - public, documented keyword API (mirrors `query`'s `format`)
+        export_location: Optional[str] = None,
+    ) -> Union[da.Array, SerializedTensor]:
+        """Plan a read of a tensor, addressed by its array_id.
+
+        One ``GetFlightInfo`` either way; ``output`` picks what you get back,
+        so the two forms can never drift apart on ``array_id`` /
+        ``slice_hint`` / ``scale_hint`` / ``reduction_method`` semantics the
+        way two separate methods eventually would.
 
         Args:
             array_id: Globally-unique tensor id (identity policy) -- e.g.
@@ -629,16 +791,47 @@ class TensorFlightClient:
             slice_hint: Optional slice tuple to filter chunks
             scale_hint: Optional per-dimension integer downsampling factors
             reduction_method: Optional dynamic reduction method for scaled reads
+            output: Shape of the returned result:
+
+                - ``"da"`` (default) -- a lazy ``dask.array``, read in this
+                  process.
+                - ``"pb"`` -- a ``SerializedTensor`` protobuf: the same planned
+                  read (a serialized Arrow ``FlightInfo``) plus this
+                  connection's location and token, for a *different* process.
+                  Serialize it to bytes and broadcast it to worker processes,
+                  where each worker calls ``tensor_from_pb()`` to reconstruct
+                  the lazy dask array.
+            export_location: Address to bake into the result -- the array's
+                per-chunk fetch closures for ``output="da"``, the message's
+                ``location`` for ``output="pb"`` -- instead of the server's
+                advertised ``health.external_location`` (biopb/biopb#1158) or,
+                absent that, this connection's own dial address. A
+                ``"da"`` array is pickle-safe and reconnects lazily wherever
+                it is computed, so this is what a dask worker actually dials
+                too. Set it when neither the server's guess nor your own dial
+                address is reachable from there (e.g. a worker pool behind a
+                second NAT layer the server has no way to know about).
 
         Returns:
-            dask.array with lazy chunk loading
+            A ``dask.array`` (``output="da"``) or a ``SerializedTensor``
+            (``output="pb"``).
 
         Raises:
-            ValueError: If source not found, tensor not found, or a bare
-                multi-tensor source id is given without a within-source field
+            ValueError: If *output* is not one of the supported values, or if
+                source not found, tensor not found, or a bare multi-tensor
+                source id is given without a within-source field.
         """
+        if output not in ("da", "pb"):
+            raise ValueError(
+                f"get_tensor: unknown output {output!r}; expected 'da' or 'pb'"
+            )
         return self._fetcher.get_tensor(
-            array_id, slice_hint, scale_hint, reduction_method
+            array_id,
+            slice_hint,
+            scale_hint,
+            reduction_method,
+            output=output,
+            export_location=export_location,
         )
 
     def get_tensor_pb(
@@ -647,55 +840,55 @@ class TensorFlightClient:
         slice_hint: Optional[Tuple[slice, ...]] = None,
         scale_hint: Optional[Sequence[int]] = None,
         reduction_method: Optional[str] = None,
+        *,
+        export_location: Optional[str] = None,
     ) -> SerializedTensor:
-        """Get a SerializedTensor protobuf for cross-process transfer.
+        """Deprecated alias for :meth:`get_tensor` with ``output="pb"``.
 
-        Returns a protobuf containing connection info and chunk tickets
-        for lazy reconstruction. The protobuf can be serialized to bytes
-        and broadcast to worker processes, where each worker can call
-        tensor_from_pb() to reconstruct a lazy dask array.
-
-        Args:
-            array_id: Globally-unique tensor id (identity policy) -- e.g.
-                ``"zarr_a3f2"`` or ``"aics_7f3/Image:0"``.
-            slice_hint: Optional slice tuple to filter chunks
-            scale_hint: Optional per-dimension integer downsampling factors
-            reduction_method: Optional dynamic reduction method for scaled reads
-
-        Returns:
-            SerializedTensor protobuf object
+        .. deprecated::
+            Use ``get_tensor(..., output="pb")``. Same planned read, same
+            ``SerializedTensor`` result -- a separate method just meant the
+            two could (and did) drift on every other parameter.
         """
-        return self._fetcher.get_tensor_pb(
-            array_id, slice_hint, scale_hint, reduction_method
+        warnings.warn(
+            "TensorFlightClient.get_tensor_pb() is deprecated; use "
+            "get_tensor(..., output='pb') instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.get_tensor(
+            array_id,
+            slice_hint,
+            scale_hint,
+            reduction_method,
+            output="pb",
+            export_location=export_location,
         )
 
-    def _build_dask_array(
-        self,
-        desc: TensorDescriptor,
-        chunks: List[bytes],
-        chunk_bounds: List[ChunkBounds],
-        schema_metadata: Optional[Dict[str, str]] = None,
-    ) -> da.Array:
-        """See :meth:`ChunkFetcher._build_dask_array`."""
-        return self._fetcher._build_dask_array(
-            desc, chunks, chunk_bounds, schema_metadata
-        )
+    @staticmethod
+    def descriptor_from_pb(pb: SerializedTensor) -> TensorDescriptor:
+        """The resolved descriptor a SerializedTensor's plan names, without
+        building the array: shape, dtype, labels, for a reader that only
+        needs to describe what it was handed."""
+        info = flight.FlightInfo.deserialize(pb.flight_info)
+        return TensorDescriptor.FromString(info.descriptor.command)
 
     @staticmethod
     def tensor_from_pb(
         pb: SerializedTensor,
         cache_bytes: Optional[int] = None,
     ) -> da.Array:
-        """Reconstruct a lazy dask array from SerializedTensor protobuf.
+        """The lazy dask array a SerializedTensor describes.
 
-        Creates a dask array that fetches chunks from the Flight server
-        independently. Each worker process maintains its own connection
-        pool and LRU cache keyed by (location, auth_token).
+        The one consumer-side helper: the handle is a FlightInfo plus where and
+        as whom to read it, so this decodes the plan and builds the same
+        chunk-fetching array ``get_tensor`` builds on a live connection. Each
+        worker process maintains its own connection pool and LRU cache keyed
+        by (location, auth_token).
 
-        If endpoints field is empty, calls GetFlightInfo on the server
-        to rebuild the endpoint list.
-
-        If debug_pickled_array is populated, unpickles directly (bypasses server).
+        A handle with no endpoints -- a source declared before its chunks
+        existed -- is planned here with a GetFlightInfo on the embedded
+        descriptor; the crop the producer asked for is kept from the handle.
 
         Args:
             pb: SerializedTensor protobuf object
@@ -707,186 +900,262 @@ class TensorFlightClient:
         Returns:
             dask.array with lazy chunk loading
         """
-        import pickle
-
         if cache_bytes is None:
             cache_bytes = _default_cache_bytes()
-
-        # Debug path: unpickle directly if debug_pickled_array is present
-        if pb.debug_pickled_array:
-            return pickle.loads(pb.debug_pickled_array)
-
-        descriptor = pb.tensor_descriptor
-        shape = tuple(descriptor.shape)
-        dtype = np.dtype(descriptor.dtype)
-
-        # Parse endpoints - if empty, fetch from GetFlightInfo
-        chunks = []
-        chunk_bounds_list = []
-
-        if pb.endpoints:
-            # Use serialized endpoints directly
-            for ep in pb.endpoints:
-                chunks.append(ep.ticket.chunk_id)
-                chunk_bounds_list.append(ep.chunk_bounds)
-        else:
-            # Endpoints not provided - call GetFlightInfo to rebuild
-            logger.debug("tensor_from_pb: endpoints empty, calling GetFlightInfo")
-            chunks, chunk_bounds_list = _fetch_endpoints_via_get_flight_info(pb)
-
-        # Build the block-index -> (chunk_id, bounds) map + grid shape for lazy
-        # chunk fetching (shared with ChunkFetcher._build_dask_array).
-        chunk_map, grid_shape = _chunk_map_from_endpoints(
-            chunks, chunk_bounds_list, shape
-        )
-
-        # Extract schema_metadata from pb for SHM transfer
-        schema_metadata = dict(pb.schema_metadata) if pb.schema_metadata else None
-
-        dask_arr = _build_dask_array_from_chunk_map(
-            chunk_map,
-            grid_shape,
-            shape,
-            dtype,
-            pb.location,
-            pb.auth_token if pb.auth_token else None,
+        token = pb.auth_token or None
+        location = normalize_flight_location(pb.location)
+        info = flight.FlightInfo.deserialize(pb.flight_info)
+        requested = _requested_slice(info)
+        if not info.endpoints:
+            logger.debug("tensor_from_pb: no endpoints, calling GetFlightInfo")
+            info = _refetch_flight_info(
+                TensorDescriptor.FromString(info.descriptor.command), location, token
+            )
+        return _dask_from_flight_info(
+            info,
+            location,
+            token,
             cache_bytes,
-            schema_metadata,
-            resolve_tls_trust(pb.location),
+            resolve_tls_trust(location),
+            requested,
         )
-
-        # Crop to the originally requested region if original_slice_hint present
-        if pb.HasField("original_slice_hint") and descriptor.HasField("slice_hint"):
-            dask_arr = dask_arr[
-                _request_crop_slices(
-                    len(descriptor.shape),
-                    pb.original_slice_hint,
-                    descriptor.slice_hint,
-                    list(descriptor.scale_hint) if descriptor.scale_hint else None,
-                )
-            ]
-
-        return dask_arr
 
     # ====================
     # Upload API (EXPERIMENTAL) -- thin delegators onto the UploadSession
     # collaborator (see biopb.tensor._upload); #278 item C.
     # ====================
 
+    def setup_array_upload(
+        self,
+        array_id: str,
+        template: Any,
+        *,
+        chunk_shape: Optional[Sequence[int]] = None,
+        dim_labels: Optional[Sequence[str]] = None,
+        ome_metadata: Optional[dict] = None,
+        ttl_seconds: Optional[int] = None,
+    ) -> TensorDescriptor:
+        """Declare a tensor to fill: the first half of an upload.
+
+        Note:
+            Experimental. The upload API (tensor creation, chunk upload, and
+            upload-status polling) is experimental and may change.
+
+        **An upload adds a tensor to a source that already exists** and never
+        creates one. A result that belongs to no source of yours goes on the
+        server's scratch source, at the fixed id ``"scratch"`` -- every
+        writable server serves one, so there is nothing to ask for first.
+        Declare, then fill: the returned descriptor is the server's echo --
+        ``array_id``, ``shape``, ``dtype``, ``chunk_shape``, ``dim_labels`` --
+        and is what ``upload_array``, ``upload_chunk`` and
+        ``set_upload_status`` take. ``set_upload_status`` is what publishes the
+        tensor and marks it complete.
+
+        A field is taken while its tensor is served: a second add under it --
+        at any state -- is refused. Only the server's reclaim sweep frees one,
+        after a discarded upload's ``upload_ttl``.
+
+        Args:
+            array_id: ``"<scheme>://<source_id>/@fields/<name>"``, where
+                *scheme* is the store format -- ``zarr`` for an OME-Zarr image
+                group, ``cache`` for the chunks as uploaded -- and *source_id*
+                is a source the server already serves -- one the server
+                discovered, or ``"scratch"``.
+
+                The ``@fields`` segment is not optional. An uploaded tensor
+                keeps its own store beside its source, and the marked segment
+                is what stops its id colliding with one of the file's own
+                tensors -- so a bare ``"<source_id>/<field>"`` is a native
+                tensor id, which only a format mints, and is refused here.
+
+                The one other form is ``"zarr://<image array_id>/@labels/<name>"``,
+                a label set of an image the server already serves. A set is
+                unsigned-integer, spans its image's non-channel axes at full
+                length, and its all-zero chunks are skipped by
+                ``upload_array``.
+
+                The scheme names the store format and nothing else: the
+                answered ``array_id`` carries none.
+            template: Anything with ``.shape`` and ``.dtype`` -- the array to be
+                uploaded, or one shaped like it. A dask array also supplies the
+                chunk grid (its chunk size per axis).
+            chunk_shape: The upload grid, overriding the template's. Required
+                to get anything but one chunk from a non-dask template. A
+                request, not a promise: the server plans on its own grid and
+                answers with it (``chunk_shape`` on the returned descriptor).
+            dim_labels: Optional dimension labels
+            ome_metadata: Ignored except for a label set's ``image-label``
+                block. Metadata is source-scoped: a tensor inherits its
+                source's, and the scratch source has none.
+            ttl_seconds: How long to keep this tensor, in seconds. ``None``
+                asks for no deadline. A source may **cap** the lifetime -- the
+                scratch source caps every upload on it, an unset request
+                included -- so the answer's own ``ttl_seconds`` is what was
+                granted, which may be shorter. Past it the tensor is discarded
+                as if you had discarded it.
+
+        Returns:
+            The new tensor's descriptor, under the ``array_id`` it keeps. Its
+            ``ttl_seconds`` is the lifetime granted, absent for no deadline.
+
+        Raises:
+            pyarrow.flight.FlightServerError: the source is not served here,
+                the field is taken, or the name cannot be a directory on some
+                platform this store may be served from.
+        """
+        return self._upload.setup_array_upload(
+            array_id,
+            template,
+            chunk_shape=chunk_shape,
+            dim_labels=dim_labels,
+            ome_metadata=ome_metadata,
+            ttl_seconds=ttl_seconds,
+        )
+
     def upload_array(
         self,
-        arr: da.Array,
-        source_name: str,
-        chunk_shape: Optional[Sequence[int]] = None,
-        dim_labels: Optional[Sequence[str]] = None,
-        ome_metadata: Optional[dict] = None,
-    ) -> str:
-        """Upload dask array to server.
+        desc: TensorDescriptor,
+        arr: Any,
+        slice_hint: Optional[Tuple[slice, ...]] = None,
+    ) -> Dict[str, Any]:
+        """Fill a declared tensor with an array, and seal it.
 
         Note:
-            Experimental. The upload / writable-source API (source creation, chunk
-            upload, and upload-status polling) is experimental and may change.
+            Experimental. The upload / writable-source API (tensor creation,
+            chunk upload, and upload-status polling) is experimental and may
+            change.
+
+        *arr* must match the descriptor's shape and dtype. One
+        ``GetFlightInfo`` plans the write; *arr* is rechunked onto the grid the
+        plan came back with, every block is sent as the chunk its ticket names,
+        and the tensor is published. A numpy array is accepted and chunked the
+        same way.
+
+        With a *slice_hint* only that region is planned and uploaded, and the
+        tensor is **not** published -- a partial upload cannot know it is done,
+        so the caller says so with ``set_upload_status``. The region is in the
+        tensor's own coordinates, which are *arr*'s: *arr* still carries the
+        declared shape and the region is read out of it. The server snaps the
+        region outward to its chunk grid, so a little more than was asked for
+        may be written.
 
         Args:
-            arr: Dask array to upload
-            source_name: Source identifier format:
-                - "cache:my-name" → cache-backed (ephemeral)
-                - "cache:" → cache-backed with server-generated name
-                - "ome_zarr:my-name" → zarr-backed (persistent)
-                - "ome_zarr:" → zarr-backed with server-generated name
-            chunk_shape: Override chunk shape. If None, uses arr.chunksize with
-                         automatic rechunking if chunks are non-uniform.
-            dim_labels: Optional dimension labels
-            ome_metadata: Optional OME metadata dict
+            desc: The descriptor ``setup_array_upload`` returned
+            arr: The array to upload (dask or numpy)
+            slice_hint: Optional region to upload, as a slice per axis. An
+                open-ended ``stop`` is filled from the declared shape.
 
         Returns:
-            source_id of created source (e.g., "cache_abc123" or "ome_zarr_def456")
+            The upload status, as ``get_upload_status`` reports it: sealed
+            without a *slice_hint*, still PENDING with one.
+
+        Raises:
+            ValueError: *arr* does not match the declared shape or dtype, or
+                the region is empty.
+            UploadRefused: the upload is over -- sealed or discarded.
         """
-        return self._upload.upload_array(
-            arr, source_name, chunk_shape, dim_labels, ome_metadata
-        )
-
-    def upload_zarr(
-        self,
-        zarr_path: str,
-        source_name: str,
-        chunk_shape: Optional[Sequence[int]] = None,
-        dim_labels: Optional[Sequence[str]] = None,
-        ome_metadata: Optional[dict] = None,
-    ) -> str:
-        """Upload local zarr to server.
-
-        Note:
-            Experimental. The upload / writable-source API (source creation, chunk
-            upload, and upload-status polling) is experimental and may change.
-
-        Args:
-            zarr_path: Path to local zarr directory
-            source_name: Source identifier format:
-                - "cache:my-name" → cache-backed (ephemeral)
-                - "cache:" → cache-backed with server-generated name
-                - "ome_zarr:my-name" → zarr-backed (persistent)
-                - "ome_zarr:" → zarr-backed with server-generated name
-            chunk_shape: Override chunk shape. If None, uses zarr's chunk shape.
-            dim_labels: Optional dimension labels (read from zarr if not provided)
-            ome_metadata: Optional OME metadata (read from zarr if not provided)
-
-        Returns:
-            source_id of created source (e.g., "cache_abc123" or "ome_zarr_def456")
-        """
-        return self._upload.upload_zarr(
-            zarr_path, source_name, chunk_shape, dim_labels, ome_metadata
-        )
-
-    def create_source(
-        self,
-        source_name: str,
-        shape: Sequence[int],
-        dtype: str,
-        chunk_shape: Sequence[int],
-        dim_labels: Optional[Sequence[str]] = None,
-        ome_metadata: Optional[dict] = None,
-    ) -> str:
-        """Create source on server (internal).
-
-        Note:
-            Experimental. The upload / writable-source API (source creation, chunk
-            upload, and upload-status polling) is experimental and may change.
-
-        Args:
-            source_name: "cache:name" → cache-backed; "ome_zarr:name" → zarr-backed
-                         "cache:" or "ome_zarr:" → server-generated name
-            shape: Array shape
-            dtype: Data type string (numpy format)
-            chunk_shape: Chunk size per dimension
-            dim_labels: Optional dimension labels
-            ome_metadata: Optional OME metadata dict
-
-        Returns:
-            source_id assigned by server
-        """
-        return self._upload.create_source(
-            source_name, shape, dtype, chunk_shape, dim_labels, ome_metadata
-        )
+        return self._upload.upload_array(desc, arr, slice_hint)
 
     def upload_chunk(
         self,
-        source_id: str,
+        desc: TensorDescriptor,
         bounds: ChunkBounds,
         data: np.ndarray,
     ) -> None:
-        """Upload single chunk (internal).
+        """Upload one chunk of a declared tensor.
+
+        Note:
+            Experimental. The upload / writable-source API (tensor creation,
+            chunk upload, and upload-status polling) is experimental and may
+            change.
+
+        The manual half of ``upload_array``: a caller writing chunks itself
+        calls this per chunk and ``set_upload_status`` when done.
+
+        *bounds* must be one whole chunk of the server's grid. The call plans
+        that one chunk first (``GetFlightInfo`` with the region and nothing
+        else, a sub-millisecond round trip on localhost), so bounds that are
+        not a chunk are refused here, naming what the grid snapped them to,
+        rather than written somewhere no read asks for.
+
+        Args:
+            desc: The descriptor ``setup_array_upload`` returned
+            bounds: Chunk start/stop coordinates
+            data: Numpy array with chunk data
+
+        Raises:
+            ValueError: *bounds* is not one chunk of this tensor's grid.
+            UploadRefused: the upload is over -- sealed or discarded.
+        """
+        self._upload.upload_chunk(desc, bounds, data)
+
+    def get_upload_status(self, array_id: str) -> Dict[str, Any]:
+        """Get upload status for a writable tensor.
 
         Note:
             Experimental. The upload / writable-source API (source creation, chunk
             upload, and upload-status polling) is experimental and may change.
 
         Args:
-            source_id: Source identifier
-            bounds: Chunk start/stop coordinates
-            data: Numpy array with chunk data
+            array_id: The ``array_id`` of the descriptor ``setup_array_upload`` returned
+
+        Returns:
+            Dictionary with ``source_id`` (the ``array_id`` passed in -- the key
+            name mirrors the server's own status dict shape), ``state``,
+            ``expected_chunks``, and ``uploaded_chunks``.
         """
-        self._upload.upload_chunk(source_id, bounds, data)
+        return self._catalog.get_upload_status(array_id)
+
+    def set_upload_status(
+        self,
+        target: Union[TensorDescriptor, str],
+        state: Union[str, int],
+        reason: str = "",
+    ) -> Dict[str, Any]:
+        """Move an upload along its lifecycle; the only thing that moves one.
+
+        Note:
+            Experimental. The upload / writable-source API (tensor creation,
+            chunk upload, and upload-status polling) is experimental and may
+            change.
+
+        The states form a ladder, and a call climbs it or stands still:
+
+        - ``"READY"`` -- **publish and seal**. The source becomes readable, a
+          chunk that was never uploaded reads back as zeros, and no further
+          chunk is accepted, so what is there is final. This is the state a
+          consumer waiting on a result polls for, and what ``upload_array``
+          sets for you.
+        - ``"DISCARDED"`` -- **give up**, from any of the above. Whatever the
+          server minted goes with it: an ``ome_zarr:`` store, a label set's
+          sidecar and its listing. This is how an uploaded label set is
+          deleted; the name frees after the server's reclaim sweep, like any
+          other discarded upload's.
+
+        Setting the state the upload is already in is a no-op; moving back down
+        the ladder is refused.
+
+        Args:
+            target: The descriptor ``setup_array_upload`` returned, or an
+                ``array_id`` -- a label set's, as ``label_sets`` reports it.
+            state: ``"READY"`` or ``"DISCARDED"``.
+            reason: Why, for ``"DISCARDED"``. It is what a poller waiting on
+                this result reads back, so write it for them.
+
+        Returns:
+            The resulting upload status, as ``get_upload_status`` reports it.
+            ``DISCARDED`` is total -- an id tracking no upload answers
+            ``UNKNOWN`` rather than raising, so it is a statement about the end
+            state, not a receipt.
+
+        Raises:
+            UploadRefused: the upload was discarded, so it cannot be moved.
+            pyarrow.flight.FlightServerError: the move is backwards, or the id
+                names no upload in progress.
+        """
+        return self._upload.set_upload_status(target, state, reason)
+
+    # ====================
 
     def close(self):
         """Close the Flight client."""
@@ -905,7 +1174,10 @@ class TensorFlightClient:
                 use the freshness fields below to tell whether indexing is
                 still in progress.
             - `source_count`: Number of registered sources
-            - `metadata_db_enabled`: Whether metadata database is enabled
+            - `metadata_db_enabled`: Whether the server offers a catalog.
+                False means it serves its sources by id alone and every
+                catalog surface (list_sources, query, resolve_source,
+                annotations) refuses
             - `writable`: Whether server accepts uploads
             - `uptime_seconds`: Server uptime in seconds
             - `full_scan_in_progress`: Whether a full catalog rescan is
@@ -918,7 +1190,14 @@ class TensorFlightClient:
             FlightError: If server is unreachable or action fails
         """
         action = flight.Action("health", b"")
-        results = self._client.do_action(action, options=self._call_options)
+        try:
+            results = self._client.do_action(action, options=self._call_options)
+        except flight.FlightUnavailableError as exc:
+            # The reachability probe every caller starts from, so the one place
+            # an opaque handshake failure most needs its reason (biopb#1116).
+            raise _explain_handshake_failure(
+                exc, self._location, self._tls_trust
+            ) from exc
         for result in results:
             return json.loads(result.body.to_pybytes())
         return {"status": "UNKNOWN"}
@@ -940,92 +1219,6 @@ class TensorFlightClient:
         for result in results:
             return json.loads(result.body.to_pybytes())
         return {}
-
-    def get_upload_status(self, source_id: str) -> Dict[str, Any]:
-        """Get upload status for a writable source.
-
-        Note:
-            Experimental. The upload / writable-source API (source creation, chunk
-            upload, and upload-status polling) is experimental and may change.
-
-        Args:
-            source_id: Source identifier returned by create_source()
-
-        Returns:
-            Dictionary with source_id, state, expected_chunks, and uploaded_chunks.
-        """
-        return self._upload.get_upload_status(source_id)
-
-    def get_upload_status_pb(self, pb: SerializedTensor) -> Dict[str, Any]:
-        """Get upload status for a registration-first SerializedTensor handle.
-
-        Note:
-            Experimental. The upload / writable-source API (source creation, chunk
-            upload, and upload-status polling) is experimental and may change.
-
-        This helper is intended for cache-backed handles returned before upload
-        completion, where tensor_descriptor.array_id is the source identifier.
-
-        Args:
-            pb: SerializedTensor handle returned by a registration-first flow.
-
-        Returns:
-            Dictionary with source_id, state, expected_chunks, and uploaded_chunks.
-        """
-        return self._upload.get_upload_status_pb(pb)
-
-    def wait_for_upload_ready(
-        self,
-        source_id: str,
-        timeout_seconds: float = 60.0,
-        poll_interval_seconds: float = 0.5,
-    ) -> Dict[str, Any]:
-        """Poll upload status until the source reports READY.
-
-        Note:
-            Experimental. The upload / writable-source API (source creation, chunk
-            upload, and upload-status polling) is experimental and may change.
-
-        Applies only to sources created by ``create_source()`` /
-        ``upload_array()``. A source the server tracks no upload for reports
-        UNKNOWN, and that is rejected on the first poll rather than waited out:
-        either the source was never an upload target (a catalog source, on disk
-        or in the cloud, has no upload to wait for), or its record was dropped
-        when the source was removed or the server restarted. Neither reading
-        resolves by polling.
-
-        Args:
-            source_id: Source identifier returned by create_source().
-            timeout_seconds: Maximum time to wait before timing out.
-            poll_interval_seconds: Delay between status checks.
-
-        Returns:
-            Final upload status dictionary when READY.
-
-        Raises:
-            ValueError: If the server tracks no upload for the source (UNKNOWN).
-            TimeoutError: If the upload does not reach READY within the timeout.
-            RuntimeError: If the upload reports FAILED.
-        """
-        return self._upload.wait_for_upload_ready(
-            source_id, timeout_seconds, poll_interval_seconds
-        )
-
-    def wait_for_upload_ready_pb(
-        self,
-        pb: SerializedTensor,
-        timeout_seconds: float = 60.0,
-        poll_interval_seconds: float = 0.5,
-    ) -> Dict[str, Any]:
-        """Poll upload status until a registration-first SerializedTensor is READY.
-
-        Note:
-            Experimental. The upload / writable-source API (source creation, chunk
-            upload, and upload-status polling) is experimental and may change.
-        """
-        return self._upload.wait_for_upload_ready_pb(
-            pb, timeout_seconds, poll_interval_seconds
-        )
 
     def cache_info(self) -> Dict:
         """Return cache statistics for this connection.

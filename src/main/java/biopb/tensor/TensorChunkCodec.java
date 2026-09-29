@@ -2,13 +2,20 @@ package biopb.tensor;
 
 import java.util.List;
 
+import org.apache.arrow.flight.FlightInfo;
+
 import com.google.protobuf.InvalidProtocolBufferException;
 
 import net.imglib2.RandomAccess;
 import net.imglib2.type.NativeType;
 import net.imglib2.type.numeric.RealType;
+import net.imglib2.type.numeric.integer.ByteType;
+import net.imglib2.type.numeric.integer.IntType;
+import net.imglib2.type.numeric.integer.LongType;
+import net.imglib2.type.numeric.integer.ShortType;
 import net.imglib2.type.numeric.integer.UnsignedByteType;
 import net.imglib2.type.numeric.integer.UnsignedIntType;
+import net.imglib2.type.numeric.integer.UnsignedLongType;
 import net.imglib2.type.numeric.integer.UnsignedShortType;
 import net.imglib2.type.numeric.real.DoubleType;
 import net.imglib2.type.numeric.real.FloatType;
@@ -65,68 +72,108 @@ final class TensorChunkCodec {
         return elements * bytesPerElement(descriptor.getDtype());
     }
 
+    /**
+     * A numpy dtype string reduced to kind+size, with the byte-order mark and
+     * the spelled-out aliases folded away ({@code "<u2"}, {@code "u2"} and
+     * {@code "uint16"} are one dtype).
+     */
+    static String normalizeDtype(String dtype) {
+        String text = dtype == null ? "" : dtype.trim().toLowerCase();
+        if (!text.isEmpty()) {
+            char first = text.charAt(0);
+            if (first == '<' || first == '>' || first == '|' || first == '=') {
+                text = text.substring(1);
+            }
+        }
+        switch (text) {
+            case "uint8": return "u1";
+            case "int8": return "i1";
+            case "uint16": return "u2";
+            case "int16": return "i2";
+            case "uint32": return "u4";
+            case "int32": return "i4";
+            case "uint64": return "u8";
+            case "int64": return "i8";
+            case "float16": return "f2";
+            case "float32": return "f4";
+            case "float64": return "f8";
+            default: return text;
+        }
+    }
+
     /** Bytes per element for a numpy dtype string; unknown dtypes assume 4 (float32). */
     static int bytesPerElement(String dtype) {
-        String normalized = dtype == null ? "" : dtype.trim().toLowerCase();
-        switch (normalized) {
+        switch (normalizeDtype(dtype)) {
             case "u1":
-            case "uint8":
-            case "|u1":
+            case "i1":
                 return 1;
-            case "<u2":
-            case ">u2":
             case "u2":
-            case "uint16":
+            case "i2":
+            case "f2":
                 return 2;
-            case "<u4":
-            case ">u4":
-            case "u4":
-            case "uint32":
-            case "<f4":
-            case ">f4":
-            case "f4":
-            case "float32":
-                return 4;
-            case "<f8":
-            case ">f8":
+            case "u8":
+            case "i8":
             case "f8":
-            case "float64":
                 return 8;
+            case "u4":
+            case "i4":
+            case "f4":
             default:
                 return 4;
         }
     }
 
-    /** imglib2 type for a numpy dtype string; unknown dtypes fall back to float32. */
+    /**
+     * imglib2 type for a numpy dtype string; unknown dtypes fall back to float32.
+     *
+     * <p>Every dtype {@code TensorUploads.numpyDtype} can declare is named
+     * here. The two must stay in step: a tensor uploaded as {@code <i4} and
+     * read back as a {@link FloatType} loses every id above 2^24, silently --
+     * which is exactly the case a label set is (biopb/biopb#1059).
+     *
+     * <p>The type is right; the values reaching it are not yet. {@link
+     * ChunkDecoder} still decodes to {@code double[]} and {@link #writeChunk}
+     * still scatters with {@code setReal}, so {@code i8}/{@code u8} lose the
+     * same way above 2^53 -- biopb/biopb#1071.
+     */
     static NativeType<?> createType(String dtype) {
-        String normalized = dtype == null ? "" : dtype.trim().toLowerCase();
-        switch (normalized) {
+        switch (normalizeDtype(dtype)) {
             case "u1":
-            case "uint8":
-            case "|u1":
                 return new UnsignedByteType();
-            case "<u2":
-            case ">u2":
+            case "i1":
+                return new ByteType();
             case "u2":
-            case "uint16":
                 return new UnsignedShortType();
-            case "<u4":
-            case ">u4":
+            case "i2":
+                return new ShortType();
             case "u4":
-            case "uint32":
                 return new UnsignedIntType();
-            case "<f8":
-            case ">f8":
+            case "i4":
+                return new IntType();
+            case "u8":
+                return new UnsignedLongType();
+            case "i8":
+                return new LongType();
             case "f8":
-            case "float64":
                 return new DoubleType();
-            case "<f4":
-            case ">f4":
             case "f4":
-            case "float32":
             default:
                 return new FloatType();
         }
+    }
+
+    /** Parse a {@link TensorDescriptor} from a Flight command's bytes. */
+    static TensorDescriptor parseDescriptor(byte[] bytes) {
+        try {
+            return TensorDescriptor.parseFrom(bytes);
+        } catch (InvalidProtocolBufferException e) {
+            throw new IllegalStateException("Failed to parse TensorDescriptor", e);
+        }
+    }
+
+    /** The realized descriptor a read plan carries in its Flight descriptor. */
+    static TensorDescriptor descriptorOf(FlightInfo plan) {
+        return parseDescriptor(plan.getDescriptor().getCommand());
     }
 
     /** Parse a {@link TensorTicket} from an endpoint ticket's bytes. */
@@ -176,20 +223,42 @@ final class TensorChunkCodec {
         long[] localPosition = new long[chunkShape.length];
         long[] globalPosition = new long[chunkShape.length];
         for (int index = 0; index < values.length; index++) {
-            rowMajorPosition(index, chunkShape, localPosition);
             for (int axis = 0; axis < chunkShape.length; axis++) {
                 globalPosition[axis] = start[axis] + localPosition[axis];
             }
             access.setPosition(globalPosition);
             access.get().setReal(values[index]);
+            advanceRowMajor(localPosition, chunkShape);
         }
     }
 
-    private static void rowMajorPosition(int index, long[] shape, long[] position) {
+    /**
+     * The row-major (C-order) position of {@code index} in a block of
+     * {@code shape}: the last axis varies fastest, which is the order every
+     * chunk payload is laid out in, read or written.
+     */
+    static void rowMajorPosition(long index, long[] shape, long[] position) {
         long remaining = index;
         for (int axis = shape.length - 1; axis >= 0; axis--) {
             position[axis] = remaining % shape[axis];
             remaining /= shape[axis];
+        }
+    }
+
+    /**
+     * Step {@code position} to the next row-major coordinate in {@code shape}.
+     *
+     * <p>The odometer form of {@link #rowMajorPosition}, for walking a whole
+     * block: one increment per element instead of one division per axis per
+     * element. On a multi-million-element chunk those divisions are a dependent
+     * chain and cost more than everything else the walk does.
+     */
+    static void advanceRowMajor(long[] position, long[] shape) {
+        for (int axis = shape.length - 1; axis >= 0; axis--) {
+            if (++position[axis] < shape[axis]) {
+                return;
+            }
+            position[axis] = 0;
         }
     }
 }

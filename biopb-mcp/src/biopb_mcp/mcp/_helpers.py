@@ -1,7 +1,8 @@
 """Helper functions injected into the execute_code namespace.
 
-``add_tensor`` is monkey-patched onto the viewer instance so the agent
-calls ``viewer.add_tensor("array_id")``.
+``add_tensor`` and ``tensor`` are monkey-patched onto the viewer instance so
+the agent calls ``viewer.add_tensor("array_id")`` to put a tensor on the viewer
+and ``viewer.tensor(layer)`` to read one back off it.
 """
 
 import logging
@@ -126,12 +127,44 @@ def resync_view_for_capture(viewer, timeout: float = 30.0) -> None:
         logger.debug("resync_view_for_capture failed", exc_info=True)
 
 
-def patch_viewer_add_tensor(viewer, connection, compute_scheduler=None):
-    """Monkey-patch ``add_tensor`` onto *viewer*, reading client/sources from
-    the live ``TensorConnection`` *connection*.
+def _layer_own_array(layer):
+    """A layer's own pixels as one array, with the viewer's packaging removed.
+
+    Resolves the multiscale branch (level 0) and unwraps the ``_ViewerArray``
+    proxy, so what comes back is the array that was handed to ``add_image`` --
+    a dask array wherever the layer is backed by one. Duck-typed so it also
+    works on a layer built from a plain numpy array, which has no proxy to
+    unwrap.
+    """
+    data = layer.data
+    if getattr(layer, "multiscale", False):
+        data = data[0]  # MultiScaleData: level 0, not plane 0 (biopb/biopb#973)
+    unwrap = getattr(data, "unwrap", None)
+    return unwrap() if callable(unwrap) else data
+
+
+def _source_row(client, source_id: str) -> dict | None:
+    """The catalog row of *source_id* (``source_url``, ``tensors``), or None."""
+    from biopb.tensor._catalog_rows import sql_literal
+
+    rows = client.query(
+        "SELECT source_url, tensors FROM sources "
+        f"WHERE source_id = {sql_literal(source_id)}",
+        format="records",
+    )
+    return rows[0] if rows else None
+
+
+def patch_viewer_tensor_methods(viewer, connection, compute_scheduler=None):
+    """Monkey-patch ``add_tensor`` and ``tensor`` onto *viewer*, reading
+    through the shared ``biopb.tensor.Connection`` *connection*.
+
+    ``add_tensor`` puts a tensor on the viewer; ``tensor`` reads one back off
+    it as a plain array (biopb/biopb#974). Only the loader needs *connection*,
+    but both are installed here so both are discoverable on the viewer.
 
     *compute_scheduler*, when set, pins the loaded layer's slice reads to a
-    single-process dask scheduler (see ``_viewer_compute.wrap_levels``) so the
+    single-process dask scheduler (see ``biopb_napari_widget.wrap_levels``) so the
     serial viewer hits the shared main-process chunk cache instead of scattering
     across the distributed cluster (issue #8)."""
 
@@ -156,9 +189,8 @@ def patch_viewer_add_tensor(viewer, connection, compute_scheduler=None):
         Returns:
             The name of the created viewer layer.
         """
-        from biopb.tensor.client import _split_array_id
-
-        from .._tensor_utils import add_tensor_layer
+        from biopb.tensor.client import split_array_id
+        from biopb_napari_widget import add_tensor_layer
 
         if array_id is None:  # legacy keyword form: add_tensor(source_id="...")
             array_id = source_id
@@ -169,7 +201,7 @@ def patch_viewer_add_tensor(viewer, connection, compute_scheduler=None):
         # a routing convenience (descriptor.proto's identity policy). Splitting
         # it here is what lets this call address like every other tensor call --
         # a bare source_id still lands on `tensor_id=None` below.
-        source_id, qualified_id = _split_array_id(array_id)
+        source_id, qualified_id = split_array_id(array_id)
         if tensor_id is None:
             tensor_id = qualified_id
 
@@ -180,40 +212,25 @@ def patch_viewer_add_tensor(viewer, connection, compute_scheduler=None):
                 "Open the Tensor Browser widget and connect first."
             )
 
-        sources = connection.sources or {}
-        src = sources.get(source_id)
-        if src is None:
-            # Not in the (possibly truncated) cached catalog — fetch the tensor
-            # descriptor directly from the server and wrap it as a single-tensor
-            # source (a bare source_id resolves the source's default tensor).
-            from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
-
-            try:
-                desc = client.get_descriptor(tensor_id or source_id)
-            except Exception as exc:
-                raise ValueError(
-                    f"Source '{source_id}' not found. "
-                    f"Available: {list(sources.keys())[:20]}"
-                ) from exc
-            src = DataSourceDescriptor(source_id=source_id, tensors=[desc])
-
+        # The server answers which tensor a bare source id means, and what the
+        # tensor is; nothing here keeps a catalog to ask instead.
+        row = _source_row(client, source_id)
+        tensors = [t["array_id"] for t in (row or {}).get("tensors") or []]
         if tensor_id is None:
-            if len(src.tensors) == 1 and src.tensors[0]:
-                tensor_id = src.tensors[0].array_id
-            else:
-                ids = [t.array_id for t in src.tensors]
+            if len(tensors) > 1:
                 raise ValueError(
-                    f"Source has {len(src.tensors)} tensors — "
-                    f"specify tensor_id. Available: {ids}"
+                    f"Source has {len(tensors)} tensors — "
+                    f"specify tensor_id. Available: {tensors}"
                 )
-
-        tensor_desc = next((t for t in src.tensors if t.array_id == tensor_id), None)
-        if tensor_desc is None:
-            raise ValueError(f"Tensor '{tensor_id}' not found in source '{source_id}'")
+            tensor_id = tensors[0] if tensors else source_id
+        try:
+            tensor_desc = client.get_descriptor(tensor_id)
+        except Exception as exc:
+            raise ValueError(f"Tensor '{tensor_id}' not found: {exc}") from exc
 
         if name is None:
-            stem = _get_url_stem(src.source_url) or source_id
-            if len(src.tensors) > 1:
+            stem = _get_url_stem((row or {}).get("source_url") or "") or source_id
+            if len(tensors) > 1:
                 name = f"{stem}/{_tensor_short_name(tensor_id)}"
             else:
                 name = stem
@@ -227,13 +244,47 @@ def patch_viewer_add_tensor(viewer, connection, compute_scheduler=None):
             tensor_id,
             tensor_desc,
             name=name,
-            source_desc=src,
             compute_scheduler=compute_scheduler,
         )
 
         return name
 
+    def tensor(layer):
+        """Read a layer's pixels back as a plain, full-resolution dask array.
+
+        The inverse of :func:`add_tensor`, and the replacement for
+        ``layer.data[0] if layer.multiscale else layer.data`` -- which is not
+        one thing: on a multiscale layer ``data[0]`` is *level 0*, on a
+        single-scale one it is *plane 0*, and either way what comes back is a
+        ``_ViewerArray`` proxy rather than a dask array (biopb/biopb#973,
+        biopb/biopb#974).
+
+        Args:
+            layer: A napari layer, or the name of one on this viewer.
+
+        Returns:
+            The layer's own array, unwrapped: level 0 of its pyramid, which is
+            the full resolution ``layer.data.shape`` reports, in canonical
+            ``[..., Z, Y, X]`` order. A genuine ``dask.array.Array`` wherever
+            the layer is backed by one.
+
+        Never reads from the server, though ``metadata['array_id']`` would let
+        it: the array is already here, and a round trip would cost an
+        O(chunks) read plan, mint unscaled chunk_ids that miss the pre-warmed
+        scaled ones, and return stale pixels if the source was re-indexed
+        since the layer loaded. For a deliberate fresh read, ask for it:
+        ``client.get_tensor(layer.metadata['array_id'])``.
+        """
+        if isinstance(layer, str):
+            layer = viewer.layers[layer]
+        if not hasattr(layer, "data"):
+            raise TypeError(
+                f"tensor() takes a layer or a layer name, got {type(layer).__name__}"
+            )
+        return _layer_own_array(layer)
+
     # napari.Viewer is a pydantic evented model with validate_assignment, so a
     # plain ``viewer.add_tensor = ...`` is rejected.  Write through to the
     # instance dict to bypass field validation.
     object.__setattr__(viewer, "add_tensor", add_tensor)
+    object.__setattr__(viewer, "tensor", tensor)

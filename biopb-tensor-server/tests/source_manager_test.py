@@ -1,8 +1,10 @@
 """Regression tests for periodic SourceManager reconciliation."""
 
 import os
+import threading
 import time
 from dataclasses import replace
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -17,7 +19,6 @@ from biopb_tensor_server.sources.tree_scanner import (
     ScanSnapshot,
     _WalkContext,
 )
-from biopb_tensor_server.sources.watcher import WatcherEvent, WatcherEventType
 
 
 def _walk_ctx(*, prev_entry_states=None, prev_cloud_entry_states=None, next_state=None):
@@ -50,10 +51,45 @@ class _FakeAdapter:
         return {"url": source_config.url, "type": source_config.type}
 
 
+class _ClosingAdapter:
+    """An adapter that records ``close()``, so a leaked one is visible."""
+
+    built = []
+
+    def __init__(self, url):
+        self.url = url
+        self.closed = 0
+        _ClosingAdapter.built.append(self)
+
+    def close(self):
+        self.closed += 1
+
+
+class _ClosingAdapterFactory:
+    @classmethod
+    def claim(cls, ctx, state):
+        return _FakeAdapter.claim(ctx, state)
+
+    @classmethod
+    def create_from_config(cls, source_config, credentials_config=None):
+        return _ClosingAdapter(source_config.url)
+
+
 class _FakeMetadataDb:
     def __init__(self):
         self.added = []
         self.removed = []
+        # The orphan clock, driven from _mark_catalog_complete.
+        self.seen_calls = 0
+        self.pruned = []
+
+    def mark_sources_seen(self):
+        self.seen_calls += 1
+        return 0
+
+    def prune_unseen(self, before):
+        self.pruned.append(before)
+        return 0
 
     def sync_source_added(self, source_id, adapter):
         self.added.append(source_id)
@@ -83,6 +119,8 @@ class _FakeServer:
     def __init__(self):
         self.registered = []
         self.unregistered = []
+        self.swapped = []
+        self.sources = {}
         self._metadata_db = _FakeMetadataDb()
         # Progressive-discovery freshness signals, recorded for assertions.
         self.full_scan_in_progress = False
@@ -91,9 +129,17 @@ class _FakeServer:
 
     def register_source(self, source_id, adapter):
         self.registered.append(source_id)
+        self.sources[source_id] = adapter
+
+    def swap_source(self, source_id, adapter):
+        self.swapped.append(source_id)
+        displaced = self.sources.get(source_id)
+        self.sources[source_id] = adapter
+        return adapter, displaced
 
     def unregister_source(self, source_id):
         self.unregistered.append(source_id)
+        self.sources.pop(source_id, None)
 
     def set_full_scan_in_progress(self, in_progress):
         self.full_scan_in_progress = bool(in_progress)
@@ -129,6 +175,13 @@ class _FailingAdapter:
     @classmethod
     def create_from_config(cls, source_config, credentials_config=None):
         raise RuntimeError("adapter create failed")
+
+
+class _ClosingRegistry(_FakeRegistry):
+    def get_adapter_for_type(self, source_type):
+        if source_type == "fake":
+            return _ClosingAdapterFactory
+        return None
 
 
 class _RegistryWithFailingAdapter(_FakeRegistry):
@@ -167,36 +220,166 @@ def _make_manager(server, **kwargs):
     return SourceManager(server=server, metadata_db=server._metadata_db, **kwargs)
 
 
+class TestOrphanClockSeam:
+    """The sweep hangs off scan completion, which is where completeness is held."""
+
+    @staticmethod
+    def _manager(server, tmp_path, **kwargs):
+        return _make_manager(
+            server,
+            registry=_FakeRegistry(),
+            discovery_state=DiscoveryState(),
+            monitored_dirs={tmp_path / "data"},
+            stability_window=0.0,
+            **kwargs,
+        )
+
+    def test_a_completed_scan_records_presence(self, tmp_path):
+        server = _FakeServer()
+        manager = self._manager(server, tmp_path)
+        manager.complete_initial_scan()
+        assert server._metadata_db.seen_calls == 1
+        # Freshness is still published; the clock rides along, it does not replace it.
+        assert server.last_full_scan_at is not None
+
+    def test_a_young_server_never_prunes_however_many_scans_it_finishes(self, tmp_path):
+        # The scan count is not the question. An upstream that is down at boot
+        # is usually still down an hour later, so gating on the first scan
+        # alone would let the second one delete its annotations.
+        server = _FakeServer()
+        manager = self._manager(server, tmp_path, prune_unseen_days=7)
+        for _ in range(5):
+            manager._mark_catalog_complete()
+        assert server._metadata_db.seen_calls == 5
+        assert server._metadata_db.pruned == []
+
+    def test_pruning_arms_once_the_server_has_outlived_the_threshold(self, tmp_path):
+        server = _FakeServer()
+        manager = self._manager(server, tmp_path, prune_unseen_days=7)
+        manager._mark_catalog_complete()
+        assert server._metadata_db.pruned == []
+
+        # Seven days of uptime, less a second.
+        manager._started_at -= 7 * 86400 - 1
+        manager._mark_catalog_complete()
+        assert server._metadata_db.pruned == []
+
+        manager._started_at -= 2
+        manager._mark_catalog_complete()
+        assert len(server._metadata_db.pruned) == 1
+        age = datetime.now() - server._metadata_db.pruned[0]
+        assert timedelta(days=7) <= age < timedelta(days=7, seconds=30)
+
+    def test_prune_is_off_by_default(self, tmp_path):
+        server = _FakeServer()
+        manager = self._manager(server, tmp_path)
+        manager._started_at -= 10 * 365 * 86400  # a decade of uptime
+        manager._mark_catalog_complete()
+        assert server._metadata_db.pruned == []
+        # ... and the sweep still runs; it is the deleting that is opt-in.
+        assert server._metadata_db.seen_calls == 1
+
+    def test_a_failing_clock_does_not_fail_the_scan(self, tmp_path):
+        server = _FakeServer()
+
+        def _boom():
+            raise RuntimeError("catalog is wedged")
+
+        server._metadata_db.mark_sources_seen = _boom
+        manager = self._manager(server, tmp_path)
+        manager.complete_initial_scan()
+        # Freshness published and the startup gate flipped regardless.
+        assert server.last_full_scan_at is not None
+        assert manager._initial_scan_done
+
+
+class TestRescanLoop:
+    """The rescan timer the manager runs itself (no watcher object)."""
+
+    @staticmethod
+    def _manager(server, monitored_dirs, **kwargs):
+        return _make_manager(
+            server,
+            registry=_FakeRegistry(),
+            discovery_state=DiscoveryState(),
+            monitored_dirs=monitored_dirs,
+            stability_window=0.0,
+            **kwargs,
+        )
+
+    def test_start_is_a_no_op_with_nothing_to_rescan(self, tmp_path):
+        """A static-only config has no tree to walk, so no thread is spawned."""
+        manager = self._manager(_FakeServer(), set())
+        manager.start()
+        assert manager.is_running() is False
+
+    def test_start_is_a_no_op_when_rescanning_is_off(self, tmp_path):
+        """`monitor_mode = "off"` reaches here as a non-positive interval; the
+        sources stay configured and the launcher scans them once itself."""
+        monitored_dir = tmp_path / "monitored"
+        monitored_dir.mkdir()
+        manager = self._manager(_FakeServer(), {monitored_dir}, rescan_interval=0)
+        manager.start()
+        assert manager.is_running() is False
+
+    def test_the_loop_rescans_on_the_interval(self, tmp_path, monkeypatch):
+        """First tick immediately, then one per interval."""
+        monitored_dir = tmp_path / "monitored"
+        monitored_dir.mkdir()
+        manager = self._manager(_FakeServer(), {monitored_dir}, rescan_interval=0.01)
+
+        rescans = threading.Semaphore(0)
+        monkeypatch.setattr(manager, "_handle_rescan", rescans.release)
+        try:
+            manager.start()
+            assert manager.is_running() is True
+            for _ in range(3):
+                assert rescans.acquire(timeout=5)
+        finally:
+            manager.stop(join_timeout=5)
+        assert manager.is_running() is False
+
+    def test_a_failing_rescan_does_not_kill_the_loop(self, tmp_path, monkeypatch):
+        """The next pass sees the same tree, so a failure is logged and retried."""
+        monitored_dir = tmp_path / "monitored"
+        monitored_dir.mkdir()
+        manager = self._manager(_FakeServer(), {monitored_dir}, rescan_interval=0.01)
+
+        attempts = threading.Semaphore(0)
+
+        def boom():
+            attempts.release()
+            raise RuntimeError("scan blew up")
+
+        monkeypatch.setattr(manager, "_handle_rescan", boom)
+        try:
+            manager.start()
+            for _ in range(2):
+                assert attempts.acquire(timeout=5)
+        finally:
+            manager.stop(join_timeout=5)
+
+    def test_stop_does_not_wait_out_the_interval(self, tmp_path, monkeypatch):
+        """The loop waits on an Event, so stop() returns rather than sleeping off
+        a 30s interval -- which is what the shutdown budget depends on."""
+        monitored_dir = tmp_path / "monitored"
+        monitored_dir.mkdir()
+        manager = self._manager(_FakeServer(), {monitored_dir}, rescan_interval=300.0)
+
+        first = threading.Event()
+        monkeypatch.setattr(manager, "_handle_rescan", first.set)
+        manager.start()
+        assert first.wait(timeout=5)  # the immediate first tick ran
+
+        started = time.monotonic()
+        manager.stop(join_timeout=5)
+        assert time.monotonic() - started < 2.0
+        assert manager.is_running() is False
+
+
 class TestSourceManagerRegressions:
     def setup_method(self):
         _FlakyAdapter.calls = 0
-
-    def test_process_event_ignores_legacy_event_types(self, tmp_path):
-        monitored_dir = tmp_path / "monitored"
-        monitored_dir.mkdir()
-
-        server = _FakeServer()
-        state = DiscoveryState()
-        manager = _make_manager(
-            server,
-            registry=_FakeRegistry(),
-            discovery_state=state,
-            watcher=None,
-            monitored_dirs={monitored_dir},
-            stability_window=0.0,
-            probe_open_files=False,
-        )
-
-        ignored_event = WatcherEvent(
-            event_type=WatcherEventType.CREATED,
-            path=monitored_dir / "ignored.dat",
-            is_directory=False,
-        )
-
-        manager._process_event(ignored_event)
-
-        assert state.claims == {}
-        assert server.registered == []
 
     def test_periodic_rescan_adds_and_removes_sources(self, tmp_path):
         monitored_dir = tmp_path / "monitored"
@@ -210,10 +393,8 @@ class TestSourceManagerRegressions:
             server,
             registry=_FakeRegistry(),
             discovery_state=state,
-            watcher=None,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
-            probe_open_files=False,
         )
 
         manager._handle_rescan()
@@ -230,6 +411,76 @@ class TestSourceManagerRegressions:
         assert server.unregistered == [source_id]
         assert server._metadata_db.removed == [source_id]
 
+    def test_a_read_only_file_is_not_refused(self, tmp_path):
+        """biopb/biopb#1042: the append probe could not tell "not allowed to
+        write" from "still being written", so a file the server can read but not
+        write was never discovered. The gate is now signature age alone."""
+        monitored_dir = tmp_path / "monitored"
+        monitored_dir.mkdir()
+        data_path = monitored_dir / "sample.dat"
+        data_path.write_text("hello")
+        os.chmod(data_path, 0o444)
+
+        server = _FakeServer()
+        state = DiscoveryState()
+        manager = _make_manager(
+            server,
+            registry=_FakeRegistry(),
+            discovery_state=state,
+            monitored_dirs={monitored_dir},
+            stability_window=0.0,
+        )
+
+        manager._handle_rescan()
+
+        assert len(state.claims) == 1
+        source_id = next(iter(state.claims))
+        assert server.registered == [source_id]
+
+    def test_a_newly_read_only_file_is_not_removed(self, tmp_path, monkeypatch):
+        """biopb/biopb#1042: the append probe was a gate condition the removal
+        shield did not know about, so a file that later lost write permission was
+        deregistered. Gate and shield now share one predicate."""
+        monitored_dir = tmp_path / "monitored"
+        monitored_dir.mkdir()
+        data_path = monitored_dir / "sample.dat"
+        data_path.write_text("hello")
+
+        server = _FakeServer()
+        state = DiscoveryState()
+        manager = _make_manager(
+            server,
+            registry=_FakeRegistry(),
+            discovery_state=state,
+            monitored_dirs={monitored_dir},
+            stability_window=30.0,
+        )
+
+        base_time = time.time()
+        clock = {"now": base_time}
+        monkeypatch.setattr(
+            "biopb_tensor_server.sources.source_manager.time.time", lambda: clock["now"]
+        )
+
+        manager._handle_rescan()
+        clock["now"] = base_time + 31.0
+        manager._handle_rescan()
+
+        assert len(state.claims) == 1
+        source_id = next(iter(state.claims))
+        assert server.registered == [source_id]
+
+        os.chmod(data_path, 0o444)
+        # Outlive the chmod's ctime bump so the signature settles again while
+        # the file stays permanently unwritable.
+        clock["now"] = base_time + 62.0
+        manager._handle_rescan()
+        clock["now"] = base_time + 93.0
+        manager._handle_rescan()
+
+        assert source_id in state.claims
+        assert server.unregistered == []
+
     def test_first_rescan_does_not_cycle_unchanged_sources(self, tmp_path):
         monitored_dir = tmp_path / "monitored"
         monitored_dir.mkdir()
@@ -242,10 +493,8 @@ class TestSourceManagerRegressions:
             server,
             registry=_FakeRegistry(),
             discovery_state=state,
-            watcher=None,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
-            probe_open_files=False,
         )
 
         claim = SourceClaim(
@@ -284,10 +533,8 @@ class TestSourceManagerRegressions:
             server,
             registry=_FakeRegistry(),
             discovery_state=state,
-            watcher=None,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
-            probe_open_files=False,
             full_rescan_interval=0.0,
         )
 
@@ -325,10 +572,8 @@ class TestSourceManagerRegressions:
             server,
             registry=_FakeRegistry(),
             discovery_state=state,
-            watcher=None,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
-            probe_open_files=False,
             full_rescan_interval=0.0,
         )
 
@@ -359,10 +604,8 @@ class TestSourceManagerRegressions:
             server,
             registry=_FakeRegistry(),
             discovery_state=state,
-            watcher=None,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
-            probe_open_files=False,
             full_rescan_interval=10.0,
         )
 
@@ -416,14 +659,12 @@ class TestSourceManagerRegressions:
             server,
             registry=_FakeRegistry(),
             discovery_state=state,
-            watcher=None,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
-            probe_open_files=False,
         )
 
         manager._handle_rescan()
-        # Value-level snapshot: EntryState is mutable (pending_scan is cleared in
+        # Value-level snapshot: EntryState records are carried by reference (see
         # place), so a shallow dict() copy would share objects with the live cache
         # and a leaked mutation could silently mutate the snapshot too, making the
         # rollback assertion vacuous. Copy each record so the guarantee is real.
@@ -445,29 +686,6 @@ class TestSourceManagerRegressions:
         assert manager._entry_states == previous_entry_states
         assert manager._skipped_stable_dirs == previous_skipped_dirs
 
-    def test_process_event_dispatches_rescan(self, tmp_path, monkeypatch):
-        monitored_dir = tmp_path / "monitored"
-        monitored_dir.mkdir()
-
-        server = _FakeServer()
-        state = DiscoveryState()
-        manager = _make_manager(
-            server,
-            registry=_FakeRegistry(),
-            discovery_state=state,
-            watcher=None,
-            monitored_dirs={monitored_dir},
-            stability_window=0.0,
-            probe_open_files=False,
-        )
-
-        calls = []
-        monkeypatch.setattr(manager, "_handle_rescan", lambda: calls.append("rescan"))
-
-        manager._process_event(WatcherEvent(WatcherEventType.RESCAN, monitored_dir))
-
-        assert calls == ["rescan"]
-
     def test_aggressive_dir_pruning_can_skip_monitored_root(
         self, tmp_path, monkeypatch
     ):
@@ -482,10 +700,8 @@ class TestSourceManagerRegressions:
             server,
             registry=_FakeRegistry(),
             discovery_state=state,
-            watcher=None,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
-            probe_open_files=False,
             full_rescan_interval=0.0,
             aggressive_dir_pruning=True,
         )
@@ -520,10 +736,8 @@ class TestSourceManagerRegressions:
             server,
             registry=_FakeRegistry(),
             discovery_state=state,
-            watcher=None,
             monitored_dirs={monitored_dir},
             stability_window=30.0,
-            probe_open_files=False,
             full_rescan_interval=0.0,
             aggressive_dir_pruning=False,
         )
@@ -567,10 +781,8 @@ class TestSourceManagerRegressions:
             server,
             registry=_FakeRegistry(),
             discovery_state=state,
-            watcher=None,
             monitored_dirs={monitored_dir},
             stability_window=30.0,
-            probe_open_files=False,
             full_rescan_interval=0.0,
             aggressive_dir_pruning=True,
         )
@@ -629,10 +841,8 @@ class TestSourceManagerRegressions:
             server,
             registry=_FakeRegistry(),
             discovery_state=state,
-            watcher=None,
             monitored_dirs={monitored_dir},
             stability_window=30.0,
-            probe_open_files=False,
             full_rescan_interval=0.0,
             aggressive_dir_pruning=True,
         )
@@ -714,10 +924,8 @@ class TestSourceManagerRegressions:
             server,
             registry=_FakeRegistry(),
             discovery_state=state,
-            watcher=None,
             monitored_dirs={monitored_dir},
             stability_window=30.0,
-            probe_open_files=False,
             full_rescan_interval=0.0,
             aggressive_dir_pruning=False,
         )
@@ -782,10 +990,10 @@ class TestSourceManagerRegressions:
             server,
             registry=_FakeRegistry(),
             discovery_state=state,
-            watcher=None,
             monitored_dirs={monitored_dir},
-            stability_window=0.0,
-            probe_open_files=False,
+            # Wide enough that the just-written file is still churning, so the
+            # shield must keep it even though the walk found nothing.
+            stability_window=3600.0,
         )
 
         claim = SourceClaim(
@@ -798,10 +1006,7 @@ class TestSourceManagerRegressions:
         server.unregistered.clear()
         server._metadata_db.removed.clear()
 
-        manager._reconciler._reconcile_discovered_state(
-            DiscoveryState(),
-            unstable_paths=[data_path.resolve()],
-        )
+        manager._reconciler._reconcile_discovered_state(DiscoveryState())
 
         assert claim.source_id in state.claims
         assert server.unregistered == []
@@ -819,10 +1024,8 @@ class TestSourceManagerRegressions:
             server,
             registry=_RegistryWithFailingAdapter(),
             discovery_state=state,
-            watcher=None,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
-            probe_open_files=False,
         )
 
         claim = SourceClaim(source_type="fake", primary_path=str(data_path.resolve()))
@@ -846,10 +1049,8 @@ class TestSourceManagerRegressions:
             server,
             registry=_FakeRegistry(),
             discovery_state=state,
-            watcher=None,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
-            probe_open_files=False,
         )
 
         first_claim = SourceClaim(
@@ -891,10 +1092,8 @@ class TestSourceManagerRegressions:
             server,
             registry=_FakeRegistry(),
             discovery_state=state,
-            watcher=None,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
-            probe_open_files=False,
         )
 
         claim = SourceClaim(source_type="fake", primary_path=str(data_path.resolve()))
@@ -916,10 +1115,8 @@ class TestSourceManagerRegressions:
             server,
             registry=_FakeRegistry(),
             discovery_state=state,
-            watcher=None,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
-            probe_open_files=False,
         )
 
         claim = SourceClaim(
@@ -952,10 +1149,8 @@ class TestSourceManagerRegressions:
             server,
             registry=_FakeRegistry(),
             discovery_state=state,
-            watcher=None,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
-            probe_open_files=False,
         )
 
         claim = SourceClaim(
@@ -974,9 +1169,10 @@ class TestSourceManagerRegressions:
         assert claim.primary_path not in manager._reconciler._path_to_source_id
         assert claim.source_id not in state.claims
 
-    def test_reconcile_changed_source_removes_old_source_when_readd_fails(
-        self, tmp_path
-    ):
+    def test_reconcile_changed_source_rebuilds_it_in_place(self, tmp_path):
+        """A rewritten file is rebuilt on top of the live adapter, never removed
+        and re-added: the source stays in ListFlights and in the catalog for the
+        whole rebuild (biopb/biopb#944)."""
         monitored_dir = tmp_path / "monitored"
         monitored_dir.mkdir()
         data_path = monitored_dir / "sample.dat"
@@ -988,10 +1184,80 @@ class TestSourceManagerRegressions:
             server,
             registry=_FakeRegistry(),
             discovery_state=state,
-            watcher=None,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
-            probe_open_files=False,
+        )
+
+        manager._handle_rescan()
+        source_id = next(iter(state.claims))
+
+        server.registered.clear()
+        server.unregistered.clear()
+        server.swapped.clear()
+        server._metadata_db.added.clear()
+        server._metadata_db.removed.clear()
+
+        data_path.write_text("hello world")
+        manager._handle_rescan()
+
+        assert server.swapped == [source_id]
+        assert server.unregistered == []
+        assert server._metadata_db.removed == []
+        # sync_source_added is an upsert, so the row is replaced in place.
+        assert server._metadata_db.added == [source_id]
+        assert source_id in state.claims
+
+    def test_a_rebuild_that_does_not_take_closes_the_adapter_it_built(self, tmp_path):
+        """The replacement holds the handles it opened. Restoring the previous
+        adapter leaves it referenced by nothing, so this call is the only one
+        that can release it -- the mirror of the leak a bare ``register`` over a
+        live id causes."""
+        monitored_dir = tmp_path / "monitored"
+        monitored_dir.mkdir()
+        data_path = monitored_dir / "sample.dat"
+        data_path.write_text("hello")
+
+        server = _FakeServer()
+        state = DiscoveryState()
+        manager = _make_manager(
+            server,
+            registry=_ClosingRegistry(),
+            discovery_state=state,
+            monitored_dirs={monitored_dir},
+            stability_window=0.0,
+        )
+
+        _ClosingAdapter.built.clear()
+        manager._handle_rescan()
+        source_id = next(iter(state.claims))
+        (serving,) = _ClosingAdapter.built
+
+        # The swap lands, then the catalog write fails.
+        manager._reconciler._metadata_db = _FailingMetadataDb(fail_add=True)
+        data_path.write_text("hello world")
+        manager._handle_rescan()
+
+        built = [a for a in _ClosingAdapter.built if a is not serving]
+        assert len(built) == 1, "expected exactly one replacement to be built"
+        assert built[0].closed == 1, "the replacement was dropped still open"
+        # And the one that was serving is still serving, still open.
+        assert server.sources[source_id] is serving
+        assert serving.closed == 0
+
+    def test_reconcile_changed_source_keeps_serving_when_rebuild_fails(self, tmp_path):
+        monitored_dir = tmp_path / "monitored"
+        monitored_dir.mkdir()
+        data_path = monitored_dir / "sample.dat"
+        data_path.write_text("hello")
+
+        server = _FakeServer()
+        state = DiscoveryState()
+        manager = _make_manager(
+            server,
+            registry=_FakeRegistry(),
+            discovery_state=state,
+            monitored_dirs={monitored_dir},
+            stability_window=0.0,
         )
 
         manager._handle_rescan()
@@ -1007,12 +1273,15 @@ class TestSourceManagerRegressions:
 
         manager._handle_rescan()
 
-        assert state.claims == {}
+        # The rebuild failed, and that must cost nothing: the previously
+        # registered adapter is still the one serving. Remove-then-add used to
+        # deregister the source here -- a *rescan request* losing a working
+        # source (biopb/biopb#944).
+        assert source_id in state.claims
         assert server.registered == []
-        assert server.unregistered == [source_id]
-        assert server._metadata_db.added == []
-        assert server._metadata_db.removed == [source_id]
-        assert source_id not in manager._reconciler._source_signatures
+        assert server.unregistered == []
+        assert server._metadata_db.removed == []
+        assert source_id in manager._reconciler._source_signatures
 
     def test_rollback_source_registration_survives_rollback_errors(self, tmp_path):
         monitored_dir = tmp_path / "monitored"
@@ -1024,10 +1293,8 @@ class TestSourceManagerRegressions:
             server,
             registry=_FakeRegistry(),
             discovery_state=DiscoveryState(),
-            watcher=None,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
-            probe_open_files=False,
         )
         manager._reconciler._path_to_source_id[str(monitored_dir)] = "source-1"
 
@@ -1046,10 +1313,8 @@ class TestSourceManagerRegressions:
             server,
             registry=_RegistryWithFlakyAdapter(),
             discovery_state=DiscoveryState(),
-            watcher=None,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
-            probe_open_files=False,
         )
 
         clock = {"now": 100.0}
@@ -1089,10 +1354,8 @@ class TestSourceManagerRegressions:
             server,
             registry=_RegistryWithFlakyAdapter(),
             discovery_state=DiscoveryState(),
-            watcher=None,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
-            probe_open_files=False,
         )
 
         clock = {"now": 100.0}
@@ -1132,10 +1395,8 @@ def _make_signature_manager(monitored_dirs):
         _FakeServer(),
         registry=_FakeRegistry(),
         discovery_state=DiscoveryState(),
-        watcher=None,
         monitored_dirs=set(monitored_dirs),
         stability_window=0.0,
-        probe_open_files=False,
     )
 
 
@@ -1424,10 +1685,8 @@ class TestProgressiveDiscoveryFreshness:
             server,
             registry=_FakeRegistry(),
             discovery_state=DiscoveryState(),
-            watcher=None,
             monitored_dirs={monitored_dir},
             stability_window=0.0,
-            probe_open_files=False,
         )
         return server, manager
 
@@ -1491,7 +1750,7 @@ class TestProgressiveDiscoveryFreshness:
         assert fired == [True]
 
     def test_run_initial_scan_drives_the_bootstrap_scan(self, tmp_path):
-        # The launcher's public seam for the watcher-less path (biopb/biopb#277 C)
+        # The launcher's public seam for the rescan-less path
         # runs one full rescan: same effect as the internal _handle_rescan.
         server, manager = self._manager_with_source(tmp_path)
         fired = []
@@ -1535,14 +1794,12 @@ class TestProgressiveStreaming:
             (monitored_dir / f"s{i}.dat").write_text(f"data{i}")
 
         server = _FakeServer()
+        kw.setdefault("stability_window", 0.0)
         manager = _make_manager(
             server,
             registry=_FakeRegistry(),
             discovery_state=DiscoveryState(),
-            watcher=None,
             monitored_dirs={monitored_dir},
-            stability_window=0.0,
-            probe_open_files=False,
             **kw,
         )
         return server, manager
@@ -1556,11 +1813,9 @@ class TestProgressiveStreaming:
         seen_at_reconcile = []
         orig_reconcile = manager._reconciler._reconcile_discovered_state
 
-        def spy(discovered_state, unstable_paths, force_full=False):
+        def spy(discovered_state, force_full=False):
             seen_at_reconcile.append(len(server.registered))
-            return orig_reconcile(
-                discovered_state, unstable_paths, force_full=force_full
-            )
+            return orig_reconcile(discovered_state, force_full=force_full)
 
         monkeypatch.setattr(manager._reconciler, "_reconcile_discovered_state", spy)
 
@@ -1584,13 +1839,11 @@ class TestProgressiveStreaming:
         seen_at_reconcile = []
         orig_reconcile = manager._reconciler._reconcile_discovered_state
 
-        def spy(discovered_state, unstable_paths, force_full=False):
+        def spy(discovered_state, force_full=False):
             # The new source is NOT yet registered when reconcile starts: it is
             # added by reconcile (batch), not streamed during the walk.
             seen_at_reconcile.append(len(server.registered))
-            return orig_reconcile(
-                discovered_state, unstable_paths, force_full=force_full
-            )
+            return orig_reconcile(discovered_state, force_full=force_full)
 
         monkeypatch.setattr(manager._reconciler, "_reconcile_discovered_state", spy)
         manager._handle_rescan()
@@ -1609,13 +1862,11 @@ class TestProgressiveStreaming:
         calls = {"n": 0}
         orig_reconcile = manager._reconciler._reconcile_discovered_state
 
-        def flaky(discovered_state, unstable_paths, force_full=False):
+        def flaky(discovered_state, force_full=False):
             calls["n"] += 1
             if calls["n"] == 1:
                 raise RuntimeError("reconcile failed")
-            return orig_reconcile(
-                discovered_state, unstable_paths, force_full=force_full
-            )
+            return orig_reconcile(discovered_state, force_full=force_full)
 
         monkeypatch.setattr(manager._reconciler, "_reconcile_discovered_state", flaky)
 
@@ -1634,12 +1885,10 @@ class TestProgressiveStreaming:
         assert server.unregistered == []
 
     def test_unstable_first_scan_claim_is_not_streamed(self, tmp_path):
-        # stable_rescans_required=2: a fresh entry needs two unchanged
-        # observations before it is eligible, so the first scan defers it and
-        # streams nothing -- the same stability gate the batch path uses.
-        server, manager = self._manager(
-            tmp_path, n_sources=1, stable_rescans_required=2
-        )
+        # A just-written entry is inside the stability window, so the first scan
+        # defers it and streams nothing -- claiming it would register whatever
+        # half of the file is on disk.
+        server, manager = self._manager(tmp_path, n_sources=1, stability_window=3600.0)
 
         manager._handle_rescan()  # first (force-full) scan
 
@@ -1647,7 +1896,9 @@ class TestProgressiveStreaming:
         assert manager._initial_scan_done is True  # scan still completed
         assert server.last_full_scan_at is not None
 
-        # Not lost: once stable, a later rescan registers it (batch path).
+        # Not lost: once quiet, a later rescan registers it (batch path).
+        manager._stability_window = 0.0
+        manager._scanner._stability_window = 0.0
         for _ in range(5):
             if server.registered:
                 break
@@ -1659,9 +1910,9 @@ class _CatalogStubAdapter:
     """Adapter whose descriptor/metadata the real MetadataDatabase can index.
 
     Unlike _FakeAdapter (returns a bare dict), this implements the
-    get_source_descriptor()/get_metadata() surface that
-    MetadataDatabase.sync_source_added reads, so a static source can flow
-    through the real registration + catalog-sync path.
+    catalog_url / source_type / is_resident / list_tensor_descriptors /
+    get_metadata surface that MetadataDatabase.sync_source_added reads, so a
+    static source can flow through the real registration + catalog-sync path.
     """
 
     def __init__(self, source_id, source_url):
@@ -1672,21 +1923,22 @@ class _CatalogStubAdapter:
     def create_from_config(cls, source_config, credentials_config=None):
         return cls(source_config.source_id, source_config.url)
 
-    def get_source_descriptor(self):
-        from biopb.tensor.descriptor_pb2 import (
-            DataSourceDescriptor,
-            TensorDescriptor,
-        )
+    source_type = "zarr"
 
-        return DataSourceDescriptor(
-            source_id=self._source_id,
-            source_url=self._source_url,
-            source_type="zarr",
-            data_resident=True,
-            tensors=[
-                TensorDescriptor(array_id=self._source_id, shape=[8, 8], dtype="uint8")
-            ],
-        )
+    @property
+    def catalog_url(self):
+        return self._source_url
+
+    def is_resident(self):
+        return True
+
+    def is_resolved(self):
+        return True
+
+    def list_tensor_descriptors(self):
+        from biopb.tensor.descriptor_pb2 import TensorDescriptor
+
+        return [TensorDescriptor(array_id=self._source_id, shape=[8, 8], dtype="uint8")]
 
     def get_metadata(self):
         return {}
@@ -1704,7 +1956,7 @@ class TestStaticCatalogSeeding:
 
     def test_static_sources_populate_catalog_without_initial_sync(self, tmp_path):
         from biopb_tensor_server.core.config import SourceConfig
-        from biopb_tensor_server.core.metadata_db import MetadataDatabase
+        from biopb_tensor_server.serving.metadata_db import MetadataDatabase
         from biopb_tensor_server.sources.source_manager import create_source_manager
 
         db = MetadataDatabase()
@@ -1714,7 +1966,6 @@ class TestStaticCatalogSeeding:
         manager = create_source_manager(
             server=server,
             registry=_CatalogStubRegistry(),
-            watcher=None,
             static_sources=[static],
             metadata_db=db,
         )
@@ -1741,10 +1992,8 @@ class TestRescanCarryForwardPrefix:
             server=_FakeServer(),
             registry=_FakeRegistry(),
             discovery_state=DiscoveryState(),
-            watcher=None,
             monitored_dirs={tmp_path / "data"},
             stability_window=0.0,
-            probe_open_files=False,
         )
 
     def test_copy_cached_subtree_entries_matches_exact_prefix(self, tmp_path):
@@ -1758,10 +2007,8 @@ class TestRescanCarryForwardPrefix:
         unrelated = str(tmp_path / "other" / "y.tif")
         prev = {
             root: EntryState(True, (0, 0), 0.0),
-            child: EntryState(
-                False, (0, 0), 0.0, stable_observations=3, pending_scan=True
-            ),
-            deep: EntryState(False, (0, 0), 0.0, stable_observations=2),
+            child: EntryState(False, (0, 0), 0.0, pending_scan=True),
+            deep: EntryState(False, (0, 0), 0.0),
             decoy: EntryState(False, (0, 0), 0.0),
             unrelated: EntryState(False, (0, 0), 0.0),
         }
@@ -1774,10 +2021,8 @@ class TestRescanCarryForwardPrefix:
         assert set(ctx.next_state) - {root} == {child, deep}
         assert decoy not in ctx.next_state  # exact-prefix guard (root + os.sep)
         assert unrelated not in ctx.next_state
-        # The whole EntryState is carried, stability fields intact.
-        assert ctx.next_state[child].stable_observations == 3
+        # The whole EntryState is carried, the pending-scan flag intact.
         assert ctx.next_state[child].pending_scan is True
-        assert ctx.next_state[deep].stable_observations == 2
         assert ctx.next_state[deep].pending_scan is False
 
     def test_subtree_has_pending_scan_matches_exact_prefix(self, tmp_path):
@@ -1804,3 +2049,75 @@ class TestRescanCarryForwardPrefix:
         # a non-pending descendant does not count
         ctx = _ctx(str(tmp_path / "data" / "sub" / "f.tif"), False)
         assert scanner._subtree_has_pending_scan(root, ctx) is False
+
+
+class TestOneStabilityPredicate:
+    """The claim gate and the removal shield answer one question, one way.
+
+    "Quiet enough to claim" and "quiet enough to have stopped existing" used to
+    be two implementations of the same test, and they drifted: the gate grew an
+    append-open probe the shield knew nothing about, so a file the gate refused
+    was a file the shield let the diff delete (biopb/biopb#1042).
+    """
+
+    @staticmethod
+    def _manager(tmp_path, **kwargs):
+        monitored = tmp_path / "data"
+        monitored.mkdir(exist_ok=True)
+        server = _FakeServer()
+        manager = _make_manager(
+            server,
+            registry=_FakeRegistry(),
+            discovery_state=DiscoveryState(),
+            monitored_dirs={monitored},
+            **kwargs,
+        )
+        return server, manager, monitored
+
+    def test_a_churning_claim_is_shielded_from_removal(self, tmp_path):
+        # The shield's job: a claim missing from a walk that is still being
+        # written is churning, not gone. Asked of the claim's own paths, so it
+        # needs no walk snapshot -- which is what lets a statically registered
+        # or drag-dropped claim get a real answer too.
+        server, manager, monitored = self._manager(tmp_path, stability_window=0.0)
+        data = monitored / "sample.dat"
+        data.write_text("hello")
+        manager._handle_rescan()
+        (claim,) = manager._reconciler._state.claims.values()
+
+        manager._stability_window = 3600.0
+        manager._reconciler._stability_window = 3600.0
+        data.write_text("still writing")
+        assert manager._reconciler._claim_is_quiet(claim) is False
+
+        manager._reconciler._stability_window = 0.0
+        assert manager._reconciler._claim_is_quiet(claim) is True
+
+    def test_a_vanished_member_reads_as_gone_not_churning(self, tmp_path):
+        # Absence is the case removal exists to act on; it must not be mistaken
+        # for "cannot stat, therefore might be changing".
+        _, manager, monitored = self._manager(tmp_path, stability_window=3600.0)
+        data = monitored / "sample.dat"
+        data.write_text("hello")
+        manager._handle_rescan()
+
+        claim = SourceClaim(
+            source_type="fake",
+            primary_path=str(monitored / "never-existed.dat"),
+            source_id="gone",
+        )
+        assert manager._reconciler._claim_is_quiet(claim) is True
+
+    def test_the_walk_derives_pending_scan_from_the_same_predicate(self, tmp_path):
+        # pending_scan used to be cleared by the claim gate reaching into the
+        # cached record; it is now derived in the walk, so the #53 subtree gate
+        # and the claim gate cannot disagree about what "settling" means.
+        _, manager, monitored = self._manager(tmp_path, stability_window=3600.0)
+        (monitored / "sample.dat").write_text("hello")
+
+        entries = _scan(manager)
+        assert all(entry.pending_scan for entry in entries.values())
+
+        manager._scanner._stability_window = 0.0
+        entries = _scan(manager)
+        assert not any(entry.pending_scan for entry in entries.values())

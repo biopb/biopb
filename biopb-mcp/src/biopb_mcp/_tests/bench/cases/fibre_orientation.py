@@ -1,6 +1,6 @@
 """Fibre orientation as benchmark data: which way do these run, and how much?
 
-A deferred-tier case (`docs/skill-candidates.md`). Fibre orientation was
+A deferred-tier case. Fibre orientation was
 **prescreened and dropped** 2026-08-03 for the shipped catalog — both cold
 Sonnet arms built a global structure tensor, whose double-angle form handles the
 wrap by construction, and scored 0.1 and 0.7 degrees. It is here anyway, because

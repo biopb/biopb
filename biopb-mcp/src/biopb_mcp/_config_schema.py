@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Optional
 
 from biopb._config_schema import dataclass_section, json_type
 
-from biopb_mcp._config import _CONSTRAINTS, _SECTION_CLASSES
+from biopb_mcp._config import _CONSTRAINTS, McpConfig
 
 SCHEMA_ID = "https://biopb.org/schemas/mcp-config.json"
 SCHEMA_DIALECT = "https://json-schema.org/draft/2020-12/schema"
@@ -47,8 +47,10 @@ def _array_property(
     return prop
 
 
-def _section_schema(cls: Any) -> Dict[str, Any]:
-    """One section object: scalar fields via the shared engine + list fields."""
+def _section_schema(section: dataclasses.Field) -> Dict[str, Any]:
+    """One section object: scalar fields via the shared engine + list fields,
+    and its settings-page title and prose where it has them."""
+    cls = section.default_factory
     props = dataclass_section(cls, _CONSTRAINTS.get(cls.__name__, {}))
     inst = cls()
     for f in dataclasses.fields(cls):
@@ -57,7 +59,12 @@ def _section_schema(cls: Any) -> Dict[str, Any]:
         value = getattr(inst, f.name)
         if isinstance(value, list):
             props[f.name] = _array_property(value, f.metadata.get("help"))
-    return {"type": "object", "additionalProperties": True, "properties": props}
+    node: Dict[str, Any] = {"type": "object", "additionalProperties": True}
+    if section.metadata.get("title"):
+        node["title"] = section.metadata["title"]
+        node["description"] = section.metadata["summary"]
+    node["properties"] = props
+    return node
 
 
 def build_mcp_config_schema() -> Dict[str, Any]:
@@ -68,9 +75,7 @@ def build_mcp_config_schema() -> Dict[str, Any]:
     ones. Sections keep ``additionalProperties: true`` (values are enforced and
     keys documented without erroring on a forward-unknown key).
     """
-    properties = {
-        section: _section_schema(cls) for section, cls in _SECTION_CLASSES.items()
-    }
+    properties = {f.name: _section_schema(f) for f in dataclasses.fields(McpConfig)}
     return {
         "$schema": SCHEMA_DIALECT,
         "$id": SCHEMA_ID,

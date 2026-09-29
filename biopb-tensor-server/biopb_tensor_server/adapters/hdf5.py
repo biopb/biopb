@@ -82,7 +82,7 @@ class Hdf5Adapter(TensorAdapter):
         """Create adapter instance from SourceConfig.
 
         Args:
-            source: SourceConfig with url, source_id, dim_labels, dataset
+            source: SourceConfig with url, source_id, dataset
 
         Returns:
             Hdf5Adapter instance
@@ -98,13 +98,12 @@ class Hdf5Adapter(TensorAdapter):
             )
 
         with h5py.File(str(source.url), "r") as f:
-            return cls(f[source.dataset], source.source_id, source.dim_labels)
+            return cls(f[source.dataset], source.source_id)
 
     def __init__(
         self,
         h5_dataset,
         source_id: str,
-        dim_labels: Optional[List[str]] = None,
     ):
         """Initialize HDF5 adapter.
 
@@ -115,12 +114,10 @@ class Hdf5Adapter(TensorAdapter):
         Args:
             h5_dataset: h5py Dataset object
             source_id: Unique identifier for this data source
-            dim_labels: Optional dimension labels
         """
         self.source_id = source_id
-        self.dim_labels = dim_labels or [
-            f"dim{i}" for i in range(len(h5_dataset.shape))
-        ]
+        # HDF5 carries no axis semantics; the catalog reports positional labels.
+        self.dim_labels = [f"dim{i}" for i in range(len(h5_dataset.shape))]
 
         self._path = h5_dataset.file.filename if hasattr(h5_dataset, "file") else ""
         self._dataset_path = h5_dataset.name

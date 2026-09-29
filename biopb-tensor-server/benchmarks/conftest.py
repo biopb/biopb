@@ -16,7 +16,9 @@ import numpy as np
 import pytest
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.core.config import CacheConfig
+from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 from biopb_tensor_server.serving.server import TensorFlightServer
+from tests import register_and_catalog
 
 from benchmarks.utils import (
     generate_multiresolution_zarr,
@@ -395,17 +397,11 @@ def temp_cache_dir() -> Generator[str, None, None]:
 @pytest.fixture
 def bench_server(
     temp_cache_dir: str,
-    request: pytest.FixtureRequest,
 ) -> Generator[TensorFlightServer, None, None]:
-    """Start TensorFlightServer with configurable cache backend.
+    """Start TensorFlightServer with the on-disk Arrow file cache.
 
     When BIOPB_BENCH_SERVER_URL is set, connects to existing production server
     instead of creating a new one (for container-based benchmarking).
-
-    Cache backend controlled by:
-    - pytest parametrize (request.param) - for explicit comparison tests
-    - BIOPB_CACHE_BACKEND env var - default backend override
-    - defaults to "file" if neither specified
     """
     # Check for existing production server
     existing_url = os.environ.get("BIOPB_BENCH_SERVER_URL")
@@ -421,35 +417,22 @@ def bench_server(
         return
 
     # Create ephemeral test server (default behavior)
-    # Priority: pytest param > env var > default "file"
-    backend = getattr(request, "param", None)
-    if backend is None:
-        backend = os.environ.get("BIOPB_CACHE_BACKEND", "file")
-
-    if backend == "memory":
-        config = CacheConfig(
-            backend="memory",
-            memory_max_entries=1024,
-            memory_max_bytes=512 * 1024 * 1024,
-        )
-    elif backend == "file":
-        config = CacheConfig(
-            backend="file",
-            file_cache_dir=Path(temp_cache_dir),
-            file_max_segment_bytes=256 * 1024 * 1024,
-            file_max_total_bytes=64 * 1024 * 1024 * 1024,
-        )
-    else:
-        raise ValueError(f"Unknown cache backend: {backend}")
+    config = CacheConfig(
+        file_cache_dir=Path(temp_cache_dir),
+        file_max_segment_bytes=256 * 1024 * 1024,
+        file_max_total_bytes=64 * 1024 * 1024 * 1024,
+    )
 
     CacheManager.initialize(config)
 
     import random
 
     port = random.randint(8900, 8999)
-    server = TensorFlightServer(f"grpc://localhost:{port}")
+    server = TensorFlightServer(
+        f"grpc://localhost:{port}", metadata_db=MetadataDatabase()
+    )
     server._bench_port = port
-    server._bench_backend = backend
+    server._bench_backend = "file"
     server._bench_cache_dir = temp_cache_dir
     server._production_mode = False
 
@@ -561,7 +544,6 @@ def _register_source_with_server(
         url=path,
         type=registry_type,
         source_id=source_id,
-        dim_labels=spec.get("dim_labels"),
         dataset="data" if source_type == "hdf5" else None,
     )
 
@@ -573,7 +555,9 @@ def _register_source_with_server(
         raise ValueError(f"No adapter registered for type: {registry_type}")
 
     adapter = adapter_cls.create_from_config(source_config)
-    server.register_source(source_id, adapter)
+    # Registry + catalog: registration alone leaves a source unbrowsable, and a
+    # benchmark client that opens by descriptor reads the catalog row.
+    register_and_catalog(server, source_id, adapter)
 
     return source_id
 
@@ -665,11 +649,12 @@ def data_source(
 
         # Create adapter from config with anon credentials
         adapter = adapter_cls.create_from_config(source_config, anon_credentials)
-        bench_server.register_source(source_id, adapter)
+        register_and_catalog(bench_server, source_id, adapter)
 
         yield spec
 
         bench_server.unregister_source(source_id)
+        bench_server.metadata_db.sync_source_removed(source_id)
 
     elif is_nfs_source(source_id):
         if not has_nfs_marker:
@@ -696,6 +681,7 @@ def data_source(
         yield spec
 
         bench_server.unregister_source(source_id)
+        bench_server.metadata_db.sync_source_removed(source_id)
 
 
 # =============================================================================

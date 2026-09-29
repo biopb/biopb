@@ -12,7 +12,10 @@
  * which sections exist, their order, their prose, and which of a section's schema
  * fields are "common" (shown directly) vs "advanced" (behind a disclosure).
  * A schema field not listed as common still renders — it just lands under the
- * Advanced disclosure — so a new server field is never silently dropped.
+ * Advanced disclosure — so a new server field is never silently dropped. A whole
+ * *section* is not so lucky: it appears only if listed here. `ADMIN_HIDDEN_SECTIONS`
+ * below is what makes that checkable rather than a thing to remember
+ * (biopb/biopb#948).
  */
 
 /** How a nav item's content panel is rendered. */
@@ -61,13 +64,14 @@ export const ADMIN_NAV: AdminNavItem[] = [
     id: "cache",
     label: "Cache",
     description:
-      "In-memory and on-disk caching of decoded image chunks. Larger limits keep " +
-      "more data warm at the cost of RAM and disk.",
+      "On-disk caching of decoded image chunks. Larger limits keep more data " +
+      "warm at the cost of disk.",
     kind: "fields",
     section: "cache",
-    // On-disk keys (config-schema maps the dataclass's memory_max_bytes →
-    // cache.max_bytes); commonFields must match the schema, not the dataclass.
-    commonFields: ["backend", "max_bytes", "file_max_total_gb"],
+    // On-disk keys (config-schema maps the dataclass's file_max_total_bytes →
+    // cache.file_max_total_gb); commonFields must match the schema, not the
+    // dataclass.
+    commonFields: ["file_max_segment_mb", "file_max_total_gb"],
   },
   {
     id: "pyramid",
@@ -109,6 +113,27 @@ export const ADMIN_NAV: AdminNavItem[] = [
     commonFields: ["max_query_results", "query_timeout_ms"],
   },
   {
+    id: "catalog",
+    label: "Catalog",
+    description:
+      "The database file holding the source listing, drawn ROIs, and the cache's " +
+      "measured decode throughput. Off keeps it in memory, so none of that " +
+      "outlives the server.",
+    kind: "fields",
+    section: "catalog",
+    commonFields: ["persist", "store_path"],
+  },
+  {
+    id: "annotations",
+    label: "Annotations",
+    description:
+      "User-drawn ROIs stored in the catalog alongside the sources. Turning this " +
+      "off leaves a strictly read-only catalog; the limit is per tensor.",
+    kind: "fields",
+    section: "annotations",
+    commonFields: ["enabled", "max_rois_per_tensor"],
+  },
+  {
     id: "raw",
     label: "Raw JSON",
     description:
@@ -118,6 +143,15 @@ export const ADMIN_NAV: AdminNavItem[] = [
     kind: "raw",
   },
 ];
+
+/**
+ * Config sections deliberately absent from `ADMIN_NAV` — none: every
+ * tensor-server section is meant to be reachable here. A drift guard
+ * (config_admin_nav_test.py) asserts the schema's sections are exactly
+ * `ADMIN_NAV` plus this set, so adding a section without a nav entry fails the
+ * test rather than shipping a section only Raw JSON can reach.
+ */
+export const ADMIN_HIDDEN_SECTIONS: ReadonlySet<string> = new Set<string>();
 
 /** The default (first) nav section id. */
 export const DEFAULT_ADMIN_NAV_ID = ADMIN_NAV[0]!.id;

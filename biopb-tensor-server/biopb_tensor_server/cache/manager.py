@@ -12,18 +12,16 @@ from typing import Callable, Optional, Tuple
 
 import pyarrow as pa
 
-from biopb_tensor_server.cache.base import (
-    CacheBackend,
+from biopb_tensor_server.cache.file_backend import ArrowFileBackend, ArrowFileConfig
+from biopb_tensor_server.cache.recovery import RecoveryStatus
+from biopb_tensor_server.cache.types import (
     CacheEntry,
     CacheStats,
     ChunkLocation,
-)
-from biopb_tensor_server.cache.file_backend import ArrowFileBackend, ArrowFileConfig
-from biopb_tensor_server.cache.memory_backend import (
-    MemoryCacheBackend,
-    MemoryCacheConfig,
+    RetentionClass,
 )
 from biopb_tensor_server.core.config import CacheConfig
+from biopb_tensor_server.core.retention import DecodeRates, set_active_decode_rates
 
 
 class CacheManager:
@@ -46,27 +44,24 @@ class CacheManager:
     _init_lock = threading.Lock()
 
     def __init__(self, config: CacheConfig):
-        """Initialize with CacheConfig, selecting backend based on config.backend."""
-        if config.backend == "memory":
-            self._backend = MemoryCacheBackend(
-                MemoryCacheConfig(
-                    max_entries=config.memory_max_entries,
-                    max_bytes=config.memory_max_bytes,
-                )
+        """Initialize with CacheConfig, backed by the on-disk Arrow file cache."""
+        # On the manager rather than the backend: the scaled read holds the
+        # manager and nothing else of the config.
+        self.source_scaled_reads = bool(config.source_scaled_reads)
+        # Installed before the backend so a chunk served during recovery is
+        # classified against the same table every later one is. The threshold
+        # comes from here because it is cache policy; the persistent store is
+        # attached later by the server, which is what holds the catalog (see
+        # core.retention).
+        self._rates = DecodeRates(config.cheap_decode_mbps)
+        set_active_decode_rates(self._rates)
+        self._backend = ArrowFileBackend(
+            ArrowFileConfig(
+                cache_dir=config.file_cache_dir,
+                max_segment_bytes=config.file_max_segment_bytes,
+                max_total_bytes=config.file_max_total_bytes,
             )
-        elif config.backend == "file":
-            self._backend = ArrowFileBackend(
-                ArrowFileConfig(
-                    cache_dir=config.file_cache_dir,
-                    max_segment_bytes=config.file_max_segment_bytes,
-                    max_total_bytes=config.file_max_total_bytes,
-                    max_deferred_write_bytes=config.file_deferred_write_mb
-                    * 1024
-                    * 1024,
-                )
-            )
-        else:
-            raise ValueError(f"Unknown cache backend: {config.backend}")
+        )
 
     @classmethod
     def initialize(cls, config: CacheConfig) -> CacheManager:
@@ -83,11 +78,6 @@ class CacheManager:
         return cls._instance
 
     @classmethod
-    def is_initialized(cls) -> bool:
-        """Check if initialized."""
-        return cls._instance is not None
-
-    @classmethod
     def reset(cls) -> None:
         """Reset singleton (for testing)."""
         with cls._init_lock:
@@ -96,14 +86,24 @@ class CacheManager:
             cls._instance = None
 
     @property
-    def backend(self) -> CacheBackend:
-        """Get the underlying backend."""
+    def backend(self) -> ArrowFileBackend:
+        """The storage backend, for operations this manager does not own.
+
+        Not a leak -- the split is deliberate. This class owns the singleton,
+        the ``CacheConfig`` translation, the decode-rate table and the
+        reserve/commit dance in :meth:`put`; the backend owns storage. The
+        methods below are here because they are the cache API a chunk request
+        needs, not because the manager is meant to mirror the backend. Anything
+        else (``remove``, ``get_recovery_status``, the index internals a test
+        asserts on) is reached through here on purpose.
+        """
         return self._backend
 
     def get_or_acquire(
         self,
         key: bytes,
         compute_fn: Callable[[], Tuple[pa.RecordBatch, int]],
+        retention: RetentionClass = "normal",
     ) -> CacheEntry:
         """Get or compute entry with future/promise pattern.
 
@@ -113,17 +113,37 @@ class CacheManager:
         Args:
             key: Cache key bytes
             compute_fn: Returns (RecordBatch, size_bytes)
+            retention: What a miss for this chunk costs, declared by the caller
+                that knows how it was produced. Only the call that creates the
+                entry sets it.
 
         Returns:
             CacheEntry with state READY, ref_count >= 1
         """
-        return self._backend.get_or_acquire(key, compute_fn)
+        return self._backend.get_or_acquire(key, compute_fn, retention)
+
+    def contains(self, key: bytes) -> bool:
+        """Whether *key* is cached and servable without computing it.
+
+        See :meth:`ArrowFileBackend.contains`: a peek, not a promise.
+        """
+        return self._backend.contains(key)
+
+    def try_acquire(self, key: bytes, touch: bool = True) -> Optional[CacheEntry]:
+        """The acquired entry for *key*, or None when it is not already cached.
+
+        See :meth:`ArrowFileBackend.try_acquire`. Release it as you would an
+        entry from :meth:`get_or_acquire`; ``touch=False`` keeps the read out
+        of the eviction policy.
+        """
+        return self._backend.try_acquire(key, touch=touch)
 
     def put(
         self,
         key: bytes,
         data: pa.RecordBatch,
         size_bytes: int,
+        retention: RetentionClass = "normal",
     ) -> bool:
         """Store an already-computed batch. Returns True if this call stored it.
 
@@ -145,29 +165,18 @@ class CacheManager:
         that must not collide with a previous one gets a fresh cache namespace
         from its ``content_version`` (biopb/biopb#178), not from an overwrite.
 
-        Never deferred, whatever the backend is configured for. Deferring a
-        write is safe when the cache is a cache -- a lost write costs a re-read
-        from the backend. This path has no backend to re-read: an upload's only
-        copy is what lands in the segment (``CachedSourceAdapter.get_data``
-        raises, and it serves only chunk_ids that were written). So this caller
-        must not be told the bytes are stored until they are.
-
         Args:
             key: Cache key bytes
             data: The batch to store
             size_bytes: Size of data in bytes
+            retention: What a miss for this chunk costs. An upload takes the
+                default: nothing deletes a "pinned" entry, and an upload is
+                meant to be temporary.
         """
-        _entry, is_owner = self._backend.start_compute(key)
+        _entry, is_owner = self._backend.start_compute(key, retention)
         try:
             if is_owner:
-                if self._backend.SUPPORTS_DEFERRED_WRITES:
-                    self._backend.complete_entry(
-                        key, data, size_bytes, allow_deferred=False
-                    )
-                else:
-                    # A backend that cannot defer is called as it always was, so
-                    # one written against the historical signature keeps working.
-                    self._backend.complete_entry(key, data, size_bytes)
+                self._backend.complete_entry(key, data, size_bytes)
         except BaseException as e:
             # A failed commit must not strand a PENDING entry: readers of this
             # key would block on it until pending_timeout.
@@ -183,26 +192,10 @@ class CacheManager:
         """Release reference to entry after use."""
         return self._backend.release(key)
 
-    def remove(self, key: bytes) -> bool:
-        """Remove entry (only if evictable)."""
-        return self._backend.remove(key)
-
-    def await_deferred_write(self, key: bytes, timeout: float = 5.0) -> bool:
-        """Wait for one key's deferred write. True if nothing is owed.
-
-        For the caller that needs bytes on disk rather than data in hand -- the
-        localhost handoff, which answers with a segment byte range. Backends that
-        never defer answer True immediately.
-        """
-        waiter = getattr(self._backend, "flush_deferred_write", None)
-        return True if waiter is None else waiter(key, timeout)
-
     def locate_entry(self, key: bytes) -> Optional[ChunkLocation]:
-        """Return the on-disk ChunkLocation for a cached chunk, or None.
+        """Return the on-disk ChunkLocation for a cached chunk, or None (issue #9).
 
-        Only the file backend can locate entries on disk (issue #9); the memory
-        backend inherits the interface's None default and the caller falls back
-        to do_get.
+        None means the caller falls back to do_get.
         """
         return self._backend.locate_entry(key)
 
@@ -214,15 +207,30 @@ class CacheManager:
         """Get cache statistics."""
         return self._backend.stats()
 
-    def release_process_lock(self) -> None:
-        """Release the cross-process cache lock + clear the WAL, handles left open.
+    def get_recovery_status(self) -> Optional[RecoveryStatus]:
+        """What the boot path recovered, or None if it was a clean start.
 
-        Delegates to the backend's fast graceful-shutdown path (no-op on the
-        memory backend). Callers guard the singleton for ``None`` themselves
-        (``CacheManager.get_instance()``).
+        Populated during ``__init__`` and immutable after, so a caller reporting
+        it at startup (``cli.py``) reads it here rather than reaching past the
+        manager for it.
+        """
+        return self._backend.get_recovery_status()
+
+    def release_process_lock(self) -> None:
+        """Release the cross-process cache lock, handles left open.
+
+        Delegates to the backend's fast graceful-shutdown path. Callers guard
+        the singleton for ``None`` themselves (``CacheManager.get_instance()``).
         """
         self._backend.release_process_lock()
 
     def close(self) -> None:
-        """Close manager."""
+        """Close manager, persisting the decode rates it measured.
+
+        Flushed here rather than left to the debounce so a clean shutdown keeps
+        the last minute of measurement. The table this manager installed, not
+        whatever is active now: a second manager (a test, a reconfigure) has
+        since replaced it.
+        """
+        self._rates.flush()
         self._backend.close()

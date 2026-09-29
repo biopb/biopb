@@ -103,7 +103,6 @@ class EmdAdapter(TensorAdapter):
             source_id=source.source_id,
             url=url,
             signals=signals,
-            dim_labels=source.dim_labels,
             source_url=url,
         )
 
@@ -113,7 +112,6 @@ class EmdAdapter(TensorAdapter):
         url: str,
         signals: List[dict],
         signal_index: Optional[int] = None,
-        dim_labels: Optional[List[str]] = None,
         source_url: Optional[str] = None,
         io_lock: Optional[threading.Lock] = None,
     ):
@@ -121,7 +119,6 @@ class EmdAdapter(TensorAdapter):
         self._url = url
         self._signals = signals
         self.signal_index = signal_index
-        self._dim_labels_override = dim_labels
         self._io_lock = io_lock if io_lock is not None else threading.Lock()
         self._tensor_adapters: dict = {}
 
@@ -140,16 +137,14 @@ class EmdAdapter(TensorAdapter):
             self._original_metadata = sig.get("original_metadata", {})
             self.dim_labels = self._labels_for(sig)
         else:
-            # Source-level: no bound signal; dim_labels is the default for tensors.
+            # Source-level: no bound signal or axis labels.
             self._data = None
             self._axes = None
             self._original_metadata = None
-            self.dim_labels = dim_labels
+            self.dim_labels = None
 
     def _labels_for(self, sig: dict) -> List[str]:
-        """Dim labels for one signal: caller override, else reader axis names."""
-        if self._dim_labels_override:
-            return list(self._dim_labels_override)
+        """Dimension labels from one signal's reader axis names."""
         axes = sig["axes"]
         return [
             str(ax.get("name")) if ax.get("name") else f"dim{i}"
@@ -236,7 +231,6 @@ class EmdAdapter(TensorAdapter):
             url=self._url,
             signals=self._signals,
             signal_index=index,
-            dim_labels=self._dim_labels_override,
             source_url=self._source_url,
             io_lock=self._io_lock,
         )

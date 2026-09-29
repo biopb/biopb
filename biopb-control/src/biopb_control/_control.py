@@ -19,12 +19,16 @@ same port**, and routes by namespace so no two upstreams share a path prefix:
 - ``GET  /api/status``            -> the control's own liveness + the data-plane
                                      snapshot + a live-session count (what the
                                      dashboard polls).
+- ``GET  /api/algorithms``        -> every algorithm registry entry, with its state
+                                     and cached ops; a script entry's row carries
+                                     its loopback url and token.
+- ``POST /api/algorithms/{refresh,ensure,stop,restart}``, ``GET
+  /api/algorithms/logs`` -> the algorithm plane's verbs (``?name=``).
 - ``GET  /api/sessions``          -> the live MCP sessions from the registry, each
                                      with its ``/session/<id>/observe`` link.
-- ``POST /api/sessions/new``      -> launch an agentless ``biopb mcp view``
-                                     session on this machine's display. Refused
-                                     unless this control is loopback-bound and
-                                     has a display of its own; the child is
+- ``POST /api/sessions/new``      -> launch an agentless session on this
+                                     machine; its config decides whether it
+                                     gets a napari viewer. The child is
                                      detached and self-registering, so the
                                      control launches it without owning it.
 - ``GET  /`` (and every other non-API, non-proxy GET) -> the built ``web/``
@@ -39,8 +43,7 @@ same port**, and routes by namespace so no two upstreams share a path prefix:
                                      namespacing, base ``/``. (No bundle ->
                                      API-only.) ``url_prefix`` republishes the
                                      whole origin under a reverse-proxy path
-                                     prefix at run time; see
-                                     ``docs/url-prefix.md``.
+                                     prefix at run time.
 - ``/data_plane/{api,livez,...}`` is reverse-proxied to the supervised tensor
   server's HTTP sidecar — a ``Mount`` that strips its prefix, so the sidecar
   (which serves ``/api/*`` at its own root) needs no knowledge of
@@ -68,12 +71,11 @@ never imports — the proxy reaches it over loopback like any other client.
   accepted regardless of which external hostname the browser used to reach the
   control. (Rebinding/token protection for the origin as a whole is a
   follow-up, same as the data-plane proxy's.)
-- ``/session/<id>/console/*`` is the same hop for the **user console** — a code
-  cell on the observe page that runs in that session's kernel — and is proxied
-  **only when this control is loopback-bound** (``_session_proxy_roots``). It is
-  a separate root precisely so that "can a browser reach an RCE here?" stays one
-  checkable statement: ``api`` always, ``console`` local-mode only, ``/mcp``
-  never.
+- ``/session/<id>/chat/*`` is the same hop for the built-in chat client's
+  turns, which run code in that session's kernel, and is proxied **only when
+  this control is loopback-bound** (``_session_proxy_roots``). It is a separate
+  root precisely so that "can a browser reach an RCE here?" stays one checkable
+  statement: ``api`` always, ``chat`` local-mode only, ``/mcp`` never.
 
 This module lands the namespaced origin, the data-plane API proxy, per-session
 observe routing, and the control-served SPA bundle — the full single-origin
@@ -88,6 +90,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import socket
 import subprocess
 import sys
@@ -100,13 +103,11 @@ import httpx
 import uvicorn
 from biopb import (
     _agents,
-    _algorithms,
-    _kernel_plugins,
     _locations,
     _sessions,
     _web_auth,
 )
-from biopb._lifecycle.daemon import detach_kwargs
+from biopb.lifecycle.daemon import detach_kwargs
 from starlette.applications import Starlette
 from starlette.background import BackgroundTask
 from starlette.datastructures import Headers
@@ -122,7 +123,8 @@ from starlette.responses import (
 from starlette.routing import Mount, Route
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from ._supervisor import DataPlaneSupervisor
+from ._algorithm_plane import INSTALL_TIMEOUT, AlgorithmPlane
+from ._supervisor import DataPlaneSupervisor, tail_file as _tail_file
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +133,8 @@ logger = logging.getLogger(__name__)
 # out, else the client treats a working-but-slow control plane as unreachable.
 _RESPONSE_MARGIN = 5.0
 _MIN_ENSURE_WAIT = 1.0
+# An algorithm verb's wait when the client sends no ?client_timeout.
+_ALGORITHM_WAIT_DEFAULT = 60.0
 
 # Response headers we must not copy verbatim from the upstream tensor server:
 # hop-by-hop headers and framing that StreamingResponse re-derives itself.
@@ -149,18 +153,20 @@ _HOP_BY_HOP = frozenset(
 # to /mcp past a naive "startswith('mcp')" check.
 _SESSION_ALLOWED_ROOTS = frozenset({"api"})
 
-# The **conditionally** proxied root: the user console, a code cell on the observe
-# page that runs in the session's kernel (biopb-mcp ``docs/user-console.md``).
-# Kept out of the set above rather than added to it, because the two are gated
-# differently and the difference is the whole point: `api` is always proxied,
-# `console` only when this control is loopback-bound.
+# The **conditionally** proxied root: the built-in chat client's one write route
+# (biopb-mcp ``mcp/_chat_api.py``). A chat turn runs arbitrary code in the
+# session kernel. Kept out of the set above rather than added to it, because the
+# two are gated differently and the difference is the whole point: `api` is
+# always proxied, `chat` only when this control is loopback-bound.
 #
 # Why a separate root at all. The allowlist exists to keep the child's /mcp — an
 # RCE on the same port — off this origin. An execute route folded into `api`
 # would put arbitrary code back through exactly that hole, silently: the
 # allowlist would still be there, still enforced, and no longer true. A distinct
-# root keeps the statement checkable — `api` always, `console` local-mode only,
+# root keeps the statement checkable — `api` always, `chat` local-mode only,
 # `/mcp` never — and makes "is RCE reachable from the browser?" one boolean.
+# The chat's *reads* live under `api`: a conversation is a read like the job
+# list.
 #
 # That boolean assumes the root is **POST-only**, and `session_proxy` enforces
 # it rather than trusting the child to: the CSRF gate skips safe methods, so a
@@ -168,44 +174,31 @@ _SESSION_ALLOWED_ROOTS = frozenset({"api"})
 #
 # Known limitation: this reads the control's own **bind**, so a loopback control
 # deliberately published by a reverse proxy (the topology biopb-mcp CLAUDE.md
-# points at for untrusted networks) reads as local and gets the console. That
+# points at for untrusted networks) reads as local and gets the chat route. That
 # operator is already responsible for the token in front of the data plane; a
 # control-side opt-out flag is the follow-up if the reverse-proxy topology stops
 # being the exception.
-_SESSION_CONSOLE_ROOT = "console"
-
-# The built-in chat client's one write route (biopb-mcp ``mcp/_chat_api.py``).
-# Gated identically to the console and for the identical reason: a chat turn
-# runs arbitrary code in the session kernel, so it is the same RCE the allowlist
-# above exists to keep off this origin. Its *reads* are not here -- they live
-# under `api`, which is both correct (a conversation is a read like the job
-# list) and required, since the POST-only assumption above would forward a
-# cross-site GET to this root unchecked.
 _SESSION_CHAT_ROOT = "chat"
 
-# The execute-capable roots, which `session_proxy` narrows to POST. Both are
-# here for the same reason the console was: the CSRF gate skips safe methods, so
-# a cross-site GET to either is forwarded unchecked, and the root's claim must
-# not rest on the child's method list. Naming the set rather than testing one
-# root means a third such root inherits the narrowing by being added here.
-_SESSION_POST_ONLY_ROOTS = frozenset({_SESSION_CONSOLE_ROOT, _SESSION_CHAT_ROOT})
+# The execute-capable roots, which `session_proxy` narrows to POST (above).
+# Naming the set rather than testing one root means a second such root inherits
+# the narrowing by being added here.
+_SESSION_POST_ONLY_ROOTS = frozenset({_SESSION_CHAT_ROOT})
 
 
-def _session_proxy_roots(console_enabled: bool) -> frozenset[str]:
+def _session_proxy_roots(loopback_bound: bool) -> frozenset[str]:
     """The session-child path roots this control will proxy.
 
     One source for both the proxy's own gate and the auth middleware, so the
     guard and the thing it guards cannot disagree about what is reachable.
 
-    The flag reads "console" for history but means **this control is
-    loopback-bound**: it is computed from the bind, not from any feature switch,
-    and it gates every execute-capable root together. Whether a given one is
-    actually served is the child's own decision (``observe.console_enabled``,
-    ``observe.chat_enabled``), which is the half this control does not and
-    should not know.
+    The flag is computed from the bind, not from any feature switch, and it
+    gates every execute-capable root together. Whether a given one is actually served
+    is the child's own decision (``observe.chat_enabled``), which is the half
+    this control does not and should not know.
     """
-    if console_enabled:
-        return _SESSION_ALLOWED_ROOTS | {_SESSION_CONSOLE_ROOT, _SESSION_CHAT_ROOT}
+    if loopback_bound:
+        return _SESSION_ALLOWED_ROOTS | {_SESSION_CHAT_ROOT}
     return _SESSION_ALLOWED_ROOTS
 
 
@@ -230,35 +223,6 @@ _UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 _LOG_TAIL_DEFAULT_LINES = 200
 _LOG_TAIL_MAX_LINES = 2000
 _LOG_TAIL_MAX_BYTES = 512 * 1024
-
-
-def _tail_file(path: Path, max_lines: int, max_bytes: int) -> tuple[list[str], bool]:
-    """Return ``(lines, truncated)`` for the tail of *path*.
-
-    Reads at most the final *max_bytes* and returns at most *max_lines* lines from
-    the end. ``truncated`` is True when older content exists that was not returned
-    (the byte window didn't reach the file start, or the line cap trimmed more).
-
-    The child (tensor server) and its native libraries emit arbitrary bytes, so
-    decode UTF-8 with ``errors="replace"`` rather than risk a decode error. When
-    the byte window starts mid-file its first line is almost certainly a fragment,
-    so drop it.
-    """
-    size = path.stat().st_size
-    read_bytes = min(size, max_bytes)
-    with path.open("rb") as f:
-        if read_bytes < size:
-            f.seek(size - read_bytes)
-        data = f.read(read_bytes)
-    partial = read_bytes < size
-    lines = data.decode("utf-8", "replace").splitlines()
-    if partial and lines:
-        lines = lines[1:]  # drop the leading fragment
-    truncated = partial
-    if len(lines) > max_lines:
-        lines = lines[-max_lines:]
-        truncated = True
-    return lines, truncated
 
 
 def _is_proxied_session_path(path: str, roots=_SESSION_ALLOWED_ROOTS) -> bool:
@@ -335,7 +299,7 @@ def normalize_url_prefix(value: str | None) -> str | None:
     One leading slash, no trailing slash, empty segments dropped; ``None``,
     ``""`` and ``"/"`` all mean "serve at the root". Applied by
     :func:`build_app` — the single consumer — so every entry point (``python -m
-    biopb_control run``, the foreground CLI, tests) normalizes by the same rule.
+    biopb_control run``, tests) normalizes by the same rule.
 
     Raises :class:`ValueError` for anything that is not a plain same-origin path
     (see :data:`_SAFE_PREFIX_SEGMENT`, and ``.``/``..``, which would make the
@@ -505,12 +469,12 @@ class _ControlAuthMiddleware:
     re-validates the forwarded token), so it is not touched here.
 
     ``session_roots`` is the proxy's own root set, so whatever that forwards is
-    what this gates — including ``/session/<id>/console/*`` when the console is
-    enabled, which is the one path where the request being gated is arbitrary
-    code. Note the gate is **necessary but not sufficient** for the console: it
+    what this gates — including ``/session/<id>/chat/*`` when the control is
+    loopback-bound, which is the one path where the request being gated runs
+    arbitrary code. Note the gate is **necessary but not sufficient** there: it
     judges the caller, not the topology, and would happily authorize an execute
-    on a public origin. What keeps the console off a public origin is that the
-    root is not proxied there at all (:func:`_session_proxy_roots`).
+    on a public origin. What keeps chat off a public origin is that the root is
+    not proxied there at all (:func:`_session_proxy_roots`).
     """
 
     def __init__(
@@ -565,6 +529,21 @@ def _bounded_ensure_wait(ensure_timeout: float, client_timeout: float) -> float:
     if client_timeout <= 0:
         return ensure_timeout
     return max(_MIN_ENSURE_WAIT, min(ensure_timeout, client_timeout - _RESPONSE_MARGIN))
+
+
+def _algorithm_wait(client_timeout: float) -> float:
+    """How long an algorithm entry's ``ensure``/``restart`` waits.
+
+    Its ensure may first install the entry's environment, so the data plane's
+    ``ensure_timeout`` does not bound it: the client's timeout does (less the
+    margin), capped by how long an install may take. Without a client hint it
+    waits ``_ALGORITHM_WAIT_DEFAULT``; the row then says what is still running.
+    """
+    if client_timeout <= 0:
+        return _ALGORITHM_WAIT_DEFAULT
+    return max(
+        _MIN_ENSURE_WAIT, min(INSTALL_TIMEOUT, client_timeout - _RESPONSE_MARGIN)
+    )
 
 
 def _loopback_url(host: str, port: int, scheme: str = "http") -> str:
@@ -639,7 +618,7 @@ async def _probe_session(client: httpx.AsyncClient, rec: dict) -> dict:
     The two booleans come off the same response rather than extra requests, and
     answer different questions. ``chat_enabled`` says what that session's page
     leads with, which is how the dashboard labels its link. ``agentless`` says
-    who owns the reap — only a ``biopb mcp view`` viewer ends itself, a
+    who owns the reap — only an agentless session ends itself, a
     shim-owned child is its shim's to reap — which is how the dashboard decides
     whether to offer a stop. Both absent on an older child, which reads as
     False: an observe link and no stop button, the behaviour that predates them.
@@ -662,38 +641,35 @@ async def _probe_session(client: httpx.AsyncClient, rec: dict) -> dict:
         return dict(_PROBE_UNKNOWN)
 
 
-# --- launching a viewer session ------------------------------------------- #
+# --- launching a session ---------------------------------------------------- #
 #
 # Invariant I1 (ARCHITECTURE.md) says the control observes sessions and never
 # spawns them, and its reason is a *display* one: a session spawned from the
 # control's frozen environment would put the agent's napari viewer somewhere the
-# user is not (biopb/biopb-mcp#98). That reason covers a session serving an MCP
-# client — whose spawner is that client's shim anyway — but not an agentless
-# `biopb mcp view` viewer, whose only natural spawner is the person at the
-# machine, and whose only way to exist until now was a terminal command. So the
-# control may *launch* one, under two conditions that keep #98 shut:
+# user is not (biopb/biopb-mcp#98). That covers a session serving an MCP client,
+# whose spawner is that client's shim anyway. It does not cover the session the
+# dashboard's "new session" opens: an agentless one, driven by the person at the
+# dashboard through its chat pane or a Jupyter client, and useful with no
+# viewer at all. Whether it gets one is its own config's call, made the way
+# every session makes it -- viewer.enabled, napari installed, a display -- and a
+# session that cannot have one runs without it rather than failing.
 #
-#   * it refuses unless it could plausibly reach the user's screen
-#     (:func:`_session_launch_gate`), and
-#   * it launches `--view` specifically, never a plain http session. A non-view
-#     session with a stale DISPLAY falls back to a virtual display and renders
-#     where nobody can see it — #98 exactly. `--view` refuses instead.
-#
-# What it does not do is own the result: the child is detached, self-registers,
-# and self-de-registers, so the *registry* still only ever observes, and a
-# control restart does not close the user's viewer.
+# What the control does not do is own the result: the child is detached,
+# self-registers, and self-de-registers, so the *registry* still only ever
+# observes, and a control restart does not end the user's session.
 
-# How long POST /api/sessions/new waits for a launched viewer to publish itself.
-# Generous because `--view` starts the kernel and opens the napari window
-# *before* it registers, so this covers a cold Qt/napari import and not just the
-# http stack the stdio shim waits on. Expiring is not a failure — the child is
-# still coming up and the dashboard's own poll picks it up when it lands.
-_VIEWER_START_TIMEOUT = 150.0
-_VIEWER_POLL_INTERVAL = 0.25
+# How long POST /api/sessions/new waits for a launched session to publish
+# itself. Generous because the session starts its kernel -- and a napari window
+# where it has one -- *before* it registers, so this covers a cold Qt/napari
+# import and not just the http stack the stdio shim waits on. Expiring is not a
+# failure: the child is still coming up and the dashboard's own poll picks it up
+# when it lands.
+_SESSION_START_TIMEOUT = 150.0
+_SESSION_POLL_INTERVAL = 0.25
 
-# Characters of this launch's own output echoed back when the viewer dies before
-# registering. That tail is the whole diagnosis (a dead display, a broken
-# install) and the only one the dashboard can show.
+# Characters of this launch's own output echoed back when the session dies
+# before registering. That tail is the whole diagnosis (a broken install, a bad
+# config) and the only one the dashboard can show.
 _VIEWER_LOG_TAIL = 2000
 
 # How many past launches' logs to keep. Matches the shim's session-log retention
@@ -703,65 +679,31 @@ _VIEWER_LOG_KEEP = 5
 
 # Cap on same-second name collisions before giving up on a log for this launch.
 # Two dashboard launches inside one second is already a double-click; a hundred
-# is a bug, and a viewer that starts without a log beats one that does not start.
+# is a bug, and a session that starts without a log beats one that does not.
 _VIEWER_LOG_ATTEMPTS = 100
 
 
-def _display_available() -> bool:
-    """Whether this process could put a window on the user's screen.
+def _session_argv() -> list[str]:
+    """The command that starts an agentless session.
 
-    macOS and Windows always have a window server; on Linux it takes an X11 or
-    Wayland session in *this* process's environment, because that is what a
-    launched child inherits. A duplicate of biopb-mcp's ``_has_display`` rather
-    than a call into it: the control may not import biopb-mcp (I2).
-
-    Only ever used to decide whether to *offer* a launch. A set-but-dead
-    ``DISPLAY`` (a control that outlived the login session that started it) is
-    not catchable this cheaply and passes — which is safe, because the child
-    re-checks, and fails and exits without registering rather than rendering
-    somewhere invisible.
+    A plain http session on ``--port 0``, which is what makes it agentless and
+    self-publishing (N of them never collide on the configured MCP port), with
+    its kernel started before it publishes itself so it is ready to use. Run
+    as a module of *this* interpreter -- the supervisor's idiom for the data
+    plane -- so it resolves through the environment the control was installed
+    into and needs no console script on PATH. Importing nothing of it here
+    keeps I2.
     """
-    if sys.platform == "darwin" or os.name == "nt":
-        return True
-    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
-
-
-def _session_launch_gate(console_enabled: bool) -> tuple[bool, str | None]:
-    """Whether this control may launch a viewer, and if not, why not.
-
-    Both halves are properties of this process — its bind and its environment —
-    so this is settled once at startup, not per request.
-
-    ``console_enabled`` is the same "this control is loopback-bound" bit that
-    gates the console and chat proxies, and it is required here for the same
-    kind of reason: a remote browser cannot see a napari window that opens on
-    the server. The message is returned rather than logged because the dashboard
-    shows it in place of the button — a missing control with no explanation is
-    the thing this is meant to avoid.
-    """
-    if not console_enabled:
-        return False, (
-            "this control is not loopback-bound, so a viewer it started would "
-            "open on the server's display, not yours"
-        )
-    if not _display_available():
-        return False, (
-            "no display is available to this control plane "
-            "($DISPLAY/$WAYLAND_DISPLAY are unset); start it from a desktop "
-            "session, or run `biopb mcp view` in a terminal that has one"
-        )
-    return True, None
-
-
-def _viewer_argv() -> list[str]:
-    """The command that starts an agentless viewer session.
-
-    ``--port 0`` so N viewers never collide on the configured MCP port. Run as a
-    module of *this* interpreter — the supervisor's idiom for the data plane —
-    so it resolves through the environment the control was installed into and
-    needs no console script on PATH. Importing nothing of it here keeps I2.
-    """
-    return [sys.executable, "-m", "biopb_mcp.mcp", "--view", "--port", "0"]
+    return [
+        sys.executable,
+        "-m",
+        "biopb_mcp.mcp",
+        "--transport",
+        "http",
+        "--port",
+        "0",
+        "--start-kernel",
+    ]
 
 
 def _prune_viewer_logs(log_dir, keep: int) -> None:
@@ -839,35 +781,58 @@ def _viewer_log_tail(path) -> str:
     return data.decode("utf-8", "replace").strip()[-_VIEWER_LOG_TAIL:]
 
 
-def _launch_viewer(timeout: float) -> dict:
-    """Start an agentless viewer session; wait for it to publish itself.
+def _is_our_launch(rec: dict, launch_token: str) -> bool:
+    """Whether session record ``rec`` is the session this launch just spawned.
 
-    Registration is the readiness signal, and it is an exact one: ``--view``
-    runs its eager ``host.ensure_started()`` *before* ``_register_view_session``
-    (biopb-mcp ``mcp/__main__.py``), so a record appearing means a napari window
-    really opened, and a child that dies first never registers. The record is
-    matched on the child's own pid — a viewer registers ``os.getpid()`` — so a
-    session someone else starts concurrently is never mistaken for this one.
+    biopb-mcp and biopb-control are never mismatched -- they read the same
+    ``release-v*`` tag -- so every session this control
+    can launch echoes the token; there is no older biopb-mcp to fall back to a
+    pid match for.
+    """
+    return rec.get(_locations.LAUNCH_TOKEN_FIELD) == launch_token
+
+
+def _launch_session(timeout: float) -> dict:
+    """Start an agentless session; wait for it to publish itself.
+
+    Registration is the readiness signal: ``--start-kernel`` runs
+    ``host.ensure_started()`` *before* ``_register_session`` (biopb-mcp
+    ``mcp/__main__.py``), so a record appearing means the kernel -- and any
+    napari window -- came up, and a child that dies first never registers. The record is
+    matched on a per-launch token we hand the child in its environment
+    (:data:`biopb._locations.MCP_LAUNCH_TOKEN_ENV`), so a session someone else
+    starts concurrently is never mistaken for this one.
+
+    The token replaced a pid match, which looked exact and was not: on Windows a
+    venv's ``Scripts/python.exe`` is frequently a *trampoline* (uv's, and pip's
+    console-script launchers) that re-spawns the real interpreter and waits on
+    it, so ``proc.pid`` is the stub and the pid the session registers is its own.
+    They never matched, and every dashboard launch on such an install waited out
+    the full timeout over a window that had been open for seconds — then, if the
+    user closed the session inside that window, reported the trampoline's
+    forwarded exit as "exited before it opened" (biopb#1084).
 
     Detached (:func:`detach_kwargs`) and then forgotten: the ``Popen`` handle is
-    held only long enough to notice an early exit, never to reap or restart. A
-    viewer is the user's window, and a control restart must not close it.
+    held only long enough to notice an early exit, never to reap or restart. The
+    session is the user's, and a control restart must not end it.
 
     Returns ``{"state": "started"|"starting"|"failed", ...}``; only ``failed``
     carries ``error`` and ``log``.
     """
     log_fh, log_path = _open_viewer_log()
-    argv = _viewer_argv()
-    logger.info("Launching viewer session: %s (log: %s)", " ".join(argv), log_path)
+    argv = _session_argv()
+    logger.info("Launching session: %s (log: %s)", " ".join(argv), log_path)
     # The environment is inherited: it carries the DISPLAY/XAUTHORITY/
     # WAYLAND_DISPLAY (or the Aqua session, or the Windows station) that decides
-    # where the window lands. That inheritance is the whole risk #98 named and
-    # the whole reason for the gate above. The one addition tells the child where
-    # its own output went, so `server_status` can name the file rather than
-    # guessing the canonical one -- the same thing the shim does for its child.
-    env = None
+    # whether the session can have a window, and where. Two additions ride on
+    # top of it: the
+    # per-launch token we recognise the child's registration by, and where its
+    # own output went, so `server_status` can name the file rather than guessing
+    # the canonical one -- the same thing the shim does for its child.
+    launch_token = secrets.token_hex(8)
+    env = {**os.environ, _locations.MCP_LAUNCH_TOKEN_ENV: launch_token}
     if log_path is not None:
-        env = {**os.environ, _locations.MCP_SESSION_LOG_ENV: str(log_path)}
+        env[_locations.MCP_SESSION_LOG_ENV] = str(log_path)
     try:
         proc = subprocess.Popen(
             argv,
@@ -877,7 +842,7 @@ def _launch_viewer(timeout: float) -> dict:
             **detach_kwargs(),
         )
     except OSError as exc:
-        logger.exception("Could not launch a viewer session")
+        logger.exception("Could not launch a session")
         return {"state": "failed", "error": str(exc), "log": "", "log_path": None}
     finally:
         if log_fh is not None:
@@ -887,8 +852,10 @@ def _launch_viewer(timeout: float) -> dict:
     while True:
         for rec in _sessions.list_sessions():
             session_id = rec.get("session_id")
-            if session_id and rec.get("pid") == proc.pid:
-                logger.info("Viewer session %s is up (pid %s)", session_id, proc.pid)
+            if session_id and _is_our_launch(rec, launch_token):
+                # The record's pid, not ours: behind a trampoline the process we
+                # spawned is a stub and the session is the pid it published.
+                logger.info("Session %s is up (pid %s)", session_id, rec.get("pid"))
                 return {
                     "state": "started",
                     "session_id": session_id,
@@ -896,10 +863,10 @@ def _launch_viewer(timeout: float) -> dict:
                 }
         code = proc.poll()
         if code is not None:
-            logger.error("Viewer session exited with code %s before starting", code)
+            logger.error("Session exited with code %s before starting", code)
             return {
                 "state": "failed",
-                "error": f"the viewer exited with code {code} before it opened",
+                "error": f"the session exited with code {code} before it started",
                 "log": _viewer_log_tail(log_path) if log_path else "",
                 # Named so a tail that was truncated, or empty because no log
                 # could be opened, still leads somewhere.
@@ -909,12 +876,12 @@ def _launch_viewer(timeout: float) -> dict:
             # Still alive, just slow (a cold napari import on a loaded box). Say
             # so instead of failing: the dashboard polls /api/sessions anyway and
             # will show it the moment it registers.
-            logger.info("Viewer session still starting after %.0fs", timeout)
+            logger.info("Session still starting after %.0fs", timeout)
             return {
                 "state": "starting",
                 "log_path": str(log_path) if log_path else None,
             }
-        time.sleep(_VIEWER_POLL_INTERVAL)
+        time.sleep(_SESSION_POLL_INTERVAL)
 
 
 def build_app(
@@ -923,8 +890,9 @@ def build_app(
     data_web_url: str,
     token: str | None = None,
     static_dir: str | Path | None = None,
-    console_enabled: bool = False,
+    loopback_bound: bool = False,
     url_prefix: str | None = None,
+    algorithms: AlgorithmPlane | None = None,
 ) -> Starlette:
     """Build the control-plane ASGI app.
 
@@ -939,11 +907,11 @@ def build_app(
     that one SPA. Split out from :func:`serve_control_api` so it is unit-testable
     against a fake upstream without binding uvicorn.
 
-    ``console_enabled`` proxies ``/session/<id>/console/*`` — the user console,
-    which **executes code in that session's kernel**. Default off, and the
-    decision is the caller's because only it knows this control's bind address:
+    ``loopback_bound`` proxies ``/session/<id>/chat/*``, whose turns **execute
+    code in that session's kernel**. Default off, and the decision is the
+    caller's because only it knows this control's bind address:
     :func:`serve_control_api` derives it from a loopback bind, so a
-    network-reachable control never carries the console however it is
+    network-reachable control never carries an execute route however it is
     configured downstream. Deliberately *not* delegated to the session child —
     the proxy hop strips Host and Origin, so the child cannot tell a browser
     from this trusted loopback hop and cannot make this call.
@@ -953,12 +921,13 @@ def build_app(
     under it are stripped before routing and the served SPA shell is rewritten to
     point back at it. ``None`` (the default) is the plain root origin and changes
     nothing. It is normalized here, the single consumer.
+
+    ``algorithms`` is the algorithm plane the ``/api/algorithms`` verbs drive;
+    by default one over the user's registry.
     """
-    session_roots = _session_proxy_roots(console_enabled)
-    # Whether this control may launch a viewer session for the dashboard, and
-    # the sentence explaining it when it may not (both settled here: they read
-    # this process's bind and environment, neither of which changes).
-    can_start_session, start_session_blocked = _session_launch_gate(console_enabled)
+    session_roots = _session_proxy_roots(loopback_bound)
+    if algorithms is None:
+        algorithms = AlgorithmPlane()
     url_prefix = normalize_url_prefix(url_prefix)
 
     # The built SPA bundle the control serves at its root (None / missing ->
@@ -1007,17 +976,16 @@ def build_app(
         # whether to gate itself behind the unlock page. It tracks the *token*,
         # not the network mode: always true in remote (which requires one), and
         # true in local mode too when an optional token was supplied.
-        # `console_enabled` rides the same public probe for the same reason: the
-        # observe page must know whether to offer a code cell before it renders
-        # one, and an editor whose every POST 404s is worse than no editor. It
-        # discloses nothing a caller cannot already infer -- reaching this
-        # endpoint from off-box *is* the evidence that the bind is public and the
-        # console therefore off.
+        # `chat_proxied` rides the same public probe for the same reason: the
+        # observe page must know whether to offer the chat composer before it
+        # renders one, and a composer whose every POST 404s is worse than none.
+        # It follows the bind alone, so it discloses nothing a caller cannot
+        # already infer from reaching this endpoint.
         return JSONResponse(
             {
                 "control": "ok",
                 "auth_required": token is not None,
-                "console_enabled": console_enabled,
+                "chat_proxied": _SESSION_CHAT_ROOT in session_roots,
                 "data_plane": supervisor.snapshot(),
             }
         )
@@ -1152,18 +1120,12 @@ def build_app(
         # __version__` only works while those two stay in that order.
         from . import __version__
 
-        # `can_start_session` rides here (not /health) because the button it
-        # gates lives on the token-gated dashboard, and the reason rides with it
-        # so the page can say *why* there is no button instead of just not
-        # having one.
         return JSONResponse(
             {
                 "control": "ok",
                 "version": __version__,
                 "data_plane": supervisor.snapshot(),
                 "sessions": len(_sessions.list_sessions()),
-                "can_start_session": can_start_session,
-                "start_session_blocked": start_session_blocked,
             }
         )
 
@@ -1187,10 +1149,10 @@ def build_app(
                 "observe_url": f"/session/{rec['session_id']}/observe",
                 "kernel": probe["kernel"],
                 # Whether that page will lead with the chat client: the child
-                # mounts it (only a `biopb mcp view` viewer does) AND this
+                # mounts it (only an agentless session does) AND this
                 # control will proxy /chat/*. Both halves, as ObservePage needs
                 # both — answered here so the dashboard needs no second probe.
-                "chat": probe["chat"] and console_enabled,
+                "chat": probe["chat"] and loopback_bound,
                 # Whether the session serves a stop verb. Not gated on the bind
                 # the way chat is: the route lives under `api`, which is proxied
                 # everywhere, and stopping a session is no more destructive than
@@ -1202,23 +1164,18 @@ def build_app(
         return JSONResponse({"sessions": sessions})
 
     def api_session_new(request: Request) -> JSONResponse:
-        # Launch an agentless viewer on this machine's display. Sync: it spawns
-        # and then blocks polling the registry, so Starlette runs it in the
-        # threadpool. Gated at startup rather than here (nothing it reads can
-        # change), and 409 rather than 403 — the request is fine, this
-        # deployment just cannot serve it.
-        if not can_start_session:
-            return JSONResponse({"error": start_session_blocked}, status_code=409)
+        # Launch an agentless session on this machine. Sync: it spawns and then
+        # blocks polling the registry, so Starlette runs it in the threadpool.
         # The client passes ?client_timeout=<its HTTP timeout>; bound our wait
         # below it so a slow-but-working launch comes back as "starting" rather
-        # than as a browser-side timeout with a viewer still coming up behind it.
+        # than as a browser-side timeout with a session still coming up behind it.
         try:
             client_timeout = float(request.query_params.get("client_timeout", "0"))
         except ValueError:
             client_timeout = 0.0
-        wait = _bounded_ensure_wait(_VIEWER_START_TIMEOUT, client_timeout)
+        wait = _bounded_ensure_wait(_SESSION_START_TIMEOUT, client_timeout)
         try:
-            return JSONResponse(_launch_viewer(wait))
+            return JSONResponse(_launch_session(wait))
         except Exception as exc:  # noqa: BLE001 - report, never crash the handler
             logger.exception("session launch failed")
             return JSONResponse({"error": str(exc)}, status_code=500)
@@ -1255,32 +1212,65 @@ def build_app(
         return _agent_action(request, _agents.unregister)
 
     def api_algorithms(_request: Request) -> JSONResponse:
-        # The configured algorithm-plane servers (biopb.image ProcessImage
-        # servicers listed in the biopb-mcp config) with a live health + ops
-        # probe. Read-only inspection — no lifecycle control (the pending
-        # algorithm plane).
-        # Sync: statuses() reads a config file and makes blocking gRPC calls (run
-        # concurrently, bounded by one probe timeout), so Starlette runs it in the
-        # threadpool. Polled on demand (a dashboard button), not on the interval,
-        # because it dials external servers.
-        #
-        # `plugins` folds in the kernel-namespace "bring your own tool" surface
-        # (biopb/biopb-mcp#92) -- a static, stdlib-only listing of the ~/.config/
-        # biopb/kernel/ files and biopb_mcp.namespace packages, read (never
-        # executed, invariant I2) via _kernel_plugins. It renders in the same
-        # algorithm-plane card; a summary read failure degrades to empty rather
-        # than 500-ing the servers view alongside it.
+        # Every registry entry with its state and cached ops: a script entry as
+        # the algorithm plane supervises it, a url entry probed live (so this
+        # is polled on demand, not on the interval). Sync: it hashes files and
+        # makes blocking gRPC calls, so Starlette runs it in the threadpool.
         try:
-            servers = _algorithms.statuses()
+            servers = algorithms.rows()
         except Exception as exc:  # noqa: BLE001 - report, never crash the handler
             logger.exception("api/algorithms failed")
             return JSONResponse({"error": str(exc)}, status_code=500)
+        return JSONResponse({"servers": servers})
+
+    def _algorithm_verb(request: Request, verb) -> JSONResponse:
+        # One entry's verb, by ?name=. An unknown name is 404; a verb a url
+        # entry does not take (stop, restart, logs) is 400.
+        name = request.query_params.get("name", "")
         try:
-            plugins = _kernel_plugins.summary()
-        except Exception:  # noqa: BLE001 - inspector is never-raise; belt-and-braces
-            logger.exception("api/algorithms plugin summary failed")
-            plugins = {"dir": "", "files": [], "entry_points": []}
-        return JSONResponse({"servers": servers, "plugins": plugins})
+            client_timeout = float(request.query_params.get("client_timeout", "0"))
+        except ValueError:
+            client_timeout = 0.0
+        wait = _algorithm_wait(client_timeout)
+        try:
+            return JSONResponse(verb(name, wait))
+        except KeyError:
+            return JSONResponse({"error": f"no algorithm {name!r}"}, status_code=404)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        except Exception as exc:  # noqa: BLE001 - report, never crash the handler
+            logger.exception("api/algorithms verb failed")
+            return JSONResponse({"error": str(exc)}, status_code=500)
+
+    def algorithms_refresh(_request: Request) -> JSONResponse:
+        try:
+            return JSONResponse({"servers": algorithms.refresh()})
+        except Exception as exc:  # noqa: BLE001 - report, never crash the handler
+            logger.exception("api/algorithms/refresh failed")
+            return JSONResponse({"error": str(exc)}, status_code=500)
+
+    def algorithms_ensure(request: Request) -> JSONResponse:
+        return _algorithm_verb(
+            request, lambda name, wait: {"server": algorithms.ensure(name, wait)}
+        )
+
+    def algorithms_stop(request: Request) -> JSONResponse:
+        return _algorithm_verb(
+            request, lambda name, _wait: {"server": algorithms.stop(name)}
+        )
+
+    def algorithms_restart(request: Request) -> JSONResponse:
+        return _algorithm_verb(
+            request, lambda name, wait: {"server": algorithms.restart(name, wait)}
+        )
+
+    def algorithms_logs(request: Request) -> JSONResponse:
+        try:
+            n = int(request.query_params.get("lines", _LOG_TAIL_DEFAULT_LINES))
+        except (TypeError, ValueError):
+            n = _LOG_TAIL_DEFAULT_LINES
+        n = max(1, min(n, _LOG_TAIL_MAX_LINES))
+        return _algorithm_verb(request, lambda name, _wait: algorithms.logs(name, n))
 
     def api_mcp_config(_request: Request) -> JSONResponse:
         # The biopb-mcp settings editor's backing read: the raw on-disk config +
@@ -1444,7 +1434,7 @@ def build_app(
         sub_path = request.path_params["path"]
         # Allowlist the session data API only — the observe page itself is
         # the control-served SPA shell (session_observe below), so only /api/*
-        # proxies here (plus /console/* where the console is enabled). The
+        # proxies here (plus /chat/* when loopback-bound). The
         # child's /mcp agent transport is deliberately off this origin — agents
         # reach it directly on the child's own loopback port (stdio shim bridge /
         # `biopb mcp view`), never via the control — and this hop strips /mcp's
@@ -1459,7 +1449,7 @@ def build_app(
         # children that happen to serve them that way. The CSRF gate upstream
         # only inspects unsafe methods -- correct, since safe verbs must not
         # change state -- so a cross-site GET (`<img
-        # src=".../console/execute?code=...">`) is forwarded unchecked, exactly
+        # src=".../chat/...">`) is forwarded unchecked, exactly
         # as a GET to /api/jobs is. That is harmless only while nothing under
         # these roots acts on a GET, which is a promise about code living in
         # another package. Pinning the method here makes the roots' claim
@@ -1569,6 +1559,11 @@ def build_app(
         Route("/api/agents/{agent_id}/register", agent_register, methods=["POST"]),
         Route("/api/agents/{agent_id}/unregister", agent_unregister, methods=["POST"]),
         Route("/api/algorithms", api_algorithms, methods=["GET"]),
+        Route("/api/algorithms/refresh", algorithms_refresh, methods=["POST"]),
+        Route("/api/algorithms/ensure", algorithms_ensure, methods=["POST"]),
+        Route("/api/algorithms/stop", algorithms_stop, methods=["POST"]),
+        Route("/api/algorithms/restart", algorithms_restart, methods=["POST"]),
+        Route("/api/algorithms/logs", algorithms_logs, methods=["GET"]),
         Route("/api/mcp_config", api_mcp_config, methods=["GET"]),
         Route("/api/mcp_config", api_mcp_config_save, methods=["PUT"]),
         Mount("/data_plane", sidecar),
@@ -1629,6 +1624,7 @@ def serve_control_api(
     supervisor: DataPlaneSupervisor,
     ensure_timeout: float,
     data_web_url: str | None = None,
+    algorithms: AlgorithmPlane | None = None,
 ) -> tuple[_ControlServer, threading.Thread]:
     """Start the control-plane web origin on ``host:port`` in a background thread.
 
@@ -1648,28 +1644,27 @@ def serve_control_api(
     # origin). None in local mode -> the gate falls back to a loopback Host check
     # instead.
     #
-    # The user console (arbitrary code in a session's kernel) rides this origin
-    # only when the origin is same-machine. Derived from *this* listener's bind
+    # The execute-capable roots (arbitrary code in a session's kernel) ride this
+    # origin only when the origin is same-machine. Derived from *this* listener's bind
     # through the shared predicate, not from --remote or the plane's bind: what
     # decides is who can reach this web front. Deliberately not gated by the
     # token instead — the data-plane token authorizes reading pixels and is
     # readable from the local credential file by design (biopb/biopb#470); fine
-    # for viewing, and not a credential to trade for a shell. Remote console, if
-    # ever wanted, needs its own.
-    console_enabled = not _web_auth.host_is_public_bind(host)
+    # for viewing, and not a credential to trade for a shell. A remote execute
+    # route, if ever wanted, needs its own.
+    loopback_bound = not _web_auth.host_is_public_bind(host)
     app = build_app(
         supervisor,
         ensure_timeout,
         data_web_url,
         token=spec.token,
         static_dir=spec.static_dir,
-        console_enabled=console_enabled,
+        loopback_bound=loopback_bound,
         url_prefix=spec.url_prefix,
+        algorithms=algorithms,
     )
-    if not console_enabled:
-        logger.info(
-            "session console disabled: control bound to %s (not loopback)", host
-        )
+    if not loopback_bound:
+        logger.info("session chat disabled: control bound to %s (not loopback)", host)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     if sys.platform == "win32":

@@ -7,11 +7,18 @@ import {
   clampGamma,
   contrastLimitsFrom,
   contrastSamples,
-  dtypeContrastLimits,
+  contrastTrack,
   gammaFromOctaves,
   octavesFromGamma,
+  clampContrastLimits,
+  contrastLabel,
+  contrastStep,
   percentileBounds,
+  percentileLabel,
+  withContrastLimit,
+  clampSliceTo,
   samplesPerPixel,
+  sliderGrid,
   tileCacheSize,
   vivColor,
   vivSelection,
@@ -77,6 +84,13 @@ describe("contrastSamples", () => {
     expect(Array.from(contrastSamples(new Uint8Array([9, 1, 5]), 100))).toEqual([1, 5, 9]);
   });
 
+  it("drops NaN and the infinities instead of sorting them to the top", () => {
+    // A typed-array sort puts both at the end, so either one becomes what a
+    // percentile taken at 100 reads back as the plane's maximum.
+    const data = Float64Array.from([5, NaN, 1, Infinity, 3, -Infinity]);
+    expect(Array.from(contrastSamples(data, 100))).toEqual([1, 3, 5]);
+  });
+
   it("has a limit that keeps a full 512-edge tile's worth of sorting bounded", () => {
     expect(contrastSamples(new Uint16Array(512 * 512)).length).toBeLessThanOrEqual(
       CONTRAST_SAMPLE_LIMIT,
@@ -112,18 +126,83 @@ describe("contrastLimitsFrom", () => {
   });
 });
 
+describe("percentileLabel", () => {
+  it("prints every window in one format", () => {
+    expect(percentileLabel(0)).toBe("0.0-100.0");
+    expect(percentileLabel(1)).toBe("1.0-99.0");
+  });
+});
+
 describe("percentileBounds", () => {
-  it("is the full range in min/max mode whatever the slider says", () => {
-    expect(percentileBounds(true, 2.5)).toEqual([0, 100]);
+  it("is the full range at a scale of 0", () => {
+    expect(percentileBounds(0)).toEqual([0, 100]);
   });
 
   it("is symmetric around the slider value", () => {
-    expect(percentileBounds(false, 1)).toEqual([1, 99]);
+    expect(percentileBounds(1)).toEqual([1, 99]);
   });
 
   it("cannot invert the window", () => {
-    const [lo, hi] = percentileBounds(false, 90);
+    const [lo, hi] = percentileBounds(90);
     expect(lo).toBeLessThanOrEqual(hi);
+  });
+});
+
+describe("contrastStep", () => {
+  it("is one grey level on an integer track and a thousandth on a float one", () => {
+    expect(contrastStep([0, 65535], "Uint16")).toBe(1);
+    expect(contrastStep([0, 255], "Uint8")).toBe(1);
+    expect(contrastStep([0, 1], "Float32")).toBeCloseTo(0.001);
+  });
+
+  it("stays a thousandth of the track on a float dtype however wide it is", () => {
+    // Keyed on the width instead, a float tensor whose values span 20 would get
+    // whole units: twenty positions on the whole bar, and an integer readout.
+    expect(contrastStep([0, 20], "Float32")).toBeCloseTo(0.02);
+    expect(contrastStep([0, 4000], "Float64")).toBeCloseTo(4);
+  });
+});
+
+describe("withContrastLimit", () => {
+  const range: [number, number] = [0, 255];
+
+  it("moves one end and leaves the other where it was", () => {
+    expect(withContrastLimit([10, 200], "lo", 40, range, 1)).toEqual([40, 200]);
+    expect(withContrastLimit([10, 200], "hi", 90, range, 1)).toEqual([10, 90]);
+  });
+
+  it("stops each end a step short of the other rather than crossing", () => {
+    expect(withContrastLimit([10, 200], "lo", 240, range, 1)).toEqual([199, 200]);
+    expect(withContrastLimit([10, 200], "hi", 2, range, 1)).toEqual([10, 11]);
+  });
+
+  it("stays inside the dtype's range", () => {
+    expect(withContrastLimit([10, 200], "lo", -50, range, 1)).toEqual([0, 200]);
+    expect(withContrastLimit([10, 200], "hi", 9999, range, 1)).toEqual([10, 255]);
+  });
+});
+
+describe("clampContrastLimits", () => {
+  it("brings a window chosen on another dtype inside this one", () => {
+    // A uint16 window carried onto a uint8 image: clamped, not applied as a
+    // white frame.
+    expect(clampContrastLimits([300, 40000], [0, 255], "Uint8")).toEqual([254, 255]);
+  });
+
+  it("leaves a window that already fits alone", () => {
+    expect(clampContrastLimits([10, 200], [0, 255], "Uint8")).toEqual([10, 200]);
+  });
+
+  it("never returns a zero-width window", () => {
+    const [lo, hi] = clampContrastLimits([255, 255], [0, 255], "Uint8");
+    expect(hi).toBeGreaterThan(lo);
+  });
+});
+
+describe("contrastLabel", () => {
+  it("prints whole levels on an integer track and two decimals on a float one", () => {
+    expect(contrastLabel([12.4, 3000.6], 1)).toBe("12-3001");
+    expect(contrastLabel([0.125, 0.9], 0.001)).toBe("0.13-0.90");
   });
 });
 
@@ -170,13 +249,49 @@ describe("gamma", () => {
   });
 });
 
-describe("dtypeContrastLimits", () => {
+describe("contrastTrack", () => {
   it("covers the integer range so the first frame is not blank", () => {
-    expect(dtypeContrastLimits("Uint16")).toEqual([0, 65535]);
+    expect(contrastTrack("Uint16")).toEqual([0, 65535]);
+  });
+
+  it("ignores what a plane showed when the dtype names its own range", () => {
+    expect(contrastTrack("Uint16", [12, 400])).toEqual([0, 65535]);
+  });
+
+  it("puts a float tensor on the levels its data actually showed", () => {
+    // The bug this replaced: a float plane holding thousands was offered a
+    // 0-1 track, so a fixed window could only ever be the whole image.
+    expect(contrastTrack("Float32", [12.5, 4000])).toEqual([12.5, 4000]);
+  });
+
+  it("widens a float track to a window chosen on another plane", () => {
+    expect(contrastTrack("Float32", [12.5, 4000], [0, 6000])).toEqual([0, 6000]);
+  });
+
+  it("keeps 0-1 for a float tensor with nothing sampled yet", () => {
+    expect(contrastTrack("Float32", null, null)).toEqual([0, 1]);
+  });
+
+  it("skips a non-finite window rather than falling back off it", () => {
+    // Falling back would put the whole track on 0-1, which is the bug this
+    // function exists to remove -- and silently.
+    expect(contrastTrack("Float32", [12.5, Infinity], [12.5, 4000])).toEqual([12.5, 4000]);
+    expect(contrastTrack("Float32", [NaN, NaN], [12.5, 4000])).toEqual([12.5, 4000]);
+  });
+
+  it("unions every window it is given, so a dim plane cannot shrink the track", () => {
+    // The union from the bright planes already seen, then this dark plane.
+    expect(contrastTrack("Float32", [12.5, 4000], [0, 3])).toEqual([0, 4000]);
+  });
+
+  it("never hands back a zero-width track", () => {
+    // A uniform plane observes one value, and every fraction taken of the
+    // track divides by its width.
+    expect(contrastTrack("Float64", [3, 3])).toEqual([3, 4]);
   });
 
   it("falls back rather than throwing on an unknown dtype", () => {
-    expect(dtypeContrastLimits("Float16")).toEqual([0, 1]);
+    expect(contrastTrack("Float16")).toEqual([0, 1]);
   });
 });
 
@@ -258,5 +373,80 @@ describe("vivColor", () => {
 
   it("resolves auto from the channel name", () => {
     expect(vivColor("auto", "DAPI")).toEqual([0, 0, 255]);
+  });
+});
+
+describe("sliderGrid", () => {
+  const TENSOR = { array_id: "src_a/Image:0", dim_labels: ["t", "y", "x"], shape: [10, 512, 512], chunk_shape: [], dtype: "uint16" };
+  const SOURCES = [{
+    source_id: "src_a",
+    source_url: "file:///a.tiff",
+    source_type: "ome-tiff",
+    metadata_json: null,
+    tensors: [TENSOR],
+  }] as unknown as Parameters<typeof sliderGrid>[1];
+
+  /** The same tensor after it grew, as `tile_info` would report it. */
+  const LIVE = { ...TENSOR, array_id: "src_a@9f1c4e2b/Image:0", shape: [20, 512, 512] } as unknown as Parameters<typeof sliderGrid>[0];
+
+  it("prefers the live grid over the catalog's", () => {
+    // The point of the whole thing: the catalog says T=10, the tensor has 20.
+    expect(sliderGrid(LIVE, SOURCES, "src_a", "src_a/Image:0")?.shape).toEqual([20, 512, 512]);
+  });
+
+  it("takes the live grid even though its array_id is the versioned form", () => {
+    // `tile_info` answers with `id@token`; matching it against the stable id
+    // would silently never hold, so the slot is trusted rather than compared.
+    expect(sliderGrid(LIVE, [] as unknown as Parameters<typeof sliderGrid>[1], "src_a", "src_a/Image:0")).toBe(LIVE);
+  });
+
+  it("falls back to the catalog before a viewer has loaded", () => {
+    expect(sliderGrid(null, SOURCES, "src_a", "src_a/Image:0")?.shape).toEqual([10, 512, 512]);
+  });
+
+  it("is null when neither knows the tensor", () => {
+    expect(sliderGrid(null, SOURCES, "src_a", "src_a/Nope")).toBeNull();
+    expect(sliderGrid(null, SOURCES, "gone", "gone")).toBeNull();
+  });
+});
+
+describe("clampSliceTo", () => {
+  const GRID = { dim_labels: ["t", "c", "z", "y", "x"], shape: [10, 3, 40, 512, 512], dtype: "uint16" };
+  const AMBIGUOUS = { dim_labels: ["t", "t", "y", "x"], shape: [4, 7, 256, 256], dtype: "uint16" };
+  const base = { t: 0, z: 0, c: 0, axes: {} as Record<string, number> };
+
+  it("brings an index inside the extent", () => {
+    // The bound a URL used to get at decode time, now applied when the grid
+    // lands -- which is the only moment a pinned link has one.
+    expect(clampSliceTo({ ...base, z: 400 }, GRID).z).toBe(39);
+    expect(clampSliceTo({ ...base, t: -3 }, GRID).t).toBe(0);
+  });
+
+  it("leaves an in-range index alone", () => {
+    expect(clampSliceTo({ ...base, t: 5, z: 12, c: 1 }, GRID)).toMatchObject({ t: 5, z: 12, c: 1 });
+  });
+
+  it("clamps a stale index when the tensor shrank under it", () => {
+    const shrunk = { dim_labels: ["t", "y", "x"], shape: [4, 512, 512], dtype: "uint16" };
+    expect(clampSliceTo({ ...base, t: 9 }, shrunk).t).toBe(3);
+  });
+
+  it("keeps an unnamed axis and bounds it to its own extent", () => {
+    expect(clampSliceTo({ ...base, axes: { a1: 99 } }, AMBIGUOUS).axes).toEqual({ a1: 6 });
+  });
+
+  it("drops an axis key the grid does not have", () => {
+    // Left over from the previously viewed tensor; carrying it would put a
+    // phantom entry in the selection the viewer builds.
+    expect(clampSliceTo({ ...base, axes: { a7: 2 } }, GRID).axes).toEqual({});
+  });
+
+  it("rounds a fractional index", () => {
+    expect(clampSliceTo({ ...base, z: 7.6 }, GRID).z).toBe(8);
+  });
+
+  it("is a no-op with no grid yet", () => {
+    const slice = { ...base, z: 400 };
+    expect(clampSliceTo(slice, null)).toBe(slice);
   });
 });

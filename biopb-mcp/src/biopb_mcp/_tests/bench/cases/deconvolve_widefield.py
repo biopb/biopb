@@ -31,7 +31,7 @@ FWHM while reporting success from a visual check. Nothing in its own output
 said otherwise.
 
 The reference implementation these tolerances come from is in the pull request
-that added this case, per `biopb-mcp/docs/skills.md` §11b.
+that added this case, per `_tests/bench/README.md`.
 """
 
 from __future__ import annotations

@@ -28,16 +28,19 @@ import pyarrow.flight as flight
 import pytest
 from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server.cache import CacheManager
-from biopb_tensor_server.cache.file_backend import (
+from biopb_tensor_server.cache.bootstrap import (
     CACHE_FILE_FORMAT_VERSION,
     FORMAT_VERSION_MARKER,
+)
+from biopb_tensor_server.cache.file_backend import (
     ArrowFileBackend,
     ArrowFileConfig,
     ChunkLocation,
 )
-from biopb_tensor_server.core.adapter_base import pack_chunk_batch, unpack_chunk_array
 from biopb_tensor_server.core.chunk import encode_chunk_id
+from biopb_tensor_server.core.chunk_batch import pack_chunk_batch, unpack_chunk_array
 from biopb_tensor_server.core.config import CacheConfig
+from biopb_tensor_server.core.errors import StaleChunkError
 from biopb_tensor_server.serving.server import TensorFlightServer
 
 
@@ -88,10 +91,14 @@ def _reset_client_pools(location: str) -> None:
 
 def _first_chunk(client, array_id: str):
     """(chunk_id, start, stop) of a tensor's first chunk, from its endpoint list."""
-    pb = client.get_tensor_pb(array_id)
-    ep = pb.endpoints[0]
-    b = ep.chunk_bounds
-    return ep.ticket.chunk_id, tuple(b.start), tuple(b.stop)
+    from biopb.tensor._session import _parse_flight_endpoints
+
+    info = flight.FlightInfo.deserialize(
+        client.get_tensor(array_id, output="pb").flight_info
+    )
+    chunk_ids, bounds = _parse_flight_endpoints(info)
+    b = bounds[0]
+    return chunk_ids[0], tuple(b.start), tuple(b.stop)
 
 
 @pytest.fixture
@@ -173,7 +180,7 @@ class TestLocateEntry:
     def test_underivable_schema_length_degrades_to_do_get(self):
         """If the schema length can't be read, only that one entry loses mmap.
 
-        With no lazy walk behind it, `_schema_message_length` returning None is
+        With no lazy walk behind it, `schema_message_length` returning None is
         the sole way an entry can end up without a byte range. The blast radius
         must stay at the segment's *first* entry (the only append that shares
         its bracket with the schema message): it reports unavailable so the
@@ -189,7 +196,7 @@ class TestLocateEntry:
         arrs = {}
         try:
             with patch(
-                "biopb_tensor_server.cache.file_backend._schema_message_length",
+                "biopb_tensor_server.cache.segment_index.schema_message_length",
                 return_value=None,
             ):
                 for i in range(3):
@@ -272,8 +279,8 @@ class TestLocateEntry:
         seg_file = Path(file_backend.locate_entry(b"m0").segment_path)
         walked = {
             key: (byte_offset, byte_length)
-            for key, byte_offset, byte_length, _, _ in file_backend._scan_segment_records(
-                seg_file
+            for key, byte_offset, byte_length, _, _ in (
+                file_backend._scan_segment_records(seg_file).records
             )
         }
         for key in arrs:
@@ -487,7 +494,7 @@ class TestFormatVersionEnforcement:
     Segments written under an incompatible version must be dropped at boot rather
     than indexed and served (mis-decoded / stale). Covers: the marker is stamped
     on init; a matching marker preserves the cache across restart; and a missing
-    (pre-enforcement), mismatched, or torn marker wipes the segments + WAL.
+    (pre-enforcement), mismatched, or torn marker wipes the segments.
     """
 
     CFG = {"max_segment_bytes": 8 * 1024 * 1024, "max_total_bytes": 256 * 1024 * 1024}
@@ -592,7 +599,7 @@ class TestFormatVersionEnforcement:
             (Path(d) / FORMAT_VERSION_MARKER).write_text(
                 f"{CACHE_FILE_FORMAT_VERSION + 1}\n"
             )
-            with patch("biopb_tensor_server.cache.file_backend.shutil.rmtree"):
+            with patch("biopb_tensor_server.cache.bootstrap.shutil.rmtree"):
                 with pytest.raises(RuntimeError, match="survived the wipe"):
                     ArrowFileBackend(ArrowFileConfig(cache_dir=Path(d), **self.CFG))
 
@@ -605,17 +612,6 @@ class TestFormatVersionEnforcement:
                 be2.close()
         finally:
             shutil.rmtree(d, ignore_errors=True)
-
-
-class TestLocateViaManager:
-    def test_memory_backend_returns_none(self):
-        CacheManager.reset()
-        CacheManager.initialize(CacheConfig(backend="memory"))
-        try:
-            mgr = CacheManager.get_instance()
-            assert mgr.locate_entry(b"anything") is None
-        finally:
-            CacheManager.reset()
 
 
 # ==============================================================================
@@ -636,7 +632,7 @@ class TestChunkLocateAction:
         finally:
             server.shutdown()
 
-    def test_locate_counts_as_flight_activity(self):
+    def test_locate_counts_as_flight_activity(self, tmp_path):
         """A locate is in-flight *while it runs*, so precache parks (#548).
 
         The fast path replaces do_get, so if the handler is untracked the server
@@ -645,12 +641,21 @@ class TestChunkLocateAction:
         """
         server = TensorFlightServer("grpc://localhost:0")
         CacheManager.reset()
-        CacheManager.initialize(CacheConfig(backend="memory"))
+        CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
         try:
             observed = []
 
             class _Probe:
                 source_id = "z"
+
+                def check_chunk_version(self, chunk_id):
+                    pass
+
+                def check_readable(self):
+                    pass
+
+                def locate_chunk(self, chunk_id):
+                    return None  # no store of its own; the cache route below
 
                 def resolve_chunk_data(self, chunk_id, cache_manager):
                     # Called on a cold miss -- the heaviest work in the handler.
@@ -670,12 +675,95 @@ class TestChunkLocateAction:
             CacheManager.reset()
             server.shutdown()
 
-    def test_locate_releases_the_activity_slot_on_error(self):
+    def test_locate_rejects_stale_chunk_id_before_consulting_cache(self, tmp_path):
+        """A cache HIT must not bypass the stale-chunk_id check (biopb/biopb#178).
+
+        Before this, ``check_chunk_version`` only ran inside
+        ``resolve_chunk_data``, which a cache HIT never calls -- so a chunk_id
+        from before a re-registration, whose segment is still resident, would
+        return that stale location straight from the cache, silently serving
+        old-version pixels a ``do_get`` on the identical chunk_id would have
+        refused. Proven here by making a cache lookup fail the test outright:
+        the rejection must land before ``locate_entry`` is ever consulted.
+        """
+        server = TensorFlightServer("grpc://localhost:0")
+        CacheManager.reset()
+        CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
+        try:
+            cache_manager = CacheManager.get_instance()
+
+            class _StaleProbe:
+                source_id = "z"
+
+                def check_chunk_version(self, chunk_id):
+                    raise StaleChunkError(
+                        "stale content_version", reason="stale_content_version"
+                    )
+
+                def resolve_chunk_data(self, chunk_id, cache_manager):
+                    pytest.fail("must not read once the version check rejects it")
+
+            chunk_id = encode_chunk_id("z", ChunkBounds(start=[0, 0], stop=[8, 8]))
+            with patch.object(
+                cache_manager,
+                "locate_entry",
+                side_effect=AssertionError("locate_entry must not run"),
+            ):
+                with patch.object(
+                    server, "_get_adapter_for_chunk", return_value=_StaleProbe()
+                ):
+                    with pytest.raises(
+                        flight.FlightServerError, match="content_version"
+                    ):
+                        server._handle_chunk_locate(chunk_id)
+        finally:
+            CacheManager.reset()
+            server.shutdown()
+
+    def test_locate_rejects_non_envelope_chunk_id_before_consulting_cache(
+        self, tmp_path
+    ):
+        """Same gap, on a real RemoteTensorAdapter: a stale pre-#178-W1 (bare,
+        non-envelope) ticket must not be able to ride a persisted cache HIT
+        past the proxy's own structural rejection (biopb/biopb#958 follow-up).
+        """
+        from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+        from biopb_tensor_server.core.chunk import encode_chunk_id as _encode
+
+        server = TensorFlightServer("grpc://localhost:0")
+        CacheManager.reset()
+        CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
+        try:
+            cache_manager = CacheManager.get_instance()
+            proxy_adapter = RemoteTensorAdapter(
+                source_id="lab__img",
+                upstream_location="grpc://localhost:1",  # never dialed
+                upstream_source_id="img",
+            )
+            bare_chunk_id = _encode(
+                "lab__img", ChunkBounds(start=[0, 0], stop=[4, 4])
+            )  # never enveloped -- a pre-upgrade-format ticket
+
+            with patch.object(
+                cache_manager,
+                "locate_entry",
+                side_effect=AssertionError("locate_entry must not run"),
+            ):
+                with patch.object(
+                    server, "_get_adapter_for_chunk", return_value=proxy_adapter
+                ):
+                    with pytest.raises(flight.FlightServerError, match="non-envelope"):
+                        server._handle_chunk_locate(bare_chunk_id)
+        finally:
+            CacheManager.reset()
+            server.shutdown()
+
+    def test_locate_releases_the_activity_slot_on_error(self, tmp_path):
         """A failing locate must not leak an in-flight count (precache would
         then never run again)."""
         server = TensorFlightServer("grpc://localhost:0")
         CacheManager.reset()
-        CacheManager.initialize(CacheConfig(backend="memory"))
+        CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
         try:
             # No source registered -> the adapter lookup raises straight out of
             # the tracked block.
@@ -717,6 +805,18 @@ class TestLocalhostDetection:
 
         assert _is_localhost_location("grpc+tls://localhost:8815") is True
 
+    def test_grpc_tcp_scheme(self):
+        """The spelling Arrow's own Location factories emit. Read as remote, a
+        loopback server loses the fast path and gets the disk cache instead."""
+        from biopb.tensor._pool import _is_localhost_location
+
+        assert _is_localhost_location("grpc+tcp://localhost:8815") is True
+
+    def test_scheme_less_authority(self):
+        from biopb.tensor._pool import _is_localhost_location
+
+        assert _is_localhost_location("localhost:8815") is True
+
     def test_not_localhost_remote_ip(self):
         from biopb.tensor._pool import _is_localhost_location
 
@@ -726,28 +826,6 @@ class TestLocalhostDetection:
         from biopb.tensor._pool import _is_localhost_location
 
         assert _is_localhost_location("grpc://example.com:8815") is False
-
-
-class TestExtractSchemaMetadata:
-    def test_extracts_metadata_dict(self):
-        from biopb.tensor.client import _extract_schema_metadata
-
-        schema = pa.schema(
-            [],
-            metadata={
-                b"tensor_schema_version": b"0.4.0",
-                b"other_key": b"other_value",
-            },
-        )
-        metadata = _extract_schema_metadata(schema)
-        assert metadata is not None
-        assert metadata["tensor_schema_version"] == "0.4.0"
-        assert metadata["other_key"] == "other_value"
-
-    def test_returns_none_for_no_metadata(self):
-        from biopb.tensor.client import _extract_schema_metadata
-
-        assert _extract_schema_metadata(pa.schema([])) is None
 
 
 class TestShouldTryCachefile:
@@ -1068,7 +1146,7 @@ class TestCachefileIntegration:
         from biopb.tensor.client import TensorFlightClient
 
         tmp = tempfile.mkdtemp()
-        cfg = CacheConfig(backend="file", file_cache_dir=str(Path(tmp) / "cache"))
+        cfg = CacheConfig(file_cache_dir=str(Path(tmp) / "cache"))
         server, src = self._serve_zarr(tmp, cfg)
         loc = f"grpc://localhost:{server.port}"
         try:
@@ -1090,7 +1168,7 @@ class TestCachefileIntegration:
         from biopb.tensor.client import TensorFlightClient
 
         tmp = tempfile.mkdtemp()
-        cfg = CacheConfig(backend="file", file_cache_dir=str(Path(tmp) / "cache"))
+        cfg = CacheConfig(file_cache_dir=str(Path(tmp) / "cache"))
         server, src = self._serve_zarr(tmp, cfg)
         loc = f"grpc://localhost:{server.port}"
         try:
@@ -1107,45 +1185,53 @@ class TestCachefileIntegration:
             CacheManager.reset()
             shutil.rmtree(tmp, ignore_errors=True)
 
-    def test_memory_backend_falls_back_but_data_correct(self):
+    def test_a_range_that_names_another_entry_is_refused(self, transfer_target):
+        """The server verifies a range before handing it out, and before
+        reading through it itself.
+
+        An offset that decodes cleanly into the wrong message is the one silent
+        failure on this path: a valid batch of the same shape belonging to
+        someone else. Here one entry is pointed at another's bytes.
+        """
         import biopb.tensor._pool as cmod
         from biopb.tensor.client import TensorFlightClient
 
         tmp = tempfile.mkdtemp()
-        server, src = self._serve_zarr(tmp, CacheConfig(backend="memory"))
-        loc = f"grpc://localhost:{server.port}"
-        try:
-            cmod._cachefile_support.clear()
-            client = TensorFlightClient(loc, cache_bytes=0)
-            got = client.get_tensor("z").compute(scheduler="threads")
-            assert np.array_equal(got, src)
-            client.close()
-        finally:
-            server.shutdown()
-            CacheManager.reset()
-            shutil.rmtree(tmp, ignore_errors=True)
-
-    def test_newer_segment_format_falls_back(self):
-        """A server segment format newer than the client understands declines
-        the fast path (and is memoized off), but data is still correct via do_get."""
-        import biopb.tensor._pool as cmod
-        from biopb.tensor.client import TensorFlightClient
-
-        tmp = tempfile.mkdtemp()
-        cfg = CacheConfig(backend="file", file_cache_dir=str(Path(tmp) / "cache"))
+        cfg = CacheConfig(file_cache_dir=str(Path(tmp) / "cache"))
+        transfer_target(4096)
         server, src = self._serve_zarr(tmp, cfg)
         loc = f"grpc://localhost:{server.port}"
         try:
             cmod._cachefile_support.clear()
-            # Pretend this client can't parse the server's (>=1) segment format.
-            # The constant is read by _try_cachefile_transfer in biopb.tensor._pool
-            # (issue #278 item C), so patch it there, not on the client re-export.
-            with patch("biopb.tensor._pool._CACHEFILE_SUPPORTED_FORMAT", 0):
-                client = TensorFlightClient(loc, cache_bytes=0)
-                got = client.get_tensor("z").compute(scheduler="threads")
-                assert np.array_equal(got, src)  # correct via do_get fallback
-                assert cmod._cachefile_support.get(loc) is False  # declined + memoized
-                client.close()
+            client = TensorFlightClient(loc, cache_bytes=0)
+            assert np.array_equal(
+                client.get_tensor("z").compute(scheduler="threads"), src
+            )
+            assert len(client.get_tensor("z").chunks[0]) > 1, "need >1 chunk"
+            client.close()
+
+            backend = CacheManager.get_instance()._backend
+            keys = [k for k, i in backend._metadata.items() if i.byte_offset]
+            assert len(keys) > 1
+            # Point the second entry at the first's bytes: a real message, the
+            # right shape, the wrong chunk.
+            victim, donor = keys[1], backend._metadata[keys[0]]
+            backend._metadata[victim] = dataclasses.replace(
+                backend._metadata[victim],
+                byte_offset=donor.byte_offset,
+                byte_length=donor.byte_length,
+            )
+
+            # The handoff refuses it outright rather than publishing the range.
+            assert backend.locate_entry(victim) is None
+            # And the server's own read walks the segment instead, so it still
+            # serves the right bytes -- a repair, not a refusal.
+            cmod._cachefile_support.clear()
+            client = TensorFlightClient(loc, cache_bytes=0)
+            assert np.array_equal(
+                client.get_tensor("z").compute(scheduler="threads"), src
+            )
+            client.close()
         finally:
             server.shutdown()
             CacheManager.reset()
@@ -1162,7 +1248,7 @@ class TestCachefileIntegration:
         from biopb.tensor.client import TensorFlightClient
 
         tmp = tempfile.mkdtemp()
-        cfg = CacheConfig(backend="file", file_cache_dir=str(Path(tmp) / "cache"))
+        cfg = CacheConfig(file_cache_dir=str(Path(tmp) / "cache"))
         server, _src = self._serve_zarr(tmp, cfg)
         loc = f"grpc://localhost:{server.port}"
         try:
@@ -1212,7 +1298,7 @@ class TestCachefileIntegration:
         from biopb.tensor.client import TensorFlightClient
 
         tmp = tempfile.mkdtemp()
-        cfg = CacheConfig(backend="file", file_cache_dir=str(Path(tmp) / "cache"))
+        cfg = CacheConfig(file_cache_dir=str(Path(tmp) / "cache"))
         server, _src = self._serve_zarr(tmp, cfg)
         loc = f"grpc://localhost:{server.port}"
         try:
@@ -1241,9 +1327,10 @@ class TestCachefileIntegration:
 
     def _one_endpoint(self, client):
         """A real (chunk_id, start, stop) triple for source "z"'s first chunk."""
-        ctx = client._get_tensor_context("z")
-        chunk_id, bounds = ctx.endpoints[0]
-        return chunk_id, tuple(bounds.start), tuple(bounds.stop)
+        from biopb.tensor._session import _parse_flight_endpoints
+
+        chunk_ids, bounds = _parse_flight_endpoints(client._fetcher._plan_read("z"))
+        return chunk_ids[0], tuple(bounds[0].start), tuple(bounds[0].stop)
 
     def test_fetched_block_is_read_only_fast_path(self):
         """End-to-end read contract: a chunk pulled through the real fetch leaf
@@ -1253,7 +1340,7 @@ class TestCachefileIntegration:
         from biopb.tensor.client import TensorFlightClient
 
         tmp = tempfile.mkdtemp()
-        cfg = CacheConfig(backend="file", file_cache_dir=str(Path(tmp) / "cache"))
+        cfg = CacheConfig(file_cache_dir=str(Path(tmp) / "cache"))
         server, src = self._serve_zarr(tmp, cfg)
         loc = f"grpc://localhost:{server.port}"
         try:
@@ -1291,7 +1378,7 @@ class TestCachefileIntegration:
         from biopb.tensor.client import TensorFlightClient
 
         tmp = tempfile.mkdtemp()
-        cfg = CacheConfig(backend="file", file_cache_dir=str(Path(tmp) / "cache"))
+        cfg = CacheConfig(file_cache_dir=str(Path(tmp) / "cache"))
         server, src = self._serve_zarr(tmp, cfg)
         loc = f"grpc://localhost:{server.port}"
         try:
@@ -1328,7 +1415,7 @@ class TestCachefileIntegration:
         from biopb.tensor.client import TensorFlightClient
 
         tmp = tempfile.mkdtemp()
-        cfg = CacheConfig(backend="file", file_cache_dir=str(Path(tmp) / "cache"))
+        cfg = CacheConfig(file_cache_dir=str(Path(tmp) / "cache"))
         server, src = self._serve_zarr(tmp, cfg)
         loc = f"grpc://localhost:{server.port}"
         try:
@@ -1373,7 +1460,7 @@ class TestCachefileIntegration:
         from biopb.tensor.client import TensorFlightClient
 
         tmp = tempfile.mkdtemp()
-        cfg = CacheConfig(backend="file", file_cache_dir=str(Path(tmp) / "cache"))
+        cfg = CacheConfig(file_cache_dir=str(Path(tmp) / "cache"))
         server, src = self._serve_zarr(tmp, cfg)
         loc = f"grpc://localhost:{server.port}"
         try:
@@ -1414,7 +1501,7 @@ class TestCachefileIntegration:
         from biopb.tensor.client import TensorFlightClient
 
         tmp = tempfile.mkdtemp()
-        cfg = CacheConfig(backend="file", file_cache_dir=str(Path(tmp) / "cache"))
+        cfg = CacheConfig(file_cache_dir=str(Path(tmp) / "cache"))
         server, src = self._serve_zarr(tmp, cfg)
         loc = f"grpc://localhost:{server.port}"
         try:
@@ -1474,14 +1561,29 @@ class TestDirectSeekRead:
             info = file_backend._metadata[f"seek-{i}".encode()]
             assert info.byte_offset > 0 and info.byte_length > 0
 
-            seeked = file_backend._read_batch_at(segment_id, mmap, info)
+            key = f"seek-{i}".encode()
+            seeked = file_backend._read_batch_at(segment_id, mmap, info, key)
             # Same entry with its range stripped -> forced down the walk.
             walked = file_backend._read_batch_at(
                 segment_id,
                 mmap,
                 dataclasses.replace(info, byte_offset=0, byte_length=0),
+                key,
             )
             assert seeked.equals(walked)
+
+            # A range pointing at another entry is refused and walks instead,
+            # so the two still agree.
+            if i > 0:
+                other = file_backend._metadata[b"seek-0"]
+                misindexed = dataclasses.replace(
+                    info,
+                    byte_offset=other.byte_offset,
+                    byte_length=other.byte_length,
+                )
+                assert file_backend._read_batch_at(
+                    segment_id, mmap, misindexed, key
+                ).equals(walked)
             assert np.array_equal(unpack_chunk_array(seeked), arrs[i])
 
     def test_entry_without_range_still_reads(self, file_backend):

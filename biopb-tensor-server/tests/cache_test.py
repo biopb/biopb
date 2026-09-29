@@ -17,23 +17,18 @@ from biopb_tensor_server.cache import (
     CacheEntry,
     CacheManager,
     EntryState,
-    MemoryCacheBackend,
 )
 from biopb_tensor_server.cache.file_backend import (
-    CACHE_KEY_FIELD,
-    SIDECAR_FORMAT_VERSION,
-    SIZE_CLASS_MEDIUM_THRESHOLD,
-    SIZE_CLASS_SMALL_THRESHOLD,
+    SIZE_CLASS_BULK_THRESHOLD,
     SIZE_CLASS_TINY_THRESHOLD,
     ArrowFileBackend,
     ArrowFileConfig,
-    K,
     _get_size_class,
 )
-from biopb_tensor_server.cache.memory_backend import MemoryCacheConfig
-from biopb_tensor_server.cache.recovery import (
-    ProcessLock,
-    WriteAheadLog,
+from biopb_tensor_server.cache.recovery import K, ProcessLock
+from biopb_tensor_server.cache.segment_index import (
+    CACHE_KEY_FIELD,
+    SIDECAR_FORMAT_VERSION,
 )
 from biopb_tensor_server.core.config import CacheConfig
 
@@ -142,178 +137,181 @@ class TestCacheEntry:
         thread.join()
 
 
-class TestMemoryCacheBackend:
-    """Tests for thread-safe MemoryCacheBackend."""
+class TestProbeWithoutComputing:
+    """`contains` / `try_acquire`: the read half of the promise, on its own.
 
-    def _make_data(self, values) -> pa.RecordBatch:
-        """Helper to create RecordBatch with new schema format."""
+    The scaled read asks whether the full-resolution chunks under an extent are
+    already here before deciding to assemble it from them rather than decode the
+    source again (``cache_source.cache_sourced_units``). That question must not
+    compute anything, must not join a computation in flight, and must not move
+    the hit/miss ratio, which measures chunk serving and not probing.
+    """
+
+    @staticmethod
+    def _data(values) -> pa.RecordBatch:
         return pa.RecordBatch.from_arrays(
             [pa.array([values]), pa.array([[len(values)]]), pa.array(["int64"])],
             ["data", "shape", "dtype"],
         )
 
-    def test_start_compute_creates_pending(self):
-        """First request creates pending entry."""
-        config = MemoryCacheConfig(max_entries=10, max_bytes=1024 * 1024)
-        backend = MemoryCacheBackend(config)
+    @pytest.fixture
+    def backend(self, tmp_path):
+        be = ArrowFileBackend(
+            ArrowFileConfig(
+                cache_dir=tmp_path / "cache",
+                max_segment_bytes=1024 * 1024,
+                max_total_bytes=10 * 1024 * 1024,
+            )
+        )
+        try:
+            yield be
+        finally:
+            be.close()
 
-        entry, is_owner = backend.start_compute(b"key1")
-        assert is_owner is True
-        assert entry.state == EntryState.PENDING
+    def test_a_missing_key_is_absent_and_unacquirable(self, backend):
+        assert backend.contains(b"nope") is False
+        assert backend.try_acquire(b"nope") is None
+
+    def test_probing_computes_nothing(self, backend):
+        """The whole point: no compute_fn, so nothing is read or stored."""
+        backend.try_acquire(b"cold")
+        assert backend.contains(b"cold") is False
+        assert backend.stats().total_entries == 0
+
+    def test_a_ready_key_is_acquired_and_released(self, backend):
+        backend.start_compute(b"warm")
+        backend.complete_entry(b"warm", self._data([1, 2, 3]), 24)
+        backend.release(b"warm")
+
+        assert backend.contains(b"warm") is True
+        entry = backend.try_acquire(b"warm")
+        assert entry is not None
+        assert entry.data.column(0).to_pylist() == [[1, 2, 3]]
         assert entry.ref_count >= 1
-        backend.close()
+        assert backend.release(b"warm") >= 0
 
-    def test_start_compute_ready_entry(self):
-        """Ready entry returns immediately."""
-        config = MemoryCacheConfig(max_entries=10)
-        backend = MemoryCacheBackend(config)
+    def test_a_computation_in_flight_is_a_miss_not_a_wait(self, backend):
+        """A prober can produce the bytes itself; blocking on another reader's
+        decode would trade a bounded read for an unbounded wait."""
+        backend.start_compute(b"pending")
 
-        # Create and complete entry
-        entry, is_owner = backend.start_compute(b"key1")
-        data = self._make_data([1, 2, 3])
-        backend.complete_entry(b"key1", data, 24)
+        assert backend.contains(b"pending") is False
+        assert backend.try_acquire(b"pending") is None
 
-        # Second request should get ready entry
-        entry2, is_owner2 = backend.start_compute(b"key1")
-        assert is_owner2 is False
-        assert entry2.state == EntryState.READY
-        assert entry2.data.column(0).to_pylist() == [[1, 2, 3]]
-        backend.close()
+    def test_a_probe_does_not_move_the_ratio(self, backend):
+        backend.start_compute(b"warm")
+        backend.complete_entry(b"warm", self._data([1, 2, 3]), 24)
+        backend.release(b"warm")
+        before = backend.stats()
 
-    def test_start_compute_pending_wait(self):
-        """Second request waits on pending entry."""
-        config = MemoryCacheConfig(max_entries=10)
-        backend = MemoryCacheBackend(config)
+        backend.try_acquire(b"warm")
+        backend.release(b"warm")
+        backend.try_acquire(b"cold")
 
-        results = []
-        ready_event = threading.Event()
+        after = backend.stats()
+        assert (after.hits, after.misses) == (before.hits, before.misses)
 
-        def compute_and_complete():
-            # Wait for waiter to signal it's ready to observe
-            ready_event.wait(timeout=5.0)
-            entry, is_owner = backend.start_compute(b"key1")
-            # Should NOT be owner - waiter already created pending entry
-            assert is_owner is False
-            # Waiter's entry is pending, this thread needs to wait too
-            # Actually, this scenario shouldn't happen - both threads wait on pending
-            # Let's restructure the test
-            entry.wait_ready(timeout=5.0)
-            backend.release(b"key1")
-            results.append("computed")
+    def test_the_file_backend_hydrates_a_key_it_only_has_on_disk(self, tmp_path):
+        """The in-memory mirror is dropped on release; the segment still has it,
+        and a probe that ignored that would send a warm extent to the source."""
+        config = ArrowFileConfig(
+            cache_dir=tmp_path / "cache",
+            max_segment_bytes=1024 * 1024,
+            max_total_bytes=10 * 1024 * 1024,
+        )
+        first = ArrowFileBackend(config)
+        first.start_compute(b"ondisk")
+        first.complete_entry(b"ondisk", self._data([4, 5, 6]), 24)
+        first.release(b"ondisk")
+        first.close()
 
-        def wait_for_ready():
-            entry, is_owner = backend.start_compute(b"key1")
-            # First thread creates pending - is owner
-            assert is_owner is True
-            assert entry.state == EntryState.PENDING
-            # Signal compute thread to start (it will also find pending)
-            ready_event.set()
-            time.sleep(0.1)  # Give compute thread time to see pending
-            # Now complete
-            data = self._make_data([1, 2, 3])
-            backend.complete_entry(b"key1", data, 24)
-            backend.release(b"key1")
-            results.append("waited")
+        second = ArrowFileBackend(config)
+        try:
+            assert second.contains(b"ondisk") is True
+            before = second.stats()
+            entry = second.try_acquire(b"ondisk")
+            assert entry is not None
+            assert entry.data.column(0).to_pylist() == [[4, 5, 6]]
+            second.release(b"ondisk")
+            # Hydrating from the segment is still a probe: the ratio counts
+            # chunks served, and which copy answered is not the caller's doing.
+            after = second.stats()
+            assert (after.hits, after.misses) == (before.hits, before.misses)
+        finally:
+            second.close()
 
-        # Start waiter thread first - it creates pending entry
-        t1 = threading.Thread(target=wait_for_ready)
-        t1.start()
-        # Start compute thread second - it will find pending
-        t2 = threading.Thread(target=compute_and_complete)
-        t2.start()
+        # ... while a real read that hydrates the same key does count.
+        third = ArrowFileBackend(config)
+        try:
+            assert third.stats().hits == 0
+            third.start_compute(b"ondisk")
+            third.release(b"ondisk")
+            assert third.stats().hits == 1
+        finally:
+            third.close()
 
-        t1.join()
-        t2.join()
+    def test_a_probe_leaves_the_eviction_policy_alone(self, tmp_path):
+        """`touch=False` reads the bytes and credits nothing.
 
-        assert "waited" in results
-        assert "computed" in results
-        backend.close()
+        One coarse scaled read covers every full-resolution chunk under its
+        extent, so crediting them would flatten the Sieve-K frequency signal and
+        let a zoomed-out read decide what stays cached.
+        """
+        backend = ArrowFileBackend(
+            ArrowFileConfig(
+                cache_dir=tmp_path / "cache",
+                max_segment_bytes=1024 * 1024,
+                max_total_bytes=10 * 1024 * 1024,
+            )
+        )
+        try:
+            backend.start_compute(b"k")
+            backend.complete_entry(b"k", self._data([1, 2, 3]), 24)
+            backend.release(b"k")
+            pool_queue = backend._pool_queues.get(("normal", "tiny"))
+            assert pool_queue is not None, "expected the entry to land in a pool"
+            seg_info = pool_queue.segments[backend._metadata[b"k"].segment_id]
 
-    def test_release(self):
-        """Release decrements ref_count."""
-        config = MemoryCacheConfig()
-        backend = MemoryCacheBackend(config)
+            def credit():
+                return (
+                    seg_info.frequency,
+                    seg_info.last_access_time,
+                    pool_queue.hits,
+                )
 
-        entry, _ = backend.start_compute(b"key1")
-        data = self._make_data([1])
-        backend.complete_entry(b"key1", data, 8)
-        assert entry.ref_count >= 1
+            before = credit()
 
-        backend.release(b"key1")
-        assert entry.ref_count == 0
-        backend.close()
+            for _ in range(5):
+                assert backend.try_acquire(b"k", touch=False) is not None
+                backend.release(b"k")
 
-    def test_eviction_skips_referenced_entries(self):
-        """Entries with ref_count > 0 cannot be evicted."""
-        config = MemoryCacheConfig(max_entries=3, max_bytes=1024 * 1024)
-        backend = MemoryCacheBackend(config)
+            assert credit() == before
 
-        # Create and hold entry
-        entry1, _ = backend.start_compute(b"key1")
-        backend.complete_entry(b"key1", self._make_data([1]), 8)
+            # ... and the default still promotes, so a real read is unaffected.
+            assert backend.try_acquire(b"k") is not None
+            backend.release(b"k")
+            assert seg_info.frequency > before[0]
+        finally:
+            backend.close()
 
-        # Create more entries (should trigger eviction)
-        entry2, _ = backend.start_compute(b"key2")
-        backend.complete_entry(b"key2", self._make_data([2]), 8)
-        backend.release(b"key2")
-
-        entry3, _ = backend.start_compute(b"key3")
-        backend.complete_entry(b"key3", self._make_data([3]), 8)
-        backend.release(b"key3")
-
-        entry4, _ = backend.start_compute(b"key4")
-        backend.complete_entry(b"key4", self._make_data([4]), 8)
-        backend.release(b"key4")
-
-        # key1 should still exist (has ref_count > 0)
-        assert backend.start_compute(b"key1")[0].state == EntryState.READY
-        backend.close()
-
-    def test_stats_tracking(self):
-        """Statistics are tracked."""
-        config = MemoryCacheConfig()
-        backend = MemoryCacheBackend(config)
-
-        entry, is_owner = backend.start_compute(b"key1")
-        backend.complete_entry(b"key1", self._make_data([1]), 8)
-        backend.release(b"key1")
-
-        # Hit
-        entry2, _ = backend.start_compute(b"key1")
-        backend.release(b"key1")
-
-        stats = backend.stats()
-        assert stats.hits == 1
-        assert stats.misses == 1
-        backend.close()
-
-    def test_clear_evictable_only(self):
-        """Clear only removes evictable entries."""
-        config = MemoryCacheConfig()
-        backend = MemoryCacheBackend(config)
-
-        entry1, _ = backend.start_compute(b"key1")
-        backend.complete_entry(b"key1", self._make_data([1]), 8)
-        # Don't release - still referenced
-
-        entry2, _ = backend.start_compute(b"key2")
-        backend.complete_entry(b"key2", self._make_data([2]), 8)
-        backend.release(b"key2")  # Evictable
-
-        backend.clear()
-
-        # key1 should still exist
-        assert backend.start_compute(b"key1")[0].state == EntryState.READY
-        # key2 should be gone
-        entry, is_owner = backend.start_compute(b"key2")
-        assert is_owner is True  # New computation needed
-        backend.close()
+    def test_the_manager_drives_both(self, tmp_path):
+        manager = CacheManager(CacheConfig(file_cache_dir=tmp_path / "cache"))
+        try:
+            assert manager.contains(b"nope") is False
+            assert manager.try_acquire(b"nope") is None
+            manager.put(b"warm", self._data([7, 8]), 16)
+            assert manager.contains(b"warm") is True
+            entry = manager.try_acquire(b"warm")
+            assert entry is not None
+            manager.release(b"warm")
+        finally:
+            manager.close()
 
 
 class TestCacheManager:
     """Tests for CacheManager singleton."""
 
-    def test_initialize_singleton(self):
+    def test_initialize_singleton(self, tmp_path):
         """Singleton initialization is thread-safe."""
         CacheManager.reset()
 
@@ -327,7 +325,7 @@ class TestCacheManager:
             with init_lock:
                 if not first_done.is_set():
                     # First thread initializes
-                    config = CacheConfig(backend="memory")
+                    config = CacheConfig(file_cache_dir=tmp_path / "cache")
                     manager = CacheManager.initialize(config)
                     first_done.set()
                 else:
@@ -352,10 +350,12 @@ class TestCacheManager:
             ["data", "shape", "dtype"],
         )
 
-    def test_put_stores_the_batch(self):
+    def test_put_stores_the_batch(self, tmp_path):
         """put() commits an already-computed batch and reports that it stored it."""
         CacheManager.reset()
-        manager = CacheManager.initialize(CacheConfig(backend="memory"))
+        manager = CacheManager.initialize(
+            CacheConfig(file_cache_dir=tmp_path / "cache")
+        )
 
         assert manager.put(b"key1", self._batch(), 24) is True
 
@@ -365,7 +365,7 @@ class TestCacheManager:
         manager.release(b"key1")
         CacheManager.reset()
 
-    def test_put_holds_no_reference(self):
+    def test_put_holds_no_reference(self, tmp_path):
         """put() leaves the entry unreferenced, so the cache can reclaim it.
 
         The leak this API replaced (biopb/biopb#545): the caller drove
@@ -374,20 +374,24 @@ class TestCacheManager:
         making the entry permanently un-removable.
         """
         CacheManager.reset()
-        manager = CacheManager.initialize(CacheConfig(backend="memory"))
+        manager = CacheManager.initialize(
+            CacheConfig(file_cache_dir=tmp_path / "cache")
+        )
 
         manager.put(b"key1", self._batch(), 24)
 
         entry = manager.backend._entries[b"key1"]
         assert entry.ref_count == 0
         assert entry.is_evictable()
-        assert manager.remove(b"key1") is True
+        assert manager.backend.remove(b"key1") is True
         CacheManager.reset()
 
-    def test_put_declines_an_existing_key(self):
+    def test_put_declines_an_existing_key(self, tmp_path):
         """A second put() does not overwrite -- the incumbent batch survives."""
         CacheManager.reset()
-        manager = CacheManager.initialize(CacheConfig(backend="memory"))
+        manager = CacheManager.initialize(
+            CacheConfig(file_cache_dir=tmp_path / "cache")
+        )
 
         assert manager.put(b"key1", self._batch(), 24) is True
 
@@ -402,13 +406,15 @@ class TestCacheManager:
         manager.release(b"key1")
         CacheManager.reset()
 
-    def test_put_failure_leaves_no_pending_entry(self):
+    def test_put_failure_leaves_no_pending_entry(self, tmp_path):
         """A commit that raises must not strand a PENDING entry.
 
         Readers of that key would otherwise block on it until pending_timeout.
         """
         CacheManager.reset()
-        manager = CacheManager.initialize(CacheConfig(backend="memory"))
+        manager = CacheManager.initialize(
+            CacheConfig(file_cache_dir=tmp_path / "cache")
+        )
 
         def boom(*args, **kwargs):
             raise OSError("no space left on device")
@@ -424,10 +430,9 @@ class TestCacheManager:
 class TestConcurrentCompute:
     """Tests for concurrent computation scenarios."""
 
-    def test_concurrent_same_key_only_one_computes(self):
+    def test_concurrent_same_key_only_one_computes(self, tmp_path):
         """Multiple threads requesting same key - only one computes."""
-        config = MemoryCacheConfig(max_entries=10)
-        backend = MemoryCacheBackend(config)
+        backend = ArrowFileBackend(ArrowFileConfig(cache_dir=tmp_path / "cache"))
 
         compute_counts = [0]  # Use list for thread-safe increment
         compute_lock = threading.Lock()
@@ -459,10 +464,9 @@ class TestConcurrentCompute:
         assert compute_counts[0] == 1
         backend.close()
 
-    def test_concurrent_different_keys(self):
+    def test_concurrent_different_keys(self, tmp_path):
         """Different keys are computed independently."""
-        config = MemoryCacheConfig(max_entries=10)
-        backend = MemoryCacheBackend(config)
+        backend = ArrowFileBackend(ArrowFileConfig(cache_dir=tmp_path / "cache"))
 
         results = {}
 
@@ -490,10 +494,11 @@ class TestConcurrentCompute:
         assert len(results) == 3
         backend.close()
 
-    def test_timeout_on_pending(self):
+    def test_timeout_on_pending(self, tmp_path):
         """Waiting on pending entry returns False on timeout."""
-        config = MemoryCacheConfig(max_entries=10, pending_timeout=0.5)
-        backend = MemoryCacheBackend(config)
+        backend = ArrowFileBackend(
+            ArrowFileConfig(cache_dir=tmp_path / "cache", pending_timeout=0.5)
+        )
 
         entry, is_owner = backend.start_compute(b"key1")
         assert is_owner is True
@@ -870,8 +875,8 @@ def _simulate_crash(backend):
     """Release a backend's OS file handles the way a dying process would.
 
     A real crash makes the OS reclaim every open handle -- writers, sinks, mmaps,
-    and the cache lock's descriptor -- while leaving the on-disk owner record and
-    WAL behind (no clean shutdown). The test process stays alive, so we drop those
+    and the cache lock's descriptor -- while leaving the on-disk owner record
+    behind (no clean shutdown). The test process stays alive, so we drop those
     handles explicitly; on Windows a lingering handle also blocks the segment files
     from being deleted (issue #5). Deliberately does NOT call backend.close() or
     ProcessLock.release(), either of which would clean up and thus erase the crash
@@ -953,7 +958,7 @@ class TestArrowFileBackendRecovery:
 
         A dying process releases the OS lock (the kernel closes its fd) but
         cannot remove its record, so the next owner acquires successfully *and*
-        finds the marker -- which is precisely the case WAL recovery is for.
+        finds the marker -- which is precisely the case recovery is for.
         """
         cache_dir = self._make_temp_cache_dir()
         lock_path = cache_dir / "lock"
@@ -1026,25 +1031,6 @@ class TestArrowFileBackendRecovery:
 
         shutil.rmtree(cache_dir)
 
-    def test_wal_pending_detection(self):
-        """WAL detects pending writes."""
-        cache_dir = self._make_temp_cache_dir()
-        wal_path = cache_dir / "wal.json"
-
-        wal = WriteAheadLog(wal_path)
-        wal.log_pending(b"test_key")
-
-        # Pending key should be tracked
-        pending = wal.get_pending_keys()
-        assert b"test_key" in pending
-        assert wal.has_pending() is True
-
-        wal.log_committed(b"test_key")
-        assert wal.has_pending() is False
-
-        wal.clear()
-        shutil.rmtree(cache_dir)
-
     def test_recovery_after_simulated_crash(self):
         """Valid entries survive after simulated crash."""
         cache_dir = self._make_temp_cache_dir()
@@ -1075,42 +1061,42 @@ class TestArrowFileBackendRecovery:
         backend2.close()
         shutil.rmtree(cache_dir)
 
-    def test_stale_lock_triggers_recovery_without_wal_entries(self):
-        """An unclean exit alone (no WAL entries) triggers recovery on restart."""
+    def test_stale_lock_triggers_recovery(self):
+        """An unclean exit triggers recovery on restart.
+
+        The only trigger there is, since the write-ahead log was removed: a
+        clean shutdown releases the lock, so a stale one means the last owner
+        did not get there.
+        """
         cache_dir = self._make_temp_cache_dir()
         config = ArrowFileConfig(cache_dir=cache_dir)
 
-        # First instance: write a complete entry (WAL is cleared after commit)
         backend1 = ArrowFileBackend(config)
-        entry1, _ = backend1.start_compute(b"key1")
-        data = self._make_data([1, 2, 3])
-        backend1.complete_entry(b"key1", data, 24)
+        backend1.start_compute(b"key1")
+        backend1.complete_entry(b"key1", self._make_data([1, 2, 3]), 24)
         backend1.release(b"key1")
 
         # Crash: the lock's descriptor goes, its owner record stays behind.
         _simulate_crash(backend1)
 
-        # Verify WAL has no pending entries (so recovery must be triggered by
-        # the leftover owner record alone)
-        from biopb_tensor_server.cache.recovery import WriteAheadLog
-
-        wal = WriteAheadLog(cache_dir / "wal.json")
-        assert not wal.has_pending(), "Test requires no pending WAL entries"
-
-        # Reinitialize: recovery should trigger due to stale lock
         backend2 = ArrowFileBackend(config)
-        assert backend2.get_recovery_status() is not None, (
-            "Recovery should be triggered by stale lock even without pending WAL entries"
-        )
+        status = backend2.get_recovery_status()
+        assert status is not None, "a stale lock must trigger recovery"
+        # A complete write is not a lost one: nothing was torn.
+        assert status.lost_entries == 0
 
         backend2.close()
         shutil.rmtree(cache_dir)
 
-    def test_pending_write_is_discarded_on_recovery(self):
-        """An interrupted write (logged pending, never committed) is dropped on
-        recovery and never served as a torn cache hit -- the WAL's whole purpose,
-        and the crash-safety property that must hold without a clean shutdown
-        (#138 item 2). A committed entry alongside it must still survive.
+    def test_interrupted_write_is_discarded_on_recovery(self):
+        """A write cut off mid-message is dropped on recovery and never served
+        as a torn cache hit -- the crash-safety property that must hold without a
+        clean shutdown (#138 item 2). A committed entry alongside it survives,
+        and recovery reports the loss.
+
+        The interrupted write is simulated on disk, as the head of a message
+        whose body never landed, rather than by faking a bookkeeping record: the
+        boot walk is what detects it, so that is what the test has to feed.
         """
         cache_dir = self._make_temp_cache_dir()
         config = ArrowFileConfig(cache_dir=cache_dir)
@@ -1120,29 +1106,60 @@ class TestArrowFileBackendRecovery:
         backend1.start_compute(b"key_good")
         backend1.complete_entry(b"key_good", self._make_data([1, 2, 3]), 24)
         backend1.release(b"key_good")
-        # An in-flight write: pending in the WAL with no committed segment -- the
-        # on-disk shape of a crash mid-complete_entry (after log_pending, before
-        # log_committed).
-        backend1._wal.log_pending(b"key_bad")
+        segment = backend1._segment_path(backend1._metadata[b"key_good"].segment_id)
 
-        # Crash without clean shutdown: the OS frees the lock descriptor so a
-        # fresh instance can reclaim it, and recovery is driven by the pending
-        # WAL entry (the lock file and owner record stay -- no crash unlinks them).
+        # Crash without clean shutdown: the OS frees the lock descriptor, the
+        # owner record stays (no crash unlinks it).
         _simulate_crash(backend1)
 
+        # ... with a write that had started when the power went: a message
+        # header with no body behind it.
+        with open(segment, "ab") as handle:
+            handle.write(b"\xff\xff\xff\xff\x80\x00\x00\x00" + b"\x00" * 16)
+
         backend2 = ArrowFileBackend(config)
-        # Recovery ran (driven by the pending WAL entry) and purged the in-flight
-        # write: the pending marker is gone, so the key is "lost" per _recover().
-        assert backend2.get_recovery_status() is not None, "recovery must run"
-        assert not backend2._wal.has_pending(), "pending write must be purged"
+        status = backend2.get_recovery_status()
+        assert status is not None, "recovery must run"
+        assert status.lost_entries == 1, "the partial write must be reported lost"
 
         good, good_owner = backend2.start_compute(b"key_good")
         assert good_owner is False, "committed entry must survive as a cache hit"
         assert good.state == EntryState.READY
-        # The interrupted key was lost: the caller becomes the owner (must
-        # recompute) rather than getting a torn/partial hit.
+        # Nothing torn is ever served: the slack bytes index no entry at all.
         _bad, bad_owner = backend2.start_compute(b"key_bad")
         assert bad_owner is True, "interrupted write must be recomputed, not served"
+
+        backend2.close()
+        shutil.rmtree(cache_dir)
+
+    def test_torn_first_batch_is_dropped_and_still_counted(self):
+        """A segment whose only batch was cut off holds nothing recoverable, so
+        the boot drops it -- but the write it cost is still one lost entry. This
+        is every crash that lands on the first write after a rotation, so the
+        count must not depend on the segment surviving.
+        """
+        cache_dir = self._make_temp_cache_dir()
+        config = ArrowFileConfig(cache_dir=cache_dir)
+
+        backend1 = ArrowFileBackend(config)
+        backend1.start_compute(b"key")
+        backend1.complete_entry(b"key", self._make_data([1, 2, 3]), 24)
+        backend1.release(b"key")
+        info = backend1._metadata[b"key"]
+        segment = backend1._segment_path(info.segment_id)
+        _simulate_crash(backend1)
+
+        # Cut the first batch's body short: schema message intact, then a
+        # message that never finished landing.
+        with open(segment, "r+b") as handle:
+            handle.truncate(info.byte_offset + info.byte_length - 5)
+
+        backend2 = ArrowFileBackend(config)
+        status = backend2.get_recovery_status()
+        assert status is not None, "recovery must run"
+        assert status.lost_entries == 1, "the torn first batch must be counted"
+        assert status.recovered_entries == 0
+        assert not segment.exists(), "a segment that can serve nothing is dropped"
 
         backend2.close()
         shutil.rmtree(cache_dir)
@@ -1181,50 +1198,6 @@ class TestArrowFileBackendRecovery:
         shutil.rmtree(cache_dir)
 
 
-class TestBackendSelection:
-    """Tests for CacheManager backend selection."""
-
-    def test_memory_backend_selection(self):
-        """Config with backend='memory' uses MemoryCacheBackend."""
-        CacheManager.reset()
-        config = CacheConfig(
-            backend="memory",
-            memory_max_entries=100,
-            memory_max_bytes=1024 * 1024,
-        )
-        manager = CacheManager.initialize(config)
-        assert isinstance(manager.backend, MemoryCacheBackend)
-        CacheManager.reset()
-
-    def test_file_backend_selection(self):
-        """Config with backend='file' uses ArrowFileBackend."""
-        CacheManager.reset()
-        cache_dir = Path(tempfile.mkdtemp(prefix="biopb-cache-test-"))
-        config = CacheConfig(
-            backend="file",
-            file_cache_dir=cache_dir,
-            file_max_segment_bytes=1024 * 1024,
-            file_max_total_bytes=10 * 1024 * 1024,
-        )
-        manager = CacheManager.initialize(config)
-        assert isinstance(manager.backend, ArrowFileBackend)
-        CacheManager.reset()
-        shutil.rmtree(cache_dir)
-
-    def test_unknown_backend_raises(self):
-        """Unknown backend raises ValueError.
-
-        Config *files* never get here -- the read step clamps a bad backend to
-        the default (biopb/biopb#34) -- so this guards the in-process caller that
-        builds a CacheConfig directly.
-        """
-        CacheManager.reset()
-        config = CacheConfig(backend="unknown")
-        with pytest.raises(ValueError, match="Unknown cache backend"):
-            CacheManager.initialize(config)
-        CacheManager.reset()
-
-
 class TestOversizedChunkHandling:
     """Tests for oversized chunk handling (>2GB)."""
 
@@ -1233,26 +1206,6 @@ class TestOversizedChunkHandling:
             [pa.array([values]), pa.array([[len(values)]]), pa.array(["int64"])],
             ["data", "shape", "dtype"],
         )
-
-    def test_memory_backend_skips_oversized(self):
-        """Memory backend skips caching oversized chunks."""
-        config = MemoryCacheConfig()
-        backend = MemoryCacheBackend(config)
-
-        entry, is_owner = backend.start_compute(b"big_key")
-        # Simulate oversized chunk (use MAX_ARROW_BATCH_BYTES + 1)
-        oversized_bytes = MAX_ARROW_BATCH_BYTES + 1
-        data = self._make_data([1])
-        backend.complete_entry(b"big_key", data, oversized_bytes)
-
-        # Entry should be ready but not stored in cache properly
-        assert entry.state == EntryState.READY
-
-        # Stats should show oversized skip
-        stats = backend.stats()
-        assert stats.oversized_skips == 1
-
-        backend.close()
 
     def test_file_backend_skips_oversized(self):
         """File backend skips caching oversized chunks."""
@@ -1291,19 +1244,19 @@ class TestSizeClassClassification:
         assert _get_size_class(1) == "tiny"
         assert _get_size_class(SIZE_CLASS_TINY_THRESHOLD - 1) == "tiny"
 
-    def test_small_size_class(self):
-        """Chunks between TINY and SMALL thresholds are small."""
-        assert _get_size_class(SIZE_CLASS_TINY_THRESHOLD) == "small"
-        assert _get_size_class(SIZE_CLASS_SMALL_THRESHOLD - 1) == "small"
+    def test_bulk_size_class(self):
+        """Everything between the two thresholds is one bulk class.
 
-    def test_medium_size_class(self):
-        """Chunks between SMALL and MEDIUM thresholds are medium."""
-        assert _get_size_class(SIZE_CLASS_SMALL_THRESHOLD) == "medium"
-        assert _get_size_class(SIZE_CLASS_MEDIUM_THRESHOLD - 1) == "medium"
+        Deliberately spans the 8 MB transfer target: splitting there cut the
+        population at its own mode.
+        """
+        assert _get_size_class(SIZE_CLASS_TINY_THRESHOLD) == "bulk"
+        assert _get_size_class(8 * 1024 * 1024) == "bulk"
+        assert _get_size_class(SIZE_CLASS_BULK_THRESHOLD - 1) == "bulk"
 
     def test_large_size_class(self):
-        """Chunks over MEDIUM_THRESHOLD are large."""
-        assert _get_size_class(SIZE_CLASS_MEDIUM_THRESHOLD) == "large"
+        """Chunks over BULK_THRESHOLD are large."""
+        assert _get_size_class(SIZE_CLASS_BULK_THRESHOLD) == "large"
         assert _get_size_class(MAX_ARROW_BATCH_BYTES) == "large"
 
 
@@ -1329,7 +1282,7 @@ class TestSchemaPooling:
 
         # Different dtypes now all serialize to the ONE unified binary chunk
         # schema (raw bytes + dtype string), so they share a pool.
-        from biopb_tensor_server.core.adapter_base import pack_chunk_batch
+        from biopb_tensor_server.core.chunk_batch import pack_chunk_batch
 
         int_data = pack_chunk_batch(np.array([1, 2, 3], dtype=np.int32))
         float_data = pack_chunk_batch(np.array([1.0, 2.0, 3.0], dtype=np.float32))
@@ -1529,7 +1482,7 @@ class TestSieveKEviction:
         backend.release(key)
 
         # Get pool queue for this segment
-        pool_key = ("unified", "tiny")
+        pool_key = ("normal", "tiny")
         pool_queue = backend._pool_queues.get(pool_key)
 
         if pool_queue:
@@ -1570,7 +1523,7 @@ class TestSieveKEviction:
             backend.complete_entry(key, data, 400)
             backend.release(key)
 
-        pool_key = ("unified", "tiny")
+        pool_key = ("normal", "tiny")
         pool_queue = backend._pool_queues.get(pool_key)
 
         if pool_queue and len(pool_queue.queue) > 2:
@@ -1636,11 +1589,11 @@ class TestSieveKEviction:
         assert stats.evictions >= 1
 
         # Tiny pool should have lower hit rate
-        if "unified-tiny" in stats.pool_stats and "unified-small" in stats.pool_stats:
-            tiny_rate = stats.pool_stats["unified-tiny"].hit_rate
-            small_rate = stats.pool_stats["unified-small"].hit_rate
-            # Small pool was accessed more, should have higher hit rate
-            assert small_rate >= tiny_rate
+        if "normal-tiny" in stats.pool_stats and "normal-bulk" in stats.pool_stats:
+            tiny_rate = stats.pool_stats["normal-tiny"].hit_rate
+            bulk_rate = stats.pool_stats["normal-bulk"].hit_rate
+            # Bulk pool was accessed more, should have higher hit rate
+            assert bulk_rate >= tiny_rate
 
         backend.close()
         shutil.rmtree(cache_dir)
@@ -1666,9 +1619,9 @@ class TestSieveKEviction:
             backend.release(key)
 
         stats = backend.stats()
-        assert "unified-tiny" in stats.pool_stats
+        assert "normal-tiny" in stats.pool_stats
 
-        pool_stat = stats.pool_stats["unified-tiny"]
+        pool_stat = stats.pool_stats["normal-tiny"]
         assert pool_stat.hits >= 3  # 3 hits
         assert pool_stat.misses >= 5  # 5 misses (initial writes)
         assert pool_stat.segments >= 1
@@ -1689,7 +1642,7 @@ class TestSieveKEviction:
         backend.complete_entry(key, data, 24)
         backend.release(key)
 
-        pool_key = ("unified", "tiny")
+        pool_key = ("normal", "tiny")
         pool_queue = backend._pool_queues.get(pool_key)
 
         if pool_queue and pool_queue.queue:
@@ -1719,7 +1672,7 @@ class TestSieveKEviction:
             backend.complete_entry(key, data, 400)
             backend.release(key)
 
-        pool_key = ("unified", "tiny")
+        pool_key = ("normal", "tiny")
         pool_queue = backend._pool_queues.get(pool_key)
 
         if pool_queue and len(pool_queue.queue) >= 3:
@@ -2034,6 +1987,52 @@ class TestSegmentSidecarIndex:
             assert entry.data.column("data").to_pylist() == [[i, i + 1, i + 2]]
             b2.release(key)
         b2.close()
+        shutil.rmtree(cache_dir)
+
+    def test_concurrent_locates_and_reads_do_not_share_a_file_position(self):
+        """Threads locating and reading across sealed segments each decode their
+        own entry.
+
+        A segment's mapping has one read position; a locate that seeks it while
+        another thread does the same used to decode from the other's offset --
+        a wrong batch at best (reported as an index/body mismatch), a fault of
+        the whole process at worst.
+        """
+        cache_dir = self._make_temp_cache_dir()
+        config = self._rotating_config(cache_dir)
+        b1 = ArrowFileBackend(config)
+        n = 40
+        self._write_entries(b1, n)
+
+        backend = ArrowFileBackend(config)
+        assert len(self._seg_files(cache_dir)) > 1
+        failures = []
+
+        def hammer(seed):
+            try:
+                for step in range(300):
+                    i = (seed * 7 + step * 3) % n
+                    key = f"key{i}".encode()
+                    if backend.locate_entry(key) is None:
+                        failures.append(f"locate {key!r} returned None")
+                        return
+                    batch = backend._read_batch_from_segment(key, touch=False)
+                    if batch is None or batch.column("data").to_pylist() != [
+                        [i, i + 1, i + 2]
+                    ]:
+                        failures.append(f"read {key!r} decoded another entry")
+                        return
+            except Exception as e:  # noqa: BLE001
+                failures.append(repr(e))
+
+        threads = [threading.Thread(target=hammer, args=(t,)) for t in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert failures == []
+        backend.close()
         shutil.rmtree(cache_dir)
 
     def test_missing_sidecar_walks_that_segment_and_backfills(self):

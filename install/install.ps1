@@ -40,7 +40,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
 # Where to fetch the engine from when running via `irm | iex` (no script on disk).
-# Served from biopb.org alongside install.ps1 (see docs/release-model.md).
+# Served from biopb.org alongside install.ps1.
 $EngineUrl = "https://biopb.org/biopb-engine.ps1"
 
 # Release pin -- stamped at publish, empty in the committed source (twin of
@@ -133,8 +133,9 @@ function Resolve-EngineSource {
     # BIOPB_INSTALL_VERSION), fetch the engine FROM THAT RELEASE's assets: a
     # versioned, immutable copy that matches the wheels we install, so a lone
     # install.ps1 downloaded from a release is fully self-contained (no second
-    # download). Old releases predate the engine-as-asset, so fall back to the
-    # biopb.org copy on any fetch error.
+    # download). Falls back to the biopb.org copy on a fetch error; that engine
+    # refuses a release older than its install_schema floor and names the
+    # installer shipped with it.
     if ($EngineTag) {
         $releaseEngine = "https://github.com/biopb/biopb/releases/download/$EngineTag/biopb-engine.ps1"
         try {
@@ -207,8 +208,8 @@ function Show-Summary {
         Write-Host ""
     }
 
-    Write-Inf "biopb-mcp configuration file:"
-    Write-Cmd "  $ConfigDir\mcp-config.json"
+    Write-Inf "Algorithm registry (one file per server):"
+    Write-Cmd "  $ConfigDir\algorithms\"
     Write-Host ""
 
     Write-Inf "Data server configuration file:"
@@ -259,11 +260,9 @@ try {
     . ([scriptblock]::Create((Resolve-EngineSource)))
 
     $BiopbHome  = $env:USERPROFILE
-    # Canonical config is biopb.json (biopb/biopb#34); a legacy biopb.toml from a
-    # pre-#34 install still counts as "a config exists" for the keep prompt.
+    # biopb.json is the only config format (biopb/biopb#34).
     $configDir  = Get-BiopbTree "BIOPB_CONFIG_HOME" ".config"
     $configFile = Join-Path $configDir "biopb.json"
-    $legacyConfig = Join-Path $configDir "biopb.toml"
 
     # ----- Resolve component choices (no longer prompted -- biopb/biopb#237) -----
 
@@ -283,7 +282,7 @@ try {
     # samples). Set $env:BIOPB_INSTALL_SAMPLES=0 to seed nothing.
     $dataDir = ""
     $keepConfig = $false
-    $configExists = (Test-Path -LiteralPath $configFile) -or (Test-Path -LiteralPath $legacyConfig)
+    $configExists = Test-Path -LiteralPath $configFile
     if ($configExists -and (-not $env:BIOPB_DATA_DIR)) {
         # Existing config, no override: keep it exactly as-is (upgrade fast path).
         $keepConfig = $true
@@ -291,8 +290,7 @@ try {
     }
     elseif ($configExists) {
         # BIOPB_DATA_DIR is a fresh-install override only; an existing config wins.
-        $existing = if (Test-Path -LiteralPath $configFile) { $configFile } else { $legacyConfig }
-        Write-Note "BIOPB_DATA_DIR is set but a config already exists; keeping it (remove $existing to apply it)."
+        Write-Note "BIOPB_DATA_DIR is set but a config already exists; keeping it (remove $configFile to apply it)."
         $keepConfig = $true
     }
     elseif ($env:BIOPB_DATA_DIR) {
@@ -314,11 +312,13 @@ try {
     # Remote algorithm plugins consent. The default plugins point at off-site
     # servers (cell segmentation, etc.) hosted at UConn Health that log client
     # IPs, so ask before enabling them rather than quietly shipping a third-party
-    # network dependency. Only fires when no biopb-mcp config exists yet, so a
-    # prior choice survives a rerun. Default is Yes (Enter = enable).
+    # network dependency. Only fires when neither the algorithm registry nor an
+    # older install's mcp-config.json (whose servers the control moves into the
+    # registry) exists, so a prior choice survives a rerun. Default is Yes.
     $noRemotePlugins = $false
-    $mcpConfig = Join-Path (Get-BiopbTree "BIOPB_CONFIG_HOME" ".config") "mcp-config.json"
-    if (-not (Test-Path -LiteralPath $mcpConfig)) {
+    $biopbConfig = Get-BiopbTree "BIOPB_CONFIG_HOME" ".config"
+    if (-not (Test-Path -LiteralPath (Join-Path $biopbConfig "algorithms")) -and
+        -not (Test-Path -LiteralPath (Join-Path $biopbConfig "mcp-config.json"))) {
         if ($script:NonInteractive) {
             # Consent can't be asked unattended: enable only on explicit opt-in.
             if ($env:BIOPB_REMOTE_PLUGINS -eq '1') {

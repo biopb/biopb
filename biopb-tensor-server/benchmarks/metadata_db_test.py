@@ -9,7 +9,7 @@ Measures performance for:
 import concurrent.futures
 
 import pytest
-from biopb_tensor_server.core.metadata_db import MetadataDatabase
+from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 
 
 class MockAdapter:
@@ -22,21 +22,30 @@ class MockAdapter:
         self._shape = shape
         self._dtype = dtype
 
-    def get_source_descriptor(self):
-        from biopb.tensor.descriptor_pb2 import DataSourceDescriptor, TensorDescriptor
+    @property
+    def catalog_url(self):
+        return self._source_url
 
-        return DataSourceDescriptor(
-            source_id=self.source_id,
-            source_url=self._source_url,
-            source_type=self._source_type,
-            tensors=[
-                TensorDescriptor(
-                    array_id=self.source_id,
-                    shape=self._shape,
-                    dtype=self._dtype,
-                )
-            ],
-        )
+    @property
+    def source_type(self):
+        return self._source_type
+
+    def is_resident(self):
+        return True
+
+    def is_resolved(self):
+        return True
+
+    def list_tensor_descriptors(self):
+        from biopb.tensor.descriptor_pb2 import TensorDescriptor
+
+        return [
+            TensorDescriptor(
+                array_id=self.source_id,
+                shape=self._shape,
+                dtype=self._dtype,
+            )
+        ]
 
     def get_metadata(self):
         return {
@@ -109,12 +118,14 @@ class TestConcurrentAccess:
                 if thread_id % 3 == 0:
                     sql = "SELECT source_id FROM sources WHERE source_type='ome-zarr' LIMIT 10"
                 elif thread_id % 3 == 1:
-                    sql = "SELECT source_id, dtype FROM sources WHERE dtype='uint16' LIMIT 10"
+                    sql = (
+                        "SELECT source_id, tensors[1].dtype FROM sources "
+                        "WHERE tensors[1].dtype = 'uint16' LIMIT 10"
+                    )
                 else:
                     sql = "SELECT COUNT(*) FROM sources"
 
-                info = db.handle_query(sql)
-                result = db.get_pending_result(info.endpoints[0].ticket.ticket.decode())
+                result = db.query(sql)
                 return result.num_rows
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
@@ -151,10 +162,7 @@ class TestConcurrentAccess:
             def query_worker(thread_id):
                 try:
                     sql = "SELECT COUNT(*) FROM sources"
-                    info = fresh_db.handle_query(sql)
-                    fresh_db.get_pending_result(
-                        info.endpoints[0].ticket.ticket.decode()
-                    )
+                    fresh_db.query(sql)
                 except Exception as e:
                     errors.append(str(e))
 
@@ -209,8 +217,7 @@ class TestLargeScale:
 
         def query_all():
             sql = "SELECT source_id FROM sources"
-            info = db.handle_query(sql)
-            result = db.get_pending_result(info.endpoints[0].ticket.ticket.decode())
+            result = db.query(sql)
             return result.num_rows
 
         n_rows = benchmark(query_all)
@@ -222,8 +229,7 @@ class TestLargeScale:
 
         def query_all():
             sql = "SELECT source_id FROM sources"
-            info = db.handle_query(sql)
-            result = db.get_pending_result(info.endpoints[0].ticket.ticket.decode())
+            result = db.query(sql)
             return result.num_rows
 
         n_rows = benchmark(query_all)
@@ -236,8 +242,7 @@ class TestLargeScale:
 
         def query_all():
             sql = "SELECT source_id FROM sources"
-            info = db.handle_query(sql)
-            result = db.get_pending_result(info.endpoints[0].ticket.ticket.decode())
+            result = db.query(sql)
             return result.num_rows
 
         n_rows = benchmark(query_all)
@@ -253,8 +258,7 @@ class TestQueryComplexity:
 
         def count_query():
             sql = "SELECT COUNT(*) FROM sources"
-            info = db.handle_query(sql)
-            result = db.get_pending_result(info.endpoints[0].ticket.ticket.decode())
+            result = db.query(sql)
             return result.column(0).to_pylist()[0]
 
         count = benchmark(count_query)
@@ -267,8 +271,7 @@ class TestQueryComplexity:
         def filtered_query():
             # This filter matches ~20 sources (plate-0000 and plate-0001)
             sql = "SELECT source_id FROM sources WHERE source_url LIKE '%experiment-0000%' OR source_url LIKE '%experiment-0001%'"
-            info = db.handle_query(sql)
-            result = db.get_pending_result(info.endpoints[0].ticket.ticket.decode())
+            result = db.query(sql)
             return result.num_rows
 
         n_rows = benchmark(filtered_query)
@@ -280,8 +283,7 @@ class TestQueryComplexity:
 
         def json_query():
             sql = "SELECT source_id, metadata_json->>'plate_id' as plate FROM sources LIMIT 1000"
-            info = db.handle_query(sql)
-            result = db.get_pending_result(info.endpoints[0].ticket.ticket.decode())
+            result = db.query(sql)
             return result.num_rows
 
         n_rows = benchmark(json_query)
@@ -296,12 +298,11 @@ class TestQueryComplexity:
                 SELECT source_id, source_url
                 FROM sources
                 WHERE source_type='ome-zarr'
-                  AND dtype='uint16'
-                  AND shape_summary LIKE '%512%'
+                  AND tensors[1].dtype = 'uint16'
+                  AND list_contains(tensors[1].shape, 512)
                 LIMIT 500
             """
-            info = db.handle_query(sql)
-            result = db.get_pending_result(info.endpoints[0].ticket.ticket.decode())
+            result = db.query(sql)
             return result.num_rows
 
         n_rows = benchmark(complex_query)

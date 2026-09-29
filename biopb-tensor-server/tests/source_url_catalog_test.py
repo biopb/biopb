@@ -62,7 +62,7 @@ class TestToCatalogUrl:
 
 
 class _StubAdapter(SourceAdapter):
-    """Minimal concrete SourceAdapter to exercise get_source_descriptor()."""
+    """Minimal concrete SourceAdapter to exercise ``catalog_url``."""
 
     def __init__(self, source_url: str, source_type: str = "aics"):
         self.source_id = "stub_id"
@@ -86,13 +86,10 @@ class _StubAdapter(SourceAdapter):
 
 class TestDescriptorNormalization:
     def test_windows_path_becomes_file_uri(self):
-        desc = _StubAdapter(
-            r"C:\Users\me\OneDrive\Pictures\shot.png"
-        ).get_source_descriptor()
-        assert desc.source_url == "file:///C:/Users/me/OneDrive/Pictures/shot.png"
+        stub = _StubAdapter(r"C:\Users\me\OneDrive\Pictures\shot.png")
+        assert stub.catalog_url == "file:///C:/Users/me/OneDrive/Pictures/shot.png"
         # source_id is independent of the URL string (no re-index needed).
-        assert desc.source_id == "stub_id"
+        assert stub.source_id == "stub_id"
 
     def test_remote_path_unchanged(self):
-        desc = _StubAdapter("s3://bucket/x.zarr").get_source_descriptor()
-        assert desc.source_url == "s3://bucket/x.zarr"
+        assert _StubAdapter("s3://bucket/x.zarr").catalog_url == "s3://bucket/x.zarr"

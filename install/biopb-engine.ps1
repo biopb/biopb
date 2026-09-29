@@ -41,8 +41,8 @@
 [CmdletBinding()]
 param(
     # Target microscopy data directory. When empty AND -KeepConfig is not set, the
-    # engine keeps an existing config (biopb.json or legacy biopb.toml) if present,
-    # else falls back to a dedicated data subfolder (never the profile root).
+    # engine keeps an existing biopb.json if present, else falls back to a
+    # dedicated data subfolder (never the profile root).
     [string]$DataDir = "",
 
     # DEPRECATED / accepted-but-ignored: the web interface is always installed now
@@ -121,15 +121,18 @@ $ProgressPreference = 'SilentlyContinue'  # speeds up Invoke-WebRequest
 # LHS verbatim -- the stamp anchors on it.
 $script:BiopbPinnedRelease = ''
 
+# Must equal install.sh's INSTALL_SCHEMA (a test enforces it).
+$script:InstallSchema = 1
+
 # Install the uv tool environment under %LOCALAPPDATA%, not uv's Roaming default
 # (%APPDATA%\uv\tools). The biopb tool env holds native binaries and a long-lived
 # napari/Qt process -- machine-specific state that has no business in a roaming
 # profile (which on managed machines is synced/redirected, inviting locks and slow
 # logons). This matches the rest of the installer, which is deliberately Local (the
-# Inno GUI installs under {localappdata}\biopb; see docs/windows-installer.md). Set
-# at script scope so it is inherited by every `uv` invocation in install AND
-# uninstall. An explicit user UV_TOOL_DIR wins. Runs on dot-source too, so the
-# console front-end (which dot-sources this engine) gets it before it drives uv.
+# Inno GUI installs under {localappdata}\biopb). Set at script scope so it is
+# inherited by every `uv` invocation in install AND uninstall. An explicit user
+# UV_TOOL_DIR wins. Runs on dot-source too, so the console front-end (which
+# dot-sources this engine) gets it before it drives uv.
 if ((-not $env:UV_TOOL_DIR) -and $env:LOCALAPPDATA) {
     $env:UV_TOOL_DIR = Join-Path $env:LOCALAPPDATA "uv\tools"
 }
@@ -265,18 +268,16 @@ function Set-FileUtf8NoBom {
 #
 # When -Prior points at an existing biopb.json its settings (server/cache/...)
 # are loaded and *preserved*; only the `sources` list is replaced with the chosen
-# data dir, so re-running with a new folder no longer discards tuning. PowerShell
-# has no TOML parser, so migrating from a legacy biopb.toml starts from the
-# installer defaults instead (the caller retires the .toml). `metadata_db.enabled`
-# is intentionally omitted -- the DB is on by default and the flag is deprecated
-# (biopb/biopb#225).
+# data dir, so re-running with a new folder no longer discards tuning.
+# `metadata_db.enabled` is intentionally omitted -- the DB is on by default and
+# the flag is deprecated (biopb/biopb#225).
 function Write-ServerConfig {
     param(
         [string]$Path,         # biopb.json to write
         [string]$DataDir,
         [bool]$Cloud,
         [bool]$Monitor = $true, # watch the source (false for the static sample bundle)
-        [string]$Prior = "",   # existing config to preserve (.json) or migrate (.toml)
+        [string]$Prior = "",   # existing biopb.json whose settings to preserve
         [string]$Alias = ""    # catalog tree-root label ("samples" for the sample bundle)
     )
 
@@ -292,7 +293,6 @@ function Write-ServerConfig {
                 aggressive_dir_pruning = $true
             }
             cache = [pscustomobject]@{
-                backend           = "file"
                 file_max_total_gb = 32
             }
         }
@@ -631,6 +631,28 @@ function Test-IsCloudPath {
     return $false
 }
 
+# Seed the algorithm registry on a fresh install. The off-site cellpose server
+# goes in only with consent (-NoRemotePlugins absent), and only when neither the
+# registry nor an older install's mcp-config.json exists (the control moves that
+# file's servers into the registry).
+function Set-AlgorithmRegistry {
+    param([string]$ConfigDir, [switch]$NoRemotePlugins)
+
+    $algorithms = Join-Path $ConfigDir "algorithms"
+    if ((Test-Path -LiteralPath $algorithms) -or (Test-Path -LiteralPath (Join-Path $ConfigDir "mcp-config.json"))) {
+        Report-Ok "Algorithm registry kept ($algorithms)"
+    } else {
+        New-Item -ItemType Directory -Force -Path $algorithms | Out-Null
+        if ($NoRemotePlugins) {
+            Report-Ok "Remote algorithm plugins disabled (add servers later in $algorithms)"
+        } else {
+            $cellpose = Join-Path $algorithms "cellpose.json"
+            Set-FileUtf8NoBom -Path $cellpose -Content "{""url"": ""grpcs://cellpose.biopb.org:443""}`n"
+            Report-Ok "Added the cellpose server: $cellpose"
+        }
+    }
+}
+
 # Compute candidate microscopy data directories WITHOUT prompting. Front-ends use
 # this to populate their data-directory pickers (console menu, GUI dir page), so
 # the candidate logic lives in one place. Returns a string[] of existing dirs:
@@ -641,10 +663,9 @@ function Test-IsCloudPath {
 # (Test-IsCloudPath), which admits placeholders as unresolved sources instead. A
 # Microscopy subfolder under a cloud root is preferred over the whole synced root.
 # Detect installed agent systems and register the biopb MCP server with each.
-# -NoRemotePlugins leaves process_image_servers empty when creating a fresh
-# config (the default off-site cellpose server logs client IPs, so enabling it is
-# a consent decision the front-end collects). Existing configs are preserved
-# regardless, so a prior choice survives a rerun.
+# -NoRemotePlugins leaves a fresh algorithm registry empty (the off-site cellpose
+# server logs client IPs, so adding it is a consent decision the front-end
+# collects). An existing registry is kept, so a prior choice survives a rerun.
 function Set-McpClients {
     param([string]$BiopbHome, [string]$ConfigDir, [switch]$NoRemotePlugins)
 
@@ -665,51 +686,22 @@ function Set-McpClients {
     # still find it.
     $mcpArgs = @("--transport", "stdio")
 
-    # Minimal biopb-mcp config (preconfigured biopb.image servicers). Preserved if
-    # it already exists so the user's tweaks survive a rerun. Co-located with the
-    # tensor config in ~/.config/biopb (distinct from the client-definition
-    # mcp.json below); the schema is flat sections.
-    $mcpConfig = Join-Path $ConfigDir "mcp-config.json"
     if (-not (Test-Path -LiteralPath $ConfigDir)) { New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null }
-    if (Test-Path -LiteralPath $mcpConfig) {
-        Report-Ok "biopb-mcp config exists at $mcpConfig (preserved)"
-    } else {
-        # Seed the off-site cellpose server only with consent (-NoRemotePlugins
-        # absent). Declining leaves process_image_servers empty; the user can add
-        # servers later by editing the config.
-        if ($NoRemotePlugins) {
-            $processImageServers = ''
-            Report-Ok "Remote algorithm plugins disabled (add servers later in $mcpConfig)"
-        } else {
-            $processImageServers = '        "grpcs://cellpose.biopb.org:443"'
-            Report-Ok "Remote algorithm plugins enabled"
-        }
-        $mcpConfigContent = @"
-{
-  "services": {
-    "process_image_servers": [
-$processImageServers
-    ]
-  }
-}
-"@
-        Set-FileUtf8NoBom -Path $mcpConfig -Content $mcpConfigContent
-        Report-Ok "Created biopb-mcp config: $mcpConfig"
-    }
 
-    # Seed the built-in example kernel plugin(s) into ~/.config/biopb/kernel/ so
-    # they load into the agent kernel namespace at startup and are visible as a
-    # "bring your own tool" example (biopb/biopb-mcp#92). Delivered as a file
-    # there (not only an installed module) so it is user-visible/editable and
-    # loads via the robust startup-file path. Idempotent (never clobbers a
-    # user-edited file); best-effort so a failure never aborts the install.
-    $seedCmd = (Get-Command biopb-mcp-seed-plugins -ErrorAction SilentlyContinue).Source
+    Set-AlgorithmRegistry -ConfigDir $ConfigDir -NoRemotePlugins:$NoRemotePlugins
+
+    # Seed the bundled correctness-critical algorithm-plane ops (segmentation
+    # QC, image resolution) into ~/.config/biopb/algorithms/ as script entries,
+    # so a procedure doc's op requirement is met without the agent re-deriving
+    # them. Idempotent (never clobbers a user-edited file); best-effort so a
+    # failure never aborts the install.
+    $seedCmd = (Get-Command biopb-mcp-seed-algorithms -ErrorAction SilentlyContinue).Source
     if ($seedCmd) {
         try {
             & $seedCmd | Out-Null
-            Report-Ok "Seeded example kernel plugins: $ConfigDir\kernel"
+            Report-Ok "Seeded bundled algorithm ops: $ConfigDir\algorithms"
         } catch {
-            Report-Info "Skipped seeding example kernel plugins (add later: biopb-mcp-seed-plugins)"
+            Report-Info "Skipped seeding bundled algorithm ops (add later: biopb-mcp-seed-algorithms)"
         }
     }
 
@@ -760,8 +752,10 @@ function Remove-McpClients {
     $ErrorActionPreference = 'SilentlyContinue'
 
     # Claude Code (via the CLI).
+    # Registration uses user scope; the bare form covers older wirings.
     if (Get-Command claude -ErrorAction SilentlyContinue) {
-        & claude mcp remove biopb *> $null
+        & claude mcp remove biopb -s user *> $null
+        if ($LASTEXITCODE -ne 0) { & claude mcp remove biopb *> $null }
         if ($LASTEXITCODE -eq 0) { Report-Ok "Claude Code: removed biopb" }
     }
 
@@ -773,10 +767,16 @@ function Remove-McpClients {
     }
 
     # JSON-config clients: delete the biopb entry under its container property.
+    # opencode reads opencode.jsonc over opencode.json, and registration writes
+    # the one it reads; a .jsonc with comments fails to parse and is reported.
+    $opencode = Join-Path $BiopbHome ".config\opencode\opencode.jsonc"
+    if (-not (Test-Path -LiteralPath $opencode)) {
+        $opencode = Join-Path $BiopbHome ".config\opencode\opencode.json"
+    }
     $targets = @(
         @{ File = (Join-Path $env:APPDATA "Claude\claude_desktop_config.json"); Prop = 'mcpServers'; Label = 'Claude Desktop' },
         @{ File = (Join-Path $BiopbHome ".cursor\mcp.json");                     Prop = 'mcpServers'; Label = 'Cursor' },
-        @{ File = (Join-Path $BiopbHome ".config\opencode\opencode.json");       Prop = 'mcp';        Label = 'opencode' }
+        @{ File = $opencode;                                                      Prop = 'mcp';        Label = 'opencode' }
     )
     foreach ($t in $targets) {
         if (-not (Test-Path -LiteralPath $t.File)) { continue }
@@ -994,6 +994,144 @@ function Invoke-Precompile {
     }
 }
 
+# Keep the installed release's own engine and uninstall.ps1 (its assets) in
+# $Dir, with an uninstall.cmd that runs them, so a later uninstall is the code
+# that installed this rather than whatever is newest. Best-effort.
+function Save-Uninstaller {
+    param($Release, [string]$Dir)
+    try {
+        if (-not $Release) { throw "no release" }
+        New-Item -ItemType Directory -Force -Path $Dir | Out-Null
+        foreach ($name in 'biopb-engine.ps1', 'uninstall.ps1') {
+            $asset = $Release.assets | Where-Object { $_.name -eq $name } | Select-Object -First 1
+            if (-not $asset) { throw "$($Release.tag_name) has no $name" }
+            Invoke-WebRequest -Uri $asset.browser_download_url -OutFile (Join-Path $Dir $name) -ErrorAction Stop
+        }
+        # Double-clickable, and past a Restricted execution policy.
+        Set-FileUtf8NoBom -Path (Join-Path $Dir 'uninstall.cmd') -Content `
+            "@powershell -NoProfile -ExecutionPolicy Bypass -File ""%~dp0uninstall.ps1"" %*`r`n"
+        Report-Ok "Uninstaller saved: $(Join-Path $Dir 'uninstall.cmd')"
+    } catch {
+        Remove-Item -LiteralPath $Dir -Recurse -Force -ErrorAction SilentlyContinue
+        Report-Note "Could not save the uninstaller ($($_.Exception.Message)); uninstall through this release's uninstall.ps1"
+    }
+}
+
+# The biopb env's interpreter, or $null when there is no env.
+function Get-ToolPython {
+    $toolDir = (uv tool dir 2>$null)
+    if (-not $toolDir) { return $null }
+    # Windows tool-venv layout puts the interpreter under Scripts\ (bin/ on POSIX).
+    $py = Join-Path $toolDir 'biopb\Scripts\python.exe'
+    if (Test-Path -LiteralPath $py) { return $py }
+    return $null
+}
+
+# The two per-user kernel specs biopb registers, and the names a first-time user
+# sees in a Jupyter kernel picker (the same texts as install.sh).
+$script:KernelSpecBiopb = @{ Name = 'biopb'; Title = 'biopb: start a new kernel in biopb''s environment' }
+$script:KernelSpecSession = @{ Name = 'biopb-session'; Title = 'biopb: connect to the running biopb session' }
+
+# The same program as install.sh's _kernelspec_state: prints absent | ours |
+# foreign, then the per-user kernel spec dir named by its argument, as the env's
+# own jupyter_core resolves it. Fed on stdin, so no quote survives PowerShell
+# 5.1's native command-line quoting to break it.
+$script:KernelSpecStateProgram = @'
+import json, os, sys
+from jupyter_core.paths import jupyter_data_dir
+
+spec = os.path.join(jupyter_data_dir(), "kernels", sys.argv[1])
+try:
+    with open(os.path.join(spec, "kernel.json")) as f:
+        argv0 = json.load(f)["argv"][0]
+except FileNotFoundError:
+    state = "absent"
+except Exception:
+    state = "foreign"
+else:
+    env = os.path.normcase(os.path.abspath(sys.prefix)) + os.sep
+    ours = os.path.normcase(os.path.abspath(argv0)).startswith(env)
+    state = "ours" if ours else "foreign"
+print(state)
+print(spec)
+'@
+
+# The same program as install.sh's _write_session_kernelspec: the biopb-session
+# spec, a proxy to the running session run by the env's own interpreter.
+$script:SessionKernelSpecProgram = @'
+import json, os, sys
+
+spec, title = sys.argv[1], sys.argv[2]
+os.makedirs(spec, exist_ok=True)
+with open(os.path.join(spec, "kernel.json"), "w") as f:
+    json.dump(
+        {
+            "argv": [sys.executable, "-m", "biopb_mcp.mcp._session_proxy", "-f", "{connection_file}"],
+            "display_name": title,
+            "language": "python",
+            "interrupt_mode": "message",
+        },
+        f,
+        indent=1,
+    )
+'@
+
+function Get-KernelSpecState {
+    param([string]$Python, [string]$Name)
+    $out = @($script:KernelSpecStateProgram | & $Python - $Name 2>$null)
+    if ($LASTEXITCODE -ne 0 -or $out.Count -lt 2) { return $null }
+    return @{ State = $out[0].Trim(); Dir = $out[1].Trim() }
+}
+
+# Register the biopb env as two Jupyter kernels (see install.sh's
+# _install_kernelspec): "biopb" starts a standalone kernel in the env,
+# "biopb-session" connects to the running session kernel. Best-effort; skip with
+# BIOPB_INSTALL_KERNELSPEC=0. -Python overrides the interpreter (tests).
+function Install-KernelSpec {
+    param([string]$Python = "")
+    if ($env:BIOPB_INSTALL_KERNELSPEC -eq '0') {
+        Report-Info "Jupyter kernel skipped (BIOPB_INSTALL_KERNELSPEC=0)"
+        return
+    }
+    try {
+        # Function-scoped: a native command's stderr must not end the install.
+        $ErrorActionPreference = 'Continue'
+        if (-not $Python) { $Python = Get-ToolPython }
+        if (-not $Python) { return }
+        foreach ($k in @($script:KernelSpecBiopb, $script:KernelSpecSession)) {
+            $spec = Get-KernelSpecState -Python $Python -Name $k.Name
+            if (-not $spec) { continue }
+            if ($spec.State -eq 'foreign') {
+                Report-Note "Kept the existing Jupyter kernel spec at $($spec.Dir)"
+                continue
+            }
+            if ($k.Name -eq 'biopb') {
+                & $Python -m ipykernel install --user --name $k.Name --display-name $k.Title *> $null
+            } else {
+                $script:SessionKernelSpecProgram | & $Python - $spec.Dir $k.Title *> $null
+            }
+            if ($LASTEXITCODE -eq 0) { Report-Ok "Jupyter kernel `"$($k.Name)`" registered" }
+            else { Report-Note "Could not register the Jupyter kernel `"$($k.Name)`"; skipping" }
+        }
+    } catch { }
+}
+
+# Remove the kernel specs Install-KernelSpec wrote; needs the env still present.
+function Remove-KernelSpec {
+    param([string]$Python = "")
+    try {
+        $ErrorActionPreference = 'Continue'
+        if (-not $Python) { $Python = Get-ToolPython }
+        if (-not $Python) { return }
+        foreach ($k in @($script:KernelSpecBiopb, $script:KernelSpecSession)) {
+            $spec = Get-KernelSpecState -Python $Python -Name $k.Name
+            if (-not $spec -or $spec.State -ne 'ours') { continue }
+            Remove-Item -LiteralPath $spec.Dir -Recurse -Force -ErrorAction SilentlyContinue
+            if (-not (Test-Path -LiteralPath $spec.Dir)) { Report-Ok "Removed the Jupyter kernel spec $($spec.Dir)" }
+        }
+    } catch { }
+}
+
 # Drop a "biopb Dashboard" shortcut (.lnk) on the user's Desktop that runs
 # `biopb dashboard` -- start the control plane if needed, then open the browser.
 # Best-effort: a failure only means no icon, never aborts the install. Skip with
@@ -1109,7 +1247,7 @@ function Invoke-BiopbInstall {
         return $result
     }
 
-    # All three wheels (+ webapp) are pulled from ONE biopb release-v* deployment.
+    # The product wheels (+ webapp) are pulled from ONE biopb release-v* deployment.
     $BiopbRepoUrl = "https://github.com/biopb/biopb"
     $RepoUrl      = $BiopbRepoUrl
     $ReleaseRepo  = "biopb/biopb"
@@ -1275,14 +1413,17 @@ function Invoke-BiopbInstall {
     # Windows has a pylibczirw wheel, so the CZI reader ([czi]) is always included
     # here -- only Intel macOS lacks the wheel (handled in install.sh).
     # HDF5 ([hdf5] -> h5py) is opt-in, not bundled by default (see install.sh).
-    $tensorExtras = "web,aics,czi,medical,ndtiff"
+    # No [aics]: bioio is out of the default install (biopb/biopb#799). [vendor]
+    # holds the readers the native vendor adapters import directly.
+    $tensorExtras = "web,vendor,qptiff,czi,medical,ndtiff"
     if ($InstallBioformats) {
         $tensorExtras = "$tensorExtras,bioformats"
         Report-Info "including Bio-Formats (Java fetched on first use, not now)"
     }
 
     # Resolve the wheel set from a single release-v* build (a matched set);
-    # never let the resolver pull biopb/tensor-server/mcp from PyPI.
+    # never let the resolver pull tensor-server/mcp/control from PyPI. The SDK
+    # they were built against comes from PyPI, pinned exactly.
     try { $release = Get-LatestRelease -Repo $ReleaseRepo -TagPrefix $ReleaseTagPrefix -AllowRc $AllowRc -PinTag $PinTag } catch { $release = $null }
     if (-not $release) {
         if ($PinTag) {
@@ -1293,13 +1434,32 @@ function Invoke-BiopbInstall {
             throw "Could not fetch the latest biopb release-v* deployment from $ReleaseRepo (check network and rerun)."
         }
     }
+    # versions.json pins the SDK and napari to the versions this release was
+    # built and tested with, and carries the `release` version recorded below.
+    # Its `install_schema` must equal this engine's.
+    $versions = $null
+    $verAsset = $release.assets | Where-Object { $_.name -eq 'versions.json' } | Select-Object -First 1
+    if ($verAsset) {
+        # Via a file: PS 5.1 hands back .Content as a byte[] for the
+        # application/octet-stream GitHub serves assets as.
+        $verFile = Join-Path $env:TEMP "biopb-versions.json"
+        try {
+            Invoke-WebRequest -Uri $verAsset.browser_download_url -OutFile $verFile -UseBasicParsing
+            $versions = Get-Content -Raw -LiteralPath $verFile | ConvertFrom-Json
+        } catch { $versions = $null }
+        Remove-Item -LiteralPath $verFile -Force -ErrorAction SilentlyContinue
+    }
+    if (-not $versions -or "$($versions.install_schema)" -ne "$script:InstallSchema") {
+        throw "Release $($release.tag_name) is not supported by this installer. Install it with the installer published alongside it: https://github.com/$ReleaseRepo/releases/download/$($release.tag_name)/install.ps1"
+    }
+    if (-not $versions.biopb -or -not $versions.napari -or -not $versions.release) {
+        throw "Release $($release.tag_name) has an incomplete versions.json."
+    }
+    $napariReq   = "napari[all]==$($versions.napari)"
     $mcpAsset    = $release.assets | Where-Object { $_.name -match '^biopb_mcp-.*\.whl$' } | Select-Object -First 1
-    $sdkAsset    = $release.assets | Where-Object { $_.name -match '^biopb-.*\.whl$' } | Select-Object -First 1
     $tensorAsset = $release.assets | Where-Object { $_.name -match '^biopb_tensor_server-.*\.whl$' } | Select-Object -First 1
-    # biopb-control (control plane). Its underscore filename (biopb_control-…) is not
-    # matched by the sdk pattern '^biopb-.*' above, so the two stay distinct.
     $controlAsset  = $release.assets | Where-Object { $_.name -match '^biopb_control-.*\.whl$' } | Select-Object -First 1
-    if (-not $mcpAsset -or -not $sdkAsset -or -not $tensorAsset -or -not $controlAsset) {
+    if (-not $mcpAsset -or -not $tensorAsset -or -not $controlAsset) {
         throw "Release $($release.tag_name) is missing one of the biopb wheels."
     }
     Report-Info "Installing from release $($release.tag_name)"
@@ -1307,49 +1467,45 @@ function Invoke-BiopbInstall {
     if (Test-Path -LiteralPath $wheelsDir) { Remove-Item -LiteralPath $wheelsDir -Recurse -Force }
     New-Item -ItemType Directory -Force -Path $wheelsDir | Out-Null
     $mcpWhl    = Join-Path $wheelsDir $mcpAsset.name
-    $sdkWhl    = Join-Path $wheelsDir $sdkAsset.name
     $tensorWhl = Join-Path $wheelsDir $tensorAsset.name
     $controlWhl  = Join-Path $wheelsDir $controlAsset.name
     Invoke-WebRequest -Uri $mcpAsset.browser_download_url -OutFile $mcpWhl
-    Invoke-WebRequest -Uri $sdkAsset.browser_download_url -OutFile $sdkWhl
     Invoke-WebRequest -Uri $tensorAsset.browser_download_url -OutFile $tensorWhl
     Invoke-WebRequest -Uri $controlAsset.browser_download_url -OutFile $controlWhl
+    $wheels = @($mcpWhl, $tensorWhl, $controlWhl)
 
     # Verify the wheels against the release's SHA256SUMS before installing them
-    # (issue #87 trust item). Hard-fail on a mismatch or a wheel missing from a
-    # SHA256SUMS that exists; fail open (warn) when the release predates it.
+    # (issue #87 trust item). Hard-fail on a mismatch, a wheel missing from
+    # SHA256SUMS, or no SHA256SUMS at all.
     $sumsAsset = $release.assets | Where-Object { $_.name -eq 'SHA256SUMS' } | Select-Object -First 1
-    if ($sumsAsset) {
-        $sums = @{}
-        # Download to a temp file and read it back rather than reading .Content
-        # directly: GitHub serves SHA256SUMS as application/octet-stream, and
-        # PowerShell 5.1's Invoke-WebRequest returns .Content as a byte[] for
-        # non-text content types -- splitting a byte[] on "`n" yields individual
-        # bytes, so the regex matches nothing and every wheel fails with
-        # "No checksum for ...". -OutFile + Get-Content -Raw sidesteps the
-        # encoding trap and matches the wheel-download pattern above.
-        $sumsFile = Join-Path $wheelsDir "SHA256SUMS"
-        Invoke-WebRequest -Uri $sumsAsset.browser_download_url -OutFile $sumsFile -UseBasicParsing
-        foreach ($line in ((Get-Content -Raw -LiteralPath $sumsFile) -split "`n")) {
-            # "<64-hex>  <filename>" (a leading '*' marks binary mode — strip it).
-            $m = [regex]::Match($line.Trim(), '^([0-9a-fA-F]{64})\s+\*?(.+)$')
-            if ($m.Success) { $sums[$m.Groups[2].Value] = $m.Groups[1].Value.ToLower() }
-        }
-        foreach ($w in @($mcpWhl, $sdkWhl, $tensorWhl, $controlWhl)) {
-            $base = Split-Path -Leaf $w
-            $expected = $sums[$base]
-            if (-not $expected) { throw "No checksum for $base in the release SHA256SUMS" }
-            $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $w).Hash.ToLower()
-            if ($actual -ne $expected) { throw "Checksum mismatch for $base - refusing to install (expected $expected, got $actual)" }
-        }
-        Report-Ok "Wheel checksums verified"
-    } else {
-        Report-Warn "Release $($release.tag_name) has no SHA256SUMS; skipping wheel integrity check"
+    if (-not $sumsAsset) { throw "Release $($release.tag_name) has no SHA256SUMS; refusing to install unverified wheels" }
+    $sums = @{}
+    # Download to a temp file and read it back rather than reading .Content
+    # directly: GitHub serves SHA256SUMS as application/octet-stream, and
+    # PowerShell 5.1's Invoke-WebRequest returns .Content as a byte[] for
+    # non-text content types -- splitting a byte[] on "`n" yields individual
+    # bytes, so the regex matches nothing and every wheel fails with
+    # "No checksum for ...". -OutFile + Get-Content -Raw sidesteps the
+    # encoding trap and matches the wheel-download pattern above.
+    $sumsFile = Join-Path $wheelsDir "SHA256SUMS"
+    Invoke-WebRequest -Uri $sumsAsset.browser_download_url -OutFile $sumsFile -UseBasicParsing
+    foreach ($line in ((Get-Content -Raw -LiteralPath $sumsFile) -split "`n")) {
+        # "<64-hex>  <filename>" (a leading '*' marks binary mode — strip it).
+        $m = [regex]::Match($line.Trim(), '^([0-9a-fA-F]{64})\s+\*?(.+)$')
+        if ($m.Success) { $sums[$m.Groups[2].Value] = $m.Groups[1].Value.ToLower() }
     }
+    foreach ($w in $wheels) {
+        $base = Split-Path -Leaf $w
+        $expected = $sums[$base]
+        if (-not $expected) { throw "No checksum for $base in the release SHA256SUMS" }
+        $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $w).Hash.ToLower()
+        if ($actual -ne $expected) { throw "Checksum mismatch for $base - refusing to install (expected $expected, got $actual)" }
+    }
+    Report-Ok "Wheel checksums verified"
 
     # Direct file:// references pin each package to this exact wheel.
-    $mcpReq    = "biopb-mcp[mcp] @ $(([System.Uri]$mcpWhl).AbsoluteUri)"
-    $biopbReq  = "biopb[tensor] @ $(([System.Uri]$sdkWhl).AbsoluteUri)"
+    $mcpReq    = "biopb-mcp[napari] @ $(([System.Uri]$mcpWhl).AbsoluteUri)"
+    $biopbReq  = "biopb[tensor]==$($versions.biopb)"
     $tensorReq = "biopb-tensor-server[$tensorExtras] @ $(([System.Uri]$tensorWhl).AbsoluteUri)"
     $controlReq  = "biopb-control @ $(([System.Uri]$controlWhl).AbsoluteUri)"
 
@@ -1363,10 +1519,10 @@ function Invoke-BiopbInstall {
         "--with", $tensorReq,
         "--with-executables-from", "biopb-tensor-server"
     )
-    Report-Info "including biopb-mcp + napari"
+    Report-Info "including biopb-mcp + $napariReq"
     $installArgs += @(
         "--with", $mcpReq,
-        "--with", "napari[all]",
+        "--with", $napariReq,
         "--with-executables-from", "biopb-mcp"
     )
     # biopb-control (control plane): `biopb control …` runs through the core CLI (which
@@ -1452,18 +1608,14 @@ function Invoke-BiopbInstall {
 
     # Warm the bytecode cache now (admin-free) so the first viewer launch is fast.
     Invoke-Precompile
+    Install-KernelSpec
+    Save-Uninstaller -Release $release -Dir (Join-Path $DataRoot "uninstall")
 
     # Record the installed deployment version as the kernel-start auto-updater's
     # baseline (issue #87): the check compares the latest release-v* deployment's
-    # versions.json `release` against this marker. Read `release` from the same
-    # manifest; fall back to the tag (release-vX.Y.Z -> X.Y.Z). Best-effort — a
+    # versions.json `release` against this marker, read above. Best-effort — a
     # write failure only re-prompts a future update, never the install.
-    $releaseVersion = ""
-    $verAsset = $release.assets | Where-Object { $_.name -eq 'versions.json' } | Select-Object -First 1
-    if ($verAsset) {
-        try { $releaseVersion = ((Invoke-WebRequest -Uri $verAsset.browser_download_url -UseBasicParsing).Content | ConvertFrom-Json).release } catch { $releaseVersion = "" }
-    }
-    if (-not $releaseVersion) { $releaseVersion = ($release.tag_name -replace "^$([regex]::Escape($ReleaseTagPrefix))", "") }
+    $releaseVersion = $versions.release
     try {
         if (-not (Test-Path -LiteralPath $ConfigDir)) { New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null }
         Set-FileUtf8NoBom -Path (Join-Path $ConfigDir "release.version") -Content $releaseVersion
@@ -1525,14 +1677,10 @@ function Invoke-BiopbInstall {
     Report-Step 5 "Config..."
 
     if (-not (Test-Path -LiteralPath $ConfigDir)) { New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null }
-    $configFile   = Join-Path $ConfigDir "biopb.json"   # canonical (biopb/biopb#34)
-    $legacyConfig = Join-Path $ConfigDir "biopb.toml"   # pre-#34 installs
+    $configFile   = Join-Path $ConfigDir "biopb.json"   # the only format (biopb/biopb#34)
 
-    # An existing config in either format counts; biopb.json wins when both exist
-    # (matches the server's find_config).
     $existingConfig = ""
-    if (Test-Path -LiteralPath $configFile)        { $existingConfig = $configFile }
-    elseif (Test-Path -LiteralPath $legacyConfig)  { $existingConfig = $legacyConfig }
+    if (Test-Path -LiteralPath $configFile) { $existingConfig = $configFile }
     $configExists = [bool]$existingConfig
 
     # Decide keep-vs-write. The interactive prompt now lives in the front-end; the
@@ -1582,7 +1730,7 @@ function Invoke-BiopbInstall {
                 try { Invoke-WebRequest -Uri $sUrl -OutFile $sTarball } catch { $sOk = $false }
                 # Soft checksum check: never seed corrupt/tampered data, but never
                 # abort the install over it. $expectedSum stays $null on any lookup
-                # miss (older release, fetch error) -> treated as "not verifiable".
+                # miss (fetch error) -> treated as "not verifiable".
                 if ($sOk) {
                     $expectedSum = $null
                     try {
@@ -1650,26 +1798,7 @@ function Invoke-BiopbInstall {
     # or the untouched existing file when the user keeps it.
     $activeConfig = $existingConfig
     if ($effectiveKeep) {
-        # Keeping the user's existing config. If it is a pre-#34 legacy TOML,
-        # convert it in place to the canonical JSON via `biopb-tensor-server
-        # migrate-config` (settings preserved verbatim, old file backed up to
-        # biopb.toml.bak) so an upgraded install stops warning about the
-        # deprecated format. A JSON config is already canonical -- nothing to do.
-        if ($existingConfig -eq $legacyConfig -and (Get-Command biopb-tensor-server -ErrorAction SilentlyContinue)) {
-            Report-Info "Migrating legacy TOML config to canonical JSON..."
-            $prevEAP2 = $ErrorActionPreference
-            $ErrorActionPreference = 'Continue'
-            try { & biopb-tensor-server migrate-config *> $null } catch { }
-            $ErrorActionPreference = $prevEAP2
-            if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $configFile)) {
-                $activeConfig = $configFile
-                Report-Ok "Migrated config: $legacyConfig -> $configFile (old file backed up)"
-            } else {
-                Report-Warn "Could not migrate legacy config; keeping $existingConfig"
-            }
-        } else {
-            Report-Ok "Keeping current config: $existingConfig"
-        }
+        Report-Ok "Keeping current config: $existingConfig"
     } else {
         # Cloud/synced root? Auto-detect from the path so any front-end (GUI,
         # console menu, manual entry, BIOPB_DATA_DIR) gets it right; -Cloud forces
@@ -1696,19 +1825,11 @@ function Invoke-BiopbInstall {
             if (-not (Test-Path -LiteralPath $SamplesDir)) { New-Item -ItemType Directory -Force -Path $SamplesDir | Out-Null }
         }
 
-        # Load existing settings (json) / migrate from defaults (toml) and replace
-        # only the sources block -- a new data dir no longer discards tuning (#34).
+        # Load existing settings and replace only the sources block -- a new data
+        # dir no longer discards tuning (#34).
         $sourceAlias = if ($seedSamples) { "samples" } else { "" }
         Write-ServerConfig -Path $configFile -DataDir $effectiveDataDir -Cloud $isCloud -Monitor $isMonitored -Prior $existingConfig -Alias $sourceAlias
         $activeConfig = $configFile
-
-        # Retire a legacy TOML we just superseded so the server does not warn about
-        # both files shadowing (find_config prefers biopb.json).
-        if ($existingConfig -eq $legacyConfig -and (Test-Path -LiteralPath $legacyConfig)) {
-            $backup = "$legacyConfig.bak." + (Get-Date -Format "yyyyMMddHHmmss")
-            Move-Item -LiteralPath $legacyConfig -Destination $backup -Force
-            Report-Info "Migrated legacy TOML config to JSON (old file backed up)"
-        }
 
         $verb = if ($existingConfig) { "Updated" } else { "Created" }
         if ($isCloud) {
@@ -1828,16 +1949,36 @@ function Invoke-BiopbUninstall {
 
         Report-Step 2 "Removing biopb packages..."
         if (Get-Command uv -ErrorAction SilentlyContinue) {
+            # The spec's owner is judged by the env's interpreter, so before it goes.
+            Remove-KernelSpec
             try { uv tool uninstall biopb *> $null } catch { }
             Report-Ok "Removed the biopb uv tool environment (and its console shims)"
         } else {
             Report-Warn "uv not found; skipped package removal"
         }
+        # The web interface and the saved uninstaller are installed program
+        # files, not the user's data. The uninstaller can go while it runs: its
+        # script and this engine are already read into memory.
+        $dataRoot = Get-BiopbTree "BIOPB_DATA_HOME" ".local\share"
+        $webapp = Join-Path $dataRoot "webapp"
+        if (Test-Path -LiteralPath $webapp) {
+            Remove-Item -LiteralPath $webapp -Recurse -Force -ErrorAction SilentlyContinue
+            if (-not (Test-Path -LiteralPath $webapp)) { Report-Ok "Removed the web interface ($webapp)" }
+        }
+        Remove-Item -LiteralPath (Join-Path $dataRoot "uninstall") -Recurse -Force -ErrorAction SilentlyContinue
 
         Report-Step 3 "Deregistering MCP clients..."
         Remove-McpClients -BiopbHome $BiopbHome
 
         Report-Step 4 "Cleaning up..."
+        # The same Desktop Install-DesktopShortcut resolves.
+        $desktop = [Environment]::GetFolderPath('Desktop')
+        if (-not $desktop) { $desktop = Join-Path $BiopbHome 'Desktop' }
+        $lnk = Join-Path $desktop 'biopb Dashboard.lnk'
+        if (Test-Path -LiteralPath $lnk) {
+            Remove-Item -LiteralPath $lnk -Force -ErrorAction SilentlyContinue
+            if (-not (Test-Path -LiteralPath $lnk)) { Report-Ok "Removed $lnk" }
+        }
         if ($Purge) {
             # The file-backend cache lives in the system temp dir (the tensor
             # server's _default_file_cache_dir), NOT under .local\share, so the

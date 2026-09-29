@@ -9,9 +9,9 @@ authors = [
   {email = "jyu@uchc.edu"},
 ]
 classifiers = [
-    "Development Status :: 2 - Pre-Alpha",
-    "Framework :: napari",
+    "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python",
@@ -28,14 +28,24 @@ classifiers = [
 # matches the classifiers above (3.10-3.12 only).
 requires-python = ">=3.10,<3.13"
 dependencies = [
+    # mcp <2: 2.x deleted `mcp.server.fastmcp`, which `mcp/_server.py` is built
+    # on, and imports cryptography at module scope, which our pyjwt override
+    # (root pyproject / install.sh) drops. Lift the cap only together with the
+    # FastMCP port and a re-examined override.
+    "mcp >= 1.20, < 2",
+    "uvicorn >= 0.29",
+    "jupyter_client",
+    "ipykernel",
+    "psutil",
+    # packaging: imported by mcp/_update.py (version compare for the update check).
+    # It always arrives transitively, but the import is direct, so declare it.
+    "packaging",
     "numpy",
     "pandas",
-    "magicgui",
-    "qtpy",
     "scikit-image",
-    # scipy: arrives transitively via scikit-image, but the built-in rolling-ball
-    # kernel plugin (biopb_mcp/plugins/) hard-imports scipy.ndimage, so make the
-    # requirement explicit.
+    # scipy: arrives transitively via scikit-image, but the bundled algorithm-plane
+    # ops (biopb_mcp/algorithms/) hard-import scipy.ndimage / scipy.optimize, so
+    # make the requirement explicit.
     #
     # !=1.15.*: the whole 1.15 series raises `AttributeError: 'coo_matrix'
     # object has no attribute 'indices'` from
@@ -46,77 +56,49 @@ dependencies = [
     # call that raises is worth excluding rather than debugging once per user.
     # It also happens to be what upstream tracking libraries pin against, which
     # is what lets a `pkg:` skill declare one without the resolver moving scipy
-    # backwards under a live kernel (`docs/skills.md` §9a).
+    # backwards under a live kernel.
     #
     # Costs nothing on 3.11+, which already resolve past 1.15 to 1.16+. On 3.10
     # -- where 1.15.3 is the newest scipy, since 1.16 requires 3.11 -- it means
     # 1.14.1. Retire this with the 3.10 floor, not before.
     "scipy != 1.15.*",
-    # 0.6.3: query_sources(format=...) for pandas/arrow results (agent guidance
-    # in guide://tensor, issue #27); also carries the 0.5.8 localhost cache
-    # disable + configure_cache/worker-init cache plugin (data-plane chunk-cache
-    # budget used by mcp/_bootstrap._register_cache_plugin).
-    "biopb[tensor] >= 0.6.4",
-    # ome-zarr-py: backs the napari OME-Zarr writers (biopb_mcp._writers, the
-    # `contributions.writers` in napari.yaml). Already arrives transitively via
-    # biopb[tensor], but the writers hard-import it, so a direct dep makes the
-    # requirement explicit.
-    "ome-zarr >= 0.6.1",
-    "opencv-python-headless",
-    # grpcio (runtime) comes via biopb[tensor]; grpcio-health-checking pulls it
-    # too and provides grpc_health.v1 used in image_processing/_grpc.py. We do
-    # NOT depend on grpcio-tools: it is a build-time codegen plugin, is never
-    # imported at runtime, and being unpinned it drags resolvers down to an
-    # ancient, unbuildable grpcio-tools when co-installed with biopb.
-    "grpcio-health-checking",
+    # distributed: for a cell that builds a dask Client (the kernel guide's cluster
+    # recipe); the kernel itself never imports it.
+    "distributed >= 2023.9.0",
+    # matplotlib / scikit-learn: nothing in this package imports them. They are for
+    # the agent's kernel namespace -- guide://kernel names them as importable, so the
+    # install has to make that true. Neither is guaranteed otherwise: matplotlib
+    # reaches an env only through *optional* extras of napari/tifffile/vedo, and
+    # scikit-learn through nothing at all.
+    "matplotlib",
+    "scikit-learn",
+    # biopb.control, biopb.tensor.Connection and the Ops protocol (.dev0: a pre-tag dev build).
+    "biopb[tensor] >= 0.11.1",
 ]
 
 [project.optional-dependencies]
-tables = [
-    "napari-skimage-regionprops",  # For annotation table display
-]
-# The MCP server is a standalone process (not a plugin loaded inside a running
-# napari) that constructs its own napari.Viewer() in the kernel bootstrap, so it
-# must bring napari and a real Qt binding itself — qtpy in the core deps is only
-# a shim. napari is pinned EXACTLY (not a floor) and is the single source of
-# truth for the version: dev/CI (`uv sync ... --extra mcp`), the published wheel,
-# and the installer all resolve the identical napari, so the graph-walk
+# The viewer: the kernel constructs its own napari.Viewer() with the Tensor
+# Browser docked, so it must bring napari and a real Qt binding itself (qtpy is
+# only a shim). Optional because a session need not show one -- the web SPA can
+# be the user's view.
+#
+# napari is pinned EXACTLY (not a floor) and is the single source of truth for
+# the version: dev/CI (`uv sync ... --extra napari`), the published wheel, and
+# the installer all resolve the identical napari, so the graph-walk
 # thread-safety test certifies the same object graph that actually ships (see
-# _jobs.wrap_viewer_for_threads). `[all]` brings PyQt6 in modern napari — its
+# _jobs.wrap_viewer_for_threads). `[all]` brings PyQt6 in modern napari -- its
 # default Qt binding is version-dependent, so the exact pin freezes that too
 # (>=0.7 was also needed to stay off the 0.6.x line, which pins vispy<0.16 and
 # can't init a GL canvas under Qt 6.11). The release pipeline surfaces this
 # version as a `versions.json` release attribute that install.sh reads to pin
 # `napari[all]==` at deploy time (release.yaml + install/install.sh). Bump here.
-# distributed floor: the session child owns the LocalCluster (DaskClusterHost),
-# so its worker processes live in the *session child's* process group, not the
-# kernel's. On an abnormal session-child death (SIGKILL/OOM) neither _shutdown nor
-# the atexit close runs to reap them — the sole remaining cleanup is dask's own
-# "worker shuts down when it loses the scheduler" behavior, which only holds since
-# the `reconnect` era ended (>=2023.9). Pin a floor so orphan-hardening (issue #13)
-# can't silently regress on an older distributed. See biopb._lifecycle.deathwatch
-# and mcp/_cluster.
-# packaging: imported by mcp/_update.py (version compare for the update check).
-# It always arrives transitively, but the import is direct, so declare it.
-# matplotlib / scikit-learn: nothing in this package imports them. They are for
-# the agent's kernel namespace — guide://kernel names them as importable, so the
-# install has to make that true. Neither is guaranteed otherwise: matplotlib
-# reaches an env only through *optional* extras of napari/tifffile/vedo, and
-# scikit-learn through nothing at all.
-#
-# mcp <2: the 2.0 SDK is a breaking rewrite. It deleted `mcp.server.fastmcp`
-# outright -- `mcp/_server.py` builds the whole server on `FastMCP` -- and it
-# added a module-scope `cryptography` import (`mcp/server/request_state.py`, the
-# 2026-07-28 sealed-`requestState` codec) on the path `import mcp` itself walks,
-# while still declaring that dep only as `pyjwt[crypto]`. Our pyjwt override
-# (root pyproject / install.sh) un-requests that extra, so 2.x dies at
-# `from mcp import types` with ModuleNotFoundError: cryptography before it ever
-# reaches the FastMCP breakage. The floor alone let install.sh -- which resolves
-# fresh from PyPI, not from uv.lock -- swallow the new major, so every release
-# back to 0.8.0 installs a server that cannot start. Lift the cap only together
-# with the FastMCP port and a re-examined override.
-mcp = ["mcp>=1.20,<2", "uvicorn>=0.29", "jupyter_client", "ipykernel", "psutil", "distributed>=2023.9.0", "napari[all]==0.7.0", "pyqt6", "packaging", "matplotlib", "scikit-learn", "agent-client-protocol>=0.12,<1"]
-3d = ["vedo"] # 3d rendering from mesh
+napari = [
+    "napari[all]==0.7.0",
+    "pyqt6",
+    "qtpy",
+    # The Tensor Browser the kernel docks, and add_tensor's layer pipeline.
+    "biopb-napari-widget >= 0.1.0",
+]
 
 # Test/dev dependencies live in a PEP 735 dependency *group* rather than a
 # `testing` extra so they stay out of biopb-mcp's published metadata (groups are
@@ -124,7 +106,7 @@ mcp = ["mcp>=1.20,<2", "uvicorn>=0.29", "jupyter_client", "ipykernel", "psutil",
 # biopb-tensor-server, which is NOT on PyPI; they resolve it from the in-tree
 # workspace member (root [tool.uv.workspace] / [tool.uv.sources]), so install
 # with uv (CI uses uv too — tox/pip are not workspace-aware):
-#   uv sync --package biopb-mcp --extra mcp --group testing
+#   uv sync --package biopb-mcp --extra napari --group testing
 # A plain `pip install biopb-mcp[...]` can never pull the tensor server (not on
 # PyPI); that would require publishing biopb-tensor-server and exposing it as a
 # normal extra.
@@ -142,12 +124,15 @@ mcp = ["mcp>=1.20,<2", "uvicorn>=0.29", "jupyter_client", "ipykernel", "psutil",
 # (`biopb server start`) imports its HTTP server at module load, so without it
 # even importing the CLI raises ModuleNotFoundError: fastapi.
 integration = [
-    "biopb-mcp[mcp]",  # MCP server deps (napari>=0.7, pyqt6, jupyter_client, …)
+    "biopb-mcp[napari]",  # the viewer: napari, pyqt6, biopb-napari-widget
     "biopb[tensor]",
     "biopb-tensor-server[web]",
+    # @op/serve, imported directly by biopb_mcp/algorithms/*.py -- and by the
+    # agentbench harness (_FakeControlAlgorithms), which runs a real Ops server
+    # for them in-process rather than through uv's script isolation.
+    "biopb-image-base",
 ]
-# Full stack + test tooling. = integration plus pytest. (napari/pyqt6 come in
-# via biopb-mcp[mcp] in the integration group.)
+# Full stack + test tooling. = integration plus pytest.
 testing = [
     {include-group = "integration"},
     "pytest",  # https://docs.pytest.org/en/latest/contents.html
@@ -170,13 +155,9 @@ testing = [
 [project.scripts]
 biopb-mcp = "biopb_mcp.mcp.__main__:main"
 # Light console entry (stdlib + biopb._locations only, no kernel/napari
-# import) the installer calls to seed the built-in example kernel plugins
-# (biopb_mcp/plugins/) into ~/.config/biopb/kernel/ — the #92 "bring your own
-# tool" example, delivered as a visible file rather than a buried entry point.
-biopb-mcp-seed-plugins = "biopb_mcp.plugins._seed:_cli"
-
-[project.entry-points."napari.manifest"]
-biopb-mcp = "biopb_mcp:napari.yaml"
+# import) the installer calls to seed the bundled correctness-critical
+# algorithm-plane ops (biopb_mcp/algorithms/) into ~/.config/biopb/algorithms/.
+biopb-mcp-seed-algorithms = "biopb_mcp.algorithms._seed:_cli"
 
 [project.urls]
 "Bug Tracker" = "https://github.com/biopb/biopb/issues"
@@ -201,12 +182,11 @@ exclude = ["biopb_mcp._tests", "biopb_mcp._tests.*"]
 
 [tool.setuptools.package-data]
 "*" = ["*.yaml"]
-# The curated skills (mcp/_skills_data/). These ship with the package and are the
-# only source the runtime reads — a skill is documentation about a specific
-# runtime version, so it rides that version's upgrade cycle rather than being
-# fetched. There is no catalog index: the frontmatter is the metadata and
-# mcp/_skills.py parses it. See biopb-mcp/docs/skills.md §1.
-"biopb_mcp.mcp" = ["_skills_data/*.md"]
+# The shipped knowledge store (mcp/_docs_data/), including the seed index. A doc
+# quotes an API of a particular runtime, so it rides that runtime's upgrade cycle
+# rather than being fetched. Everything ships: what the agent is *offered* is the
+# seed index's decision.
+"biopb_mcp.mcp" = ["_docs_data/*.md", "_docs_data/**/*.md"]
 
 # Dropping biopb_mcp._tests from packages.find is not enough on its own: once it
 # is no longer a package, setuptools reclassifies its files as *data* of the
@@ -262,12 +242,12 @@ markers = [
     # body or against a named piece of work. Slow, needs a GL-capable display,
     # and the model rows need an API key; never in CI. One marker, because it
     # is one runner: which cases an invocation pays for is `--cases`, not a
-    # second marker. biopb-mcp/docs/skills.md §10 and _tests/bench/README.md.
+    # second marker. See _tests/bench/README.md.
     "bench: drives a real biopb-mcp session, and sometimes a model",
     # Hashes a curated fixture tree against its manifest. Out-of-band on
     # purpose: hashing multi-gigabyte volumes on a mount would cost more than
     # the run it guards, and would do it once per arm. Run after syncing a
-    # tree, or when a result looks wrong. biopb-mcp/docs/fixtures.md.
+    # tree, or when a result looks wrong.
     "fixtures: checks an on-disk fixture tree against its manifest",
 ]
 

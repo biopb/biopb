@@ -4,7 +4,7 @@ or something -- network, cloud-synced, or RAM -- that an mmap cache can't use.
 Lives in the core ``biopb`` SDK rather than the tensor server because it has two
 tenants that may not import each other: the server's Arrow file cache, and the
 SDK's own on-disk chunk cache (``biopb.tensor._diskcache``, which cannot import
-the server -- it isn't on PyPI). Same reasoning that put ``_lifecycle.file_lock``
+the server -- it isn't on PyPI). Same reasoning that put ``lifecycle.file_lock``
 and the ``_config_*`` modules here. Stdlib-only, so it costs an importer nothing.
 
 The file cache mmaps its segment files -- both the server (segment reads, boot
@@ -86,8 +86,7 @@ _NETWORK_FUSE_SUBTYPES = frozenset(
 # are local POSIX and mmap fine -- but a cache placed here is stored in the very
 # resource it exists to conserve, so its pages are unevictable RAM plus a mapping
 # that is also RAM. Strictly worse than the in-memory LRU it would be replacing,
-# and silently so, which is why the client's disk cache refuses one
-# (docs/client-disk-cache.md).
+# and silently so, which is why the client's disk cache refuses one.
 _MEMORY_FSTYPES = frozenset({"tmpfs", "ramfs", "devtmpfs"})
 
 # Windows file-attribute bits marking non-resident (cloud placeholder / HSM stub)

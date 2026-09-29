@@ -1,8 +1,17 @@
 "use client";
 
-import { sliderAxes, type SliderAxis } from "@biopb/tensor-flight-client";
+import { sliderAxes, vivDtype, type SliderAxis } from "@biopb/tensor-flight-client";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useAppStore } from "../store";
+import type { CSSProperties } from "react";
+import { useDebouncedCommit } from "../hooks/useDebouncedCommit";
+import { useShallow } from "zustand/react/shallow";
+import {
+  selectContrastTrack,
+  selectContrastWindow,
+  selectPlaneLimits,
+  selectTileInfo,
+  useAppStore,
+} from "../store";
 import {
   PRESET_COLORS,
   type ColorValue,
@@ -10,8 +19,24 @@ import {
   isHexColor,
   resolveAutoColor,
 } from "../utils/colorUtils";
-import { GAMMA_OCTAVES, gammaFromOctaves, octavesFromGamma } from "../utils/vivUtils";
-import { VOLUME_RENDER_MODES } from "../utils/volumeUtils";
+import {
+  PLAY_FPS,
+  orderSliderAxes,
+  sliderThumbPx,
+} from "../utils/sliceUi";
+import {
+  GAMMA_OCTAVES,
+  clampContrastLimits,
+  contrastLabel,
+  contrastStep,
+  contrastTrack,
+  gammaFromOctaves,
+  octavesFromGamma,
+  percentileLabel,
+  sliderGrid,
+  withContrastLimit,
+} from "../utils/vivUtils";
+import { VOLUME_RENDER_MODES, volumeRefusal } from "../utils/volumeUtils";
 
 // Debounce delay for slider updates (matches the viewer's keyboard+wheel debounce)
 const SLIDER_DEBOUNCE_MS = 150;
@@ -25,10 +50,45 @@ function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
 
+const CONTRAST_MODES = [
+  {
+    key: "auto" as const,
+    label: "Auto",
+    title: "Window taken from each plane's own histogram",
+  },
+  {
+    key: "fixed" as const,
+    label: "Fixed",
+    title: "Window fixed at two grey levels, so planes stay comparable",
+  },
+];
+
+/** Where a grey level sits on a track spanning `range`, as a percentage. */
+function trackFraction(value: number, range: [number, number]): number {
+  const span = range[1] - range[0];
+  if (span <= 0) return 0;
+  return ((value - range[0]) / span) * 100;
+}
+
+/** One readout, wide enough for its longest string and never wrapped. */
+const VALUE_READOUT: CSSProperties = {
+  width: 76,
+  flexShrink: 0,
+  textAlign: "right",
+  fontSize: 11,
+  // A readout that rewraps as the number grows moves the whole row. Fixed
+  // width plus tabular figures also keeps the digits from jittering
+  // left and right while a slider is dragged.
+  whiteSpace: "nowrap",
+  fontVariantNumeric: "tabular-nums",
+};
+
 export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
   const sources = useAppStore((s) => s.sources);
-  const slice = useAppStore((s) => s.slice);
-  const setSlice = useAppStore((s) => s.setSlice);
+  const tileInfo = useAppStore(selectTileInfo);
+  const position = useAppStore((s) => s.position);
+  const display = useAppStore((s) => s.display);
+  const setDisplay = useAppStore((s) => s.setDisplay);
   const channelNames = useAppStore((s) => s.channelNames);
   const channelColors = useAppStore((s) => s.channelColors);
   const getChannelColor = useAppStore((s) => s.getChannelColor);
@@ -38,46 +98,59 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
   const setRender3d = useAppStore((s) => s.setRender3d);
   const volumeRenderMode = useAppStore((s) => s.volumeRenderMode);
   const setVolumeRenderMode = useAppStore((s) => s.setVolumeRenderMode);
+  // What the shader is applying, and the plane's own extremes: derived from the
+  // store, by the selectors the viewers call.
+  const appliedLimits = useAppStore(useShallow(selectContrastWindow));
+  const planeLimits = useAppStore(useShallow(selectPlaneLimits));
+  const playAxis = useAppStore((s) => s.playAxis);
+  const setPlayAxis = useAppStore((s) => s.setPlayAxis);
 
   // Track custom color picker state (separate from preset dropdown)
   const [useCustomColor, setUseCustomColor] = useState(false);
 
-  // Debounce timer ref for slider updates
-  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // One debounce per slider: a shared timer dropped the first slider's commit
+  // when a second was moved inside the window.
+  const schedule = useDebouncedCommit(SLIDER_DEBOUNCE_MS);
+  const setAxisIndex = useAppStore((s) => s.setAxisIndex);
 
   // Local state for slider values (for immediate visual feedback), keyed by
   // SliderAxis.key so an axis with no name is held the same way as T/Z/C.
   const [localAxes, setLocalAxes] = useState<Record<string, number>>({});
-  const [localPercentile, setLocalPercentile] = useState(slice.percentileScale);
+  const [localPercentile, setLocalPercentile] = useState(display.percentileScale);
+  // The fixed window mid-drag, in grey levels; null when nothing is being
+  // dragged and the store's own value is what to show.
+  const [localFixed, setLocalFixed] = useState<[number, number] | null>(null);
   // Held in octaves, the units of the slider, so a drag does not round-trip
   // through log2/exp and drift off the position the user put it at.
-  const [localOctaves, setLocalOctaves] = useState(() => octavesFromGamma(slice.gamma));
+  const [localOctaves, setLocalOctaves] = useState(() => octavesFromGamma(display.gamma));
 
   // Sync local state when store slice changes (e.g., from wheel navigation in the viewer)
   useEffect(() => {
-    setLocalAxes({ t: slice.t, z: slice.z, c: slice.c, ...slice.axes });
-    setLocalPercentile(slice.percentileScale);
-    setLocalOctaves(octavesFromGamma(slice.gamma));
-  }, [slice.t, slice.z, slice.c, slice.axes, slice.percentileScale, slice.gamma]);
-
-  // Cleanup debounce timer on unmount
-  useEffect(() => {
-    return () => {
-      if (debounceRef.current) {
-        clearTimeout(debounceRef.current);
-      }
-    };
-  }, []);
+    setLocalAxes({ t: position.t, z: position.z, c: position.c, ...position.axes });
+    setLocalPercentile(display.percentileScale);
+    setLocalFixed(null);
+    setLocalOctaves(octavesFromGamma(display.gamma));
+  }, [
+    position.t,
+    position.z,
+    position.c,
+    position.axes,
+    display.percentileScale,
+    display.fixedLimits,
+    display.gamma,
+  ]);
 
   // Load channel names when source changes
   useEffect(() => {
     loadChannelNames(sourceId);
   }, [sourceId, loadChannelNames]);
 
-  const descriptor = useMemo(() => {
-    const src = sources.find((s) => s.source_id === sourceId);
-    return src?.tensors.find((t) => t.array_id === tensorId) ?? null;
-  }, [sourceId, sources, tensorId]);
+  // See `sliderGrid`: the live grid bounds the sliders, the catalog is only a
+  // fallback for before a viewer has loaded.
+  const descriptor = useMemo(
+    () => sliderGrid(tileInfo, sources, sourceId, tensorId),
+    [tileInfo, sources, sourceId, tensorId],
+  );
 
   // Not buildAxisMap: its positional fallback would title a TIFF sequence's
   // `i` axis "Z", asserting depth about 155 stacked files on the strength of
@@ -89,22 +162,92 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
     );
   }, [descriptor]);
 
+  // What the panel actually shows, in display order. Z is the volume's depth in
+  // 3-D, read whole -- there is no plane to step through, so a slider for it
+  // would move nothing.
+  const visibleAxes = useMemo(
+    () => orderSliderAxes(axes.filter((axis) => !(render3d && axis.named === "z"))),
+    [axes, render3d],
+  );
+
+  // The axis sliders' track width, measured from the first of them -- every
+  // axis row has the same layout, so one measurement sizes all their thumbs.
+  // `sliderThumbPx` needs it because a range input's thumb cannot be sized as a
+  // percentage of its track.
+  const trackRef = useRef<HTMLInputElement | null>(null);
+  const [trackPx, setTrackPx] = useState(0);
+  useEffect(() => {
+    const el = trackRef.current;
+    if (!el) return;
+    const measure = () => setTrackPx((w) => (w === el.clientWidth ? w : el.clientWidth));
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [visibleAxes.length]);
+
+  // Whether there is a second viewer to switch to. `volumeRefusal` answers for
+  // the grid a viewer actually fetched, so this is null-when-unknown rather
+  // than false-when-unknown: a tensor whose grid has not landed keeps the
+  // toggle, and the 3-D pane reports its own refusal if one comes.
+  const volumeOffered = useMemo(
+    () => (tileInfo ? volumeRefusal(tileInfo) === null : true),
+    [tileInfo],
+  );
+
+  // One `vivDtype` for the panel: it is what decides whether the track below is
+  // the dtype's own range or the data's, and what the step is counted in.
+  const dtype = useMemo(
+    () => (descriptor ? vivDtype(descriptor.dtype) : null),
+    [descriptor],
+  );
+  // The track a fixed window is chosen on: the dtype's whole range where it has
+  // one, so the window's position on the bar says what part of the possible
+  // signal is in view; for a float tensor, which has no such range, every level
+  // the data has shown -- not just this plane's, or a window chosen against a
+  // bright plane could not be widened from a dim one.
+  //
+  // The same selector the viewers' shader reads (biopb/biopb#955), so the bar
+  // and the window it is drawn for cannot disagree.
+  //
+  // The fallback is reached while the grid has not landed. Dtype alone
+  // is exact for every dtype with an intrinsic range, and for a float tensor
+  // nothing has read yet there is nothing better to say. `sliderGrid` supplies
+  // the dtype from the live grid or the catalog, so this needs no read.
+  const published = useAppStore(useShallow(selectContrastTrack));
+  const track = useMemo<[number, number]>(
+    () => published ?? contrastTrack(dtype),
+    [published, dtype],
+  );
+  const fixedStep = useMemo(() => contrastStep(track, dtype), [track, dtype]);
+  // Local first (a drag in progress), then the committed window, then whatever
+  // the viewer is applying -- which is the whole track until one is chosen.
+  const fixedWindow = useMemo<[number, number]>(
+    () =>
+      clampContrastLimits(
+        localFixed ?? display.fixedLimits ?? appliedLimits ?? track,
+        track,
+        dtype,
+      ),
+    [localFixed, display.fixedLimits, appliedLimits, track, dtype],
+  );
+
   // Get channel name for current channel index
   const currentChannelName = useMemo(() => {
     const names = channelNames[sourceId];
-    if (names && names[slice.c]) {
-      return names[slice.c];
+    if (names && names[position.c]) {
+      return names[position.c];
     }
     return null;
-  }, [channelNames, sourceId, slice.c]);
+  }, [channelNames, sourceId, position.c]);
 
   // Get current color for the channel
   const currentColor = useMemo(() => {
-    return getChannelColor(sourceId, slice.c);
+    return getChannelColor(sourceId, position.c);
     // getChannelColor is a stable store method that reads channelColors via get();
     // list channelColors so the memo recomputes when a color is edited.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [getChannelColor, sourceId, slice.c, channelColors]);
+  }, [getChannelColor, sourceId, position.c, channelColors]);
 
   // Determine if current color is a custom hex color
   const isCustomColor = useMemo(() => {
@@ -133,21 +276,14 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
   // Always show color picker - pseudo-color rendering is useful for any image
   const showColorPicker = true;
 
-  /** Write a slider's new index back, under its name or into `axes`. */
-  const commitAxis = (axis: SliderAxis, value: number) => {
-    if (axis.named) {
-      setSlice({ [axis.named]: value });
-      return;
-    }
-    // Read `axes` at commit time rather than closing over the render's copy:
-    // these writes are debounced, so a stale map here would silently drop a
-    // sibling axis's index every time two of them are moved in quick
-    // succession. The named axes have their own store fields and cannot
-    // collide this way.
-    setSlice({
-      axes: { ...useAppStore.getState().slice.axes, [axis.key]: value },
-    });
-  };
+  // "Already there" differs by mode: an untrimmed percentile, or a fixed window
+  // already sitting on the plane's extremes. With nothing sampled yet there is
+  // no image min/max to reset onto, so there is nothing for the button to do.
+  const minMaxActive =
+    display.contrastMode === "auto"
+      ? display.percentileScale === 0
+      : planeLimits === null ||
+        (fixedWindow[0] === planeLimits[0] && fixedWindow[1] === planeLimits[1]);
 
   // Handle preset color selection
   const handlePresetChange = (value: string) => {
@@ -155,26 +291,29 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
       setUseCustomColor(true);
     } else {
       setUseCustomColor(false);
-      setChannelColor(sourceId, slice.c, value as ColorValue);
+      setChannelColor(sourceId, position.c, value as ColorValue);
     }
   };
 
   // Handle custom color picker change
   const handleCustomColorChange = (hex: string) => {
-    setChannelColor(sourceId, slice.c, hex);
+    setChannelColor(sourceId, position.c, hex);
   };
 
   return (
     <section className="slice-controls">
       <div className="slice-grid" style={{ display: "grid", gap: 8 }}>
-        {/* Which viewer is mounted, not which pixels it asks for. Offered
-            unconditionally: whether this tensor has a volume is the server's
-            answer (`tile_info.volume`), and the 3-D pane is the thing that
-            asks — disabling the toggle here would mean fetching that a second
-            time just to grey out a button. */}
+        {/* Which viewer is mounted, not which pixels it asks for. The 3-D
+            choice drops out when the live grid says this tensor has no volume
+            to render -- the answer is the server's (`tile_info.volume`), and it
+            is already here because the mounted viewer published the grid it
+            fetched. The row itself stays, so the pane still says what it is
+            showing. Offered while that grid is missing: unknown is not a
+            refusal, and the 3-D pane says so itself for a tensor it cannot
+            open. */}
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           <span style={{ width: 20, fontSize: 11, color: "#64748b" }}>View</span>
-          {([false, true] as const).map((mode) => (
+          {(volumeOffered ? ([false, true] as const) : ([false] as const)).map((mode) => (
             <button
               key={String(mode)}
               onClick={() => setRender3d(mode)}
@@ -221,60 +360,86 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
           </div>
         )}
 
-        {axes
-          // Z is the volume's depth in 3-D, read whole — there is no plane to
-          // step through, so a slider for it would move nothing.
-          .filter((axis) => !(render3d && axis.named === "z"))
-          .map((axis) => {
+        {visibleAxes.map((axis, i) => {
           const max = Math.max(0, axis.extent - 1);
           const value = localAxes[axis.key] ?? 0;
+          const playing = playAxis === axis.key;
           return (
-            <label
-              key={axis.key}
-              style={{ display: "flex", alignItems: "center", gap: 8 }}
-              // The wire index is what the tile route is actually asked for, so
-              // it is what to check against when a plane looks wrong.
-              title={`${axis.title} — wire axis ${axis.axis}, ${axis.extent} positions`}
-            >
-              <span
+            <div key={axis.key} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <label
+                style={{ display: "flex", alignItems: "center", gap: 8, flex: 1 }}
+                // The wire index is what the tile route is actually asked for,
+                // so it is what to check against when a plane looks wrong.
+                title={`${axis.title} — wire axis ${axis.axis}, ${axis.extent} positions`}
+              >
+                <span
+                  style={{
+                    width: 20,
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                    // An unnamed axis carries the source's own label, which is
+                    // not a single letter and should not pretend to be one.
+                    fontSize: axis.named ? undefined : 10,
+                    color: axis.named ? undefined : "#94a3b8",
+                  }}
+                >
+                  {axis.title}
+                </span>
+                <input
+                  ref={i === 0 ? trackRef : undefined}
+                  type="range"
+                  min={0}
+                  max={max}
+                  value={clamp(value, 0, max)}
+                  onChange={(e) => {
+                    const val = Number(e.target.value);
+                    setLocalAxes((prev) => ({ ...prev, [axis.key]: val }));
+                    schedule(`axis:${axis.key}`, () => setAxisIndex(axis, val));
+                  }}
+                  // The grab handle is the axis's share of the track, as a
+                  // scrollbar's is: two channels get half the bar, not the same
+                  // sliver a 4000-frame timelapse is dragged by.
+                  style={
+                    {
+                      flex: 1,
+                      "--thumb-w": `${sliderThumbPx(axis.extent, trackPx)}px`,
+                    } as CSSProperties
+                  }
+                />
+                <span style={VALUE_READOUT}>
+                  {value}/{max}
+                </span>
+              </label>
+              <button
+                onClick={() => setPlayAxis(playing ? null : axis.key)}
+                title={
+                  playing
+                    ? `Stop scrubbing ${axis.title}`
+                    : `Play ${axis.title} at up to ${PLAY_FPS}/s`
+                }
+                aria-label={playing ? `Stop ${axis.title}` : `Play ${axis.title}`}
                 style={{
-                  width: 20,
-                  overflow: "hidden",
-                  textOverflow: "ellipsis",
-                  whiteSpace: "nowrap",
-                  // An unnamed axis carries the source's own label, which is
-                  // not a single letter and should not pretend to be one.
-                  fontSize: axis.named ? undefined : 10,
-                  color: axis.named ? undefined : "#94a3b8",
+                  width: 24,
+                  padding: "2px 0",
+                  fontSize: 10,
+                  lineHeight: "12px",
+                  cursor: "pointer",
+                  background: playing ? "#4f8ef7" : "#2d3748",
+                  border: "1px solid #4a5568",
+                  borderRadius: 4,
+                  color: "#e2e8f0",
                 }}
               >
-                {axis.title}
-              </span>
-              <input
-                type="range"
-                min={0}
-                max={max}
-                value={clamp(value, 0, max)}
-                onChange={(e) => {
-                  const val = Number(e.target.value);
-                  setLocalAxes((prev) => ({ ...prev, [axis.key]: val }));
-                  if (debounceRef.current) clearTimeout(debounceRef.current);
-                  debounceRef.current = setTimeout(() => {
-                    commitAxis(axis, val);
-                  }, SLIDER_DEBOUNCE_MS);
-                }}
-                style={{ flex: 1 }}
-              />
-              <span style={{ width: 40, textAlign: "right", fontSize: 11 }}>
-                {value}/{max}
-              </span>
-            </label>
+                {playing ? "■" : "▶"}
+              </button>
+            </div>
           );
         })}
 
         {/* Navigation above, display below. Suppressed when nothing is above
             it: a rule against the top of the panel divides nothing. */}
-        {axes.length > 0 && (
+        {visibleAxes.length > 0 && (
           <hr
             style={{
               width: "100%",
@@ -285,20 +450,66 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
           />
         )}
 
-        {/* Intensity scaling controls */}
+        {/* Intensity: how the contrast window is chosen, then the window. */}
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           <span style={{ width: 20, fontSize: 11, color: "#64748b" }}>Int</span>
+          {CONTRAST_MODES.map((mode) => (
+            <button
+              key={mode.key}
+              onClick={() => {
+                if (mode.key === "fixed") {
+                  // Seeded from what is on screen, so turning the mode on does
+                  // not change the image -- it stops it from changing.
+                  setDisplay({
+                    contrastMode: "fixed",
+                    fixedLimits: clampContrastLimits(appliedLimits ?? track, track, dtype),
+                  });
+                  return;
+                }
+                // `fixedLimits` is kept: toggling back must return to the
+                // window the user chose, not to the whole track.
+                setDisplay({ contrastMode: "auto" });
+              }}
+              disabled={display.contrastMode === mode.key}
+              title={mode.title}
+              style={{
+                padding: "2px 8px",
+                fontSize: 10,
+                cursor: display.contrastMode === mode.key ? "default" : "pointer",
+                background: display.contrastMode === mode.key ? "#4a5568" : "#2d3748",
+                border: "1px solid #4a5568",
+                borderRadius: 4,
+                color: "#e2e8f0",
+              }}
+            >
+              {mode.label}
+            </button>
+          ))}
+          {/* The untrimmed window, in whichever sense the mode gives it: the
+              automatic window with neither tail trimmed, or a fixed one moved
+              onto the extremes of the plane in view. */}
           <button
             onClick={() => {
+              if (display.contrastMode === "fixed") {
+                if (!planeLimits) return;
+                setLocalFixed(null);
+                setDisplay({ fixedLimits: clampContrastLimits(planeLimits, track, dtype) });
+                return;
+              }
               setLocalPercentile(0);
-              setSlice({ useMinMax: true, percentileScale: 0 });
+              setDisplay({ percentileScale: 0 });
             }}
-            disabled={slice.useMinMax}
+            disabled={minMaxActive}
+            title={
+              display.contrastMode === "fixed"
+                ? "Set the window to this image's own min and max grey level"
+                : "Automatic window with neither tail trimmed"
+            }
             style={{
               padding: "2px 6px",
               fontSize: 10,
-              cursor: slice.useMinMax ? "default" : "pointer",
-              background: slice.useMinMax ? "#4a5568" : "#2d3748",
+              cursor: minMaxActive ? "default" : "pointer",
+              background: minMaxActive ? "#4a5568" : "#2d3748",
               border: "1px solid #4a5568",
               borderRadius: 4,
               color: "#e2e8f0",
@@ -306,24 +517,78 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
           >
             Min/Max
           </button>
-          <input
-            type="range"
-            min={0}
-            max={4}
-            step={0.1}
-            value={localPercentile}
-            onChange={(e) => {
-              const val = Number(e.target.value);
-              setLocalPercentile(val);
-              if (debounceRef.current) clearTimeout(debounceRef.current);
-              debounceRef.current = setTimeout(() => {
-                setSlice({ percentileScale: val, useMinMax: false });
-              }, SLIDER_DEBOUNCE_MS);
-            }}
-            style={{ flex: 1 }}
-          />
-          <span style={{ width: 40, textAlign: "right", fontSize: 11 }}>
-            {slice.useMinMax ? "0-100" : `${localPercentile.toFixed(1)}-${(100 - localPercentile).toFixed(1)}`}
+        </div>
+
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ width: 20 }} />
+          {display.contrastMode === "auto" ? (
+            <input
+              type="range"
+              min={0}
+              max={4}
+              step={0.1}
+              value={localPercentile}
+              aria-label="Percentile window width"
+              title="How much of each tail the automatic window trims"
+              onChange={(e) => {
+                const val = Number(e.target.value);
+                setLocalPercentile(val);
+                schedule("percentile", () => setDisplay({ percentileScale: val }));
+              }}
+              style={{ flex: 1 }}
+            />
+          ) : (
+            // Two grabs on one bar, and the bar is the whole track -- so where
+            // the window sits says what part of the available signal is being
+            // shown, which a self-scaled bar could not.
+            <div className="dual-range" style={{ flex: 1 }}>
+              <div className="dual-range-track" />
+              <div
+                className="dual-range-fill"
+                style={{
+                  left: `${trackFraction(fixedWindow[0], track)}%`,
+                  right: `${100 - trackFraction(fixedWindow[1], track)}%`,
+                }}
+              />
+              {(["lo", "hi"] as const).map((end) => (
+                <input
+                  key={end}
+                  type="range"
+                  min={track[0]}
+                  max={track[1]}
+                  step={fixedStep}
+                  value={end === "lo" ? fixedWindow[0] : fixedWindow[1]}
+                  aria-label={end === "lo" ? "Black level" : "White level"}
+                  title={end === "lo" ? "Grey level rendered black" : "Grey level rendered white"}
+                  // The ends may sit one step apart, which puts the two thumbs
+                  // on the same pixel. Whichever one has travelled past the
+                  // middle goes on top, so the grab that can still move the
+                  // window is always the one the pointer finds.
+                  style={{
+                    zIndex:
+                      end === "lo" && trackFraction(fixedWindow[0], track) > 50 ? 2 : 1,
+                  }}
+                  onChange={(e) => {
+                    const next = withContrastLimit(
+                      fixedWindow,
+                      end,
+                      Number(e.target.value),
+                      track,
+                      fixedStep,
+                    );
+                    setLocalFixed(next);
+                    // Both handles share one key: each commit carries the whole
+                    // window, so the later one supersedes the earlier.
+                    schedule("fixed", () => setDisplay({ contrastMode: "fixed", fixedLimits: next }));
+                  }}
+                />
+              ))}
+            </div>
+          )}
+          <span style={VALUE_READOUT}>
+            {display.contrastMode === "auto"
+              ? percentileLabel(localPercentile)
+              : contrastLabel(fixedWindow, fixedStep)}
           </span>
         </div>
 
@@ -338,14 +603,14 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
           <button
             onClick={() => {
               setLocalOctaves(0);
-              setSlice({ gamma: 1 });
+              setDisplay({ gamma: 1 });
             }}
-            disabled={slice.gamma === 1}
+            disabled={display.gamma === 1}
             style={{
               padding: "2px 6px",
               fontSize: 10,
-              cursor: slice.gamma === 1 ? "default" : "pointer",
-              background: slice.gamma === 1 ? "#4a5568" : "#2d3748",
+              cursor: display.gamma === 1 ? "default" : "pointer",
+              background: display.gamma === 1 ? "#4a5568" : "#2d3748",
               border: "1px solid #4a5568",
               borderRadius: 4,
               color: "#e2e8f0",
@@ -366,16 +631,11 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
             onChange={(e) => {
               const val = Number(e.target.value);
               setLocalOctaves(val);
-              if (debounceRef.current) clearTimeout(debounceRef.current);
-              debounceRef.current = setTimeout(() => {
-                setSlice({ gamma: gammaFromOctaves(val) });
-              }, SLIDER_DEBOUNCE_MS);
+              schedule("gamma", () => setDisplay({ gamma: gammaFromOctaves(val) }));
             }}
             style={{ flex: 1 }}
           />
-          <span style={{ width: 40, textAlign: "right", fontSize: 11 }}>
-            {gammaFromOctaves(localOctaves).toFixed(2)}
-          </span>
+          <span style={VALUE_READOUT}>{gammaFromOctaves(localOctaves).toFixed(2)}</span>
         </div>
 
         {showColorPicker && (

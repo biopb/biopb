@@ -8,11 +8,12 @@ import pytest
 from biopb.tensor import TensorFlightClient
 from biopb_tensor_server import TensorFlightServer
 from biopb_tensor_server.core.adapter_base import (
-    DataSourceDescriptor,
     TensorAdapter,
     TensorDescriptor,
     strip_source_prefix,
 )
+
+from tests import catalog_server, register_and_catalog
 
 
 class MockMultifieldAdapter(TensorAdapter):
@@ -81,16 +82,6 @@ class MockMultifieldAdapter(TensorAdapter):
         if tensor_id in self._tensor_adapters:
             return self._tensor_adapters[tensor_id]
         raise ValueError(f"Unknown tensor: {tensor_id}")
-
-    def get_source_descriptor(self) -> DataSourceDescriptor:
-        """Build DataSourceDescriptor with correct source_id."""
-        return DataSourceDescriptor(
-            source_id=self.source_id,  # Use actual source_id, not tensor's
-            source_url=self._source_url,
-            source_type=self._source_type,
-            tensors=self.list_tensor_descriptors(),
-            metadata_json="",  # Not populated; returned via GetFlightInfo instead
-        )
 
     def get_metadata(self) -> dict:
         return {"multifield": True, "n_tensors": len(self.tensor_specs)}
@@ -190,22 +181,23 @@ class TestMultifieldSourceLevel:
         assert desc.array_id == "multifield-source/tensor_1"  # Full path
         assert desc.shape == [128, 128]
 
-    def test_get_source_descriptor_contains_all_tensors(self):
-        """get_source_descriptor() should contain all tensor info."""
+    def test_catalog_row_fields_cover_all_tensors(self):
+        """What the source contributes to its catalog row: its own id/url/type,
+        and a structural entry per tensor (not just tensors[0])."""
+        from biopb_tensor_server.core.adapter_base import catalog_tensors
+
         tensor_specs = [
             ("tensor_0", (64, 64), "uint8"),
             ("tensor_1", (128, 128), "uint16"),
         ]
         adapter = MockMultifieldAdapter("multifield-source", tensor_specs)
 
-        source_desc = adapter.get_source_descriptor()
-
-        assert source_desc.source_id == "multifield-source"  # Uses actual source_id
-        assert source_desc.source_url == "mock://multifield"
-        assert source_desc.source_type == "mock-multifield"
-        assert len(source_desc.tensors) == 2
-        assert source_desc.tensors[0].array_id == "tensor_0"
-        assert source_desc.tensors[1].array_id == "tensor_1"
+        assert adapter.source_id == "multifield-source"
+        assert adapter.catalog_url == "mock://multifield"
+        assert adapter.source_type == "mock-multifield"
+        entries = catalog_tensors(adapter)
+        assert [t.array_id for t in entries] == ["tensor_0", "tensor_1"]
+        assert all(not t.chunk_shape for t in entries)  # #812
 
 
 class TestMultifieldServerClient:
@@ -219,8 +211,8 @@ class TestMultifieldServerClient:
         ]
         adapter = MockMultifieldAdapter("multifield-test", tensor_specs)
 
-        server = TensorFlightServer("grpc://localhost:0")
-        server.register_source("multifield-test", adapter)
+        server = catalog_server("grpc://localhost:0")
+        register_and_catalog(server, "multifield-test", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
         server_thread.start()
@@ -333,8 +325,8 @@ class TestMultifieldServerClient:
         ]
         adapter = MockMultifieldAdapter("multi", tensor_specs)
 
-        server = TensorFlightServer("grpc://localhost:0")
-        server.register_source("multi", adapter)
+        server = catalog_server("grpc://localhost:0")
+        register_and_catalog(server, "multi", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
         server_thread.start()
@@ -365,9 +357,11 @@ class TestMultifieldServerClient:
                 16,
                 16,
             ]
-            # Read the _sources cache directly -- re-calling list_sources() would
-            # just refetch.
-            assert len(client._sources["multi"].tensors) == 3
+            (row,) = client.query(
+                "SELECT tensors FROM sources WHERE source_id = 'multi'",
+                format="records",
+            )
+            assert len(row["tensors"]) == 3
 
             client.close()
         finally:
@@ -407,16 +401,17 @@ class TestMultifieldServerClient:
             server.shutdown()
 
     def test_get_tensor_array_id_addressing(self):
-        """get_tensor/get_tensor_pb take a single array_id (identity policy); a
-        bare multi-tensor source id is ambiguous and must be qualified."""
+        """get_tensor (its output="pb" form too) takes a single array_id
+        (identity policy); a bare multi-tensor source id is ambiguous and must
+        be qualified."""
         tensor_specs = [
             ("pos_0", (32, 32), "uint8"),
             ("pos_1", (64, 64), "uint8"),
         ]
         adapter = MockMultifieldAdapter("mf", tensor_specs)
 
-        server = TensorFlightServer("grpc://localhost:0")
-        server.register_source("mf", adapter)
+        server = catalog_server("grpc://localhost:0")
+        register_and_catalog(server, "mf", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
         server_thread.start()
@@ -427,7 +422,7 @@ class TestMultifieldServerClient:
 
             # Canonical single-arg form: a qualified array_id reaches the scene.
             assert client.get_tensor("mf/pos_1").shape == (64, 64)
-            assert client.get_tensor_pb("mf/pos_1") is not None
+            assert client.get_tensor("mf/pos_1", output="pb") is not None
 
             # A bare multi-tensor source id is ambiguous -> must specify (never a
             # silent default; the #75 lesson).
@@ -438,18 +433,16 @@ class TestMultifieldServerClient:
         finally:
             server.shutdown()
 
-    def test_fetch_endpoints_via_get_flight_info_multi_tensor(self):
-        """The SerializedTensor endpoint-fetch fallback must derive source_id
-        from a multi-tensor qualified array_id ("source_id/field").
+    def test_refetch_flight_info_multi_tensor(self):
+        """The endpoint-less handle's replan must derive source_id from a
+        multi-tensor qualified array_id ("source_id/field").
 
-        Regression for the identity-policy alignment: previously it set the
-        FlightCmd source_id to the *whole* array_id, so for "mf-fetch/pos_1" the
-        server looked up source "mf-fetch/pos_1" and failed. It must split on the
-        first "/" -> source "mf-fetch", and the server reduces the tensor_id to
-        the "pos_1" field.
+        Regression for the identity-policy alignment: the request carries the
+        *whole* array_id "mf-fetch/pos_1", and the server splits on the first
+        "/" -> source "mf-fetch", field "pos_1".
         """
-        from biopb.tensor.client import _fetch_endpoints_via_get_flight_info
-        from biopb.tensor.serialized_pb2 import SerializedTensor
+        from biopb.tensor._session import _parse_flight_endpoints, _refetch_flight_info
+        from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
         tensor_specs = [
             ("pos_0", (32, 32), "uint8"),
@@ -465,12 +458,14 @@ class TestMultifieldServerClient:
         time.sleep(1)
 
         try:
-            pb = SerializedTensor(location=f"grpc://localhost:{server.port}")
-            # Qualified multi-tensor array_id; endpoints left empty triggers the
-            # GetFlightInfo fallback under test.
-            pb.tensor_descriptor.array_id = "mf-fetch/pos_1"
-
-            chunk_ids, bounds = _fetch_endpoints_via_get_flight_info(pb)
+            # Qualified multi-tensor array_id, as a handle with no endpoints
+            # would carry it.
+            info = _refetch_flight_info(
+                TensorDescriptor(array_id="mf-fetch/pos_1"),
+                f"grpc://localhost:{server.port}",
+                None,
+            )
+            chunk_ids, bounds = _parse_flight_endpoints(info)
 
             assert len(chunk_ids) > 0
             assert len(chunk_ids) == len(bounds)
@@ -488,8 +483,8 @@ class TestMultifieldServerClient:
         ]
         adapter = MockMultifieldAdapter("single-source", tensor_specs)
 
-        server = TensorFlightServer("grpc://localhost:0")
-        server.register_source("single-source", adapter)
+        server = catalog_server("grpc://localhost:0")
+        register_and_catalog(server, "single-source", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
         server_thread.start()
@@ -650,14 +645,12 @@ class TestStripSourcePrefix:
         assert strip_source_prefix("src", "") == ""
 
 
-class TestDescriptorCacheCollision:
-    """Regression for #45: cross-source descriptor cache collisions.
+class TestSameBareFieldNameAcrossSources:
+    """Regression for #45: two sources whose fields share a bare name.
 
-    Two single-scene-aicsimageio-like sources share the bare tensor id
-    "Image:0". A descriptor cache keyed by the bare array_id collapses them to
-    one entry, so get_physical_scale / get_source silently return another
-    source's descriptor (wrong shape, dims, physical scale). The cache must be
-    keyed per (source_id, array_id).
+    Two single-scene-aicsimageio-like sources both call their tensor "Image:0".
+    The qualified array_id is globally unique, so each must answer with its own
+    descriptor.
     """
 
     def test_same_bare_array_id_across_sources_returns_own_descriptor(self):
@@ -702,10 +695,10 @@ class TestDescriptorCacheCollision:
             assert scale_b == [4.0, 0.1, 0.1]
             assert unit_b == ["um", "um", "um"]
 
-            # Both sources coexist: the qualified array_id is globally unique,
-            # so the two same-named fields cannot collide.
-            assert "aics_aaa/Image:0" in client._descriptors
-            assert "aics_bbb/Image:0" in client._descriptors
+            # Asked again in the other order: nothing is memoized between
+            # calls, so a collision could only come from the id itself.
+            assert client.get_physical_scale("aics_bbb/Image:0")[0] == [4.0, 0.1, 0.1]
+            assert client.get_physical_scale("aics_aaa/Image:0")[0] == [2.0, 0.5, 0.5]
 
             client.close()
         finally:

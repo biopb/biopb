@@ -1,18 +1,19 @@
-"""Unit tests for the instance-segmentation QC plugin (biopb_mcp.plugins.segmentation_qc).
+"""Unit tests for the instance-segmentation QC op (biopb_mcp.algorithms.segmentation_qc).
 
 Pins the behaviour a user would notice being wrong: counts and rates on
 hand-checkable cases, IoU computed against the definition rather than against
 itself, one-to-one matching that a greedy pass cannot fake, splits/merges charged
 to the right side, border exclusion applied symmetrically, and empty inputs
-scoring ``nan`` instead of 0.0. Also checks the delivery path -- the plugin seeds
-into the kernel dir and loads via the startup-file path with a clean namespace
-surface. No kernel/display needed.
+scoring ``nan`` instead of 0.0. Also checks the delivery path -- the op file
+seeds into the algorithm registry and declares the ops it advertises. No
+kernel/display needed; `@op` leaves a function directly callable, so calling
+`match_labels`/`f1_at_thresholds` here is the same call the server makes.
 """
 
 import numpy as np
 import pytest
 
-from biopb_mcp.plugins import segmentation_qc as qc
+from biopb_mcp.algorithms import segmentation_qc as qc
 
 
 def _boxes(shape, boxes, start=1):
@@ -21,6 +22,16 @@ def _boxes(shape, boxes, start=1):
     for i, (ys, xs) in enumerate(boxes, start=start):
         lab[ys[0] : ys[1], xs[0] : xs[1]] = i
     return lab
+
+
+def _load_seeded(dest, filename):
+    """Import a just-seeded op file as its own module, the way the control does."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(filename, dest / filename)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 class TestIoUAndCounts:
@@ -229,59 +240,34 @@ class TestThresholdSweep:
 
 
 class TestSeeding:
-    """The delivery path: the installer seeds the plugin into the kernel dir."""
+    """The delivery path: the installer seeds the op file into the algorithm registry."""
 
-    def test_seed_includes_the_qc_plugin(self, tmp_path):
-        from biopb_mcp.plugins._seed import SEED_FILES, seed_kernel_plugins
+    def test_seed_includes_the_qc_op(self, tmp_path):
+        from biopb_mcp.algorithms._seed import SEED_FILES, seed_algorithms
 
         assert "segmentation_qc.py" in SEED_FILES
-        dest = tmp_path / "kernel"
-        seed_kernel_plugins(dest)
+        dest = tmp_path / "algorithms"
+        seed_algorithms(dest)
         assert (dest / "segmentation_qc.py").exists()
 
-    def test_seeded_file_loads_with_a_clean_namespace_surface(self, tmp_path):
-        # The production path: the loader imports the seeded file and binds it
-        # under its stem, so it contributes one name — its public API is reached
-        # through the module, and the reserved np handle is left intact.
-        from biopb_mcp.mcp import _bootstrap
-        from biopb_mcp.plugins._seed import seed_kernel_plugins
+    def test_seeded_file_declares_exactly_its_two_ops(self, tmp_path):
+        # The production path: the control runs the seeded file under uv and
+        # discovers its ops by importing it, which registers each `@op`.
+        from biopb_mcp.algorithms._seed import seed_algorithms
 
-        dest = tmp_path / "kernel"
-        seed_kernel_plugins(dest)
-        # Other seeded plugins have their own surface tests; drop them so this
-        # assertion stays an exact set for *this* file rather than a superset check.
-        for other in dest.glob("*.py"):
-            if other.name not in ("__init__.py", "segmentation_qc.py"):
-                other.unlink()
+        dest = tmp_path / "algorithms"
+        seed_algorithms(dest)
+        mod = _load_seeded(dest, "segmentation_qc.py")
+        assert mod.match_labels.__biopb_op__.name == "match_labels"
+        assert set(mod.match_labels.__biopb_op__.tensors) == {"gt", "pred"}
+        assert mod.f1_at_thresholds.__biopb_op__.name == "f1_at_thresholds"
+        assert set(mod.f1_at_thresholds.__biopb_op__.tensors) == {"gt", "pred"}
 
-        class IP:
-            def __init__(self):
-                self.user_ns = {"viewer": 1, "client": 1, "np": np, "da": 1, "ops": {}}
+    def test_seeded_op_is_callable(self, tmp_path):
+        from biopb_mcp.algorithms._seed import seed_algorithms
 
-        ip = IP()
-        _bootstrap._load_plugin_files(ip, dest)
-        builtins_ = {"viewer", "client", "np", "da", "ops"}
-        contributed = {
-            n for n in ip.user_ns if not n.startswith("_") and n not in builtins_
-        }
-        assert contributed == {"segmentation_qc"}
-        plug = ip.user_ns["segmentation_qc"]
-        assert {"match_labels", "f1_at_thresholds", "SegQCResult"} <= set(dir(plug))
-        assert ip.user_ns["np"] is np  # reserved handle untouched
-
-    def test_seeded_plugin_is_callable_from_the_namespace(self, tmp_path):
-        from biopb_mcp.mcp import _bootstrap
-        from biopb_mcp.plugins._seed import seed_kernel_plugins
-
-        dest = tmp_path / "kernel"
-        seed_kernel_plugins(dest)
-
-        class IP:
-            def __init__(self):
-                self.user_ns = {"viewer": 1, "client": 1, "np": np, "da": 1, "ops": {}}
-
-        ip = IP()
-        _bootstrap._load_plugin_files(ip, dest)
+        dest = tmp_path / "algorithms"
+        seed_algorithms(dest)
+        mod = _load_seeded(dest, "segmentation_qc.py")
         gt = _boxes((20, 20), [((2, 10), (2, 10))])
-        qc = ip.user_ns["segmentation_qc"]
-        assert qc.match_labels(gt, gt.copy()).f1 == pytest.approx(1.0)
+        assert mod.match_labels(gt, gt.copy()).f1 == pytest.approx(1.0)

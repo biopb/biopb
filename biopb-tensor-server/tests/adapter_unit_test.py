@@ -97,8 +97,6 @@ class TestTensorConfig:
                     "rescan_interval": 12,
                     "full_rescan_interval": 120,
                     "stability_window": 45,
-                    "stable_rescans_required": 2,
-                    "probe_open_files": False,
                     "aggressive_dir_pruning": True,
                 },
                 "sources": [],
@@ -109,8 +107,6 @@ class TestTensorConfig:
         assert config.rescan_interval == 12.0
         assert config.full_rescan_interval == 120.0
         assert config.stability_window == 45.0
-        assert config.stable_rescans_required == 2
-        assert config.probe_open_files is False
         assert config.aggressive_dir_pruning is True
 
     def test_parse_legacy_monitor_aliases(self):
@@ -128,8 +124,6 @@ class TestTensorConfig:
         assert config.rescan_interval == 9.0
         assert config.full_rescan_interval == 3600.0
         assert config.stability_window == 30.0
-        assert config.stable_rescans_required == 0
-        assert config.probe_open_files is True
         assert config.aggressive_dir_pruning is False
 
     def test_claim_generic_images_defaults_off(self):
@@ -148,6 +142,15 @@ class TestTensorConfig:
     def test_handle_reaper_ttl_defaults_to_150(self):
         config = parse_config({"server": {}, "sources": []})
         assert config.handle_reaper_ttl == 150.0
+
+    def test_upload_ttl_defaults_to_an_hour(self):
+        config = parse_config({"server": {}, "sources": []})
+        assert config.upload_ttl == 3600.0
+
+    def test_parse_upload_ttl(self):
+        config = parse_config({"server": {"upload_ttl": 90}, "sources": []})
+        assert config.upload_ttl == 90.0
+        assert parse_config({"server": {"upload_ttl": 0}}).upload_ttl == 0.0
 
     def test_parse_handle_reaper_ttl(self):
         # Carried and coerced to float; 0 is the documented "disable" sentinel.
@@ -251,21 +254,28 @@ class TestAdvisoryReductionCacheKey:
             arr[:] = np.arange(64 * 64, dtype="uint16").reshape(64, 64)
 
             adapter = ZarrAdapter(arr, "test-array", ["y", "x"])
-            cache_manager = CacheManager(CacheConfig(backend="memory"))
+            cache_manager = CacheManager(
+                CacheConfig(file_cache_dir=os.path.join(tmpdir, "cache"))
+            )
+            try:
+                bounds = ChunkBounds(start=[0, 0], stop=[64, 64])
+                scaled_id = encode_chunk_id_with_scale("test-array", bounds, (4, 4))
 
-            bounds = ChunkBounds(start=[0, 0], stop=[64, 64])
-            scaled_id = encode_chunk_id_with_scale("test-array", bounds, (4, 4))
+                first = adapter.resolve_chunk_data(scaled_id, cache_manager)
+                stats = cache_manager.stats()
+                assert stats.misses == 1
 
-            first = adapter.resolve_chunk_data(scaled_id, cache_manager)
-            stats = cache_manager.stats()
-            assert stats.misses == 1
+                second = adapter.resolve_chunk_data(scaled_id, cache_manager)
+                stats = cache_manager.stats()
+                assert stats.misses == 1
+                assert stats.hits == 1
 
-            second = adapter.resolve_chunk_data(scaled_id, cache_manager)
-            stats = cache_manager.stats()
-            assert stats.misses == 1
-            assert stats.hits == 1
-
-            assert first.column("data").to_pylist() == second.column("data").to_pylist()
+                assert (
+                    first.column("data").to_pylist()
+                    == second.column("data").to_pylist()
+                )
+            finally:
+                cache_manager.close()
 
 
 class TestGetScaledReadPlan:
@@ -2200,14 +2210,15 @@ class TestGetData:
 
 
 class TestOmeZarrStorePathResolution:
-    """One store->path resolver for both call sites (biopb/biopb#530).
+    """One store->path resolution, at construction (biopb/biopb#530).
 
     ``__init__`` (find the group/plate ``.zattrs``) and ``_open_level_array``
     (find the group root a pyramid level hangs off) used to enumerate different
     store shapes. A store with ``root`` but no ``path`` -- the zarr-3
     ``LocalStore`` shape -- resolved in the first and fell through to
     ``str(store)`` in the second, which silently degrades a level read into a
-    CWD-relative open.
+    CWD-relative open. The level open now reuses the root ``__init__`` kept, so
+    there is one resolution rather than two that must agree.
     """
 
     def test_resolver_covers_every_store_shape(self):
@@ -2231,8 +2242,13 @@ class TestOmeZarrStorePathResolution:
         assert _store_filesystem_path(_Store("<Weird>")) == "<Weird>"
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-    def test_both_call_sites_use_the_one_resolver(self, monkeypatch):
-        """Structural: neither site may grow its own store-shape enumeration."""
+    def test_level_open_reuses_the_root_resolved_at_construction(self, monkeypatch):
+        """Structural: the store shape is read once, and a level hangs off that
+        root rather than re-deriving one.
+
+        The second derivation was a walk that stopped at the first ``.zattrs``
+        it met, so a level of an array carrying its own attrs opened one
+        directory too deep (biopb/biopb#1059)."""
         import json
 
         import zarr
@@ -2285,7 +2301,7 @@ class TestOmeZarrStorePathResolution:
             assert len(calls) == 1  # __init__
 
             level = adapter.get_level_adapter("1")
-            assert len(calls) == 2  # _open_level_array
+            assert len(calls) == 1  # the level rode on __init__'s root
             assert list(level.get_tensor_descriptor().shape) == [20, 20]
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")

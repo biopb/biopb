@@ -14,7 +14,7 @@ from starlette.applications import Starlette
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
-from biopb_mcp.mcp import _chat, _chat_api, _model, _observe
+from biopb_mcp.mcp import _chat, _chat_api, _kernel_rpc, _model, _observe
 
 # The shape the launcher actually threads: `load_config()` returns a **dict**,
 # and every consumer reads it with `get_setting`, which falls back to
@@ -73,15 +73,7 @@ class TestRootSplit:
 
 class TestStatus:
     def test_reports_ready_when_configured(self, client):
-        body = client.get("/api/chat/status").json()
-        # Lifted out and asserted on its own: whether the *ACP* engine is ready
-        # depends on whether a harness is installed on the machine running the
-        # tests, which is not something this case is about.
-        engines = body.pop("engines")
-        assert [e["engine"] for e in engines] == ["builtin", "acp"]
-        assert engines[0] == {"engine": "builtin", "ready": True, "reason": None}
-        assert set(engines[1]) == {"engine", "ready", "reason"}
-        assert body == {
+        assert client.get("/api/chat/status").json() == {
             "enabled": True,
             "ready": True,
             "reason": None,
@@ -91,8 +83,21 @@ class TestStatus:
             # message either way, so compaction would otherwise be invisible to
             # the person who asked for it.
             "compacted": 0,
-            "engine": "builtin",
         }
+
+    def test_the_history_read_carries_who_is_answering(self, client, configured):
+        """The only read the pane repeats, so it is where a `/model` switch
+        reaches a window that did not make it. Without this the header names
+        the model it was switched off until the page is reloaded."""
+        assert client.get("/api/chat/history").json()["model"] == "test-model"
+
+        client.post(
+            "/chat/model",
+            json={"model": "other-model"},
+            headers={"Content-Type": "application/json"},
+        )
+
+        assert client.get("/api/chat/history").json()["model"] == "other-model"
 
     def test_reports_why_it_is_not_ready(self, client, configured):
         configured["chat"]["model"] = ""
@@ -104,26 +109,13 @@ class TestStatus:
         assert body["model"] == ""
 
 
-class TestEngineRead:
-    def test_the_engine_is_readable_on_its_own(self, client):
-        # Read before every history read, because the engine is session state
-        # and the window that switched it is not necessarily the one asking.
-        assert client.get("/api/chat/engine").json() == {
-            "engine": "builtin",
-            "model": "test-model",
-        }
-
-
 class TestModelRoute:
-    def test_the_built_in_loop_lists_what_the_provider_publishes(
-        self, client, monkeypatch
-    ):
+    def test_it_lists_what_the_provider_publishes(self, client, monkeypatch):
         async def listed(config):
             return [{"value": "deepseek-v4-flash", "name": "deepseek-v4-flash"}]
 
         monkeypatch.setattr(_model, "list_models", listed)
         assert client.get("/api/chat/models").json() == {
-            "engine": "builtin",
             "model": "test-model",
             "choices": [{"value": "deepseek-v4-flash", "name": "deepseek-v4-flash"}],
         }
@@ -145,10 +137,9 @@ class TestModelRoute:
             headers={"Content-Type": "application/json"},
         )
         assert r.status_code == 200
-        # Read back through the routes a pane actually polls, not the config
+        # Read back through the route a pane actually polls, not the config
         # dict: the model is read per provider call, so this is the next turn's
         # model and the header's in one.
-        assert client.get("/api/chat/engine").json()["model"] == "other-model"
         assert client.get("/api/chat/status").json()["model"] == "other-model"
         assert configured["chat"]["model"] == "other-model"
 
@@ -511,7 +502,9 @@ class TestCancel:
 
         monkeypatch.setattr(_model, "make_model", lambda cfg: hang)
         monkeypatch.setattr(
-            _chat, "_job_call", lambda *a, **k: touched.append(a) or (None, {}, None)
+            _kernel_rpc,
+            "_execute",
+            lambda *a, **k: touched.append(a) or (None, {}, None),
         )
         client.post("/chat/turn", json={"text": "hello"})
         assert self._wait_for(started.is_set)
@@ -521,9 +514,9 @@ class TestCancel:
 
 
 def test_routes_are_not_mounted_when_chat_is_off():
-    # Off drops the surface entirely rather than serving a refusing one, the
-    # same shape the console's gate takes: "is there a way to submit here?" has
-    # one answer rather than a status code to interpret.
+    # Off drops the surface entirely rather than serving a refusing one: "is
+    # there a way to submit here?" has one answer rather than a status code to
+    # interpret.
     cfg = chat_config()
     cfg["observe"]["chat_enabled"] = False
     assert _chat_api.configure(cfg, agentless=True) is False

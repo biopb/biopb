@@ -3,17 +3,23 @@
 Extends ZarrAdapter with OME multiscales metadata support.
 """
 
+import hashlib
 import json
 import logging
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 from biopb.tensor.descriptor_pb2 import PyramidLevel, TensorDescriptor
 
-from biopb_tensor_server.adapters.zarr import ZarrAdapter
+from biopb_tensor_server.adapters.zarr import (
+    ZarrAdapter,
+    is_unfinished_upload,
+    is_upload_subsystem_store,
+)
 from biopb_tensor_server.core.adapter_base import catalog_entry
+from biopb_tensor_server.core.axes import canonical_axis
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import InvalidTensorId, TensorNotFound
 
@@ -29,12 +35,12 @@ logger = logging.getLogger(__name__)
 def _store_filesystem_path(store) -> str:
     """Resolve a zarr store to the local filesystem path it is rooted at.
 
-    One definition, two callers (biopb/biopb#530): ``__init__`` walks up from here
-    to find the group/plate ``.zattrs``, and ``_open_level_array`` walks up from
-    here to find the group root a pyramid level hangs off. They used to enumerate
-    different store shapes, so a store carrying ``root`` but not ``path`` resolved
-    correctly in one and degraded to ``str(store)`` -- a repr, not a path -- in the
-    other, which silently turns a level read into a CWD-relative open.
+    One definition, one caller (biopb/biopb#530): ``__init__`` walks up from here
+    to find the group/plate ``.zattrs`` and keeps the root it lands on, which is
+    what ``_open_level_array`` then hangs a pyramid level off. Two callers each
+    enumerating store shapes was the original bug -- a store carrying ``root``
+    but not ``path`` resolved correctly in one and degraded to ``str(store)``, a
+    repr rather than a path, in the other -- and the second derivation is gone.
 
     ``path`` is the zarr-2 attribute (``DirectoryStore`` / ``FSStore``); ``root`` is
     the zarr-3 ``LocalStore`` one, unreachable under the current ``zarr<3`` pin and
@@ -176,6 +182,43 @@ class _HcsFieldAdapter(ZarrAdapter):
         return self._field_metadata
 
 
+#: OME-NGFF axis "type" for each canonical axis ``core.axes.canonical_axis``
+#: resolves a label to. An axis it doesn't recognize gets no "type", same as
+#: OME-NGFF allows.
+_OME_AXIS_TYPE = {"x": "space", "y": "space", "z": "space", "c": "channel", "t": "time"}
+
+
+def minimal_ome_metadata(desc: TensorDescriptor) -> dict:
+    """The smallest ``.zattrs`` that makes an uploaded array an OME-Zarr."""
+    dim_labels = (
+        list(desc.dim_labels)
+        if desc.dim_labels
+        else [f"dim{i}" for i in range(len(desc.shape))]
+    )
+
+    axes = []
+    for label in dim_labels:
+        ome_type = _OME_AXIS_TYPE.get(canonical_axis(label) or "")
+        axes.append({"name": label, "type": ome_type} if ome_type else {"name": label})
+
+    return {
+        "multiscales": [
+            {
+                "version": "0.4",
+                "axes": axes,
+                "datasets": [
+                    {
+                        "path": "0",
+                        "coordinateTransformations": [
+                            {"type": "scale", "scale": [1.0] * len(desc.shape)}
+                        ],
+                    }
+                ],
+            }
+        ]
+    }
+
+
 class OmeZarrAdapter(ZarrAdapter):
     """Adapter for OME-Zarr (OME-NGFF) datasets.
 
@@ -243,6 +286,8 @@ class OmeZarrAdapter(ZarrAdapter):
         zattrs_ctx = ctx.join(".zattrs")
         if not zattrs_ctx.exists():
             return None
+        if is_unfinished_upload(ctx) or is_upload_subsystem_store(ctx):
+            return None
 
         # Cloud-storage phase 2: if the .zattrs sidecar is a non-resident cloud
         # placeholder, reading it would trigger a whole-file recall (or block
@@ -301,7 +346,7 @@ class OmeZarrAdapter(ZarrAdapter):
         the root it just descended from.
 
         Args:
-            source: SourceConfig with url, source_id, dim_labels
+            source: SourceConfig with url, source_id
             credentials_config: Optional CredentialsConfig for remote authentication
 
         Returns:
@@ -332,7 +377,6 @@ class OmeZarrAdapter(ZarrAdapter):
         return cls(
             arr,
             source.source_id,
-            source.dim_labels,
             _threaded_zattrs=zattrs or None,
             _threaded_root=threaded_root,
         )
@@ -425,6 +469,20 @@ class OmeZarrAdapter(ZarrAdapter):
             return zarr.open_array(zarr_store, path=relpath, mode="r")
         return zarr.open_array(os.path.join(zarr_path, relpath), mode="r")
 
+    @staticmethod
+    def upload_source_id(zarr_path: Path) -> str:
+        """The ``source_id`` the removed ``ome_zarr:`` kind gave the store at
+        *zarr_path*.
+
+        Migration only. The ``ome_zarr:`` kind is gone and
+        nothing mints these ids any more, but a persisted catalog still carries
+        the rows its uploads wrote, and only this hash of the path can name
+        them for ``UploadManager._drop_legacy_ome_zarr_stores`` to drop. Goes
+        when a release has passed and no catalog can still hold one.
+        """
+        digest = hashlib.sha256(str(zarr_path.resolve()).encode()).hexdigest()
+        return f"ome_zarr_{digest[:12]}"
+
     def __init__(
         self,
         zarr_array,
@@ -439,7 +497,8 @@ class OmeZarrAdapter(ZarrAdapter):
         Args:
             zarr_array: Zarr array object (from specific resolution level)
             source_id: Unique identifier for this data source
-            dim_labels: Optional dimension labels (overrides OME metadata)
+            dim_labels: Labels supplied by the caller materializing this tensor
+                (the upload path); when None, OME metadata wins
             resolution_level: Which resolution level to use (default 0)
             _threaded_zattrs / _threaded_root: the root ``.zattrs`` and its local
                 path, supplied by :meth:`create_from_config` (which already read
@@ -477,6 +536,8 @@ class OmeZarrAdapter(ZarrAdapter):
             plate_root_path, zattrs = self._find_group_root(
                 _store_filesystem_path(zarr_array.store)
             )
+        # The image (or plate) group, where an NGFF ``labels/`` group would sit.
+        self._group_root_path = plate_root_path
 
         if zattrs is not None:
             self.ome_metadata = zattrs
@@ -496,7 +557,8 @@ class OmeZarrAdapter(ZarrAdapter):
                         ch.get("label", f"ch{i}") for i, ch in enumerate(channels)
                     ]
 
-        # Override dimension labels from OME metadata if not explicitly provided
+        # Dimension labels come from OME metadata unless the caller
+        # materializing this tensor supplied them (upload/internal).
         if dim_labels is None and self.axes:
             self.dim_labels = _axes_to_dim_labels(self.axes)
 
@@ -629,6 +691,19 @@ class OmeZarrAdapter(ZarrAdapter):
                         ch.get("label", f"ch{i}") for i, ch in enumerate(channels)
                     ]
 
+    def _iter_hcs_fields(self):
+        """``(well_name, well_path, field_idx, field_path)`` for every plate field."""
+        for well_name, well_path in self._hcs_well_paths.items():
+            well_meta = self._hcs_well_metadata.get(well_name, {})
+            images = well_meta.get("well", {}).get("images", [])
+            for field_idx, image_info in enumerate(images):
+                yield (
+                    well_name,
+                    well_path,
+                    field_idx,
+                    image_info.get("path", str(field_idx)),
+                )
+
     def _enumerate_hcs_fields(self) -> List[TensorDescriptor]:
         """Enumerate all fields in HCS plate as flattened tensor list.
 
@@ -648,55 +723,69 @@ class OmeZarrAdapter(ZarrAdapter):
 
         descriptors = []
 
-        for well_name, well_path in self._hcs_well_paths.items():
-            well_meta = self._hcs_well_metadata.get(well_name, {})
-            well_info = well_meta.get("well", {})
-            images = well_info.get("images", [])
+        for well_name, well_path, field_idx, field_path in self._iter_hcs_fields():
+            field_key = f"{well_name}/{field_idx}"
 
-            for field_idx, image_info in enumerate(images):
-                field_path = image_info.get("path", str(field_idx))
-                field_key = f"{well_name}/{field_idx}"
+            shape = []
+            dtype = ""
+            dim_labels = self.dim_labels
 
-                shape = []
-                dtype = ""
-                dim_labels = self.dim_labels
-
-                field_zattrs = self._read_zattrs_at(well_path, field_path)
-                multiscales = (field_zattrs or {}).get("multiscales", [])
-                res = _first_dataset_path(multiscales)
-                if res is not None:
-                    # Open the level-0 array for actual shape/dtype.
-                    try:
-                        arr = zarr.open_array(
-                            self._field_array_path(well_path, field_path, res),
-                            mode="r",
-                        )
-                        shape = list(arr.shape)
-                        dtype = arr.dtype.str
-                    except Exception:
-                        # Fallback: leave shape/dtype unfilled (metadata-only).
-                        pass
-                if multiscales:
-                    dim_labels = (
-                        _axes_to_dim_labels(multiscales[0].get("axes", []))
-                        or self.dim_labels
+            field_zattrs = self._read_zattrs_at(well_path, field_path)
+            multiscales = (field_zattrs or {}).get("multiscales", [])
+            res = _first_dataset_path(multiscales)
+            if res is not None:
+                # Open the level-0 array for actual shape/dtype.
+                try:
+                    arr = zarr.open_array(
+                        self._field_array_path(well_path, field_path, res),
+                        mode="r",
                     )
-
-                descriptors.append(
-                    TensorDescriptor(
-                        # Globally-unique array_id = source_id/field (identity
-                        # policy). The HCS field is itself hierarchical
-                        # ("well_name/field_index"), so array_id is
-                        # "source_id/well_name/field_index"; source_id is slash-free
-                        # and recovered by splitting on the first '/'.
-                        array_id=f"{self.source_id}/{field_key}",
-                        dim_labels=dim_labels,
-                        shape=shape,
-                        dtype=dtype,
-                    )
+                    shape = list(arr.shape)
+                    dtype = arr.dtype.str
+                except Exception:
+                    # Fallback: leave shape/dtype unfilled (metadata-only).
+                    pass
+            if multiscales:
+                dim_labels = (
+                    _axes_to_dim_labels(multiscales[0].get("axes", []))
+                    or self.dim_labels
                 )
 
+            descriptors.append(
+                TensorDescriptor(
+                    # Globally-unique array_id = source_id/field (identity
+                    # policy). The HCS field is itself hierarchical
+                    # ("well_name/field_index"), so array_id is
+                    # "source_id/well_name/field_index"; source_id is slash-free
+                    # and recovered by splitting on the first '/'.
+                    array_id=f"{self.source_id}/{field_key}",
+                    dim_labels=dim_labels,
+                    shape=shape,
+                    dtype=dtype,
+                )
+            )
+
         return descriptors
+
+    def get_embedded_labels(self) -> Dict[str, "TensorAdapter"]:
+        """The NGFF ``labels/`` group of the image, or of every plate field.
+
+        Each set binds to the tensor whose group it sits under: ``labels/<name>``
+        on a single image, ``<well>/<field>/labels/<name>`` on a plate. Local
+        stores only, like the plate's own field serving.
+        """
+        from biopb_tensor_server.adapters.labels import native_label_sets
+
+        root = self._group_root_path
+        if root is None:
+            return {}
+        if not self._is_hcs_plate:
+            return native_label_sets(self, Path(root), "")
+        sets: Dict[str, TensorAdapter] = {}
+        for well_name, well_path, field_idx, field_path in self._iter_hcs_fields():
+            group = Path(self._field_array_path(well_path, field_path, ""))
+            sets.update(native_label_sets(self, group, f"{well_name}/{field_idx}"))
+        return sets
 
     def get_ome_metadata(self) -> dict:
         """Return OME-Zarr metadata."""
@@ -1028,41 +1117,41 @@ class OmeZarrAdapter(ZarrAdapter):
             source_id=self.source_id,
             dim_labels=self.dim_labels,
         )
-        # Set tensor name for multi-tensor context
-        level_adapter._tensor_name = path
+        # The level rides under this adapter's own field -- ``1`` for an
+        # image, ``labels/nuclei/1`` for a label set -- and carries the same
+        # content_version: it is the same content, and a level minting its own
+        # directory-stat token would let level chunks outlive a re-registration
+        # that invalidated the base ones (biopb/biopb#1059).
+        level_adapter._tensor_name = (
+            path if self._tensor_name is None else f"{self._tensor_name}/{path}"
+        )
+        level_adapter._content_version = self._content_version
 
         self._level_adapters[path] = level_adapter
         return level_adapter
 
     def _open_level_array(self, path: str):
-        """Open the Zarr array at the given level path (relative to group root)."""
+        """Open the Zarr array at level *path*, relative to the group root.
+
+        The root is whatever ``__init__`` resolved -- threaded by
+        ``create_from_config`` or walked up from the array's store -- and never
+        re-derived here. A second walk used to run from this method and stopped
+        at the first ``.zattrs`` it met, so a level of an array carrying its own
+        attrs (a label set's ``_ARRAY_DIMENSIONS``) was opened one directory too
+        deep (biopb/biopb#1059).
+        """
         import zarr
 
-        store_path = _store_filesystem_path(self.zarr_array.store)
-
-        # Navigate to the group root. Terminate on the dirname fixed point rather
-        # than on '/', so a Windows drive root ends the walk instead of spinning
-        # forever -- the same termination bug already fixed in __init__.
-        current_path = store_path.rstrip("/")
-        group_root = None
-        while current_path:
-            if os.path.exists(os.path.join(current_path, ".zattrs")):
-                group_root = current_path
-                break
-            parent_path = os.path.dirname(current_path)
-            if parent_path == current_path:
-                break
-            current_path = parent_path
-
-        if group_root is None:
-            # Exhausting the walk used to leave current_path == "", so
-            # os.path.join("", path) handed zarr a *relative* path resolved
-            # against the process CWD: a level read that fails obscurely, or
-            # worse succeeds against an unrelated store (biopb/biopb#530).
+        if self._group_root_path is None:
+            # No group root was found at construction, so there is nothing to
+            # hang the level off. Raising beats ``os.path.join("", path)``,
+            # which hands zarr a *relative* path resolved against the process
+            # CWD: a level read that fails obscurely, or worse succeeds against
+            # an unrelated store (biopb/biopb#530).
             raise FileNotFoundError(
-                f"no OME-Zarr group root (a directory holding .zattrs) at or above "
-                f"{store_path!r}; cannot open pyramid level {path!r} of source "
-                f"{self.source_id!r}"
+                f"no OME-Zarr group root (a directory holding .zattrs with "
+                f"multiscales or plate) at or above "
+                f"{_store_filesystem_path(self.zarr_array.store)!r}; cannot open "
+                f"pyramid level {path!r} of source {self.source_id!r}"
             )
-
-        return zarr.open_array(os.path.join(group_root, path), mode="r")
+        return zarr.open_array(os.path.join(self._group_root_path, path), mode="r")

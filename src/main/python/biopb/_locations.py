@@ -3,10 +3,9 @@
 Two concerns, one module because they answer the same question ("what path does
 this file have?") and every consumer needs both:
 
-1. **The config file** — *where* the tensor-server config lives and *which*
-   format wins when both exist (JSON is the only format read; a leftover legacy
-   TOML is detected purely to point at the migration command). Imported by
-   ``biopb-tensor-server`` (``config.find_config``) and the umbrella ``biopb`` CLI.
+1. **The config file** — *where* the tensor-server config lives, and its one
+   format. Imported by ``biopb-tensor-server`` (``config.find_config``) and the
+   umbrella ``biopb`` CLI.
 2. **The runtime trees** — the XDG base dirs and every log / session-registry /
    pid / stop-sentinel / asset path derived from them. These used to be
    open-coded as literal strings across five packages (the core CLI, biopb-mcp,
@@ -42,15 +41,12 @@ JSON is the *only* on-disk config format: the config is machine-generated (the
 installer / the admin endpoint write it), and once nobody hand-edits it, TOML's
 hand-editing ergonomics stop paying for its one wart — no stdlib *writer*. JSON
 has a stdlib writer on both ends, unifies the format with biopb-mcp's
-``mcp-config.json``, and pairs with JSON Schema for validation. The TOML read
-path was dropped once the deprecation window closed (biopb/biopb#34); a leftover
-``biopb.toml`` is still *recognized* — by the installers, which convert it, and
-by :func:`find_config`, which names ``biopb-tensor-server migrate-config`` — so an old
-install fails with the fix rather than with a phantom missing file.
+``mcp-config.json``, and pairs with JSON Schema for validation (biopb/biopb#34).
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import sys
@@ -72,6 +68,29 @@ SESSIONS_DIR_ENV = "BIOPB_SESSIONS_DIR"
 # others (control ARCHITECTURE.md, I2).
 MCP_SESSION_LOG_ENV = "BIOPB_MCP_SESSION_LOG"
 
+# Env var carrying a one-shot token that identifies *this* launch of a viewer
+# session. Set by the control on the child it spawns and written verbatim into
+# that child's registry record, so the launcher can recognise its own session
+# among all the live ones.
+#
+# It exists because the obvious signal -- match the record's pid against the
+# spawned ``Popen.pid`` -- is not reliable: on Windows a venv's
+# ``Scripts/python.exe`` is often a *trampoline* (uv, and pip's console-script
+# launchers) that re-spawns the real interpreter and waits on it, so the pid the
+# launcher holds is the stub's and the pid the child records is its own. They
+# never match, and the launcher waits out its whole timeout over a viewer that
+# opened seconds ago. A token also beats a pid on the merits: it cannot be
+# recycled, and it says "the process I started", not "a process with this
+# number". Defined here for the same reason MCP_SESSION_LOG_ENV is -- two
+# packages that may not import each other must agree on one string.
+MCP_LAUNCH_TOKEN_ENV = "BIOPB_MCP_LAUNCH_TOKEN"
+
+# The registry-record field the token above is echoed into (biopb._sessions
+# .register); named here, not just at each call site, so the two ends
+# (biopb-control reading it, biopb-mcp writing it) can't drift apart on the
+# key's spelling.
+LAUNCH_TOKEN_FIELD = "launch_token"
+
 
 # --- base trees ---------------------------------------------------------- #
 #
@@ -85,7 +104,7 @@ MCP_SESSION_LOG_ENV = "BIOPB_MCP_SESSION_LOG"
 # working directory (opencode desktop does) has that value inherited by the
 # biopb-mcp shim it spawns, while a control plane started from a terminal keeps
 # the default. The two then disagree about where the state tree is, and the
-# session registry -- whose whole contract is that the shim writes what the
+# session registry -- whose whole contract is that a session writes what the
 # control reads (see ``biopb._sessions``) -- silently splits in half.
 #
 # The other consumers of the state tree hid the same skew behind fallbacks: the
@@ -214,7 +233,6 @@ def cache_dir() -> Path:
 # ``$XDG_CONFIG_HOME``. ``config_dir()`` is the call-time source.
 DEFAULT_CONFIG_DIR = config_dir()
 CANONICAL_CONFIG_NAME = "biopb.json"
-LEGACY_CONFIG_NAME = "biopb.toml"
 
 # biopb-mcp's own settings file, co-located in the same dir. Distinct from the
 # installer's client-definition ``mcp.json`` (which registers biopb-mcp with MCP
@@ -235,77 +253,45 @@ def mcp_config_path() -> Path:
     return config_dir() / MCP_CONFIG_NAME
 
 
-def mcp_plugin_dir() -> Path:
-    """User kernel-plugin dir (``~/.config/biopb/kernel``).
+def mcp_docs_dir() -> Path:
+    """The agent's own docs (``~/.config/biopb/docs``).
 
-    ``*.py`` files here are loaded into the biopb-mcp agent kernel's namespace at
-    bootstrap -- the low-friction "bring your own tool" path (biopb/biopb-mcp#92),
-    beside the installed ``biopb_mcp.namespace`` entry-point packages. Config-tree
-    (user-authored), co-located with ``mcp-config.json``. Resolved at call time for
-    test isolation and **not created on access**: absence is the normal no-plugins
-    case and the loader / the dashboard inspector simply find nothing, so a bare
-    read must not materialize an empty dir.
+    The local tier of biopb-mcp's knowledge store: ``*.md`` files the agent
+    writes with ``write_doc``, plus the index it edits. A doc here shadows a
+    shipped one of the same id. Config-tree (user-authored), resolved at call
+    time for test isolation and **not created on access** -- the store creates
+    it when it seeds the index or writes the first doc.
     """
-    return config_dir() / "kernel"
+    return config_dir() / "docs"
 
 
-def mcp_skill_dir() -> Path:
-    """User skills dir (``~/.config/biopb/skills``).
+def algorithms_dir() -> Path:
+    """The algorithm registry (``~/.config/biopb/algorithms``).
 
-    ``*.md`` files here are merged into the agent's skills catalog beside the
-    curated ones, which ship inside biopb-mcp -- the personal tier of the same
-    "drop a file in a config dir" path as :func:`mcp_plugin_dir`, and the only
-    way a skill reaches a machine outside a release. Config-tree
-    (user-authored), resolved at call time for test isolation and **not created
-    on access**: absence is the normal no-local-skills case, and a bare read
-    must not materialize an empty dir.
+    One entry per file, named by its stem: ``<name>.py`` is a server file the
+    control runs under uv, ``<name>.json`` (``{"url": ...}``) a server someone
+    else runs. Resolved at call time for test isolation; not created on access.
     """
-    return config_dir() / "skills"
+    return config_dir() / "algorithms"
+
+
+def algorithms_state_dir() -> Path:
+    """What the control keeps per algorithm entry: each script's cached op
+    list, and its log. Created on access."""
+    d = state_dir() / "algorithms"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 def find_config(config_dir: Path = DEFAULT_CONFIG_DIR) -> Path:
-    """Resolve the config file in *config_dir*: ``biopb.json``, else a legacy
-    ``biopb.toml`` that must be migrated.
+    """Resolve the config file in *config_dir*: ``biopb.json``.
 
-    Returns the first of ``biopb.json`` / ``biopb.toml`` that exists. When
-    neither exists, returns the canonical JSON path so callers seed / print the
-    forward-looking name. Callers that need a guaranteed-existing file should
-    still check ``.exists()`` on the result.
-
-    A legacy TOML is **no longer readable** (biopb/biopb#34) but is still
-    returned when it is the only config present, and both cases log a warning
-    naming ``biopb-tensor-server migrate-config``. Handing the real file back — rather
-    than the canonical name that does not exist — is what lets the caller fail
-    with "this config needs migrating" instead of "no config at all", which
-    every downstream default (a defaulted bind address, a seeded fresh config)
-    would otherwise quietly paper over.
+    Returns the canonical path whether or not it exists, so a caller that is
+    seeding a fresh config and one that is reading an existing one name the same
+    file. Callers that need a guaranteed-existing file should check
+    ``.exists()`` on the result.
     """
-    json_path = config_dir / CANONICAL_CONFIG_NAME
-    toml_path = config_dir / LEGACY_CONFIG_NAME
-    if json_path.exists():
-        if toml_path.exists():
-            logger.warning(
-                "Both %s and %s exist in %s; using %s and ignoring the legacy "
-                "%s. Run `biopb-tensor-server migrate-config` to retire it. "
-                "See biopb/biopb#34.",
-                CANONICAL_CONFIG_NAME,
-                LEGACY_CONFIG_NAME,
-                config_dir,
-                CANONICAL_CONFIG_NAME,
-                LEGACY_CONFIG_NAME,
-            )
-        return json_path
-    if toml_path.exists():
-        logger.warning(
-            "%s in %s is the legacy TOML config format, which is no longer "
-            "read; %s is the only supported format. Run "
-            "`biopb-tensor-server migrate-config` to convert it. See biopb/biopb#34.",
-            LEGACY_CONFIG_NAME,
-            config_dir,
-            CANONICAL_CONFIG_NAME,
-        )
-        return toml_path
-    return json_path
+    return config_dir / CANONICAL_CONFIG_NAME
 
 
 # --- logs (daemon: control + supervised tensor server) ------------------- #
@@ -375,7 +361,7 @@ def sessions_dir() -> Path:
 
     ``BIOPB_SESSIONS_DIR`` overrides the location (used by tests and unusual
     deployments); otherwise ``state/biopb/sessions``. The override must be an
-    absolute path -- this registry is the one directory a shim and a control
+    absolute path -- this registry is the one directory a session and a control
     *must* agree on, and they do not share a working directory
     (:func:`_require_absolute`).
     """
@@ -385,6 +371,23 @@ def sessions_dir() -> Path:
     d = Path(raw) if raw else state_dir() / "sessions"
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def tls_served_certs() -> Path:
+    """What each local flight plane serves (``state/biopb/tls-served.json``).
+
+    Written by a plane that serves TLS, read by clients on the same machine so
+    they verify the certificate it is *actually* serving. Distinct from
+    :func:`tls_server_cert`, which is the pair the plane **mints** — an operator's
+    own ``--tls-cert`` never lands there, and copying it in would be wrong: its
+    key would have to follow, and a later plain ``--tls`` would then serve a
+    certificate whose key is not beside it (biopb/biopb#916).
+
+    Keyed by port, because that is what distinguishes two planes on one machine
+    and this file is only ever consulted for a loopback dial, where the host is
+    an alias. Machine-local, regenerable, and never created on access.
+    """
+    return state_dir() / "tls-served.json"
 
 
 def tls_known_hosts() -> Path:
@@ -457,6 +460,27 @@ def tensor_stop_sentinel() -> Path:
     (they previously duplicated the literal and relied on a "keep in sync" note).
     """
     return state_dir() / "tensor-server.stop"
+
+
+def tensor_catalog_path(config_path: Path) -> Path:
+    """The tensor server's on-disk DuckDB catalog for *config_path*.
+
+    Named by a digest of the resolved config path, because a tensor server is a
+    singleton only with respect to one set of data: two servers started from two
+    ``biopb.json`` files are a normal deployment, and a single shared file would
+    have them take turns clearing each other's ``sources``. DuckDB takes an
+    exclusive lock on the file, so the collision would surface as the second
+    server failing to start rather than as corruption -- but a per-config path
+    means it never arises.
+
+    In the state tree, not the cache tree: the catalog's ``sources`` rows are
+    regenerable, but its ``rois`` rows are hand-drawn and are not, and
+    :func:`cache_dir` is documented as safe for a janitor to empty.
+    """
+    digest = hashlib.sha256(
+        str(Path(config_path).expanduser().resolve()).encode("utf-8")
+    ).hexdigest()[:16]
+    return state_dir() / "catalogs" / f"{digest}.duckdb"
 
 
 # --- portable assets (data tree) ----------------------------------------- #

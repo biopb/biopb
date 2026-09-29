@@ -1,6 +1,7 @@
 """Shared pytest fixtures for biopb-mcp tests."""
 
 import asyncio
+import json
 import pathlib
 
 import pytest
@@ -12,15 +13,118 @@ def call_tool(fn, *args, **kwargs):
     """Drive an ``async def`` MCP tool from a synchronous test.
 
     The tools are async so their kernel round trips go to a thread rather
-    than stalling the process's one event loop (``_kernel_rpc._job_call``).
+    than stalling the process's one event loop (``_kernel_rpc._execute``).
     The suite stays synchronous and gives each call its own loop -- the
     ``asyncio.run`` convention the chat tests already use.
     """
     return asyncio.run(fn(*args, **kwargs))
 
 
+def rpc_reply(r, window_alive=True):
+    """A kernel ``execute`` result carrying *r* in a ``user_expression``, as
+    ``{"r": r, "w": <viewer window alive?>}`` JSON."""
+    payload = json.dumps({"r": r, "w": window_alive})
+    return {
+        "stdout": "",
+        "result_text": "",
+        "error_text": "",
+        "status": "ok",
+        "user_expressions": {
+            "rpc": {"status": "ok", "data": {"text/plain": repr(payload)}}
+        },
+    }
+
+
+def iopub_event(content):
+    """A ``biopb_job`` announcement as the host's iopub listener receives it."""
+    from biopb_mcp.mcp._job_log import MSG_TYPE
+
+    return {"header": {"msg_type": MSG_TYPE}, "parent_header": {}, "content": content}
+
+
+class ScriptedJobs:
+    """``host.jobs`` for a mock host: the host's job records, scripted.
+
+    Polls are answered from *polls* in order, the last one repeating (none:
+    every job is unknown); the running job is *running*, an id or ``None``;
+    the job list and the export are *summary* and
+    *export*. The foreign-activity digest is *digest*, less what
+    has been acked; acks and the point of view each read was made from are
+    recorded for the test to assert on.
+    """
+
+    def __init__(
+        self,
+        polls=(),
+        digest=(),
+        summary=(),
+        export=(),
+        restarts=(),
+        running=None,
+        running_origin="mcp",
+        window=None,
+    ):
+        self._polls = list(polls)
+        self._running = running
+        self._running_origin = running_origin
+        self._window = window
+        self._summary = list(summary)
+        self._export = list(export)
+        self._restarts = list(restarts)
+        self.polled = 0
+        self._digest = list(digest)
+        self.acked = []
+        self.digest_origins = []
+
+    def poll(self, job_id):
+        self.polled += 1
+        if not self._polls:
+            return {"job_id": job_id, "status": "unknown", "error_text": ""}
+        snap = self._polls.pop(0) if len(self._polls) > 1 else self._polls[0]
+        return {"job_id": job_id, **snap}
+
+    def new_id(self):
+        self._ids = getattr(self, "_ids", 0) + 1
+        return f"job-{self._ids}"
+
+    def running(self, prefer=None):
+        if self._running is None:
+            return None
+        return {
+            "job_id": self._running,
+            "status": "running",
+            "origin": self._running_origin,
+        }
+
+    def running_cell(self):
+        return None
+
+    def window_alive(self, job_id):
+        return self._window
+
+    def foreign_digest(self, for_origin):
+        self.digest_origins.append(for_origin)
+        return [d for d in self._digest if d["job_id"] not in self.acked]
+
+    def ack_foreign_digest(self, job_ids):
+        self.acked.extend(job_ids)
+        return len(job_ids)
+
+    def summary(self):
+        return list(self._summary)
+
+    def restarts(self):
+        return list(self._restarts)
+
+    def history(self):
+        return list(self._summary)
+
+    def export(self):
+        return list(self._export)
+
+
 def pytest_addoption(parser):
-    """Register the benchmark's run options (`--bench-fixtures`, `--bench-skills`, …).
+    """Register the benchmark's run options (`--bench-fixtures`, `--bench-docs`, …).
 
     Here rather than in `bench/conftest.py` because pytest calls this hook only
     on the conftests it loads at *startup* — the rootdir's and those on the way
@@ -95,21 +199,3 @@ def _isolate_config(monkeypatch, tmp_path):
     CONFIG.reload()
     yield
     CONFIG.reload()
-
-
-@pytest.fixture(autouse=True)
-def _isolate_loaded_plugins():
-    """Reset the kernel-plugin record between tests.
-
-    ``mcp/_requires.py`` holds what the plugin loader loaded in module state (one
-    kernel, one record — see its docstring), so any test that drives a load leaks
-    into the next one's ``server_status`` report.
-    """
-    from biopb_mcp.mcp import _requires
-
-    def clear():
-        _requires.record_loaded_plugins()
-
-    clear()
-    yield
-    clear()

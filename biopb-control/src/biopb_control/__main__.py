@@ -33,6 +33,26 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Serve the data plane's flight port over TLS (passed to `launch`).",
     )
+    run.add_argument(
+        "--tls-cert",
+        default=None,
+        help="PEM certificate chain the data plane serves, instead of the "
+        "self-signed one it mints into the state tree. Implies --tls. Must carry "
+        "a loopback SAN (localhost / 127.0.0.1) or the co-located sidecar cannot "
+        "reach the flight plane. Requires --tls-key.",
+    )
+    run.add_argument(
+        "--tls-key",
+        default=None,
+        help="PEM private key paired with --tls-cert.",
+    )
+    run.add_argument(
+        "--san",
+        action="append",
+        default=None,
+        help="Extra hostname or IP for a certificate the data plane mints "
+        "(repeatable). Ignored once a cert exists, and by --tls-cert.",
+    )
     run.add_argument("--web-host", default="127.0.0.1")
     run.add_argument("--web-port", type=int, default=8814)
     run.add_argument("--static-dir", default=None)
@@ -42,6 +62,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="path prefix a reverse proxy publishes this web origin under, e.g. "
         "/node/$host/$port for an Open OnDemand app (or BIOPB_URL_PREFIX). "
         "Configuration only -- never inferred from a request header.",
+    )
+    run.add_argument(
+        "--grpc-external-location",
+        default=None,
+        help="address a remote client should dial to reach the data plane, "
+        "advertised via its `health` action (or BIOPB_GRPC_EXTERNAL_LOCATION; "
+        "biopb/biopb#1158). Required when --grpc-host is a public address -- "
+        "enforced by the data plane itself, not here.",
     )
     run.add_argument("--log-level", default="INFO")
     run.add_argument("--server-log", default=None, help="data-plane stdout/stderr log")
@@ -105,7 +133,7 @@ def main(argv: list[str] | None = None) -> int:
     # `--control-host` (or BIOPB_CONTROL_HOST) -- e.g. behind an operator's own
     # TLS proxy.
     from biopb import _web_auth
-    from biopb._endpoints import control_host, control_port
+    from biopb._control._endpoints import control_host, control_port
 
     resolved_control_host = args.control_host or control_host()
 
@@ -138,6 +166,28 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
+    # BYO TLS material, validated before anything is spawned: a half pair, or
+    # material the server cannot read, would otherwise exit 2 inside the
+    # supervised child on every spawn, crash-looping with the reason in
+    # tensor-server.log (biopb/biopb#913). The shared rule opens each file rather
+    # than stat'ing it -- a key readable only by root passes `is_file()`.
+    from biopb import _tls_material
+
+    if (args.tls_cert is None) != (args.tls_key is None):
+        print(
+            "biopb-control: --tls-cert and --tls-key must be given together.",
+            file=sys.stderr,
+        )
+        return 2
+    for label, value in (("--tls-cert", args.tls_cert), ("--tls-key", args.tls_key)):
+        if value is None:
+            continue
+        try:
+            _tls_material.read_pem(Path(value), label)
+        except _tls_material.TlsMaterialError as e:
+            print(f"biopb-control: {e}", file=sys.stderr)
+            return 2
+
     # Validate the URL prefix here so a bad one is a named configuration error
     # rather than a traceback out of build_app. Normalizing twice is harmless
     # (it is pure and idempotent); build_app stays the authority.
@@ -150,11 +200,23 @@ def main(argv: list[str] | None = None) -> int:
         print(f"biopb-control: {exc}", file=sys.stderr)
         return 2
 
+    grpc_external_location = (
+        args.grpc_external_location
+        or os.environ.get("BIOPB_GRPC_EXTERNAL_LOCATION")
+        or None
+    )
+
     spec = DataPlaneSpec(
         config=Path(args.config),
         grpc_host=args.grpc_host,
         grpc_port=args.grpc_port,
-        tls=args.tls,
+        # A supplied cert means TLS whether or not --tls was also passed: the
+        # plane serves it either way, and this flag is also what the control
+        # advertises the plane's scheme from.
+        tls=args.tls or args.tls_cert is not None,
+        tls_cert=Path(args.tls_cert) if args.tls_cert else None,
+        tls_key=Path(args.tls_key) if args.tls_key else None,
+        sans=tuple(args.san or ()),
         web_host=args.web_host,
         web_port=args.web_port,
         static_dir=Path(args.static_dir) if args.static_dir else None,
@@ -164,6 +226,7 @@ def main(argv: list[str] | None = None) -> int:
         # Env fallback for a direct `python -m biopb_control run`; `biopb control
         # start` passes it explicitly (and inherits the env anyway).
         url_prefix=url_prefix,
+        external_location=grpc_external_location,
     )
     return run_control(
         spec,

@@ -15,6 +15,7 @@ import {
   computeScaleHint,
   TensorArray,
   type AxisMap,
+  splitArrayVersion,
 } from "./tensor-array.js";
 import type { TensorHttpClient } from "./client.js";
 import type { TensorDescriptor, TypedNdArray } from "./types.js";
@@ -404,5 +405,44 @@ describe("TensorArray.compute", () => {
     (client.slice as Mock).mockRejectedValueOnce(new Error("network error"));
     const ta = new TensorArray(client, desc);
     await expect(ta.compute()).rejects.toThrow("network error");
+  });
+});
+
+describe("splitArrayVersion", () => {
+  it("splits a pinned source half", () => {
+    expect(splitArrayVersion("plate_a1b2@9f1c4e2b/A01/0")).toEqual({
+      arrayId: "plate_a1b2/A01/0",
+      token: "9f1c4e2b",
+    });
+  });
+
+  it("splits a single-tensor source with no field", () => {
+    expect(splitArrayVersion("mm_1278219a9bf5@8ee0d6fa")).toEqual({
+      arrayId: "mm_1278219a9bf5",
+      token: "8ee0d6fa",
+    });
+  });
+
+  it("returns an unpinned id unchanged", () => {
+    expect(splitArrayVersion("hpc__ome-tiff_00b764c29c31/Image:0")).toEqual({
+      arrayId: "hpc__ome-tiff_00b764c29c31/Image:0",
+      token: null,
+    });
+  });
+
+  it("leaves an '@' in a field name alone", () => {
+    // The trap the sidecar's own splitter exists to avoid: only the half before
+    // the first '/' is parsed, because '@' is legal in a field.
+    expect(splitArrayVersion("src_abc/Image@2")).toEqual({
+      arrayId: "src_abc/Image@2",
+      token: null,
+    });
+  });
+
+  it("keeps a field that itself contains slashes", () => {
+    expect(splitArrayVersion("plate_x@ab12/A01/0/sub")).toEqual({
+      arrayId: "plate_x/A01/0/sub",
+      token: "ab12",
+    });
   });
 });

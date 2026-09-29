@@ -114,9 +114,6 @@ importers:
 
   packages/tensor-flight-client:
     dependencies:
-      '@bufbuild/protobuf':
-        specifier: ^2.2.4
-        version: 2.12.1
       '@vivjs/types':
         specifier: 0.22.1
         version: 0.22.1
@@ -222,9 +219,6 @@ packages:
   '@bcoe/v8-coverage@1.0.2':
     resolution: {integrity: sha512-6zABk/ECA/QYSCQ1NGiVwwbQerUCZ+TQbp64Q3AgmfNvurHH0j8TtXa1qbShXA6qqkpAj4V5W8pP6mLe1mcMqA==}
     engines: {node: '>=18'}
-
-  '@bufbuild/protobuf@2.12.1':
-    resolution: {integrity: sha512-BvAMfS6LrgZiryOAZ4pBYucu4wG/Ei/9o9DZ9akbREnMLbPJiom2i8b9C8IsKErQoiKqVhrerzt3kOT/RrzLHg==}
 
   '@deck.gl/core@9.3.10':
     resolution: {integrity: sha512-BAJ6r+eRV4euuGcIi2SnlzrodgZ+sD2VuXsoL1DER0LwwKXmKmQu6WA8ax6DB9KFsBghLVoTUN5zaCGF6uKHuQ==}
@@ -2407,8 +2401,6 @@ snapshots:
       '@babel/helper-validator-identifier': 7.29.7
 
   '@bcoe/v8-coverage@1.0.2': {}
-
-  '@bufbuild/protobuf@2.12.1': {}
 
   '@deck.gl/core@9.3.10':
     dependencies:

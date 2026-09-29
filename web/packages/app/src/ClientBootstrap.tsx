@@ -92,10 +92,12 @@ export function ClientBootstrap() {
         // Production mode - require token
         const token = sessionStorage.getItem("biopb_token") ?? "";
         if (!token) {
-          // Preserve the current path so unlock returns here (e.g. /admin).
+          // Preserve the current path and query so unlock returns to shared
+          // viewer links (e.g. /viewer?id=...&t=...).
           // appPath, not the raw pathname: `next` is handed to the router, which
           // is already relative to the basename.
-          const here = appPath(window.location.pathname);
+          const query = searchParams.toString();
+          const here = appPath(window.location.pathname) + (query ? `?${query}` : "");
           const next = here && here !== "/unlock" ? `?next=${encodeURIComponent(here)}` : "";
           navigate(`/unlock${next}`);
           return;

@@ -65,22 +65,17 @@ export async function authRequired(): Promise<boolean> {
   }
 }
 
-/** Whether this control will proxy a session's *local* roots — `/console/*` and
- * `/chat/*` — from the same public `/health` probe.
- *
- * One bit for both, because it answers one question: whether the control is
- * loopback-bound. `/health` still calls it `console_enabled`, from when the
- * console was the only such root. It is only half the answer either way — the
- * session child has its own `observe.console_enabled` and `observe.chat_enabled`
- * — and each surface must be offered only when both halves agree, so a false
- * here is final. Defaults to false when the probe can't be read: a control whose
- * every submit 404s is worse than no editor and no chat box. */
-export async function localRootsProxied(): Promise<boolean> {
+/** Whether this control will proxy a session's `/chat/*`, from the same public
+ * `/health` probe. It is only half the answer — the session child has its own
+ * `observe.chat_enabled` — and chat must be offered only when both halves agree,
+ * so a false here is final. Defaults to false when the probe can't be read: a
+ * composer whose every submit 404s is worse than no chat box. */
+export async function chatProxied(): Promise<boolean> {
   try {
     const r = await fetch(withBase("/health"));
     if (!r.ok) return false;
     const j = await r.json();
-    return !!j.console_enabled;
+    return !!j.chat_proxied;
   } catch {
     return false;
   }
@@ -90,7 +85,10 @@ export async function localRootsProxied(): Promise<boolean> {
 export function redirectToUnlock(): void {
   // `here` is a router path (so UnlockPage can navigate() back to it), while the
   // assign target is a real URL and needs the prefix.
-  const here = appPath(window.location.pathname);
+  const url = new URL(window.location.href);
+  url.searchParams.delete("token");
+  const query = url.searchParams.toString();
+  const here = appPath(url.pathname) + (query ? `?${query}` : "");
   const next =
     here && here !== "/unlock" ? "?next=" + encodeURIComponent(here) : "";
   window.location.assign(withBase("/unlock") + next);

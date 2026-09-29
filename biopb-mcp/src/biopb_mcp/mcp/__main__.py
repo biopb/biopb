@@ -1,9 +1,9 @@
 """Launcher for the biopb-mcp MCP server.
 
 Under the http transport this process *is* the MCP server: it owns a child
-Jupyter kernel that hosts the napari viewer — on the user's display when one
-is present, else on a launcher-owned Xvfb virtual display (see ``_xvfb``; the
-viewer and screenshots always exist).  Under the (deprecated) stdio transport it is
+Jupyter kernel that holds the agent's namespace and, when the session has one,
+a napari viewer on the user's display (or, opted into by config, on a
+launcher-owned Xvfb virtual display; see ``_xvfb``).  Under the (deprecated) stdio transport it is
 instead a thin bridge: it spawns its own http session child on a dynamic port
 and pumps stdio JSON-RPC to it, reaping it on disconnect (see ``_shim``).  Run
 it with::
@@ -11,29 +11,27 @@ it with::
     biopb-mcp        # console script
     python -m biopb_mcp.mcp
 
-Install the optional dependencies first: ``pip install biopb-mcp[mcp]``.
+The viewer needs the ``napari`` extra: ``pip install biopb-mcp[napari]``.
 """
 
 import argparse
 import atexit
 import logging
 import os
-import shutil
 import signal
 import socket
 import sys
-import tempfile
 
-from biopb._locations import MCP_SESSION_LOG_ENV
+from biopb._locations import (
+    LAUNCH_TOKEN_FIELD,
+    MCP_LAUNCH_TOKEN_ENV,
+    MCP_SESSION_LOG_ENV,
+)
+
+from ._shim import ENV_PORT_REPORT_FILE, ENV_SESSION_ID
 
 logger = logging.getLogger(__name__)
 
-
-# Env var carrying the path of the file a shim-owned child publishes its
-# OS-assigned port to (the shim-owned session model). Presence of this var is also
-# how _serve_http tells a shim-owned child (dynamic port, reported back) from a
-# direct `--transport http` launch (fixed port). Kept in sync with _shim.
-ENV_PORT_REPORT_FILE = "BIOPB_PORT_REPORT_FILE"
 
 # Env var naming this process's own logfile, so it can report it (server_status)
 # and the agent's execute_code can read it from os.environ. Set by whoever
@@ -41,6 +39,12 @@ ENV_PORT_REPORT_FILE = "BIOPB_PORT_REPORT_FILE"
 # a viewer it launches. Bound from the core SDK rather than repeated, since it is
 # now three processes across two packages that must agree on one string.
 ENV_SESSION_LOG = MCP_SESSION_LOG_ENV
+
+# Env var naming the launch this viewer belongs to, set by the control when it
+# spawns one from the dashboard. Echoed into our registry record so that
+# launcher can pick our session out of the registry; absent for every other way
+# a viewer starts (`biopb mcp view` in a terminal), and then simply not recorded.
+ENV_LAUNCH_TOKEN = MCP_LAUNCH_TOKEN_ENV
 
 
 def _report_port(path, port):
@@ -67,30 +71,34 @@ def _report_port(path, port):
         logger.warning("Could not write port report file %s", path, exc_info=True)
 
 
-def _register_view_session(port):
-    """Publish this agentless viewer in the session registry; return its id.
+def _register_session(port, mcp_url, session_id=None, launched_by=None):
+    """Publish this session in the session registry; return its id.
 
     The control lists live sessions and proxies ``/session/<id>/*`` from this
     registry, so a session nobody publishes is a session with no observe page
-    and no dashboard entry. The stdio shim publishes the child it owns
-    (``_shim.spawn_session``); a `biopb mcp view` session has no shim, so it
-    publishes itself.
+    and no dashboard entry. Every session on a dynamic port publishes itself --
+    a shim-owned child under *session_id*, the id its shim minted, a `biopb mcp
+    view` session under a fresh one -- and drops the record in ``_shutdown``.
+    *launched_by* is the control's launch token, echoed so that launcher can
+    recognise *this* session (see MCP_LAUNCH_TOKEN_ENV).
 
-    Best-effort, and broadly caught for the same reason the shim's publish is
-    (biopb/biopb#422): a registry write failure — a serialization error, an
-    unwritable state dir — must cost the viewer its discoverability and nothing
-    else. Returns ``None`` in that case, leaving the caller nothing to
-    de-register.
+    Best-effort, and broadly caught (biopb/biopb#422): a registry write failure
+    -- a serialization error, an unwritable state dir -- must cost the session
+    its discoverability and nothing else. Returns ``None`` in that case, leaving
+    the caller nothing to de-register.
     """
     from biopb import _sessions
 
+    extra = {LAUNCH_TOKEN_FIELD: launched_by} if launched_by else {}
+
     try:
-        session_id = _sessions.new_session_id()
+        session_id = session_id or _sessions.new_session_id()
         _sessions.register(
             session_id,
             port=port,
             pid=os.getpid(),
-            mcp_url=f"http://127.0.0.1:{port}/mcp",
+            mcp_url=mcp_url,
+            **extra,
         )
     except Exception:
         logger.warning("Could not register this session", exc_info=True)
@@ -147,6 +155,12 @@ def _parse_args(argv, default_transport, default_port):
         "still serves /mcp on a dynamic port for optional agent attach. A "
         "user-owned foreground session. Fronted by `biopb mcp view`.",
     )
+    parser.add_argument(
+        "--start-kernel",
+        action="store_true",
+        help="Start the kernel (and any viewer) before serving rather than on "
+        "the first start_kernel tool call. Implied by --view.",
+    )
     return parser.parse_args(argv)
 
 
@@ -159,6 +173,45 @@ def _has_display():
     if sys.platform == "darwin" or os.name == "nt":
         return True
     return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def _decide_viewer(config, view=False):
+    """Whether this session gets a napari viewer, and where it renders.
+
+    Returns ``(reason, virtual)``: *reason* says why there is no viewer (None
+    when there is one), and *virtual* whether it renders on a launcher-owned
+    Xvfb. A viewer needs the config to want one, napari to be installed, and a
+    display -- or, on a display-less host, ``viewer.virtual_display``, which
+    tests use. ``view`` (`biopb mcp view`) is a request for a window a person
+    will look at, so it overrides the config and raises RuntimeError where it
+    cannot have one instead of degrading.
+    """
+    import importlib.util
+
+    from .._config import get_setting
+
+    if not view and not get_setting(config, "viewer.enabled"):
+        return "the viewer is off in the biopb-mcp config (viewer.enabled)", False
+    if not all(importlib.util.find_spec(m) for m in ("napari", "biopb_napari_widget")):
+        reason = "napari is not installed (pip install 'biopb-mcp[napari]')"
+        if view:
+            raise RuntimeError(reason)
+        return reason, False
+    if _has_display():
+        return None, False
+    if view:
+        raise RuntimeError(
+            "no display detected ($DISPLAY/$WAYLAND_DISPLAY are unset); "
+            "`biopb mcp view` opens a viewer window for a human, so it needs a "
+            "real X/Wayland session."
+        )
+    if get_setting(config, "viewer.virtual_display"):
+        return None, True
+    return (
+        "no display detected: $DISPLAY and $WAYLAND_DISPLAY are unset, which "
+        "an MCP client can cause by dropping them on the way in, as Codex CLI does",
+        False,
+    )
 
 
 def _setup_observe(config, agentless=False, on_shutdown=None):
@@ -185,7 +238,6 @@ def _setup_observe(config, agentless=False, on_shutdown=None):
         _observe.configure(
             max_output_chars=get_setting(config, "observe.max_output_chars"),
             poll_interval_ms=get_setting(config, "observe.poll_interval_ms"),
-            console_enabled=get_setting(config, "observe.console_enabled"),
             allowed_origins=get_setting(config, "transport.allowed_origins"),
             allowed_hosts=get_setting(config, "transport.allowed_hosts"),
         )
@@ -196,30 +248,31 @@ def _setup_observe(config, agentless=False, on_shutdown=None):
         return False
 
 
-def _is_agentless_viewer(view, shim_owned):
-    """Whether this session is a viewer a human opened, not a harness's child.
+def _is_agentless(view, shim_owned, port):
+    """Whether this session is one a human opened, not a harness's child.
 
-    Two things follow from it and must not drift apart: such a session publishes
-    *itself* to the registry (nothing else owns its reap), and it is the only
-    kind that gets the built-in chat loop. A shim-owned child is serving an MCP
-    client; a direct ``--transport http`` launch is neither, and publishes no
-    session at all, so it has no observe page for a pane to live on.
+    That is `biopb mcp view`, or a ``--port 0`` http session nobody reaps for
+    it (the dashboard's "new session"). Two things follow from it and must not
+    drift apart: such a session owns its own reap (it serves the stop route),
+    and it is the only kind that gets the built-in chat loop. A shim-owned child
+    is serving an MCP client; a direct ``--transport http`` launch on a fixed
+    port is neither, and publishes no session, so it has no observe page.
     """
-    return bool(view and not shim_owned)
+    return bool(not shim_owned and (view or port == 0))
 
 
 def _setup_chat(config, agentless):
     """Wire up the built-in chat client.
 
-    Switched by ``observe.chat_enabled``, beside the console's. On by default,
+    Switched by ``observe.chat_enabled``. On by default,
     which costs nothing: without a model and key in ``chat`` the pane is inert,
     so it never spends the user's provider credits uninvited. Guarded like
     observe — a chat failure logs and is swallowed rather
     than blocking the MCP server, which is the surface an already-working
     harness depends on. Returns True if mounted.
 
-    *agentless* says whether this session is a `biopb mcp view` viewer rather
-    than a child some MCP client is driving; chat is served only on the former.
+    *agentless* says whether a human opened this session (:func:`_is_agentless`)
+    rather than some MCP client driving it; chat is served only on the former.
 
     The verdict is also published on ``/api/status``
     (:func:`_observe.set_chat_enabled`), so the control's dashboard can label
@@ -289,7 +342,7 @@ def main(argv=None):
         # Agentless foreground viewer (fronted by `biopb mcp view`): serve http
         # with a visible, eagerly-started viewer, regardless of the configured
         # transport. Blocks until Ctrl-C.
-        return _serve_http(config, opts.port, view=True)
+        return _serve_http(config, opts.port, view=True, start_kernel=True)
 
     if opts.transport == "stdio":
         # Bridge mode: keep this process featherweight — the heavy stack
@@ -305,21 +358,29 @@ def main(argv=None):
             return 1
         return 0
 
-    return _serve_http(config, opts.port)
+    return _serve_http(config, opts.port, start_kernel=opts.start_kernel)
 
 
-def _serve_http(config, port, view=False):
+def _serve_http(config, port, view=False, start_kernel=False):
     """Run the real MCP server (streamable-http) in the foreground.
 
     ``view`` selects the agentless-viewer mode (`biopb mcp view`): force a
     visible display, bind a dynamic port and print its URL, and start the
     kernel/viewer eagerly so the window opens immediately instead of on the
-    first ``start_kernel`` tool call.
+    first ``start_kernel`` tool call. ``start_kernel`` does only the last of
+    those, for a session that is to be usable -- attachable from Jupyter, say --
+    the moment it is published.
     """
     from .._config import get_setting
     from . import _app, _scratch, _server, _xvfb
-    from ._cluster import DaskClusterHost
-    from ._kernel import ENV_SCRATCH, KernelHost
+    from ._kernel import ENV_NO_VIEWER, ENV_SCRATCH, KernelHost
+
+    # What our launcher handed *this* process, taken out of the environment the
+    # kernel inherits so a session started from a cell is not mistaken for us.
+    # (The session log path stays: the kernel reports it too.)
+    report_file = os.environ.pop(ENV_PORT_REPORT_FILE, None)
+    minted_id = os.environ.pop(ENV_SESSION_ID, None)
+    launched_by = os.environ.pop(ENV_LAUNCH_TOKEN, None)
 
     # Windows: serve on the Selector event loop, not the default Proactor one
     # (biopb/biopb#383). The Proactor accept loop treats *any* OSError from
@@ -327,8 +388,8 @@ def _serve_http(config, port, view=False):
     # accept -- leaving the server "alive but not serving."
     # The Selector loop's also silences zmq's "Proactor does not implement
     # add_reader" warning, since jupyter_client's kernel channels want exactly
-    # this loop. Safe to set because both child kernel and Dask's `LocalCluster`
-    # uses synchronous `subprocess.Popen`, so the Selector loop's lack of
+    # this loop. Safe to set because the child kernel uses synchronous
+    # `subprocess.Popen`, so the Selector loop's lack of
     # asyncio-subprocess support is fine. Caveat: the Windows Selector loop is
     # select()-based (FD_SETSIZE 512); this single-agent localhost transport
     # handles only the listener plus a handful of /mcp + observe connections,
@@ -338,23 +399,17 @@ def _serve_http(config, port, view=False):
 
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-    # Decide where the kernel's viewer renders. With no display a Qt viewer
-    # hard-aborts the kernel (SIGABRT, not a catchable error): a display-less
-    # Linux host gets a launcher-owned Xvfb virtual display — a real viewer,
-    # working screenshots, no human-visible window (#90) — or, when the binary
-    # is missing, a fail-fast with the install hint. There is no compute-only
-    # fallback. `--view` opens a window *for a human*, so a virtual display is
-    # useless there and it fails fast instead.
+    # Decided here, before the kernel exists: with no display a Qt viewer
+    # hard-aborts the kernel (SIGABRT, not a catchable error). An Xvfb the
+    # config asked for fails fast when the binary is missing.
+    try:
+        no_viewer, virtual = _decide_viewer(config, view)
+    except RuntimeError as exc:
+        logger.error("Cannot open the napari viewer: %s", exc)
+        return 2
     xvfb_proc = None
     virtual_display = None
-    if not _has_display():
-        if view:
-            logger.error(
-                "No display detected ($DISPLAY/$WAYLAND_DISPLAY are unset); "
-                "`biopb mcp view` opens a viewer window for a human, so it "
-                "needs a real X/Wayland session."
-            )
-            return 2
+    if virtual:
         try:
             xvfb_proc, virtual_display = _xvfb.start()
         except RuntimeError as exc:
@@ -367,6 +422,8 @@ def _serve_http(config, port, view=False):
             "display %s (screenshots work; no visible window).",
             virtual_display,
         )
+    elif no_viewer:
+        logger.info("This session has no napari viewer: %s.", no_viewer)
 
     bootstrap_line = "import biopb_mcp.mcp._bootstrap as _b; _b.bootstrap()"
     extra_arguments = [f"--IPKernelApp.exec_lines={bootstrap_line}"]
@@ -389,51 +446,27 @@ def _serve_http(config, port, view=False):
     if virtual_display:
         kernel_env["DISPLAY"] = virtual_display
         kernel_env["BIOPB_VIRTUAL_DISPLAY"] = "1"
+    # No viewer: the kernel skips Qt and napari, and the tools report why.
+    if no_viewer:
+        kernel_env[ENV_NO_VIEWER] = no_viewer
 
     # The kernel inherits this process' fds. fd 1 is not a protocol channel
     # under http, so native Qt/GL/dask/gRPC output is harmless: it lands on
     # the launcher's stdout/stderr — which, for a shim-spawned session child, is
-    # that session's log file (biopb._lifecycle.owned_child.open_child_log).
-
-    # Launcher-owned scratch dir for the dask LocalCluster's worker spill files.
-    # The launcher rmtree's it on shutdown so a group-SIGKILL of the kernel
-    # (which leaves workers no chance to clean up) doesn't leak spill dirs
-    # (issue #13, secondary disk-leak note). Consumed by the session-child-owned
-    # cluster (below) via DaskClusterHost.local_dir.
-    dask_local_dir = tempfile.mkdtemp(prefix="biopb-mcp-dask-")
-
-    def _cleanup_dask_dir():
-        shutil.rmtree(dask_local_dir, ignore_errors=True)
-
-    # Register now (before host.start()) so the scratch dir is still removed on
-    # interpreter exit if start() raises. rmtree(ignore_errors) makes this and
-    # the explicit calls on the os._exit paths harmless if they both run.
-    atexit.register(_cleanup_dask_dir)
-
-    # Session-child-owned dask cluster: spun lazily on the first kernel launch
-    # (from KernelHost._launch, which injects its address), kept warm across
-    # kernel restarts, and closed only on real process exit (the _shutdown
-    # chokepoint + atexit backstop). Detaching the cluster from the kernel avoids
-    # re-spinning N cold workers on every restart_kernel — the dominant restart
-    # cost on Windows (no fork). Construction is cheap (no dask import until
-    # ensure()); atexit is a backstop for exits that skip _shutdown.
-    cluster_host = DaskClusterHost(config, local_dir=dask_local_dir)
-    atexit.register(cluster_host.close)
+    # that session's log file (biopb.lifecycle.owned_child.open_child_log).
 
     host = KernelHost(
         extra_arguments=extra_arguments,
         kernel_name=get_setting(config, "kernel.name"),
         startup_timeout=get_setting(config, "kernel.startup_timeout"),
         execute_timeout=get_setting(config, "kernel.execute_timeout"),
-        busy_lock_timeout=get_setting(config, "kernel.busy_lock_timeout"),
         env=kernel_env,
         watchdog_interval=get_setting(config, "kernel.watchdog_interval"),
         watchdog_max_respawns=get_setting(config, "kernel.watchdog_max_respawns"),
         watchdog_respawn_window=get_setting(config, "kernel.watchdog_respawn_window"),
         parent_death_pipe=get_setting(config, "kernel.parent_death_pipe"),
-        # Session-child-owned dask cluster; _launch calls ensure() and injects
-        # its scheduler address so the kernel attaches instead of spinning its own.
-        cluster_host=cluster_host,
+        # The window-close signal needs a window.
+        window_close_pipe=not no_viewer,
     )
 
     # How to build the scratch kernel a verification runs in: the same config
@@ -445,36 +478,25 @@ def _serve_http(config, port, view=False):
     def _scratch_host():
         scratch_env = dict(kernel_env or os.environ)
         scratch_env[ENV_SCRATCH] = "1"
+        scratch_env[ENV_NO_VIEWER] = "a scratch kernel verifies a workflow"
         return KernelHost(
             extra_arguments=extra_arguments,
             kernel_name=get_setting(config, "kernel.name"),
             startup_timeout=get_setting(config, "kernel.startup_timeout"),
             execute_timeout=get_setting(config, "kernel.execute_timeout"),
-            busy_lock_timeout=get_setting(config, "kernel.busy_lock_timeout"),
             env=scratch_env,
-            # The session kernel's probe asks for `viewer`; this one has none by
-            # design, so it asks for what a verification actually needs.
-            health_probe_code="print('_jobs' in dir() and 'ops' in dir())",
             # No watchdog: for the session kernel a respawn is recovery, for
             # this one death is the verdict (an OOM means the workflow does not
             # fit). No window-close pipe: there is no window.
             watchdog_interval=0,
             window_close_pipe=False,
             parent_death_pipe=get_setting(config, "kernel.parent_death_pipe"),
-            cluster_host=cluster_host,
         )
 
     _scratch.set_host_factory(_scratch_host)
 
-    # Now that the kernel host exists, let the cluster's idle reaper ask it
-    # whether a kernel is attached — the one thing that makes a teardown safe.
-    cluster_host.set_kernel_alive(host.is_alive)
-    cluster_host.start_reaper()
     _app.set_kernel_host(host)
     _app.set_promote_after(get_setting(config, "kernel.promote_after"))
-    # Advertise the curated-skills catalog only when it is enabled (off by
-    # default) — mirrors what list_skills / the skill:// resource actually serve.
-    _app.set_skills_enabled(get_setting(config, "services.skills_enabled"))
 
     # Tell server_status where this process's log lives, so an agent can find it.
     #   * shim session -> the per-session file (BIOPB_MCP_SESSION_LOG, set by the
@@ -493,44 +515,52 @@ def _serve_http(config, port, view=False):
         session_log = None
     _app.set_session_log_path(session_log)
 
-    # On-demand start: the kernel is NOT launched here. The server stays cheap
-    # and idle (no viewer window pops, no Qt abort on a display-less server)
-    # until an agent calls the `start_kernel` tool, which drives
+    # On-demand start (unless `start_kernel`, below): the kernel is NOT
+    # launched here. The server stays cheap and idle (no viewer window pops, no
+    # Qt abort on a display-less server) until an agent calls the
+    # `start_kernel` tool, which drives
     # host.ensure_started() — a synchronous bring-up that blocks that one tool
     # call until the kernel is ready. Other tool calls landing before then get a
     # structured "not started" status (see KernelHost.execute).
-    logger.info(
-        "Ready. The napari kernel (and viewer window) starts on the first "
-        "start_kernel call."
-    )
+    if not start_kernel:
+        logger.info(
+            "Ready. The kernel (and any viewer window) starts on the first "
+            "start_kernel call."
+        )
 
     # Reap the kernel on exit even if it is still mid-bringup when we stop
     # (a no-op safe on an idle, never-started host).
     atexit.register(host.shutdown)
 
-    # Two foreground modes bind a *dynamic* port and report it back rather than
-    # binding the configured fixed port:
+    # Three modes bind their own socket and publish the session:
     #   * the de-daemonized shim-owned child — the shim set
     #     BIOPB_PORT_REPORT_FILE and passed --port 0; it reaps us directly (own
     #     process group / Job Object) and we report the OS-assigned port back;
     #   * the agentless `biopb mcp view` viewer — a user-owned Ctrl-C session; it
-    #     prints its URL instead.
+    #     prints its URL instead;
+    #   * an agentless ``--port 0`` http session (the dashboard's "new
+    #     session"), which prints its URL like the viewer.
     # A direct `--transport http` binds the configured port. The POSIX signal
     # handlers below reap our kernel gracefully in every mode.
-    report_file = os.environ.get(ENV_PORT_REPORT_FILE)
     shim_owned = bool(report_file)
-    dynamic_port = shim_owned or view
+    agentless = _is_agentless(view, shim_owned, port)
+    dynamic_port = shim_owned or agentless
     listen_sock = None
     if dynamic_port:
         listen_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         listen_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listen_sock.bind(("127.0.0.1", port))  # port 0 -> OS assigns one
+        # Listening from here on, so a connection that arrives before uvicorn
+        # starts accepting (the shim's, the control's) queues instead of being
+        # refused.
+        listen_sock.listen()
         port = listen_sock.getsockname()[1]
+        mcp_url = f"http://127.0.0.1:{port}/mcp"
         if shim_owned:
             _report_port(report_file, port)
-        else:  # view
+        else:
             print(
-                f"biopb-mcp viewer serving on http://127.0.0.1:{port}/mcp "
+                f"biopb-mcp session serving on {mcp_url} "
                 "(Ctrl-C to stop; an agent may attach at this URL).",
                 flush=True,
             )
@@ -540,28 +570,9 @@ def _serve_http(config, port, view=False):
     # even on a Ctrl-C that arrives during the viewer's bring-up.
     session_id = None
 
-    def _stop_acp_agent():
-        """Reap the chat pane's ACP harness and remove its scratch dir.
-
-        Guarded and imported late for the same reason the chat mount is: an
-        engine that was never used, or a module that failed to import, must not
-        be able to stop this process from exiting.
-        """
-        try:
-            from . import _chat_acp
-
-            _chat_acp.stop_sync()
-            _chat_acp.cleanup_cwd()
-        except Exception:  # noqa: BLE001 - teardown is best-effort
-            logger.debug("stopping the ACP agent failed", exc_info=True)
-
-    # Backstop for the exits that skip _shutdown, matching the dask cluster's.
-    atexit.register(_stop_acp_agent)
-
     def _shutdown(reason):
         """One teardown for every deliberate-exit path — POSIX signals, the
-        server loop returning: reap the kernel, close the session-child-owned
-        dask cluster, remove our scratch, exit.
+        server loop returning: reap the kernel, remove our scratch, exit.
 
         Skips Python finalization: this process still has a live asyncio/epoll
         event-loop thread and the numpy OpenBLAS worker pool running, and
@@ -573,22 +584,13 @@ def _serve_http(config, port, view=False):
         # Drop the routing record before anything else, so a control stops
         # routing here while this process can still refuse a connection cleanly
         # rather than after it has stopped answering. Teardown and
-        # de-registration are one path, as they are in the shim's _reap_session;
-        # the registry's own pid-liveness prune is the backstop for a kill this
-        # never runs for.
+        # de-registration are one path; the registry's own pid-liveness prune is
+        # the backstop for a kill this never runs for.
         _unregister_session(session_id)
-        # Before the kernel: an ACP harness holds an MCP session against this
-        # server, so it is a client, and clients go before the thing they are
-        # attached to. Cheap and idempotent when chat never ran.
-        _stop_acp_agent()
         host.shutdown()
-        # After the kernel is reaped (no clients left attached): stop the
-        # session-child-owned cluster, then rmtree its now-idle spill dir. This
-        # is the only path that closes the cluster — kernel restart/reap leaves
-        # it warm. The Xvfb display outlives kernel restarts the same way, so
-        # it too goes down only here (its X clients died with the kernel).
-        cluster_host.close()
-        _cleanup_dask_dir()
+        # Any dask cluster a cell spun went with the kernel's process group. The
+        # Xvfb display is the one thing here that outlives a kernel restart, so
+        # it goes down only on this path (its X clients died with the kernel).
         _xvfb.stop(xvfb_proc)
         os._exit(0)
 
@@ -597,12 +599,6 @@ def _serve_http(config, port, view=False):
 
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
-
-    # Whether this session owns its own reap. Two things hang off it, and the
-    # single expression keeps them from drifting: the built-in chat loop, and
-    # the stop route (a shim-owned child is reaped by its shim, so ending it
-    # here would leave that shim bridging to a dead process).
-    agentless = _is_agentless_viewer(view, shim_owned)
 
     # Opt-in web "observe" UI. Set up before the (blocking) transport run:
     # custom routes are read when the streamable-http app is built. `_shutdown`
@@ -616,25 +612,25 @@ def _serve_http(config, port, view=False):
     # built-in loop is not for.
     _setup_chat(config, agentless=agentless)
 
-    if view:
-        # Agentless viewer: bring the window up now (the human wants it
-        # immediately) rather than waiting for a start_kernel tool call. Same
-        # synchronous bring-up the start_kernel tool drives.
-        logger.info("Opening the napari viewer (Ctrl-C to stop)...")
-        try:
-            host.ensure_started()
-        except Exception:
-            logger.exception("Failed to open the viewer; exiting")
+    if start_kernel:
+        # Wanted usable now -- the window up, a kernel a Jupyter client can
+        # attach to -- rather than on a start_kernel tool call. Same synchronous
+        # bring-up that tool drives.
+        logger.info("Starting the kernel (Ctrl-C to stop)...")
+        state = host.ensure_started()
+        if state["state"] == "error":
+            # Exit rather than serve a broken kernel: no client is attached yet
+            # to retry it, and a launcher that sees us die unregistered reports
+            # our log instead of a session that cannot run anything.
+            logger.error("The kernel did not start: %s", state["error"])
             return 1  # atexit reaps the kernel/cluster and cleans the spill dir
 
-    # Only the agentless viewer registers *itself*: a shim-owned child is
-    # published by the shim that owns its reap (and so its de-registration), and
-    # a direct `--transport http` launch binds the configured fixed port its
-    # operator already knows. Done last, with the kernel up and the serve loop
-    # the next statement, so a record implies a session that is all but
-    # answering.
-    if _is_agentless_viewer(view, shim_owned):
-        session_id = _register_view_session(port)
+    # A session on a dynamic port publishes itself; a direct `--transport http`
+    # launch binds the configured fixed port its operator already knows. Done
+    # last, with any eager kernel up and the serve loop the next statement, so
+    # a record implies a session that is all but answering.
+    if dynamic_port:
+        session_id = _register_session(port, mcp_url, minted_id, launched_by)
 
     _server.run(
         port,

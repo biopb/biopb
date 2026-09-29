@@ -12,12 +12,14 @@ it wrong, which is the point of running against a real session at all.
 
 "Not an MCP client" is a claim about the **wire**, and reading it as a claim
 about *capability* is what cost the benchmark a measurement. An MCP server also
-exposes **resources** — `skill://<id>`, `guide://<name>` — and a resource has no
-function-calling equivalent, so translating tools alone handed the agent uris it
-had no verb to dereference: the skill *body* was unreachable, and the arms that
-were supposed to have the procedure were running on catalog metadata.
-:data:`._session.CLIENT_TOOLS` supplies the two verbs every shipped client
-already has. They arrive here as ordinary `ToolSpec`s and translate like the
+exposes **resources**, and a resource has no function-calling equivalent, so
+translating tools alone handed the agent uris it had no verb to dereference: the
+procedure *body* was unreachable, and the arms that were supposed to have it
+were running on catalog metadata. The knowledge store is ordinary tools now, so
+nothing the agent needs sits behind that gap -- but
+:data:`._session.CLIENT_TOOLS` still supplies the two verbs every shipped client
+has, so a resource added later does not reopen it. They arrive here as ordinary
+`ToolSpec`s and translate like the
 rest.
 
 The one liberty taken is dropping keys some providers reject in a function

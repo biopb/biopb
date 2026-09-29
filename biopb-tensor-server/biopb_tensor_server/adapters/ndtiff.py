@@ -246,7 +246,7 @@ class NdTiffAdapter(TensorAdapter):
         both to the adapter.
 
         Args:
-            source: SourceConfig with url, source_id, dim_labels
+            source: SourceConfig with url, source_id
             credentials_config: Optional CredentialsConfig for remote authentication
 
         Returns:
@@ -262,7 +262,6 @@ class NdTiffAdapter(TensorAdapter):
             dataset=reopen(),
             source_id=source.source_id or "",
             source_url=str(source.url),
-            dim_labels=source.dim_labels,
             reopen=reopen,
         )
 
@@ -303,7 +302,6 @@ class NdTiffAdapter(TensorAdapter):
         dataset: NDTiffDataset,
         source_id: str,
         source_url: str,
-        dim_labels: Optional[List[str]] = None,
         io_lock: Optional[threading.Lock] = None,
         reopen: Optional[Callable[[], NDTiffDataset]] = None,
     ):
@@ -313,7 +311,6 @@ class NdTiffAdapter(TensorAdapter):
             dataset: NDTiffDataset instance (the initial open handle)
             source_id: Unique identifier for this data source
             source_url: URL or path to the data source
-            dim_labels: Optional dimension labels (if None, inferred from dataset)
             io_lock: Optional thread lock for IO serialization
             reopen: Optional zero-arg thunk that reopens the dataset. When set (the
                 ``create_from_config`` path), the reaper may close the acquisition
@@ -359,17 +356,12 @@ class NdTiffAdapter(TensorAdapter):
             "column": "x",
         }
 
-        # Build dim_labels
-        if dim_labels:
-            self.dim_labels = dim_labels
-        else:
-            # Infer from axes - last two are always y, x
-            self.dim_labels = []
-            for ax in self._axes[:-2]:  # Exclude row, column
-                label = axis_alias.get(ax.lower(), ax.lower()[0])
-                self.dim_labels.append(label)
-            # Add spatial dims
-            self.dim_labels.extend(["y", "x"])
+        # Infer from axes - last two are always y, x
+        self.dim_labels = []
+        for ax in self._axes[:-2]:  # Exclude row, column
+            label = axis_alias.get(ax.lower(), ax.lower()[0])
+            self.dim_labels.append(label)
+        self.dim_labels.extend(["y", "x"])
 
         # Get shape and dtype from dask array
         self._shape = list(self._dask_arr.shape)

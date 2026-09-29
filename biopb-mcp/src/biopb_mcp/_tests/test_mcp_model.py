@@ -231,6 +231,66 @@ class TestCall:
         with pytest.raises(RuntimeError, match="context_length_exceeded"):
             asyncio.run(_model.make_model(config)([], []))
 
+    def test_a_4xx_names_the_shape_of_what_it_sent(self, config, state_home):
+        # The provider names the field it wanted, never the message that
+        # lacked it, and the thread is re-sent whole every turn -- so the
+        # shape is what says which turn drew the rejection (biopb/biopb#990).
+        write_credential("sk-x", _model.KEY_NAME)
+        _FakeClient.reply = _response(
+            status=400, text="reasoning_content must be passed back"
+        )
+        messages = [
+            {"role": "user", "content": "segment the nuclei"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{"id": "a"}, {"id": "b"}],
+            },
+            {"role": "tool", "tool_call_id": "a", "content": "ok"},
+        ]
+        with pytest.raises(RuntimeError) as caught:
+            asyncio.run(_model.make_model(config)(messages, []))
+
+        text = str(caught.value)
+        assert "reasoning_content must be passed back" in text
+        assert "last 3 of 3 messages sent" in text
+        assert "tool_calls=2" in text
+        shape = text.split("messages sent:")[1]
+        assert "reasoning_content" not in shape, (
+            "the assistant turn had no such key; the shape must not invent one"
+        )
+
+    def test_the_shape_never_carries_content(self, config, state_home):
+        # The whole reason this is safe to put in front of a user: keys and
+        # counts, never what the user typed or what a tool returned.
+        write_credential("sk-x", _model.KEY_NAME)
+        _FakeClient.reply = _response(status=400, text="bad request")
+        messages = [
+            {"role": "user", "content": "my unpublished experiment"},
+            {"role": "tool", "tool_call_id": "a", "content": "patient_07.nd2"},
+        ]
+        with pytest.raises(RuntimeError) as caught:
+            asyncio.run(_model.make_model(config)(messages, []))
+
+        text = str(caught.value)
+        assert "my unpublished experiment" not in text
+        assert "patient_07.nd2" not in text
+        assert "keys=[content]" in text
+
+    def test_a_5xx_is_the_providers_fault_not_the_threads(self, config, state_home):
+        # Nothing about the payload drew a 502, so its shape is noise between
+        # the reader and the provider's words.
+        write_credential("sk-x", _model.KEY_NAME)
+        _FakeClient.reply = _response(status=502, text="upstream unavailable")
+        with pytest.raises(RuntimeError) as caught:
+            asyncio.run(
+                _model.make_model(config)([{"role": "user", "content": "hi"}], [])
+            )
+
+        text = str(caught.value)
+        assert "upstream unavailable" in text
+        assert "messages sent" not in text
+
     def test_an_image_refusal_is_told_apart_from_a_400_it_cannot_act_on(
         self, config, state_home
     ):
@@ -276,3 +336,216 @@ class TestCall:
         _FakeClient.reply = _response(payload={"choices": []})
         with pytest.raises(RuntimeError, match="no choices"):
             asyncio.run(_model.make_model(config)([], []))
+
+
+class TestResponsesApi:
+    """``chat.api = "responses"``: the other OpenAI shape, translated here.
+
+    The loop is not part of this. It speaks chat-completions in both
+    directions and never learns which endpoint answered, so what is under test
+    is the translation -- and that the default is unchanged, since a config
+    that says nothing must keep talking to the endpoint it always did.
+    """
+
+    @pytest.fixture(autouse=True)
+    def stub(self, monkeypatch):
+        _FakeClient.calls = []
+        _FakeClient.gets = []
+        monkeypatch.setattr(_model.httpx, "AsyncClient", _FakeClient)
+        yield
+
+    @pytest.fixture
+    def config(self, config):
+        config["chat"]["api"] = "responses"
+        return config
+
+    def test_the_default_is_still_chat_completions(self):
+        # A gateway that serves both disagrees per model, so this is a choice
+        # nobody should make by upgrading.
+        assert McpConfig().chat.api == "completions"
+
+    def test_the_route_and_the_payload(self, config, state_home):
+        write_credential("sk-x", _model.KEY_NAME)
+        _FakeClient.reply = _response(
+            payload={
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "reasoning",
+                        "encrypted_content": "opaque",
+                    },
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "hi"}],
+                    },
+                ],
+            }
+        )
+        out = asyncio.run(
+            _model.make_model(config)(
+                [{"role": "user", "content": "q"}],
+                [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "run",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                    }
+                ],
+            )
+        )
+        # Reasoning is dropped; the text is the answer.
+        assert out == {"role": "assistant", "content": "hi"}
+
+        (call,) = _FakeClient.calls
+        assert call["url"] == "https://api.openai.com/v1/responses"
+        assert call["json"]["input"] == [{"role": "user", "content": "q"}]
+        assert "messages" not in call["json"]
+        # Flattened out of the `function` envelope, and non-strict: strict mode
+        # rejects the open schemas biopb's tools publish.
+        assert call["json"]["tools"] == [
+            {
+                "type": "function",
+                "name": "run",
+                "description": "",
+                "parameters": {"type": "object", "properties": {}},
+                "strict": False,
+            }
+        ]
+        # The thread is re-sent whole every turn, so retention buys nothing and
+        # would leave the conversation with the provider.
+        assert call["json"]["store"] is False
+
+    def test_tool_calls_survive_the_round_trip(self, config, state_home):
+        # The loop keys a tool result to the id it was given, so the call_id
+        # has to come back as `id` -- otherwise every result strands its call.
+        write_credential("sk-x", _model.KEY_NAME)
+        _FakeClient.reply = _response(
+            payload={
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "function_call",
+                        "id": "item-1",
+                        "call_id": "call-1",
+                        "name": "execute_code",
+                        "arguments": '{"code": "1+1"}',
+                    }
+                ],
+            }
+        )
+        out = asyncio.run(_model.make_model(config)([], []))
+        assert out["tool_calls"] == [
+            {
+                "id": "call-1",
+                "type": "function",
+                "function": {"name": "execute_code", "arguments": '{"code": "1+1"}'},
+            }
+        ]
+
+        # ...and the loop's own spelling of that exchange goes back out as the
+        # two item types the Responses API uses instead of messages.
+        asyncio.run(
+            _model.make_model(config)(
+                [
+                    {
+                        "role": "assistant",
+                        "content": "running it",
+                        "tool_calls": out["tool_calls"],
+                    },
+                    {"role": "tool", "tool_call_id": "call-1", "content": "2"},
+                ],
+                [],
+            )
+        )
+        assert _FakeClient.calls[-1]["json"]["input"] == [
+            {"role": "assistant", "content": "running it"},
+            {
+                "type": "function_call",
+                "call_id": "call-1",
+                "name": "execute_code",
+                "arguments": '{"code": "1+1"}',
+            },
+            {"type": "function_call_output", "call_id": "call-1", "output": "2"},
+        ]
+
+    def test_an_image_changes_spelling(self, config, state_home):
+        write_credential("sk-x", _model.KEY_NAME)
+        _FakeClient.reply = _response(
+            payload={"status": "completed", "output": [{"type": "message"}]}
+        )
+        asyncio.run(
+            _model.make_model(config)(
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "(image)"},
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": "data:image/png;base64,x"},
+                            },
+                        ],
+                    }
+                ],
+                [],
+            )
+        )
+        (call,) = _FakeClient.calls
+        assert call["json"]["input"] == [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "(image)"},
+                    # A string, where chat-completions nests it in an object.
+                    {"type": "input_image", "image_url": "data:image/png;base64,x"},
+                ],
+            }
+        ]
+
+    def test_a_200_that_did_not_complete_is_an_error(self, config, state_home):
+        # This shape reports failure in the body, so a status nobody read would
+        # reach the pane as an empty answer from a turn that never ran.
+        write_credential("sk-x", _model.KEY_NAME)
+        _FakeClient.reply = _response(
+            payload={
+                "status": "failed",
+                "error": {"message": "model overloaded"},
+                "output": [],
+            }
+        )
+        with pytest.raises(RuntimeError, match="model overloaded"):
+            asyncio.run(_model.make_model(config)([], []))
+
+    def test_no_output_is_an_error_not_an_empty_answer(self, config, state_home):
+        write_credential("sk-x", _model.KEY_NAME)
+        _FakeClient.reply = _response(payload={"status": "completed", "output": []})
+        with pytest.raises(RuntimeError, match="no output"):
+            asyncio.run(_model.make_model(config)([], []))
+
+
+class TestWrongRoute:
+    """The failure a wrong ``base_url``/``chat.api`` actually produces."""
+
+    @pytest.fixture(autouse=True)
+    def stub(self, monkeypatch):
+        _FakeClient.calls = []
+        _FakeClient.gets = []
+        monkeypatch.setattr(_model.httpx, "AsyncClient", _FakeClient)
+        yield
+
+    def test_a_web_page_is_diagnosed_not_quoted(self, config, state_home):
+        # A base_url carrying the route already ("…/v1/chat/completions") gets
+        # the appended one landing on the gateway's website. Quoting 500 bytes
+        # of its 404 markup names neither the problem nor the fix.
+        write_credential("sk-x", _model.KEY_NAME)
+        config["chat"]["base_url"] = "https://opencode.ai/zen/v1/chat/completions"
+        _FakeClient.reply = _response(
+            status=404,
+            text='<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">',
+        )
+        with pytest.raises(RuntimeError) as caught:
+            asyncio.run(_model.make_model(config)([], []))
+        assert "chat.base_url" in str(caught.value)
+        assert "<!DOCTYPE" not in str(caught.value)

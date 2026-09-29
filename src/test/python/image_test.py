@@ -5,13 +5,13 @@ import dask.array as da
 import numpy as np
 import pytest
 from biopb.image import BinData, ImageData, Pixels
-from biopb.image.utils import (
+from biopb.image._utils import (
     _canonicalize_dtype,
+    _deserialize_to_numpy,
     _np_from_pb,
     _pb_from_np,
     _serialize_from_numpy,
     deserialize_image_data,
-    deserialize_to_numpy,
     get_image_data_dim_labels,
     get_image_data_shape,
     normalize_array_dims,
@@ -22,7 +22,9 @@ from biopb.image.utils import (
 def test_import():
     import biopb.image as proto
 
-    assert proto.__version__
+    # The version lives on the distribution's top-level package, not here
+    # (biopb/biopb#998), so this checks the package is populated instead.
+    assert proto.OpsStub is not None
 
 
 def test_canonicalize_dtype():
@@ -81,7 +83,7 @@ def test_roundtrip_uint8():
     """Test round-trip serialization for uint8."""
     img = np.random.randint(0, 256, size=(64, 64, 3), dtype=np.uint8)
     pixels = _serialize_from_numpy(img)
-    img_new = deserialize_to_numpy(pixels)
+    img_new = _deserialize_to_numpy(pixels)
     assert img_new.shape == (1, 64, 64, 3)
     assert img_new.dtype == np.uint8
     np.testing.assert_array_equal(img_new.squeeze(), img)
@@ -91,7 +93,7 @@ def test_roundtrip_uint16():
     """Test round-trip serialization for uint16."""
     img = np.random.randint(0, 65536, size=(64, 64, 3), dtype=np.uint16)
     pixels = _serialize_from_numpy(img)
-    img_new = deserialize_to_numpy(pixels)
+    img_new = _deserialize_to_numpy(pixels)
     assert img_new.shape == (1, 64, 64, 3)
     assert img_new.dtype == np.uint16
     np.testing.assert_array_equal(img_new.squeeze(), img)
@@ -101,7 +103,7 @@ def test_roundtrip_int16():
     """Test round-trip serialization for int16."""
     img = np.random.randint(-1000, 1000, size=(64, 64, 3), dtype=np.int16)
     pixels = _serialize_from_numpy(img)
-    img_new = deserialize_to_numpy(pixels)
+    img_new = _deserialize_to_numpy(pixels)
     assert img_new.shape == (1, 64, 64, 3)
     assert img_new.dtype == np.int16
     np.testing.assert_array_equal(img_new.squeeze(), img)
@@ -111,7 +113,7 @@ def test_roundtrip_float32():
     """Test round-trip serialization for float32."""
     img = np.random.random(size=(64, 64, 3)).astype(np.float32)
     pixels = _serialize_from_numpy(img)
-    img_new = deserialize_to_numpy(pixels)
+    img_new = _deserialize_to_numpy(pixels)
     assert img_new.shape == (1, 64, 64, 3)
     assert img_new.dtype == np.float32
     np.testing.assert_array_almost_equal(img_new.squeeze(), img)
@@ -121,7 +123,7 @@ def test_roundtrip_float64():
     """Test round-trip serialization for float64."""
     img = np.random.random(size=(64, 64, 3)).astype(np.float64)
     pixels = _serialize_from_numpy(img)
-    img_new = deserialize_to_numpy(pixels)
+    img_new = _deserialize_to_numpy(pixels)
     assert img_new.shape == (1, 64, 64, 3)
     assert img_new.dtype == np.float64
     np.testing.assert_array_almost_equal(img_new.squeeze(), img)
@@ -147,21 +149,21 @@ def test_endianness_conflict_warning():
 
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
-        deserialize_to_numpy(conflicting_pixels)
+        _deserialize_to_numpy(conflicting_pixels)
         assert len(w) == 1
         assert "Endianness conflict" in str(w[0].message)
 
 
 def test_utils():
     import numpy as np
-    from biopb.image.utils import _serialize_from_numpy, deserialize_to_numpy
+    from biopb.image._utils import _deserialize_to_numpy, _serialize_from_numpy
 
     img = np.random.random(size=[64, 64, 3])
     img = (img * 65536).astype("<u2")
 
     pixels = _serialize_from_numpy(img)
 
-    img_new = deserialize_to_numpy(pixels)
+    img_new = _deserialize_to_numpy(pixels)
 
     assert img_new.shape == (1, 64, 64, 3)
     assert img_new.dtype.str == "<u2"
@@ -171,7 +173,7 @@ def test_np_index_order_default():
     """Test that default np_index_order produces ZYXC order."""
     img = np.random.randint(0, 256, size=(32, 32, 3), dtype=np.uint8)
     pixels = _serialize_from_numpy(img)
-    img_new = deserialize_to_numpy(pixels)
+    img_new = _deserialize_to_numpy(pixels)
     # Default is ZYXC, so shape should be (Z, Y, X, C) = (1, 32, 32, 3)
     assert img_new.shape == (1, 32, 32, 3)
 
@@ -182,15 +184,15 @@ def test_np_index_order_custom():
     pixels = _serialize_from_numpy(img)
 
     # Test CZYX order (C, Z, Y, X)
-    img_czyx = deserialize_to_numpy(pixels, np_index_order="CZYX")
+    img_czyx = _deserialize_to_numpy(pixels, np_index_order="CZYX")
     assert img_czyx.shape == (3, 1, 32, 32)
 
     # Test XYZC order (X, Y, Z, C)
-    img_xyzc = deserialize_to_numpy(pixels, np_index_order="XYZC")
+    img_xyzc = _deserialize_to_numpy(pixels, np_index_order="XYZC")
     assert img_xyzc.shape == (32, 32, 1, 3)
 
     # Test YXCZ order
-    img_yxcz = deserialize_to_numpy(pixels, np_index_order="YXCZ")
+    img_yxcz = _deserialize_to_numpy(pixels, np_index_order="YXCZ")
     assert img_yxcz.shape == (32, 32, 3, 1)
 
 
@@ -200,13 +202,13 @@ def test_np_index_order_invalid():
     pixels = _serialize_from_numpy(img)
 
     with pytest.raises(ValueError, match="np_index_order"):
-        deserialize_to_numpy(pixels, np_index_order="ABCD")
+        _deserialize_to_numpy(pixels, np_index_order="ABCD")
 
     with pytest.raises(ValueError, match="np_index_order"):
-        deserialize_to_numpy(pixels, np_index_order="ZYX")  # missing C
+        _deserialize_to_numpy(pixels, np_index_order="ZYX")  # missing C
 
     with pytest.raises(ValueError, match="np_index_order"):
-        deserialize_to_numpy(pixels, np_index_order="ZYXCC")  # duplicate C
+        _deserialize_to_numpy(pixels, np_index_order="ZYXCC")  # duplicate C
 
 
 def test_serialize_np_index_order():
@@ -235,12 +237,12 @@ def test_deserialize_5d_with_t():
     pixels = _serialize_from_numpy(img, np_index_order="TZYXC")
 
     # Deserialize with 5D output
-    img_5d = deserialize_to_numpy(pixels, np_index_order="TZYXC")
+    img_5d = _deserialize_to_numpy(pixels, np_index_order="TZYXC")
     assert img_5d.shape == (2, 32, 32, 3, 4)
 
     # Deserialize with 4D output should fail (T is not singleton)
     with pytest.raises(ValueError, match="Dimension T has size"):
-        deserialize_to_numpy(pixels, np_index_order="ZYXC")
+        _deserialize_to_numpy(pixels, np_index_order="ZYXC")
 
 
 def test_deserialize_2d_output():
@@ -250,7 +252,7 @@ def test_deserialize_2d_output():
     pixels = _serialize_from_numpy(img)  # Z=1, C=1, T=1
 
     # Deserialize to 2D
-    img_2d = deserialize_to_numpy(pixels, np_index_order="YX")
+    img_2d = _deserialize_to_numpy(pixels, np_index_order="YX")
     assert img_2d.shape == (32, 64)
 
 
@@ -285,14 +287,14 @@ def test_serialize_transpose_dimension_order():
     assert pixels.size_t == 1
 
     # Deserialize back with matching np_index_order
-    img_back = deserialize_to_numpy(pixels, np_index_order="ZYX")
+    img_back = _deserialize_to_numpy(pixels, np_index_order="ZYX")
 
     # Verify the data round-trips correctly
     assert img_back.shape == img.shape
     np.testing.assert_array_equal(img_back, img)
 
     # Also test with different np_index_order to verify transpose worked
-    img_back_xyz = deserialize_to_numpy(pixels, np_index_order="XYZ")
+    img_back_xyz = _deserialize_to_numpy(pixels, np_index_order="XYZ")
     assert img_back_xyz.shape == (x_size, y_size, z_size)
     # Verify specific values: at position (x,y,z), we should get z*10000 + y*100 + x
     for z in range(z_size):
@@ -328,21 +330,10 @@ def test_serialize_transpose_with_channel():
         assert pixels.size_c == c_size
 
         # Round-trip
-        img_back = deserialize_to_numpy(pixels, np_index_order="ZYXC")
+        img_back = _deserialize_to_numpy(pixels, np_index_order="ZYXC")
         np.testing.assert_array_equal(
             img_back, img, err_msg=f"Round-trip failed for dimension_order={out_order}"
         )
-
-
-def test_singleton_t_deprecation_warning():
-    """Test that singleton_t=False raises deprecation warning."""
-    img = np.random.randint(0, 256, size=(32, 32, 3), dtype=np.uint8)
-    pixels = _serialize_from_numpy(img)
-
-    with warnings.catch_warnings(record=True) as w:
-        warnings.simplefilter("always")
-        deserialize_to_numpy(pixels, singleton_t=False, np_index_order="ZYXCT")
-        assert any(issubclass(warn.category, DeprecationWarning) for warn in w)
 
 
 def test_serialize_non_contiguous_array():
@@ -368,7 +359,7 @@ def test_serialize_non_contiguous_array():
     assert pixels.size_z == 2
 
     # Round-trip should work correctly
-    img_back = deserialize_to_numpy(pixels, np_index_order="XYZ")
+    img_back = _deserialize_to_numpy(pixels, np_index_order="XYZ")
     np.testing.assert_array_equal(img_back, img_f)
 
 
@@ -388,7 +379,7 @@ def test_serialize_f_order_input():
     assert pixels.size_c == 1
 
     # Round-trip
-    img_back = deserialize_to_numpy(pixels, np_index_order="ZYXC")
+    img_back = _deserialize_to_numpy(pixels, np_index_order="ZYXC")
     np.testing.assert_array_equal(img_back, img)
 
 
@@ -414,29 +405,10 @@ def test_deserialize_image_data_eager_data():
 def test_deserialize_image_data_lazy_data():
     """Test deserialize_image_data with lazy_data (SerializedTensor)."""
     from biopb.image import ImageData
-    from biopb.tensor.descriptor_pb2 import TensorDescriptor
-    from biopb.tensor.serialized_pb2 import SerializedEndpoint, SerializedTensor
-    from biopb.tensor.ticket_pb2 import ChunkBounds, TensorTicket
+    from biopb.tensor.serialized_pb2 import SerializedTensor
 
-    # Create a mock SerializedTensor
-    descriptor = TensorDescriptor(
-        array_id="test-tensor",
-        shape=[64, 64],
-        dtype="uint8",
-        chunk_shape=[32, 32],
-    )
-
-    serialized_tensor = SerializedTensor(
-        tensor_descriptor=descriptor,
-        location="grpc://localhost:8815",
-        auth_token="",
-        endpoints=[
-            SerializedEndpoint(
-                ticket=TensorTicket(chunk_id=b"chunk-0"),
-                chunk_bounds=ChunkBounds(start=[0, 0], stop=[32, 32]),
-            ),
-        ],
-    )
+    # A handle; its plan is opaque here since reconstruction is mocked below.
+    serialized_tensor = SerializedTensor(location="grpc://localhost:8815")
 
     image_data = ImageData(lazy_data=serialized_tensor)
 
@@ -488,7 +460,7 @@ def test_deserialize_image_data_no_data_raises():
 
 def test_serialize_from_numpy_to_image_data():
     """Test serialize_from_numpy_to_image_data."""
-    from biopb.image.utils import serialize_from_numpy_to_image_data
+    from biopb.image._utils import serialize_from_numpy_to_image_data
 
     img = np.random.randint(0, 256, size=(32, 32, 3), dtype=np.uint8)
 
@@ -504,7 +476,7 @@ def test_serialize_from_numpy_to_image_data():
 
 def test_serialize_from_numpy_to_image_data_with_dim_labels():
     """Test serialize_from_numpy_to_image_data with dim_labels."""
-    from biopb.image.utils import serialize_from_numpy_to_image_data
+    from biopb.image._utils import serialize_from_numpy_to_image_data
 
     img = np.random.randint(0, 256, size=(32, 32, 3), dtype=np.uint8)
 
@@ -601,19 +573,9 @@ def test_pb_from_np_and_np_from_pb():
 def test_deserialize_image_data_cache_bytes_parameter():
     """Test deserialize_image_data with cache_bytes parameter for lazy_data."""
     from biopb.image import ImageData
-    from biopb.tensor.descriptor_pb2 import TensorDescriptor
     from biopb.tensor.serialized_pb2 import SerializedTensor
 
-    descriptor = TensorDescriptor(
-        array_id="test-tensor",
-        shape=[64, 64],
-        dtype="uint8",
-    )
-
-    serialized_tensor = SerializedTensor(
-        tensor_descriptor=descriptor,
-        location="grpc://localhost:8815",
-    )
+    serialized_tensor = SerializedTensor(location="grpc://localhost:8815")
 
     image_data = ImageData(lazy_data=serialized_tensor)
 

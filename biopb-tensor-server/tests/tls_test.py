@@ -16,6 +16,8 @@ import time
 import pyarrow.flight as flight
 import pytest
 
+from tests import catalog_server, register_and_catalog
+
 
 def _zarr_available() -> bool:
     return importlib.util.find_spec("zarr") is not None
@@ -25,30 +27,41 @@ def _crypto_available() -> bool:
     return importlib.util.find_spec("cryptography") is not None
 
 
-def _self_signed_cert() -> tuple[bytes, bytes]:
-    """A throwaway self-signed cert (PEM) + key (PEM), SANs localhost/127.0.0.1."""
+def _self_signed_cert(
+    valid_days: int = 3650,
+    dns_names: tuple[str, ...] = ("localhost",),
+    ip_addresses: tuple[str, ...] = ("127.0.0.1", "::1"),
+) -> tuple[bytes, bytes]:
+    """A throwaway self-signed cert (PEM) + key (PEM), SANs localhost/127.0.0.1.
+
+    A negative *valid_days* backdates notAfter, minting an already-expired cert.
+    The SAN arguments exist for the certificates an operator supplies, which
+    carry the names clients dial and nothing else -- notably no loopback.
+    """
     from cryptography import x509
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import rsa
     from cryptography.x509.oid import NameOID
 
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
+    cn = dns_names[0] if dns_names else "localhost"
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
     now = datetime.datetime.now(datetime.timezone.utc)
+    not_after = now + datetime.timedelta(days=valid_days)
     cert = (
         x509.CertificateBuilder()
         .subject_name(name)
         .issuer_name(name)
         .public_key(key.public_key())
         .serial_number(x509.random_serial_number())
-        .not_valid_before(now - datetime.timedelta(days=1))
-        .not_valid_after(now + datetime.timedelta(days=3650))
+        # Backdated a day against clock skew -- and further still when the span
+        # itself is in the past, so an expired cert is orderly rather than absurd.
+        .not_valid_before(min(now, not_after) - datetime.timedelta(days=1))
+        .not_valid_after(not_after)
         .add_extension(
             x509.SubjectAlternativeName(
-                [
-                    x509.DNSName("localhost"),
-                    x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
-                ]
+                [x509.DNSName(d) for d in dns_names]
+                + [x509.IPAddress(ipaddress.ip_address(i)) for i in ip_addresses]
             ),
             critical=False,
         )
@@ -92,18 +105,18 @@ def test_tls_cert_without_key_is_rejected():
 @pytest.mark.skipif(not _crypto_available(), reason="cryptography not available")
 def test_trusting_client_reads_over_tls(simple_zarr_array):
     import zarr
-    from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+    from biopb_tensor_server import ZarrAdapter
 
     zarr_path, _, _ = simple_zarr_array
     arr = zarr.open_array(zarr_path, mode="r")
     cert_pem, key_pem = _self_signed_cert()
 
-    server = TensorFlightServer(
+    server = catalog_server(
         "grpc://localhost:0",
         tls_cert_chain=cert_pem,
         tls_private_key=key_pem,
     )
-    server.register_source("img", ZarrAdapter(arr, "img", ["y", "x"]))
+    register_and_catalog(server, "img", ZarrAdapter(arr, "img", ["y", "x"]))
     server.mark_ready()
     _serve(server)
     try:
@@ -111,8 +124,14 @@ def test_trusting_client_reads_over_tls(simple_zarr_array):
         client = flight.FlightClient(
             f"grpc+tls://localhost:{server.port}", tls_root_certs=cert_pem
         )
-        flights = list(client.list_flights())
-        assert any(b"img" in fi.descriptor.command for fi in flights)
+        # The catalog flight: DoGet the advertised `sources` ticket.
+        sources = next(
+            fi
+            for fi in client.list_flights()
+            if list(fi.descriptor.path) == [b"sources"]
+        )
+        table = client.do_get(sources.endpoints[0].ticket).read_all()
+        assert "img" in table.column("source_id").to_pylist()
         client.close()
     finally:
         server.shutdown()
@@ -122,18 +141,18 @@ def test_trusting_client_reads_over_tls(simple_zarr_array):
 @pytest.mark.skipif(not _crypto_available(), reason="cryptography not available")
 def test_plaintext_client_is_refused_by_tls_server(simple_zarr_array):
     import zarr
-    from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+    from biopb_tensor_server import ZarrAdapter
 
     zarr_path, _, _ = simple_zarr_array
     arr = zarr.open_array(zarr_path, mode="r")
     cert_pem, key_pem = _self_signed_cert()
 
-    server = TensorFlightServer(
+    server = catalog_server(
         "grpc://localhost:0",
         tls_cert_chain=cert_pem,
         tls_private_key=key_pem,
     )
-    server.register_source("img", ZarrAdapter(arr, "img", ["y", "x"]))
+    register_and_catalog(server, "img", ZarrAdapter(arr, "img", ["y", "x"]))
     server.mark_ready()
     _serve(server)
     try:
@@ -159,7 +178,7 @@ def test_sdk_client_tofu_roundtrip(simple_zarr_array, tmp_path, monkeypatch):
     import numpy as np
     import zarr
     from biopb.tensor import TensorFlightClient
-    from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+    from biopb_tensor_server import ZarrAdapter
 
     # Isolate the TOFU pin store (state/biopb/tls-known-hosts.json) to a tmp tree.
     monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path / "state"))
@@ -168,12 +187,12 @@ def test_sdk_client_tofu_roundtrip(simple_zarr_array, tmp_path, monkeypatch):
     arr = zarr.open_array(zarr_path, mode="r")
     cert_pem, key_pem = _self_signed_cert()
 
-    server = TensorFlightServer(
+    server = catalog_server(
         "grpc://localhost:0",
         tls_cert_chain=cert_pem,
         tls_private_key=key_pem,
     )
-    server.register_source("img", ZarrAdapter(arr, "img", ["y", "x"]))
+    register_and_catalog(server, "img", ZarrAdapter(arr, "img", ["y", "x"]))
     server.mark_ready()
     _serve(server)
     try:
@@ -186,6 +205,119 @@ def test_sdk_client_tofu_roundtrip(simple_zarr_array, tmp_path, monkeypatch):
 
         assert f"localhost:{server.port}" in tls_known_hosts().read_text()
         client.close()
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.skipif(not _crypto_available(), reason="cryptography not available")
+def test_expired_cert_fails_with_its_actual_reason(tmp_path, monkeypatch):
+    """An expired cert is refused, and the client says so (biopb/biopb#913).
+
+    The pin is the trust anchor, not an exemption from validity: gRPC checks
+    notAfter on the anchor even when the anchor is the presented leaf. Left to the
+    transport this surfaces as `FlightUnavailableError: failed to connect to all
+    addresses`, with `certificate has expired` only in gRPC's stderr log -- an
+    outage on a date nobody was watching, presenting as a network fault.
+    """
+    from biopb.tensor import TensorFlightClient
+    from biopb.tensor._tls import TlsCertExpiredError
+    from biopb_tensor_server import TensorFlightServer
+
+    monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path / "state"))
+
+    cert_pem, key_pem = _self_signed_cert(valid_days=-30)
+    server = TensorFlightServer(
+        "grpc://localhost:0", tls_cert_chain=cert_pem, tls_private_key=key_pem
+    )
+    server.mark_ready()
+    _serve(server)
+    try:
+        with pytest.raises(TlsCertExpiredError) as excinfo:
+            TensorFlightClient(f"grpcs://localhost:{server.port}")
+        assert "cert init --force" in str(excinfo.value)
+    finally:
+        server.shutdown()
+
+
+def _health(**client_kwargs):
+    import json
+
+    client = flight.FlightClient(**client_kwargs)
+    (result,) = client.do_action(flight.Action("health", b""))
+    return json.loads(result.body.to_pybytes())
+
+
+@pytest.mark.skipif(not _crypto_available(), reason="cryptography not available")
+def test_health_reports_when_the_certificate_expires():
+    """A poller can read the expiry without holding the certificate
+    (biopb/biopb#1117); a plaintext server has none to report."""
+    from biopb_tensor_server import TensorFlightServer
+
+    cert_pem, key_pem = _self_signed_cert(valid_days=90)
+    tls = TensorFlightServer(
+        "grpc://localhost:0", tls_cert_chain=cert_pem, tls_private_key=key_pem
+    )
+    plain = TensorFlightServer("grpc://localhost:0")
+    for server in (tls, plain):
+        server.mark_ready()
+        _serve(server)
+    try:
+        health = _health(
+            location=f"grpc+tls://localhost:{tls.port}",
+            tls_root_certs=cert_pem,
+        )
+        expires = datetime.datetime.strptime(
+            health["tls_not_after"], "%Y-%m-%dT%H:%M:%SZ"
+        )
+        remaining = expires - datetime.datetime.now(datetime.timezone.utc).replace(
+            tzinfo=None
+        )
+        assert datetime.timedelta(days=89) < remaining < datetime.timedelta(days=91)
+        assert "tls_not_after" not in _health(location=f"grpc://localhost:{plain.port}")
+    finally:
+        tls.shutdown()
+        plain.shutdown()
+
+
+@pytest.mark.skipif(not _crypto_available(), reason="cryptography not available")
+def test_an_expired_configured_ca_is_refused_without_dialing():
+    """A configured CA resolves offline, so the probe that names expiry for a
+    pin never runs; the anchor's own date is checked instead."""
+    from biopb.tensor import TensorFlightClient
+    from biopb.tensor._tls import TlsCertExpiredError
+
+    cert_pem, _ = _self_signed_cert(valid_days=-30)
+    with pytest.raises(TlsCertExpiredError, match="replace the configured CA"):
+        TensorFlightClient("grpcs://localhost:1", tls_ca_pem=cert_pem)
+
+
+@pytest.mark.skipif(not _crypto_available(), reason="cryptography not available")
+def test_a_handshake_failure_names_its_reason():
+    """The error a caller catches says why the handshake failed, not only that it
+    did (biopb/biopb#1116)."""
+    from biopb.tensor import TensorFlightClient
+    from biopb_tensor_server import TensorFlightServer
+
+    served, key_pem = _self_signed_cert()
+    stranger, _ = _self_signed_cert()
+    server = TensorFlightServer(
+        "grpc://localhost:0", tls_cert_chain=served, tls_private_key=key_pem
+    )
+    server.mark_ready()
+    _serve(server)
+    try:
+        client = TensorFlightClient(
+            f"grpcs://localhost:{server.port}", tls_ca_pem=stranger
+        )
+        with pytest.raises(flight.FlightUnavailableError) as excinfo:
+            client.health_check()
+        # Whichever layer supplies it: gRPC's own message on builds that carry
+        # the verify error, else the SDK's re-probe (see TestExplainHandshakeFailure).
+        message = str(excinfo.value)
+        assert (
+            "self-signed certificate" in message
+            or f"TLS handshake with localhost:{server.port} failed" in message
+        )
     finally:
         server.shutdown()
 
@@ -211,8 +343,9 @@ def test_sidecar_reads_over_tls_without_pinning(
     """
     import zarr
     from biopb._locations import tls_known_hosts
-    from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+    from biopb_tensor_server import ZarrAdapter
     from biopb_tensor_server.serving.http_server import create_app
+    from biopb_tensor_server.serving.tls import cert_fingerprint
     from fastapi.testclient import TestClient
 
     monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path / "state"))
@@ -221,17 +354,17 @@ def test_sidecar_reads_over_tls_without_pinning(
     arr = zarr.open_array(zarr_path, mode="r")
     cert_pem, key_pem = _self_signed_cert()
 
-    server = TensorFlightServer(
+    server = catalog_server(
         "grpc://localhost:0", tls_cert_chain=cert_pem, tls_private_key=key_pem
     )
-    server.register_source("img", ZarrAdapter(arr, "img", ["y", "x"]))
+    register_and_catalog(server, "img", ZarrAdapter(arr, "img", ["y", "x"]))
     server.mark_ready()
     _serve(server)
     try:
         app = create_app(
             flight_location=f"grpcs://localhost:{server.port}",
             token=None,
-            tls_ca_pem=cert_pem,
+            tls_fingerprint=cert_fingerprint(cert_pem),
         )
         with TestClient(app, raise_server_exceptions=True) as tc:
             resp = tc.get("/api/sources")
@@ -247,10 +380,170 @@ def test_sidecar_reads_over_tls_without_pinning(
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
 @pytest.mark.skipif(not _crypto_available(), reason="cryptography not available")
+def test_sidecar_reads_over_a_cert_that_does_not_name_loopback(
+    simple_zarr_array, tmp_path, monkeypatch
+):
+    """The shape of an operator's own certificate: the public name, and nothing else.
+
+    The sidecar dials the plane over loopback, and gRPC checks the dialed name
+    against the SANs however trust was established -- so this used to fail every
+    request with "Peer name 127.0.0.1 is not in peer certificate", surfacing to
+    the caller as a bare 502 (biopb/biopb#916). Anchoring on the fingerprint
+    instead of the PEM is what earns the hostname override that fixes it.
+    """
+    import zarr
+    from biopb._locations import tls_known_hosts
+    from biopb_tensor_server import ZarrAdapter
+    from biopb_tensor_server.serving.http_server import create_app
+    from biopb_tensor_server.serving.tls import cert_fingerprint
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path / "state"))
+
+    zarr_path, _, _ = simple_zarr_array
+    arr = zarr.open_array(zarr_path, mode="r")
+    cert_pem, key_pem = _self_signed_cert(
+        dns_names=("gpu-051.hpc.example",), ip_addresses=()
+    )
+
+    server = catalog_server(
+        "grpc://127.0.0.1:0", tls_cert_chain=cert_pem, tls_private_key=key_pem
+    )
+    register_and_catalog(server, "img", ZarrAdapter(arr, "img", ["y", "x"]))
+    server.mark_ready()
+    _serve(server)
+    try:
+        app = create_app(
+            flight_location=f"grpcs://127.0.0.1:{server.port}",
+            token=None,
+            tls_fingerprint=cert_fingerprint(cert_pem),
+        )
+        with TestClient(app, raise_server_exceptions=True) as tc:
+            resp = tc.get("/api/sources")
+            assert resp.status_code == 200, resp.text
+            assert any(s["source_id"] == "img" for s in resp.json())
+
+        assert not tls_known_hosts().exists(), (
+            "verified-first-use, not TOFU: nothing may be pinned"
+        )
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+@pytest.mark.skipif(not _crypto_available(), reason="cryptography not available")
+def test_sidecar_refuses_a_plane_presenting_a_different_certificate(
+    simple_zarr_array, tmp_path, monkeypatch
+):
+    """The other half of the trade: the fingerprint is checked on every connect.
+
+    Reaching the wire to resolve trust is only acceptable because a mismatch is
+    refused -- this is verified-first-use, not the trust-on-first-use the pin
+    store does for a plane whose certificate the client cannot already know.
+    """
+    import zarr
+    from biopb.tensor._tls import clear_pin_cache
+    from biopb_tensor_server import ZarrAdapter
+    from biopb_tensor_server.serving.http_server import create_app
+    from biopb_tensor_server.serving.tls import cert_fingerprint
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path / "state"))
+    clear_pin_cache()
+
+    zarr_path, _, _ = simple_zarr_array
+    arr = zarr.open_array(zarr_path, mode="r")
+    served, key_pem = _self_signed_cert()
+    other, _ = _self_signed_cert()  # a different cert with the same names
+
+    server = catalog_server(
+        "grpc://127.0.0.1:0", tls_cert_chain=served, tls_private_key=key_pem
+    )
+    register_and_catalog(server, "img", ZarrAdapter(arr, "img", ["y", "x"]))
+    server.mark_ready()
+    _serve(server)
+    try:
+        app = create_app(
+            flight_location=f"grpcs://127.0.0.1:{server.port}",
+            token=None,
+            tls_fingerprint=cert_fingerprint(other),
+        )
+        with TestClient(app, raise_server_exceptions=False) as tc:
+            assert tc.get("/api/sources").status_code >= 500
+    finally:
+        clear_pin_cache()
+        server.shutdown()
+
+
+@pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+@pytest.mark.skipif(not _crypto_available(), reason="cryptography not available")
+def test_a_local_sdk_client_reads_a_plane_serving_a_byo_cert(
+    simple_zarr_array, tmp_path, monkeypatch
+):
+    """The other local consumer of #916: `biopb tensor` and biopb-mcp.
+
+    `local_fingerprint` used to anchor on state/biopb/tls/server-cert.pem, which
+    a `--tls-cert` never writes -- so a plane serving an operator's own cert was
+    unreachable from this machine, with remediation advice (`cert init`) that
+    would have produced a certificate the plane was not serving. The plane now
+    publishes what it serves, keyed by port.
+    """
+    import numpy as np
+    import zarr
+    from biopb import (
+        LocalTrustError,
+        _tls_material,
+        _tls_record,
+        local_data_plane_fingerprint,
+    )
+    from biopb.tensor import TensorFlightClient
+    from biopb_tensor_server import ZarrAdapter
+
+    monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path / "state"))
+
+    zarr_path, _, _ = simple_zarr_array
+    arr = zarr.open_array(zarr_path, mode="r")
+    # An operator's own certificate: the names clients dial, no loopback, and
+    # nothing of it in the state tree.
+    cert_pem, key_pem = _self_signed_cert(
+        dns_names=("gpu-051.hpc.example",), ip_addresses=()
+    )
+
+    server = catalog_server(
+        "grpc://127.0.0.1:0", tls_cert_chain=cert_pem, tls_private_key=key_pem
+    )
+    register_and_catalog(server, "img", ZarrAdapter(arr, "img", ["y", "x"]))
+    server.mark_ready()
+    _serve(server)
+    try:
+        url = f"grpcs://127.0.0.1:{server.port}"
+        # Without the record there is nothing on this disk that identifies the
+        # plane, and that is an error rather than a silent fall back to TOFU.
+        with pytest.raises(LocalTrustError):
+            local_data_plane_fingerprint(url)
+
+        _tls_record.publish(
+            server.port, _tls_material.fingerprint(_tls_material.leaf_pem(cert_pem))
+        )
+        client = TensorFlightClient(
+            url, tls_fingerprint=local_data_plane_fingerprint(url)
+        )
+        np.testing.assert_array_equal(client.get_tensor("img").compute(), arr[:])
+        client.close()
+
+        from biopb._locations import tls_known_hosts
+
+        assert not tls_known_hosts().exists(), "verified, not pinned"
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+@pytest.mark.skipif(not _crypto_available(), reason="cryptography not available")
 def test_sidecar_dialing_plaintext_at_a_tls_plane_fails(simple_zarr_array):
     """A grpc:// sidecar against a TLS plane must fail, not silently degrade."""
     import zarr
-    from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+    from biopb_tensor_server import ZarrAdapter
     from biopb_tensor_server.serving.http_server import create_app
     from fastapi.testclient import TestClient
 
@@ -258,10 +551,10 @@ def test_sidecar_dialing_plaintext_at_a_tls_plane_fails(simple_zarr_array):
     arr = zarr.open_array(zarr_path, mode="r")
     cert_pem, key_pem = _self_signed_cert()
 
-    server = TensorFlightServer(
+    server = catalog_server(
         "grpc://localhost:0", tls_cert_chain=cert_pem, tls_private_key=key_pem
     )
-    server.register_source("img", ZarrAdapter(arr, "img", ["y", "x"]))
+    register_and_catalog(server, "img", ZarrAdapter(arr, "img", ["y", "x"]))
     server.mark_ready()
     _serve(server)
     try:
@@ -326,16 +619,16 @@ def test_override_hostname_is_what_makes_a_mismatched_cert_connect(simple_zarr_a
     used anywhere.)
     """
     import zarr
-    from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+    from biopb_tensor_server import ZarrAdapter
 
     zarr_path, _, _ = simple_zarr_array
     arr = zarr.open_array(zarr_path, mode="r")
     cert_pem, key_pem = _cert_with_sans("wrong.example", "alt.example")
 
-    server = TensorFlightServer(
+    server = catalog_server(
         "grpc://localhost:0", tls_cert_chain=cert_pem, tls_private_key=key_pem
     )
-    server.register_source("img", ZarrAdapter(arr, "img", ["y", "x"]))
+    register_and_catalog(server, "img", ZarrAdapter(arr, "img", ["y", "x"]))
     server.mark_ready()
     _serve(server)
     loc = f"grpc+tls://localhost:{server.port}"
@@ -351,7 +644,9 @@ def test_override_hostname_is_what_makes_a_mismatched_cert_connect(simple_zarr_a
         overridden = flight.FlightClient(
             loc, tls_root_certs=cert_pem, override_hostname="wrong.example"
         )
-        assert any(b"img" in fi.descriptor.command for fi in overridden.list_flights())
+        assert any(
+            list(fi.descriptor.path) == [b"sources"] for fi in overridden.list_flights()
+        )
         overridden.close()
 
         # A name the cert does *not* carry still fails: this substitutes the name
@@ -381,7 +676,7 @@ def test_sdk_client_derives_the_override_and_reads(
     import numpy as np
     import zarr
     from biopb.tensor import TensorFlightClient
-    from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+    from biopb_tensor_server import ZarrAdapter
 
     monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path / "state"))
 
@@ -389,10 +684,10 @@ def test_sdk_client_derives_the_override_and_reads(
     arr = zarr.open_array(zarr_path, mode="r")
     cert_pem, key_pem = _cert_with_sans("wrong.example", "alt.example")
 
-    server = TensorFlightServer(
+    server = catalog_server(
         "grpc://localhost:0", tls_cert_chain=cert_pem, tls_private_key=key_pem
     )
-    server.register_source("img", ZarrAdapter(arr, "img", ["y", "x"]))
+    register_and_catalog(server, "img", ZarrAdapter(arr, "img", ["y", "x"]))
     server.mark_ready()
     _serve(server)
     try:
@@ -412,7 +707,7 @@ def test_a_cert_that_lists_the_dialed_name_gets_no_override(
     """The normal case is untouched: nothing is substituted when nothing is wrong."""
     import zarr
     from biopb.tensor import TensorFlightClient
-    from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+    from biopb_tensor_server import ZarrAdapter
 
     monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path / "state"))
 
@@ -420,10 +715,10 @@ def test_a_cert_that_lists_the_dialed_name_gets_no_override(
     arr = zarr.open_array(zarr_path, mode="r")
     cert_pem, key_pem = _self_signed_cert()  # SANs: localhost + 127.0.0.1
 
-    server = TensorFlightServer(
+    server = catalog_server(
         "grpc://localhost:0", tls_cert_chain=cert_pem, tls_private_key=key_pem
     )
-    server.register_source("img", ZarrAdapter(arr, "img", ["y", "x"]))
+    register_and_catalog(server, "img", ZarrAdapter(arr, "img", ["y", "x"]))
     server.mark_ready()
     _serve(server)
     try:

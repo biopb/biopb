@@ -7,8 +7,8 @@ Commands:
     stats        Compute statistics (min, max, mean) for a tensor
     cache-stats  Show the server's cache hit/miss diagnostics
 
-Every command dials the *same* plane through the one resolver in
-``biopb._data_plane`` (biopb/biopb#615): ``--server`` -> ``BIOPB_TENSOR_URL`` ->
+Every command dials the *same* plane through the one resolver,
+:func:`biopb.resolve_data_plane` (biopb/biopb#615): ``--server`` -> ``BIOPB_TENSOR_URL`` ->
 the control plane's published endpoint -> the default. ``--server`` stays because
 a plane launched directly on a custom port is recorded nowhere and so cannot be
 discovered; everything else is asked for rather than reconstructed.
@@ -18,6 +18,7 @@ import json
 import pickle
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Literal, Optional, Tuple
 
@@ -26,7 +27,13 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from biopb import _data_plane
+from biopb import (
+    ENV_TENSOR_TOKEN,
+    DataPlaneEndpoint,
+    LocalTrustError,
+    resolve_data_plane,
+)
+from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS
 from biopb.tensor.client import TensorFlightClient
 
 app = typer.Typer(
@@ -65,13 +72,28 @@ _OPT_SLICE = typer.Option(
 )
 
 
+def _browse(client) -> dict:
+    """The catalog as ``{source_id: row}``.
+
+    ``query`` rather than the deprecated ``list_sources``: same rows
+    and the same server-side cap, but a row carries ``is_resolved``, which the
+    listing needs to tell "not resolved yet" from "nothing readable in it"
+    (biopb/biopb#1032).
+    """
+    rows = client.query(
+        f"SELECT {SOURCE_ROW_COLUMNS} FROM sources ORDER BY source_id",
+        format="records",
+    )
+    return {row["source_id"]: row for row in rows}
+
+
 def _log_timing(start_time: float) -> None:
     """Print elapsed time since start_time to stderr."""
     elapsed = time.time() - start_time
     stderr_console.print(f"[dim]Completed in {elapsed:.2f}s[/dim]")
 
 
-def _dial_error(exc: Exception, endpoint: _data_plane.Endpoint) -> str:
+def _dial_error(exc: Exception, endpoint: DataPlaneEndpoint) -> str:
     """Why a dial failed, classified by exception *type*.
 
     Every failure used to render as "server unreachable or cache not initialized"
@@ -88,7 +110,7 @@ def _dial_error(exc: Exception, endpoint: _data_plane.Endpoint) -> str:
     import pyarrow.flight as flight
 
     where = f"{endpoint.url} ({endpoint.origin_note})"
-    if isinstance(exc, _data_plane.LocalTrustError):
+    if isinstance(exc, LocalTrustError):
         return str(exc)
     if isinstance(
         exc, (flight.FlightUnauthenticatedError, flight.FlightUnauthorizedError)
@@ -102,11 +124,11 @@ def _dial_error(exc: Exception, endpoint: _data_plane.Endpoint) -> str:
             return (
                 f"The data plane at {where} requires an access token. An endpoint "
                 "named explicitly is not dialed with the control plane's credential "
-                f"file, so pass --token or set ${_data_plane.ENV_TOKEN}."
+                f"file, so pass --token or set ${ENV_TENSOR_TOKEN}."
             )
         return (
             f"The data plane at {where} requires an access token. Pass --token, set "
-            f"${_data_plane.ENV_TOKEN}, or start it through `biopb control start` "
+            f"${ENV_TENSOR_TOKEN}, or start it through `biopb control start` "
             "(which writes the credential file local clients read)."
         )
     if isinstance(exc, (flight.FlightUnavailableError, flight.FlightTimedOutError)):
@@ -120,9 +142,7 @@ def _dial_error(exc: Exception, endpoint: _data_plane.Endpoint) -> str:
     return f"{type(exc).__name__} from the data plane at {where}: {exc}"
 
 
-def _operation_error(
-    exc: Exception, endpoint: _data_plane.Endpoint, context: str
-) -> str:
+def _operation_error(exc: Exception, endpoint: DataPlaneEndpoint, context: str) -> str:
     """Classify a failure raised *after* the client was built.
 
     ``TensorFlightClient`` opens its socket lazily, so the connect-time failures
@@ -140,25 +160,23 @@ def _operation_error(
     """
     import pyarrow.flight as flight
 
-    if isinstance(exc, (_data_plane.LocalTrustError, flight.FlightError)):
+    if isinstance(exc, (LocalTrustError, flight.FlightError)):
         return _dial_error(exc, endpoint)
     return f"{context}: {exc}"
 
 
-def _resolve_endpoint(
-    server: Optional[str], token: Optional[str]
-) -> _data_plane.Endpoint:
+def _resolve_endpoint(server: Optional[str], token: Optional[str]) -> DataPlaneEndpoint:
     """Resolve the endpoint every command dials, exiting 1 with the reason on failure."""
     try:
-        return _data_plane.resolve(server, token)
-    except _data_plane.LocalTrustError as exc:
+        return resolve_data_plane(server, token)
+    except LocalTrustError as exc:
         stderr_console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1)
 
 
 def _connect(
     server: Optional[str], token: Optional[str], cache_bytes: int
-) -> Tuple[TensorFlightClient, _data_plane.Endpoint]:
+) -> Tuple[TensorFlightClient, DataPlaneEndpoint]:
     """Resolve the endpoint and open a client to it, or exit 1 saying why not."""
     endpoint = _resolve_endpoint(server, token)
     try:
@@ -169,6 +187,7 @@ def _connect(
             cache_bytes=cache_bytes,
             token=endpoint.token,
             tls_ca_pem=endpoint.tls_ca_pem,
+            tls_fingerprint=endpoint.tls_fingerprint,
         )
     except Exception as exc:
         stderr_console.print(f"[red]{_dial_error(exc, endpoint)}[/red]")
@@ -251,7 +270,7 @@ def query(
     start_time = time.time()
     client, endpoint = _connect(server, token, cache_bytes)
     try:
-        sources = client.list_sources()
+        sources = _browse(client)
         if not sources:
             stderr_console.print(f"[yellow]No sources found on {endpoint.url}[/yellow]")
             _log_timing(start_time)
@@ -263,16 +282,21 @@ def query(
         table.add_column("Shape", style="green")
         table.add_column("Dtype", style="blue")
 
-        for source_id, source_desc in sources.items():
-            if not source_desc.tensors:
-                table.add_row(source_id, "<no tensors>", "-", "-")
+        for source_id, row in sources.items():
+            tensors = row.get("tensors") or []
+            if not tensors:
+                # Two different states, and only one of them is actionable:
+                # an unresolved source has tensors the server has not looked
+                # for yet (biopb/biopb#1032).
+                why = "<no tensors>" if row.get("is_resolved", True) else "<unresolved>"
+                table.add_row(source_id, why, "-", "-")
                 continue
-            for tensor_desc in source_desc.tensors:
+            for tensor in tensors:
                 table.add_row(
                     source_id,
-                    tensor_desc.array_id,
-                    str(list(tensor_desc.shape)),
-                    str(tensor_desc.dtype),
+                    tensor["array_id"],
+                    str(list(tensor.get("shape") or [])),
+                    str(tensor.get("dtype") or ""),
                 )
 
         console.print(table)
@@ -290,6 +314,94 @@ def query(
     except Exception as exc:
         stderr_console.print(
             f"[red]{_operation_error(exc, endpoint, 'Error querying server')}[/red]"
+        )
+        raise typer.Exit(1)
+    finally:
+        client.close()
+
+
+@app.command(
+    "prune-annotations",
+    help="Report, and optionally delete, ROI annotations whose image is gone.",
+)
+def prune_annotations(
+    days: int = typer.Option(
+        ..., "--days", help="Delete annotations unseen for this many days."
+    ),
+    apply: bool = typer.Option(
+        False, "--apply", help="Actually delete. Without it this only reports."
+    ),
+    server: Optional[str] = _OPT_SERVER,
+    token: Optional[str] = _OPT_TOKEN,
+    cache_bytes: int = _OPT_CACHE_BYTES,
+):
+    """Clear annotations whose source the server has not seen in a while.
+
+    One ``roi_prune`` action against a *running* server: report first, then
+    the same predicate with ``apply``.
+
+    The server's own ``annotations.prune_unseen_days`` is off by default and,
+    when on, will not fire until the server has been up for the whole threshold.
+    This is how a person does it on demand instead.
+
+    Reports unless given ``--apply``. Absence is not proof of deletion -- an
+    unmounted drive and a removed image look identical from here -- so the
+    confirmation is the point, not a formality.
+
+    Example:
+        biopb tensor prune-annotations --days 30
+        biopb tensor prune-annotations --days 30 --apply
+    """
+    client, endpoint = _connect(server, token, cache_bytes)
+    try:
+        report = client.prune_rois(days, apply=False)
+        if not report.unseen:
+            console.print(f"[green]Nothing unseen for {days} days.[/green]")
+            return
+
+        table = Table(
+            title=f"Annotations whose source has not been seen in {days} days"
+        )
+        table.add_column("Annotations", justify="right", style="cyan")
+        table.add_column("Last seen", style="magenta")
+        table.add_column("Image")
+        table.add_column("Tensor", style="dim")
+        total = 0
+        for group in report.unseen:
+            total += group.count
+            seen = (
+                datetime.fromtimestamp(group.last_seen_at_unix_ms / 1000).strftime(
+                    "%Y-%m-%d"
+                )
+                if group.last_seen_at_unix_ms
+                else "never"
+            )
+            table.add_row(
+                str(group.count),
+                seen,
+                # Empty means the source was never in the catalog while these
+                # were written, so there is no name to give the image.
+                group.source_url or "[red]unknown[/red]",
+                group.array_id,
+            )
+        console.print(table)
+
+        if not apply:
+            console.print(
+                f"\n[yellow]{total} annotation(s) would be deleted. "
+                f"Re-run with --apply to do it.[/yellow]"
+            )
+            return
+
+        # The server deletes by the same predicate it reported on, so what
+        # was shown is what goes.
+        removed = client.prune_rois(days, apply=True).deleted
+        console.print(f"[red]Deleted {removed} annotation(s).[/red]")
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        stderr_console.print(
+            f"[red]{_operation_error(exc, endpoint, 'Error pruning annotations')}[/red]"
         )
         raise typer.Exit(1)
     finally:
@@ -318,28 +430,30 @@ def metadata(
     start_time = time.time()
     client, endpoint = _connect(server, token, cache_bytes)
     try:
-        sources = client.list_sources()
+        sources = _browse(client)
         if source_id not in sources:
             stderr_console.print(f"[red]Source not found:[/red] {source_id}")
             raise typer.Exit(1)
 
-        source_desc = sources[source_id]
+        row = sources[source_id]
+        tensors = row.get("tensors") or []
 
         # Show metadata for the entire source
         console.print(f"[bold green]Source:[/bold green] {source_id}")
-        console.print(f"[bold green]Tensors:[/bold green] {len(source_desc.tensors)}")
+        console.print(f"[bold green]Tensors:[/bold green] {len(tensors)}")
 
         # List all tensors in the source
-        for tensor_desc in source_desc.tensors:
+        for entry in tensors:
             console.print(
-                f"  [cyan]{tensor_desc.array_id}[/cyan] "
-                f"shape={list(tensor_desc.shape)} dtype={tensor_desc.dtype}"
+                f"  [cyan]{entry['array_id']}[/cyan] "
+                f"shape={list(entry.get('shape') or [])} "
+                f"dtype={entry.get('dtype') or ''}"
             )
 
         # If --tensor specified, show detailed descriptor info
         if tensor:
             tensor_desc = next(
-                (t for t in source_desc.tensors if t.array_id == tensor),
+                (t for t in tensors if t["array_id"] == tensor),
                 None,
             )
             if tensor_desc is None:
@@ -348,9 +462,9 @@ def metadata(
 
             console.print(f"\n[bold green]Tensor Descriptor: {tensor}[/bold green]")
             detail_table = Table(show_header=False)
-            detail_table.add_row("Array ID", tensor_desc.array_id)
-            detail_table.add_row("Shape", str(list(tensor_desc.shape)))
-            detail_table.add_row("Dtype", str(tensor_desc.dtype))
+            detail_table.add_row("Array ID", tensor_desc["array_id"])
+            detail_table.add_row("Shape", str(list(tensor_desc.get("shape") or [])))
+            detail_table.add_row("Dtype", str(tensor_desc.get("dtype") or ""))
             console.print(detail_table)
 
         # Fetch and display source-level metadata (OME/vendor JSON)
@@ -430,7 +544,7 @@ def get(
 
         if fmt == "pb":
             # Protobuf format: lazy SerializedTensor
-            serialized = client.get_tensor_pb(array_id, slice_hint=selection)
+            serialized = client.get_tensor(array_id, slice_hint=selection, output="pb")
             pb_bytes = serialized.SerializeToString()
 
             if output == "-":
@@ -669,6 +783,83 @@ def cache_stats(
         raise typer.Exit(0)
 
     _render_cache_stats(stats)
+
+
+@app.command(
+    "decode-rates",
+    help="Show measured decode throughput (MB/s) per tensor.",
+)
+def decode_rates(
+    server: Optional[str] = _OPT_SERVER,
+    token: Optional[str] = _OPT_TOKEN,
+    json_output: bool = typer.Option(
+        False, "--json", help="Emit machine-readable JSON instead of a table"
+    ),
+):
+    """Show what each tensor has been measured to decode at.
+
+    This is the input for ``cache.cheap_decode_mbps``: a tensor measured well
+    above the threshold has its full-resolution chunks evicted before slower
+    tensors', on the grounds that re-decoding one is cheaper than the cache
+    space it occupies. Pick the threshold by looking at the spread here, not
+    from a portable default -- there isn't one.
+
+    Only full-resolution reads are sampled, so a tensor served exclusively at
+    reduced scale is absent rather than slow, and a row with only a few
+    samples may still be settling -- weigh it accordingly.
+
+    The rate is what a rebuild costs per byte, not what the format can sustain:
+    a tensor with small chunks amortizes its per-read overhead over fewer bytes
+    and reads slower here than the same format would with large ones.
+
+    This is a preset over the catalog's `decode_rates` table; anything else you
+    want to ask of it -- a join against `sources`, a filter, a different order
+    -- is a `client.query` call.
+    """
+    client, endpoint = _connect(server, token, cache_bytes=0)
+    try:
+        rows = client.query(
+            "SELECT array_id, mbps, samples, updated_at FROM decode_rates "
+            "ORDER BY mbps DESC",
+            format="records",
+        )
+    except Exception as exc:  # noqa: BLE001 - rendered by type, not swallowed
+        stderr_console.print(
+            f"[red]{_operation_error(exc, endpoint, 'Failed to read decode rates')}[/red]"
+        )
+        raise typer.Exit(1)
+    finally:
+        client.close()
+
+    if json_output:
+        print(json.dumps(rows, default=str))
+        raise typer.Exit(0)
+
+    if not rows:
+        # Not an error: a server that has served only downsampled reads has
+        # nothing to report, and so has one that just started.
+        console.print(
+            "[yellow]No decode measurements yet -- nothing has been read at "
+            "full resolution.[/yellow]"
+        )
+        raise typer.Exit(0)
+
+    table = Table(title="Measured decode throughput")
+    table.add_column("array_id", style="cyan")
+    table.add_column("MB/s", style="green", justify="right")
+    table.add_column("Samples", justify="right")
+    # Rows outlive the run that measured them, so this is what separates a
+    # tensor measured minutes ago from one last read weeks and a remount ago.
+    table.add_column("Updated")
+    for row in rows:
+        updated = row.get("updated_at")
+        table.add_row(
+            str(row.get("array_id", "")),
+            f"{row.get('mbps') or 0.0:.0f}",
+            str(row.get("samples", 0)),
+            updated.strftime("%Y-%m-%d %H:%M") if updated is not None else "-",
+        )
+    console.print(table)
 
 
 if __name__ == "__main__":

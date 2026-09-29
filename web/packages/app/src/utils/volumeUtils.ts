@@ -8,11 +8,12 @@
  * `TileInfo.volume` — the one scale it keeps a whole volume warm at. A client
  * that computed its own would have to reimplement the server's pyramid planner,
  * and landing one rung away misses every warmed chunk and pays a cold decode of
- * the source. See biopb-tensor-server/docs/precache-policy.md §5.
+ * the source.
  */
 
 import { sliderAxes } from "@biopb/tensor-flight-client";
 import type { SliceRequest, TileInfo, VolumeAvailable } from "@biopb/tensor-flight-client";
+import { axisIndexOf } from "./sliceUi";
 import type { SliceIndices } from "./vivUtils";
 
 /**
@@ -121,7 +122,7 @@ export function volumeRequest(
   const pinned = new Map<number, number>();
   for (const axis of sliderAxes(info.dim_labels, info.shape)) {
     if (whole.has(axis.axis)) continue;
-    const want = axis.named ? slice[axis.named] : slice.axes[axis.key] ?? 0;
+    const want = axisIndexOf(slice, axis);
     pinned.set(axis.axis, Math.min(Math.max(0, want), Math.max(0, axis.extent - 1)));
   }
   const slice_start: number[] = [];

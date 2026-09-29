@@ -185,13 +185,12 @@ class QptiffAdapter(TensorAdapter):
         cls, source: "SourceConfig", credentials_config: Optional[Any] = None
     ) -> "QptiffAdapter":
         """Create a source-level adapter (the tifffile handle opens lazily)."""
-        return cls(str(source.url), source.source_id, dim_labels=source.dim_labels)
+        return cls(str(source.url), source.source_id)
 
     def __init__(
         self,
         url: str,
         source_id: str,
-        dim_labels: Optional[List[str]] = None,
         io_lock: Optional[threading.RLock] = None,
     ):
         self.source_id = source_id
@@ -207,7 +206,6 @@ class QptiffAdapter(TensorAdapter):
         # safe should any of those paths ever acquire it while already held.
         self._io_lock = io_lock if io_lock is not None else threading.RLock()
 
-        self._dim_labels_override = list(dim_labels) if dim_labels else None
         self.dim_labels: Optional[List[str]] = None
 
         self._tiff = None
@@ -371,7 +369,7 @@ class QptiffAdapter(TensorAdapter):
             return self._cached_descriptor
         za, _ = self._level_store(0)
         shape = self._level_shape(0)
-        labels = self._dim_labels_override or _default_dim_labels(len(shape))
+        labels = _default_dim_labels(len(shape))
         self.dim_labels = labels
         self._cached_descriptor = TensorDescriptor(
             array_id=self.array_id,

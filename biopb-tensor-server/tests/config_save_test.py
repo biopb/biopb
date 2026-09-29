@@ -47,7 +47,7 @@ def test_round_trips_raw_dict_preserving_unknown_keys(tmp_path):
     path = tmp_path / CANONICAL_CONFIG_NAME
     data = {
         "server": {"host": "127.0.0.1", "port": 9000},
-        "cache": {"backend": "memory"},
+        "cache": {"file_max_total_gb": 4},
         # An advanced / future key the form never surfaces -- must survive.
         "experimental_knob": {"deep": [1, 2, 3]},
     }
@@ -79,21 +79,6 @@ def test_does_not_mutate_caller_dict(tmp_path):
     save_config(data, tmp_path / CANONICAL_CONFIG_NAME)
     # The $schema embed happens on a copy, not the caller's dict.
     assert "$schema" not in data
-
-
-def test_migrates_legacy_toml_to_json_with_backup(tmp_path):
-    toml_path = tmp_path / "biopb.toml"
-    toml_path.write_text("[server]\nport = 8815\n")
-
-    returned = save_config({"server": {"port": 9000}}, toml_path)
-
-    # Write redirected to the canonical JSON sibling...
-    assert returned == tmp_path / CANONICAL_CONFIG_NAME
-    assert returned.exists()
-    assert _read(returned)["server"]["port"] == 9000
-    # ...and the legacy file was backed up out of the way (no shadow warning).
-    assert not toml_path.exists()
-    assert (tmp_path / "biopb.toml.bak").exists()
 
 
 def test_saved_config_loads_back_without_unknown_key_warning(tmp_path, caplog):

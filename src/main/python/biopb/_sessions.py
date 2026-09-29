@@ -3,9 +3,9 @@
 Two independent processes need to agree on where the ephemeral MCP sessions are:
 
 - ``biopb-mcp``'s session side, which must *publish* (session id → port + pid)
-  so the session is discoverable. Two writers land here: the stdio **shim**
-  publishes the private http child it spawns on a dynamic port, and an agentless
-  ``biopb mcp view`` session — which has no shim — publishes itself; and
+  so the session is discoverable. Every session on a dynamic port publishes
+  itself -- the http child a stdio shim spawns, and an agentless
+  ``biopb mcp view`` session; and
 - the **control plane** (``biopb-control``), which reads this registry to list
   live sessions (``/api/sessions``) and reverse-proxy ``/session/<id>/*`` to the
   right port.
@@ -25,12 +25,12 @@ routing ghost. (HTTP self-registration would be the alternative only if the
 front and the sessions could later cross a machine boundary.)
 
 Liveness is an **identity** check, not a bare PID probe: a record stores the
-child's per-process create-time token (``biopb._lifecycle.proc.process_create_time``), and a
+child's per-process create-time token (``biopb.lifecycle.proc.process_create_time``), and a
 reader treats the session as gone if the PID is dead *or* the PID is alive but now
 names a different process (create-time mismatch → the OS recycled the PID). This
 is the same PID-reuse guard as the daemon PID files (biopb#138); without it a
 recycled PID would keep a ghost "alive" and, worse, could route ``/session/<id>``
-traffic to an unrelated process. Delegated to ``biopb._lifecycle.proc`` (itself
+traffic to an unrelated process. Delegated to ``biopb.lifecycle.proc`` (itself
 dependency-free) so the liveness/identity computation matches the CLI's exactly.
 
 Concurrency: writes are atomic (temp file + ``os.replace`` in the same dir), so a
@@ -50,7 +50,7 @@ from pathlib import Path
 from typing import Optional
 
 from . import _locations
-from ._lifecycle.proc import is_process_running, process_create_time
+from .lifecycle.proc import is_process_running, process_create_time
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +73,7 @@ def sessions_dir() -> Path:
 
 # Characters that would let a session id escape the registry dir when spliced
 # into a filename. Both platforms' separators are rejected regardless of the
-# host OS — a record is written by the shim and its id is read back from the
+# host OS — a record is written by a session and its id is read back from the
 # control's ``/session/<id>/...`` URL, and the two may run on different OSes — as
 # is ``:`` (a Windows drive / alternate-data-stream selector) and NUL.
 _UNSAFE_ID_CHARS = frozenset({"/", "\\", ":", "\x00"})
@@ -82,14 +82,13 @@ _UNSAFE_ID_CHARS = frozenset({"/", "\\", ":", "\x00"})
 def new_session_id() -> str:
     """Mint an id for a session about to be registered: ``<timestamp>-<pid>``.
 
-    Sortable (so a listing is chronological) and unique per registering process.
-    Lives here, beside :func:`_is_safe_session_id` and the record layout, because
-    there is now more than one writer — the stdio shim publishes the child it
-    owns, and an agentless ``biopb mcp view`` session publishes itself — and two
-    id formats would be two things for a reader to recognise.
+    Sortable (so a listing is chronological) and unique per minting process.
+    Lives here, beside :func:`_is_safe_session_id` and the record layout, so
+    every minter -- the stdio shim for the child it spawns (the id names the
+    child's logfile too), a ``biopb mcp view`` session for itself -- produces one
+    format.
 
-    ``os.getpid()`` is the *registering* process, which is the shim in the first
-    case and the session itself in the second. The id is only an identifier; the
+    ``os.getpid()`` is the *minting* process. The id is only an identifier; the
     pid a reader prunes on is the one passed to :func:`register`.
     """
     return time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}"
@@ -138,9 +137,9 @@ def register(
     Written atomically so a concurrent reader never sees a partial record. Any
     ``extra`` keys are stored verbatim (forward room for e.g. an observe base path).
 
-    Raises ``ValueError`` for an unsafe ``session_id`` (biopb/biopb#422). The sole
-    writer only ever passes the safe ``<timestamp>-<pid>`` id, so this can only
-    trip on a programming error, and the shim's publish is best-effort anyway.
+    Raises ``ValueError`` for an unsafe ``session_id`` (biopb/biopb#422). Writers
+    only ever pass the safe ``<timestamp>-<pid>`` id, so this can only trip on a
+    programming error, and a session's publish is best-effort anyway.
     """
     if not _is_safe_session_id(session_id):
         raise ValueError(f"unsafe session id: {session_id!r}")
@@ -227,8 +226,8 @@ def list_sessions(prune: bool = True) -> list[dict]:
 
     With ``prune`` (the default) a record whose owning process is gone — the pid
     is dead, or alive but a different process on a recycled pid — is dropped *and
-    its file unlinked*. This is the registry's self-heal: a shim that died without
-    running its reap leaves a ghost record that the first reader
+    its file unlinked*. This is the registry's self-heal: a session killed too
+    hard to drop its own record leaves a ghost record that the first reader
     cleans up, so the control never proxies to a dead (or reused) port. A record
     with no usable pid, or one we cannot decide on, is kept (fail-open, so a
     transient probe error never hides a live session).
@@ -269,7 +268,7 @@ def list_sessions(prune: bool = True) -> list[dict]:
 def _record_is_live(rec: dict) -> bool:
     """Whether ``rec``'s owning process is still the session child we registered.
 
-    Liveness *and* identity (biopb#138), delegated to :mod:`biopb._lifecycle.proc` so the
+    Liveness *and* identity (biopb#138), delegated to :mod:`biopb.lifecycle.proc` so the
     computation matches the daemon PID files exactly:
 
     - No usable pid -> ``True`` (fail-open: can't disprove, so never drop it).

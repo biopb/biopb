@@ -2,7 +2,7 @@
 
 Covers:
 - `require_resolved` / `SourceUnresolvedError` at the read-planning boundary,
-- the `is_resident()` residency gate and the `data_resident` descriptor copy.
+- the `is_resident()` residency gate, which is answered live and stored nowhere.
 """
 
 import os
@@ -59,6 +59,7 @@ class TestResolvedAdapterRegression:
     """A normal resolved source still plans, builds a schema, and reports resident."""
 
     def _make_adapter(self, tmpdir):
+        import numpy as np
         import zarr
         from biopb_tensor_server.adapters.zarr import ZarrAdapter
 
@@ -66,6 +67,10 @@ class TestResolvedAdapterRegression:
         arr = zarr.open_array(
             zarr_path, mode="w", shape=(100, 200), chunks=(50, 100), dtype="uint16"
         )
+        # Write real data so chunk files actually exist on disk -- an array
+        # opened but never written has only metadata (.zarray/.zattrs), which
+        # residency checks skip as hidden, leaving nothing to sample.
+        arr[:] = np.ones((100, 200), dtype="uint16")
         return ZarrAdapter(arr, "test-array", ["y", "x"])
 
     def test_read_plan_and_schema_unchanged(self):
@@ -80,7 +85,21 @@ class TestResolvedAdapterRegression:
         with tempfile.TemporaryDirectory() as tmpdir:
             adapter = self._make_adapter(tmpdir)
             assert adapter.is_resident() is True
-            assert adapter.get_source_descriptor().data_resident is True
+
+    def test_dehydrated_chunk_is_not_resident(self, monkeypatch):
+        # Regression: is_resident() used to report True for ANY directory
+        # source unconditionally, so a resolved multi-file cloud source whose
+        # chunks were never warmed still read as resident (biopb/biopb#1028
+        # follow-up). Simulate one dehydrated chunk without depending on a
+        # real cloud filesystem's placeholder semantics.
+        from biopb_tensor_server.core import discovery
+
+        monkeypatch.setattr(
+            discovery, "_is_offline_placeholder", lambda path, stat_result=None: True
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            adapter = self._make_adapter(tmpdir)
+            assert adapter.is_resident() is False
 
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
@@ -101,4 +120,3 @@ class TestRemoteSourceResidency:
             adapter._source_url = "s3://bucket/remote.zarr"
 
             assert adapter.is_resident() is False
-            assert adapter.get_source_descriptor().data_resident is False

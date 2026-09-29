@@ -352,3 +352,29 @@ export class TensorArray {
     return this._client.slice(req);
   }
 }
+
+/**
+ * Separates a source_id from its content version in the HTTP-only versioned
+ * array_id form, `source_id "@" token [ "/" field ]`.
+ *
+ * The single client-side mirror of the sidecar's `_split_array_version`. It is
+ * here, once and tested, rather than inline at a call site because the rule has
+ * a trap: a '@' is legal in a *field* name and must survive untouched, so only
+ * the half before the first '/' is ever parsed. A source_id can never contain
+ * one (it is `<type>_<hex>`).
+ *
+ * See the tensor identity policy in `proto/biopb/tensor/descriptor.proto`: the
+ * versioned form exists only above the Flight wire, so this converts a pinned
+ * address back to the stable identity the catalog knows.
+ */
+export function splitArrayVersion(arrayId: string): {
+  arrayId: string;
+  token: string | null;
+} {
+  const slash = arrayId.indexOf("/");
+  const head = slash === -1 ? arrayId : arrayId.slice(0, slash);
+  const rest = slash === -1 ? "" : arrayId.slice(slash);
+  const at = head.indexOf("@");
+  if (at === -1) return { arrayId, token: null };
+  return { arrayId: head.slice(0, at) + rest, token: head.slice(at + 1) };
+}

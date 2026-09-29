@@ -3,7 +3,7 @@
 Runs in the **session child** — the process that owns the ``KernelHost`` and
 serves ``/mcp`` — for the same reason the dask cluster does: it must outlive
 kernel restarts, and a widget inside the kernel could be destroyed by its own
-agent. See ``docs/chat-client-evaluation.md`` for the argument.
+agent.
 
 Design notes
 ------------
@@ -50,11 +50,10 @@ from . import _app, _kernel_rpc, _server, _writers
 
 # The kernel round trip, off the loop. Bound here under the name this module
 # uses so a test can still swap it (test_mcp_chat_api).
-from ._kernel_rpc import _job_call
 
 logger = logging.getLogger(__name__)
 
-#: This loop's client id, for the kernel's one-agent claim (``_jobs.submit``).
+#: This loop's client id, for the one-agent claim (``_writers.take_claim``).
 #: A fixed string rather than a per-view id, because every view drives the one
 #: conversation: the loop is a single writer no matter how many windows are open.
 WRITER_ID = "biopb-chat"
@@ -64,13 +63,6 @@ WRITER_LABEL = "chat"
 #: foreign-activity digest is read from (``_writers._local_origin``): a cell is
 #: someone *else's* only relative to whoever is asking.
 ORIGIN = "chat"
-
-#: Name of the synthesized tool that reads ``guide://`` and ``skill://``.
-#: Resources are an MCP concept with no function-calling equivalent, so a model
-#: driven by this loop cannot reach them unless one is invented -- and the
-#: session instructions and ``list_skills`` both send it there, so without this
-#: the agent is told to read documents it has no way to open.
-RESOURCE_TOOL = "read_resource"
 
 #: Cap on tool-call rounds within one turn. A model that keeps calling tools
 #: without answering is not converging, and the user is sitting there watching.
@@ -140,10 +132,10 @@ _turn_lock = asyncio.Lock()
 class TurnInProgress(RuntimeError):
     """Raised when a turn is asked for while one is already running.
 
-    Refused rather than queued, matching ``_jobs.submit``: a queued turn would
-    be composed against a conversation its sender has not seen the end of, which
-    is an ordering nobody can inspect. The transport reports it the way the user
-    console reports a busy kernel -- as state, with a 409.
+    Refused rather than queued, as a cell is (``_server._submit_job``): a
+    queued turn would be composed against a conversation its sender has not seen
+    the end of, which is an ordering nobody can inspect. The transport reports
+    it as state, with a 409.
     """
 
 
@@ -292,80 +284,17 @@ def _clean_schema(schema):
     return {k: v for k, v in (schema or {}).items() if k not in ("$schema", "title")}
 
 
-async def _resource_tool():
-    """A function-calling tool for the resource surface, built from the registry.
-
-    An MCP client reads ``guide://kernel`` through ``resources/read``; a model
-    speaking function-calling has no such verb, so the loop hands it one. This
-    is not a convenience — ``_BASE_INSTRUCTIONS`` tells the agent to read the
-    guides before non-trivial work and ``list_skills`` answers with
-    ``skill://<id>``, so an agent without it is instructed to open documents it
-    cannot reach, and will answer from guesswork instead.
-
-    The catalogue in the description is generated, not written down, for the
-    same reason the tool list is: a hand-kept copy is what silently stops
-    matching what is registered.
-    """
-    listed = await _app.mcp.list_resources()
-    templates = await _app.mcp.list_resource_templates()
-    lines = [f"- {r.uri} — {r.description or ''}".rstrip() for r in listed]
-    lines += [f"- {t.uriTemplate} — {t.description or ''}".rstrip() for t in templates]
-    return {
-        "type": "function",
-        "function": {
-            "name": RESOURCE_TOOL,
-            "description": (
-                "Read one of this session's reference documents. The guides are "
-                "what the session instructions mean by 'read guide://...' — read "
-                "the relevant one before non-trivial work rather than guessing "
-                "at the API. A curated workflow's steps come from "
-                "skill://<skill_id>, and list_skills is what gives you the id.\n"
-                + "\n".join(lines)
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "uri": {
-                        "type": "string",
-                        "description": "e.g. guide://data or skill://drift-correction",
-                    }
-                },
-                "required": ["uri"],
-            },
-        },
-    }
-
-
-async def _read_resource(uri):
-    """Resolve *uri*, or say why it did not resolve.
-
-    A bad URI is the model's mistake to correct on the next round, not the
-    turn's end -- so it comes back as a tool result like any other.
-    """
-    try:
-        parts = list(await _app.mcp.read_resource(uri))
-    except Exception as exc:  # noqa: BLE001 - unknown uri, or the reader raised
-        return f"Could not read {uri!r}: {exc}"
-    out = []
-    for part in parts:
-        content = part.content
-        out.append(
-            content.decode("utf-8", "replace")
-            if isinstance(content, bytes)
-            else str(content)
-        )
-    return "\n".join(out)
-
-
 #: What :func:`_run_code` actually does, in place of the promote-and-poll
 #: paragraph the wire tools describe. The behaviour is already overridden in
 #: :func:`_dispatch`; the description has to be overridden at the same seam, or
 #: the model is told to poll for a handle it will never be given -- and offered
 #: ``poll_job`` to do it with.
-_CHAT_RUN_PARAGRAPH = """Code runs in a background thread so it does not block the main thread.
+_CHAT_RUN_PARAGRAPH = """Code runs as a cell on the kernel's main thread, like a notebook cell.
     This call waits for the cell to finish and returns its output -- there is no
-    job handle and nothing to poll for. Only one job runs at a time; stop a cell
-    with interrupt_kernel (best-effort) or restart_kernel (guaranteed).
+    job handle for a cell. While it runs a viewer does not repaint; for a long
+    compute, end the cell with run_async(fn), which returns a task id at once and
+    runs fn on a worker thread -- poll the task with poll_job. Only one job runs
+    at a time; stop one with interrupt_kernel or restart_kernel (guaranteed).
 
     poll_job still reads cells *the user* ran from the observe page, which is
     what the activity notice on these results points you at."""
@@ -391,10 +320,11 @@ async def tool_payload():
 
     Read from ``list_tools()`` rather than declared here: a hand-written copy is
     the one thing that can silently stop matching the tools that actually run.
-    The resource reader is appended because the registry has no such tool to
-    generate from -- see :func:`_resource_tool`.
+    Nothing is appended: the knowledge store is `read_doc`/`write_doc`, which are
+    ordinary tools, so a function-calling model reaches it without a synthesized
+    reader for the resource surface.
     """
-    return [await _resource_tool()] + [
+    return [
         {
             "type": "function",
             "function": {
@@ -417,8 +347,6 @@ async def _dispatch(name, arguments, on_progress):
     to a ``CallToolResult``. A test pins the shape per tool, so a FastMCP bump
     fails loudly rather than quietly reshaping what the loop receives.
     """
-    if name == RESOURCE_TOOL:
-        return await _read_resource(arguments.get("uri") or ""), []
     if name == "execute_code":
         return await _run_code(arguments, on_progress), []
     result = await _app.mcp._tool_manager.call_tool(
@@ -472,10 +400,9 @@ async def _run_code(arguments, on_progress):
     code = arguments.get("python_code") or ""
     intent = arguments.get("intent") or _last_user_text()
 
-    # Off the loop, like every other kernel round trip here. The context copy
-    # carries `_local_origin`, which is what keeps this loop's own cells out of
-    # its own digest.
-    digest = await asyncio.to_thread(_writers._foreign_digest, host)
+    # Read under this dispatch's `_local_origin`, which is what keeps this
+    # loop's own cells out of its own digest.
+    digest = _writers._foreign_digest(host)
     foreign_note = _writers._render_foreign_note(digest)
 
     def deliver(text):
@@ -502,16 +429,15 @@ async def _run_code(arguments, on_progress):
 
     # The claim protocol is `_server._submit_job`'s, not a copy of it: presume
     # the claim, submit, believe whatever the kernel answers. `_local_identity`
-    # is set for this whole dispatch, so `_client_identity()` inside it already
-    # resolves to this loop's writer. Off the loop, like every other kernel
-    # round trip here.
+    # and `_local_origin` are both set for this whole dispatch, so the writer
+    # and the origin `_submit_job` records are already this loop's. Off the
+    # loop, like every other kernel round trip here.
     job_id, message, drop_note, _w = await asyncio.to_thread(
         _server._submit_job,
         host,
         code,
         digest,
         _busy_message,
-        origin=ORIGIN,
         intent=intent,
     )
     if drop_note:
@@ -528,10 +454,7 @@ async def _run_code(arguments, on_progress):
     try:
         while True:
             await asyncio.sleep(_POLL_INTERVAL)
-            snap, res, _w = await _job_call(host, "poll", job_id)
-            if snap is None:
-                _running_job_id = None
-                return deliver(_kernel_rpc._format_execute_result(res))
+            snap = _server._poll_submitted(host, job_id)
             out = snap.get("stdout") or ""
             # Diffed against the job's monotonic total, not against `len(out)`:
             # the output cap compacts the buffer from the front mid-cell, so a
@@ -645,7 +568,7 @@ async def _discharge_notice():
     """Retire the activity notice now that the result carrying it is recorded.
 
     The read/ack split exists so a notice is **deferred, never dropped**
-    (:func:`_jobs.ack_foreign_digest`), and the ack is meant to happen "once the
+    (:func:`_writers._ack_foreign_digest`), and the ack is meant to happen "once the
     note carrying them is on its way back to the agent". In this loop the note
     is on its way back when it is in ``_messages``: the next projection carries
     it whatever becomes of this turn.
@@ -661,7 +584,7 @@ async def _discharge_notice():
     host = _app._kernel_host
     if not digest or host is None:
         return
-    await asyncio.to_thread(_writers._ack_foreign_digest, host, digest, WRITER_ID)
+    _writers._ack_foreign_digest(host, digest, WRITER_ID)
 
 
 #: Framing for the compacted prefix, so the model reads it as the record it is
@@ -914,7 +837,7 @@ async def _run_turn(user_text, model, on_progress):
                     failed = False
                 except Exception as exc:  # noqa: BLE001 - a raising tool is content
                     # The hand-written paths already answer their own failures
-                    # (_read_resource, _run_code); this gives the generic one the
+                    # (_run_code); this gives the generic one the
                     # same manners. A tool that raises is usually the model's
                     # mistake to correct -- a hallucinated name, an argument the
                     # schema let through -- so it gets another round to do that,

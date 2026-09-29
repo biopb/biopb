@@ -4,6 +4,8 @@ import struct
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
+from importlib import import_module
 from pathlib import Path
 
 import numpy as np
@@ -17,6 +19,8 @@ from biopb_tensor_server.core.discovery import ClaimContext, DiscoveryState
 pytest.importorskip("rsciio")
 
 from biopb.tensor.ticket_pb2 import ChunkBounds  # noqa: E402
+
+from tests import catalog_server, register_and_catalog
 
 # numpy dtype -> MRC MODE code
 _MODE = {
@@ -112,8 +116,18 @@ class TestMrcAdapter:
         self._adapters.append(adapter)
         return adapter, data
 
-    def test_descriptor(self):
+    @contextmanager
+    def _temporary_directory(self):
+        """Release mappings before Windows removes the backing file."""
         with tempfile.TemporaryDirectory() as tmpdir:
+            try:
+                yield tmpdir
+            finally:
+                for adapter in self._adapters:
+                    adapter.close()
+
+    def test_descriptor(self):
+        with self._temporary_directory() as tmpdir:
             adapter, data = self._adapter(tmpdir, shape=(4, 8, 8))
             desc = adapter.get_tensor_descriptor()
             assert list(desc.shape) == [4, 8, 8]
@@ -125,7 +139,7 @@ class TestMrcAdapter:
         """No rsciio-dask fallback (biopb/biopb#71): that array's graph holds a
         memmap, so falling back would silently reintroduce the file pin. A file
         whose data region can't back the header's layout is a hard failure."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with self._temporary_directory() as tmpdir:
             p = Path(tmpdir) / "truncated.mrc"
             create_synthetic_mrc(p, shape=(4, 8, 8))
             with open(p, "rb") as f:
@@ -145,7 +159,7 @@ class TestMrcAdapter:
     def test_catalogued_but_unread_source_maps_nothing(self):
         """Constructing probes the layout, then lets go: a source that is
         registered and never read pins nothing (biopb/biopb#71)."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with self._temporary_directory() as tmpdir:
             self._adapter(tmpdir, shape=(4, 8, 8))
             assert self._mapped() is False
 
@@ -153,7 +167,7 @@ class TestMrcAdapter:
         """A fresh mapping per read arrives with an empty page table, so the copy
         re-faults every page it touches even from page cache -- 3.2x on a warm
         1.6 GB volume. One mapping serves every read instead."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with self._temporary_directory() as tmpdir:
             adapter, _ = self._adapter(tmpdir, shape=(4, 8, 8))
             bounds = ChunkBounds(start=[0, 0, 0], stop=[4, 8, 8])
             adapter.get_data(bounds)
@@ -167,7 +181,7 @@ class TestMrcAdapter:
         """What #71 was protecting is kept, bounded rather than absent: the pin
         ends (Windows undeletable, POSIX unlink-frees-nothing) instead of lasting
         as long as the source stays catalogued."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with self._temporary_directory() as tmpdir:
             adapter, _ = self._adapter(tmpdir, shape=(4, 8, 8))
             adapter.get_data(ChunkBounds(start=[0, 0, 0], stop=[4, 8, 8]))
             assert self._mapped() is True
@@ -176,9 +190,9 @@ class TestMrcAdapter:
             assert self._mapped() is False
 
     def test_reaper_releases_an_idle_mapping_and_the_next_read_remaps(self):
-        from biopb_tensor_server.adapters import mrc as mrc_module
+        mrc_module = import_module("biopb_tensor_server.adapters.mrc")
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with self._temporary_directory() as tmpdir:
             adapter, data = self._adapter(tmpdir, shape=(4, 8, 8))
             bounds = ChunkBounds(start=[0, 0, 0], stop=[4, 8, 8])
             adapter.get_data(bounds)
@@ -197,9 +211,9 @@ class TestMrcAdapter:
     def test_a_read_in_flight_blocks_the_reap(self):
         """Reads copy OUTSIDE _io_lock so they stay parallel, which is exactly
         why the count is needed: unmapping under a copy would fault, not raise."""
-        from biopb_tensor_server.adapters import mrc as mrc_module
+        mrc_module = import_module("biopb_tensor_server.adapters.mrc")
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with self._temporary_directory() as tmpdir:
             adapter, _ = self._adapter(tmpdir, shape=(4, 8, 8))
             adapter.get_data(ChunkBounds(start=[0, 0, 0], stop=[4, 8, 8]))
             adapter._persistent_last_access -= mrc_module._mapping_reaper.ttl + 1
@@ -215,7 +229,7 @@ class TestMrcAdapter:
     def test_concurrent_reads_do_not_serialize_on_the_io_lock(self):
         """#71's parallel-read property, kept: the lock is held only to hand out
         the mapping and take the count, never across the copy."""
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with self._temporary_directory() as tmpdir:
             adapter, data = self._adapter(tmpdir, shape=(4, 8, 8))
             bounds = ChunkBounds(start=[0, 0, 0], stop=[4, 8, 8])
             adapter.get_data(bounds)  # establish the mapping
@@ -240,26 +254,26 @@ class TestMrcAdapter:
                 np.testing.assert_array_equal(r, data)
 
     def test_get_data_subregion(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with self._temporary_directory() as tmpdir:
             adapter, data = self._adapter(tmpdir, shape=(4, 8, 8))
             sub = adapter.get_data(ChunkBounds(start=[1, 2, 3], stop=[3, 6, 7]))
             np.testing.assert_array_equal(sub, data[1:3, 2:6, 3:7])
 
     def test_get_data_full(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with self._temporary_directory() as tmpdir:
             adapter, data = self._adapter(tmpdir, shape=(3, 5, 7), dtype=np.int16)
             sub = adapter.get_data(ChunkBounds(start=[0, 0, 0], stop=[3, 5, 7]))
             np.testing.assert_array_equal(sub, data)
             assert sub.dtype == np.int16
 
     def test_get_data_out_of_bounds(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with self._temporary_directory() as tmpdir:
             adapter, _ = self._adapter(tmpdir, shape=(4, 8, 8))
             with pytest.raises(ValueError):
                 adapter.get_data(ChunkBounds(start=[0, 0, 0], stop=[99, 8, 8]))
 
     def test_physical_scale(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with self._temporary_directory() as tmpdir:
             # cell (x,y,z)=(10,10,10) A over MX,MY,MZ=(8,8,4) -> per-voxel nm:
             # x=y=(10/8)/10=0.125, z=(10/4)/10=0.25
             adapter, _ = self._adapter(tmpdir, shape=(4, 8, 8), cell=(10, 10, 10))
@@ -268,7 +282,7 @@ class TestMrcAdapter:
             assert unit[1] == "nm" and unit[2] == "nm"
 
     def test_metadata(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with self._temporary_directory() as tmpdir:
             adapter, _ = self._adapter(tmpdir)
             meta = adapter.get_metadata()
             assert meta["format"] == "mrc"
@@ -280,7 +294,6 @@ class TestMrcAdapterIntegration:
 
     def test_server_client_roundtrip(self):
         from biopb.tensor import TensorFlightClient
-        from biopb_tensor_server import TensorFlightServer
 
         with tempfile.TemporaryDirectory() as tmpdir:
             p = Path(tmpdir) / "vol.mrc"
@@ -288,8 +301,8 @@ class TestMrcAdapterIntegration:
             adapter = MrcAdapter.create_from_config(SourceConfig(url=str(p)))
             source_id = adapter.source_id
 
-            server = TensorFlightServer("grpc://localhost:0")
-            server.register_source(source_id, adapter)
+            server = catalog_server("grpc://localhost:0")
+            register_and_catalog(server, source_id, adapter)
             server.mark_ready()
             t = threading.Thread(target=server.serve, daemon=True)
             t.start()
@@ -307,3 +320,4 @@ class TestMrcAdapterIntegration:
                 client.close()
             finally:
                 server.shutdown()
+                adapter.close()

@@ -16,8 +16,8 @@ It serves two tiers, in strict priority order:
 
 Design constraints (all best-effort, never fatal to the server):
 
-- **File backend only.** Inert unless the cache is the persistent
-  ``ArrowFileBackend``; on a memory backend it drops queued work.
+- **Inert without a cache.** Drops queued work when no ``CacheManager`` is
+  configured -- otherwise warming has nowhere to land.
 - **Stays out of the way.** Before each chunk it waits until the Flight server
   has been idle for ``idle_debounce_seconds`` (no in-flight ``do_get``), and it
   re-checks between chunks so a burst of live traffic preempts it at chunk
@@ -46,7 +46,8 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Sequence, Set, Tuple
 import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
-from biopb_tensor_server.cache import ArrowFileBackend, CacheManager
+from biopb_tensor_server.cache import CacheManager
+from biopb_tensor_server.core.adapter_base import catalog_tensors
 from biopb_tensor_server.core.chunk import (
     compute_warm_selection,
     compute_warm_targets,
@@ -184,9 +185,9 @@ class PrecacheWorker:
                 self._process_live(source_id)
                 continue
 
-            # 2. Backlog tier (secondary): only on a file backend with headroom.
+            # 2. Backlog tier (secondary): only with a cache and headroom.
             if self._backlog_has_items():
-                if not self._file_backend_active():
+                if not self._cache_active():
                     self._clear_backlog()
                     continue
                 if not self._has_headroom():
@@ -258,12 +259,9 @@ class PrecacheWorker:
 
     # -- gates -------------------------------------------------------------
 
-    def _file_backend_active(self) -> bool:
-        """True only when the persistent file cache is in use."""
-        cache_manager = CacheManager.get_instance()
-        return cache_manager is not None and isinstance(
-            cache_manager.backend, ArrowFileBackend
-        )
+    def _cache_active(self) -> bool:
+        """True only when a cache manager is configured to warm into."""
+        return CacheManager.get_instance() is not None
 
     def _has_headroom(self) -> bool:
         """True while the file cache is below the backlog high-water mark.
@@ -275,7 +273,7 @@ class PrecacheWorker:
         if cache_manager is None:
             return False
         try:
-            st = cache_manager.backend.stats()
+            st = cache_manager.stats()
         except Exception:
             return False
         if st.max_bytes <= 0:
@@ -296,10 +294,9 @@ class PrecacheWorker:
     def _process_source(self, source_id: str, backlog: bool = False) -> bool:
         """Warm every tensor of a source. Return True if a backlog pass was
         preempted (and should be re-queued)."""
-        # Runtime file-backend gate: the "only run if file-based caching"
-        # condition, enforced regardless of config.
-        if not self._file_backend_active():
-            logger.debug("precache: file backend not active, skipping %s", source_id)
+        # Runtime cache gate: nothing to warm into without a CacheManager.
+        if not self._cache_active():
+            logger.debug("precache: no cache configured, skipping %s", source_id)
             return False
         # Residency gate (#174): under a cloud root, skip a source whose member
         # files have been re-dehydrated since registration. Reading them would
@@ -317,15 +314,14 @@ class PrecacheWorker:
         if source_adapter is None:
             return False
 
-        # Skip non-local (remote) sources entirely (biopb/biopb#299). Warming a
-        # remote-tensor proxy source would speculatively pull every chunk across
-        # the network from the upstream at startup -- costly I/O of questionable
+        # Skip non-local (remote) sources entirely (biopb/biopb#303). Warming a
+        # remote-tensor proxy source would speculatively pull chunks across the
+        # network from the upstream at startup -- costly I/O of questionable
         # value (the real read path caches on demand, and the upstream caches
-        # too), and it inflates the local file cache (feeding the slow-restart
-        # recovery, #300). It is also unsound today: the proxy does not implement
-        # has_native_pyramid(), so a pyramidal upstream would be warmed at a
-        # computed coarse level the upstream already serves natively -- caching
-        # chunks the native-pyramid skip below is meant to avoid.
+        # too). It is also unsound today: the proxy does not implement
+        # has_native_pyramid() (#1120), so a pyramidal upstream would be warmed
+        # at a computed coarse level the upstream already serves natively --
+        # caching chunks the native-pyramid skip below is meant to avoid.
         from biopb_tensor_server.core.remote import is_remote_url
 
         if is_remote_url(source_adapter.source_url or ""):
@@ -335,11 +331,10 @@ class PrecacheWorker:
             return False
 
         try:
-            descriptors = source_adapter.list_tensor_descriptors()
+            # The catalog's view: image tensors and label sets alike.
+            descriptors = catalog_tensors(source_adapter)
         except Exception:
-            logger.exception(
-                "precache: list_tensor_descriptors failed for %s", source_id
-            )
+            logger.exception("precache: catalog_tensors failed for %s", source_id)
             return False
 
         for td in descriptors:
@@ -364,9 +359,9 @@ class PrecacheWorker:
         # (TensorFlightClient), so the request we build mirrors get_flight_info.
         tensor_id = td.array_id
         try:
-            tensor_adapter = source_adapter.get_tensor_adapter(tensor_id)
+            tensor_adapter = source_adapter.resolve_tensor(tensor_id)
         except Exception:
-            logger.exception("precache: get_tensor_adapter failed for %s", tensor_id)
+            logger.exception("precache: resolve_tensor failed for %s", tensor_id)
             return False
         # Skip a tensor that ships its own multi-resolution pyramid (e.g. a
         # well-formed OME-Zarr image, or a pyramidal qptiff/ndtiff series): it
@@ -414,12 +409,7 @@ class PrecacheWorker:
         # is both the costliest warm and the one warming cannot help.
         cfg = self._pyramid_cfg
         targets = compute_warm_targets(
-            list(base_desc.shape),
-            list(base_desc.dim_labels),
-            threshold=cfg.threshold,
-            downscale_factor=cfg.downscale_factor,
-            pixel_budget_cubic_root=cfg.pixel_budget_cubic_root,
-            plane_max_pixels=cfg.plane_max_pixels,
+            list(base_desc.shape), list(base_desc.dim_labels), **cfg.level_kwargs()
         )
 
         if not targets:

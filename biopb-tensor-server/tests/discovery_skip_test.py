@@ -17,6 +17,7 @@ from biopb_tensor_server.core import discovery
 from biopb_tensor_server.core.discovery import (
     _is_offline_placeholder,
     _is_skippable_system_dir,
+    directory_is_resident,
     walk_with_identity_tracking,
 )
 
@@ -96,6 +97,59 @@ class TestOfflinePlaceholder:
             pytest.skip("filesystem allocates blocks for sparse files; signal N/A")
         monkeypatch.setattr(discovery, "_SKIP_OFFLINE", False)
         assert _is_offline_placeholder(f) is False
+
+
+class TestDirectoryIsResident:
+    """directory_is_resident samples files inside a directory rather than
+    trusting the directory's own stat bits (biopb/biopb#1028-followup: the
+    prior unconditional `path.is_dir() -> True` reported a resolved-but-
+    never-warmed multi-file cloud source as resident)."""
+
+    def test_directory_of_real_files_is_resident(self, tmp_path):
+        (tmp_path / "a.bin").write_bytes(b"real bytes")
+        (tmp_path / "b.bin").write_bytes(b"more real bytes")
+        assert directory_is_resident(tmp_path) is True
+
+    def test_empty_directory_is_resident(self, tmp_path):
+        # Nothing to disprove residency with -- best-effort default, same as
+        # an unreadable directory.
+        assert directory_is_resident(tmp_path) is True
+
+    @requires_st_blocks
+    def test_directory_with_placeholder_file_is_not_resident(self, tmp_path):
+        (tmp_path / "resident.bin").write_bytes(b"real bytes")
+        stub = tmp_path / "chunk.bin"
+        with open(stub, "wb") as fh:
+            fh.truncate(4 * 1024 * 1024)
+        if os.stat(stub).st_blocks != 0:
+            pytest.skip("filesystem allocates blocks for sparse files; signal N/A")
+        assert directory_is_resident(tmp_path) is False
+
+    @requires_st_blocks
+    def test_nested_placeholder_is_found(self, tmp_path):
+        # Mirrors a zarr/ome-zarr array's chunk store: data files live in
+        # nested subdirectories, not at the source root.
+        nested = tmp_path / "0" / "0"
+        nested.mkdir(parents=True)
+        stub = nested / "chunk.0.0"
+        with open(stub, "wb") as fh:
+            fh.truncate(4 * 1024 * 1024)
+        if os.stat(stub).st_blocks != 0:
+            pytest.skip("filesystem allocates blocks for sparse files; signal N/A")
+        assert directory_is_resident(tmp_path) is False
+
+    @requires_st_blocks
+    def test_sample_cap_is_respected(self, tmp_path):
+        # A placeholder past the sample cap is not found -- best-effort, not a
+        # full-tree guarantee.
+        for i in range(5):
+            (tmp_path / f"resident-{i}.bin").write_bytes(b"real bytes")
+        stub = tmp_path / "z-placeholder.bin"
+        with open(stub, "wb") as fh:
+            fh.truncate(4 * 1024 * 1024)
+        if os.stat(stub).st_blocks != 0:
+            pytest.skip("filesystem allocates blocks for sparse files; signal N/A")
+        assert directory_is_resident(tmp_path, max_files=2) is True
 
 
 def _write_tiff(path: Path) -> None:

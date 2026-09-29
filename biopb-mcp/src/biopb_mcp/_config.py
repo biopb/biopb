@@ -16,17 +16,15 @@ the shared biopb XDG *state* tree (``~/.local/state/biopb/mcp``), resolved via
 :mod:`biopb._locations` (no more separate top-level ``biopb-mcp`` dir).
 
 Sections are flat (no ``mcp.``/``widget.`` wrapper): ``transport`` / ``kernel`` /
-``dask`` / ``tensor`` / ``viewer`` / ``services`` / ``observe`` / ``update`` are
-the MCP-server knobs; ``widget`` / ``detection`` / ``grid`` are the demo napari
-widgets (``image_processing/``); ``pyramid`` is a GUI-independent knob read by the
-MCP kernel too; ``timeout`` / ``grpc`` / ``memory`` are compute-plane knobs
-shared by the widgets and ``ops``.
+``viewer`` / ``services`` / ``observe`` / ``update`` are
+the MCP-server knobs; ``timeout`` / ``grpc`` / ``memory`` are compute-plane knobs
+read by ``ops``. The napari widgets keep their own settings (biopb-napari-widget).
 
 There is deliberately **no data-plane endpoint here** (biopb/biopb#628): the
 control plane owns the data plane and is asked for its address at connect time,
 so a configured URL could only be a second, staler answer -- and was how this
-machine's credential reached endpoints the control never named (#626). A legacy
-``tensor_browser`` section in an existing file is simply ignored by the merge.
+machine's credential reached endpoints the control never named (#626). A section the
+schema does not know is carried by the merge and read by nothing.
 
 Read settings with :func:`get_setting`, which falls back to ``DEFAULT_CONFIG`` so
 call sites never duplicate a default literal.
@@ -42,33 +40,23 @@ import os
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import List, Optional
 
-# Shared with the tensor server: the constraint primitives (so the pyramid knobs
-# are validated by the exact same rules in both packages -- the same bug, not an
-# analogous one; biopb/biopb#182, #34) and the config-file location.
+# Shared with the tensor server: the constraint primitives (so a knob is judged
+# by the same rules in both packages; biopb/biopb#182, #34) and the config-file
+# location.
 from biopb import _locations
-from biopb._config_constraints import PYRAMID_CONSTRAINTS, Enum, Range
+from biopb._config_constraints import Enum, Range
 from biopb._config_io import atomic_write_json
 from biopb._config_validate import MISSING, Problem, check_sections, warn_and_clamp
 from biopb._locations import mcp_config_path
 
-if TYPE_CHECKING:
-    import numpy as np
-
 logger = logging.getLogger(__name__)
 
-# Platform-dependent defaults for the two kernel-bring-up knobs Windows pays a
-# structural penalty on. Windows has no fork(): dask's multi-process LocalCluster
-# must *spawn* every worker -- a fresh interpreter re-importing the whole
-# numpy/dask/distributed stack cold -- where POSIX forks near-free via
-# copy-on-write. With num_workers=0 (dask picks ~n_cores) that spawn+reimport
-# storm both lengthens bring-up (risking startup_timeout) and multiplies memory.
-# So Windows caps the worker count and widens the startup budget; POSIX keeps the
-# lean defaults. A user config still overrides either leaf on any platform.
+# Windows widens the kernel's startup budget: it has no fork(), so the kernel
+# and everything it imports start cold. A user config still overrides it.
 _IS_WINDOWS = os.name == "nt"
 _DEFAULT_STARTUP_TIMEOUT = 120.0 if _IS_WINDOWS else 60.0
-_DEFAULT_DASK_NUM_WORKERS = 4 if _IS_WINDOWS else 0
 
 
 def _h(default, help_text, **kw):
@@ -90,90 +78,16 @@ def _hlist(default_list, help_text):
 
 
 @dataclass
-class WidgetConfig:
-    """Settings for the experimental napari demo widgets (image_processing/).
-
-    Only those widgets read this section; the MCP server does not.
-    """
-
-    server_url: str = _h(
-        "localhost:50051", "ProcessImage server the demo widgets target."
-    )
-    is_3d: bool = _h(
-        False, "Whether the demo widgets operate in 3D mode (persisted toggle)."
-    )
-
-
-@dataclass
-class DetectionConfig:
-    """Object-detection parameters for the demo widgets."""
-
-    min_score: float = _h(0.4, "Minimum detection score to keep a predicted object.")
-    size_hint: float = _h(
-        32.0, "Approximate object size (px) hint passed to the detector."
-    )
-    nms: str = _h("Off", "Non-maximum-suppression mode for overlapping detections.")
-    z_aspect_ratio: float = _h(1.0, "Z-vs-XY voxel aspect ratio for 3D detection.")
-
-
-@dataclass
-class GridConfig:
-    """Tiling grid for large-image detection (size/stride per 2D and 3D mode).
-
-    Each is a per-axis pixel vector; stride < size gives overlap between tiles.
-    """
-
-    size_2d: List[int] = _hlist([4096, 4096], "2D tile size [y, x] (px).")
-    stride_2d: List[int] = _hlist(
-        [4000, 4000], "2D tile stride [y, x] (px); < size overlaps tiles."
-    )
-    size_3d: List[int] = _hlist([64, 512, 512], "3D tile size [z, y, x] (px).")
-    stride_3d: List[int] = _hlist(
-        [48, 480, 480], "3D tile stride [z, y, x] (px); < size overlaps tiles."
-    )
-
-
-@dataclass
-class PyramidConfig:
-    """Multiscale pyramid construction for large tensors.
-
-    Shared by the Tensor Browser widget and MCP ``add_tensor`` (both call
-    ``_tensor_utils.build_pyramid_levels``), so it is GUI-independent and lives at
-    the top level rather than under ``widget``. The numeric bounds are the
-    identical rows the tensor server enforces (PYRAMID_CONSTRAINTS), so the two
-    cannot drift.
-    """
-
-    threshold: int = _h(
-        4096,
-        "Build a pyramid only if an x/y dimension exceeds this size; also the stop "
-        "criterion (coarsest level fits within threshold in x and y).",
-    )
-    downscale_factor: int = _h(
-        2,
-        "Linear downscale between successive levels. 2x keeps every level on the "
-        "dyadic grid the browser tile route also uses, and keeps napari's "
-        "level pick (the coarsest still above the canvas) from over-fetching by "
-        "up to 4x per axis.",
-    )
-    pixel_budget_cubic_root: int = _h(
-        448,
-        "Per-axis edge length of the coarsest level's 3D whole-volume read (#29); "
-        "the voxel budget is this value cubed. 448 -> ~90M voxels, measured as "
-        "the point a float32 volume stays interactive (biopb-tensor-server "
-        "docs/precache-policy.md 9.1).",
-    )
-
-
-@dataclass
 class TimeoutConfig:
     """Per-call gRPC timeouts (seconds) for the compute plane."""
 
     health_check: float = _h(5.0, "Timeout for a server health check.")
-    get_op_names: float = _h(10.0, "Timeout for listing a server's op names.")
-    detection_2d: int = _h(15, "Timeout for a 2D detection call.")
-    detection_3d: int = _h(300, "Timeout for a 3D detection call.")
-    process_image: int = _h(300, "Timeout for a ProcessImage call.")
+    get_op_names: float = _h(
+        10.0, "Timeout for listing the algorithm servers and their ops."
+    )
+    process_image: int = _h(
+        300, "How long an op call may go without a word from its server."
+    )
 
 
 @dataclass
@@ -232,13 +146,6 @@ class TransportConfig:
         "Extra Host header values appended to the loopback allowlist. Set only when "
         "fronting the server with a reverse proxy. http transport only.",
     )
-    server_start_timeout: float = _h(
-        60.0,
-        "Give-up budget (seconds) applied twice on auto_connect's control path "
-        "(control-ensure, then boot wait), so the worst-case wall wait is ~2x "
-        "this. The $BIOPB_TENSOR_URL path spends it once, on a STARTING server. "
-        "The normal path (plane already up) has no timeout.",
-    )
 
 
 @dataclass
@@ -249,16 +156,13 @@ class KernelConfig:
     startup_timeout: float = _h(
         _DEFAULT_STARTUP_TIMEOUT,
         "Seconds to wait for kernel bring-up. 60 on POSIX; 120 on Windows, where "
-        "the cold spawn+reimport of dask workers makes bring-up legitimately slower.",
+        "a cold interpreter start makes bring-up legitimately slower.",
     )
     execute_timeout: float = _h(
         120.0,
         "Bounds only the quick in-band kernel snippets (screenshot / status / "
         "inspect / job submit+poll), not long jobs -- execute_code runs agent code "
         "in a background thread that may run indefinitely.",
-    )
-    busy_lock_timeout: float = _h(
-        5.0, "Seconds to wait for the kernel RLock before reporting busy."
     )
     promote_after: float = _h(
         10.0,
@@ -284,72 +188,23 @@ class KernelConfig:
 
 
 @dataclass
-class DaskConfig:
-    """Dask scheduler / cluster for the kernel's compute."""
-
-    scheduler: str = _h(
-        "distributed",
-        'Dask scheduler: "distributed" (a LocalCluster; enables mid-compute '
-        'cancel and real CPU parallelism), "threads"/"synchronous" (low-overhead '
-        "in-process, no mid-compute cancel).",
-    )
-    num_workers: int = _h(
-        _DEFAULT_DASK_NUM_WORKERS,
-        "n_workers for the auto-spun LocalCluster (0 -> dask picks ~n_cores). 0 on "
-        "POSIX (fork is cheap); capped at 4 on Windows (each worker is a cold spawn).",
-    )
-    address: str = _h(
-        "",
-        "Non-empty -> connect to this external scheduler address; empty -> the "
-        "session child spins/owns a LocalCluster.",
-    )
-    threads_per_worker: int = _h(
-        1, "LocalCluster threads per worker (local cluster only)."
-    )
-    memory_limit: str = _h(
-        "auto", "LocalCluster per-worker memory limit (local cluster only)."
-    )
-    dashboard_address: str = _h(
-        "127.0.0.1:0",
-        "Bokeh dashboard bind address; loopback-only to match the server's security "
-        'model. ":0" picks a free port.',
-    )
-    cache_budget: str = _h(
-        "1G",
-        "Cluster-wide chunk-cache budget for the data-plane client, split evenly "
-        "across workers. Human size (1G/512M/2GiB) or int bytes; 0 disables. "
-        "Applies to localhost and remote alike.",
-    )
-    idle_ttl: float = _h(
-        900.0,
-        "Seconds with no kernel attached after which the session child's own "
-        "LocalCluster is torn down, freeing its workers; the next start_kernel "
-        "re-spins it. Only counts while no kernel is alive, so a live viewer or "
-        "a restart never loses the warm cluster. 0 disables. An external "
-        "dask.address is never reaped (we do not own it).",
-    )
-
-
-@dataclass
-class TensorRuntimeConfig:
-    """Background source-catalog watcher in the kernel (#44)."""
-
-    health_poll_min_interval: float = _h(
-        2.0,
-        "Min poll interval (s) for the source-catalog watcher; it re-lists sources "
-        "when the server's source_count changes so a partial catalog self-heals. "
-        "The interval backs off to the max while stable, snaps back on a change. "
-        "0 disables the watcher.",
-    )
-    health_poll_max_interval: float = _h(
-        60.0,
-        "Max poll interval (s) the watcher backs off to while the catalog is stable.",
-    )
-
-
-@dataclass
 class ViewerConfig:
-    """napari viewer slice-read behavior in the kernel."""
+    """The napari viewer, for a session that has one."""
+
+    enabled: bool = _h(
+        True,
+        "Open a napari viewer window in the kernel, bound as `viewer`. Needs the "
+        "biopb-mcp[napari] extra and a display; without either the session runs "
+        "with no viewer, and results are shown through the web viewer. Off -> "
+        "never open one. `biopb mcp view` opens one regardless.",
+    )
+    virtual_display: bool = _h(
+        False,
+        "On a Linux host with no display, render the viewer on a launcher-owned "
+        "Xvfb virtual display instead of running without one. Screenshots work, "
+        "but no window is visible and 3-D volumes render in software GL; meant "
+        "for tests. Needs the Xvfb binary.",
+    )
 
     compute_scheduler: str = _h(
         "threads",
@@ -367,48 +222,14 @@ class ViewerConfig:
 
 @dataclass
 class ServicesConfig:
-    """Compute-plane servers and the skills catalog wired into the kernel."""
+    """The knowledge store wired into the kernel."""
 
-    process_image_servers: List[str] = _hlist(
-        [],
-        "biopb.image ProcessImage servicer URLs (grpc:// or grpcs://). Each is "
-        "queried via GetOpNames and exposed as callables in the kernel's `ops` dict.",
-    )
-    skills_enabled: bool = _h(
-        True,
-        "Master switch for skills discovery/retrieval. On by default: the agent is "
-        "told to consult list_skills, which resolves the curated workflows shipped "
-        "with this package plus the user's own (skills_local_dir). Set false to keep "
-        "the subsystem dormant -- list_skills returns nothing and the agent is not "
-        "told about skills.",
-    )
-    skills_local_dir: str = _h(
+    docs_local_dir: str = _h(
         "",
-        "Directory of user-authored skill files (*.md) merged into the catalog "
-        "beside the shipped ones; empty -> ~/.config/biopb/skills. Personal and "
-        "unreviewed (list_skills reports them as origin=local), re-read on every "
-        "discovery so an edit is live without a restart. Since the curated set now "
-        "arrives only with a release, this is also the only way a skill reaches a "
-        "machine out of band. Off with skills_enabled like the rest of the "
-        "subsystem.",
-    )
-    skills_index_plugins: bool = _h(
-        True,
-        "Also return kernel plugins from list_skills, described by their module "
-        "docstring (read with ast, never imported). Without this a plugin is "
-        "discoverable only as a bare name in server_status, which conveys nothing "
-        "about what it does -- measured: five benchmark arms were shown the name "
-        "and none followed it up. Rows carry kind='plugin' and a namespace handle "
-        "instead of a skill:// uri. Off with skills_enabled or namespace_enabled, "
-        "since there is nothing to advertise if the catalog is dormant or the "
-        "plugins will not load.",
-    )
-    namespace_enabled: bool = _h(
-        True,
-        "Load user 'bring your own tool' plugins into the agent kernel namespace at "
-        "start: *.py files in ~/.config/biopb/kernel/ and installed "
-        "biopb_mcp.namespace packages (biopb/biopb-mcp#92). Off -> a clean "
-        "built-in-only namespace.",
+        "Directory of the agent's own docs (*.md), written by write_doc and "
+        "shadowing a shipped doc of the same id; empty -> ~/.config/biopb/docs. "
+        "Holds the index the agent edits, and is re-read on every access so a "
+        "hand edit is live without a restart.",
     )
 
 
@@ -431,38 +252,27 @@ class ObserveConfig:
         "How often (ms) the observe page polls the job list/status. Deliberately "
         "slow: each poll is a kernel round-trip competing with agent calls.",
     )
-    console_enabled: bool = _h(
-        True,
-        "Offer the user console: a code cell on the observe page that runs in "
-        "this session's kernel, serialized against the agent by the same "
-        "one-job-at-a-time rule. Off drops the route entirely. This can only "
-        "narrow the surface -- the control refuses to proxy the console at all "
-        "unless it is loopback-bound, whatever this says.",
-    )
     chat_enabled: bool = _h(
         True,
         "Offer the built-in chat client: a pane on the observe page that drives "
-        "this session's kernel through a model. Lives here beside the console "
-        "because it is the same kind of thing -- an execute-capable surface on "
-        "this page -- and because it needs the page: chat routes served without "
-        "one have nothing to reach them. On by default, but inert until the "
-        "model and key in `chat` are set, so it costs nothing to leave on. "
-        "Like the console, this can only narrow the surface.",
+        "this session's kernel through a model. Lives here because it needs the "
+        "page: chat routes served without one have nothing to reach them. On by "
+        "default, but inert until the model and key in `chat` are set, so it "
+        "costs nothing to leave on. This can only narrow the surface -- the "
+        "control refuses to proxy chat at all unless it is loopback-bound.",
     )
 
 
 @dataclass
 class ChatConfig:
-    """Which agent drives the chat pane, and how to reach it.
+    """Which model drives the chat pane, and how to reach it.
 
-    Two engines. ``builtin`` is the in-process loop (``mcp/_chat.py``) talking to
-    an OpenAI-compatible endpoint: ``model`` / ``base_url`` / ``api_key_env`` /
-    ``request_timeout`` describe it. ``acp`` hands the pane to a coding harness
-    the user already runs, over the Agent Client Protocol: the ``acp_*`` settings
-    describe that one. Nothing is shared between the two but the pane.
+    The pane is an in-process loop (``mcp/_chat.py``) talking to an
+    OpenAI-compatible endpoint: ``model`` / ``base_url`` / ``api_key_env`` /
+    ``request_timeout`` describe it.
 
-    The on/off switch is **not** here: it is ``observe.chat_enabled``, beside the
-    console's, because what it turns on is a pane on the observe page. This
+    The on/off switch is **not** here: it is ``observe.chat_enabled``, because
+    what it turns on is a pane on the observe page. This
     section is only *which* agent that pane talks to, so there is one place to
     enable a surface and one place to point it somewhere.
 
@@ -474,12 +284,6 @@ class ChatConfig:
     a person may reasonably want to change and no one needs to keep secret.
     """
 
-    engine: str = _h(
-        "builtin",
-        "Which agent drives the pane: 'builtin' (the in-process loop, needs a "
-        "model and a provider key) or 'acp' (a coding harness you already have, "
-        "which brings its own model and its own subscription).",
-    )
     model: str = _h(
         "",
         "Model id to send, e.g. 'gpt-4o' or 'deepseek-v4'. Empty means chat is "
@@ -488,8 +292,17 @@ class ChatConfig:
     )
     base_url: str = _h(
         "https://api.openai.com/v1",
-        "OpenAI-compatible chat-completions base URL. Any gateway speaking that "
-        "shape works; '/chat/completions' is appended.",
+        "OpenAI-compatible API root. Any gateway speaking that shape works; the "
+        "route ('/chat/completions' or '/responses', per chat.api) is appended, "
+        "so this is the root and not the endpoint itself.",
+    )
+    api: str = _h(
+        "completions",
+        "Which API shape chat.model speaks: 'completions' (POST "
+        "{base_url}/chat/completions) or 'responses' (POST {base_url}/responses). "
+        "One gateway can serve both and disagree per model, and GET /models does "
+        "not say which, so it is configured rather than probed -- a probe costs a "
+        "billed call and reads a wrong-route 500 as an outage.",
     )
     api_key_env: str = _h(
         "BIOPB_CHAT_API_KEY",
@@ -521,32 +334,6 @@ class ChatConfig:
         "not merely fail the screenshot -- the image is stored and re-sent, so "
         "every later turn fails too, which is what 'auto' recovers from.",
     )
-    acp_agent: str = _h(
-        "opencode",
-        "Which ACP harness to run when engine is 'acp'. Only 'opencode' is "
-        "supported: it is the one that ships an ACP mode natively and honours "
-        "the MCP server handed to it in the session handshake.",
-    )
-    acp_command: str = _h(
-        "",
-        "Absolute path to the harness binary, overriding the usual lookup. For "
-        "an install PATH does not reach; empty means resolve 'opencode' the "
-        "normal way.",
-    )
-    acp_model: str = _h(
-        "",
-        "Model the harness should use, in its own spelling (opencode: "
-        "'openai/gpt-5.5'). Empty takes whatever the harness defaults to — "
-        "which is a model you did not choose, on a provider that may not even "
-        "be reachable. Ignored by a harness that exposes no model setting.",
-    )
-    acp_permission: str = _h(
-        "ask",
-        "What to do when the harness asks permission to run something: 'ask' "
-        "puts the request in the pane, 'allow' answers yes for you. A harness "
-        "brings its own file and shell tools, so 'allow' is unattended access "
-        "to this machine, not just to the viewer.",
-    )
 
 
 @dataclass
@@ -576,26 +363,67 @@ class UpdateConfig:
     )
 
 
+def _section(cls, title=None, summary=None):
+    """A top-level section. *title* and *summary* are its settings-page nav
+    label and panel prose (schema ``title`` / ``description``); a section with
+    no title is left off the page, still editable as raw JSON."""
+    return field(default_factory=cls, metadata={"title": title, "summary": summary})
+
+
 @dataclass
 class McpConfig:
-    """The whole biopb-mcp config: one field per top-level section."""
+    """The whole biopb-mcp config: one field per top-level section, in the
+    settings page's nav order."""
 
-    widget: WidgetConfig = field(default_factory=WidgetConfig)
-    detection: DetectionConfig = field(default_factory=DetectionConfig)
-    grid: GridConfig = field(default_factory=GridConfig)
-    pyramid: PyramidConfig = field(default_factory=PyramidConfig)
-    timeout: TimeoutConfig = field(default_factory=TimeoutConfig)
-    grpc: GrpcConfig = field(default_factory=GrpcConfig)
-    memory: MemoryConfig = field(default_factory=MemoryConfig)
-    transport: TransportConfig = field(default_factory=TransportConfig)
-    kernel: KernelConfig = field(default_factory=KernelConfig)
-    dask: DaskConfig = field(default_factory=DaskConfig)
-    tensor: TensorRuntimeConfig = field(default_factory=TensorRuntimeConfig)
-    viewer: ViewerConfig = field(default_factory=ViewerConfig)
-    services: ServicesConfig = field(default_factory=ServicesConfig)
-    observe: ObserveConfig = field(default_factory=ObserveConfig)
-    chat: ChatConfig = field(default_factory=ChatConfig)
-    update: UpdateConfig = field(default_factory=UpdateConfig)
+    services: ServicesConfig = _section(
+        ServicesConfig,
+        "Services",
+        "The knowledge store and the kernel's plugins. The algorithm servers "
+        "behind `ops` are the control's: ~/.config/biopb/algorithms/.",
+    )
+    timeout: TimeoutConfig = _section(
+        TimeoutConfig, "Timeouts", "Per-call gRPC timeouts for the compute plane."
+    )
+    grpc: GrpcConfig = _section(
+        GrpcConfig, "gRPC", "gRPC channel limits for the compute plane."
+    )
+    memory: MemoryConfig = _section(
+        MemoryConfig, "Memory", "Chunk-size guardrails for eager transfers."
+    )
+    transport: TransportConfig = _section(
+        TransportConfig,
+        "Transport",
+        "The MCP server's front-end transport (stdio / http) and its network guards.",
+    )
+    kernel: KernelConfig = _section(
+        KernelConfig,
+        "Kernel",
+        "The child Jupyter kernel that runs agent code: bring-up, timeouts, and "
+        "the orphan watchdog.",
+    )
+    viewer: ViewerConfig = _section(
+        ViewerConfig, "Viewer", "How the napari viewer fetches image slices."
+    )
+    observe: ObserveConfig = _section(
+        ObserveConfig,
+        "Observe",
+        "The loopback web UI for watching execute_code job history (http "
+        "transport only).",
+    )
+    chat: ChatConfig = _section(
+        ChatConfig,
+        "Chat",
+        "Which model the built-in chat pane talks to. The on/off switch is on "
+        "the Observe page (chat_enabled); the provider key is not here, by "
+        "design — this file is served to the browser, so the key lives in an "
+        "owner-only credential file.",
+    )
+    update: UpdateConfig = _section(
+        UpdateConfig,
+        "Updates",
+        "The kernel-start auto-updater that offers to re-run the installer on a "
+        "newer release.",
+    )
 
 
 # Section name -> its dataclass, derived from McpConfig so the two never drift.
@@ -606,15 +434,11 @@ _SECTION_CLASSES = {
 
 
 # Per-class validation rules (biopb/biopb#182). Keyed by class name like the
-# tensor server's table; the shared Range/Enum primitives judge the same knobs
-# (notably the pyramid rows) identically in both packages.
+# tensor server's table, judged by the same shared Range/Enum primitives.
 _CONSTRAINTS = {
-    "PyramidConfig": {**PYRAMID_CONSTRAINTS},
     "TimeoutConfig": {
         "health_check": Range(exclusive_min=0),
         "get_op_names": Range(exclusive_min=0),
-        "detection_2d": Range(exclusive_min=0),
-        "detection_3d": Range(exclusive_min=0),
         "process_image": Range(exclusive_min=0),
     },
     "GrpcConfig": {
@@ -627,34 +451,21 @@ _CONSTRAINTS = {
     },
     "ChatConfig": {
         "request_timeout": Range(exclusive_min=0),
-        "engine": Enum({"builtin", "acp"}),
-        "acp_agent": Enum({"opencode"}),
-        "acp_permission": Enum({"ask", "allow"}),
+        "api": Enum({"completions", "responses"}),
         "vision": Enum({"auto", "on", "off"}),
     },
     "TransportConfig": {
         "kind": Enum({"http", "stdio"}),
         "port": Range(min=1, max=65535),
         "session_log_keep": Range(min=1),  # keep at least the current
-        "server_start_timeout": Range(exclusive_min=0),
     },
     "KernelConfig": {
         "startup_timeout": Range(exclusive_min=0),
         "execute_timeout": Range(exclusive_min=0),
-        "busy_lock_timeout": Range(exclusive_min=0),
         "promote_after": Range(exclusive_min=0),
         "watchdog_interval": Range(min=0),  # 0 disables the watchdog
         "watchdog_max_respawns": Range(min=0),
         "watchdog_respawn_window": Range(min=0),
-    },
-    "DaskConfig": {
-        "scheduler": Enum({"distributed", "threads", "synchronous"}),
-        "num_workers": Range(min=0),  # 0 -> dask picks ~n_cores
-        "idle_ttl": Range(min=0),  # 0 disables the idle reaper
-    },
-    "TensorRuntimeConfig": {
-        "health_poll_min_interval": Range(min=0),  # 0 disables the watcher
-        "health_poll_max_interval": Range(min=0),
     },
 }
 
@@ -679,7 +490,7 @@ _MISSING = MISSING
 def get_setting(config: dict, path: str, default=_MISSING):
     """Read an absolute dotted *path* from *config*, else ``DEFAULT_CONFIG``.
 
-    ``get_setting(config, "dask.scheduler")`` walks *config* by the dotted path;
+    ``get_setting(config, "kernel.promote_after")`` walks *config* by the dotted path;
     on a miss at any level it falls back to *default* if given, else to the value
     at the same path in ``DEFAULT_CONFIG``. Mutable defaults are deep-copied so
     callers cannot alias the shared ``DEFAULT_CONFIG``. Centralizing the fallback
@@ -776,7 +587,7 @@ def _deep_merge(base: dict, override: dict) -> dict:
     """Recursively merge *override* into *base* in place, returning *base*.
 
     Nested dicts are merged key-by-key so a partial user section (e.g. only
-    ``{"dask": {"num_workers": 4}}``) overrides just that leaf and leaves its
+    ``{"kernel": {"promote_after": 30}}``) overrides just that leaf and leaves its
     sibling defaults intact. Non-dict values (and dict-vs-non-dict mismatches)
     replace wholesale.
     """
@@ -808,33 +619,6 @@ def _walk_path(node: dict, keys):
     return node
 
 
-def _health_poll_not_inverted(get) -> List[Problem]:
-    """The health-poll backoff must not invert (min > max).
-
-    A cross-field rule: no per-field ``Range`` can express it, so it is declared
-    here as data and applied by the shared walker -- which is what makes the
-    control's ``PUT /api/mcp_config`` enforce it too, instead of restating the
-    comparison in its own handler. Both ends are reported, so the load path
-    resets the whole range to its defaults rather than half of it.
-    """
-    lo = get("tensor", "health_poll_min_interval")
-    hi = get("tensor", "health_poll_max_interval")
-    if not isinstance(lo, (int, float)) or not isinstance(hi, (int, float)):
-        return []  # absent or wrong-typed: the per-field pass owns that
-    if lo <= hi:
-        return []
-    message = (
-        f"health_poll_min_interval={lo!r} must be <= health_poll_max_interval={hi!r}"
-    )
-    return [
-        Problem(("tensor", "health_poll_min_interval"), message),
-        Problem(("tensor", "health_poll_max_interval"), message),
-    ]
-
-
-CROSS_FIELD_RULES = (_health_poll_not_inverted,)
-
-
 def config_problems(config: dict) -> List[Problem]:
     """Every constraint violation in *config* (empty when valid).
 
@@ -846,7 +630,6 @@ def config_problems(config: dict) -> List[Problem]:
         ((section, config.get(section, {})) for section in _SECTION_CLASSES),
         _CONSTRAINTS,
         class_names={s: cls.__name__ for s, cls in _SECTION_CLASSES.items()},
-        cross_field=CROSS_FIELD_RULES,
     )
 
 
@@ -857,26 +640,71 @@ def _validate_and_clamp(config: dict) -> dict:
     not reach the runtime, but must not take the session down either -- a raise
     here is a dead MCP client and no viewer. A leaf absent from the merged dict
     is skipped (nothing to check). Returns *config*.
-
-    Clamped to a fixpoint: resetting a per-field leaf to its default can *create*
-    a cross-field violation the first pass didn't see (a negative
-    ``health_poll_min_interval`` clamped to a default above a small but valid
-    ``max``), so re-check until clean. Converges because the defaults are
-    mutually consistent (``test_shipped_defaults_pass_the_whole_check``); the
-    bound is a belt-and-braces guard against a cycle.
     """
-    for _ in range(len(_CONSTRAINTS) + len(CROSS_FIELD_RULES) + 1):
-        problems = config_problems(config)
-        if not problems:
-            break
-        warn_and_clamp(
-            problems,
-            lambda path: _walk_path(DEFAULT_CONFIG, path),
-            lambda path, value: config[path[0]].__setitem__(
-                path[1], copy.deepcopy(value)
-            ),
-            logger,
-        )
+    warn_and_clamp(
+        config_problems(config),
+        lambda path: _walk_path(DEFAULT_CONFIG, path),
+        lambda path, value: config[path[0]].__setitem__(path[1], copy.deepcopy(value)),
+        logger,
+    )
+    return config
+
+
+# Keys renamed by the knowledge-store redesign, read for one release so an
+# existing config file is not silently ignored. The new key wins where both are
+# present.
+_RENAMED_KEYS = {
+    "services": {
+        "skills_local_dir": "docs_local_dir",
+    },
+}
+
+# Keys that no longer exist at all, with what to say about each. Dropped rather
+# than carried, and *said* rather than dropped quietly: an unknown key is
+# otherwise kept by the merge, ignored by the constraints, and invisible in the
+# admin editor, so the setting goes on looking honoured forever.
+_RETIRED_KEYS = {
+    "chat": {
+        "engine": "the pane is the in-process loop; set chat.model",
+        "acp_agent": "the ACP engine is gone",
+        "acp_command": "the ACP engine is gone",
+        "acp_model": "the ACP engine is gone; set chat.model",
+        "acp_permission": "the ACP engine is gone",
+    },
+}
+
+
+def _apply_key_changes(config: dict) -> dict:
+    """Reconcile a config file with keys this release moved or dropped, in place.
+
+    Retirements first, then renames: the two sets are disjoint, and doing it in
+    this order means a key that is retired *and* shares a name with a rename
+    target cannot be resurrected by the second pass.
+    """
+    for section, mapping in _RETIRED_KEYS.items():
+        values = config.get(section)
+        if not isinstance(values, dict):
+            continue
+        for key, advice in mapping.items():
+            if key in values:
+                values.pop(key)
+                logger.warning(
+                    "config: %s.%s is retired and ignored -- %s", section, key, advice
+                )
+    for section, mapping in _RENAMED_KEYS.items():
+        values = config.get(section)
+        if not isinstance(values, dict):
+            continue
+        for old, new in mapping.items():
+            if old in values and new not in values:
+                values[new] = values.pop(old)
+                logger.warning(
+                    "config: %s.%s is now %s.%s; reading the old key this release",
+                    section,
+                    old,
+                    section,
+                    new,
+                )
     return config
 
 
@@ -900,7 +728,7 @@ def _read_and_merge_from_disk() -> dict:
 
         # Deep-merge with defaults so partial user sections override only their own
         # leaves and every expected key still resolves.
-        merged = _deep_merge(get_default_config(), config)
+        merged = _deep_merge(get_default_config(), _apply_key_changes(config))
         # Reject out-of-range / bad-enum leaves (warn + reset) before any hot path
         # reads them (biopb/biopb#182).
         _validate_and_clamp(merged)
@@ -1018,13 +846,3 @@ def save_config(config: dict) -> None:
     """
     atomic_write_json(get_config_path(), config, raise_on_error=False)
     CONFIG.reload()
-
-
-def get_grid_params(is_3d: bool, config: dict) -> Tuple[np.ndarray, np.ndarray]:
-    """Get grid size and stride from config as (grid_size, stride) int arrays."""
-    import numpy as np
-
-    suffix = "3d" if is_3d else "2d"
-    grid_size = np.array(get_setting(config, f"grid.size_{suffix}"), dtype=int)
-    stride = np.array(get_setting(config, f"grid.stride_{suffix}"), dtype=int)
-    return grid_size, stride

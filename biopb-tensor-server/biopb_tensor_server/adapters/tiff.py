@@ -507,20 +507,18 @@ class TiffSequenceAdapter(_PerFileTiffLockMixin, TensorAdapter):
         cls, source: "SourceConfig", credentials_config: Optional[Any] = None
     ) -> "TiffSequenceAdapter":
         """Create adapter instance from SourceConfig."""
-        return cls(str(source.url), source.source_id or "", source.dim_labels)
+        return cls(str(source.url), source.source_id or "")
 
     def __init__(
         self,
         directory: str,
         source_id: str,
-        dim_labels: Optional[List[str]] = None,
     ):
         """Initialize TIFF sequence adapter.
 
         Args:
             directory: Path to directory containing TIFF sequence
             source_id: Unique identifier for this data source
-            dim_labels: Optional dimension labels (if None, inferred from file count)
         """
         import tifffile
 
@@ -679,12 +677,12 @@ class TiffSequenceAdapter(_PerFileTiffLockMixin, TensorAdapter):
             # page axis keeps the conventional 'z' default.
             self.full_shape = [n_files, n_pages_per_file] + spatial_shape
             self.chunk_shape = [1, 1] + self._spatial_chunk
-            self.dim_labels = dim_labels if dim_labels else ["i", "z", "y", "x"]
+            self.dim_labels = ["i", "z", "y", "x"]
         else:
             # Single-page files: (num_files, Y, X). 'i' = opaque file/stack axis.
             self.full_shape = [n_files] + spatial_shape
             self.chunk_shape = [1] + self._spatial_chunk
-            self.dim_labels = dim_labels if dim_labels else ["i", "y", "x"]
+            self.dim_labels = ["i", "y", "x"]
 
         # chunk_shape is the transfer grid (biopb/biopb#809). The per-page block
         # above -- one tile, or one whole page for a striped TIFF -- is only the
@@ -1105,20 +1103,18 @@ class MicroManagerLegacyAdapter(_PerFileTiffLockMixin, TensorAdapter):
         cls, source: "SourceConfig", credentials_config: Optional[Any] = None
     ) -> "MicroManagerLegacyAdapter":
         """Create adapter instance from SourceConfig."""
-        return cls(str(source.url), source.source_id or "", source.dim_labels)
+        return cls(str(source.url), source.source_id or "")
 
     def __init__(
         self,
         directory: str,
         source_id: str,
-        dim_labels: Optional[List[str]] = None,
     ):
         """Initialize MicroManager legacy adapter.
 
         Args:
             directory: Path to directory containing MicroManager dataset
             source_id: Unique identifier for this data source
-            dim_labels: Optional dimension labels (if None, inferred from metadata)
         """
         import json
 
@@ -1260,23 +1256,20 @@ class MicroManagerLegacyAdapter(_PerFileTiffLockMixin, TensorAdapter):
         self.chunk_shape = [1] * (len(self.full_shape) - 2) + self._spatial_chunk
 
         # Dimension labels (from remaining axes after singleton removal)
-        if dim_labels:
-            self.dim_labels = dim_labels
-        else:
-            axis_alias = {
-                "position": "p",
-                "pos": "p",
-                "time": "t",
-                "frame": "t",
-                "channel": "c",
-                "z": "z",
-                "slice": "z",
-            }
-            self.dim_labels = []
-            for axis in self._shape_axes:
-                label = axis_alias.get(axis.lower(), axis.lower()[0])
-                self.dim_labels.append(label)
-            self.dim_labels.extend(["y", "x"])
+        axis_alias = {
+            "position": "p",
+            "pos": "p",
+            "time": "t",
+            "frame": "t",
+            "channel": "c",
+            "z": "z",
+            "slice": "z",
+        }
+        self.dim_labels = []
+        for axis in self._shape_axes:
+            label = axis_alias.get(axis.lower(), axis.lower()[0])
+            self.dim_labels.append(label)
+        self.dim_labels.extend(["y", "x"])
 
         # Transfer grid, seeded by the tile/page block computed above (#809).
         self.chunk_shape = default_transfer_chunk_shape(

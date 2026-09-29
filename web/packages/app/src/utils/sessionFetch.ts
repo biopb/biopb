@@ -57,13 +57,13 @@ export function sessionVerdict(
 /**
  * `fetch`, carrying the stored token and treating a 401 as a locked session.
  *
- * The redirect matches what every other page already does with a 401
- * (`AdminPage`, `LogsPage`, `McpAdminPage`). It also settles a gate the observe
- * page could not otherwise ask about: the console and the chat pane decide
- * *whether to render at all* from two advertised halves — the control is
+ * Every page's calls go through here, and an eslint rule
+ * (`no-restricted-globals`) rejects a bare `fetch` elsewhere. The redirect also
+ * settles a gate the observe page could not otherwise ask about: the chat pane decides *whether to
+ * render at all* from two advertised halves — the control is
  * loopback-bound, and the child serves the root — and a token gate is a third
  * the deployment has but neither half reports. Both halves say yes under
- * `--token`, so an editor appeared and every submit 401'd. Leaving the page
+ * `--token`, so a composer appeared and every submit 401'd. Leaving the page
  * closes that gap without the gate having to grow a third term.
  */
 export async function sessionFetch(

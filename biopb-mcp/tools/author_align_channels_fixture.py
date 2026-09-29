@@ -24,9 +24,9 @@ plus a smooth non-affine term, median displacement ~52 px. **Neither an affine
 nor a thin-plate spline through the given points represents it exactly**, so no
 route to the answer is an oracle and every one of them approximates. The
 amplitude is inherited unchanged from the 2026-08-05 landmark-registration
-prescreen (``docs/skill-candidates.md``) so the numbers stay comparable; it was
-chosen there to separate method families, which makes it harder than a typical
-section-to-section warp rather than representative of one.
+prescreen so the numbers stay comparable; it was chosen there to separate
+method families, which makes it harder than a typical section-to-section warp
+rather than representative of one.
 
 Usage::
 
@@ -234,10 +234,10 @@ def write(root: Path, data: dict, truth: dict, facts: dict, source: dict) -> Non
             f"{Path(__file__).name}; the run never perturbs anything. Neither an "
             "affine nor a TPS through the shipped correspondences represents that "
             "map exactly, so no route to the answer is an oracle. Amplitude is "
-            "inherited from the 2026-08-05 landmark-registration prescreen "
-            "(docs/skill-candidates.md), where it was chosen to separate method "
-            "families -- harder than a typical section-to-section warp, not a "
-            f"sample of one. Measured: {json.dumps(facts)}."
+            "inherited from the 2026-08-05 landmark-registration prescreen, "
+            "where it was chosen to separate method families -- harder than a "
+            "typical section-to-section warp, not a sample of one. "
+            f"Measured: {json.dumps(facts)}."
         ),
         "files": {
             "data.npz": {
@@ -279,7 +279,7 @@ def main() -> None:
 
     url = ""
     try:
-        rows = client.query_sources(
+        rows = client.query(
             f"SELECT source_url FROM sources WHERE source_id = '{args.source_id}'",
             format="pandas",
         )

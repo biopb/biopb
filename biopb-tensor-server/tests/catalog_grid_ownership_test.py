@@ -18,7 +18,6 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 from biopb.tensor.descriptor_pb2 import (
-    DataSourceDescriptor,
     TensorDescriptor,
     TensorReadOption,
 )
@@ -27,9 +26,14 @@ from biopb_tensor_server.adapters.hdf5 import Hdf5Adapter
 from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
 from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
 from biopb_tensor_server.adapters.zarr import ZarrAdapter
-from biopb_tensor_server.core.adapter_base import SourceAdapter, catalog_entry
+from biopb_tensor_server.core.adapter_base import (
+    SourceAdapter,
+    catalog_entry,
+    catalog_tensors,
+)
 from biopb_tensor_server.core.config import PyramidConfig, SourceConfig
-from biopb_tensor_server.core.metadata_db import MetadataDatabase
+from biopb_tensor_server.serving.metadata_db import MetadataDatabase
+from google.protobuf.field_mask_pb2 import FieldMask
 
 # --- the invariant, over the real adapters ----------------------------------
 
@@ -89,12 +93,12 @@ def test_listing_is_structural_and_binding_answers_the_grid(live_sources, family
         assert all(1 <= g <= dim for g, dim in zip(grid, entry.shape, strict=True))
 
 
-def test_source_descriptor_strips_a_grid_the_listing_leaked(live_sources):
-    """The base class enforces it, not each adapter's good behaviour.
+def test_catalog_tensors_strips_a_grid_the_listing_leaked(live_sources):
+    """The projection enforces it, not each adapter's good behaviour.
 
-    ``get_source_descriptor`` is the only path into the DuckDB row and into the
-    adapter-fallback ListFlights, so an adapter that still names a grid cannot
-    reach a client through it.
+    ``catalog_tensors`` is the only path into the DuckDB row, and the row is the
+    only representation of a source that crosses the wire -- so an adapter that
+    still names a grid cannot reach a client through it.
     """
 
     class _LeakyAdapter(SourceAdapter):
@@ -124,8 +128,7 @@ def test_source_descriptor_strips_a_grid_the_listing_leaked(live_sources):
                 )
             ]
 
-    desc = _LeakyAdapter().get_source_descriptor()
-    (tensor,) = desc.tensors
+    (tensor,) = catalog_tensors(_LeakyAdapter())
     assert list(tensor.shape) == [64, 64]  # structure survives
     assert tensor.dtype == "uint8"
     assert list(tensor.chunk_shape) == []  # the read plan does not
@@ -222,11 +225,9 @@ class _MultiSceneBioImage:
 
 
 def _multi_scene_source():
-    # dim_labels=None: each scene reports its own axis order, which is half the
-    # per-scene state a shared grid would flatten.
-    return ZeissAdapter(
-        _MultiSceneBioImage(), scene_index=None, source_id="multi", dim_labels=None
-    )
+    # Each scene reports its own axis order, which is half the per-scene
+    # state a shared grid would flatten.
+    return ZeissAdapter(_MultiSceneBioImage(), scene_index=None, source_id="multi")
 
 
 def test_no_scene_state_leaks_into_a_sibling_scene():
@@ -284,7 +285,7 @@ def test_source_level_descriptor_binds_the_default_scene():
 # --- the wire: ListFlights lean, GetFlightInfo authoritative -----------------
 
 
-def test_list_flights_is_structural_and_get_flight_info_carries_the_grid(
+def test_the_catalog_is_structural_and_get_flight_info_carries_the_grid(
     multires_ome_zarr,
 ):
     """End to end through the server, on one source, both surfaces.
@@ -302,15 +303,21 @@ def test_list_flights_is_structural_and_get_flight_info_carries_the_grid(
     server = TensorFlightServer(location="grpc://localhost:0", metadata_db=db)
     server.sources.replace({"oz": adapter})
 
-    (info,) = list(server.list_flights(None, b""))
-    listed = DataSourceDescriptor.FromString(info.descriptor.command)
-    (entry,) = listed.tensors
-    assert list(entry.shape)
-    assert list(entry.chunk_shape) == []
+    from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS
 
-    tensor_adapter = adapter.get_tensor_adapter(entry.array_id)
+    (listed,) = db.query(f"SELECT {SOURCE_ROW_COLUMNS} FROM sources").to_pylist()
+    (entry,) = listed["tensors"]
+    assert entry["shape"]
+    # Not "empty grid" -- no grid. The row's tensors struct has no
+    # chunk_shape column to be wrong about (biopb/biopb#812).
+    assert "chunk_shape" not in entry
+
+    tensor_adapter = adapter.get_tensor_adapter(entry["array_id"])
     plan = tensor_adapter.plan_flight_info(
-        TensorReadOption(tensor_id=entry.array_id), PyramidConfig()
+        TensorReadOption(
+            array_id=entry["array_id"], fields=FieldMask(paths=["endpoints"])
+        ),
+        PyramidConfig(),
     )
     grid = list(plan.descriptor.chunk_shape)
     assert grid == list(tensor_adapter.get_transfer_chunk_size())
@@ -318,17 +325,19 @@ def test_list_flights_is_structural_and_get_flight_info_carries_the_grid(
 
 
 def test_catalog_round_trip_never_reintroduces_a_grid(multires_ome_zarr):
-    """query_sources / list_source_descriptors answer structure, nothing more."""
+    """query answers structure, nothing more."""
     adapter = OmeZarrAdapter.create_from_config(
         SourceConfig(url=multires_ome_zarr[0], type="ome-zarr", source_id="oz")
     )
     db = MetadataDatabase()
     db.sync_source_added("oz", adapter)
 
-    descriptors, _ = db.list_source_descriptors()
-    (entry,) = descriptors[0].tensors
-    assert list(entry.shape)
-    assert list(entry.chunk_shape) == []
+    from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS
+
+    rows = db.query(f"SELECT {SOURCE_ROW_COLUMNS} FROM sources").to_pylist()
+    (entry,) = rows[0]["tensors"]
+    assert entry["shape"]
+    assert "chunk_shape" not in entry
 
     ((_, struct_type, *_),) = [
         row

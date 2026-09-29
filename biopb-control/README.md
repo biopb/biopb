@@ -27,13 +27,25 @@ plumbing):
 biopb control start      # detach a persistent supervisor; brings up the data plane
 biopb control status     # is the control up? is the data plane serving?
 biopb control stop
-biopb control run        # run in the foreground (Ctrl-C to stop)
 ```
 
 `biopb control start` brings the data plane up by default; pass `--no-data-plane`
 to run the control as an adopt-only supervisor (it will only monitor / restart a
-tensor server that is already running, not spawn one). `start` and `run` take the
-*same* flags and stand up the same deployment — only process ownership differs.
+tensor server that is already running, not spawn one). It resolves sensible
+defaults for everything, including `--config` and `--static-dir`.
+
+Foreground use (a systemd/launchd unit, an Open OnDemand app, debugging
+supervision) runs `biopb-control run` (or `python -m biopb_control run` if that
+script isn't on PATH) directly — the same entry point `start` spawns as its own
+child. Unlike `start`, it has **no defaults**: `--config` and `--static-dir`
+must both be passed explicitly (and every other setting individually, rather
+than derived from `--base-port`) or the process refuses to start / comes up
+with no web UI. This is deliberately not advertised as a drop-in replacement
+for casual use — reach for `biopb control start` unless you specifically need
+a foreground process (`biopb/biopb#736`: `biopb control run`, the typer wrapper
+that used to fill in those same defaults, bypassed the fail-closed guard this
+entry point already enforces on a public `--control-host` — retired rather than
+kept as a second copy of the same check).
 
 **Ports** come from `--base-port` (default 8810): control = base+3, sidecar =
 base+4, flight = base+5, the container's convention. A control that moved off
@@ -48,8 +60,14 @@ HTTP with no TLS support, so publishing it would put the data-plane token on the
 wire in the clear (biopb/biopb#614). Reach the UI from another machine over a
 tunnel, `ssh -L 8813:localhost:8813 <host>`, which `control start` prints
 whenever the plane goes public. To publish it anyway (behind your own TLS proxy),
-pass an explicit `--control-host 0.0.0.0` to `python -m biopb_control run`; that
-bind is fail-closed and refuses to come up without a token.
+pass an explicit `--control-host 0.0.0.0` to `biopb-control run`; that bind is
+fail-closed and refuses to come up without a token.
+
+A public `--grpc-bind` also requires `--grpc-external-location` — the address a
+*different* machine dials to reach the plane (e.g. an HPC scheduler's assigned
+FQDN), since a wildcard bind is not itself dialable. Forwarded to the data
+plane, which aligns its transport scheme with the listener before advertising
+it to clients and is where it is actually enforced.
 
 Clients use the API to ask "is the data plane up, and bring it up if not" — this
 is what replaced `biopb-mcp` shelling out `biopb server start`.

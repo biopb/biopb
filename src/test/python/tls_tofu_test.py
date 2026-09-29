@@ -15,10 +15,13 @@ collects it, so the two certs below are static fixtures instead: throwaway
 self-signed leaves generated once, valid 2020-2120, never used by anything real.
 """
 
+import calendar
 import ssl
 
+import pyarrow.flight as flight
 import pytest
-from biopb.tensor import _tls
+from biopb.tensor import _session, _tls
+from biopb.tensor.client import TensorFlightClient
 
 # Two distinct self-signed certs. Only their *bytes* matter to these tests -- the
 # code under test fingerprints the DER and compares, and never validates a chain.
@@ -278,12 +281,42 @@ DER_B = _tls._anchor_der(CERT_B)
 SANS = (("DNS", "wrong.example"), ("DNS", "alt.example"), ("IP Address", "10.0.0.5"))
 
 
-def _hostname_mismatch() -> Exception:
-    """The error OpenSSL raises when the dialed name isn't in the cert."""
-    return ssl.SSLCertVerificationError(
-        "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: Hostname "
-        "mismatch, certificate is not valid for 'lab-gpu.local'. (_ssl.c:1006)"
+def _hostname_mismatch() -> ssl.SSLCertVerificationError:
+    """The error OpenSSL raises when the dialed *name* isn't in the cert."""
+    return _verify_error(
+        "Hostname mismatch, certificate is not valid for 'lab-gpu.local'.", code=62
     )
+
+
+def _ip_mismatch() -> ssl.SSLCertVerificationError:
+    """The same verdict for a dialed *address* -- a different code and wording.
+
+    Which of the two you get depends only on what was dialed, and the sidecar
+    always dials an address, so anything that recognizes one must recognize both
+    (biopb/biopb#916).
+    """
+    return _verify_error(
+        "IP address mismatch, certificate is not valid for '127.0.0.1'.", code=64
+    )
+
+
+def _verify_error(message: str, *, code: int) -> ssl.SSLCertVerificationError:
+    """An OpenSSL verification failure carrying *code* on ``verify_code``.
+
+    Constructed rather than provoked: this suite mints no certs (see the module
+    docstring), and ``verify_code`` is what the code under test reads.
+    """
+    err = ssl.SSLCertVerificationError(
+        f"[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: {message}"
+    )
+    err.verify_code = code
+    err.verify_message = message
+    return err
+
+
+def _expired() -> ssl.SSLCertVerificationError:
+    """The error OpenSSL raises when the anchor is past its notAfter."""
+    return _verify_error("certificate has expired", code=10)
 
 
 def _stub_probe(monkeypatch, *, strict, lenient):
@@ -344,6 +377,24 @@ def test_override_is_derived_when_the_dialed_name_is_absent(monkeypatch):
     assert calls == [True, False]
 
 
+def test_an_address_mismatch_is_a_name_mismatch_too(monkeypatch):
+    """The co-located sidecar's exact shape: dial 127.0.0.1, cert names a host.
+
+    Read as a verify code rather than as message text -- OpenSSL words this one
+    "IP address mismatch", so a check for "hostname mismatch" declined to help
+    the one caller that always dials an address (biopb/biopb#916).
+    """
+    calls = _stub_probe(
+        monkeypatch,
+        strict=_ip_mismatch(),
+        lenient=({"subjectAltName": (("DNS", "gpu-051.hpc.example"),)}, DER_A),
+    )
+    assert (
+        _REAL_OVERRIDE("127.0.0.1", 8815, CERT_A, tofu=False) == "gpu-051.hpc.example"
+    )
+    assert calls == [True, False]
+
+
 def test_no_override_when_the_anchor_is_not_the_presented_leaf(monkeypatch, caplog):
     """A private-CA anchor keeps the SAN check -- it is load-bearing there.
 
@@ -379,10 +430,11 @@ def test_no_usable_san_still_warns_with_the_mode_s_own_fix(monkeypatch, caplog):
 
 def test_probe_failures_never_produce_an_override(monkeypatch):
     """A diagnostic must not turn a working connection into a broken one."""
-    # An expired cert (not a hostname mismatch) -> not our business.
+    # A verification failure that is neither a name mismatch nor an expiry
+    # -> not our business.
     _stub_probe(
         monkeypatch,
-        strict=ssl.SSLCertVerificationError("certificate has expired"),
+        strict=_verify_error("unable to get local issuer certificate", code=20),
         lenient=({"subjectAltName": SANS}, DER_A),
     )
     assert _REAL_OVERRIDE("lab-gpu.local", 8815, CERT_A, tofu=True) is None
@@ -398,6 +450,32 @@ def test_probe_failures_never_produce_an_override(monkeypatch):
         monkeypatch, strict=_hostname_mismatch(), lenient=OSError("connection reset")
     )
     assert _REAL_OVERRIDE("lab-gpu.local", 8815, CERT_A, tofu=True) is None
+
+
+def test_an_expired_certificate_is_raised_not_swallowed(monkeypatch):
+    """Expiry is fatal and gRPC will not say why, so say it here (biopb/biopb#913).
+
+    A pin is the trust anchor, not an exemption from validity: the handshake is
+    refused, and the transport reports only "failed to connect to all addresses".
+    The remediation names both halves -- re-mint, then drop the stale anchor --
+    and which half is the client's depends on the mode.
+    """
+    for tofu, expected in ((True, "entry from"), (False, "configured TLS fingerprint")):
+        calls = _stub_probe(monkeypatch, strict=_expired(), lenient=({}, DER_A))
+        with pytest.raises(_tls.TlsCertExpiredError) as excinfo:
+            _REAL_OVERRIDE("lab-gpu.local", 8815, CERT_A, tofu=tofu)
+        assert "cert init --force" in str(excinfo.value)
+        assert expected in str(excinfo.value)
+        assert calls == [True]  # no point re-handshaking; the cert is done
+
+
+def test_expiry_reaches_the_caller_of_resolve(monkeypatch):
+    """The whole point: the reason surfaces at resolution, not in absl's stderr."""
+    monkeypatch.setattr(_tls, "_resolve_hostname_override", _REAL_OVERRIDE)
+    monkeypatch.setattr(_tls, "_fetch_server_cert", lambda h, p: CERT_A)
+    _stub_probe(monkeypatch, strict=_expired(), lenient=({}, DER_A))
+    with pytest.raises(_tls.TlsCertExpiredError):
+        _tls.resolve_tls_trust("grpc+tls://lab-gpu.local:8815")
 
 
 def test_anchor_der_rejects_a_bundle():
@@ -455,3 +533,245 @@ def test_key_id_separates_endpoints_and_anchors(monkeypatch):
     # handing one upstream's connection to another.
     assert _tls.resolve_tls_trust(loc, ca_pem=CERT_B).key_id == configured
     assert _tls._fingerprint(CERT_B) not in configured  # digests the PEM, not the DER
+
+
+# --- expiry: read the date, warn ahead of it, explain a failed handshake ------
+# (biopb/biopb#1117, #1116). No certs are minted here (module docstring), so the
+# parser is fed the two static leaves and hand-built DER for the encodings they
+# lack.
+
+
+def _tlv(tag: int, body: bytes) -> bytes:
+    n = len(body)
+    length = bytes([n]) if n < 0x80 else b"\x82" + n.to_bytes(2, "big")
+    return bytes([tag]) + length + body
+
+
+def _cert_ending(tag: int, text: str, *, versioned: bool = True) -> bytes:
+    """A PEM whose only true content is its notAfter: enough for a date read."""
+    validity = _tlv(0x30, _tlv(tag, b"200101000000Z") + _tlv(tag, text.encode()))
+    tbs = (
+        (_tlv(0xA0, _tlv(0x02, b"\x02")) if versioned else b"")
+        + _tlv(0x02, b"\x01")
+        + _tlv(0x30, b"")
+        + _tlv(0x30, b"")
+        + validity
+    )
+    return ssl.DER_cert_to_PEM_cert(_tlv(0x30, _tlv(0x30, tbs))).encode()
+
+
+def _epoch(*ymdhms: int) -> float:
+    return float(calendar.timegm(ymdhms))
+
+
+def test_not_after_reads_a_generalized_time():
+    assert _tls.cert_not_after(CERT_A) == _epoch(2120, 1, 1, 0, 0, 0)
+
+
+@pytest.mark.parametrize(
+    ("tag", "text", "versioned", "expected"),
+    [
+        (0x17, "300615120000Z", True, _epoch(2030, 6, 15, 12, 0, 0)),  # UTCTime < 50
+        (0x17, "500101000000Z", True, _epoch(1950, 1, 1, 0, 0, 0)),  # UTCTime >= 50
+        (0x18, "21300101000000Z", True, _epoch(2130, 1, 1, 0, 0, 0)),
+        (0x17, "300615120000Z", False, _epoch(2030, 6, 15, 12, 0, 0)),  # a v1 cert
+    ],
+)
+def test_not_after_reads_both_time_encodings(tag, text, versioned, expected):
+    assert _tls.cert_not_after(_cert_ending(tag, text, versioned=versioned)) == expected
+
+
+def test_not_after_of_a_bundle_is_its_earliest():
+    soon = _cert_ending(0x17, "300615120000Z")
+    assert _tls.cert_not_after(CERT_A + soon) == _epoch(2030, 6, 15, 12, 0, 0)
+
+
+@pytest.mark.parametrize(
+    "junk",
+    [
+        b"",
+        b"not a cert",
+        b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n",
+    ],
+)
+def test_not_after_of_unreadable_input_is_none(junk):
+    assert _tls.cert_not_after(junk) is None
+
+
+def test_an_anchor_near_expiry_warns_once_per_connection(monkeypatch, caplog):
+    monkeypatch.setattr(_tls, "_fetch_server_cert", lambda host, port: CERT_A)
+    almost = _epoch(2120, 1, 1, 0, 0, 0) - 10 * 86400
+    monkeypatch.setattr(_tls.time, "time", lambda: almost)
+    with caplog.at_level("WARNING", logger=_tls.logger.name):
+        _tls.resolve_tls_trust("grpc+tls://host:8815")
+        _tls.resolve_tls_trust("grpc+tls://host:8815")  # memoized: no second warning
+    warnings = [r for r in caplog.records if "expires in" in r.getMessage()]
+    assert len(warnings) == 1
+    assert "10 days" in warnings[0].getMessage()
+    assert "2120-01-01" in warnings[0].getMessage()
+
+
+def test_an_anchor_with_time_to_spare_is_silent(monkeypatch, caplog):
+    monkeypatch.setattr(_tls, "_fetch_server_cert", lambda host, port: CERT_A)
+    with caplog.at_level("WARNING", logger=_tls.logger.name):
+        _tls.resolve_tls_trust("grpc+tls://host:8815")
+    assert not [r for r in caplog.records if "expires" in r.getMessage()]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({}, "clear the"),  # TOFU
+        ({"fingerprint": True}, "configured TLS fingerprint"),
+    ],
+)
+def test_an_expired_fetched_anchor_is_refused(monkeypatch, kwargs, match):
+    expired = _cert_ending(0x17, "200101000000Z")
+    monkeypatch.setattr(_tls, "_fetch_server_cert", lambda host, port: expired)
+    extra = (
+        {"expected_fingerprint": _tls._fingerprint(expired)}
+        if kwargs.get("fingerprint")
+        else {}
+    )
+    with pytest.raises(_tls.TlsCertExpiredError, match=match):
+        _tls.resolve_tls_trust("grpc+tls://host:8815", **extra)
+
+
+def test_an_expired_configured_ca_is_refused_offline(monkeypatch):
+    # The one mode the probe never reaches: nothing dials, so the date on the
+    # anchor itself is all there is to check.
+    expired = _cert_ending(0x17, "200101000000Z")
+
+    def dialed(*_a, **_k):
+        raise AssertionError("a configured CA must not touch the network")
+
+    monkeypatch.setattr(_tls, "_fetch_server_cert", dialed)
+    with pytest.raises(_tls.TlsCertExpiredError, match="replace the configured CA"):
+        _tls.resolve_tls_trust("grpc+tls://host:8815", ca_pem=expired)
+
+
+def test_a_ca_bundle_is_not_judged_by_one_of_its_roots(monkeypatch, caplog):
+    # A bundle holds roots the server may never chain to; a system one carries
+    # expired ones, and refusing the connection over them would break a
+    # configuration that works.
+    expired = _cert_ending(0x17, "200101000000Z")
+    with caplog.at_level("WARNING", logger=_tls.logger.name):
+        trust = _tls.resolve_tls_trust("grpc+tls://host:8815", ca_pem=expired + CERT_A)
+    assert trust.root_certs == expired + CERT_A
+    assert not [r for r in caplog.records if "expire" in r.getMessage()]
+
+
+def test_handshake_failure_reason_names_the_verify_error(monkeypatch):
+    seen = {}
+
+    def probe(host, port, pem, *, check_hostname):
+        seen["check_hostname"] = check_hostname
+        raise _verify_error("certificate has expired", code=10)
+
+    monkeypatch.setattr(_tls, "_probe_peer", probe)
+    reason = _tls.handshake_failure_reason(
+        "grpc+tls://host:8815", _tls.TlsTrust(root_certs=CERT_A)
+    )
+    assert "host:8815" in reason and "certificate has expired" in reason
+    assert "cert init --force" in reason
+    assert seen["check_hostname"] is True
+
+
+def test_handshake_failure_skips_the_name_when_an_override_is_in_force(monkeypatch):
+    seen = {}
+
+    def probe(host, port, pem, *, check_hostname):
+        seen["check_hostname"] = check_hostname
+        raise _verify_error("unable to get local issuer certificate", code=20)
+
+    monkeypatch.setattr(_tls, "_probe_peer", probe)
+    reason = _tls.handshake_failure_reason(
+        "grpc+tls://host:8815",
+        _tls.TlsTrust(root_certs=CERT_A, override_hostname="real-name"),
+    )
+    assert seen["check_hostname"] is False
+    assert "local issuer" in reason and "cert init" not in reason
+
+
+@pytest.mark.parametrize("outcome", [OSError("refused"), None])
+def test_handshake_failure_reason_is_none_when_it_cannot_say(monkeypatch, outcome):
+    def probe(host, port, pem, *, check_hostname):
+        if outcome is not None:
+            raise outcome
+        return {}, b""
+
+    monkeypatch.setattr(_tls, "_probe_peer", probe)
+    trust = _tls.TlsTrust(root_certs=CERT_A)
+    assert _tls.handshake_failure_reason("grpc+tls://host:8815", trust) is None
+
+
+class TestExplainHandshakeFailure:
+    """The first RPC's opaque "Ssl handshake failed" gains gRPC's unlogged
+    reason (biopb/biopb#1116) without changing the exception's type."""
+
+    LOC = "grpc+tls://host:8815"
+    OPAQUE = "failed to connect to all addresses; last error: Ssl handshake failed"
+
+    def _explain(self, message, trust):
+        exc = flight.FlightUnavailableError(message)
+        return exc, _session._explain_handshake_failure(exc, self.LOC, trust)
+
+    def test_a_handshake_failure_gets_the_reason(self, monkeypatch):
+        monkeypatch.setattr(
+            _session, "handshake_failure_reason", lambda loc, trust: "expired, sorry"
+        )
+        original, explained = self._explain(self.OPAQUE, _tls.TlsTrust(CERT_A))
+
+        assert isinstance(explained, flight.FlightUnavailableError)
+        assert self.OPAQUE in str(explained) and "expired, sorry" in str(explained)
+        assert explained is not original
+
+    def test_health_check_explains_an_opaque_failure(self, monkeypatch):
+        # health_check is what Connection and the sidecar call first, and it
+        # talks to the raw client, so it needs the explanation itself.
+        class Refusing:
+            def do_action(self, action, options=None):
+                raise flight.FlightUnavailableError(TestExplainHandshakeFailure.OPAQUE)
+
+        monkeypatch.setattr(
+            _session, "handshake_failure_reason", lambda loc, trust: "expired, sorry"
+        )
+        client = TensorFlightClient.__new__(TensorFlightClient)
+        client._client = Refusing()
+        client._call_options = None
+        client._location = self.LOC
+        client._tls_trust = _tls.TlsTrust(CERT_A)
+
+        with pytest.raises(flight.FlightUnavailableError, match="expired, sorry"):
+            client.health_check()
+
+    def test_another_unavailable_error_is_left_alone(self, monkeypatch):
+        def boom(loc, trust):
+            raise AssertionError("no handshake was involved")
+
+        monkeypatch.setattr(_session, "handshake_failure_reason", boom)
+        original, explained = self._explain("connection refused", _tls.TlsTrust(CERT_A))
+        assert explained is original
+
+    def test_a_message_that_already_says_why_is_left_alone(self, monkeypatch):
+        def boom(loc, trust):
+            raise AssertionError("the reason is already in the message")
+
+        monkeypatch.setattr(_session, "handshake_failure_reason", boom)
+        already = (
+            self.OPAQUE
+            + " (TSI_PROTOCOL_FAILURE): SSL_ERROR_SSL: certificate verify failed"
+        )
+        original, explained = self._explain(already, _tls.TlsTrust(CERT_A))
+        assert explained is original
+
+    def test_no_reason_means_the_original_error(self, monkeypatch):
+        monkeypatch.setattr(
+            _session, "handshake_failure_reason", lambda loc, trust: None
+        )
+        original, explained = self._explain(self.OPAQUE, _tls.TlsTrust(CERT_A))
+        assert explained is original
+
+    def test_a_plaintext_client_has_no_trust_to_explain(self):
+        original, explained = self._explain(self.OPAQUE, None)
+        assert explained is original

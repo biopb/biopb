@@ -26,7 +26,9 @@ html, body {
 
 .app-shell {
   display: grid;
-  grid-template-columns: 320px 1fr;
+  /* Both side panes are draggable; the variables exist only once one has been
+     dragged, so an untouched layout is sized exactly as it always was. */
+  grid-template-columns: var(--sidebar-w, 320px) 1fr;
   /* The last row is the tip bar. It keeps its height when tips are dismissed:
      a footer that appears and disappears would resize the viewport under the
      canvas, which costs a deck.gl re-layout for a cosmetic change. */
@@ -61,13 +63,38 @@ html, body {
 .viewer-column { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
 
 .control-column {
-  width: 320px;
+  flex: 0 0 var(--control-w, 320px);
   display: flex;
   flex-direction: column;
   background: #141820;
   border-left: 1px solid #2d3748;
   overflow-y: auto;
 }
+
+/* The grab strip between two panes. Transparent until pointed at: it sits on
+   the panes' own borders, and a second permanent line there would read as a
+   gap rather than as a handle. */
+.pane-splitter {
+  flex: 0 0 8px;
+  align-self: stretch;
+  position: relative;
+  cursor: col-resize;
+  background: none;
+  border: none;
+  padding: 0;
+}
+.pane-splitter::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 3px;
+  width: 2px;
+  background: transparent;
+}
+.pane-splitter:hover::after,
+.pane-splitter:focus-visible::after { background: #4f8ef7; }
+.pane-splitter:focus-visible { outline: none; }
 
 .source-tree { padding: 0; flex: 1; }
 
@@ -82,6 +109,113 @@ html, body {
 .tree-item:hover { background: #1e2435; color: #e2e8f0; }
 .tree-item.active { background: #2a3347; color: #60a5fa; }
 
+/* An unresolved (cloud / synced-folder) source: dimmed and not openable until
+   the server hydrates it. Matches the napari tensor_browser's greyed row. */
+.tree-item.unresolved {
+  color: #64748b;
+  cursor: not-allowed;
+  font-style: italic;
+}
+.tree-item.unresolved:hover { background: none; color: #64748b; }
+
+.unresolved-glyph {
+  font-size: 11px;
+  font-style: normal;
+  line-height: 1;
+  opacity: 0.8;
+}
+
+/* Resolve trigger, in the slot an unresolved row's shape badge would occupy.
+   A span with role=button, not a <button>: it sits inside the row's own button
+   and nested interactive elements are invalid HTML. */
+.resolve-btn {
+  font-size: 10px;
+  font-style: normal;
+  background: #1e3a5f;
+  border: 1px solid #2d5a8f;
+  border-radius: 3px;
+  padding: 1px 6px;
+  margin-left: 8px;
+  color: #93c5fd;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.resolve-btn:hover { background: #2d5a8f; color: #dbeafe; }
+
+/* Hydrate-ahead tray, pinned to the foot of the catalog pane. flex-shrink so
+   it keeps its height while the tree above it takes the slack. */
+.warm-tray {
+  flex-shrink: 0;
+  border-top: 1px solid #2d3748;
+  background: #11151d;
+  padding: 0.5rem 0.75rem 0.6rem;
+  max-height: 40%;
+  overflow-y: auto;
+}
+.warm-tray-title {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #64748b;
+  margin-bottom: 0.4rem;
+}
+.warm-tray-list { list-style: none; margin: 0; padding: 0; }
+
+.warm-row { margin-bottom: 0.55rem; }
+.warm-row:last-child { margin-bottom: 0; }
+.warm-row-head { display: flex; align-items: center; gap: 0.5rem; }
+.warm-row-name {
+  flex: 1;
+  font-size: 11px;
+  color: #cbd5e1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.warm-row-action {
+  background: none;
+  border: none;
+  color: #64748b;
+  font-size: 10px;
+  cursor: pointer;
+  padding: 0 2px;
+}
+.warm-row-action:hover:not(:disabled) { color: #e2e8f0; }
+.warm-row-action:disabled { cursor: default; opacity: 0.6; }
+.warm-row-detail { font-size: 10px; color: #64748b; margin-top: 2px; }
+.warm-row.error .warm-row-detail { color: #fca5a5; }
+
+.warm-bar {
+  height: 3px;
+  background: #1e293b;
+  border-radius: 2px;
+  overflow: hidden;
+  margin-top: 4px;
+}
+.warm-bar-fill { height: 100%; background: #3b82f6; transition: width 0.2s; }
+.warm-row.done .warm-bar-fill { background: #34d399; }
+.warm-row.error .warm-bar-fill { background: #ef4444; }
+.warm-row.cancelled .warm-bar-fill { background: #64748b; }
+
+/* Enumerating, or a resolve, where the server reports no completed fraction at
+   all -- so the bar has to say "working" without implying a number. */
+.warm-bar.indeterminate .warm-bar-fill {
+  width: 100% !important;
+  background: linear-gradient(
+    90deg,
+    transparent 0%, #3b82f6 50%, transparent 100%
+  );
+  background-size: 200% 100%;
+  animation: warm-sweep 1.4s linear infinite;
+}
+@keyframes warm-sweep {
+  from { background-position: 200% 0; }
+  to { background-position: -200% 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .warm-bar.indeterminate .warm-bar-fill { animation: none; opacity: 0.55; }
+}
+
 .tree-folder {
   color: #e2e8f0;
   font-weight: 500;
@@ -91,6 +225,13 @@ html, body {
 .tensor-item { color: #64748b; }
 .tensor-item:hover { color: #94a3b8; }
 .tensor-item.active { color: #60a5fa; }
+
+/* A label set under its image. Dimmer than a tensor row, because it is not an
+   alternative to the image: clicking it draws it over the image instead of
+   opening it. The glyph is the state, so the row reads as on/off at a glance. */
+.label-item { color: #64748b; }
+.label-item:hover { color: #94a3b8; }
+.label-item.active { color: #34d399; }
 
 .tensor-pill {
   font-size: 10px;
@@ -373,6 +514,8 @@ html, body {
   padding: 1.5rem 1.75rem; max-width: 440px;
 }
 .admin-modal.wide { max-width: 760px; width: 90vw; }
+.attach-cmd { display: flex; gap: 0.5rem; margin: 0.6rem 0; }
+.attach-cmd input { flex: 1; min-width: 0; font-family: monospace; }
 .admin-modal h2 { margin: 0 0 0.6rem; font-size: 1.1rem; }
 .admin-modal p { color: #94a3b8; font-size: 13px; line-height: 1.5; margin: 0 0 1.25rem; }
 .admin-modal-actions { display: flex; justify-content: flex-end; gap: 0.75rem; }
@@ -386,10 +529,66 @@ html, body {
   flex-direction: column;
   gap: 0.75rem;
 }
+/* Drawn rather than accent-coloured: the grab handle's width carries how many
+   positions the axis has (see `sliderThumbPx`), and a native thumb cannot be
+   sized. --thumb-w is set per slider; the fallback is the continuous case. */
 .slice-controls input[type="range"] {
-  accent-color: #4f8ef7;
-  height: 4px;
+  -webkit-appearance: none;
+  appearance: none;
+  height: 14px;
+  background: transparent;
+  cursor: pointer;
 }
+.slice-controls input[type="range"]::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 2px;
+  background: #2d3748;
+}
+.slice-controls input[type="range"]::-moz-range-track {
+  height: 4px;
+  border-radius: 2px;
+  background: #2d3748;
+}
+.slice-controls input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: var(--thumb-w, 12px);
+  height: 12px;
+  margin-top: -4px;
+  border-radius: 3px;
+  background: #4f8ef7;
+}
+.slice-controls input[type="range"]::-moz-range-thumb {
+  width: var(--thumb-w, 12px);
+  height: 12px;
+  border: none;
+  border-radius: 3px;
+  background: #4f8ef7;
+}
+/* Two grabs on one bar: the inputs are stacked and transparent, so only their
+   thumbs take the pointer and the rail below is drawn once. */
+.dual-range { position: relative; height: 14px; }
+.dual-range-track,
+.dual-range-fill {
+  position: absolute;
+  top: 5px;
+  height: 4px;
+  border-radius: 2px;
+  pointer-events: none;
+}
+.dual-range-track { left: 0; right: 0; background: #2d3748; }
+.dual-range-fill { background: #4f8ef7; opacity: 0.4; }
+.dual-range input[type="range"] {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  margin: 0;
+  pointer-events: none;
+}
+.dual-range input[type="range"]::-webkit-slider-runnable-track { background: transparent; }
+.dual-range input[type="range"]::-moz-range-track { background: transparent; }
+.dual-range input[type="range"]::-webkit-slider-thumb { pointer-events: auto; }
+.dual-range input[type="range"]::-moz-range-thumb { pointer-events: auto; }
+
 .slice-controls select {
   background: #1e2435;
   border: 1px solid #2d3748;
@@ -425,6 +624,149 @@ html, body {
   color: #94a3b8;
 }
 .meta-panel pre { white-space: pre-wrap; word-break: break-all; color: #cbd5e1; }
+
+.roi-panel {
+  background: #141820;
+  border-top: 1px solid #232a38;
+  color: #94a3b8;
+  flex: 0 0 auto;
+  font-size: 12px;
+  padding: 0.6rem 1rem 0.7rem;
+}
+.roi-panel-head {
+  align-items: center;
+  display: flex;
+  justify-content: space-between;
+}
+.roi-panel-head label { color: #cbd5e1; cursor: pointer; }
+.roi-count { color: #64748b; font-variant-numeric: tabular-nums; }
+.roi-sets { list-style: none; margin: 0.5rem 0 0; padding: 0; }
+.roi-sets li {
+  align-items: center;
+  display: flex;
+  justify-content: space-between;
+  padding: 1px 0;
+}
+.roi-set-actions { align-items: center; display: flex; flex: 0 0 auto; gap: 6px; }
+.roi-set-clear {
+  background: none; border: none; border-radius: 3px;
+  color: #475569; cursor: pointer; font: inherit; line-height: 1; padding: 1px 4px;
+}
+.roi-set-clear:hover { background: #232a38; color: #cbd5e1; }
+/* Armed, and the next click deletes the set: red, and no longer a glyph the
+   eye slides over. */
+.roi-set-clear.armed, .roi-set-clear.armed:hover { color: #f87171; }
+.roi-sets label {
+  align-items: center;
+  cursor: pointer;
+  display: flex;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.roi-note { color: #64748b; margin: 0.5rem 0 0; }
+.roi-error { color: #fca5a5; }
+
+.label-panel {
+  background: #141820;
+  border-top: 1px solid #232a38;
+  color: #94a3b8;
+  flex: 0 0 auto;
+  font-size: 12px;
+  padding: 0.6rem 1rem 0.7rem;
+}
+.label-panel-head {
+  align-items: center;
+  display: flex;
+  justify-content: space-between;
+}
+/* One line: the pane is narrow and draggable, so a long set name elides rather
+   than pushing the Hide button off the edge. The full address is in the title. */
+.label-panel-name {
+  color: #34d399;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.label-hide {
+  background: none; border: 1px solid #2d3748; border-radius: 4px;
+  color: #cbd5e1; cursor: pointer; flex: 0 0 auto; font: inherit; margin-left: 8px;
+  padding: 0 6px;
+}
+.label-hide:hover { border-color: #34d399; color: #34d399; }
+.label-opacity { align-items: center; display: flex; gap: 8px; margin-top: 6px; }
+.label-opacity span:first-child { color: #64748b; flex: 0 0 auto; }
+.label-opacity input { flex: 1; min-width: 0; }
+.label-opacity-value {
+  color: #64748b;
+  flex: 0 0 auto;
+  font-variant-numeric: tabular-nums;
+  width: 34px;
+  text-align: right;
+}
+
+.roi-author {
+  background: #141820;
+  border-top: 1px solid #232a38;
+  color: #94a3b8;
+  flex: 0 0 auto;
+  font-size: 12px;
+  padding: 0.6rem 1rem 0.7rem;
+}
+.roi-field { align-items: center; display: flex; gap: 8px; margin-bottom: 4px; }
+.roi-field span { color: #64748b; width: 34px; }
+.roi-field input {
+  background: #0f1117; border: 1px solid #2d3748; border-radius: 4px;
+  color: #cbd5e1; flex: 1; font: inherit; min-width: 0; padding: 2px 6px;
+}
+.roi-field-head { color: #64748b; margin: 8px 0 2px; }
+.roi-pin-toggle, .roi-tool-text {
+  background: none; border: 1px solid #2d3748; border-radius: 4px;
+  color: #cbd5e1; cursor: pointer; font: inherit; padding: 0 6px;
+}
+.roi-pin-toggle[aria-pressed="true"] { border-color: #38bdf8; color: #38bdf8; }
+.roi-tool-text:disabled { color: #475569; cursor: default; }
+/* One line: the panel is narrow and draggable, so the summary elides rather
+   than reflowing the controls above it. The full text is in the title. */
+.roi-selected {
+  border-top: 1px solid #232a38;
+  margin-top: 8px;
+  overflow: hidden;
+  padding-top: 6px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.roi-tools {
+  background: rgba(15, 17, 23, 0.85);
+  border: 1px solid #2d3748;
+  border-radius: 6px;
+  padding: 4px;
+}
+.roi-tool-row { display: flex; gap: 2px; }
+/* Rides with the polyline tool, so it has to fit the strip's width rather than
+   widen it: the slider takes what is left after the label and the number. */
+.roi-width {
+  align-items: center;
+  color: #94a3b8;
+  display: flex;
+  font-size: 11px;
+  gap: 6px;
+  padding: 4px 2px 0;
+}
+.roi-width input[type="range"] { accent-color: #38bdf8; flex: 1 1 auto; min-width: 0; width: 72px; }
+.roi-width-value { color: #cbd5e1; font-variant-numeric: tabular-nums; min-width: 2ch; text-align: right; }
+.roi-tool {
+  background: none; border: 1px solid transparent; border-radius: 4px;
+  color: #94a3b8; cursor: pointer; font-size: 15px; line-height: 1;
+  padding: 4px 7px;
+}
+.roi-tool:hover { background: #1e2435; color: #e2e8f0; }
+.roi-tool.active { border-color: #38bdf8; color: #38bdf8; }
+.roi-draft-status {
+  align-items: center; color: #94a3b8; display: flex; font-size: 11px;
+  gap: 6px; padding: 4px 2px 2px;
+}
 
 .icon-btn {
   background: none; border: 1px solid #2d3748; border-radius: 6px;

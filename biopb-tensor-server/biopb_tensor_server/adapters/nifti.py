@@ -81,7 +81,7 @@ class NiftiAdapter(TensorAdapter):
         """Create adapter instance from SourceConfig.
 
         Args:
-            source: SourceConfig with url, source_id, dim_labels
+            source: SourceConfig with url, source_id
             credentials_config: Optional CredentialsConfig for remote authentication
 
         Returns:
@@ -122,7 +122,6 @@ class NiftiAdapter(TensorAdapter):
             return cls(
                 nifti_img,
                 source.source_id,
-                source.dim_labels,
                 source_url=str(source.url),
                 temp_file=tmp_path,
             )
@@ -132,7 +131,6 @@ class NiftiAdapter(TensorAdapter):
             return cls(
                 nifti_img,
                 source.source_id,
-                source.dim_labels,
                 source_url=str(source.url),
             )
 
@@ -140,7 +138,6 @@ class NiftiAdapter(TensorAdapter):
         self,
         nifti_img,
         source_id: str,
-        dim_labels: Optional[List[str]] = None,
         source_url: Optional[str] = None,
         temp_file: Optional[Path] = None,
     ):
@@ -149,7 +146,6 @@ class NiftiAdapter(TensorAdapter):
         Args:
             nifti_img: nibabel Nifti1Image or Nifti2Image object
             source_id: Unique identifier for this data source
-            dim_labels: Optional dimension labels (overrides header-derived labels)
             source_url: Optional source URL (overrides file_map-derived path)
             temp_file: Optional path to temp file for remote sources (for cleanup tracking)
         """
@@ -187,11 +183,7 @@ class NiftiAdapter(TensorAdapter):
         # and return scaled float64 values via nibabel's lazy slicing.
         self._dtype = "float64"
 
-        # Dimension labels
-        if dim_labels:
-            self.dim_labels = dim_labels
-        else:
-            self.dim_labels = self._derive_dim_labels()
+        self.dim_labels = self._derive_dim_labels()
 
     def _derive_dim_labels(self) -> List[str]:
         """Derive dimension labels from NIfTI header."""

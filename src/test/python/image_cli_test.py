@@ -16,42 +16,55 @@ runner = CliRunner()
 
 _ROWS = [
     {
+        "name": "a",
+        "kind": "url",
         "url": "grpc://a:1",
         "target": "a:1",
         "scheme": "grpc",
-        "state": "serving",
-        "ops": ["threshold", "segment"],
+        "state": "up",
+        "ops": [{"name": "threshold"}, {"name": "segment"}],
         "op_count": 2,
+        "fingerprint": "f",
         "error": None,
-        "single_op": False,
     },
     {
+        "name": "b",
+        "kind": "url",
         "url": "grpcs://b:2",
         "target": "b:2",
         "scheme": "grpcs",
         "state": "unreachable",
         "ops": [],
         "op_count": 0,
+        "fingerprint": "",
         "error": "UNAVAILABLE: down",
-        "single_op": False,
     },
 ]
 
 
 @pytest.fixture
 def stub_statuses(monkeypatch):
-    """Patch _algorithms.statuses; return a dict capturing the timeout it saw."""
+    """Answer for the control; return a dict capturing the timeout it saw.
+
+    ``rows`` None is no control, which falls back to probing the registry
+    (``_algorithms.statuses``, answering ``fallback``).
+    """
     # Widen the rich console so table cells (ops preview, error text) never wrap
     # mid-string under CliRunner's non-terminal default width of 80.
     monkeypatch.setenv("COLUMNS", "200")
     seen = {}
 
-    def _factory(rows):
-        def fake(*, timeout):
+    def _factory(rows, fallback=()):
+        def control(timeout):
             seen["timeout"] = timeout
             return rows
 
-        monkeypatch.setattr("biopb._algorithms.statuses", fake)
+        def probe(*, timeout):
+            seen["probed"] = timeout
+            return list(fallback)
+
+        monkeypatch.setattr("biopb.algorithms", control)
+        monkeypatch.setattr("biopb._algorithms.statuses", probe)
         return seen
 
     return _factory
@@ -63,7 +76,7 @@ def test_servers_table_lists_configured_servers(stub_statuses):
     assert result.exit_code == 0
     out = result.stdout
     assert "a:1" in out and "b:2" in out
-    assert "threshold, segment" in out  # ops preview for the serving row
+    assert "threshold, segment" in out  # ops preview for the up row
     assert "UNAVAILABLE: down" in out  # error shown for the unreachable row
 
 
@@ -72,26 +85,6 @@ def test_servers_json_emits_the_rows(stub_statuses):
     result = runner.invoke(app, ["servers", "--json"])
     assert result.exit_code == 0
     assert json.loads(result.stdout) == {"servers": _ROWS}
-
-
-def test_servers_single_op_rendered(stub_statuses):
-    stub_statuses(
-        [
-            {
-                "url": "grpc://s:1",
-                "target": "s:1",
-                "scheme": "grpc",
-                "state": "serving",
-                "ops": [],
-                "op_count": 1,
-                "error": None,
-                "single_op": True,
-            }
-        ]
-    )
-    result = runner.invoke(app, ["servers"])
-    assert result.exit_code == 0
-    assert "(single-op)" in result.stdout
 
 
 def test_servers_empty_config_message(stub_statuses):
@@ -106,4 +99,14 @@ def test_servers_threads_timeout_to_probe(stub_statuses):
     seen = stub_statuses(_ROWS)
     result = runner.invoke(app, ["servers", "--timeout", "1.5"])
     assert result.exit_code == 0
-    assert seen["timeout"] == 1.5
+    # The control probes url entries under the same deadline, then answers.
+    assert seen["timeout"] > 1.5
+
+
+def test_servers_without_a_control_probes_the_registry(stub_statuses):
+    seen = stub_statuses(None, fallback=_ROWS)
+    result = runner.invoke(app, ["servers", "--timeout", "1.5"])
+    assert result.exit_code == 0
+    assert seen["probed"] == 1.5
+    assert "No control answered" in result.stderr
+    assert "a:1" in result.stdout

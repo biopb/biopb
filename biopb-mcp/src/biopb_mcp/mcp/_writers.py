@@ -3,13 +3,13 @@
 Runs **in the MCP server process**. Two questions, one subject -- the set of
 clients writing to a single namespace and viewer:
 
-* **May I write?** The kernel owns the one-agent claim (``_jobs.submit`` is the
-  only thing that can enforce it atomically), but this process mirrors it, for
-  the reason spelled out on :data:`_claimed_by`.
-* **Who else did?** A person can run cells from the observe page, and the chat
-  loop from its own turn, leaving an agent's picture of the namespace stale with
-  nothing in its own results to say so. The foreign-activity digest is that
-  notice, and its read/ack split is what makes it deferred-never-dropped.
+* **May I write?** This process owns the one-agent claim
+  (:func:`take_claim`): every agent's cell enters the kernel through it.
+* **Who else did?** A person can run cells from an attached Jupyter client, and
+  the chat loop from its own turn, leaving an agent's picture of the namespace
+  stale with nothing in its own results to say so. The foreign-activity digest
+  is that notice, read from the host's job records (``_job_log``), and its
+  read/ack split is what makes it deferred-never-dropped.
 
 Both are policy about co-writers, so they are one module: a caller asking either
 question is asking about the same relation, and "foreign" is defined by
@@ -21,93 +21,100 @@ import logging
 import threading
 
 from . import _app
-from ._kernel_rpc import _run_job_call
 
 logger = logging.getLogger(__name__)
 
-# This process's mirror of the kernel's one-agent claim: the last client whose
-# code the kernel actually accepted, or None while unclaimed.
-#
-# The kernel owns the claim -- ``_jobs.submit`` is the choke point and the only
-# thing that can enforce it atomically. But ``restart_kernel`` cannot be gated
-# from inside the kernel it destroys, and asking the kernel who owns it first is
-# both a check-then-act race and *fail-open on a busy kernel*: a round trip that
-# comes back "busy" would read as "no owner", and a kernel busy running the
-# holder's job is exactly when a stray restart costs the most. Every claim
-# passes through this process, so mirroring it here answers the question with no
-# round trip and no window.
-#
-# Set from the kernel's own decision wherever a reply arrives: any submit the
-# kernel did not refuse came from the holder, and a refusal names the holder
-# outright, so assigning on both keeps the mirror true through a restart that
-# happened somewhere else (the observe page's, which clears it explicitly).
-#
-# **Recorded before the submit is sent, not after.** A reply can be lost while
-# the kernel goes on to claim and run the code anyway -- ``execute_interactive``
-# hands the request over before it starts its clock, so a timed-out call is still
-# queued and executes when the main thread frees up. Setting the mirror only on
-# the way back would leave it empty while the kernel is genuinely held, and an
-# empty mirror lets a stranger restart the session that just started. The window
-# is claimed first and corrected from whatever the kernel says, so the failure
-# direction is "held by the client that asked" rather than "held by nobody".
+# The one-agent claim: the client whose code this kernel runs, or None while
+# unclaimed. Decided here (:func:`take_claim`), where every agent's cell enters
+# the kernel, so the check and the claim are one step under one lock. It lasts
+# one kernel: a restart clears it, and a respawn -- a new generation of the
+# host's kernel -- voids it.
 _claimed_by: str | None = None
+_claimed_gen = None
+_claim_label = ""
 
 # Guards :data:`_claimed_by`, and -- the reason it is a lock rather than nothing
 # -- is held across a whole restart by :func:`restart`.
 #
-# The mirror is read-then-written from several threads: the tools await their
-# kernel round trips off the event loop, so a submit claiming the kernel and a
+# The claim is read and written from several threads: the tools await their
+# kernel round trips off the event loop, so a cell claiming the kernel and a
 # restart clearing it genuinely overlap. The window that matters is the restart:
-# gate, replace the kernel, clear the claim is one decision, and a submit that
+# gate, replace the kernel, clear the claim is one decision, and a cell that
 # lands in the middle of it would have its claim on the *new* kernel wiped by
-# the clear that follows. An empty mirror over a held kernel is the failure
-# direction :data:`_claimed_by` exists to prevent -- it lets a stranger restart
-# the session that just started.
+# the clear that follows -- an empty claim over a held kernel lets a stranger
+# restart the session that just started.
 #
-# Reentrant because _presume_claim calls _note_claim. Lock order is
-# _claim_lock -> KernelHost._lock, and nothing takes them the other way round:
-# every claim update happens outside the kernel round trip, never during one.
+# Reentrant so a caller holding it can take a claim. Lock order is
+# _claim_lock -> KernelHost._lock, and nothing takes them the other way round.
 _claim_lock = threading.RLock()
 
 
-def _note_claim(writer):
-    """Record that the kernel is held by *writer* (ignores ``None``)."""
-    global _claimed_by
+def take_claim(host, writer, label=""):
+    """Claim *host*'s kernel for *writer*, or refuse: returns None when
+    *writer* holds it (now or already), else the holder's label.
+
+    A caller with ``writer=None`` -- a transport that yields no client id --
+    neither claims nor is checked, since there is nothing to tell two of them
+    apart with.
+    """
+    global _claimed_by, _claimed_gen, _claim_label
+    with _claim_lock:
+        if _claimed_gen is not None and _claimed_gen != host.generation:
+            _claimed_by = None  # the kernel it was made on is gone
+        if writer is None or _claimed_by == writer:
+            return None
+        if _claimed_by is None:
+            _claimed_by, _claimed_gen, _claim_label = writer, host.generation, label
+            return None
+        return _claim_label
+
+
+def _note_claim(writer, label=""):
+    """Record that the kernel is held by *writer*, on whichever kernel runs
+    now (ignores ``None``)."""
+    global _claimed_by, _claimed_gen, _claim_label
     if writer is not None:
         with _claim_lock:
-            _claimed_by = writer
-
-
-def _presume_claim(writer):
-    """Take the claim for *writer* only if this process has not seen one.
-
-    Guarded on "not seen": a client the kernel is about to refuse must never
-    overwrite a holder already known here, and it will be corrected by the
-    refusal in any case.
-    """
-    with _claim_lock:
-        if _claimed_by is None:
-            _note_claim(writer)
+            _claimed_by, _claimed_gen, _claim_label = writer, None, label
 
 
 def clear_claim():
-    """Forget the mirrored claim, for a caller that just replaced the kernel."""
-    global _claimed_by
+    """Forget the claim, for a caller that just replaced the kernel."""
+    global _claimed_by, _claimed_gen, _claim_label
     with _claim_lock:
-        _claimed_by = None
+        _claimed_by, _claimed_gen, _claim_label = None, None, ""
 
 
 def claim_holder():
     """Who holds this kernel, as far as this process has seen, or ``None``.
 
-    A read for a caller deciding whether an action is worth offering at all --
-    the chat pane's engine switch, which would otherwise hand the session to a
-    second client that the kernel then refuses on its first cell. Mirrored, so
-    it can be stale in the safe direction only: it is set from what the kernel
-    actually said (:func:`_note_claim`), and cleared when the kernel is replaced.
+    A read for the stop path (:func:`stop_refusal`), which has to know who the
+    kernel answers to before it lets one client stop another's job. A claim on
+    a kernel since respawned still reads as held until the next
+    :func:`take_claim`, which is the safe direction.
     """
     with _claim_lock:
         return _claimed_by
+
+
+def stop_refusal(holder, job_origin, writer, origin):
+    """Why the client *writer*, of *origin*, may not stop a job of
+    *job_origin* on a kernel held by *holder*, as a refusal dict; None when
+    it may.
+
+    One rule for the session's jobs and a verification's: a client that does
+    not hold the kernel is refused (``not_owner``), and so is a job another
+    writer started (``foreign_job``) -- the stop would be silent to them. The
+    person at the machine (``origin="user"``) may stop anything, and a caller
+    with no identity is not checked for the claim.
+    """
+    if origin == "user":
+        return None
+    if writer is not None and holder not in (None, writer):
+        return {"refused": "not_owner"}
+    if job_origin != origin:
+        return {"refused": "foreign_job", "origin": job_origin}
+    return None
 
 
 def restart(host, writer, also_discard=None):
@@ -120,8 +127,8 @@ def restart(host, writer, also_discard=None):
 
     **Blocking, and meant to be called off the event loop.** The steps are one
     critical section rather than several statements at a call site: reading the
-    holder, replacing the kernel and clearing the mirror have to be indivisible,
-    or a submit landing between the restart and the clear loses the claim it just
+    holder, replacing the kernel and clearing the claim have to be indivisible,
+    or a cell landing between the restart and the clear loses the claim it just
     made on the new kernel (see :data:`_claim_lock`). Holding the lock for the
     seconds a restart takes is the point -- a claim on a kernel that is being
     destroyed is not a claim.
@@ -141,9 +148,8 @@ def restart(host, writer, also_discard=None):
     bad state either way, and leaving the slot held would be the worse of the
     two.
 
-    Deliberately reads the mirror rather than asking the kernel who holds it:
-    that is a check-then-act race *and* fail-open on a busy kernel. See
-    :data:`_claimed_by`.
+    Reads the claim here rather than asking the kernel: a round trip would be
+    a check-then-act race *and* fail-open on a busy kernel.
     """
     with _claim_lock:
         held = _claimed_by
@@ -173,7 +179,7 @@ def restart_for_user(host, also_discard=None):
 
 
 # Refusal for a client that does not hold this kernel's one-agent claim
-# (_jobs.submit). Shared by every state-changing tool so the agent gets one
+# (take_claim). Shared by every state-changing tool so the agent gets one
 # explanation rather than three, and so the recovery named is the same in all of
 # them: the person at the machine, never a second agent.
 _NOT_OWNER_MSG = (
@@ -212,7 +218,7 @@ def _client_identity():
     The streamable-http transport mints a per-connection ``mcp-session-id``, so
     two clients reaching one session child are distinguishable even though the
     tool surface itself is stateless — this is the id the kernel's one-agent
-    claim is keyed on (``_jobs.submit``). ``clientInfo.name`` from the initialize
+    claim is keyed on (``take_claim``). ``clientInfo.name`` from the initialize
     handshake rides along as a label, purely so a refusal can name who holds the
     kernel.
 
@@ -251,54 +257,45 @@ def _foreign_digest(host) -> list:
     or ``[]``.
 
     "Another writer" is relative to :data:`_local_origin`, so the chat loop is
-    not handed its own cells.
-
-    A pure read — see :func:`_ack_foreign_digest` for why the ack is a second call.
-    Auxiliary, like the window-liveness probe: a kernel that answers with
-    anything but the expected list yields no digest rather than breaking the
-    result the agent actually asked for.
+    not handed its own cells. A pure read -- see :func:`_ack_foreign_digest`
+    for why the ack is a second call.
     """
-    digest, _res, _w = _run_job_call(host, "foreign_digest", _local_origin.get())
-    if not digest or not isinstance(digest, list):
-        return []
-    if not all(isinstance(d, dict) and "job_id" in d for d in digest):
-        return []
-    return digest
+    return host.jobs.foreign_digest(_local_origin.get())
 
 
 def _ack_foreign_digest(host, digest, writer=None) -> None:
     """Retire the *terminal* entries of *digest*, once the note carrying them is
     on its way back to the agent.
 
-    Split from the read because acking inside it consumed notices that were
-    never delivered: ``execute_interactive`` sends the request before it starts
-    its timeout clock, so a probe that times out is still queued at the kernel
-    and runs when the main thread frees up — setting the flag for a note nobody
-    received. Acking only after this process has parsed a reply keeps the
-    guarantee that a notice is deferred, never dropped.
+    Split from the read so a notice is retired only by the call that delivers
+    it: a result that never reaches the agent must leave it pending.
 
-    Running entries are excluded here rather than in the kernel: they were
-    reported as ``running``, which is not the final status the agent is promised,
-    so they must stay pending even if they have finished since.
+    Running entries are excluded: they were reported as ``running``, which is
+    not the final status the agent is promised, so they must stay pending even
+    if they have finished since.
 
-    *writer* is the asking client, passed through so the kernel can refuse an ack
-    from a client that does not hold it: a second client's ``poll_job`` may
-    *read* the digest, but discharging a notice the holder has not received
-    would defeat the exactly-once promise this split exists to keep.
+    **Only the kernel's holder can discharge a notice.** Reading the digest is
+    open to anyone -- a second client watching the session is welcome to see
+    that a cell ran -- but a bystander's ``poll_job`` acking it would retire a
+    notice the holder never received. Decided on the claim; a caller
+    with no identity is the in-process case and acks.
     """
+    with _claim_lock:
+        if writer is not None and _claimed_by not in (None, writer):
+            return
     ids = [d["job_id"] for d in digest if d.get("status") != "running"]
     if ids:
-        _run_job_call(host, "ack_foreign_digest", ids, writer=writer)
+        host.jobs.ack_foreign_digest(ids)
 
 
 def _render_foreign_note(digest) -> str:
     """The digest as a line appended to an agent-facing result, or ``""``.
 
     The agent is not the only writer of this namespace: a person can run code
-    from the observe page, through the same job runner (``docs/user-console.md``).
-    That leaves the agent's picture of the namespace stale with nothing in its
-    own results to say so — hence this note, appended at the same seam as
-    ``_window_note``, which is how every other user-attributed fact already
+    from a Jupyter client attached to the kernel, recorded as a job the same
+    way. That leaves the agent's picture of the namespace stale with nothing
+    in its own results to say so — hence this note, appended at the same seam
+    as ``_window_note``, which is how every other user-attributed fact already
     reaches the agent (``cancel_reason``, ``teardown_reason``).
 
     Deliberately says *that* something changed, not *what*: the agent is told to

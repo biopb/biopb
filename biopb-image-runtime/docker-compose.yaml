@@ -1,4 +1,4 @@
-# Single-container setup: image-server with embedded tensor cache
+# Single-container setup: an Ops server with its embedded tensor cache
 # For testing lazy data handling and gRPC infrastructure
 #
 # Build from repo root:
@@ -6,7 +6,7 @@
 #   docker compose -f biopb-image-runtime/docker-compose.yaml up
 #
 # Ports:
-#   50051: gRPC image service (ObjectDetection, ProcessImage)
+#   50051: gRPC Ops service (echo_server.py); the token it mints is in its log
 #   8817: Arrow Flight tensor server (for lazy data access from clients)
 #
 # Note: tensor-external-location should be set to host's externally reachable address
@@ -14,7 +14,7 @@
 # For deployment: "grpc://<hostname>:8817"
 
 services:
-  mock:
+  echo:
     build:
       context: ..
       dockerfile: biopb-image-runtime/Dockerfile
@@ -23,12 +23,13 @@ services:
       - "8817:8817"
     volumes:
       - tensor-cache:/data/cache
+      - ./echo_server.py:/opt/biopb/echo_server.py:ro
     environment:
       BIOPB_LOG_LEVEL: "INFO"
     command: [
-      "python", "-m", "biopb_image_base.mock_servicer",
+      "python", "/opt/biopb/echo_server.py",
+      "--host", "0.0.0.0",
       "--port", "50051",
-      "--mode", "echo",
       "--cache-dir", "/data/cache",
       "--cache-size", "32GB",
       "--tensor-port", "8817",

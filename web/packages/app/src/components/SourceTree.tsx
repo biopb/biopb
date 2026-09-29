@@ -1,58 +1,34 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useAppStore } from "../store";
 import type { DataSourceDescriptor } from "@biopb/tensor-flight-client";
+import { readRecents, subscribeRecents } from "../utils/recentSources";
+import { WarmTray } from "./WarmTray";
+import {
+  type TreeNode,
+  UNRESOLVED_GLYPH,
+  UNRESOLVED_TOOLTIP,
+  getPathParts,
+  groupTensors,
+  isEmptySource,
+  isUnresolved,
+  matchesQuery,
+  recentNode,
+  sourceLabel,
+} from "../utils/sourceTree";
 
 // Threshold for switching to server-side SQL query
 const SERVER_QUERY_THRESHOLD = 1000;
-
-// Origin scheme the tensor server stamps on a drag-dropped source's source_url
-// (server-side DND_URL_PREFIX). Display-only marker of drop provenance; the tree
-// strips it so a dropped source renders under a clean root, identical to a
-// scheme-less re-root. Keep in sync with the server constant and the napari
-// plugin's _get_path_parts.
-const DND_URL_PREFIX = "dnd://";
-
-interface TreeNode {
-  id: string;           // unique id (path for folders, source_id for sources)
-  name: string;         // display name
-  type: "folder" | "source";
-  children: TreeNode[];
-  source?: DataSourceDescriptor;  // only for source nodes
-  depth: number;
-}
-
-function getPathParts(url: string): string[] {
-  if (!url) return [];
-  if (url.startsWith(DND_URL_PREFIX)) {
-    // Drag-dropped source: strip the origin scheme and split the re-rooted
-    // remainder as a plain path. String-strip (not URL parse) avoids host/port
-    // misparsing of a basename like "exp:2.zarr".
-    return url.slice(DND_URL_PREFIX.length).split(/[\\/]+/).filter(Boolean);
-  }
-  try {
-    const parsed = new URL(url);
-    const path = parsed.pathname.split("/").filter(Boolean);
-    // Authority URLs (remote tensor-server mirrors "grpc://host:port/remote/path",
-    // "s3://bucket/key", …) surface the endpoint "<protocol>//<host>" as the root,
-    // so mirrored sources nest by their remote filepath under an endpoint node
-    // instead of collapsing into a flat "grpc:" node (biopb/biopb#297). Local
-    // file:// has an empty host, so it is unchanged (just its path). Mirror of the
-    // napari plugin's _get_path_parts — keep the two behaviorally in lockstep.
-    if (parsed.host) {
-      return [`${parsed.protocol}//${parsed.host}`, ...path];
-    }
-    return path;
-  } catch {
-    return url.split("/").filter(Boolean);
-  }
-}
 
 function tensorShortName(arrayId: string): string {
   const parts = arrayId.split("/").filter(Boolean);
   return parts[parts.length - 1] || arrayId;
 }
+
+/** On, off. A radio rather than a checkbox: only one set is drawn at a time. */
+const LABEL_ON_GLYPH = "\u25c9";
+const LABEL_OFF_GLYPH = "\u25cb";
 
 function formatShape(shape: number[]): string {
   return shape.join("×");
@@ -68,7 +44,7 @@ function buildTree(sources: DataSourceDescriptor[]): TreeNode {
       // No path parts, add directly to root
       root.children.push({
         id: src.source_id,
-        name: src.source_id,
+        name: sourceLabel(src),
         type: "source",
         children: [],
         source: src,
@@ -96,10 +72,9 @@ function buildTree(sources: DataSourceDescriptor[]): TreeNode {
     }
 
     // Add source as leaf
-    const sourceName = parts[parts.length - 1]!;
     current.children.push({
       id: src.source_id,
-      name: sourceName,
+      name: sourceLabel(src),
       type: "source",
       children: [],
       source: src,
@@ -194,6 +169,27 @@ function filterTree(
   return { ...node, children: filteredChildren };
 }
 
+/**
+ * The folders between the root and `sourceId`, outermost first, or null when no
+ * source node answers to it.
+ *
+ * Walked rather than derived from `source_url`: `flattenPaths` merges a
+ * single-child chain into one node and takes the *grandchild's* id, so a folder
+ * id is not a prefix of the path it displays. The built tree is the only thing
+ * that knows which ids survived.
+ */
+function folderPathTo(node: TreeNode, sourceId: string): string[] | null {
+  for (const child of node.children) {
+    if (child.type === "source") {
+      if (child.id === sourceId) return [];
+      continue;
+    }
+    const below = folderPathTo(child, sourceId);
+    if (below) return [child.id, ...below];
+  }
+  return null;
+}
+
 function Chevron({ expanded }: { expanded: boolean }) {
   return (
     <span
@@ -223,24 +219,55 @@ function ChevronSlot() {
   );
 }
 
-interface TreeRowProps {
+export interface TreeRowProps {
   node: TreeNode;
   activeSourceId: string | null;
   activeTensorId: string | null;
   expandedFolders: Set<string>;
   toggleFolder: (id: string) => void;
   selectSource: (sourceId: string, tensorId?: string) => void;
+  /**
+   * Begin resolving an unresolved source. Optional so `TreeRow` stays a pure
+   * props component (it is rendered standalone in tests); a row without it
+   * simply shows no resolve button.
+   */
+  startResolve?: (sourceId: string) => void;
+  /** Source ids with a resolve already under way, so the button can say so. */
+  resolving?: ReadonlySet<string>;
+  /**
+   * The label set currently drawn, as its whole `array_id`, or null. Unscoped
+   * on purpose: the rows this marks belong to one image, and a set of another
+   * image can never be one of them.
+   */
+  labelOverlay?: string | null;
+  /** Draw this set, or nothing. Optional, so a row renders standalone. */
+  setLabelOverlay?: (arrayId: string | null) => void;
 }
 
-function TreeRow({
+export function TreeRow({
   node,
   activeSourceId,
   activeTensorId,
   expandedFolders,
   toggleFolder,
   selectSource,
+  startResolve,
+  resolving,
+  labelOverlay,
+  setLabelOverlay,
 }: TreeRowProps) {
   const indent = node.depth * 12 + 12;
+  // Label sets filed under the image they annotate, rather than listed beside
+  // it: a set is a tensor of the source, but it is *about* one of the others.
+  //
+  // Memoized: an unrelated store change (e.g. toggling the overlay) re-renders
+  // every row, and re-sorting every source's tensors on each one adds up.
+  //
+  // Hoisted above the folder branch because that branch returns: a hook after
+  // it runs only for source rows, which is the hook-order rule React enforces
+  // and eslint refuses to build. A folder has no tensors, so it memoizes an
+  // empty list and pays nothing.
+  const groups = useMemo(() => groupTensors(node.source?.tensors ?? []), [node.source]);
 
   if (node.type === "folder") {
     const expanded = expandedFolders.has(node.id);
@@ -270,6 +297,10 @@ function TreeRow({
               expandedFolders={expandedFolders}
               toggleFolder={toggleFolder}
               selectSource={selectSource}
+              startResolve={startResolve}
+              resolving={resolving}
+              labelOverlay={labelOverlay}
+              setLabelOverlay={setLabelOverlay}
             />
           ))}
       </>
@@ -279,8 +310,59 @@ function TreeRow({
   // Source node
   const src = node.source!;
   const isActive = src.source_id === activeSourceId;
-  const hasMultipleTensors = src.tensors.length > 1;
+  // Grouped, not the raw tensor count: a label set files under the image it
+  // annotates (see `groups` above), so one image plus its label set is still
+  // one tensor as far as expanding into a per-image list is concerned. Label
+  // toggle rows render regardless (below) -- they're the only place to reach
+  // the overlay -- but the redundant image row is skipped when there's only
+  // one to pick from.
+  const showImageRows = groups.length > 1;
   const firstTensor = src.tensors[0];
+  // An unresolved source has no tensor to read, so selecting it would send the
+  // viewer after a tile that cannot exist.
+  const unresolved = isUnresolved(src);
+  const inFlight = resolving?.has(src.source_id) ?? false;
+
+  // An unresolved row is a plain div, not a disabled button: it carries a real
+  // Resolve button, and interactive content cannot nest inside a button. The
+  // row itself has nothing to activate -- there is no tensor to open until the
+  // server hydrates it -- so dropping it from the tab order costs nothing and
+  // leaves exactly one focusable control, the one that does something.
+  if (unresolved) {
+    return (
+      <div
+        className="tree-item unresolved"
+        style={{
+          width: "100%",
+          display: "flex",
+          alignItems: "center",
+          paddingLeft: indent,
+        }}
+        data-source-id={node.id === src.source_id ? src.source_id : undefined}
+        title={`${src.source_url}\n${UNRESOLVED_TOOLTIP}`}
+      >
+        <ChevronSlot />
+        <span className="unresolved-glyph" aria-label="Not resolved">
+          {UNRESOLVED_GLYPH}
+        </span>
+        <span style={{ flex: 1, marginLeft: 4 }}>{node.name}</span>
+        {startResolve ? (
+          <button
+            className="resolve-btn"
+            disabled={inFlight}
+            onClick={() => startResolve(src.source_id)}
+            title={
+              inFlight
+                ? "Already resolving this source"
+                : "Resolve this source \u2014 downloads its content, which can take minutes"
+            }
+          >
+            {inFlight ? "Resolving\u2026" : "Resolve"}
+          </button>
+        ) : null}
+      </div>
+    );
+  }
 
   return (
     <>
@@ -293,9 +375,16 @@ function TreeRow({
           alignItems: "center",
           paddingLeft: indent,
         }}
+        // Only the catalog row carries this: it is what the reveal effect
+        // scrolls to, and the "Recent" copy of the same source -- same
+        // descriptor, different node -- comes first in document order and would
+        // otherwise shadow it.
+        data-source-id={node.id === src.source_id ? src.source_id : undefined}
         onClick={() => {
-          if (src.tensors.length === 1) {
-            selectSource(src.source_id, src.tensors[0]?.array_id);
+          // One image is unambiguous whether or not it carries label sets; two
+          // are a choice, and guessing it here is what biopb/biopb#75 was about.
+          if (groups.length === 1) {
+            selectSource(src.source_id, groups[0]?.image.array_id);
           } else {
             selectSource(src.source_id);
           }
@@ -304,9 +393,9 @@ function TreeRow({
       >
         <ChevronSlot />
         <span style={{ flex: 1, marginLeft: 4 }}>{node.name}</span>
-        {hasMultipleTensors ? (
+        {groups.length > 1 ? (
           <span className="tensor-pill" style={{ marginLeft: 8 }}>
-            {src.tensors.length}
+            {groups.length}
           </span>
         ) : firstTensor ? (
           <span
@@ -319,29 +408,72 @@ function TreeRow({
         ) : null}
       </button>
 
-      {/* Nested tensors when source is active and has multiple tensors */}
-      {isActive && hasMultipleTensors &&
-        src.tensors.map((t) => {
-          const tActive = t.array_id === activeTensorId;
-          const tName = tensorShortName(t.array_id);
+      {/* Nested rows when the source is active. The per-image row only earns
+          its place when there's an actual choice between images; a label set's
+          toggle row renders regardless, since it's the only place to reach it. */}
+      {isActive &&
+        groups.map(({ image, labelSets }) => {
+          const tActive = image.array_id === activeTensorId;
           return (
-            <button
-              key={`tensor:${src.source_id}:${t.array_id}`}
-              className={`tree-item tensor-item ${tActive ? "active" : ""}`}
-              style={{
-                width: "100%",
-                textAlign: "left",
-                paddingLeft: indent + 12,
-                display: "flex",
-                alignItems: "center",
-                fontSize: 12,
-              }}
-              onClick={() => selectSource(src.source_id, t.array_id)}
-              title={`${t.array_id}\nShape: ${formatShape(t.shape)}\nDtype: ${t.dtype}`}
-            >
-              <ChevronSlot />
-              <span style={{ flex: 1, marginLeft: 4 }}>{tName}</span>
-            </button>
+            <Fragment key={`tensor:${src.source_id}:${image.array_id}`}>
+              {showImageRows && (
+                <button
+                  className={`tree-item tensor-item ${tActive ? "active" : ""}`}
+                  style={{
+                    width: "100%",
+                    textAlign: "left",
+                    paddingLeft: indent + 12,
+                    display: "flex",
+                    alignItems: "center",
+                    fontSize: 12,
+                  }}
+                  onClick={() => selectSource(src.source_id, image.array_id)}
+                  title={`${image.array_id}\nShape: ${formatShape(image.shape)}\nDtype: ${image.dtype}`}
+                >
+                  <ChevronSlot />
+                  <span style={{ flex: 1, marginLeft: 4 }}>
+                    {tensorShortName(image.array_id)}
+                  </span>
+                </button>
+              )}
+              {labelSets.map((set) => {
+                const on = set.array_id === labelOverlay;
+                return (
+                  <button
+                    key={`labels:${src.source_id}:${set.array_id}`}
+                    className={`tree-item label-item ${on ? "active" : ""}`}
+                    style={{
+                      width: "100%",
+                      textAlign: "left",
+                      paddingLeft: indent + (showImageRows ? 24 : 12),
+                      display: "flex",
+                      alignItems: "center",
+                      fontSize: 12,
+                    }}
+                    aria-pressed={on}
+                    // Selecting the image as well, because the overlay is drawn
+                    // over whatever the viewer has: switching it on from a row
+                    // whose image is not open would otherwise be a control with
+                    // nothing to act on.
+                    onClick={() => {
+                      if (!tActive) selectSource(src.source_id, image.array_id);
+                      setLabelOverlay?.(on ? null : set.array_id);
+                    }}
+                    title={
+                      `${set.array_id}\nLabel set over ${image.array_id}` +
+                      `\nShape: ${formatShape(set.shape)}\nDtype: ${set.dtype}` +
+                      `\n${on ? "Drawn — click to hide" : "Click to draw it over the image"}`
+                    }
+                  >
+                    <ChevronSlot />
+                    <span aria-hidden="true">{on ? LABEL_ON_GLYPH : LABEL_OFF_GLYPH}</span>
+                    <span style={{ flex: 1, marginLeft: 4 }}>
+                      {tensorShortName(set.array_id)}
+                    </span>
+                  </button>
+                );
+              })}
+            </Fragment>
           );
         })}
     </>
@@ -353,14 +485,64 @@ export function SourceTree() {
   const sourcesLoading = useAppStore((s) => s.sourcesLoading);
   const scanning = useAppStore((s) => s.scanning);
   const activeSourceId = useAppStore((s) => s.activeSourceId);
-  const activeTensorId = useAppStore((s) => s.activeTensorId);
-  const selectSource = useAppStore((s) => s.selectSource);
+  // Which tensor row to mark, in the catalog's own spelling: the target's
+  // resolved, token-free key, and no row carries a token. Until it resolves,
+  // the address that was asked for.
+  const activeTensorId = useAppStore((s) => s.target.key ?? s.activeTensorId);
+  const openTensor = useAppStore((s) => s.openTensor);
+  // A source row opens the bare source, which the server resolves to its
+  // default tensor.
+  const selectSource = useCallback(
+    (sourceId: string, tensorId?: string) => openTensor(tensorId ?? sourceId),
+    [openTensor],
+  );
   const querySources = useAppStore((s) => s.querySources);
+  const recentIds = useAppStore((s) => s.recentIds);
+  const recentSources = useAppStore((s) => s.recentSources);
+  const syncRecents = useAppStore((s) => s.syncRecents);
+  const hydrateRecents = useAppStore((s) => s.hydrateRecents);
+  const startResolve = useAppStore((s) => s.startResolve);
+  const sourceJobs = useAppStore((s) => s.sourceJobs);
+  // Raw, not through `selectLabelOverlay`: a row marks the set it names, and a
+  // set of another image is never one of the rows shown here. Reading the
+  // scoped value would leave the mark off for the moment between selecting an
+  // image and its grid landing.
+  const labelOverlay = useAppStore((s) => s.labelOverlay);
+  const setLabelOverlay = useAppStore((s) => s.setLabelOverlay);
+
+  // Ids whose resolve is under way, so a row can say so rather than offering a
+  // button that would only join the job it already started.
+  const resolving = useMemo(
+    () =>
+      new Set(
+        Object.values(sourceJobs)
+          .filter((j) => j.kind === "resolve" && j.state === "running")
+          .map((j) => j.source_id),
+      ),
+    [sourceJobs],
+  );
 
   const [query, setQuery] = useState("");
   const [serverFilteredIds, setServerFilteredIds] = useState<Set<string> | null>(null);
   const [serverQueryLoading, setServerQueryLoading] = useState(false);
-  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
+  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(
+    () => new Set(),
+  );
+
+  // Another tab's writes. localStorage is shared but does not re-render, so
+  // without this two tabs of one link would drift apart -- which is the reason
+  // the list is not in sessionStorage.
+  useEffect(() => {
+    syncRecents(readRecents());
+    return subscribeRecents(syncRecents);
+  }, [syncRecents]);
+
+  // Re-resolved when the list changes or the catalog does: a recent id that the
+  // catalog has just listed should stop costing a `tile_info` round trip, and
+  // one the server has dropped should leave the node.
+  useEffect(() => {
+    void hydrateRecents();
+  }, [hydrateRecents, recentIds, sources]);
 
   // Determine if we should use server-side queries
   const useServerQuery = sources.length > SERVER_QUERY_THRESHOLD;
@@ -400,23 +582,33 @@ export function SourceTree() {
       });
   }, [debouncedQuery, useServerQuery, querySources]);
 
-  // Client-side filter
+  // Client-side filter. Empty sources are dropped unconditionally, before the
+  // search query narrows further -- a source with nothing on it is never
+  // worth a row, matching or not.
   const filteredSources = useMemo(() => {
+    const visible = sources.filter((s) => !isEmptySource(s));
     const q = query.trim().toLowerCase();
-    if (!q) return sources;
+    if (!q) return visible;
 
     if (serverFilteredIds) {
-      return sources.filter((s) => serverFilteredIds.has(s.source_id));
+      return visible.filter((s) => serverFilteredIds.has(s.source_id));
     }
 
-    return sources.filter((s) => {
-      const hay = `${s.source_id} ${s.source_url} ${s.source_type}`.toLowerCase();
-      return hay.includes(q);
-    });
+    return visible.filter((s) => matchesQuery(s, q));
   }, [query, sources, serverFilteredIds]);
 
   // Build tree from filtered sources
   const tree = useMemo(() => buildTree(filteredSources), [filteredSources]);
+
+  // Recents filter client-side even when the catalog has switched to a
+  // server-side query: that query is SQL against the catalog, which by
+  // construction does not hold the uploads this node exists to show.
+  const recent = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    const visible = recentSources.filter((s) => !isEmptySource(s));
+    const matching = q ? visible.filter((s) => matchesQuery(s, q)) : visible;
+    return recentNode(matching);
+  }, [recentSources, query]);
 
   // Filter tree when search is active (client-side only)
   const displayTree = useMemo(() => {
@@ -439,6 +631,48 @@ export function SourceTree() {
     return filtered ?? tree;
   }, [tree, query, filteredSources, serverFilteredIds, expandedFolders]);
 
+  const listRef = useRef<HTMLDivElement | null>(null);
+  // The selection this has already revealed. Latched so a later catalog poll --
+  // which rebuilds the tree every 60s -- cannot re-open a folder the user just
+  // collapsed, while a selection the catalog does not hold *yet* stays unlatched
+  // and is revealed by whichever poll first brings it in.
+  const revealed = useRef<string | null>(null);
+  const pendingScroll = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!activeSourceId) {
+      revealed.current = null;
+      return;
+    }
+    if (revealed.current === activeSourceId) return;
+    // A link can select a source that is filtered out by the search box, or one
+    // the catalog has not listed (still scanning, or past its cap). Nothing to
+    // reveal then, and nothing latched, so clearing the search brings it in.
+    const folders = folderPathTo(tree, activeSourceId);
+    if (!folders) return;
+    revealed.current = activeSourceId;
+    pendingScroll.current = activeSourceId;
+    if (folders.length > 0) {
+      setExpandedFolders((prev) => {
+        if (folders.every((id) => prev.has(id))) return prev;
+        const next = new Set(prev);
+        for (const id of folders) next.add(id);
+        return next;
+      });
+    }
+  }, [activeSourceId, tree]);
+
+  // Deliberately every commit: the row this wants may not exist until the
+  // expansion above has rendered, and it is one ref read until it does.
+  useEffect(() => {
+    const id = pendingScroll.current;
+    if (id === null) return;
+    const row = listRef.current?.querySelector(`[data-source-id="${CSS.escape(id)}"]`);
+    if (!row) return;
+    pendingScroll.current = null;
+    row.scrollIntoView({ block: "nearest" });
+  });
+
   const toggleFolder = useCallback((id: string) => {
     setExpandedFolders((prev) => {
       const next = new Set(prev);
@@ -450,6 +684,28 @@ export function SourceTree() {
       return next;
     });
   }, []);
+
+  /**
+   * Selecting from "Recent", which must leave the catalog exactly where it is.
+   *
+   * The reveal effect above keys on `activeSourceId` alone and so cannot tell a
+   * catalog click from a shortcut; without this, picking a row near the top of
+   * the pane expands a folder chain further down and scrolls the tree to it --
+   * a jump to somewhere the reader did not click. Recording the origin here is
+   * what the effect cannot work out for itself.
+   *
+   * Marking it *revealed* rather than adding a flag to skip: the two say the
+   * same thing (this selection needs no reveal) and the latch already means
+   * "shown", so a later catalog poll does not reopen the question either. A
+   * catalog click and a shared link leave it unlatched and still reveal.
+   */
+  const selectFromRecent = useCallback(
+    (sourceId: string, tensorId?: string) => {
+      revealed.current = sourceId;
+      selectSource(sourceId, tensorId);
+    },
+    [selectSource],
+  );
 
   return (
     <section style={{ display: "grid", gridTemplateRows: "auto 1fr", height: "100%" }}>
@@ -468,31 +724,55 @@ export function SourceTree() {
         )}
       </div>
 
-      <div style={{ overflow: "auto" }}>
+      <div ref={listRef} style={{ overflow: "auto" }}>
         {sourcesLoading || serverQueryLoading ? (
           <div style={{ padding: "0.5rem 1rem", opacity: 0.8 }}>
             {serverQueryLoading ? "Searching..." : "Loading sources..."}
           </div>
-        ) : filteredSources.length === 0 ? (
-          <div style={{ padding: "0.5rem 1rem", opacity: 0.8 }}>
-            {scanning && sources.length === 0
-              ? "Indexing data folder… (sources will appear as they are found)"
-              : "No sources"}
-          </div>
-        ) : displayTree ? (
-          displayTree.children.map((child) => (
-            <TreeRow
-              key={child.id}
-              node={child}
-              activeSourceId={activeSourceId}
-              activeTensorId={activeTensorId}
-              expandedFolders={expandedFolders}
-              toggleFolder={toggleFolder}
-              selectSource={selectSource}
-            />
-          ))
-        ) : null}
+        ) : (
+          <>
+            {recent && (
+              <TreeRow
+                node={recent}
+                activeSourceId={activeSourceId}
+                activeTensorId={activeTensorId}
+                expandedFolders={expandedFolders}
+                toggleFolder={toggleFolder}
+                selectSource={selectFromRecent}
+                labelOverlay={labelOverlay}
+                setLabelOverlay={setLabelOverlay}
+              />
+            )}
+            {/* The empty notice is about the catalog, so it is suppressed while
+                "Recent" has rows -- "No sources" above a list of sources reads
+                as a bug. */}
+            {filteredSources.length === 0 && !recent ? (
+              <div style={{ padding: "0.5rem 1rem", opacity: 0.8 }}>
+                {scanning && sources.length === 0
+                  ? "Indexing data folder… (sources will appear as they are found)"
+                  : "No sources"}
+              </div>
+            ) : (
+              displayTree.children.map((child) => (
+                <TreeRow
+                  key={child.id}
+                  node={child}
+                  activeSourceId={activeSourceId}
+                  activeTensorId={activeTensorId}
+                  expandedFolders={expandedFolders}
+                  toggleFolder={toggleFolder}
+                  selectSource={selectSource}
+                  startResolve={startResolve}
+                  resolving={resolving}
+                  labelOverlay={labelOverlay}
+                  setLabelOverlay={setLabelOverlay}
+                />
+              ))
+            )}
+          </>
+        )}
       </div>
+      <WarmTray />
     </section>
   );
 }

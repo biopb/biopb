@@ -102,7 +102,7 @@ def bench_real_server(
     from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
     from biopb_tensor_server.cache import CacheManager
     from biopb_tensor_server.core.config import CacheConfig
-    from biopb_tensor_server.serving.server import TensorFlightServer
+    from tests import catalog_server, register_and_catalog
 
     location = f"grpc://127.0.0.1:{port}"
     edge = int(np.sqrt(batch.nbytes / 2))  # uint16 = 2 bytes
@@ -131,31 +131,25 @@ def bench_real_server(
         }
         (zarr_path / ".zattrs").write_text(json.dumps(ome))
 
-        # Setup cache
+        # Setup cache. No CacheManager at all is the "no caching" arm --
+        # resolve_chunk_data skips caching whenever cache_manager is None.
         if use_file_cache:
             CacheManager.initialize(
                 CacheConfig(
-                    backend="file",
                     file_cache_dir=Path(tmpdir) / "fcache",
                     file_max_segment_bytes=256 * 1024 * 1024,
                     file_max_total_bytes=512 * 1024 * 1024,
                 )
             )
         else:
-            CacheManager.initialize(
-                CacheConfig(
-                    backend="memory",
-                    memory_max_entries=0,  # No caching for raw reads
-                    memory_max_bytes=0,
-                )
-            )
+            CacheManager.reset()
 
         grp = zarr.open_group(zarr_path, mode="r")
         level_arr = grp["0"]
         adapter = OmeZarrAdapter(level_arr, "test")
 
-        server = TensorFlightServer(location)
-        server.register_source("test", adapter)
+        server = catalog_server(location)
+        register_and_catalog(server, "test", adapter)
         server_thread = threading.Thread(target=server.serve, daemon=True)
         server_thread.start()
         time.sleep(0.3)

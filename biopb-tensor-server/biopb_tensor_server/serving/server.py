@@ -3,48 +3,104 @@
 This module implements a Flight server that exposes chunked multi-dimensional
 arrays through the source/tensor adapter interface.
 
-The server supports:
-- ListFlights: Browse available tensors
-- GetFlightInfo: Get tensor metadata and chunk endpoints
-- DoGet: Fetch individual chunk data
-- DoPut: Upload data (when writable mode enabled)
-- Metadata queries: SQL queries against source catalog (via DuckDB)
+Three flights, and the dispatch is always a proto oneof (never a sentinel
+or a byte-prefix sniff):
+
+- ``catalog`` -- the public DuckDB catalog. ListFlights advertises one flight
+  per table with its schema; GetFlightInfo / DoGet take a ``CatalogQuery``.
+  Gated by the server-wide token.
+- ``data`` -- pixels. GetFlightInfo takes a ``TensorReadOption`` and plans
+  chunk endpoints; DoGet serves one of those tickets, and DoPut takes the same
+  ticket back as ``chunk_ticket`` (writable servers). Private: gated per
+  source.
+- ``roi`` -- annotations. DoGet serves one tensor's set as ROI rows; DoPut
+  takes a ``RoiPut`` / ``RoiDelete``. Private: gated per source.
+
+Custom actions (``list_actions``) cover health, uploads, cache locate, cloud
+resolve / warm, runtime source add / remove, and annotation pruning.
 """
 
+import hmac
+import ipaddress
 import json
 import logging
 import os
 import threading
 import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+from urllib.parse import unquote
 
 import pyarrow as pa
 import pyarrow.flight as flight
+from biopb.image.annotation_pb2 import (
+    RoiDeleteResult,
+    RoiPruneRequest,
+    RoiPruneResult,
+    RoiPutResult,
+    RoiUnseen,
+)
+from biopb.tensor._labels import split_label_array_id
+from biopb.tensor._pool import WIRE_WRITE_OPTIONS
+from biopb.tensor._roi_rows import (
+    rois_to_table,
+    table_to_roi_ids,
+    table_to_rois,
+)
+from biopb.tensor._session import split_array_id
+from biopb.tensor._tls import cert_not_after
+from biopb.tensor._wire_version import FLIGHT_PROTOCOL_VERSION
 from biopb.tensor.descriptor_pb2 import (
     AddSourceProgress,
     AddSourceRequest,
     AddSourceResult,
     AddSourceStreamMessage,
-    FlightCmd,
+    CatalogQuery,
+    FlightRequest,
     RemoveSourceRequest,
     RemoveSourceResult,
     ResolveProgress,
     ResolveStreamMessage,
     TensorDescriptor,
+    UploadStatus as UploadStatusPb,
     WarmProgress,
     WarmStreamMessage,
 )
-from biopb.tensor.ticket_pb2 import ChunkBounds, ChunkUpload, TensorTicket
+from biopb.tensor.ticket_pb2 import (
+    ChunkBounds,
+    PutCommand,
+    SetUploadStatus,
+    TensorTicket,
+)
+from google.protobuf.message import DecodeError, Message
 
-from biopb_tensor_server.cache import CACHE_FILE_FORMAT_VERSION, CacheManager
-from biopb_tensor_server.core.activity import ActivityTracker
+from biopb_tensor_server.adapters._writable import (
+    UploadProgress,
+    UploadStatus,
+    unsettable_state_message,
+    upload_of,
+)
+from biopb_tensor_server.adapters.fields import (
+    fields_attacher,
+    fields_root,
+    upload_attacher,
+)
+from biopb_tensor_server.adapters.labels import labels_root, sidecar_attacher
+from biopb_tensor_server.adapters.scratch import DEFAULT_SCRATCH_TTL
+from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.core.adapter_base import (
     SourceAdapter,
     TensorAdapter,
     strip_source_prefix,
 )
-from biopb_tensor_server.core.chunk import cache_key_for_chunk_id, routing_array_id
+from biopb_tensor_server.core.chunk import (
+    cache_key_for_chunk_id,
+    is_proxy_envelope,
+    is_scaled_chunk,
+    routing_array_id,
+)
 from biopb_tensor_server.core.config import PyramidConfig
 from biopb_tensor_server.core.errors import (
     SourceResolveRetriableError,
@@ -53,11 +109,52 @@ from biopb_tensor_server.core.errors import (
     TensorResolutionError,
     UnknownResolutionError,
 )
-from biopb_tensor_server.core.metadata_db import MetadataDatabase, NumpyEncoder
+from biopb_tensor_server.core.labels import split_label_field
+from biopb_tensor_server.core.read_mask import (
+    IS_RESIDENT,
+    METADATA_JSON,
+    UPLOAD_STATUS,
+    read_mask,
+)
+from biopb_tensor_server.core.remote import is_remote_url
+from biopb_tensor_server.core.retention import set_active_pyramid_config
 from biopb_tensor_server.core.source_registry import SourceRegistry
-from biopb_tensor_server.serving.upload_manager import UploadManager
+from biopb_tensor_server.serving.activity import ActivityTracker
+from biopb_tensor_server.serving.metadata_db import (
+    MetadataDatabase,
+    NumpyEncoder,
+    is_reserved_set,
+)
+from biopb_tensor_server.serving.upload_manager import (
+    DEFAULT_UPLOAD_TTL,
+    UploadManager,
+)
 
 logger = logging.getLogger(__name__)
+
+#: The reads a narrow grant can cover. Two, not one: pixels and annotations are
+#: separate reads of the same source, and a bare capability token grants both
+#: today -- naming them is what lets that stop being true without touching a
+#: call site (biopb/biopb#1048).
+READ_PIXELS = "read:pixels"
+READ_ANNOTATIONS = "read:annotations"
+_CAPABILITY_ACTIONS = frozenset({READ_PIXELS, READ_ANNOTATIONS})
+
+
+def _peer_is_remote(peer: str) -> bool:
+    """Whether a gRPC peer string (``ipv4:1.2.3.4:5``, ``ipv6:[::1]:5``) names a
+    client on another machine. A unix socket, or anything not read as a TCP
+    address, counts as local: compression only pays over a real network."""
+    scheme, _, rest = unquote(peer).partition(":")
+    if scheme not in ("ipv4", "ipv6"):
+        return False
+    try:
+        addr = ipaddress.ip_address(rest.rsplit(":", 1)[0].strip("[]"))
+    except ValueError:
+        return False
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped:
+        addr = addr.ipv4_mapped
+    return not addr.is_loopback
 
 
 def _ensure_tls_scheme(location: str) -> str:
@@ -120,6 +217,35 @@ def to_flight_error(exc: Exception) -> flight.FlightError:
     return flight.FlightServerError(str(exc), extra_info)
 
 
+def _with_label_axes(metadata: dict, source_adapter: Any, desc: Any) -> dict:
+    """*metadata* plus ``biopb.labels.image_axes`` when *desc* is a label set.
+
+    The mapping the extent rule already implies -- which of the image's axes
+    each axis of the set indexes -- said out loud, so a client reads it instead
+    of re-deriving it from two descriptors (design, "Extent"). Stamped at the
+    one place a tensor's served metadata is assembled, and measured against
+    the descriptor being served, so it lines up with the axes the client is
+    about to see.
+
+    NGFF's own ``image-label`` block is left alone: that is a spec block and
+    this is not in the spec. It rides in the ``biopb`` namespace beside it,
+    merged into whatever the source already has there -- an uploaded store's
+    own ``.zattrs`` carry an upload marker -- rather than replacing it.
+
+    ``source_id`` is the slash-free prefix by the identity policy, so the
+    within-source field is everything after the first "/".
+    """
+    parsed = split_label_field(desc.array_id.partition("/")[2])
+    if parsed is None or source_adapter is None:
+        return metadata
+    axes = source_adapter.label_image_axes(parsed.set_field, desc)
+    if axes is None:
+        return metadata
+    biopb = {**(metadata.get("biopb") or {})}
+    biopb["labels"] = {**(biopb.get("labels") or {}), "image_axes": list(axes)}
+    return {**metadata, "biopb": biopb}
+
+
 def _adapter_lookup_error(exc: Exception, miss_context: str) -> flight.FlightError:
     """Map an exception raised while resolving the adapter for a read request to a
     Flight error, identically for every read verb (biopb/biopb#378).
@@ -161,13 +287,26 @@ _RESOLVE_HEARTBEAT_SECONDS = 15.0
 # resolve heartbeat cadence.
 _WARM_READ_BLOCK_BYTES = 8 * 1024 * 1024
 _WARM_PROGRESS_MIN_INTERVAL = 0.5
+_WARM_MAX_WORKERS = 4
+_WARM_POLL_SECONDS = 0.1
+
+
+def _upload_attacher(write_dir: Path):
+    """The registry's ``on_register`` hook over every layout the upload path owns.
+
+    Fields before sets, the order ``catalog_tensors`` lists them in.
+    """
+    return upload_attacher(
+        fields_attacher(fields_root(write_dir)),
+        sidecar_attacher(labels_root(write_dir)),
+    )
 
 
 class _AuthMiddleware(flight.ServerMiddleware):
     """Per-call middleware that carries the caller's presented Bearer token.
 
-    Handlers retrieve it via ``context.get_middleware("auth")`` to enforce
-    per-source capability tokens (see ``_authorize_source``).
+    Handlers retrieve it via ``context.get_middleware("auth")`` and decide what
+    it opens (``TensorFlightServer._authorize`` / ``_authorize_read``).
     """
 
     def __init__(self, token: Optional[str]) -> None:
@@ -181,16 +320,17 @@ class _AuthMiddleware(flight.ServerMiddleware):
 
 
 class BearerAuthMiddlewareFactory(flight.ServerMiddlewareFactory):
-    """Validate the server-wide Bearer token and expose the presented token.
+    """Capture the caller's presented Bearer token for the handlers.
+
+    Deliberately decides nothing: which token a call needs depends on what it
+    is about -- the server-wide token opens everything, while a source's own
+    capability token opens that source's reads and nothing else -- and only the
+    handler knows which it is asking about. A factory that rejected every
+    non-server bearer up front would lock a capability holder out of the one
+    source it may read (biopb/biopb#1010).
 
     Header value must be exactly ``Bearer <token>`` (case-sensitive).
-    When *token* is ``None`` or empty the server-wide check is disabled (the
-    factory becomes a no-op for it), but the presented token is still captured
-    so per-source capability tokens can be enforced in the handlers.
     """
-
-    def __init__(self, token: Optional[str]) -> None:
-        self._expected = f"Bearer {token}" if token else None
 
     def start_call(
         self,
@@ -200,10 +340,69 @@ class BearerAuthMiddlewareFactory(flight.ServerMiddlewareFactory):
         # Header values are lists; gRPC lowercases header names.
         values: List[str] = headers.get("authorization", [])
         bearer = values[0] if values else ""
-        if self._expected is not None and bearer != self._expected:
-            raise flight.FlightUnauthenticatedError("Invalid or missing Bearer token")
         provided = bearer[len("Bearer ") :] if bearer.startswith("Bearer ") else None
         return _AuthMiddleware(provided)
+
+
+def _fill_upload_status(
+    desc: TensorDescriptor, upload: UploadProgress, source_id: str
+) -> None:
+    """Copy an upload's live progress onto the descriptor GetFlightInfo returns.
+
+    Read from the record at response time and stored nowhere, which is what
+    biopb/biopb#1035 requires of any live per-source fact. Shipping it on the
+    descriptor is not a second home for it -- nothing keeps the copy, and both
+    client caches strip it.
+
+    An unrecognized state is left unset rather than guessed at, so a client
+    reads "I do not know" instead of a wrong PENDING.
+    """
+    _copy_upload_status(desc.upload_status, upload.as_status_dict(source_id))
+
+
+def _copy_upload_status(pb: UploadStatusPb, status: Dict[str, Any]) -> None:
+    """The manager's status dict onto the wire message.
+
+    Shared by the descriptor field and the ``set_upload_status`` reply so the
+    two cannot drift into describing the same upload differently.
+    """
+    state = _UPLOAD_STATES.get(status["state"])
+    if state is None:
+        return
+    pb.state = state
+    pb.expected_chunks = int(status["expected_chunks"])
+    pb.uploaded_chunks = int(status["uploaded_chunks"])
+    pb.reason = status.get("reason") or ""
+
+
+#: ``UploadStatus.state`` strings -> the wire enum. UNKNOWN is deliberately
+#: absent: it is what the manager says about a source tracking no upload, and
+#: such a source leaves the whole field unset instead.
+_UPLOAD_STATES = {
+    "PENDING": UploadStatusPb.PENDING,
+    "READY": UploadStatusPb.READY,
+    "DISCARDED": UploadStatusPb.DISCARDED,
+}
+
+
+#: The wire enum -> what ``set_upload_status`` may ask for. The inverse of
+#: ``_UPLOAD_STATES`` restricted to the settable states, so a request naming
+#: PENDING or an unrecognized value is refused at the boundary rather than
+#: reaching an adapter that would refuse it anyway with a worse message.
+_UPLOAD_TARGETS = {
+    UploadStatusPb.READY: UploadStatus.READY,
+    UploadStatusPb.DISCARDED: UploadStatus.DISCARDED,
+}
+
+
+def _require_array_id(array_id: str) -> None:
+    """Refuse an annotation request that names no tensor.
+
+    Authorization takes the whole ``array_id``
+    (``TensorFlightServer._grants``); this is only the emptiness check.
+    """
+    if not array_id:
+        raise ValueError("array_id is required")
 
 
 class TensorFlightServer(flight.FlightServerBase):
@@ -238,9 +437,12 @@ class TensorFlightServer(flight.FlightServerBase):
         arr = zarr.open_array('data.zarr', mode='r')
         adapter = ZarrAdapter(arr, 'my-tensor')
 
-        # Start the server
-        server = TensorFlightServer('grpc://0.0.0.0:8815')
-        server.register_source('my-tensor', adapter)
+        # Start the server. Pass a catalog if the sources must be browsable:
+        # registration is the registry, cataloguing is a separate second step
+        # and the registering caller's job (see ``metadata_db``).
+        db = MetadataDatabase()
+        server = TensorFlightServer('grpc://0.0.0.0:8815', metadata_db=db)
+        db.sync_source_added('my-tensor', server.register_source('my-tensor', adapter))
         server.mark_ready()  # registration done -> health reports SERVING
         server.serve()
     """
@@ -252,22 +454,53 @@ class TensorFlightServer(flight.FlightServerBase):
         writable: bool = False,
         write_dir: Optional[Path] = None,
         metadata_db: Optional[MetadataDatabase] = None,
-        max_list_flights_results: int = 100000,
+        annotations_enabled: bool = True,
         grpc_max_message_size: Optional[int] = None,
         pyramid_config: Optional[PyramidConfig] = None,
         tls_cert_chain: Optional[bytes] = None,
         tls_private_key: Optional[bytes] = None,
+        upload_ttl: float = DEFAULT_UPLOAD_TTL,
+        scratch_ttl: float = DEFAULT_SCRATCH_TTL,
+        external_location: Optional[str] = None,
         **kwargs,
     ):
         """Initialize the Flight server.
 
         Args:
             location: Server location (e.g., 'grpc://0.0.0.0:8815')
-            token: Bearer token required on every call.  ``None`` disables auth.
-            writable: Enable write mode for source creation and data upload
-            write_dir: Directory for zarr-backed uploaded sources (required if writable)
-            metadata_db: MetadataDatabase instance for source filtering queries (optional)
-            max_list_flights_results: Safety cap on list_flights() returned sources
+            token: The server-wide Bearer token (the catalog tier, and the
+                fallback for every source without a capability token of its
+                own). ``None`` disables it.
+            external_location: The address a client *other than the one that
+                dialed this server* should use to reach it -- advertised on
+                the ``health`` action (biopb/biopb#1158). ``None`` (the
+                default) advertises nothing, so a client falls back to
+                whatever address it dialed. Required by the CLI on a public
+                bind (mirroring ``--tensor-external-location`` on the
+                embedded cache); this class itself does no such validation.
+            writable: Serve the Flight write path -- ``add_tensor``,
+                ``set_upload_status`` and DoPut. Independent of *write_dir*: an
+                in-process producer uploads through ``self.uploads`` directly
+                and wants those actions refused on the wire.
+            write_dir: Directory for uploaded tensors, and what decides whether
+                this server has a scratch source at all (required to upload)
+            upload_ttl: Seconds before a PENDING upload with no writes is
+                discarded and a discarded one is unregistered
+                (``UploadManager.reap``); 0 disables the sweep.
+            scratch_ttl: Ceiling, in seconds, on how long a tensor uploaded to
+                the scratch source is kept, applied to an upload that asked for
+                no lifetime too. 0 keeps them until someone discards them.
+            metadata_db: The catalog -- the browse surface behind the
+                ``catalog`` and ``roi`` flights. ``None`` builds a catalog-less
+                server: its sources are addressed by ``source_id`` and served,
+                but nothing can be listed, queried or annotated, and every
+                catalog surface refuses with ``FlightUnavailableError``. That
+                is the embedded in-process cache's shape (biopb-image-runtime),
+                where a result's id goes back to its one caller directly.
+            annotations_enabled: Serve the ``roi`` flight. Not tied to
+                ``writable``: an annotation writes no pixels, so the token is its
+                boundary. This is the switch for a deployment that wants a
+                strictly read-only catalog.
             grpc_max_message_size: gRPC max message size in bytes (default: 16MB)
             tls_cert_chain: PEM-encoded server certificate chain. When supplied
                 together with ``tls_private_key`` the server serves TLS: the
@@ -284,11 +517,13 @@ class TensorFlightServer(flight.FlightServerBase):
             raise ValueError(
                 "tls_cert_chain and tls_private_key must be provided together"
             )
+        # When the served certificate runs out, reported on ``health`` so a
+        # caller can poll it (biopb/biopb#1117). None without TLS.
+        self._tls_not_after: Optional[float] = None
         if tls_cert_chain is not None:
-            # FlightServerBase serves TLS only when the location scheme says so;
-            # accept the plaintext/grpcs shorthands and rewrite to Arrow's form.
             location = _ensure_tls_scheme(location)
             kwargs["tls_certificates"] = [(tls_cert_chain, tls_private_key)]
+            self._tls_not_after = cert_not_after(tls_cert_chain)
 
         # Apply gRPC max message size via URL query parameter
         if grpc_max_message_size:
@@ -296,65 +531,76 @@ class TensorFlightServer(flight.FlightServerBase):
             location = f"{location}{separator}grpc.max_send_message_size={grpc_max_message_size}&grpc.max_receive_message_size={grpc_max_message_size}"
 
         middleware = kwargs.pop("middleware", {})
-        middleware.setdefault("auth", BearerAuthMiddlewareFactory(token))
-        super().__init__(location, middleware=middleware, **kwargs)
-        self.sources = SourceRegistry()
-        self._writable = writable
-        self._metadata_db: Optional[MetadataDatabase] = metadata_db
-        self._max_list_flights_results = max_list_flights_results
-        # Authoritative resolution-pyramid knobs. Used to advertise
-        # TensorDescriptor.pyramid in get_flight_info (computed levels) and shared
-        # with the precache worker so the warmed scales can't drift from the
-        # advertised ones.
-        self._pyramid_config = pyramid_config or PyramidConfig()
+        middleware.setdefault("auth", BearerAuthMiddlewareFactory())
+
         self._start_time: float = time.time()
-        # DoPut upload path: source creation, chunk writes, and per-source upload
-        # progress. Registers created sources through the shared registry.
-        self.uploads = UploadManager(self.sources, write_dir, metadata_db)
-        # Readiness gate: the Flight port binds (and gRPC starts serving) in the
-        # base __init__ above, *before* the caller scans/registers the data
-        # folder -- a scan that can be slow for large catalogs. Until the caller
-        # finishes that scan and calls ``mark_ready()``, the ``health`` action
-        # reports ``STARTING`` so a connecting client can tell "booting" apart
-        # from "down" and wait instead of timing out. Set on the main thread,
-        # read from gRPC handler threads, hence an Event.
+        super().__init__(location, middleware=middleware, **kwargs)
+
+        self._writable = writable
+        self._annotations_enabled = annotations_enabled
+
+        # The server-wide token: what the public catalog tier requires, and
+        # what a private source without a capability token of its own falls
+        # back to. None disables it (local mode).
+        self._server_token: Optional[str] = token or None
+
+        # The address advertised on ``health`` for a client that isn't the one
+        # that dialed us (biopb/biopb#1158). None means advertise nothing.
+        self._external_location: Optional[str] = external_location or None
+
+        # The source registry is the single chokepoint for adapter lifecycle.
+        # Sever with a write_dir set gets an on_register hook for attaching
+        # sidecar data.
+        self.sources = SourceRegistry(
+            on_register=_upload_attacher(Path(write_dir))
+            if write_dir is not None
+            else None
+        )
+
+        # The catalog, or None for a catalog-less server.
+        self._metadata_db: Optional[MetadataDatabase] = metadata_db
+
+        # Authoritative resolution-pyramid knobs. Used to tweak the advertised
+        # TensorDescriptor.pyramid in get_flight_info (computed levels) and shared
+        # with the precache worker so the warmed scales matches the advertised ones.
+        # The read path gets it via an injection and use it to classifies the rentention
+        # class of each chunk.
+        self._pyramid_config = pyramid_config or PyramidConfig()
+        set_active_pyramid_config(self._pyramid_config)
+
+        # Upload path. Half-written uploads, dead uploads and tombstones are cleanned
+        # up here. Also install the scratch source for uploads that doesn't attach to
+        # any discovered source.
+        self.uploads = UploadManager(
+            self.sources, write_dir, self._metadata_db, ttl=upload_ttl
+        )
+        self.uploads.discard_unfinished_stores()
+        self.uploads.install_scratch(scratch_ttl if scratch_ttl > 0 else None)
+        self.uploads.start_sweep()
+
+        # Readiness gate: Set on the main thread, read from gRPC handler threads, hence
+        # an Event.
         self._ready = threading.Event()
 
         # Flight activity + warm-guard tracking for the background precache
-        # worker: counts in-flight heavy reads (do_get/warm), stamps the last one
-        # to finish (so the worker parks while real traffic flows), and holds the
-        # set of sources with a warm in flight (so a concurrent warm of the same
-        # source is rejected). Cheap -- one uncontended lock.
+        # worker.
         self.activity = ActivityTracker()
 
-        # Catalog-freshness signals for the ``health`` action (progressive
-        # discovery, biopb/biopb#212). ``SERVING`` only means "up and serving the
-        # possibly-still-populating catalog"; these two fields carry *how fresh*
-        # the catalog is. Written by the SourceManager's single event-loop thread
-        # via the setters below, read from gRPC handler threads -- guarded by a
-        # dedicated lock so a health read never contends with catalog/activity
-        # locks. ``None`` until the first full scan succeeds.
+        # Catalog-freshness signals for the ``health`` action. Written by the
+        # SourceManager's single event-loop thread via the setters below, read from
+        # gRPC handler threads. ``None`` indicates the catalog is not yet fully initialized.
         self._scan_status_lock = threading.Lock()
         self._full_scan_in_progress = False
         self._last_full_scan_at: Optional[float] = None
 
-        # Runtime source registration (the "add_source" Flight action / tensor-
-        # browser drag-drop). The SourceManager injects its ``add_local_source``
+        # Runtime source registration (the "add_source/remove_source" action).
+        # The SourceManager injects its ``add_local_source``/``remove_dropped_root``
         # generator via ``set_add_source_handler`` at launch (the server holds no
         # SourceManager reference otherwise). ``None`` means the feature is
-        # unavailable (e.g. a server with no source manager); the action then
-        # reports a clear error. Distinct from ``_writable`` (upload mode): a
-        # normal read-only server still registers dropped local files, so this
-        # gates on its own flag defaulting on -- a hardened deployment can set it
-        # off to refuse runtime path registration.
-        self._add_source_handler: Optional[Callable[..., Any]] = None
+        # unavailable. Distinct from ``_writable`` (upload mode): a normal read-only
+        # server still registers dropped local files.
         self._allow_runtime_source_add = True
-
-        # Runtime removal of a drag-dropped source branch (the "remove_source"
-        # action / tensor-browser [x] button). Injected via
-        # ``set_remove_source_handler`` alongside the add handler. Gated on the
-        # SAME ``_allow_runtime_source_add`` flag: a server that cannot add has no
-        # dnd:// sources to remove, so removal is a no-op there anyway.
+        self._add_source_handler: Optional[Callable[..., Any]] = None
         self._remove_source_handler: Optional[Callable[..., Any]] = None
 
     def flight_idle_for(self, seconds: float) -> bool:
@@ -416,8 +662,40 @@ class TensorFlightServer(flight.FlightServerBase):
         """
         self._remove_source_handler = handler
 
+    @property
+    def metadata_db(self) -> Optional[MetadataDatabase]:
+        """The catalog behind the ``catalog`` and ``roi`` flights, or ``None``.
+
+        Public because registering a source does not catalogue it: a caller that
+        wants its source browsable calls ``metadata_db.sync_source_added``
+        itself, under whatever failure policy that call site owes its own caller
+        (the reconciler rolls the registration back, an upload swallows it).
+        ``None`` on a catalog-less server -- see ``_require_catalog``.
+        """
+        return self._metadata_db
+
+    def _require_catalog(self) -> MetadataDatabase:
+        """The catalog, or the refusal a catalog-less server owes its client.
+
+        ``metadata_db=None`` is a deployment shape, not a degenerate one: the
+        embedded in-process cache hands each result's ``source_id`` straight
+        back to the caller that asked for it, so there is nothing to browse and
+        no store to annotate into. Unavailable rather than ServerError, the same
+        distinction ``_require_annotations`` draws: "this server does not offer
+        the feature", not "your request was bad".
+        """
+        if self._metadata_db is None:
+            raise flight.FlightUnavailableError(
+                "This server has no catalog: its sources are addressed by "
+                "source_id, not listed"
+            )
+        return self._metadata_db
+
     def register_source(self, source_id: str, adapter: SourceAdapter) -> SourceAdapter:
         """Register a data source with the server (delegates to ``sources``).
+
+        The registry only -- cataloguing is the caller's second step, see
+        ``metadata_db``.
 
         Returns the adapter as registered: the registry normalizes a
         non-canonical axis order on the way in (biopb/biopb#596), so a caller
@@ -425,10 +703,24 @@ class TensorFlightServer(flight.FlightServerBase):
         """
         return self.sources.register(source_id, adapter)
 
+    def swap_source(
+        self, source_id: str, adapter: SourceAdapter
+    ) -> Tuple[SourceAdapter, Optional[SourceAdapter]]:
+        """Replace a registered source's adapter in place (delegates to ``sources``).
+
+        Returns ``(registered, displaced)``. Upload state is deliberately NOT
+        forgotten: the source is not going away, only its adapter is being
+        rebuilt against the current bytes. The displaced adapter is left open
+        for the caller to close once in-flight reads have drained.
+        """
+        return self.sources.swap(source_id, adapter)
+
     def unregister_source(self, source_id: str) -> None:
-        """Unregister a data source and drop any in-flight upload state."""
+        """Unregister a data source (its upload state, if any, goes with it).
+
+        The registry only, mirroring ``register_source``.
+        """
         self.sources.unregister(source_id)
-        self.uploads.forget(source_id)
 
     def shutdown(self) -> None:
         """Release source-adapter resources, then shut down the Flight server.
@@ -438,42 +730,136 @@ class TensorFlightServer(flight.FlightServerBase):
         handles -- required on Windows, where an open file cannot be deleted
         (otherwise a test's TemporaryDirectory cleanup raises WinError 32).
         """
+        self.uploads.stop_sweep()
         self.sources.close_all()
         super().shutdown()
 
-    def _authorize_source(
-        self, context: flight.ServerCallContext, source_id: str
-    ) -> None:
-        """Enforce a per-source capability token when the source carries one.
+    def _presented_token(self, context: flight.ServerCallContext) -> Optional[str]:
+        # In-process callers (tests, the embedded runtime) pass no context.
+        mw = context.get_middleware("auth") if context is not None else None
+        return getattr(mw, "token", None) if mw is not None else None
 
-        Sources created with a ``token`` attribute (e.g. embedded result caches)
-        are readable only by callers presenting the matching Bearer token. This
-        binds the result to the requester that received its ``SerializedTensor``,
-        without relying on the server-wide token.
+    def _has_full_access(self, provided: Optional[str]) -> bool:
+        """The server-wide token, which grants everything.
 
-        Sources without a token fall back to the server-wide auth performed by
-        ``BearerAuthMiddlewareFactory``, so this is backward compatible with the
-        standalone tensor server.
+        False in local mode (no token configured): there is no *credential*
+        granting it. The distinction matters one caller up, where a
+        capability-gated source must stay gated in local mode.
         """
+        if self._server_token is None:
+            return False
+        return provided is not None and hmac.compare_digest(
+            provided, self._server_token
+        )
+
+    def _grants(
+        self, provided: Optional[str], action: str, array_id: str
+    ) -> Optional[bool]:
+        """Does *provided* carry a narrow grant covering (*action*, *array_id*)?
+
+        ``None`` means this tensor carries no grant, which is not a refusal --
+        it is "this object has opted into nothing, so the ordinary rule
+        applies". ``False`` is a real refusal.
+
+        **A grant covers one tensor.** Only an attached tensor carries one
+        (:meth:`SourceAdapter.tensor_capability_token`), never the source it
+        hangs off: one source is shared by uploads with different producers, so
+        a grant at source scope would open every sibling to whoever holds one
+        of them.
+
+        A grant table or a signed token (biopb/biopb#1048) replaces this body
+        and nothing else: call sites ask here rather than comparing tokens
+        themselves.
+        """
+        source_id, _ = split_array_id(array_id)
         adapter = self.sources.get(source_id)
-        expected = adapter.capability_token if adapter is not None else None
+        if adapter is None:
+            return None
+        expected = adapter.tensor_capability_token(array_id)
         if not expected:
+            return None
+        if provided is None or not hmac.compare_digest(provided, expected):
+            return False
+        return action in _CAPABILITY_ACTIONS
+
+    def _authorize(self, context: flight.ServerCallContext) -> None:
+        """Full access: everything that is not a narrow read.
+
+        The catalog flights and SQL, health, cache stats, every ``do_action``,
+        and every write. Requires the server-wide token when one is configured;
+        open otherwise (local mode -- the machine is the boundary).
+
+        **A capability never reaches this.** Actions are the control surface,
+        and a grant meaning "read this one tensor" must not authorize, say,
+        ``warm`` -- whose cost is not scoped to that tensor at all, since it
+        walks the page-cache LRU and evicts the segments serving every other
+        source (biopb/biopb#1043).
+        """
+        if self._server_token is None:
             return
-        mw = context.get_middleware("auth")
-        provided = getattr(mw, "token", None) if mw is not None else None
-        if provided != expected:
-            raise flight.FlightUnauthenticatedError("Invalid or missing source token")
+        if not self._has_full_access(self._presented_token(context)):
+            raise flight.FlightUnauthenticatedError("Invalid or missing Bearer token")
+
+    def _authorize_read(
+        self, context: flight.ServerCallContext, array_id: str, action: str
+    ) -> None:
+        """Full access, or a narrow grant covering this read of this tensor.
+
+        The server-wide token is checked first and grants everything, so a
+        capability *adds* access rather than replacing it -- do not reorder
+        these (biopb/biopb#1048).
+
+        Takes the whole ``array_id``, not its source half: a grant may sit on
+        one attached tensor (:meth:`_grants`), and only the full id tells it
+        from its siblings.
+
+        A tensor nothing has granted is as open as the catalog is, so it falls
+        through to :meth:`_authorize`. One carrying a grant stays gated even in
+        local mode: that is why the embedded result cache can mint them on a
+        server with no server-wide token at all.
+
+        Knowing an array_id is not what this gates -- a private tensor may still
+        be catalogued. Reading it is.
+        """
+        provided = self._presented_token(context)
+        if self._has_full_access(provided):
+            return
+        granted = self._grants(provided, action, array_id)
+        if granted:
+            return
+        if granted is None:
+            self._authorize(context)
+            return
+        raise flight.FlightUnauthenticatedError("Invalid or missing capability token")
+
+    @staticmethod
+    def _parse(
+        msg: Message, data: bytes, what: str, *, allow_empty: bool = False
+    ) -> Message:
+        """Decode a wire message, or refuse the call with the reason.
+
+        The oneof arm is the dispatch, so a payload that decodes but sets no
+        arm is refused here too -- that is what a protocol-1 client's request
+        or bare ticket looks like, and the message says so. *allow_empty* is
+        for the messages that carry no oneof and whose fields are all optional,
+        where an empty body is a real request rather than a mis-sent one.
+        """
+        try:
+            msg.ParseFromString(data)
+        except DecodeError as exc:
+            raise flight.FlightServerError(
+                f"{what} is not a {type(msg).__name__}: {exc}"
+            )
+        if not allow_empty and not msg.ListFields():
+            raise flight.FlightServerError(
+                f"{what} names nothing: expected a {type(msg).__name__} with one arm "
+                f"set (this server speaks Flight protocol v{FLIGHT_PROTOCOL_VERSION})"
+            )
+        return msg
 
     def _parse_ticket(self, ticket: flight.Ticket) -> TensorTicket:
-        """Parse a TensorTicket from a Flight Ticket.
-
-        Args:
-            ticket: Flight ticket with ticket bytes
-
-        Returns:
-            Parsed TensorTicket
-        """
-        return TensorTicket.FromString(ticket.ticket)
+        """Parse a TensorTicket from a Flight Ticket."""
+        return self._parse(TensorTicket(), ticket.ticket, "ticket")
 
     def _encode_metadata(self, bounds: ChunkBounds) -> bytes:
         """Encode ChunkBounds to bytes for app_metadata.
@@ -506,6 +892,33 @@ class TensorFlightServer(flight.FlightServerBase):
             return None
         return strip_source_prefix(source_id, tensor_id)
 
+    @staticmethod
+    def _catalog_endpoint(sql: str) -> flight.FlightEndpoint:
+        """The one endpoint every catalog ``FlightInfo`` carries: a ticket with
+        the SQL itself, so nothing is parked server-side between this call and
+        the DoGet.
+        """
+        ticket = TensorTicket(catalog_query=CatalogQuery(sql=sql))
+        return flight.FlightEndpoint(
+            ticket=flight.Ticket(ticket.SerializeToString()), locations=[]
+        )
+
+    def _catalog_flight_info(self, table: str) -> flight.FlightInfo:
+        """One catalog table as a flight: its real schema and a ticket that
+        reads it whole. What ListFlights advertises and what GetFlightInfo on
+        the table's path answers."""
+        try:
+            schema = self._require_catalog().table_schema(table)
+        except ValueError as e:
+            raise flight.FlightServerError(str(e)) from e
+        return flight.FlightInfo(
+            schema=schema,
+            descriptor=flight.FlightDescriptor.for_path(table),
+            endpoints=[self._catalog_endpoint(f"SELECT * FROM {table}")],
+            total_records=-1,
+            total_bytes=-1,
+        )
+
     def _get_adapter_for_tensor(
         self, source_id: str, tensor_id: str
     ) -> Optional[TensorAdapter]:
@@ -524,10 +937,15 @@ class TensorFlightServer(flight.FlightServerBase):
         if source_adapter is None:
             return None
 
-        return source_adapter.get_tensor_adapter(tensor_id)
+        return source_adapter.resolve_tensor(tensor_id)
 
-    def _get_adapter_for_chunk(self, chunk_id: bytes) -> TensorAdapter:
+    def _get_adapter_for_chunk(
+        self, chunk_id: bytes, array_id: Optional[str] = None
+    ) -> TensorAdapter:
         """Get the adapter responsible for a chunk, by its chunk_id.
+
+        *array_id* is ``routing_array_id(chunk_id)``, already computed by a
+        caller that gated on it -- passed through rather than re-derived.
 
         Raises rather than returning None, and maps a lookup failure itself, so
         every verb that resolves a chunk -- ``do_get`` and the cache-file locate
@@ -556,23 +974,18 @@ class TensorFlightServer(flight.FlightServerBase):
             # routing_array_id handles both a plain/versioned chunk_id and a proxy
             # envelope (whose route token IS the local array_id) without decoding an
             # opaque envelope inner (biopb/biopb#178 W1).
-            array_id = routing_array_id(chunk_id)
+            if array_id is None:
+                array_id = routing_array_id(chunk_id)
             source_id, *rest = array_id.split("/")
             rest = "/".join(rest) if rest else None
 
             adapter = None
             source_adapter = self.sources.get(source_id)
             if source_adapter is not None:
-                # A within-source suffix names either a native pyramid level
-                # (OME-Zarr / QPTIFF precompute) or a tensor field (an HCS
-                # well/field, a multi-scene file). Ask through the contract, not
-                # by sniffing for the method (biopb/biopb#557): a native-pyramid
-                # adapter returns the level's backend; every other adapter (and a
-                # bare suffix) returns None and the read routes to the tensor field.
-                if rest is not None:
-                    adapter = source_adapter.get_level_adapter(rest)
-                if adapter is None:
-                    adapter = source_adapter.get_tensor_adapter(rest)
+                # A within-source suffix names a native pyramid level, a tensor
+                # field, or a label set (and a level under it); the source
+                # decides which (``SourceAdapter.resolve_chunk_adapter``).
+                adapter = source_adapter.resolve_chunk_adapter(rest)
         except (
             SourceUnresolvedError,
             TensorResolutionError,
@@ -594,22 +1007,100 @@ class TensorFlightServer(flight.FlightServerBase):
             )
         return adapter
 
+    def _put_chunk_id(self, ticket_bytes: bytes) -> bytes:
+        """The chunk_id a DoPut ticket names, or the refusal.
+
+        The ticket is a ``FlightEndpoint.ticket`` from this tensor's own read
+        plan, echoed back whole -- so the two things a write must not be are
+        checked here, where the bytes are still a ticket:
+
+        - a **scaled** ticket, which names a downsampled view. There is no
+          store behind one; writing it would either land under an id no read
+          ever asks for or overwrite the full-resolution chunk with reduced
+          pixels.
+        - a **proxy envelope**, whose inner is another server's opaque token.
+          A mirror serves what it fetched, so there is nothing local to write.
+
+        The version and epoch check is the adapter's
+        (:meth:`TensorAdapter.check_chunk_version`), run by the caller once the
+        ticket has routed -- the same gate a read passes.
+        """
+        ticket = self._parse(TensorTicket(), ticket_bytes, "DoPut chunk ticket")
+        if ticket.WhichOneof("payload") != "chunk_id":
+            raise flight.FlightServerError(
+                "DoPut: chunk_ticket must be an endpoint ticket naming a chunk, "
+                "as GetFlightInfo minted it."
+            )
+        chunk_id = ticket.chunk_id
+        if is_proxy_envelope(chunk_id):
+            raise flight.FlightServerError(
+                "DoPut: this tensor is served from another server; its chunks "
+                "are not writable here."
+            )
+        if is_scaled_chunk(chunk_id):
+            raise flight.FlightServerError(
+                "DoPut: a scaled ticket is not writable. Plan the write with "
+                "GetFlightInfo carrying no scale_hint."
+            )
+        return chunk_id
+
+    def _require_annotations(self) -> MetadataDatabase:
+        """The store behind the ``roi`` flight, or the refusal.
+
+        Unavailable vs. ServerError is load-bearing for the HTTP sidecar: it
+        maps the former to 501 (this server does not offer the feature) and the
+        latter to 422 (your request was rejected).
+        """
+        if not self._annotations_enabled:
+            raise flight.FlightUnavailableError(
+                "ROI annotations are disabled on this server"
+            )
+        # Annotations live in the catalog's store, so a catalog-less server has
+        # nowhere to put them either.
+        return self._require_catalog()
+
+    def _handle_roi_prune(self, req: RoiPruneRequest) -> bytes:
+        """Report, and with ``apply`` delete, annotations whose source is gone.
+
+        Orphans have no live source to authorize against, which is why this is
+        a catalog-tier action rather than a ``roi`` flight verb. The report
+        and the delete share the store's one predicate, so what was shown is
+        what goes.
+        """
+        db = self._require_annotations()
+        if req.unseen_days <= 0:
+            raise flight.FlightServerError("roi_prune: unseen_days must be positive")
+        before = datetime.now(timezone.utc) - timedelta(days=req.unseen_days)
+        unseen = [
+            RoiUnseen(
+                array_id=u.array_id,
+                source_url=u.source_url or "",
+                count=u.count,
+                last_seen_at_unix_ms=(
+                    int(u.last_seen_at.timestamp() * 1000) if u.last_seen_at else 0
+                ),
+            )
+            for u in db.unseen_rois(before)
+        ]
+        deleted = db.prune_unseen(before) if req.apply and unseen else 0
+        return RoiPruneResult(unseen=unseen, deleted=deleted).SerializeToString()
+
     def list_actions(
         self,
         context: flight.ServerCallContext,
     ) -> List[flight.ActionType]:
-        """List available actions on this server.
-
-        Returns:
-            List of ActionType objects describing available actions.
-        """
+        """List available actions on this server."""
+        self._authorize(context)
         return [
             flight.ActionType("health", "Health check - returns server status JSON"),
             flight.ActionType(
-                "create_source",
-                "Create a writable source from a TensorDescriptor request",
+                "add_tensor",
+                "Add a tensor to a source that already exists; answers its descriptor",
             ),
-            flight.ActionType("upload_status", "Upload status for a writable source"),
+            flight.ActionType(
+                "set_upload_status",
+                "Move an upload: READY (publish and seal) or DISCARDED (give up)",
+            ),
             flight.ActionType(
                 "chunk_locate", "Locate a cached chunk on disk for localhost mmap reads"
             ),
@@ -628,6 +1119,10 @@ class TensorFlightServer(flight.FlightServerBase):
                 "remove_source",
                 "Deregister a drag-dropped (dnd://) source branch at runtime",
             ),
+            flight.ActionType(
+                "roi_prune",
+                "Report (or with apply, delete) annotations whose source is gone",
+            ),
         ]
 
     def do_action(
@@ -637,6 +1132,30 @@ class TensorFlightServer(flight.FlightServerBase):
     ) -> Iterator[bytes]:
         """Execute a custom action.
 
+        Every arm takes full access (:meth:`_authorize`) but two. Actions are
+        the control surface: a capability means "read this one tensor", and
+        what is reachable here is not scoped to one -- ``warm`` walks the
+        page-cache LRU and evicts the segments serving every other source
+        (biopb/biopb#1043), and a mutation on a source is never covered by a
+        read grant on it.
+
+        ``health`` is **ungated**, the way an HTTP server answers ``/healthz``
+        to anyone: it is the liveness probe, so a caller that cannot yet
+        authenticate -- an orchestrator, a readiness gate, an SDK checking the
+        protocol before its first call -- still has to be able to ask. It
+        reports status, protocol and capability flags, never a source name or
+        a path.
+
+        ``chunk_locate`` is the other, because it is not control: it is a read
+        of one tensor, an action only because Flight has no other verb for
+        handing back a byte range. It takes :meth:`_authorize_read` on the
+        chunk's own tensor, exactly as ``do_get`` does for the same ticket.
+        Treating it as control was wrong in both directions -- a capability
+        holder was refused the localhost fast path on every chunk, and on a
+        server with no server-wide token ``_authorize`` waved everyone
+        through, handing out a path and offset that is read by mmap
+        afterwards, where no later call can gate it.
+
         Args:
             context: Server call context
             action: Action to execute
@@ -645,14 +1164,24 @@ class TensorFlightServer(flight.FlightServerBase):
             Result bytes (JSON-encoded for health action)
         """
         if action.type == "health":
+            # Ungated on purpose: see do_action's docstring.
             uptime_seconds = int(time.time() - self._start_time)
             with self._scan_status_lock:
                 full_scan_in_progress = self._full_scan_in_progress
                 last_full_scan_at = self._last_full_scan_at
+            db = self._metadata_db
             health_status = {
                 "status": "SERVING" if self._ready.is_set() else "STARTING",
+                # The Flight protocol shape this server speaks; the SDK checks
+                # it before its first call. A server without the key is v1.
+                "protocol": FLIGHT_PROTOCOL_VERSION,
                 "source_count": len(self.sources),
-                "metadata_db_enabled": self._metadata_db is not None,
+                # Whether this server offers a catalog at all. A constant True
+                # since #225 ("every server has a catalog now"), which is the
+                # assumption retiring _owns_catalog removes -- so it is a real
+                # signal again, and the one a client can read *before* calling a
+                # catalog surface rather than eating its refusal.
+                "metadata_db_enabled": db is not None,
                 "writable": self._writable,
                 "uptime_seconds": uptime_seconds,
                 # Catalog-freshness signals (progressive discovery). ``SERVING``
@@ -661,25 +1190,69 @@ class TensorFlightServer(flight.FlightServerBase):
                 # null until the first full scan succeeds). See biopb/biopb#212.
                 "full_scan_in_progress": full_scan_in_progress,
                 "last_full_scan_finished_at": last_full_scan_at,
+                # Whether drawn ROIs survive a restart. A store that was asked
+                # for and could not be opened is fatal at startup, so this is
+                # False for a deliberately session-only server, or one with no
+                # catalog at all (which cannot take annotations either) -- both
+                # of which a client may want to say out loud before someone
+                # spends a morning tracing.
+                "annotations_persisted": db is not None and db.annotations_persisted,
+                # The same question one level down, and not the same answer: the
+                # catalog also holds `decode_rates`, and a server with the
+                # annotation actions off keeps a file for those alone. A sibling
+                # key rather than a redefinition -- `annotations_persisted` is
+                # already on the wire and means what it says.
+                "catalog_persisted": db is not None and db.store_path is not None,
             }
+            if self._external_location:
+                # Omitted rather than null when unset, so an old client -- which
+                # never looks for this key -- and a new one against an old
+                # server -- which finds no key at all -- see the same shape.
+                health_status["external_location"] = self._external_location
+            if self._tls_not_after is not None:
+                health_status["tls_not_after"] = datetime.fromtimestamp(
+                    self._tls_not_after, timezone.utc
+                ).strftime("%Y-%m-%dT%H:%M:%SZ")
             yield json.dumps(health_status).encode("utf-8")
-        elif action.type == "create_source":
+        elif action.type == "add_tensor":
+            self._authorize(context)
             if not self._writable:
                 raise flight.FlightUnauthenticatedError("Server not in write mode")
 
             req_desc = TensorDescriptor.FromString(action.body.to_pybytes())
-            response_desc = self.uploads.create_source(req_desc)
-            yield response_desc.SerializeToString()
-        elif action.type == "upload_status":
-            source_id = action.body.to_pybytes().decode("utf-8")
-            yield json.dumps(self.uploads.status(source_id)).encode("utf-8")
+            yield self.uploads.add_tensor(req_desc).SerializeToString()
+        elif action.type == "set_upload_status":
+            self._authorize(context)
+            if not self._writable:
+                raise flight.FlightUnauthenticatedError("Server not in write mode")
+
+            req = self._parse(
+                SetUploadStatus(), action.body.to_pybytes(), "set_upload_status request"
+            )
+            state = _UPLOAD_TARGETS.get(req.state)
+            if state is None:
+                raise flight.FlightServerError(
+                    unsettable_state_message(UploadStatusPb.State.Name(req.state))
+                )
+            status = self.uploads.set_status(req.array_id, state, req.reason)
+            reply = UploadStatusPb()
+            _copy_upload_status(reply, status)
+            yield reply.SerializeToString()
         elif action.type == "chunk_locate":
-            ticket_bytes = action.body.to_pybytes()
-            ticket = self._parse_ticket(flight.Ticket(ticket_bytes))
-            source_id = routing_array_id(ticket.chunk_id).split("/")[0]
-            self._authorize_source(context, source_id)
-            yield self._handle_chunk_locate(ticket.chunk_id).encode("utf-8")
+            ticket = self._parse_ticket(flight.Ticket(action.body.to_pybytes()))
+            if ticket.WhichOneof("payload") != "chunk_id":
+                raise flight.FlightServerError("chunk_locate takes a chunk ticket")
+            # The ticket first, then the gate it names: routing_array_id reads
+            # the route token without decoding the chunk, the same way do_get
+            # does for this ticket. Computed once and passed on, so the
+            # adapter lookup below does not re-derive it from the chunk_id.
+            array_id = routing_array_id(ticket.chunk_id)
+            self._authorize_read(context, array_id, READ_PIXELS)
+            yield self._handle_chunk_locate(ticket.chunk_id, array_id=array_id).encode(
+                "utf-8"
+            )
         elif action.type == "cache_stats":
+            self._authorize(context)
             from dataclasses import asdict
 
             manager = CacheManager.get_instance()
@@ -688,20 +1261,27 @@ class TensorFlightServer(flight.FlightServerBase):
             # asdict recurses into the per-pool PoolStats dataclasses under pool_stats.
             yield json.dumps(asdict(manager.stats())).encode("utf-8")
         elif action.type == "resolve":
+            self._authorize(context)
             source_id = action.body.to_pybytes().decode("utf-8")
-            self._authorize_source(context, source_id)
             yield from self._handle_resolve(source_id)
         elif action.type == "warm":
+            self._authorize(context)
             source_id = action.body.to_pybytes().decode("utf-8")
-            self._authorize_source(context, source_id)
             yield from self._handle_warm(source_id, context)
         elif action.type == "add_source":
+            self._authorize(context)
             req = AddSourceRequest.FromString(action.body.to_pybytes())
             yield from self._handle_add_source(req, context)
         elif action.type == "remove_source":
+            self._authorize(context)
             req = RemoveSourceRequest.FromString(action.body.to_pybytes())
             yield self._handle_remove_source(req)
+        elif action.type == "roi_prune":
+            self._authorize(context)
+            req = RoiPruneRequest.FromString(action.body.to_pybytes())
+            yield self._handle_roi_prune(req)
         else:
+            self._authorize(context)
             raise flight.FlightServerError(f"Unknown action: {action.type}")
 
     def _handle_resolve(self, source_id: str) -> Iterator[bytes]:
@@ -714,16 +1294,24 @@ class TensorFlightServer(flight.FlightServerBase):
         proxy idle read timeouts (e.g. nginx ``grpc_read_timeout``, default 60s)
         and reset the stream, and the elapsed/size fields let a client show
         progress and decide whether to cancel. The single terminal message
-        carries the now-resolved ``DataSourceDescriptor`` in its ``result`` arm.
+        carries the source's now-concrete catalog row.
 
-        Resolving an already-resident source is a cheap no-op (returns its
-        descriptor). If the client disconnects mid-resolve the daemon thread runs
-        to completion and caches the result on the adapter, so a retry coalesces
-        onto the finished work rather than downloading again.
+        The row, not a descriptor rebuilt from the adapter: resolution has
+        already written it, and returning a second encoding of the same
+        projection let the two disagree (the adapter answers ``is_resident()``
+        live, the row is a snapshot).
+
+        Resolving an already-resident source is a cheap no-op. If the client
+        disconnects mid-resolve the daemon thread runs to completion and caches
+        the result on the adapter, so a retry coalesces onto the finished work
+        rather than downloading again.
         """
         adapter = self.sources.get(source_id)
         if adapter is None:
             raise flight.FlightServerError(f"Source not found: {source_id}")
+        # The terminal message IS the catalog row, so refuse before the recall
+        # rather than after minutes of download with nothing to hand back.
+        catalog = self._require_catalog()
 
         # Name/size of what is being recalled, computed once (stat is recall-free).
         # Best-effort: an unresolved adapter exposes its URL; a directory or a
@@ -752,7 +1340,7 @@ class TensorFlightServer(flight.FlightServerBase):
 
         def _run() -> None:
             try:
-                result["desc"] = adapter.resolve()
+                adapter.resolve()
             except BaseException as exc:  # surfaced on the stream below
                 result["err"] = exc
 
@@ -782,7 +1370,18 @@ class TensorFlightServer(flight.FlightServerBase):
             raise flight.FlightServerError(
                 f"resolve failed for {source_id!r}: {exc}"
             ) from exc
-        yield ResolveStreamMessage(result=result["desc"]).SerializeToString()
+
+        # The row read back is the one the adapter's ``on_resolved`` callback
+        # just backfilled -- resolution fires it, and that is the only thing
+        # that overwrites the NULL-shape placeholder registration wrote. An
+        # unresolved source built without the callback has no way to correct its
+        # row, which is why this reads the catalog rather than re-syncing here.
+        row = catalog.source_row_ipc(source_id)
+        if row is None:
+            raise flight.FlightServerError(
+                f"resolve succeeded for {source_id!r} but the catalog has no row for it"
+            )
+        yield ResolveStreamMessage(source_row=row).SerializeToString()
 
     def _handle_warm(
         self, source_id: str, context: flight.ServerCallContext
@@ -799,17 +1398,18 @@ class TensorFlightServer(flight.FlightServerBase):
         cross the wire, only the ``WarmStreamMessage`` progress.
 
         Unlike ``resolve`` (one opaque blocking call wrapped on a daemon thread),
-        warming is our own loop, so it runs inline in this generator: progress is
-        yielded between files (throttled to ``_WARM_PROGRESS_MIN_INTERVAL``) and
-        ``context.is_cancelled()`` is polled between files and read blocks, so a
-        client closing the stream halts the recall promptly. Warming is a pure
-        side-effect (residency), so a cancel genuinely stops -- there is no result
-        to preserve.
+        warming is our own loop, so it runs inline in this generator: a bounded
+        worker pool recalls files concurrently while the generator polls for
+        cancellation and emits progress (throttled to
+        ``_WARM_PROGRESS_MIN_INTERVAL``). Warming is a pure side-effect
+        (residency), so a cancel genuinely stops -- there is no result to
+        preserve.
 
         Properties:
-        - **No-op for non-directory sources** -- a single-file source's one file
-          was already recalled by resolve, so this emits one terminal ``done``
-          with ``files_total == 0`` and returns.
+        - **No-op for single-file sources** -- their one file was already
+          recalled by resolve, so this emits one terminal ``done`` with
+          ``files_total == 0`` and returns. A *remote* source raises instead;
+          nothing here can be made resident.
         - **Read every file unconditionally** -- residency is volatile (eviction /
           re-dehydration can flip it underneath us), so a "skip already-resident"
           check would be a TOCTOU trap; an unconditional read is idempotent
@@ -825,7 +1425,20 @@ class TensorFlightServer(flight.FlightServerBase):
             raise flight.FlightServerError(f"Source not found: {source_id}")
 
         root = adapter.source_url
-        # Single-file / remote / non-directory source: nothing to warm beyond what
+        # A remote source has no local tree to walk, so refuse rather than fall
+        # into the no-op below: `files_total == 0` is how a client learns a
+        # source is single-file, and must not also mean "not applicable"
+        # (biopb/biopb#1035). Scheme only, so a mirror's aliased `source_url`
+        # (display authority, never the dial address) is still sound to ask.
+        if root and is_remote_url(root):
+            scheme = root.split("://", 1)[0]
+            raise flight.FlightServerError(
+                f"Cannot warm {source_id!r}: it is a remote ({scheme}) source, "
+                "and warm recalls member files onto the serving machine's own "
+                "filesystem. Nothing here can be made resident. Warm it on the "
+                "server that holds the data."
+            )
+        # Single-file / non-directory source: nothing to warm beyond what
         # resolve already recalled. One terminal `done`, files_total == 0.
         if not root or not os.path.isdir(root):
             yield WarmStreamMessage(done=WarmProgress()).SerializeToString()
@@ -840,7 +1453,14 @@ class TensorFlightServer(flight.FlightServerBase):
 
         started = time.monotonic()
         last_yield = 0.0
-        buf = bytearray(_WARM_READ_BLOCK_BYTES)
+        progress_lock = threading.Lock()
+        cancel_event = threading.Event()
+        progress_state = {
+            "files_done": 0,
+            "bytes_done": 0,
+            "current_name": "",
+        }
+        worker_local = threading.local()
 
         def _progress(
             files_total: int,
@@ -859,6 +1479,52 @@ class TensorFlightServer(flight.FlightServerBase):
                     elapsed_seconds=time.monotonic() - started,
                 )
             ).SerializeToString()
+
+        def _snapshot() -> Tuple[int, int, str]:
+            with progress_lock:
+                return (
+                    progress_state["files_done"],
+                    progress_state["bytes_done"],
+                    progress_state["current_name"],
+                )
+
+        def _read_file(fpath: str) -> None:
+            """Read one file, updating the shared warm progress snapshot."""
+            if cancel_event.is_set():
+                return
+
+            name = os.path.basename(fpath)
+            with progress_lock:
+                # A cancellation can race with a worker being scheduled. Do not
+                # open a new file once the main loop has observed cancellation.
+                if cancel_event.is_set():
+                    return
+                progress_state["current_name"] = name
+
+            try:
+                # Each executor worker owns and reuses its buffer: sharing the
+                # old single buffer would race readinto() calls and corrupt the
+                # byte tally.
+                buf = getattr(worker_local, "buf", None)
+                if buf is None:
+                    buf = bytearray(_WARM_READ_BLOCK_BYTES)
+                    worker_local.buf = buf
+                with open(fpath, "rb", buffering=0) as fh:
+                    while not cancel_event.is_set():
+                        n = fh.readinto(buf)
+                        if not n:
+                            break
+                        # current_name was already set above; re-stamping it on
+                        # every block would retake the lock for no new value and
+                        # serialize the fast path -- already-resident files that
+                        # read fast enough for 4 workers to contend on this lock.
+                        with progress_lock:
+                            progress_state["bytes_done"] += n
+            except OSError as exc:
+                logger.warning("warm: skipping %s: %s", fpath, exc)
+            finally:
+                with progress_lock:
+                    progress_state["files_done"] += 1
 
         try:
             # Warming registers as in-flight activity so the precache worker parks.
@@ -902,42 +1568,71 @@ class TensorFlightServer(flight.FlightServerBase):
                 yield _progress(files_total, files_done, bytes_total, bytes_done, "")
 
                 # 3. Recall loop: read every file to completion (forces residency).
-                for _size, fpath in entries:
+                # Keep only one batch of work per worker in flight. Besides
+                # bounding threads, fds, and per-worker buffers, this preserves
+                # the existing smallest-files-first launch order without queuing
+                # tens of thousands of futures in the executor.
+                pending = set()
+                next_entry = 0
+
+                def _check_cancel() -> None:
                     if context.is_cancelled():
-                        break
-                    name = os.path.basename(fpath)
+                        cancel_event.set()
+
+                with ThreadPoolExecutor(max_workers=_WARM_MAX_WORKERS) as pool:
+
+                    def _refill() -> None:
+                        nonlocal next_entry
+                        while (
+                            not cancel_event.is_set()
+                            and len(pending) < _WARM_MAX_WORKERS
+                            and next_entry < files_total
+                        ):
+                            fpath = entries[next_entry][1]
+                            next_entry += 1
+                            pending.add(pool.submit(_read_file, fpath))
+
                     try:
-                        with open(fpath, "rb", buffering=0) as fh:
-                            while True:
-                                if context.is_cancelled():
-                                    break
-                                n = fh.readinto(buf)
-                                if not n:
-                                    break
-                                bytes_done += n
-                                now = time.monotonic()
-                                if now - last_yield >= _WARM_PROGRESS_MIN_INTERVAL:
-                                    last_yield = now
-                                    yield _progress(
-                                        files_total,
-                                        files_done,
-                                        bytes_total,
-                                        bytes_done,
-                                        name,
-                                    )
-                    except OSError as exc:
-                        logger.warning("warm: skipping %s: %s", fpath, exc)
-                    files_done += 1
-                    now = time.monotonic()
-                    if now - last_yield >= _WARM_PROGRESS_MIN_INTERVAL:
-                        last_yield = now
-                        yield _progress(
-                            files_total,
-                            files_done,
-                            bytes_total,
-                            bytes_done,
-                            name,
-                        )
+                        _check_cancel()
+                        _refill()
+
+                        while pending:
+                            _check_cancel()
+
+                            completed, pending = wait(
+                                pending,
+                                timeout=_WARM_POLL_SECONDS,
+                                return_when=FIRST_COMPLETED,
+                            )
+                            for future in completed:
+                                future.result()
+
+                            _check_cancel()
+                            _refill()
+
+                            now = time.monotonic()
+                            if now - last_yield >= _WARM_PROGRESS_MIN_INTERVAL:
+                                last_yield = now
+                                done_files, done_bytes, current_name = _snapshot()
+                                yield _progress(
+                                    files_total,
+                                    done_files,
+                                    bytes_total,
+                                    done_bytes,
+                                    current_name,
+                                )
+
+                        # The executor has no queued work here. Shutdown still
+                        # joins any read that was in progress before cancellation.
+                        done_files, done_bytes, current_name = _snapshot()
+                        files_done = done_files
+                        bytes_done = done_bytes
+                    finally:
+                        # A client may close the generator at a progress yield.
+                        # Set the flag before the `with` block joins the
+                        # executor's in-flight workers so they stop before
+                        # opening another file.
+                        cancel_event.set()
 
                 # 4. Terminal done (partial counts if cancelled mid-loop).
                 yield WarmStreamMessage(
@@ -980,12 +1675,6 @@ class TensorFlightServer(flight.FlightServerBase):
             events = self._add_source_handler(
                 req.url,
                 source_type=req.source_type,
-                # An unset repeated field arrives as [], which is "the caller
-                # said nothing" and not "the caller said no labels". Passing the
-                # empty list on makes _record_claim stamp it onto the claim, and
-                # an adapter that reads a claim's labels as an override then
-                # rejects every series whose rank is not zero.
-                dim_labels=list(req.dim_labels) or None,
                 should_cancel=_should_cancel,
             )
             for event in events:
@@ -998,12 +1687,14 @@ class TensorFlightServer(flight.FlightServerBase):
                     )
                     yield AddSourceStreamMessage(progress=progress).SerializeToString()
                 else:  # "result"
-                    _, added, already_present, failed = event
+                    _, tally = event
                     result = AddSourceResult(
-                        already_present=already_present,
+                        added=tally.added,
+                        already_present=tally.already_present,
+                        refreshed=tally.refreshed,
+                        removed=tally.removed,
                     )
-                    result.added.extend(d for d in added if d is not None)
-                    for path, reason in failed:
+                    for path, reason in tally.failed:
                         result.failed.add(path=path, reason=reason)
                     yield AddSourceStreamMessage(result=result).SerializeToString()
         except (FileNotFoundError, PermissionError, ValueError) as exc:
@@ -1034,229 +1725,62 @@ class TensorFlightServer(flight.FlightServerBase):
     def list_flights(
         self, context: flight.ServerCallContext, criteria: bytes
     ) -> Iterator[flight.FlightInfo]:
-        """List all available data sources.
+        """Advertise the public catalog: one flight per queryable table.
 
-        Each flight represents a data source (which may contain multiple tensors).
-
-        Results are capped at `max_list_flights_results` for safety. Truncation
-        is signaled via schema metadata on all returned FlightInfos.
-
-        Served from the DuckDB catalog when a metadata DB is present, so the
-        browse surface cannot drift from ``query_sources`` (biopb/biopb#265); an
-        embedded/test server built without a DB (``metadata_db=None``) falls back
-        to iterating adapters.
-
-        Args:
-            context: Server call context
-            criteria: Unused criteria bytes
-
-        Yields:
-            FlightInfo for each registered data source (up to max_list_flights_results)
+        Each carries the table's real Arrow schema and one endpoint whose
+        ticket is ``SELECT * FROM <table>``, so a stock Flight client can list,
+        see the columns, and DoGet the whole catalog without a biopb proto.
+        Browsing *sources* is a catalog query too (the SDK's ``list_sources``);
+        the pixels and annotations of one source are not listable, they are
+        addressed.
         """
-        if self._metadata_db is not None:
-            yield from self._list_flights_from_catalog()
-        else:
-            yield from self._list_flights_from_adapters()
-
-    def _list_flights_from_catalog(self) -> Iterator[flight.FlightInfo]:
-        """Build ListFlights results from the DuckDB catalog (the default path).
-
-        One SQL read replaces the per-adapter ``get_source_descriptor()`` calls.
-        Token-protected sources never appear here: the only ones that exist live
-        in the embedded image-base server, which runs with ``metadata_db=None``
-        and therefore takes the adapter fallback instead -- so the DuckDB path
-        has no tokened source to leak (biopb/biopb#265).
-        """
-        max_sources = self._max_list_flights_results
-        descriptors, total_sources = self._metadata_db.list_source_descriptors(
-            limit=max_sources
-        )
-        returned_count = len(descriptors)
-        truncated = total_sources > returned_count
-
-        if truncated:
-            logger.warning(
-                f"list_flights truncated: returning {returned_count} of {total_sources} sources"
-            )
-
-        base_metadata = {
-            b"total_sources": str(total_sources).encode(),
-            b"max_sources": str(max_sources).encode(),
-            b"returned_sources": str(returned_count).encode(),
-            b"truncated": str(truncated).encode(),
-        }
-
-        for source_desc in descriptors:
-            schema = pa.schema([], metadata=base_metadata)
-            flight_descriptor = flight.FlightDescriptor.for_command(
-                source_desc.SerializeToString()
-            )
-            endpoint = flight.FlightEndpoint(
-                ticket=flight.Ticket(b""),  # Empty ticket for listing
-                locations=[],
-            )
-            yield flight.FlightInfo(
-                schema=schema,
-                descriptor=flight_descriptor,
-                endpoints=[endpoint],
-                total_records=-1,
-                total_bytes=-1,
-            )
-
-    def _list_flights_from_adapters(self) -> Iterator[flight.FlightInfo]:
-        """List sources by iterating adapters (fallback when no metadata DB).
-
-        Used by embedded/test servers built with ``metadata_db=None`` (e.g. the
-        image-base result-cache server). Honors per-source capability tokens by
-        skipping token-protected sources from enumeration.
-        """
-        source_items = self.sources.snapshot()
-        total_sources = len(source_items)
-        max_sources = self._max_list_flights_results
-        returned_count = min(total_sources, max_sources)
-        truncated = total_sources > max_sources
-
-        if truncated:
-            logger.warning(
-                f"list_flights truncated: returning {max_sources} of {total_sources} sources"
-            )
-
-        # Build base schema metadata for truncation signaling
-        base_metadata = {
-            b"total_sources": str(total_sources).encode(),
-            b"max_sources": str(max_sources).encode(),
-            b"returned_sources": str(returned_count).encode(),
-            b"truncated": str(truncated).encode(),
-        }
-
-        count = 0
-        skipped = 0
-        for source_id, adapter in source_items:
-            if count >= max_sources:
-                break
-
-            # Token-protected sources (per-source capabilities) are not
-            # enumerable: knowing the source_id must not be enough to list them.
-            if adapter.capability_token:
-                continue
-
-            # Building a source's descriptor can fail (e.g. an aicsimageio
-            # source whose scene-switching fallback raises). A single bad source
-            # must not abort the whole listing, so skip it and continue — the
-            # FlightInfo is built fully inside the try and only yielded on
-            # success, so a partial flight is never emitted.
-            try:
-                source_desc = adapter.get_source_descriptor()
-
-                # Build schema with truncation metadata
-                schema = pa.schema([], metadata=base_metadata)
-
-                # Create a FlightDescriptor for this source
-                flight_descriptor = flight.FlightDescriptor.for_command(
-                    source_desc.SerializeToString()
-                )
-
-                # Create a single endpoint for listing (no specific tensor selected)
-                endpoint = flight.FlightEndpoint(
-                    ticket=flight.Ticket(b""),  # Empty ticket for listing
-                    locations=[],
-                )
-
-                info = flight.FlightInfo(
-                    schema=schema,
-                    descriptor=flight_descriptor,
-                    endpoints=[endpoint],
-                    total_records=-1,
-                    total_bytes=-1,
-                )
-            except Exception as e:
-                logger.exception(
-                    f"list_flights: skipping source {source_id} due to "
-                    f"descriptor build failure: {e}",
-                )
-                skipped += 1
-                continue
-
-            yield info
-            count += 1
-
-        if skipped:
-            logger.warning(
-                f"list_flights: skipped {skipped} source(s) that failed to build descriptors"
-            )
+        self._authorize(context)
+        for table in sorted(self._require_catalog().allowed_tables):
+            yield self._catalog_flight_info(table)
 
     def get_flight_info(
         self, context: flight.ServerCallContext, descriptor: flight.FlightDescriptor
     ) -> flight.FlightInfo:
-        """Get metadata and chunk endpoints for a tensor.
+        """Plan a read.
 
-        Args:
-            context: Server call context
-            descriptor: Flight descriptor with FlightCmd
-
-        Returns:
-            FlightInfo with schema and chunk endpoints
+        A path descriptor names a catalog table (public tier): its schema and
+        a ticket that reads it. A command is a ``FlightRequest`` whose
+        ``tensor_read`` binds one tensor and plans its chunk endpoints (private,
+        authorized as a pixel read of the tensor's source). An arbitrary catalog query
+        needs no GetFlightInfo: the SQL rides the DoGet ticket.
         """
         import json
 
-        cmd = FlightCmd.FromString(descriptor.command)
-
-        # Dispatch based on source_id
-        if cmd.source_id == "__metadata_query__":
-            # Metadata SQL query branch
-            if cmd.HasField("metadata_query"):
-                sql = cmd.metadata_query.sql
-                logger.debug(f"get_flight_info: metadata_query sql={sql[:100]}...")
-                if self._metadata_db is None:
-                    # The CLI always attaches a metadata DB (mandatory,
-                    # biopb/biopb#225); reaching here means this server was
-                    # constructed without one (an embedded/test instance).
-                    raise flight.FlightServerError(
-                        "This server has no metadata database attached, so SQL "
-                        "queries are unavailable."
-                    )
-                try:
-                    return self._metadata_db.handle_query(sql)
-                except ValueError as e:
-                    # Query validation or execution failure
-                    raise flight.FlightInternalError(
-                        f"Metadata query failed: {e}"
-                    ) from e
-            else:
-                raise flight.FlightServerError(
-                    "Metadata query source_id but no MetadataQueryOption"
-                )
-
-        # Tensor read branch
-        if not cmd.HasField("tensor_read"):
-            raise flight.FlightServerError(
-                f"Tensor read source_id '{cmd.source_id}' but no TensorReadOption"
+        if descriptor.descriptor_type == flight.DescriptorType.PATH:
+            self._authorize(context)
+            table = "/".join(
+                part.decode() if isinstance(part, bytes) else part
+                for part in descriptor.path
             )
+            return self._catalog_flight_info(table)
 
-        read_opt = cmd.tensor_read
-        source_id = cmd.source_id
-        tensor_id = read_opt.tensor_id
+        req = self._parse(FlightRequest(), descriptor.command, "GetFlightInfo command")
+        read_opt = req.tensor_read
+        source_id, tensor_id = split_array_id(read_opt.array_id)
+        if not source_id:
+            raise flight.FlightServerError("tensor_read: array_id is required")
 
-        self._authorize_source(context, source_id)
+        self._authorize_read(context, read_opt.array_id, READ_PIXELS)
+        mask = read_mask(read_opt)
 
-        # Reduce the request tensor_id to the within-source field -- or None =
+        # Reduce the request array_id to the within-source field -- or None =
         # "the source's default (first) tensor" (identity policy: array_id is
-        # source_id or source_id/field). Both a falsy tensor_id (proto3 default
-        # "") and a bare source_id reduce to None. The wire descriptor still
-        # reports the full array_id, carried by get_tensor_descriptor().
+        # source_id or source_id/field). The wire descriptor still reports the
+        # full array_id, carried by get_tensor_descriptor().
         field = self._field_within_source(source_id, tensor_id)
 
         # Substitute the source's default (first) tensor for every no-field
-        # request -- empty tensor_id *and* a bare source_id, both -> field None
-        # (#44). get_flight_info / get_source / get_physical_scale are documented
-        # to accept no tensor_id; forwarding None to a multi-tensor adapter's
-        # get_tensor_adapter would otherwise select a bogus field (a bioio scene
-        # lookup on None, OME-Zarr HCS field parsing crashing on None.split), so
-        # honor the documented default in this one chokepoint rather than at every
-        # adapter call site. The first descriptor's array_id is the same default
-        # the client's own get_tensor path resolves to; re-reducing it yields the
-        # sole tensor's field (None for a single-tensor source, whose array_id ==
-        # source_id, so the base still returns self).
+        # request (#44). get_flight_info / get_source / get_physical_scale are
+        # documented to accept a bare source_id; forwarding None to a
+        # multi-tensor adapter's get_tensor_adapter would otherwise select a
+        # bogus field (a bioio scene lookup on None, OME-Zarr HCS field parsing
+        # crashing on None.split), so honor the documented default in this one
+        # chokepoint rather than at every adapter call site.
         if field is None:
             default_adapter = self.sources.get(source_id)
             if default_adapter is not None:
@@ -1325,24 +1849,33 @@ class TensorFlightServer(flight.FlightServerBase):
             # it to decide whether a cache entry is still valid, and this call is
             # fetch-per-call by contract while a listing is a natural thing to
             # cache. None stays unset -- absent is "no claim", not "unchanged".
-            if source_adapter is not None and source_adapter.content_version:
-                read_plan.descriptor.content_version = source_adapter.content_version
+            #
+            # A claim about the data, so the raw content_version and never the
+            # serving epoch: a consumer builds an identity from this (the HTTP
+            # sidecar's versioned array_id) and stamps its own records with it
+            # (an ROI's ``drawn_against_version``), neither of which may move on
+            # a server upgrade that changed no data.
+            #
+            # From the TENSOR adapter: an uploaded label set's bytes are its own
+            # (``adapters/labels.py``), not the source's.
+            if tensor_adapter.content_version:
+                read_plan.descriptor.content_version = tensor_adapter.content_version
 
             # Populate metadata_json in response descriptor if requested
-            if read_opt.with_metadata:
+            if METADATA_JSON in mask:
                 # One scheme (biopb/biopb#253): the source-level metadata is
                 # computed once at registration and read back from the catalog --
-                # the cache -- never recomputed on the adapter. The catalog is
-                # mandatory: a DB-less server (the embedded image-base cache) has
-                # no metadata to serve, so a metadata request fails closed. A DB
-                # read error propagates (no fallback); a NULL row is a legitimate
-                # "no metadata" (empty base).
-                if self._metadata_db is None:
-                    raise flight.FlightInternalError(
-                        f"Metadata requested for {source_id} but this server "
-                        "has no metadata catalog"
-                    )
-                raw_metadata = self._metadata_db.get_metadata_json(source_id) or {}
+                # the cache -- never recomputed on the adapter. A DB read error
+                # propagates (no fallback); a NULL row is a legitimate "no
+                # metadata" (empty base). A catalog-less server has no cache to
+                # read, and nothing released the adapter's registration copy
+                # either (``sync_source_added`` is what does that), so there it
+                # is the adapter that answers.
+                raw_metadata = (
+                    self._metadata_db.get_metadata_json(source_id)
+                    if self._metadata_db is not None
+                    else source_adapter.get_metadata()
+                ) or {}
                 # Overlay the tensor adapter's cheap per-tensor delta -- fields the
                 # source-level row cannot carry (an OME-Zarr HCS field's own OME
                 # metadata; an EMD signal's original_metadata). Merged over the
@@ -1350,6 +1883,9 @@ class TensorFlightServer(flight.FlightServerBase):
                 tensor_extra = tensor_adapter.get_tensor_metadata()
                 if tensor_extra:
                     raw_metadata = {**raw_metadata, **tensor_extra}
+                raw_metadata = _with_label_axes(
+                    raw_metadata, source_adapter, read_plan.descriptor
+                )
                 if raw_metadata and source_adapter is not None:
                     wrapped_metadata = {
                         "type": source_adapter.source_type,
@@ -1359,16 +1895,54 @@ class TensorFlightServer(flight.FlightServerBase):
                     read_plan.descriptor.metadata_json = json.dumps(
                         wrapped_metadata, cls=NumpyEncoder
                     )
-        except SourceUnresolvedError as e:
-            # Expected for a not-yet-hydrated source: surface the same retriable
-            # "open to resolve" mapping as the adapter-lookup path (to_flight_error),
-            # rather than burying it in "Metadata error" as a bare ValueError ->
-            # INTERNAL. Must precede the ValueError clause (it subclasses ValueError).
+        except (SourceUnresolvedError, TensorResolutionError) as e:
+            # The typed taxonomy, mapped precisely: a not-yet-hydrated source to
+            # the retriable "open to resolve", and a caller's malformed slice or
+            # scale hint to a terminal INVALID_ARGUMENT. Both would otherwise be
+            # buried in "Metadata error" as a bare ValueError -> INTERNAL, which
+            # blames the server and tells a client nothing it can act on. Must
+            # precede the ValueError clause (both subclass ValueError).
             raise to_flight_error(e) from e
         except (OSError, ValueError, json.JSONDecodeError) as e:
             raise flight.FlightInternalError(
                 f"Metadata error for {source_id}: {e}"
             ) from e
+
+        # Upload progress, for a source that is one. Here rather than in an
+        # action because `do_action` takes full access, and the caller waiting
+        # on a fast-return result holds a per-source read capability and
+        # nothing else (biopb/biopb#1048). An empty mask makes the poll cheap:
+        # no endpoint enumeration, so this is the only work it does.
+        #
+        # A discarded source answers too. The adapter stays registered as a
+        # tombstone and describe is not a chunk read, so it never reaches
+        # `check_readable` -- a poller learns the reason instead of
+        # meeting a dead call.
+        if UPLOAD_STATUS in mask:
+            # The tensor first: a label set is a tensor of a source that is not
+            # itself an upload, and it is the set's own progress its producer
+            # polls (biopb/biopb#1059). The two source kinds answer from the
+            # source, where the array_id and the source_id are the same string.
+            upload = upload_of(tensor_adapter) or upload_of(source_adapter)
+            if upload is not None:
+                _fill_upload_status(
+                    read_plan.descriptor, upload, read_plan.descriptor.array_id
+                )
+
+        # Residency, only when asked. It is a bounded stat walk of the source,
+        # so it is never free -- which is why it is per-source and opt-in rather
+        # than the catalog-wide action it was: that made a live filesystem walk
+        # the cost of listing, for every source, on every browse
+        # (biopb/biopb#1035, biopb/biopb#1048).
+        #
+        # A source that cannot answer leaves the field unset. Unset reads as
+        # "unknown", never as False -- which would send a client to hydrate what
+        # is already on disk.
+        if IS_RESIDENT in mask:
+            try:
+                read_plan.descriptor.is_resident = bool(source_adapter.is_resident())
+            except Exception:  # noqa: BLE001 -- a balky adapter is not the request
+                logger.debug("is_resident failed for %s", source_id, exc_info=True)
 
         # Convert to FlightEndpoints. Each endpoint carries the server-minted
         # chunk_id as an opaque ticket and the chunk's bounds as app_metadata;
@@ -1385,6 +1959,11 @@ class TensorFlightServer(flight.FlightServerBase):
             endpoints.append(endpoint)
 
         logger.debug(f"get_flight_info: returning {len(endpoints)} chunk endpoints")
+        # The requested slice, verbatim, so the plan says what it was asked for
+        # as well as what it realized: the descriptor's slice_hint is snapped
+        # outward to chunk-aligned bounds, and a consumer -- this connection or
+        # one handed the FlightInfo as a SerializedTensor -- crops back to the
+        # request from here rather than remembering it separately.
         return flight.FlightInfo(
             schema=schema,
             descriptor=flight.FlightDescriptor.for_command(
@@ -1393,46 +1972,41 @@ class TensorFlightServer(flight.FlightServerBase):
             endpoints=endpoints,
             total_records=-1,
             total_bytes=-1,
+            app_metadata=(
+                read_opt.slice_hint.SerializeToString()
+                if read_opt.HasField("slice_hint")
+                else b""
+            ),
         )
 
     def do_get(
         self, context: flight.ServerCallContext, ticket: flight.Ticket
     ) -> flight.FlightDataStream:
-        """Fetch a chunk's data or metadata query result.
+        """Serve what the ticket's oneof arm names: a catalog query result,
+        one tensor's annotation set, or one pixel chunk."""
+        tensor_ticket = self._parse_ticket(ticket)
+        arm = tensor_ticket.WhichOneof("payload")
 
-        Args:
-            context: Server call context
-            ticket: Flight ticket with TensorTicket or metadata query ID
+        if arm == "catalog_query":
+            self._authorize(context)
+            try:
+                table = self._require_catalog().query(tensor_ticket.catalog_query.sql)
+            except ValueError as e:
+                raise flight.FlightServerError(f"Catalog query failed: {e}") from e
+            return flight.RecordBatchStream(table)
 
-        Returns:
-            FlightDataStream with the chunk data or query result
-        """
-        # Check for metadata query result by checking the ticket prefix
-        ticket_bytes = ticket.ticket
-        metadata_prefix = b"metadata-query-"
-        if ticket_bytes.startswith(metadata_prefix):
-            ticket_id = ticket_bytes.decode()
-            logger.debug(f"do_get: metadata query result ticket={ticket_id}")
-            if self._metadata_db is None:
-                raise flight.FlightInternalError("Metadata database not enabled")
-            result = self._metadata_db.get_pending_result(ticket_id)
-            if result is None:
-                # Internal error: pending result should exist if ticket was valid
-                raise flight.FlightInternalError(
-                    f"Metadata query result not found: {ticket_id}"
-                )
-            return flight.RecordBatchStream(result)
+        if arm == "roi_read":
+            return self._roi_read_stream(context, tensor_ticket.roi_read)
 
         # Heavy chunk-read path: track it as in-flight so the background
         # precache worker stays idle while real reads are happening.
         with self.activity.serving_request():
-            tensor_ticket = self._parse_ticket(ticket)
             logger.debug(f"do_get: chunk_id={tensor_ticket.chunk_id[:16]}...")
 
-            source_id = routing_array_id(tensor_ticket.chunk_id).split("/")[0]
-            self._authorize_source(context, source_id)
+            array_id = routing_array_id(tensor_ticket.chunk_id)
+            self._authorize_read(context, array_id, READ_PIXELS)
 
-            adapter = self._get_adapter_for_chunk(tensor_ticket.chunk_id)
+            adapter = self._get_adapter_for_chunk(tensor_ticket.chunk_id, array_id)
 
             # Get cache manager singleton (if initialized)
             cache_manager = CacheManager.get_instance()
@@ -1442,6 +2016,13 @@ class TensorFlightServer(flight.FlightServerBase):
                 record_batch = adapter.resolve_chunk_data(
                     tensor_ticket.chunk_id, cache_manager
                 )
+            except TensorResolutionError as e:
+                # A stale chunk_id (biopb/biopb#178) is the client's held ticket
+                # outliving a re-registration, not a server bug -- surface it as
+                # the typed terminal taxonomy (to_flight_error) rather than
+                # burying it in "I/O error" as a bare ValueError -> INTERNAL.
+                # Must precede the ValueError clause (it subclasses ValueError).
+                raise to_flight_error(e) from e
             except (OSError, ValueError) as e:
                 # ValueError can be raised by bounds validation or parsing failures
                 raise flight.FlightInternalError(
@@ -1455,10 +2036,48 @@ class TensorFlightServer(flight.FlightServerBase):
             reader = pa.RecordBatchReader.from_batches(
                 record_batch.schema, [record_batch]
             )
-            return flight.RecordBatchStream(reader)
+            # A label set over a real network compresses 25-50x (biopb#1111);
+            # anything else goes raw, keeping the zero-copy path.
+            compressed = split_label_array_id(array_id) is not None and _peer_is_remote(
+                context.peer()
+            )
+            return flight.RecordBatchStream(
+                reader, options=WIRE_WRITE_OPTIONS if compressed else None
+            )
 
-    def _handle_chunk_locate(self, chunk_id: bytes) -> str:
+    def _roi_read_stream(
+        self, context: flight.ServerCallContext, req
+    ) -> flight.FlightDataStream:
+        """One tensor's annotations as ROI rows; ``truncated`` and the tensor's
+        ``sets`` (JSON) ride the stream's schema metadata."""
+        db = self._require_annotations()
+        try:
+            _require_array_id(req.array_id)
+            self._authorize_read(context, req.array_id, READ_ANNOTATIONS)
+            rois, truncated = db.list_rois(req.array_id, req.set_name)
+            sets = [
+                {"set_name": name, "count": count, "reserved": is_reserved_set(name)}
+                for name, count in db.list_roi_sets(req.array_id)
+            ]
+        except ValueError as e:
+            raise flight.FlightServerError(str(e))
+        table = rois_to_table(
+            rois,
+            {
+                b"truncated": str(truncated).encode(),
+                b"sets": json.dumps(sets).encode(),
+            },
+        )
+        return flight.RecordBatchStream(table)
+
+    def _handle_chunk_locate(
+        self, chunk_id: bytes, array_id: Optional[str] = None
+    ) -> str:
         """Locate a cached chunk on disk for the localhost cache-file handoff.
+
+        *array_id* is ``routing_array_id(chunk_id)``, already computed by a
+        caller that gated on it (``do_action``'s ``chunk_locate`` arm) -- passed
+        through so the adapter lookup below does not re-derive it.
 
         Locates the chunk's Arrow IPC message in the file cache and returns its
         on-disk byte range as JSON. If the chunk isn't cached yet, materializes
@@ -1482,29 +2101,53 @@ class TensorFlightServer(flight.FlightServerBase):
             return json.dumps({"available": False})
 
         with self.activity.serving_request():
-            adapter = self._get_adapter_for_chunk(chunk_id)
+            adapter = self._get_adapter_for_chunk(chunk_id, array_id=array_id)
 
             # Entries are stored under the method-stripped canonical key
             # (biopb/biopb#76); locate with the same key or a warm chunk cached
             # under a different reduction_method is never found.
             cache_key = cache_key_for_chunk_id(chunk_id)
             try:
-                # If the chunk is already cached, just locate it. Resolving first
-                # would, on a chunk whose in-RAM entry has been trimmed, re-read the
-                # whole chunk from its segment server-side for nothing. Only
-                # materialize (same path as do_get) on a genuine cold miss.
-                location = cache_manager.locate_entry(cache_key)
+                # Reject a stale chunk_id before consulting the cache: a cache
+                # HIT below returns its mmap location directly and never calls
+                # resolve_chunk_data, so without this a chunk_id from before a
+                # re-registration would silently return whatever old-version
+                # bytes are still resident instead of the StaleChunkError a
+                # do_get on the same id would raise (biopb/biopb#178). Pure
+                # in-memory comparison -- no adapter I/O -- so it costs nothing
+                # to run on every locate, hit or miss.
+                adapter.check_chunk_version(chunk_id)
+
+                # And the same for the read gate, for the same reason: a warm
+                # chunk of an upload nobody has published yet -- or of one that
+                # has been discarded -- is still sitting in the cache, and this
+                # path would hand out its byte range without the adapter ever
+                # being asked (biopb/biopb#1048).
+                adapter.check_readable()
+
+                # The adapter first: a source whose own store holds the chunk
+                # as the batch a client wants answers its byte range there,
+                # cold, with nothing resolved and nothing copied into the chunk
+                # cache (``adapters.cache_member``). Everything else answers
+                # None and takes the route below.
+                location = adapter.locate_chunk(chunk_id)
                 if location is None:
-                    adapter.resolve_chunk_data(chunk_id, cache_manager)
-                    # A deferred cache write returns before the bytes are on
-                    # disk, and this reply IS a byte range -- so unlike do_get,
-                    # which is happy with the entry in memory, this caller has to
-                    # wait for the write it just triggered. Without it, every
-                    # cold locate would answer "unavailable" and send the client
-                    # back for a do_get, retiring the fast path exactly where it
-                    # was meant to win.
-                    cache_manager.await_deferred_write(cache_key)
+                    # If the chunk is already cached, just locate it. Resolving
+                    # first would, on a chunk whose in-RAM entry has been
+                    # trimmed, re-read the whole chunk from its segment
+                    # server-side for nothing. Only materialize (same path as
+                    # do_get) on a genuine cold miss.
                     location = cache_manager.locate_entry(cache_key)
+                if location is None:
+                    # Resolving caches the chunk synchronously, so by the time
+                    # this returns the bytes are on disk and the second locate
+                    # can answer with their range.
+                    adapter.resolve_chunk_data(chunk_id, cache_manager)
+                    location = cache_manager.locate_entry(cache_key)
+            except TensorResolutionError as e:
+                # Same stale-chunk_id mapping as do_get (biopb/biopb#178); must
+                # precede the ValueError clause (it subclasses ValueError).
+                raise to_flight_error(e) from e
             except (OSError, ValueError) as e:
                 raise flight.FlightInternalError(
                     f"I/O error locating chunk data: {e}"
@@ -1516,7 +2159,6 @@ class TensorFlightServer(flight.FlightServerBase):
             return json.dumps(
                 {
                     "available": True,
-                    "format_version": CACHE_FILE_FORMAT_VERSION,
                     "segment_path": location.segment_path,
                     "byte_offset": location.byte_offset,
                     "byte_length": location.byte_length,
@@ -1531,54 +2173,50 @@ class TensorFlightServer(flight.FlightServerBase):
         reader: flight.MetadataRecordBatchReader,
         writer: flight.FlightMetadataWriter,
     ) -> None:
-        """Handle source creation and chunk upload.
+        """Take what the command's oneof arm names: a pixel chunk, or an
+        annotation put / delete. Each arm gates itself: pixels need a writable
+        server, annotations need the store; both authorize on the source."""
+        cmd = self._parse(PutCommand(), descriptor.command, "DoPut command")
+        arm = cmd.WhichOneof("command")
 
-        Args:
-            context: Server call context
-            descriptor: Flight descriptor with command bytes
-            reader: Flight data stream reader
-            writer: Flight metadata writer for responses
-
-        Raises:
-            FlightUnauthenticatedError: If server not in write mode
-            FlightServerError: If source/chunk creation fails
-        """
-        if not self._writable:
-            raise flight.FlightUnauthenticatedError("Server not in write mode")
-
-        command = descriptor.command
-
-        # Discriminate the command *first*, then run the handler outside the
-        # discriminating try. Both TensorDescriptor and ChunkUpload are lenient
-        # protobufs (parse rarely raises), so the real discriminator is the
-        # shape/dtype check -- a populated shape+dtype means a source creation,
-        # anything else is a chunk upload. Deciding the branch before
-        # invoking the handler keeps a genuine create/write failure (bad prefix,
-        # missing write_dir, malformed metadata_json) surfacing as itself instead
-        # of being swallowed and mis-reported as "Invalid upload command"
-        # (biopb/biopb#354).
-        req_desc: Optional[TensorDescriptor] = None
-        try:
-            candidate = TensorDescriptor.FromString(command)
-            if candidate.shape and candidate.dtype:
-                req_desc = candidate
-        except Exception:
-            req_desc = None
-
-        if req_desc is not None:
-            # Source creation -- handler runs outside the try, so its errors propagate.
-            writer.write(self.uploads.create_source(req_desc).SerializeToString())
+        if arm == "chunk_ticket":
+            if not self._writable:
+                raise flight.FlightUnauthenticatedError("Server not in write mode")
+            self._authorize(context)
+            chunk_id = self._put_chunk_id(cmd.chunk_ticket)
+            adapter = self._get_adapter_for_chunk(chunk_id)
+            try:
+                # The read path's gate, on the write path: a ticket minted
+                # before a re-registration names bytes this source no longer
+                # serves, and writing under it would land the chunk in the
+                # next upload's cache namespace (biopb/biopb#178).
+                adapter.check_chunk_version(chunk_id)
+            except TensorResolutionError as e:
+                raise to_flight_error(e) from e
+            self.uploads.write_chunk(adapter, chunk_id, reader)
             return
 
-        # Chunk upload. Only the *parse* is guarded here (a command that is
-        # neither a source descriptor nor a decodable ChunkUpload is genuinely
-        # malformed); write_chunk runs outside so its own FlightServerError
-        # translation is preserved verbatim.
+        db = self._require_annotations()
         try:
-            upload = ChunkUpload.FromString(command)
-        except Exception as e:
-            raise flight.FlightServerError(f"Invalid upload command: {e}")
-        self.uploads.write_chunk(upload, reader)
+            if arm == "roi_put":
+                self._authorize(context)
+                rois = table_to_rois(reader.read_all())
+                stored, conflicts = db.put_rois(
+                    cmd.roi_put.array_id, rois, check_rev=cmd.roi_put.check_rev
+                )
+                reply = RoiPutResult(stored=stored, conflicts=conflicts)
+            else:
+                self._authorize(context)
+                roi_ids = table_to_roi_ids(reader.read_all())
+                deleted = db.delete_rois(
+                    cmd.roi_delete.array_id, roi_ids, cmd.roi_delete.set_name
+                )
+                reply = RoiDeleteResult(deleted=deleted)
+        except ValueError as e:
+            # Rejected geometry, a mismatched array_id, a breached cap, a stream
+            # not in the row schema: the caller's problem, so say which.
+            raise flight.FlightServerError(str(e))
+        writer.write(reply.SerializeToString())
 
 
 def serve(
@@ -1593,7 +2231,11 @@ def serve(
     """
     server = TensorFlightServer(location, **kwargs)
     for source_id, adapter in adapters.items():
-        server.register_source(source_id, adapter)
+        registered = server.register_source(source_id, adapter)
+        # Registration is the registry; the catalog row is what makes a source
+        # browsable, and only a caller that passed a ``metadata_db`` has one.
+        if server.metadata_db is not None:
+            server.metadata_db.sync_source_added(source_id, registered)
     # All sources registered up front -> ready immediately (health: SERVING).
     server.mark_ready()
 

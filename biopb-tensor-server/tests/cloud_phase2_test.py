@@ -13,10 +13,13 @@ dehydrated cloud placeholder without a special filesystem.
 import json
 import os
 import tempfile
+import threading
+import time
 
 import pytest
 from biopb_tensor_server.adapters import tiff as tiff_mod
 from biopb_tensor_server.core import discovery
+from biopb_tensor_server.core.adapter_base import SourceAdapter
 from biopb_tensor_server.core.config import SourceConfig, parse_config
 from biopb_tensor_server.core.discovery import (
     ClaimContext,
@@ -27,6 +30,8 @@ from biopb_tensor_server.core.discovery import (
 )
 from biopb_tensor_server.sources import reconciler as rec_mod
 from biopb_tensor_server.sources.tree_scanner import build_entry_signature
+
+from tests import catalog_server, register_and_catalog
 
 
 def _zarr_available():
@@ -153,9 +158,9 @@ class TestContentFreeClaimsDoNotRead:
             ("img.lsm", "lsm"),
             ("scan.nii.gz", "nifti"),
             ("img.czi", "czi"),
-            ("img.lif", "leica"),
-            ("img.nd2", "nikon"),
-            ("img.dv", "dv"),
+            ("img.lif", "lif"),
+            ("img.nd2", "nd2"),
+            ("img.dv", "deltavision"),
             ("img.oif", "olympus"),
         ],
     )
@@ -175,7 +180,14 @@ class TestContentFreeClaimsDoNotRead:
 
     @pytest.mark.parametrize(
         "filename, source_type",
-        [("img.tif", "tiff"), ("img.lsm", "lsm"), ("img.czi", "czi")],
+        [
+            ("img.tif", "tiff"),
+            ("img.lsm", "lsm"),
+            ("img.czi", "czi"),
+            ("img.lif", "lif"),
+            ("img.dv", "deltavision"),
+            ("img.nd2", "nd2"),
+        ],
     )
     def test_native_adapters_claim_a_dehydrated_placeholder(
         self, tmp_path, force_nonresident, filename, source_type
@@ -399,16 +411,13 @@ class TestUnresolvedProxy:
         # (pyramid checks are now tensor-scoped on the resolved adapter).
         assert proxy.list_tensor_descriptors() == []
         assert proxy.is_resident() is False
-        desc = proxy.get_source_descriptor()
-        assert list(desc.tensors) == []
-        assert desc.data_resident is False
-        assert desc.source_type == "ome-zarr"
-        assert proxy.is_resolved is False
+        assert proxy.source_type == "ome-zarr"
+        assert proxy.is_resolved() is False
 
     def test_close_forwards_to_the_resolved_adapter(self):
         """The proxy must not swallow the inner adapter's close (biopb/biopb#71).
 
-        ``_close_adapter`` is duck-typed, so a proxy without ``close`` silently
+        ``close_adapter`` is duck-typed, so a proxy without ``close`` silently
         skips cleanup for exactly the resolved cloud OME-TIFF / QPTIFF sources
         whose ``close()`` is the one that matters.
         """
@@ -422,7 +431,7 @@ class TestUnresolvedProxy:
         proxy._resolved = _Inner()
         proxy.close()
         assert closed == [True]
-        assert proxy.is_resolved is False
+        assert proxy.is_resolved() is False
         proxy.close()  # idempotent
         assert closed == [True]
 
@@ -465,7 +474,7 @@ class TestUnresolvedProxy:
             proxy = self._make_proxy(zpath)
             with pytest.raises(SourceUnresolvedError):
                 proxy.get_tensor_adapter("s1")
-            assert proxy.is_resolved is False  # the refusal did not hydrate
+            assert proxy.is_resolved() is False  # the refusal did not hydrate
             # After an explicit resolve the serve surface delegates normally.
             proxy.resolve()
             ta = proxy.get_tensor_adapter("s1")
@@ -485,11 +494,8 @@ class TestUnresolvedProxy:
                 source_type="ome-zarr",  # provisional guess; real type is "zarr"
                 on_resolved=lambda sid, ad: fired.update(sid=sid, type=ad._source_type),
             )
-            # resolve() returns the full, now-resolved descriptor directly.
-            desc = proxy.resolve()
-            assert [list(t.shape) for t in desc.tensors] == [[64, 128]]
-            assert desc.data_resident is True
-            assert proxy.is_resolved is True
+            proxy.resolve()
+            assert proxy.is_resolved() is True
             # The authoritative type came from re-probing the hydrated content.
             assert fired == {"sid": "s1", "type": "zarr"}
             # Catalog surface now delegates to the resolved adapter.
@@ -542,6 +548,9 @@ class _FakeServer:
     def __init__(self):
         self.registered = {}
         self._metadata_db = _FakeMetadataDb()
+        # The reconciler reaches adapters through `sources`, the real server's
+        # registry; `registered` is this fake's own record of the same calls.
+        self.sources = self.registered
 
     def register_source(self, source_id, adapter):
         self.registered[source_id] = adapter
@@ -565,7 +574,6 @@ def _make_manager(server, cloud_roots=None, monitored=None):
         metadata_db=server._metadata_db,
         registry=get_default_registry(),
         discovery_state=DiscoveryState(),
-        watcher=None,
         monitored_dirs=monitored or set(),
         cloud_roots=cloud_roots or set(),
     )
@@ -606,21 +614,41 @@ class TestUnresolvedDecision:
         assert mgr._reconciler._claim_is_unresolved(claim) is False
 
 
+class _ResidencyAdapter:
+    """Stand-in carrying the *real* ``is_resident()`` off the adapter base.
+
+    Not a canned bool: the gate's failure mode is asking a weaker question than
+    the adapter would, so the test runs the adapter's own answer.
+    """
+
+    def __init__(self, source_url):
+        self._source_url = str(source_url)
+
+    def is_resident(self):
+        return SourceAdapter.is_resident(self)
+
+
 class TestShouldWarm:
     """Residency gate the precache worker consults before warming (#174).
 
-    Mirrors ``_claim_is_unresolved`` so a source that re-dehydrates after
+    Asks the registered adapter, live, so a source that re-dehydrates after
     registration is skipped instead of recalled on a later backlog pass.
     """
 
-    def _register(self, mgr, claim):
+    def _register(self, mgr, claim, server=None):
         mgr._reconciler._state.claims[claim.source_id] = claim
+        if server is not None:
+            server.register_source(
+                claim.source_id, _ResidencyAdapter(claim.primary_path)
+            )
 
     def test_unknown_source_not_warmed(self, tmp_path):
         mgr = _make_manager(_FakeServer())
         assert mgr.should_warm("nope") is False
 
     def test_local_source_outside_cloud_root_always_warms(self, tmp_path):
+        # No adapter registered, and none needed: outside a cloud root the gate
+        # short-circuits rather than paying for a stat walk per source.
         mgr = _make_manager(_FakeServer())
         f = tmp_path / "scan.nii"
         f.write_bytes(b"payload")
@@ -629,16 +657,46 @@ class TestShouldWarm:
         assert mgr.should_warm("s1") is True
 
     def test_resident_cloud_source_warms(self, tmp_path):
-        mgr = _make_manager(_FakeServer(), cloud_roots={tmp_path.resolve()})
+        server = _FakeServer()
+        mgr = _make_manager(server, cloud_roots={tmp_path.resolve()})
         f = tmp_path / "scan.nii"
         f.write_bytes(b"payload")
         claim = SourceClaim("nifti", str(f), source_id="s1")
-        self._register(mgr, claim)
+        self._register(mgr, claim, server)
         assert mgr.should_warm("s1") is True
 
     def test_rehydrated_cloud_source_skipped(self, tmp_path, force_nonresident):
         # Registered as a normal adapter while resident, then OneDrive evicted the
         # bytes: should_warm now returns False so the warm read never recalls them.
+        server = _FakeServer()
+        mgr = _make_manager(server, cloud_roots={tmp_path.resolve()})
+        f = tmp_path / "scan.nii"
+        f.write_bytes(b"payload")
+        claim = SourceClaim("nifti", str(f), source_id="s1")
+        self._register(mgr, claim, server)
+        assert mgr.should_warm("s1") is False
+
+    def test_dehydrated_directory_source_skipped(self, tmp_path, force_nonresident):
+        """A zarr store claims the *directory*, so ``member_paths`` is just that
+        directory and an ``is_file``-guarded member check cannot see a
+        placeholder inside it -- the whole store reads as resident and precache
+        recalls it, against #174's policy. The adapter samples the interior.
+        """
+        server = _FakeServer()
+        mgr = _make_manager(server, cloud_roots={tmp_path.resolve()})
+        store = tmp_path / "img.zarr"
+        store.mkdir()
+        (store / ".zattrs").write_text("{}")
+        (store / "0.0").write_bytes(b"chunk")
+        claim = SourceClaim("ome-zarr", str(store), source_id="s1")
+        self._register(mgr, claim, server)
+        # The member check still says "resident" -- it is looking at a directory.
+        assert mgr._reconciler._claim_has_dehydrated_member(claim) is False
+        assert mgr.should_warm("s1") is False
+
+    def test_unregistered_adapter_is_not_permission_to_warm(self, tmp_path):
+        # A claim without a live adapter: nothing can answer, so the gate stays
+        # shut rather than defaulting open.
         mgr = _make_manager(_FakeServer(), cloud_roots={tmp_path.resolve()})
         f = tmp_path / "scan.nii"
         f.write_bytes(b"payload")
@@ -677,11 +735,11 @@ class TestCloudRegistrationEndToEnd:
         assert isinstance(adapter, UnresolvedSourceAdapter)
         assert adapter.list_tensor_descriptors() == []
         assert server._metadata_db.added[-1][0] == "cloud1"
-        assert adapter.get_source_descriptor().data_resident is False
+        assert adapter.is_resident() is False
 
-        # An explicit resolve -> backfills the DB with the concrete descriptor.
-        desc = adapter.resolve()
-        assert [list(t.shape) for t in desc.tensors] == [[32, 48]]
+        # An explicit resolve -> backfills the DB with the concrete row.
+        adapter.resolve()
+        assert [list(t.shape) for t in adapter.list_tensor_descriptors()] == [[32, 48]]
         # on_resolved fired a second sync_source_added (the upsert backfill).
         assert [sid for sid, _ in server._metadata_db.added].count("cloud1") == 2
         resolved_adapter = server._metadata_db.added[-1][1]
@@ -710,7 +768,7 @@ class TestPrecacheSkipsUnresolved:
 
         monkeypatch.setattr(proxy, "get_tensor_adapter", _boom)
         assert proxy.list_tensor_descriptors() == []
-        assert proxy.is_resolved is False
+        assert proxy.is_resolved() is False
 
     def test_real_precache_worker_does_not_resolve_unresolved(self, monkeypatch):
         # Drives the actual PrecacheWorker._process_source: the empty tensor list
@@ -737,14 +795,14 @@ class TestPrecacheSkipsUnresolved:
             sources = _Registry()
 
         worker = PrecacheWorker(_Srv(), PrecacheConfig())
-        # Past the file-backend gate so the real source-processing logic runs.
-        monkeypatch.setattr(worker, "_file_backend_active", lambda: True)
+        # Past the cache gate so the real source-processing logic runs.
+        monkeypatch.setattr(worker, "_cache_active", lambda: True)
         assert worker._process_source("s1") is False
-        assert proxy.is_resolved is False
+        assert proxy.is_resolved() is False
 
 
 # --------------------------------------------------------------------------- #
-# Cloud rescan gating (the watcher path)
+# Cloud rescan gating (the periodic rescan path)
 # --------------------------------------------------------------------------- #
 
 
@@ -760,7 +818,7 @@ class TestCloudRescanGating:
     """
 
     def test_rescan_registers_unresolved_without_opening_content(
-        self, tmp_path, force_nonresident, monkeypatch
+        self, tmp_path, force_nonresident
     ):
         root = tmp_path / "cloudroot"
         root.mkdir()
@@ -774,12 +832,11 @@ class TestCloudRescanGating:
         server = _FakeServer()
         mgr = _make_manager(server, cloud_roots={root.resolve()}, monitored={root})
 
-        # The open-for-append probe would recall a placeholder; the cloud gate must
-        # bypass it entirely. Make it explode if ever reached during the rescan.
-        def _no_probe(path):
-            raise AssertionError(f"cloud rescan must not open-probe {path}")
-
-        monkeypatch.setattr(mgr, "_can_open_for_append", _no_probe)
+        # The cloud gate bypasses the stability machinery outright: a placeholder's
+        # mtime is untrustworthy, so it could never age into eligibility. Set a
+        # window no local entry could satisfy -- the cloud source must still register.
+        mgr._stability_window = 10**9
+        mgr._scanner._stability_window = 10**9
 
         mgr._handle_rescan()
 
@@ -789,7 +846,7 @@ class TestCloudRescanGating:
         adapter = next(iter(server.registered.values()))
         assert isinstance(adapter, UnresolvedSourceAdapter)
         assert adapter.list_tensor_descriptors() == []
-        assert adapter.get_source_descriptor().data_resident is False
+        assert adapter.is_resident() is False
         # Catalogued in the DB with an empty (NULL-shape) row.
         assert server._metadata_db.added
 
@@ -964,14 +1021,16 @@ class TestCloudRescanGating:
 class TestResolveAction:
     """The dedicated streaming `resolve` do_action: the SOLE resolution entry
     point. Emits ``ResolveStreamMessage`` progress heartbeats while the recall
-    runs, then one terminal message carrying the full DataSourceDescriptor in its
-    ``result`` arm."""
+    runs, then one terminal message carrying the source's now-concrete catalog
+    row in its ``source_row`` arm."""
 
     def _server(self, source_id, adapter):
-        from biopb_tensor_server.serving.server import TensorFlightServer
-
-        server = TensorFlightServer("grpc://localhost:0")
-        server.register_source(source_id, adapter)
+        """Registered AND catalogued -- what a SourceManager leaves behind, and
+        what the terminal row read at the end of the resolve stream needs. The
+        action refuses outright on a catalog-less server: the row IS its
+        terminal message."""
+        server = catalog_server("grpc://localhost:0")
+        register_and_catalog(server, source_id, adapter)
         return server
 
     @staticmethod
@@ -981,11 +1040,20 @@ class TestResolveAction:
         msgs = [ResolveStreamMessage.FromString(b) for b in bodies]
         return msgs, [m.WhichOneof("payload") for m in msgs]
 
-    def test_resolve_action_streams_full_descriptor(self):
+    @staticmethod
+    def _rows(msg):
+        import pyarrow as pa
+
+        return pa.ipc.open_stream(msg.source_row).read_all().to_pylist()
+
+    def test_resolve_action_streams_the_backfilled_catalog_row(self):
         import pyarrow.flight as flight
         import zarr
+        from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS
         from biopb_tensor_server.adapters import get_default_registry
         from biopb_tensor_server.adapters.unresolved import UnresolvedSourceAdapter
+        from biopb_tensor_server.serving.metadata_db import MetadataDatabase
+        from biopb_tensor_server.serving.server import TensorFlightServer
 
         with tempfile.TemporaryDirectory() as d:
             zpath = os.path.join(d, "img.zarr")
@@ -993,23 +1061,39 @@ class TestResolveAction:
                 zpath, mode="w", shape=(16, 24), chunks=(8, 12), dtype="uint8"
             )
             cfg = SourceConfig(url=zpath, type="ome-zarr", source_id="cloud1")
-            proxy = UnresolvedSourceAdapter(cfg, get_default_registry())
-            server = self._server("cloud1", proxy)
+            # One catalog, wired into both halves the way cli.py does: the
+            # adapter's on_resolved backfills the row that registration wrote as
+            # a NULL-shape placeholder. Nothing else corrects it.
+            db = MetadataDatabase()
+            proxy = UnresolvedSourceAdapter(
+                cfg, get_default_registry(), on_resolved=db.sync_source_added
+            )
+            server = TensorFlightServer("grpc://localhost:0", metadata_db=db)
+            db.sync_source_added("cloud1", server.register_source("cloud1", proxy))
 
             action = flight.Action("resolve", b"cloud1")
             # do_action yields raw bytes (the Flight framework wraps each in a Result).
             bodies = [bytes(r) for r in server.do_action(None, action)]
             msgs, kinds = self._parse(bodies)
-            results = [
-                m.result for m, k in zip(msgs, kinds, strict=True) if k == "result"
+            terminal = [
+                m for m, k in zip(msgs, kinds, strict=True) if k == "source_row"
             ]
-            assert len(results) == 1  # exactly one terminal descriptor
-            assert kinds[-1] == "result"
-            desc = results[0]
-            assert desc.source_id == "cloud1"
-            assert [list(t.shape) for t in desc.tensors] == [[16, 24]]
-            assert desc.data_resident is True
-            assert proxy.is_resolved is True
+            assert len(terminal) == 1  # exactly one terminal row
+            assert kinds[-1] == "source_row"
+            (row,) = self._rows(terminal[0])
+            assert row["source_id"] == "cloud1"
+            assert [t["shape"] for t in row["tensors"]] == [[16, 24]]
+            assert row["is_resolved"] is True
+            assert "data_resident" not in row  # never in a row
+            assert proxy.is_resolved() is True
+
+            # It IS the catalog row, not a second encoding built beside it. The
+            # backfill matters here: without on_resolved above, the placeholder
+            # row would still read empty.
+            browsed = db.query(
+                f"SELECT {SOURCE_ROW_COLUMNS} FROM sources WHERE source_id = 'cloud1'"
+            ).to_pylist()
+            assert browsed == [row]
 
     def test_resolve_action_emits_heartbeats_during_long_recall(self, monkeypatch):
         # The stream must carry progress keep-alives BEFORE the terminal descriptor
@@ -1025,7 +1109,7 @@ class TestResolveAction:
         import threading
 
         import pyarrow.flight as flight
-        from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
+        from biopb.tensor.descriptor_pb2 import TensorDescriptor
         from biopb_tensor_server.serving import server as server_mod
 
         monkeypatch.setattr(server_mod, "_RESOLVE_HEARTBEAT_SECONDS", 0.01)
@@ -1035,12 +1119,25 @@ class TestResolveAction:
         class _SlowAdapter:
             source_url = None
             capability_token = None
+            catalog_url = "file:///slow"
+            source_type = "zarr"
+
+            def is_resident(self):
+                return True
+
+            def is_resolved(self):
+                return True
+
+            def list_tensor_descriptors(self):
+                return [TensorDescriptor(array_id="slow", shape=[2, 2], dtype="uint8")]
+
+            def get_metadata(self):
+                return {}
 
             def resolve(self):
                 # Park until the test has observed the first heartbeat, then finish.
                 # Bounded wait so a broken test can never hang the drain below.
                 release.wait(timeout=5.0)
-                return DataSourceDescriptor(source_id="slow")
 
         server = self._server("slow", _SlowAdapter())
         action = flight.Action("resolve", b"slow")
@@ -1056,8 +1153,8 @@ class TestResolveAction:
 
         assert kinds[0] == "progress"  # deterministically, a heartbeat leads
         assert kinds.count("progress") >= 1  # at least one heartbeat
-        assert kinds[-1] == "result"  # terminal is the descriptor
-        assert msgs[-1].result.source_id == "slow"
+        assert kinds[-1] == "source_row"  # terminal is the catalog row
+        assert self._rows(msgs[-1])[0]["source_id"] == "slow"
         # progress heartbeats carry a monotonically non-decreasing elapsed clock
         elapsed = [
             m.progress.elapsed_seconds
@@ -1067,10 +1164,79 @@ class TestResolveAction:
         assert elapsed == sorted(elapsed)
         assert elapsed[-1] >= 0.0
 
+    @pytest.mark.parametrize(
+        "exc_type, flight_error",
+        [
+            ("retriable", "FlightUnavailableError"),
+            ("permanent", "FlightInternalError"),
+        ],
+    )
+    def test_a_resolve_that_does_not_hydrate_raises_and_syncs_nothing(
+        self, exc_type, flight_error
+    ):
+        """The failure branch is what makes the backfill below it safe: a
+        resolve that did not hydrate never reaches the catalog sync or the row
+        read, so the placeholder row stays as registration wrote it."""
+        import pyarrow.flight as flight
+        from biopb_tensor_server.core.errors import (
+            SourceResolveRetriableError,
+            SourceUnresolvedError,
+        )
+
+        err = (
+            SourceResolveRetriableError("recall failed")
+            if exc_type == "retriable"
+            else SourceUnresolvedError("unsupported type")
+        )
+
+        class _WontHydrate:
+            capability_token = None
+            source_url = None
+            catalog_url = "file:///cloud1"
+            source_type = "ome-zarr"
+            synced = 0
+
+            def is_resident(self):
+                return False
+
+            def is_resolved(self):
+                return False
+
+            def list_tensor_descriptors(self):
+                # Empty before AND after: the source never hydrates.
+                return []
+
+            def get_metadata(self):
+                type(self).synced += 1
+                return {}
+
+            def resolve(self):
+                raise err
+
+        adapter = _WontHydrate()
+        server = self._server("cloud1", adapter)
+        synced_at_registration = _WontHydrate.synced
+
+        action = flight.Action("resolve", b"cloud1")
+        with pytest.raises(getattr(flight, flight_error)):
+            list(server.do_action(None, action))
+
+        # No second sync: the backfill is downstream of the raise.
+        assert _WontHydrate.synced == synced_at_registration
+        # ... and the placeholder row is untouched.
+        (row,) = server.metadata_db.query(
+            "SELECT tensors FROM sources WHERE source_id = 'cloud1'"
+        ).to_pylist()
+        assert row["tensors"] == []
+
     def test_resolve_action_unknown_source_errors(self):
         import pyarrow.flight as flight
+        from biopb_tensor_server.serving.server import TensorFlightServer
 
-        server = self._server("cloud1", _SlowSentinel())
+        # Registry only, no catalog row: the sentinel is never described, and
+        # the id under test is a *missing* one.
+        server = TensorFlightServer("grpc://localhost:0")
+        server.register_source("cloud1", _SlowSentinel())
         action = flight.Action("resolve", b"missing")
         with pytest.raises(flight.FlightServerError, match="Source not found"):
             list(server.do_action(None, action))
@@ -1116,6 +1282,9 @@ class _Ctx:
             return False
         return self.calls > self._cancel_after
 
+    def get_middleware(self, name):
+        return None  # no bearer presented; the servers here have no token
+
 
 class TestWarmAction:
     """The dedicated streaming `warm` do_action: server-side hydrate-ahead. It
@@ -1123,6 +1292,10 @@ class TestWarmAction:
     emitting ``WarmStreamMessage`` progress, then one terminal ``done``."""
 
     def _server(self, source_id, adapter):
+        # Catalog-less and registry-only: warm walks the source directory, not
+        # the catalog, and _DirAdapter is a format-agnostic stub with no
+        # metadata to catalogue anyway. The residency test below wires a real
+        # catalog because that one IS about the row.
         from biopb_tensor_server.serving.server import TensorFlightServer
 
         server = TensorFlightServer("grpc://localhost:0")
@@ -1152,6 +1325,39 @@ class TestWarmAction:
                 fh.write(b"\xa5" * size)
             paths.append(p)
         return paths
+
+    def test_warm_writes_nothing_to_the_catalog(self, tmp_path):
+        """Warm touches no catalog at all: residency is not stored, so there is
+        nothing for it to correct, and the `directory_is_resident()` walk that
+        used to run here was pure cost (biopb/biopb#1035)."""
+        import pyarrow.flight as flight
+
+        class _Forbidden:
+            annotations_persisted = False
+            store_path = None
+
+            def __getattr__(self, name):
+                raise AssertionError(f"warm touched the catalog: {name}")
+
+        root = str(tmp_path / "src")
+        os.makedirs(root)
+        self._make_files(root, {"a.bin": 8})
+
+        server = self._server("s1", _DirAdapter(root))
+        server._metadata_db = _Forbidden()
+
+        bodies = [
+            bytes(r) for r in server.do_action(_Ctx(), flight.Action("warm", b"s1"))
+        ]
+        _msgs, kinds = self._parse(bodies)
+        assert kinds[-1] == "done"
+
+    def test_the_catalog_cannot_refresh_residency_at_all(self):
+        """It wrote `data_resident`, plus an `is_resolved` already true on the
+        one path that called it."""
+        from biopb_tensor_server.serving.metadata_db import MetadataDatabase
+
+        assert not hasattr(MetadataDatabase, "refresh_residency")
 
     def test_warm_streams_progress_and_terminal_done(self, tmp_path, monkeypatch):
         import pyarrow.flight as flight
@@ -1187,29 +1393,86 @@ class TestWarmAction:
 
     def test_warm_orders_files_ascending_by_size(self, tmp_path, monkeypatch):
         import pyarrow.flight as flight
+        from biopb_tensor_server.serving import server as server_mod
 
         self._no_throttle(monkeypatch)
         root = str(tmp_path / "src")
         os.makedirs(root)
         self._make_files(root, {"big": 90, "small": 10, "mid": 40})
 
-        server = self._server("s2", _DirAdapter(root))
-        bodies = [
-            bytes(r) for r in server.do_action(_Ctx(), flight.Action("warm", b"s2"))
-        ]
-        msgs, kinds = self._parse(bodies)
+        submitted = []
+        original_submit = server_mod.ThreadPoolExecutor.submit
 
-        # The current_name as each file finishes, in order (dedupe consecutive
-        # repeats from per-block progress): smallest first.
-        names = []
-        for m, k in zip(msgs, kinds, strict=True):
-            if (
-                k == "progress"
-                and m.progress.current_name
-                and (not names or names[-1] != m.progress.current_name)
-            ):
-                names.append(m.progress.current_name)
-        assert names == ["small", "mid", "big"]
+        def record_submit(executor, fn, *args, **kwargs):
+            submitted.append(os.path.basename(args[0]))
+            return original_submit(executor, fn, *args, **kwargs)
+
+        monkeypatch.setattr(server_mod.ThreadPoolExecutor, "submit", record_submit)
+        server = self._server("s2", _DirAdapter(root))
+        list(server.do_action(_Ctx(), flight.Action("warm", b"s2")))
+
+        # Completion order is intentionally concurrent and may vary. The
+        # scheduler must still feed the pool in the coarsest-first order.
+        assert submitted == ["small", "mid", "big"]
+
+    def test_warm_reads_files_concurrently_with_bounded_workers(
+        self, tmp_path, monkeypatch
+    ):
+        import pyarrow.flight as flight
+        from biopb_tensor_server.serving import server as server_mod
+
+        self._no_throttle(monkeypatch)
+        root = str(tmp_path / "src")
+        os.makedirs(root)
+        worker_count = server_mod._WARM_MAX_WORKERS
+        sizes = {f"f{i}.bin": 8 for i in range(worker_count + 2)}
+        self._make_files(root, sizes)
+
+        active = [0]
+        max_active = [0]
+        active_lock = threading.Lock()
+        real_open = open
+
+        class TrackedFile:
+            def __init__(self, wrapped):
+                self._wrapped = wrapped
+
+            def __enter__(self):
+                self._wrapped.__enter__()
+                return self
+
+            def __exit__(self, *exc_info):
+                try:
+                    return self._wrapped.__exit__(*exc_info)
+                finally:
+                    with active_lock:
+                        active[0] -= 1
+
+            def readinto(self, buf):
+                # Hold each read briefly so all initially scheduled workers have
+                # an opportunity to overlap before the first one completes.
+                time.sleep(0.05)
+                return self._wrapped.readinto(buf)
+
+        def tracked_open(*args, **kwargs):
+            wrapped = real_open(*args, **kwargs)
+            with active_lock:
+                active[0] += 1
+                max_active[0] = max(max_active[0], active[0])
+            return TrackedFile(wrapped)
+
+        monkeypatch.setattr(server_mod, "open", tracked_open, raising=False)
+        server = self._server("s-concurrent", _DirAdapter(root))
+        bodies = [
+            bytes(r)
+            for r in server.do_action(_Ctx(), flight.Action("warm", b"s-concurrent"))
+        ]
+        msgs, _kinds = self._parse(bodies)
+
+        assert max_active[0] > 1
+        assert max_active[0] <= server_mod._WARM_MAX_WORKERS
+        assert msgs[-1].done.files_done == len(sizes)
+        assert msgs[-1].done.bytes_done == sum(sizes.values())
 
     def test_warm_walk_is_recursive(self, tmp_path, monkeypatch):
         import pyarrow.flight as flight
@@ -1243,6 +1506,44 @@ class TestWarmAction:
         msgs, kinds = self._parse(bodies)
         assert kinds == ["done"]
         assert msgs[-1].done.files_total == 0  # nothing to warm
+
+    def test_warm_refuses_a_remote_source(self):
+        """A remote url has no local tree to recall into, so warm fails loudly
+        rather than answering `files_total == 0` -- which a local single-file
+        source already uses to mean "nothing left to warm" (biopb/biopb#1035).
+        """
+        import pyarrow.flight as flight
+
+        server = self._server("s9", _DirAdapter("grpc://lab/img.zarr"))
+        with pytest.raises(flight.FlightServerError, match="remote"):
+            list(server.do_action(_Ctx(), flight.Action("warm", b"s9")))
+
+    def test_warm_names_the_scheme_and_where_to_go(self):
+        # Actionable: which source, why not here, and where to warm it.
+        import pyarrow.flight as flight
+
+        server = self._server("s10", _DirAdapter("s3://bucket/img.zarr"))
+        with pytest.raises(flight.FlightServerError) as caught:
+            list(server.do_action(_Ctx(), flight.Action("warm", b"s10")))
+        message = str(caught.value)
+        assert "s10" in message
+        assert "s3" in message
+        assert "server that holds the data" in message
+
+    def test_warm_still_no_ops_on_a_local_single_file_source(self, tmp_path):
+        # The refusal must not swallow this: `files_total == 0` is how a client
+        # (the web SPA) learns a source is single-file.
+        import pyarrow.flight as flight
+
+        f = tmp_path / "scan.nii"
+        f.write_bytes(b"payload")
+        server = self._server("s11", _DirAdapter(str(f)))
+        bodies = [
+            bytes(r) for r in server.do_action(_Ctx(), flight.Action("warm", b"s11"))
+        ]
+        msgs, kinds = self._parse(bodies)
+        assert kinds == ["done"]
+        assert msgs[-1].done.files_total == 0
 
     def test_warm_cancel_stops_early_with_partial_done(self, tmp_path, monkeypatch):
         import pyarrow.flight as flight
@@ -1411,7 +1712,7 @@ class TestCloudMultiFileBan:
         # multi-file ban fires there too, not only on the monitored rescan. Spy on
         # the series adapter to capture the cloud_root it is handed.
         from biopb_tensor_server.adapters.dicom import DicomSeriesAdapter
-        from biopb_tensor_server.core.config import discover_sources
+        from biopb_tensor_server.sources.resolve import discover_sources
 
         d = tmp_path / "series"
         d.mkdir()

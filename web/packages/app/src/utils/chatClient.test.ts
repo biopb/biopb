@@ -9,7 +9,6 @@ vi.mock("../auth", () => ({
 
 import {
   fetchChatStatus,
-  fetchEngine,
   fetchHistory,
   fetchModels,
   setModel,
@@ -43,33 +42,6 @@ describe("fetchChatStatus", () => {
   });
 });
 
-describe("fetchEngine", () => {
-  it("reads the engine and who is answering under it", async () => {
-    // Both move together: an engine switched by another window that still names
-    // the outgoing engine's model is a header contradicting the switcher.
-    answering({ engine: "acp", model: "opencode · claude-sonnet-5" });
-    expect(await fetchEngine("/s")).toEqual({
-      engine: "acp",
-      model: "opencode · claude-sonnet-5",
-    });
-  });
-
-  it("reads anything else as the built-in loop", async () => {
-    // A child too old to have the route 404s, which is a failed read; a child
-    // that answers with something unexpected is the one this covers.
-    answering({ engine: "", model: "m" });
-    expect((await fetchEngine("/s"))!.engine).toBe("builtin");
-  });
-
-  it("is null when the read fails, so the pane keeps its thread", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => new Response("nope", { status: 404 })),
-    );
-    expect(await fetchEngine("/s")).toBe(null);
-  });
-});
-
 describe("fetchHistory", () => {
   it("keeps whether the page is the whole thread", async () => {
     // Without it a view cannot tell a reset from a delta, and appends the new
@@ -81,6 +53,26 @@ describe("fetchHistory", () => {
   it("treats a child that does not say as sending a delta", async () => {
     answering({ messages: [], busy: false });
     expect((await fetchHistory("/s", "m-1"))!.full).toBe(false);
+  });
+
+  it("keeps who is answering, so a /model switch reaches every window", () => {
+    // This is the only read the pane repeats; the header would otherwise name
+    // the model it was switched off until the page is reloaded.
+    answering({ messages: [], busy: false, full: true, model: "other-model" });
+    return fetchHistory("/s", null).then((p) => expect(p!.model).toBe("other-model"));
+  });
+
+  it("reads a child that sends none as keep-what-you-have, not as unset", async () => {
+    answering({ messages: [], busy: false });
+    expect((await fetchHistory("/s", "m-1"))!.model).toBe("");
+  });
+
+  it("is null when the read fails, so the pane keeps its thread", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("nope", { status: 404 })),
+    );
+    expect(await fetchHistory("/s", null)).toBe(null);
   });
 });
 
@@ -108,9 +100,9 @@ describe("fetchModels", () => {
     ]);
   });
 
-  it("reads an engine with no list as having none, not as unreachable", async () => {
-    // The built-in loop. Null is a failed read and means keep what you have;
-    // an empty list is an answer.
+  it("reads a provider with no list as having none, not as unreachable", async () => {
+    // Null is a failed read and means keep what you have; an empty list is an
+    // answer -- `GET /models` is optional in the OpenAI-compatible shape.
     answering({ model: "test-model", choices: [] });
     expect((await fetchModels("/s"))!.choices).toEqual([]);
   });
@@ -123,10 +115,10 @@ describe("setModel", () => {
       vi.fn(async () => new Response(JSON.stringify(body), { status })),
     );
 
-  it("passes on what the agent does offer", async () => {
+  it("passes on what the provider said", async () => {
     // The refusal has to say what to type instead, or it sends the reader to
     // the config file to find out.
-    refusing(400, { error: "opencode does not offer 'gpt-6'. Offered: x, y" });
+    refusing(400, { error: "no such model 'gpt-6'. Offered: x, y" });
     expect(await setModel("/s", "gpt-6")).toContain("Offered: x, y");
   });
 

@@ -20,6 +20,8 @@ import tifffile  # noqa: E402
 from biopb.tensor.descriptor_pb2 import TensorDescriptor  # noqa: E402
 from biopb.tensor.ticket_pb2 import ChunkBounds  # noqa: E402
 
+from tests import catalog_server, register_and_catalog
+
 _QPI_DESC = (
     "<PerkinElmer-QPI-ImageDescription>"
     "<Objective>x20</Objective><Name>{name}</Name>"
@@ -298,8 +300,7 @@ class TestQptiffAdapter:
                 # repr).
                 assert lvl.source_url == adapter._source_url
                 assert lvl.source_type == "qptiff"
-                src_desc = lvl.get_source_descriptor()
-                assert src_desc.source_id == adapter.source_id
+                assert lvl.source_id == adapter.source_id
                 assert [d.array_id for d in lvl.list_tensor_descriptors()] == [
                     f"{adapter.source_id}/1"
                 ]
@@ -352,7 +353,6 @@ class TestQptiffAdapterIntegration:
 
     def test_server_client_roundtrip(self):
         from biopb.tensor import TensorFlightClient
-        from biopb_tensor_server import TensorFlightServer
 
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "slide.qptiff"
@@ -360,8 +360,8 @@ class TestQptiffAdapterIntegration:
             adapter = _adapter(p)
             source_id = adapter.source_id
 
-            server = TensorFlightServer("grpc://localhost:0")
-            server.register_source(source_id, adapter)
+            server = catalog_server("grpc://localhost:0")
+            register_and_catalog(server, source_id, adapter)
             server.mark_ready()
             t = threading.Thread(target=server.serve, daemon=True)
             t.start()

@@ -7,22 +7,22 @@ Measures performance for end-to-end query path through TensorFlightClient:
 
 Unlike metadata_db_test.py which tests MetadataDatabase directly,
 these tests measure full request path:
-  TensorFlightClient.query_sources(sql)
-    -> FlightClient.get_flight_info(TensorSelection with metadata_query)
-      -> TensorFlightServer.get_flight_info()
-        -> MetadataDatabase.handle_query(sql)
-    -> FlightClient.do_get(ticket)
+  TensorFlightClient.query(sql)
+    -> FlightClient.do_get(TensorTicket.catalog_query with the SQL)
+      -> TensorFlightServer.do_get()
+        -> MetadataDatabase.query(sql)
       -> Returns Arrow Table with query results
 """
 
 import concurrent.futures
 import random
+import tempfile
 import threading
 import time
 
 import pytest
 from biopb.tensor import TensorFlightClient
-from biopb_tensor_server.core.metadata_db import MetadataDatabase
+from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 from biopb_tensor_server.serving.server import TensorFlightServer
 
 
@@ -36,21 +36,30 @@ class MockAdapter:
         self._shape = shape
         self._dtype = dtype
 
-    def get_source_descriptor(self):
-        from biopb.tensor.descriptor_pb2 import DataSourceDescriptor, TensorDescriptor
+    @property
+    def catalog_url(self):
+        return self._source_url
 
-        return DataSourceDescriptor(
-            source_id=self.source_id,
-            source_url=self._source_url,
-            source_type=self._source_type,
-            tensors=[
-                TensorDescriptor(
-                    array_id=self.source_id,
-                    shape=self._shape,
-                    dtype=self._dtype,
-                )
-            ],
-        )
+    @property
+    def source_type(self):
+        return self._source_type
+
+    def is_resident(self):
+        return True
+
+    def is_resolved(self):
+        return True
+
+    def list_tensor_descriptors(self):
+        from biopb.tensor.descriptor_pb2 import TensorDescriptor
+
+        return [
+            TensorDescriptor(
+                array_id=self.source_id,
+                shape=self._shape,
+                dtype=self._dtype,
+            )
+        ]
 
     def get_metadata(self):
         return {
@@ -87,7 +96,9 @@ def _create_server_with_sources(n_sources: int):
     from biopb_tensor_server.cache import CacheManager
     from biopb_tensor_server.core.config import CacheConfig
 
-    CacheManager.initialize(CacheConfig(backend="memory"))
+    CacheManager.initialize(
+        CacheConfig(file_cache_dir=tempfile.mkdtemp(prefix="biopb-bench-cache-"))
+    )
 
     port = random.randint(8900, 8999)
     location = f"grpc://127.0.0.1:{port}"
@@ -141,7 +152,9 @@ def server_with_metadata_db():
     from biopb_tensor_server.cache import CacheManager
     from biopb_tensor_server.core.config import CacheConfig
 
-    CacheManager.initialize(CacheConfig(backend="memory"))
+    CacheManager.initialize(
+        CacheConfig(file_cache_dir=tempfile.mkdtemp(prefix="biopb-bench-cache-"))
+    )
 
     port = random.randint(8900, 8999)
     location = f"grpc://127.0.0.1:{port}"
@@ -180,11 +193,14 @@ class TestConcurrentAccess:
                 if thread_id % 3 == 0:
                     sql = "SELECT source_id FROM sources WHERE source_type='ome-zarr' LIMIT 10"
                 elif thread_id % 3 == 1:
-                    sql = "SELECT source_id, dtype FROM sources WHERE dtype='uint16' LIMIT 10"
+                    sql = (
+                        "SELECT source_id, tensors[1].dtype FROM sources "
+                        "WHERE tensors[1].dtype = 'uint16' LIMIT 10"
+                    )
                 else:
                     sql = "SELECT COUNT(*) FROM sources"
 
-                result = client.query_sources(sql)
+                result = client.query(sql)
                 return result.num_rows
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
@@ -235,7 +251,7 @@ class TestConcurrentAccess:
                 try:
                     client = query_clients[thread_id % 8]  # reuse pooled client
                     sql = "SELECT COUNT(*) FROM sources"
-                    client.query_sources(sql)
+                    client.query(sql)
                 except Exception as e:
                     errors.append(str(e))
 
@@ -309,7 +325,7 @@ class TestLargeScale:
 
         def query_all():
             sql = "SELECT source_id FROM sources"
-            result = client.query_sources(sql)
+            result = client.query(sql)
             return result.num_rows
 
         n_rows = benchmark(query_all)
@@ -326,7 +342,7 @@ class TestLargeScale:
 
         def query_all():
             sql = "SELECT source_id FROM sources"
-            result = client.query_sources(sql)
+            result = client.query(sql)
             return result.num_rows
 
         n_rows = benchmark(query_all)
@@ -343,7 +359,7 @@ class TestLargeScale:
 
         def query_all():
             sql = "SELECT source_id FROM sources"
-            result = client.query_sources(sql)
+            result = client.query(sql)
             return result.num_rows
 
         n_rows = benchmark(query_all)
@@ -364,7 +380,7 @@ class TestLargeScale:
 
         def query_all():
             sql = "SELECT source_id FROM sources"
-            result = client.query_sources(sql)
+            result = client.query(sql)
             return result.num_rows
 
         n_rows = benchmark(query_all)
@@ -385,7 +401,7 @@ class TestQueryComplexity:
 
         def count_query():
             sql = "SELECT COUNT(*) FROM sources"
-            result = client.query_sources(sql)
+            result = client.query(sql)
             return result.column(0).to_pylist()[0]
 
         count = benchmark(count_query)
@@ -406,7 +422,7 @@ class TestQueryComplexity:
                 "WHERE source_url LIKE '%experiment-0000%' "
                 "OR source_url LIKE '%experiment-0001%'"
             )
-            result = client.query_sources(sql)
+            result = client.query(sql)
             return result.num_rows
 
         n_rows = benchmark(filtered_query)
@@ -422,7 +438,7 @@ class TestQueryComplexity:
 
         def json_query():
             sql = "SELECT source_id, metadata_json->>'plate_id' as plate FROM sources LIMIT 1000"
-            result = client.query_sources(sql)
+            result = client.query(sql)
             return result.num_rows
 
         n_rows = benchmark(json_query)
@@ -441,11 +457,11 @@ class TestQueryComplexity:
                 SELECT source_id, source_url
                 FROM sources
                 WHERE source_type='ome-zarr'
-                  AND dtype='uint16'
-                  AND shape_summary LIKE '%512%'
+                  AND tensors[1].dtype = 'uint16'
+                  AND list_contains(tensors[1].shape, 512)
                 LIMIT 500
             """
-            result = client.query_sources(sql)
+            result = client.query(sql)
             return result.num_rows
 
         n_rows = benchmark(complex_query)

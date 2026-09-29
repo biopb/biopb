@@ -7,10 +7,10 @@ request/response bodies -- with the mount prefix stripped, and (3) the control i
 built ``web/`` SPA bundle at its root, falling back to ``index.html`` for deep
 links (``/``, ``/viewer``, ``/session/<id>/observe``) and serving hashed assets
 as real files, and (4) which session-child roots it will proxy at all — ``api``
-always, the ``console`` (an RCE into that session's kernel) only on a
-loopback-bound control, ``/mcp`` never. A trivial stdlib HTTP server stands in
-for the tensor sidecar so no real tensor server is needed; a tmp bundle stands
-in for ``web/packages/app/dist``.
+always, ``chat`` (an RCE into that session's kernel) only on a loopback-bound
+control, ``/mcp`` never. A trivial stdlib HTTP
+server stands in for the tensor sidecar so no real tensor server is needed; a
+tmp bundle stands in for ``web/packages/app/dist``.
 """
 
 import json
@@ -54,30 +54,30 @@ from biopb_control._supervisor import DataPlaneSpec, DataPlaneSupervisor
         ("/session/s1/mcp", False),  # non-API surface (proxy allowlist 404s it)
         ("/sessionfoo/api/x", False),  # not a /session/<id>/ path
         ("/api/status", False),  # control's own API, handled by the other branch
-        # Not proxied by default, so not gated by default either -- the console
+        # Not proxied by default, so not gated by default either -- the chat
         # root only exists where _session_proxy_roots put it (test below).
-        ("/session/s1/console/execute", False),
+        ("/session/s1/chat/turn", False),
     ],
 )
 def test_is_proxied_session_path(path, guarded):
     assert _is_proxied_session_path(path) is guarded
 
 
-def test_console_root_is_gated_wherever_it_is_proxied():
-    # The auth gate reads the proxy's own root set, so enabling the console
-    # cannot open an unauthenticated execute path: the same switch that makes it
-    # reachable makes it guarded.
-    roots = _session_proxy_roots(console_enabled=True)
-    assert _is_proxied_session_path("/session/s1/console/execute", roots) is True
+def test_chat_root_is_gated_wherever_it_is_proxied():
+    # The auth gate reads the proxy's own root set, so enabling chat cannot open
+    # an unauthenticated execute path: the same switch that makes it reachable
+    # makes it guarded.
+    roots = _session_proxy_roots(loopback_bound=True)
+    assert _is_proxied_session_path("/session/s1/chat/turn", roots) is True
     assert _is_proxied_session_path("/session/s1/api/jobs", roots) is True
     assert _is_proxied_session_path("/session/s1/mcp", roots) is False
 
 
-def test_console_root_is_off_by_default():
-    assert "console" not in _session_proxy_roots(console_enabled=False)
-    assert "console" in _session_proxy_roots(console_enabled=True)
-    # Enabling the console only adds; it never displaces the always-on root.
-    assert _session_proxy_roots(console_enabled=True) >= _SESSION_ALLOWED_ROOTS
+def test_chat_root_is_off_by_default():
+    assert "chat" not in _session_proxy_roots(loopback_bound=False)
+    assert "chat" in _session_proxy_roots(loopback_bound=True)
+    # Loopback only adds; it never displaces the always-on root.
+    assert _session_proxy_roots(loopback_bound=True) >= _SESSION_ALLOWED_ROOTS
 
 
 def _free_port() -> int:
@@ -141,6 +141,13 @@ def _isolated_sessions(tmp_path, monkeypatch):
     """Point the session registry at a per-test dir (resolve() reads the env per
     request, so setting it here reaches the in-process uvicorn thread too)."""
     monkeypatch.setenv("BIOPB_SESSIONS_DIR", str(tmp_path / "sessions"))
+    # And the algorithm registry, so no test reads (or probes) the user's.
+    monkeypatch.setattr(
+        "biopb._locations.algorithms_dir", lambda: tmp_path / "algorithms"
+    )
+    state = tmp_path / "algorithm-state"
+    state.mkdir(exist_ok=True)
+    monkeypatch.setattr("biopb._locations.algorithms_state_dir", lambda: state)
 
 
 @pytest.fixture
@@ -198,13 +205,13 @@ def test_control_health_is_not_proxied(control):
     assert "path" not in payload
 
 
-def test_health_advertises_the_console_gate(control):
-    # The observe page must know before it renders an editor, and only the
+def test_health_advertises_whether_chat_is_proxied(control):
+    # The observe page must know before it renders a composer, and only the
     # control knows this half. Unauthenticated like `auth_required`, and for the
     # same reason: the bundle needs it before it holds a token.
     _status, _headers, body = _get(f"{control}/health")
-    # The fixture binds 127.0.0.1, so the console is on here.
-    assert json.loads(body)["console_enabled"] is True
+    # The fixture binds 127.0.0.1.
+    assert json.loads(body)["chat_proxied"] is True
 
 
 def test_root_serves_the_spa_shell(control):
@@ -873,9 +880,12 @@ def test_api_agents_is_token_gated(tokened_control, monkeypatch):
 # --------------------------------------------------------------------------- #
 # Algorithm-plane inspection API (/api/algorithms)
 # --------------------------------------------------------------------------- #
-# A thin, read-only front over biopb._algorithms; we stub that core so the tests
-# never dial a real gRPC server, and assert the wiring: GET returns the probed
-# server rows, a core error is a clean 500, and the surface is token-gated.
+# The rows come from the algorithm plane (stubbed here; see
+# test_algorithm_plane.py); these assert the wiring: GET returns them, a failure
+# is a clean 500, and the surface is token-gated.
+
+
+_ROWS = "biopb_control._algorithm_plane.AlgorithmPlane.rows"
 
 
 def test_api_algorithms_lists_probed_servers(control, monkeypatch):
@@ -884,60 +894,30 @@ def test_api_algorithms_lists_probed_servers(control, monkeypatch):
             "url": "grpc://localhost:50051",
             "target": "localhost:50051",
             "scheme": "grpc",
-            "state": "serving",
-            "ops": ["threshold", "segment"],
+            "state": "up",
+            "ops": [{"name": "threshold"}, {"name": "segment"}],
             "op_count": 2,
             "error": None,
-            "single_op": False,
         },
     ]
-    monkeypatch.setattr("biopb._algorithms.statuses", lambda: fake)
+    monkeypatch.setattr(_ROWS, lambda self, **kw: fake)
     status, _h, body = _get(f"{control}/api/algorithms")
     assert status == 200
     assert json.loads(body)["servers"] == fake
 
 
-def test_api_algorithms_folds_in_kernel_plugins(control, monkeypatch):
-    # The kernel-plugin "bring your own tool" listing (biopb-mcp#92) rides in the
-    # same payload under `plugins`, from the stubbed core inspector.
-    monkeypatch.setattr("biopb._algorithms.statuses", list)
-    fake_plugins = {
-        "dir": "/home/u/.config/biopb/kernel",
-        "files": [{"name": "tool.py", "summary": "My tool."}],
-        "entry_points": [{"name": "lab", "dist": "lab-tools 1.2"}],
-    }
-    monkeypatch.setattr("biopb._kernel_plugins.summary", lambda: fake_plugins)
-    status, _h, body = _get(f"{control}/api/algorithms")
-    assert status == 200
-    assert json.loads(body)["plugins"] == fake_plugins
-
-
-def test_api_algorithms_plugin_error_degrades_not_500(control, monkeypatch):
-    # A servers sweep succeeds but the plugin inspector blows up: the panel still
-    # returns 200 with an empty plugin listing rather than 500-ing the whole card.
-    monkeypatch.setattr("biopb._algorithms.statuses", list)
-
-    def boom():
-        raise RuntimeError("plugin dir unreadable")
-
-    monkeypatch.setattr("biopb._kernel_plugins.summary", boom)
-    status, _h, body = _get(f"{control}/api/algorithms")
-    assert status == 200
-    assert json.loads(body)["plugins"] == {"dir": "", "files": [], "entry_points": []}
-
-
 def test_api_algorithms_core_error_is_500(control, monkeypatch):
-    def boom():
+    def boom(self, **kw):
         raise RuntimeError("config unreadable")
 
-    monkeypatch.setattr("biopb._algorithms.statuses", boom)
+    monkeypatch.setattr(_ROWS, boom)
     with pytest.raises(urllib.error.HTTPError) as exc:
         _get(f"{control}/api/algorithms")
     assert exc.value.code == 500
 
 
 def test_api_algorithms_is_token_gated(tokened_control, monkeypatch):
-    monkeypatch.setattr("biopb._algorithms.statuses", list)
+    monkeypatch.setattr(_ROWS, lambda self, **kw: [])
     with pytest.raises(urllib.error.HTTPError) as exc:
         _get(f"{tokened_control}/api/algorithms")
     assert exc.value.code == 401
@@ -1070,20 +1050,20 @@ def test_session_proxy_allowlists_api_surface(control, upstream):
         assert exc.value.code == 404, path
 
 
-def test_session_console_is_proxied_on_a_loopback_control(control, upstream):
-    # The user console (code into the session's kernel) rides the same hop as the
+def test_session_chat_is_proxied_on_a_loopback_control(control, upstream):
+    # A chat turn (code into the session's kernel) rides the same hop as the
     # data API, under its own root. The `control` fixture binds 127.0.0.1, which
     # is what enables it.
     _register_session("s1", upstream)
     req = urllib.request.Request(
-        f"{control}/session/s1/console/execute",
-        data=b'{"code": "1 + 1"}',
+        f"{control}/session/s1/chat/turn",
+        data=b'{"text": "hi"}',
         method="POST",
         headers={"Content-Type": "application/json"},
     )
     with urllib.request.urlopen(req, timeout=5) as resp:
         echoed = json.loads(resp.read())
-    assert echoed["path"] == "/console/execute"
+    assert echoed["path"] == "/chat/turn"
     assert echoed["method"] == "POST"
 
 
@@ -1109,21 +1089,21 @@ def test_session_roots_are_reachable_with_a_token(tokened_control, upstream):
     assert json.loads(body)["path"] == "/api/jobs"
 
 
-def test_session_console_is_gated_like_the_api(control, upstream):
-    # The console is the one proxied path whose payload is arbitrary code, so it
-    # must not be reachable by DNS-rebinding or as a cross-site write. Same gate,
+def test_session_chat_is_gated_like_the_api(control, upstream):
+    # Chat is the one proxied path whose payload runs arbitrary code, so it must
+    # not be reachable by DNS-rebinding or as a cross-site write. Same gate,
     # asserted here because a new root that slipped past _guarded would be an
     # unauthenticated execute.
     _register_session("s1", upstream)
     with pytest.raises(urllib.error.HTTPError) as exc:
         _get(
-            f"{control}/session/s1/console/execute",
+            f"{control}/session/s1/chat/turn",
             headers={"Host": "evil.example:8813"},
         )
     assert exc.value.code == 421
 
     req = urllib.request.Request(
-        f"{control}/session/s1/console/execute",
+        f"{control}/session/s1/chat/turn",
         data=b"{}",
         method="POST",
         headers={"Sec-Fetch-Site": "cross-site", "Content-Type": "application/json"},
@@ -1133,15 +1113,14 @@ def test_session_console_is_gated_like_the_api(control, upstream):
     assert exc.value.code == 403
 
 
-@pytest.mark.parametrize("path", ["console/execute", "chat/turn"])
+@pytest.mark.parametrize("path", ["chat/turn"])
 def test_the_execute_capable_roots_are_post_only(control, upstream, path):
     # The CSRF gate skips safe methods (correctly -- safe verbs must not change
     # state), so a cross-site GET is forwarded unchecked to whatever the child
-    # serves. `<img src=".../console/execute?code=...">` is the shape. Pinning
-    # POST here means that claim does not depend on the child's method list --
-    # which is the whole point, and is why chat is checked too: it is the same
-    # RCE behind the same gate, and a promise about another package's route
-    # table is exactly what this refuses to rely on.
+    # serves. `<img src=".../chat/turn?text=...">` is the shape. Pinning POST
+    # here means that claim does not depend on the child's method list: a
+    # promise about another package's route table is exactly what this refuses
+    # to rely on.
     _register_session("s1", upstream)
     for method in ("GET", "HEAD", "PUT", "DELETE"):
         req = urllib.request.Request(f"{control}/session/s1/{path}?x=1", method=method)
@@ -1154,21 +1133,32 @@ def test_the_execute_capable_roots_are_post_only(control, upstream, path):
     assert status == 200
 
 
-# --- launching a viewer session (POST /api/sessions/new) ------------------ #
+# --- launching a session (POST /api/sessions/new) ------------------------- #
 
 
 def _launchable(monkeypatch, tmp_path, argv):
-    """Make the launch verb runnable in a test: a display this control believes
-    in, an isolated state tree for the child log, and *argv* standing in for the
-    real `python -m biopb_mcp.mcp --view`."""
+    """Make the launch verb runnable in a test: an isolated state tree for the
+    child log, and *argv* standing in for the real session command."""
     from biopb_control import _control
 
     monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path / "state"))
-    monkeypatch.setattr(_control, "_display_available", lambda: True)
-    monkeypatch.setattr(_control, "_viewer_argv", lambda: argv)
+    monkeypatch.setattr(_control, "_session_argv", lambda: argv)
 
 
-def _launch_app(tmp_path, console_enabled=True):
+def _registering_child_script(session_id: str) -> str:
+    """Source for a stand-in session child: register under *session_id*,
+    echoing the launch token it was handed, then stay alive like a real
+    session would."""
+    return (
+        "import os, time;"
+        "from biopb import _locations, _sessions;"
+        f"_sessions.register({session_id!r}, port=1234, pid=os.getpid(),"
+        " launch_token=os.environ[_locations.MCP_LAUNCH_TOKEN_ENV]);"
+        "time.sleep(30)"
+    )
+
+
+def _launch_app(tmp_path, loopback_bound=True):
     spec = DataPlaneSpec(
         config=tmp_path / "config.json",
         grpc_host="127.0.0.1",
@@ -1179,95 +1169,119 @@ def _launch_app(tmp_path, console_enabled=True):
         DataPlaneSupervisor(spec),
         8.0,
         f"http://127.0.0.1:{_free_port()}",
-        console_enabled=console_enabled,
+        loopback_bound=loopback_bound,
     )
 
 
-@pytest.mark.parametrize(
-    "console_enabled, has_display, can_start, reason_hint",
-    [
-        (True, True, True, None),
-        # A viewer this control started would open on the server's display.
-        (False, True, False, "loopback"),
-        # Nowhere to put a window: it would fail every time, so do not offer it.
-        (True, False, False, "display"),
-        (False, False, False, "loopback"),  # the bind is reported first
-    ],
-)
-def test_session_launch_gate(
-    monkeypatch, console_enabled, has_display, can_start, reason_hint
-):
+def test_session_argv_is_an_agentless_http_session():
+    # `--port 0` is what makes the child agentless and self-publishing, and
+    # `--start-kernel` what makes its registration mean "ready". No `--view`: the
+    # session's config decides on a viewer, and it runs without one where it
+    # cannot have one.
     from biopb_control import _control
 
-    monkeypatch.setattr(_control, "_display_available", lambda: has_display)
-    ok, reason = _control._session_launch_gate(console_enabled)
-    assert ok is can_start
-    if can_start:
-        assert reason is None
-    else:
-        assert reason and reason_hint in reason
+    argv = _control._session_argv()
+    assert argv[1:3] == ["-m", "biopb_mcp.mcp"]
+    assert "--view" not in argv
+    assert argv[argv.index("--transport") + 1] == "http"
+    assert argv[argv.index("--port") + 1] == "0"
+    assert "--start-kernel" in argv
 
 
-def test_api_status_advertises_the_launch_verb(tmp_path, monkeypatch):
-    # The dashboard shows the button only where the control says it works, and
-    # shows the refusal in its place otherwise -- so both ride /api/status.
+@pytest.mark.parametrize("loopback_bound", [True, False])
+def test_start_session_is_offered_on_any_bind(tmp_path, monkeypatch, loopback_bound):
+    # No display or bind gate: a session without a viewer is still useful.
     from starlette.testclient import TestClient
 
     from biopb_control import _control
 
-    monkeypatch.setattr(_control, "_display_available", lambda: True)
-    with TestClient(_launch_app(tmp_path), base_url="http://127.0.0.1:8813") as client:
-        body = client.get("/api/status").json()
-        assert body["can_start_session"] is True
-        assert body["start_session_blocked"] is None
-
-    monkeypatch.setattr(_control, "_display_available", lambda: False)
-    with TestClient(_launch_app(tmp_path), base_url="http://127.0.0.1:8813") as client:
-        body = client.get("/api/status").json()
-        assert body["can_start_session"] is False
-        assert "display" in body["start_session_blocked"]
-
-
-@pytest.mark.parametrize("console_enabled", [True, False])
-def test_start_session_is_refused_when_gated(tmp_path, monkeypatch, console_enabled):
-    # 409, not 403: the request is fine, this deployment just cannot serve it --
-    # and nothing is spawned, which is the part that matters.
-    from starlette.testclient import TestClient
-
-    from biopb_control import _control
-
-    spawned = []
-    monkeypatch.setattr(_control, "_display_available", lambda: False)
-    monkeypatch.setattr(
-        _control.subprocess, "Popen", lambda *a, **k: spawned.append(a) or None
-    )
-    app = _launch_app(tmp_path, console_enabled=console_enabled)
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    monkeypatch.setattr(_control, "_launch_session", lambda wait: {"state": "starting"})
+    app = _launch_app(tmp_path, loopback_bound=loopback_bound)
     with TestClient(app, base_url="http://127.0.0.1:8813") as client:
         resp = client.post("/api/sessions/new")
-        assert resp.status_code == 409
-        assert resp.json()["error"]
-    assert spawned == []
+        assert resp.status_code == 200
+        assert resp.json() == {"state": "starting"}
 
 
 def test_start_session_waits_for_the_child_to_register(tmp_path, monkeypatch):
-    # The readiness signal is the child publishing itself, matched on its own
-    # pid: `--view` registers only after its napari window is really open, so a
-    # record under that pid is the proof the launch worked. The stand-in child
-    # does exactly that, then stays alive as a real viewer would.
+    # The readiness signal is the child publishing itself, matched on the launch
+    # token we handed it: `--view` registers only after its napari window is
+    # really open, so a record carrying our token is the proof the launch
+    # worked. The stand-in child does exactly that, then stays alive as a real
+    # viewer would.
     from starlette.testclient import TestClient
 
-    child = (
-        "import os, time;"
-        "from biopb import _sessions;"
-        "_sessions.register('launched', port=1234, pid=os.getpid());"
-        "time.sleep(30)"
-    )
+    child = _registering_child_script("launched")
     _launchable(monkeypatch, tmp_path, [sys.executable, "-c", child])
     with TestClient(_launch_app(tmp_path), base_url="http://127.0.0.1:8813") as client:
         body = client.post("/api/sessions/new").json()
     assert body["state"] == "started"
     assert body["session_id"] == "launched"
     assert body["observe_url"] == "/session/launched/observe"
+
+
+def test_a_viewer_behind_a_trampoline_is_still_recognised(tmp_path, monkeypatch):
+    # biopb#1084. On Windows a venv's Scripts/python.exe is often a trampoline
+    # (uv's, pip's console-script launchers) that re-spawns the real interpreter
+    # and waits on it, so the pid we hold is the stub's and the pid the viewer
+    # registers is its own. Matching on the pid never fired: the launch waited
+    # out its whole timeout over a window that was already open, and a session
+    # stopped inside that window came back as "exited before it opened".
+    from starlette.testclient import TestClient
+
+    from biopb_control import _control
+
+    grandchild = _registering_child_script("behind-a-stub")
+    # The stub: spawn the real thing under a pid of its own, then wait on it and
+    # forward its exit code, exactly as the trampolines do.
+    stub = (
+        "import subprocess, sys;"
+        f"sys.exit(subprocess.run([sys.executable, '-c', {grandchild!r}]).returncode)"
+    )
+    _launchable(monkeypatch, tmp_path, [sys.executable, "-c", stub])
+    monkeypatch.setattr(_control, "_SESSION_START_TIMEOUT", 30.0)
+    with TestClient(_launch_app(tmp_path), base_url="http://127.0.0.1:8813") as client:
+        body = client.post("/api/sessions/new").json()
+    assert body["state"] == "started"
+    assert body["session_id"] == "behind-a-stub"
+
+
+def test_another_launch_in_flight_is_not_mistaken_for_ours(tmp_path, monkeypatch):
+    # The token is what keeps a concurrent viewer from being reported as this
+    # launch's -- the property the pid match was there for, and the reason a
+    # record carrying *someone else's* token never falls back to a pid compare.
+    from biopb_control import _control
+
+    _launchable(
+        monkeypatch, tmp_path, [sys.executable, "-c", "import time; time.sleep(30)"]
+    )
+    monkeypatch.setattr(_control, "_SESSION_START_TIMEOUT", 1.0)
+
+    calls = []
+    real_popen = _control.subprocess.Popen
+
+    def _spy(argv, **kwargs):
+        proc = real_popen(argv, **kwargs)
+        # Somebody else's viewer publishes itself mid-launch, on our pid.
+        _sessions.register(
+            "not-ours",
+            port=1234,
+            pid=proc.pid,
+            launch_token="a-different-launch",
+        )
+        calls.append(proc)
+        return proc
+
+    monkeypatch.setattr(_control.subprocess, "Popen", _spy)
+    try:
+        body = _control._launch_session(1.0)
+        assert body["state"] == "starting"
+        assert "session_id" not in body
+    finally:
+        for proc in calls:
+            proc.kill()
 
 
 def test_start_session_reports_a_child_that_dies_first(tmp_path, monkeypatch):
@@ -1299,7 +1313,7 @@ def test_each_launch_gets_its_own_log(tmp_path, monkeypatch):
     with TestClient(_launch_app(tmp_path), base_url="http://127.0.0.1:8813") as client:
         old = client.post("/api/sessions/new").json()
         monkeypatch.setattr(
-            _control, "_viewer_argv", lambda: [sys.executable, "-c", second]
+            _control, "_session_argv", lambda: [sys.executable, "-c", second]
         )
         new = client.post("/api/sessions/new").json()
 
@@ -1366,7 +1380,7 @@ def test_the_child_is_told_where_its_log_went(tmp_path, monkeypatch):
 
     _launchable(monkeypatch, tmp_path, [sys.executable, "-c", "pass"])
     monkeypatch.setattr(_control.subprocess, "Popen", _spy)
-    _control._launch_viewer(5.0)
+    _control._launch_session(5.0)
     logged = seen["env"][_locations.MCP_SESSION_LOG_ENV]
     assert Path(logged).name.startswith("viewer-")
     assert Path(logged).exists()
@@ -1383,7 +1397,7 @@ def test_start_session_returns_starting_when_the_child_is_slow(tmp_path, monkeyp
     _launchable(
         monkeypatch, tmp_path, [sys.executable, "-c", "import time; time.sleep(30)"]
     )
-    monkeypatch.setattr(_control, "_VIEWER_START_TIMEOUT", 1.0)
+    monkeypatch.setattr(_control, "_SESSION_START_TIMEOUT", 1.0)
     with TestClient(_launch_app(tmp_path), base_url="http://127.0.0.1:8813") as client:
         body = client.post("/api/sessions/new").json()
     assert body["state"] == "starting"
@@ -1405,48 +1419,16 @@ def test_launched_viewer_is_detached_from_the_control(tmp_path, monkeypatch):
 
     _launchable(monkeypatch, tmp_path, [sys.executable, "-c", "pass"])
     monkeypatch.setattr(_control.subprocess, "Popen", _spy)
-    _control._launch_viewer(5.0)
+    _control._launch_session(5.0)
     if sys.platform == "win32":
         assert seen["creationflags"]
     else:
         assert seen["start_new_session"] is True
 
 
-@pytest.mark.parametrize("console_enabled, expected", [(True, 502), (False, 404)])
-def test_console_root_follows_the_switch(tmp_path, console_enabled, expected):
-    # The behavioral half of the local-mode gate, asserted on build_app so the
-    # "off" case needs no public listener. The session child is deliberately a
-    # closed port, which separates the two outcomes cleanly: 404 means the root
-    # is not a route at all (nothing was forwarded), 502 means it was routed and
-    # only the child was absent. Answering the question with no upstream also
-    # keeps this independent of what a child would reply.
-    from starlette.testclient import TestClient
-
-    _sessions.register("s1", host="127.0.0.1", port=_free_port(), pid=os.getpid())
-    spec = DataPlaneSpec(
-        config=tmp_path / "config.json",
-        grpc_host="127.0.0.1",
-        grpc_port=_free_port(),
-        server_log=tmp_path / "server.log",
-    )
-    app = build_app(
-        DataPlaneSupervisor(spec),
-        8.0,
-        f"http://127.0.0.1:{_free_port()}",
-        console_enabled=console_enabled,
-    )
-    # A loopback base_url: TestClient otherwise sends `Host: testserver`, which
-    # the gate refuses (421) before the routing question under test is reached.
-    with TestClient(app, base_url="http://127.0.0.1:8813") as client:
-        resp = client.post("/session/s1/console/execute", json={"code": "1 + 1"})
-        assert resp.status_code == expected
-        # The data API is unaffected either way -- the switch narrows one root.
-        assert client.get("/session/s1/api/jobs").status_code == 502
-
-
-@pytest.mark.parametrize("console_enabled", [True, False])
-def test_stop_verb_rides_the_api_root_not_the_local_gate(tmp_path, console_enabled):
-    # Stopping a session is deliberately NOT gated like the console and chat:
+@pytest.mark.parametrize("loopback_bound", [True, False])
+def test_stop_verb_rides_the_api_root_not_the_local_gate(tmp_path, loopback_bound):
+    # Stopping a session is deliberately NOT gated like chat:
     # it is not an execute surface, it lives under `api`, and `api` already
     # carries a comparably destructive verb in /api/kernel/restart. 502 both
     # ways means routed to a child that is not there -- the point is that the
@@ -1465,17 +1447,16 @@ def test_stop_verb_rides_the_api_root_not_the_local_gate(tmp_path, console_enabl
         DataPlaneSupervisor(spec),
         8.0,
         f"http://127.0.0.1:{_free_port()}",
-        console_enabled=console_enabled,
+        loopback_bound=loopback_bound,
     )
     with TestClient(app, base_url="http://127.0.0.1:8813") as client:
         assert client.post("/session/s1/api/shutdown").status_code == 502
 
 
-@pytest.mark.parametrize("console_enabled, expected", [(True, 502), (False, 404)])
-def test_chat_root_follows_the_same_switch(tmp_path, console_enabled, expected):
+@pytest.mark.parametrize("loopback_bound, expected", [(True, 502), (False, 404)])
+def test_chat_root_follows_the_same_switch(tmp_path, loopback_bound, expected):
     # The chat turn runs arbitrary code in the session kernel, so it is the same
     # RCE the allowlist exists to keep off this origin and rides the same gate.
-    # The flag reads "console" but means "this control is loopback-bound".
     from starlette.testclient import TestClient
 
     _sessions.register("s1", host="127.0.0.1", port=_free_port(), pid=os.getpid())
@@ -1489,7 +1470,7 @@ def test_chat_root_follows_the_same_switch(tmp_path, console_enabled, expected):
         DataPlaneSupervisor(spec),
         8.0,
         f"http://127.0.0.1:{_free_port()}",
-        console_enabled=console_enabled,
+        loopback_bound=loopback_bound,
     )
     with TestClient(app, base_url="http://127.0.0.1:8813") as client:
         resp = client.post("/session/s1/chat/turn", json={"text": "hi"})
@@ -1509,17 +1490,17 @@ class _StopServe(Exception):
     "host, expected",
     [("127.0.0.1", True), ("localhost", True), ("0.0.0.0", False), ("::", False)],
 )
-def test_bind_address_decides_the_console(
+def test_bind_address_decides_the_local_roots(
     monkeypatch, tmp_path, upstream, host, expected
 ):
     # The gate reads *this* listener's bind through the shared predicate: a
-    # loopback control enables the console, a network-reachable one does not --
+    # loopback control proxies the local roots, a network-reachable one does not --
     # regardless of --remote or the data plane's own bind. Asserted on the call
     # into build_app, so the "public" cases need no public listener.
     captured = {}
 
-    def _capture(*_args, console_enabled, **_kwargs):
-        captured["console"] = console_enabled
+    def _capture(*_args, loopback_bound, **_kwargs):
+        captured["loopback"] = loopback_bound
         raise _StopServe
 
     monkeypatch.setattr("biopb_control._control.build_app", _capture)
@@ -1537,7 +1518,7 @@ def test_bind_address_decides_the_console(
             ensure_timeout=8.0,
             data_web_url=upstream,
         )
-    assert captured["console"] is expected
+    assert captured["loopback"] is expected
 
 
 def test_unknown_session_returns_404(control):
@@ -1926,19 +1907,3 @@ def test_mcp_config_put_rejects_unhashable_enum_value_as_422_not_500(control, mc
     )
     assert status == 422, payload
     assert ("transport", "kind") in {tuple(e["path"]) for e in payload["errors"]}
-
-
-def test_mcp_config_put_rejects_inverted_health_poll(control, mcp_home):
-    # The cross-field rule is declared once, in biopb-mcp, and reaches this
-    # endpoint through the shared checker -- this handler restates nothing, so a
-    # rule added there cannot silently pass here (biopb/biopb#34).
-    status, payload = _put(
-        f"{control}/api/mcp_config",
-        {"tensor": {"health_poll_min_interval": 90, "health_poll_max_interval": 10}},
-    )
-    assert status == 422, payload
-    paths = {tuple(e["path"]) for e in payload["errors"]}
-    # Both ends of the range are flagged, so the form can highlight the pair the
-    # user has to reconcile (and the load path clamps both).
-    assert ("tensor", "health_poll_min_interval") in paths
-    assert ("tensor", "health_poll_max_interval") in paths

@@ -1,6 +1,6 @@
 """H&E stain separation as benchmark data: how much of each stain is here?
 
-A deferred-tier case (`docs/skill-candidates.md`). Colour deconvolution was
+A deferred-tier case. Colour deconvolution was
 **prescreened and dropped** 2026-08-03 for the shipped catalog — both cold
 Sonnet arms produced Ruifrok & Johnston unprompted, cited the paper, and
 cross-checked themselves against `skimage.color.rgb2hed`. It is one call plus a

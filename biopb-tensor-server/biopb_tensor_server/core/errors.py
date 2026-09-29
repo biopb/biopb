@@ -54,11 +54,12 @@ class SourceResolveRetriableError(SourceUnresolvedError):
 
 
 class TensorResolutionError(ValueError):
-    """A field/tensor within a source could not be resolved to an adapter.
+    """The read request is the caller's mistake, not a server bug.
 
-    The base for the *terminal client-error* taxonomy on the read path
-    (``get_tensor_adapter``): a bad ``array_id`` is the caller's mistake, not a
-    server bug. Subclasses ``ValueError`` on purpose -- like
+    The base for the *terminal client-error* taxonomy on the read path: a bad
+    ``array_id`` (``get_tensor_adapter``) or a malformed slice/scale hint
+    (:class:`InvalidReadRequest`) is something only the caller can fix.
+    Subclasses ``ValueError`` on purpose -- like
     ``SourceUnresolvedError`` -- so the read paths' existing ``except ValueError``
     guards still catch it and every adapter that has not yet adopted the typed
     taxonomy degrades gracefully.
@@ -105,6 +106,24 @@ class InvalidTensorId(TensorResolutionError):
     grpc_code = "INVALID_ARGUMENT"
 
 
+class InvalidReadRequest(TensorResolutionError):
+    """The request's own slice/scale parameters are malformed for this tensor.
+
+    Canonical gRPC ``INVALID_ARGUMENT``. Distinct from :class:`InvalidTensorId`,
+    which is about the id: here the tensor resolved fine and the caller asked it
+    for something it cannot answer -- a scale hint of the wrong rank, a slice
+    running past the shape.
+
+    Typed because these are raised deep in read planning (``core.chunk``'s
+    ``normalized_slice_bounds`` / ``normalized_scale_hint``), where a bare
+    ``ValueError`` reached the boundary's catch-all and was reported as a
+    ``FlightInternalError`` -- a caller's mistake dressed as a server bug, which
+    a client has no reason to stop retrying.
+    """
+
+    grpc_code = "INVALID_ARGUMENT"
+
+
 class UnknownResolutionError(TensorResolutionError):
     """A resolution-path exception that could not be classified.
 
@@ -121,6 +140,82 @@ class UnknownResolutionError(TensorResolutionError):
     """
 
     grpc_code = "UNKNOWN"
+
+
+class StaleChunkError(TensorResolutionError):
+    """A chunk_id's content_version no longer matches the source's current one.
+
+    The id still decodes to a well-formed (array_id, bounds) -- ``chunk.py``'s
+    versioning comment promises that mismatch makes the OLD cache entry
+    "un-lookupable, not mis-served" (biopb/biopb#178), but that guarantee is
+    cache-key-only: nothing on the read-dispatch path used to compare the
+    version a client is holding against the source's current one, so a stale
+    chunk_id decoded fine and got read against whatever is registered under
+    that array_id now -- silently wrong pixels when the new bounds still fit
+    the new shape, a confusing bounds-validation crash when they don't.
+
+    Raised by :meth:`TensorAdapter.resolve_chunk_data` before any bytes are
+    read, so a re-registration turns a held chunk_id into a clean, terminal
+    error instead of either failure mode. Canonical gRPC NOT_FOUND: the chunk
+    this id names no longer exists at that identity, so the client's fix is to
+    re-request GetFlightInfo/the read plan, not to retry the same id.
+    """
+
+    grpc_code = "NOT_FOUND"
+
+
+class UploadNotPublishedError(TensorResolutionError):
+    """A read of an upload whose producer has not published it yet (PENDING).
+
+    Canonical gRPC ``FAILED_PRECONDITION``: the source exists and the read is
+    well-formed, but the state it is in cannot answer. Retrying is the right
+    move once the producer sets READY, which is exactly what a poller on
+    ``upload_status`` is waiting for -- so this must not read as "no such
+    chunk".
+
+    The gate exists because READY is what makes a hole meaningful: after it, a
+    chunk that never arrived reads as zeros, and before it that same chunk is
+    one still in flight. Serving zeros for both would hand a consumer a
+    half-written result it cannot tell from a finished one.
+    """
+
+    grpc_code = "FAILED_PRECONDITION"
+
+    def __init__(self, source_id: str) -> None:
+        super().__init__(
+            f"Upload '{source_id}' is not readable yet: it is PENDING, and its "
+            "producer has not set READY. Poll `upload_status` on the "
+            "descriptor GetFlightInfo returns.",
+            reason="upload_not_published",
+        )
+        self.source_id = source_id
+
+
+class UploadDiscardedReadError(TensorResolutionError):
+    """A read of an upload whose owner gave up on it (DISCARDED).
+
+    Canonical gRPC ``FAILED_PRECONDITION``, the same code as
+    :class:`UploadNotPublishedError`: the source exists and the read is
+    well-formed, but the state it is in cannot answer, and retrying is
+    pointless -- there is no later state a discard leads to. A still-unwinding
+    reader gets this same reason a writer does (biopb/biopb#1048), rather than
+    the tombstone reading as "no such chunk".
+
+    Distinct from :class:`UploadDiscardedError`, which is the *write*-path
+    exception (off this hierarchy, wire-mapped to ``FlightCancelledError`` by
+    the DoPut boundary) -- a read needs the read boundary's typed taxonomy
+    instead, so its ``grpc_code``/``reason`` reach the client's ``extra_info``.
+    """
+
+    grpc_code = "FAILED_PRECONDITION"
+
+    def __init__(self, source_id: str, reason: str = "") -> None:
+        super().__init__(
+            f"Upload discarded for source '{source_id}'"
+            + (f": {reason}" if reason else ""),
+            reason="upload_discarded",
+        )
+        self.source_id = source_id
 
 
 class UpstreamConfigError(ValueError):
@@ -147,4 +242,101 @@ class WriteNotSupportedError(Exception):
     the ``ValueError`` hierarchy on purpose so it is never swallowed by the
     read-path ``except ValueError`` guards -- a write rejection is unrelated to
     read planning.
+    """
+
+
+class UploadClosedError(Exception):
+    """A write to an upload that no longer accepts them -- discarded or sealed.
+
+    The shared base of :class:`UploadDiscardedError` and
+    :class:`UploadSealedError`, so a boundary that maps both to the same wire
+    error (the DoPut path's ``FlightCancelledError``) catches one type instead
+    of enumerating the pair. Off the ``ValueError`` hierarchy for the same
+    reason as :class:`WriteNotSupportedError`. Not raised directly -- catch one
+    of the two subclasses to discriminate why.
+
+    ``wire_reason`` and ``state`` are what the boundary puts in the Flight
+    error's ``extra_info``, so a client raises one typed exception with the
+    terminal state as a field rather than parsing it out of the message
+    (biopb/biopb#1048 step 7). The gRPC code itself is not part of that
+    payload: both subclasses map to ``FlightCancelledError`` unconditionally,
+    so it is implied by the exception type, not data a client would switch on.
+
+    Declares no ``wire_reason``/``state`` of its own -- never raised directly,
+    so every instance is one of the subclasses below, which each supply both.
+    """
+
+
+class UploadDiscardedError(UploadClosedError):
+    """A write to an upload its owner has given up on (biopb/biopb#1).
+
+    Raised by ``WritableSource.put_chunk`` once the source is discarded, so a
+    job still unwinding learns it was given up on rather than that its source
+    is missing. The reason rides in the message.
+    """
+
+    wire_reason = "upload_discarded"
+    state = "DISCARDED"
+
+    def __init__(self, source_id: str, reason: str = "") -> None:
+        super().__init__(
+            f"Upload discarded for source '{source_id}'"
+            + (f": {reason}" if reason else "")
+        )
+        self.source_id = source_id
+        self.reason = reason
+
+
+class UploadSealedError(UploadClosedError):
+    """A write to an upload its producer has already published.
+
+    READY seals and publishes in one move, so by the time a late write lands a
+    consumer may already have read what is there -- and cached it, on either
+    side of the wire. Accepting the write would change bytes someone has seen
+    and cannot be told about.
+    """
+
+    wire_reason = "upload_sealed"
+    state = "READY"
+
+    def __init__(self, source_id: str) -> None:
+        super().__init__(
+            f"Upload already finished for source '{source_id}': it was sealed "
+            "by `set_upload_status` and accepts no further chunks."
+        )
+        self.source_id = source_id
+
+
+class UploadTransitionError(ValueError):
+    """``set_upload_status`` was asked for a state the upload cannot move to.
+
+    Backwards down the PENDING -> READY ladder, or to a state that
+    is not settable at all (PENDING, or an unrecognized one). A caller's
+    mistake, so it surfaces as a terminal Flight error rather than a refusal
+    the upload path retries -- unlike ``UploadClosedError``, which says the
+    upload is over and the caller should stop.
+
+    ``ValueError`` so the boundary's existing guards catch it; it is never on
+    the read path, where the ``TensorResolutionError`` taxonomy lives.
+    """
+
+
+class AnnotationStoreError(RuntimeError):
+    """The persistent catalog was configured but could not be opened.
+
+    Fatal on purpose. ``catalog.persist`` is a promise about durability, and the
+    alternative to refusing here is serving normally while every ROI a user
+    draws goes to an in-memory catalog and disappears at the next restart --
+    loss that is discovered a day later, by which time the work is gone.
+
+    Every cause survives a retry and is a decision for a person: a corrupt file
+    wants restoring, a permission error wants fixing, a file written by a newer
+    DuckDB wants the versions matched, and a held lock means another server is
+    already serving this catalog. Running anyway is wrong for all four; the
+    operator who genuinely wants a session-only store says so with
+    ``catalog.persist = false``.
+
+    Named for annotations because they are the rows the promise is about -- a
+    server not serving them degrades to an in-memory catalog instead of raising
+    this, since nothing else in the file is load-bearing.
     """

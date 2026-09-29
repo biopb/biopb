@@ -22,8 +22,67 @@ export interface DataSourceDescriptor {
   source_type: string;
   /** Raw OME-NGFF JSON string, or null. */
   metadata_json: string | null;
+  /**
+   * Deterministic: does a real, hydrated adapter back this source right now?
+   * False only for an unresolved cloud/synced-folder source awaiting an
+   * explicit `resolve`. Unlike a residency/warm-state flag, this never flips
+   * back to false once true for the life of the server process.
+   */
+  is_resolved: boolean;
   /** Structural entry per tensor: array_id, dim_labels, shape, dtype. */
   tensors: TensorDescriptor[];
+}
+
+/**
+ * One resolve or warm job on one source, as `/api/sources/{id}/{kind}/status`
+ * reports it.
+ *
+ * Both hydrate cloud / synced-folder data and both can run for minutes, so they
+ * are jobs rather than requests: start, poll, optionally cancel. The recall
+ * lives on the server and outlives any one HTTP request.
+ */
+export interface SourceJobStatus {
+  kind: "resolve" | "warm";
+  source_id: string;
+  state: "running" | "done" | "error" | "cancelled";
+  /**
+   * Kind-specific counters. Resolve reports `elapsed_seconds`, `target_name`
+   * and `target_bytes`; warm reports files/bytes done vs total plus
+   * `current_name`. Empty until the first heartbeat lands.
+   */
+  progress: Partial<SourceJobProgress>;
+  /** Reason, on `state === "error"` only. */
+  error: string | null;
+  elapsed_seconds: number;
+  /**
+   * Set the moment a cancel is asked for -- before `state` turns, which only
+   * happens once the server-side worker unwinds. Use this, not the state, to
+   * stop offering a cancel the user has already clicked.
+   */
+  cancel_requested: boolean;
+  /** Only on the response that started it: false means it joined one running. */
+  started?: boolean;
+}
+
+/** The union of both job kinds' progress counters; each reports its own subset. */
+export interface SourceJobProgress {
+  elapsed_seconds: number;
+  /** Resolve: basename of the recall target. */
+  target_name: string;
+  /** Resolve: size of the recall target, 0 when unknown. */
+  target_bytes: number;
+  /**
+   * Warm: files discovered under the source. **0 on a finished warm means the
+   * source had nothing to warm** -- it is single-file, and resolve already
+   * recalled it. That is the server's own structural answer, so no client
+   * keeps its own list of which source types are multi-file.
+   */
+  files_total: number;
+  files_done: number;
+  bytes_total: number;
+  bytes_done: number;
+  /** Warm: the file being recalled right now. */
+  current_name: string;
 }
 
 /** Parameters for a single array-slice request. */
@@ -104,6 +163,7 @@ export interface DiagnosticsSnapshot {
 export interface BackendHealth {
   status?: string;
   source_count?: number;
+  /** Whether the server offers a catalog; false means every catalog surface refuses. */
   metadata_db_enabled?: boolean;
   writable?: boolean;
   uptime_seconds?: number;
@@ -276,6 +336,20 @@ export interface TileInfo {
    */
   sel_axes: TileAxis[];
   levels: TileLevel[];
+  /**
+   * A label set only: which of its image's axes each of its own indexes.
+   *
+   * `[0, 2, 3, 4]` for a `T Z Y X` set of a `T C Z Y X` image. The server
+   * states it because the two tensors do not number their axes alike -- a set
+   * spans the image's *non-channel* extent -- and a client matching them by
+   * name gets `t`/`z` right and an unnamed axis wrong, which reads frame 0 of
+   * a timelapse where frame 40 was asked for. That is a picture rather than an
+   * error, so it is not a rule worth re-deriving.
+   *
+   * Absent on an image, and on a server that predates the field; see
+   * {@link labelSelection}, which falls back to the extent rule there.
+   */
+  image_axes?: number[];
   /**
    * The ladder the *server* advertises, which is what each rung of `levels` is
    * read from: the coarsest entry whose `scale_hint` divides the rung's scale,

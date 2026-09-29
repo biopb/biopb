@@ -3,23 +3,23 @@
 Covers the daemon liveness/health probe, the `control status` / `control run`
 argv wiring, mode resolution, and the bind/TLS/token derivations. The lower-level
 detached-daemon lifecycle helpers those commands call live in
-:mod:`biopb._lifecycle.daemon` (``daemon_test.py``); the data-plane commands that
+:mod:`biopb.lifecycle.daemon` (``daemon_test.py``); the data-plane commands that
 used to live under `biopb server` moved with biopb/biopb#615 -- cache-stats to
-``cli_test.py`` (it is a `biopb tensor` command now) and migrate-config to
-biopb-tensor-server's own suite. OS calls are mocked so the tests are
+``cli_test.py`` (it is a `biopb tensor` command now). OS calls are mocked so the tests are
 deterministic and fast on any platform; time.sleep is neutralized.
 """
 
 import inspect
 import json
 import os
+import sys
 from unittest.mock import MagicMock, patch
 
 import biopb.cli as cli
 import pytest
 import typer
 from biopb import _locations
-from biopb._lifecycle import daemon as _daemon
+from biopb.lifecycle import daemon as _daemon
 from typer.testing import CliRunner
 
 
@@ -176,7 +176,7 @@ class TestControlStatus:
         monkeypatch.setattr(cli, "_require_biopb_control", lambda: None)
         monkeypatch.setattr(cli, "_read_pid_record", lambda *_a: (pid, None))
         # `control status` decides liveness via _is_our_daemon (now backed by
-        # _lifecycle.daemon); stub the verdict directly.
+        # lifecycle.daemon); stub the verdict directly.
         monkeypatch.setattr(cli, "_is_our_daemon", lambda *_a: running)
         monkeypatch.setattr(cli, "_control_endpoint", lambda: ("127.0.0.1", 8813))
         monkeypatch.setattr(cli, "_query_control_health", lambda *_a, **_k: health)
@@ -218,32 +218,6 @@ class TestControlStatus:
         assert res.exit_code == 0, res.output
         for cmd in ("start", "stop", "status", "run"):
             assert cmd in res.output
-
-
-class TestRejectLegacyToml:
-    """`control start` / `run` refuse a pre-#34 `biopb.toml` up front.
-
-    Every config probe further in is best-effort, so without this gate a legacy
-    config surfaces as a plane serving defaults instead of the user's data.
-    """
-
-    def test_legacy_toml_exits_with_the_migration_command(self, tmp_path, capsys):
-        legacy = tmp_path / "biopb.toml"
-        legacy.write_text("[server]\nport = 8815\n")
-        with pytest.raises(typer.Exit) as exc:
-            cli._reject_legacy_toml(legacy)
-        assert exc.value.exit_code == 1
-        assert "migrate-config" in capsys.readouterr().out
-
-    def test_json_config_passes(self, tmp_path):
-        config = tmp_path / "biopb.json"
-        config.write_text('{"server": {"port": 8815}}')
-        cli._reject_legacy_toml(config)  # no raise
-
-    def test_absent_toml_passes(self, tmp_path):
-        # find_config hands back the canonical name when nothing exists; a
-        # never-created .toml path must not be mistaken for a legacy install.
-        cli._reject_legacy_toml(tmp_path / "biopb.toml")
 
 
 class TestControlRunArgv:
@@ -319,6 +293,25 @@ class TestControlRunArgv:
             url_prefix="/node/mantis-051/29847",
         )
         assert argv[argv.index("--url-prefix") + 1] == "/node/mantis-051/29847"
+
+    def test_grpc_external_location_is_forwarded_only_when_set(self, tmp_path):
+        # Also not a secret -- an address, not a credential (biopb/biopb#1158).
+        assert "--grpc-external-location" not in self._argv(
+            tmp_path, grpc_bind="0.0.0.0"
+        )
+        argv = cli._control_run_argv(
+            config=tmp_path / "biopb.json",
+            static_dir=None,
+            web_host="127.0.0.1",
+            base_port=8810,
+            log_level="INFO",
+            data_plane=True,
+            grpc_bind="0.0.0.0",
+            grpc_external_location="grpc://real-host:8815",
+        )
+        assert (
+            argv[argv.index("--grpc-external-location") + 1] == "grpc://real-host:8815"
+        )
 
 
 class TestUiTunnelHint:
@@ -524,6 +517,28 @@ class TestDashboardCommand:
         assert res.exit_code == 0, res.output
         assert start.call_args.kwargs["remote"] is True
 
+    def test_grpc_external_location_flag_forwarded_to_control_start(self, monkeypatch):
+        # biopb/biopb#1158: `dashboard --remote` needs a way to supply the flag
+        # `control_start` now requires on a public bind, or the data plane can
+        # never come up through this command at all.
+        monkeypatch.setattr(cli, "_port_listening", lambda *_a, **_k: False)
+        start = MagicMock(side_effect=typer.Exit(0))
+        monkeypatch.setattr(cli, "control_start", start)
+        with patch("webbrowser.open", lambda url: True):
+            res = CliRunner().invoke(
+                cli.app,
+                [
+                    "dashboard",
+                    "--remote",
+                    "--grpc-external-location",
+                    "grpc://real-host:8815",
+                ],
+            )
+        assert res.exit_code == 0, res.output
+        assert (
+            start.call_args.kwargs["grpc_external_location"] == "grpc://real-host:8815"
+        )
+
     def test_ui_passes_every_control_start_parameter(self, monkeypatch):
         """`dashboard` calls `control_start` as a plain function, so typer applies
         no defaults: a parameter it forgets arrives as the `OptionInfo` sentinel
@@ -589,57 +604,56 @@ class TestVersionCommand:
         return out
 
     def test_reports_release_and_sdk(self, monkeypatch, tmp_path):
-        # Two lines only: the product deployment (marker) and the biopb SDK.
-        marker = tmp_path / "release.version"
-        marker.write_text("1.2.3\n")
-        monkeypatch.setattr(cli, "_RELEASE_VERSION_FILE", marker)
+        # Two lines only: the product deployment and the biopb SDK.
         monkeypatch.setattr(
             cli,
             "_package_version",
-            lambda name: {"biopb": "0.9.3"}.get(name, "not installed"),
+            lambda name: {"biopb": "0.9.3", "biopb-control": "1.2.3"}.get(
+                name, "not installed"
+            ),
         )
 
         res = CliRunner().invoke(cli.app, ["version"])
 
         assert res.exit_code == 0, res.output
         labels = self._labels(res.output)
-        # Deployment version is the marker's contents (the release-v* product
-        # line), distinct from the biopb SDK's own v* version.
+        # The deployment line is a release-v* wheel's own version, distinct from
+        # the biopb SDK's v* version.
         assert labels["release"] == "1.2.3"
         assert labels["biopb"] == "0.9.3"
-        # The product wheels are no longer listed individually — they all share
-        # the release version, so the marker stands in for the set.
+        # The product wheels are not listed individually — they all share the
+        # release version, so one stands in for the set.
         assert set(labels) == {"release", "biopb"}
         assert "biopb-tensor-server" not in labels
         assert "biopb-mcp" not in labels
 
-    def test_release_version_unknown_when_marker_absent(self, monkeypatch, tmp_path):
-        # A dev checkout / non-installer setup has no marker: report 'unknown',
-        # never crash.
-        monkeypatch.setattr(cli, "_RELEASE_VERSION_FILE", tmp_path / "missing.version")
+    def test_the_installer_marker_is_not_read_here(self):
+        # Why this is metadata: the marker is user-global, so running from a dev
+        # venv printed that venv's SDK beside a different installation's
+        # deployment. It stays on disk for the auto-updater, which reads it
+        # itself (biopb_mcp.mcp._update).
+        assert not hasattr(cli, "_RELEASE_VERSION_FILE")
+        assert not hasattr(cli, "_read_release_version")
+
+    def test_any_member_of_the_set_answers(self, monkeypatch):
+        # One release-v* tag versions them together, so a partial install (no
+        # control) still reports the deployment.
+        monkeypatch.setattr(
+            cli,
+            "_package_version",
+            lambda name: {"biopb-tensor-server": "1.2.3"}.get(name, "not installed"),
+        )
+
+        assert cli._release_version() == "1.2.3"
+
+    def test_release_is_not_installed_when_no_member_is(self, monkeypatch):
+        # More honest than a stale marker left behind by a previous install.
+        monkeypatch.setattr(cli, "_package_version", lambda _: "not installed")
 
         res = CliRunner().invoke(cli.app, ["version"])
 
         assert res.exit_code == 0, res.output
-        assert self._labels(res.output)["release"] == "unknown"
-
-    def test_read_release_version_strips_marker_contents(self, monkeypatch, tmp_path):
-        marker = tmp_path / "release.version"
-        # The installer writes no trailing newline; be tolerant of both.
-        marker.write_text("  9.9.9\n")
-        monkeypatch.setattr(cli, "_RELEASE_VERSION_FILE", marker)
-        assert cli._read_release_version() == "9.9.9"
-
-    def test_read_release_version_corrupt_marker_is_unknown(
-        self, monkeypatch, tmp_path
-    ):
-        # A corrupt (non-UTF-8) marker must degrade to 'unknown', not raise a
-        # UnicodeDecodeError out of the command -- reading a version is
-        # best-effort, like _package_version.
-        marker = tmp_path / "release.version"
-        marker.write_bytes(b"\xff\xfe\x00bad")
-        monkeypatch.setattr(cli, "_RELEASE_VERSION_FILE", marker)
-        assert cli._read_release_version() == "unknown"
+        assert self._labels(res.output)["release"] == "not installed"
 
     def test_package_version_missing_is_not_installed(self):
         # A distribution name that is guaranteed absent maps to 'not installed'.
@@ -824,6 +838,105 @@ class TestPlaneBind:
         }
         assert "--tls" not in cli._control_run_argv(**kwargs)
         assert "--tls" in cli._control_run_argv(**kwargs, tls=True)
+
+
+class TestControlTlsMaterial:
+    """`--tls-cert` / `--tls-key` / `--san`, forwarded to the data plane.
+
+    `serve` and `launch` have taken all three since TLS landed; `control start`
+    took only `--tls`, so an operator with a certificate of their own had to
+    pre-seed the state tree behind the control's back (biopb/biopb#913).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _stub_helpers(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("BIOPB_CONTROL_PORT", raising=False)
+        monkeypatch.delenv("BIOPB_CONTROL_HOST", raising=False)
+        monkeypatch.setattr(cli, "_get_log_file", lambda: tmp_path / "s.log")
+        monkeypatch.setattr(
+            cli, "_control_shutdown_sentinel", lambda: tmp_path / "c.stop"
+        )
+
+    @staticmethod
+    def _pair(tmp_path):
+        """A readable PEM pair -- the material's *bytes* are validated, not just
+        its existence, so a placeholder string no longer passes."""
+        cert, key = tmp_path / "c.pem", tmp_path / "k.pem"
+        cert.write_bytes(
+            b"-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END CERTIFICATE-----\n"
+        )
+        key.write_bytes(
+            b"-----BEGIN PRIVATE KEY-----\nZmFrZQ==\n-----END PRIVATE KEY-----\n"
+        )
+        return cert, key
+
+    def test_the_material_is_forwarded_on_the_child_argv(self, tmp_path):
+        """`control start`'s hop: the daemon spawns the control as a subprocess."""
+        cert, key = self._pair(tmp_path)
+        argv = cli._control_run_argv(
+            config=tmp_path / "biopb.json",
+            static_dir=None,
+            web_host="127.0.0.1",
+            base_port=8810,
+            log_level="INFO",
+            data_plane=True,
+            grpc_bind="127.0.0.1",
+            tls=True,
+            tls_cert=cert,
+            tls_key=key,
+            san=["gpu-051.hpc.example"],
+        )
+        assert argv[argv.index("--tls-cert") + 1] == str(cert)
+        assert argv[argv.index("--tls-key") + 1] == str(key)
+        assert argv[argv.index("--san") + 1] == "gpu-051.hpc.example"
+
+    def test_a_supplied_cert_means_tls_even_without_the_flag(self, tmp_path):
+        """The control advertises the plane's scheme from this, so a cert that is
+        served must not leave it reporting grpc://."""
+        cert, key = self._pair(tmp_path)
+        assert cli._resolve_tls_material(False, cert, key) is True
+        assert cli._resolve_tls_material(False, None, None) is False
+
+    def test_unusable_tls_material_fails_the_command_the_user_typed(self, tmp_path):
+        """Not the supervised child, which would crash-loop on backoff with the
+        reason in tensor-server.log while the control reported a clean start."""
+        cert, key = self._pair(tmp_path)
+        with pytest.raises(typer.Exit):  # half a pair
+            cli._resolve_tls_material(True, cert, None)
+        with pytest.raises(typer.Exit):  # names a file that isn't there
+            cli._resolve_tls_material(True, tmp_path / "absent.pem", key)
+        empty = tmp_path / "empty.pem"
+        empty.write_text("")
+        with pytest.raises(typer.Exit):  # exists, holds nothing
+            cli._resolve_tls_material(True, empty, key)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits")
+    @pytest.mark.skipif(
+        hasattr(os, "geteuid") and os.geteuid() == 0, reason="root reads anything"
+    )
+    def test_a_key_that_only_root_can_read_is_caught_here(self, tmp_path):
+        """The preflight opens the pair rather than stat'ing it: mode 0600 owned
+        by someone else is the ordinary shape of a private key, and `is_file()`
+        passes on it (biopb/biopb#913)."""
+        cert, key = self._pair(tmp_path)
+        key.chmod(0o000)
+        try:
+            assert key.is_file()
+            with pytest.raises(typer.Exit):
+                cli._resolve_tls_material(True, cert, key)
+        finally:
+            key.chmod(0o600)
+
+    def test_control_run_is_removed(self):
+        """biopb/biopb#736: this command used to build the spec itself,
+        in-process, with no argv round trip -- and no fail-closed guard on a
+        public --control-host either. Retired in favor of
+        `python -m biopb_control run`, which already has both the flags (see
+        biopb_control's own test_main.py for the TLS-material coverage this
+        class used to duplicate here) and the guard."""
+        with pytest.raises(typer.Exit) as exc:
+            cli.control_run()
+        assert exc.value.exit_code == 2
 
 
 class TestBasePort:

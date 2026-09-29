@@ -27,26 +27,24 @@ would upload the same volumes again every time — and these are the large
 fixtures by construction. It is also the production shape, where a durable
 plane outlives the sessions that come and go against it.
 
-**Isolated by construction, not by cleanup.** The plane must be writable — the
-skills' own steps upload results (`drift-correction` step 7, `stitch-tiles`
-step 7) — so an agent can create sources, and there is *no API to drop one*:
-`remove_source` refuses any url that is not `dnd://`, and cache adapters are
-expected to accumulate until the server stops. So isolation cannot come from
-cleaning up between sessions. It comes from the id:
+**Not isolated from a determined agent, and it does not claim to be.** The
+plane must be writable — the skills' own steps upload results
+(`drift-correction` step 7, `stitch-tiles` step 7) — and
+`set_upload_status(..., DISCARDED)` is total: it reaches a published tensor,
+fixtures included. The agent is handed each fixture's `array_id` anyway.
 
-    source_id = f"cache_{sha256(source_name)[:12]}"       (upload_manager.py)
+What the layer buys is that nothing can happen *quietly*. A fixture's field
+name is salted with :attr:`secret`, and a discarded name stays taken until the
+reclaim sweep frees it (`upload_ttl`), so an agent cannot drop a fixture and
+put its own bytes back under the same id within a run. And
+:meth:`TensorPlane.fingerprint` samples a corner of the served array, which
+`bench/_engine` compares after every sample, reading it as contaminated
+whether the bytes changed or the tensor stopped being readable at all. A
+changed fingerprint does not fail a test — it flags the row, the same way
+`read-harness-internals` does, because `execute_code` is arbitrary Python.
 
-The id an agent sees is a **one-way hash of a name it is never told**. The
-adapter keeps the id and the url (`cache://<source_id>`), never the name, so
-the name appears nowhere in a descriptor, a layer or the catalog. A fixture
-uploaded under a per-run random name therefore cannot be collided with by
-accident and cannot be replaced by an agent that only knows the id.
-
-That is an argument, so it is also checked: :meth:`TensorPlane.fingerprint`
-samples a corner of the served array, and `bench/_engine` compares it after
-every sample. A changed fingerprint does not fail a test — it flags the row, the same
-way `read-harness-internals` does, because `execute_code` is arbitrary Python
-and the layer's defence is that nothing can happen *quietly*.
+Making a fixture genuinely undroppable means serving it from a discovery root
+instead of uploading it, which is a different plane and not this one.
 """
 
 from __future__ import annotations
@@ -73,6 +71,11 @@ import numpy as np
 #: (empty) source tree and binds before it is ready, and a slow machine timing
 #: out here would report as "no tensor cases ran" rather than as a hang.
 BOOT_TIMEOUT_S = 60.0
+
+#: The scratch source every writable tensor server serves, which is where a
+#: fixture is uploaded: the upload path adds a tensor to a source that already
+#: exists and creates none.
+SCRATCH_SOURCE_ID = "scratch"
 
 
 def plane_unavailable() -> str:
@@ -103,8 +106,10 @@ class TensorPlane:
     url: str
     root: Path
     process: subprocess.Popen
-    #: Random per run, and never sent anywhere. It is the pre-image of every
-    #: fixture id this plane serves, which is what makes those ids unforgeable.
+    #: Random per run, and never sent anywhere. It salts the *name* every
+    #: fixture is registered under, which is what keeps one run's names from
+    #: colliding with another's and keeps the name out of everything an agent
+    #: can read.
     secret: str = field(default_factory=lambda: secrets.token_hex(8))
     _client: Any = None
 
@@ -126,9 +131,14 @@ class TensorPlane:
     ) -> str:
         """Put one fixture array on the plane and return its ``array_id``.
 
-        *key* names it only within this run: the name actually sent is salted
-        with :attr:`secret`, so the id the agent receives is not derivable from
-        anything the agent knows.
+        An upload adds a tensor to a source that already exists and creates
+        none, so this adds one to the plane server's scratch source:
+        ``add_tensor`` declares the ``cache://`` tensor and ``upload_array``
+        fills and publishes it.
+
+        *key* names it only within this run: the field name is salted with
+        :attr:`secret`, so two runs never collide and a name freed by a discard
+        is not one the harness would reuse.
 
         ``chunks`` is explicit rather than left to the uploader's default,
         because where laziness is the point the chunking *is* the thing under
@@ -140,12 +150,14 @@ class TensorPlane:
         array = np.asarray(array)
         chunk_shape = tuple(chunks) if chunks else array.shape
         lazy = da.from_array(array, chunks=chunk_shape)
-        return self.client.upload_array(
+        desc = self.client.setup_array_upload(
+            f"cache://{SCRATCH_SOURCE_ID}/@fields/{self.secret}-{key}",
             lazy,
-            f"cache:{self.secret}-{key}",
             chunk_shape=list(chunk_shape),
             dim_labels=list(dim_labels) if dim_labels else None,
         )
+        self.client.upload_array(desc, lazy)
+        return desc.array_id
 
     def fingerprint(self, array_id: str) -> str:
         """A hash of a corner of what the plane currently serves for *array_id*.
@@ -176,7 +188,13 @@ class TensorPlane:
 def _write_plane_config(root: Path) -> Path:
     """A config tree of the plane's own, so the developer's catalog is neither
     read nor written — the same discipline `_session._write_config` applies to
-    the MCP config."""
+    the MCP config.
+
+    **`writable` and `write_dir` are nested under `server`.** The loader reads
+    them from ``data.get("server", {})`` (`core/config.py`), so a top-level
+    spelling is silently ignored -- and `--writable` on the command line would
+    cover for one of them while `write_dir` had no effect at all.
+    """
     (root / "cache").mkdir(parents=True, exist_ok=True)
     (root / "write").mkdir(parents=True, exist_ok=True)
     path = root / "biopb.json"
@@ -187,9 +205,16 @@ def _write_plane_config(root: Path) -> Path:
                 # No sources: everything this plane serves arrives by upload,
                 # which is a supported runtime state (an empty catalog boots).
                 "sources": [],
-                "writable": True,
-                "write_dir": str(root / "write"),
-                "cache": {"backend": "file", "file_cache_dir": str(root / "cache")},
+                "server": {
+                    "writable": True,
+                    "write_dir": str(root / "write"),
+                    # No lifetime on this server's scratch source. A fixture
+                    # plane outlives the sessions that run against it, so the
+                    # default day-long cap -- which is right for an
+                    # intermediate result -- would be wrong for a fixture.
+                    "scratch_ttl": 0,
+                },
+                "cache": {"file_cache_dir": str(root / "cache")},
             }
         ),
         encoding="utf-8",

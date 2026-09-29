@@ -35,6 +35,17 @@ on:
           - old-python
           - rerun
           - bioformats
+      via:
+        description: 'Install with this checkout (installer), or the way users do, through the bootstrap biopb.org serves (bootstrap: installs a release, not this checkout)'
+        default: installer
+        type: choice
+        options:
+          - installer
+          - bootstrap
+      version:
+        description: 'Release to install (X.Y.Z or an rc such as 0.15.0rc8); empty is the latest stable'
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -59,4 +70,6 @@ jobs:
       # run.sh builds the image and runs assert.sh in it, exiting nonzero on the
       # first failed post-condition.
       - name: Assert ${{ matrix.scenario }}
-        run: install/test/run.sh --assert ${{ matrix.scenario }}
+        env:
+          BIOPB_INSTALL_VERSION: ${{ inputs.version }}
+        run: install/test/run.sh --assert ${{ inputs.via == 'bootstrap' && '--bootstrap' || '' }} ${{ matrix.scenario }}

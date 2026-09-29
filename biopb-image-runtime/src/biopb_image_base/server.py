@@ -1,37 +1,29 @@
-"""Server creation helper for biopb services.
-
-Provides a simplified interface for creating gRPC servers with
-health checks, interceptors, and standard configuration.
-Optionally starts an embedded tensor cache server for lazy data handling.
-"""
+"""The embedded tensor cache: a server returns large results through its own
+TensorFlight server, from a file-based cache with a TTL."""
 
 import logging
 import os
+import re
 import secrets
+import shutil
 import threading
-from concurrent import futures
 from itertools import product
 from pathlib import Path
 from typing import Iterator, Optional, Sequence, Union
 
-import biopb.image as proto
 import biopb.tensor as tensor_proto
 import dask.array as da
-import grpc
 import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.serialized_pb2 import SerializedTensor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 from dask.utils import parse_bytes
 
-from biopb_image_base.common import _MAX_MSG_SIZE, TokenValidationInterceptor
-from biopb_image_base.debug import get_system_info
-from biopb_image_base.health import HealthServicer, add_health_servicer
-from biopb_image_base.logging_config import LogLevel, setup_logging
+from biopb_image_base.common import _pyarrow_available
 
 logger = logging.getLogger(__name__)
 
-_NON_UNIFORM_CHUNKS_ERROR = "Non-uniform dask chunks are not supported; rechunk to a uniform grid before uploading."
+_NON_UNIFORM_CHUNKS_ERROR = "Non-uniform dask chunks are not supported; rechunk to a regular grid before uploading."
 
 
 def _resolve_tensor_external_location(
@@ -61,15 +53,6 @@ def _resolve_tensor_external_location(
     return f"grpc://{ip}:{tensor_port}"
 
 
-def _normalize_dim_labels(
-    dim_labels: Optional[Sequence[str]],
-    ndim: int,
-) -> list[str]:
-    if dim_labels is not None:
-        return list(dim_labels)
-    return [f"dim{i}" for i in range(ndim)]
-
-
 def _as_dask_array(array: Union[np.ndarray, da.Array]) -> da.Array:
     if isinstance(array, da.Array):
         return array
@@ -77,8 +60,10 @@ def _as_dask_array(array: Union[np.ndarray, da.Array]) -> da.Array:
 
 
 def _uniform_chunk_shape(array: da.Array) -> tuple[int, ...]:
-    if not all(len(set(axis_chunks)) == 1 for axis_chunks in array.chunks):
-        raise ValueError(_NON_UNIFORM_CHUNKS_ERROR)
+    """The chunk grid of *array*: one size per axis, a smaller last chunk allowed."""
+    for axis_chunks in array.chunks:
+        if len(set(axis_chunks[:-1])) > 1 or axis_chunks[-1] > axis_chunks[0]:
+            raise ValueError(_NON_UNIFORM_CHUNKS_ERROR)
     return tuple(int(axis_chunks[0]) for axis_chunks in array.chunks)
 
 
@@ -105,35 +90,54 @@ def _bounds_to_slices(bounds: ChunkBounds) -> tuple[slice, ...]:
     )
 
 
-def _build_registration_tensor(
-    source_id: str,
-    shape: Sequence[int],
-    dtype: str,
-    chunk_shape: Sequence[int],
-    dim_labels: Optional[Sequence[str]],
-    location: str,
-    auth_token: str = "",
+def _handle(
+    descriptor: TensorDescriptor, location: str, auth_token: str
 ) -> SerializedTensor:
-    descriptor = TensorDescriptor(
-        array_id=source_id,
-        dim_labels=_normalize_dim_labels(dim_labels, len(shape)),
-        shape=list(shape),
-        chunk_shape=list(chunk_shape),
-        dtype=dtype,
+    """A SerializedTensor for a source this process serves.
+
+    Describe-only: a FlightInfo carrying the descriptor and no endpoints, which
+    the consumer plans with its own GetFlightInfo when it reads. One shape for
+    a result still being filled and a finished one, and no second copy of the
+    read plan to keep in step with the server's.
+    """
+    import pyarrow as pa
+    import pyarrow.flight as flight
+
+    info = flight.FlightInfo(
+        schema=pa.schema([]),
+        descriptor=flight.FlightDescriptor.for_command(descriptor.SerializeToString()),
+        endpoints=[],
+        total_records=-1,
+        total_bytes=-1,
     )
     return SerializedTensor(
-        tensor_descriptor=descriptor,
-        location=location,
-        auth_token=auth_token,
-        endpoints=[],
+        location=location, auth_token=auth_token, flight_info=info.serialize()
     )
 
 
-def _normalize_cache_source_name(source_name: Optional[str]) -> str:
-    normalized_name = source_name or ""
-    if normalized_name.startswith("cache:"):
-        normalized_name = normalized_name[6:]
-    return normalized_name
+#: The tensor server's scratch source, which every server with a ``write_dir``
+#: serves at this fixed id. Spelled out rather than imported so this module
+#: stays importable without the tensor server installed.
+SCRATCH_SOURCE_ID = "scratch"
+
+#: How long a result is kept on it. Half an hour: a fast-return consumer reads
+#: its result as soon as the job reports done, so anything still here long
+#: after that is one nobody came back for.
+RESULT_TTL_S = 30 * 60
+
+_UNSAFE_IN_A_FIELD_NAME = re.compile(r"[^A-Za-z0-9_-]+")
+
+
+def _result_field_name(source_name: Optional[str]) -> str:
+    """A field name for one result: the caller's word for it, plus a salt.
+
+    Salted because a field is taken for as long as its tensor is served, so a
+    second result under one name is refused rather than replacing it.
+    """
+    stem = _UNSAFE_IN_A_FIELD_NAME.sub(
+        "-", (source_name or "").removeprefix("cache:")
+    ).strip("-")
+    return f"{stem or 'result'}-{os.urandom(4).hex()}"
 
 
 class EmbeddedTensorCache:
@@ -163,35 +167,46 @@ class EmbeddedTensorCache:
         source_name: Optional[str] = None,
         dim_labels: Optional[Sequence[str]] = None,
     ) -> tuple[str, da.Array, tuple[int, ...]]:
-        import hashlib
+        """Declare one result; answer the ``array_id`` it will be filled under.
 
-        from biopb_tensor_server.adapters.cached_source import CachedSourceAdapter
-
+        A result is a tensor added to the scratch source, through the same
+        ``add_tensor`` boundary a remote client uses -- called in-process, so
+        the Flight write path stays refused. Adding rather than registering a
+        source of its own is what gives it a deadline (``RESULT_TTL_S``) and a
+        producer: a source is shared, and the grant below covers this tensor
+        alone.
+        """
         chunk_shape = _uniform_chunk_shape(array_template)
-        normalized_name = _normalize_cache_source_name(source_name)
-
-        if normalized_name:
-            source_id = (
-                f"cache_{hashlib.sha256(normalized_name.encode()).hexdigest()[:12]}"
-            )
-        else:
-            source_id = f"cache_{hashlib.sha256(os.urandom(16)).hexdigest()[:12]}"
-
-        adapter = CachedSourceAdapter(
-            source_id=source_id,
+        descriptor = TensorDescriptor(
+            array_id=(
+                f"cache://{SCRATCH_SOURCE_ID}/@fields/{_result_field_name(source_name)}"
+            ),
             shape=list(array_template.shape),
             dtype=array_template.dtype.str,
             chunk_shape=list(chunk_shape),
-            dim_labels=list(dim_labels) if dim_labels is not None else None,
+            dim_labels=list(dim_labels) if dim_labels is not None else [],
         )
-        # Per-source capability token: the result is readable only by the caller
-        # that receives this SerializedTensor (carried in its auth_token). The
-        # embedded server runs writable=False and writes happen in-process, so
-        # this token gates read-back without a server-wide secret.
-        adapter.capability_token = secrets.token_urlsafe(32)
-        self._server.register_source(source_id, adapter)
-        self._server.uploads.initialize(source_id, array_template.shape, chunk_shape)
-        return source_id, array_template, chunk_shape
+        answer = self._server.uploads.add_tensor(descriptor)
+        # The capability: the result is readable by the caller that receives
+        # this SerializedTensor (it rides in the auth_token) and by nobody
+        # else. It gates read-back without a server-wide secret, which this
+        # server has none of.
+        self._result(answer.array_id).capability_token = secrets.token_urlsafe(32)
+        return answer.array_id, array_template, chunk_shape
+
+    def _result(self, array_id: str):
+        """The adapter serving one result, by the id ``add_tensor`` answered.
+
+        A result is a tensor *attached* to the scratch source rather than a
+        source of its own, so it is reached through its parent instead of
+        through the registry.
+        """
+        source_id, _, field = array_id.partition("/")
+        parent = self._server.sources.get(source_id)
+        adapter = parent.attached_tensor(field) if parent is not None else None
+        if adapter is None:
+            raise ValueError(f"Result not found: {array_id}")
+        return adapter
 
     def create_array(
         self,
@@ -199,35 +214,59 @@ class EmbeddedTensorCache:
         dim_labels: Optional[list],
         array_template: da.Array,
     ) -> tensor_proto.SerializedTensor:
-        source_id, normalized_array, chunk_shape = self._register_array_template(
+        array_id, _, _ = self._register_array_template(
             array_template=array_template,
             source_name=source_name,
             dim_labels=dim_labels,
         )
-        return _build_registration_tensor(
-            source_id=source_id,
-            shape=normalized_array.shape,
-            dtype=normalized_array.dtype.str,
-            chunk_shape=chunk_shape,
-            dim_labels=dim_labels,
-            location=self._external_location,
-            auth_token=self._server.sources.get(source_id).capability_token,
-        )
+        return self.to_serialized_tensor(array_id)
 
     def upload_array_chunks(
         self,
-        source_id: str,
+        array_id: str,
         endpoint: ChunkBounds,
         chunk: np.ndarray,
     ) -> None:
-        adapter = self._server.sources.get(source_id)
-        if adapter is None:
-            raise ValueError(f"Source not found: {source_id}")
-        adapter.write_chunk(endpoint, chunk)
-        self._server.uploads.mark_chunk(source_id, endpoint)
+        """Write one chunk into a result this process declared."""
+        import pyarrow.flight as flight
+        from biopb_tensor_server.core.errors import UploadClosedError
 
-    def get_upload_status(self, source_id: str) -> dict:
-        return self._server.uploads.status(source_id)
+        # The adapter counts the chunk and refuses once the upload is over; both
+        # refusals surface as the exception type the wire path raises, so a
+        # servicer's job discriminates on it the way a remote client would.
+        try:
+            self._result(array_id).write_chunk(endpoint, chunk)
+        except UploadClosedError as e:
+            raise flight.FlightCancelledError(str(e)) from e
+
+    def finish(self, array_id: str) -> dict:
+        """Seal a result: the output is complete and takes no further chunks.
+
+        The counterpart to :meth:`discard`, and the only route to READY, which
+        is what a consumer polling for the result waits on. A fast-return
+        servicer calls this when its job succeeds, exactly as it calls
+        ``discard`` when the job dies (biopb/biopb#1048).
+
+        READY is one rung of the upload ladder rather than an operation of its
+        own, so it goes through ``set_status``; the name stays because sealing
+        is the only rung a servicer ever asks for.
+        """
+        from biopb_tensor_server.adapters._writable import UploadStatus
+
+        return self._server.uploads.set_status(array_id, UploadStatus.READY)
+
+    def get_upload_status(self, array_id: str) -> dict:
+        return self._server.uploads.status(array_id)
+
+    def discard(self, array_id: str, reason: str = "") -> dict:
+        """Give up on a result: drop the source, leave a tombstone saying why.
+
+        For a servicer whose background job died or was told to stop. Stopping
+        the job itself is the servicer's own concern -- this disposes of the
+        output it was going to fill, and makes any write still in flight fail
+        with *reason* rather than with a missing source (biopb/biopb#1).
+        """
+        return self._server.uploads.discard(array_id, reason)
 
     def create_source(
         self,
@@ -243,10 +282,10 @@ class EmbeddedTensorCache:
             dim_labels: Optional dimension labels
 
         Returns:
-            Source ID for use with to_serialized_tensor()
+            The result's array_id, for use with to_serialized_tensor()
         """
         dask_array = _as_dask_array(array)
-        source_id, normalized_array, chunk_shape = self._register_array_template(
+        array_id, normalized_array, chunk_shape = self._register_array_template(
             array_template=dask_array,
             source_name=source_name,
             dim_labels=dim_labels,
@@ -254,58 +293,49 @@ class EmbeddedTensorCache:
 
         for bounds in _iter_chunk_bounds(normalized_array.shape, chunk_shape):
             chunk_data = normalized_array[_bounds_to_slices(bounds)].compute()
-            self.upload_array_chunks(source_id, bounds, chunk_data)
+            self.upload_array_chunks(array_id, bounds, chunk_data)
+        # Synchronous: every chunk is written by the time we get here, so this
+        # is the one caller that can seal on its own behalf. `create_array`'s
+        # producer fills the result later and finishes for itself.
+        self.finish(array_id)
 
         logger.debug(
-            "Created cache source %s: shape=%s, dtype=%s",
-            source_id,
+            "Created result %s: shape=%s, dtype=%s",
+            array_id,
             list(normalized_array.shape),
             normalized_array.dtype.str,
         )
-        return source_id
+        return array_id
 
     def to_serialized_tensor(
         self,
-        source_id: str,
+        array_id: str,
         tensor_id: Optional[str] = None,
     ) -> tensor_proto.SerializedTensor:
-        """Get SerializedTensor for a source with rewritten location.
+        """Get SerializedTensor for a result, with rewritten location.
+
+        auth_token carries the result's own capability token, so only this
+        caller can read it.
 
         Args:
-            source_id: Source identifier
-            tensor_id: Tensor ID (optional for single-tensor sources)
+            array_id: The id ``create_source`` / ``create_array`` answered
+            tensor_id: Unused; a result is one tensor
 
         Returns:
             SerializedTensor protobuf with external location
         """
-        from biopb.tensor.serialized_pb2 import SerializedEndpoint, SerializedTensor
-        from biopb.tensor.ticket_pb2 import TensorTicket
-
-        # Get adapter from server
-        adapter = self._server.sources.get(source_id)
-        if adapter is None:
-            raise ValueError(f"Source not found: {source_id}")
-
-        # Get descriptor
+        adapter = self._result(array_id)
         descriptor = adapter.get_tensor_descriptor()
-
-        # Build endpoints from written chunks
-        endpoints = []
-        for chunk_id, bounds in adapter._written_chunks.items():
-            ticket = TensorTicket(chunk_id=chunk_id)
-            ep = SerializedEndpoint(ticket=ticket, chunk_bounds=bounds)
-            endpoints.append(ep)
-
-        # Build SerializedTensor with external location. auth_token carries the
-        # per-source capability token so only this caller can read the result.
-        serialized = SerializedTensor(
-            tensor_descriptor=descriptor,
-            location=self._external_location,
-            auth_token=adapter.capability_token or "",
-            endpoints=endpoints,
+        remaining = adapter.remaining_ttl()
+        if remaining is not None:
+            # What the handle is for: the consumer reads this result later, and
+            # the one thing it cannot work out for itself is how much later.
+            descriptor.ttl_seconds = remaining
+        return _handle(
+            descriptor,
+            self._external_location,
+            adapter.capability_token or "",
         )
-
-        return serialized
 
 
 def _start_embedded_tensor_cache(
@@ -331,6 +361,11 @@ def _start_embedded_tensor_cache(
     from biopb_tensor_server.core.config import CacheConfig
     from biopb_tensor_server.serving.server import TensorFlightServer
 
+    # Clear the previous run's results since a result's capability
+    # token is minted in memory and would not survive restart.
+    write_dir = cache_dir / "uploads"
+    shutil.rmtree(write_dir, ignore_errors=True)
+
     # Clean stale lock file (from previous run/crash)
     lock_path = cache_dir / "lock"
     if lock_path.exists():
@@ -340,9 +375,8 @@ def _start_embedded_tensor_cache(
         except Exception as e:
             logger.warning(f"Could not remove stale lock: {e}")
 
-    # Initialize cache manager singleton with file backend
+    # Initialize cache manager singleton with the on-disk Arrow file cache
     cache_config = CacheConfig(
-        backend="file",
         file_cache_dir=cache_dir,
         file_max_segment_bytes=64 * 1024 * 1024,  # 64MB segments
         file_max_total_bytes=cache_size,
@@ -352,23 +386,28 @@ def _start_embedded_tensor_cache(
     # Bind to specified host (0.0.0.0 for external access)
     location = f"grpc://{tensor_host}:{tensor_port}"
 
-    # Read-only over Flight: results are written in-process (adapter.write_chunk),
-    # so the Flight write path (do_put / create_source) is pure attack surface here.
-    # Read-back is gated by per-source capability tokens (adapter.capability_token).
+    # The server-wide token is minted and *kept*. It exists so ``_authorize``
+    # fails closed on every action arm except ``health`` and ``chunk_locate``.
+    # Read-back is gated per result by its own capability token and unaffected.
+    #
+    # Read-only over Flight: Setting a ``write_dir`` is sufficient for the
+    # in-process path to reaches through ``uploads`` with the wire verbs
+    # still refused.
+    #
+    # No catalog (metadata_db=None): instead a result is addressed by the
+    # array_id its SerializedTensor carries.
     tensor_server = TensorFlightServer(
         location,
+        token=secrets.token_urlsafe(32),
         writable=False,
+        write_dir=write_dir,
+        scratch_ttl=RESULT_TTL_S,
+        annotations_enabled=False,
     )
 
-    # This embedded server is a *bypass* of the normal tensor-server lifecycle:
-    # it hijacks a TensorFlightServer purely as scratch-pad storage for op
-    # results and has no data-folder scan / source-registration stage at all
-    # (sources appear in-process via adapter.write_chunk). It is therefore ready
-    # to serve the instant its Flight port binds. The CLI launcher is the
-    # authoritative path that defers mark_ready() until after its scan; here
-    # there is nothing to wait for, so mark ready immediately -- otherwise the
-    # health action would report STARTING forever and readiness-gating clients
-    # (e.g. biopb-mcp) would wait indefinitely.
+    # Unlike the CLI launcher, which defers mark_ready() until after catalog
+    # scan; the embedded server has no catalog to scan, so it marks ready
+    # immediately.
     tensor_server.mark_ready()
 
     # Start in background thread
@@ -382,179 +421,21 @@ def _start_embedded_tensor_cache(
     return tensor_server, location
 
 
-def create_server(
-    servicer,
-    port: int = 50051,
-    workers: int = 10,
-    ip: str = "0.0.0.0",
-    local: bool = False,
-    token: Optional[bool] = None,
-    log_level: LogLevel = "INFO",
-    compression: bool = True,
-    health_check: bool = True,
-    readiness_check: Optional[callable] = None,
-    tensor_cache: Optional[EmbeddedTensorCache] = None,
-) -> tuple[grpc.Server, Optional[str], Optional[HealthServicer]]:
-    """Create a configured gRPC server with standard features.
-
-    This creates a gRPC server with:
-    - ObjectDetection and ProcessImage services registered
-    - Optional token authentication
-    - Health check service (standard grpc.health.v1.Health)
-    - Configurable compression
-    - Proper message size limits
-
-    Args:
-        servicer: The main servicer implementing ObjectDetection and ProcessImage
-        port: Port to listen on (default 50051)
-        workers: Thread pool size (default 10)
-        ip: IP to bind to (default "0.0.0.0")
-        local: Use local server credentials for secure local-only access
-        token: Enable token authentication (None = auto based on local flag)
-        log_level: Log level for server (DEBUG, INFO, WARNING, ERROR, CRITICAL)
-        compression: Enable gzip compression
-        health_check: Enable gRPC health check service
-        readiness_check: Optional callable for readiness probe
-        tensor_cache: Optional tensor cache for lazy data handling
-
-    Returns:
-        Tuple of (server, token_string, health_servicer)
-        - server: The configured gRPC server (not started)
-        - token_string: The auth token if enabled, None otherwise
-        - health_servicer: Health servicer for status updates, None if disabled
-    """
-    # Inject tensor_cache into servicer if provided
-    if tensor_cache is not None and hasattr(servicer, "_tensor_cache"):
-        servicer._tensor_cache = tensor_cache
-
-    # Determine token setting
-    if token is None:
-        token = not local
-
-    # Generate token if needed
-    token_str = None
-    if token:
-        token_str = secrets.token_urlsafe(64)
-        print()
-        print("COPY THE TOKEN BELOW FOR ACCESS.")
-        print("=======================================================================")
-        print(f"{token_str}")
-        print("=======================================================================")
-        print()
-
-    # Create server with interceptors
-    interceptors = [TokenValidationInterceptor(token_str)]
-
-    server = grpc.server(
-        futures.ThreadPoolExecutor(max_workers=workers),
-        compression=grpc.Compression.Gzip
-        if compression
-        else grpc.Compression.NoCompression,
-        interceptors=tuple(interceptors),
-        options=(
-            ("grpc.max_receive_message_length", _MAX_MSG_SIZE),
-            ("grpc.max_send_message_length", _MAX_MSG_SIZE),
-        ),
-    )
-
-    # Register main services
-    proto.add_ObjectDetectionServicer_to_server(servicer, server)
-    proto.add_ProcessImageServicer_to_server(servicer, server)
-
-    # Register health check service
-    health_servicer = None
-    if health_check:
-        health_servicer = add_health_servicer(server, readiness_check)
-
-    # Add port
-    if local:
-        server.add_secure_port(f"127.0.0.1:{port}", grpc.local_server_credentials())
-        logger.info(f"Server configured with local credentials on 127.0.0.1:{port}")
-    else:
-        server.add_insecure_port(f"{ip}:{port}")
-        logger.info(f"Server configured on {ip}:{port}")
-
-    return server, token_str, health_servicer
-
-
-def _pyarrow_available() -> bool:
-    """True if pyarrow can be imported.
-
-    The tensor cache (lazy data side channel) is built on Arrow Flight and needs
-    pyarrow. On builds for old CPUs without SSE4.2/AVX, pyarrow is removed (its
-    wheels SIGILL on import there -- see cellpose/BUILD_NO_SSE42.md), so the side
-    channel must not be started. find_spec only locates the module; it does not
-    import it, so this is safe even on a CPU that cannot run pyarrow.
-    """
-    import importlib.util
-
-    return importlib.util.find_spec("pyarrow") is not None
-
-
-def run_server(
-    servicer,
-    port: int = 50051,
-    workers: int = 10,
-    ip: str = "0.0.0.0",
-    local: bool = False,
-    token: Optional[bool] = None,
-    log_level: LogLevel = "INFO",
-    compression: bool = True,
-    health_check: bool = True,
-    readiness_check: Optional[callable] = None,
-    cache_dir: Optional[str] = None,
+def start_embedded_cache(
+    cache_dir: str,
     cache_size: str = "32GB",
+    *,
+    ip: str = "0.0.0.0",
+    local: bool = False,
     tensor_port: int = 8817,
     tensor_external_location: Optional[str] = None,
-) -> None:
-    """Create and run a gRPC server (blocking).
+) -> Optional[EmbeddedTensorCache]:
+    """Start the embedded tensor server a remote deployment returns results through.
 
-    Optionally starts an embedded tensor cache server for lazy data handling.
-    When cache_dir is provided, creates an EmbeddedTensorCache wrapper and injects it
-    into the servicer for returning large/lazy results.
-
-    Args:
-        servicer: The main servicer implementing ObjectDetection and ProcessImage
-        port: Port to listen on (default 50051)
-        workers: Thread pool size (default 10)
-        ip: IP to bind to (default "0.0.0.0")
-        local: Use local server credentials for secure local-only access
-        token: Enable token authentication (None = auto based on local flag)
-        log_level: Log level for server (DEBUG, INFO, WARNING, ERROR, CRITICAL)
-        compression: Enable gzip compression
-        health_check: Enable gRPC health check service
-        readiness_check: Optional callable for readiness probe
-        cache_dir: Directory for tensor cache files (enables embedded tensor server)
-        cache_size: Maximum cache size (e.g., "32GB", "100GB")
-        tensor_port: Port for embedded tensor Flight server (default 8817)
-        tensor_external_location: External URL for tensor server in SerializedTensor
-            (e.g., "grpc://hostname:8817"). Defaults to "grpc://<ip>:<tensor_port>".
-            The tensor server binds to 0.0.0.0 for external access.
+    Answers ``None`` where pyarrow cannot run, so the server serves inline
+    results only.
     """
-    # Setup logging
-    setup_logging(log_level)
-
-    # Log system info
-    sys_info = get_system_info()
-    logger.info(
-        f"System: {sys_info.get('platform', 'unknown')}, "
-        f"Python {sys_info.get('python_version', 'unknown')}, "
-        f"CPU {sys_info.get('cpu_count', 'unknown')}"
-    )
-    if "memory_total_mb" in sys_info:
-        logger.info(
-            f"Memory: {sys_info['memory_total_mb']:.0f}MB total, "
-            f"{sys_info.get('memory_available_mb', 0):.0f}MB available"
-        )
-    if "gpu" in sys_info:
-        gpu = sys_info["gpu"]
-        logger.info(
-            f"GPU: {gpu['device']}, {gpu['total_mb']:.0f}MB total, "
-            f"{gpu['free_mb']:.0f}MB free"
-        )
-
-    tensor_cache = None
-    if cache_dir is not None and not _pyarrow_available():
+    if not _pyarrow_available():
         # No-SSE4.2/AVX build: pyarrow (hence the lazy/Flight side channel) is
         # unavailable. Do not start the tensor server -- it would crash. Lazy
         # (dask) requests will be cleanly rejected by the servicer instead.
@@ -564,62 +445,37 @@ def run_server(
             "without SSE4.2/AVX. Disabling the tensor server; only eager image "
             "data is supported and lazy (dask) input/output will be rejected."
         )
-    elif cache_dir is not None:
-        cache_path = Path(cache_dir)
-        cache_path.mkdir(parents=True, exist_ok=True)
+        return None
 
-        # Parse the size string with common units, or a bare byte count. Uses
-        # dask.utils.parse_bytes for one uniform size grammar across the project
-        # (also accepts GiB/MiB/KB/TB and spaces). NOTE: parse_bytes reads "GB"
-        # as decimal 1e9 -- use "GiB" for the binary 2**30 the old ad-hoc parser
-        # assumed.
-        cache_bytes = parse_bytes(cache_size)
+    cache_path = Path(cache_dir)
+    cache_path.mkdir(parents=True, exist_ok=True)
 
-        logger.info(
-            f"Starting embedded tensor cache at {cache_dir} (size: {cache_size})"
-        )
+    # NOTE: parse_bytes reads "GB" as decimal 1e9 -- use "GiB" for the binary
+    # 2**30 the old ad-hoc parser assumed.
+    cache_bytes = parse_bytes(cache_size)
 
-        # Determine external location for SerializedTensor
-        external_location = _resolve_tensor_external_location(
-            ip=ip,
-            local=local,
-            tensor_port=tensor_port,
-            tensor_external_location=tensor_external_location,
-        )
+    logger.info(f"Starting embedded tensor cache at {cache_dir} (size: {cache_size})")
 
-        # Start embedded tensor server (binds to 0.0.0.0 for external access)
-        tensor_server, bind_location = _start_embedded_tensor_cache(
-            cache_dir=cache_path,
-            cache_size=cache_bytes,
-            tensor_port=tensor_port,
-            tensor_host="0.0.0.0",
-        )
-
-        # Create wrapper with location rewriting
-        tensor_cache = EmbeddedTensorCache(
-            tensor_server=tensor_server,
-            external_location=external_location,
-        )
-        logger.info(f"Tensor server listening on {bind_location}")
-        logger.info(f"Tensor server advertised at {external_location}")
-
-    logger.info("server starting ...")
-
-    server, token_str, health_servicer = create_server(
-        servicer=servicer,
-        port=port,
-        workers=workers,
+    # Determine external location for SerializedTensor
+    external_location = _resolve_tensor_external_location(
         ip=ip,
         local=local,
-        token=token,
-        log_level=log_level,
-        compression=compression,
-        health_check=health_check,
-        readiness_check=readiness_check,
-        tensor_cache=tensor_cache,
+        tensor_port=tensor_port,
+        tensor_external_location=tensor_external_location,
     )
 
-    logger.info("server ready")
+    # Start embedded tensor server (binds to 0.0.0.0 for external access)
+    tensor_server, bind_location = _start_embedded_tensor_cache(
+        cache_dir=cache_path,
+        cache_size=cache_bytes,
+        tensor_port=tensor_port,
+        tensor_host="0.0.0.0",
+    )
 
-    server.start()
-    server.wait_for_termination()
+    logger.info(f"Tensor server listening on {bind_location}")
+    logger.info(f"Tensor server advertised at {external_location}")
+    # Create wrapper with location rewriting
+    return EmbeddedTensorCache(
+        tensor_server=tensor_server,
+        external_location=external_location,
+    )

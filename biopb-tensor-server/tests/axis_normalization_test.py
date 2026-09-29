@@ -8,10 +8,11 @@ Covers the rule (``core.axes.canonical_permutation``), the seam that applies it
 2. the guarantee is unconditional on the read path, including for the geometry a
    read plan hands a client and for what lands in the chunk cache;
 3. an axis order this server does not own is refused rather than permuted -- an
-   uploader's declared order at ``create_source``, and a remote upstream's
+   uploader's declared order at ``add_tensor``, and a remote upstream's
    advertised order at the proxy's read boundary.
 """
 
+import os
 import tempfile
 import threading
 import time
@@ -31,6 +32,9 @@ from biopb_tensor_server.core.normalize import (
 )
 from biopb_tensor_server.core.source_registry import SourceRegistry
 from biopb_tensor_server.serving.server import TensorFlightServer
+from google.protobuf.field_mask_pb2 import FieldMask
+
+from tests import catalog_server, register_and_catalog
 
 
 def _zarr_available() -> bool:
@@ -265,7 +269,8 @@ class TestNormalizeAdapter:
             adapter = registry.register("src", _zarr_adapter(tmp, src, ["x", "y", "z"]))
             assert isinstance(adapter, NormalizingAdapter)
             plan = adapter.get_tensor_adapter(None).plan_flight_info(
-                TensorReadOption(tensor_id="src"), PyramidConfig()
+                TensorReadOption(array_id="src", fields=FieldMask(paths=["endpoints"])),
+                PyramidConfig(),
             )
             assert len(plan.chunk_endpoints) > 1
 
@@ -308,10 +313,12 @@ class TestNormalizedDescriptorAndData:
             )
             assert list(desc.chunk_shape) == native[::-1]
 
-    def test_source_descriptor_and_catalog_row_are_canonical(self):
+    def test_catalog_row_tensors_are_canonical(self):
+        from biopb_tensor_server.core.adapter_base import catalog_tensors
+
         with tempfile.TemporaryDirectory() as tmp:
             adapter, _ = self._wrapped(tmp)
-            tensors = adapter.get_source_descriptor().tensors
+            tensors = catalog_tensors(adapter)
             assert [list(t.dim_labels) for t in tensors] == [["z", "y", "x"]]
             assert [list(t.shape) for t in tensors] == [[4, 3, 2]]
             assert [list(t.dim_labels) for t in adapter.list_tensor_descriptors()] == [
@@ -350,7 +357,8 @@ class TestNormalizedDescriptorAndData:
         with tempfile.TemporaryDirectory() as tmp:
             adapter, _ = self._wrapped(tmp)
             plan = adapter.plan_flight_info(
-                TensorReadOption(tensor_id="src"), PyramidConfig()
+                TensorReadOption(array_id="src", fields=FieldMask(paths=["endpoints"])),
+                PyramidConfig(),
             )
             assert list(plan.descriptor.dim_labels) == ["z", "y", "x"]
             assert list(plan.descriptor.shape) == [4, 3, 2]
@@ -367,11 +375,12 @@ class TestNormalizedDescriptorAndData:
         with tempfile.TemporaryDirectory() as tmp:
             adapter, src = self._wrapped(tmp)
             plan = adapter.plan_flight_info(
-                TensorReadOption(tensor_id="src"), PyramidConfig()
+                TensorReadOption(array_id="src", fields=FieldMask(paths=["endpoints"])),
+                PyramidConfig(),
             )
             out = np.zeros(tuple(plan.descriptor.shape), dtype=np.uint16)
             for ce in plan.chunk_endpoints:
-                from biopb_tensor_server.core.adapter_base import unpack_chunk_array
+                from biopb_tensor_server.core.chunk_batch import unpack_chunk_array
 
                 arr = unpack_chunk_array(adapter.resolve_chunk_data(ce.chunk_id))
                 sl = tuple(
@@ -390,7 +399,9 @@ class TestNormalizedDescriptorAndData:
         transfer_target(4)
         with tempfile.TemporaryDirectory() as tmp:
             adapter, src = self._wrapped(tmp)
-            read_opt = TensorReadOption(tensor_id="src")
+            read_opt = TensorReadOption(
+                array_id="src", fields=FieldMask(paths=["endpoints"])
+            )
             read_opt.slice_hint.start[:] = [0, 0, 0]
             read_opt.slice_hint.stop[:] = [2, 3, 2]
             plan = adapter.plan_flight_info(read_opt, PyramidConfig())
@@ -403,14 +414,16 @@ class TestNormalizedDescriptorAndData:
         """A downsampled read is the subtlest path: the client's ``scale_hint``
         is canonical, the delegate downsamples in native order inside the
         chunk_id, and the result comes back transposed. All three have to agree."""
-        from biopb_tensor_server.core.adapter_base import unpack_chunk_array
+        from biopb_tensor_server.core.chunk_batch import unpack_chunk_array
 
         with tempfile.TemporaryDirectory() as tmp:
             src = (np.arange(4 * 32 * 64, dtype=np.uint16) % 251).reshape(4, 32, 64)
             adapter = normalize_adapter(_zarr_adapter(tmp, src, ["x", "y", "z"]))
             canonical = src.transpose(2, 1, 0)
 
-            read_opt = TensorReadOption(tensor_id="src")
+            read_opt = TensorReadOption(
+                array_id="src", fields=FieldMask(paths=["endpoints"])
+            )
             read_opt.scale_hint[:] = [2, 2, 1]  # canonical: z/2, y/2, x untouched
             # Asked for explicitly: this test is about the permutation agreeing
             # across scale_hint / chunk_id / result, and the expected value below
@@ -440,7 +453,9 @@ class TestNormalizedDescriptorAndData:
             src = np.zeros((128, 64, 4), np.uint16)  # x, y, z
             adapter = normalize_adapter(_zarr_adapter(tmp, src, ["x", "y", "z"]))
             plan = adapter.plan_flight_info(
-                TensorReadOption(tensor_id="src", with_pyramid=True),
+                TensorReadOption(
+                    array_id="src", fields=FieldMask(paths=["endpoints", "pyramid"])
+                ),
                 PyramidConfig(threshold=32),
             )
             assert list(plan.descriptor.shape) == [4, 64, 128]
@@ -533,14 +548,17 @@ class TestNormalizedCaching:
         with tempfile.TemporaryDirectory() as tmp:
             CacheManager.reset()
             CacheManager.initialize(
-                CacheConfig(backend="file", file_cache_dir=str(Path(tmp) / "cache"))
+                CacheConfig(file_cache_dir=str(Path(tmp) / "cache"))
             )
             try:
                 cache = CacheManager.get_instance()
                 src = np.arange(2 * 3 * 4, dtype=np.uint16).reshape(2, 3, 4)
                 adapter = normalize_adapter(_zarr_adapter(tmp, src, ["x", "y", "z"]))
                 plan = adapter.plan_flight_info(
-                    TensorReadOption(tensor_id="src"), PyramidConfig()
+                    TensorReadOption(
+                        array_id="src", fields=FieldMask(paths=["endpoints"])
+                    ),
+                    PyramidConfig(),
                 )
                 ce = plan.chunk_endpoints[0]
                 first = adapter.resolve_chunk_data(ce.chunk_id, cache)
@@ -556,14 +574,13 @@ class TestNormalizedCaching:
             finally:
                 CacheManager.reset()
 
-    def test_format_version_was_bumped_for_the_transpose(self):
-        from biopb.tensor._pool import _CACHEFILE_SUPPORTED_FORMAT
-        from biopb_tensor_server.cache.file_backend import CACHE_FILE_FORMAT_VERSION
+    def test_the_segment_marker_still_refuses_pre_transpose_segments(self):
+        """This server must never read back a v1 segment: it holds
+        pre-transpose bytes under an id that is still valid, so the marker
+        never goes below 2."""
+        from biopb_tensor_server.cache.bootstrap import CACHE_FILE_FORMAT_VERSION
 
         assert CACHE_FILE_FORMAT_VERSION >= 2
-        # The layout did not change, so this client parses the new version; an
-        # older one declines the fast path and falls back to do_get.
-        assert _CACHEFILE_SUPPORTED_FORMAT >= CACHE_FILE_FORMAT_VERSION
 
 
 # ==============================================================================
@@ -571,17 +588,17 @@ class TestNormalizedCaching:
 # ==============================================================================
 
 
-class TestCreateSourceValidation:
-    def _manager(self):
+class TestAddTensorValidation:
+    def _manager(self, tmp_path=None):
         from biopb_tensor_server.serving.upload_manager import UploadManager
 
-        return UploadManager(SourceRegistry(), None, None)
+        return UploadManager(SourceRegistry(), tmp_path, None)
 
     def test_non_canonical_upload_is_rejected(self):
         with pytest.raises(flight.FlightServerError, match="canonical"):
-            self._manager().create_source(
+            self._manager().add_tensor(
                 TensorDescriptor(
-                    array_id="cache:bad",
+                    array_id="cache://any/bad",
                     dim_labels=["x", "y", "z"],
                     shape=[4, 5, 6],
                     chunk_shape=[4, 5, 6],
@@ -591,9 +608,9 @@ class TestCreateSourceValidation:
 
     def test_the_error_names_the_order_to_use(self):
         with pytest.raises(flight.FlightServerError) as exc:
-            self._manager().create_source(
+            self._manager().add_tensor(
                 TensorDescriptor(
-                    array_id="cache:bad",
+                    array_id="cache://any/bad",
                     dim_labels=["x", "y"],
                     shape=[4, 5],
                     chunk_shape=[4, 5],
@@ -602,27 +619,36 @@ class TestCreateSourceValidation:
             )
         assert "['y', 'x']" in str(exc.value)
 
-    def test_canonical_upload_is_accepted(self):
-        desc = self._manager().create_source(
+    def _create(self, tmp_path, desc):
+        """Accepting an order takes a source to add the tensor to."""
+        manager = self._manager(tmp_path)
+        source = manager.install_scratch(None)
+        desc.array_id = f"cache://{source}/@fields/{desc.array_id}"
+        return manager.add_tensor(desc)
+
+    def test_canonical_upload_is_accepted(self, tmp_path):
+        desc = self._create(
+            tmp_path,
             TensorDescriptor(
-                array_id="cache:good",
+                array_id="good",
                 dim_labels=["z", "y", "x"],
                 shape=[4, 5, 6],
                 chunk_shape=[4, 5, 6],
                 dtype="<u2",
-            )
+            ),
         )
         assert list(desc.dim_labels) == ["z", "y", "x"]
 
-    def test_unlabeled_upload_is_accepted(self):
+    def test_unlabeled_upload_is_accepted(self, tmp_path):
         """An uploader that declares no semantics is not forced to invent any."""
-        desc = self._manager().create_source(
+        desc = self._create(
+            tmp_path,
             TensorDescriptor(
-                array_id="cache:plain",
+                array_id="plain",
                 shape=[4, 5, 6],
                 chunk_shape=[4, 5, 6],
                 dtype="<u2",
-            )
+            ),
         )
         assert list(desc.shape) == [4, 5, 6]
 
@@ -641,7 +667,7 @@ class TestServedOverFlight:
 
         tmp = tempfile.mkdtemp()
         CacheManager.reset()
-        CacheManager.initialize(CacheConfig(backend="memory"))
+        CacheManager.initialize(CacheConfig(file_cache_dir=os.path.join(tmp, "cache")))
         src = (np.arange(8 * 12 * 3, dtype=np.uint16) % 251).reshape(8, 12, 3)
         server = TensorFlightServer("grpc://localhost:0")
         server.register_source("nii", _zarr_adapter(tmp, src, ["x", "y", "z"], "nii"))
@@ -665,7 +691,7 @@ class TestServedOverFlight:
 
         tmp = tempfile.mkdtemp()
         CacheManager.reset()
-        CacheManager.initialize(CacheConfig(backend="memory"))
+        CacheManager.initialize(CacheConfig(file_cache_dir=os.path.join(tmp, "cache")))
         src = (np.arange(8 * 12, dtype=np.uint16) % 251).reshape(8, 12)
         server = TensorFlightServer("grpc://localhost:0")
         server.register_source("img", _zarr_adapter(tmp, src, ["y", "x"], "img"))
@@ -720,7 +746,7 @@ def _legacy_upstream(tmp, arr, labels, name="u"):
 class TestRemoteProxyRefusesRatherThanPermutes:
     """The upstream owns a mirrored source's axis order -- it mints the chunk_ids,
     plans the reads (#295) and sizes the grid -- so the server validates that
-    order instead of permuting behind it, exactly as ``create_source`` does for an
+    order instead of permuting behind it, exactly as ``add_tensor`` does for an
     uploader's declared order."""
 
     def test_a_proxy_is_never_wrapped(self):
@@ -742,11 +768,11 @@ class TestRemoteProxyRefusesRatherThanPermutes:
 
         tmp = tempfile.mkdtemp()
         CacheManager.reset()
-        CacheManager.initialize(CacheConfig(backend="memory"))
+        CacheManager.initialize(CacheConfig(file_cache_dir=os.path.join(tmp, "cache")))
         src = np.arange(2 * 3 * 8, dtype=np.uint16).reshape(2, 3, 8)
         up = _legacy_upstream(tmp, src, ["x", "y", "z"])
-        down = TensorFlightServer("grpc://localhost:0")
-        down.register_source("m", _proxy_adapter(up.port))
+        down = catalog_server("grpc://localhost:0")
+        register_and_catalog(down, "m", _proxy_adapter(up.port))
         down.mark_ready()
         threading.Thread(target=down.serve, daemon=True).start()
         time.sleep(0.8)
@@ -778,11 +804,11 @@ class TestRemoteProxyRefusesRatherThanPermutes:
 
         tmp = tempfile.mkdtemp()
         CacheManager.reset()
-        CacheManager.initialize(CacheConfig(backend="memory"))
+        CacheManager.initialize(CacheConfig(file_cache_dir=os.path.join(tmp, "cache")))
         src = np.arange(2 * 3 * 8, dtype=np.uint16).reshape(2, 3, 8)
         up = _legacy_upstream(tmp, src, ["x", "y", "z"])
-        down = TensorFlightServer("grpc://localhost:0")
-        down.register_source("m", _proxy_adapter(up.port))
+        down = catalog_server("grpc://localhost:0")
+        register_and_catalog(down, "m", _proxy_adapter(up.port))
         down.mark_ready()
         threading.Thread(target=down.serve, daemon=True).start()
         time.sleep(0.8)
@@ -802,11 +828,11 @@ class TestRemoteProxyRefusesRatherThanPermutes:
 
         tmp = tempfile.mkdtemp()
         CacheManager.reset()
-        CacheManager.initialize(CacheConfig(backend="memory"))
+        CacheManager.initialize(CacheConfig(file_cache_dir=os.path.join(tmp, "cache")))
         src = (np.arange(4 * 3 * 8, dtype=np.uint16) % 251).reshape(4, 3, 8)
         up = _legacy_upstream(tmp, src, ["z", "y", "x"])
-        down = TensorFlightServer("grpc://localhost:0")
-        down.register_source("m", _proxy_adapter(up.port))
+        down = catalog_server("grpc://localhost:0")
+        register_and_catalog(down, "m", _proxy_adapter(up.port))
         down.mark_ready()
         threading.Thread(target=down.serve, daemon=True).start()
         time.sleep(0.8)
@@ -864,7 +890,7 @@ class TestRemoteProxyRefusesRatherThanPermutes:
             is None
         )
 
-    def test_the_refusal_wording_is_shared_with_create_source(self):
+    def test_the_refusal_wording_is_shared_with_add_tensor(self):
         """One rule stated once: both seams that validate an order they do not own
         report it through ``noncanonical_order``."""
         from biopb_tensor_server.core.axes import noncanonical_order
@@ -874,9 +900,9 @@ class TestRemoteProxyRefusesRatherThanPermutes:
         assert why is not None and "['y', 'x']" in why
 
         with pytest.raises(flight.FlightServerError) as upload_exc:
-            UploadManager(SourceRegistry(), None, None).create_source(
+            UploadManager(SourceRegistry(), None, None).add_tensor(
                 TensorDescriptor(
-                    array_id="cache:bad",
+                    array_id="cache://any/bad",
                     dim_labels=["x", "y"],
                     shape=[4, 5],
                     chunk_shape=[4, 5],

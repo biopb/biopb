@@ -5,8 +5,8 @@
 The control plane is the **durable root** of a biopb deployment — a small
 always-on Starlette/uvicorn app that does three things:
 
-- **supervises the durable planes** as subprocesses (the data plane today, the
-  algorithm plane pending),
+- **supervises the durable planes** as subprocesses: the data plane, and the
+  algorithm servers it runs from the registry (`~/.config/biopb/algorithms/`),
 - **is the single web origin** — it serves the browser SPA and reverse-proxies
   everything behind it,
 - **holds the session registry**, so ephemeral MCP sessions on dynamic ports are
@@ -20,16 +20,13 @@ are its children, and MCP sessions are independent clients that merely register.
 Two rules keep that tree correct, and every change here must preserve them.
 
 - **I1 — the control never *owns* a session.** A session serving an MCP client is
-  spawned by that client's shim and only **registers**, so the control routes to
+  spawned by that client's shim and only **registers itself**, so the control routes to
   and lists it without holding it. The one session the control may *launch* is an
-  agentless `biopb mcp view` viewer, whose only other spawner is a terminal; that
-  child is detached and self-registering, so the registry still only observes and
-  a control restart never closes the user's window. What both preserve is
-  biopb/biopb-mcp#98: a session inherits its spawner's environment, and the wrong
-  one puts the napari viewer where the user is not. So a launch is refused unless
-  this control is loopback-bound **and** has a display of its own, and it launches
-  `--view`, which exits rather than falling back to a virtual display nobody can
-  see.
+  agentless one for the dashboard, driven through its chat pane or a Jupyter
+  client; that child is detached and self-registering, so the registry still only
+  observes and a control restart never ends the user's session. Its config decides
+  whether it gets a napari viewer, and it runs without one where napari or a
+  display is missing.
 - **I2 — the control stays lean and subprocess-based.** It supervises components
   as subprocesses, never by importing them, so no Qt/napari/dask/kernel ever enters
   this process. Facts shared with those components — the control endpoint, the
@@ -70,12 +67,12 @@ namespace, which would collide at the root. So the control serves
 | Path | Target | Hop |
 |---|---|---|
 | `/`, `/viewer`, `/admin`, `/assets/*` | control-served `web/` SPA | in-process |
-| `/api/*` | control's own API (status, sessions, data-plane verbs, viewer launch) | in-process |
+| `/api/*` | control's own API (status, sessions, data-plane verbs, session launch) | in-process |
 | `/health` | bare liveness | in-process |
 | `/data_plane/api/*` | tensor sidecar (API-only) | loopback proxy |
 | `/session/<id>/observe` | control-served SPA observe shell | in-process |
 | `/session/<id>/api/*` | that session's observe API | loopback proxy |
-| `/session/<id>/console/*` | that session's user console — **loopback-bound control only** | loopback proxy |
+| `/session/<id>/chat/*` | that session's chat turns — **loopback-bound control only** | loopback proxy |
 | `/mcp` | agent JSON-RPC — **not routed here**; shim → child, direct | — |
 
 The SPA is built with base `/` so its assets resolve from the root under any shell
@@ -101,15 +98,15 @@ authenticated, for itself and for everything it fronts.
 - **The `/session/<id>` proxy is an allowlist, not a denylist.** A session child's
   `/mcp` is arbitrary code execution sharing the same port as its observe API, and
   path normalization would let a denylist be walked around (`api/../mcp`
-  collapsing onto `/mcp`). Only a first path segment of `api` — or `console`,
+  collapsing onto `/mcp`). Only a first path segment of `api` — or `chat`,
   under the rule below — is proxied; parent traversal is rejected. (`observe` is
   not proxied at all: the page is the control's own SPA shell, served in-process.)
-- **The user console is a separate root, gated on this listener's bind.** A code
-  cell on the observe page runs in that session's kernel, so it is an RCE on the
-  same origin the allowlist above exists to keep RCE off. Folding it into `api`
-  would leave that allowlist enforced but no longer true, so it gets its own root
-  and is proxied only when the control is loopback-bound — `api` always, `console`
-  local-mode only, `/mcp` never. The control decides because only it knows its own
+- **Chat turns are a separate root, gated on this listener's bind.** A turn from
+  the observe page's chat pane runs code in that session's kernel, so it is an
+  RCE on the same origin the allowlist above exists to keep RCE off. Folding it
+  into `api` would leave that allowlist enforced but no longer true, so it gets
+  its own root and is proxied only when the control is loopback-bound — `api`
+  always, `chat` local-mode only, `/mcp` never. The control decides because only it knows its own
   bind: the proxy hop strips Host and Origin, so the child cannot tell a browser
   from this trusted hop. Not gated by the token instead: that credential
   authorizes reading pixels, is readable from a local file by design, and rides
@@ -132,33 +129,31 @@ once it is reachable, and removes it on reap; the control reads that dir. The
 contract is a stdlib-only core-SDK module (I2): the session side writes, the
 control reads, and neither imports the other.
 
-There are two writers, because there are two ways a session comes to exist. A
-shim-owned child is published by its **shim**, which owns its reap and so its
-de-registration. An agentless `biopb mcp view` session has no shim, so it
-**publishes itself** and drops its record on the way out. Either way the control
-only ever reads.
+Every session on a dynamic port **publishes itself** — a shim-owned child under
+the id its shim minted, an agentless `biopb mcp view` session under its own — and
+drops its record on the way out; a shim also drops its child's once it has reaped
+it, since Windows kills the child outright. The control only ever reads.
 
 Lookups **self-heal**, pruning records whose owning pid is dead — or alive on a
 recycled pid, caught by a create-time token — so a dead session expires to a clean
 "session ended" rather than a hang.
 
 `POST /api/sessions/new` is the third way a session comes to exist: the control
-spawns `biopb mcp view` and waits for it to appear in this registry, matched on
-the child's own pid. Registration is an exact readiness signal — `--view` opens
-its window *before* it registers — so a record means a viewer really opened, and
-a child that dies first never registers and comes back with its own log tail.
+spawns `biopb-mcp --transport http --port 0 --start-kernel` and waits for it to
+appear in this registry, matched on a per-launch token it hands the child.
+Registration is an exact readiness signal — the kernel (and any window) starts
+*before* it registers — and a child that dies first never registers and comes
+back with its own log tail.
 Each launch writes **its own** file under `state/biopb/mcp/viewers/` (pruned to
 the newest few), beside the shim's per-session logs and for the same reason: a
-shared file interleaves concurrent viewers, and lines that cannot be attributed
+shared file interleaves concurrent sessions, and lines that cannot be attributed
 to a process are no use for diagnosing a session that is still running. The
 child is told the path, so `server_status` names the file its output really
 went to.
-The verb is offered only where it can work (I1); the dashboard reads that from
-`/api/status` and shows the refusal in the button's place.
 
 **Stopping one is not the mirror image.** The control does not signal a pid — it
 proxies `/session/<id>/api/shutdown`, and the session runs the same teardown
-Ctrl-C does. So ownership never enters it: a viewer started from a terminal and
+Ctrl-C does. So ownership never enters it: a session started from a terminal and
 one started here are the same process ending itself, and the control keeps no
 record of which it launched. The route rides `api` rather than the local-only
 gate (it is not an execute surface, and `api` already carries the kernel

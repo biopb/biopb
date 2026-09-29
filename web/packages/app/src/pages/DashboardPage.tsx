@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { useDocumentTitle } from "../hooks/useDocumentTitle";
 import { withBase } from "../base";
+import { sessionFetch } from "../utils/sessionFetch";
 import {
-  authHeaders,
   authRequired,
   captureUrlToken,
   clearToken,
@@ -53,45 +53,20 @@ interface AgentRec {
   drifted?: boolean;
 }
 interface AlgoRec {
+  name: string;
+  kind: string; // "script" | "url"
   target: string;
-  state: string; // "serving" | "down" | "unknown" | "invalid"
+  // new | installing | stopped | starting | up | failed (a script entry);
+  // up | unreachable | error | invalid (a url entry)
+  state: string;
   scheme?: string;
-  single_op?: boolean;
   op_count?: number;
-  ops?: string[];
+  ops?: { name: string }[];
   error?: string;
 }
-// The kernel-namespace "bring your own tool" plugins (biopb-mcp#92), folded into
-// /api/algorithms. A static listing (files + installed packages), NOT the live
-// set of names a running kernel bound — the control reads it without executing
-// user code (invariant I2).
-interface PluginsRec {
-  dir: string;
-  files: { name: string; summary: string }[];
-  entry_points: { name: string; dist: string }[];
-}
-
-// The control's /api/* is token-gated at this single origin. Attach the stored
-// token ('biopb_token') as a Bearer header via the shared auth helper; in the
-// common local deployment there is no token and the header is simply absent. A
-// 401 means remote mode with a missing/stale token, so bounce to /unlock.
-async function fetchAuth(
-  url: string,
-  opts: RequestInit = {},
-): Promise<Response> {
-  const r = await fetch(url, {
-    ...opts,
-    headers: authHeaders(opts.headers as Record<string, string> | undefined),
-  });
-  if (r.status === 401) {
-    redirectToUnlock();
-  }
-  return r;
-}
-
 async function jpost(url: string): Promise<{ error?: string; data_plane?: DataPlane }> {
   try {
-    const r = await fetchAuth(url, { method: "POST" });
+    const r = await sessionFetch(url, { method: "POST" });
     return await r.json().catch(() => ({}));
   } catch (e) {
     return { error: String(e) };
@@ -111,14 +86,8 @@ export default function DashboardPage() {
   const [sessions, setSessions] = useState<SessionRec[] | null>(null);
   const [agents, setAgents] = useState<AgentRec[] | null>(null);
   const [algos, setAlgos] = useState<AlgoRec[] | null>(null);
-  const [plugins, setPlugins] = useState<PluginsRec | null>(null);
   const [verbBusy, setVerbBusy] = useState(false);
   const [agentsBusy, setAgentsBusy] = useState(false);
-  // Whether this control will launch a viewer session, and the sentence it gave
-  // for refusing. Both from /api/status; undefined on an older control, which is
-  // read as "no" so the button appears only where it is known to work.
-  const [canStart, setCanStart] = useState(false);
-  const [startBlocked, setStartBlocked] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
   // Which session's stop is in flight, so only that row's button goes busy.
   const [stoppingId, setStoppingId] = useState<string | null>(null);
@@ -130,25 +99,48 @@ export default function DashboardPage() {
   // Whether a token is held (remote mode). Lock only means something when there
   // is a token to drop; local mode has none, so the button is disabled.
   const [hasToken, setHasToken] = useState(() => !!getToken());
+  // Whether the data plane itself answers SERVING on its own Flight health
+  // check (not just "our child holds the port"). null = not yet probed.
+  // `dataPlane.state` comes from DataPlaneSupervisor.snapshot(), which is a
+  // raw TCP port check by design (_supervisor.py) -- true the moment the gRPC
+  // socket accepts a connection, well before mark_ready() (e.g. while static
+  // sources are still being registered synchronously at startup). Badging
+  // that alone as "serving" reads as "ready" when the catalog can still be
+  // empty (biopb/biopb#1028), so the badge is downgraded to "starting" until
+  // this independently confirms the backend's own readyz.
+  const [backendReady, setBackendReady] = useState<boolean | null>(null);
 
   const pollStatus = useCallback(async () => {
     try {
-      const s = await (await fetchAuth(withBase("/api/status"))).json();
+      const s = await (await sessionFetch(withBase("/api/status"))).json();
       setConn("control: ok · " + (s.sessions || 0) + " session(s)");
       setConnOk(true);
       setDataPlane(s.data_plane || {});
       if (s.version) setVersion(s.version);
-      setCanStart(!!s.can_start_session);
-      setStartBlocked(s.start_session_blocked || null);
     } catch {
       setConn("control unreachable");
       setConnOk(false);
     }
   }, []);
 
+  // Reverse-proxied to the data plane's own HTTP sidecar (unauthenticated,
+  // see http_server.py:/readyz); a plain fetch, same as ClientBootstrap's
+  // startup wait, not sessionFetch -- the sidecar's health endpoints predate any
+  // token gate. 503/unreachable both read as "not ready yet".
+  const pollBackendReady = useCallback(async () => {
+    try {
+      // eslint-disable-next-line no-restricted-globals -- unauthenticated by design
+      const r = await fetch(withBase("/data_plane/readyz"));
+      const j = await r.json().catch(() => null);
+      setBackendReady(!!j && j.ready === true);
+    } catch {
+      setBackendReady(false);
+    }
+  }, []);
+
   const pollSessions = useCallback(async () => {
     try {
-      const data = await (await fetchAuth(withBase("/api/sessions"))).json();
+      const data = await (await sessionFetch(withBase("/api/sessions"))).json();
       setSessions((data && data.sessions) || []);
     } catch {
       /* keep last */
@@ -157,7 +149,7 @@ export default function DashboardPage() {
 
   const pollAgents = useCallback(async () => {
     try {
-      const data = await (await fetchAuth(withBase("/api/agents"))).json();
+      const data = await (await sessionFetch(withBase("/api/agents"))).json();
       setAgents((data && data.agents) || []);
     } catch {
       /* keep last */
@@ -166,9 +158,8 @@ export default function DashboardPage() {
 
   const pollAlgos = useCallback(async () => {
     try {
-      const data = await (await fetchAuth(withBase("/api/algorithms"))).json();
+      const data = await (await sessionFetch(withBase("/api/algorithms"))).json();
       setAlgos((data && data.servers) || []);
-      setPlugins((data && data.plugins) || null);
     } catch {
       /* keep last */
     }
@@ -177,7 +168,7 @@ export default function DashboardPage() {
   // Token-driven unlock gate. Capture a ?token= handed over by the one-time
   // access URL, then — only where the control's /health advertises auth_required
   // — bounce to /unlock if we still have no token. A tokenless local deployment
-  // advertises auth_required=false, so this never redirects. The /api/* fetchAuth
+  // advertises auth_required=false, so this never redirects. The /api/* sessionFetch
   // 401 path is the backstop for a stale/invalid token.
   useEffect(() => {
     captureUrlToken();
@@ -204,16 +195,18 @@ export default function DashboardPage() {
     pollSessions();
     pollAgents();
     pollAlgos();
+    pollBackendReady();
     const id = setInterval(() => {
       pollStatus();
       pollSessions();
+      pollBackendReady();
     }, POLL_MS);
     return () => clearInterval(id);
-  }, [pollStatus, pollSessions, pollAgents, pollAlgos]);
+  }, [pollStatus, pollSessions, pollAgents, pollAlgos, pollBackendReady]);
 
-  // Launching a viewer is slow by nature: the control waits for the child to
-  // open its napari window before it answers, so this holds for as long as a
-  // cold Qt/napari import takes. Bound it with an AbortController and tell the
+  // Launching a session is slow by nature: the control waits for the child to
+  // start its kernel (and napari window, where it has one) before it answers,
+  // so this holds for as long as a cold Qt/napari import takes. Bound it with an AbortController and tell the
   // control our bound (?client_timeout), so it answers "starting" just before we
   // would give up rather than leaving us to time out over a working launch.
   const startSession = useCallback(async () => {
@@ -222,7 +215,7 @@ export default function DashboardPage() {
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), START_TIMEOUT_MS);
     try {
-      const r = await fetchAuth(
+      const r = await sessionFetch(
         withBase("/api/sessions/new?client_timeout=" + START_TIMEOUT_MS / 1000),
         { method: "POST", signal: ctl.signal },
       );
@@ -239,11 +232,11 @@ export default function DashboardPage() {
         setStartMsg({
           err: false,
           text:
-            "Still opening the viewer — it will appear here when it is up." +
+            "Still starting the session — it will appear here when it is up." +
             (res.log_path ? `\nLog: ${res.log_path}` : ""),
         });
       } else {
-        setStartMsg({ err: false, text: "Viewer session started." });
+        setStartMsg({ err: false, text: "Session started." });
       }
     } catch (e) {
       setStartMsg({ err: true, text: String(e) });
@@ -263,7 +256,7 @@ export default function DashboardPage() {
     async (id: string) => {
       if (
         !confirm(
-          `Stop session ${id}?\n\nThe napari window closes and any running ` +
+          `Stop session ${id}?\n\nIts kernel (and napari window) closes and any running ` +
             `work is lost. If it was started with \`biopb mcp view\` in a ` +
             `terminal, that terminal returns.`,
         )
@@ -272,7 +265,7 @@ export default function DashboardPage() {
       setStoppingId(id);
       setStartMsg(null);
       try {
-        const r = await fetchAuth(withBase(`/session/${id}/api/shutdown`), {
+        const r = await sessionFetch(withBase(`/session/${id}/api/shutdown`), {
           method: "POST",
         });
         const res = await r.json().catch(() => ({}));
@@ -320,7 +313,12 @@ export default function DashboardPage() {
   );
 
   const dpState = dataPlane.state || "unknown";
+  // Links stay live as soon as the port is up (a TCP dial succeeds regardless
+  // of backend readiness); the badge is what a human reads as "is it up", so
+  // it also folds in whether the data plane's own health check agrees.
   const linksOff = dpState !== "serving";
+  const displayState =
+    dpState === "serving" && backendReady === false ? "starting" : dpState;
 
   return (
     <div className="ctrl-dash">
@@ -360,7 +358,16 @@ export default function DashboardPage() {
         <div className="card">
           <h2>Data plane</h2>
           <div>
-            <span className={"badge " + dpState}>{dpState}</span>
+            <span
+              className={"badge " + displayState}
+              title={
+                displayState === "starting" && dpState === "serving"
+                  ? "Process is up but the data plane hasn't finished its own startup scan yet."
+                  : undefined
+              }
+            >
+              {displayState}
+            </span>
           </div>
           <dl>
             <dt>gRPC</dt>
@@ -444,51 +451,8 @@ export default function DashboardPage() {
             )}
           </ul>
           <p className="note">
-            Read-only view of the biopb.image ProcessImage servers configured for
-            agent kernels, with a live health + ops probe. Lifecycle control is
-            not offered here.
-          </p>
-
-          <div className="subhead">Kernel plugins</div>
-          <ul>
-            {plugins == null ? (
-              <li className="empty">loading…</li>
-            ) : plugins.files.length === 0 && plugins.entry_points.length === 0 ? (
-              <li className="empty">no kernel plugins</li>
-            ) : (
-              <>
-                {plugins.files.map((f) => (
-                  <li key={"f:" + f.name}>
-                    <span className="dot serving"></span>
-                    <span className="sid">{f.name}</span>
-                    {f.summary ? (
-                      <span className="ops" title={f.summary}>
-                        {f.summary}
-                      </span>
-                    ) : null}
-                  </li>
-                ))}
-                {plugins.entry_points.map((e) => (
-                  <li key={"e:" + e.name}>
-                    <span className="dot serving"></span>
-                    <span className="sid">{e.name}</span>
-                    <span className="tls">pkg</span>
-                    {e.dist ? (
-                      <span className="ops" title={e.dist}>
-                        {e.dist}
-                      </span>
-                    ) : null}
-                  </li>
-                ))}
-              </>
-            )}
-          </ul>
-          <p className="note">
-            User "bring your own tool" helpers loaded into agent kernels:{" "}
-            <code>*.py</code> files in{" "}
-            <code>{plugins?.dir || "~/.config/biopb/kernel/"}</code> and installed{" "}
-            <code>biopb_mcp.namespace</code> packages. Static listing — the live set
-            depends on each plugin.
+            The entries in ~/.config/biopb/algorithms/: server files the control
+            runs on first use, and servers someone else runs, probed live.
           </p>
         </div>
 
@@ -524,17 +488,15 @@ export default function DashboardPage() {
         <div className="card">
           <h2 className="with-actions">
             Sessions
-            {canStart ? (
-              <button
-                className="mini"
-                onClick={startSession}
-                disabled={starting}
-                title="Open a napari viewer session on this machine"
-              >
-                {starting ? "opening…" : "+ new viewer"}
-              </button>
-            ) : null}
-            {/* biopb-mcp's own global settings (transport/kernel/dask/algorithm
+            <button
+              className="mini"
+              onClick={startSession}
+              disabled={starting}
+              title="Start a session on this machine"
+            >
+              {starting ? "starting…" : "+ new session"}
+            </button>
+            {/* biopb-mcp's own global settings (transport/kernel/algorithm
                 servers), served by the control at /api/mcp_config. It sits here
                 rather than in the header because it is what every session in
                 this list was launched with — including the ones the button
@@ -592,7 +554,7 @@ export default function DashboardPage() {
                         className="mini stop"
                         onClick={() => stopSession(s.session_id)}
                         disabled={stoppingId === s.session_id}
-                        title="Stop this session (closes its napari window)"
+                        title="Stop this session"
                         aria-label={`Stop session ${s.session_id}`}
                       >
                         {stoppingId === s.session_id ? "…" : "✕"}
@@ -608,9 +570,6 @@ export default function DashboardPage() {
               {startMsg.text}
             </p>
           ) : null}
-          {!canStart && startBlocked ? (
-            <p className="note">Cannot open a viewer here: {startBlocked}.</p>
-          ) : null}
         </div>
       </main>
       <style>{DASH_CSS}</style>
@@ -622,24 +581,25 @@ export default function DashboardPage() {
 // state + op count, and an ops preview (full list in the hover title). A
 // non-serving server shows its error message in the preview slot instead.
 function AlgoRow({ s }: { s: AlgoRec }) {
-  const serving = s.state === "serving";
-  const dotCls =
-    "dot " + (serving ? "serving" : s.state === "unknown" ? "" : "down");
+  const serving = s.state === "up";
+  // A script entry that is installed but not running is healthy: it starts
+  // on its first call.
+  const idle = ["new", "installing", "stopped", "starting"].includes(s.state);
+  const dotCls = "dot " + (serving ? "serving" : idle ? "" : "down");
   let stateLabel = s.state;
-  if (serving)
-    stateLabel = s.single_op
-      ? "serving · single-op"
-      : "serving · " + (s.op_count || 0) + " op" + (s.op_count === 1 ? "" : "s");
-  else if (s.state === "invalid") stateLabel = "invalid URL";
-  else if (s.state === "unknown") stateLabel = "gRPC unavailable";
-  const joined = s.ops ? s.ops.join(", ") : "";
+  if (serving || s.state === "stopped")
+    stateLabel =
+      s.state + " · " + (s.op_count || 0) + " op" + (s.op_count === 1 ? "" : "s");
+  else if (s.state === "invalid") stateLabel = "invalid entry";
+  const joined = s.ops ? s.ops.map((o) => o.name).join(", ") : "";
   return (
     <li>
       <span className={dotCls}></span>
-      <span className="sid">{s.target}</span>
+      <span className="sid">{s.name}</span>
+      {s.kind === "url" ? <span className="sid">{s.target}</span> : null}
       {s.scheme === "grpcs" ? <span className="tls">TLS</span> : null}
       <span className="state">{stateLabel}</span>
-      {serving && s.ops && s.ops.length ? (
+      {(serving || s.state === "stopped") && s.ops && s.ops.length ? (
         <span className="ops" title={joined}>
           {joined}
         </span>

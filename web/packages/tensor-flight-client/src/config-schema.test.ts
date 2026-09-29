@@ -56,8 +56,7 @@ const SCHEMA: ConfigSchema = {
       type: "object",
       additionalProperties: true,
       properties: {
-        backend: { type: "string", enum: ["memory", "file"] },
-        max_bytes: { type: "integer", minimum: 1 },
+        file_max_total_gb: { type: "integer", minimum: 1 },
       },
     },
     sources: {
@@ -114,9 +113,10 @@ describe("schema accessors", () => {
     const server = sectionProperties(SCHEMA, "server");
     expect(isDeprecated(server.watcher_type)).toBe(true);
     expect(isDeprecated(server.host)).toBe(false);
-    expect(enumValues(sectionProperties(SCHEMA, "cache").backend)).toEqual([
-      "memory",
-      "file",
+    expect(enumValues(sourceItemProperties(SCHEMA).type)).toEqual([
+      "zarr",
+      "ome-zarr",
+      null,
     ]);
     expect(enumValues(server.host)).toBeNull();
     // A union ["string","null"] picks the non-null member for the control.
@@ -134,7 +134,7 @@ describe("validateConfig", () => {
   it("passes a valid config", () => {
     const cfg = {
       server: { host: "0.0.0.0", port: 8815 },
-      cache: { backend: "memory", max_bytes: 1000 },
+      cache: { file_max_total_gb: 4 },
       sources: [{ url: "/data", monitor: true, type: "zarr" }],
     };
     expect(validateConfig(cfg, SCHEMA)).toEqual([]);
@@ -153,11 +153,11 @@ describe("validateConfig", () => {
   });
 
   it("flags a bad hard enum", () => {
-    const errs = validateConfig({ cache: { backend: "bogus" } }, SCHEMA);
+    const errs = validateConfig({ sources: [{ url: "/d", type: "bogus" }] }, SCHEMA);
     expect(errs).toHaveLength(1);
-    expect(errs[0]!.path).toEqual(["cache", "backend"]);
-    expect(errs[0]!.message).toContain("memory");
-    expect(errs[0]!.message).toContain("file");
+    expect(errs[0]!.path).toEqual(["sources", 0, "type"]);
+    expect(errs[0]!.message).toContain("zarr");
+    expect(errs[0]!.message).toContain("ome-zarr");
   });
 
   it("does NOT hard-fail case-insensitive enums (no schema enum)", () => {
@@ -299,6 +299,6 @@ describe("fieldErrors", () => {
   });
   it("returns [] for a non-match / prefix", () => {
     expect(fieldErrors(errs, ["server"])).toEqual([]);
-    expect(fieldErrors(errs, ["cache", "backend"])).toEqual([]);
+    expect(fieldErrors(errs, ["cache", "file_max_total_gb"])).toEqual([]);
   });
 });

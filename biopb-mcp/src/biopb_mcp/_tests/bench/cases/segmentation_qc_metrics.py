@@ -24,7 +24,7 @@ The counts are known in closed form by construction — 32 matched pairs, 8
 predictions with nothing under them, 2 annotated cells the model missed — and
 the builder asserts that `segmentation_qc` agrees before handing the fixture
 over. That check is the cheap half of proving the fixture measures what it
-claims: if the plugin and the bookkeeping ever disagree, the truth is wrong and
+claims: if the op and the bookkeeping ever disagree, the truth is wrong and
 every arm scored against it is meaningless.
 
 Nothing touches a border, so `EXCLUDE_BORDER` cannot move the numbers. That is
@@ -130,7 +130,7 @@ class TwoRuns:
             "fn": self.n_missed,
             "gt_layer": "labels_run_b",
         }
-        _agrees_with_the_plugin(gt, pred, truth)
+        _agrees_with_the_op(gt, pred, truth)
 
         return Fixture(
             provenance=(
@@ -151,8 +151,8 @@ class TwoRuns:
         )
 
 
-def _agrees_with_the_plugin(gt, pred, truth) -> None:
-    """The closed-form counts, checked against the plugin the skill calls.
+def _agrees_with_the_op(gt, pred, truth) -> None:
+    """The closed-form counts, checked against the op the skill calls.
 
     Two independent derivations of the same numbers: the construction knows how
     many objects it matched, and `segmentation_qc` matches them by IoU without
@@ -161,7 +161,7 @@ def _agrees_with_the_plugin(gt, pred, truth) -> None:
     threshold — and every arm scored against it would be meaningless, so this
     raises at build time rather than reporting a quiet zero later.
     """
-    from biopb_mcp.plugins import segmentation_qc
+    from biopb_mcp.algorithms import segmentation_qc
 
     got = segmentation_qc.match_labels(gt, pred, iou_threshold=0.5)
     counted = (got.tp, got.fp, got.fn)
@@ -170,11 +170,11 @@ def _agrees_with_the_plugin(gt, pred, truth) -> None:
         raise AssertionError(
             f"{NAMESPACE} fixture: segmentation_qc counts {counted} (tp, fp, fn) but "
             f"the construction declares {declared}. The truth is wrong, not the "
-            "plugin."
+            "op."
         )
     if got.splits or got.merges:
         raise AssertionError(
-            f"{NAMESPACE} fixture: objects are meant to be isolated, but the plugin "
+            f"{NAMESPACE} fixture: objects are meant to be isolated, but the op "
             f"reports {got.splits} splits and {got.merges} merges"
         )
 
@@ -297,10 +297,10 @@ CASE = Case(
     collect={"precision": "precision", "recall": "recall", "f1": "f1"},
     score=verify,
     save_artifacts=save_artifacts,
-    # `checklist: plugin:segmentation_qc`, and the body says there is no degraded
-    # path. Without this the session has no such plugin and the run would be
-    # scoring an environment the skill declares it cannot work in.
-    plugins=("segmentation_qc",),
+    # The doc requires the `segmentation_qc` op, and its body says there is
+    # no degraded path. Without this the session has no such op and the run
+    # would be scoring an environment the doc declares it cannot work in.
+    algorithms=("segmentation_qc",),
     # It must be able to answer which layer is which.
     persona_must_know=("labels_run_a", "labels_run_b", "by hand"),
     # And it must not know the metric — only which layer it drew.

@@ -5,7 +5,10 @@ for efficient multi-dimensional array storage and retrieval.
 
 Key components:
 - TensorFlightClient: Client for accessing tensors from a TensorFlightServer
+- Connection: the data plane this machine's control names, dialed and shared
 - Proto messages: TensorTicket, ChunkBounds, TensorDescriptor, SliceHint
+- query / resolve hand back `sources` catalog rows; what you decode
+  them into is yours (descriptors_from_rows is the deprecated proto form)
 - CLI diagnostics: `biopb tensor` command for inspecting sources and tensors
 
 The CLI module provides the `biopb tensor` command with four subcommands:
@@ -17,19 +20,27 @@ The CLI module provides the `biopb tensor` command with four subcommands:
 Note: Server components have been moved to the biopb-tensor-server package.
 """
 
+from biopb.tensor._catalog_rows import descriptor_from_row, descriptors_from_rows
+from biopb.tensor._labels import (
+    LABELS_SEGMENT,
+    RESERVED_LABEL_PREFIX,
+    LabelAddress,
+    is_reserved_label_name,
+    label_image_axes,
+    split_label_array_id,
+)
+
 # Import proto-generated classes with explicit paths
 from biopb.tensor.descriptor_pb2 import (
-    FlightCmd,
-    MetadataQueryOption,
+    CatalogQuery,
+    FlightRequest,
     ResolveProgress,
     SliceHint,
-    TensorCriteria,
     TensorDescriptor,
     TensorReadOption,
-    TensorWriteOptions,
     WarmProgress,
 )
-from biopb.tensor.serialized_pb2 import SerializedEndpoint, SerializedTensor
+from biopb.tensor.serialized_pb2 import SerializedTensor
 from biopb.tensor.ticket_pb2 import ChunkBounds, TensorTicket
 
 # Import client lazily. biopb.tensor.client imports pyarrow at module load, and
@@ -40,10 +51,16 @@ from biopb.tensor.ticket_pb2 import ChunkBounds, TensorTicket
 _LAZY_CLIENT_EXPORTS = (
     "TensorFlightClient",
     "ResolveCancelled",
+    "UploadRefused",
 )
 
 
 def __getattr__(name):
+    if name == "Connection":
+        from biopb.tensor._connection import Connection
+
+        globals()["Connection"] = Connection
+        return Connection
     if name in _LAZY_CLIENT_EXPORTS:
         from biopb.tensor import client
 
@@ -59,16 +76,27 @@ __all__ = [
     "ChunkBounds",
     "TensorDescriptor",
     "SliceHint",
-    "TensorCriteria",
-    "TensorWriteOptions",
-    "FlightCmd",
+    "FlightRequest",
     "TensorReadOption",
-    "MetadataQueryOption",
+    "CatalogQuery",
     "ResolveProgress",
     "WarmProgress",
     "SerializedTensor",
-    "SerializedEndpoint",
+    # Deprecated: `sources` rows as DataSourceDescriptor (biopb/biopb#1032).
+    # There is no replacement -- a row is the data structure.
+    "descriptor_from_row",
+    "descriptors_from_rows",
+    # Label sets: what an array_id says, and how a set lines up with its
+    # image. Pure string/shape rules -- no client needed to ask them.
+    "LABELS_SEGMENT",
+    "RESERVED_LABEL_PREFIX",
+    "LabelAddress",
+    "is_reserved_label_name",
+    "label_image_axes",
+    "split_label_array_id",
     # Client
+    "Connection",
     "TensorFlightClient",
     "ResolveCancelled",
+    "UploadRefused",
 ]

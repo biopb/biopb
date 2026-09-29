@@ -136,8 +136,8 @@ def test_a_fixture_tree_does_not_change_what_a_procedural_case_runs(
     replaced a case's own fixture, silently and per machine. **Substituting the
     data makes it a different experiment with the same name** — the truth
     changes, the achievable accuracy changes, and the conclusion can invert,
-    which was measured rather than supposed (`docs/fixtures.md`). It is a
-    root path now, and a procedural case must not so much as look at it.
+    which was measured rather than supposed. It is a root path now, and a
+    procedural case must not so much as look at it.
     """
     case = next(c for c in CASES if c.fixture.kind == "synthetic")
     decoy = tmp_path / case.namespace / case.case_id
@@ -263,7 +263,7 @@ def test_every_layer_is_presented_in_a_way_the_harness_can_produce(case):
 
 def test_a_case_on_a_plane_tells_the_agent_where_its_data_is(case):
     """A `tensor` fixture is addressable but **not discoverable** — an uploaded
-    source is deliberately not synced to the catalog, so `query_sources()` will
+    source is deliberately not synced to the catalog, so `query()` will
     not find it. What the agent gets instead is the layer the harness already
     added and the ids under :data:`TENSOR_HANDLE`, and the prompt has to point
     at one of them: an agent nobody told would be scored on failing to guess at

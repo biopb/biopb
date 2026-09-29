@@ -1,6 +1,6 @@
 """Tests for the audit-notebook serializer (_notebook.py).
 
-Pure-function tests: build_notebook turns a list of _jobs.export() snapshots into
+Pure-function tests: build_notebook turns a list of JobLog.export() snapshots into
 an nbformat-v4 dict. No kernel, no Qt.
 """
 
@@ -45,7 +45,7 @@ def test_one_job_cell_structure():
     assert "x = 1" in src
     assert job["metadata"]["biopb"]["job_id"] == "job-1"
     # Who ran it, in both places. A record predating `origin` reads as the
-    # agent, which is what every pre-console session was.
+    # agent, which is what every session before other writers was.
     assert job["metadata"]["biopb"]["origin"] == "mcp"
 
 
@@ -114,10 +114,21 @@ def test_suggested_filename():
 
 
 def _record(**kw):
+    """A verification record: the document, and what running its cells did.
+
+    Both halves, because that is what the export now is -- the agent's document
+    with the run's outputs stamped into it.
+    """
     base = {
         "title": "Count foci per cell",
         "created": 1_700_000_000.0,
         "status": "ok",
+        "blocks": [
+            {"kind": "markdown", "text": "# Count foci per cell\n\nSet it up."},
+            {"kind": "code", "text": "a = 2"},
+            {"kind": "markdown", "text": "Then triple it."},
+            {"kind": "code", "text": "print(a * 3)\na * 3"},
+        ],
         "cells": [
             {
                 "code": "a = 2",
@@ -141,12 +152,32 @@ def _record(**kw):
     return base
 
 
-def test_workflow_notebook_is_title_bootstrap_then_the_cells():
+def test_the_workflow_notebook_is_the_document_with_the_run_stamped_into_it():
     nb = _notebook.build_workflow_notebook(_record())
     json.dumps(nb)
-    assert [c["cell_type"] for c in nb["cells"]] == ["markdown", "code", "code", "code"]
+    # Provenance, then the document as written: prose where the author put it,
+    # and no bootstrap cell -- the document builds its own environment.
+    assert [c["cell_type"] for c in nb["cells"]] == [
+        "markdown",
+        "markdown",
+        "code",
+        "markdown",
+        "code",
+    ]
     assert "Count foci per cell" in "".join(nb["cells"][0]["source"])
-    assert "build_ops" in "".join(nb["cells"][1]["source"])
+    assert "".join(nb["cells"][3]["source"]) == "Then triple it."
+
+
+def test_the_outputs_come_from_the_run_not_from_the_document():
+    # The agent writes the code; only the run can say what it printed. They are
+    # zipped by position -- the code blocks and the results are one list.
+    nb = _notebook.build_workflow_notebook(_record())
+    first, second = nb["cells"][2], nb["cells"][4]
+    assert first["outputs"] == []
+    assert {o["output_type"] for o in second["outputs"]} == {
+        "stream",
+        "execute_result",
+    }
 
 
 def test_a_workflow_cell_carries_no_audit_header():
@@ -154,10 +185,15 @@ def test_a_workflow_cell_carries_no_audit_header():
     # workflow has one author, and a banner per cell is noise in a document
     # someone is meant to read and edit.
     nb = _notebook.build_workflow_notebook(_record())
-    src = "".join(nb["cells"][-1]["source"])
-    assert src == "print(a * 3)\na * 3"
-    kinds = {o["output_type"] for o in nb["cells"][-1]["outputs"]}
-    assert kinds == {"stream", "execute_result"}
+    assert "".join(nb["cells"][-1]["source"]) == "print(a * 3)\na * 3"
+
+
+def test_a_document_not_yet_re_run_still_builds():
+    # No results at all: every code cell renders, with no output. This is the
+    # shape a draft read back off disk has.
+    nb = _notebook.build_workflow_notebook(_record(cells=[]))
+    assert [c["cell_type"] for c in nb["cells"]].count("code") == 2
+    assert all(c.get("outputs") == [] for c in nb["cells"] if c["cell_type"] == "code")
 
 
 def test_the_intro_states_what_the_run_did_and_did_not_prove():
@@ -171,35 +207,32 @@ def test_the_intro_states_what_the_run_did_and_did_not_prove():
     assert "no layer the session happened to have" in intro
 
 
-def test_the_workflow_notebook_has_no_viewer_and_the_audit_one_does():
-    """The two exports differ by exactly one thing, and it is deliberate.
+def test_the_intro_says_the_kernel_was_given_nothing():
+    # The invariant the whole feature now rests on: the scratch kernel holds
+    # nothing, so what ran here runs for the reader.
+    intro = "".join(_notebook.build_workflow_notebook(_record())["cells"][0]["source"])
+    assert "was given" in intro and "no napari viewer" in intro
 
-    A workflow is run by someone already looking at their own screen, so the
-    viewer is one dependency it does not need -- and dropping it is what lets
-    the notebook run headless, under `nbconvert --execute`. The audit export
-    keeps it, because a session transcript is full of viewer cells that need
-    somewhere to land.
 
-    This is also the scratch kernel's policy (`_bootstrap`), and the two have to
-    agree: a workflow verified without a viewer is one this cell can rebuild
-    exactly.
+def test_the_workflow_export_has_no_bootstrap_cell_and_the_audit_one_does():
+    """The two exports no longer differ by a viewer; they differ by an author.
+
+    The audit export reconstructs a session it recorded, so it writes its own
+    bootstrap. A workflow document builds its own environment and was verified
+    doing it, so there is nothing left to rebuild on its behalf.
     """
-    wf = "".join(_notebook.build_workflow_notebook(_record())["cells"][1]["source"])
-    # The *code*, not the comment that explains its absence.
-    code = "\n".join(ln for ln in wf.splitlines() if not ln.lstrip().startswith("#"))
-    assert "napari" not in code and "viewer" not in code
-    assert "get_ipython" in code and "_load_namespace_plugins" in code  # plugins stay
-    assert "build_ops" in code and "TensorConnection" in code  # ops/client stay
-    compile(wf, "<workflow-bootstrap>", "exec")
+    wf = _notebook.build_workflow_notebook(_record())
+    assert "Connection()" not in json.dumps(wf)
 
     audit = "".join(_notebook.build_notebook([])["cells"][1]["source"])
     assert "import napari" in audit and "napari.Viewer()" in audit
     compile(audit, "<audit-bootstrap>", "exec")
 
 
-def test_the_workflow_intro_says_there_is_no_viewer():
+def test_the_intro_says_the_prose_is_unverified():
+    # Running the cell checks the code; nothing checks the sentence above it.
     intro = "".join(_notebook.build_workflow_notebook(_record())["cells"][0]["source"])
-    assert "no napari viewer" in intro and "headless" in intro
+    assert "unverified" in intro
 
 
 def test_an_empty_record_still_builds():
@@ -208,6 +241,13 @@ def test_an_empty_record_still_builds():
     nb = _notebook.build_workflow_notebook(None)
     json.dumps(nb)
     assert "Verified workflow" in "".join(nb["cells"][0]["source"])
+
+
+def test_the_draft_is_named_for_the_workflow_and_not_stamped():
+    # One file per workflow: attempts are drafts of one document, and a stamp
+    # per attempt would make a directory of dead ends.
+    assert _notebook.draft_filename("Count Foci / cell (v2)") == "count-foci-cell-v2.md"
+    assert _notebook.draft_filename("") == "workflow.md"
 
 
 def test_suggested_workflow_filename_slugs_the_title():
@@ -225,23 +265,15 @@ def test_the_bootstrap_cell_is_valid_python():
     compile(_notebook.BOOTSTRAP_SRC, "<bootstrap>", "exec")
 
 
-def test_the_bootstrap_cell_loads_kernel_plugins_after_the_handles():
-    # A workflow calling `rolling_ball.subtract_background(...)` verified fine —
-    # the scratch namespace has the plugins, because they are in the bootstrap
-    # baseline — and then failed on a fresh kernel, because this cell rebuilt
-    # every handle except them. Ordered last, like the kernel's own step 7b, so
-    # a plugin can reference the handles above it.
-    src = _notebook.BOOTSTRAP_SRC
-    assert "_load_namespace_plugins" in src
-    assert src.index("napari.Viewer()") < src.index("_load_namespace_plugins")
-
-
-def test_both_intros_say_the_plugins_come_from_the_reader_s_machine():
-    audit = "".join(_notebook.build_notebook([])["cells"][0]["source"])
-    workflow = "".join(
-        _notebook.build_workflow_notebook(_record())["cells"][0]["source"]
+def test_a_restart_marker_becomes_a_note_between_the_cells():
+    nb = _notebook.build_notebook(
+        [_snap(job_id="job-1"), {"restart": True, "at": 100.0}, _snap(job_id="job-2")]
     )
-    assert "kernel plugins" in audit
-    # The workflow export claims reproducibility, so it owes the sharper note:
-    # the plugins are the reader's, not the session's.
-    assert "~/.config/biopb/kernel" in workflow and "NameError" in workflow
+    kinds = [c["cell_type"] for c in nb["cells"]]
+    marker = next(c for c in nb["cells"] if "Kernel restarted" in "".join(c["source"]))
+    assert marker["cell_type"] == "markdown"
+    at = nb["cells"].index(marker)
+    # A code cell for each job, one on each side of the note.
+    assert kinds[at - 1] == "code" and kinds[at + 1] == "code"
+    assert "1 job" not in "".join(nb["cells"][0]["source"])  # counts jobs, not markers
+    assert "2 job(s)" in "".join(nb["cells"][0]["source"])

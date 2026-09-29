@@ -14,10 +14,11 @@ from biopb_mcp._config import McpConfig
 from biopb_mcp.mcp import __main__ as launcher
 from biopb_mcp.mcp.__main__ import (
     _config_defaults,
+    _decide_viewer,
     _has_display,
-    _is_agentless_viewer,
+    _is_agentless,
     _parse_args,
-    _register_view_session,
+    _register_session,
     _setup_chat,
     _setup_observe,
     _unregister_session,
@@ -62,6 +63,10 @@ class TestParseArgs:
     def test_view_flag_sets_true(self):
         opts = _parse_args(["--view"], default_transport="http", default_port=8765)
         assert opts.view is True
+
+    def test_start_kernel_flag(self):
+        assert _parse_args([], "http", 8765).start_kernel is False
+        assert _parse_args(["--start-kernel"], "http", 8765).start_kernel is True
 
 
 def _cfg(**transport):
@@ -127,10 +132,24 @@ class TestMainDispatch:
         monkeypatch.setattr(
             launcher,
             "_serve_http",
-            lambda config, port, view=False: calls.append((port, view)) or 0,
+            lambda config, port, view=False, start_kernel=False: (
+                calls.append((port, view, start_kernel)) or 0
+            ),
         )
         assert main(["--view", "--port", "0"]) == 0
-        assert calls == [(0, True)]
+        assert calls == [(0, True, True)]
+
+    def test_http_passes_start_kernel(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            launcher,
+            "_serve_http",
+            lambda config, port, view=False, start_kernel=False: (
+                calls.append((port, view, start_kernel)) or 0
+            ),
+        )
+        assert main(["--transport", "http", "--port", "0", "--start-kernel"]) == 0
+        assert calls == [(0, False, True)]
 
     def test_view_takes_precedence_over_stdio_default(self, monkeypatch):
         # empty config -> default transport stdio, but --view wins (viewer path).
@@ -138,7 +157,9 @@ class TestMainDispatch:
         monkeypatch.setattr(
             launcher,
             "_serve_http",
-            lambda config, port, view=False: calls.append(view) or 0,
+            lambda config, port, view=False, start_kernel=False: (
+                calls.append(view) or 0
+            ),
         )
         assert main(["--view"]) == 0
         assert calls == [True]
@@ -166,6 +187,63 @@ class TestHasDisplay:
         monkeypatch.delenv("DISPLAY", raising=False)
         monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
         assert _has_display() is True
+
+
+class TestDecideViewer:
+    """Whether a session gets a viewer: the config wants one, napari is
+    installed, and there is a display -- or Xvfb, which only the config opts
+    into. `--view` is a person asking for a window, so it fails instead."""
+
+    @pytest.fixture
+    def host(self, monkeypatch):
+        """A host with napari installed and a display; tests take them away."""
+        import importlib.util
+
+        state = {"napari": True, "display": True}
+        real_find_spec = importlib.util.find_spec
+
+        def find_spec(name, *a, **kw):
+            if name in ("napari", "biopb_napari_widget"):
+                return object() if state["napari"] else None
+            return real_find_spec(name, *a, **kw)
+
+        monkeypatch.setattr(importlib.util, "find_spec", find_spec)
+        monkeypatch.setattr(launcher, "_has_display", lambda: state["display"])
+        return state
+
+    @staticmethod
+    def _config(**viewer):
+        return {"viewer": viewer}
+
+    def test_a_viewer_by_default(self, host):
+        assert _decide_viewer(self._config()) == (None, False)
+
+    def test_config_turns_it_off(self, host):
+        reason, virtual = _decide_viewer(self._config(enabled=False))
+        assert "viewer.enabled" in reason and virtual is False
+
+    def test_none_without_napari(self, host):
+        host["napari"] = False
+        reason, _ = _decide_viewer(self._config())
+        assert "biopb-mcp[napari]" in reason
+
+    def test_no_display_means_no_viewer_not_xvfb(self, host):
+        host["display"] = False
+        reason, virtual = _decide_viewer(self._config())
+        assert "no display" in reason and virtual is False
+
+    def test_xvfb_only_when_the_config_opts_in(self, host):
+        host["display"] = False
+        assert _decide_viewer(self._config(virtual_display=True)) == (None, True)
+
+    def test_view_overrides_the_config(self, host):
+        assert _decide_viewer(self._config(enabled=False), view=True) == (None, False)
+
+    @pytest.mark.parametrize("missing", ["napari", "display"])
+    def test_view_fails_where_it_cannot_have_a_window(self, host, missing):
+        host[missing] = False
+        with pytest.raises(RuntimeError):
+            _decide_viewer(self._config(virtual_display=True), view=True)
 
 
 class TestSetupObserve:
@@ -324,39 +402,41 @@ class TestSetupChat:
         assert _observe._chat_enabled is False
 
 
-class TestAgentlessViewer:
-    """Which sessions count as a viewer a human opened.
+class TestAgentless:
+    """Which sessions count as one a human opened.
 
-    Two things hang off this and must not drift apart: such a session publishes
-    itself to the registry, and it is the only kind served the built-in chat
-    loop. Pinned as a truth table rather than trusted to two inline expressions,
-    which is what they were.
+    Two things hang off this and must not drift apart: such a session owns its
+    reap (the stop route), and it is the only kind served the built-in chat
+    loop. Pinned as a truth table rather than trusted to two inline expressions.
     """
 
     @pytest.mark.parametrize(
-        "view,shim_owned,expected",
+        "view,shim_owned,port,expected",
         [
-            # `biopb mcp view`: a human opened a window; no agent is attached.
-            (True, False, True),
-            # A shim-owned child is serving an MCP client. It cannot reach here
-            # with view=True today, and must answer False if it ever does.
-            (True, True, False),
-            # The stdio shim's ordinary child.
-            (False, True, False),
-            # A direct `--transport http` launch: wired to something by its
-            # operator, and publishes no session, so it has no observe page.
-            (False, False, False),
+            # `biopb mcp view`, on a dynamic or a chosen port.
+            (True, False, 0, True),
+            (True, False, 9000, True),
+            # The dashboard's new session: a plain http session on port 0.
+            (False, False, 0, True),
+            # A shim-owned child is serving an MCP client, whatever its port.
+            (False, True, 0, False),
+            (True, True, 0, False),
+            # A direct `--transport http` launch on a fixed port: wired to
+            # something by its operator, and publishes no session.
+            (False, False, 8765, False),
         ],
     )
-    def test_only_a_shimless_viewer_counts(self, view, shim_owned, expected):
-        assert _is_agentless_viewer(view, shim_owned) is expected
+    def test_truth_table(self, view, shim_owned, port, expected):
+        assert _is_agentless(view, shim_owned, port) is expected
 
 
-class TestViewSessionRegistration:
-    """`biopb mcp view` has no shim, so it publishes itself into the shared
-    registry the control reads (`biopb._sessions`). Without this an agentless
-    viewer is invisible: no dashboard entry, no observe page, no
-    `/session/<id>/*` proxying."""
+_URL = "http://127.0.0.1:45678/mcp"
+
+
+class TestSessionRegistration:
+    """Every session on a dynamic port publishes itself into the shared registry
+    the control reads (`biopb._sessions`). Without this a session is invisible:
+    no dashboard entry, no observe page, no `/session/<id>/*` proxying."""
 
     @pytest.fixture(autouse=True)
     def _isolated_registry(self, tmp_path, monkeypatch):
@@ -365,7 +445,7 @@ class TestViewSessionRegistration:
     def test_registers_a_routable_record(self):
         from biopb import _sessions
 
-        session_id = _register_view_session(45678)
+        session_id = _register_session(45678, _URL)
         assert session_id is not None
         rec = _sessions.read_session(session_id)
         # Everything the control needs to route /session/<id>/* here.
@@ -373,11 +453,33 @@ class TestViewSessionRegistration:
         assert rec["host"] == "127.0.0.1"
         assert rec["pid"] == os.getpid()
         assert rec["mcp_url"] == "http://127.0.0.1:45678/mcp"
+        # Nobody launched us, so there is no launch to attribute this to.
+        assert "launch_token" not in rec
+
+    def test_a_shim_minted_id_is_used(self):
+        # The shim names the session's logfile with it, so the record must match.
+        from biopb import _sessions
+
+        assert (
+            _register_session(45678, _URL, "20260101-000000-7") == "20260101-000000-7"
+        )
+        assert _sessions.read_session("20260101-000000-7")["port"] == 45678
+
+    def test_a_launchers_token_is_echoed_onto_the_record(self, monkeypatch):
+        # How the control recognises the viewer it just spawned. It cannot use
+        # the pid it holds: behind a Windows trampoline (uv / pip console-script
+        # launchers) that is the stub's, not ours (biopb#1084).
+        from biopb import _sessions
+
+        rec = _sessions.read_session(
+            _register_session(45678, _URL, launched_by="tok-abc123")
+        )
+        assert rec["launch_token"] == "tok-abc123"
 
     def test_registered_session_is_listed_as_live(self):
         from biopb import _sessions
 
-        session_id = _register_view_session(45678)
+        session_id = _register_session(45678, _URL)
         # Our own pid owns the record, so the liveness prune must keep it --
         # this is what makes the session show up on the dashboard at all.
         assert session_id in [r["session_id"] for r in _sessions.list_sessions()]
@@ -385,7 +487,7 @@ class TestViewSessionRegistration:
     def test_unregister_removes_the_record(self):
         from biopb import _sessions
 
-        session_id = _register_view_session(45678)
+        session_id = _register_session(45678, _URL)
         _unregister_session(session_id)
         assert _sessions.read_session(session_id) is None
 
@@ -402,7 +504,7 @@ class TestViewSessionRegistration:
 
         monkeypatch.setattr(_sessions, "register", _boom)
         # No exception out of the launcher, and nothing to de-register.
-        assert _register_view_session(45678) is None
+        assert _register_session(45678, _URL) is None
 
     def test_unregister_failure_does_not_break_teardown(self, monkeypatch):
         from biopb import _sessions

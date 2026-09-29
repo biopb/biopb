@@ -18,7 +18,7 @@
 ;   diagnostics in view.) The engine's terminal ::biopb::DONE|<code> record ends
 ;   the loop. A full transcript is also written to <LogFile>.full.log.
 ;
-; Compiles with Inno Setup 6.x (iscc). See ../docs/windows-installer.md.
+; Compiles with Inno Setup 6.x (iscc).
 ;
 ; Design decisions (per planning):
 ;   * Online bootstrapper  -> ship the tiny engine .ps1; it downloads wheels.
@@ -63,8 +63,8 @@ OutputBaseFilename=biopb-setup-{#AppVersion}
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
-; CI signs the output (see ../docs/windows-installer.md). Once a signer is
-; registered with iscc, uncomment to sign installer + uninstaller:
+; CI compiles this unsigned. Once a signer is registered with
+; iscc, uncomment to sign installer + uninstaller:
 ; SignTool=biopbsign
 
 [Languages]
@@ -182,11 +182,8 @@ begin
     NextButtonClick); declining passes the engine -Reset, which re-wires the
     server to the sample bundle. No data-directory page is created -- like the
     console, the installer never asks for a microscopy folder. }
-  { Canonical config is biopb.json (biopb/biopb#34); a legacy biopb.toml from a
-    pre-#34 install still counts. Prefer the JSON path for display when present. }
+  { biopb.json is the only config format (biopb/biopb#34). }
   ConfigPath := AddBackslash(GetEnv('USERPROFILE')) + '.config\biopb\biopb.json';
-  if not FileExists(ConfigPath) then
-    ConfigPath := AddBackslash(GetEnv('USERPROFILE')) + '.config\biopb\biopb.toml';
   ConfigExists := FileExists(ConfigPath);
   KeepConfig   := False;
 

@@ -34,7 +34,9 @@ from biopb_tensor_server.core.config import (
     _CONSTRAINTS,
     _SECRET_PROFILE_KEYS,
     _SECTION_FOR,
+    AnnotationsConfig,
     CacheConfig,
+    CatalogConfig,
     MetadataDbConfig,
     PrecacheConfig,
     PyramidConfig,
@@ -56,16 +58,16 @@ _SECTION_CLASSES = (
     PyramidConfig,
     PrecacheConfig,
     MetadataDbConfig,
+    AnnotationsConfig,
+    CatalogConfig,
 )
 
 # (ClassName, dataclass field) -> (on-disk section, on-disk key) for the fields
 # whose wire form diverges from the dataclass. Everything else maps to
 # (_SECTION_FOR[class], field-name). See parse_config:
-#   - cache.max_entries/max_bytes feed memory_max_*; file_max_*_mb/_gb are
-#     converted to the *_bytes fields (the >= 1 bound stays sensible in MB/GB).
+#   - file_max_*_mb/_gb are converted to the *_bytes fields (the >= 1 bound
+#     stays sensible in MB/GB).
 _ONDISK_OVERRIDES: Dict[Tuple[str, str], Tuple[str, str]] = {
-    ("CacheConfig", "memory_max_entries"): ("cache", "max_entries"),
-    ("CacheConfig", "memory_max_bytes"): ("cache", "max_bytes"),
     ("CacheConfig", "file_max_segment_bytes"): ("cache", "file_max_segment_mb"),
     ("CacheConfig", "file_max_total_bytes"): ("cache", "file_max_total_gb"),
 }
@@ -168,9 +170,6 @@ def _sources_schema() -> Dict[str, Any]:
             "url": _prop("url", {"type": "string"}),
             "source_id": _prop("source_id", {"type": "string", "deprecated": True}),
             "dataset": _prop("dataset", {"type": "string"}),
-            "dim_labels": _prop(
-                "dim_labels", {"type": "array", "items": {"type": "string"}}
-            ),
             "monitor": _prop("monitor", {"type": "boolean"}),
             "cloud": _prop("cloud", {"type": "boolean"}),
             "credentials_profile": _prop("credentials_profile", {"type": "string"}),

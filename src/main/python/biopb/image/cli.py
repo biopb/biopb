@@ -1,9 +1,9 @@
-"""CLI client for ProcessImage gRPC services.
+"""CLI client for algorithm servers (the ``biopb.image`` Ops protocol).
 
 Commands:
-    servers     List the configured algorithm-plane servers with health + ops
-    ops         List available operations from a ProcessImage server
-    process     Execute an operation on input image data
+    servers     List the algorithm servers the control knows, with their state
+    ops         List the operations an algorithm server offers
+    process     Run one operation on an image
 """
 
 import json
@@ -14,20 +14,13 @@ from typing import Literal, Optional
 import grpc
 import imageio
 import typer
-from google.protobuf import empty_pb2
+from google.protobuf import empty_pb2, json_format, struct_pb2
 from rich.console import Console
 from rich.table import Table
 
 from biopb import _algorithms
-from biopb.image import (
-    ImageData,
-    OpNames,
-    OpSchema,
-    ProcessImageStub,
-    ProcessRequest,
-    ProcessResponse,
-)
-from biopb.image.utils import (
+from biopb.image import Arg, Call, ImageData, OpInfo, OpList, OpsStub
+from biopb.image._utils import (
     deserialize_image_data,
     serialize_from_numpy_to_image_data,
 )
@@ -35,7 +28,7 @@ from biopb.tensor.serialized_pb2 import SerializedTensor
 
 app = typer.Typer(
     name="image",
-    help="Call ProcessImage algorithm servers.",
+    help="Call algorithm servers.",
 )
 console = Console()
 stderr_console = Console(stderr=True)
@@ -118,145 +111,124 @@ def _parse_input(input_path: Optional[str]) -> tuple[bool, bytes]:
         return (True, input_path)
 
 
-def _build_image_data(is_file: bool, data_or_path: str) -> "ImageData":
-    """Build ImageData from file path or raw bytes.
-
-    Args:
-        is_file: True if data_or_path is a file path, False if raw bytes
-        data_or_path: File path string or raw bytes
-
-    Returns:
-        ImageData protobuf message
-    """
-
+def _build_arg(is_file: bool, data_or_path) -> Arg:
+    """A tensor argument from a file path or raw bytes: an image read with
+    imageio, or a SerializedTensor (a reference to a tensor on a plane)."""
     if is_file:
-        # Try imageio for image files
         try:
             np_arr = imageio.imread(data_or_path)
             stderr_console.print(
                 f"[green]Loaded image:[/green] shape={np_arr.shape}, dtype={np_arr.dtype}"
             )
-            return serialize_from_numpy_to_image_data(np_arr)
+            return Arg(eager=serialize_from_numpy_to_image_data(np_arr).eager_data)
         except Exception as img_exc:
             stderr_console.print(
                 f"[yellow]imageio failed, trying protobuf parse:[/yellow] {img_exc}"
             )
-            # Fallback: read file as protobuf
             with open(data_or_path, "rb") as f:
                 raw_bytes = f.read()
-            return _parse_bytes_to_image_data(raw_bytes)
-    else:
-        # Raw bytes from stdin - try protobuf first
-        return _parse_bytes_to_image_data(data_or_path)
+            return _parse_bytes_to_arg(raw_bytes)
+    return _parse_bytes_to_arg(data_or_path)
 
 
-def _parse_bytes_to_image_data(raw_bytes: bytes) -> "ImageData":
-    """Parse raw bytes to ImageData.
-
-    Try protobuf SerializedTensor first, fallback to imageio.
-    """
-    # Try protobuf SerializedTensor
+def _parse_bytes_to_arg(raw_bytes: bytes) -> Arg:
+    """A SerializedTensor if the bytes parse as one, else an image."""
     try:
         serialized = SerializedTensor.FromString(raw_bytes)
-        stderr_console.print(
-            f"[green]Parsed as SerializedTensor:[/green] location={serialized.location}"
-        )
-        return ImageData(lazy_data=serialized)
+        if serialized.location:
+            stderr_console.print(
+                f"[green]Parsed as SerializedTensor:[/green] location={serialized.location}"
+            )
+            return Arg(lazy=serialized)
     except Exception:
         pass
-
-    # Try imageio for image data
     try:
         np_arr = imageio.imread(raw_bytes)
         stderr_console.print(
             f"[green]Parsed as image:[/green] shape={np_arr.shape}, dtype={np_arr.dtype}"
         )
-        return serialize_from_numpy_to_image_data(np_arr)
+        return Arg(eager=serialize_from_numpy_to_image_data(np_arr).eager_data)
     except Exception as img_exc:
         stderr_console.print(f"[red]Cannot parse input:[/red] {img_exc}")
         raise typer.Exit(1)
 
 
-def _write_output(
-    response: ProcessResponse,
-    output: str,
-    format: Literal["pb", "pickle"],
-) -> None:
-    """Write response to output file or stdout.
+def _output_path(output: str, key: str, tensor_count: int) -> str:
+    """Where one tensor output goes: *output* itself when it is the only one,
+    else *output* with the output's name before the extension."""
+    if tensor_count <= 1 or output == "-":
+        return output
+    stem, dot, ext = output.rpartition(".")
+    return f"{stem}-{key}.{ext}" if dot and stem else f"{output}-{key}"
 
-    Args:
-        response: ProcessResponse from server
-        output: Output path or "-" for stdout
-        format: Output format for lazy data ("pb" or "pickle")
-    """
-    image_data = response.image_data
 
-    # Print annotation if present
-    if response.annotation:
-        stderr_console.print(f"[green]Server annotation:[/green] {response.annotation}")
-
-    # Check data type
-    data_type = image_data.WhichOneof("data")
-
-    if data_type == "eager_data":
-        # Eager tensor - must save as image file
+def _write_tensor(arg: Arg, output: str, format: Literal["pb", "pickle"]) -> None:  # noqa: A002 - mirrors the --format option
+    """Write one tensor output: pixels as an image file, a reference as a
+    SerializedTensor (protobuf or pickle, to a file or stdout)."""
+    if arg.WhichOneof("kind") == "eager":
         if output == "-":
             stderr_console.print(
                 "[red]Error:[/red] stdout not allowed for eager image data. "
                 "Provide output filename."
             )
             raise typer.Exit(1)
-
-        stderr_console.print("[green]Server returned eager data[/green]")
-        np_arr = deserialize_image_data(image_data)
+        np_arr = deserialize_image_data(ImageData(eager_data=arg.eager))
         stderr_console.print(
             f"[green]Output shape:[/green] {np_arr.shape}, dtype={np_arr.dtype}"
         )
         imageio.imwrite(output, np_arr)
         stderr_console.print(f"[green]Saved to:[/green] {output}")
+        return
 
-    elif data_type == "lazy_data":
-        # Lazy tensor - protobuf or pickle
-        stderr_console.print("[green]Server returned lazy data[/green]")
-        serialized = image_data.lazy_data
-        stderr_console.print(f"[green]Tensor location:[/green] {serialized.location}")
-
-        if format == "pb":
-            pb_bytes = serialized.SerializeToString()
-            if output == "-":
-                sys.stdout.buffer.write(pb_bytes)
-                stderr_console.print(
-                    f"[green]Protobuf written to stdout[/green] ({len(pb_bytes)} bytes)"
-                )
-            else:
-                with open(output, "wb") as f:
-                    f.write(pb_bytes)
-                stderr_console.print(
-                    f"[green]Protobuf saved to:[/green] {output} ({len(pb_bytes)} bytes)"
-                )
+    serialized = arg.lazy
+    stderr_console.print(f"[green]Tensor location:[/green] {serialized.location}")
+    if format == "pb":
+        pb_bytes = serialized.SerializeToString()
+        if output == "-":
+            sys.stdout.buffer.write(pb_bytes)
+            stderr_console.print(
+                f"[green]Protobuf written to stdout[/green] ({len(pb_bytes)} bytes)"
+            )
         else:
-            # Pickle format
-            import pickle
+            with open(output, "wb") as f:
+                f.write(pb_bytes)
+            stderr_console.print(
+                f"[green]Protobuf saved to:[/green] {output} ({len(pb_bytes)} bytes)"
+            )
+        return
 
-            if output == "-":
-                pickle.dump(serialized, sys.stdout.buffer)
-                stderr_console.print(
-                    "[green]Pickled SerializedTensor written to stdout[/green]"
-                )
-            else:
-                with open(output, "wb") as f:
-                    pickle.dump(serialized, f)
-                stderr_console.print(f"[green]Pickled saved to:[/green] {output}")
+    import pickle
 
+    if output == "-":
+        pickle.dump(serialized, sys.stdout.buffer)
+        stderr_console.print(
+            "[green]Pickled SerializedTensor written to stdout[/green]"
+        )
     else:
-        stderr_console.print(f"[red]Error:[/red] Unknown data type: {data_type}")
-        raise typer.Exit(1)
+        with open(output, "wb") as f:
+            pickle.dump(serialized, f)
+        stderr_console.print(f"[green]Pickled saved to:[/green] {output}")
+
+
+def _write_outputs(outputs, output: str, format: Literal["pb", "pickle"]) -> None:  # noqa: A002 - mirrors the --format option
+    """Tensor outputs to *output*; JSON outputs printed plain, one per line,
+    to stdout, or to stderr when a tensor goes to stdout. With more than one
+    output, each line is ``<name>: <json>``."""
+    tensors = [k for k, v in outputs.items() if v.WhichOneof("kind") != "json"]
+    stream = sys.stderr if tensors and output == "-" else sys.stdout
+    for key in sorted(outputs):
+        arg = outputs[key]
+        if arg.WhichOneof("kind") == "json":
+            text = json.dumps(json_format.MessageToDict(arg.json))
+            print(text if len(outputs) == 1 else f"{key}: {text}", file=stream)
+        else:
+            _write_tensor(arg, _output_path(output, key, len(tensors)), format)
 
 
 def _state_style(state: str) -> str:
     """Rich colour for a probe state, so the table reads at a glance."""
     return {
-        "serving": "green",
+        "up": "green",
         "unreachable": "red",
         "error": "red",
         "invalid": "yellow",
@@ -273,19 +245,24 @@ def servers(
         4.0, "--timeout", help="Per-server probe deadline in seconds"
     ),
 ) -> None:
-    """List the configured algorithm-plane servers with a health + ops probe.
+    """List the algorithm servers, as the control reports them.
 
-    Reads the ProcessImage servers wired into the biopb-mcp config (under
-    services.process_image_servers) -- the same set an agent kernel exposes as
-    ops -- and probes each for liveness and its advertised operations. This is the
-    CLI face of the control dashboard's Algorithm plane section: read-only (no
-    lifecycle control), never writes config.
+    The entries of ~/.config/biopb/algorithms/: a server file the control runs,
+    with its state, and a url entry, probed. With no control, the url entries
+    are probed from here. Read-only.
 
     Examples:
         biopb image servers
         biopb image servers --json --timeout 2
     """
-    rows = _algorithms.statuses(timeout=timeout)
+    from biopb import algorithms
+
+    rows = algorithms(timeout=timeout + 6)
+    if rows is None:
+        stderr_console.print(
+            "[yellow]No control answered:[/yellow] probing url entries only."
+        )
+        rows = _algorithms.statuses(timeout=timeout)
 
     if json_output:
         print(json.dumps({"servers": rows}))
@@ -293,69 +270,67 @@ def servers(
 
     if not rows:
         stderr_console.print(
-            "[yellow]No algorithm servers configured.[/yellow] Add ProcessImage "
-            "server URLs under [bold]services.process_image_servers[/bold] in "
-            "the biopb-mcp config."
+            "[yellow]No algorithm servers configured.[/yellow] Add a server file "
+            'or a {"url": ...} file to [bold]~/.config/biopb/algorithms/[/bold].'
         )
         raise typer.Exit(0)
 
     table = Table(title="Algorithm plane servers")
+    table.add_column("Name", style="cyan")
     table.add_column("Server", style="cyan")
     table.add_column("Scheme", style="blue")
     table.add_column("State", style="green")
     table.add_column("Ops", style="magenta")
 
     for r in rows:
-        if r["state"] == "serving":
-            ops_cell = (
-                "(single-op)" if r.get("single_op") else ", ".join(r["ops"]) or "-"
-            )
+        if r["state"] == "up":
+            ops_cell = ", ".join(o.get("name", "") for o in r["ops"]) or "-"
         else:
             ops_cell = r.get("error") or "-"
         state = f"[{_state_style(r['state'])}]{r['state']}[/]"
-        table.add_row(r["target"], r["scheme"], state, ops_cell)
+        table.add_row(r["name"], r["target"], r["scheme"], state, ops_cell)
 
     console.print(table)
-    n_serving = sum(1 for r in rows if r["state"] == "serving")
+    n_up = sum(1 for r in rows if r["state"] == "up")
     stderr_console.print(
-        f"\n[green]Servers:[/green] {len(rows)}  [green]serving:[/green] {n_serving}"
+        f"\n[green]Servers:[/green] {len(rows)}  [green]up:[/green] {n_up}"
     )
 
 
-@app.command(help="List the operations a ProcessImage server offers.")
-def ops(
-    server: str = typer.Option(
-        "grpc://localhost:50051",
-        "--server",
-        "-s",
-        envvar="BIOPB_IMAGE_SERVER",
-        help="ProcessImage server URI",
-    ),
-    token: Optional[str] = typer.Option(
-        None,
-        "--token",
-        "-t",
-        envvar="BIOPB_IMAGE_TOKEN",
-        help="Bearer token for server authentication",
-    ),
-) -> None:
-    """List available operations from a ProcessImage server.
+_SERVER_OPTION = typer.Option(
+    "grpc://localhost:50051",
+    "--server",
+    "-s",
+    envvar="BIOPB_IMAGE_SERVER",
+    help="Algorithm server URI (grpc:// or grpcs://)",
+)
+_TOKEN_OPTION = typer.Option(
+    None,
+    "--token",
+    "-t",
+    envvar="BIOPB_IMAGE_TOKEN",
+    help="Bearer token for server authentication",
+)
+
+
+def _describe(stub: OpsStub, metadata) -> OpList:
+    return stub.Describe(empty_pb2.Empty(), metadata=metadata, timeout=10)
+
+
+@app.command(help="List the operations an algorithm server offers.")
+def ops(server: str = _SERVER_OPTION, token: Optional[str] = _TOKEN_OPTION) -> None:
+    """List the operations an algorithm server offers.
 
     Example:
         biopb image ops --server grpc://localhost:50051
         biopb image ops -s grpc://myhost:9000 --token mytoken123
-        BIOPB_IMAGE_TOKEN=mytoken123 biopb image ops
     """
     start_time = time.time()
     channel = _create_grpc_channel(server)
     metadata = [("authorization", f"Bearer {token}")] if token else None
     try:
-        stub = ProcessImageStub(channel)
-        response: OpNames = stub.GetOpNames(
-            empty_pb2.Empty(), metadata=metadata, timeout=10
-        )
-
-        if not response.names:
+        listing = _describe(OpsStub(channel), metadata)
+        if not listing.ops:
             stderr_console.print(f"[yellow]No operations found on {server}[/yellow]")
             _log_timing(start_time)
             return
@@ -364,33 +339,30 @@ def ops(
         table.add_column("Name", style="cyan")
         table.add_column("Description", style="green")
         table.add_column("Labels", style="magenta")
-        table.add_column("Input Hint", style="blue")
-
-        for name in response.names:
-            schema: OpSchema = response.op_schemas.get(name)
-            if schema:
-                labels_str = ", ".join(schema.labels) if schema.labels else "-"
-                hint_parts = []
-                if schema.input_shape_hint:
-                    if schema.input_shape_hint.expected_singletons:
-                        hint_parts.append(
-                            f"singleton: {','.join(schema.input_shape_hint.expected_singletons)}"
-                        )
-                    if schema.input_shape_hint.required_multivalue:
-                        hint_parts.append(
-                            f"multi: {','.join(schema.input_shape_hint.required_multivalue)}"
-                        )
-                hint_str = "; ".join(hint_parts) if hint_parts else "-"
-                table.add_row(name, schema.description or "-", labels_str, hint_str)
-            else:
-                table.add_row(name, "-", "-", "-")
-
+        table.add_column("Mode", style="white")
+        table.add_column("Tensors", style="blue")
+        table.add_column("Arguments", style="yellow")
+        for info in listing.ops:
+            tensors = ", ".join(
+                f"{name}: {t.axes}" + (" (mapped)" if t.mapped else "")
+                for name, t in sorted(info.tensors.items())
+            )
+            mode = OpInfo.InputMode.Name(info.input).lower()
+            if info.streaming:
+                mode += ", streaming"
+            table.add_row(
+                info.name,
+                info.description or "-",
+                ", ".join(info.labels) or "-",
+                mode,
+                tensors or "-",
+                info.kwargs or "-",
+            )
         console.print(table)
         stderr_console.print(
-            f"\n[green]Server:[/green] {server}  [green]Operations:[/green] {len(response.names)}"
+            f"\n[green]Server:[/green] {server}  [green]Operations:[/green] {len(listing.ops)}"
         )
         _log_timing(start_time)
-
     except grpc.RpcError as exc:
         stderr_console.print(f"[red]gRPC error:[/red] {exc.code()} - {exc.details()}")
         raise typer.Exit(1)
@@ -401,9 +373,9 @@ def ops(
         channel.close()
 
 
-@app.command(help="Run an image-processing operation on a ProcessImage server.")
+@app.command(help="Run an operation on an algorithm server.")
 def process(
-    input: Optional[str] = typer.Argument(
+    input: Optional[str] = typer.Argument(  # noqa: A002 - the CLI's positional name
         None,
         help="Input file path or '-' for stdin. If omitted, reads from stdin.",
     ),
@@ -411,7 +383,18 @@ def process(
         None,
         "--op",
         "-o",
-        help="Operation name (optional if server has single/default op)",
+        help="Operation name (optional if the server has a single op)",
+    ),
+    tensor: Optional[str] = typer.Option(
+        None,
+        "--tensor",
+        help="Which tensor argument the input is (optional if the op has one)",
+    ),
+    kwargs: Optional[str] = typer.Option(
+        None,
+        "--kwargs",
+        "-k",
+        help="The op's other arguments as a JSON object, e.g. '{\"sigma\": 2}'",
     ),
     output: str = typer.Option(
         "-",
@@ -419,43 +402,31 @@ def process(
         "-O",
         help="Output path. Use '-' for stdout. Eager data requires filename.",
     ),
-    format: Optional[str] = typer.Option(
+    format: Optional[str] = typer.Option(  # noqa: A002 - public option name
         None,
         "--format",
         "-f",
         help="Output format for lazy data: pb (default) or pickle.",
     ),
-    server: str = typer.Option(
-        "grpc://localhost:50051",
-        "--server",
-        "-s",
-        envvar="BIOPB_IMAGE_SERVER",
-        help="ProcessImage server URI",
-    ),
-    token: Optional[str] = typer.Option(
-        None,
-        "--token",
-        "-t",
-        envvar="BIOPB_IMAGE_TOKEN",
-        help="Bearer token for server authentication",
-    ),
+    server: str = _SERVER_OPTION,
+    token: Optional[str] = _TOKEN_OPTION,
 ) -> None:
-    """Execute an image processing operation.
+    """Run one operation on an image.
 
     Input can be:
     - An image file (png, tiff, etc.) read via imageio
     - A protobuf SerializedTensor file (.pb)
     - Stdin containing protobuf or image bytes
 
-    Output depends on server response:
-    - Eager data: saved as image file (stdout not allowed)
-    - Lazy data: protobuf (.pb) or pickle (.pkl) format
+    A tensor output is written to --output: pixels as an image file (stdout not
+    allowed), a reference as protobuf (.pb) or pickle (.pkl). Several tensor
+    outputs get their name before the extension. Other outputs are JSON,
+    printed.
 
     Examples:
-        biopb image process input.png --op mock_echo --output output.png
-        biopb image process input.pb --op mock_echo -O output.pb
+        biopb image process input.png --op gaussian --kwargs '{"sigma": 2}' -O out.png
+        biopb image process input.pb --op segment -O out.pb
         biopb tensor get my-source -o - | biopb image process --op segment -O -
-        biopb image process input.png --op segment --token mytoken123 -O output.pb
     """
     start_time = time.time()
     channel = _create_grpc_channel(server)
@@ -463,26 +434,46 @@ def process(
     metadata = [("authorization", f"Bearer {token}")] if token else None
 
     try:
-        # Parse input
+        stub = OpsStub(channel)
+        listing = _describe(stub, metadata)
+        by_name = {info.name: info for info in listing.ops}
+        if op is None:
+            if len(by_name) != 1:
+                stderr_console.print(
+                    f"[red]Error:[/red] --op is required; the server has {sorted(by_name)}"
+                )
+                raise typer.Exit(1)
+            op = next(iter(by_name))
+        info = by_name.get(op)
+        if info is None:
+            stderr_console.print(
+                f"[red]Error:[/red] no op {op!r}; the server has {sorted(by_name)}"
+            )
+            raise typer.Exit(1)
+        if tensor is None:
+            if len(info.tensors) != 1:
+                stderr_console.print(
+                    f"[red]Error:[/red] --tensor is required; {op} takes {sorted(info.tensors)}"
+                )
+                raise typer.Exit(1)
+            tensor = next(iter(info.tensors))
+
         is_file, data_or_path = _parse_input(input)
-        image_data = _build_image_data(is_file, data_or_path)
+        args = {tensor: _build_arg(is_file, data_or_path)}
+        for name, value in json.loads(kwargs or "{}").items():
+            args[name] = Arg(json=json_format.ParseDict(value, struct_pb2.Value()))
 
-        # Build request
-        request = ProcessRequest(image_data=image_data)
-        if op:
-            request.op_name = op
-
-        stderr_console.print(
-            f"[green]Sending request to[/green] {server}"
-            + (f" (op: {op})" if op else "")
-        )
-
-        # Call server
-        stub = ProcessImageStub(channel)
-        response: ProcessResponse = stub.Run(request, metadata=metadata, timeout=60)
-
-        # Write output
-        _write_output(response, output, fmt)
+        stderr_console.print(f"[green]Sending request to[/green] {server} (op: {op})")
+        outputs = None
+        for event in stub.Call(Call(op=op, args=args), metadata=metadata):
+            if event.progress and not event.outputs:
+                stderr_console.print(f"[dim]{event.progress}[/dim]")
+            if event.outputs:
+                outputs = event.outputs
+        if outputs is None:
+            stderr_console.print("[yellow]The op returned nothing.[/yellow]")
+        else:
+            _write_outputs(outputs, output, fmt)
         _log_timing(start_time)
 
     except typer.Exit:

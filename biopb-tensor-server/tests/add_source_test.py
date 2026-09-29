@@ -17,12 +17,15 @@ import numpy as np
 import pytest
 from biopb_tensor_server import TensorFlightServer
 from biopb_tensor_server.adapters import get_default_registry
+from biopb_tensor_server.core.adapter_base import catalog_tensors
 from biopb_tensor_server.core.discovery import DiscoveryState
 from biopb_tensor_server.sources.source_manager import (
     DND_URL_PREFIX,
     SourceManager,
     _drop_catalog_url,
 )
+
+from tests import catalog_server
 
 
 def _zarr_available() -> bool:
@@ -49,25 +52,42 @@ def _make_zarr(parent, name, shape=(4, 8, 8)):
 
 
 def _make_manager():
-    server = TensorFlightServer("grpc://localhost:0")
+    # One catalog, threaded into both halves -- the wiring cli.py does for a
+    # real deployment. The reconciler is the only thing that writes it.
+    server = catalog_server("grpc://localhost:0")
     manager = SourceManager(
         server=server,
         registry=get_default_registry(),
         discovery_state=DiscoveryState(),
-        watcher=None,
         monitored_dirs=set(),
-        metadata_db=None,
+        metadata_db=server.metadata_db,
     )
     return manager, server
 
 
-def _drain(gen):
+def _url(server, source_id):
+    """The catalog source_url a registered source carries.
+
+    The tally is source_ids now, so a test that cares about the display url
+    reads it off the registered adapter -- the same value the catalog row got.
+    """
+    return server.sources.get(source_id).catalog_url
+
+
+def _drain_all(gen):
     """Run an add_local_source generator to its terminal ``(added, already,
-    failed)`` result tuple."""
-    added, already, failed = [], [], []
+    refreshed, removed, failed)`` result tuple."""
+    result = ([], [], [], [], [])
     for event in gen:
         if event[0] == "result":
-            _, added, already, failed = event
+            t = event[1]
+            result = (t.added, t.already_present, t.refreshed, t.removed, t.failed)
+    return result
+
+
+def _drain(gen):
+    """The three original tallies; ``_drain_all`` for the refresh/removal ones."""
+    added, already, _refreshed, _removed, failed = _drain_all(gen)
     return added, already, failed
 
 
@@ -103,7 +123,7 @@ class TestAddLocalSource:
         added, already, failed = _drain(manager.add_local_source(zpath))
 
         assert len(added) == 1 and not already and not failed
-        sid = added[0].source_id
+        sid = added[0]
         assert sid in server.sources
 
     def test_dropped_single_source_reroots_to_basename(self, tmp_path):
@@ -111,18 +131,18 @@ class TestAddLocalSource:
         basename under the ``dnd://`` origin scheme, so the browser renders it as
         its own top-level root instead of nesting it under the shared
         absolute-path tree, and can tell it is a removable drop."""
-        manager, _ = _make_manager()
+        manager, server = _make_manager()
         zpath = _make_zarr(str(tmp_path), "exp.zarr")
 
         added, *_ = _drain(manager.add_local_source(zpath))
 
-        assert added[0].source_url == "dnd://exp.zarr"
+        assert _url(server, added[0]) == "dnd://exp.zarr"
 
     def test_dropped_folder_reroots_children_under_folder(self, tmp_path):
         """Dropping a plain folder re-roots every discovered source under the
         folder's basename (one drop == one root, sources as children), all under
         the ``dnd://`` origin scheme."""
-        manager, _ = _make_manager()
+        manager, server = _make_manager()
         root = tmp_path / "my_experiment"
         root.mkdir()
         _make_zarr(str(root), "a.zarr")
@@ -131,7 +151,7 @@ class TestAddLocalSource:
         added, _, failed = _drain(manager.add_local_source(str(root)))
 
         assert not failed
-        urls = sorted(d.source_url for d in added)
+        urls = sorted(_url(server, sid) for sid in added)
         assert urls == ["dnd://my_experiment/a.zarr", "dnd://my_experiment/b.zarr"]
 
     def test_overlapping_drop_keeps_native_url_no_reroot(self, tmp_path):
@@ -139,7 +159,7 @@ class TestAddLocalSource:
         monitor=false config dir to pick up new files) is a rescan of a known
         location, so new siblings keep their native source_url -- they must NOT
         re-root into a separate tree root and split the dir across two places."""
-        manager, _ = _make_manager()
+        manager, server = _make_manager()
         root = tmp_path / "proj"
         root.mkdir()
         a = _make_zarr(str(root), "a.zarr")
@@ -154,8 +174,8 @@ class TestAddLocalSource:
         assert len(already) == 1  # a.zarr already present
         # The overlap suppressed re-rooting: b.zarr keeps a native file:// url,
         # coherent with a.zarr, instead of a bare "proj/b.zarr" own-root url.
-        assert added[0].source_url.startswith("file://")
-        assert added[0].source_url.endswith("/proj/b.zarr")
+        assert _url(server, added[0]).startswith("file://")
+        assert _url(server, added[0]).endswith("/proj/b.zarr")
 
     def test_static_config_via_symlink_containment(self, tmp_path):
         """A static-config source configured through a symlinked path still
@@ -178,7 +198,6 @@ class TestAddLocalSource:
         manager = create_source_manager(
             server=server,
             registry=get_default_registry(),
-            watcher=None,
             static_sources=[SourceConfig(url=str(link / "exp.zarr"), type="zarr")],
         )
         assert manager is not None
@@ -200,8 +219,8 @@ class TestAddLocalSource:
         from biopb_tensor_server.core.config import (
             ServerConfig,
             SourceConfig,
-            resolve_all_sources,
         )
+        from biopb_tensor_server.sources.resolve import resolve_all_sources
         from biopb_tensor_server.sources.source_manager import create_source_manager
 
         root = tmp_path / "acquisition"
@@ -216,15 +235,11 @@ class TestAddLocalSource:
         manager = create_source_manager(
             server=server,
             registry=get_default_registry(),
-            watcher=None,
             static_sources=static_sources,
         )
         assert manager is not None
 
-        urls = sorted(
-            adapter.get_source_descriptor().source_url
-            for adapter in server.sources.values()
-        )
+        urls = sorted(adapter.catalog_url for adapter in server.sources.values())
         assert urls == ["exp/a.zarr", "exp/b.zarr"]
         # Display-only: source_id still hashes the raw path, not the alias.
         assert all("exp" not in sid for sid in server.sources)
@@ -233,7 +248,7 @@ class TestAddLocalSource:
         manager, _ = _make_manager()
         zpath = _make_zarr(str(tmp_path), "exp.zarr")
         added, *_ = _drain(manager.add_local_source(zpath))
-        sid = added[0].source_id
+        sid = added[0]
 
         added2, already2, failed2 = _drain(manager.add_local_source(zpath))
 
@@ -258,7 +273,7 @@ class TestAddLocalSource:
         z1 = _make_zarr(str(tmp_path), "a.zarr")
         _make_zarr(str(tmp_path), "b.zarr")
         added1, *_ = _drain(manager.add_local_source(z1))
-        sid1 = added1[0].source_id
+        sid1 = added1[0]
 
         added, already, failed = _drain(manager.add_local_source(str(tmp_path)))
 
@@ -298,6 +313,40 @@ class TestAddLocalSource:
         with pytest.raises(ValueError, match="local filesystem paths only"):
             _drain(manager.add_local_source("grpc://host:8815/x"))
 
+    @pytest.mark.parametrize("spelling", ["s.zarr", "./s.zarr", "../tmp/s.zarr"])
+    def test_rootless_path_rejected(self, tmp_path, monkeypatch, spelling):
+        """A rootless path over the wire would silently mean the server's cwd.
+
+        The caller cannot see that directory and did not choose it, so the same
+        request means different data depending on how the server was launched
+        (biopb/biopb#947). The path here EXISTS relative to the cwd, so nothing
+        but the explicit check stops it.
+
+        The predicate is `discovery.local_path_is_rooted`, shared with the config
+        loader so the two surfaces cannot drift apart.
+        """
+        _make_zarr(str(tmp_path), "s.zarr")
+        monkeypatch.chdir(tmp_path)
+        manager, _ = _make_manager()
+        with pytest.raises(ValueError, match="rooted path"):
+            _drain(manager.add_local_source(spelling))
+
+    def test_file_url_registers_under_the_path_it_names(self, tmp_path):
+        """`file://` and the plain path are one source, not two.
+
+        `resolve_local_path` strips the scheme, so the url form reaches the same
+        identity -- an id equal to the plain path's, and a second add that
+        deduplicates instead of registering a twin.
+        """
+        zpath = _make_zarr(str(tmp_path), "s.zarr")
+        manager, _ = _make_manager()
+
+        added, *_ = _drain(manager.add_local_source(f"file://{zpath}"))
+        assert len(added) == 1
+
+        again_added, already, _ = _drain(manager.add_local_source(zpath))
+        assert again_added == [] and already == [added[0]]
+
     def test_cancel_keeps_already_committed(self, tmp_path):
         """A cancel between sources stops discovery but keeps what registered."""
         manager, server = _make_manager()
@@ -311,16 +360,16 @@ class TestAddLocalSource:
             return state["n"] >= 1
 
         gen = manager.add_local_source(str(tmp_path), should_cancel=should_cancel)
-        added, already, failed = [], [], []
+        added = []
         for event in gen:
             if event[0] == "progress":
                 state["n"] += 1
             else:
-                _, added, already, failed = event
+                added = event[1].added
 
         assert 1 <= len(added) < 3  # stopped early, kept what was registered
-        for desc in added:
-            assert desc.source_id in server.sources
+        for source_id in added:
+            assert source_id in server.sources
 
 
 class TestAddSourceRoundtrip:
@@ -339,9 +388,9 @@ class TestAddSourceRoundtrip:
         try:
             client = TensorFlightClient(f"grpc://localhost:{server.port}")
 
-            result = client.add_source(zpath)
+            result = client.register_local_path(zpath)
             assert len(result.added) == 1
-            sid = result.added[0].source_id
+            sid = result.added[0]
             assert not result.failed
 
             # The new source is now listable and readable.
@@ -350,32 +399,21 @@ class TestAddSourceRoundtrip:
             assert darr.compute().shape == (4, 8, 8)
 
             # Re-add over the wire -> already_present, no duplicate.
-            again = client.add_source(zpath)
+            again = client.register_local_path(zpath)
             assert again.added == [] and list(again.already_present) == [sid]
 
             # A bogus path is a whole-request failure surfaced as a server error.
             import pyarrow.flight as flight
 
             with pytest.raises(flight.FlightServerError):
-                client.add_source(str(tmp_path / "nope"))
+                client.register_local_path(str(tmp_path / "nope"))
 
             client.close()
         finally:
             server.shutdown()
 
-    def test_plain_tiff_folder_drop_carries_no_dim_labels(self, tmp_path):
-        """A drop that names no labels must not register as labelled.
-
-        ``AddSourceRequest.dim_labels`` is unset here, and an unset repeated
-        field is ``[]``. Passing that on stamps the empty list onto the claim,
-        and an adapter that reads a claim's labels as an override then rejects
-        every series -- so this drop failed with "cannot read TIFF source" for
-        every plain TIFF, drag-drop included.
-
-        A *folder*, because that is the branch that carried it: the walk hands
-        its labels to ``discover_sources``, while the per-claim assignment
-        beside it already tests them for truth and so never saw the bug.
-        """
+    def test_plain_tiff_folder_drop_uses_format_labels(self, tmp_path):
+        """A dropped folder registers with the format's own axis semantics."""
         import tifffile
         from biopb.tensor import TensorFlightClient
 
@@ -393,11 +431,11 @@ class TestAddSourceRoundtrip:
         )
         try:
             client = TensorFlightClient(f"grpc://localhost:{server.port}")
-            result = client.add_source(folder)
+            result = client.register_local_path(folder)
 
             assert not result.failed
             assert len(result.added) == 1
-            source_id = result.added[0].source_id
+            source_id = result.added[0]
 
             # Unlabelled, so the adapter fills the canonical slots itself.
             descriptor = client.get_descriptor(f"{source_id}/Image:0")
@@ -422,8 +460,8 @@ class TestRemoveDroppedRoot:
         manager, server = _make_manager()
         zpath = _make_zarr(str(tmp_path), "exp.zarr")
         added, *_ = _drain(manager.add_local_source(zpath))
-        sid = added[0].source_id
-        assert added[0].source_url == "dnd://exp.zarr"
+        sid = added[0]
+        assert _url(server, added[0]) == "dnd://exp.zarr"
         assert sid in server.sources
 
         removed, failed = manager.remove_dropped_root("dnd://exp.zarr")
@@ -438,7 +476,7 @@ class TestRemoveDroppedRoot:
         _make_zarr(str(root), "b.zarr")
         added, _, failed = _drain(manager.add_local_source(str(root)))
         assert not failed and len(added) == 2
-        sids = {d.source_id for d in added}
+        sids = set(added)
 
         removed, failed = manager.remove_dropped_root("dnd://my_experiment")
         assert set(removed) == sids and not failed
@@ -454,7 +492,7 @@ class TestRemoveDroppedRoot:
         added_b, *_ = _drain(
             manager.add_local_source(_make_zarr(str(tmp_path), "exp2.zarr"))
         )
-        sid_a, sid_b = added_a[0].source_id, added_b[0].source_id
+        sid_a, sid_b = added_a[0], added_b[0]
 
         removed, failed = manager.remove_dropped_root("dnd://exp.zarr")
         assert removed == [sid_a] and not failed
@@ -501,13 +539,15 @@ class TestRemoveSourceRoundtrip:
         try:
             client = TensorFlightClient(f"grpc://localhost:{server.port}")
 
-            added = client.add_source(str(root))
+            added = client.register_local_path(str(root))
             assert len(added.added) == 2
-            sids = {d.source_id for d in added.added}
+            sids = set(added.added)
             assert sids <= set(client.list_sources())
 
-            # Remove the whole dropped branch by its dnd:// root.
-            result = client.remove_source("dnd://exp")
+            # Remove the whole dropped branch by its dnd:// root, through the
+            # deprecated alias -- same RPC, so this doubles as its coverage.
+            with pytest.warns(DeprecationWarning, match="remove_source"):
+                result = client.remove_source("dnd://exp")
             assert set(result.removed) == sids and not result.failed
             assert not (sids & set(client.list_sources()))
 
@@ -515,7 +555,7 @@ class TestRemoveSourceRoundtrip:
             import pyarrow.flight as flight
 
             with pytest.raises(flight.FlightServerError):
-                client.remove_source("file:///data/x.zarr")
+                client.deregister_local_path("file:///data/x.zarr")
 
             client.close()
         finally:
@@ -539,7 +579,6 @@ class TestAddedSourceSurvivesRescanUnderSkippedDir:
             server=server,
             registry=get_default_registry(),
             discovery_state=DiscoveryState(),
-            watcher=None,
             monitored_dirs=set(monitored_dirs),
             metadata_db=None,
             stability_window=0.0,
@@ -558,12 +597,12 @@ class TestAddedSourceSurvivesRescanUnderSkippedDir:
 
         added, _already, failed = _drain(manager.add_local_source(str(drop)))
         assert len(added) == 1 and not failed
-        sid = added[0].source_id
+        sid = added[0]
         assert sid in server.sources
         # Re-rooted for a tidy display root, but NOT stamped ``dnd://``: it sits
         # under a monitored root, so the rescan re-discovers it -- it is not
         # safely removable, so it must not carry the removable marker.
-        assert added[0].source_url == "samples/exp.zarr"
+        assert _url(server, added[0]) == "samples/exp.zarr"
 
         # First rescan is force_full; the second is the steady-state incremental
         # that actually reaped the source before the fix (~20 s after the drop).
@@ -571,3 +610,254 @@ class TestAddedSourceSurvivesRescanUnderSkippedDir:
         assert sid in server.sources, "reaped by the initial force_full rescan"
         manager._rescan_monitored_dirs()
         assert sid in server.sources, "reaped by the steady-state incremental rescan"
+
+
+class TestReDropRebuilds:
+    """A re-drop of an already-registered path rebuilds it (biopb/biopb#944).
+
+    ``add_source`` used to report a known ``source_id`` as ``already_present``
+    and stop there, so a ``monitor: false`` root had a way to pick up new files
+    and none at all to notice a changed or removed one. The descriptor AND the
+    ``content_version`` that namespaces the chunk cache are both sampled when
+    the adapter is built, so noticing means building a new adapter.
+    """
+
+    def test_redrop_reports_refreshed_and_already_present(self, tmp_path):
+        manager, _ = _make_manager()
+        zpath = _make_zarr(str(tmp_path), "exp.zarr")
+        added, *_ = _drain(manager.add_local_source(zpath))
+        sid = added[0]
+
+        _, already, refreshed, removed, failed = _drain_all(
+            manager.add_local_source(zpath)
+        )
+
+        assert refreshed == [sid]
+        # Still already_present: an older client reads a re-drop as "already
+        # present" rather than "nothing happened".
+        assert already == [sid]
+        assert not removed and not failed
+
+    def test_redrop_picks_up_an_in_place_rewrite(self, tmp_path):
+        manager, server = _make_manager()
+        zpath = _make_zarr(str(tmp_path), "exp.zarr", shape=(4, 8, 8))
+        added, *_ = _drain(manager.add_local_source(zpath))
+        sid = added[0]
+        before = server.sources.get(sid)
+
+        _make_zarr(str(tmp_path), "exp.zarr", shape=(2, 5, 5))
+        _drain(manager.add_local_source(zpath))
+
+        adapter = server.sources.get(sid)
+        assert adapter is not before, "the adapter was not rebuilt"
+        shape = tuple(catalog_tensors(adapter)[0].shape)
+        assert shape[-2:] == (5, 5)
+
+    def test_rebuild_moves_the_content_version(self, tmp_path):
+        """The cache namespaces on this token, so a rebuild that left it alone
+        would keep serving the pre-edit chunks."""
+        manager, server = _make_manager()
+        zpath = _make_zarr(str(tmp_path), "exp.zarr", shape=(4, 8, 8))
+        added, *_ = _drain(manager.add_local_source(zpath))
+        sid = added[0]
+        before = server.sources.get(sid).content_version
+
+        _make_zarr(str(tmp_path), "exp.zarr", shape=(2, 5, 5))
+        _drain(manager.add_local_source(zpath))
+
+        assert server.sources.get(sid).content_version != before
+
+    def test_rebuild_always_offers_the_source_to_precache(self, tmp_path):
+        """A drop is the user saying they care about this data, and the cache
+        evicts under LRU -- so an unchanged re-drop is still worth warming. It
+        costs little: the chunk_ids are identical, so the warm hits."""
+        manager, _ = _make_manager()
+        zpath = _make_zarr(str(tmp_path), "exp.zarr", shape=(4, 8, 8))
+        _drain(manager.add_local_source(zpath))
+
+        committed = []
+        manager._reconciler._notify_source_committed = committed.append
+
+        _, _, refreshed, _, _ = _drain_all(manager.add_local_source(zpath))
+        assert committed == refreshed
+
+        _make_zarr(str(tmp_path), "exp.zarr", shape=(2, 5, 5))
+        _, _, refreshed_again, _, _ = _drain_all(manager.add_local_source(zpath))
+        assert committed == refreshed + refreshed_again
+
+    def test_rebuild_keeps_the_dnd_display_root(self, tmp_path):
+        """Re-deriving the url would hand the source its native ``file://`` one
+        back, and ``remove_source`` authorizes on the ``dnd://`` scheme."""
+        manager, server = _make_manager()
+        zpath = _make_zarr(str(tmp_path), "exp.zarr")
+        _drain(manager.add_local_source(zpath))
+
+        _, _, refreshed, _, _ = _drain_all(manager.add_local_source(zpath))
+
+        assert server.sources.get(refreshed[0]).catalog_url == "dnd://exp.zarr"
+
+    def test_a_failed_rebuild_keeps_the_source_served(self, tmp_path):
+        """Register-before-unregister: the replacement goes in on top of the
+        live adapter, so a rebuild that fails costs nothing."""
+
+        class _FailingDb:
+            def sync_source_added(self, *a, **kw):
+                raise RuntimeError("catalog write failed")
+
+            def sync_source_removed(self, *a, **kw):
+                pass
+
+        manager, server = _make_manager()
+        zpath = _make_zarr(str(tmp_path), "exp.zarr")
+        added, *_ = _drain(manager.add_local_source(zpath))
+        sid = added[0]
+        original = server.sources.get(sid)
+
+        manager._reconciler._metadata_db = _FailingDb()
+        _, already, refreshed, _, failed = _drain_all(manager.add_local_source(zpath))
+
+        assert not refreshed
+        assert already == [sid]
+        assert len(failed) == 1
+        assert sid in server.sources
+        assert server.sources.get(sid) is original
+
+    def test_the_restored_adapter_was_never_closed(self, tmp_path, monkeypatch):
+        """Identity is not enough (biopb/biopb#979): restoring the adapter the
+        swap displaced only keeps the source *served* if nobody closed it on
+        the way through. A registry that closed on swap would satisfy the test
+        above and still leave this source live in ListFlights with its handles
+        released -- which is the reason ``SourceRegistry.swap`` hands the
+        displaced adapter back open rather than closing it.
+        """
+
+        class _FailingDb:
+            def sync_source_added(self, *a, **kw):
+                raise RuntimeError("catalog write failed")
+
+            def sync_source_removed(self, *a, **kw):
+                pass
+
+        manager, server = _make_manager()
+        zpath = _make_zarr(str(tmp_path), "exp.zarr")
+        added, *_ = _drain(manager.add_local_source(zpath))
+        sid = added[0]
+        original = server.sources.get(sid)
+
+        closes = []
+        real_close = original.close
+        monkeypatch.setattr(
+            original, "close", lambda: (closes.append(1), real_close())[1]
+        )
+
+        manager._reconciler._metadata_db = _FailingDb()
+        _drain_all(manager.add_local_source(zpath))
+
+        assert server.sources.get(sid) is original
+        assert closes == [], "the restored adapter was closed on its way back"
+
+    def test_a_committed_rebuild_does_close_the_one_it_displaced(
+        self, tmp_path, monkeypatch
+    ):
+        """The other half of the same ownership rule: once the replace has
+        committed there is no rollback left to need the old adapter, so its
+        handles are released rather than held for the life of the server."""
+        manager, server = _make_manager()
+        zpath = _make_zarr(str(tmp_path), "exp.zarr")
+        added, *_ = _drain(manager.add_local_source(zpath))
+        sid = added[0]
+        original = server.sources.get(sid)
+
+        closes = []
+        real_close = original.close
+        monkeypatch.setattr(
+            original, "close", lambda: (closes.append(1), real_close())[1]
+        )
+
+        _, _, refreshed, _, _ = _drain_all(manager.add_local_source(zpath))
+
+        assert refreshed == [sid]
+        assert server.sources.get(sid) is not original
+        assert closes == [1], "the displaced adapter was leaked, still open"
+
+
+class TestReDropRemovesVanished:
+    """The removal half: a registered source whose files are gone."""
+
+    def test_redrop_deregisters_a_deleted_source(self, tmp_path):
+        import shutil
+
+        manager, server = _make_manager()
+        root = tmp_path / "exp"
+        root.mkdir()
+        _make_zarr(str(root), "a.zarr")
+        _make_zarr(str(root), "b.zarr")
+        added, *_ = _drain(manager.add_local_source(str(root)))
+        by_url = {_url(server, sid): sid for sid in added}
+
+        shutil.rmtree(str(root / "a.zarr"))
+        _, _, _, removed, failed = _drain_all(manager.add_local_source(str(root)))
+
+        assert removed == [by_url["dnd://exp/a.zarr"]]
+        assert by_url["dnd://exp/a.zarr"] not in server.sources
+        assert by_url["dnd://exp/b.zarr"] in server.sources
+        assert not failed
+
+    def test_emptied_folder_removes_instead_of_failing(self, tmp_path):
+        """A folder whose only dataset was deleted is how a stale entry gets
+        noticed, so the drop reports the removal rather than "nothing here"."""
+        import shutil
+
+        manager, server = _make_manager()
+        root = tmp_path / "exp"
+        root.mkdir()
+        _make_zarr(str(root), "a.zarr")
+        added, *_ = _drain(manager.add_local_source(str(root)))
+        sid = added[0]
+
+        shutil.rmtree(str(root / "a.zarr"))
+        _, _, _, removed, failed = _drain_all(manager.add_local_source(str(root)))
+
+        assert removed == [sid]
+        assert not failed
+        assert sid not in server.sources
+
+    def test_removal_is_scoped_to_the_drop(self, tmp_path):
+        """The periodic reconcile's diff is whole-catalog; run against a subtree
+        walk it would deregister everything outside the drop."""
+        import shutil
+
+        manager, server = _make_manager()
+        outside = _make_zarr(str(tmp_path), "outside.zarr")
+        added_outside, *_ = _drain(manager.add_local_source(outside))
+
+        root = tmp_path / "exp"
+        root.mkdir()
+        _make_zarr(str(root), "a.zarr")
+        added, *_ = _drain(manager.add_local_source(str(root)))
+
+        shutil.rmtree(str(root / "a.zarr"))
+        _, _, _, removed, _ = _drain_all(manager.add_local_source(str(root)))
+
+        assert removed == [added[0]]
+        assert added_outside[0] in server.sources
+
+    def test_a_still_present_but_unclaimed_path_is_kept(self, tmp_path):
+        """Absence from the walk is not evidence of deletion -- a drop has none
+        of the stability gating the periodic path removes under -- so only a
+        vanished path deregisters."""
+        manager, server = _make_manager()
+        root = tmp_path / "exp"
+        root.mkdir()
+        zpath = _make_zarr(str(root), "a.zarr")
+        added, *_ = _drain(manager.add_local_source(str(root)))
+        sid = added[0]
+
+        # Break the store so nothing claims it, but leave the path in place.
+        for meta in ("zarr.json", ".zarray"):
+            if os.path.exists(os.path.join(zpath, meta)):
+                os.remove(os.path.join(zpath, meta))
+        _, _, _, removed, _ = _drain_all(manager.add_local_source(str(root)))
+
+        assert not removed
+        assert sid in server.sources

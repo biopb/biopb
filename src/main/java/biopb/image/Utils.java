@@ -7,8 +7,8 @@ import java.util.logging.Logger;
 import com.google.protobuf.ByteString;
 
 import biopb.tensor.LocationUris;
-import biopb.tensor.SerializableTensorImg;
 import biopb.tensor.SerializedTensor;
+import biopb.tensor.TensorFlightClient;
 import net.imglib2.RandomAccessibleInterval;
 import net.imglib2.img.array.ArrayImgFactory;
 import net.imglib2.type.NativeType;
@@ -66,78 +66,38 @@ public final class Utils {
     /**
      * Serialize a RandomAccessibleInterval to Pixels protobuf with default dimension order "XYZCT".
      *
-     * @deprecated Use {@link #serializeFromIntervalToImageData(RandomAccessibleInterval)} instead
-     *             to get ImageData protobuf which supports both eager and lazy data.
-     *
-     * <p>This method converts imglib2 image data to a protobuf format suitable for
-     * gRPC transmission. The input interval is assumed to be in imglib2's XYZC dimension
-     * order (dimension 0 = X, dimension 1 = Y, dimension 2 = Z, dimension 3 = C).
-     *
-     * <p>The original data type is preserved. Big-endian byte order is used.
-     *
-     * <p>Dimension handling:
-     * <ul>
-     *   <li>2D inputs (X, Y) are promoted to 4D by adding singleton Z and C dimensions</li>
-     *   <li>3D inputs (X, Y, Z) are promoted to 4D by adding a singleton C dimension</li>
-     *   <li>4D inputs (X, Y, Z, C) are used as-is</li>
-     *   <li>5D inputs (X, Y, Z, C, T) are used as-is</li>
-     * </ul>
+     * <p>Package-internal: the legacy Pixels wire format is superseded by
+     * {@link #serializeFromIntervalToImageData(RandomAccessibleInterval)}, which
+     * produces ImageData supporting both eager and lazy data. This overload
+     * remains for {@link #deserializeImageData}'s legacy-pixels fallback and its
+     * own tests.
      *
      * @param crop the input RandomAccessibleInterval to serialize
      * @return a Pixels protobuf message containing the serialized image data
      * @throws IllegalArgumentException if the input has more than 5 dimensions
      */
-    @Deprecated
-    public static <T extends RealType<T> & NativeType<T> > Pixels SerializeFromInterval(RandomAccessibleInterval<T> crop) {
+    static <T extends RealType<T> & NativeType<T> > Pixels SerializeFromInterval(RandomAccessibleInterval<T> crop) {
         return _SerializeFromInterval(crop, "XYZCT", null);
     }
 
     /**
      * Serialize a RandomAccessibleInterval to Pixels protobuf with specified dimension order.
      *
-     * @deprecated Use {@link #serializeFromIntervalToImageData(RandomAccessibleInterval)} instead
-     *             to get ImageData protobuf which supports both eager and lazy data.
-     *
-     * <p>This method converts imglib2 image data to a protobuf format suitable for
-     * gRPC transmission. The input interval is assumed to be in imglib2's XYZC dimension
-     * order (dimension 0 = X, dimension 1 = Y, dimension 2 = Z, dimension 3 = C).
-     *
-     * <p>The original data type is preserved. Big-endian byte order is used.
-     *
-     * <p>The dimension_order string describes how bytes are laid out in memory:
-     * <ul>
-     *   <li>"XYZCT" - X varies fastest (Fortran/memory order), default for imglib2</li>
-     *   <li>"CXYZT" - C varies fastest (C order), used by Python/numpy</li>
-     * </ul>
-     *
-     * <p>Dimension handling:
-     * <ul>
-     *   <li>2D inputs (X, Y) are promoted to 4D by adding singleton Z and C dimensions</li>
-     *   <li>3D inputs (X, Y, Z) are promoted to 4D by adding a singleton C dimension</li>
-     *   <li>4D inputs (X, Y, Z, C) are used as-is</li>
-     *   <li>5D inputs (X, Y, Z, C, T) are used as-is</li>
-     * </ul>
+     * <p>Package-internal; see {@link #SerializeFromInterval(RandomAccessibleInterval)}.
      *
      * @param crop the input RandomAccessibleInterval to serialize
      * @param dimensionOrder the dimension order string (e.g., "XYZCT" or "CXYZT"). Must be 5 chars.
      * @return a Pixels protobuf message containing the serialized image data
      * @throws IllegalArgumentException if the input has more than 5 dimensions
      */
-    @Deprecated
-    public static <T extends RealType<T> & NativeType<T> > Pixels SerializeFromInterval(RandomAccessibleInterval<T> crop, String dimensionOrder) {
+    static <T extends RealType<T> & NativeType<T> > Pixels SerializeFromInterval(RandomAccessibleInterval<T> crop, String dimensionOrder) {
         return _SerializeFromInterval(crop, dimensionOrder, null);
     }
 
     /**
      * Serialize a RandomAccessibleInterval to Pixels protobuf with specified dimension orders.
      *
-     * @deprecated Use {@link #serializeFromIntervalToImageData(RandomAccessibleInterval, java.util.List)} instead
-     *             to get ImageData protobuf which supports both eager and lazy data with dimension labels.
-     *
-     * <p>This method converts imglib2 image data to a protobuf format suitable for
-     * gRPC transmission. The original data type is preserved.
-     *
-     * <p>Byte order (endianness) is always big-endian in the output.
+     * <p>Package-internal; see {@link #SerializeFromInterval(RandomAccessibleInterval)}.
      *
      * @param crop the input RandomAccessibleInterval to serialize
      * @param dimensionOrder F-order string for output protobuf (must be 5 chars, e.g., "XYZCT").
@@ -149,16 +109,13 @@ public final class Utils {
      * @return a Pixels protobuf message containing the serialized image data
      * @throws IllegalArgumentException if dimensions are invalid
      */
-    @Deprecated
-    public static <T extends RealType<T> & NativeType<T> > Pixels SerializeFromInterval(
+    static <T extends RealType<T> & NativeType<T> > Pixels SerializeFromInterval(
             RandomAccessibleInterval<T> crop, String dimensionOrder, String imglibIndexOrder) {
         return _SerializeFromInterval(crop, dimensionOrder, imglibIndexOrder);
     }
 
     /**
-     * Serialize a RandomAccessibleInterval to Pixels protobuf with specified dimension orders.
-     *
-     * <p>This is the internal implementation method. Use public deprecated methods for external access.
+     * Internal implementation for serializing a RandomAccessibleInterval to Pixels protobuf.
      *
      * <p>This method converts imglib2 image data to a protobuf format suitable for
      * gRPC transmission. The original data type is preserved.
@@ -389,55 +346,26 @@ public final class Utils {
     }
 
     /**
-     * Deserialize a Pixels protobuf message to a RandomAccessibleInterval.
+     * Deserialize a Pixels protobuf message to a RandomAccessibleInterval, in
+     * imglib2's XYZC dimension order.
      *
-     * @deprecated Use {@link #deserializeImageData(ImageData)} instead
-     *             which handles both eager and lazy data representations.
-     *
-     * <p>This method converts protobuf image data received via gRPC to imglib2 format.
-     * The returned interval is in imglib2's XYZC dimension order
-     * (dimension 0 = X, dimension 1 = Y, dimension 2 = Z, dimension 3 = C).
-     *
-     * <p>This is equivalent to calling {@link #_DeserializeToInterval(Pixels, String)}
-     * with outputIndexOrder="XYZC".
+     * <p>Package-internal: the legacy Pixels wire format is superseded by
+     * {@link #deserializeImageData(ImageData)}, which handles both eager and
+     * lazy data. This overload remains for {@link #deserializeImageData}'s own
+     * legacy-pixels fallback and its tests.
      *
      * @param pixels the protobuf message containing serialized image data
      * @return a RandomAccessibleInterval in XYZC dimension order
      * @throws IllegalArgumentException if the dimension order is invalid or dtype is unsupported
      */
-    @Deprecated
-    public static RandomAccessibleInterval<?> DeserializeToInterval(Pixels pixels) {
+    static RandomAccessibleInterval<?> DeserializeToInterval(Pixels pixels) {
         return _DeserializeToInterval(pixels, "XYZC");
     }
 
     /**
      * Deserialize a Pixels protobuf message to a RandomAccessibleInterval with specified output index order.
      *
-     * @deprecated Use {@link #deserializeImageData(ImageData)} instead
-     *             which handles both eager and lazy data representations.
-     *
-     * <p>This method converts protobuf image data received via gRPC to imglib2 format.
-     * The returned interval has the specified dimension order.
-     *
-     * <p>Supported data types (dtype):
-     * <ul>
-     *   <li>"f4" or "float32" - 32-bit float</li>
-     *   <li>"f8" or "float64" - 64-bit float</li>
-     *   <li>"u1" or "uint8" - 8-bit unsigned integer</li>
-     *   <li>"u2" or "uint16" - 16-bit unsigned integer</li>
-     *   <li>"u4" or "uint32" - 32-bit unsigned integer</li>
-     *   <li>"i1" or "int8" - 8-bit signed integer</li>
-     *   <li>"i2" or "int16" - 16-bit signed integer</li>
-     *   <li>"i4" or "int32" - 32-bit signed integer</li>
-     * </ul>
-     *
-     * <p>The outputIndexOrder specifies which dimensions to include in the output.
-     * Dimensions not in outputIndexOrder are squeezed (must be singleton).
-     *
-     * <p>Byte order (endianness) is read from the BinData field and applied correctly.
-     * Dtype prefixes like "&gt;", "&lt;", "|", "=" are automatically stripped for backward
-     * compatibility. Note that BinData.endianness is the authoritative source for endianness;
-     * a warning is logged if the dtype prefix conflicts with BinData.endianness.
+     * <p>Package-internal; see {@link #DeserializeToInterval(Pixels)}.
      *
      * @param pixels the protobuf message containing serialized image data
      * @param outputIndexOrder the desired dimension order of the output (2-5 chars, e.g., "XY", "XYZC", "XYZCT").
@@ -446,8 +374,7 @@ public final class Utils {
      * @throws IllegalArgumentException if the dimension order is invalid, outputIndexOrder is invalid,
      *                                  a non-singleton dimension is excluded, or dtype is unsupported
      */
-    @Deprecated
-    public static RandomAccessibleInterval<?> DeserializeToInterval(Pixels pixels, String outputIndexOrder) {
+    static RandomAccessibleInterval<?> DeserializeToInterval(Pixels pixels, String outputIndexOrder) {
         return _DeserializeToInterval(pixels, outputIndexOrder);
     }
 
@@ -717,8 +644,8 @@ public final class Utils {
      * Also handles legacy pixels field for backward compatibility.
      *
      * @param imageData the protobuf message containing serialized image data
-     * @return a RandomAccessibleInterval (ArrayImg for eager_data, or
-     *         SerializableTensorImg for lazy_data)
+     * @return a RandomAccessibleInterval (ArrayImg for eager_data, or a lazy
+     *         Flight-plan-backed interval for lazy_data)
      * @throws IllegalArgumentException if no data field is set or dtype is unsupported
      */
     public static RandomAccessibleInterval<?> deserializeImageData(ImageData imageData) {
@@ -741,31 +668,16 @@ public final class Utils {
     }
 
     /**
-     * Reconstruct a SerializableTensorImg from SerializedTensor protobuf.
+     * Reconstruct a lazy interval from a SerializedTensor protobuf.
      *
      * The returned RandomAccessibleInterval is a lazy imglib2 CellImg that
      * fetches chunks on-demand from the Flight server.
      *
      * @param serializedTensor the SerializedTensor protobuf
-     * @return a SerializableTensorImg wrapping the lazy tensor
+     * @return a lazy interval wrapping the tensor's immutable Flight plan
      */
     private static RandomAccessibleInterval<?> reconstructFromSerializedTensor(SerializedTensor serializedTensor) {
-        // Use SerializableTensorImg's static reconstruction method
-        // We create a minimal wrapper that reconstructs on first access
-        return new SerializableTensorImg<>(
-                LocationUris.parse(serializedTensor.getLocation()),
-                serializedTensor.getAuthToken().isEmpty() ? null : serializedTensor.getAuthToken(),
-                100_000_000L,  // Default cache size 100MB
-                serializedTensor.getTensorDescriptor().getArrayId(),
-                serializedTensor.getTensorDescriptor().getArrayId(),  // tensorId == arrayId; server reduces to field
-                serializedTensor.hasOriginalSliceHint() ? serializedTensor.getOriginalSliceHint() : null,
-                serializedTensor.getTensorDescriptor().getScaleHintList().isEmpty() ? null
-                        : toLongArray(serializedTensor.getTensorDescriptor().getScaleHintList()),
-                serializedTensor.getTensorDescriptor().getReductionMethod().isEmpty() ? null
-                        : serializedTensor.getTensorDescriptor().getReductionMethod(),
-                serializedTensor.getTensorDescriptor(),
-                null  // delegate reconstructed lazily
-        );
+        return TensorFlightClient.tensorFromPb(serializedTensor, 100_000_000L);
     }
 
     private static long[] toLongArray(java.util.List<Long> values) {
@@ -1016,7 +928,7 @@ public final class Utils {
             }
             return null;
         } else if (dataCase == ImageData.DataCase.LAZY_DATA) {
-            biopb.tensor.TensorDescriptor descriptor = imageData.getLazyData().getTensorDescriptor();
+            biopb.tensor.TensorDescriptor descriptor = TensorFlightClient.descriptorOf(imageData.getLazyData());
             if (descriptor.getDimLabelsCount() > 0) {
                 return new java.util.ArrayList<>(descriptor.getDimLabelsList());
             }
@@ -1043,7 +955,7 @@ public final class Utils {
             }
             return shape;
         } else if (dataCase == ImageData.DataCase.LAZY_DATA) {
-            biopb.tensor.TensorDescriptor descriptor = imageData.getLazyData().getTensorDescriptor();
+            biopb.tensor.TensorDescriptor descriptor = TensorFlightClient.descriptorOf(imageData.getLazyData());
             long[] shape = new long[descriptor.getShapeCount()];
             for (int i = 0; i < descriptor.getShapeCount(); i++) {
                 shape[i] = descriptor.getShape(i);

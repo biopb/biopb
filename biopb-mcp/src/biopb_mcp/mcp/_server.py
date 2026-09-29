@@ -20,7 +20,7 @@ synchronous tool function directly on the event loop, and this process serves
 waits on the kernel there does not make its caller wait, it makes every caller
 wait, for as long as the round trip takes (``execute_code`` used to hold it for
 the whole ``promote_after`` window). Kernel round trips therefore go to a thread
-(``_kernel_rpc._job_call`` / ``_execute``), and the promote window is a loop
+(``_kernel_rpc._execute``), and the promote window is a loop
 sleep. Adding a tool means adding an async one.
 """
 
@@ -28,16 +28,30 @@ import asyncio
 import functools
 import logging
 import os
+import threading
 import time
 from typing import Annotated
 
 from mcp.types import ImageContent, TextContent
-from pydantic import Field
+from pydantic import AnyUrl, Field
 
-from . import _app, _kernel_rpc, _resources, _scratch, _skills, _writers
+from . import (
+    _app,
+    _docs,
+    _kernel_rpc,
+    _scratch,
+    _workflow_doc,
+    _writers,
+)
 from ._app import mcp
 
 logger = logging.getLogger(__name__)
+
+#: What a session without a viewer loses, and the route that replaces it.
+_NO_VIEWER_HINT = (
+    "there is no `viewer` and no take_screenshot, so show results through the "
+    'web viewer (read_doc("web-viewer"))'
+)
 
 _SCREENSHOT_SNIPPET = (
     "import base64 as _b64, cv2 as _cv2\n"
@@ -92,10 +106,10 @@ else:
 """
 
 _STATUS_SNIPPET = """
-# This kernel's interpreter -- the one a skill's `pkg:` requirement is about, and
+# This kernel's interpreter -- the one a doc's package requirement is about, and
 # not necessarily the server process's env (the kernelspec need not be it). The
-# common such token is `pkg:biopb-mcp>=X`, how a skill says it needs a release
-# that carries some plugin, so report that one instead of making the agent import.
+# most common such requirement is `biopb-mcp>=X`, how a doc says it needs a release
+# that carries some feature, so report that one instead of making the agent import.
 # The interpreter, and how to install into it, come from _requires (which decides
 # the command from the env's shape) rather than being composed here.
 print("## Versions")
@@ -108,118 +122,108 @@ except Exception as _e:
 
 print("")
 print("## Dask")
+# Where a .compute() runs: dask's own default, in-process unless a cell built a
+# dask Client. Read without importing distributed, which only a cell that
+# built one has loaded.
 try:
-    import dask as _dask
-    print("  scheduler: " + str(_dask.config.get("scheduler", default="unknown")))
+    import sys as _sys
+    _dc = None
+    if "distributed" in _sys.modules:
+        from distributed import Client as _Client
+        try:
+            _dc = _Client.current(allow_global=True)
+        except ValueError:
+            pass
+    if _dc is None:
+        print("  mode: in-process (dask's default)")
+    elif _dc.status != "running":
+        print("  mode: dask Client, " + str(_dc.status))
+        print("  WARNING: a .compute() would fail or block; close this dask "
+              "Client or build a new one")
+    else:
+        _nw = len(_dc.nthreads())
+        print("  mode: dask Client at " + str(_dc.scheduler.address))
+        print("  workers: " + str(_nw))
+        print("  dashboard: " + str(_dc.dashboard_link))
+        if _nw == 0:
+            print("  WARNING: no workers left -- a .compute() would block forever; "
+                  "close this dask Client or build a new one")
 except Exception as _e:
     print("  error: " + str(_e))
-try:
-    if _dask_client is not None:
-        _info = _dask_client.scheduler_info()
-        print("  distributed_workers: " + str(len(_info.get("workers", {}))))
-        print("  dashboard: " + str(_dask_client.dashboard_link))
-    elif not globals().get("_dask_attach_done", True):
-        print("  distributed: starting (attaching to cluster)")
-    else:
-        print("  distributed: not active")
-except Exception:
-    print("  distributed: not active")
 
 print("")
 print("## Tensor Server")
 _tc = _conn.client
 if _tc is not None:
+    print("  connected: true")
+    print("  url: " + str(_conn.url))
     try:
-        print("  connected: true")
         print("  health: " + str(_tc.health_check()))
-        print("  sources_cached: " + str(len(_conn.sources or {})))
     except Exception as _e:
-        print("  connected: true")
         print("  health_error: " + str(_e))
-elif getattr(_conn, "last_status", "") == "starting":
-    print("  connected: false")
-    print("  state: starting — " + str(getattr(_conn, "last_message", "")))
 else:
     print("  connected: false")
     _lm = str(getattr(_conn, "last_message", ""))
     if _lm:
-        # issue #86: surface the reason (auth required / unreachable) instead of
-        # a bare "connected: false" the agent can't act on.
-        print("  error: " + _lm)
+        # issue #86: surface the reason (starting / auth required / unreachable)
+        # instead of a bare "connected: false" the agent can't act on.
+        print("  reason: " + _lm)
 
 print("")
 print("## Viewer")
 import os as _os
 import sys as _sys
-if _sys.platform == "darwin" or _os.name == "nt":
-    # Mirrors _has_display(): the native window server is ambient, so $DISPLAY
-    # (XQuartz, VcXsrv) says nothing about where Qt actually renders.
-    print("  display: (host window server)")
-elif _os.environ.get("BIOPB_VIRTUAL_DISPLAY"):
-    # Launcher-owned Xvfb (#90). A silent degradation: every tool below still
-    # works, so the agent relaying it is the only thing that reaches the user
-    # (#892). Kept as loud as start_kernel's — a session can reach here without
-    # having seen that message (context cleared, kernel already up).
-    print("  display: VIRTUAL (Xvfb " + str(_os.environ.get("DISPLAY", "?")) + ")")
-    print("    The user sees NO napari window, and software GL renders 3-D")
-    print("    volumes ~13x slower than a real GPU. TELL THE USER, if you have")
-    print("    not already. Usually the host does have a display and the MCP")
-    print("    client dropped $DISPLAY on the way in (Codex CLI does) — ask")
-    print("    whether they sit at a desktop on this machine before treating")
-    print("    the host as headless.")
+from biopb_mcp.mcp._bootstrap import no_viewer_reason as _no_viewer_reason
+_no_viewer = _no_viewer_reason()
+if _no_viewer:
+    print("  none -- " + _no_viewer)
+    print("    " + __NO_VIEWER_HINT__)
 else:
-    print("  display: " + str(
-        _os.environ.get("DISPLAY") or _os.environ.get("WAYLAND_DISPLAY") or "?"
-    ))
-if not _viewer_window_alive():
-    print("  window: CLOSED — the napari window was closed; layer mutations")
-    print("    won't display. Data/compute still work; restart_kernel to restore.")
-    print("  layers: " + str(len(viewer.layers)) + " (model only, not shown)")
-else:
-    print("  window: open")
-    print("  layers: " + str(len(viewer.layers)))
-    for _layer in list(viewer.layers)[:10]:
-        _shape = getattr(_layer.data, "shape", "?")
-        print("    - " + str(_layer.name) + " (" + str(_shape) + ")")
+    if _sys.platform == "darwin" or _os.name == "nt":
+        # Mirrors _has_display(): the native window server is ambient, so $DISPLAY
+        # (XQuartz, VcXsrv) says nothing about where Qt actually renders.
+        print("  display: (host window server)")
+    elif _os.environ.get("BIOPB_VIRTUAL_DISPLAY"):
+        # Launcher-owned Xvfb (#90). A silent degradation: every tool below still
+        # works, so the agent relaying it is the only thing that reaches the user
+        # (#892). Kept as loud as start_kernel's — a session can reach here without
+        # having seen that message (context cleared, kernel already up).
+        print("  display: VIRTUAL (Xvfb " + str(_os.environ.get("DISPLAY", "?")) + ")")
+        print("    The user sees NO napari window, and software GL renders 3-D")
+        print("    volumes ~13x slower than a real GPU. Show results through the")
+        print("    web viewer instead (## Web viewer above) — it needs no display")
+        print("    here and is what the user can actually look at.")
+        print("    Say so once, and ask: usually the host does have a display and")
+        print("    the MCP client dropped $DISPLAY on the way in (Codex CLI does),")
+        print("    in which case a restart with it set gives them a real window.")
+    else:
+        print("  display: " + str(
+            _os.environ.get("DISPLAY") or _os.environ.get("WAYLAND_DISPLAY") or "?"
+        ))
+    if not _viewer_window_alive():
+        print("  window: CLOSED — the napari window was closed; layer mutations")
+        print("    won't display. Data/compute still work; restart_kernel to restore,")
+        print("    or show results through the web viewer, which needs no window.")
+        print("  layers: " + str(len(viewer.layers)) + " (model only, not shown)")
+    else:
+        print("  window: open")
+        print("  layers: " + str(len(viewer.layers)))
+        for _layer in list(viewer.layers)[:10]:
+            _shape = getattr(_layer.data, "shape", "?")
+            print("    - " + str(_layer.name) + " (" + str(_shape) + ")")
 
 print("")
 print("## Ops")
 _ops = globals().get("ops")
-if _ops:
+if hasattr(_ops, "status"):
+    for _line in _ops.status().splitlines():
+        print("  " + _line)
+elif _ops:
     print("  " + ", ".join(sorted(_ops)))
 else:
-    print("  (none configured -- services.process_image_servers -- or unreachable)")
+    print("  (no ops)")
 
-print("")
-# What the plugin loader actually loaded, which neither the kernel dir (fail-open:
-# a file that raised is on disk and not loaded) nor dir() (a file contributes its
-# function names, not its own name) can tell the agent. It reads this to resolve a
-# skill's `plugin:<name>` requirement.
-print("## Kernel plugins")
-try:
-    from biopb_mcp.mcp import _requires as _req
-
-    for _line in _req.plugin_status_lines():
-        print(_line)
-except Exception as _e:
-    print("  error: " + str(_e))
-
-print("")
-print("## Jobs")
-try:
-    _js = _jobs.jobs_summary()
-    if _js:
-        for _j in _js:
-            print(
-                "  - " + _j["job_id"] + ": " + _j["status"]
-                + " (" + str(_j["elapsed"]) + "s, stdout "
-                + str(_j["stdout_len"]) + "b)"
-            )
-    else:
-        print("  (none)")
-except Exception as _e:
-    print("  error: " + str(_e))
-"""
+""".replace("__NO_VIEWER_HINT__", repr(_NO_VIEWER_HINT))
 
 
 # Whether psutil's CPU counter has a previous reading to measure against.
@@ -245,8 +249,8 @@ def _cpu_percent(psutil):
 async def _start_job(host, code, **kwargs):
     """Submit a job and resolve everything that can happen before it runs.
 
-    *code* and *kwargs* are :func:`_jobs.submit`'s own arguments, passed as
-    values. The client identity is added here rather than passed in, because
+    *code* and *kwargs* are :func:`_submit_job`'s. The client identity is
+    added here rather than passed in, because
     claiming the kernel is this function's business:
     every submitting tool answers "am I the holder?" and "is something already
     running?" the same way, and a second answer to either is a second policy.
@@ -254,19 +258,18 @@ async def _start_job(host, code, **kwargs):
     Returns ``(job_id, foreign_note, window_alive, message)``. Exactly one of
     *job_id* and *message* is not None — *message* is the finished tool reply
     for every outcome that never started a job, and *foreign_note* is what the
-    caller appends to whatever it returns instead. *window_alive* rides along
-    because the submit round trip carries it too, and with a promote window of
-    zero it is the only one there will be.
+    caller appends to whatever it returns instead. *window_alive* is always
+    None (see :func:`_submit_job`).
     """
     writer, _label = _writers._client_identity()
 
-    # Read once at entry, append to whichever path returns below. Every kernel
-    # round trip below goes to a thread for the reason on _kernel_rpc._job_call:
-    # blocking here blocks the whole process, not this one call.
-    digest = await asyncio.to_thread(_writers._foreign_digest, host)
+    # Read once at entry, append to whichever path returns below. The submit
+    # goes to a thread for the reason on _kernel_rpc._execute: blocking here
+    # blocks the whole process, not this one call.
+    digest = _writers._foreign_digest(host)
     foreign_note = _writers._render_foreign_note(digest)
     if foreign_note:
-        await asyncio.to_thread(_writers._ack_foreign_digest, host, digest, writer)
+        _writers._ack_foreign_digest(host, digest, writer)
 
     job_id, message, drop_note, window_alive = await asyncio.to_thread(
         _submit_job, host, code, digest, _tool_busy_message, **kwargs
@@ -283,8 +286,8 @@ def _tool_busy_message(running, running_origin) -> str:
 
     Whose job is running decides the advice. Telling the agent to "stop it with
     interrupt_kernel" while *someone else* is running a cell would have it kill
-    their work; interrupt_kernel refuses that anyway (_jobs.interrupt_current),
-    so the wording must not send it there.
+    their work; interrupt_kernel refuses that anyway, so the wording must not
+    send it there.
     """
     if running_origin and running_origin != "mcp":
         who = "The user" if running_origin == "user" else "Another writer"
@@ -300,90 +303,90 @@ def _tool_busy_message(running, running_origin) -> str:
     )
 
 
-def _submit_job(host, code, digest, busy_message, **kwargs):
-    """Claim the kernel, submit *code*, and classify whatever comes back.
+# Serializes _submit_job's check and send: two submits must not both find the
+# kernel free and queue a cell each.
+_submit_lock = threading.Lock()
 
-    The claim protocol -- presume before the call, then believe the kernel's
-    answer -- is the same for every writer of this namespace, and it is a
-    security-relevant one, so it is written once here. Both the MCP tools (via
-    :func:`_start_job`) and the in-process chat loop go through it.
 
-    What legitimately differs between those surfaces is only how a busy kernel
-    is described: a tool caller gets a job handle it can poll, the chat loop
-    never does (its path has no promote window), so it must not be told to poll
-    one. Hence *busy_message*, a ``(running_job_id, running_origin) -> str``.
+def _submit_job(host, code, digest, busy_message, intent=""):
+    """Claim the kernel, send *code* as a cell, and classify the outcome.
+
+    The claim protocol is the same for every writer of this namespace, and it
+    is a security-relevant one, so it is written once here. Both the MCP tools
+    (via :func:`_start_job`) and the in-process chat loop go through it.
+
+    The origin is added here for the same reason the identity is: it is the
+    caller's point of view, every seam that reads a job back compares against
+    it, and a surface that let it default recorded its cells as the MCP
+    client's (biopb/biopb#880). One contextvar, read at one seam.
+
+    **One job at a time.** A cell is refused while anything runs -- a cell
+    (anyone's) or a task -- rather than queued behind it: an agent that queued
+    would lose track of what ran when. What legitimately differs between the
+    surfaces is only how that refusal reads: a tool caller gets a job handle it
+    can poll, the chat loop never does, so it must not be told to poll one.
+    Hence *busy_message*, a ``(running_job_id, running_origin) -> str``.
 
     Returns ``(job_id, message, drop_note, window_alive)``; exactly one of
     *job_id* and *message* is not None. *drop_note* asks the caller to suppress
     its foreign-activity note: a running foreign job stays in the digest by
     design, so the note would report the very job the refusal already reports.
-    Keep it when other cells also finished -- those were acked and will not be
-    offered again.
+    *window_alive* is always None here: it is known only once the cell has run
+    (``host.jobs.window_alive``).
     """
     writer, writer_label = _writers._client_identity()
-    # Before the call, not after: a lost reply must not leave the kernel claimed
-    # while this process still reads as unclaimed. See _claimed_by.
-    _writers._presume_claim(writer)
-    submitted, res, window_alive = _kernel_rpc._run_job_call(
-        host, "submit", code, writer=writer, writer_label=writer_label, **kwargs
-    )
-    if submitted is None:
-        return None, _kernel_rpc._format_execute_result(res), False, window_alive
-    if submitted.get("error") == "not_owner":
-        # The authority speaking: whatever this process presumed above, the
-        # kernel just named the real holder.
-        _writers._note_claim(submitted.get("owner_id"))
-        held_by = submitted.get("owner") or ""
-        held_by = f" ({held_by})" if held_by else ""
-        return (
-            None,
-            _writers._NOT_OWNER_MSG.format(held_by=held_by),
-            False,
-            window_alive,
-        )
-    # Anything the kernel did not refuse came from the holder, "busy" included:
-    # submit() decides the claim before it looks at what is running.
-    _writers._note_claim(writer)
-    if submitted.get("error") == "busy":
-        running = submitted.get("running_job_id")
-        drop_note = [d.get("job_id") for d in digest] == [running]
-        return (
-            None,
-            busy_message(running, submitted.get("running_job_origin")),
-            drop_note,
-            window_alive,
-        )
-    return submitted["job_id"], None, False, window_alive
+    holder = _writers.take_claim(host, writer, writer_label)
+    if holder is not None:
+        held_by = f" ({holder})" if holder else ""
+        return None, _writers._NOT_OWNER_MSG.format(held_by=held_by), False, None
+    with _submit_lock:
+        running = host.jobs.running()
+        if running is not None:
+            drop_note = [d.get("job_id") for d in digest] == [running["job_id"]]
+            message = busy_message(running["job_id"], running.get("origin"))
+            return None, message, drop_note, None
+        job_id = host.jobs.new_id()
+        try:
+            host.run_cell(
+                code, job_id, origin=_writers._local_origin.get(), intent=intent
+            )
+        except Exception as exc:  # noqa: BLE001 - reported, not raised
+            return None, str(exc), False, None
+    return job_id, None, False, None
 
 
-async def _await_job(host, job_id, window_alive=None, budget=None, snap=None):
-    """Poll *job_id* until it is terminal or *budget* seconds run out.
+def _poll_submitted(host, job_id):
+    """*job_id*'s snapshot, for a job this caller has just submitted.
+
+    Its start travels on iopub and the submit's reply on the shell socket, so
+    the reply can arrive first: until the record appears, the job is running as
+    far as the caller knows, not unknown.
+    """
+    snap = host.jobs.poll(job_id)
+    if snap.get("status") == "unknown":
+        return {"job_id": job_id, "status": "running", "stdout": ""}
+    return snap
+
+
+async def _await_job(host, job_id, budget=None, submitted=False):
+    """*job_id*'s snapshot once it is terminal, or when *budget* seconds run out.
 
     *budget* defaults to the promote window, which is what a submitting tool
-    waits; ``poll_job`` passes its own. Returns ``(snap, res, window_alive)``.
-    *snap* is None when a poll round trip failed, and *res* is the raw kernel
-    reply to report instead. Otherwise a ``status`` of ``running`` means the
+    waits; ``poll_job`` passes its own. A ``status`` of ``running`` means the
     budget expired and the caller hands back a job handle rather than a result.
+    *submitted* is the submitting tool's: see :func:`_poll_submitted`.
 
-    *window_alive* seeds the flag with the submit round trip's, and *snap* the
-    snapshot, so a budget short enough to poll zero times still reports a closed
-    viewer and still answers with whatever its caller already knew. A submitting
-    tool has no snapshot yet and passes none, which reads as "running".
-
-    The wait is a loop sleep and each probe is a thread hop, so waiting costs
-    this process nothing: for however long it runs, the loop is free to serve
-    the observe page and any other client.
+    Each look is a read of the host's records (``host.jobs``), and the wait a
+    loop sleep, so waiting costs the kernel nothing and leaves this process's
+    loop free for every other caller.
     """
+    look = _poll_submitted if submitted else (lambda h, j: h.jobs.poll(j))
     deadline = time.monotonic() + (_app._promote_after if budget is None else budget)
-    snap, res = ({"status": "running"} if snap is None else snap), None
-    while time.monotonic() < deadline:
-        await asyncio.sleep(0.4)
-        snap, res, window_alive = await _kernel_rpc._job_call(host, "poll", job_id)
-        if snap is None:
-            return None, res, None
-        if snap.get("status") != "running":
-            break
-    return snap, res, window_alive
+    snap = look(host, job_id)
+    while snap.get("status") == "running" and time.monotonic() < deadline:
+        await asyncio.sleep(0.2)
+        snap = look(host, job_id)
+    return snap
 
 
 def _format_verification(record: dict, job_id: str, saved_path=None) -> str:
@@ -417,7 +420,7 @@ def _format_verification(record: dict, job_id: str, saved_path=None) -> str:
     for i, cell in enumerate(cells, 1):
         # The head, not the output: a verification's record is polled, and the
         # full text of every cell belongs to the notebook, not to a ledger line
-        # (see _jobs._Cell.snapshot).
+        # (see _scratch._record).
         head = (cell.get("stdout_head") or "").strip()
         lines.append(
             f"  {i}. {cell.get('status')} · {cell.get('elapsed')}s"
@@ -454,6 +457,23 @@ def _format_verification(record: dict, job_id: str, saved_path=None) -> str:
     return "\n".join(lines)
 
 
+def _viewer_base_url() -> str:
+    """The control's origin, which is where the web viewer is served.
+
+    Resolved per call because the port is configurable and a control that
+    restarts elsewhere republishes it. A control published below the root
+    (``--url-prefix``) still answers here; what carries the prefix is the URL
+    the *user's* browser reaches it by, which nothing in this process can know.
+    """
+    try:
+        from biopb import base_url
+
+        return base_url()
+    except Exception:  # pragma: no cover - core SDK always present in practice
+        logger.debug("status: control base url unresolvable", exc_info=True)
+        return "http://127.0.0.1:8813"
+
+
 def _format_job_status(snap: dict) -> str:
     """Render a job snapshot (poll_job output).
 
@@ -482,54 +502,16 @@ def _format_job_status(snap: dict) -> str:
 # ---------------------------------------------------------------------------
 
 
-@mcp.resource("guide://kernel")
-def get_kernel_guide() -> str:
-    """Overview: available namespaces, helper functions, resource URIs.
+@mcp.resource("docs://index")
+def get_index() -> str:
+    """The doc index, for hosts that subscribe to resources.
 
-    The skill-requirements section is appended only when the catalog is enabled
-    (``services.skills_enabled``): with it off there is no ``list_skills`` to
-    return a ``checklist:``, so the section would document an unreachable
-    tool -- the same gate the handshake instructions use.
+    The same text the handshake carries and ``read_doc("index")`` returns. It is
+    a resource as well so a host that honours ``resources/updated`` re-reads it
+    after a write -- the nearest thing MCP has to a harness injecting recall.
+    Nothing depends on it; the tool is the contract.
     """
-    if _app._skills_enabled:
-        return _resources.GUIDE + _resources.SKILL_REQUIREMENTS
-    return _resources.GUIDE
-
-
-@mcp.resource("guide://data")
-def get_data_guide() -> str:
-    """How array data is represented here: the three sources, and their traps."""
-    return _resources.DATA
-
-
-@mcp.resource("guide://viewer")
-def get_viewer_guide() -> str:
-    """Viewer operations: layers, camera, dims, display."""
-    return _resources.VIEWER
-
-
-@mcp.resource("guide://client")
-def get_client_guide() -> str:
-    """The `client` handle: listing sources, loading, uploading."""
-    return _resources.CLIENT
-
-
-@mcp.resource("guide://ops")
-def get_ops_guide() -> str:
-    """Image processing operations: segmentation, feature extraction, super-resolution."""
-    return _resources.OPS
-
-
-@mcp.resource("skill://{skill_id}")
-def get_skill(skill_id: str) -> str:
-    """Full workflow body for a curated skill; discover ids with `list_skills`.
-
-    The catalog (metadata) is served separately via the `list_skills` tool; this
-    resource reads one skill's markdown body from the file the catalog named.
-    Fail-open: returns a short explanatory string rather than erroring when a
-    skill is unknown or its file is unreadable.
-    """
-    return _skills.get_skill_body(skill_id)
+    return _docs.render_index()
 
 
 # ---------------------------------------------------------------------------
@@ -538,58 +520,107 @@ def get_skill(skill_id: str) -> str:
 
 
 @mcp.tool()
-async def list_skills(keywords: list[str] | None = None) -> list:
-    """Discover curated biopb workflows ("skills"). Call at the start of a task.
+async def read_doc(id: str) -> str:  # noqa: A002 - the parameter name is the wire contract
+    """Read one doc from the biopb knowledge store.
 
-    Skills are vetted, reusable recipes (e.g. "segment nuclei", "measure
-    labels").
+    `id` is what the index lists. `read_doc("index")` returns the index itself
+    -- the catalog of everything readable, with the agent's own hooks -- and is
+    worth re-reading when the session's handshake copy has gone stale.
 
-    **`keywords` is a keyword filter, not a search engine.** Each keyword must
-    appear in a skill's id/title/description/tags, so every one you add can only
-    remove results. Pass **one or two** domain terms and widen from there:
-    `["drift"]`, `["fret"]`, `["illumination"]`, `["stitch", "tiles"]`. Omit it
-    to list the whole catalog — worth doing once, since it is small.
+    A doc links another as `[[other-id]]`; follow one with another `read_doc`.
 
-    **An empty result usually means too many keywords, not no such skill.**
-    `["count", "foci", "per", "nucleus"]` returns nothing while `["foci"]`
-    returns the skill that counts them. If you get nothing back, drop keywords
-    and call again, or call with none and read the list.
-
-    **Results are of two `kind`s, and they are used differently.**
-
-    - `kind="skill"` — a curated workflow. It carries a `uri` (`skill://<id>`);
-      read that resource for the full step-by-step body. Prefer an existing
-      skill over improvising.
-    - `kind="plugin"` — a Python module already loaded into the kernel
-      namespace, listed with its docstring summary. There is no body to read.
-      It carries a `handle`, the name it is bound under: call
-      `inspect_object(handle)` for its callables and signatures, then use it in
-      `execute_code` as `handle.some_function(...)`. **Prefer it over writing
-      your own** — these exist because the from-scratch version is slow, subtly
-      wrong, or both, and the docstring says which.
-
-    Skills are listed before plugins.
-
-    A result's `checklist` lists what the skill touches (`viewer`, `tensor`, `dask`,
-    `ops:<name>`, `plugin:<name>`, `pkg:<name>`). Resolve it before starting the
-    skill — it informs rather than blocks, so a gap is something to name and
-    work around, not a reason to abandon the skill: `server_status` answers every token except a third-party `pkg:` — it
-    does carry biopb-mcp's own version — and for those, `execute_code` an
-    `import <name>` and read the version with
-    `importlib.metadata.version("<name>")`, not the module's `__version__`
-    (packages forget to bump it). A gap is the user's call —
-    installing, seeding a plugin, restarting the kernel all need their consent —
-    but naming it up front beats failing halfway through.
-
-    Fail-open: returns an empty list (never errors) rather than reporting a
-    catalog that could not be read.
+    `read_doc("<id>@diff")` shows your local copy of a shipped doc against the
+    shipped text -- what an upgrade changed that your copy hides.
     """
-    return await asyncio.to_thread(_skills.list_skills, keywords or ())
+    return await asyncio.to_thread(_docs.read_doc, id)
+
+
+@mcp.tool()
+async def write_doc(
+    id: str,  # noqa: A002 - the parameter name is the wire contract
+    body: str | None = None,
+    old: str | None = None,
+    new: str | None = None,
+) -> str:
+    """Write a doc into the biopb knowledge store. Returns a diff of the change.
+
+    Two forms. `body` writes the whole doc. `old`/`new` replaces one exact
+    occurrence of `old` -- the cheaper form, and the only sane one for the
+    index, which is long enough that rewriting it loses lines. The call is
+    refused if `old` is absent or matches more than once, so include enough
+    surrounding text to name one place. Several edits are several calls.
+
+    Writing a shipped doc creates your own copy shadowing it; the shipped file
+    is never touched, so an upgrade can still replace it. There is no delete:
+    retire a doc of your own by removing its index entry, and a shipped one by
+    adding its id to the index's `ignored:` line.
+
+    A new doc is filed in the index automatically, under `## Unfiled` -- move
+    the line where it belongs next time you edit the index.
+
+    Five rules, and they are what keep this store worth reading:
+
+    - Write only a **validated, multi-step** procedure -- one the user has just
+      confirmed on real data. A doc is a claim that the procedure works.
+    - Never a **dataset-specific** one. A source_id, an array_id or a pathname
+      makes it unusable by the next session; that run belongs in a notebook.
+    - Phrase the index hook **as the user's request**, not as an implementation
+      summary. It is what a later session matches against.
+    - **Update an existing doc rather than write a near-duplicate.** Read the
+      index first, and prefer an `old`/`new` edit to a new file.
+    - **Verify that a name, flag or call the doc quotes still exists** before
+      relying on it. Nothing else checks a doc of yours.
+
+    `read_doc("authoring")` has what a procedure doc must contain.
+    """
+    result = await asyncio.to_thread(_docs.write_doc, id, body, old, new)
+    await _notify_doc_written(id)
+    return result
+
+
+async def _notify_doc_written(doc_id: str) -> None:
+    """Tell a subscribing host the index resource moved. Best-effort.
+
+    Only the index is exposed as a resource, and only some hosts subscribe, so
+    a failure here is not a failed write.
+    """
+    if doc_id != _docs.INDEX_ID:
+        return
+    try:
+        session = mcp.get_context().session
+        await session.send_resource_updated(AnyUrl("docs://index"))
+    except Exception:
+        logger.debug("docs: could not notify the index resource update", exc_info=True)
+
+
+def _own_cell_holds_main(host, what):
+    """The refusal for a tool that needs the kernel's main thread while the
+    caller's own cell holds it, or None.
+
+    Answered at once rather than queued: the tool would only wait for the cell
+    to end, and asking while it runs is a mistake in the plan -- the agent
+    started that cell -- not a busy kernel. A user's cell is not the agent's to
+    foresee, so behind one the tool still waits.
+    """
+    cell = host.jobs.running_cell()
+    if cell is None or cell.get("origin") != _writers._local_origin.get():
+        return None
+    job_id = cell["job_id"]
+    return (
+        f"Refused: your cell {job_id} is running on the kernel's main thread, "
+        f"and {what} needs that thread, so it could only wait for the cell to "
+        "end. Asking now is a mistake in the plan, not a busy kernel: run a "
+        "compute you want to watch with run_async(fn), which leaves the main "
+        f"thread free. Poll the cell with poll_job('{job_id}')."
+    )
 
 
 @mcp.tool()
 async def take_screenshot(canvas_only: bool = True) -> list:
-    """Capture the napari viewer as a PNG image.
+    """Capture the napari viewer as a PNG image, where the session has one.
+
+    A session without a viewer refuses, saying why; show a result through the
+    web viewer there instead (read_doc("web-viewer")).
 
     Args:
         canvas_only: If True, capture only the canvas area. If False,
@@ -600,6 +631,19 @@ async def take_screenshot(canvas_only: bool = True) -> list:
     host, err = _app._require_kernel_host()
     if err is not None:
         return [TextContent(type="text", text=err)]
+    if host.no_viewer_reason:
+        return [
+            TextContent(
+                type="text",
+                text=(
+                    "No screenshot: this session has no napari viewer "
+                    f"({host.no_viewer_reason}): {_NO_VIEWER_HINT}."
+                ),
+            )
+        ]
+    refusal = _own_cell_holds_main(host, "a screenshot")
+    if refusal is not None:
+        return [TextContent(type="text", text=refusal)]
 
     snippet = _SCREENSHOT_SNIPPET.format(canvas_only=bool(canvas_only))
     res = await _kernel_rpc._execute(host, snippet)
@@ -642,12 +686,15 @@ _INTENT_DESC = (
 #: so it substitutes its own (``_chat._CHAT_RUN_PARAGRAPH``); named here, and
 #: pinned by a test, so a reworded docstring fails loudly rather than quietly
 #: leaving the loop's model told to poll for a handle it will never be given.
-PROMOTE_PARAGRAPH = """Code runs in a background thread so it does not block the main thread.
+PROMOTE_PARAGRAPH = """Code runs as a cell on the kernel's main thread, like a notebook cell.
     If it finishes quickly the result is returned inline; otherwise this returns
-    a job handle (job-N) and the code keeps running. Poll it with poll_job,
-    watch it with take_screenshot / server_status, and stop it with
-    interrupt_kernel (best-effort) or restart_kernel (guaranteed). Only one job
-    runs at a time."""
+    a job handle (job-N) and the cell keeps running. Poll it with poll_job, and
+    stop it with interrupt_kernel or restart_kernel (guaranteed). While it runs
+    it holds the main thread: a viewer does not repaint and take_screenshot /
+    inspect_object refuse. For a long compute you want to watch, end the cell
+    with run_async(fn) instead -- fn runs on a worker thread, the cell returns
+    at once with a task id (task-...) to poll, and the main thread stays free.
+    Only one job runs at a time."""
 
 
 @mcp.tool()
@@ -655,54 +702,70 @@ async def execute_code(
     python_code: str,
     intent: Annotated[str, Field(description=_INTENT_DESC)] = "",
 ) -> str:
-    """Execute Python code in the napari kernel.
+    """Execute Python code in the session's kernel.
 
-    The kernel is a full Jupyter/IPython kernel (imports allowed) with the
-    namespace: viewer (with an add_tensor method), client(image data access), and ops (a
-    dict of image processing operations). np and da are also imported. Variables persist
-    across calls until the kernel is restarted.
+    The kernel is a full Jupyter/IPython kernel (imports allowed). Its namespace
+    always holds the data plane -- client (image data access) -- and the
+    algorithm plane -- ops (server-side image-processing operations);
+    np and da are imported. A viewer (a
+    napari viewer with add_tensor/tensor methods) is there only when the session
+    has one: server_status's ## Viewer says. Variables persist across calls
+    until the kernel is restarted.
 
-    Code runs in a background thread so it does not block the main thread.
+    Code runs as a cell on the kernel's main thread, like a notebook cell.
     If it finishes quickly the result is returned inline; otherwise this returns
-    a job handle (job-N) and the code keeps running. Poll it with poll_job,
-    watch it with take_screenshot / server_status, and stop it with
-    interrupt_kernel (best-effort) or restart_kernel (guaranteed). Only one job
-    runs at a time.
+    a job handle (job-N) and the cell keeps running. Poll it with poll_job, and
+    stop it with interrupt_kernel or restart_kernel (guaranteed). While it runs
+    it holds the main thread: a viewer does not repaint and take_screenshot /
+    inspect_object refuse. For a long compute you want to watch, end the cell
+    with run_async(fn) instead -- fn runs on a worker thread, the cell returns
+    at once with a task id (task-...) to poll, and the main thread stays free.
+    Only one job runs at a time.
 
     Only one *agent* runs code in a kernel, too: whoever calls this first holds
     it until the kernel restarts. A second client is refused here and by every
     other tool that changes kernel state (interrupt_kernel, restart_kernel), and
     keeps only the read-only ones. The person at the machine is exempt — they
-    can run cells from the observe page while you work, which is what the
-    user-activity notice on these results is telling you about.
+    can run cells from a Jupyter notebook attached to this kernel while you
+    work, which is what the user-activity notice on these results is telling
+    you about. A cell of theirs sent while yours runs waits for it; one sent
+    while a run_async task runs runs beside it.
 
     Results include print() output and the last expression's repr. Rich IPython
     display() output is not captured; use print().
 
-    * viewer mutations (see guide://viewer for more details):
-    The viewer is thread-safe: mutations are auto-marshaled to the Qt main
-    thread, so mutate it directly from job code. run_on_main(fn) is optional --
-    use it to batch many mutations into one main-thread hop, or to touch raw Qt
-    (viewer.window), which still requires the main thread.
+    * viewer mutations, where there is a viewer (read_doc("napari-viewer") has
+    more): Mutate the viewer directly. From a run_async task too: its mutations are
+    marshaled to the main thread, one hop each, so bulk viewer work and raw Qt
+    (viewer.window) belong in a cell.
 
-    * data access (see guide://client for more details):
-    - client.query_sources(sql, format="pandas") runs server-side DuckDB and
+    * data access (read_doc("tensor-server-client") has more):
+    - client.query(sql, format="pandas") runs server-side DuckDB and
       returns a DataFrame. The `sources` table columns are: source_id,
-      source_url, source_type, dtype, indexed_at, metadata_json, shape_summary,
-      data_resident (note source_url, not "url"). Prefer this over
-      client.list_sources() (server-capped for large catalogs). Unresolved
-      (cloud) sources have NULL dtype/shape_summary, so a `WHERE dtype=...`
-      predicate hides them; use `data_resident` to filter on residency on
-      purpose (e.g. `WHERE NOT data_resident` to list what isn't resolved yet).
-    - viewer.add_tensor(array_id) loads a tensor as a layer (auto-handles the
-      multiscale pyramid); client.get_tensor(array_id) returns a lazy dask
-      array without adding a layer. Both take the same id: "source_id/t1"
+      source_url, source_type, indexed_at, metadata_json, is_resolved, and
+      `tensors`, a LIST of STRUCT(array_id, dim_labels, shape, dtype) with one
+      entry per tensor (note source_url, not "url"). This is the browse
+      surface; there is no other. Structure is a per-tensor question, so ask it
+      of `tensors`: `WHERE len(list_filter(tensors, t -> t.dtype='uint16')) > 0`,
+      or `tensors[1].dtype` for the source's first tensor (DuckDB lists are
+      1-indexed, unlike `tensors[0]` in Python/TS code). An unresolved (cloud)
+      source has an empty `tensors`, so any such predicate hides it; use
+      `is_resolved` to filter on them on purpose (e.g. `WHERE NOT is_resolved`
+      to list what hasn't been resolved yet).
+    - resolved is not the same as local. Assume a cloud or synced-folder
+      source's bytes may not be on the serving machine, so its first read can
+      be slow or fail offline -- say so before starting one, not after.
+    - client.get_tensor(array_id) returns a lazy dask array;
+      viewer.add_tensor(array_id), where there is a viewer, loads it as a layer
+      (auto-handles the multiscale pyramid). Both take the same id: "source_id/t1"
       within a multi-tensor source, a bare "source_id" for a single-tensor one.
-    - reading pixels back off a layer is not plain napari: layer.data is a
-      *list* of pyramid levels when layer.multiscale, in display axis order
-      ([..., Z, Y, X], at the source's own rank), and lazy. Use
-      `layer.data[0] if layer.multiscale else layer.data`, and read
-      guide://data before measuring or computing from a layer.
+    - reading pixels back off a layer is not plain napari: layer.data is
+      napari's MultiScaleData sequence of pyramid levels when layer.multiscale,
+      in display axis order ([..., Z, Y, X], at the source's own rank), and
+      lazy -- np.asarray() of it silently gives the *lowest* level. Use
+      viewer.tensor(layer), which returns a plain full-resolution dask array
+      from any layer, and read_doc("napari-viewer") before measuring or computing from
+      a layer.
     """
     host, err = _app._require_kernel_host()
     if err is not None:
@@ -714,107 +777,128 @@ async def execute_code(
         # a verification is running in a second one, on the same dask cluster.
         return _tool_busy_message(verifying["job_id"], "mcp")
 
-    job_id, foreign_note, window_alive, msg = await _start_job(
-        host, python_code, intent=intent
-    )
+    job_id, foreign_note, _w, msg = await _start_job(host, python_code, intent=intent)
     if msg is not None:
         return msg
 
-    snap, res, window_alive = await _await_job(host, job_id, window_alive)
-    if snap is None:
-        return _kernel_rpc._format_execute_result(res) + foreign_note
+    snap = await _await_job(host, job_id, submitted=True)
     if snap.get("status") != "running":
         return (
             _kernel_rpc._format_execute_result(snap)
-            + _kernel_rpc._window_note(window_alive)
+            + _kernel_rpc._window_note(host.jobs.window_alive(job_id))
             + foreign_note
         )
 
     partial = snap.get("stdout", "") if snap else ""
     return (
-        f"Job {job_id} is still running after {_app._promote_after:.0f}s. "
-        f"Poll it with poll_job('{job_id}'); watch with take_screenshot / "
-        f"server_status; stop with interrupt_kernel or restart_kernel.\n"
-        "Partial output:\n"
-        + (partial or "(none yet)")
-        + _kernel_rpc._window_note(window_alive)
-        + foreign_note
+        f"Job {job_id} is still running after {_app._promote_after:.0f}s, "
+        "holding the main thread: take_screenshot and inspect_object refuse "
+        f"until it ends. Poll it with poll_job('{job_id}'); stop it with "
+        "interrupt_kernel or restart_kernel. Next time, run a compute this long "
+        "with run_async(fn) to keep the main thread free.\n"
+        "Partial output:\n" + (partial or "(none yet)") + foreign_note
     )
 
 
 @mcp.tool()
-async def verify_workflow(
-    cells: list[str],
-    title: str = "",
-) -> str:
-    """Check that a candidate workflow runs on its own, in a scratch kernel.
+async def verify_workflow(document: str, title: str = "") -> str:
+    """Check that a workflow notebook runs on its own, in a scratch kernel.
 
     Use this when the user wants a workflow they have just proven kept as a
-    document. Rewrite the session into a clean program — one entry in *cells*
-    per notebook cell — and verify it here; on success the notebook is written
-    to disk for them and this tool reports where. Tell them the path; do not
-    write the file yourself.
+    document. **You write the whole document** — prose and code — and this runs
+    it; on success the notebook is saved for them and this tool reports where.
+    Tell them the path; do not write the file yourself.
 
-    **Rewrite it, do not select from it.** The program that works is almost
-    never a subsequence of what was run: a cell that created a variable and a
-    later cell that corrected its value have to merge into one, and dead ends,
-    retries, and debugging prints drop out. Read the session with poll_job and
-    write the cells you *mean*, in the order a reader would want them.
+    **The format** is markdown with fenced ``python`` cells. Each fence is one
+    notebook cell, run in order; everything between them is markdown, rendered
+    as written. A fence in another language (```bash) is prose about a command,
+    not a cell. The first ``# `` heading becomes the title. A saved ``.ipynb``
+    is also accepted verbatim, which is what to send back when the user has
+    edited one.
 
-    The cells run in order in a **second kernel**, spawned for this and thrown
-    away afterwards: a fresh namespace with none of this session's state. The run
-    stops at the first failure; the cells after it are reported as skipped.
+    Write it as a document, not as a list of cells with comments: a heading, a
+    sentence on what each step does and why in the terms the user would use
+    ("the threshold is 0.4 because the background peak sits at 0.3"), and the
+    code between them. That prose is most of what makes the notebook usable
+    months later, and you are the only one who knows it.
 
-    **There is no `viewer` there, and that is deliberate.** The viewer exists so
-    you can show something to the person you are working with, and nobody is
-    watching a verification. So a workflow cell must not touch `viewer` — it
-    raises `NameError` — and the saved notebook has no viewer either, which is
-    what makes it an ordinary notebook that runs headless. Write the workflow to
-    *compute* and to `print` what matters; leave displaying the result to the
-    live session, where there is someone to see it.
+    **It starts with its own setup cell.** The scratch kernel is given nothing —
+    no ``client``, no ``ops``, no ``np``, no ``viewer`` — because
+    the reader's kernel will have nothing either. So the first cell is the
+    document's own environment:
 
-    **The live session is untouched** — its variables, its layers, its viewer —
-    so there is nothing to ask the user about on that account. Bringing the
-    scratch kernel up takes a few seconds, and while a verification runs the
-    session kernel accepts no cells (one job at a time, across both).
+        import numpy as np
+        from biopb_mcp.workflow_env import workflow_env
 
-    **What it proves:** every cell runs, in order, against nothing but a fresh
-    kernel. That covers the whole class of defect that makes a transcript
-    unrunnable — a cell reading a variable an earlier discarded cell created, or
-    a layer this session happened to have.
+        conn, ops = workflow_env()
+        client = conn.client
+
+    A workflow that skips it fails with ``NameError``, which is the verdict: it
+    would have failed the same way for whoever opened the notebook.
+
+    **Rewrite the session, do not select from it.** The program that works is
+    almost never a subsequence of what was run: a cell that created a variable
+    and a later cell that corrected its value have to merge into one, and dead
+    ends, retries and debugging prints drop out. Read the session with poll_job
+    and write the document you *mean*.
+
+    **There is no `viewer`, and that is deliberate.** The viewer exists so you
+    can show something to the person you are working with, and nobody is
+    watching a verification. Write the workflow to *compute* and to ``print``
+    what matters; leave displaying the result to the live session.
+
+    **Failing is normal; the draft is where you fix it.** Every attempt, pass or
+    fail, is written to a draft file in the document's own format, and this tool
+    reports its path. On a failure, **read that file, edit it, and send the
+    whole thing back** — do not retype the document from memory, because the
+    user may have edited it themselves in the meantime, and their edit is the
+    one that should survive. A pass promotes the draft to the saved notebook and
+    removes it.
+
+    **The live session is untouched** — its variables, its layers, its viewer.
+    Bringing the scratch kernel up takes a few seconds, and while a verification
+    runs the session kernel accepts no cells (one job at a time, across both).
+
+    **What it proves:** every cell runs, in order, on a bare kernel with
+    biopb-mcp installed. That covers the whole class of defect that makes a
+    transcript unrunnable — a cell reading a variable an earlier discarded cell
+    created, a handle only this session had.
 
     **What it does not.** The numbers are right: check them. And a scratch
     *process* is not a scratch *world* — it talks to the same tensor server and
-    the same filesystem, so `client.upload_array` / `upload_zarr` /
-    `add_source`, and any cell that writes a file, write through for real. Verify
-    a workflow three times and you have three uploaded arrays. **Say so before
-    running one that writes.**
+    the same filesystem, so `client.upload_array` / `register_local_path`,
+    and any cell that writes a file, write through for real. Verify a workflow
+    three times and you have three uploaded arrays. **Say so before running one
+    that writes.**
 
     Args:
-        cells: the workflow's cells, in order, each a complete piece of Python.
-        title: what the workflow does, in a few words. Names the saved file and
-            titles the notebook.
+        document: the workflow, as markdown with fenced ``python`` cells (or a
+            complete ``.ipynb`` document).
+        title: overrides the document's own ``# `` heading. Names the saved
+            file; leave it out unless the heading is wrong.
     """
     host, err = _app._require_kernel_host()
     if err is not None:
         return err
-    if not cells:
-        return "verify_workflow needs at least one cell."
+    try:
+        blocks = _workflow_doc.parse(document)
+    except _workflow_doc.DocumentError as exc:
+        # The agent's mistake to correct, and it has not cost anything yet: no
+        # kernel was spawned and nothing was written.
+        return f"{exc} Send markdown with ```python cells, or a saved .ipynb."
+    title = title.strip() or _workflow_doc.title_of(blocks)
 
-    # The verification is claimed for this client, and the claim is enforced by
-    # the scratch kernel's own one-agent check (_jobs.submit) rather than a
-    # second one here -- so a stranger is refused an interrupt on it exactly as
-    # on the session kernel.
-    writer, label = _writers._client_identity()
-    foreign_note = await asyncio.to_thread(_writers._foreign_activity_note, host)
+    # The verification is this client's: a stranger is refused an interrupt on
+    # it (_scratch.interrupt), as on the session kernel.
+    writer, _label = _writers._client_identity()
+    foreign_note = _writers._foreign_activity_note(host)
     started = await asyncio.to_thread(
         _scratch.start,
-        list(cells),
+        blocks,
         title,
         host,
-        f"verify workflow: {title}" if title else "verify workflow",
         writer,
-        label,
+        _writers._local_origin.get(),
     )
     if started.get("error") == "busy":
         return (
@@ -842,9 +926,30 @@ async def verify_workflow(
         return (
             f"Verification {job_id} did not run: "
             + (snap.get("error_text") or "the scratch kernel produced no record.")
+            + _draft_note(snap)
             + foreign_note
         )
-    return _format_verification(record, job_id, snap.get("saved_path")) + foreign_note
+    return (
+        _format_verification(record, job_id, snap.get("saved_path"))
+        + _draft_note(snap)
+        + foreign_note
+    )
+
+
+def _draft_note(snap):
+    """Where the document that just failed is, so the next attempt edits it.
+
+    Only on a failure: a pass promotes the draft and the report already names
+    the notebook it became, so pointing at a file that is gone would be worse
+    than saying nothing.
+    """
+    draft = snap.get("draft_path")
+    if not draft:
+        return ""
+    return (
+        f"\n\nThe document is at {draft} — read it, edit it, and send the whole "
+        "file back rather than retyping it: the user may have edited it too."
+    )
 
 
 async def _await_verification(job_id, budget=None):
@@ -893,9 +998,11 @@ async def poll_job(
 ) -> str:
     """Get the status and output of a job started by execute_code.
 
-    Returns the job's status (running/ok/error/interrupted), elapsed time, and
-    output so far (full output once terminal). Job records persist until the
-    kernel is restarted (older terminal jobs are eventually evicted).
+    Returns the job's status (running/ok/error/interrupted/kernel_lost),
+    elapsed time, and output so far (full output once terminal). `kernel_lost`:
+    the kernel restarted or died under the job, and its variables are gone.
+    Records outlive restarts and ids are never reused (older terminal jobs are
+    eventually evicted), so a job from before a restart can still be polled.
 
     **This call already waits, so do not poll it in a loop.** A running job is
     watched here for up to `wait` seconds and answered the instant it ends;
@@ -908,7 +1015,7 @@ async def poll_job(
     if err is not None:
         return err
 
-    foreign_note = await asyncio.to_thread(_writers._foreign_activity_note, host)
+    foreign_note = _writers._foreign_activity_note(host)
     if _scratch.owns(job_id):
         # A verification runs in a kernel this one cannot see. The id says which,
         # because the session child issued it (_scratch._ID_PREFIX).
@@ -918,24 +1025,12 @@ async def poll_job(
         if snap.get("status") == "running" and wait > 0:
             snap = await _await_verification(job_id, min(wait, _POLL_WAIT_MAX))
         return _format_job_status(snap) + foreign_note
-    snap, res, window_alive = await _kernel_rpc._job_call(host, "poll", job_id)
-    if snap is not None and snap.get("status") == "running" and wait > 0:
-        # Probe first, wait second: a job that is already terminal -- the common
-        # case for a caller that has been polling -- answers with no delay, and
-        # only a genuinely running one costs the wait.
-        snap, res, window_alive = await _await_job(
-            host, job_id, window_alive, budget=min(wait, _POLL_WAIT_MAX), snap=snap
-        )
-    if snap is None:
-        return _kernel_rpc._format_execute_result(res) + foreign_note
+    # A job that is already terminal -- the common case for a caller that has
+    # been polling -- answers with no delay; only a running one costs the wait.
+    snap = await _await_job(host, job_id, budget=min(max(wait, 0), _POLL_WAIT_MAX))
     if snap.get("status") == "unknown":
         return f"No such job '{job_id}'." + foreign_note
-    note = (
-        _kernel_rpc._window_note(window_alive)
-        if snap.get("status") != "running"
-        else ""
-    )
-    return _format_job_status(snap) + note + foreign_note
+    return _format_job_status(snap) + foreign_note
 
 
 @mcp.tool()
@@ -948,6 +1043,9 @@ async def inspect_object(object_path: str) -> str:
     host, err = _app._require_kernel_host()
     if err is not None:
         return err
+    refusal = _own_cell_holds_main(host, "inspecting an object")
+    if refusal is not None:
+        return refusal
 
     snippet = _INSPECT_TEMPLATE.replace("__PATH__", repr(object_path))
     res = await _kernel_rpc._execute(host, snippet)
@@ -958,25 +1056,25 @@ async def inspect_object(object_path: str) -> str:
 
 @mcp.tool()
 async def interrupt_kernel() -> str:
-    """Force-stop the current job by raising KeyboardInterrupt in its thread.
+    """Force-stop your running job: your cell, or your run_async task.
 
-    Also cancels the job's in-flight dask futures. The job runs in a background
-    worker thread, so a SIGINT (which Python delivers only to the kernel main
-    thread) can't reach it — this raises the exception directly into the worker.
-    Best-effort: it lands at the next bytecode, so a
-    blocking C-level call (gRPC tensor fetch, native dask compute) stops only when
-    it returns to Python; if YOUR job stays stuck, use restart_kernel — the
-    guaranteed stop.
+    A cell runs on the kernel's main thread and gets a SIGINT, which also wakes
+    a blocking sleep or wait; a task gets a KeyboardInterrupt raised into its
+    thread. Either lands at the next bytecode, so a blocking C-level call (gRPC
+    tensor fetch, native compute) stops only when it returns to Python. A
+    blocking `.compute()` on a dask `Client` cancels its own tasks when
+    interrupted; in a task that lands within 10 s. If YOUR job stays stuck,
+    use restart_kernel -- the guaranteed stop.
 
-    Stops YOUR job only. A cell the user ran from the observe page shares this
-    kernel and this one-job-at-a-time runner, but is not yours to stop: this
-    refuses it, and you should wait for it instead. A refusal is not a stuck
+    Stops YOUR job only. A cell the user runs from an attached Jupyter notebook
+    shares this kernel but is not yours to stop: this refuses it, so wait for it
+    instead. A refusal is not a stuck
     kernel and restart_kernel is not the way around it — restarting would destroy
     the user's running cell, variables and layers along with yours. Wait, or ask
     them.
 
-    Takes no argument for which job because there is only ever one: the slot is
-    the session's, not a kernel's. So this also stops a verification of yours
+    Takes no argument for which job because you have at most one running: the
+    slot is the session's, not a kernel's. So this also stops a verification of yours
     running in its scratch kernel, and refuses one that is not yours, by the
     same rule and for the same reason.
 
@@ -997,7 +1095,9 @@ async def interrupt_kernel() -> str:
     # same as nothing running, since one that ended a moment ago leaves the
     # session kernel free to have started something. So fall through; never
     # answer "nothing is running" from here.
-    data = await asyncio.to_thread(_scratch.interrupt, None, "mcp", writer)
+    data = await asyncio.to_thread(
+        _scratch.interrupt, None, _writers._local_origin.get(), writer
+    )
     if data is not None:
         job_id = data.get("job_id")
         if data.get("interrupted"):
@@ -1011,21 +1111,50 @@ async def interrupt_kernel() -> str:
                 "is discarded. Your session is untouched; nothing here needs "
                 "restart_kernel."
             )
-        if data.get("refused") == "not_owner":
-            return _writers._NOT_OWNER_MSG.format(held_by="")
+        refused = _stop_refused_message(data, job_id)
+        if refused is not None:
+            return refused
         return (
             f"Nothing to interrupt in verification {job_id}; it may have "
             "finished already. Poll it to see."
         )
-    data, res, _w = await _kernel_rpc._job_call(
-        host, "interrupt_current", requester="mcp", writer=writer
+    origin = _writers._local_origin.get()
+    running = host.jobs.running(prefer=origin)
+    if running is None:
+        return "No running job to interrupt."
+    job_id = running["job_id"]
+    # Decided here, where the records and the claim are: the kernel stops
+    # what it is told to.
+    data = _writers.stop_refusal(
+        _writers.claim_holder(), running.get("origin"), writer, origin
     )
     if data is None:
-        return _kernel_rpc._format_execute_result(res)
+        try:
+            data = await asyncio.to_thread(host.interrupt_job, job_id)
+        except Exception as exc:  # noqa: BLE001 - the agent reads why
+            return f"Could not reach the kernel to interrupt {job_id}: {exc}"
+    if data.get("refused") == "not_running":
+        now = data.get("running_job_id")
+        return f"{job_id} is no longer running" + (
+            f"; {now} is. Poll it before deciding to stop it." if now else "."
+        )
+    refused = _stop_refused_message(data, job_id)
+    if refused is not None:
+        return refused
+    if data.get("interrupted"):
+        return (
+            f"Interrupted job {job_id} (a KeyboardInterrupt, at its next "
+            "bytecode). If it does not stop, use restart_kernel."
+        )
+    return "No running job to interrupt."
+
+
+def _stop_refused_message(data, job_id):
+    """The tool's reply to a stop refused by ``_writers.stop_refusal``, or
+    None when *data* is no such refusal."""
     if data.get("refused") == "not_owner":
         return _writers._NOT_OWNER_MSG.format(held_by="")
     if data.get("refused") == "foreign_job":
-        running = data.get("job_id")
         # "Foreign" is not a synonym for "the user's": it is anything this agent
         # did not start. Naming the wrong writer would tell the agent to wait on
         # a person who is not there.
@@ -1034,21 +1163,17 @@ async def interrupt_kernel() -> str:
         )
         who = "The user" if by == "the user" else "Whoever started it"
         return (
-            f"Refused: {running} was started by {by}, not by you — it is not "
-            f"yours to stop. Wait for it and poll_job('{running}'). ({who} can "
+            f"Refused: {job_id} was started by {by}, not by you — it is not "
+            f"yours to stop. Wait for it and poll_job('{job_id}'). ({who} can "
             "stop it.)"
         )
-    if data.get("interrupted"):
-        return (
-            f"Interrupted job {data.get('job_id')} (KeyboardInterrupt raised in "
-            "its thread). If it does not stop, use restart_kernel."
-        )
-    return "No running job to interrupt."
+    return None
 
 
 @mcp.tool()
 async def start_kernel() -> str:
-    """Start biopb: bring up the napari viewer, dask, and the tensor client.
+    """Start biopb: bring up the kernel with the tensor client and ops -- and
+    the napari viewer, where the session has one.
 
     Call this as the first action of every session, and whenever the user asks
     to start, open, or launch biopb, napari, or the viewer. Nothing auto-starts
@@ -1071,9 +1196,15 @@ async def start_kernel() -> str:
         return err
     result = await asyncio.to_thread(host.ensure_started)
     if result.get("state") == "ready":
+        if host.no_viewer_reason:
+            return (
+                "Kernel ready: the tensor client (`client`) and `ops` are up; "
+                "use execute_code now. This session has no napari "
+                f"viewer ({host.no_viewer_reason}): {_NO_VIEWER_HINT}."
+            )
         ready = (
-            "Kernel ready. The napari viewer, dask, and tensor client are up; "
-            "use execute_code / take_screenshot now."
+            "Kernel ready. The tensor client, `ops` and the "
+            "napari viewer are up; use execute_code / take_screenshot now."
         )
         # A virtual display is a silent degradation: screenshots still work, so
         # nothing downstream notices, but the user is watching a window that
@@ -1082,15 +1213,17 @@ async def start_kernel() -> str:
         display = host.virtual_display
         if display:
             ready += (
-                "\n\nWARNING: no display was detected, so the viewer is on a "
-                f"virtual one (Xvfb {display}). Screenshots work, but the "
+                "\n\nWARNING: no display was detected, so the napari window is "
+                f"on a virtual one (Xvfb {display}). Screenshots work, but the "
                 "window is invisible to the user and software GL renders 3-D "
                 "volumes ~13x slower than a real GPU.\n"
                 "TELL THE USER THIS NOW, before doing any work: no napari "
-                "window will appear for them. Usually the host does have a "
-                "display and their MCP client dropped $DISPLAY on the way in "
-                "(Codex CLI does this) — so ask whether they are at a desktop "
-                "on this machine before treating the host as headless."
+                "window will appear for them. Show results through the web "
+                "viewer instead — server_status has its URL, and it needs no "
+                "display on this machine. Usually the host does have one and "
+                "their MCP client dropped $DISPLAY on the way in (Codex CLI "
+                "does this) — so ask whether they are at a desktop here before "
+                "treating the host as headless."
             )
         return ready
     return (
@@ -1105,9 +1238,10 @@ async def restart_kernel() -> str:
     """Hard-restart the kernel: the guaranteed stop for runaway execution.
 
     Kills the kernel process group (reaping any dask child processes) and
-    respawns a fresh kernel, rebuilding the tensor client and the napari
-    viewer. All variables defined in previous execute_code calls are lost; a
-    new viewer window replaces the old one.
+    respawns a fresh kernel, rebuilding the tensor client and ops, and
+    the napari viewer where the session has one. All variables defined in
+    previous execute_code calls are lost; a new viewer window replaces the old
+    one.
 
     This destroys the USER's work too, not only yours — their running cell,
     their variables, their layers — and it is not undoable or announced to them
@@ -1145,7 +1279,8 @@ async def restart_kernel() -> str:
     if refusal is not None:
         return refusal
     note = f" Verification {discarded} was discarded with it." if discarded else ""
-    return "Kernel restarted. Viewer rebuilt; previous variables are gone." + note
+    rebuilt = "" if host.no_viewer_reason else " Viewer rebuilt;"
+    return f"Kernel restarted.{rebuilt} Previous variables are gone." + note
 
 
 @mcp.tool()
@@ -1154,9 +1289,8 @@ async def server_status() -> str:
 
     Returns CPU/memory usage (this MCP process / host), kernel liveness, and —
     queried from the kernel — its biopb-mcp/python versions, dask scheduler info,
-    tensor server connectivity, viewer layer count, the available `ops`, and which
-    kernel plugins loaded. Use before heavy computation, and to resolve a skill's
-    `checklist:` list.
+    tensor server connectivity, viewer layer count, and the available `ops`. Use
+    before heavy computation, and to resolve a procedure doc's Requirements line.
     """
     import psutil
 
@@ -1193,13 +1327,23 @@ async def server_status() -> str:
         lines.append("  status: not running (observe.enabled off or failed to start)")
     lines.append("")
 
-    # Where a skill the agent writes has to land. Server-process state (the
-    # catalog is scanned here, not in the kernel), and the path is configurable,
-    # so a hard-coded ~/.config/biopb/skills in a skill body can be wrong.
-    if _app._skills_enabled:
-        lines.append("## Skills")
-        lines.append(_skills.local_dir_status())
-        lines.append("")
+    # The display surface that does not need this session to have one. Reported
+    # rather than probed: the control serves the page *and* this session's data
+    # plane, so "## Tensor Server: connected" already answers whether it is up,
+    # and a probe here would put a network round trip on every status call.
+    lines.append("## Web viewer")
+    lines.append(f"  url: {_viewer_base_url()}/viewer?id=<array_id>")
+    lines.append("    Served by the control. Works with no napari window; shows")
+    lines.append("    what is in the catalog, so a result has to be uploaded")
+    lines.append('    first. read_doc("web-viewer") has the parameters.')
+    lines.append("")
+
+    # Where a doc the agent writes lands. Server-process state (the store is
+    # read here, not in the kernel) and the path is configurable, so a doc body
+    # quoting ~/.config/biopb/docs can be wrong.
+    lines.append("## Docs")
+    lines.append(_docs.local_dir_status())
+    lines.append("")
 
     lines.append("## Kernel")
 
@@ -1214,6 +1358,12 @@ async def server_status() -> str:
     lines.append(f"  watchdog_running: {health['watchdog_running']}")
     if health["recent_respawns"]:
         lines.append(f"  recent_respawns: {health['recent_respawns']}")
+    if health.get("connection_file"):
+        # For the user: a notebook on this kernel shares its namespace. Its
+        # cells are refused while a job runs and reported to the agent otherwise.
+        lines.append(f"  connection_file: {health['connection_file']}")
+        if health.get("attach_command"):
+            lines.append(f"    attach a notebook: {health['attach_command']}")
 
     # Kernel-state summary: dead / failed / starting / not-started are mutually
     # exclusive (each implies ready is false), so report exactly one and return —
@@ -1252,7 +1402,7 @@ async def server_status() -> str:
     if res.get("status") == "ok":
         lines.append("")
         lines.append(res.get("stdout", "").rstrip())
-    elif res.get("status") == "busy":
+    elif res.get("status") == "timeout":
         lines.append("  (kernel busy — dask/tensor/viewer status unavailable)")
     else:
         lines.append("")
@@ -1260,11 +1410,25 @@ async def server_status() -> str:
             "  kernel query error: " + (res.get("error_text") or str(res.get("status")))
         )
 
-    # Only on this path: the early returns above are all "kernel not usable",
-    # where the digest round-trip cannot land anyway.
-    return "\n".join(lines) + await asyncio.to_thread(
-        _writers._foreign_activity_note, host
-    )
+    # From the host's records, so the list survives a kernel that is busy.
+    lines.append("")
+    lines.append("## Jobs")
+    jobs = host.jobs.history()
+    for j in jobs:
+        if j.get("restart"):
+            lines.append(
+                "  -- kernel restarted: the jobs above ran in a namespace that is gone --"
+            )
+            continue
+        lines.append(
+            f"  - {j['job_id']}: {j['status']} ({j['elapsed']}s, "
+            f"stdout {j['stdout_len']}b)"
+        )
+    if not jobs:
+        lines.append("  (none)")
+
+    # Only on this path: the early returns above are all "kernel not usable".
+    return "\n".join(lines) + _writers._foreign_activity_note(host)
 
 
 # ---------------------------------------------------------------------------

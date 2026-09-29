@@ -144,6 +144,13 @@ fi
 
 _phase "2/5  Post-conditions"
 
+# Under --bootstrap the install log is the only evidence the bootstrap ran, and
+# that it handed over to a release's own installer rather than being skipped.
+if [ "$(basename "$INSTALL_SH")" = "bootstrap.sh" ]; then
+    check "the install went through the bootstrap, to a release's installer" \
+        grep -q '^Fetching the release-v.* installer' /tmp/install-1.log
+fi
+
 for shim in biopb biopb-mcp biopb-tensor-server biopb-control; do
     # The shim file, not `command -v`: whether a FUTURE shell finds it depends on
     # uv's rc-file editing, which correctly does nothing in the uv-preinstalled
@@ -188,11 +195,15 @@ case "$SCENARIO" in
             "$py" -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)"
         ;;
     rerun)
-        # The image stages a pre-#34 legacy TOML. An upgrade keeps the user's
-        # settings but converts the file, so the server stops warning about the
-        # deprecated format on every startup.
-        check "legacy TOML migrated to JSON" test -f "$CONFIG_JSON"
-        check "legacy TOML backed up, not deleted" test -f "$CONFIG_DIR/biopb.toml.bak"
+        # The image stages a config whose cache tuning differs from the installer
+        # defaults. "Keeps an existing config untouched" has to mean that tuning
+        # is still there after the upgrade, not merely that a file exists.
+        py=$(tool_python)
+        check "prior config's tuning preserved across the upgrade" "$py" -c "
+import json
+cfg = json.load(open('$CONFIG_JSON'))
+assert cfg['cache']['file_max_total_gb'] == 128, cfg['cache']
+"
         ;;
     bioformats)
         check "Bio-Formats / ZVI support works" bash /verify_bioformats.sh

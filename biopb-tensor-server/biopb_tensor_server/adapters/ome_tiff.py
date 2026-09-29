@@ -19,6 +19,7 @@ Chunk ID format: array_id + bounds encoding (start, stop coordinates). Relies on
 the OS page cache for raw-data caching.
 """
 
+import base64
 import io
 import logging
 import os
@@ -28,7 +29,7 @@ import time
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
 from pathlib import Path
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
@@ -38,6 +39,12 @@ from biopb_tensor_server.adapters._handle_reaper import (
     DEFAULT_HANDLE_REAPER_TTL,
     IdleHandleReaper,
 )
+from biopb_tensor_server.adapters._ome_rois import (
+    OME_SET_NAME,
+    imported_annotations,
+    tensors_by_field,
+)
+from biopb_tensor_server.adapters.ome_masks import RasterizedMaskAdapter, masks_by_image
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
     catalog_entry,
@@ -48,6 +55,7 @@ from biopb_tensor_server.core.chunk import (
 )
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import TensorNotFound
+from biopb_tensor_server.core.labels import label_extent, label_field
 
 logger = logging.getLogger(__name__)
 
@@ -290,6 +298,47 @@ _STRIP_EMPTY_BINDATA = re.compile(
 )
 
 
+def _strip_mask_bindata_payloads(ome_xml: str) -> str:
+    """Redact inline ``Mask/BinData`` bytes while retaining mask geometry.
+
+    ``Length=0`` keeps the element valid for ome-types if metadata is read
+    after registration; removing the element entirely makes ome-types discard
+    the containing ROI.  This is called only after the label adapters have
+    copied the decoded payloads they need for rasterization.
+    """
+    root = ET.fromstring(ome_xml)
+    for mask in root.iter():
+        if mask.tag.rsplit("}", 1)[-1] != "Mask":
+            continue
+        for child in mask:
+            if child.tag.rsplit("}", 1)[-1] == "BinData":
+                child.text = None
+                child.set("Length", "0")
+    return ET.tostring(root, encoding="unicode")
+
+
+def _b64_encode_mask_bindata(ome: Any) -> None:
+    """Base64-encode every ``<Mask>``'s ``bin_data.value`` in place.
+
+    A mask's bitmap is arbitrary binary, and pydantic's ``mode="json"`` dump of
+    a ``bytes`` field decodes it as UTF-8 -- which raises on the overwhelming
+    majority of real bitmaps (they are not valid UTF-8) and, since there is no
+    partial ``model_dump``, would fail the WHOLE metadata parse over one mask,
+    silently costing the file every other piece of its OME metadata too. Base64
+    is ASCII, so it survives the dump intact; the label rasterizer
+    (``adapters/ome_masks.py``) decodes it back off the resulting dict.
+
+    Best-effort: a shape this cannot walk is left alone, and the dump either
+    succeeds anyway (no real bitmap) or fails exactly as it would have without
+    this call -- never worse.
+    """
+    for roi in getattr(ome, "rois", None) or ():
+        for mask in getattr(getattr(roi, "union", None), "masks", None) or ():
+            value = getattr(getattr(mask, "bin_data", None), "value", None)
+            if isinstance(value, (bytes, bytearray)):
+                mask.bin_data.value = base64.b64encode(bytes(value))
+
+
 def _fast_ome_metadata(
     ome_xml: str, *, already_reduced: bool = False
 ) -> Optional[dict]:
@@ -299,8 +348,9 @@ def _fast_ome_metadata(
     with the real ome-types parser, so the result is structurally identical to
     ``ome_metadata.model_dump(mode="json")`` EXCEPT that ``planes`` and
     ``tiff_data_blocks`` come back empty -- the deliberate accuracy trade for
-    making registration O(structure) instead of O(plane-count) (biopb/biopb#168).
-    Returns ``None`` on any failure.
+    making registration O(structure) instead of O(plane-count) (biopb/biopb#168)
+    -- and that a ``<Mask>``'s ``bin_data.value`` is base64 text rather than raw
+    bytes (:func:`_b64_encode_mask_bindata`). Returns ``None`` on any failure.
     """
     try:
         from ome_types import from_xml
@@ -312,6 +362,7 @@ def _fast_ome_metadata(
         )
         ome = from_xml(reduced)
         if hasattr(ome, "model_dump"):
+            _b64_encode_mask_bindata(ome)
             return ome.model_dump(mode="json")
         if hasattr(ome, "dict"):
             return ome.dict(by_alias=False, exclude_none=False)
@@ -385,7 +436,6 @@ class OmeTiffAdapter(TensorAdapter):
         source_id: str,
         scene_index: Optional[int] = None,
         tensor_descriptor: Optional[TensorDescriptor] = None,
-        dim_labels: Optional[List[str]] = None,
         io_lock: Optional[threading.Lock] = None,
     ):
         """Initialize an OME-TIFF adapter.
@@ -396,9 +446,6 @@ class OmeTiffAdapter(TensorAdapter):
             scene_index: None for source-level, int for a bound scene.
             tensor_descriptor: The scene's authoritative tifffile descriptor
                 (scene-level only); its dim_labels become this adapter's.
-            dim_labels: Optional dimension-label override (source-level; a set
-                value routes off the canonical tifffile path -- see
-                ``_tifffile_descriptors``).
             io_lock: Shared IO lock. Source-level creates one if None; scene-level
                 receives the source's lock.
         """
@@ -417,7 +464,7 @@ class OmeTiffAdapter(TensorAdapter):
         if tensor_descriptor is not None:
             self.dim_labels = list(tensor_descriptor.dim_labels)
         else:
-            self.dim_labels = dim_labels
+            self.dim_labels = None
 
         # Persistent aszarr-store state (opened lazily on first get_data). The
         # read serves regions straight from the zarr array -- no dask.
@@ -453,6 +500,18 @@ class OmeTiffAdapter(TensorAdapter):
         self._raw_ome_xml_released = False
         self._reduced_ome_xml = None
         self._reduced_ome_xml_probed = False
+        # The dict _reduced_ome_xml parses into (biopb/biopb#1059 step 4): a pure
+        # function of that already-cached string, so caching it costs nothing in
+        # correctness and saves a second ome-types parse when both get_metadata
+        # and get_embedded_labels run in the same registration (metadata_db.py
+        # calls the former directly; the latter is label_sets' one-time call).
+        self._parsed_metadata: Optional[dict] = None
+        self._parsed_metadata_probed = False
+        # Set only after get_embedded_labels has handed every usable bitmap to
+        # its RasterizedMaskAdapter.  release_registration_cache may also run
+        # on an adapter that has never entered label discovery, in which case
+        # its metadata must remain complete for that later discovery.
+        self._mask_payloads_transferred = False
 
         # Per-scene adapter cache, source-level only. Assigned here (not lazily on
         # first get_tensor_adapter) so no code path has to hedge about whether the
@@ -465,7 +524,7 @@ class OmeTiffAdapter(TensorAdapter):
         cls, source: "SourceConfig", credentials_config: Optional[object] = None
     ) -> "OmeTiffAdapter":
         """Create a source-level adapter from a SourceConfig."""
-        return cls(str(source.url), source.source_id, dim_labels=source.dim_labels)
+        return cls(str(source.url), source.source_id)
 
     # ---- reads --------------------------------------------------------------
 
@@ -651,14 +710,70 @@ class OmeTiffAdapter(TensorAdapter):
 
         Goes through ``_reduced_ome_xml_cached()``, not the raw string, so a re-sync
         (an unresolved source resolving) re-parses the stripped form already in
-        hand rather than re-opening the file for a string it would strip again.
+        hand rather than re-opening the file for a string it would strip again --
+        and the *dict* that parse produces is itself cached (``_parsed_metadata``),
+        since it is a pure function of that same string: a caller that also
+        touches ``get_embedded_labels`` in the same registration (``label_sets``)
+        gets the one parse already done, not a second one.
         """
+        if self._parsed_metadata_probed:
+            return self._parsed_metadata or {}
+        self._parsed_metadata_probed = True
         reduced = self._reduced_ome_xml_cached()
         if reduced:
-            fast = _fast_ome_metadata(reduced, already_reduced=True)
-            if fast is not None:
-                return fast
-        return {}
+            self._parsed_metadata = _fast_ome_metadata(reduced, already_reduced=True)
+        return self._parsed_metadata or {}
+
+    def get_embedded_rois(self, metadata, tensors, *, max_per_tensor=None):
+        """The OME-XML ``<ROI>`` elements this file carries (see the base).
+
+        Matched by id: ``_ome_scene_ids`` puts the OME image id straight into
+        the array_id's field half, so the two id spaces are the same one.
+        """
+        return imported_annotations(
+            metadata,
+            tensors_by_field(tensors),
+            content_version=self.content_version,
+            max_per_tensor=max_per_tensor,
+        )
+
+    def get_embedded_labels(self) -> Dict[str, TensorAdapter]:
+        """The ``@ome`` set: this file's own ``<Mask>`` ROI shapes, rasterized.
+
+        One tensor per scene that carries at least one mask, keyed
+        ``[<scene field>/]labels/@ome`` (see ``adapters/ome_masks.py``). Same
+        OME-image-id join as :meth:`get_embedded_rois` (``tensors_by_field``):
+        the field half of a scene's ``array_id`` IS the OME image id for this
+        format, so the match is string equality, not inference.
+        """
+        descriptors = self._scene_descriptors()
+        by_image = masks_by_image(
+            self.get_metadata(),
+            tensors_by_field([(d.array_id, list(d.dim_labels)) for d in descriptors]),
+        )
+        if not by_image:
+            self._mask_payloads_transferred = True
+            return {}
+        sets: Dict[str, TensorAdapter] = {}
+        for desc in descriptors:
+            masks = by_image.get(desc.array_id)
+            if not masks:
+                continue
+            dim_labels, shape = label_extent(list(desc.dim_labels), list(desc.shape))
+            field = label_field(
+                self._within_source_field(desc.array_id) or "", OME_SET_NAME
+            )
+            sets[field] = RasterizedMaskAdapter(
+                self.source_id,
+                field,
+                dim_labels=dim_labels,
+                shape=shape,
+                masks=masks,
+                parent_array_id=desc.array_id,
+                content_version=self.content_version,
+            )
+        self._mask_payloads_transferred = True
+        return sets
 
     def _reduced_ome_xml_cached(self) -> Optional[str]:
         """The plane-stripped OME-XML, computed once and kept for the adapter's life.
@@ -745,15 +860,37 @@ class OmeTiffAdapter(TensorAdapter):
         # inherits either (raw, unsettled) and gets cascaded below, or (no raw,
         # settled) and needs nothing.
         reduced = self._reduced_ome_xml_cached()
+        if reduced is not None and self._mask_payloads_transferred:
+            # The label adapters have already copied the decoded mask bytes.
+            # Retaining either the base64 XML or the parsed dict would duplicate
+            # a potentially very large payload for the source lifetime. This
+            # method must never raise (docstring above), so a reduced XML the
+            # stdlib parser rejects is left un-redacted rather than aborting the
+            # release below and the cascade to every scene -- worse for memory
+            # on that one source, not a correctness problem.
+            try:
+                reduced = _strip_mask_bindata_payloads(reduced)
+            except ET.ParseError:
+                logger.debug("could not redact mask payloads", exc_info=True)
+            else:
+                self._reduced_ome_xml = reduced
+                self._parsed_metadata = None
+                self._parsed_metadata_probed = False
         if self._raw_ome_xml is not None:
             self._raw_ome_xml = None
             self._raw_ome_xml_released = True
         for adapter in list(self._tensor_adapters.values()):
             if adapter is self:
                 continue
-            if reduced is not None and not adapter._reduced_ome_xml_probed:
+            if reduced is not None and (
+                self._mask_payloads_transferred or not adapter._reduced_ome_xml_probed
+            ):
                 adapter._reduced_ome_xml = reduced
                 adapter._reduced_ome_xml_probed = True
+            if self._mask_payloads_transferred:
+                adapter._parsed_metadata = None
+                adapter._parsed_metadata_probed = False
+                adapter._mask_payloads_transferred = True
             adapter.release_registration_cache()
 
     def __del__(self):
@@ -803,17 +940,11 @@ class OmeTiffAdapter(TensorAdapter):
         """Build per-scene descriptors straight from tifffile (biopb/biopb#168).
 
         Returns a list of ``TensorDescriptor`` on success, or ``None`` to decline
-        (custom ``dim_labels`` override, remote/non-``file://`` URL, non-OME TIFF,
-        zero series, or a non-OME axis). Scene IDs match the OME ``Image`` IDs so
+        (remote/non-``file://`` URL, non-OME TIFF, zero series, or a non-OME axis). Scene IDs match the OME ``Image`` IDs so
         the catalog array_ids are stable, and only the tiny OME-XML header is read
         (no ome-types object graph). Canonical ``TCZYX`` and interleaved RGB(A)
         (``TCZYXS``) are both mapped natively via ``_ome_axes_shape``.
         """
-        # An explicit dim_labels override is not supported on the pure-tifffile
-        # path (it owned the non-canonical relabeling in the old aicsimageio path).
-        if self.dim_labels:
-            return None
-
         url = self._source_url or ""
         if "://" in url and not url.startswith("file://"):
             return None  # remote/fsspec source: no local tifffile handle

@@ -23,6 +23,7 @@ from biopb_tensor_server.core.downsample import (
     ceil_div,
     normalize_reduction_method,
 )
+from biopb_tensor_server.core.errors import InvalidReadRequest
 
 logger = logging.getLogger(__name__)
 
@@ -93,42 +94,104 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 _CV_SENTINEL = 0xFF  # leading byte marking a version-wrapped chunk_id
-_CV_FORMAT = 1  # wrapper layout version (after the sentinel byte)
+# Wrapper layout, the byte after the sentinel. The discriminator: a v1 payload
+# can never be read as a v2 one.
+_CV_FORMAT_CONTENT = 1  # [0xFF][1][uint32 cv_len][cv]
+_CV_FORMAT_EPOCH = 2  # [0xFF][2][uint32 epoch][uint32 cv_len][cv]
 
 
-def _version_header(content_version: bytes) -> bytes:
-    """The constant prefix that wraps a chunk_id with a content_version.
+def _version_header(content_version: Optional[bytes], epoch: int) -> bytes:
+    """The prefix that wraps a chunk_id with the versions it was minted under.
 
-    ``[0xFF sentinel][uint8 fmt][uint32 cv_len][cv bytes]``. Precompute once per
-    read plan (content_version is constant across a source's chunks) and prepend.
+    Epoch 0 writes the v1 form, which carries no epoch field, so a server that
+    has declared no epoch mints the same bytes it always did.
     """
-    return (
-        struct.pack(">BBI", _CV_SENTINEL, _CV_FORMAT, len(content_version))
-        + content_version
-    )
+    cv = content_version or b""
+    if epoch == 0:
+        return struct.pack(">BBI", _CV_SENTINEL, _CV_FORMAT_CONTENT, len(cv)) + cv
+    return struct.pack(">BBII", _CV_SENTINEL, _CV_FORMAT_EPOCH, epoch, len(cv)) + cv
 
 
-def wrap_content_version(inner_chunk_id: bytes, content_version: bytes) -> bytes:
-    """Prepend a content_version header to a legacy (inner) chunk_id."""
-    return _version_header(content_version) + inner_chunk_id
+def wrap_content_version(
+    inner_chunk_id: bytes, content_version: Optional[bytes]
+) -> bytes:
+    """Prepend a version header, under this server's current epoch."""
+    return _version_header(content_version, current_epoch()) + inner_chunk_id
 
 
-def _split_version(chunk_id: bytes) -> Tuple[Optional[bytes], bytes]:
-    """Split a chunk_id into ``(content_version | None, inner_legacy_chunk_id)``.
+def _split_version(chunk_id: bytes) -> Tuple[int, Optional[bytes], bytes]:
+    """Split a chunk_id into ``(epoch, content_version | None, inner)``.
 
-    Unversioned chunk_ids (no 0xFF sentinel) pass through unchanged, so every
-    codec function below can strip first and reuse the pre-#178 logic verbatim.
+    An unwrapped chunk_id (no 0xFF sentinel) passes through as ``(0, None, id)``,
+    so every codec function below can strip first and work on the inner alone.
+    A zero-length content_version field decodes to None -- an epoch-only header
+    makes no claim about content.
     """
     if not chunk_id or chunk_id[0] != _CV_SENTINEL:
-        return None, chunk_id
-    cv_len = struct.unpack(">I", chunk_id[2:6])[0]
-    inner_offset = 6 + cv_len
-    return chunk_id[6:inner_offset], chunk_id[inner_offset:]
+        return 0, None, chunk_id
+    if chunk_id[1] == _CV_FORMAT_EPOCH:
+        epoch, cv_len = struct.unpack(">II", chunk_id[2:10])
+        start = 10
+    else:
+        epoch = 0
+        cv_len = struct.unpack(">I", chunk_id[2:6])[0]
+        start = 6
+    end = start + cv_len
+    return epoch, (chunk_id[start:end] if cv_len else None), chunk_id[end:]
+
+
+def split_chunk_version(chunk_id: bytes) -> Tuple[int, Optional[bytes], bytes]:
+    """``(epoch, content_version | None, inner)`` in one parse.
+
+    For the staleness gate, which needs both halves.
+    """
+    return _split_version(chunk_id)
 
 
 def content_version_of(chunk_id: bytes) -> Optional[bytes]:
-    """The chunk_id's content_version, or None if it carries no version header."""
+    """The chunk_id's content_version, or None if it carries none.
+
+    The content signal alone, whatever epoch the id was minted under.
+    """
+    return _split_version(chunk_id)[1]
+
+
+def epoch_of(chunk_id: bytes) -> int:
+    """The serving-semantics epoch the chunk_id was minted under (0 if none)."""
     return _split_version(chunk_id)[0]
+
+
+# =============================================================================
+# Serving-semantics epoch (biopb/biopb#1076)
+# -----------------------------------------------------------------------------
+# content_version says "this source's data changed". The epoch says "what this
+# server returns for a stable chunk_id changed" -- a chunking or normalization
+# change, which moves no per-source signal at all. Both are framed in the
+# version header, so a bump re-keys every chunk_id and every cache keyed by one:
+# this server's segments, the SDK's disk cache, a proxy's, any yet to be
+# written. Nothing on the wire; chunk_id is opaque by contract (#346, #520).
+#
+# The epoch is never published. Re-keying a chunk is not a claim that the data
+# changed, and a consumer that reads it as one -- an ROI's
+# drawn_against_version -- would treat a server upgrade as an edit. A cache that
+# cannot key by chunk_id (the HTTP sidecar's tile URLs) folds the epoch into its
+# own keys itself.
+#
+# BUMP IT when a server change alters what the bytes for a stable chunk_id mean.
+# NOT for a segment-file layout change -- that is CACHE_FILE_FORMAT_VERSION.
+# A bump cold-starts every cache everywhere, which is the correct outcome for a
+# change in what the bytes mean.
+CHUNK_SEMANTICS_EPOCH = 0
+
+
+def current_epoch() -> int:
+    """The epoch this server is serving under.
+
+    Call this rather than importing the constant: ``from ... import
+    CHUNK_SEMANTICS_EPOCH`` binds at import, so a test that patches the module
+    would not be seen.
+    """
+    return CHUNK_SEMANTICS_EPOCH
 
 
 # =============================================================================
@@ -153,7 +216,9 @@ def content_version_of(chunk_id: bytes) -> Optional[bytes]:
 # =============================================================================
 
 _ENV_SENTINEL = 0xFE  # leading byte marking a proxy-envelope chunk_id
-_ENV_FORMAT = 1  # envelope layout version (after the sentinel byte)
+# Envelope layout, the byte after the sentinel.
+_ENV_FORMAT_CONTENT = 1  # (route, cv, inner)
+_ENV_FORMAT_EPOCH = 2  # (route, epoch, cv, inner)
 
 
 def is_proxy_envelope(chunk_id: bytes) -> bool:
@@ -168,22 +233,25 @@ def encode_proxy_envelope(
 
     ``route`` is the proxy's LOCAL array_id (how the server dispatches the chunk
     back to this adapter); ``content_version`` is the upstream source's version
-    (``None``/empty when the upstream is unversioned). The inner is stored and
-    later forwarded byte-for-byte -- the proxy never interprets it.
+    (``None``/empty when the upstream is unversioned). This proxy's own serving
+    epoch is added here: the mirror re-serves those bytes locally, so a change
+    in what they mean here has to re-key here. The inner is stored and later
+    forwarded byte-for-byte -- the proxy never interprets it.
     """
     route_bytes = route.encode("utf-8")
     cv = content_version or b""
-    return (
-        struct.pack(">BBI", _ENV_SENTINEL, _ENV_FORMAT, len(route_bytes))
-        + route_bytes
-        + struct.pack(">I", len(cv))
-        + cv
-        + inner_chunk_id
-    )
+    epoch = current_epoch()
+    fmt = _ENV_FORMAT_CONTENT if epoch == 0 else _ENV_FORMAT_EPOCH
+    head = struct.pack(">BBI", _ENV_SENTINEL, fmt, len(route_bytes)) + route_bytes
+    if epoch != 0:
+        head += struct.pack(">I", epoch)
+    return head + struct.pack(">I", len(cv)) + cv + inner_chunk_id
 
 
-def peel_proxy_envelope(chunk_id: bytes) -> Tuple[str, Optional[bytes], bytes]:
-    """Split a proxy envelope into ``(route, content_version | None, inner)``.
+def peel_proxy_envelope(
+    chunk_id: bytes,
+) -> Tuple[str, int, Optional[bytes], bytes]:
+    """Split a proxy envelope into ``(route, epoch, content_version | None, inner)``.
 
     Inverse of :func:`encode_proxy_envelope`. A zero-length content_version field
     decodes back to ``None``. ``inner`` is the verbatim upstream chunk_id.
@@ -191,12 +259,17 @@ def peel_proxy_envelope(chunk_id: bytes) -> Tuple[str, Optional[bytes], bytes]:
     route_len = struct.unpack(">I", chunk_id[2:6])[0]
     offset = 6 + route_len
     route = chunk_id[6:offset].decode("utf-8")
+    if chunk_id[1] == _ENV_FORMAT_EPOCH:
+        epoch = struct.unpack(">I", chunk_id[offset : offset + 4])[0]
+        offset += 4
+    else:
+        epoch = 0
     cv_len = struct.unpack(">I", chunk_id[offset : offset + 4])[0]
     offset += 4
     cv = chunk_id[offset : offset + cv_len]
     offset += cv_len
     inner = chunk_id[offset:]
-    return route, (cv if cv_len > 0 else None), inner
+    return route, epoch, (cv if cv_len > 0 else None), inner
 
 
 def routing_array_id(chunk_id: bytes) -> str:
@@ -209,7 +282,7 @@ def routing_array_id(chunk_id: bytes) -> str:
     """
     if is_proxy_envelope(chunk_id):
         return peel_proxy_envelope(chunk_id)[0]
-    return decode_chunk_id(chunk_id)[0]
+    return array_id_from_chunk_id(chunk_id)
 
 
 def content_version_from_path(path: object) -> Optional[bytes]:
@@ -259,7 +332,7 @@ def encode_chunk_id(
 def decode_chunk_id(chunk_id: bytes) -> Tuple[str, ChunkBounds]:
     """Decode array_id and bounds from chunk_id. Works for both regular
     and virtual chunk_ids (ignores virtual payload) and version-wrapped ones."""
-    _, chunk_id = _split_version(chunk_id)
+    _epoch, _cv, chunk_id = _split_version(chunk_id)
     array_id_len = struct.unpack(">I", chunk_id[:4])[0]
     array_id = chunk_id[4 : 4 + array_id_len].decode("utf-8")
 
@@ -274,6 +347,18 @@ def decode_chunk_id(chunk_id: bytes) -> Tuple[str, ChunkBounds]:
     bounds = ChunkBounds(start=start, stop=stop)
 
     return array_id, bounds
+
+
+def array_id_from_chunk_id(chunk_id: bytes) -> str:
+    """Just the array_id, without decoding (and discarding) the bounds.
+
+    The prefix is all a caller that only wants to key on the tensor needs, and
+    :func:`decode_chunk_id` builds a ``ChunkBounds`` message to get there --
+    paid per chunk on the routing and retention paths, thrown away by both.
+    """
+    _epoch, _cv, chunk_id = _split_version(chunk_id)
+    array_id_len = struct.unpack(">I", chunk_id[:4])[0]
+    return chunk_id[4 : 4 + array_id_len].decode("utf-8")
 
 
 def get_bounds_from_chunk_id(chunk_id: bytes) -> ChunkBounds:
@@ -339,6 +424,30 @@ def encode_chunk_id_with_scale(
     return base + scale_payload + method_suffix
 
 
+def mint_chunk_id(
+    array_id: str,
+    bounds: ChunkBounds,
+    scale_hint: Optional[Tuple[int, ...]] = None,
+    reduction_method: str = CHUNK_ID_IMPLICIT_REDUCTION_METHOD,
+    content_version: Optional[bytes] = None,
+) -> bytes:
+    """Mint the canonical chunk_id for a read-plan endpoint.
+
+    The single composition point for regular or scaled encoding and the version
+    header, so cache probes mint the same bytes as read plans. The caller passes
+    its ``content_version``; the epoch is this server's and is applied here.
+    """
+    if scale_hint is None:
+        inner = encode_chunk_id(array_id, bounds)
+    else:
+        inner = encode_chunk_id_with_scale(
+            array_id, bounds, scale_hint, reduction_method
+        )
+    if content_version is None and current_epoch() == 0:
+        return inner  # nothing to version by: no header at all
+    return wrap_content_version(inner, content_version)
+
+
 def _bounds_end(chunk_id: bytes) -> Tuple[int, int]:
     """``(ndim, bounds_end)`` for an INNER (legacy, version-stripped) chunk_id.
 
@@ -355,7 +464,7 @@ def _bounds_end(chunk_id: bytes) -> Tuple[int, int]:
 
 def is_scaled_chunk(chunk_id: bytes) -> bool:
     """Check if chunk_id has scale info appended after bounds."""
-    _, inner = _split_version(chunk_id)
+    _epoch, _cv, inner = _split_version(chunk_id)
     _, bounds_end = _bounds_end(inner)
     return len(inner) > bounds_end
 
@@ -391,13 +500,17 @@ def cache_key_for_chunk_id(chunk_id: bytes) -> bytes:
     """
     if is_proxy_envelope(chunk_id):
         return chunk_id
-    cv, inner = _split_version(chunk_id)
+    epoch, cv, inner = _split_version(chunk_id)
     ndim, bounds_end = _bounds_end(inner)
     scale_end = bounds_end + ndim * 8
     # Keep array_id+bounds+scale_hint and at most the one-byte method suffix; a
     # longer trailing run is the legacy uint16 method form, stripped (#76).
     base = inner if len(inner) <= scale_end + 1 else inner[:scale_end]
-    return wrap_content_version(base, cv) if cv is not None else base
+    if cv is None and epoch == 0:
+        return base
+    # The header the id was MINTED with, not the one this server would mint now:
+    # a key has to find what was written, including an entry now stale.
+    return _version_header(cv, epoch) + base
 
 
 def decode_scale_info(chunk_id: bytes) -> Tuple[int, ...]:
@@ -408,7 +521,7 @@ def decode_scale_info(chunk_id: bytes) -> Tuple[int, ...]:
     :func:`decode_reduction_method`; any trailing bytes here are ignored, so a
     legacy method-carrying chunk_id still decodes its scale correctly.
     """
-    _, chunk_id = _split_version(chunk_id)
+    _epoch, _cv, chunk_id = _split_version(chunk_id)
     ndim, bounds_end = _bounds_end(chunk_id)
 
     return struct.unpack_from(f">{ndim}q", chunk_id, bounds_end)
@@ -429,7 +542,7 @@ def decode_reduction_method(chunk_id: bytes) -> str:
     legacy ``uint16 len + bytes`` method suffix resolve the same way, so an old
     scaled read is served exactly as before, never rejected.
     """
-    _, inner = _split_version(chunk_id)
+    _epoch, _cv, inner = _split_version(chunk_id)
     ndim, bounds_end = _bounds_end(inner)
     scale_end = bounds_end + ndim * 8
     if len(inner) == scale_end + 1:
@@ -486,7 +599,9 @@ def normalized_slice_bounds(
         Tuple of (start, stop) coordinates
 
     Raises:
-        ValueError: If slice hint dimensionality mismatch or invalid bounds
+        InvalidReadRequest: If slice hint dimensionality mismatch or invalid
+            bounds. Typed, not a bare ValueError: the boundary maps it to a
+            terminal INVALID_ARGUMENT instead of a "server bug" INTERNAL.
     """
     if slice_hint is None:
         return tuple(0 for _ in shape), tuple(int(dim) for dim in shape)
@@ -495,20 +610,30 @@ def normalized_slice_bounds(
     stop = tuple(int(value) for value in slice_hint.stop)
 
     if len(start) != len(shape) or len(stop) != len(shape):
-        raise ValueError(
+        raise InvalidReadRequest(
             f"Slice hint dimensionality mismatch: expected {len(shape)}, "
-            f"got start={len(start)} stop={len(stop)}"
+            f"got start={len(start)} stop={len(stop)}",
+            reason="slice_rank",
         )
 
     for axis, (axis_start, axis_stop, axis_shape) in enumerate(
         zip(start, stop, shape, strict=True)
     ):
         if axis_start < 0 or axis_stop < 0:
-            raise ValueError(f"Slice bounds must be non-negative on axis {axis}")
+            raise InvalidReadRequest(
+                f"Slice bounds must be non-negative on axis {axis}",
+                reason="slice_negative",
+            )
         if axis_start > axis_stop:
-            raise ValueError(f"Slice start must be <= stop on axis {axis}")
+            raise InvalidReadRequest(
+                f"Slice start must be <= stop on axis {axis}",
+                reason="slice_inverted",
+            )
         if axis_stop > axis_shape:
-            raise ValueError(f"Slice stop exceeds tensor shape on axis {axis}")
+            raise InvalidReadRequest(
+                f"Slice stop exceeds tensor shape on axis {axis}",
+                reason="slice_out_of_range",
+            )
 
     return start, stop
 
@@ -527,20 +652,26 @@ def normalized_scale_hint(
         Scale hint tuple if valid and non-trivial, None otherwise
 
     Raises:
-        ValueError: If scale hint dimensionality mismatch or invalid values
+        InvalidReadRequest: If scale hint dimensionality mismatch or invalid
+            values. Typed for the same reason as the slice bounds above.
     """
     if scale_hint is None or len(scale_hint) == 0:
         return None
 
     scale_hint_tuple = tuple(int(value) for value in scale_hint)
     if len(scale_hint_tuple) != len(shape):
-        raise ValueError(
-            f"Scale hint dimensionality mismatch: expected {len(shape)}, got {len(scale_hint_tuple)}"
+        raise InvalidReadRequest(
+            f"Scale hint dimensionality mismatch: expected {len(shape)}, "
+            f"got {len(scale_hint_tuple)}",
+            reason="scale_rank",
         )
 
     for axis, scale in enumerate(scale_hint_tuple):
         if scale <= 0:
-            raise ValueError(f"Scale hint must be positive on axis {axis}")
+            raise InvalidReadRequest(
+                f"Scale hint must be positive on axis {axis}",
+                reason="scale_not_positive",
+            )
 
     if all(scale == 1 for scale in scale_hint_tuple):
         return None
@@ -583,7 +714,6 @@ PRECACHE_DOWNSCALE_FACTOR = 2
 # 448**3 = 90 Mvox. The coarsest level is uploaded whole as one 3-D texture by
 # both renderers, and Viv casts it to float32 -- measured on a Quadro P2000,
 # 90 Mvox holds 50 fps there where 512**3 (134 Mvox) drops to 17.
-# See docs/precache-policy.md 9.1.
 PRECACHE_PIXEL_BUDGET_CUBIC_ROOT = 448
 # 2048**2. Caps the 2-D rungs, and is chosen to land on the level deck.gl asks
 # for at fit-to-view in a ~1500-2000px window, so the warmed level is the one
@@ -662,8 +792,7 @@ def _pyramid_levels(
 
     Everything below documents the levels themselves.
 
-    Full resolution, then the two levels the precache worker warms (see
-    ``docs/precache-policy.md`` §4.1, §5):
+    Full resolution, then the two levels the precache worker warms:
 
     - **the 2-D target**, X and Y only, halved by ``downscale_factor`` until the
       plane fits ``plane_max_pixels`` (and X/Y fit ``threshold``). Z is left
@@ -829,14 +958,6 @@ def compute_warm_targets(
     ]
 
 
-# 256 MiB, per warm level. Not sized to make a catalog fit -- at a few hundred
-# tensors nothing in the hundreds of MiB does, and the backlog high-water gate is
-# what stops a full cache. What it bounds is one tensor eating the cache, and
-# above the first plane it buys *scrub headroom*: at this value a 200-plane
-# confocal keeps 128 of its Z planes rather than 32, so paging through the stack
-# stays warm instead of only the opening slab.
-PRECACHE_WARM_BUDGET_BYTES = 256 * 1024 * 1024
-
 # Order in which selection axes give up extent when a level is over budget.
 # Unnamed axes (a plate's POS, a sequence's `i`) go first and are not in this
 # tuple -- they are independent acquisitions like T, and a viewer opens on one.
@@ -852,8 +973,8 @@ def compute_warm_selection(
     dim_labels,
     scale_hint: Sequence[int],
     itemsize: int,
+    budget_bytes: int,
     volumetric: bool = False,
-    budget_bytes: int = PRECACHE_WARM_BUDGET_BYTES,
 ) -> Tuple[List[int], List[int]]:
     """``(start, stop)`` in full-resolution coords for the part worth warming.
 

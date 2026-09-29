@@ -14,12 +14,14 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from . import _agents, _endpoints, _locations, _web_auth
-from ._endpoints import (
+from . import _agents, _locations, _tls_material, _web_auth
+from ._control import _endpoints
+from ._control._endpoints import (
     flight_port_for as _flight_port,
     sidecar_port_for as _sidecar_port,
 )
-from ._lifecycle.daemon import (
+from ._locations import find_config
+from .lifecycle.daemon import (
     detach_kwargs as _detach_kwargs,
     is_our_daemon as _is_our_daemon,
     read_pid_record as _read_pid_record,
@@ -27,12 +29,11 @@ from ._lifecycle.daemon import (
     stop_daemon as _stop_daemon,
     write_pid_file as _write_pid_file,
 )
-from ._lifecycle.file_lock import LockTimeout, file_lock
-from ._lifecycle.proc import (
+from .lifecycle.file_lock import LockTimeout, file_lock
+from .lifecycle.proc import (
     is_process_running as _is_process_running,
     process_create_time as _process_create_time,
 )
-from ._locations import DEFAULT_CONFIG_DIR, find_config
 
 console = Console()
 
@@ -42,36 +43,75 @@ app = typer.Typer(
 )
 
 
-def _add_optional_typer(name: str, import_path: str, help: str) -> None:
-    """Register a subcommand whose imports may fail.
+class _LazySubcommands(typer.core.TyperGroup):
+    """A subcommand group whose module is imported on first use, not at startup.
 
     The tensor/image subcommands pull in optional dependencies (installed via
-    biopb[tensor]) that may be absent or broken (e.g. a transient
-    numcodecs/zarr ImportError). When that happens we still want the rest of
-    the CLI (version, server management) to work, so we register a stub that
-    surfaces the error only when the subcommand is actually invoked.
+    biopb[tensor]) that are heavy -- `biopb.tensor.client` alone imports
+    dask.array, which drags pandas and scipy along -- and that may be absent or
+    broken (e.g. a transient numcodecs/zarr ImportError). Importing them at
+    registration made every `biopb` invocation, `biopb version` included, pay
+    ~0.7 s for a module it never used. Here the group knows only its name and
+    help until something asks for its commands: the module loads when the group
+    is invoked, its own help is rendered, or a shell completion lists it.
+    `biopb --help` lists the group without loading it.
+
+    An import failure is reported the way the eager stub did: any `biopb <name>
+    ...` invocation prints the error and the install hint and exits 1, so the
+    rest of the CLI (version, server management) keeps working.
     """
-    import importlib
 
-    try:
-        module = importlib.import_module(import_path)
-        app.add_typer(module.app, name=name, help=help)
-    except Exception as exc:  # noqa: BLE001 - degrade gracefully on any import error
-        error = exc
+    import_path: str = ""  # set on the per-group subclass by `_add_optional_typer`
 
-        # Register a catch-all command so that any `biopb <name> ...` invocation
-        # surfaces the import error instead of a confusing crash or usage error.
-        @app.command(
-            name=name,
-            help=f"{help} (unavailable - optional dependencies missing)",
-            context_settings={"ignore_unknown_options": True, "allow_extra_args": True},
-        )
-        def _unavailable(args: List[str] = typer.Argument(None)) -> None:
+    def __init__(self, **attrs) -> None:
+        self._loaded: Optional[dict] = None
+        self._error: Optional[BaseException] = None
+        super().__init__(**attrs)
+
+    # `TyperGroup` keeps its subcommands in a plain `commands` dict that every
+    # path reads (listing, resolution, help, suggestions); making it a property
+    # is the one hook that covers them all. The constructor's assignment of an
+    # empty dict is discarded.
+    @property
+    def commands(self) -> dict:
+        self._ensure_loaded()
+        return self._loaded or {}
+
+    @commands.setter
+    def commands(self, value) -> None:
+        pass
+
+    def _ensure_loaded(self) -> None:
+        if self._loaded is not None or self._error is not None:
+            return
+        import importlib
+
+        try:
+            module = importlib.import_module(self.import_path)
+            self._loaded = dict(typer.main.get_group(module.app).commands)
+        except Exception as exc:  # noqa: BLE001 - degrade gracefully on any import error
+            self._error = exc
+            self.help = f"{self.help} (unavailable - optional dependencies missing)"
+
+    def invoke(self, ctx: typer.Context):
+        self._ensure_loaded()
+        if self._error is not None:
             console.print(
-                f"[red]The '{name}' commands are unavailable:[/red] {error}\n"
+                f"[red]The '{self.name}' commands are unavailable:[/red] {self._error}\n"
                 r"[yellow]Install optional dependencies with: pip install 'biopb\[tensor]'[/yellow]"
             )
             raise typer.Exit(1)
+        return super().invoke(ctx)
+
+    def format_help(self, ctx, formatter) -> None:
+        self._ensure_loaded()  # so a failed import's note is in the help text
+        return super().format_help(ctx, formatter)
+
+
+def _add_optional_typer(name: str, import_path: str, help: str) -> None:
+    """Register `import_path`'s Typer `app` as the `name` subcommand group, lazily."""
+    cls = type(f"_Lazy_{name}", (_LazySubcommands,), {"import_path": import_path})
+    app.add_typer(typer.Typer(), name=name, help=help, cls=cls)
 
 
 # TensorFlight client diagnostics
@@ -81,23 +121,20 @@ _add_optional_typer(
     "Query a TensorFlight data plane (sources, tensors, stats, cache).",
 )
 
-# ProcessImage client operations
-_add_optional_typer("image", "biopb.image.cli", "Call ProcessImage algorithm servers.")
+# Ops client operations
+_add_optional_typer("image", "biopb.image.cli", "Call algorithm servers (Ops).")
 
 # The `biopb server` group is gone (biopb/biopb#615). Its lifecycle commands went
-# first, when the control plane took over the data-plane process; the two that
-# outlived them were not a group: `cache-stats` is a Flight query, so it moved to
-# `biopb tensor cache-stats` beside the other queries, and `migrate-config` needs
-# biopb-tensor-server to do anything at all, so it moved to
-# `biopb-tensor-server migrate-config` and left the SDK.
+# first, when the control plane took over the data-plane process; the one that
+# outlived them was not a group: `cache-stats` is a Flight query, so it moved to
+# `biopb tensor cache-stats` beside the other queries.
 
 # Daemon management constants. On-disk locations come from the shared
 # `_locations` module (XDG-aware): the installed webapp bundle is a portable
 # asset (data tree); logs / pid / sentinels are per-machine state (state tree).
 DEFAULT_WEBAPP = _locations.webapp_dir()
 
-# Default config path, preferring JSON over legacy TOML and warning when both
-# exist. Shared with biopb-tensor-server and biopb-mcp via the (dependency-light)
+# Default config path. Shared with biopb-tensor-server and biopb-mcp via the (dependency-light)
 # core module, so resolving this typer Option default does not import the heavy
 # server config module (biopb/biopb#34).
 DEFAULT_CONFIG = find_config()
@@ -112,42 +149,46 @@ DEFAULT_CONFIG = find_config()
 CONTROL_PID_FILE = _locations.control_pid_file()
 
 
-# The installer records the release-v* deployment version it pulled the wheels
-# from in this marker file -- a clean PEP 440 string (e.g. "0.11.0"), the
-# auto-updater's baseline. This is the *product* version: one release-v* tag
-# versions the mutually-paired biopb-tensor-server / biopb-mcp / biopb-control /
-# web set together, so the marker represents them all. (The biopb SDK ships on
-# its own v* line, so its wheel version differs.) Kept in sync with
-# CONFIG_DIR/release.version in install/install.sh.
-_RELEASE_VERSION_FILE = DEFAULT_CONFIG_DIR / "release.version"
+# One release-v* tag versions this set together, so any installed member reports
+# the product version. (The biopb SDK ships on its own v* line, so its wheel
+# version differs.) Tried in order; the first one installed answers.
+_RELEASE_PACKAGES = ("biopb-control", "biopb-mcp", "biopb-tensor-server")
 
 
-def _read_release_version() -> str:
-    """The installed deployment version from the installer's marker file, or
-    'unknown' when it is absent (a dev checkout or non-installer setup that never
-    wrote CONFIG_DIR/release.version) or unreadable. Best-effort like
-    ``_package_version`` -- reading a version must never crash ``biopb version``,
-    so a missing/permission-denied/corrupt (non-UTF-8) marker degrades to
-    'unknown' rather than propagating."""
-    try:
-        # Explicit utf-8 (the installer writes a plain ASCII/utf-8 version), so
-        # decoding is deterministic across platforms rather than dependent on the
-        # reader's locale (cp1252 on Windows would decode a corrupt marker to
-        # garbage instead of failing to 'unknown').
-        return _RELEASE_VERSION_FILE.read_text(encoding="utf-8").strip() or "unknown"
-    except OSError:
-        return "unknown"
-    except Exception:  # noqa: BLE001 - marker read is best-effort (e.g. decode errors)
-        return "unknown"
+def _release_version() -> str:
+    """The product deployment version, from whichever release-v* wheel is here.
+
+    Read from distribution metadata rather than the installer's
+    ``CONFIG_DIR/release.version`` marker, because the marker is *user-global*:
+    a ``biopb version`` run from another environment -- a dev venv, a second
+    tool install -- printed that environment's SDK beside a different
+    installation's deployment. Metadata is per-environment, so both lines now
+    describe the one you ran from, and a set upgraded by hand rather than by
+    the installer reports what is actually present.
+
+    The marker stays for the auto-updater, which reads it itself
+    (``biopb_mcp.mcp._update``).
+    """
+    for name in _RELEASE_PACKAGES:
+        found = _package_version(name)
+        if found not in ("not installed", "unknown"):
+            return found
+    return "not installed"
 
 
 def _package_version(dist_name: str) -> str:
     """Installed version of distribution `dist_name`, or 'not installed'.
 
-    Reads distribution metadata (like biopb.__init__ does for its own version)
-    instead of importing the package, so `biopb version` never drags in the
-    packages' heavy optional stacks just to print a number, and still reports a
-    version when a package is installed but its runtime imports are broken.
+    Reads distribution metadata rather than importing the package, and that is
+    deliberate: this command reports what is *installed* here -- the same
+    question its release-marker line answers. A package's own ``__version__``
+    answers a different one, what is *running*, and resolves the build-time file
+    first (biopb/biopb#910), so in an editable checkout the two legitimately
+    differ until the next install.
+
+    Not importing also keeps `biopb version` from dragging in the packages'
+    heavy optional stacks just to print a number, and still reports a version
+    when a package is installed but its runtime imports are broken.
     """
     from importlib.metadata import PackageNotFoundError, version as _dist_version
 
@@ -164,9 +205,9 @@ def version():
     """Show the two version lines: the product deployment and the biopb SDK."""
     rows = [
         # The product line (release-v*): biopb-tensor-server / mcp / control / web
-        # all share this version, so the installer's deployment marker stands in
-        # for the whole set -- no need to list each wheel separately.
-        ("release", _read_release_version()),
+        # all share this version, so one member stands in for the whole set --
+        # no need to list each wheel separately.
+        ("release", _release_version()),
         # The SDK line (v*): biopb ships to PyPI/Maven on its own tag, so its
         # version is independent of the product bundle it is also packaged into.
         ("biopb", _package_version("biopb")),
@@ -204,7 +245,7 @@ def _tensor_line_level(line: str) -> Optional[str]:
     """Level of a data-plane log line, or None if it has none.
 
     tensor-server.log carries the server's own format (DEFAULT_LOG_FORMAT in
-    biopb_tensor_server.core.logging_config): `[2026-06-12 10:00:00] WARNING
+    biopb_tensor_server.logging_config): `[2026-06-12 10:00:00] WARNING
     biopb_tensor_server.x: msg`. Returns None for the supervisor's `--- control:
     starting data plane ---` banners, blank lines, native gRPC/Arrow stdout, and
     traceback continuations — all of which _filter_lines carries forward.
@@ -344,24 +385,6 @@ def _tail_and_follow(
     finally:
         f.close()
     raise typer.Exit(0)
-
-
-def _reject_legacy_toml(config: Path) -> None:
-    """Refuse to start on a pre-#34 ``biopb.toml``, naming the migration command.
-
-    The server no longer reads TOML (biopb/biopb#34), and every config probe on
-    the start path is best-effort, so a legacy config would otherwise surface as
-    a plane that starts on defaults and serves none of the user's data. Check it
-    once, up front, where the user can act on it.
-    """
-    if config and config.suffix.lower() == ".toml" and config.exists():
-        console.print(f"[red]Config {config} is in the legacy TOML format.[/red]")
-        console.print(
-            "JSON is the only supported format. Convert it with "
-            "[bold]biopb-tensor-server migrate-config[/bold] (settings are "
-            "preserved and the old file is backed up), then retry."
-        )
-        raise typer.Exit(1)
 
 
 def _plane_bind(grpc_bind: str, base_port: int) -> Tuple[str, int]:
@@ -508,7 +531,7 @@ def _require_biopb_mcp() -> None:
         console.print(
             "[red]The 'mcp' commands require the biopb-mcp package, which is "
             "not installed.[/red]\n"
-            r"[yellow]Install it with: pip install 'biopb-mcp\[mcp]'[/yellow]"
+            r"[yellow]Install it with: pip install 'biopb-mcp\[napari]'[/yellow]"
         )
         raise typer.Exit(1)
 
@@ -529,9 +552,9 @@ def _require_control_for_view() -> None:
     so a control busy in an ``ensure`` answers late — and here a false negative is
     a hard exit, not a degraded reading.
     """
-    from . import _data_plane
+    from . import ENV_TENSOR_URL
 
-    if os.environ.get(_data_plane.ENV_URL, "").strip():
+    if os.environ.get(ENV_TENSOR_URL, "").strip():
         return
     if _query_control_health(*_control_endpoint()) is not None:
         return
@@ -728,7 +751,7 @@ def _control_endpoint() -> Tuple[str, int]:
     Binding to a discovered value would mean a crashed control's stale record
     dictates where the next one listens.
     """
-    from ._endpoints import control_host, control_port
+    from ._control._endpoints import control_host, control_port
 
     return control_host(), control_port()
 
@@ -742,7 +765,7 @@ def _control_bind_endpoint(base_port: int) -> Tuple[str, int]:
     nowhere else -- notably *not* from the published record, which describes some
     other (possibly dead) control.
     """
-    from ._endpoints import CONTROL_DEFAULT_HOST, control_port_for
+    from ._control._endpoints import CONTROL_DEFAULT_HOST, control_port_for
 
     host = os.environ.get("BIOPB_CONTROL_HOST") or CONTROL_DEFAULT_HOST
     raw = os.environ.get("BIOPB_CONTROL_PORT")
@@ -807,7 +830,7 @@ def _control_start_lock() -> Path:
     lock across the check-then-spawn below makes it atomic between processes:
     without it two starters can both see "no pidfile", both spawn a control, and
     the bind-loser's parent overwrite/remove the live winner's pidfile, orphaning a
-    control that `control stop` can no longer reach. See biopb._lifecycle.file_lock.
+    control that `control stop` can no longer reach. See biopb.lifecycle.file_lock.
     """
     return CONTROL_PID_FILE.parent / "control.start.lock"
 
@@ -854,6 +877,39 @@ def _resolve_tls(tls: Optional[bool], grpc_bind: str) -> bool:
     if tls is not None:
         return tls
     return _web_auth.host_is_public_bind(grpc_bind)
+
+
+def _resolve_tls_material(
+    tls: bool, tls_cert: Optional[Path], tls_key: Optional[Path]
+) -> bool:
+    """Validate BYO TLS material and return whether the plane serves TLS.
+
+    A supplied cert means TLS whether or not ``--tls`` was also passed: the plane
+    serves it either way, and this is also the flag the control advertises the
+    plane's scheme from, so leaving it false would publish ``grpc://`` for a
+    ``grpcs://`` plane.
+
+    Validated here, in the command the user typed, for the same reason
+    :func:`_require_tls_extra` is: a half pair, or material the server cannot
+    read, exits 2 in the supervised child -- which crash-loops on backoff with
+    the one useful sentence in tensor-server.log while the control reports a
+    clean start (biopb/biopb#913). Each file is opened rather than stat'd: a key
+    readable only by root passes ``is_file()`` and fails everything after it. The
+    rule is shared with the other two entry points that resolve this same pair
+    (:mod:`biopb._tls_material`).
+    """
+    if (tls_cert is None) != (tls_key is None):
+        console.print("[red]--tls-cert and --tls-key must be given together.[/red]")
+        raise typer.Exit(2)
+    for label, path in (("--tls-cert", tls_cert), ("--tls-key", tls_key)):
+        if path is None:
+            continue
+        try:
+            _tls_material.read_pem(path, label)
+        except _tls_material.TlsMaterialError as e:
+            console.print(f"[red]{e}[/red]")
+            raise typer.Exit(2) from None
+    return tls or tls_cert is not None
 
 
 def _warn_public_plaintext(grpc_bind: str, tls: bool) -> None:
@@ -1001,7 +1057,11 @@ def _control_run_argv(
     data_plane: bool,
     grpc_bind: str,
     tls: bool = False,
+    tls_cert: Optional[Path] = None,
+    tls_key: Optional[Path] = None,
+    san: Optional[List[str]] = None,
     url_prefix: Optional[str] = None,
+    grpc_external_location: Optional[str] = None,
 ) -> List[str]:
     """Build the `python -m biopb_control run ...` argv `control start` spawns.
 
@@ -1056,10 +1116,19 @@ def _control_run_argv(
     if url_prefix:
         # Not secret (it is a hostname and a port), unlike the token above.
         argv += ["--url-prefix", url_prefix]
+    if grpc_external_location:
+        # Not secret either -- an address, not a credential.
+        argv += ["--grpc-external-location", grpc_external_location]
     if not data_plane:
         argv.append("--no-data-plane")
     if tls:
         argv.append("--tls")
+    # Paths and hostnames, not secrets -- unlike the token above, these belong on
+    # the argv (biopb/biopb#913).
+    if tls_cert and tls_key:
+        argv += ["--tls-cert", str(tls_cert), "--tls-key", str(tls_key)]
+    for name in san or ():
+        argv += ["--san", name]
     return argv
 
 
@@ -1111,6 +1180,35 @@ _OPT_TLS = typer.Option(
     "fingerprint with `biopb-tensor-server cert init`. --no-tls on a public bind "
     "sends the token in cleartext — trusted networks only.",
 )
+_OPT_TLS_CERT = typer.Option(
+    None,
+    "--tls-cert",
+    help="PEM certificate chain the data plane serves, instead of the "
+    "self-signed one it mints into the state tree. Implies --tls, and needs no "
+    "'cryptography' extra. Use it to serve one long-lived certificate that "
+    "outlives a single launch — one cert shared by every node a scheduler might "
+    "pick — so clients pin once instead of per launch. It must carry a loopback "
+    "SAN (localhost / 127.0.0.1) besides the names clients dial, or the "
+    "co-located sidecar cannot reach the flight plane; and a client on this "
+    "machine reads its anchor from the state tree, so put a copy of the cert "
+    "(not the key) there too. Requires --tls-key.",
+)
+_OPT_TLS_KEY = typer.Option(
+    None,
+    "--tls-key",
+    help="PEM private key paired with --tls-cert.",
+)
+_OPT_SAN = typer.Option(
+    None,
+    "--san",
+    help="Extra hostname or IP to put in the certificate the data plane mints "
+    "(repeatable). Needed when clients dial a name this host cannot discover "
+    "itself — a NAT/VPN address, a CNAME, the scheduler's name for this node — "
+    "because gRPC verifies the dialed name against the SANs even though trust "
+    "comes from the client's pin. Applies only when the cert is generated: it is "
+    "ignored once one exists (re-mint with `biopb-tensor-server cert init "
+    "--force --san ...`) and by --tls-cert.",
+)
 _OPT_TOKEN = typer.Option(
     None,
     "--token",
@@ -1139,6 +1237,17 @@ _OPT_DATA_PLANE = typer.Option(
     "control plane starts without it; a client brings it up on demand via the "
     "control API.",
 )
+_OPT_GRPC_EXTERNAL_LOCATION = typer.Option(
+    None,
+    "--grpc-external-location",
+    envvar="BIOPB_GRPC_EXTERNAL_LOCATION",
+    help="The address a remote client should dial to reach the data plane, "
+    "advertised via its `health` action (biopb/biopb#1158) -- e.g. "
+    "'grpc://hostname:8815', or a scheduler-assigned FQDN on an HPC job. "
+    "Required when --grpc-bind is a public address: nothing here can guess a "
+    "reachable address for a wildcard bind. Pure passthrough -- the data "
+    "plane is the single place this is validated and enforced.",
+)
 
 
 @control_app.command(
@@ -1151,9 +1260,13 @@ def control_start(
     log_level: str = _OPT_LOG_LEVEL,
     grpc_bind: Optional[str] = _OPT_GRPC_BIND,
     tls: Optional[bool] = _OPT_TLS,
+    tls_cert: Optional[Path] = _OPT_TLS_CERT,
+    tls_key: Optional[Path] = _OPT_TLS_KEY,
+    san: Optional[List[str]] = _OPT_SAN,
     token: Optional[str] = _OPT_TOKEN,
     data_plane: bool = _OPT_DATA_PLANE,
     url_prefix: Optional[str] = _OPT_URL_PREFIX,
+    grpc_external_location: Optional[str] = _OPT_GRPC_EXTERNAL_LOCATION,
     remote: bool = typer.Option(
         False,
         "--remote",
@@ -1184,6 +1297,26 @@ def control_start(
     control's own guard share, so "public but unauthenticated" is unrepresentable
     rather than something to validate against (biopb/biopb#604).
 
+    A public ``--grpc-bind`` also requires ``--grpc-external-location`` -- the
+    address a *different* machine dials to reach the plane, since a wildcard
+    bind is not itself a dialable address (e.g. an HPC scheduler's assigned
+    FQDN). Forwarded verbatim to the data plane, which is where it is both
+    required and enforced.
+
+    **A certificate that outlives one launch.** ``--tls`` alone mints a
+    self-signed cert into the state tree and clients pin it on first connect, so
+    a deployment that re-mints — a per-job state tree, an ephemeral container
+    volume — hands a returning client a certificate it refuses. ``--tls-cert`` /
+    ``--tls-key`` serve an operator's own long-lived cert instead (no
+    ``cryptography`` needed), and ``--san`` names addresses a minted cert could
+    not discover for itself; both are forwarded to the data plane.
+
+    A supplied cert has to satisfy the two consumers *on this machine*, which the
+    minted one satisfies by construction: the co-located sidecar dials the plane
+    over loopback, so the cert needs a ``localhost`` / ``127.0.0.1`` SAN, and a
+    local SDK client anchors on ``state/biopb/tls/server-cert.pem``, so a copy of
+    the cert (never the key) belongs there as well.
+
     Only the flight plane is ever published. The tensor HTTP sidecar stays on
     loopback (the control proxies it), and so does the control itself — the
     browser UI is plaintext HTTP with no TLS support, so publishing it would send
@@ -1195,15 +1328,16 @@ def control_start(
     _require_biopb_control()
     grpc_bind = _resolve_grpc_bind(grpc_bind, remote)
     url_prefix = _resolve_url_prefix(url_prefix)
-    tls = _resolve_tls(tls, grpc_bind)
-    if tls:
+    tls = _resolve_tls_material(_resolve_tls(tls, grpc_bind), tls_cert, tls_key)
+    # A BYO cert is read straight off disk, so it is the escape hatch when the
+    # extra is not installed -- only a cert the plane has to *mint* needs it.
+    if tls and tls_cert is None:
         _require_tls_extra()
     _warn_public_plaintext(grpc_bind, tls)
     _ensure_dirs()
-    _reject_legacy_toml(config)
 
     # Serialize concurrent starts so the check-then-spawn below is atomic across
-    # processes (see _control_start_lock / biopb._lifecycle.file_lock). Held through the
+    # processes (see _control_start_lock / biopb.lifecycle.file_lock). Held through the
     # readiness wait too, so a second starter that was blocked wakes to a fully
     # started control (pidfile written, port listening) and reports the idempotent
     # "already running" rather than racing a half-up one. The lock auto-releases if
@@ -1237,7 +1371,11 @@ def control_start(
                 data_plane=data_plane,
                 grpc_bind=grpc_bind,
                 tls=tls,
+                tls_cert=tls_cert,
+                tls_key=tls_key,
+                san=san,
                 url_prefix=url_prefix,
+                grpc_external_location=grpc_external_location,
             )
 
             log_file = _control_log_file()
@@ -1281,6 +1419,8 @@ def control_start(
                 console.print(
                     f"  Data plane: starting on {_flight_location(grpc_bind, base_port, tls)}"
                 )
+                if grpc_external_location:
+                    console.print(f"  Data plane advertises: {grpc_external_location}")
             else:
                 console.print("  Data plane: not started (--no-data-plane; on-demand)")
             console.print(f"  Logs: {log_file}")
@@ -1482,86 +1622,41 @@ def control_logs(
 
 
 @control_app.command(
-    "run", help="Run the control plane in the foreground (Ctrl-C to stop)."
+    "run",
+    help="Removed -- use `biopb control start`, or `biopb-control run` for a "
+    "true foreground process.",
 )
-def control_run(
-    config: Path = _OPT_CONFIG,
-    static_dir: Optional[Path] = _OPT_STATIC_DIR,
-    base_port: int = _OPT_BASE_PORT,
-    log_level: str = _OPT_LOG_LEVEL,
-    grpc_bind: Optional[str] = _OPT_GRPC_BIND,
-    tls: Optional[bool] = _OPT_TLS,
-    token: Optional[str] = _OPT_TOKEN,
-    data_plane: bool = _OPT_DATA_PLANE,
-    url_prefix: Optional[str] = _OPT_URL_PREFIX,
-    remote: bool = typer.Option(
-        False,
-        "--remote",
-        hidden=True,
-        help="Deprecated alias for --grpc-bind 0.0.0.0.",
-    ),
-):
-    """Run the control plane in the foreground (Ctrl-C to stop).
+def control_run() -> None:
+    """Removed (biopb/biopb#736).
 
-    The foreground counterpart of `biopb control start`, and the *same*
-    deployment: identical flags, identical binds, identical port derivation from
-    ``--base-port``. Only process ownership differs — no PID file, blocks this
-    terminal, tears everything down on Ctrl-C. Useful for a systemd/launchd unit
-    (let the service manager own the process) or for debugging supervision.
+    This command built a ``DataPlaneSpec`` and called ``run_control()``
+    in-process, which bypassed the fail-closed guard on a public
+    ``--control-host`` that ``biopb-control run``/``python -m biopb_control
+    run`` (``biopb_control/__main__.py``) already enforces -- the same guard
+    `biopb control start` goes through as a matter of course, since it spawns
+    exactly that entry point as its child. Retiring the duplicate closes the
+    gap for good rather than keeping a second copy of the same check in sync
+    by hand.
 
-    It still publishes where it listens, so `status` / `logs` and biopb-mcp find
-    a foreground control exactly as they find a daemonized one. `biopb control
-    stop` does not reach it, by design: the pid file is the daemon's lifecycle
-    record and this process belongs to your terminal or your service manager.
-    See `biopb control start` for the bind / token / TLS model.
+    For the same deployment with the same defaults, use `biopb control start`.
+    A true foreground process (a systemd/launchd unit, an Open OnDemand app,
+    debugging supervision) runs `biopb-control run` directly -- but unlike this
+    command, it fills in none of the defaults `--config`/`--static-dir` used to
+    resolve on their own, and every other setting individually rather than
+    deriving them from ``--base-port``; see `biopb-control run --help`.
     """
-    _require_biopb_control()
-    grpc_bind = _resolve_grpc_bind(grpc_bind, remote)
-    url_prefix = _resolve_url_prefix(url_prefix)
-    tls = _resolve_tls(tls, grpc_bind)
-    if tls:
-        _require_tls_extra()
-    _warn_public_plaintext(grpc_bind, tls)
-    _ensure_dirs()
-    _reject_legacy_toml(config)
-    from biopb_control import run_control
-    from biopb_control._supervisor import DataPlaneSpec
-
-    grpc_host, grpc_port = _plane_bind(grpc_bind, base_port)
-    control_host, control_port = _control_bind_endpoint(base_port)
-    # The same pre-flight `start` does. It used to be missing here, so a busy port
-    # surfaced as uvicorn's bind traceback instead of a message naming the port.
-    _guard_ports_free(base_port, grpc_bind, data_plane)
-    resolved_token = _resolve_mode(grpc_bind, token)
-    console.print(f"  Control: http://{control_host}:{control_port}")
-    if data_plane:
-        console.print(f"  Data plane: {_flight_location(grpc_bind, base_port, tls)}")
-    # Only the flight plane is ever published; the control and the sidecar stay on
-    # loopback either way (biopb/biopb#614), so point the user at the tunnel.
-    if _web_auth.host_is_public_bind(grpc_bind):
-        _print_ui_tunnel_hint(control_port)
-    spec = DataPlaneSpec(
-        config=config,
-        grpc_host=grpc_host,
-        grpc_port=grpc_port,
-        tls=tls,
-        web_host="127.0.0.1",
-        web_port=_sidecar_port(base_port),
-        static_dir=static_dir if (static_dir and static_dir.exists()) else None,
-        log_level=log_level,
-        server_log=_get_log_file(),
-        token=resolved_token,
-        url_prefix=url_prefix,
+    console.print(
+        "[red]`biopb control run` has been removed (biopb/biopb#736).[/red]\n"
+        "For the same deployment with the same defaults, use [bold]biopb "
+        "control start[/bold].\n"
+        "For a true foreground process, use [bold]biopb-control run[/bold] "
+        "(or `python -m biopb_control run` if that script isn't on PATH) -- "
+        "but note it fills in none of this command's defaults: `--config` and "
+        "`--static-dir` must both be passed explicitly, and every other "
+        "setting individually rather than derived from --base-port. See "
+        "`biopb-control run --help`."
     )
-    code = run_control(
-        spec,
-        control_host=control_host,
-        control_port=control_port,
-        data_plane=data_plane,
-        win_sentinel=_control_shutdown_sentinel(),
-        log_level=log_level,
-    )
-    raise typer.Exit(code)
+    raise typer.Exit(2)
 
 
 app.add_typer(control_app, name="control")
@@ -1573,6 +1668,7 @@ app.add_typer(control_app, name="control")
 def dashboard(
     base_port: int = _OPT_BASE_PORT,
     grpc_bind: Optional[str] = _OPT_GRPC_BIND,
+    grpc_external_location: Optional[str] = _OPT_GRPC_EXTERNAL_LOCATION,
     no_browser: bool = typer.Option(
         False,
         "--no-browser",
@@ -1593,8 +1689,9 @@ def dashboard(
     at the dashboard. Idempotent -- if the control plane is already up it just
     opens the page. This is what the desktop shortcut the installer creates runs.
 
-    ``--base-port`` / ``--grpc-bind`` are forwarded to `biopb control start` and
-    only matter when there is nothing running to open.
+    ``--base-port`` / ``--grpc-bind`` / ``--grpc-external-location`` are
+    forwarded to `biopb control start` and only matter when there is nothing
+    running to open.
     """
     # Prefer a control that is already serving -- it publishes its endpoint, so
     # this finds one that `--base-port` moved. Fall back to where we *would* start
@@ -1624,10 +1721,14 @@ def dashboard(
                 log_level="INFO",
                 grpc_bind=grpc_bind,
                 tls=None,
+                tls_cert=None,
+                tls_key=None,
+                san=None,
                 token=None,
                 data_plane=True,
                 remote=remote,
                 url_prefix=None,
+                grpc_external_location=grpc_external_location,
             )
         except typer.Exit as started:
             if started.exit_code:

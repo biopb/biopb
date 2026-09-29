@@ -1,16 +1,11 @@
 name: Image Runtime CI
 
-# Test/build on branch pushes & PRs; PUBLISH the biopb-image-base Docker image on
-# a FINAL SDK `vX.Y.Z` tag (an rc/a/b prerelease tag tests + builds but publishes
-# nothing — same rule as tensor-server-ci). image-base tracks the SDK line (it is the foundation compute
-# servers build on), so its Docker image is cut on the same `v*` tag that ships
-# the SDK to PyPI/Maven — on the SDK's cadence, not the product's `release-v*`.
-# (Path filters are not evaluated for tag pushes, so a `v*` tag triggers this
-# regardless of the `paths` below.)
+# Test/build on branch pushes & PRs. PUBLISH the biopb-image-base Docker image
+# only by manual dispatch, tagged with the commit SHA (`sha-<7 chars>`): the image
+# bundles the in-repo biopb-tensor-server, so neither the SDK's `v*` tag nor the
+# product's `release-v*` says what is inside it.
 on:
   push:
-    tags:
-      - 'v*'
     branches:
       - main
       - dev
@@ -37,13 +32,18 @@ on:
       - 'pyproject.toml'
       - '.github/workflows/image-runtime-ci.yaml'
   workflow_dispatch:
+    inputs:
+      latest:
+        description: Also move the :latest tag to this image
+        type: boolean
+        default: true
 
 permissions:
   contents: read
 
 jobs:
-  # Container-free unit + service tests. The server-backed tests launch the mock
-  # servicer as a local subprocess (no Docker, no GPU); the pure suites
+  # Container-free unit + service tests. The server-backed tests launch an Ops
+  # server file as a local subprocess (no Docker, no GPU); the pure suites
   # (stitch / dynamics_local) need only numpy + scipy.
   test:
     runs-on: ubuntu-latest
@@ -71,7 +71,7 @@ jobs:
       # biopb and biopb-tensor-server are NOT on PyPI. The biopb-image-base
       # [test] extra requires biopb-tensor-server, so install it (and biopb)
       # editable from source FIRST — that satisfies the requirement and stops
-      # pip from trying (and failing) to fetch it from PyPI. The mock servicer
+      # pip from trying (and failing) to fetch it from PyPI. The Ops server
       # the tests spawn as a subprocess needs biopb-tensor-server at runtime.
       - name: Install Python packages
         run: |
@@ -138,49 +138,14 @@ jobs:
           docker run --rm biopb-image-base:ci \
             python -c "from biopb_image_base import stitch, dynamics_local; import scipy; print('image import ok')"
 
-  # Gate: only a FINAL `vX.Y.Z` tag publishes an image. A PEP 440 prerelease
-  # (`…rc1`/`a1`/`b1`) still runs the full test + build matrix above — that is what
-  # an rc tag is for — but pushes NOTHING to a registry. Registry tags are
-  # permanent and public, and an rc parked a `biopb-image-base:X.Y.ZrcN` tag next
-  # to the real releases that nothing pulls: derived services build
-  # `FROM biopb-image-base` (README) — i.e. `:latest` or a pinned stable X.Y.Z —
-  # and an rc image never moved `:latest` anyway. To try an rc, build it locally
-  # from the tagged commit (biopb-image-runtime/scripts/build.sh).
-  #
-  # A tiny separate job because GitHub's `if:` expressions have no regex, so
-  # "tag is X.Y.Z and not X.Y.ZrcN" cannot be written inline. Deciding here rather
-  # than per-step also means an rc never builds wheels or logs into Docker Hub,
-  # and the skip is visible in the run graph. Mirrors tensor-server-ci's `guard`.
-  guard:
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    outputs:
-      publish: ${{ steps.decide.outputs.publish }}
-    steps:
-      - name: Decide whether to publish
-        id: decide
-        run: |
-          set -euo pipefail
-          VER="${GITHUB_REF#refs/tags/v}"
-          if [[ "$VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "publish=true" >> "$GITHUB_OUTPUT"
-            echo "final SDK release $VER -> publish the image"
-          else
-            echo "publish=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::prerelease $VER -> no image published (only a final vX.Y.Z tag publishes biopb-image-base)"
-          fi
-
-  # Publish the biopb-image-base Docker image on a FINAL SDK `vX.Y.Z` tag (ghcr.io
-  # + Docker Hub jiyuuchc/). The image's version IS the SDK version (the `v*` tag);
-  # image-base's setuptools_scm reads `v*`, so the wheel and the image agree. It
-  # always moves :latest, since prereleases are filtered out by `guard` above.
-  # Idempotent: an already-published version is skipped, so re-running a tag is a
-  # noop. This is the ONLY place image-base is published — release.yaml no longer
-  # builds it.
+  # Manual dispatch only: builds the image from the dispatched commit and pushes it
+  # to ghcr.io + Docker Hub jiyuuchc/ as `sha-<7 chars>` (and `:latest` unless the
+  # `latest` input is off). Idempotent: a SHA already in both registries is
+  # skipped, so re-dispatching a commit is a noop. This is the ONLY place
+  # image-base is published — release.yaml does not build it.
   publish:
-    needs: [test, guard]
-    if: needs.guard.outputs.publish == 'true'
+    needs: [test]
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -206,34 +171,43 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       # The image-base Dockerfile COPYs biopb-*.whl + biopb_tensor_server-*.whl.
-      # Neither is on PyPI, so build both from the tagged tree.
+      # Neither is on PyPI, so build both from the dispatched commit.
       - name: Build wheels
         run: |
           pip wheel . --no-deps -w wheels/
           pip wheel ./biopb-tensor-server --no-deps -w wheels/
 
-      - name: Compute version + tags
+      - name: Compute tags + labels
         id: ver
         run: |
           set -euo pipefail
-          # v* SDK tag -> image-base version (the clean tag name is Docker-safe).
-          VER="${GITHUB_REF#refs/tags/v}"
-          # Belt-and-braces: `guard` already proved this is a final X.Y.Z, so a
-          # prerelease reaching here means the gate was mis-wired -- fail loudly
-          # rather than quietly move :latest onto an rc image.
-          [[ "$VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
-            echo "::error::expected a final vX.Y.Z tag, got $VER"; exit 1; }
-          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          # The dispatched commit's short SHA is the image's version: it is a clean,
+          # Docker-safe tag and names exactly what the image was built from.
+          TAG="sha-$(git rev-parse --short=7 HEAD)"
+          echo "version=$TAG" >> "$GITHUB_OUTPUT"
           owner="${{ github.repository_owner }}"
           {
             echo "tags<<TAGS_EOF"
-            echo "ghcr.io/$owner/biopb-image-base:$VER"
-            echo "docker.io/jiyuuchc/biopb-image-base:$VER"
-            echo "ghcr.io/$owner/biopb-image-base:latest"
-            echo "docker.io/jiyuuchc/biopb-image-base:latest"
+            echo "ghcr.io/$owner/biopb-image-base:$TAG"
+            echo "docker.io/jiyuuchc/biopb-image-base:$TAG"
+            if [[ "${{ inputs.latest }}" == "true" ]]; then
+              echo "ghcr.io/$owner/biopb-image-base:latest"
+              echo "docker.io/jiyuuchc/biopb-image-base:latest"
+            fi
             echo "TAGS_EOF"
           } >> "$GITHUB_OUTPUT"
-          echo "image-base $VER (final SDK release; moves :latest)"
+          # What the image bundles, read off the wheels the Dockerfile installs.
+          biopb=$(basename wheels/biopb-*.whl | cut -d- -f2)
+          ts=$(basename wheels/biopb_tensor_server-*.whl | cut -d- -f2)
+          {
+            echo "labels<<LABELS_EOF"
+            echo "org.opencontainers.image.revision=${GITHUB_SHA}"
+            echo "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+            echo "io.biopb.biopb-version=$biopb"
+            echo "io.biopb.biopb-tensor-server-version=$ts"
+            echo "LABELS_EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "image-base $TAG (biopb $biopb, tensor-server $ts)"
 
       - name: Login to ghcr.io
         uses: docker/login-action@v3
@@ -248,8 +222,8 @@ jobs:
           username: jiyuuchc
           password: ${{ secrets.DOCKER_HUB_PASSWORD }}
 
-      # Idempotent: skip only if this version is already in BOTH registries (re-run
-      # a tag -> noop). Checking both (not just ghcr) means a partial prior publish
+      # Idempotent: skip only if this SHA is already in BOTH registries (re-dispatch
+      # a commit -> noop). Checking both (not just ghcr) means a partial prior publish
       # (ghcr pushed, Docker Hub failed) re-publishes to fill the gap instead of
       # skipping and leaving Docker Hub permanently missing the version.
       - name: Check if already published
@@ -276,5 +250,6 @@ jobs:
           file: biopb-image-runtime/Dockerfile
           push: true
           tags: ${{ steps.ver.outputs.tags }}
+          labels: ${{ steps.ver.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

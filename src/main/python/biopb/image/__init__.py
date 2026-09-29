@@ -1,38 +1,88 @@
-try:
-    import importlib.metadata
-
-    __version__ = importlib.metadata.version("biopb")
-except Exception:
-    pass
-
-from biopb.image.bindata_pb2 import BinData
-from biopb.image.detection_request_pb2 import DetectionRequest
-from biopb.image.detection_response_pb2 import DetectionResponse, ScoredROI
-from biopb.image.detection_settings_pb2 import DetectionSettings
-from biopb.image.image_data_pb2 import ImageAnnotation, ImageData, Pixels, Tensor
-from biopb.image.op_schema_pb2 import InputShapeHint, OpNames, OpSchema
-from biopb.image.roi_pb2 import ROI, Mask, Mesh, Point, Polygon, Rectangle
-from biopb.image.rpc_object_detection_pb2_grpc import (
-    ObjectDetection,
-    ObjectDetectionServicer,
-    ObjectDetectionStub,
-    add_ObjectDetectionServicer_to_server,
-)
-from biopb.image.rpc_process_image_pb2 import ProcessRequest, ProcessResponse
-from biopb.image.rpc_process_image_pb2_grpc import (
-    ProcessImage,
-    ProcessImageServicer,
-    ProcessImageStub,
-    add_ProcessImageServicer_to_server,
-)
-
+# No `__version__` here: one distribution, one version, published as
+# `biopb.__version__` (biopb/biopb#998). `biopb.tensor` has never had one.
 # Utility functions for image data serialization/deserialization
-from biopb.image.utils import (
+from biopb.image._utils import (
     deserialize_image_data,
-    deserialize_to_numpy,  # deprecated, use deserialize_image_data_to_numpy instead
     get_image_data_dim_labels,
     get_image_data_shape,
+    mask_to_roi,
     normalize_array_dims,
-    serialize_from_numpy,  # deprecated, use serialize_from_numpy_to_image_data instead
+    roi_to_mask,
     serialize_from_numpy_to_image_data,
 )
+from biopb.image.annotation_pb2 import (
+    RoiAnnotation,
+    RoiConflict,
+    RoiDeleteResult,
+    RoiListResult,
+    RoiPruneRequest,
+    RoiPruneResult,
+    RoiPutResult,
+    RoiSetInfo,
+    RoiUnseen,
+)
+from biopb.image.bindata_pb2 import BinData
+from biopb.image.image_data_pb2 import ImageAnnotation, ImageData, Pixels, Tensor
+from biopb.image.roi_pb2 import (
+    ROI,
+    Ellipse,
+    Mask,
+    Mesh,
+    Point,
+    Polygon,
+    Polyline,
+    Rectangle,
+)
+from biopb.image.rpc_ops_pb2 import Arg, Call, Event, OpInfo, OpList, TensorArg
+from biopb.image.rpc_ops_pb2_grpc import (
+    Ops,
+    OpsServicer,
+    OpsStub,
+    add_OpsServicer_to_server,
+)
+
+# mkdocstrings only documents a module's re-exports when __all__ names them
+# explicitly (see biopb/__init__.py, biopb/tensor/__init__.py) -- without it
+# this page rendered as an empty stub despite every name below being the
+# actual public surface.
+__all__ = [
+    "Arg",
+    "BinData",
+    "Call",
+    "Ellipse",
+    "Event",
+    "ImageAnnotation",
+    "ImageData",
+    "Mask",
+    "Mesh",
+    "OpInfo",
+    "OpList",
+    "Ops",
+    "OpsServicer",
+    "OpsStub",
+    "Pixels",
+    "Point",
+    "Polygon",
+    "Polyline",
+    "ROI",
+    "Rectangle",
+    "RoiAnnotation",
+    "RoiConflict",
+    "RoiDeleteResult",
+    "RoiListResult",
+    "RoiPruneRequest",
+    "RoiPruneResult",
+    "RoiPutResult",
+    "RoiSetInfo",
+    "RoiUnseen",
+    "Tensor",
+    "TensorArg",
+    "add_OpsServicer_to_server",
+    "deserialize_image_data",
+    "get_image_data_dim_labels",
+    "get_image_data_shape",
+    "mask_to_roi",
+    "normalize_array_dims",
+    "roi_to_mask",
+    "serialize_from_numpy_to_image_data",
+]

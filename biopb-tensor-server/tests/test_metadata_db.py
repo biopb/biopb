@@ -10,8 +10,9 @@ Tests cover:
 
 import json
 
+import duckdb
 import pytest
-from biopb_tensor_server.core.metadata_db import MetadataDatabase
+from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 
 
 class MockAdapter:
@@ -20,31 +21,44 @@ class MockAdapter:
     capability_token = None
 
     def __init__(
-        self, source_id, source_url, source_type, shape, dtype, data_resident=True
+        self,
+        source_id,
+        source_url,
+        source_type,
+        shape,
+        dtype,
+        is_resolved=True,
     ):
         self.source_id = source_id
         self._source_url = source_url
         self._source_type = source_type
         self._shape = shape
         self._dtype = dtype
-        self._data_resident = data_resident
+        self._is_resolved = is_resolved
 
-    def get_source_descriptor(self):
-        from biopb.tensor.descriptor_pb2 import DataSourceDescriptor, TensorDescriptor
+    @property
+    def catalog_url(self):
+        return self._source_url
 
-        return DataSourceDescriptor(
-            source_id=self.source_id,
-            source_url=self._source_url,
-            source_type=self._source_type,
-            data_resident=self._data_resident,
-            tensors=[
-                TensorDescriptor(
-                    array_id=self.source_id,
-                    shape=self._shape,
-                    dtype=self._dtype,
-                )
-            ],
-        )
+    @property
+    def source_type(self):
+        return self._source_type
+
+    # No is_resident(): the catalog does not ask, and a fake that answers a
+    # question nothing puts would only invite putting it (biopb/biopb#1035).
+    def is_resolved(self):
+        return self._is_resolved
+
+    def list_tensor_descriptors(self):
+        from biopb.tensor.descriptor_pb2 import TensorDescriptor
+
+        return [
+            TensorDescriptor(
+                array_id=self.source_id,
+                shape=self._shape,
+                dtype=self._dtype,
+            )
+        ]
 
     def get_metadata(self):
         return {"test_key": "test_value", "nested": {"a": 1, "b": 2}}
@@ -102,17 +116,20 @@ class TestSourceSync:
         db.sync_source_added("plate-001", adapter)
 
         conn = db._get_connection()
-        result = conn.execute(
-            "SELECT * FROM sources WHERE source_id='plate-001'"
+        row = conn.execute(
+            "SELECT source_url, source_type, metadata_json, tensors "
+            "FROM sources WHERE source_id='plate-001'"
         ).fetchone()
 
-        assert result is not None
-        assert result[0] == "plate-001"
-        assert result[1] == "/data/plate.ome.zarr"
-        assert result[2] == "ome-zarr"
-        assert result[3] == "uint16"
-        assert result[5] is not None  # metadata_json
-        assert result[6] == "[512, 512, 64]"  # shape_summary
+        assert row is not None
+        source_url, source_type, metadata_json, tensors = row
+        assert source_url == "/data/plate.ome.zarr"
+        assert source_type == "ome-zarr"
+        assert metadata_json is not None
+        # Shape and dtype live in `tensors` and nowhere else.
+        assert [(t["shape"], t["dtype"]) for t in tensors] == [
+            ([512, 512, 64], "uint16")
+        ]
 
     def test_sync_numpy_types(self):
         """Test that numpy scalar types are serialized correctly."""
@@ -177,11 +194,11 @@ class TestSourceSync:
         assert result[0] == 0
 
     def test_sync_source_added_propagates_failure(self):
-        """A descriptor-read error surfaces to the caller instead of being
+        """An adapter-read error surfaces to the caller instead of being
         swallowed, so the registration path can roll back (issue #223)."""
 
         class FailingAdapter(MockAdapter):
-            def get_source_descriptor(self):
+            def list_tensor_descriptors(self):
                 raise RuntimeError("Simulated failure")
 
         db = MetadataDatabase()
@@ -205,25 +222,39 @@ class TestSourceSync:
 class MultiTensorAdapter:
     """Mock adapter exposing several tensors (multi-field / HCS source)."""
 
-    def __init__(self, source_id, source_url, source_type, tensors, data_resident=True):
+    def __init__(
+        self,
+        source_id,
+        source_url,
+        source_type,
+        tensors,
+        is_resolved=True,
+    ):
         self.source_id = source_id
         self._source_url = source_url
         self._source_type = source_type
         self._tensors = (
             tensors  # list of dicts: array_id, dim_labels, shape, chunk_shape, dtype
         )
-        self._data_resident = data_resident
+        self._is_resolved = is_resolved
 
-    def get_source_descriptor(self):
-        from biopb.tensor.descriptor_pb2 import DataSourceDescriptor, TensorDescriptor
+    @property
+    def catalog_url(self):
+        return self._source_url
 
-        return DataSourceDescriptor(
-            source_id=self.source_id,
-            source_url=self._source_url,
-            source_type=self._source_type,
-            data_resident=self._data_resident,
-            tensors=[TensorDescriptor(**t) for t in self._tensors],
-        )
+    @property
+    def source_type(self):
+        return self._source_type
+
+    # No is_resident(): the catalog does not ask, and a fake that answers a
+    # question nothing puts would only invite putting it (biopb/biopb#1035).
+    def is_resolved(self):
+        return self._is_resolved
+
+    def list_tensor_descriptors(self):
+        from biopb.tensor.descriptor_pb2 import TensorDescriptor
+
+        return [TensorDescriptor(**t) for t in self._tensors]
 
     def get_metadata(self):
         return {}
@@ -319,41 +350,45 @@ class TestPerTensorCatalog:
         ).fetchall()
         assert rows == [("hcs",)]
 
-    def test_scalar_projection_still_first_tensor(self):
-        """The back-compat scalar dtype/shape_summary stay the first-tensor
-        projection, written in the same upsert so they can't desync."""
+    def test_there_is_no_scalar_projection(self):
+        """The scalar `dtype` / `shape_summary` columns are gone: they described
+        tensors[0] only, and `tensors[1]` says the same thing."""
         db = MetadataDatabase()
         db.sync_source_added(
             "hcs",
             MultiTensorAdapter("hcs", "/data/hcs.zarr", "ome-zarr", self._fields()),
         )
         conn = db._get_connection()
-        dtype, shape_summary = conn.execute(
-            "SELECT dtype, shape_summary FROM sources WHERE source_id='hcs'"
+        with pytest.raises(duckdb.BinderException):
+            conn.execute("SELECT dtype, shape_summary FROM sources")
+
+        dtype, shape = conn.execute(
+            "SELECT tensors[1].dtype, tensors[1].shape FROM sources "
+            "WHERE source_id='hcs'"
         ).fetchone()
-        assert dtype == "uint16"  # tensors[0]
-        assert shape_summary == "[512, 512]"
+        assert dtype == "uint16"
+        assert shape == [512, 512]
 
     def test_no_tensors_is_empty_list(self):
         """An unresolved (no-tensor) source stores an empty list, so per-tensor
-        predicates exclude it while `WHERE NOT data_resident` still finds it."""
+        predicates exclude it while `WHERE NOT is_resolved` still finds it."""
         db = MetadataDatabase()
         db.sync_source_added(
             "unresolved",
             MultiTensorAdapter(
-                "unresolved", "s3://b/x.zarr", "zarr", [], data_resident=False
+                "unresolved", "s3://b/x.zarr", "zarr", [], is_resolved=False
             ),
         )
         conn = db._get_connection()
-        tensors, resident = conn.execute(
-            "SELECT tensors, data_resident FROM sources WHERE source_id='unresolved'"
+        tensors, resolved = conn.execute(
+            "SELECT tensors, is_resolved FROM sources WHERE source_id='unresolved'"
         ).fetchone()
         assert tensors == []
-        assert resident is False
+        assert resolved is False
 
-    def test_per_tensor_query_roundtrips_through_handle_query(self):
+    def test_per_tensor_query_roundtrips_through_query(self):
         """The documented per-tensor idiom works through the real query path
-        (handle_query: SQL validator -> Arrow -> Flight ticket), not just the raw
+        (query: SQL validator -> Arrow table), not just the raw
         connection the other tests use. UNNEST(tensors) must pass _validate_query
         (it references the column, not a table) and the nested LIST(STRUCT) column
         must round-trip whole through the Arrow serialization behind DoGet."""
@@ -365,17 +400,14 @@ class TestPerTensorCatalog:
         db.sync_source_added(
             "unresolved",
             MultiTensorAdapter(
-                "unresolved", "s3://b/x.zarr", "zarr", [], data_resident=False
+                "unresolved", "s3://b/x.zarr", "zarr", [], is_resolved=False
             ),
         )
 
         # UNNEST -> one row per tensor, through the validator + Arrow path.
-        info = db.handle_query(
+        rows = db.query(
             "SELECT source_id, t.array_id, t.dtype "
             "FROM sources, UNNEST(tensors) AS u(t) ORDER BY t.array_id"
-        )
-        rows = db.get_pending_result(
-            info.endpoints[0].ticket.ticket.decode()
         ).to_pylist()
         assert rows == [
             {"source_id": "hcs", "array_id": "hcs/A1/0", "dtype": "uint16"},
@@ -384,13 +416,10 @@ class TestPerTensorCatalog:
 
         # The nested column itself round-trips whole -- including the empty list
         # for the unresolved source (Arrow/Flight handles the LIST(STRUCT) type).
-        info = db.handle_query(
-            "SELECT source_id, tensors FROM sources ORDER BY source_id"
-        )
         by_id = {
             r["source_id"]: r["tensors"]
-            for r in db.get_pending_result(
-                info.endpoints[0].ticket.ticket.decode()
+            for r in db.query(
+                "SELECT source_id, tensors FROM sources ORDER BY source_id"
             ).to_pylist()
         }
         assert by_id["unresolved"] == []
@@ -398,36 +427,42 @@ class TestPerTensorCatalog:
         assert by_id["hcs"][1]["shape"] == [8, 256, 256]  # full struct, not projection
 
 
-class TestListSourceDescriptors:
-    """Rebuild lean ListFlights descriptors from the catalog (biopb/biopb#265)."""
+def _sources(db):
+    """The `sources` rows a client browses, in the shared column contract."""
+    from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS
 
-    def test_empty_catalog_returns_no_rows_and_zero_total(self):
-        # The COUNT(*) OVER () window yields no rows on an empty table, so the
-        # total must fall back to 0 rather than indexing an empty result.
-        db = MetadataDatabase()
-        descriptors, total = db.list_source_descriptors()
-        assert descriptors == []
-        assert total == 0
+    return db.query(
+        f"SELECT {SOURCE_ROW_COLUMNS} FROM sources ORDER BY source_id"
+    ).to_pylist()
 
-    def test_reconstructs_lean_descriptor(self):
+
+class TestSourceRowProjection:
+    """A catalog row carries the lean projection, nothing more (biopb/biopb#265)."""
+
+    def test_empty_catalog_returns_no_rows(self):
+        assert _sources(MetadataDatabase()) == []
+
+    def test_row_is_lean(self):
         db = MetadataDatabase()
         db.sync_source_added(
             "s1", MockAdapter("s1", "/data/s1.zarr", "zarr", [8, 512, 512], "uint16")
         )
 
-        descriptors, total = db.list_source_descriptors()
-        assert total == 1
-        assert len(descriptors) == 1
-        d = descriptors[0]
-        assert d.source_id == "s1"
-        assert d.source_url == "/data/s1.zarr"
-        assert d.source_type == "zarr"
-        assert d.data_resident is True
-        assert d.metadata_json == ""  # lean: filled only by GetFlightInfo
-        assert len(d.tensors) == 1
-        assert d.tensors[0].array_id == "s1"
-        assert list(d.tensors[0].shape) == [8, 512, 512]
-        assert d.tensors[0].dtype == "uint16"
+        sources = _sources(db)
+        assert len(sources) == 1
+        d = sources[0]
+        assert d["source_id"] == "s1"
+        assert d["source_url"] == "/data/s1.zarr"
+        assert d["source_type"] == "zarr"
+        assert d["is_resolved"] is True
+        assert "data_resident" not in d  # the action answers it, not a column
+        # Lean: source metadata is filled only by GetFlightInfo, so the browse
+        # projection does not select it at all.
+        assert "metadata_json" not in d
+        assert len(d["tensors"]) == 1
+        assert d["tensors"][0]["array_id"] == "s1"
+        assert d["tensors"][0]["shape"] == [8, 512, 512]
+        assert d["tensors"][0]["dtype"] == "uint16"
 
     def test_multi_tensor_all_reconstructed(self):
         db = MetadataDatabase()
@@ -451,15 +486,14 @@ class TestListSourceDescriptors:
             "hcs", MultiTensorAdapter("hcs", "/data/hcs.zarr", "ome-zarr", fields)
         )
 
-        descriptors, _ = db.list_source_descriptors()
-        tensors = descriptors[0].tensors
-        assert [t.array_id for t in tensors] == ["hcs/A1/0", "hcs/A2/0"]
-        assert list(tensors[1].dim_labels) == ["z", "y", "x"]
-        assert list(tensors[1].shape) == [8, 256, 256]
-        # Structural only: no grid is stored, so none is reconstructed
-        # (biopb/biopb#812).
-        assert list(tensors[1].chunk_shape) == []
-        assert tensors[1].dtype == "uint8"
+        tensors = _sources(db)[0]["tensors"]
+        assert [t["array_id"] for t in tensors] == ["hcs/A1/0", "hcs/A2/0"]
+        assert tensors[1]["dim_labels"] == ["z", "y", "x"]
+        assert tensors[1]["shape"] == [8, 256, 256]
+        # Structural only: no grid is stored, and the tensors struct has no
+        # column to reconstruct one into (biopb/biopb#812).
+        assert "chunk_shape" not in tensors[1]
+        assert tensors[1]["dtype"] == "uint8"
 
     def test_ordered_by_source_id(self):
         db = MetadataDatabase()
@@ -467,28 +501,83 @@ class TestListSourceDescriptors:
             db.sync_source_added(
                 sid, MockAdapter(sid, f"/d/{sid}", "zarr", [4, 4], "uint8")
             )
-        descriptors, _ = db.list_source_descriptors()
-        assert [d.source_id for d in descriptors] == ["a", "b", "c"]
-
-    def test_limit_clips_and_total_reflects_full_count(self):
-        db = MetadataDatabase()
-        for sid in ("a", "b", "c"):
-            db.sync_source_added(
-                sid, MockAdapter(sid, f"/d/{sid}", "zarr", [4, 4], "uint8")
-            )
-        descriptors, total = db.list_source_descriptors(limit=2)
-        assert total == 3
-        assert [d.source_id for d in descriptors] == ["a", "b"]
+        assert [d["source_id"] for d in _sources(db)] == ["a", "b", "c"]
 
     def test_unresolved_source_has_no_tensors(self):
         db = MetadataDatabase()
         db.sync_source_added(
             "u",
-            MultiTensorAdapter("u", "s3://b/x.zarr", "zarr", [], data_resident=False),
+            MultiTensorAdapter(
+                "u",
+                "s3://b/x.zarr",
+                "zarr",
+                [],
+                is_resolved=False,
+            ),
         )
-        descriptors, _ = db.list_source_descriptors()
-        assert len(descriptors[0].tensors) == 0
-        assert descriptors[0].data_resident is False
+        sources = _sources(db)
+        assert len(sources[0]["tensors"]) == 0
+        # Empty tensors is not what makes it unresolved -- the flag is
+        # (biopb/biopb#1032).
+        assert sources[0]["is_resolved"] is False
+
+
+class TestDeprecatedDescriptorProjection:
+    """The proto decoder still answers, and still cannot carry `is_resolved`."""
+
+    def _rows(self, db):
+        from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS
+
+        return db.query(
+            f"SELECT {SOURCE_ROW_COLUMNS} FROM sources ORDER BY source_id"
+        ).to_pylist()
+
+    def test_still_builds_the_same_descriptor(self):
+        import warnings
+
+        from biopb.tensor import descriptors_from_rows
+
+        db = MetadataDatabase()
+        db.sync_source_added(
+            "s1", MockAdapter("s1", "/data/s1.zarr", "zarr", [8, 512, 512], "uint16")
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            (d,) = descriptors_from_rows(self._rows(db))
+
+        assert d.source_id == "s1"
+        assert d.source_url == "/data/s1.zarr"
+        # Nothing to decode, so the field stays unset rather than claiming False.
+        assert not d.HasField("data_resident")
+        assert d.metadata_json == ""  # lean: filled only by GetFlightInfo
+        assert list(d.tensors[0].shape) == [8, 512, 512]
+        assert any(issubclass(w.category, DeprecationWarning) for w in caught)
+
+    def test_cannot_carry_is_resolved(self):
+        """The reason for the deprecation, pinned: an unresolved source decodes
+        to a descriptor indistinguishable from a resolved-but-empty one."""
+        import warnings
+
+        from biopb.tensor import descriptors_from_rows
+
+        db = MetadataDatabase()
+        db.sync_source_added(
+            "u",
+            MultiTensorAdapter(
+                "u",
+                "s3://b/x.zarr",
+                "zarr",
+                [],
+                is_resolved=False,
+            ),
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            (d,) = descriptors_from_rows(self._rows(db))
+
+        assert not hasattr(d, "is_resolved")
+        # The row itself answers.
+        assert _sources(db)[0]["is_resolved"] is False
 
 
 class TestGetMetadataJson:
@@ -567,7 +656,7 @@ class TestGetMetadataJson:
 class TestQueryHandling:
     """Test SQL query handling."""
 
-    def test_handle_query_simple(self):
+    def test_query_simple(self):
         """Test simple SELECT query."""
         db = MetadataDatabase()
         adapter = MockAdapter(
@@ -575,16 +664,12 @@ class TestQueryHandling:
         )
         db.sync_source_added("test-1", adapter)
 
-        info = db.handle_query("SELECT source_id, source_type FROM sources")
-        assert info is not None
-        assert len(info.endpoints) == 1
+        table = db.query("SELECT source_id, source_type FROM sources")
+        assert table.num_rows == 1
+        assert table.schema.metadata is not None
+        assert int(table.schema.metadata[b"total_sources"]) == 1
 
-        # Check schema metadata
-        assert info.schema.metadata is not None
-        assert b"total_sources" in info.schema.metadata
-        assert int(info.schema.metadata[b"total_sources"]) == 1
-
-    def test_handle_query_with_filter(self):
+    def test_query_with_filter(self):
         """Test SELECT query with WHERE clause."""
         db = MetadataDatabase()
 
@@ -602,17 +687,10 @@ class TestQueryHandling:
             MockAdapter("tiff-1", "/data/t1.tiff", "ome-tiff", [300, 300], "uint8"),
         )
 
-        info = db.handle_query(
-            "SELECT source_id FROM sources WHERE source_type='ome-zarr'"
-        )
-        assert info is not None
-
-        # Retrieve result
-        result = db.get_pending_result(info.endpoints[0].ticket.ticket.decode())
-        assert result is not None
+        result = db.query("SELECT source_id FROM sources WHERE source_type='ome-zarr'")
         assert result.num_rows == 2
 
-    def test_handle_query_json_field(self):
+    def test_query_json_field(self):
         """Test query using DuckDB JSON operators."""
         db = MetadataDatabase()
         adapter = MockAdapter(
@@ -620,18 +698,14 @@ class TestQueryHandling:
         )
         db.sync_source_added("test-1", adapter)
 
-        # Query JSON field
-        info = db.handle_query(
+        result = db.query(
             "SELECT source_id, metadata_json->>'test_key' as test_key FROM sources"
         )
-        assert info is not None
-
-        result = db.get_pending_result(info.endpoints[0].ticket.ticket.decode())
-        assert result is not None
         assert result.num_rows == 1
 
-    def test_handle_query_truncation(self):
-        """Test truncation signaling when results exceed max."""
+    def test_query_truncation(self):
+        """Truncation is signaled on the table's own schema metadata -- the
+        table DoGet streams, so a client reading the stream sees it."""
         db = MetadataDatabase(max_query_results=2)
 
         # Add 5 sources
@@ -643,42 +717,18 @@ class TestQueryHandling:
                 ),
             )
 
-        info = db.handle_query("SELECT source_id FROM sources")
-        assert info is not None
-
-        # Check truncation metadata
-        assert int(info.schema.metadata[b"total_sources"]) == 5
-        assert int(info.schema.metadata[b"returned_sources"]) == 2
-
-        # Result should be truncated
-        result = db.get_pending_result(info.endpoints[0].ticket.ticket.decode())
+        result = db.query("SELECT source_id FROM sources")
         assert result.num_rows == 2
+        md = result.schema.metadata
+        assert md[b"truncated"] == b"True"
+        assert (md[b"total_rows"], md[b"returned_rows"]) == (b"5", b"2")
+        assert int(md[b"total_sources"]) == 5
 
-    def test_truncation_metadata_rides_on_the_doget_table(self):
-        """The truncation keys must be on the STORED table, not just the FlightInfo.
-
-        DoGet streams the pending table, so a client that reads its result from
-        the stream (rather than from the FlightInfo) sees exactly this schema.
-        Tagging only the FlightInfo left `schema.metadata is None` there, which
-        is what broke the sidecar's /api/sources/query.
-        """
-        db = MetadataDatabase(max_query_results=2)
-        for i in range(5):
-            db.sync_source_added(
-                f"test-{i}",
-                MockAdapter(
-                    f"test-{i}", f"/data/test{i}.zarr", "ome-zarr", [100, 100], "uint16"
-                ),
-            )
-
-        info = db.handle_query("SELECT source_id FROM sources")
-        result = db.get_pending_result(info.endpoints[0].ticket.ticket.decode())
-
-        assert result.schema.metadata is not None
-        assert int(result.schema.metadata[b"total_sources"]) == 5
-        assert int(result.schema.metadata[b"returned_sources"]) == 2
-        # ... and the FlightInfo still agrees with it.
-        assert result.schema.metadata == info.schema.metadata
+    def test_table_schema_names_a_public_table_only(self):
+        db = MetadataDatabase()
+        assert db.table_schema("sources").names[:2] == ["source_id", "source_url"]
+        with pytest.raises(ValueError, match="unknown catalog table"):
+            db.table_schema("rois")
 
 
 class TestSQLValidation:
@@ -690,7 +740,8 @@ class TestSQLValidation:
 
         db._validate_query("SELECT * FROM sources")
         db._validate_query(
-            "SELECT source_id, source_type FROM sources WHERE dtype='uint16'"
+            "SELECT source_id, source_type FROM sources "
+            "WHERE tensors[1].dtype = 'uint16'"
         )
 
     def test_validate_forbidden_insert(self):
@@ -758,6 +809,46 @@ class TestSQLValidation:
                 "DROP TABLE sources"
             )
 
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            'SELECT * FROM "rois"',
+            "SELECT * FROM 'rois'",
+            "SELECT * FROM main.rois",
+            "SELECT r.* FROM sources s, rois r",
+            "SELECT * FROM sources s JOIN rois r ON true",
+            "WITH x AS (SELECT * FROM rois) SELECT * FROM x",
+            "SELECT * FROM sources WHERE source_id IN (SELECT roi_id FROM rois)",
+            "SELECT (SELECT count(*) FROM rois)",
+            "FROM rois",
+        ],
+    )
+    def test_every_way_of_naming_a_private_table_is_refused(self, sql):
+        """The guard walks DuckDB's parse, not the text: quoting, schema
+        qualification, comma joins, CTEs and subqueries all resolve to the
+        table they read (biopb/biopb#1010)."""
+        db = MetadataDatabase()
+        with pytest.raises(ValueError, match="disallowed table: rois"):
+            db._validate_query(sql)
+
+    def test_describe_and_show_are_refused(self):
+        db = MetadataDatabase()
+        for sql in ("DESCRIBE rois", "SUMMARIZE sources", "SHOW TABLES"):
+            with pytest.raises(ValueError, match="not available here"):
+                db._validate_query(sql)
+
+    def test_a_cte_may_shadow_nothing_but_its_own_name(self):
+        db = MetadataDatabase()
+        db._validate_query("WITH x AS (SELECT * FROM sources) SELECT * FROM x")
+        db._validate_query(
+            "SELECT source_id, t.array_id FROM sources, UNNEST(tensors) AS u(t)"
+        )
+        db._validate_query("SELECT * FROM sources LIMIT 1 ;  ")
+        with pytest.raises(
+            ValueError, match="disallowed table function: duckdb_tables"
+        ):
+            db._validate_query("SELECT * FROM duckdb_tables()")
+
     def test_validate_disallowed_table(self):
         """Test that references to non-sources tables are blocked."""
         db = MetadataDatabase()
@@ -786,11 +877,12 @@ class TestSQLValidation:
         secret = tmp_path / "secret.txt"
         secret.write_text("TOP-SECRET")
 
-        # Bypasses the denylist validator (FROM only sees `sources`)...
-        db._validate_query(f"SELECT * FROM sources, read_text('{secret}')")
-        # ...but execution is blocked by enable_external_access=False.
-        with pytest.raises(ValueError, match="file system operations are disabled"):
-            db.handle_query(f"SELECT content FROM sources, read_text('{secret}')")
+        # Refused by the validator as a table function outside the allowlist...
+        with pytest.raises(ValueError, match="disallowed table function: read_text"):
+            db._validate_query(f"SELECT * FROM sources, read_text('{secret}')")
+        # ...and, behind that, execution is blocked by enable_external_access=False.
+        with pytest.raises(duckdb.Error, match="file system operations are disabled"):
+            db._get_cursor().execute(f"SELECT content FROM read_text('{secret}')")
 
     def test_set_external_access_cannot_be_reenabled(self):
         """An attacker can't turn external access back on mid-query."""
@@ -800,27 +892,13 @@ class TestSQLValidation:
             MockAdapter("z1", "/data/z1.zarr", "ome-zarr", [10, 10], "uint16"),
         )
         with pytest.raises(ValueError):
-            db.handle_query("SET enable_external_access=true; SELECT * FROM sources")
+            db.query("SET enable_external_access=true; SELECT * FROM sources")
 
 
-class TestFlightInfo:
-    """Test FlightInfo generation."""
+class TestQueryMetadata:
+    """The stream carries the counts a client sizes the browse surface by."""
 
-    def test_flight_info_schema(self):
-        """Test that FlightInfo has correct schema."""
-        db = MetadataDatabase()
-        adapter = MockAdapter(
-            "test-1", "/data/test.zarr", "ome-zarr", [100, 100], "uint16"
-        )
-        db.sync_source_added("test-1", adapter)
-
-        info = db.handle_query("SELECT source_id, source_type FROM sources")
-
-        # Schema should have the queried columns
-        assert info.schema.names == ["source_id", "source_type"]
-
-    def test_flight_info_metadata(self):
-        """Test that FlightInfo schema metadata contains counts."""
+    def test_query_metadata(self):
         db = MetadataDatabase()
 
         for i in range(3):
@@ -831,39 +909,11 @@ class TestFlightInfo:
                 ),
             )
 
-        info = db.handle_query("SELECT source_id FROM sources")
-
-        assert info.schema.metadata is not None
-        assert b"total_sources" in info.schema.metadata
-        assert b"returned_sources" in info.schema.metadata
-        assert b"query_elapsed_ms" in info.schema.metadata
-
-    def test_get_pending_result(self):
-        """Test retrieval of pending results."""
-        db = MetadataDatabase()
-        adapter = MockAdapter(
-            "test-1", "/data/test.zarr", "ome-zarr", [100, 100], "uint16"
-        )
-        db.sync_source_added("test-1", adapter)
-
-        info = db.handle_query("SELECT source_id FROM sources")
-        ticket_id = info.endpoints[0].ticket.ticket.decode()
-
-        # Retrieve result
-        result = db.get_pending_result(ticket_id)
-        assert result is not None
-        assert result.num_rows == 1
-
-        # Second retrieval should return None (result was consumed)
-        result2 = db.get_pending_result(ticket_id)
-        assert result2 is None
-
-    def test_get_pending_result_not_found(self):
-        """Test retrieval of non-existent ticket."""
-        db = MetadataDatabase()
-
-        result = db.get_pending_result("nonexistent-ticket")
-        assert result is None
+        md = db.query("SELECT source_id FROM sources").schema.metadata
+        assert md is not None
+        assert b"total_sources" in md
+        assert b"returned_rows" in md
+        assert b"query_elapsed_ms" in md
 
 
 class TestClose:
@@ -891,171 +941,69 @@ class TestClose:
         db.close()
 
 
-class TestListFlightsTruncation:
-    """Test list_flights truncation signaling."""
+class TestNoResidencyColumn:
+    """There is no residency column, and registration never asks for one.
 
-    def test_list_flights_schema_metadata(self):
-        """Test that list_flights includes truncation metadata in schema."""
-        from biopb_tensor_server.serving.server import TensorFlightServer
-
-        # Bind to port 0: the OS assigns a free port and this test never connects
-        # a client (it calls list_flights in-process), so the value is irrelevant.
-        # Fixed-range random ports caused flaky "Address already in use" failures
-        # under the full suite.
-        server = TensorFlightServer(
-            "grpc://localhost:0",
-            max_list_flights_results=5,
-        )
-
-        # Register 3 sources (under limit)
-        for i in range(3):
-            adapter = MockAdapter(
-                f"test-{i}", f"/data/test{i}.zarr", "ome-zarr", [100, 100], "uint16"
-            )
-            server.register_source(f"test-{i}", adapter)
-
-        # Call list_flights
-        results = list(server.list_flights(None, b""))
-
-        assert len(results) == 3
-
-        # Check schema metadata
-        info = results[0]
-        assert info.schema.metadata is not None
-        assert int(info.schema.metadata[b"total_sources"]) == 3
-        assert int(info.schema.metadata[b"max_sources"]) == 5
-        assert info.schema.metadata[b"truncated"].decode() == "False"
-
-    def test_list_flights_truncation(self):
-        """Test that list_flights truncates and signals via metadata."""
-        from biopb_tensor_server.serving.server import TensorFlightServer
-
-        # Bind to port 0: the OS assigns a free port and this test never connects
-        # a client (it calls list_flights in-process), so the value is irrelevant.
-        # Fixed-range random ports caused flaky "Address already in use" failures
-        # under the full suite.
-        server = TensorFlightServer(
-            "grpc://localhost:0",
-            max_list_flights_results=3,
-        )
-
-        # Register 10 sources (over limit)
-        for i in range(10):
-            adapter = MockAdapter(
-                f"test-{i}", f"/data/test{i}.zarr", "ome-zarr", [100, 100], "uint16"
-            )
-            server.register_source(f"test-{i}", adapter)
-
-        # Call list_flights
-        results = list(server.list_flights(None, b""))
-
-        # Should only get 3 results (truncated)
-        assert len(results) == 3
-
-        # Check schema metadata signals truncation
-        info = results[0]
-        assert info.schema.metadata is not None
-        assert int(info.schema.metadata[b"total_sources"]) == 10
-        assert int(info.schema.metadata[b"max_sources"]) == 3
-        assert info.schema.metadata[b"truncated"].decode() == "True"
-
-    def test_list_flights_uses_stable_snapshot_during_mutation(self):
-        """list_flights should not fail if sources mutate mid-iteration."""
-        from biopb_tensor_server.serving.server import TensorFlightServer
-
-        # Bind to port 0: the OS assigns a free port and this test never connects
-        # a client (it calls list_flights in-process), so the value is irrelevant.
-        # Fixed-range random ports caused flaky "Address already in use" failures
-        # under the full suite.
-        server = TensorFlightServer(
-            "grpc://localhost:0",
-            max_list_flights_results=10,
-        )
-
-        class MutatingAdapter(MockAdapter):
-            def __init__(self, *args, on_descriptor=None, **kwargs):
-                super().__init__(*args, **kwargs)
-                self._on_descriptor = on_descriptor
-
-            def get_source_descriptor(self):
-                if self._on_descriptor is not None:
-                    self._on_descriptor()
-                    self._on_descriptor = None
-                return super().get_source_descriptor()
-
-        def mutate_sources():
-            server.unregister_source("test-2")
-
-        server.register_source(
-            "test-1",
-            MutatingAdapter(
-                "test-1",
-                "/data/test1.zarr",
-                "ome-zarr",
-                [100, 100],
-                "uint16",
-                on_descriptor=mutate_sources,
-            ),
-        )
-        server.register_source(
-            "test-2",
-            MockAdapter("test-2", "/data/test2.zarr", "ome-zarr", [100, 100], "uint16"),
-        )
-
-        results = list(server.list_flights(None, b""))
-
-        assert len(results) == 2
-
-
-class TestDataResidentColumn:
-    """The `data_resident` column (#110): a queryable residency signal so
-    unresolved (cloud) sources can be filtered on purpose, not hidden by NULLs."""
+    `is_resolved` carries what #110 added `data_resident` for -- keeping a
+    tensor-less cloud source filterable -- and can be stored, being monotonic
+    (biopb/biopb#1035).
+    """
 
     class _UnresolvedAdapter:
-        """A cloud / synced-folder source catalogued by URL only: no tensors
-        (so NULL dtype/shape_summary) and not resident until resolved."""
+        """A cloud / synced-folder source catalogued by URL only: no tensors,
+        and not resident until resolved."""
 
         def __init__(self, source_id, source_url):
             self.source_id = source_id
             self._source_url = source_url
 
-        def get_source_descriptor(self):
-            from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
+        source_type = "unresolved"
 
-            return DataSourceDescriptor(
-                source_id=self.source_id,
-                source_url=self._source_url,
-                source_type="unresolved",
-                data_resident=False,  # not local yet
-                # no tensors -> NULL dtype / shape_summary
-            )
+        @property
+        def catalog_url(self):
+            return self._source_url
+
+        def is_resident(self):
+            raise AssertionError("sync_source_added must not ask about residency")
+
+        def is_resolved(self):
+            return False
+
+        def list_tensor_descriptors(self):
+            return []  # nothing to say about shape or dtype yet
 
         def get_metadata(self):
             return {}
 
-    def test_resident_local_source_is_true(self):
+    def test_the_column_is_gone(self):
+        import duckdb
+
         db = MetadataDatabase()
         db.sync_source_added(
             "local-1",
-            MockAdapter(
-                "local-1",
-                "/data/x.zarr",
-                "ome-zarr",
-                [10, 10],
-                "uint8",
-                data_resident=True,
-            ),
+            MockAdapter("local-1", "/data/x.zarr", "ome-zarr", [10, 10], "uint8"),
         )
-        row = (
+        with pytest.raises(duckdb.BinderException):
+            db._get_connection().execute("SELECT data_resident FROM sources")
+
+    def test_registration_never_asks_the_adapter(self):
+        """The upsert reads no residency at all, so an adapter that refuses to
+        answer still registers -- a `directory_is_resident()` walk is not
+        free."""
+        db = MetadataDatabase()
+        db.sync_source_added(
+            "cloud-1", self._UnresolvedAdapter("cloud-1", "https://x/y.zarr")
+        )
+        (resolved,) = (
             db._get_connection()
-            .execute("SELECT data_resident FROM sources WHERE source_id='local-1'")
+            .execute("SELECT is_resolved FROM sources WHERE source_id='cloud-1'")
             .fetchone()
         )
-        assert row[0] is True
+        assert resolved is False
 
-    def test_unresolved_source_is_false_and_filterable(self):
-        # An unresolved source has NULL dtype, so a dtype predicate hides it;
-        # data_resident makes it filterable on purpose instead.
+    def test_unresolved_source_is_still_filterable(self):
+        # The footgun #110 was about: a dtype predicate silently drops a source
+        # with no tensors. `is_resolved` is what makes it discoverable now.
         db = MetadataDatabase()
         db.sync_source_added(
             "local-1",
@@ -1066,44 +1014,71 @@ class TestDataResidentColumn:
         )
         conn = db._get_connection()
 
-        resident = conn.execute(
-            "SELECT data_resident FROM sources WHERE source_id='cloud-1'"
-        ).fetchone()
-        assert resident[0] is False
-
-        # The footgun: a dtype filter silently drops the unresolved source...
         by_dtype = conn.execute(
-            "SELECT source_id FROM sources WHERE dtype='uint8'"
+            "SELECT source_id FROM sources WHERE tensors[1].dtype = 'uint8'"
         ).fetchall()
         assert [r[0] for r in by_dtype] == ["local-1"]
 
-        # ...but residency makes the unresolved one discoverable on purpose.
         unresolved = conn.execute(
-            "SELECT source_id FROM sources WHERE NOT data_resident"
+            "SELECT source_id FROM sources WHERE NOT is_resolved"
         ).fetchall()
         assert [r[0] for r in unresolved] == ["cloud-1"]
 
-    def test_column_is_not_null_with_false_default(self):
-        # The NOT NULL DEFAULT FALSE constraint: an insert omitting data_resident
-        # gets FALSE (future insert paths can't accidentally leave it NULL), and
-        # an explicit NULL is rejected -- so the column always partitions cleanly.
+
+class TestIsResolvedColumn:
+    """The `is_resolved` column: deterministic, which is what lets it be a
+    column at all. It answers "does a client need to resolve this"; whether the
+    bytes are cheap to read right now is the `is_resident` action's question,
+    and is stored nowhere."""
+
+    def test_resolved_source_is_true(self):
+        db = MetadataDatabase()
+        db.sync_source_added(
+            "local-1",
+            MockAdapter("local-1", "/data/x.zarr", "ome-zarr", [10, 10], "uint8"),
+        )
+        row = (
+            db._get_connection()
+            .execute("SELECT is_resolved FROM sources WHERE source_id='local-1'")
+            .fetchone()
+        )
+        assert row[0] is True
+
+    def test_unresolved_source_is_false_and_filterable(self):
+        db = MetadataDatabase()
+        db.sync_source_added(
+            "local-1",
+            MockAdapter("local-1", "/x.zarr", "ome-zarr", [10, 10], "uint8"),
+        )
+        db.sync_source_added(
+            "cloud-1",
+            TestNoResidencyColumn._UnresolvedAdapter("cloud-1", "https://x/y.zarr"),
+        )
+        conn = db._get_connection()
+
+        unresolved = conn.execute(
+            "SELECT source_id FROM sources WHERE NOT is_resolved"
+        ).fetchall()
+        assert [r[0] for r in unresolved] == ["cloud-1"]
+
+    def test_column_is_not_null_with_true_default(self):
+        # NOT NULL DEFAULT TRUE: an insert omitting is_resolved gets TRUE (every
+        # adapter but the unresolved-cloud proxy is resolved by construction),
+        # and an explicit NULL is rejected.
         import duckdb
 
         db = MetadataDatabase()
-        db.sync_source_added(
-            "seed", MockAdapter("seed", "/s.zarr", "ome-zarr", [4, 4], "uint8")
-        )
         conn = db._get_connection()
 
         conn.execute(
             "INSERT INTO sources (source_id, source_url) VALUES ('partial', '/p')"
         )
         row = conn.execute(
-            "SELECT data_resident FROM sources WHERE source_id='partial'"
+            "SELECT is_resolved FROM sources WHERE source_id='partial'"
         ).fetchone()
-        assert row[0] is False  # DEFAULT filled it, not NULL
+        assert row[0] is True  # DEFAULT filled it, not NULL
 
         with pytest.raises(duckdb.ConstraintException):
             conn.execute(
-                "INSERT INTO sources (source_id, data_resident) VALUES ('bad', NULL)"
+                "INSERT INTO sources (source_id, is_resolved) VALUES ('bad', NULL)"
             )

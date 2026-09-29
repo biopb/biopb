@@ -74,7 +74,6 @@ def _run_server_process(
     try:
         CacheManager.initialize(
             CacheConfig(
-                backend="file",
                 file_cache_dir=Path(temp_cache_dir) / "server-cache",
                 file_max_segment_bytes=256 * 1024 * 1024,
                 file_max_total_bytes=64 * 1024 * 1024 * 1024,
@@ -95,7 +94,9 @@ def _run_server_process(
                 client = TensorFlightClient(location, cache_bytes=0)
                 try:
                     health = client.health_check()
-                    sources = client.list_sources()
+                    sources = client.query(
+                        "SELECT source_id FROM sources", format="records"
+                    )
                 finally:
                     client.close()
                 if health.get("status") and len(sources) >= len(source_specs):
@@ -231,7 +232,7 @@ def _init_process_worker(location: str, wave_barrier) -> None:
     global _PROCESS_WORKER_CLIENT
     global _PROCESS_WAVE_BARRIER
     _PROCESS_WORKER_CLIENT = TensorFlightClient(location, cache_bytes=0)
-    _PROCESS_WORKER_CLIENT.list_sources()
+    _PROCESS_WORKER_CLIENT.query("SELECT source_id FROM sources")
     _PROCESS_WAVE_BARRIER = wave_barrier
 
     # Register cleanup to close client on worker process exit
@@ -261,7 +262,7 @@ def _create_prewarmed_clients(location: str, client_count: int):
     clients = [TensorFlightClient(location, cache_bytes=0) for _ in range(client_count)]
 
     for client in clients:
-        client.list_sources()
+        client.query("SELECT source_id FROM sources")
 
     return clients
 

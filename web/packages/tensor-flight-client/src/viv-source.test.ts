@@ -162,6 +162,25 @@ describe("vivLabels", () => {
 // Source construction
 // ---------------------------------------------------------------------------
 
+describe("layer identity", () => {
+  // Viv derives a deck.gl layer id from `loader[0].constructor.name`; a plain
+  // object gives every tensor "Object".
+  const idOf = (sources: ReturnType<typeof pixelSourcesFromInfo>) => sources[0]!.constructor.name;
+
+  it("names a source after its tensor and level", () => {
+    const sources = pixelSourcesFromInfo(stubClient(), INFO);
+    expect(sources[0]!.constructor.name).toBe("src0/Image:0@L0");
+    expect(sources[1]!.constructor.name).toBe("src0/Image:0@L1");
+  });
+
+  it("gives two tensors different ids", () => {
+    const other = { ...INFO, array_id: "src1/Image:0" };
+    expect(idOf(pixelSourcesFromInfo(stubClient(), other))).not.toBe(
+      idOf(pixelSourcesFromInfo(stubClient(), INFO)),
+    );
+  });
+});
+
 describe("pixelSourcesFromInfo", () => {
   it("returns one source per level, index 0 full resolution", () => {
     const sources = pixelSourcesFromInfo(stubClient(), INFO);

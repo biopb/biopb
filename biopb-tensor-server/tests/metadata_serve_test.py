@@ -16,6 +16,8 @@ import time
 
 import pytest
 
+from tests import catalog_server, register_and_catalog
+
 
 def _zarr_available() -> bool:
     return importlib.util.find_spec("zarr") is not None
@@ -50,7 +52,7 @@ def test_serve_reads_metadata_from_catalog_without_recompute(simple_zarr_array):
     import zarr
     from biopb.tensor import TensorFlightClient
     from biopb_tensor_server import TensorFlightServer
-    from biopb_tensor_server.core.metadata_db import MetadataDatabase
+    from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 
     zarr_path, _, _ = simple_zarr_array
     arr = zarr.open_array(zarr_path, mode="r")
@@ -85,7 +87,7 @@ def test_serve_null_row_yields_empty_metadata_no_adapter_recompute(simple_zarr_a
     import zarr
     from biopb.tensor import TensorFlightClient
     from biopb_tensor_server import TensorFlightServer
-    from biopb_tensor_server.core.metadata_db import MetadataDatabase
+    from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 
     zarr_path, _, _ = simple_zarr_array
     arr = zarr.open_array(zarr_path, mode="r")
@@ -111,28 +113,59 @@ def test_serve_null_row_yields_empty_metadata_no_adapter_recompute(simple_zarr_a
 
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-def test_serve_without_metadata_db_raises(simple_zarr_array):
-    """A metadata request against a DB-less server (the embedded image-base cache)
-    fails closed -- there is no catalog to read and no adapter fallback."""
+def test_the_catalog_row_is_the_metadata_cache(simple_zarr_array):
+    """Metadata is computed once, at registration, and served from the catalog
+    row -- never recomputed on the adapter (biopb/biopb#253)."""
     import zarr
     from biopb.tensor import TensorFlightClient
-    from biopb_tensor_server import TensorFlightServer
-    from pyarrow import flight
 
     zarr_path, _, _ = simple_zarr_array
     arr = zarr.open_array(zarr_path, mode="r")
     _MetaZarr = _meta_zarr_cls()
 
-    server = TensorFlightServer("grpc://localhost:0")  # no metadata_db
+    server = catalog_server("grpc://localhost:0")
+    adapter = _MetaZarr(arr, "img", ["y", "x"], meta={"ome": {"channel": "GFP"}})
+    register_and_catalog(server, "img", adapter)
+    _serve(server)
+    try:
+        client = TensorFlightClient(f"grpc://localhost:{server.port}")
+        assert client.get_source_metadata("img") == {"ome": {"channel": "GFP"}}
+        client.get_descriptor("img", with_metadata=True)
+        assert adapter.get_metadata_calls == 1  # once, at registration
+        client.close()
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+def test_a_catalog_less_server_reads_metadata_off_the_adapter(simple_zarr_array):
+    """With no catalog there is no metadata cache -- and nothing released the
+    adapter's registration copy either, since ``sync_source_added`` is what does
+    that. So the adapter answers, and a descriptor still carries its metadata.
+
+    ``get_source_metadata`` is a catalog query, so that one refuses: the
+    embedded in-process cache serves a result it was asked for by id, it does
+    not offer a browse.
+    """
+    import pyarrow.flight as flight
+    import zarr
+    from biopb.tensor import TensorFlightClient
+    from biopb_tensor_server import TensorFlightServer
+
+    zarr_path, _, _ = simple_zarr_array
+    arr = zarr.open_array(zarr_path, mode="r")
+    _MetaZarr = _meta_zarr_cls()
+
+    server = TensorFlightServer("grpc://localhost:0")
     adapter = _MetaZarr(arr, "img", ["y", "x"], meta={"ome": {"channel": "GFP"}})
     server.register_source("img", adapter)
     _serve(server)
     try:
         client = TensorFlightClient(f"grpc://localhost:{server.port}")
-        # GetFlightInfo(with_metadata) fails closed -> FlightInternalError
-        with pytest.raises(flight.FlightInternalError, match="no metadata catalog"):
-            client.get_descriptor("img", with_metadata=True)
-        assert adapter.get_metadata_calls == 0  # never recomputed
+        desc = client.get_descriptor("img", with_metadata=True)
+        assert json.loads(desc.metadata_json)["metadata"] == {"ome": {"channel": "GFP"}}
+        with pytest.raises(flight.FlightUnavailableError, match="no catalog"):
+            client.get_source_metadata("img")
         client.close()
     finally:
         server.shutdown()
@@ -157,7 +190,7 @@ def test_serve_merges_per_tensor_delta_over_catalog(simple_zarr_array):
     import zarr
     from biopb.tensor import TensorFlightClient
     from biopb_tensor_server import TensorFlightServer, ZarrAdapter
-    from biopb_tensor_server.core.metadata_db import MetadataDatabase
+    from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 
     zarr_path, _, _ = simple_zarr_array
     arr = zarr.open_array(zarr_path, mode="r")
@@ -192,13 +225,50 @@ def test_serve_merges_per_tensor_delta_over_catalog(simple_zarr_array):
 
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+def test_source_metadata_excludes_the_per_tensor_delta(simple_zarr_array):
+    """get_source_metadata() is source-scoped: it reads the source's own catalog
+    row and must NOT carry a field's per-tensor delta. Routing it through a
+    tensor-bound GetFlightInfo used to overlay tensors[0]'s
+    get_tensor_metadata(), so a multi-field source reported one arbitrary
+    field's extras as the source's metadata."""
+    import zarr
+    from biopb.tensor import TensorFlightClient
+    from biopb_tensor_server import TensorFlightServer, ZarrAdapter
+    from biopb_tensor_server.serving.metadata_db import MetadataDatabase
+
+    zarr_path, _, _ = simple_zarr_array
+    arr = zarr.open_array(zarr_path, mode="r")
+
+    class _PerTensorZarr(ZarrAdapter):
+        def get_metadata(self):
+            return {"plate": {"rows": ["A"]}}
+
+        def get_tensor_metadata(self):
+            return {"ome": "field"}
+
+    db = MetadataDatabase()
+    server = TensorFlightServer("grpc://localhost:0", metadata_db=db)
+    adapter = _PerTensorZarr(arr, "plate", ["y", "x"])
+    server.register_source("plate", adapter)
+    db.sync_source_added("plate", adapter)
+
+    _serve(server)
+    try:
+        client = TensorFlightClient(f"grpc://localhost:{server.port}")
+        assert client.get_source_metadata("plate") == {"plate": {"rows": ["A"]}}
+        client.close()
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
 def test_serve_no_delta_serves_catalog_row(simple_zarr_array):
     """get_tensor_metadata() None (the default) means no delta: the tensor is
     fully described by the cached source-level catalog row."""
     import zarr
     from biopb.tensor import TensorFlightClient
     from biopb_tensor_server import TensorFlightServer, ZarrAdapter
-    from biopb_tensor_server.core.metadata_db import MetadataDatabase
+    from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 
     zarr_path, _, _ = simple_zarr_array
     arr = zarr.open_array(zarr_path, mode="r")

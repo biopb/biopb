@@ -3,9 +3,32 @@
 Imports fixture factory functions from fixtures module and wraps them as pytest fixtures.
 """
 
+import os
 import tempfile
+import threading
+from pathlib import Path
+
+# Neutralise terminal colour before anything builds a Rich Console. Several
+# tests assert on the *text* a CLI prints, and Rich emits ANSI escapes into
+# captured output whenever it believes colour is wanted -- turning
+# `assert "Deleted 1" in captured` into a comparison against "\x1b[3m...".
+#
+# `FORCE_COLOR` is the one that bites: Rich checks it *before* `NO_COLOR`, so
+# setting `NO_COLOR` alone does not help, and several terminal tools and agent
+# harnesses export it. CI has neither set, which is why these tests pass there
+# and fail on a developer's machine -- the worst place for a test to disagree
+# with CI. Duplicated from the repo-root conftest because this package sets its
+# own `[tool.pytest.ini_options]`, which makes it pytest's rootdir, so the root
+# conftest is never collected for these tests.
+os.environ.pop("FORCE_COLOR", None)
+os.environ["NO_COLOR"] = "1"
+os.environ.setdefault("TERM", "dumb")
 
 import pytest
+from biopb.tensor.client import TensorFlightClient
+from biopb_tensor_server.adapters.scratch import SCRATCH_SOURCE_ID
+from biopb_tensor_server.cache import CacheManager
+from biopb_tensor_server.core.config import CacheConfig
 from biopb_tensor_server.fixtures import (
     create_5d_6d_micromanager_dataset,
     create_companion_ome_dataset,
@@ -17,6 +40,8 @@ from biopb_tensor_server.fixtures import (
     create_tiled_ome_tiff,
     create_zarr_array,
 )
+
+from tests import catalog_server
 
 # =============================================================================
 # pytest fixtures using the factory functions
@@ -135,3 +160,86 @@ def transfer_target(monkeypatch):
         return int(nbytes)
 
     return _set
+
+
+@pytest.fixture
+def epoch(monkeypatch):
+    """Set the serving-semantics epoch for the duration of a test.
+
+    The epoch (biopb/biopb#1076) re-keys every chunk_id, so a test about
+    invalidation bumps it rather than contriving a content change.
+    """
+
+    def _set(value: int) -> int:
+        from biopb_tensor_server.core import chunk
+
+        monkeypatch.setattr(chunk, "CHUNK_SEMANTICS_EPOCH", int(value))
+        return int(value)
+
+    return _set
+
+
+@pytest.fixture
+def writable_server(tmp_path):
+    """A live, writable server on an OS-assigned port.
+
+    No wait after `serve()`: `FlightServerBase` binds and starts serving in
+    `__init__`, so the port is live before this returns -- the thread only parks
+    on it.
+    """
+    CacheManager.reset()
+    CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
+    server = catalog_server(
+        location="grpc://localhost:0", writable=True, write_dir=Path(tmp_path)
+    )
+    server.mark_ready()
+    threading.Thread(target=server.serve, daemon=True).start()
+    try:
+        yield server
+    finally:
+        server.shutdown()
+        CacheManager.reset()
+
+
+@pytest.fixture
+def client(writable_server):
+    """A client connected to `writable_server`."""
+    c = TensorFlightClient(f"grpc://localhost:{writable_server.port}")
+    yield c
+    c.close()
+
+
+@pytest.fixture
+def source(writable_server):
+    """The server's scratch source, which is what a test uploads onto.
+
+    Nothing on the upload path creates a source, so a test that uploads names
+    its tensors ``<scheme>://<this>/@fields/<name>``.
+
+    Its lifetime cap is cleared, so an upload here gets no deadline unless the
+    test asks for one. A test that cares about the cap sets ``max_upload_ttl``
+    itself (``upload_ttl_test``) or runs a server of its own
+    (``scratch_source_test``).
+    """
+    writable_server.sources.get(SCRATCH_SOURCE_ID).max_upload_ttl = None
+    return SCRATCH_SOURCE_ID
+
+
+@pytest.fixture
+def cache(tmp_path):
+    """A file-backed cache with the scaled-read knob on.
+
+    The backend matters: `resolve_chunk_data` caches *unscaled* chunks only on
+    the file backend, so it is the one where a full-resolution read leaves
+    anything for a probe to find.
+    """
+    manager = CacheManager(
+        CacheConfig(
+            file_cache_dir=tmp_path / "cache",
+            source_scaled_reads=True,
+        )
+    )
+    try:
+        yield manager
+    finally:
+        manager.close()

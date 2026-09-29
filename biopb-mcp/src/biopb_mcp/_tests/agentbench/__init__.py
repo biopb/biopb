@@ -20,7 +20,7 @@ machinery (does *this skill* change what an agent does; can an agent do *this
 work*). Nothing here knows which of the two a run is about, and nothing here
 knows how a run was configured: whether the catalogue was offered and who
 answers the agent are arguments this package is *given*
-(``live_session(skills_enabled=...)``, whichever :class:`._respondent.Respondent`
+(``live_session(docs_enabled=...)``, whichever :class:`._respondent.Respondent`
 is passed to the loop), never a decision it makes.
 
 What is here:

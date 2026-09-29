@@ -15,7 +15,7 @@ import net.imglib2.view.Views;
  * This scale-aware arithmetic was forked three ways across the two Flight
  * clients -- {@code SerializableTensorImg.reconstructDelegate},
  * {@code TensorFlightClient.getTensor}, and
- * {@code TensorFlightClient.materializeSerializedArray} (biopb/biopb#277 item D).
+ * {@code TensorFlightClient.materializeArray} (biopb/biopb#277 item D).
  * This is its single home.
  */
 final class RegionCrop {

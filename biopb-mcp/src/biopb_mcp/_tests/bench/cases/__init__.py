@@ -26,11 +26,11 @@ tuple, `DEFERRED_CASES`, holding the cases of skills the runtime does not serve,
 checked hermetically and never run. That distinction is gone along with the
 field that expressed it.
 
-**This package knows nothing about the skills catalog.** A case used to carry
+**This package knows nothing about the knowledge store.** A case used to carry
 ``skill=``, and three things read it: a `--bench-cases=skills|tasks` filter, a
 coverage ledger asserting every shipped skill was benchmarked or exempted, and a
 rule about which agent could score it. All three are gone. Nothing here imports
-`mcp/_skills_layout.py`, globs `_skills_data`, or can tell a served skill from a
+a layout rule, globs `_docs_data`, or can tell a served doc from a
 banked one — so promoting or banking a skill is a change to the catalog and to
 no file in this tree, and a case's `namespace` is a subject on disk that stays
 put either way.

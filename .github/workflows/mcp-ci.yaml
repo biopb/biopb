@@ -1,9 +1,9 @@
-# CI for biopb-mcp (napari plugin + MCP server). Lives in the monorepo at
+# CI for biopb-mcp (the MCP server). Lives in the monorepo at
 # biopb-mcp/. This is a TEST-ONLY workflow: biopb-mcp is no longer published to
 # PyPI (the product ships as the release-v* wheel triple the installer
-# file://-installs — see docs/release-model.md). biopb-mcp is a product component,
-# so its version comes from the single `release-v*` tag (setuptools_scm stamps the
-# clean X.Y.Z onto the wheel built in release.yaml); there is no per-package tag.
+# file://-installs). biopb-mcp is a product component, so its version comes from
+# the single `release-v*` tag (setuptools_scm stamps the clean X.Y.Z onto the
+# wheel built in release.yaml); there is no per-package tag.
 #
 # push and pull_request carry the SAME paths filter so branch-push and PR runs are
 # scoped identically (test-only, MCP-relevant changes), with no tag trigger.
@@ -124,8 +124,8 @@ jobs:
       # Resolve the whole workspace so biopb[tensor] and biopb-tensor-server[web]
       # come from the in-tree members (the server is never on PyPI). uv is the
       # workspace-aware installer; this is why CI no longer uses tox+pip.
-      - name: Install (workspace, mcp extra + testing group)
-        run: uv sync --package biopb-mcp --extra mcp --group testing --python ${{ matrix.python-version }}
+      - name: Install (workspace, napari extra + testing group)
+        run: uv sync --package biopb-mcp --extra napari --group testing --python ${{ matrix.python-version }}
 
       - name: Run tests
         env:
@@ -133,21 +133,21 @@ jobs:
         run: uv run --no-sync pytest -v --color=yes --cov=biopb_mcp --cov-report=xml biopb-mcp/src/biopb_mcp/_tests
 
       # Deselected from the run above (pyproject addopts) because each token is a
-      # real resolver run. Resolves every `pkg:` a shipped skill's `checklist:` declares against
-      # the environment just built, so a skill whose package installs only by
+      # real resolver run. Resolves every `packages:` entry a shipped doc declares against
+      # the environment just built, so a doc whose package installs only by
       # downgrading biopb's own deps fails here rather than on a user's machine.
       # Metadata only -- nothing is downloaded or installed.
       #
       # This step owns ONE question: does installing it move something already
       # here. That is fatal wherever it happens -- a live kernel has the old
-      # versions imported -- so one red cell rejects the skill, and required and
+      # versions imported -- so one red cell rejects the doc, and required and
       # optional packages are judged the same way.
       #
       # Whether the package can be installed on a platform at all is a different
-      # question with a different verdict, and it is the skill-availability job
+      # question with a different verdict, and it is the doc-availability job
       # below rather than another per-cell step (#680).
       - name: Skill package satisfiability
-        run: uv run --no-sync pytest -v --color=yes -m satisfiability biopb-mcp/src/biopb_mcp/_tests/skills
+        run: uv run --no-sync pytest -v --color=yes -m satisfiability biopb-mcp/src/biopb_mcp/_tests/docs
 
       - name: Coverage
         uses: codecov/codecov-action@v6
@@ -167,11 +167,13 @@ jobs:
   # gates nothing, so a session without the package says so and works around it.
   # Installing on NO cell still fails -- that is a token nobody can ever satisfy
   # rather than a platform gap.
-  skill-availability:
-    name: skill package availability
+  doc-availability:
+    name: doc package availability
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0  # setuptools_scm: the resolve builds biopb from here
 
       # `biopb`'s build generates the protobuf stubs, and it is installed below
       # because biopb_mcp._config imports biopb._locations.
@@ -201,4 +203,4 @@ jobs:
       - name: Skill package availability
         run: >-
           uv run --no-sync pytest -v --color=yes -m availability
-          biopb-mcp/src/biopb_mcp/_tests/skills/test_availability.py
+          biopb-mcp/src/biopb_mcp/_tests/docs/test_availability.py

@@ -8,12 +8,12 @@ import json
 import os
 import socket
 import tempfile
+from datetime import datetime
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
 from biopb.tensor.cli import _parse_slice_hint, app
-from biopb.tensor.descriptor_pb2 import DataSourceDescriptor, TensorDescriptor
 from typer.testing import CliRunner
 
 runner = CliRunner()
@@ -44,27 +44,30 @@ def _build_mock_client() -> MagicMock:
     """Build a mock TensorFlightClient for testing."""
     mock_client = MagicMock()
 
-    # Create mock source and tensor descriptors
-    tensor_desc_1 = TensorDescriptor(
-        array_id="pos_0",
-        shape=[512, 512],
-        dtype="uint8",
-    )
-    tensor_desc_2 = TensorDescriptor(
-        array_id="pos_1",
-        shape=[512, 512],
-        dtype="uint16",
-    )
-
-    source_desc = DataSourceDescriptor(
-        source_id="my-source",
-        tensors=[tensor_desc_1, tensor_desc_2],
-    )
-
-    # Mock list_sources
-    mock_client.list_sources.return_value = {
-        "my-source": source_desc,
-    }
+    # The CLI browses with query + sources_from_rows, so the mock
+    # answers with catalog rows rather than a descriptor map.
+    mock_client.query.return_value = [
+        {
+            "source_id": "my-source",
+            "source_url": "/data/my-source.zarr",
+            "source_type": "zarr",
+            "is_resolved": True,
+            "tensors": [
+                {
+                    "array_id": "pos_0",
+                    "dim_labels": ["y", "x"],
+                    "shape": [512, 512],
+                    "dtype": "uint8",
+                },
+                {
+                    "array_id": "pos_1",
+                    "dim_labels": ["y", "x"],
+                    "shape": [512, 512],
+                    "dtype": "uint16",
+                },
+            ],
+        }
+    ]
 
     # Mock get_source_metadata
     mock_client.get_source_metadata.return_value = {
@@ -131,6 +134,7 @@ class TestQueryCommand:
                 cache_bytes=100_000_000,
                 token=None,
                 tls_ca_pem=None,
+                tls_fingerprint=None,
             )
 
     def test_query_shows_cache_info(self):
@@ -149,7 +153,7 @@ class TestQueryCommand:
         """Test that query handles empty source list gracefully."""
         with patch("biopb.tensor.cli.TensorFlightClient") as mock_fc_class:
             mock_client = _build_mock_client()
-            mock_client.list_sources.return_value = {}
+            mock_client.query.return_value = []
             mock_fc_class.return_value = mock_client
 
             result = runner.invoke(app, ["query"])
@@ -490,15 +494,15 @@ class TestCacheStatsCommand:
         kwargs = mock_fc_class.call_args.kwargs
         # No control answered (see the autouse fixture), so this is the default
         # endpoint -- base+5, derived, not the literal 8815 spelled in a command.
-        from biopb import _data_plane
+        from biopb._control import _data_plane
 
-        assert kwargs["location"] == _data_plane.default_url()
+        assert kwargs["location"] == _data_plane.default_data_plane_url()
         assert kwargs["token"] is None
 
     def test_the_control_plane_decides_the_endpoint(self, monkeypatch):
         """A published endpoint wins over the default — #615's central claim."""
         monkeypatch.setattr(
-            "biopb._data_plane.control_grpc_url",
+            "biopb._control._data_plane.control_grpc_url",
             lambda timeout=1.0: "grpc://127.0.0.1:9915",
         )
         with patch("biopb.tensor.cli.TensorFlightClient") as mock_fc_class:
@@ -568,10 +572,10 @@ class TestCacheStatsCommand:
 
         Classified by type, so it names the certificate rather than a token.
         """
-        from biopb import _data_plane
+        from biopb._control import _data_plane
 
         monkeypatch.setattr(
-            "biopb._data_plane.control_grpc_url",
+            "biopb._control._data_plane.control_grpc_url",
             lambda timeout=1.0: "grpcs://127.0.0.1:8815",
         )
         result = runner.invoke(app, ["cache-stats"])  # no cert in the state dir
@@ -595,9 +599,9 @@ class TestEveryCommandClassifiesItsFailures:
 
     # (argv, the client method whose call is the command's first RPC)
     CASES = [
-        (["query"], "list_sources"),
-        (["metadata", "my-source"], "list_sources"),
-        (["get", "my-source", "-o", "-"], "get_tensor_pb"),
+        (["query"], "query"),
+        (["metadata", "my-source"], "query"),
+        (["get", "my-source", "-o", "-"], "get_tensor"),
         (["stats", "my-source"], "get_tensor"),
         (["cache-stats"], "cache_stats"),
     ]
@@ -621,7 +625,7 @@ class TestEveryCommandClassifiesItsFailures:
     @pytest.mark.parametrize("argv,method", CASES)
     def test_an_unreachable_plane_says_so_and_names_the_endpoint(self, argv, method):
         import pyarrow.flight as flight
-        from biopb import _data_plane
+        from biopb._control import _data_plane
 
         result = self._run(argv, method, flight.FlightUnavailableError("refused"))
 
@@ -629,7 +633,7 @@ class TestEveryCommandClassifiesItsFailures:
         assert "Cannot reach the data plane" in result.stderr
         # The origin is part of the message: a guessed default is not the same
         # failure as an endpoint the control published.
-        assert _data_plane.default_url() in result.stderr
+        assert _data_plane.default_data_plane_url() in result.stderr
 
     def test_a_local_failure_keeps_the_command_s_own_words(self):
         """Not everything that goes wrong in a command body is the plane's doing.
@@ -646,3 +650,147 @@ class TestEveryCommandClassifiesItsFailures:
         assert result.exit_code == 1
         assert "Failed to compute statistics" in result.stderr
         assert "data plane" not in result.stderr
+
+
+class TestPruneAnnotations:
+    """`biopb tensor prune-annotations`: one `roi_prune` action, report then apply."""
+
+    @staticmethod
+    def _report():
+        from biopb.image.annotation_pb2 import RoiPruneResult, RoiUnseen
+
+        seen_ms = int(datetime(2026, 6, 9, 12).timestamp() * 1000)
+        return RoiPruneResult(
+            unseen=[
+                RoiUnseen(
+                    array_id="zarr_gone/Image:0",
+                    source_url="file:///data/plate3.zarr",
+                    count=2,
+                    last_seen_at_unix_ms=seen_ms,
+                )
+            ]
+        )
+
+    def _client(self, report):
+        from biopb.image.annotation_pb2 import RoiPruneResult
+
+        client = _build_mock_client()
+
+        def prune(days, *, apply=False):
+            if apply:
+                return RoiPruneResult(deleted=sum(u.count for u in report.unseen))
+            return report
+
+        client.prune_rois.side_effect = prune
+        return client
+
+    def test_it_reports_without_deleting(self):
+        with patch("biopb.tensor.cli.TensorFlightClient") as mock_fc_class:
+            client = self._client(self._report())
+            mock_fc_class.return_value = client
+
+            result = runner.invoke(app, ["prune-annotations", "--days", "30"])
+
+            assert result.exit_code == 0
+            assert "plate3.zarr" in result.stdout
+            assert "2026-06-09" in result.stdout
+            assert "would be deleted" in result.stdout
+            client.prune_rois.assert_called_once_with(30, apply=False)
+
+    def test_apply_deletes_what_was_reported(self):
+        with patch("biopb.tensor.cli.TensorFlightClient") as mock_fc_class:
+            client = self._client(self._report())
+            mock_fc_class.return_value = client
+
+            result = runner.invoke(
+                app, ["prune-annotations", "--days", "30", "--apply"]
+            )
+
+            assert result.exit_code == 0
+            assert "Deleted 2" in result.stdout
+            assert client.prune_rois.call_args_list[-1].kwargs == {"apply": True}
+
+    def test_nothing_unseen_says_so(self):
+        from biopb.image.annotation_pb2 import RoiPruneResult
+
+        with patch("biopb.tensor.cli.TensorFlightClient") as mock_fc_class:
+            client = self._client(RoiPruneResult())
+            mock_fc_class.return_value = client
+
+            result = runner.invoke(
+                app, ["prune-annotations", "--days", "30", "--apply"]
+            )
+
+            assert result.exit_code == 0
+            assert "Nothing unseen" in result.stdout
+            client.prune_rois.assert_called_once_with(30, apply=False)
+
+    def test_the_threshold_reaches_the_server(self):
+        from biopb.image.annotation_pb2 import RoiPruneResult
+
+        with patch("biopb.tensor.cli.TensorFlightClient") as mock_fc_class:
+            client = self._client(RoiPruneResult())
+            mock_fc_class.return_value = client
+
+            runner.invoke(app, ["prune-annotations", "--days", "7"])
+
+            client.prune_rois.assert_called_once_with(7, apply=False)
+
+    def test_days_is_required(self):
+        result = runner.invoke(app, ["prune-annotations"])
+        assert result.exit_code != 0
+
+
+class TestDecodeRatesCommand:
+    """A preset over the catalog's `decode_rates` table. There is no action
+    behind it -- the server surface is SQL, so the command is a query."""
+
+    _ROWS = [
+        {
+            "array_id": "fast/0",
+            "mbps": 1400.0,
+            "samples": 40,
+            "updated_at": datetime(2026, 9, 12, 10, 30),
+        },
+        {
+            "array_id": "slow/0",
+            "mbps": 90.0,
+            "samples": 12,
+            "updated_at": datetime(2026, 8, 1, 9, 0),
+        },
+    ]
+
+    def _run(self, *args, rows=None):
+        with patch("biopb.tensor.cli.TensorFlightClient") as mock_fc_class:
+            client = MagicMock()
+            client.query.return_value = self._ROWS if rows is None else rows
+            mock_fc_class.return_value = client
+            result = runner.invoke(app, ["decode-rates", *args])
+        return result, mock_fc_class, client
+
+    def test_it_reads_the_table_ordered_by_rate(self):
+        # The threshold is read off the top of the spread, so the ordering is
+        # the server's, not a client-side sort of whatever arrived.
+        result, _, client = self._run()
+        assert result.exit_code == 0, result.output
+        sql = client.query.call_args.args[0]
+        assert "FROM decode_rates" in sql
+        assert "ORDER BY mbps DESC" in sql
+        client.close.assert_called_once()
+
+    def test_json_emits_the_rows(self):
+        result, _, _ = self._run("--json")
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        assert payload[0]["samples"] == 40
+
+    def test_nothing_measured_is_not_an_error(self):
+        # A server that has only served downsampled reads measures nothing, by
+        # design -- unlike cache-stats, an empty answer here is a normal state.
+        result, _, _ = self._run(rows=[])
+        assert result.exit_code == 0
+        assert "No decode measurements yet" in result.stdout
+
+    def test_it_asks_for_no_client_side_cache(self):
+        _, mock_fc_class, _ = self._run()
+        assert mock_fc_class.call_args.kwargs["cache_bytes"] == 0

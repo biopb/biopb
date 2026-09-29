@@ -1,17 +1,5 @@
-"""Unit tests for ``biopb._algorithms`` — inspecting the algorithm plane.
-
-Two concerns, mirroring the module's two layers:
-
-- **configured()** — a stdlib read of the biopb-mcp config's flat
-  ``services.process_image_servers`` key (and total tolerance of a
-  missing/malformed/mistyped config), against a monkeypatched ``$HOME`` so the
-  machine's real config can't leak in.
-- **probe()/statuses()** — the gRPC path, exercised end-to-end against a *real*
-  in-process ``ProcessImage`` server (grpcio + the ``biopb.image`` stubs are base
-  ``biopb`` deps, so no mocking of grpc itself): a server that lists ops, one that
-  leaves ``GetOpNames`` unimplemented (single-op), one that errors, and a closed
-  port (unreachable).
-"""
+"""Unit tests for ``biopb._algorithms``: the registry, its migration, and the
+``Ops.Describe`` probe against a real in-process server."""
 
 import json
 from concurrent import futures
@@ -22,91 +10,108 @@ import grpc
 import pytest
 from biopb import _algorithms
 
-# --------------------------------------------------------------------------- #
-# configured(): the stdlib config read
-# --------------------------------------------------------------------------- #
-
 
 @pytest.fixture
 def home(tmp_path, monkeypatch):
-    """Isolate the biopb-mcp config location under a per-test home.
-
-    Also drops inherited tree vars: ``_locations.config_dir`` honors
-    ``$BIOPB_CONFIG_HOME`` when it is set (and CI sets the legacy
-    ``$XDG_CONFIG_HOME``, which is now ignored but still warns), which
-    would otherwise bypass the monkeypatched ``Path.home`` and read the real
-    config -- so ``configured()`` would resolve outside this per-test home.
-    """
+    """Isolate the config tree under a per-test home (see xdg-test-isolation)."""
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     for var in ("BIOPB_CONFIG_HOME", "BIOPB_STATE_HOME", "BIOPB_DATA_HOME"):
         monkeypatch.delenv(var, raising=False)
     return tmp_path
 
 
-def _write_config(home: Path, data: dict) -> None:
+@pytest.fixture
+def registry(home) -> Path:
+    d = _algorithms.registry_dir()
+    d.mkdir(parents=True)
+    return d
+
+
+def _write_mcp_config(home: Path, data: dict) -> None:
     cfg = home / ".config" / "biopb" / "mcp-config.json"
     cfg.parent.mkdir(parents=True, exist_ok=True)
     cfg.write_text(json.dumps(data), encoding="utf-8")
 
 
-def test_configured_reads_flat_services_location(home):
-    _write_config(
-        home,
-        {"services": {"process_image_servers": ["grpc://a:1", "grpc://b:2"]}},
-    )
-    assert _algorithms.configured() == ["grpc://a:1", "grpc://b:2"]
-
-
-def test_configured_drops_non_string_and_blank_entries(home):
-    _write_config(
-        home,
-        {"services": {"process_image_servers": ["grpc://a:1", "", 5, None]}},
-    )
-    assert _algorithms.configured() == ["grpc://a:1"]
-
-
-def test_configured_is_empty_when_unset(home):
-    _write_config(home, {"services": {}})
-    assert _algorithms.configured() == []
-
-
-def test_configured_tolerates_missing_file(home):
-    assert _algorithms.configured() == []  # no config written
-
-
-def test_configured_tolerates_malformed_json(home):
-    cfg = home / ".config" / "biopb" / "mcp-config.json"
-    cfg.parent.mkdir(parents=True, exist_ok=True)
-    cfg.write_text("{ not json", encoding="utf-8")
-    assert _algorithms.configured() == []
-
-
-def test_configured_tolerates_non_object_config(home):
-    cfg = home / ".config" / "biopb" / "mcp-config.json"
-    cfg.parent.mkdir(parents=True, exist_ok=True)
-    cfg.write_text("[1, 2, 3]", encoding="utf-8")
-    assert _algorithms.configured() == []
-
-
 # --------------------------------------------------------------------------- #
-# servers_from_config(): the shared normalization seam (no disk)
+# The registry
 # --------------------------------------------------------------------------- #
-# The single source of truth the biopb-mcp kernel also calls with its live CONFIG
-# dict, so the key location lives in exactly one place.
 
 
-def test_servers_from_config_reads_flat():
-    cfg = {"services": {"process_image_servers": ["grpc://a:1"]}}
+def test_entries_reads_scripts_and_urls(registry):
+    (registry / "cellpose.py").write_text("")
+    (registry / "remote.json").write_text('{"url": "grpc://gpu:50051"}')
+    (registry / "_draft.py").write_text("")  # skipped
+    (registry / "cellpose.py.lock").write_text("")  # uv's lock, not an entry
+    (registry / "notes.txt").write_text("")
+    listed = {e["name"]: e for e in _algorithms.entries()}
+    assert set(listed) == {"cellpose", "remote"}
+    assert listed["cellpose"]["kind"] == "script"
+    assert listed["remote"] == {
+        "name": "remote",
+        "kind": "url",
+        "path": str(registry / "remote.json"),
+        "url": "grpc://gpu:50051",
+        "error": None,
+    }
+    assert _algorithms.configured() == _algorithms.entries()
+
+
+def test_a_bad_entry_is_listed_with_its_error(registry):
+    (registry / "a.json").write_text("{nope")
+    (registry / "b.json").write_text('{"host": "x"}')
+    (registry / "c.py").write_text("")
+    (registry / "c.json").write_text('{"url": "grpc://x:1"}')
+    listed = {e["name"]: e["error"] for e in _algorithms.entries()}
+    assert "unreadable" in listed["a"]
+    assert "url" in listed["b"]
+    assert "both" in listed["c"]
+
+
+def test_no_registry_is_empty(home):
+    assert _algorithms.entries() == []
+    assert _algorithms.statuses() == []
+
+
+def test_servers_from_config_normalizes():
+    cfg = {"services": {"process_image_servers": ["grpc://a:1", "", 3]}}
     assert _algorithms.servers_from_config(cfg) == ["grpc://a:1"]
-
-
-def test_servers_from_config_filters_and_tolerates_bad_shapes():
-    assert _algorithms.servers_from_config(
-        {"services": {"process_image_servers": ["grpc://a:1", "", 5, None]}}
-    ) == ["grpc://a:1"]
     assert _algorithms.servers_from_config({}) == []
     assert _algorithms.servers_from_config({"services": "nope"}) == []
     assert _algorithms.servers_from_config(None) == []
+
+
+def test_migration_writes_url_entries_once(home):
+    _write_mcp_config(
+        home,
+        {
+            "services": {
+                "process_image_servers": ["grpc://gpu:50051", "grpcs://b:2"],
+                "docs_local_dir": "/d",
+            },
+            "timeout": {"process_image": 60},
+        },
+    )
+    assert _algorithms.migrate_from_mcp_config() == ["gpu-50051", "b-2"]
+    urls = {e["name"]: e["url"] for e in _algorithms.entries()}
+    assert urls == {"gpu-50051": "grpc://gpu:50051", "b-2": "grpcs://b:2"}
+    # The key leaves the mcp config; the rest of it stays.
+    cfg = json.loads((home / ".config" / "biopb" / "mcp-config.json").read_text())
+    assert cfg == {
+        "services": {"docs_local_dir": "/d"},
+        "timeout": {"process_image": 60},
+    }
+
+    # Once: an existing registry is the user's, even an emptied one.
+    for path in _algorithms.registry_dir().iterdir():
+        path.unlink()
+    assert _algorithms.migrate_from_mcp_config() == []
+    assert _algorithms.entries() == []
+
+
+def test_migration_without_an_mcp_config_creates_the_registry(home):
+    assert _algorithms.migrate_from_mcp_config() == []
+    assert _algorithms.registry_dir().is_dir()
 
 
 # --------------------------------------------------------------------------- #
@@ -118,29 +123,23 @@ def test_servers_from_config_filters_and_tolerates_bad_shapes():
 def test_probe_rejects_non_grpc_urls(url):
     result = _algorithms.probe(url, timeout=1.0)
     assert result["state"] == "invalid"
-    assert result["ops"] == [] and result["op_count"] == 0
-
-
-def test_probe_unreachable_on_closed_port():
-    # Nothing listening -> UNAVAILABLE within the deadline, folded to "unreachable".
-    result = _algorithms.probe("grpc://127.0.0.1:1", timeout=2.0)
-    assert result["state"] == "unreachable"
-    assert result["error"]  # a code/detail string, not None
+    assert result["ops"] == []
 
 
 @pytest.mark.parametrize("url", ["grpc://[::1", "grpcs://[bad"])
 def test_probe_does_not_raise_on_malformed_url(url):
-    # urlparse raises ValueError on a malformed bracketed IPv6 literal; probe()
-    # must fold that into a result, never propagate (it would tank the sweep).
     result = _algorithms.probe(url, timeout=1.0)
     assert result["state"] == "invalid"
     assert result["error"]
 
 
-def test_probe_folds_channel_creation_failure(monkeypatch):
-    # Channel creation can raise (bad target / TLS init); probe() must catch it.
-    import grpc
+def test_probe_unreachable_on_closed_port():
+    result = _algorithms.probe("grpc://127.0.0.1:1", timeout=2.0)
+    assert result["state"] == "unreachable"
+    assert result["error"]
 
+
+def test_probe_folds_channel_creation_failure(monkeypatch):
     def boom(*a, **k):
         raise RuntimeError("channel init blew up")
 
@@ -151,103 +150,88 @@ def test_probe_folds_channel_creation_failure(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# probe()/statuses(): against a real in-process ProcessImage server
+# probe()/statuses(): against real in-process servers
 # --------------------------------------------------------------------------- #
 
 
-class _Servicer(proto.ProcessImageServicer):
-    """A minimal ProcessImage server. ``op_names`` -> GetOpNames returns them;
-    ``op_names=None`` -> GetOpNames is left UNIMPLEMENTED (single-op server);
-    ``fail`` -> GetOpNames aborts with an unexpected code (INTERNAL)."""
-
-    def __init__(self, op_names=None, fail=False):
-        self._op_names = op_names
+class _Ops(proto.OpsServicer):
+    def __init__(self, names=(), fail=False, token=None):
+        self._names = names
         self._fail = fail
+        self._token = token
 
-    def GetOpNames(self, request, context):  # noqa: N802 - gRPC method name
+    def Describe(self, request, context):  # noqa: N802 - gRPC method name
+        if self._token and (
+            ("authorization", f"Bearer {self._token}")
+            not in context.invocation_metadata()
+        ):
+            context.abort(grpc.StatusCode.UNAUTHENTICATED, "token")
         if self._fail:
             context.abort(grpc.StatusCode.INTERNAL, "kaboom")
-        if self._op_names is None:
-            context.abort(grpc.StatusCode.UNIMPLEMENTED, "no GetOpNames")
-        return proto.OpNames(names=list(self._op_names))
+        return proto.OpList(
+            ops=[proto.OpInfo(name=n, description=f"does {n}") for n in self._names],
+            fingerprint="abc",
+        )
 
 
 @pytest.fixture
-def grpc_server():
-    """Start a real insecure ProcessImage server; yields a ``start(servicer)->url``
-    factory and tears the server down afterward."""
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
+def serve():
+    servers = []
 
-    def start(servicer) -> str:
-        proto.add_ProcessImageServicer_to_server(servicer, server)
+    def start(servicer=None) -> str:
+        # No servicer: a server that does not implement Ops, as an older
+        # ProcessImage server answers.
+        server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
+        if servicer is not None:
+            proto.add_OpsServicer_to_server(servicer, server)
         port = server.add_insecure_port("127.0.0.1:0")
         server.start()
+        servers.append(server)
         return f"grpc://127.0.0.1:{port}"
 
     yield start
-    server.stop(None)
+    for server in servers:
+        server.stop(None)
 
 
-def test_probe_serving_lists_ops(grpc_server):
-    url = grpc_server(_Servicer(op_names=["threshold", "segment"]))
-    result = _algorithms.probe(url, timeout=5.0)
-    assert result["state"] == "serving"
-    assert result["ops"] == ["threshold", "segment"]
-    assert result["op_count"] == 2
-    assert result["single_op"] is False
+def test_probe_lists_ops(serve):
+    result = _algorithms.probe(serve(_Ops(["threshold", "segment"])), timeout=5.0)
+    assert result["state"] == "up"
+    assert [o["name"] for o in result["ops"]] == ["threshold", "segment"]
+    assert result["ops"][0]["description"] == "does threshold"
+    assert result["fingerprint"] == "abc"
     assert result["error"] is None
 
 
-def test_probe_single_op_server_when_get_op_names_unimplemented(grpc_server):
-    url = grpc_server(_Servicer(op_names=None))  # UNIMPLEMENTED GetOpNames
-    result = _algorithms.probe(url, timeout=5.0)
-    assert result["state"] == "serving"
-    assert result["single_op"] is True
-    assert result["op_count"] == 1
-    assert result["ops"] == []
+def test_probe_sends_the_token(serve):
+    url = serve(_Ops(["a"], token="secret"))
+    assert _algorithms.probe(url, timeout=5.0)["state"] == "error"
+    assert _algorithms.probe(url, token="secret", timeout=5.0)["state"] == "up"
 
 
-def test_probe_unexpected_rpc_error_is_error_state(grpc_server):
-    url = grpc_server(_Servicer(fail=True))  # aborts INTERNAL
-    result = _algorithms.probe(url, timeout=5.0)
+def test_probe_names_the_retired_protocol(serve):
+    result = _algorithms.probe(serve(), timeout=5.0)
+    assert result["state"] == "error"
+    assert "ProcessImage" in result["error"]
+
+
+def test_probe_unexpected_rpc_error_is_error_state(serve):
+    result = _algorithms.probe(serve(_Ops(fail=True)), timeout=5.0)
     assert result["state"] == "error"
     assert "INTERNAL" in result["error"]
 
 
-def test_probe_filters_empty_op_names(grpc_server):
-    url = grpc_server(_Servicer(op_names=["a", "", "b"]))
-    assert _algorithms.probe(url, timeout=5.0)["ops"] == ["a", "b"]
-
-
-def test_status_carries_identity_fields(grpc_server):
-    url = grpc_server(_Servicer(op_names=["a"]))
-    row = _algorithms.status(url, timeout=5.0)
-    assert row["url"] == url
-    assert row["target"] == url.removeprefix("grpc://")  # 127.0.0.1:<port>
-    assert row["scheme"] == "grpc"
-    assert row["state"] == "serving"
-
-
-def test_statuses_probes_all_configured_in_order(home, grpc_server, monkeypatch):
-    up = grpc_server(_Servicer(op_names=["only"]))
-    down = "grpc://127.0.0.1:1"  # nothing listening
-    # Configure both (order matters); statuses() reads them via configured().
-    _write_config(home, {"services": {"process_image_servers": [up, down]}})
-    rows = _algorithms.statuses(timeout=2.0)
-    assert [r["url"] for r in rows] == [up, down]  # config order preserved
-    assert rows[0]["state"] == "serving" and rows[0]["ops"] == ["only"]
-    assert rows[1]["state"] == "unreachable"
-
-
-def test_statuses_is_empty_with_no_servers(home):
-    _write_config(home, {"services": {"process_image_servers": []}})
-    assert _algorithms.statuses(timeout=1.0) == []
-
-
-def test_statuses_survives_a_malformed_configured_url(home, grpc_server):
-    # A malformed URL alongside a good one must not abort the concurrent sweep
-    # (pool.map re-raises) -- it comes back as an "invalid" row instead.
-    up = grpc_server(_Servicer(op_names=["ok"]))
-    _write_config(home, {"services": {"process_image_servers": ["grpc://[::1", up]}})
-    rows = _algorithms.statuses(timeout=2.0)
-    assert [r["state"] for r in rows] == ["invalid", "serving"]
+def test_statuses_rows(registry, serve):
+    up = serve(_Ops(["only"]))
+    (registry / "a-up.json").write_text(json.dumps({"url": up}))
+    (registry / "b-down.json").write_text('{"url": "grpc://127.0.0.1:1"}')
+    (registry / "c-bad.json").write_text('{"url": "grpc://[::1"}')
+    (registry / "d-script.py").write_text("")
+    rows = {r["name"]: r for r in _algorithms.statuses(timeout=2.0)}
+    assert rows["a-up"]["state"] == "up"
+    assert rows["a-up"]["target"] == up.removeprefix("grpc://")
+    assert rows["a-up"]["op_count"] == 1
+    assert rows["b-down"]["state"] == "unreachable"
+    assert rows["c-bad"]["state"] == "invalid"
+    assert rows["d-script"]["state"] == "unknown"
+    assert rows["d-script"]["kind"] == "script"

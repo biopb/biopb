@@ -54,7 +54,7 @@ from pathlib import Path
 
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb_tensor_server.cache import CacheManager
-from biopb_tensor_server.core.adapter_base import unpack_chunk_array
+from biopb_tensor_server.core.chunk_batch import unpack_chunk_array
 from biopb_tensor_server.core.config import CacheConfig
 
 
@@ -171,7 +171,6 @@ def _one_cell(path, open_adapter, descriptor, scale, method, cold, rounds):
         cache_dir = tempfile.mkdtemp(prefix="planebench-")
         cache = CacheManager(
             CacheConfig(
-                backend="file",
                 file_cache_dir=Path(cache_dir),
                 file_max_total_bytes=16 * 1024**3,
             )

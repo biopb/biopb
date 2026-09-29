@@ -14,6 +14,7 @@ import logging
 
 import pytest
 from biopb_tensor_server.core.config import (
+    AnnotationsConfig,
     CacheConfig,
     MetadataDbConfig,
     PrecacheConfig,
@@ -40,13 +41,14 @@ def _default_of(section, field):
         "pyramid": PyramidConfig,
         "precache": PrecacheConfig,
         "metadata_db": MetadataDbConfig,
+        "annotations": AnnotationsConfig,
     }
     return getattr(defaults[section](), field)
 
 
 # --- the concrete failure modes named in the issue ---------------------------
-# Raw on-disk configs, so the on-disk key (`cache.max_bytes`) and the dataclass
-# field it feeds (`memory_max_bytes`) are both exercised.
+# Raw on-disk configs, so the on-disk key (`cache.file_max_segment_mb`) and the
+# dataclass field it feeds (`file_max_segment_bytes`) are both exercised.
 
 
 @pytest.mark.parametrize(
@@ -77,8 +79,7 @@ def _default_of(section, field):
             "pyramid",
             "reduction_method",
         ),
-        ({"cache": {"backend": "bogus"}}, "cache", "backend"),
-        ({"cache": {"max_bytes": 0}}, "cache", "memory_max_bytes"),
+        ({"cache": {"file_max_segment_mb": 0}}, "cache", "file_max_segment_bytes"),
         ({"cache": {"file_max_total_gb": -1}}, "cache", "file_max_total_bytes"),
         ({"precache": {"backlog_high_water": 1.5}}, "precache", "backlog_high_water"),
         ({"precache": {"backlog_high_water": -0.1}}, "precache", "backlog_high_water"),
@@ -88,6 +89,24 @@ def _default_of(section, field):
             "max_query_results",
         ),
         ({"metadata_db": {"query_timeout_ms": 0}}, "metadata_db", "query_timeout_ms"),
+        # A cap of 0 or less fails every annotation write with "Annotation limit
+        # reached", which is `enabled: false` reached by accident (biopb#948).
+        (
+            {"annotations": {"max_rois_per_tensor": 0}},
+            "annotations",
+            "max_rois_per_tensor",
+        ),
+        (
+            {"annotations": {"max_rois_per_tensor": -5}},
+            "annotations",
+            "max_rois_per_tensor",
+        ),
+        # SourceManager clamps a negative to 0, so accepting one silently ignores it.
+        (
+            {"annotations": {"prune_unseen_days": -1}},
+            "annotations",
+            "prune_unseen_days",
+        ),
         ({"server": {"rescan_interval": -1}}, "server", "rescan_interval"),
         ({"server": {"rescan_interval": -1.0}}, "server", "rescan_interval"),
     ],
@@ -105,10 +124,10 @@ def test_bad_value_is_clamped_with_a_warning(raw, section, field, caplog):
 
 def test_warning_describes_accepted_range_and_enum_and_the_default_used(caplog):
     with caplog.at_level(logging.WARNING):
-        parse_config({"pyramid": {"downscale_factor": 0}, "cache": {"backend": "bad"}})
+        parse_config({"pyramid": {"downscale_factor": 0, "reduction_method": "bogus"}})
     joined = "\n".join(_violations(caplog))
     assert ">= 2" in joined  # range
-    assert "file" in joined and "memory" in joined  # enum members
+    assert "area" in joined and "stride" in joined  # enum members
     assert "using the default" in joined  # what actually ran
 
 
@@ -156,6 +175,20 @@ def test_valid_defaults_do_not_warn(caplog):
             "linear",
         ),
         # boundaries are inclusive.
+        # prune_unseen_days 0 is the documented "never delete" sentinel, and the
+        # default -- the bound must not turn it into a warning.
+        (
+            {"annotations": {"prune_unseen_days": 0}},
+            "annotations",
+            "prune_unseen_days",
+            0,
+        ),
+        (
+            {"annotations": {"max_rois_per_tensor": 1}},
+            "annotations",
+            "max_rois_per_tensor",
+            1,
+        ),
         (
             {"precache": {"backlog_high_water": 0.0}},
             "precache",
@@ -185,21 +218,21 @@ def test_every_bad_section_is_reported_not_just_the_first(caplog):
             {
                 "server": {"rescan_interval": -5},
                 "pyramid": {"downscale_factor": 0},
-                "cache": {"backend": "nope"},
+                "cache": {"file_max_segment_mb": 0},
             }
         )
     joined = "\n".join(_violations(caplog))
     assert "server.rescan_interval" in joined
     assert "pyramid.downscale_factor" in joined
-    assert "cache.backend" in joined
+    assert "cache.file_max_segment_bytes" in joined
     assert (
         config.rescan_interval,
         config.pyramid.downscale_factor,
-        config.cache.backend,
+        config.cache.file_max_segment_bytes,
     ) == (
         ServerConfig().rescan_interval,
         PyramidConfig().downscale_factor,
-        CacheConfig().backend,
+        CacheConfig().file_max_segment_bytes,
     )
 
 
@@ -227,16 +260,16 @@ def test_validate_config_dict_flags_reduction_method():
 
 
 def test_validate_config_dict_uses_ondisk_paths():
-    # A field whose wire section diverges from the dataclass (memory_max_entries
-    # is a CacheConfig field but lives at [cache] max_entries on disk) reports
-    # the on-disk path, so it dedupes against the JSON Schema's path at the
-    # endpoint.
-    problems = validate_config_dict({"cache": {"max_entries": 0}})
-    assert [p["path"] for p in problems] == [["cache", "max_entries"]]
-    # The message names the on-disk key too, matching the path -- not the internal
-    # `memory_max_entries` field the form has no name for.
-    assert problems[0]["message"].startswith("max_entries=")
-    assert "memory_max_entries" not in problems[0]["message"]
+    # A field whose wire section diverges from the dataclass
+    # (file_max_segment_bytes is a CacheConfig field but lives at [cache]
+    # file_max_segment_mb on disk) reports the on-disk path, so it dedupes
+    # against the JSON Schema's path at the endpoint.
+    problems = validate_config_dict({"cache": {"file_max_segment_mb": 0}})
+    assert [p["path"] for p in problems] == [["cache", "file_max_segment_mb"]]
+    # The message names the on-disk key too, matching the path -- not the
+    # internal `file_max_segment_bytes` field the form has no name for.
+    assert problems[0]["message"].startswith("file_max_segment_mb=")
+    assert "file_max_segment_bytes" not in problems[0]["message"]
 
 
 def test_validate_config_dict_ignores_removed_compute_section():
@@ -274,25 +307,30 @@ def _unknown(caplog):
 
 
 def test_misnamed_cache_key_warns_naming_the_right_key(caplog):
-    # The reported trap: the dataclass field name `memory_max_entries` instead
-    # of the file key `max_entries` -> silently keeps the default. Must warn and
-    # point at the real key.
+    # The reported trap: the dataclass field name `file_max_segment_bytes`
+    # instead of the file key `file_max_segment_mb` -> silently keeps the
+    # default. Must warn and point at the real key.
     with caplog.at_level(logging.WARNING):
         cfgobj = parse_config(
-            {"cache": {"backend": "memory", "memory_max_entries": 1, "max_bytes": 1}}
+            {
+                "cache": {
+                    "file_max_segment_bytes": 1,
+                    "file_max_total_gb": 1,
+                }
+            }
         )
     msgs = _unknown(caplog)
-    assert any("memory_max_entries" in m and "[cache]" in m for m in msgs)
+    assert any("file_max_segment_bytes" in m and "[cache]" in m for m in msgs)
     # The warning lists the accepted keys so the fix is discoverable.
-    assert any("max_entries" in m and "max_bytes" in m for m in msgs)
+    assert any("file_max_segment_mb" in m for m in msgs)
     # The recognized key still took effect; the bogus one was ignored.
-    assert cfgobj.cache.memory_max_bytes == 1
-    assert cfgobj.cache.memory_max_entries == 1024  # default (key was dropped)
+    assert cfgobj.cache.file_max_total_bytes == 1 * 1024 * 1024 * 1024
+    assert cfgobj.cache.file_max_segment_bytes == 64 * 1024 * 1024  # default
 
 
 def test_unknown_top_level_section_warns(caplog):
     with caplog.at_level(logging.WARNING):
-        parse_config({"kache": {"backend": "memory"}})
+        parse_config({"kache": {"file_max_total_gb": 1}})
     assert any(
         "[kache]" in m and "Unknown config section" in m for m in _unknown(caplog)
     )
@@ -323,7 +361,7 @@ def test_valid_config_does_not_warn_unknown(caplog):
                     "poll_interval": 15.0,  # legacy alias
                     "aggressive_dir_pruning": True,
                 },
-                "cache": {"backend": "memory", "max_entries": 1, "max_bytes": 1},
+                "cache": {"file_max_segment_mb": 64, "file_max_total_gb": 1},
                 "precache": {
                     "enabled": True,
                     "downscale_factor": 4,
@@ -403,7 +441,7 @@ def test_present_keys_override_defaults_only_where_set():
     assert cfgobj.log_level == "DEBUG"
     assert cfgobj.writable == ServerConfig().writable  # untouched -> default
     assert cfgobj.cache.file_max_segment_bytes == 32 * 1024 * 1024
-    assert cfgobj.cache.memory_max_bytes == default_cache.memory_max_bytes
+    assert cfgobj.cache.file_max_total_bytes == default_cache.file_max_total_bytes
 
 
 def test_per_upstream_tls_trust_survives_the_parse():

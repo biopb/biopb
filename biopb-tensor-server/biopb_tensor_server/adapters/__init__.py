@@ -13,6 +13,11 @@ from biopb_tensor_server.core.adapter_base import SourceAdapter, TensorAdapter
 from biopb_tensor_server.core.discovery import AdapterRegistry
 
 from .hdf5 import Hdf5Adapter
+
+# Not a format: a label set bound as a tensor of its image (biopb/biopb#1059).
+# Imported here so the class is part of the package like every adapter class.
+from .labels import LabelSetAdapter
+from .ome_masks import RasterizedMaskAdapter
 from .ome_tiff import OmeTiffAdapter
 from .ome_zarr import OmeZarrAdapter
 from .remote_tensor import RemoteTensorAdapter
@@ -59,8 +64,42 @@ try:
 except ImportError:
     EmdAdapter = None  # type: ignore
 
-# Optional bioio adapters (format-specific subclasses)
+# Native phase-3 vendor adapters (biopb/biopb#799): readlif / mrc / nd2 direct,
+# no bioio dependency. Each is optional on its own package, independent of the
+# others and of the bioio-based fallback group below.
+#
+# The reader is probed here rather than left to the module import: every adapter
+# in this file imports its reader lazily, inside the method that uses it, so the
+# module imports fine with the package absent and the adapter would register,
+# claim its extension, and only then fail at read. Probing makes "not installed"
+# mean "not claimed".
 try:
+    import readlif  # noqa: F401
+
+    from .lif import LifAdapter
+except ImportError:
+    LifAdapter = None  # type: ignore
+
+try:
+    import mrc  # noqa: F401
+
+    from .dv import DeltaVisionAdapter
+except ImportError:
+    DeltaVisionAdapter = None  # type: ignore
+
+try:
+    import nd2  # noqa: F401
+
+    from .nd2 import Nd2Adapter
+except ImportError:
+    Nd2Adapter = None  # type: ignore
+
+# Optional bioio adapters (format-specific subclasses). Out of the default
+# install since biopb/biopb#799; ``bioio`` itself is probed for the reason given
+# above -- adapters/bioio.py imports BioImage inside create_from_config.
+try:
+    import bioio  # noqa: F401
+
     from .bioio import (
         AicsImageIoAdapter,
         BioformatsAdapter,
@@ -97,6 +136,8 @@ __all__ = [
     "SourceAdapter",
     "TensorAdapter",
     "ZarrAdapter",
+    "LabelSetAdapter",
+    "RasterizedMaskAdapter",
     "Hdf5Adapter",
     "TiffSequenceAdapter",
     "MicroManagerLegacyAdapter",
@@ -110,6 +151,9 @@ __all__ = [
     "MrcAdapter",
     "EmdAdapter",
     "CziAdapter",
+    "LifAdapter",
+    "DeltaVisionAdapter",
+    "Nd2Adapter",
     "ZeissAdapter",
     "LeicaAdapter",
     "NikonAdapter",
@@ -135,11 +179,15 @@ def get_default_registry() -> AdapterRegistry:
       native pyramid)
     - MrcAdapter - MRC electron microscopy (.mrc/.mrcs/.rec/.st/.map; rosettasciio)
     - EmdAdapter - EMD electron microscopy (.emd, NCEM/Velox; rosettasciio)
+    - LifAdapter - local Leica LIF files (.lif; readlif)
+    - DeltaVisionAdapter - local DeltaVision DV files (.dv; mrc.DVFile)
+    - Nd2Adapter - local Nikon ND2 files (.nd2; nd2)
     - ZeissAdapter - Zeiss microscopy (remote CZI and LSM only; the native
       adapters above own every local one)
-    - LeicaAdapter - Leica LIF files
-    - NikonAdapter - Nikon ND2 files
-    - DvAdapter - DeltaVision DV files
+    - LeicaAdapter - Leica LIF files (remote only; LifAdapter owns every local one)
+    - NikonAdapter - Nikon ND2 files (remote only; Nd2Adapter owns every local one)
+    - DvAdapter - DeltaVision DV files (remote only; DeltaVisionAdapter owns
+      every local one)
     - OlympusAdapter - Olympus OIF/OIB files
     - BioformatsAdapter - Legacy Bio-Formats-only formats (ZVI, ...; requires the
       optional bioformats component)
@@ -193,6 +241,22 @@ def get_default_registry() -> AdapterRegistry:
         registry.register(MrcAdapter, "mrc")
     if EmdAdapter is not None:
         registry.register(EmdAdapter, "emd")
+
+    # Native phase-3 vendor adapters (biopb/biopb#799), same shape as CziAdapter
+    # above: extension-only local claim, remote declined and left to the bioio
+    # group below. Each needs its own type string, distinct from the bioio
+    # class's -- the cloud phase-2 lazy-resolve flow looks a claimed source
+    # back up by this string, so two classes cannot share one. LIF ("leica")
+    # and ND2 ("nikon") already had a bioio type distinct from their extension;
+    # DV did not (DeltaVision has no separate multi-extension vendor family the
+    # way Zeiss does), so the native adapter here is "deltavision" rather than
+    # colliding with bioio's "dv".
+    if LifAdapter is not None:
+        registry.register(LifAdapter, "lif")
+    if DeltaVisionAdapter is not None:
+        registry.register(DeltaVisionAdapter, "deltavision")
+    if Nd2Adapter is not None:
+        registry.register(Nd2Adapter, "nd2")
 
     # Register bioio-based adapters in priority order (most specific first)
     if ZeissAdapter is not None:

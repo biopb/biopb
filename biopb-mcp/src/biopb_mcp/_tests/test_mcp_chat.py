@@ -12,29 +12,19 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from biopb_mcp._tests.conftest import rpc_reply
 from biopb_mcp.mcp import _app, _chat, _kernel_rpc, _server, _writers
 
 _PNG = base64.b64encode(b"\x89PNG\r\n\x1a\n").decode()
 
 
 def _envelope(value, window_alive=True):
-    """A kernel reply carrying the job runner's ``<<JOB_JSON>>`` payload."""
-    return {
-        "stdout": _kernel_rpc._JOB_DELIM
-        + json.dumps({"r": value, "w": window_alive})
-        + "\n",
-        "result_text": "",
-        "error_text": "",
-        "status": "ok",
-    }
+    """A kernel reply carrying a job call's return value."""
+    return rpc_reply(value, window_alive)
 
 
 class _Kernel(MagicMock):
     """A kernel host whose job answers can be scripted per call."""
-
-    def script_submit(self, reply):
-        """Make the next ``submit`` return *reply* instead of a fresh job."""
-        self._submit = reply
 
     def script_job(self, states):
         """Answer successive polls with ``(status, stdout)`` from *states*.
@@ -45,6 +35,55 @@ class _Kernel(MagicMock):
         field, which is what an older child looks like.
         """
         self._states = list(states)
+
+
+class _Jobs:
+    """``host.jobs`` for the chat fixture, answering from its scripted state."""
+
+    def __init__(self, host):
+        self._host = host
+
+    def new_id(self):
+        return "job-1"
+
+    def running(self, prefer=None):
+        return self._host._running
+
+    def running_cell(self):
+        return None
+
+    def window_alive(self, job_id):
+        return None
+
+    def poll(self, job_id):
+        h = self._host
+        state = h._states.pop(0) if len(h._states) > 1 else h._states[0]
+        snap = {
+            "job_id": job_id,
+            "status": state[0],
+            "stdout": state[1],
+            "result_text": "",
+            "error_text": "",
+            "elapsed": 0.1,
+        }
+        if len(state) > 2:
+            snap["stdout_total"] = state[2]
+        return snap
+
+    def foreign_digest(self, for_origin):
+        self._host.digest_origins.append(for_origin)
+        return list(self._host._digest)
+
+    def ack_foreign_digest(self, job_ids):
+        self._host.acked.append(list(job_ids))
+        self._host.events.append("ack")
+        return len(job_ids)
+
+    def summary(self):
+        return []
+
+    def history(self):
+        return []
 
 
 @pytest.fixture
@@ -62,40 +101,22 @@ def chat_host():
         "recent_respawns": 0,
         "watchdog_running": True,
     }
-    host._submit = None
+    host._running = None
+    host.no_viewer_reason = None
     host._states = [("ok", "")]
     host.interrupts = []
     # What another writer has run and the loop has not been told about, and the
     # acks it sends back. Empty by default: most tests are not about the notice.
     host._digest = []
     host.acked = []
+    host.digest_origins = []
+    # Submits and acks, in order.
+    host.events = []
+    host.jobs = _Jobs(host)
+
+    host.run_cell.side_effect = lambda *a, **k: host.events.append("submit")
 
     def execute(code, *_args, **_kwargs):
-        if "_jobs.submit(" in code:
-            if host._submit is not None:
-                return _envelope(host._submit)
-            return _envelope({"job_id": "job-1", "status": "running"})
-        if "_jobs.poll(" in code:
-            state = host._states.pop(0) if len(host._states) > 1 else host._states[0]
-            snap = {
-                "job_id": "job-1",
-                "status": state[0],
-                "stdout": state[1],
-                "result_text": "",
-                "error_text": "",
-                "elapsed": 0.1,
-            }
-            if len(state) > 2:
-                snap["stdout_total"] = state[2]
-            return _envelope(snap)
-        if "_jobs.interrupt_current(" in code:
-            host.interrupts.append(code)
-            return _envelope({"job_id": "job-1", "interrupted": True, "status": "ok"})
-        if "_jobs.foreign_digest(" in code:
-            return _envelope(host._digest)
-        if "_jobs.ack_foreign_digest(" in code:
-            host.acked.append(code)
-            return _envelope(len(host._digest))
         if _kernel_rpc._PNG_DELIM in code or "screenshot" in code:
             return {
                 "stdout": _kernel_rpc._PNG_DELIM + _PNG + "\n",
@@ -106,6 +127,12 @@ def chat_host():
         return {"stdout": "", "result_text": "", "error_text": "", "status": "ok"}
 
     host.execute.side_effect = execute
+
+    def interrupt_job(job_id, **kwargs):
+        host.interrupts.append((job_id, kwargs))
+        return {"job_id": job_id, "interrupted": True}
+
+    host.interrupt_job.side_effect = interrupt_job
 
     old_host, old_poll = _app._kernel_host, _chat._POLL_INTERVAL
     _app.set_kernel_host(host)
@@ -309,10 +336,11 @@ class TestToolSurface:
         payload = asyncio.run(_chat.tool_payload())
         names = {t["function"]["name"] for t in payload}
         listed = {t.name for t in asyncio.run(_app.mcp.list_tools())}
-        # Every registered tool, and exactly one thing that is not one: the
-        # resource reader, which has no registry entry to generate from. Pinned
-        # as equality so a second hand-written tool cannot creep in unnoticed.
-        assert names == listed | {_chat.RESOURCE_TOOL}
+        # Exactly the registered tools and nothing else: the knowledge store is
+        # read_doc/write_doc, which are ordinary tools, so the loop no longer
+        # synthesizes a reader for the resource surface. Pinned as equality so a
+        # hand-written tool cannot creep back in unnoticed.
+        assert names == listed
         # $schema/title are pydantic's and several providers reject them.
         for tool in payload:
             assert "$schema" not in tool["function"]["parameters"]
@@ -320,12 +348,12 @@ class TestToolSurface:
 
     def test_both_call_tool_shapes_collapse(self, chat_host):
         # server_status has an output schema and returns (blocks, structured);
-        # list_skills has none and returns a bare block list. The loop is below
-        # the layer that collapses them, so it does that job -- and must, for
-        # both, or one whole class of tool comes back as a tuple.
+        # take_screenshot has none and returns a bare block list. The loop is
+        # below the layer that collapses them, so it does that job -- and must,
+        # for both, or one whole class of tool comes back as a tuple.
         for name, args in (
             ("server_status", {}),
-            ("list_skills", {"keywords": ["drift"]}),
+            ("read_doc", {"id": "index"}),
         ):
             text, images = asyncio.run(_chat._dispatch(name, args, None))
             assert isinstance(text, str) and text
@@ -475,57 +503,32 @@ class TestVision:
         assert _chat.images_allowed() is True
 
 
-class TestResources:
-    """The resource surface, which function-calling has no verb for.
+class TestTheKnowledgeStore:
+    """The store reaches a function-calling model as ordinary tools.
 
-    Both halves of the borrowed system prompt point at it -- the guides by URI
-    and, through list_skills, the skills -- so an agent that cannot reach it is
-    being told to open documents it has no way to open.
+    That is the whole reason it is tools and not resources: a chat-completions
+    API has no verb for `resources/read`, so before the redesign the loop had to
+    synthesize one or the agent was told to open documents it could not open.
     """
 
-    def test_the_reader_is_offered_and_lists_what_is_registered(self, chat_host):
+    def test_no_reader_is_synthesized_any_more(self, chat_host):
         payload = asyncio.run(_chat.tool_payload())
-        reader = [t for t in payload if t["function"]["name"] == _chat.RESOURCE_TOOL]
-        assert len(reader) == 1
-        described = reader[0]["function"]["description"]
-        # Generated from the registry, so it cannot drift from what exists.
-        for res in asyncio.run(_app.mcp.list_resources()):
-            assert str(res.uri) in described
-        for tpl in asyncio.run(_app.mcp.list_resource_templates()):
-            assert tpl.uriTemplate in described
+        names = {t["function"]["name"] for t in payload}
+        assert "read_resource" not in names
+        assert {"read_doc", "write_doc"} <= names
 
-    def test_a_guide_reads_back(self, chat_host):
+    def test_a_doc_reads_back(self, chat_host):
         text, images = asyncio.run(
-            _chat._dispatch(_chat.RESOURCE_TOOL, {"uri": "guide://data"}, None)
+            _chat._dispatch("read_doc", {"id": "tensor-server-client"}, None)
         )
         assert images == []
-        assert text == _server.get_data_guide()
+        assert "client.get_tensor" in text
 
-    def test_the_skill_template_resolves(self, chat_host):
-        # list_skills answers with ids and nothing else, so this is the half
-        # that makes a curated workflow reachable at all.
-        from biopb_mcp.mcp import _skills
-
-        skill_id = _skills.load_catalog()[0]["id"]
-        text, _images = asyncio.run(
-            _chat._dispatch(_chat.RESOURCE_TOOL, {"uri": f"skill://{skill_id}"}, None)
-        )
-        assert text.strip()
-
-    def test_an_unknown_uri_is_a_tool_result_not_a_dead_turn(self, chat_host):
+    def test_an_unknown_doc_is_a_tool_result_not_a_dead_turn(self, chat_host):
         # The model's mistake to correct on the next round, like any other bad
         # argument -- not an exception that ends the conversation.
-        model = _scripted(
-            {
-                "content": "",
-                "tool_calls": [_call(_chat.RESOURCE_TOOL, uri="guide://nope")],
-            },
-            {"content": "I will read guide://data instead"},
-        )
-        asyncio.run(_chat.run_turn("what ops exist?", model))
-        tool_msg = [m for m in _chat.history() if m["role"] == "tool"][0]
-        assert "Could not read" in tool_msg["content"]
-        assert _chat.history()[-1]["content"].startswith("I will read")
+        text, _images = asyncio.run(_chat._dispatch("read_doc", {"id": "nope"}, None))
+        assert "No doc 'nope'" in text
 
 
 class TestExecuteCode:
@@ -535,16 +538,11 @@ class TestExecuteCode:
             {"content": "done"},
         )
         asyncio.run(_chat.run_turn("set x", model))
-        (snippet,) = [
-            c[0][0]
-            for c in chat_host.execute.call_args_list
-            if "_jobs.submit(" in c[0][0]
-        ]
         # Its own origin, so the notebook export and the observe badge do not
         # read a chat cell as an MCP agent's...
-        assert "origin='chat'" in snippet
-        # ...and its own writer id, so the kernel's one-agent claim covers it.
-        assert "writer='biopb-chat'" in snippet
+        assert chat_host.run_cell.call_args.kwargs["origin"] == "chat"
+        # ...and its own writer id, so the one-agent claim covers it.
+        assert _writers.claim_holder() == "biopb-chat"
 
     def test_the_model_is_not_told_to_poll_for_a_handle_it_never_gets(self, chat_host):
         # _dispatch already overrides the behaviour; the description has to be
@@ -564,7 +562,7 @@ class TestExecuteCode:
         # this fails rather than quietly restoring the wire wording.
         assert _server.PROMOTE_PARAGRAPH not in payload["description"]
         # ...and the rest is still the registry's own words, not a copy.
-        assert "napari kernel" in payload["description"]
+        assert "session's kernel" in payload["description"]
 
     def test_intent_asks_for_itself_on_the_parameter(self, chat_host):
         # A function-calling model reads the schema per argument. With the
@@ -602,12 +600,7 @@ class TestExecuteCode:
             {"content": "done"},
         )
         asyncio.run(_chat.run_turn("set x", model))
-        (snippet,) = [
-            c[0][0]
-            for c in chat_host.execute.call_args_list
-            if "foreign_digest(" in c[0][0]
-        ]
-        assert "foreign_digest('chat')" in snippet
+        assert chat_host.digest_origins == ["chat"]
 
     def test_the_notice_is_not_discharged_until_the_result_is_recorded(self, chat_host):
         # The ack promises the agent *has been told*, and it has been told when
@@ -621,10 +614,7 @@ class TestExecuteCode:
             {"content": "done"},
         )
         asyncio.run(_chat.run_turn("set x", model))
-        calls = [c[0][0] for c in chat_host.execute.call_args_list]
-        submitted = next(i for i, c in enumerate(calls) if "_jobs.submit(" in c)
-        acked = next(i for i, c in enumerate(calls) if "ack_foreign_digest(" in c)
-        assert acked > submitted
+        assert chat_host.events == ["submit", "ack"]
 
     def test_the_notice_is_discharged_only_once_it_has_been_delivered(self, chat_host):
         chat_host._digest = [{"job_id": "job-7", "status": "ok", "origin": "user"}]
@@ -633,10 +623,21 @@ class TestExecuteCode:
             {"content": "done"},
         )
         asyncio.run(_chat.run_turn("set x", model))
-        # Acked as the loop, because the kernel refuses an ack from a client
-        # that does not hold it -- a bystander must not retire a notice the
-        # agent working here never received.
-        assert chat_host.acked and "writer='biopb-chat'" in chat_host.acked[0]
+        assert chat_host.acked == [["job-7"]]
+
+    def test_the_notice_is_not_discharged_by_a_loop_that_does_not_hold_the_kernel(
+        self, chat_host
+    ):
+        # Acked as the loop, and only the holder may: a bystander must not
+        # retire a notice the agent working here never received.
+        chat_host._digest = [{"job_id": "job-7", "status": "ok", "origin": "user"}]
+        _writers._note_claim("someone-else")
+        model = _scripted(
+            {"content": "", "tool_calls": [_call("execute_code", python_code="x = 1")]},
+            {"content": "done"},
+        )
+        asyncio.run(_chat.run_turn("set x", model))
+        assert chat_host.acked == []
 
     def test_nothing_is_acked_when_there_is_nothing_to_report(self, chat_host):
         model = _scripted(
@@ -654,12 +655,7 @@ class TestExecuteCode:
             {"content": "done"},
         )
         asyncio.run(_chat.run_turn("measure the drift", model))
-        (snippet,) = [
-            c[0][0]
-            for c in chat_host.execute.call_args_list
-            if "_jobs.submit(" in c[0][0]
-        ]
-        assert "intent='measure the drift'" in snippet
+        assert chat_host.run_cell.call_args.kwargs["intent"] == "measure the drift"
 
     def test_the_models_own_intent_wins(self, chat_host):
         model = _scripted(
@@ -672,12 +668,7 @@ class TestExecuteCode:
             {"content": "done"},
         )
         asyncio.run(_chat.run_turn("measure the drift", model))
-        (snippet,) = [
-            c[0][0]
-            for c in chat_host.execute.call_args_list
-            if "_jobs.submit(" in c[0][0]
-        ]
-        assert "intent='warm the cache'" in snippet
+        assert chat_host.run_cell.call_args.kwargs["intent"] == "warm the cache"
 
     def test_partial_output_is_reported_while_the_job_runs(self, chat_host):
         # The whole reason the promote window is dropped: a long cell must show
@@ -731,9 +722,7 @@ class TestExecuteCode:
         assert seen == ["aaa", "zzz"]
 
     def test_a_kernel_held_by_another_client_is_reported_not_retried(self, chat_host):
-        chat_host.script_submit(
-            {"error": "not_owner", "owner": "claude-code", "owner_id": "sess-A"}
-        )
+        _writers._note_claim("sess-A", label="claude-code")
         model = _scripted(
             {"content": "", "tool_calls": [_call("execute_code", python_code="x = 1")]},
             {"content": "I cannot run code here."},
@@ -741,14 +730,14 @@ class TestExecuteCode:
         asyncio.run(_chat.run_turn("go", model))
         tool_msg = [m for m in _chat.history() if m["role"] == "tool"][0]
         assert "already in use by another client (claude-code)" in tool_msg["content"]
-        # The refusal names the real holder, so the mirror is corrected rather
-        # than left guessing at the loop.
+        # Refused, not claimed: the holder keeps the kernel.
         assert _writers._claimed_by == "sess-A"
+        chat_host.run_cell.assert_not_called()
 
 
 class TestConcurrency:
     def test_a_second_turn_is_refused_not_queued(self, chat_host):
-        # Same rule as _jobs.submit, for the same reason: a queued turn would be
+        # Same rule as a cell's, for the same reason: a queued turn would be
         # composed against a conversation its sender has not seen the end of.
         started = asyncio.Event()
         release = asyncio.Event()
@@ -1095,14 +1084,14 @@ class TestProviderEcho:
         model = _scripted(
             {
                 "content": "",
-                "tool_calls": [_call(_chat.RESOURCE_TOOL, uri="guide://data")],
-                "reasoning_content": "which guide",
+                "tool_calls": [_call("read_doc", id="tensor-server-client")],
+                "reasoning_content": "which doc",
             },
             {"content": "done"},
         )
         asyncio.run(_chat.run_turn("what ops exist?", model))
         called = self._assistant(model)[0]
-        assert called["reasoning_content"] == "which guide"
+        assert called["reasoning_content"] == "which doc"
         assert called["tool_calls"]
 
     def test_the_providers_own_spelling_is_kept(self, chat_host):

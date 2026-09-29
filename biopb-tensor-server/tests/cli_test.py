@@ -7,6 +7,7 @@ import typer
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.cache.recovery import ProcessLock
 from biopb_tensor_server.core.config import CacheConfig
+from biopb_tensor_server.serving.tls import cert_fingerprint
 
 
 def _cache_lock_is_free(lock_path: Path) -> bool:
@@ -41,6 +42,7 @@ def _fake_server_config(**overrides):
         "host": "127.0.0.1",
         "port": 8815,
         "log_level": "INFO",
+        "log_scope_to_biopb": True,
         "tls": False,
         "tls_cert": None,
         "tls_key": None,
@@ -60,11 +62,12 @@ def _run_serve(config, **overrides):
     kwargs = {
         "config": config,
         "log_level": None,
-        "log_scope_biopb": True,
-        "host": None,
-        "port": None,
-        "writable": False,
+        "log_scope_biopb": None,
+        "host": cli.DEFAULT_FLIGHT_HOST,
+        "port": cli.DEFAULT_FLIGHT_PORT,
+        "writable": None,
         "token": None,
+        "external_location": None,
         "tls": None,
         "tls_cert": None,
         "tls_key": None,
@@ -84,13 +87,14 @@ def _run_launch(config, **overrides):
     kwargs = {
         "config": config,
         "log_level": None,
-        "log_scope_biopb": True,
-        "host": None,
-        "port": None,
-        "writable": False,
+        "log_scope_biopb": None,
+        "host": cli.DEFAULT_FLIGHT_HOST,
+        "port": cli.DEFAULT_FLIGHT_PORT,
+        "writable": None,
         "web_port": 8816,
         "web_host": "127.0.0.1",
         "token": None,
+        "external_location": None,
         "tls": None,
         "tls_cert": None,
         "tls_key": None,
@@ -119,14 +123,13 @@ class _FakeStoppable:
 
     def stop(self, join_timeout=None):
         # _graceful_shutdown passes a short join_timeout to source_manager.stop();
-        # accept-and-ignore it here (also used as the watcher, called with no arg).
+        # accept-and-ignore it here.
         self.stop_calls += 1
 
 
 def test_serve_stops_monitoring_resources_on_keyboard_interrupt(monkeypatch):
     server = _FakeServer()
     source_manager = _FakeStoppable()
-    watcher = _FakeStoppable()
     server_config = _fake_server_config()
 
     monkeypatch.setattr(cli, "load_config", lambda path: server_config)
@@ -135,13 +138,12 @@ def test_serve_stops_monitoring_resources_on_keyboard_interrupt(monkeypatch):
     monkeypatch.setattr(
         cli,
         "_setup_flight_server",
-        lambda *args, **kwargs: (server, source_manager, watcher, None),
+        lambda *args, **kwargs: (server, source_manager, None),
     )
 
     _run_serve(Path("unused.json"))
 
     assert source_manager.stop_calls == 1
-    assert watcher.stop_calls == 1
     assert server.shutdown_calls == 1
 
 
@@ -162,7 +164,6 @@ def test_launch_installs_sigterm_handler_before_blocking_and_runs_finally(
 
     flight_server = SimpleNamespace(serve=lambda: None)
     source_manager = _FakeStoppable()
-    watcher = _FakeStoppable()
     server_config = _fake_server_config()
 
     monkeypatch.setattr(cli, "load_config", lambda path: server_config)
@@ -173,7 +174,7 @@ def test_launch_installs_sigterm_handler_before_blocking_and_runs_finally(
     monkeypatch.setattr(
         cli,
         "_setup_flight_server",
-        lambda *args, **kwargs: (flight_server, source_manager, watcher, None),
+        lambda *args, **kwargs: (flight_server, source_manager, None),
     )
     monkeypatch.setattr(
         cli, "_install_sigterm_handler", lambda: order.append("install_sigterm")
@@ -195,6 +196,115 @@ def test_launch_installs_sigterm_handler_before_blocking_and_runs_finally(
     assert order == ["install_sigterm", "run_http_server", "graceful_shutdown"]
 
 
+def _cfg(tmp_path) -> Path:
+    """A config file that exists. `--config` is `exists=True`, so a real parse
+    needs the path to be there; the contents never matter to these tests because
+    `load_config` is faked."""
+    path = tmp_path / "biopb.json"
+    path.write_text("{}", encoding="utf-8")
+    return path
+
+
+def _patched_launch_internals(monkeypatch, server_config=None) -> dict:
+    """No-op every `launch`/`_setup_flight_server` collaborator except the
+    latter, whose kwargs land in the returned dict -- shared scaffolding for
+    tests that only care what `launch` computed and forwarded.
+
+    `setup_logging` is a no-op too, but its `scope_to_biopb` is recorded under
+    `log_scope` first: that one `launch` resolves against the config itself
+    rather than handing to `_setup_flight_server`.
+    """
+    captured: dict = {}
+    config = server_config if server_config is not None else _fake_server_config()
+    monkeypatch.setattr(cli, "load_config", lambda path: config)
+    monkeypatch.setattr(cli, "get_log_level_from_env", lambda: None)
+    monkeypatch.setattr(
+        cli,
+        "setup_logging",
+        lambda *a, **k: captured.update(log_scope=k.get("scope_to_biopb")),
+    )
+    monkeypatch.setattr(cli, "_install_sigterm_handler", lambda: None)
+    monkeypatch.setattr(cli, "run_http_server", lambda **k: None)
+    monkeypatch.setattr(cli, "_graceful_shutdown", lambda *a, **k: None)
+
+    def _capture_setup(cfg, **kwargs):
+        captured.update(kwargs)
+        return (SimpleNamespace(serve=lambda: None), _FakeStoppable(), None)
+
+    monkeypatch.setattr(cli, "_setup_flight_server", _capture_setup)
+    return captured
+
+
+@pytest.mark.parametrize(
+    "argv, forwarded",
+    [
+        ([], None),  # no opinion -> the config file decides
+        (["--writable"], True),  # explicit on
+        (["--no-writable"], False),  # explicit off, overriding a config that says on
+    ],
+)
+def test_writable_flag_is_three_state_through_typer(
+    monkeypatch, tmp_path, argv, forwarded
+):
+    """Absence of --writable must mean "no opinion", not "off".
+
+    `_setup_flight_server` resolves `writable=None` to the config file's
+    `server.writable`, so the flag has to be able to *not* be given. Declared as
+    a plain `bool` it could not: omitting it arrived as False, which silently
+    pinned every config-driven deployment to read-only -- `server.writable: true`
+    had no effect anywhere, the control plane's supervised data plane included,
+    since it passes no flag by design (biopb#1085).
+
+    This goes through typer's own parsing via CliRunner. The sibling helpers here
+    call the command as a plain function and supply their own defaults, which is
+    exactly why the suite could not see it -- and why the config path has to be a
+    real file: `--config` is declared `exists=True`, which only a real parse
+    enforces.
+    """
+    from typer.testing import CliRunner
+
+    captured = _patched_launch_internals(monkeypatch)
+
+    result = CliRunner().invoke(
+        cli.app, ["launch", "--config", str(_cfg(tmp_path)), *argv]
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["writable"] is forwarded
+
+
+@pytest.mark.parametrize(
+    "argv, cfg_value, expected",
+    [
+        ([], True, True),  # no opinion -> the config decides...
+        ([], False, False),  # ...either way
+        (["--log-scope-biopb"], False, True),  # explicit on overrides the config
+        (["--log-scope-all"], True, False),  # explicit off overrides the config
+    ],
+)
+def test_log_scope_flag_defers_to_the_config(
+    monkeypatch, tmp_path, argv, cfg_value, expected
+):
+    """`server.log_scope_to_biopb` must actually reach setup_logging.
+
+    The second field the `writable` audit turned up, with a worse prognosis: a
+    documented ServerConfig field, carried into the JSON Schema so the settings
+    editor offers it, and with no readers at all. Both commands kept their own
+    `--log-scope-biopb/--log-scope-all` defaulting True and handed that straight
+    to setup_logging, so the config key was inert whatever it said (biopb#1085).
+    """
+    from typer.testing import CliRunner
+
+    captured = _patched_launch_internals(
+        monkeypatch, _fake_server_config(log_scope_to_biopb=cfg_value)
+    )
+
+    result = CliRunner().invoke(
+        cli.app, ["launch", "--config", str(_cfg(tmp_path)), *argv]
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["log_scope"] is expected
+
+
 def test_launch_forwards_flight_overrides_and_resolves_token_against_host(
     monkeypatch,
 ):
@@ -202,32 +312,20 @@ def test_launch_forwards_flight_overrides_and_resolves_token_against_host(
     flight bind, and the token mode switch follows the *overridden* host. A public
     --host with no token must auto-generate one (fail-closed), not bind open.
     """
-    captured: dict = {}
-    # Config binds loopback; the override makes the flight plane public.
-    server_config = _fake_server_config()
-    monkeypatch.setattr(cli, "load_config", lambda path: server_config)
-    monkeypatch.setattr(cli, "get_log_level_from_env", lambda: None)
-    monkeypatch.setattr(cli, "setup_logging", lambda *a, **k: None)
-    monkeypatch.setattr(cli, "_install_sigterm_handler", lambda: None)
-
-    def _capture_setup(cfg, **kwargs):
-        captured.update(kwargs)
-        return (
-            SimpleNamespace(serve=lambda: None),
-            _FakeStoppable(),
-            _FakeStoppable(),
-            None,
-        )
-
-    monkeypatch.setattr(cli, "_setup_flight_server", _capture_setup)
+    captured = _patched_launch_internals(monkeypatch)
     monkeypatch.setattr(
         cli,
         "run_http_server",
         lambda **kwargs: captured.update(sidecar_token=kwargs.get("token")),
     )
-    monkeypatch.setattr(cli, "_graceful_shutdown", lambda *a, **k: None)
 
-    _run_launch(Path("unused.json"), host="0.0.0.0", port=9001, writable=True)
+    _run_launch(
+        Path("unused.json"),
+        host="0.0.0.0",
+        port=9001,
+        writable=True,
+        external_location="grpc://real-host:9001",
+    )
 
     # Overrides reached the flight server...
     assert captured["host"] == "0.0.0.0"
@@ -240,6 +338,26 @@ def test_launch_forwards_flight_overrides_and_resolves_token_against_host(
     assert captured["sidecar_token"] == tok
 
 
+def test_launch_forwards_external_location_to_the_flight_server(monkeypatch):
+    """biopb/biopb#1158: a supplied --external-location reaches
+    _setup_flight_server (and from there TensorFlightServer) unchanged."""
+    captured = _patched_launch_internals(monkeypatch)
+
+    _run_launch(Path("unused.json"), external_location="grpc://real-host:8815")
+
+    assert captured["external_location"] == "grpc://real-host:8815"
+
+
+def test_launch_refuses_a_public_bind_with_no_external_location(monkeypatch):
+    """biopb/biopb#1158: mirrors the embedded cache's own required-on-public-bind
+    rule -- there is no way to guess a reachable address for a wildcard bind."""
+    _patched_launch_internals(monkeypatch)
+
+    with pytest.raises(typer.Exit) as exc:
+        _run_launch(Path("unused.json"), host="0.0.0.0")
+    assert exc.value.exit_code == 2
+
+
 def test_graceful_shutdown_releases_file_cache_lock(tmp_path):
     """Shutdown must close the cache so the file-backend process lock is removed.
 
@@ -247,13 +365,13 @@ def test_graceful_shutdown_releases_file_cache_lock(tmp_path):
     crash (and could falsely block a concurrent same-user start).
     """
     cache_dir = tmp_path / "cache"
-    config = CacheConfig(backend="file", file_cache_dir=cache_dir)
+    config = CacheConfig(file_cache_dir=cache_dir)
     CacheManager.initialize(config)
     lock_path = cache_dir / "lock"
     assert not _cache_lock_is_free(lock_path)  # held while server "runs"
 
     try:
-        cli._graceful_shutdown(source_manager=None, watcher=None, flight_server=None)
+        cli._graceful_shutdown(source_manager=None, flight_server=None)
         assert _cache_lock_is_free(lock_path)  # released on shutdown
     finally:
         mgr = CacheManager.get_instance()
@@ -267,7 +385,7 @@ def test_graceful_shutdown_releases_lock_before_slow_source_manager(tmp_path):
     raising source_manager.stop() must not keep the lock from being released.
     """
     cache_dir = tmp_path / "cache"
-    CacheManager.initialize(CacheConfig(backend="file", file_cache_dir=cache_dir))
+    CacheManager.initialize(CacheConfig(file_cache_dir=cache_dir))
     lock_path = cache_dir / "lock"
     assert not _cache_lock_is_free(lock_path)
 
@@ -291,7 +409,6 @@ def test_graceful_shutdown_releases_lock_before_slow_source_manager(tmp_path):
     try:
         cli._graceful_shutdown(
             source_manager=_SourceManager(),
-            watcher=None,
             flight_server=_Flight(),
         )
         # Lock released before the flight drain and the join.
@@ -317,7 +434,7 @@ def test_graceful_shutdown_bounds_a_hanging_flight_drain(tmp_path, monkeypatch):
     import time
 
     cache_dir = tmp_path / "cache"
-    CacheManager.initialize(CacheConfig(backend="file", file_cache_dir=cache_dir))
+    CacheManager.initialize(CacheConfig(file_cache_dir=cache_dir))
     lock_path = cache_dir / "lock"
     assert not _cache_lock_is_free(lock_path)
 
@@ -336,7 +453,6 @@ def test_graceful_shutdown_bounds_a_hanging_flight_drain(tmp_path, monkeypatch):
         start = time.monotonic()
         cli._graceful_shutdown(
             source_manager=None,
-            watcher=None,
             flight_server=_HangingFlight(),
         )
         elapsed = time.monotonic() - start
@@ -357,7 +473,7 @@ def test_graceful_shutdown_bounds_a_hanging_flight_drain(tmp_path, monkeypatch):
 def test_serve_releases_cache_lock_on_keyboard_interrupt(monkeypatch, tmp_path):
     """End-to-end: serve()'s shutdown path releases the cache lock."""
     cache_dir = tmp_path / "cache"
-    CacheManager.initialize(CacheConfig(backend="file", file_cache_dir=cache_dir))
+    CacheManager.initialize(CacheConfig(file_cache_dir=cache_dir))
     lock_path = cache_dir / "lock"
     assert not _cache_lock_is_free(lock_path)
 
@@ -369,7 +485,7 @@ def test_serve_releases_cache_lock_on_keyboard_interrupt(monkeypatch, tmp_path):
     monkeypatch.setattr(
         cli,
         "_setup_flight_server",
-        lambda *a, **k: (server, _FakeStoppable(), _FakeStoppable(), None),
+        lambda *a, **k: (server, _FakeStoppable(), None),
     )
 
     _run_serve(Path("unused.json"))
@@ -388,7 +504,7 @@ def test_serve_releases_cache_lock_when_setup_fails(monkeypatch, tmp_path):
     the finally releases the lock on every exit path, not just a clean return.
     """
     cache_dir = tmp_path / "cache"
-    CacheManager.initialize(CacheConfig(backend="file", file_cache_dir=cache_dir))
+    CacheManager.initialize(CacheConfig(file_cache_dir=cache_dir))
     lock_path = cache_dir / "lock"
     assert not _cache_lock_is_free(lock_path)  # held once cache init ran
 
@@ -414,21 +530,20 @@ def test_serve_releases_cache_lock_when_setup_fails(monkeypatch, tmp_path):
             mgr.close()
 
 
-def test_file_cache_on_network_dir_falls_back_to_memory(tmp_path, monkeypatch):
-    """A file cache configured on network/cloud storage demotes to memory.
+def test_file_cache_on_network_dir_refuses_to_start(tmp_path, monkeypatch):
+    """A file cache configured on network/cloud storage refuses to start.
 
     The Arrow file backend mmaps its segments and assumes local-POSIX semantics;
     on NFS/CIFS an evicted-but-mapped segment can SIGBUS/ESTALE, and a cloud
     Files-On-Demand folder recalls a dehydrated segment on mmap read
-    (biopb/biopb#571 follow-up). The launcher classifies the cache dir at startup
-    and, on a positive network/cloud signal, initializes the memory backend
-    instead -- which also disables the localhost fast path (a memory backend
-    never locates a chunk).
+    (biopb/biopb#571 follow-up). The launcher classifies the cache dir at
+    startup and, on a positive network/cloud signal, exits rather than serve
+    unsafe reads -- the on-disk cache is required infrastructure, not an
+    optional accelerator with a fallback.
     """
     import json
 
     from biopb_tensor_server.cache import CacheManager
-    from biopb_tensor_server.cache.file_backend import ArrowFileBackend
 
     cache_dir = tmp_path / "cache"  # a real local dir...
     config_path = tmp_path / "biopb.json"
@@ -436,7 +551,7 @@ def test_file_cache_on_network_dir_falls_back_to_memory(tmp_path, monkeypatch):
         json.dumps(
             {
                 "server": {"host": "127.0.0.1", "port": 0},
-                "cache": {"backend": "file", "file_cache_dir": str(cache_dir)},
+                "cache": {"file_cache_dir": str(cache_dir)},
                 "sources": [],
             }
         )
@@ -448,22 +563,13 @@ def test_file_cache_on_network_dir_falls_back_to_memory(tmp_path, monkeypatch):
 
     config = cli.load_config(config_path)
     CacheManager.reset()
-    server, source_manager, watcher, precache_worker = cli._setup_flight_server(
-        config, port=0
-    )
     try:
-        mgr = CacheManager.get_instance()
-        assert not isinstance(mgr.backend, ArrowFileBackend)  # demoted to memory
-        # The file cache dir was never created (backend never touched disk).
+        with pytest.raises(typer.Exit) as exc:
+            cli._setup_flight_server(config, port=0)
+        assert exc.value.exit_code == 1
+        # The cache dir was never created (the server exited before touching disk).
         assert not cache_dir.exists()
     finally:
-        if watcher is not None:
-            watcher.stop()
-        if precache_worker is not None:
-            precache_worker.stop()
-        if source_manager is not None:
-            source_manager.stop(join_timeout=1)
-        server.shutdown()
         CacheManager.reset()
 
 
@@ -480,7 +586,7 @@ def test_file_cache_on_local_dir_stays_file(tmp_path):
         json.dumps(
             {
                 "server": {"host": "127.0.0.1", "port": 0},
-                "cache": {"backend": "file", "file_cache_dir": str(cache_dir)},
+                "cache": {"file_cache_dir": str(cache_dir)},
                 "sources": [],
             }
         )
@@ -488,15 +594,11 @@ def test_file_cache_on_local_dir_stays_file(tmp_path):
 
     config = cli.load_config(config_path)
     CacheManager.reset()
-    server, source_manager, watcher, precache_worker = cli._setup_flight_server(
-        config, port=0
-    )
+    server, source_manager, precache_worker = cli._setup_flight_server(config, port=0)
     try:
         mgr = CacheManager.get_instance()
         assert isinstance(mgr.backend, ArrowFileBackend)  # tmp_path is local disk
     finally:
-        if watcher is not None:
-            watcher.stop()
         if precache_worker is not None:
             precache_worker.stop()
         if source_manager is not None:
@@ -524,16 +626,14 @@ def test_setup_empty_sources_serves_empty_catalog(tmp_path):
         json.dumps(
             {
                 "server": {"host": "127.0.0.1", "port": 0},
-                "cache": {"backend": "memory"},
+                "cache": {"file_cache_dir": str(tmp_path / "cache")},
                 "sources": [],
             }
         )
     )
 
     config = cli.load_config(config_path)
-    server, source_manager, watcher, precache_worker = cli._setup_flight_server(
-        config, port=0
-    )
+    server, source_manager, precache_worker = cli._setup_flight_server(config, port=0)
     try:
         assert server.is_ready is True
         assert source_manager is not None  # an empty manager, not None
@@ -543,11 +643,9 @@ def test_setup_empty_sources_serves_empty_catalog(tmp_path):
         assert health["status"] == "SERVING"
         assert health["source_count"] == 0
 
-        # And the empty catalog lists no flights.
-        assert list(server.list_flights(None, None)) == []
+        # And the catalog holds no sources.
+        assert server._metadata_db.query("SELECT source_id FROM sources").num_rows == 0
     finally:
-        if watcher is not None:
-            watcher.stop()
         if precache_worker is not None:
             precache_worker.stop()
         if source_manager is not None:
@@ -680,6 +778,63 @@ class TestResolveFlightToken:
         )
 
 
+class TestResolveExternalLocation:
+    """biopb/biopb#1158: the `health`-advertised address, required/fail-loud
+    on a public bind -- mirroring the embedded cache's own
+    ``_resolve_tensor_external_location`` rule."""
+
+    @pytest.mark.parametrize(
+        "host, external_location, expected",
+        [
+            # No opinion on a loopback bind -> advertise nothing; a client's
+            # own dial address is already correct for local mode.
+            ("127.0.0.1", None, None),
+            # Not refused, not silently dropped -- an operator can advertise a
+            # tunnel/NAT address even off a loopback bind.
+            ("127.0.0.1", "grpc://tunnel:8815", "grpc://tunnel:8815"),
+            ("0.0.0.0", "grpc://real-host:8815", "grpc://real-host:8815"),
+            # The advertised scheme follows the actual listener transport, so
+            # a shorthand supplied by control cannot make workers dial the
+            # wrong transport.
+            ("0.0.0.0", "grpc://real-host:8815", "grpc+tls://real-host:8815"),
+            ("0.0.0.0", "grpcs://real-host:8815", "grpc://real-host:8815"),
+        ],
+    )
+    def test_resolution(self, host, external_location, expected):
+        tls_cert_chain = (
+            b"cert"
+            if isinstance(expected, str) and expected.startswith("grpc+tls://")
+            else None
+        )
+        assert (
+            cli._resolve_external_location(
+                host, 8815, tls_cert_chain, external_location
+            )
+            == expected
+        )
+
+    def test_public_bind_with_nothing_supplied_is_refused(self):
+        with pytest.raises(typer.Exit) as exc:
+            cli._resolve_external_location("0.0.0.0", 8815, None, None)
+        assert exc.value.exit_code == 2
+
+    @pytest.mark.parametrize(
+        "external_location",
+        [
+            "real-host:8815",  # bare host:port, no scheme
+            "real-host",  # no scheme, no port
+            "http://real-host:8815",  # a scheme, but not one Flight speaks
+        ],
+    )
+    def test_a_schemeless_or_unrecognized_value_is_refused(self, external_location):
+        # A malformed value advertised verbatim via `health` would fail every
+        # downstream client with a confusing parse/connect error instead of
+        # being caught here, at the one place that could name the problem.
+        with pytest.raises(typer.Exit) as exc:
+            cli._resolve_external_location("0.0.0.0", 8815, None, external_location)
+        assert exc.value.exit_code == 2
+
+
 def test_setup_static_only_serves_immediately_with_freshness(tmp_path):
     """A static-only config reaches SERVING and reports a freshness timestamp.
 
@@ -699,7 +854,7 @@ def test_setup_static_only_serves_immediately_with_freshness(tmp_path):
         json.dumps(
             {
                 "server": {"host": "127.0.0.1", "port": 0},
-                "cache": {"backend": "memory"},
+                "cache": {"file_cache_dir": str(tmp_path / "cache")},
                 "sources": [
                     {
                         "type": "zarr",
@@ -712,9 +867,7 @@ def test_setup_static_only_serves_immediately_with_freshness(tmp_path):
     )
 
     config = cli.load_config(config_path)
-    server, source_manager, watcher, precache_worker = cli._setup_flight_server(
-        config, port=0
-    )
+    server, source_manager, precache_worker = cli._setup_flight_server(config, port=0)
     try:
         assert server.is_ready is True
 
@@ -725,8 +878,6 @@ def test_setup_static_only_serves_immediately_with_freshness(tmp_path):
         assert health["last_full_scan_finished_at"] is not None
         assert health["source_count"] == 1
     finally:
-        if watcher is not None:
-            watcher.stop()
         if precache_worker is not None:
             precache_worker.stop()
         server.shutdown()
@@ -777,7 +928,7 @@ def test_serve_starts_with_a_bad_knob_clamped_to_its_default(tmp_path, monkeypat
 
     def _capture(config, port=None, **kwargs):
         loaded["config"] = config
-        return _FakeServer(), _FakeStoppable(), _FakeStoppable(), None
+        return _FakeServer(), _FakeStoppable(), None
 
     monkeypatch.setattr(cli, "_setup_flight_server", _capture)
     _run_serve(config_path)
@@ -785,16 +936,6 @@ def test_serve_starts_with_a_bad_knob_clamped_to_its_default(tmp_path, monkeypat
     from biopb_tensor_server.core.config import PyramidConfig
 
     assert loaded["config"].pyramid.downscale_factor == PyramidConfig().downscale_factor
-
-
-def test_serve_refuses_legacy_toml_naming_the_migration_command(tmp_path, capsys):
-    config_path = tmp_path / "biopb.toml"
-    config_path.write_text("[server]\nport = 8815\n")
-
-    with pytest.raises(typer.Exit) as exc:
-        _run_serve(config_path)
-    assert exc.value.exit_code == 1
-    assert "migrate-config" in capsys.readouterr().out
 
 
 # --- TLS material resolution ------------------------------------------------
@@ -827,12 +968,7 @@ def _launch_capturing_tls(monkeypatch, server_config, **launch_kwargs):
 
     def _capture_setup(cfg, **kwargs):
         captured["flight_cert"] = kwargs.get("tls_cert_chain")
-        return (
-            SimpleNamespace(serve=lambda: None),
-            _FakeStoppable(),
-            _FakeStoppable(),
-            None,
-        )
+        return (SimpleNamespace(serve=lambda: None), _FakeStoppable(), None)
 
     monkeypatch.setattr(cli, "_setup_flight_server", _capture_setup)
     monkeypatch.setattr(cli, "run_http_server", lambda **kw: captured.update(kw))
@@ -849,23 +985,30 @@ def test_launch_points_the_sidecar_at_grpcs_and_hands_it_the_cert(
     The sidecar is co-located, so it gets the served cert as an explicit trust
     anchor rather than pinning it off the wire.
     """
+    # PEM-shaped, not a placeholder string: the BYO pair is validated by opening
+    # it and looking at the bytes (biopb/biopb#913).
+    cert_pem = b"-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END CERTIFICATE-----\n"
+    key_pem = b"-----BEGIN PRIVATE KEY-----\nZmFrZQ==\n-----END PRIVATE KEY-----\n"
     cert, key = tmp_path / "c.pem", tmp_path / "k.pem"
-    cert.write_bytes(b"CERTPEM")
-    key.write_bytes(b"KEYPEM")
+    cert.write_bytes(cert_pem)
+    key.write_bytes(key_pem)
 
     captured = _launch_capturing_tls(
         monkeypatch, _fake_server_config(), tls_cert=cert, tls_key=key
     )
 
-    assert captured["flight_cert"] == b"CERTPEM"  # the plane serves it...
-    assert captured["tls_ca_pem"] == b"CERTPEM"  # ...and the sidecar trusts it
+    assert captured["flight_cert"] == cert_pem  # the plane serves it...
+    # ...and the sidecar verifies that exact leaf on every connect. A fingerprint
+    # rather than the PEM, because the PEM resolves offline and so forfeits the
+    # hostname override this loopback dial needs (biopb/biopb#916).
+    assert captured["tls_fingerprint"] == cert_fingerprint(cert_pem)
     assert captured["flight_location"].startswith("grpcs://")
 
 
 def test_launch_without_tls_keeps_the_sidecar_on_plaintext(monkeypatch):
     captured = _launch_capturing_tls(monkeypatch, _fake_server_config())
     assert captured["flight_cert"] is None
-    assert captured["tls_ca_pem"] is None
+    assert captured["tls_fingerprint"] is None
     assert captured["flight_location"].startswith("grpc://")
 
 
@@ -905,108 +1048,6 @@ def test_the_default_bind_is_loopback():
     """Fail-safe. The old config default was 0.0.0.0, which made a plane public
     unless something said otherwise -- the wrong direction for a default."""
     assert cli.DEFAULT_FLIGHT_HOST == "127.0.0.1"
-
-
-class TestMigrateConfig:
-    """`biopb-tensor-server migrate-config`: legacy biopb.toml -> canonical biopb.json.
-
-    Moved here from the core SDK's suite with biopb/biopb#615, along with the
-    command: the migration is done by *this* package's `read_legacy_toml` /
-    `save_config`, so `biopb server migrate-config` was a command the SDK could
-    advertise but not perform on its own.
-    """
-
-    _TOML = (
-        "[server]\n"
-        'host = "127.0.0.1"\n'
-        "port = 8815\n\n"
-        "[cache]\n"
-        "max_bytes = 3000000000\n\n"
-        "[[sources]]\n"
-        'url = "/data/microscopy"\n'
-        "monitor = true\n\n"
-        "# advanced/unknown key that must survive the migration\n"
-        "[experimental]\n"
-        'foo = "bar"\n'
-    )
-
-    def _run(self, config_dir, *extra):
-        from typer.testing import CliRunner
-
-        return CliRunner().invoke(
-            cli.app, ["migrate-config", "--config", str(config_dir), *extra]
-        )
-
-    def test_migrates_toml_and_preserves_unknown_keys(self, tmp_path):
-        import json
-
-        (tmp_path / "biopb.toml").write_text(self._TOML)
-        res = self._run(tmp_path)
-        assert res.exit_code == 0, res.output
-
-        json_path = tmp_path / "biopb.json"
-        assert json_path.exists()
-        data = json.loads(json_path.read_text())
-        assert data["server"]["port"] == 8815
-        assert data["cache"]["max_bytes"] == 3000000000
-        assert data["sources"][0]["url"] == "/data/microscopy"
-        # The unknown table survives (raw-dict round-trip, not dataclass).
-        assert data["experimental"] == {"foo": "bar"}
-        # Legacy file retired to .bak; schema sidecar written.
-        assert (tmp_path / "biopb.toml.bak").exists()
-        assert not (tmp_path / "biopb.toml").exists()
-        assert (tmp_path / "biopb.schema.json").exists()
-
-    def test_dry_run_writes_nothing(self, tmp_path):
-        (tmp_path / "biopb.toml").write_text(self._TOML)
-        res = self._run(tmp_path, "--dry-run")
-        assert res.exit_code == 0, res.output
-        assert (tmp_path / "biopb.toml").exists()  # untouched
-        assert not (tmp_path / "biopb.json").exists()
-        assert not (tmp_path / "biopb.toml.bak").exists()
-
-    def test_already_json_is_noop(self, tmp_path):
-        (tmp_path / "biopb.json").write_text('{"server": {"port": 8815}}')
-        res = self._run(tmp_path)
-        assert res.exit_code == 0
-        assert "Already canonical" in res.output
-        assert not (tmp_path / "biopb.toml.bak").exists()
-
-    def test_both_present_retires_toml_without_touching_json(self, tmp_path):
-        (tmp_path / "biopb.toml").write_text("[server]\nport = 8815\n")
-        # A JSON that must be left byte-for-byte untouched (it already wins).
-        original = '{"server": {"port": 9999}}'
-        (tmp_path / "biopb.json").write_text(original)
-        res = self._run(tmp_path)
-        assert res.exit_code == 0, res.output
-        assert (tmp_path / "biopb.json").read_text() == original  # untouched
-        assert (tmp_path / "biopb.toml.bak").exists()
-        assert not (tmp_path / "biopb.toml").exists()
-
-    def test_no_config_present(self, tmp_path):
-        res = self._run(tmp_path)
-        assert res.exit_code == 0
-        assert "No legacy config found" in res.output
-
-    def test_config_pointing_at_file_uses_its_dir(self, tmp_path):
-        # --config may name the file itself, not just the directory.
-        toml = tmp_path / "biopb.toml"
-        toml.write_text(self._TOML)
-        res = self._run(toml)
-        assert res.exit_code == 0, res.output
-        assert (tmp_path / "biopb.json").exists()
-
-    def test_the_sdk_no_longer_offers_the_command(self):
-        """The move is one-way: `biopb server migrate-config` is gone, not aliased.
-
-        Two spellings of one migration is how a user runs the one that is not
-        wired to this package's writer (biopb/biopb#615).
-        """
-        import biopb.cli as core_cli
-        from typer.testing import CliRunner
-
-        res = CliRunner().invoke(core_cli.app, ["server", "migrate-config"])
-        assert res.exit_code != 0
 
 
 # --- validate checks the trust anchors it will actually use (biopb/biopb#608) -

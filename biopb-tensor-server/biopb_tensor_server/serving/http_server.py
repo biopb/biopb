@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import collections
 import hashlib
+import json
 import logging
 import os
 import re
@@ -45,11 +46,26 @@ import sys
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Any, Deque, Dict, List, NamedTuple, Optional, Sequence, Tuple
+from decimal import Decimal
+from functools import partial
+from typing import (
+    Any,
+    Callable,
+    Deque,
+    Dict,
+    List,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 import numpy as np
 import pyarrow.flight as flight
 from biopb import _web_auth
+from biopb.image.annotation_pb2 import RoiAnnotation
+from biopb.tensor._catalog_rows import sql_literal
+from biopb.tensor._session import ResolveCancelled
 from biopb.tensor.client import TensorFlightClient
 from biopb.tensor.ticket_pb2 import TensorTicket
 from fastapi import (
@@ -63,7 +79,11 @@ from fastapi import (
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from google.protobuf import json_format
 from pydantic import BaseModel
+
+from biopb_tensor_server.core.chunk import current_epoch
+from biopb_tensor_server.core.labels import split_label_field
 
 logger = logging.getLogger(__name__)
 
@@ -302,15 +322,26 @@ class _SidecarContext:
         cache_bytes: int,
         config_path: Optional[str] = None,
         supervised: bool = False,
-        tls_ca_pem: Optional[bytes] = None,
+        tls_fingerprint: Optional[str] = None,
     ) -> None:
         self.flight_location = flight_location
         self.token = token
         self.cache_bytes = cache_bytes
-        # PEM the flight plane serves, when it serves TLS. We are co-located with
-        # that plane and read this off local disk, so it is an explicit trust
-        # anchor -- not a trust-on-first-use pin. None for a plaintext plane.
-        self.tls_ca_pem = tls_ca_pem
+        # SHA-256 of the leaf the flight plane serves, when it serves TLS. We are
+        # co-located with that plane and take this from the material it was
+        # handed, so the anchor is verified rather than trusted-on-first-use --
+        # and pinning the exact certificate is stronger than trusting the CA
+        # bundle it came from, which would accept any sibling that CA issued.
+        #
+        # A fingerprint rather than the PEM (biopb/biopb#916): passing the PEM
+        # resolves entirely offline, which also skips the hostname-override probe
+        # -- and this dial is loopback, so a certificate minted for the host's
+        # public name alone (the ordinary shape of an operator's own cert) fails
+        # verification with "Peer name 127.0.0.1 is not in peer certificate". The
+        # fingerprint path reaches the wire, ends up with the presented leaf as
+        # its anchor, and so earns the override that makes the loopback dial
+        # verify. None for a plaintext plane.
+        self.tls_fingerprint = tls_fingerprint
         # The config file this daemon was launched with (read/written by the
         # /api/config endpoints).
         self.config_path = config_path
@@ -324,6 +355,9 @@ class _SidecarContext:
         # Lazy-init Flight client (first request will connect)
         self._client_lock = threading.Lock()
         self._client_holder: Dict[str, Optional[TensorFlightClient]] = {"client": None}
+        # In-flight resolve/warm recalls. Per-app, so two apps in one process
+        # (tests) cannot see each other's jobs.
+        self.jobs = _SourceJobs()
 
     def get_client(self) -> TensorFlightClient:
         """Return the Flight client, connecting on first use."""
@@ -337,7 +371,7 @@ class _SidecarContext:
                         location=self.flight_location,
                         cache_bytes=self.cache_bytes,
                         token=self.token,
-                        tls_ca_pem=self.tls_ca_pem,
+                        tls_fingerprint=self.tls_fingerprint,
                     )
                     self.diag.mark_connected()
                     logger.info(f"Connected to Flight server at {self.flight_location}")
@@ -346,6 +380,14 @@ class _SidecarContext:
                     logger.error(f"Failed to connect to Flight server: {exc}")
                     raise
             return self._client_holder["client"]
+
+    def reset_client(self) -> None:
+        """Forget the cached client so the next ``get_client()`` builds a new one.
+
+        Dropped, not closed: another request may be mid-call on it.
+        """
+        with self._client_lock:
+            self._client_holder["client"] = None
 
     def peek_client(self) -> Optional[TensorFlightClient]:
         """Return the client only if already connected (never forces a connect)."""
@@ -378,6 +420,9 @@ class _SidecarContext:
             return client.health_check(), None
         except Exception as exc:
             logger.warning(f"Backend health check failed: {exc}")
+            # Retry on a fresh client. A rotated TOFU/CA anchor still needs its
+            # re-pin: trust resolution is memoized per process.
+            self.reset_client()
             return None, f"health check failed: {exc}"
 
     def check_token(self, request: Request) -> None:
@@ -391,6 +436,149 @@ class _SidecarContext:
         expected = self.token
         if not _web_auth.token_valid(request.headers.get, expected):
             raise HTTPException(status_code=401, detail="Invalid or missing token")
+
+
+# ---------------------------------------------------------------------------
+# Resolve / warm jobs
+#
+# Both are minutes-long, consenting recalls of cloud / synced-folder data, which
+# is longer than any request should be held open. They run on a daemon thread
+# and the browser polls; the shape is start -> poll -> (optionally) cancel.
+#
+# Polling rather than SSE deliberately: every other route here is
+# request/response, and a status object the client re-reads survives the two
+# things a stream does not -- a reload mid-resolve, and a second tab watching
+# the same source. The server-side recall outlives the HTTP request either way.
+# ---------------------------------------------------------------------------
+
+#: How long a finished job's outcome stays readable. Long enough that a client
+#: polling on a slow interval still sees *why* a job ended rather than finding
+#: nothing and having to guess; short enough that the registry cannot grow
+#: without bound on a long-lived server.
+_JOB_RETENTION_SECONDS = 300.0
+
+#: Terminal job states. "cancelled" is distinct from "error" because the UI
+#: treats them oppositely -- a cancel is the user's own doing and stays quiet,
+#: an error needs saying.
+_JOB_DONE = "done"
+_JOB_ERROR = "error"
+_JOB_CANCELLED = "cancelled"
+_JOB_RUNNING = "running"
+
+
+class _SourceJob:
+    """One resolve or warm, in flight or recently finished.
+
+    Every field a route reads is taken under ``_lock``: the worker thread writes
+    progress on the Flight client's callback while a request thread is rendering
+    the status JSON.
+    """
+
+    def __init__(self, kind: str, source_id: str) -> None:
+        self.kind = kind
+        self.source_id = source_id
+        self.started_at = time.time()
+        self._lock = threading.Lock()
+        self._cancel = threading.Event()
+        self._state = _JOB_RUNNING
+        self._progress: Dict[str, Any] = {}
+        self._error: Optional[str] = None
+        self._finished_at: Optional[float] = None
+
+    def request_cancel(self) -> None:
+        self._cancel.set()
+
+    def cancel_requested(self) -> bool:
+        """The ``should_cancel`` predicate handed to the Flight client."""
+        return self._cancel.is_set()
+
+    def set_progress(self, progress: Dict[str, Any]) -> None:
+        with self._lock:
+            self._progress = progress
+
+    def finish(self, state: str, error: Optional[str] = None) -> None:
+        with self._lock:
+            self._state = state
+            self._error = error
+            self._finished_at = time.time()
+
+    @property
+    def running(self) -> bool:
+        with self._lock:
+            return self._state == _JOB_RUNNING
+
+    def finished_before(self, cutoff: float) -> bool:
+        with self._lock:
+            return self._finished_at is not None and self._finished_at < cutoff
+
+    def snapshot(self) -> Dict[str, Any]:
+        """The status JSON for this job."""
+        with self._lock:
+            end = self._finished_at if self._finished_at is not None else time.time()
+            return {
+                "kind": self.kind,
+                "source_id": self.source_id,
+                "state": self._state,
+                "progress": dict(self._progress),
+                "error": self._error,
+                "elapsed_seconds": end - self.started_at,
+                # Distinct from state == "cancelled": the flag is set the moment
+                # the cancel is asked for, while the state only turns once the
+                # worker has actually unwound. A UI needs the first to stop
+                # offering a button it has already been told about.
+                "cancel_requested": self._cancel.is_set(),
+            }
+
+
+class _SourceJobs:
+    """The per-app registry of resolve/warm jobs, keyed by ``(kind, source_id)``.
+
+    Keyed by the pair, not by a generated job id, because that key *is* the
+    idempotency the callers need: a double-click, a retry, or a second tab must
+    join the recall already running rather than start a second one against the
+    same bytes. Re-reading a finished job is what makes the poll work.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._jobs: Dict[Tuple[str, str], _SourceJob] = {}
+
+    def start(
+        self, kind: str, source_id: str, run: Callable[[_SourceJob], None]
+    ) -> Tuple[_SourceJob, bool]:
+        """Start a job, or join the one already running. ``(job, started_now)``."""
+        with self._lock:
+            self._evict_locked()
+            key = (kind, source_id)
+            existing = self._jobs.get(key)
+            if existing is not None and existing.running:
+                return existing, False
+            job = _SourceJob(kind, source_id)
+            self._jobs[key] = job
+            threading.Thread(
+                target=run,
+                args=(job,),
+                name=f"{kind}-{source_id}",
+                daemon=True,
+            ).start()
+            return job, True
+
+    def get(self, kind: str, source_id: str) -> Optional[_SourceJob]:
+        with self._lock:
+            return self._jobs.get((kind, source_id))
+
+    def _evict_locked(self) -> None:
+        """Drop outcomes nobody can still be waiting on.
+
+        On ``start`` only: a registry that is never written to is never read
+        either, so there is nothing to reap, and this avoids a timer.
+        """
+        cutoff = time.time() - _JOB_RETENTION_SECONDS
+        self._jobs = {
+            key: job
+            for key, job in self._jobs.items()
+            if not job.finished_before(cutoff)
+        }
 
 
 def _sidecar(request: Request) -> _SidecarContext:
@@ -486,7 +674,7 @@ async def _abort_if_client_gone(request: Request, ctx: _SidecarContext) -> None:
 # Preferred tile edge in pixels. 512x512 uint16 is 512 KB on the wire, which is
 # where the per-request cost of the control's /data_plane proxy stops dominating
 # (biopb/biopb#762): below ~256 KB of payload the deployment spends its capacity
-# on proxy overhead rather than pixels. See docs/remote-viewer-tiles.md.
+# on proxy overhead rather than pixels.
 _TILE_TARGET_EDGE = 512
 
 # Tiles are cached by URL, and the URL carries no token -- auth rides in the
@@ -540,8 +728,17 @@ def _version_token(content_version: bytes) -> str:
     matter only between two versions OF ONE SOURCE, where the alternative to a
     collision is today's behaviour (no versioning at all), so the trade is
     strictly favourable.
+
+    The serving epoch is hashed in with it: this token is the tile cache's key
+    namespace, and a browser holding an `immutable` URL has no other way to hear
+    about a bump (the Flight plane carries it inside the opaque chunk_id). Read
+    from the local constant -- ``cli.py`` points the sidecar at the Flight plane
+    it ships with. See ``core.chunk.CHUNK_SEMANTICS_EPOCH``.
     """
-    return hashlib.sha256(content_version).hexdigest()[:8]
+    epoch = current_epoch()
+    # Epoch 0 hashes the content alone, as the chunk_id header omits the field.
+    seed = content_version if epoch == 0 else b"%d:" % epoch + content_version
+    return hashlib.sha256(seed).hexdigest()[:8]
 
 
 def _descriptor_version_token(td: Any) -> Optional[str]:
@@ -583,8 +780,41 @@ def _versioned_array_id(array_id: str, token: Optional[str]) -> str:
     return f"{source}{_VERSION_SEP}{token}{slash}{field}"
 
 
+def _names_label_set(array_id: str) -> bool:
+    """Whether *array_id* addresses a label set rather than an image.
+
+    ``source_id`` is the slash-free prefix by the identity policy, so the
+    within-source field is everything after the first "/". The one reading of
+    the path in this module; see ``core/labels.py``.
+    """
+    return split_label_field(array_id.partition("/")[2]) is not None
+
+
+def _label_image_axes(td: Any) -> Optional[List[int]]:
+    """Which of the image's axes each axis of this set indexes, as the server
+    states it (``biopb.labels.image_axes``), or None.
+
+    Read, never re-derived: the whole point of the server publishing it is that
+    a client matching the two tensors' axes by name gets `t`/`z` right and an
+    unnamed axis wrong. None for a server that predates the block, which leaves
+    the client to fall back to the extent rule as it did before.
+    """
+    raw = getattr(td, "metadata_json", None)
+    if not raw:
+        return None
+    try:
+        wrapped = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    block = ((wrapped or {}).get("metadata") or {}).get("biopb") or {}
+    axes = (block.get("labels") or {}).get("image_axes")
+    if not isinstance(axes, list) or not all(isinstance(a, int) for a in axes):
+        return None
+    return axes
+
+
 def _tensor_desc_by_array_id(
-    client: TensorFlightClient, array_id: str
+    client: TensorFlightClient, array_id: str, *, with_metadata: bool = False
 ) -> Tuple[Any, Optional[str]]:
     """``(TensorDescriptor, current version token)`` for *array_id*.
 
@@ -618,7 +848,9 @@ def _tensor_desc_by_array_id(
     """
     array_id, asked_version = _split_array_version(array_id)
     try:
-        bound = client.get_descriptor(array_id, with_pyramid=False)
+        bound = client.get_descriptor(
+            array_id, with_pyramid=False, with_metadata=with_metadata
+        )
     except (flight.FlightServerError, ValueError):
         # The two terminal answers: a Flight-side addressing refusal (NOT_FOUND
         # / INVALID_ARGUMENT ride FlightServerError -- pyarrow exposes no typed
@@ -639,12 +871,20 @@ def _tensor_desc_by_array_id(
 def _tensor_candidates(client: TensorFlightClient, array_id: str) -> List[str]:
     """array_ids of the source *array_id* points at, for a 404 that helps.
 
+    One addressed row, not a listing: naming the alternatives needs this
+    source's tensors, and streaming the whole catalog to find them also
+    inherited the browse cap, so a source past it lost its 404 text.
+
     Unversioned ids: they are what the catalog holds, and an unversioned request
     resolves fine (it just gets the hour-long cache policy rather than
     ``immutable``). The canonical versioned form comes from ``tile_info``.
     """
-    desc = client.list_sources().get(_split_array_version(array_id)[0].split("/", 1)[0])
-    return [td.array_id for td in desc.tensors] if desc else []
+    source_id = _split_array_version(array_id)[0].split("/", 1)[0]
+    rows = client.query(
+        f"SELECT tensors FROM sources WHERE source_id = {sql_literal(source_id)}",
+        format="records",
+    )
+    return [t["array_id"] for t in (rows[0]["tensors"] or [])] if rows else []
 
 
 def _no_such_tensor(array_id: str, candidates: List[str]) -> str:
@@ -663,9 +903,9 @@ def _tile_edge(
     Chosen so a tile *nests* inside a stored chunk -- ``chunk / 2**k`` -- rather
     than equalling it. Straddling a chunk boundary is what costs: locally it is
     a few extra page touches, but against a proxied upstream it turns one cold
-    chunk pull into two (docs/remote-viewer-tiles.md). Nesting keeps the segment
-    cache hitting while letting the transport unit be sized for latency instead
-    of for mmap locality, which is the whole point of separating the two.
+    chunk pull into two. Nesting keeps the segment cache hitting while letting
+    the transport unit be sized for latency instead of for mmap locality, which
+    is the whole point of separating the two.
     """
     height, width = int(shape[y_idx]), int(shape[x_idx])
     plane_max = max(height, width, 1)
@@ -923,10 +1163,10 @@ def _tile_read(
 
     The remainder is decimated in-process rather than asked of the data plane as
     a separate scaled read, so one advertised level serves the whole tail of the
-    ladder above it (docs/precache-policy.md 4.2) and mints no second cache
-    entry. A rung *finer* than every advertised level reads full resolution,
-    which is the planner's own position: it omits the intermediate rungs because
-    they cost a client a level-0 read anyway and save it nothing.
+    ladder above it (a strided ``nearest`` pick composes exactly) and mints no
+    second cache entry. A rung *finer* than every advertised level reads full
+    resolution, which is the planner's own position: it omits the intermediate
+    rungs because they cost a client a level-0 read anyway and save it nothing.
 
     What the level is decides what the read costs. A **computed** level is the
     one precache warmed, so this is a warm read plus a decimation. A **native**
@@ -989,9 +1229,9 @@ def _tile_read(
 # A volume is not a rung of either ladder: `XR3DLayer` and napari's 3-D mode
 # both upload one whole 3-D texture, so there is nothing to tile and nothing to
 # zoom between. What they need is the single scale the precache worker keeps a
-# whole volume warm at -- the Flight ladder's coarsest level (N1,
-# docs/precache-policy.md 3.2, 5). The server decides it; a client that guessed
-# would miss the warm chunks by a factor of two and pay a cold decode.
+# whole volume warm at -- the Flight ladder's coarsest level. The server decides
+# it; a client that guessed would miss the warm chunks by a factor of two and
+# pay a cold decode.
 
 
 def _volume_plan(
@@ -1210,8 +1450,8 @@ def _volume_spacing(
 
 
 # The scale decisions a caller may delegate to the server. One today; named
-# rather than boolean because the warm set has two targets (2-D and 3-D,
-# docs/precache-policy.md 5) and "the warm scale" would not say which.
+# rather than boolean because the warm set has two targets (2-D and 3-D) and
+# "the warm scale" would not say which.
 _SCALE_POLICIES = ("volume",)
 
 
@@ -1663,8 +1903,8 @@ async def list_sources(request: Request) -> JSONResponse:
     t0 = time.monotonic()
     try:
         client = ctx.get_client()
-        sources = client.list_sources()
-        result = [_source_desc_to_dict(desc) for desc in sources.values()]
+        rows = client.query(_SOURCE_LIST_SQL + " ORDER BY source_id", format="records")
+        result = [_source_row_to_dict(row) for row in rows]
         elapsed = (time.monotonic() - t0) * 1000
         ctx.diag.latency.record(elapsed)
         logger.debug(f"list_sources: returned {len(result)} sources in {elapsed:.1f}ms")
@@ -1679,6 +1919,42 @@ async def list_sources(request: Request) -> JSONResponse:
         )
 
 
+def _query_json_default(value: Any) -> Any:
+    """Spell the Arrow value types `json.dumps` has no encoding for.
+
+    A TIMESTAMP column arrives as `datetime`. The metadata DB stores them as
+    naive server-local time, so a bare ISO string would be ambiguous: it is
+    written with the server's UTC offset instead. Anything else is refused, not
+    stringified, so a new column type fails loudly rather than reaching a client
+    in a shape nobody chose.
+    """
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.astimezone()
+        return value.isoformat()
+    if hasattr(value, "isoformat"):  # date, time
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return str(value)  # exact; a float would round it
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).hex()
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
+class _QueryJSONResponse(JSONResponse):
+    """`JSONResponse` for query rows, which can carry timestamps."""
+
+    def render(self, content: Any) -> bytes:
+        return json.dumps(
+            content,
+            ensure_ascii=False,
+            allow_nan=False,
+            indent=None,
+            separators=(",", ":"),
+            default=_query_json_default,
+        ).encode("utf-8")
+
+
 @_router.post("/api/sources/query")
 async def query_sources(req: QuerySourcesRequest, request: Request) -> Response:
     """Execute SQL query against source metadata database.
@@ -1688,7 +1964,9 @@ async def query_sources(req: QuerySourcesRequest, request: Request) -> Response:
       X-Total-Sources    — total matching (before truncation)
       X-Returned-Sources — actual rows returned
       X-Truncated        — "true" if truncated
-    Response body: JSON array of query results
+    Response body: JSON array of query results. A TIMESTAMP is an ISO-8601 string
+    with the server's UTC offset; a MAP is a list of [key, value] pairs, not an
+    object.
     """
     ctx = _sidecar(request)
     ctx.check_token(request)
@@ -1696,7 +1974,7 @@ async def query_sources(req: QuerySourcesRequest, request: Request) -> Response:
 
     try:
         client = ctx.get_client()
-        arrow_table = client.query_sources(req.sql)
+        arrow_table = client.query(req.sql)
 
         # Convert Arrow Table to JSON
         result = arrow_table.to_pylist()
@@ -1707,9 +1985,24 @@ async def query_sources(req: QuerySourcesRequest, request: Request) -> Response:
         # total" rather than raise an AttributeError that the handler below would
         # then report as a 502 Flight error.
         table_metadata = arrow_table.schema.metadata or {}
-        total = int(table_metadata.get(b"total_sources", len(result)))
-        returned = int(table_metadata.get(b"returned_sources", len(result)))
-        truncated = total > returned
+        # Prefer this query's own row counts; fall back to the legacy
+        # source-count keys for a server that predates them, then to the table.
+        total = int(
+            table_metadata.get(b"total_rows")
+            or table_metadata.get(b"total_sources")
+            or len(result)
+        )
+        returned = int(
+            table_metadata.get(b"returned_rows")
+            or table_metadata.get(b"returned_sources")
+            or len(result)
+        )
+        # Trust the server's own flag: it is the only party that saw the pre-cap
+        # size. Differencing the counts is what made every filtered query report
+        # truncation -- `total_sources` counts the catalog, not this result.
+        # Fall back to the difference only for a server that predates the flag.
+        flag = table_metadata.get(b"truncated")
+        truncated = flag.decode() == "True" if flag else total > returned
 
         elapsed = (time.monotonic() - t0) * 1000
         ctx.diag.latency.record(elapsed)
@@ -1723,7 +2016,7 @@ async def query_sources(req: QuerySourcesRequest, request: Request) -> Response:
             "X-Truncated": str(truncated).lower(),
         }
 
-        return JSONResponse(result, headers=headers)
+        return _QueryJSONResponse(result, headers=headers)
 
     except ValueError as exc:
         # SQL validation error (forbidden keyword, disallowed table)
@@ -1805,7 +2098,7 @@ async def get_chunk(source_id: str, ticket_hex: str, request: Request) -> Respon
         # Read all data from the stream. do_get returns the unified binary chunk
         # schema (biopb/biopb#293); decode it, then ensure native byte order +
         # C-contiguous layout for the browser.
-        from biopb_tensor_server.core.adapter_base import unpack_chunk_array
+        from biopb_tensor_server.core.chunk_batch import unpack_chunk_array
 
         table = reader.read_all()
         arr = _normalize_array(unpack_chunk_array(table.to_batches()[0]))
@@ -1848,6 +2141,186 @@ async def get_chunk(source_id: str, ticket_hex: str, request: Request) -> Respon
         )
 
 
+# -- Resolve / warm (consented cloud recalls) --------------------------------
+#
+# Registered above the greedy /api/sources/{source_id:path} catch-all, the same
+# way /metadata and /ticket are: route order is what keeps a sub-path from being
+# swallowed as part of the id.
+
+
+def _run_recall(
+    ctx: _SidecarContext,
+    job: _SourceJob,
+    call: Callable[[], Any],
+    on_success: Callable[[Any], None] = lambda _result: None,
+) -> None:
+    """Shared try/except/finish skeleton for a resolve or warm job.
+
+    ``call`` does the blocking Flight-client recall; ``on_success`` gets its
+    return value to record any final progress before the job finishes done.
+    """
+    try:
+        result = call()
+    except ResolveCancelled:
+        job.finish(_JOB_CANCELLED)
+    except Exception as exc:  # noqa: BLE001 -- surfaced to the client as `error`
+        logger.warning(f"{job.kind} failed for {job.source_id}: {exc}")
+        ctx.diag.mark_error(f"{job.kind.upper()}_FAILED", str(exc))
+        job.finish(_JOB_ERROR, f"{type(exc).__name__}: {exc}")
+    else:
+        on_success(result)
+        job.finish(_JOB_DONE)
+
+
+def _resolve_worker(ctx: _SidecarContext, job: _SourceJob) -> None:
+    """Body of a resolve job. Runs on the registry's daemon thread."""
+
+    def _call() -> None:
+        ctx.get_client().resolve_source(
+            job.source_id,
+            on_progress=lambda p: job.set_progress(
+                {
+                    "elapsed_seconds": float(p.elapsed_seconds),
+                    "target_name": str(p.target_name),
+                    "target_bytes": int(p.target_bytes),
+                }
+            ),
+            should_cancel=job.cancel_requested,
+        )
+
+    _run_recall(ctx, job, _call)
+
+
+def _warm_worker(ctx: _SidecarContext, job: _SourceJob) -> None:
+    """Body of a warm job. Runs on the registry's daemon thread."""
+
+    def _snapshot(p: Any) -> Dict[str, Any]:
+        # Coerced, not passed through: `progress` is rendered straight to JSON
+        # by the status route, so anything unserializable landing here would
+        # turn every subsequent poll into a 500 rather than a failed job.
+        return {
+            "files_total": int(p.files_total),
+            "files_done": int(p.files_done),
+            "bytes_total": int(p.bytes_total),
+            "bytes_done": int(p.bytes_done),
+            "current_name": str(p.current_name),
+            "elapsed_seconds": float(p.elapsed_seconds),
+        }
+
+    def _call() -> Any:
+        return ctx.get_client().warm_source(
+            job.source_id,
+            on_progress=lambda p: job.set_progress(_snapshot(p)),
+            should_cancel=job.cancel_requested,
+        )
+
+    # The terminal counts, not the last heartbeat: a fast warm can finish
+    # without ever emitting one, and `files_total == 0` is how a client learns
+    # the source had nothing to warm (single-file -- resolve already recalled
+    # it). That is the server's own structural answer, so no client has to
+    # keep its own list of which source types are multi-file.
+    _run_recall(
+        ctx, job, _call, on_success=lambda final: job.set_progress(_snapshot(final))
+    )
+
+
+def _start_job(
+    kind: str,
+    worker: Callable[[_SidecarContext, _SourceJob], None],
+    source_id: str,
+    request: Request,
+) -> JSONResponse:
+    ctx = _sidecar(request)
+    ctx.check_token(request)
+    _require_same_origin(request)
+    job, started = ctx.jobs.start(kind, source_id, lambda j: worker(ctx, j))
+    # 202 either way: the caller's question is "is it under way", and joining a
+    # recall already in flight is the same answer as having begun one. `started`
+    # distinguishes them for a caller that cares.
+    return JSONResponse({**job.snapshot(), "started": started}, status_code=202)
+
+
+def _job_status(kind: str, source_id: str, request: Request) -> JSONResponse:
+    ctx = _sidecar(request)
+    ctx.check_token(request)
+    job = ctx.jobs.get(kind, source_id)
+    if job is None:
+        raise HTTPException(
+            status_code=404, detail=f"No {kind} job for source: {source_id}"
+        )
+    return JSONResponse(job.snapshot())
+
+
+def _cancel_job(kind: str, source_id: str, request: Request) -> JSONResponse:
+    ctx = _sidecar(request)
+    ctx.check_token(request)
+    _require_same_origin(request)
+    job = ctx.jobs.get(kind, source_id)
+    if job is None:
+        raise HTTPException(
+            status_code=404, detail=f"No {kind} job for source: {source_id}"
+        )
+    # Idempotent, and deliberately not an error on an already-finished job: the
+    # click races the last heartbeat often enough that treating it as a failure
+    # would mean showing the user an error for doing nothing wrong.
+    job.request_cancel()
+    return JSONResponse(job.snapshot())
+
+
+@_router.post("/api/sources/{source_id:path}/resolve/cancel")
+async def cancel_resolve(source_id: str, request: Request) -> JSONResponse:
+    """Ask an in-flight resolve to stop.
+
+    The server-side recall runs to completion and is cached regardless -- this
+    stops the client waiting on it, so a later resolve coalesces onto the
+    finished work rather than downloading again.
+    """
+    return _cancel_job("resolve", source_id, request)
+
+
+@_router.get("/api/sources/{source_id:path}/resolve/status")
+async def resolve_status(source_id: str, request: Request) -> JSONResponse:
+    """Progress of the resolve on this source. 404 if none was ever started."""
+    return _job_status("resolve", source_id, request)
+
+
+@_router.post("/api/sources/{source_id:path}/resolve")
+async def start_resolve(source_id: str, request: Request) -> JSONResponse:
+    """Begin resolving an unresolved (cloud / synced-folder) source.
+
+    Hydrating a dehydrated placeholder downloads the whole file -- minutes, real
+    disk, and a failure mode when offline -- so this is the consenting action
+    that catalog browsing deliberately avoids. Returns immediately with a job to
+    poll; a second call while one is running joins it rather than starting a
+    second recall of the same bytes.
+    """
+    return _start_job("resolve", _resolve_worker, source_id, request)
+
+
+@_router.post("/api/sources/{source_id:path}/warm/cancel")
+async def cancel_warm(source_id: str, request: Request) -> JSONResponse:
+    """Ask an in-flight warm to stop. Files already recalled stay resident."""
+    return _cancel_job("warm", source_id, request)
+
+
+@_router.get("/api/sources/{source_id:path}/warm/status")
+async def warm_status(source_id: str, request: Request) -> JSONResponse:
+    """Progress of the warm on this source. 404 if none was ever started."""
+    return _job_status("warm", source_id, request)
+
+
+@_router.post("/api/sources/{source_id:path}/warm")
+async def start_warm(source_id: str, request: Request) -> JSONResponse:
+    """Hydrate-ahead: recall a resolved source's member files server-side.
+
+    Idempotent and safe to call on any resolved source -- one with nothing to
+    warm finishes immediately with ``files_total == 0``, which is how a client
+    tells a single-file source from a multi-file one without keeping its own
+    list of source types.
+    """
+    return _start_job("warm", _warm_worker, source_id, request)
+
+
 @_router.get("/api/sources/{source_id:path}")
 async def get_source(source_id: str, request: Request) -> JSONResponse:
     ctx = _sidecar(request)
@@ -1855,13 +2328,20 @@ async def get_source(source_id: str, request: Request) -> JSONResponse:
     t0 = time.monotonic()
     try:
         client = ctx.get_client()
-        sources = client.list_sources()
-        if source_id not in sources:
+        # One row, not the whole catalog. This route is addressed -- the id is
+        # already in hand -- so streaming every source to look one up cost
+        # O(catalog) per call and, worse, inherited the listing's safety cap:
+        # a source past it answered 404 while being perfectly readable.
+        rows = client.query(
+            f"{_SOURCE_LIST_SQL} WHERE source_id = {sql_literal(source_id)}",
+            format="records",
+        )
+        if not rows:
             raise HTTPException(
                 status_code=404, detail=f"Source not found: {source_id}"
             )
         ctx.diag.latency.record((time.monotonic() - t0) * 1000)
-        return JSONResponse(_source_desc_to_dict(sources[source_id]))
+        return JSONResponse(_source_row_to_dict(rows[0]))
     except HTTPException:
         raise
     except Exception as exc:
@@ -1872,6 +2352,152 @@ async def get_source(source_id: str, request: Request) -> JSONResponse:
 
 
 # -- Tiles (cacheable GET reads) --------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# ROI annotations
+#
+# Its own /api/rois/* namespace, so nothing here is shadowed by the greedy
+# /api/sources/{source_id:path} catch-all. Bodies are canonical proto3 JSON in
+# both directions -- json_format here, protobuf-es in the SPA -- so one schema
+# serves both ends and neither hand-writes a DTO.
+# ---------------------------------------------------------------------------
+
+
+def _roi_bare_id(array_id: str) -> Tuple[str, Optional[str]]:
+    """Strip the HTTP version token before the store ever sees the array_id.
+
+    Annotations anchor on the UNVERSIONED array_id so they outlive an in-place
+    edit of the image; the token is spliced back onto the way out so the SPA
+    keeps addressing tensors in the form it already uses.
+    """
+    return _split_array_version(array_id)
+
+
+def _roi_flight_error(exc: Exception) -> HTTPException:
+    """Map a Flight failure onto the status the caller can act on."""
+    if isinstance(exc, flight.FlightUnavailableError):
+        # The server does not offer annotations (disabled, or no metadata DB).
+        return HTTPException(status_code=501, detail=str(exc))
+    if isinstance(exc, flight.FlightServerError):
+        # Rejected geometry, mismatched array_id, cap breached: caller's problem.
+        return HTTPException(status_code=422, detail=str(exc))
+    return HTTPException(status_code=502, detail=f"Flight error: {type(exc).__name__}")
+
+
+@_router.get("/api/rois/{array_id:path}")
+async def list_rois(array_id: str, request: Request) -> JSONResponse:
+    """A tensor's annotations, or one layer (``?set=``).
+
+    Without ``?set=`` the result covers the client-owned sets; a reserved
+    (``@``) set is returned only when named. No plane or bbox filter: the
+    client hit-tests and re-renders from the resident set.
+    """
+    ctx = _sidecar(request)
+    ctx.check_token(request)
+    bare_id, token = _roi_bare_id(array_id)
+    set_name = request.query_params.get("set", "")
+    try:
+        client = await run_in_threadpool(ctx.get_client)
+        result = await run_in_threadpool(client.list_rois, bare_id, set_name)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        ctx.diag.mark_error("ROI_LIST_FAILED", str(exc))
+        raise _roi_flight_error(exc)
+    return JSONResponse(_roi_result_to_dict(result, token))
+
+
+@_router.post("/api/rois/{array_id:path}")
+async def put_rois(array_id: str, request: Request) -> JSONResponse:
+    """Create or update annotations: ``{"rois": [...], "check_rev": bool}``.
+
+    ``drawn_against_version`` is the caller's to set -- the SPA already holds the
+    tensor's descriptor, and filling it here would cost a describe round trip on
+    every save.
+    """
+    ctx = _sidecar(request)
+    ctx.check_token(request)
+    _require_same_origin(request)
+    bare_id, token = _roi_bare_id(array_id)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=422, detail="Request body is not valid JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="Body must be a JSON object")
+
+    # No bool() coercion: bool("false") is True, so a client sending the
+    # string would silently get conditional writes ON. Refuse a non-bool as a
+    # 422 instead.
+    check_rev = body.get("check_rev", body.get("checkRev", False))
+    if not isinstance(check_rev, bool):
+        raise HTTPException(status_code=422, detail="check_rev must be a boolean")
+    raw_rois = body.get("rois", [])
+    if not isinstance(raw_rois, list):
+        raise HTTPException(status_code=422, detail="rois must be a list")
+    rois = []
+    try:
+        for item in raw_rois:
+            rois.append(json_format.ParseDict(item, RoiAnnotation()))
+    except (json_format.ParseError, TypeError) as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid annotation: {exc}")
+
+    # Strip the version from the BODY too, not just the path. Responses carry
+    # versioned array_ids (so the SPA keeps addressing tensors the way it
+    # already does), which means the natural read-edit-write round trip hands
+    # them straight back -- and the store, which only ever sees bare ids, would
+    # reject them as a mismatched tensor. The sidecar owns this translation at
+    # every boundary it has: path in, body in, body out.
+    for roi in rois:
+        if roi.array_id:
+            roi.array_id = _split_array_version(roi.array_id)[0]
+
+    try:
+        client = await run_in_threadpool(ctx.get_client)
+        result = await run_in_threadpool(
+            partial(client.put_rois, bare_id, rois, check_rev=check_rev)
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        ctx.diag.mark_error("ROI_PUT_FAILED", str(exc))
+        raise _roi_flight_error(exc)
+
+    payload = json_format.MessageToDict(result)
+    for stored in payload.get("stored", []):
+        stored["arrayId"] = _versioned_array_id(stored.get("arrayId", ""), token)
+    return JSONResponse(payload)
+
+
+@_router.delete("/api/rois/{array_id:path}")
+async def delete_rois(array_id: str, request: Request) -> JSONResponse:
+    """Delete annotations: ``?ids=a,b`` for specific ones, else the whole
+    tensor's set, narrowed by ``?set=`` when given."""
+    ctx = _sidecar(request)
+    ctx.check_token(request)
+    _require_same_origin(request)
+    bare_id, _token = _roi_bare_id(array_id)
+    raw_ids = request.query_params.get("ids", "")
+    roi_ids = [part for part in raw_ids.split(",") if part]
+    set_name = request.query_params.get("set", "")
+    try:
+        client = await run_in_threadpool(ctx.get_client)
+        result = await run_in_threadpool(client.delete_rois, bare_id, roi_ids, set_name)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        ctx.diag.mark_error("ROI_DELETE_FAILED", str(exc))
+        raise _roi_flight_error(exc)
+    return JSONResponse(json_format.MessageToDict(result))
+
+
+def _roi_result_to_dict(result, token: Optional[str]) -> Dict[str, Any]:
+    """Proto3 JSON for a RoiListResult, with array_ids re-versioned."""
+    payload = json_format.MessageToDict(result)
+    for roi in payload.get("rois", []):
+        roi["arrayId"] = _versioned_array_id(roi.get("arrayId", ""), token)
+    return payload
 
 
 @_router.get("/api/tile_info/{array_id:path}")
@@ -1891,7 +2517,13 @@ async def tile_info(array_id: str, request: Request) -> JSONResponse:
         # Published here and nowhere else: the viewer threads this array_id
         # through every subsequent tile URL, so the versioned form IS the
         # delivery mechanism -- no new field, no client change (biopb/biopb#780).
-        td, version = _tensor_desc_by_array_id(client, array_id)
+        # Metadata is asked for only when the id names a label set: it is
+        # where the axis mapping rides, and pulling a source's whole metadata
+        # row (an OME-XML, say) for every image's grid would be a real cost for
+        # a field only a set has.
+        td, version = _tensor_desc_by_array_id(
+            client, array_id, with_metadata=_names_label_set(array_id)
+        )
         candidates = [] if td is not None else _tensor_candidates(client, array_id)
         levels = () if td is None else _advertised_levels(client, td, version)
     except HTTPException:
@@ -1917,6 +2549,7 @@ async def tile_info(array_id: str, request: Request) -> JSONResponse:
     y_idx, x_idx, s_idx = plane_axes(dim_labels, shape)
     edge = _tile_edge(shape, [int(d) for d in td.chunk_shape], y_idx, x_idx)
 
+    image_axes = _label_image_axes(td)
     return JSONResponse(
         {
             "array_id": _versioned_array_id(td.array_id, version),
@@ -1933,6 +2566,10 @@ async def tile_info(array_id: str, request: Request) -> JSONResponse:
                 dim_labels, shape, _plane_axes_set(y_idx, x_idx, s_idx)
             ),
             "levels": _tile_levels(shape, y_idx, x_idx, edge),
+            # A label set only: which of its image's axes each of its own
+            # indexes, as the server states it. Absent for an image, and for a
+            # server that predates the block.
+            **({"image_axes": image_axes} if image_axes is not None else {}),
             # Advisory: the ladder the SERVER advertises, which is what the rungs
             # above are actually read from -- a native on-disk level where the
             # source ships one, else the computed level precache warms. Published
@@ -1992,7 +2629,7 @@ async def get_tile(
     ``png``/``jpeg`` forms this route used to serve: they have no caller since the
     server-rendered viewer was retired, and answering raw bytes to a request that
     asked for an image would be the silent-wrong-content failure the ``sel`` work
-    was written to avoid (docs/remote-viewer-tiles.md).
+    was written to avoid.
 
     Response headers mirror /api/slice (``X-Shape``/``X-Dtype``/``X-Dim-Labels``)
     plus ``X-Tile-Size``/``X-Tile-Level``/``X-Tile-Col``/``X-Tile-Row`` so a
@@ -2113,6 +2750,12 @@ async def get_tile(
             # answering 304 for bytes that changed. Empty when the source
             # publishes no version, which keeps exactly today's semantics.
             ("cv", current_version or ""),
+            # The epoch on its own, because an unversioned source has no `cv`
+            # to carry it and its tile URL never moves; without this the browser
+            # revalidates to the same ETag forever. Such a source still gets no
+            # version token: a token means `immutable` for a year, and an
+            # unversioned source is one whose content can change unannounced.
+            ("epoch", current_epoch()),
         ],
     )
     # The resolution above already refused a superseded token, so a token that
@@ -2222,7 +2865,7 @@ async def slice_tensor(req: SliceRequest, request: Request) -> Response:
     The scale is normally the caller's (``scale_hint``). ``scale_policy`` hands
     that decision back to the server: ``"volume"`` reads at the one scale a
     whole 3-D volume is kept warm at, which is the level napari 3-D and
-    ``XR3DLayer`` upload as a single texture (docs/precache-policy.md 5). A
+    ``XR3DLayer`` upload as a single texture. A
     client cannot compute that itself without reimplementing the pyramid
     planner, and a guess that lands one rung away misses every warmed chunk and
     pays a cold decode of the source instead. The two are mutually exclusive:
@@ -2484,6 +3127,8 @@ async def admin_status(request: Request) -> JSONResponse:
             "uptime_seconds": _h("uptime_seconds"),
             "full_scan_in_progress": _h("full_scan_in_progress"),
             "last_full_scan_finished_at": _h("last_full_scan_finished_at"),
+            "annotations_persisted": _h("annotations_persisted"),
+            "catalog_persisted": _h("catalog_persisted"),
         }
     )
 
@@ -2580,7 +3225,7 @@ def create_app(
     cors_origins: Optional[List[str]] = None,
     config_path: Optional[str] = None,
     supervised: Optional[bool] = None,
-    tls_ca_pem: Optional[bytes] = None,
+    tls_fingerprint: Optional[str] = None,
 ) -> FastAPI:
     """Create and return the FastAPI application.
 
@@ -2605,9 +3250,10 @@ def create_app(
             restarted from the browser (biopb/biopb#418). Defaults to reading
             ``BIOPB_DATA_PLANE_SUPERVISED`` from the env the control set, so a
             directly-launched ``biopb-tensor-server launch`` is not supervised.
-        tls_ca_pem: PEM certificate the flight plane serves, when TLS is on. The
-            sidecar is co-located with that plane and reads this off local disk,
-            so it trusts it explicitly instead of pinning it on first use.
+        tls_fingerprint: SHA-256 of the leaf the flight plane serves, when TLS is
+            on. The sidecar is co-located with that plane and takes this from the
+            material it was handed, so it verifies the certificate on every
+            connect instead of pinning whatever answers first.
             ``flight_location`` must then be a ``grpcs://`` URL.
 
     Returns:
@@ -2629,7 +3275,7 @@ def create_app(
         cache_bytes=cache_bytes,
         config_path=config_path,
         supervised=supervised,
-        tls_ca_pem=tls_ca_pem,
+        tls_fingerprint=tls_fingerprint,
     )
 
     app.add_middleware(
@@ -2669,18 +3315,35 @@ def create_app(
 # ---------------------------------------------------------------------------
 
 
-def _source_desc_to_dict(desc: Any) -> Dict[str, Any]:
-    """Convert a DataSourceDescriptor proto to a JSON-serialisable dict."""
+#: The catalog columns the source routes project. Deliberately not
+#: ``metadata_json``: the listing is structural, and the OME tree is its own
+#: route (``/api/sources/{id}/metadata``).
+_SOURCE_LIST_SQL = (
+    "SELECT source_id, source_url, source_type, is_resolved, tensors FROM sources"
+)
+
+
+def _source_row_to_dict(row: Dict[str, Any]) -> Dict[str, Any]:
+    """One ``sources`` catalog row as the TS ``DataSourceDescriptor`` JSON."""
     return {
-        "source_id": desc.source_id,
-        "source_url": desc.source_url,
-        "source_type": desc.source_type,
-        "metadata_json": desc.metadata_json or None,
-        "tensors": [_tensor_desc_to_dict(t) for t in desc.tensors],
+        "source_id": row["source_id"],
+        "source_url": row.get("source_url") or "",
+        "source_type": row.get("source_type") or "",
+        # Always null on a listing; see _SOURCE_LIST_SQL.
+        "metadata_json": None,
+        # There is no residency field here, and no column to read one from:
+        # "are the bytes local right now" is answered live by the `is_resident`
+        # action, never by a row (biopb/biopb#1035). `is_resolved` is the
+        # opposite case and belongs here -- monotonic, so a persisted row can
+        # only lag in the harmless direction. Default True for a row from a
+        # server predating the column, the right reading for every pre-existing
+        # source.
+        "is_resolved": bool(row.get("is_resolved", True)),
+        "tensors": [_tensor_row_to_dict(t) for t in (row.get("tensors") or [])],
     }
 
 
-def _tensor_desc_to_dict(td: Any) -> Dict[str, Any]:
+def _tensor_row_to_dict(t: Dict[str, Any]) -> Dict[str, Any]:
     """JSON form of one tensor entry inside a source listing.
 
     ``chunk_shape`` is carried for shape-compatibility with the TS
@@ -2689,11 +3352,11 @@ def _tensor_desc_to_dict(td: Any) -> Dict[str, Any]:
     ``/api/tile_info`` (which describes the tensor) -- biopb/biopb#812.
     """
     return {
-        "array_id": td.array_id,
-        "dim_labels": list(td.dim_labels),
-        "shape": [int(x) for x in td.shape],
-        "chunk_shape": [int(x) for x in td.chunk_shape],
-        "dtype": td.dtype,
+        "array_id": t["array_id"],
+        "dim_labels": list(t.get("dim_labels") or []),
+        "shape": [int(x) for x in (t.get("shape") or [])],
+        "chunk_shape": [],
+        "dtype": t.get("dtype") or "",
     }
 
 
@@ -2778,7 +3441,7 @@ def run(
     cache_bytes: int = 512 * 1024 * 1024,  # 512MB default (fits ~8 chunks of 64MB)
     cors_origins: Optional[List[str]] = None,
     config_path: Optional[str] = None,
-    tls_ca_pem: Optional[bytes] = None,
+    tls_fingerprint: Optional[str] = None,
 ) -> None:
     """Start the HTTP sidecar with uvicorn (blocking)."""
     import uvicorn
@@ -2789,7 +3452,7 @@ def run(
         cache_bytes=cache_bytes,
         cors_origins=cors_origins,
         config_path=config_path,
-        tls_ca_pem=tls_ca_pem,
+        tls_fingerprint=tls_fingerprint,
     )
     server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level="info"))
     # Windows: enable graceful `biopb server stop` via a sentinel-file watcher

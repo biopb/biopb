@@ -5,12 +5,12 @@ set (``DiscoveryState``), the server registration, the metadata-DB rows, and the
 derived indices (path->source_id, per-source signatures, cloud-source ids, and
 failed-source retry state). It is the single writer of that catalog, reached from
 the three desired-state sources, all of which reduce to the same
-add/remove/register primitives:
+add/refresh/remove/register primitives:
 
   * the periodic filesystem rescan  -> :meth:`_reconcile_discovered_state` /
     :meth:`_preserve_skipped_claims` (fed the walk's discovered claims);
-  * a runtime drag-drop / SDK add   -> :meth:`_commit_add_claim` (driven by
-    ``SourceManager.add_local_source``);
+  * a runtime drag-drop / SDK add   -> :meth:`_commit_add_claim` /
+    :meth:`_refresh_claim` (driven by ``SourceManager.add_local_source``);
   * a tensor-server upstream re-list -> :meth:`_reconcile_one_upstream`.
 
 ``SourceManager`` owns the *rescan machinery* (event loop, the filesystem walk
@@ -36,6 +36,8 @@ taken by the commit primitives) lives here.
 from __future__ import annotations
 
 import logging
+import os
+import stat
 import threading
 import time
 from dataclasses import dataclass
@@ -54,13 +56,19 @@ from biopb_tensor_server.core.discovery import (
 from biopb_tensor_server.core.errors import UpstreamConfigError
 from biopb_tensor_server.core.normalize import normalize_adapter
 from biopb_tensor_server.core.remote import is_remote_url
-from biopb_tensor_server.sources.tree_scanner import EntryState, build_entry_signature
+from biopb_tensor_server.core.source_registry import close_adapter
+from biopb_tensor_server.sources.tree_scanner import (
+    EntryState,
+    build_entry_signature,
+    entry_change_time,
+    entry_is_quiet,
+)
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import (
         SourceConfig as _SourceConfig,  # noqa: F401
     )
-    from biopb_tensor_server.core.metadata_db import MetadataDatabase
+    from biopb_tensor_server.serving.metadata_db import MetadataDatabase
     from biopb_tensor_server.serving.server import TensorFlightServer
 
 logger = logging.getLogger(__name__)
@@ -90,12 +98,11 @@ _EXPERIMENTAL_SOURCE_MESSAGES = {
     "cloud": (
         "Cloud / synced-folder sources (cloud=true, e.g. OneDrive Files "
         "On-Demand) are EXPERIMENTAL: resolve-on-serve and hydrate-ahead behavior "
-        "may change. See docs/cloud-storage-support.md."
+        "may change."
     ),
     "tensor-server": (
         "Remote tensor-server proxy sources (type=tensor-server) are "
-        "EXPERIMENTAL: the caching-passthrough proxy may change. "
-        "See docs/remote-tensor-cache.md."
+        "EXPERIMENTAL: the caching-passthrough proxy may change."
     ),
     "remote-url": (
         "Remote URL sources (s3://, http(s)://, ...) are EXPERIMENTAL and may change."
@@ -124,6 +131,10 @@ class Reconciler:
     _retry_backoff_initial = 1.0
     _retry_backoff_max = 60.0
     _failure_log_interval = 30.0
+    # A rebuild failing this many times running is presumed permanent (a member
+    # file deleted), not a transient DB hiccup -- remove the source rather than
+    # serve stale bytes forever on capped backoff.
+    _max_refresh_failures = 5
 
     def __init__(
         self,
@@ -137,6 +148,7 @@ class Reconciler:
         cloud_roots: Set[Path],
         entry_for: Callable[[str], Optional[EntryState]],
         notify_source_committed: Callable[[str], None],
+        stability_window: float = 30.0,
     ):
         self._server = server
         self._registry = registry
@@ -150,6 +162,10 @@ class Reconciler:
         # Injected SourceManager seams (see module docstring).
         self._entry_for = entry_for
         self._notify_source_committed = notify_source_committed
+        # Quiet period a claim must have had before this reconcile will remove or
+        # rebuild it -- the same window, and the same predicate, the claim gate
+        # applies on the way in (see ``_claim_is_quiet``).
+        self._stability_window = stability_window
 
         # Fine-grained state RLock: rescan/reconcile helpers re-enter other
         # state-mutating helpers, so nested calls on the same thread must not
@@ -209,7 +225,6 @@ class Reconciler:
     def _reconcile_discovered_state(
         self,
         discovered_state: DiscoveryState,
-        unstable_paths: List[Path],
         force_full: bool = False,
     ) -> None:
         """Apply add/remove/update diffs between the current and discovered states.
@@ -246,21 +261,32 @@ class Reconciler:
 
         removed_ids = [
             source_id
-            for source_id in sorted(current_ids - discovered_ids | changed_ids)
-            if not self._claim_overlaps_unstable(
-                current_claims[source_id], unstable_paths
-            )
+            for source_id in sorted(current_ids - discovered_ids)
+            if self._claim_is_quiet(current_claims[source_id])
         ]
         added_claims = [
             discovered_claims[source_id]
-            for source_id in sorted((discovered_ids - current_ids) | changed_ids)
+            for source_id in sorted(discovered_ids - current_ids)
             if self._should_retry_source(source_id)
+        ]
+        # A changed source is REBUILT in place rather than removed and re-added:
+        # the replacement adapter is registered on top of the live one, so the
+        # source is never absent from ListFlights or the catalog and a failed
+        # rebuild does not cost a working source. Still gated on stability --
+        # rebuilding mid-write reads a half-written file.
+        refreshed_ids = [
+            source_id
+            for source_id in sorted(changed_ids)
+            if self._claim_is_quiet(current_claims[source_id])
+            and self._should_retry_source(source_id)
         ]
 
         for source_id in removed_ids:
             self._commit_remove_source(source_id)
         for claim in added_claims:
             self._commit_add_claim(claim)
+        for source_id in refreshed_ids:
+            self._refresh_claim(discovered_claims[source_id])
 
     def _is_monitored_claim(self, claim: SourceClaim) -> bool:
         """Check if a claim belongs to one of the monitored local roots."""
@@ -277,32 +303,62 @@ class Reconciler:
             for monitored_dir in self._monitored_dirs
         )
 
-    def _claim_overlaps_unstable(
-        self,
-        claim: SourceClaim,
-        unstable_paths: List[Path],
-    ) -> bool:
-        """Check if any claimed member path falls in an unstable area."""
-        for member_path in claim.member_paths:
-            try:
-                resolved_member = Path(member_path).resolve(strict=False)
-            except OSError:
-                continue
+    def _claim_is_quiet(self, claim: SourceClaim) -> bool:
+        """Has this claim stopped changing long enough to remove or rebuild it?
 
-            for unstable_path in unstable_paths:
-                if resolved_member == unstable_path:
-                    return True
-                if unstable_path.is_dir() and resolved_member.is_relative_to(
-                    unstable_path
-                ):
-                    return True
-        return False
+        The removal/rebuild side of the stability gate, and deliberately the
+        *same* predicate (``entry_is_quiet``) the claim gate applies on the way
+        in: "quiet enough to claim" and "quiet enough to have stopped existing"
+        are one question asked from two sides, and answering it in two places is
+        what let them drift apart (biopb/biopb#1042).
+
+        Asks the claim's own member paths rather than scanning the walk
+        snapshot for unstable paths. Three reasons:
+
+        * it is the question actually being asked -- is *this source* churning
+          -- instead of "does it overlap anything that is";
+        * it is O(members), not O(catalog) with a ``Path.resolve()`` per member
+          per unstable path;
+        * it needs no snapshot, so a member the walk skipped this pass (a
+          pruned subtree, or a claim just added) still gets a real answer
+          instead of "not in the snapshot, so not unstable".
+
+        Prefers ``_entry_for``'s cached signature over a live stat, same as
+        ``_build_claim_signatures`` -- the walk that ran this pass already paid
+        for it, and for a cloud member skipping the cache means a network
+        round-trip. A member that cannot be stat'd on a cache miss is not
+        churning: it is gone, which is the case removal exists to act on.
+        """
+        now = time.time()
+        for member_path in {claim.primary_path, *claim.member_paths}:
+            if is_remote_url(member_path):
+                continue
+            entry = self._entry_for(member_path)
+            if entry is not None:
+                last_changed = entry.last_changed
+            else:
+                try:
+                    stat_result = os.stat(member_path)
+                except OSError:
+                    continue
+                last_changed = entry_change_time(stat_result, now)
+            if not entry_is_quiet(last_changed, now, self._stability_window):
+                return False
+        return True
 
     def _build_claim_signatures(
         self,
         claim: SourceClaim,
+        use_cache: bool = True,
     ) -> Dict[str, Tuple[Any, ...]]:
-        """Collect cached member-path signatures for a claim."""
+        """Collect member-path signatures for a claim.
+
+        ``use_cache=False`` stats every member instead of reading the scan
+        cache. The cache is the right source on the periodic path -- the walk
+        that just populated it is where the signatures came from -- and the
+        wrong one for a refresh fired between passes, which would compare
+        against the previous pass's entry and see nothing.
+        """
         signatures: Dict[str, Tuple[Any, ...]] = {}
         # Cloud-root membership is a property of the *source*, not the individual
         # member: every member lives under ``claim.primary_path``, so they share
@@ -313,14 +369,16 @@ class Reconciler:
         # ``cloud`` flag).
         cloud = self._is_under_cloud_root(claim.primary_path)
         for member_path in sorted(claim.member_paths):
-            entry = self._entry_for(member_path)
+            entry = self._entry_for(member_path) if use_cache else None
             if entry is not None:
                 signatures[member_path] = entry.signature
                 continue
 
             try:
-                resolved_path = Path(member_path).resolve(strict=False)
-                stat_result = resolved_path.stat()
+                # `stat` follows symlinks, so it lands where an explicit
+                # `resolve()` would -- and the mode it returns answers is_dir
+                # without a second trip.
+                stat_result = Path(member_path).stat()
             except OSError:
                 continue
 
@@ -329,7 +387,7 @@ class Reconciler:
             # per-claim flag so hydration/eviction does not flap a resolved source.
             signatures[member_path] = build_entry_signature(
                 stat_result,
-                resolved_path.is_dir(),
+                stat.S_ISDIR(stat_result.st_mode),
                 cloud=cloud,
             )
         return signatures
@@ -419,24 +477,113 @@ class Reconciler:
             self._record_failed_source_attempt(claim.source_id)
             return False
 
+        signatures = self._build_claim_signatures(claim)
         with self._lock:
             added = self._state.add_claim(claim, notify=False)
             if not added:
                 self._rollback_source_registration(claim.source_id)
                 self._record_failed_source_attempt(claim.source_id)
                 return False
-            self._source_signatures[claim.source_id] = self._build_claim_signatures(
-                claim
-            )
-            # Track cloud-root sources so the incremental reconcile can preserve
-            # them by a hash-set check (see _reconcile_discovered_state).
-            if self._is_under_cloud_root(claim.primary_path):
-                self._cloud_source_ids.add(claim.source_id)
-            self._clear_failed_source_attempt(claim.source_id)
+            self._commit_claim_bookkeeping(claim, signatures)
 
         # Route the freshly committed source to the precache worker. The
         # live-vs-startup gate (and the best-effort hook invocation) lives in the
         # injected SourceManager callback, which owns the startup/suppress state.
+        self._notify_source_committed(claim.source_id)
+        return True
+
+    def _commit_claim_bookkeeping(
+        self, claim: SourceClaim, signatures: Dict[str, Tuple[Any, ...]]
+    ) -> None:
+        """Index a claim that has just been committed. Caller holds ``self._lock``.
+
+        Every index a commit must leave consistent, in one place: the add and
+        refresh paths share it so a new one cannot be added to only one of them.
+        ``_cloud_source_ids`` is what lets the incremental reconcile preserve a
+        cloud-root source by a hash-set check (see _reconcile_discovered_state).
+        """
+        self._source_signatures[claim.source_id] = signatures
+        if self._is_under_cloud_root(claim.primary_path):
+            self._cloud_source_ids.add(claim.source_id)
+        self._clear_failed_source_attempt(claim.source_id)
+
+    def _refresh_claim(
+        self, claim: SourceClaim, fresh_signatures: bool = False
+    ) -> bool:
+        """Re-register an already-confirmed source against its bytes as they are now.
+
+        A source's descriptor and its ``content_version`` are both sampled in the
+        adapter's ``__init__``, so building a new adapter is the only way to
+        notice that a file was rewritten in place -- and the version is what
+        namespaces the chunk cache, so a refresh that skipped it would go on
+        serving the pre-edit bytes (biopb/biopb#944).
+
+        Registration goes through ``replace=True``, which swaps the new adapter
+        in over the old one and closes the old one only afterwards; see
+        :meth:`_register_source_claim`.
+
+        ``fresh_signatures`` re-stats the members rather than reading the scan
+        cache -- what a refresh fired outside the periodic pass needs, since the
+        cache still holds what the last pass saw.
+        """
+        with self._lock:
+            previous = self._state.claims.get(claim.source_id)
+        if previous is None:
+            return False
+
+        # The display url is the source's, not the rebuild's. Re-deriving it
+        # would either hand a dnd:// drop its native file:// url back -- losing
+        # its removability, since remove_source authorizes on that scheme -- or
+        # stamp the marker onto a monitored source, where it would falsely
+        # promise that nothing will re-add it.
+        live = self._server.sources.get(claim.source_id)
+        catalog_url = getattr(live, "_catalog_url", None) if live is not None else None
+
+        if not self._register_source_claim(
+            claim, catalog_url=catalog_url, replace=True
+        ):
+            self._record_failed_source_attempt(claim.source_id)
+            tracker = self._failed_sources.get(claim.source_id)
+            if tracker is not None and tracker.attempts >= self._max_refresh_failures:
+                logger.warning(
+                    "Giving up on source %s after %d consecutive failed "
+                    "rebuild attempts; removing it instead of continuing to "
+                    "serve its stale adapter",
+                    claim.source_id,
+                    tracker.attempts,
+                )
+                self._commit_remove_source(claim.source_id)
+            return False
+
+        # Outside the lock: with fresh_signatures this stats every member, and
+        # the lock it would otherwise hold also serializes the rescan's reconcile.
+        signatures = self._build_claim_signatures(claim, use_cache=not fresh_signatures)
+
+        with self._lock:
+            # Membership moves under a source (a file added to a sequence dir),
+            # so the claim is replaced rather than left at what was discovered
+            # when it was first registered.
+            self._state.remove_claim(previous.primary_path, notify=False)
+            # The rebuilt adapter is already live, so state must track the NEW
+            # membership even where it overlaps another source's claim; the old
+            # membership would describe an adapter that no longer exists. Hence
+            # replace_claim rather than add_claim's reject-on-conflict.
+            conflicting = self._state.replace_claim(claim)
+            if conflicting:
+                logger.error(
+                    "Refreshed source %s now overlaps another source's claim "
+                    "on %s; the rebuilt adapter is serving but those paths "
+                    "remain attributed to the other source",
+                    claim.source_id,
+                    sorted(conflicting),
+                )
+            self._commit_claim_bookkeeping(claim, signatures)
+
+        logger.info(f"Refreshed source: {claim.source_id}")
+        # Warm as a fresh add does, not only when the content_version moved: the
+        # cache evicts under LRU, so an unchanged source can still have holes.
+        # Cheap when it has none -- an unmoved token leaves every cache key
+        # identical, and resolve_chunk_data calls compute_fn only on a miss.
         self._notify_source_committed(claim.source_id)
         return True
 
@@ -477,7 +624,7 @@ class Reconciler:
             list_upstream_source_ids,
             resolve_upstream_credentials,
         )
-        from biopb_tensor_server.core.config import _namespaced_source_id
+        from biopb_tensor_server.sources.resolve import _namespaced_source_id
 
         endpoint, _ = _split_grpc_url(upstream.url)
         alias = upstream.alias
@@ -495,7 +642,7 @@ class Reconciler:
             tls_fingerprint=credentials.tls_fingerprint,
         )
         try:
-            # ONE bulk query_sources fetches every upstream source's id AND its
+            # ONE bulk query fetches every upstream source's id AND its
             # seed data (tensors + metadata), so mirroring is O(1) upstream RPCs
             # instead of one per added source at registration (biopb/biopb#266).
             # Complete: the server-side DuckDB catalog is not truncated like
@@ -508,7 +655,10 @@ class Reconciler:
             else:
                 # Legacy upstream without a SQL catalog: id-only enumeration, no
                 # seed -> each added source syncs via a live per-source RPC.
-                upstream_ids, complete = list_upstream_source_ids(client, endpoint)
+                # Complete: list_upstream_source_ids raises rather than
+                # returning a truncated list.
+                upstream_ids = list_upstream_source_ids(client, endpoint)
+                complete = True
                 seed_by_up_id = {}
         finally:
             # An exception here would replace whatever is propagating out of the
@@ -541,7 +691,7 @@ class Reconciler:
             self._commit_remove_source(source_id)
 
         def _row_to_seed(row):
-            """(tensors, metadata, data_resident, source_url, indexed_at) for
+            """(tensors, metadata, is_resolved, source_url, indexed_at) for
             seed_catalog, or None."""
             if row is None:
                 return None
@@ -553,7 +703,9 @@ class Reconciler:
             return (
                 row.get("tensors") or [],
                 metadata,
-                bool(row.get("data_resident")),
+                # Whether that row describes a real source yet. True for an
+                # upstream predating the column.
+                bool(row.get("is_resolved", True)),
                 row.get("source_url"),
                 row.get("indexed_at"),  # -> proxy content_version (biopb/biopb#178)
             )
@@ -579,7 +731,7 @@ class Reconciler:
 
         # Refresh already-mirrored sources from the same bulk result, so an
         # in-place upstream change -- notably unresolved -> resolved (empty ->
-        # populated tensors, data_resident false -> true) -- is reflected on the
+        # populated tensors, is_resolved false -> true) -- is reflected on the
         # catalog surface without a per-source RPC (biopb/biopb#266). Re-sync the
         # DuckDB row only when the seed actually changed, so a steady re-list does
         # not churn indexed_at.
@@ -717,27 +869,22 @@ class Reconciler:
     def should_warm(self, source_id: str) -> bool:
         """Whether the precache worker may warm *source_id* right now.
 
-        Residency is decided once, at registration time (``_claim_is_unresolved``):
-        a source whose files were resident then registers as a normal adapter and
-        keeps that registration even if the cloud provider (OneDrive Files
-        On-Demand, ...) later re-dehydrates the bytes. Precache has no per-chunk
-        residency gate, so a later backlog pass would read those bytes and trigger
-        a background recall the ``cloud = true`` policy exists to prevent (#174).
+        Registration decides residency once (``_claim_is_unresolved``), but the
+        cloud provider (OneDrive Files On-Demand, ...) can re-dehydrate the bytes
+        afterwards, and precache has no per-chunk gate -- so a backlog pass would
+        trigger exactly the recall the ``cloud = true`` policy exists to prevent
+        (#174).
 
-        This re-checks residency at warm time, mirroring the registration-path
-        rule so the two stay in sync. Only sources under a ``cloud`` root are
-        gated -- a normal local source always warms -- and the check is
-        metadata-only, so it never recalls content itself. Returns False (skip)
-        when any member *file* is now a placeholder, or when the source is no
-        longer registered.
+        Ask the adapter, not the claim's ``member_paths``: those are just the
+        directory for every dir-claimed format (zarr, ome-zarr, ome-zarr-hcs,
+        ndtiff, tiff-sequence, micromanager-legacy), and the placeholder stat is
+        ``is_file``-guarded, so a wholly dehydrated store reads as resident
+        (biopb/biopb#1035).
 
-        Boundary: like ``_claim_has_dehydrated_member``, the residency check is
-        ``is_file``-guarded, so it does not catch re-dehydration of a
-        dir-claiming source's *interior* files (ome-zarr, micromanager, ndtiff,
-        tiff-sequence, whose ``member_paths`` is just the directory). Those are
-        kept safe today by ``UnresolvedSourceAdapter.list_tensor_descriptors``
-        returning empty until resolved; closing the post-resolution re-warm path
-        is the cloud-storage spec's phase-4 deferral.
+        Only sources under a ``cloud`` root are asked, which keeps the bounded
+        stat walk off the common path. Returns False when the source is no longer
+        registered or its adapter cannot answer -- a gate that cannot see is not
+        permission to read.
         """
         with self._lock:
             claim = self._state.claims.get(source_id)
@@ -745,7 +892,13 @@ class Reconciler:
             return False
         if not self._is_under_cloud_root(claim.primary_path):
             return True
-        return not self._claim_has_dehydrated_member(claim)
+        adapter = self._server.sources.get(source_id)
+        if adapter is None:
+            return False
+        try:
+            return bool(adapter.is_resident())
+        except Exception:  # noqa: BLE001 -- a gate that cannot see fails closed
+            return False
 
     def _on_source_resolved(self, source_id: str, adapter: Any) -> None:
         """Backfill the metadata DB when an unresolved cloud source resolves.
@@ -801,12 +954,20 @@ class Reconciler:
         claim: SourceClaim,
         catalog_seed: Optional[tuple] = None,
         catalog_url: Optional[str] = None,
+        replace: bool = False,
     ) -> bool:
         """Create and register a source, rolling back on partial failure.
 
+        ``replace`` re-registers a source that is already live: the new adapter
+        is swapped in on top of the old one and the old one is closed only after
+        the swap and the catalog upsert have both succeeded. Ordering matters --
+        unregister-then-register would leave the source absent from ListFlights
+        and its catalog row deleted for the length of the rebuild, and gone for
+        good if the rebuild then failed.
+
         ``catalog_seed`` (biopb/biopb#266) is an optional
-        ``(tensors, metadata, data_resident, source_url)`` tuple from a bulk upstream
-        ``query_sources``; when the adapter supports it (the remote proxy), it is
+        ``(tensors, metadata, is_resolved, source_url)`` tuple from a bulk upstream
+        ``query``; when the adapter supports it (the remote proxy), it is
         applied before ``sync_source_added`` so registration needs no per-source
         upstream RPC. ``catalog_url`` (drag-drop re-rooting) overrides the display
         ``source_url`` on the adapter *before* register/sync so both ListFlights
@@ -818,7 +979,6 @@ class Reconciler:
                 type=claim.source_type,
                 url=str(claim.primary_path),
                 source_id=claim.source_id,
-                dim_labels=claim.dim_labels,
                 dataset=claim.extra_config.get("dataset"),
                 credentials_profile=claim.extra_config.get("credentials_profile"),
                 alias=claim.extra_config.get("alias"),
@@ -855,11 +1015,11 @@ class Reconciler:
                 # no per-source upstream RPC (biopb/biopb#266). Guarded by the
                 # adapter opting in via seed_catalog (only the remote proxy does).
                 if catalog_seed is not None and hasattr(adapter, "seed_catalog"):
-                    tensors, metadata, data_resident, source_url, indexed_at = (
+                    tensors, metadata, is_resolved, source_url, indexed_at = (
                         catalog_seed
                     )
                     adapter.seed_catalog(
-                        tensors, metadata, data_resident, source_url, indexed_at
+                        tensors, metadata, is_resolved, source_url, indexed_at
                     )
         except UpstreamConfigError as e:
             # Same skip, different diagnosis: "failed to create adapter" reads as
@@ -891,6 +1051,7 @@ class Reconciler:
             adapter._catalog_url = catalog_url
 
         registered = False
+        displaced: Optional[Any] = None
         try:
             # Normalize the axis order here rather than leaning on what
             # register_source hands back (biopb/biopb#596): the catalog row
@@ -898,16 +1059,29 @@ class Reconciler:
             # out, and the wrap is idempotent, so the registry re-applying it
             # is a no-op.
             adapter = normalize_adapter(adapter)
-            self._server.register_source(claim.source_id, adapter)
+            if replace:
+                adapter, displaced = self._server.swap_source(claim.source_id, adapter)
+            else:
+                self._server.register_source(claim.source_id, adapter)
             registered = True
 
             # Raises on failure -> the except below rolls back register_source,
             # so a catalog write error never leaves a source visible in
-            # ListFlights but absent from DuckDB.
+            # ListFlights but absent from DuckDB. sync_source_added is an upsert,
+            # so a replace overwrites the row rather than needing it deleted
+            # first -- which is what keeps the source continuously catalogued.
             if self._metadata_db is not None:
                 self._metadata_db.sync_source_added(claim.source_id, adapter)
 
             self._path_to_source_id[claim.primary_path] = claim.source_id
+            if displaced is not None:
+                # Only now, and this ordering is the reason `swap` hands the
+                # displaced adapter back open rather than closing it: until the
+                # catalog upsert above has succeeded, the except below may still
+                # restore this adapter and go on serving from it. Draining the
+                # reader that resolved it before the swap is close()'s own job,
+                # not what the delay buys.
+                close_adapter(displaced)
             logger.info(f"Registered source with server: {claim.source_id}")
             return True
         except Exception as e:
@@ -919,9 +1093,32 @@ class Reconciler:
                 e,
                 exc_info=True,
             )
-            if registered:
+            if registered and displaced is not None:
+                # A failed REBUILD must not cost the working source: put the
+                # adapter that was serving back, and its catalog row with it.
+                self._restore_displaced_source(claim.source_id, displaced)
+            elif registered:
                 self._rollback_source_registration(claim.source_id)
+            if self._server.sources.get(claim.source_id) is not adapter:
+                # The adapter this call built is not the one serving -- the swap
+                # never took, or was undone above -- and nothing else holds it,
+                # so its handles are ours to release. Harmless where the
+                # rollback already closed it: close() must be safe twice.
+                close_adapter(adapter)
             return False
+
+    def _restore_displaced_source(self, source_id: str, displaced: Any) -> None:
+        """Put a swapped-out adapter back after a failed replace (best-effort)."""
+        try:
+            self._server.swap_source(source_id, displaced)
+            if self._metadata_db is not None:
+                self._metadata_db.sync_source_added(source_id, displaced)
+        except Exception:
+            logger.exception(
+                "Failed to restore the previous adapter for source %s; it is "
+                "no longer served",
+                source_id,
+            )
 
     def _teardown_source_bookkeeping(self, source_id: str) -> None:
         """Drop a source's catalog row and path-map entries (best-effort).

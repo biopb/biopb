@@ -86,6 +86,11 @@ export const TIPS: Tip[] = [
     when: (ctx) => ctx.scanning,
   },
   {
+    id: "roi-delete",
+    text: "Pick ↖, click an annotation, then press Delete to remove it — the panel names what is selected.",
+    when: selected,
+  },
+  {
     id: "hover-details",
     text: "Hover a source for its full path, or a tensor for its array id, shape and dtype.",
   },

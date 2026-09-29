@@ -4,6 +4,10 @@ Relies on OS page cache for raw data caching.
 """
 
 import json
+import logging
+import os
+import shutil
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
@@ -11,6 +15,7 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
+from biopb_tensor_server.adapters._writable import WritableSource
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
     catalog_entry,
@@ -25,14 +30,148 @@ if TYPE_CHECKING:
     from biopb_tensor_server.core.config import SourceConfig
     from biopb_tensor_server.core.discovery import DiscoveryState
 
+logger = logging.getLogger(__name__)
 
-class ZarrAdapter(TensorAdapter):
+# The upload marker a server-minted store carries in its root ``.zattrs``:
+# ``{"biopb": {"upload": {"state": "pending" | "ready"}}}``. Written at create,
+# flipped when the upload reaches READY. A store still ``pending`` when a
+# server starts belonged to an upload nobody ever published -- it is a
+# crashed upload, so ``UploadManager.discard_unfinished_stores`` deletes it and
+# discovery declines it (``is_unfinished_upload``), so a shared root never
+# serves a partial store as a source of its own (biopb/biopb#1059).
+UPLOAD_ATTR = "biopb"
+UPLOAD_PENDING = "pending"
+UPLOAD_READY = "ready"
+
+
+def read_zattrs(store: Path) -> Optional[dict]:
+    """The root ``.zattrs`` of a local store as a dict, or None if unreadable.
+
+    The one reader for the server's own stores (uploads, label sidecars);
+    discovery reads through ``ClaimContext`` because its paths may be remote.
+    """
+    try:
+        parsed = json.loads((store / ".zattrs").read_text())
+    except (OSError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def upload_state(zattrs: Any) -> Optional[str]:
+    """The upload marker's state from a parsed ``.zattrs``, or None if unmarked."""
+    if not isinstance(zattrs, dict):
+        return None
+    upload = (zattrs.get(UPLOAD_ATTR) or {}).get("upload")
+    if not isinstance(upload, dict):
+        return None
+    state = upload.get("state")
+    return state if isinstance(state, str) else None
+
+
+def with_upload_state(
+    zattrs: dict, state: str, expires_at: Optional[float] = None
+) -> dict:
+    """*zattrs* with the upload marker set to *state* (a copy; input untouched).
+
+    The rest of the marker is **kept**: ``_publish_store`` rewrites the state
+    over whatever is on disk, and a deadline granted at ``add_tensor`` must
+    survive reaching READY.
+
+    *expires_at* is unix seconds -- a wall clock, unlike the intervals
+    ``UploadProgress`` measures, because it is written down and has to mean the
+    same thing to the next life of the server.
+    """
+    out = dict(zattrs)
+    block = dict(out.get(UPLOAD_ATTR) or {})
+    upload = dict(block.get("upload") or {})
+    upload["state"] = state
+    if expires_at is not None:
+        upload["expires_at"] = float(expires_at)
+    block["upload"] = upload
+    out[UPLOAD_ATTR] = block
+    return out
+
+
+def upload_expires_at(zattrs: Any) -> Optional[float]:
+    """When the marker says this upload stops being served, or None for never.
+
+    Read back at adoption, so a lifetime outlives the process that granted it.
+    """
+    if not isinstance(zattrs, dict):
+        return None
+    upload = (zattrs.get(UPLOAD_ATTR) or {}).get("upload")
+    if not isinstance(upload, dict):
+        return None
+    deadline = upload.get("expires_at")
+    return float(deadline) if isinstance(deadline, (int, float)) else None
+
+
+def is_unfinished_upload(ctx: ClaimContext) -> bool:
+    """Whether the ``.zarr`` directory at *ctx* is an upload that never finished.
+
+    Reads ``.zattrs`` only when it is present and resident: a non-resident
+    cloud placeholder is deferred by the claims themselves, and a store nobody
+    marked is not an upload.
+    """
+    return _biopb_block(ctx).get("upload", {}).get("state") == UPLOAD_PENDING
+
+
+def is_upload_subsystem_store(ctx: ClaimContext) -> bool:
+    """Whether the directory at *ctx* belongs to the upload subsystem.
+
+    An uploaded tensor's store is a ``.zarr`` group like any other, so nothing
+    in its shape stops a claim taking it -- and if it were taken, the same
+    bytes would reach the catalog twice: once as a tensor of the source it was
+    added to, once as a source of its own under a path hash of discovery's. The
+    rule that keeps them apart is ``write_dir`` being outside every discovery
+    root; this is the second line, for a ``write_dir`` misplaced inside one
+    (``write_dir_under_root`` warns).
+
+    Keyed on the ``biopb`` block the subsystem writes and nothing else does
+    (``adapters.members.member_attrs``), so a user's own zarr group is
+    unaffected however it is laid out -- and on the block rather than the
+    upload marker, because a member stays the subsystem's once it is filled.
+    """
+    return "member" in _biopb_block(ctx)
+
+
+def _biopb_block(ctx: ClaimContext) -> dict:
+    """The ``biopb`` bookkeeping block of the ``.zattrs`` at *ctx*, or empty.
+
+    Read only when the file is present and resident: a non-resident cloud
+    placeholder is deferred by the claims themselves, and a store nobody
+    marked carries no block.
+    """
+    zattrs_ctx = ctx.join(".zattrs")
+    if not zattrs_ctx.exists() or not zattrs_ctx.is_resident():
+        return {}
+    try:
+        block = json.loads(ctx.read_text(".zattrs")).get(UPLOAD_ATTR)
+    except Exception:
+        return {}
+    return block if isinstance(block, dict) else {}
+
+
+class ZarrAdapter(WritableSource, TensorAdapter):
     """Adapter for Zarr/N5 chunked arrays.
 
     Supports both local filesystem and remote storage (S3, GCS, etc.) via fsspec.
     For remote storage, uses zarr.FSStore with fsspec filesystem.
 
+    Writable: a chunk-aligned ``put_chunk`` lands in the store. Only an adapter
+    minted as an upload (``adapters.fields.create_field_upload``,
+    ``adapters.labels.create_label_upload``) tracks one; a catalogued store
+    accepts writes untracked.
+
+    An upload's store is the server's own (minted under ``write_dir``), so the
+    upload half here also owns its end: discard removes the directory
+    (:meth:`_dispose_store`) and publishing clears the pending marker
+    (:meth:`_publish_store`). Neither touches a discovered store, which
+    never began an upload and so never reaches either.
     """
+
+    # A real store on disk, catalogued: the boundary keeps the row in step.
+    durable = True
 
     @classmethod
     def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:
@@ -50,6 +189,8 @@ class ZarrAdapter(TensorAdapter):
         """
         # Must be a directory ending in .zarr
         if not ctx.is_dir() or not ctx.name.endswith(".zarr"):
+            return None
+        if is_unfinished_upload(ctx) or is_upload_subsystem_store(ctx):
             return None
 
         # Check for zarr structure files
@@ -124,7 +265,7 @@ class ZarrAdapter(TensorAdapter):
         """Create adapter instance from SourceConfig.
 
         Args:
-            source: SourceConfig with url, source_id, dim_labels
+            source: SourceConfig with url, source_id
             credentials_config: Optional CredentialsConfig for remote authentication
 
         Returns:
@@ -149,7 +290,7 @@ class ZarrAdapter(TensorAdapter):
             path = Path(source.url)
             arr = zarr.open_array(str(path), mode="r")
 
-        return cls(arr, source.source_id, source.dim_labels)
+        return cls(arr, source.source_id)
 
     def __init__(
         self,
@@ -162,7 +303,6 @@ class ZarrAdapter(TensorAdapter):
         Args:
             zarr_array: Zarr array object
             source_id: Unique identifier for this data source
-            dim_labels: Optional dimension labels
         """
         self.zarr_array = zarr_array
         self.source_id = source_id
@@ -180,6 +320,18 @@ class ZarrAdapter(TensorAdapter):
         # Inherited by OmeZarrAdapter / _HcsFieldAdapter via super().__init__.
         self._content_version = content_version_from_path(self._source_url)
         self._source_type = "zarr"
+        # The directory the server minted for this adapter, for the two store
+        # hooks (and ``LabelSetAdapter.delete_store``); None on a store the
+        # server merely reads -- a discovered zarr, a label group inside a
+        # user's file -- which is not this adapter's to remove or mark.
+        self._upload_store_path: Optional[Path] = None
+        # Serializes chunk writes against store disposal. Taken by ``put_chunk``
+        # around refuse-and-store, so a write that passed ``_refuse_write``
+        # lands before ``_dispose_store`` removes the directory, and a write
+        # arriving after is refused -- rather than recreating the directory a
+        # moment after it was deleted (zarr's DirectoryStore makes parents on
+        # write). Ordered before ``progress.lock``; disposal never holds that.
+        self._write_lock = threading.Lock()
 
     @property
     def read_block_shape(self) -> Optional[Tuple[int, ...]]:
@@ -217,71 +369,76 @@ class ZarrAdapter(TensorAdapter):
         slices = self._bounds_to_slices(bounds)
         return self.zarr_array[slices]
 
-    def write_chunk(self, chunk_idx: Tuple[int, ...], data: np.ndarray) -> None:
-        """Write chunk data to zarr array.
-
-        Args:
-            chunk_idx: Chunk coordinates (e.g., (0, 1, 2))
-            data: Numpy array with chunk data
-        """
-        chunks = self.zarr_array.chunks
-        slices = tuple(
-            slice(idx * chunks[d], (idx + 1) * chunks[d])
-            for d, idx in enumerate(chunk_idx)
-        )
-
-        # Handle edge chunks - pad if data smaller than expected
-        expected_shape = tuple(s.stop - s.start for s in slices)
-        if data.shape != expected_shape:
-            padded = np.zeros(expected_shape, dtype=self.zarr_array.dtype)
-            src_slices = tuple(
-                slice(0, min(d, es))
-                for d, es in zip(data.shape, expected_shape, strict=True)
-            )
-            padded[src_slices] = data[src_slices]
-            data = padded
-
-        self.zarr_array[slices] = data
-
     def put_chunk(self, bounds, data, expected_shape, dtype) -> None:
-        """Chunk-aligned write: ``bounds`` must land on the zarr chunk grid.
+        with self._write_lock:
+            super().put_chunk(bounds, data, expected_shape, dtype)
 
-        Absorbs the alignment/reshape the DoPut handler used to perform inline,
-        then delegates the store to ``write_chunk``. The grid comes straight off
-        ``self.zarr_array.chunks`` -- the same grid ``write_chunk`` writes into
-        (and equal to the descriptor's ``chunk_shape``) -- so validation and
-        storage never disagree, and the method stays purely source-level.
+    def _dispose_store(self) -> None:
+        """Remove the minted directory; see ``_write_lock`` for the ordering."""
+        path = self._upload_store_path
+        if path is None:
+            return
+        with self._write_lock:
+            shutil.rmtree(path, ignore_errors=True)
+        logger.info(f"Removed the store of discarded upload {self.source_id}: {path}")
+
+    def _publish_store(self) -> None:
+        self._write_upload_state(UPLOAD_READY)
+
+    def _write_upload_state(self, state: str) -> None:
+        """Rewrite the root ``.zattrs`` with the upload marker set to *state*.
+
+        Atomic (write-then-replace) so a crash mid-write cannot leave a store
+        with no ``.zattrs`` at all. Raises ``OSError`` when it cannot -- the
+        store is gone because discard raced, or the disk refused -- and
+        ``set_status`` decides which of the two it was.
         """
+        path = self._upload_store_path
+        if path is None:
+            return
+        zattrs_path = path / ".zattrs"
+        with self._write_lock:
+            zattrs = json.loads(zattrs_path.read_text())
+            tmp = zattrs_path.with_name(".zattrs.tmp")
+            tmp.write_text(json.dumps(with_upload_state(zattrs, state)))
+            os.replace(tmp, zattrs_path)
+
+    def _store_chunk(self, bounds, data, expected_shape, dtype) -> None:
+        """Grid-aligned write: *bounds* must be whole zarr chunks.
+
+        In practice exactly one: a store this server minted is chunked on the
+        grid the planner mints on (``_writable.upload_grid``), and a write
+        takes a planned ticket. The check is
+        written as *whole chunks* rather than *one chunk* because that is the
+        property that makes the write safe -- anything else is a
+        read-modify-write of a chunk another write also touches, and zarr locks
+        nothing across writers -- and it holds however the two grids relate.
+        """
+        grid = list(self.zarr_array.chunks)
+        shape = list(self.zarr_array.shape)
+
+        for d, (start, stop, cell, dim) in enumerate(
+            zip(bounds.start, bounds.stop, grid, shape, strict=True)
+        ):
+            if start % cell != 0:
+                raise ValueError(
+                    f"Chunk start[{d}]={start} not aligned to chunk_shape[{d}]={cell}"
+                )
+            if stop % cell != 0 and stop != dim:
+                raise ValueError(
+                    f"Chunk stop[{d}]={stop} is not aligned to "
+                    f"chunk_shape[{d}]={cell}, and is not the tensor edge ({dim})"
+                )
+
         arr = data.to_numpy()
         if expected_shape:
             arr = arr.reshape(expected_shape)
-        chunk_shape = list(self.zarr_array.chunks)
-
-        # start must align to the chunk grid
-        for d, (start, chunk_size) in enumerate(
-            zip(bounds.start, chunk_shape, strict=True)
-        ):
-            if start % chunk_size != 0:
-                raise ValueError(
-                    f"Chunk start[{d}]={start} not aligned to chunk_shape[{d}]={chunk_size}"
-                )
-
-        # size may only shrink at the edge, never exceed the nominal chunk
-        actual_size = [
-            stop - start for start, stop in zip(bounds.start, bounds.stop, strict=True)
-        ]
-        for d, (actual, expected) in enumerate(
-            zip(actual_size, chunk_shape, strict=True)
-        ):
-            if actual > expected:
-                raise ValueError(
-                    f"Chunk size[{d}]={actual} exceeds chunk_shape[{d}]={expected}"
-                )
-
-        chunk_idx = tuple(
-            int(s // cs) for s, cs in zip(bounds.start, chunk_shape, strict=True)
-        )
-        self.write_chunk(chunk_idx, arr)
+        self.zarr_array[
+            tuple(
+                slice(int(start), int(stop))
+                for start, stop in zip(bounds.start, bounds.stop, strict=True)
+            )
+        ] = arr
 
     def get_tensor_descriptor(self) -> TensorDescriptor:
         return TensorDescriptor(

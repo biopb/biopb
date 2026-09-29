@@ -6,8 +6,6 @@ This sub-project predates the other biopb components and was folded into the bio
 
 ## Core concept
 
-TensorFlightServer has a simple goal: to **efficiently** read very large imaging datasets, and to do it regardless of the storage format the data are in.
-
 Internally, TensorFlightServer works by **_transcoding_** — converting the original data into **Apache Arrow** format — because many legacy formats are simply too difficult to read both lazily and efficiently. Notably, TensorFlightServer's transcode process is:
 
   - **on demand** - so it only transcodes the data the user cares about
@@ -16,6 +14,7 @@ Internally, TensorFlightServer works by **_transcoding_** — converting the ori
 
 The Arrow data are then served to the user via an Arrow Flight server, which brings a few additional benefits:
 
+  - **Concurrency**: a benefit of the arrow format is its well-proven concurrency efficiency. We support thread-level, multi-process, and distributed read.
   - **Network transparency**: the data can sit anywhere on the network and still be accessible.
   - **Metadata database**: all metadata is centralized in one database and queryable using standard SQL.
   - **Language-agnostic**: the data can be read from any of the languages Arrow Flight supports.
@@ -30,17 +29,14 @@ The Arrow data are then served to the user via an Arrow Flight server, which bri
 | Akoya | `.qptiff` | Native, Akoya PhenoImager multiplex whole-slide format |
 | Micro-Manager | NDTiff (`NDTiff.index`), legacy (`metadata.txt`) | Multi-file MM acquisitions; native (`ndtiff`) |
 | Zeiss | `.czi`, `.lsm` | Native (`.czi` via `pylibCZIrw`, `.lsm` via `tifffile`) |
-| Leica | `.lif` | Native (`bioio-lif`) |
-| Nikon | `.nd2` | Native (`bioio-nd2`) |
-| DeltaVision | `.dv` | Native (`bioio-dv`) |
+| Leica | `.lif` | Native (`readlif`) |
+| Nikon | `.nd2` | Native (`nd2`) |
+| DeltaVision | `.dv` | Native (`mrc`) |
 | DICOM | `.dcm` | Single files and multi-file series; native (`pydicom`) |
 | NIfTI | `.nii`, `.nii.gz` | Native (`nibabel`) |
 | MRC | `.mrc` | Native (`rosettasciio`) |
 | EMD | `.emd` | Native (`rosettasciio`) both Berkeley and Velox flavors |
 | HDF5 | `.h5`, `.hdf5` | Requires explicit dataset path in config |
-| Olympus | `.oif`, `.oib` | Java Bio-Formats (`bioio-bioformats`) |
-| Imaris | `.ims` | Java Bio-Formats (`bioio-bioformats`) |
-| Zeiss (legacy) | `.zvi` | Java Bio-Formats (`bioio-bioformats`) |
 
 ## Client
 
@@ -62,8 +58,8 @@ from biopb.tensor import TensorFlightClient
 # Connect to a running server (token is optional in local mode)
 client = TensorFlightClient("grpc://localhost:8815", token="your-token")
 
-# List available sources
-sources = client.list_sources()
+# Browse the catalog (SQL, server-side)
+sources = client.query("SELECT source_id, source_url FROM sources", format="records")
 
 # Get a lazy dask array for a specific tensor, by its globally-unique array_id:
 # "source_id/field" for a multi-tensor source, or "source_id" for a single one.
@@ -139,7 +135,6 @@ You can create a custom config file to fine-tune server behavior, e.g. specifyin
 {
   "server": { "log_level": "INFO" },
   "cache": {
-    "backend": "file",
     "file_max_segment_mb": 256,
     "file_max_total_gb": 128
   },
@@ -148,8 +143,7 @@ You can create a custom config file to fine-tune server behavior, e.g. specifyin
     {
       "url": "/experiment.zarr",
       "alias": "my-zarr",
-      "type": "zarr",
-      "dim_labels": ["z", "y", "x"]
+      "type": "zarr"
     }
   ]
 }
@@ -186,8 +180,11 @@ biopb-tensor-server diagnose ...  Diagnostic commands for a running server
 # Local mode (the default loopback bind — no token required)
 biopb-tensor-server launch --config biopb.json
 
-# Remote mode (a public bind — token required, auto-generated if omitted)
-biopb-tensor-server launch --config biopb.json --host 0.0.0.0 --token mytoken...
+# Remote mode (a public bind — token required, auto-generated if omitted;
+# --external-location is also required, since a wildcard bind is not itself
+# a reachable address — set it to the address a remote client should dial)
+biopb-tensor-server launch --config biopb.json --host 0.0.0.0 \
+  --external-location grpc://my-hostname:8815 --token mytoken...
 
 # Over TLS (clients dial grpcs:// and pin the cert on first connect)
 biopb-tensor-server launch --config biopb.json --tls

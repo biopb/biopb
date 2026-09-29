@@ -1,12 +1,16 @@
-"""Configuration management for TensorFlight server.
+"""Configuration schema and file I/O for the TensorFlight server.
+
+This module describes and parses config; it never acts on it. Executing a source
+entry -- walking a directory through the adapters, expanding a ``grpc://``
+upstream -- is :mod:`biopb_tensor_server.sources.resolve`, which sits above the
+adapters where the registry is reachable.
 
 Reads JSON config files (``biopb.json``) carrying:
 - Server settings (host, port)
 - Data source definitions (explicit files or directory auto-discovery)
 - Credential profiles for remote storage (S3, GCS, etc.)
 
-JSON is the only supported format; a pre-#34 ``biopb.toml`` is converted with
-``biopb-tensor-server migrate-config`` (see biopb/biopb#34).
+JSON is the only supported config format (see biopb/biopb#34).
 
 Example config (explicit):
 ```json
@@ -16,7 +20,6 @@ Example config (explicit):
       "type": "zarr",
       "url": "/data/images.zarr",
       "alias": "my-image",
-      "dim_labels": ["z", "y", "x"]
     },
     { "type": "hdf5", "url": "/data/sample.h5", "dataset": "/images/channel0" }
   ]
@@ -70,7 +73,7 @@ import json
 import logging
 import os
 import tempfile
-from dataclasses import MISSING as _DC_MISSING, dataclass, field, fields, replace
+from dataclasses import MISSING as _DC_MISSING, dataclass, field, fields
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
@@ -99,7 +102,6 @@ from biopb._config_validate import (
 from biopb._locations import (
     CANONICAL_CONFIG_NAME as CANONICAL_CONFIG_NAME,
     DEFAULT_CONFIG_DIR as DEFAULT_CONFIG_DIR,
-    LEGACY_CONFIG_NAME as LEGACY_CONFIG_NAME,
     find_config as find_config,
 )
 
@@ -108,17 +110,11 @@ from biopb._locations import (
 # on PyPI) validates the same pyramid rows against the same rules, with no drift
 # (biopb/biopb#34, #182). `_Range`/`_Enum` stay as local aliases so the
 # `_CONSTRAINTS` table and config_schema keep their existing spelling.
-from biopb_tensor_server.core.chunk import PRECACHE_WARM_BUDGET_BYTES
 from biopb_tensor_server.core.discovery import (
-    AdapterRegistry,
-    ClaimContext,
-    DiscoveryState,
-    SourceClaim,
-    discover_sources as claim_based_discover,
     generate_source_id,
-    get_file_identity,
+    local_path_is_rooted,
+    resolve_local_path,
 )
-from biopb_tensor_server.core.errors import UpstreamConfigError
 from biopb_tensor_server.core.remote import (
     CredentialProfile,
     CredentialsConfig,
@@ -151,22 +147,6 @@ def _default_file_cache_dir() -> Path:
 
 
 DEFAULT_FILE_CACHE_DIR = _default_file_cache_dir()
-
-
-def _default_cache_backend() -> str:
-    """Default cache backend when a config doesn't specify one.
-
-    Always "file". The file backend caches *decoded* chunks as Arrow IPC
-    segments, so repeat reads skip re-decoding the raw format -- and decoding
-    TIFF/CZI/etc. is typically slower than an Arrow IPC read-back. It also
-    persists across restarts and powers the localhost cache-file fast path
-    (issue #9). Windows is safe now that the backend copies batches off the
-    segment mmap so eviction can unlink (copy-on-read, biopb/biopb#5). The
-    localhost cache-file *handoff* stays POSIX-only (a client's cross-process
-    mmap still blocks unlink on Windows), but that is a client-side gate,
-    independent of the server's choice of backend.
-    """
-    return "file"
 
 
 # --- Declarative config validation (biopb/biopb#34) ---------------------------
@@ -213,11 +193,12 @@ _REDUCTION_METHODS = {
 # biopb._config_constraints so biopb-mcp validates the same knobs identically.
 _CONSTRAINTS = {
     "CacheConfig": {
-        "backend": _Enum({"memory", "file"}),
-        "memory_max_entries": _Range(min=1),
-        "memory_max_bytes": _Range(min=1),
         "file_max_segment_bytes": _Range(min=1),
         "file_max_total_bytes": _Range(min=1),
+        # 0 is the off switch (measure, classify nothing); negative would be a
+        # threshold every measured array clears, i.e. the off switch's opposite
+        # spelled like it.
+        "cheap_decode_mbps": _Range(min=0),
     },
     "PyramidConfig": {
         # reduction_method and plane_max_pixels are server-local: on-the-fly
@@ -238,9 +219,17 @@ _CONSTRAINTS = {
         "backlog_high_water": _Range(min=0.0, max=1.0),
         "backlog_idle_recheck_seconds": _Range(min=0),
     },
+    "AnnotationsConfig": {
+        # 0 or negative fails every write with "Annotation limit reached" -- a
+        # cap of nothing is a disabled store wearing a limit's name; `enabled`
+        # is the switch for that.
+        "max_rois_per_tensor": _Range(min=1),
+        # Negative is meaningless and SourceManager clamps it to 0 anyway, so
+        # without this the config accepts a value it silently ignores.
+        "prune_unseen_days": _Range(min=0),
+    },
     "MetadataDbConfig": {
         "max_query_results": _Range(min=1),
-        "max_list_flights_results": _Range(min=1),
         "query_timeout_ms": _Range(min=1),
     },
     "ServerConfig": {
@@ -249,8 +238,9 @@ _CONSTRAINTS = {
         ),
         "rescan_interval": _Range(min=0),
         "stability_window": _Range(min=0),
-        "stable_rescans_required": _Range(min=0),
         "handle_reaper_ttl": _Range(min=0),
+        "upload_ttl": _Range(min=0),
+        "scratch_ttl": _Range(min=0),
     },
 }
 
@@ -261,13 +251,22 @@ _SECTION_FOR = {
     "PyramidConfig": "pyramid",
     "PrecacheConfig": "precache",
     "MetadataDbConfig": "metadata_db",
+    "AnnotationsConfig": "annotations",
+    "CatalogConfig": "catalog",
     "ServerConfig": "server",
 }
 
 # The nested sections the checker walks. ServerConfig itself is the "server"
 # section (its scalars are top-level fields, not a nested dataclass), so it is
 # passed separately in _sections_of.
-_NESTED_SECTIONS = ("cache", "pyramid", "precache", "metadata_db")
+_NESTED_SECTIONS = (
+    "cache",
+    "pyramid",
+    "precache",
+    "metadata_db",
+    "annotations",
+    "catalog",
+)
 
 
 def _sections_of(config: ServerConfig) -> List[Tuple[str, Any]]:
@@ -353,8 +352,9 @@ class SourceConfig:
 
     url: str = field(
         metadata={
-            "help": "URL or path to the data source. Local paths are stable; "
-            "remote URLs (s3://, http(s)://, grpc://) are experimental."
+            "help": "URL or path to the data source. A local path must be "
+            "absolute. Local paths are stable; remote URLs (s3://, http(s)://, "
+            "grpc://) are experimental."
         }
     )
     type: Optional[
@@ -388,17 +388,6 @@ class SourceConfig:
             "resolved URL (biopb/biopb#308). Use `alias` for a display name."
         },
     )
-    dim_labels: Optional[List[str]] = field(
-        default=None,
-        metadata={
-            "help": "Dimension labels applied to all tensors in the source. This "
-            "is how a store that carries no axis semantics of its own (plain "
-            "zarr, HDF5 -- which otherwise report dim0, dim1, ...) gets them: "
-            "the server reorders labelled axes into canonical [..., z, y, x, s] "
-            "order, but never invents a label it was not given "
-            "(biopb/biopb#596)."
-        },
-    )
     dataset: Optional[str] = field(
         default=None,
         metadata={"help": "HDF5 dataset path (required for HDF5 sources)."},
@@ -427,9 +416,11 @@ class SourceConfig:
     alias: Optional[str] = field(
         default=None,
         metadata={
-            "help": "(experimental) Display name this source appears under: a "
-            "namespace prefix for a tensor-server upstream, or the catalog tree "
-            "root for a local source. Must be slash-free."
+            "help": "(experimental) Name this source appears under: the catalog "
+            "tree root for a local source (display-only), or the id namespace for "
+            "a tensor-server upstream -- there it is part of source_id, so "
+            "renaming it re-keys the cache and detaches ROI annotations. Must be "
+            "slash-free."
         },
     )
     # Internal/derived (leading underscore): not user-facing config keys, so they
@@ -461,10 +452,34 @@ class SourceConfig:
                 f"SourceConfig 'alias' must be slash-free, got: {self.alias!r}"
             )
 
+        # A local url must name a path from a filesystem root. `Path.resolve()`
+        # -- which `local_path` and the `source_id` hash both run -- completes a
+        # rootless path from the *process* cwd, and a server is started by the
+        # control plane, by systemd or by a container entrypoint, each leaving a
+        # different one: the same config would name different directories, under
+        # different source_ids, per launch (biopb/biopb#947). Config parsing
+        # drops such an entry before it reaches here, so this is the backstop for
+        # a programmatic construction.
+        if not _is_remote_url(self.url) and not local_path_is_rooted(self.url):
+            raise ValueError(
+                f"Source 'url' must be a rooted path or a remote URL, got: "
+                f"{self.url!r}. A path with no root is completed from whatever "
+                "directory the server happened to be started in."
+            )
+
         # Compute is_remote from URL
         object.__setattr__(self, "_is_remote", _is_remote_url(self.url))
 
-        # Generate source_id from URL hash if not provided
+        # Mint the id from the URL unless the caller supplied one. This is durable
+        # identity -- the metadata DB's ROI rows and the segment-cache keys hang off
+        # it -- so whatever enters the hash becomes something a user cannot change
+        # without detaching their data. Url-derivation's known cost is that `mv`
+        # re-keys a local source. Supplying an id explicitly is how the
+        # tensor-server proxy opts out: `sources.resolve._namespaced_source_id`
+        # builds one from (alias, upstream_source_id) with no endpoint in it, so a
+        # moved upstream keeps its cache and its annotations. Config never reaches
+        # this branch -- `sources.source_id` is ignored with a warning
+        # (biopb/biopb#308) -- so an explicit id is always internal.
         if self.source_id is None:
             detected_type = self.type or detect_source_type(self.url) or "data"
             object.__setattr__(
@@ -475,12 +490,16 @@ class SourceConfig:
     def local_path(self) -> Optional[Path]:
         """Return Path if url is a local file path, else None.
 
-        For remote URLs (s3://, http://, etc.), returns None.
-        For local paths, returns the resolved absolute Path.
+        For remote URLs (s3://, http://, etc.), returns None. For a local url --
+        a plain path or a ``file://`` one -- the canonical Path, through the same
+        :func:`resolve_local_path` the ``source_id`` hash uses, so a source's
+        identity and the location it reads can never disagree. ``__post_init__``
+        refuses a rootless url, so the resolution here only folds ``file://``,
+        symlinks and ``..``, never the cwd.
         """
         if _is_remote_url(self.url):
             return None
-        return Path(self.url).resolve()
+        return Path(resolve_local_path(self.url))
 
 
 @dataclass
@@ -489,26 +508,11 @@ class CacheConfig:
 
     Per-field help lives in each field's ``metadata["help"]`` (read by the config
     JSON Schema). Note the on-disk key names differ for the size fields
-    (``memory_max_bytes`` -> ``max_bytes``, ``file_max_segment_bytes`` ->
-    ``file_max_segment_mb``, ``file_max_total_bytes`` -> ``file_max_total_gb``);
-    the help is phrased for the on-disk form the editor shows.
+    (``file_max_segment_bytes`` -> ``file_max_segment_mb``, ``file_max_total_bytes``
+    -> ``file_max_total_gb``); the help is phrased for the on-disk form the
+    editor shows.
     """
 
-    backend: str = field(
-        default_factory=_default_cache_backend,
-        metadata={
-            "help": "Chunk cache backend: 'memory' (in-process only) or 'file' "
-            "(adds an on-disk cache)."
-        },
-    )
-    memory_max_entries: int = field(
-        default=1024,
-        metadata={"help": "Maximum number of decoded chunks kept in memory."},
-    )
-    memory_max_bytes: int = field(
-        default=512 * 1024 * 1024,  # 512 MB
-        metadata={"help": "Maximum total bytes of decoded chunks kept in memory."},
-    )
     file_cache_dir: Path = field(
         default=DEFAULT_FILE_CACHE_DIR,
         metadata={"help": "Directory for the on-disk chunk cache (file backend)."},
@@ -521,15 +525,29 @@ class CacheConfig:
         default=4 * 1024 * 1024 * 1024,  # 4 GB total
         metadata={"help": "Maximum total size of the on-disk chunk cache (GB)."},
     )
-    file_deferred_write_mb: int = field(
-        default=0,
+    source_scaled_reads: bool = field(
+        default=True,
         metadata={
-            "help": "EXPERIMENTAL. Bytes, in MiB, of cached chunks that may be "
-            "committed from memory and written to disk in the background, so a "
-            "cold read stops waiting for its own cache write. 0 (the default) "
-            "writes on the reading thread. Reaching the budget is not an error "
-            "and never blocks: that write goes back on the caller's thread. "
-            "Uploads are never deferred -- for them the cache is the only copy."
+            "help": "Serve a scaled (downsampled) chunk from the "
+            "full-resolution chunks already in the cache instead of reading the "
+            "source again, where all of them are present. Faster, and it leaves "
+            "those chunks' pages resident for the full-resolution read a coarse "
+            "one usually precedes. Set false to always read the source."
+        },
+    )
+    cheap_decode_mbps: float = field(
+        default=0.0,
+        metadata={
+            "help": "Evict a full-resolution chunk early once its tensor is "
+            "measured to decode at least this fast (MB/s) -- rebuilding it is "
+            "cheaper than the cache space it holds. 0 (the default) measures "
+            "but classifies nothing. Read the measurements with "
+            "`biopb tensor decode-rates` and pick a threshold from them: what "
+            "counts as fast enough depends on the machine's disk and the "
+            "formats on it, so there is no portable default. The measurements "
+            "live in the catalog database, so clearing the cache does not "
+            "reset them -- and they are session-only when catalog.persist is "
+            "off."
         },
     )
 
@@ -588,6 +606,21 @@ class PyramidConfig:
         },
     )
 
+    def level_kwargs(self) -> Dict[str, int]:
+        """The knobs that shape the ladder, as ``chunk.py`` takes them.
+
+        Every caller of ``_pyramid_levels`` and its wrappers needs exactly these
+        four, and the point of this class is that they cannot drift between the
+        levels the server advertises and the ones the precache warms -- so they
+        are unpacked once here rather than at each call.
+        """
+        return {
+            "threshold": self.threshold,
+            "downscale_factor": self.downscale_factor,
+            "pixel_budget_cubic_root": self.pixel_budget_cubic_root,
+            "plane_max_pixels": self.plane_max_pixels,
+        }
+
 
 @dataclass
 class PrecacheConfig:
@@ -626,8 +659,14 @@ class PrecacheConfig:
             "(seconds)."
         },
     )
+    # 256 MiB, per warm level. Not sized to make a catalog fit -- at a few hundred
+    # tensors nothing in the hundreds of MiB does, and the backlog high-water gate
+    # is what stops a full cache. What it bounds is one tensor eating the cache,
+    # and above the first plane it buys *scrub headroom*: at this value a
+    # 200-plane confocal keeps 128 of its Z planes rather than 32, so paging
+    # through the stack stays warm instead of only the opening slab.
     warm_budget_bytes: int = field(
-        default=PRECACHE_WARM_BUDGET_BYTES,
+        default=256 * 1024 * 1024,
         metadata={
             "help": "Per warm level, the cap on the selection cross-product "
             "(T/Z/C). Over it, those axes are narrowed to a window from index 0, "
@@ -671,7 +710,7 @@ class MetadataDbConfig:
     Replaces O(n) in-memory scans with indexed DuckDB queries.
 
     The metadata database is **mandatory** (biopb/biopb#225): it is the canonical
-    source-browsing surface (``client.query_sources``), so there is no ``enabled``
+    source-browsing surface (``client.query``), so there is no ``enabled``
     flag -- the DB is always constructed. A lingering ``metadata_db.enabled`` key
     in an old config is ignored with a warning (see ``parse_config``).
 
@@ -683,13 +722,97 @@ class MetadataDbConfig:
         default=100000,
         metadata={"help": "Safety cap on rows returned by a catalog SQL query."},
     )
-    max_list_flights_results: int = field(
-        default=100000,
-        metadata={"help": "Safety cap on sources returned by ListFlights."},
-    )
     query_timeout_ms: int = field(
         default=30000,
         metadata={"help": "Catalog SQL query timeout (milliseconds)."},
+    )
+
+
+@dataclass
+class CatalogConfig:
+    """The DuckDB catalog file: whether there is one, and where.
+
+    Three tables share it and only one is annotations, which is why these keys
+    are not under ``annotations`` any more (biopb/biopb#1002):
+
+    - ``sources`` -- scan output, dropped and recreated on every open.
+    - ``rois`` -- drawn annotations. Nothing can
+      reproduce these, which is what makes the file worth having.
+    - ``decode_rates`` -- the cache's measured per-tensor decode throughput.
+      Re-measurable by reading, but a run's worth of it at a time.
+
+    State tree, not cache: ``cache_dir()`` is documented as safe for a janitor
+    to empty and this file is not, which is the whole reason the measurements
+    live here rather than beside the segments they describe.
+
+    Per-field help lives in each field's ``metadata["help"]`` (read by the config
+    JSON Schema).
+    """
+
+    persist: bool = field(
+        default=True,
+        metadata={
+            "help": "Back the catalog with a file so it outlives the server. "
+            "Off keeps the whole catalog in memory: drawn ROIs are lost when "
+            "the server stops, and so are the cache's decode measurements."
+        },
+    )
+    store_path: str = field(
+        default="",
+        metadata={
+            "help": "Where the on-disk catalog lives. Empty derives it from the "
+            "config file's path, which is what keeps two servers on two configs "
+            "off each other's file."
+        },
+    )
+
+
+@dataclass
+class AnnotationsConfig:
+    """User-drawn ROI annotations.
+
+    Annotations live in the DuckDB catalog next to ``sources`` and are served
+    on the ``roi`` flight (DoGet / DoPut, authorized per source). They are NOT
+    tied to ``writable``: an annotation writes no pixels, so the token is its
+    boundary and ``enabled`` is the switch for a deployment that wants a strictly
+    read-only catalog.
+
+    Whether that catalog reaches a file, and which one, is :class:`CatalogConfig`
+    -- three tables share it and only this one is annotations
+    (biopb/biopb#1002).
+
+    Per-field help lives in each field's ``metadata["help"]`` (read by the config
+    JSON Schema).
+    """
+
+    enabled: bool = field(
+        default=True,
+        metadata={
+            "help": "Serve the roi flight (annotation reads and writes). Off "
+            "makes the catalog strictly read-only -- the "
+            "token says who may read, this says whether anyone may write. It "
+            "does not stop the catalog being persisted: `persist` decides that."
+        },
+    )
+    max_rois_per_tensor: int = field(
+        default=5000,
+        metadata={
+            "help": "Cap on stored annotations per tensor. Deliberately "
+            "human-scale: this is an annotation store, not an object store -- a "
+            "segmentation belongs in a label tensor."
+        },
+    )
+    prune_unseen_days: int = field(
+        default=0,
+        metadata={
+            "help": "Delete annotations whose source has not been seen in this "
+            "many days. 0 (the default) never deletes: these are hand-drawn, and "
+            "a source can be absent because a drive is unmounted or a proxy "
+            "upstream is down rather than because the image is gone. Even when "
+            "set, deleting only arms once the server has been up longer than "
+            "this -- before that it has not watched long enough to conclude "
+            "anything. `unseen_rois` reports orphans either way."
+        },
     )
 
 
@@ -759,25 +882,32 @@ class ServerConfig:
             "unaffected."
         },
     )
+    upload_ttl: float = field(
+        default=3600.0,
+        metadata={
+            "help": "Seconds an upload may sit without a write before it is "
+            "discarded as abandoned, and a discarded upload stays registered "
+            "(so a straggler still learns why its writes fail) before its name "
+            "is freed. Finished uploads are never reclaimed. 0 disables the sweep."
+        },
+    )
+    scratch_ttl: float = field(
+        default=86400.0,
+        metadata={
+            "help": "Ceiling, in seconds, on how long a tensor uploaded to "
+            "the scratch source is kept, after which it is discarded. An "
+            "upload asking for less gets what it asked for; one asking for "
+            "more, or for nothing, gets this. 0 keeps them until someone "
+            "discards them."
+        },
+    )
     stability_window: float = field(
         default=30.0,
         metadata={
             "help": "Minimum quiet period before a path is eligible for discovery "
-            "or removal (seconds)."
-        },
-    )
-    stable_rescans_required: int = field(
-        default=0,
-        metadata={
-            "help": "Extra unchanged rescans required before a path is considered "
-            "stable (0 relies on the stability window alone)."
-        },
-    )
-    probe_open_files: bool = field(
-        default=True,
-        metadata={
-            "help": "Best-effort append-open probe to skip files still being "
-            "written (advisory)."
+            "or removal (seconds). Raise it above the interval at which a slow "
+            "acquisition touches its files, or a dataset can be claimed between "
+            "writes; it only ever delays, never drops."
         },
     )
     aggressive_dir_pruning: bool = field(
@@ -803,7 +933,9 @@ class ServerConfig:
         default=None,
         metadata={
             "help": "Directory for zarr-backed uploaded sources (unset = no zarr "
-            "uploads)."
+            "uploads). Keep it outside every source directory: an uploaded "
+            "store is registered by the upload path, and discovery walking it "
+            "too would catalog it a second time."
         },
     )
     cache: CacheConfig = field(default_factory=CacheConfig)
@@ -811,15 +943,16 @@ class ServerConfig:
     precache: PrecacheConfig = field(default_factory=PrecacheConfig)
     credentials: CredentialsConfig = field(default_factory=CredentialsConfig)
     metadata_db: MetadataDbConfig = field(default_factory=MetadataDbConfig)
+    annotations: AnnotationsConfig = field(default_factory=AnnotationsConfig)
+    catalog: CatalogConfig = field(default_factory=CatalogConfig)
     sources: List[SourceConfig] = field(default_factory=list)
 
 
 def load_config(path: Path) -> ServerConfig:
     """Load configuration from a JSON file.
 
-    JSON is the only format read (biopb/biopb#34); a legacy ``biopb.toml``
-    raises with the migration command. The file is parsed to a plain dict and
-    handed to the format-agnostic :func:`parse_config`.
+    JSON is the only format read (biopb/biopb#34). The file is parsed to a
+    plain dict and handed to the format-agnostic :func:`parse_config`.
 
     Args:
         path: Path to a JSON config file (``biopb.json``)
@@ -829,8 +962,8 @@ def load_config(path: Path) -> ServerConfig:
 
     Raises:
         FileNotFoundError: If config file doesn't exist
-        ValueError: If the file is not valid JSON (including a legacy TOML), or
-            if it carries an out-of-range / bad-enum value
+        ValueError: If the file is not valid JSON, or if it carries an
+            out-of-range / bad-enum value
     """
     if isinstance(path, str):
         path = Path(path)
@@ -857,10 +990,6 @@ def save_config(data: Dict[str, Any], path: Path) -> Path:
     ``asdict`` would clobber them (and there is no dataclass->dict projection).
 
     Behavior:
-    - JSON is canonical. If *path* points at a legacy ``biopb.toml`` the write
-      targets the sibling ``biopb.json`` and the old TOML is renamed to
-      ``biopb.toml.bak``, so :func:`find_config`'s both-files shadow warning
-      never fires (biopb/biopb#34).
     - A sibling ``biopb.schema.json`` (the output of ``build_config_schema``) is
       written next to the config and a *relative* ``"$schema":
       "./biopb.schema.json"`` pointer is embedded, so editors validate the
@@ -870,13 +999,6 @@ def save_config(data: Dict[str, Any], path: Path) -> Path:
     """
     if isinstance(path, str):
         path = Path(path)
-
-    # JSON is canonical: redirect a .toml target to its sibling biopb.json and
-    # back the legacy file up so find_config's both-files warning never fires.
-    legacy_toml: Optional[Path] = None
-    if path.suffix.lower() == ".toml":
-        legacy_toml = path
-        path = path.with_name(CANONICAL_CONFIG_NAME)
 
     schema_path = path.with_name(SCHEMA_SIDECAR_NAME)
 
@@ -890,16 +1012,6 @@ def save_config(data: Dict[str, Any], path: Path) -> Path:
 
     atomic_write_json(schema_path, build_config_schema(), raise_on_error=True)
     atomic_write_json(path, payload, raise_on_error=True)
-
-    if legacy_toml is not None and legacy_toml.exists():
-        backup = legacy_toml.with_name(legacy_toml.name + ".bak")
-        legacy_toml.replace(backup)
-        logger.info(
-            "Migrated legacy %s to %s; backed up the old file to %s (biopb/biopb#34).",
-            legacy_toml.name,
-            path.name,
-            backup.name,
-        )
 
     return path
 
@@ -967,60 +1079,17 @@ def restore_redacted_secrets(
     return merged
 
 
-# Appended to every read failure: a legacy TOML is the one shape of "not JSON"
-# with a one-command fix, and a user meeting a parse error has no other way to
-# learn the format changed (biopb/biopb#34).
-_MIGRATE_HINT = (
-    "JSON is the only supported config format; convert a legacy "
-    f"{LEGACY_CONFIG_NAME} with `biopb-tensor-server migrate-config`. See biopb/biopb#34."
-)
-
-
 def _read_config_file(path: Path) -> Dict[str, Any]:
     """Read a config file into a plain dict.
 
-    JSON only. A ``.toml`` path is rejected without parsing (the read path was
-    dropped once the deprecation window closed); every other extension --
-    including none -- is read as JSON, so an unconventionally-named config still
-    loads. Both failures name ``biopb-tensor-server migrate-config``.
+    Extension-blind: the file is read as JSON whatever it is called, so an
+    unconventionally-named config still loads.
     """
-    if path.suffix.lower() == ".toml":
-        raise ValueError(
-            f"Config file {path} is in the legacy TOML format. " + _MIGRATE_HINT
-        )
-    return _load_json(path)
-
-
-def _load_json(path: Path) -> Dict[str, Any]:
     try:
         with open(path, "rb") as f:
             return json.load(f)
     except ValueError as e:
-        raise ValueError(
-            f"Invalid JSON in config file {path}: {e}. " + _MIGRATE_HINT
-        ) from e
-
-
-def read_legacy_toml(path: Path) -> Dict[str, Any]:
-    """Read a pre-#34 ``biopb.toml`` into a plain dict.
-
-    The **only** remaining TOML reader, and deliberately not reachable from
-    :func:`load_config`: it exists for `biopb-tensor-server migrate-config`, which
-    converts the old file to canonical JSON. ``tomllib`` is imported lazily so
-    the server's own read path carries no TOML dependency.
-    """
-    import sys
-
-    if sys.version_info >= (3, 11):
-        import tomllib
-    else:
-        import tomli as tomllib
-
-    try:
-        with open(path, "rb") as f:
-            return tomllib.load(f)
-    except tomllib.TOMLDecodeError as e:
-        raise ValueError(f"Invalid TOML in config file {path}: {e}") from e
+        raise ValueError(f"Invalid JSON in config file {path}: {e}") from e
 
 
 # The known-key set for the unknown-key warning is the config JSON Schema's
@@ -1063,12 +1132,12 @@ def _warn_unknown_config_keys(data: Dict[str, Any]) -> None:
     """Warn for unrecognized config sections / keys before they silently drop.
 
     An unknown key is otherwise dropped and the default used with no signal --
-    the classic trap is ``[cache] memory_max_entries`` (the dataclass field
-    name) where the parser reads ``max_entries``, so a 1-entry cache silently
-    stays at the 1024/512MB default. Value validation (range/enum) lives in the
-    dataclasses; this only flags *keys the parser never reads*. The known-key
-    set is the config JSON Schema's property lists (see :func:`_known_config_keys`).
-    Warn-only.
+    the classic trap is ``[cache] file_max_segment_bytes`` (the dataclass field
+    name) where the parser reads ``file_max_segment_mb``, so an oversized-segment
+    tweak silently stays at the 64MB default. Value validation (range/enum)
+    lives in the dataclasses; this only flags *keys the parser never reads*. The
+    known-key set is the config JSON Schema's property lists (see
+    :func:`_known_config_keys`). Warn-only.
     """
     if not isinstance(data, dict):
         return
@@ -1173,6 +1242,36 @@ def _carry(
         dst[field] = cast(value) if cast is not None else value
 
 
+def _normalized_source_url(url: str) -> Optional[str]:
+    """The url to record for a source, or None if it names no fixed location.
+
+    A remote url passes through untouched (``Path`` would mangle the scheme's
+    ``//`` and prepend the cwd) and ``~`` expands -- it used to become
+    ``$PWD/~/...``. Anything else is returned exactly as written: pushing a
+    rooted path through ``Path`` would flip its separators on Windows and take
+    the ``source_id`` with them.
+
+    A url with no root names nothing the server can honor -- there is no anchor
+    it could use that the person writing the config would recognize
+    (biopb/biopb#947) -- so it comes back None for the caller to report.
+    """
+    if _is_remote_url(url):
+        return url
+    if url.startswith("~"):
+        try:
+            expanded = str(Path(url).expanduser())
+        except RuntimeError:
+            # No home directory to expand against: POSIX with no HOME and no
+            # passwd entry, or Windows with neither USERPROFILE nor HOMEPATH (a
+            # service account). `~` then names nothing, which is this function's
+            # None -- the entry is dropped like any other unusable url rather
+            # than taking the whole config load down with a RuntimeError.
+            return None
+    else:
+        expanded = url
+    return expanded if local_path_is_rooted(expanded) else None
+
+
 def parse_config(data: Dict[str, Any]) -> ServerConfig:
     """Build a :class:`ServerConfig` from a raw config dict, checked and clamped.
 
@@ -1201,8 +1300,8 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
     forwards only the keys actually present in ``data`` (via :func:`_carry`) and
     lets each dataclass fill the rest, so a default is never declared twice
     (biopb/biopb#277 item A). What stays here is the wire<->dataclass mapping the
-    dataclasses cannot express: on-disk key aliases (``cache.max_entries`` ->
-    ``memory_max_entries``), unit scaling (``*_mb``/``*_gb`` -> ``*_bytes``),
+    dataclasses cannot express: on-disk key aliases (``cache.file_max_segment_mb``
+    -> ``file_max_segment_bytes``), unit scaling (``*_mb``/``*_gb`` -> ``*_bytes``),
     legacy back-compat keys (``watcher_type``, ``poll_interval``, the ``[precache]``
     pyramid knobs, source ``path``), and per-field coercions.
 
@@ -1239,14 +1338,9 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
 
     _carry(server_kwargs, "full_rescan_interval", server_data, cast=float)
     _carry(server_kwargs, "handle_reaper_ttl", server_data, cast=float)
+    _carry(server_kwargs, "upload_ttl", server_data, cast=float)
+    _carry(server_kwargs, "scratch_ttl", server_data, cast=float)
     _carry(server_kwargs, "stability_window", server_data, cast=float)
-    _carry(
-        server_kwargs,
-        "stable_rescans_required",
-        server_data,
-        cast=lambda v: max(0, int(v)),
-    )
-    _carry(server_kwargs, "probe_open_files", server_data, cast=bool)
     _carry(server_kwargs, "aggressive_dir_pruning", server_data, cast=bool)
     _carry(server_kwargs, "claim_generic_images", server_data, cast=bool)
     _carry(server_kwargs, "writable", server_data)
@@ -1254,14 +1348,11 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
     if write_dir_str:
         server_kwargs["write_dir"] = Path(write_dir_str)
 
-    # Parse cache settings. The wire form of four fields diverges from the
-    # dataclass (aliases + MB/GB->bytes scaling); everything else is a direct
-    # carry. Mapping mirrors config_schema._ONDISK_OVERRIDES.
+    # Parse cache settings. The wire form of two fields diverges from the
+    # dataclass (MB/GB->bytes scaling); everything else is a direct carry.
+    # Mapping mirrors config_schema._ONDISK_OVERRIDES.
     cache_data = data.get("cache", {})
     cache_kwargs: Dict[str, Any] = {}
-    _carry(cache_kwargs, "backend", cache_data)
-    _carry(cache_kwargs, "memory_max_entries", cache_data, "max_entries")
-    _carry(cache_kwargs, "memory_max_bytes", cache_data, "max_bytes")
     _carry(
         cache_kwargs,
         "file_max_segment_bytes",
@@ -1351,7 +1442,7 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
     metadata_db_data = data.get("metadata_db", {})
     # `metadata_db.enabled` was removed (biopb/biopb#225): the metadata DB is now
     # mandatory (always on) because it is the canonical source-browsing surface --
-    # the biopb-mcp guide steers agents to `client.query_sources(sql, ...)`
+    # the biopb-mcp guide steers agents to `client.query(sql, ...)`
     # (complete, server-side) over the capped `list_sources()`, and that SQL path
     # only exists when the DB is present. A lingering flag in an old config is
     # ignored (not honored) with a warning; `enabled = false` gets the stronger
@@ -1368,14 +1459,32 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
             logger.warning(
                 "Config option `metadata_db.enabled = false` is no longer honored: "
                 "the metadata database is now mandatory (always on), so the server "
-                "starts WITH the SQL catalog (`client.query_sources(...)`) despite "
+                "starts WITH the SQL catalog (`client.query(...)`) despite "
                 "this setting. Drop the flag from your config. See biopb/biopb#225."
             )
     metadata_db_kwargs: Dict[str, Any] = {}
     _carry(metadata_db_kwargs, "max_query_results", metadata_db_data)
-    _carry(metadata_db_kwargs, "max_list_flights_results", metadata_db_data)
     _carry(metadata_db_kwargs, "query_timeout_ms", metadata_db_data)
     metadata_db_config = MetadataDbConfig(**metadata_db_kwargs)
+
+    # Parse annotations settings
+    annotations_data = data.get("annotations", {})
+    annotations_kwargs: Dict[str, Any] = {}
+    _carry(annotations_kwargs, "enabled", annotations_data)
+    _carry(annotations_kwargs, "max_rois_per_tensor", annotations_data)
+    _carry(annotations_kwargs, "prune_unseen_days", annotations_data, cast=int)
+    annotations_config = AnnotationsConfig(**annotations_kwargs)
+
+    # Parse catalog settings. These lived under `annotations` for the five days
+    # between biopb/biopb#946 and biopb/biopb#1002 -- no alias, because nothing
+    # was deployed on them and a permanent second spelling costs more than the
+    # window it covers. An old config's keys land on the unknown-key warning,
+    # which names them.
+    catalog_data = data.get("catalog", {})
+    catalog_kwargs: Dict[str, Any] = {}
+    _carry(catalog_kwargs, "persist", catalog_data)
+    _carry(catalog_kwargs, "store_path", catalog_data)
+    catalog_config = CatalogConfig(**catalog_kwargs)
 
     # Parse sources. `url` accepts the legacy `path` alias; every other field is
     # carried only when present so SourceConfig owns the defaults.
@@ -1388,7 +1497,26 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
         if url is None:
             raise ValueError("Source config requires 'url' field")
 
-        src_kwargs: Dict[str, Any] = {"url": url}
+        normalized_url = _normalized_source_url(url)
+        if normalized_url is None:
+            # A relative url has no anchor the server can trust: `Path.resolve`
+            # would take the process cwd, which the control plane, systemd and a
+            # container entrypoint each leave set differently, so the entry names
+            # different data per launch (biopb/biopb#947). Drop it rather than
+            # serve a guess -- at the volume biopb/biopb#608 set for a config
+            # that will never come right on its own, since one bad line must not
+            # keep the other sources off the air. `validate` is the surface that
+            # fails hard on it.
+            logger.error(
+                "NOT SERVING %s: a source url must be a rooted path (or a remote "
+                "URL). A path with no root is completed from whatever directory "
+                "the server was started in, so it names different data per "
+                "launch. This will not resolve until the config is corrected.",
+                url,
+            )
+            continue
+
+        src_kwargs: Dict[str, Any] = {"url": normalized_url}
         _carry(src_kwargs, "type", src_data)  # auto-detected when omitted
         # `source_id` is derived from the resolved URL (a stable content
         # identity), never user-assigned. Honoring an explicit id let two configs
@@ -1403,7 +1531,6 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
                 "always maps to one catalog entry (dropping explicit ids closes "
                 "biopb/biopb#308). Use `alias` to give the source a display name."
             )
-        _carry(src_kwargs, "dim_labels", src_data)
         _carry(src_kwargs, "dataset", src_data)
         _carry(src_kwargs, "monitor", src_data)
         _carry(src_kwargs, "cloud", src_data)
@@ -1417,6 +1544,8 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
         precache=precache_config,
         credentials=credentials_config,
         metadata_db=metadata_db_config,
+        annotations=annotations_config,
+        catalog=catalog_config,
         sources=sources,
         **server_kwargs,
     )
@@ -1458,10 +1587,11 @@ def validate_config_dict(data: Dict[str, Any]) -> List[Dict[str, Any]]:
     from biopb_tensor_server.core.config_schema import ondisk_location
 
     # The checker reports dataclass-field paths; the endpoint needs the on-disk
-    # ones (CacheConfig.memory_max_entries lives at [cache] max_entries), so the
-    # section/key is remapped before it leaves -- in the message too, whose
-    # `field=...` lead-in would otherwise name the internal field the on-disk path
-    # doesn't (e.g. path [cache] max_entries with "memory_max_entries=...").
+    # ones (CacheConfig.file_max_segment_bytes lives at [cache]
+    # file_max_segment_mb), so the section/key is remapped before it leaves --
+    # in the message too, whose `field=...` lead-in would otherwise name the
+    # internal field the on-disk path doesn't (e.g. path [cache]
+    # file_max_segment_mb with "file_max_segment_bytes=...").
     problems: List[Dict[str, Any]] = []
     for problem in _config_problems(cfg):
         section, key = problem.path
@@ -1473,6 +1603,27 @@ def validate_config_dict(data: Dict[str, Any]) -> List[Dict[str, Any]]:
         if on_key != key and message.startswith(f"{key}="):
             message = f"{on_key}=" + message[len(key) + 1 :]
         problems.append({"path": [on_section, on_key], "message": message})
+
+    # `_build_config` drops a source whose url is not absolute and keeps serving
+    # the rest -- right for a supervised start, wrong here, where a human is
+    # asking whether the file is good. Report the skip, per field, so `validate`
+    # fails and the admin form can mark it (biopb/biopb#947).
+    for src_data in data.get("sources") or []:
+        if not isinstance(src_data, dict):
+            continue
+        url = src_data.get("url") or src_data.get("path")
+        if isinstance(url, str) and url and _normalized_source_url(url) is None:
+            problems.append(
+                {
+                    "path": ["sources", "url"],
+                    "message": (
+                        f"url={url!r}: a source url must be a rooted path or a "
+                        "remote URL. A path with no root is completed from "
+                        "whatever directory the server was started in, so it "
+                        "names different data per launch."
+                    ),
+                }
+            )
     return problems
 
 
@@ -1493,448 +1644,3 @@ def detect_source_type(url: str) -> Optional[str]:
         return "tensor-server"
 
     return None
-
-
-def _namespaced_source_id(alias: Optional[str], upstream_source_id: str) -> str:
-    """Local source_id for a mirrored upstream source.
-
-    The proxy serves many upstreams + local sources from one flat, source_id-keyed
-    catalog, so an upstream's ids are namespaced by the configured ``alias``:
-    ``<alias>__<upstream_source_id>`` (slash-free -- ``__`` is a cosmetic
-    separator, and the upstream id is slash-free by the array_id spec). A lone
-    upstream with no alias keeps the verbatim id.
-    """
-    return f"{alias}__{upstream_source_id}" if alias else upstream_source_id
-
-
-def _discover_tensor_server(
-    source: SourceConfig, credentials_config: Optional[Any]
-) -> List[SourceConfig]:
-    """Expand a ``tensor-server`` source into one concrete source per upstream tensor.
-
-    ``grpc://host:port/<id>`` mirrors a single upstream source; a bare
-    ``grpc://host:port`` connects to the upstream and mirrors *every* source it
-    lists (the network analogue of directory discovery). Each concrete source
-    carries the single-source url form and an alias-namespaced ``source_id`` so
-    the adapter (``RemoteTensorAdapter.create_from_config``) and the rest of the
-    server machinery treat it like any other source.
-    """
-    # EXPERIMENTAL: the tensor-server remote-source proxy is not yet stable. Its
-    # config surface (url forms, `alias`, monitor re-list) and the on-disk
-    # segment-cache keys for proxied sources may change without notice in a future
-    # release (biopb/biopb#178). Warned once per configured upstream at expansion.
-    logger.warning(
-        "Source %r uses the EXPERIMENTAL tensor-server remote proxy: its config "
-        "surface (url forms, 'alias', monitor re-list) and the on-disk cache keys "
-        "for proxied sources may change without notice in a future release.",
-        source.url,
-    )
-    from biopb_tensor_server.adapters.remote_tensor import (
-        _split_grpc_url,
-        list_upstream_source_ids,
-        resolve_upstream_credentials,
-    )
-
-    endpoint, upstream_source_id = _split_grpc_url(source.url)
-
-    if upstream_source_id is not None:
-        # Single-source form: register under the alias-namespaced local id.
-        local_id = _namespaced_source_id(source.alias, upstream_source_id)
-        return [replace(source, source_id=local_id)]
-
-    # Bare-host form: mirror every source on the upstream. Enumerate via the
-    # complete server-side catalog (not the capped list_sources -- see
-    # list_upstream_source_ids); an incomplete fallback list still mirrors what
-    # it can.
-    from biopb.tensor import TensorFlightClient
-
-    credentials = resolve_upstream_credentials(source, credentials_config)
-    client = TensorFlightClient(
-        endpoint,
-        cache_bytes=0,
-        token=credentials.token,
-        tls_ca_pem=credentials.tls_ca_pem,
-        tls_fingerprint=credentials.tls_fingerprint,
-    )
-    try:
-        ids, _complete = list_upstream_source_ids(client, endpoint)
-        upstream_ids = sorted(ids)
-    finally:
-        # Never let a failing close() replace the upstream error propagating out
-        # of the try: body (biopb/biopb#529).
-        try:
-            client.close()
-        except Exception:
-            logger.debug("error closing upstream client", exc_info=True)
-
-    expanded = []
-    for upstream_id in upstream_ids:
-        local_id = _namespaced_source_id(source.alias, upstream_id)
-        expanded.append(
-            replace(
-                source,
-                url=f"{endpoint}/{upstream_id}",
-                source_id=local_id,
-                type="tensor-server",
-            )
-        )
-    return expanded
-
-
-def _resolve_tensor_server_id_collisions(
-    sources: List[SourceConfig],
-) -> List[SourceConfig]:
-    """Drop -- don't abort on -- source_id collisions involving a tensor-server proxy.
-
-    With distinct aliases the namespaces are disjoint by construction, so a clash
-    is a misconfiguration (two upstreams sharing an alias, or a local source named
-    like a proxied id). A single bad entry must not take down the whole catalog,
-    so keep the first source for each id and skip later colliders, logging the fix
-    (set a distinct alias). Non-proxy collisions are left untouched (the historical
-    last-wins at registration).
-    """
-    seen: Dict[str, SourceConfig] = {}
-    result: List[SourceConfig] = []
-    for src in sources:
-        prior = seen.get(src.source_id)
-        if prior is not None and "tensor-server" in (src.type, prior.type):
-            logger.warning(
-                "Skipping source_id %r from %s (%s): it collides with %s (%s) "
-                "already in the catalog. Set a distinct 'alias' on the conflicting "
-                "tensor-server entry to namespace its mirrored sources.",
-                src.source_id,
-                src.url,
-                src.type,
-                prior.url,
-                prior.type,
-            )
-            continue
-        seen.setdefault(src.source_id, src)
-        result.append(src)
-    return result
-
-
-def _reroot_catalog_url(label: str, root_path: str, primary_path: str) -> str:
-    """Re-root ``primary_path`` under ``label``, preserving its position beneath
-    ``root_path``. Shared core of the two re-rooting entry points -- drag-drop
-    (``SourceManager._drop_catalog_url``, ``label`` = the dropped item's basename)
-    and a configured ``alias`` (``_alias_catalog_url``, ``label`` = the alias).
-
-    The tensor-browser (and web viewer) build their tree by splitting each
-    source's ``source_url`` on ``/``, so ``label`` becomes the top-level root and
-    the sub-structure beneath ``root_path`` is preserved under it:
-
-        root /data/exp, primary /data/exp            -> "<label>"
-        root /data/exp, primary /data/exp/sub/b.tif  -> "<label>/sub/b.tif"
-
-    Display-only: it feeds the descriptor's ``source_url`` and never the
-    ``source_id`` (which hashes the raw path), so a bare virtual path with no
-    scheme is fine.
-    """
-    try:
-        rel = os.path.relpath(str(primary_path), str(root_path)).replace("\\", "/")
-    except ValueError:  # different drive on Windows, etc. -- can't relativize
-        rel = "."
-    if rel in (".", "") or rel.startswith("../"):
-        # primary IS the root (single file / dataset dir), or (defensively) not
-        # under it -- keep the whole thing as one root, never emit a "../" url.
-        return label
-    return f"{label}/{rel}"
-
-
-def _alias_catalog_url(alias: str, root_path: str, primary_path: str) -> str:
-    """Catalog ``source_url`` that re-roots a configured local source under ``alias``.
-
-    The config-line analogue of ``SourceManager._drop_catalog_url``: the root
-    label is the configured ``alias`` (rather than a dropped item's basename), and
-    the sub-structure of a configured folder is preserved relative to it:
-
-        alias "exp", configure /data/exp/            (root_path == primary_path)
-            -> "exp"
-        alias "exp", configure folder /data/exp/ with
-            .../exp/a.tif, .../exp/sub/b.tif -> "exp/a.tif", "exp/sub/b.tif"
-
-    Display-only (never touches ``source_id``). Applied on the static / one-shot
-    expand path; a monitored directory's alias is dropped upstream (its rescan
-    re-discovers native paths), so this is never fed a live-monitored source.
-    """
-    return _reroot_catalog_url(alias, root_path, primary_path)
-
-
-def discover_sources(
-    source: SourceConfig,
-    registry: Optional[AdapterRegistry] = None,
-    credentials_config: Optional[Any] = None,
-) -> List[SourceConfig]:
-    """Expand a source config to actual data sources.
-
-    Directory scanning and file typing are done by the adapters' claim()
-    protocol -- the single source of truth for format detection
-    (biopb/biopb#277 item B). The only URL-derived typing left here is remote
-    scheme routing (grpc -> tensor-server).
-
-    Supports multiple modes:
-    - Explicit source: type set -> returned as-is (single source). source_id is
-      always present (__post_init__ auto-fills it), so type is the discriminator.
-    - Remote URL: requires explicit 'type' in config (cannot auto-discover)
-    - tensor-server (grpc://) URL: a caching proxy in front of an upstream biopb
-      tensor server -- a bare ``grpc://host:port`` mirrors *every* upstream source
-      (one concrete source each, alias-namespaced), and ``grpc://host:port/<id>``
-      mirrors a single upstream source.
-    - Local file with no type: claim-based detection (error if unclaimed)
-    - Local directory with no type: claim-based discovery
-
-    Args:
-        source: Source configuration
-        registry: Optional adapter registry (uses default if None)
-        credentials_config: Optional CredentialsConfig, used to authenticate the
-            upstream ``list_sources`` call when expanding a tensor-server source.
-
-    Returns:
-        List of concrete SourceConfig objects (one per data source, NOT expanded to tensors)
-
-    Raises:
-        ValueError: If remote URL lacks explicit 'type'
-    """
-    if registry is None:
-        # Deferred on layering grounds: core should not import adapters. At
-        # directory granularity adapters -> cache -> config -> adapters is a
-        # cycle; at module granularity it is not one *yet*, because
-        # adapters/__init__ does not import cached_source (the module that
-        # reaches the cache) -- only serving/upload_manager does. Re-exporting
-        # cached_source from adapters/__init__, the one adapter module it omits,
-        # would close it for real. So undeferring this import will appear to
-        # work: that is the trap, not a sign the comment is stale.
-        from biopb_tensor_server.adapters import get_default_registry
-
-        registry = get_default_registry()
-
-    # Case 0: Remote URLs require an explicit (or auto-detectable) type.
-    # A grpc(+tls) endpoint auto-detects to "tensor-server"; other remote
-    # schemes (s3://, http://, ...) still require an explicit 'type'.
-    if source.is_remote:
-        resolved_type = source.type or detect_source_type(source.url)
-        if resolved_type is None:
-            raise ValueError(
-                f"Remote URL requires explicit 'type' in config: {source.url}"
-            )
-        if source.type is None:
-            source = replace(source, type=resolved_type)
-        if resolved_type == "tensor-server":
-            return _discover_tensor_server(source, credentials_config)
-        # For other remote URLs, return the source as-is (no directory discovery)
-        return [source]
-
-    # Local filesystem handling
-    local_path = source.local_path
-    if local_path is None:
-        raise ValueError(f"Could not resolve local path from: {source.url}")
-
-    if not local_path.exists():
-        raise ValueError(f"Path does not exist: {local_path}")
-
-    # Case 1: explicit type -> return as-is. source_id is always set by
-    # __post_init__, so it never discriminates here; type is the real gate.
-    if source.type and source.source_id:
-        return [source]
-
-    # Case 2: File with no type - try claim-based detection
-    if local_path.is_file():
-        # Try claim-based detection first. cloud_root carries the multi-file ban
-        # (OME-TIFF/DICOM-series -> single file) onto a directly-configured cloud
-        # file, matching the monitored path.
-        ctx = ClaimContext(local_path, cloud_root=source.cloud)
-        state = DiscoveryState()
-        try:
-            identity = get_file_identity(local_path)
-            state.visited_identities.add(identity)
-        except OSError:
-            pass
-
-        claims = registry.get_claims_for_path(ctx, state)
-        if claims:
-            claim = claims[0]
-            return [_claim_to_source_config(claim, source)]
-
-        # No adapter recognized the file. There is no legacy fallback: format
-        # detection lives only in the adapters (biopb/biopb#277 item B), so an
-        # unclaimed file is a hard error rather than a guessed (often wrong) type.
-        raise ValueError(
-            f"Could not detect type for file: {local_path}. "
-            f"Please specify 'type' explicitly in config."
-        )
-
-    # Case 3: Directory with no type - use claim-based discovery.
-    # First check if the directory itself is a data source
-    ctx = ClaimContext(local_path, cloud_root=source.cloud)
-    state = DiscoveryState()
-    try:
-        identity = get_file_identity(local_path)
-        state.visited_identities.add(identity)
-    except OSError:
-        pass
-
-    claims = registry.get_claims_for_path(ctx, state)
-    if claims:
-        claim = claims[0]
-        return [_claim_to_source_config(claim, source)]
-
-    # Directory is not itself a data source - do recursive claim-based scan. Under
-    # a cloud root, admit dehydrated placeholders so the one-shot startup scan of a
-    # monitor=false cloud directory still catalogues offline data as unresolved
-    # sources, and set cloud_root so the multi-file OME-TIFF / DICOM-series ban
-    # applies -- the same gating the monitored rescan uses (cloud-storage phase 2).
-    state = claim_based_discover(
-        local_path,
-        registry,
-        dim_labels=source.dim_labels,
-        admit_nonresident=source.cloud,
-        cloud_root=source.cloud,
-    )
-    return [_claim_to_source_config(claim, source) for claim in state.get_all_claims()]
-
-
-def _claim_to_source_config(
-    claim: SourceClaim, original_source: SourceConfig
-) -> SourceConfig:
-    """Convert a SourceClaim to SourceConfig.
-
-    Args:
-        claim: SourceClaim from discovery
-        original_source: Original SourceConfig for dim_labels and credentials_profile inheritance
-
-    Returns:
-        SourceConfig with claim information
-    """
-    source_id = claim.source_id or generate_source_id(
-        str(claim.primary_path), claim.source_type
-    )
-
-    # Handle HDF5 special case - needs dataset path
-    dataset = None
-    if claim.source_type == "hdf5" and claim.extra_config.get("needs_dataset"):
-        # HDF5 claims have needs_dataset flag in extra_config. This will fail at
-        # adapter creation unless dataset is provided; for backward compatibility,
-        # pass through any original dataset.
-        dataset = original_source.dataset
-
-    return SourceConfig(
-        type=claim.source_type,
-        url=str(claim.primary_path),
-        source_id=source_id,
-        dim_labels=claim.dim_labels or original_source.dim_labels,
-        dataset=dataset,
-        credentials_profile=original_source.credentials_profile,  # preserve credentials_profile
-        cloud=original_source.cloud,  # propagate cloud gating to expanded sources
-    )
-
-
-def resolve_all_sources(
-    config: ServerConfig,
-    registry: Optional[AdapterRegistry] = None,
-    *,
-    sources: Optional[List[SourceConfig]] = None,
-    tolerant: bool = False,
-) -> List[SourceConfig]:
-    """Resolve all sources in config, expanding directories.
-
-    Uses claim-based discovery for automatic source detection.
-
-    Args:
-        config: Server configuration
-        registry: Optional adapter registry (uses default if None)
-        sources: Optional explicit list of source entries to expand. When None,
-            ``config.sources`` is used. The serve path passes a filtered subset
-            (local ``monitor=true`` directories are discovered by the rescan
-            instead, not expanded here) to avoid an extra pre-bind walk that also
-            crashes on a not-yet-mounted directory (biopb/biopb#54).
-        tolerant: When True, a source that fails to resolve (e.g. a missing
-            static path) is logged and skipped instead of aborting the whole
-            expansion. Used by the serve path so one bad entry cannot take down
-            the server; ``validate``/``list_tensors`` keep the default (False) so
-            a broken source is surfaced as a hard error.
-
-    Returns:
-        List of all concrete SourceConfig objects (one per data source)
-    """
-    if registry is None:
-        # Deferred for the same layering reason as in discover_sources.
-        from biopb_tensor_server.adapters import get_default_registry
-
-        registry = get_default_registry()
-
-    source_list = sources if sources is not None else config.sources
-    credentials_config = getattr(config, "credentials", None)
-
-    all_sources = []
-    hdf5_warnings = []
-
-    for source in source_list:
-        try:
-            discovered = discover_sources(source, registry, credentials_config)
-        except UpstreamConfigError as e:
-            if not tolerant:
-                raise
-            # Still skip rather than abort the boot -- one bad entry must not take
-            # the server down -- but not at the volume of a missing static path.
-            # The operator asked for a stronger trust anchor and the server is
-            # coming up without the source that needed it; that is a broken
-            # deployment, not a transient upstream (biopb/biopb#608).
-            logger.error(
-                "NOT SERVING %s: its credentials configuration is broken (%s). "
-                "This is a configuration error, not an unreachable upstream -- "
-                "it will not resolve until the config is corrected.",
-                source.url,
-                e,
-            )
-            continue
-        except Exception as e:
-            if not tolerant:
-                raise
-            logger.warning(
-                "Skipping source that could not be resolved: %s (%s)",
-                source.url,
-                e,
-            )
-            continue
-        # A local source's `alias` re-roots it (and everything discovered under a
-        # configured folder) into its own catalog tree root -- the config-line
-        # analogue of a drag-dropped folder becoming its own root. Compute the
-        # display source_url now, while both the configured root and each concrete
-        # child are in hand. Skipped for remote entries: a tensor-server upstream's
-        # alias means the source_id namespace (handled by the proxy adapter's own
-        # display authority), not a tree root. A monitored local *directory* never
-        # reaches here (it is discovered by the rescan, not expanded), so its alias
-        # is correctly never applied -- see _resolve_serve_sources's warning.
-        reroot = bool(source.alias) and not source.is_remote
-        root_path = source.local_path if reroot else None
-        for src in discovered:
-            # Track HDF5 sources that need dataset config
-            if src.type == "hdf5" and src.dataset is None:
-                hdf5_warnings.append(src.url)
-            if reroot and root_path is not None:
-                src = replace(
-                    src,
-                    _catalog_url=_alias_catalog_url(
-                        source.alias, str(root_path), src.url
-                    ),
-                )
-            all_sources.append(src)
-
-    # source_id collisions involving a tensor-server proxy are a misconfiguration
-    # (two upstreams sharing an alias, or a local source named like a proxied id):
-    # the catalog is one flat source_id space, so a clash would silently shadow a
-    # source. Drop the colliding entry (keeping the first) and warn with the fix --
-    # a single bad source must not abort the whole catalog. Non-proxy collisions
-    # keep the historical last-wins behavior.
-    all_sources = _resolve_tensor_server_id_collisions(all_sources)
-
-    # Print warnings for HDF5 files that need explicit dataset
-    if hdf5_warnings:
-        print("Warning: HDF5 files require explicit 'dataset' path in config:")
-        for h5_url in hdf5_warnings[:5]:
-            print(f"  - {h5_url}")
-        if len(hdf5_warnings) > 5:
-            print(f"  ... and {len(hdf5_warnings) - 5} more")
-
-    return all_sources

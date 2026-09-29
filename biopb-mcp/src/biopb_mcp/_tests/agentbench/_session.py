@@ -1,19 +1,21 @@
 """A real biopb-mcp session, brought up and driven from synchronous test code.
 
-`biopb-mcp/docs/skills.md` §10b: a real shim-spawned session child, a
+`_tests/bench/README.md`: a real shim-spawned session child, a
 real IPython kernel, a real napari viewer, real dask — and the nine real tools
 reached over real MCP. Nothing here stands in for the runtime. That is the
 whole point: a hand-written tool surface would put `execute_code`'s return
-shape, `server_status`'s report and the `guide://` bodies into a transcription
+shape, `server_status`'s report and the reference docs into a transcription
 that no longer tracks what the runtime does.
 
 What this module owns is bring-up, a synchronous façade over the async MCP
 client, and three environment facts that have to be *forced* rather than
 inherited, because each of them silently changes what a run is testing:
 
-**A display, and a GL context behind it.** With no `$DISPLAY` the launcher
-spawns its own Xvfb and renders the viewer there (`mcp/_xvfb.py`), so a
-display-less box with the `xvfb` package installed runs these tests unaided.
+**A display, and a GL context behind it.** The config tree below turns on
+`viewer.virtual_display`, so with no `$DISPLAY` the launcher spawns its own
+Xvfb and renders the viewer there (`mcp/_xvfb.py`) instead of running without
+one: a display-less box with the `xvfb` package installed runs these tests
+unaided.
 What still cannot be conjured is the binary itself (plus Mesa's software GL
 behind it): absent both a display and Xvfb, the session child fails fast at
 spawn — so these tests **skip with instructions** rather than pay the slow
@@ -24,7 +26,7 @@ probe, because offscreen Qt has no GL context.)
 **No tensor plane.** A developer box often has a data plane up, and then
 `client` is live and the agent can wander into whatever that machine's catalog
 happens to hold — so a finding might not reproduce anywhere else. The child is
-pointed at an unreachable URL instead: `auto_connect` fails best-effort,
+pointed at an unreachable URL instead: the connect fails best-effort,
 `client` lands as ``None``, and the fixture reaches the agent as a napari layer
 and nothing else. Every skill's Parameters table already accepts "a layer on
 `viewer`" as a source, and a session with no tensor plane is a real
@@ -32,7 +34,7 @@ configuration a user can be in, so step 1 still has something true to resolve.
 
 **A config tree of our own.** `BIOPB_CONFIG_HOME` points at a temp dir, so the
 run neither reads the developer's `mcp-config.json` nor their personal
-`~/.config/biopb/skills/*.md`. The catalog under test is the shipped one.
+`~/.config/biopb/docs/*.md`. The store under test is the shipped one.
 
 Arrays cross the boundary as ``.npy`` files in a shared temp dir, not as base64
 inside a tool call: the session child is on this machine, a fixture movie is
@@ -65,17 +67,17 @@ ENV_GUARD_MARKERS = "BIOPB_GUARD_MARKERS"
 #:
 #: `execute_code` is arbitrary Python by design, so a run can open the fixture
 #: that defines its own answer (`truth["structural_channel"]`, the trajectory,
-#: the tolerances, the persona's facts) or the skill markdown an ablated arm is
-#: supposed to lack. Both have happened: a measured `skill+asked` arm reached
-#: its procedure by walking the installed package and opening
-#: `mcp/_skills_data/drift-correction.md`.
+#: the tolerances, the persona's facts) or the doc an ablated arm is supposed to
+#: lack. Both have happened: a measured `skill+asked` arm reached its procedure
+#: by walking the installed package and opening
+#: `mcp/_skills_data/drift-correction.md` (that tree is `mcp/_docs_data/` now).
 #:
 #: Recording rather than refusing, on purpose. The agent is curious, not
 #: adversarial, and it says what it did in the trace; what the layer actually
 #: needs is for a compromised run to be *loud* instead of scoring like a good
 #: one. Refusing would also change the environment under test, which §5
-#: forbids — "disclose the environment, withhold only the skill" — and would
-#: break the session child's own legitimate reads of `_skills_data`. Judgement
+#: forbids — "disclose the environment, withhold only the doc" — and would
+#: break the session child's own legitimate reads of `_docs_data`. Judgement
 #: about which reads matter belongs in the parent, where it is testable, so the
 #: hook stays a dumb recorder and writes down who was asking.
 _TRIPWIRE = '''\
@@ -108,8 +110,8 @@ def _watch(event, args):
     _busy = True
     try:
         # Which process was asking is the whole discrimination: the session
-        # child reads `_skills_data` to serve `skill://`, and that is the
-        # system working. The kernel is where agent code runs.
+        # child reads `_docs_data` to serve `read_doc`, and that is the system
+        # working. The kernel is where agent code runs.
         with open(_LOG, "a", encoding="utf-8") as fh:
             fh.write(
                 json.dumps(
@@ -134,11 +136,10 @@ if _MARKERS and _LOG:
 
 
 def guard_markers() -> list[str]:
-    """What a run must not read: the harness's own tree, and the shipped skill
-    bodies.
+    """What a run must not read: the harness's own tree, and the shipped docs.
 
     `_tests/` holds every case's `truth`, its tolerances and its persona — read
-    it and any arm passes, with nothing in the result to say so. `_skills_data`
+    it and any arm passes, with nothing in the result to say so. `_docs_data`
     is narrower: legitimate for the session child to read, and the ablation's
     undoing if the *kernel* reads it.
 
@@ -151,7 +152,7 @@ def guard_markers() -> list[str]:
     sep = os.sep
     return [
         f"{sep}biopb_mcp{sep}_tests{sep}",
-        f"{sep}biopb_mcp{sep}mcp{sep}_skills_data{sep}",
+        f"{sep}biopb_mcp{sep}mcp{sep}_docs_data{sep}",
     ]
 
 
@@ -326,30 +327,19 @@ class ToolSpec:
 #: advertises. Not `@mcp.tool()`s, and deliberately not: they are the harness
 #: standing in for a capability every shipped MCP client already has.
 #:
-#: A skill body and a `guide://` page are MCP **resources**, and a resource is
-#: not a tool. `list_skills` returns metadata plus a `uri`, the handshake
-#: instructions say to read that uri, and `_bridge` translates *tools* onto a
-#: chat-completions API — so before this existed the agent was handed a pointer
-#: it had no verb to dereference. Measured on the 2026-08-03 sweep, that cost
-#: the benchmark its independent variable: `skill+silent` reached for
-#: `pystackreg` because the catalog *metadata* named it in `checklist:`, having
-#: never read a line of the procedure, and `skill+asked` got the body only by
-#: walking the installed package directory. A broken or empty skill body would
-#: have scored the same.
-#:
-#: The ablation still holds through here, and is not re-implemented: the
-#: `skill://` resource resolves through `load_catalog()`, which returns `[]`
-#: when `services.skills_enabled` is off, so an ablated run that reads the uri
-#: gets "No skill '<id>' in the catalog" — the server's own answer, not one the
-#: harness invented.
+#: The knowledge store is `read_doc`/`write_doc`, which are ordinary tools, so
+#: the agent reaches the docs without either of these. They stay because a
+#: resource is still not a tool and `_bridge` translates *tools* onto a
+#: chat-completions API: a server that grows a resource the agent is pointed at
+#: would otherwise hand it a pointer it has no verb to dereference, which is
+#: what cost the 2026-08-03 sweep its independent variable.
 CLIENT_TOOLS: tuple[ToolSpec, ...] = (
     ToolSpec(
         name="list_resources",
         description=(
             "List the MCP resources this server exposes, including URI "
             "templates. Resources carry reference material rather than "
-            "actions: the `guide://` pages and the full body of each "
-            "curated skill."
+            "actions."
         ),
         input_schema={"type": "object", "properties": {}},
     ),
@@ -357,16 +347,14 @@ CLIENT_TOOLS: tuple[ToolSpec, ...] = (
         name="read_resource",
         description=(
             "Read one MCP resource and return its text. `uri` is a full "
-            "resource URI — for example `skill://drift-correction` (the `uri` "
-            "field of a `list_skills` result, whose body holds the actual "
-            "step-by-step workflow) or `guide://kernel`."
+            "resource URI, as `list_resources` prints it."
         ),
         input_schema={
             "type": "object",
             "properties": {
                 "uri": {
                     "type": "string",
-                    "description": "e.g. skill://<id> or guide://<name>",
+                    "description": "a uri from list_resources",
                 }
             },
             "required": ["uri"],
@@ -411,13 +399,13 @@ class LiveSession:
     instructions: str
     tools: list[ToolSpec]
     scratch: Path
-    #: Whether the curated catalog was offered at all (`--bench-skills`).
-    skills_enabled: bool
+    #: Whether the curated procedure docs were listed at all (`--bench-docs`).
+    docs_enabled: bool
     #: Where the tripwire writes. Absent until something is recorded.
     guard_log: Path = Path()
-    #: The session child's own pid. It reads `_skills_data` to serve
-    #: `skill://`, which is the system working, so `peeked` needs to tell that
-    #: process apart from the kernel underneath it.
+    #: The session child's own pid. It reads `_docs_data` to serve `read_doc`,
+    #: which is the system working, so `peeked` needs to tell that process apart
+    #: from the kernel underneath it.
     child_pid: int | None = None
     _loop: _LoopThread = None  # type: ignore[assignment]
     _session: Any = None
@@ -489,14 +477,14 @@ class LiveSession:
     def peeked(self) -> list[dict]:
         """Harness-owned files this run read that it had no business reading.
 
-        Serving `skill://` means the *session child* opens `_skills_data`, and
-        `load_catalog` scans the whole directory — the system working. The
+        Serving `read_doc` means the *session child* opens `_docs_data`, and
+        rendering the index walks the whole directory — the system working. The
         kernel is where agent code runs, so the discriminator is the process,
         and it is applied here rather than in the hook: the recorder stays dumb
         and the judgement stays somewhere a test can reach it.
 
         Not `"ipykernel" in sys.modules`, which reads true in the session child
-        as well and quietly classified every catalog scan as a peek.
+        as well and quietly classified every store read as a peek.
         """
         if not self.guard_log.exists():
             return []
@@ -506,9 +494,9 @@ class LiveSession:
                 entry = json.loads(line)
             except ValueError:
                 continue
-            serving = entry.get(
-                "pid"
-            ) == self.child_pid and "_skills_data" in entry.get("path", "")
+            serving = entry.get("pid") == self.child_pid and "_docs_data" in entry.get(
+                "path", ""
+            )
             if not serving:
                 out.append(entry)
         return out
@@ -583,70 +571,202 @@ class LiveSession:
         return f"{SENTINEL} client True" in out.text
 
 
-def _write_config(
-    root: Path, *, skills_enabled: bool = True, plugins: Sequence[str] = ()
-) -> None:
+#: The seed index heading the procedures sit under. The one heading named from
+#: outside the index, and only here: the store classifies nothing, so the
+#: ablation is expressed as an index, and the seed gate
+#: (`_tests/docs/test_seed.py`) pins that the seed keeps this heading.
+PROCEDURES_HEADING = "Procedures"
+
+
+def ablated_index(seed: str) -> str:
+    """The seed index with every entry under *PROCEDURES_HEADING* moved to
+    ``ignored:``.
+
+    Moved, not deleted: an ignored id stays out of the *New shipped docs* tail,
+    so the ablated arm's handshake names no procedure at all. What survives is
+    ``read_doc`` of an id the agent already knows, which the handshake does not
+    give it -- the same leak the old tool-based ablation had, through a narrower
+    door.
+    """
+    from biopb_mcp.mcp import _docs
+
+    out: list[str] = []
+    withheld: list[str] = []
+    under = False
+    ignored_line = None
+    for line in seed.splitlines():
+        if line.startswith("#"):
+            under = line.strip() == f"## {PROCEDURES_HEADING}"
+        if under and (doc_id := _docs._entry_id(line)):
+            withheld.append(doc_id)
+            continue
+        if _docs._IGNORED.match(line):
+            ignored_line = len(out)
+        out.append(line)
+    already = _docs._ignored_ids(seed)
+    ids = sorted(already | set(withheld))
+    ignored = "ignored: " + ", ".join(ids)
+    if ignored_line is None:
+        out.extend(["", ignored])
+    else:
+        out[ignored_line] = ignored
+    return "\n".join(out).rstrip() + "\n"
+
+
+def _op_defs_for(names: Sequence[str]) -> list:
+    """Every ``@op``-decorated top-level callable in each named bundled
+    algorithm file (``biopb_mcp.algorithms.<name>``), as ``_OpDef``s."""
+    import importlib
+
+    defs = []
+    for name in names:
+        mod = importlib.import_module(f"biopb_mcp.algorithms.{name}")
+        for attr in vars(mod).values():
+            info = getattr(attr, "__biopb_op__", None)
+            if info is not None:
+                defs.append(info)
+    return defs
+
+
+class _FakeControlAlgorithms:
+    """A real op gRPC server for the requested bundled ops, discoverable the
+    normal way (the control's runtime record + ``GET /api/algorithms``).
+
+    There is no control process in a bench session (`live_session`'s own
+    docstring: "the control plane is bypassed entirely"), so
+    ``build_ops_from_config`` -- which the *child* calls, over the wire, from
+    the real ``biopb`` control client -- would otherwise see an empty
+    registry regardless of what a case declares. This starts the real
+    ``Ops`` server the bundled algorithm file would run under ``uv``, and
+    answers the one HTTP call the client makes as if a control were up, so
+    the loader that runs is the real one on both sides of the wire.
+    """
+
+    def __init__(self, names: Sequence[str]):
+        from biopb_image_base.ops import build_server
+
+        self._defs = _op_defs_for(names)
+        self._grpc_server, self._grpc_port = build_server(self._defs)
+        self._grpc_server.start()
+        self._http = self._make_http_server()
+
+    def _make_http_server(self):
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        from google.protobuf import json_format
+
+        body = json.dumps(
+            {
+                "servers": [
+                    {
+                        "name": "bench",
+                        "kind": "url",
+                        "state": "up",
+                        "url": f"grpc://127.0.0.1:{self._grpc_port}",
+                        "token": None,
+                        "ops": [
+                            json_format.MessageToDict(d.info()) for d in self._defs
+                        ],
+                    }
+                ]
+            }
+        ).encode("utf-8")
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802 - stdlib's naming
+                if self.path.startswith("/api/algorithms"):
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+            def log_message(self, *a):  # noqa: A003 - silence stdlib's access log
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return server
+
+    def publish(self) -> None:
+        """Write the control runtime record so ``biopb.algorithms()``
+        finds this fake control the same way it would a real one."""
+        from biopb._control._endpoints import write_runtime_record
+
+        host, port = self._http.server_address
+        write_runtime_record(host, port, os.getpid())
+
+    def close(self) -> None:
+        from biopb._control._endpoints import remove_runtime_record
+
+        remove_runtime_record()
+        self._http.shutdown()
+        self._http.server_close()
+        self._grpc_server.stop(grace=1).wait()
+
+
+def _write_config(root: Path, *, docs_enabled: bool = True) -> None:
     """A config tree of our own, so neither the developer's settings nor their
-    personal skills reach the child.
+    personal docs reach the child.
 
-    ``skills_enabled=False`` is what **`--bench-skills=false`** sets: the ``list_skills`` tool
-    stays registered but ``load_catalog()`` returns an empty list, so the agent
-    can call it and get nothing back, while the kernel, napari, dask and every
-    library stay exactly as they were. That is §5's rule — disclose the
-    environment, withhold only the skill — and it is a real shipped
-    configuration rather than a hole cut for the test.
-
-    ``plugins`` names kernel plugins the case's skill declares in its
-    ``checklist:``. They are seeded into this tree's own ``biopb/kernel/`` from
-    the ones biopb-mcp ships, so the loader that runs is the real one — and only
-    what a case asks for is present, since a plugin the skill never declared is
-    an environment difference nobody chose.
+    ``docs_enabled=False`` is what **`--bench-docs=false`** sets: the tree gets
+    a local index that is the seed with its procedures on the ``ignored:`` line
+    (:func:`ablated_index`), so the handshake lists none and the tail
+    resurfaces none, while the kernel, napari, dask and every library stay
+    exactly as they were. That is §5's rule — disclose the environment,
+    withhold only the procedure — done with the same file an agent would edit
+    rather than a switch cut into the store for the test.
     """
     (root / "biopb").mkdir(parents=True, exist_ok=True)
-    if plugins:
-        from biopb_mcp import plugins as bundled
-
-        kernel_dir = root / "biopb" / "kernel"
-        kernel_dir.mkdir(exist_ok=True)
-        source = Path(bundled.__file__).parent
-        for name in plugins:
-            shutil.copyfile(source / f"{name}.py", kernel_dir / f"{name}.py")
     (root / "biopb" / "mcp-config.json").write_text(
         json.dumps(
             {
-                # One process, no cluster: the fixtures are small and a
-                # LocalCluster is the slowest part of bring-up.
-                "dask": {"scheduler": "threads"},
                 # Nothing watches a web UI during an unattended run.
                 "observe": {"enabled": False},
                 "transport": {"kind": "http"},
-                "services": {"skills_enabled": skills_enabled},
+                # A display-less box renders on the launcher's Xvfb rather than
+                # running without a viewer, which the cases assume.
+                "viewer": {"virtual_display": True},
             }
         ),
         encoding="utf-8",
     )
-    # Present but empty: the local-skills dir must exist as *nothing*, so the
-    # catalog under test is exactly what the package ships.
-    (root / "biopb" / "skills").mkdir(exist_ok=True)
+    # The local tier. Empty on the docs-on arm, so the store under test is
+    # exactly what the package ships and its own seeding runs; on the docs-off
+    # arm it holds the one file the ablation is.
+    docs_dir = root / "biopb" / "docs"
+    docs_dir.mkdir(exist_ok=True)
+    if not docs_enabled:
+        from biopb_mcp.mcp import _docs
+
+        (docs_dir / "index.md").write_text(
+            ablated_index(_docs._seed_index_text()), encoding="utf-8"
+        )
 
 
 @contextmanager
 def live_session(
     *,
-    skills_enabled: bool = True,
-    plugins: Sequence[str] = (),
+    docs_enabled: bool = True,
+    algorithms: Sequence[str] = (),
     tensor_url: str = "",
 ) -> Iterator[LiveSession]:
     """Bring a session up, hand back a driver, and reap it on the way out.
 
-    ``skills_enabled=False`` withholds the curated catalog and nothing else
-    -- the ablated half of a skill's delta, `--bench-skills=false`. ``plugins``
-    seeds the kernel plugins a case's skill declares.
+    ``docs_enabled=False`` unlists the curated procedure docs and nothing
+    else -- the ablated half of a doc's delta, `--bench-docs=false`. The
+    reference docs stay. ``algorithms`` names bundled algorithm-plane files
+    (``biopb_mcp.algorithms.<name>``) the case's procedure needs; see
+    :class:`_FakeControlAlgorithms`.
 
     ``tensor_url`` is the run's data plane, for a case presented on one. Empty
     -- the usual state -- points the child at an address nothing answers, so
     ``client is None`` and the agent meets the environment every `array` case's
-    task prompt describes. Either way the *control* plane is bypassed
+    task prompt describes. Either way the *real* control plane is bypassed
     entirely: ``$BIOPB_TENSOR_URL`` is read before it is consulted, which is
     what keeps a benchmark run from touching the developer's own deployment.
     """
@@ -657,12 +777,13 @@ def live_session(
     from biopb_mcp.mcp import _shim
 
     scratch = Path(tempfile.mkdtemp(prefix="biopb-skill-session-"))
-    _write_config(scratch / "config", skills_enabled=skills_enabled, plugins=plugins)
+    _write_config(scratch / "config", docs_enabled=docs_enabled)
 
     saved = {
         k: os.environ.get(k)
         for k in (
             "BIOPB_CONFIG_HOME",
+            "BIOPB_STATE_HOME",
             "BIOPB_TENSOR_URL",
             "QT_QPA_PLATFORM",
             "PYTHONPATH",
@@ -671,6 +792,10 @@ def live_session(
         )
     }
     os.environ["BIOPB_CONFIG_HOME"] = str(scratch / "config")
+    # Isolates the control's runtime-record discovery too: a real control
+    # left running on the developer's machine must never shadow (or be
+    # shadowed by) the fake one `_FakeControlAlgorithms` may publish below.
+    os.environ["BIOPB_STATE_HOME"] = str(scratch / "state")
     os.environ["BIOPB_TENSOR_URL"] = tensor_url or UNREACHABLE_TENSOR_URL
     os.environ.pop("QT_QPA_PLATFORM", None)  # a real GL platform, not offscreen
 
@@ -689,6 +814,7 @@ def live_session(
 
     child = session_id = loop = None
     stop = None
+    fake_control = None
     try:
         # Inside the try, because building the wheel can fail and everything
         # above has already redirected `BIOPB_CONFIG_HOME` and the tensor URL for
@@ -707,6 +833,12 @@ def live_session(
                 *([saved["PYTHONPATH"]] if saved["PYTHONPATH"] else []),
             ]
         )
+        if algorithms:
+            # Published before spawn: the child's own bootstrap calls
+            # `build_ops_from_config` once, at start_kernel, so the record has
+            # to be discoverable from the first `GET /api/algorithms`.
+            fake_control = _FakeControlAlgorithms(algorithms)
+            fake_control.publish()
         child, url, session_id = _shim.spawn_session(
             load_config(), timeout=SPAWN_TIMEOUT
         )
@@ -718,7 +850,7 @@ def live_session(
             instructions=(init.instructions or "").strip(),
             tools=tools,
             scratch=scratch,
-            skills_enabled=skills_enabled,
+            docs_enabled=docs_enabled,
             guard_log=guard_log,
             child_pid=child.pid,
             _loop=loop,
@@ -748,6 +880,8 @@ def live_session(
                 pass
         if child is not None:
             _shim._reap_session(child, session_id)
+        if fake_control is not None:
+            fake_control.close()
         for key, value in saved.items():
             if value is None:
                 os.environ.pop(key, None)

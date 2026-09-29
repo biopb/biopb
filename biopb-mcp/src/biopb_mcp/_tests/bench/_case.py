@@ -2,7 +2,7 @@
 
 One :class:`Case` asks one question — **can an agent do this work** — and
 answers it with a number that has a knowable right value. Two runs either side
-of ``--bench-skills`` say what the catalog was worth to that work; repetition
+of ``--bench-docs`` say what the procedure docs were worth to that work; repetition
 says what the spread is. Both are properties of the invocation, not of the case.
 
 They were two dataclasses in two packages for a while (`Case` and `TaskCase`),
@@ -12,19 +12,18 @@ vocabularies that agreed by hand, two classifiers that ordered `turn-cap` and
 contamination checks. The second engine was written by copying the first, which
 is exactly the cost this file exists to stop paying a third time.
 
-**Nothing here decides how a run is configured.** Whether the catalog is offered
-and who answers the agent are switches on the invocation (`_options.py`), not
-properties of the case.
+**Nothing here decides how a run is configured.** Whether the procedure docs are
+offered and who answers the agent are switches on the invocation
+(`_options.py`), not properties of the case.
 
-**And nothing here names a skill.** A case used to carry ``skill``, which fed a
-``--bench-cases=skills|tasks`` filter, a coverage ledger over the shipped
-catalog, and a rule about which agent could score it. All three are gone: this
-package no longer imports the skills layout, reads ``_skills_data``, or knows
-which entries ship. Promoting or banking a skill is a change to the catalog and
-to nothing here, and a case's namespace stays put whether or not a skill by that
-name exists. What remains is one assertion that the catalog matched the switch
-it was run under, which reads what ``list_skills`` returned at runtime and never
-names an entry.
+**And nothing here names a doc.** A case used to carry ``skill``, which fed a
+case filter, a coverage ledger over the shipped catalog, and a rule about which
+agent could score it. All three are gone: this package no longer imports a
+layout rule, reads ``_docs_data``, or knows which docs ship. Promoting or
+banking one is a change to the store and to nothing here, and a case's namespace
+stays put whether or not a doc by that name exists. What remains is one
+assertion that what was served matched the switch it was run under, which reads
+the store at runtime and never names a doc.
 """
 
 from __future__ import annotations
@@ -51,8 +50,8 @@ BLOCKING_BUDGET = 3
 
 #: The namespace a case falls back to when it declares none of its own. A
 #: curated case is found at ``$BIOPB_FIXTURES/<namespace>/<case_id>/``
-#: and every artifact path starts the same way (`docs/fixtures.md`), so this is
-#: a directory name on somebody's disk and not merely a label.
+#: and every artifact path starts the same way, so this is a directory name on
+#: somebody's disk and not merely a label.
 TASK_NAMESPACE = "tasks"
 
 #: The two environments a fixture array can arrive in. Peers, not a ladder:
@@ -131,7 +130,7 @@ class Case:
     or a file on disk — is decided here, when the case is written, never
     resolved at run time. Covering one subject both ways is *two cases*, each
     with its own `case_id`, and `(namespace, case_id)` is what names a run's
-    artifacts (`docs/fixtures.md`).
+    artifacts.
 
     The fixture is a spec rather than a built value so a case module costs
     nothing at import: 30 of these are collected by every ordinary test run,
@@ -160,21 +159,22 @@ class Case:
     #: What this case is about, and where its data and artifacts live:
     #: ``$BIOPB_FIXTURES/<namespace>/<case_id>/``. Defaults to `tasks`.
     #:
-    #: **This layer knows nothing about the skills catalog.** A namespace is a
+    #: **This layer knows nothing about the knowledge store.** A namespace is a
     #: subject, not a catalog entry — it is a directory somebody has on disk,
     #: and it keeps its name whether or not a skill by that name is served,
     #: banked, or has never been written. Promoting or banking a skill is
     #: therefore not an edit to any case: what a run measures comes from the
-    #: switches, and `--bench-skills` withholds the catalog wholesale rather
+    #: switches, and `--bench-docs` withholds the catalog wholesale rather
     #: than per entry.
     namespace: str = ""
 
     #: Optional ``(outcome, dir) -> None`` — the before/after images.
     save_artifacts: Callable[[Outcome, Path], None] | None = None
-    #: Kernel plugins this case's work needs, seeded into the session's own
-    #: config tree. Without this a `plugin:` token is unresolvable and the run
-    #: is scoring an environment the work cannot be done in.
-    plugins: Sequence[str] = ()
+    #: Bundled algorithm-plane ops (`biopb_mcp.algorithms.<name>`) this case's
+    #: work needs, published for the session via `_FakeControlAlgorithms`.
+    #: Without this an `op:` token is unresolvable and the run is scoring an
+    #: environment the work cannot be done in.
+    algorithms: Sequence[str] = ()
     #: Case-folded substrings that must appear in the persona's rendered
     #: prompt: the fact the fixture strips, so the run is answerable at all.
     #: Checked wherever it is declared; a case that withholds nothing leaves it

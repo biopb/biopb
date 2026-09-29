@@ -21,11 +21,13 @@ import numpy as np
 import pytest
 import tifffile
 from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
-from biopb_tensor_server.core.metadata_db import MetadataDatabase
 from biopb_tensor_server.fixtures import (
     create_per_plane_ome_tiff,
     create_tiled_ome_tiff,
 )
+from biopb_tensor_server.serving.metadata_db import MetadataDatabase
+
+from tests import catalog_server, register_and_catalog
 
 N_PLANES = 400
 FIELD = "Image:0"
@@ -41,7 +43,7 @@ def per_plane_tiff(tmp_path):
 def registered(per_plane_tiff):
     """A source adapter taken through the registration calls, before release."""
     adapter = OmeTiffAdapter(per_plane_tiff, "perplane")
-    adapter.get_source_descriptor()
+    adapter.list_tensor_descriptors()
     adapter.get_metadata()
     return adapter
 
@@ -140,7 +142,7 @@ def test_scene_built_in_the_registration_gap_is_settled_by_the_release(
     is the leak back on an adapter nothing releases a second time.
     """
     source = OmeTiffAdapter(per_plane_tiff, "perplane")
-    source.get_source_descriptor()  # descriptor discovery
+    source.list_tensor_descriptors()  # descriptor discovery
     scene = source.get_tensor_adapter(FIELD)  # <-- in the gap
     assert scene._raw_ome_xml and scene._reduced_ome_xml is None
 
@@ -160,7 +162,7 @@ def test_release_settles_the_stripped_form_even_if_metadata_never_ran(per_plane_
     # first, so the invariant holds under any call order: no adapter is ever
     # released into a state where the file is its only remaining source.
     source = OmeTiffAdapter(per_plane_tiff, "perplane")
-    source.get_source_descriptor()
+    source.list_tensor_descriptors()
     scene = source.get_tensor_adapter(FIELD)
 
     source.release_registration_cache()
@@ -194,7 +196,7 @@ def test_physical_scale_does_not_force_the_strip(per_plane_tiff):
     # <Pixels>; producing the stripped one costs a regex over the whole thing.
     # An adapter that has not been asked for metadata must not pay the latter.
     source = OmeTiffAdapter(per_plane_tiff, "perplane")
-    source.get_source_descriptor()  # descriptors only, no get_metadata
+    source.list_tensor_descriptors()  # descriptors only, no get_metadata
     scene = source.get_tensor_adapter(FIELD)
     assert scene._reduced_ome_xml is None
 
@@ -260,19 +262,18 @@ def test_resync_after_release_still_writes_the_same_row(registered):
     assert db.get_metadata_json("perplane") == first
 
 
-def test_registering_without_a_catalog_releases_nothing(per_plane_tiff):
-    # The embedded image-base cache builds its TensorFlightServer with
-    # metadata_db=None; a source registered there has nowhere else for its
-    # metadata to live, so nothing may be dropped out from under it.
-    from biopb_tensor_server import TensorFlightServer
+def test_registering_on_a_bare_server_releases_into_its_own_catalog(per_plane_tiff):
+    # A server built with metadata_db=None (the embedded image-base cache) makes
+    # an in-memory catalog, and its caller syncs registrations into it, so the
+    # metadata has somewhere to live and the XML can go.
 
     adapter = OmeTiffAdapter(per_plane_tiff, "perplane")
-    adapter.get_source_descriptor()
-    server = TensorFlightServer(location="grpc://localhost:0", writable=False)
+    adapter.list_tensor_descriptors()
+    server = catalog_server(location="grpc://localhost:0", writable=False)
     try:
-        server.register_source("perplane", adapter)
-        assert adapter._raw_ome_xml
-        assert adapter._raw_ome_xml_released is False
+        register_and_catalog(server, "perplane", adapter)
+        assert adapter._raw_ome_xml_released is True
+        assert server.metadata_db.get_metadata_json("perplane")
     finally:
         server.shutdown()
 

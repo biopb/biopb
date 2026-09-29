@@ -41,7 +41,7 @@ describe("JobRow", () => {
   });
 
   it("falls back to the code line when nobody said", () => {
-    // The user console submits no intent, and neither does an older child.
+    // A Jupyter client's cell carries no intent, and neither does an older child.
     for (const j of [job(), job({ intent_preview: "" })]) {
       expect(render(j)).toContain("print(1)");
     }
@@ -77,7 +77,7 @@ describe("JobRow", () => {
     // The kernel runs one cell at a time, so a row that is not running has
     // nothing to interrupt -- and a button that cannot act is how the old
     // header placement earned its "No running job." dialog.
-    for (const status of ["ok", "error", "interrupted"]) {
+    for (const status of ["ok", "error", "interrupted", "kernel_lost"]) {
       expect(render(job({ status }))).not.toContain("job-stop");
     }
   });

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
 from biopb_tensor_server.core.adapter_base import SourceAdapter
 from biopb_tensor_server.core.normalize import normalize_adapter
@@ -24,8 +24,13 @@ from biopb_tensor_server.core.normalize import normalize_adapter
 logger = logging.getLogger(__name__)
 
 
-def _close_adapter(adapter: Optional[SourceAdapter]) -> None:
+def close_adapter(adapter: Optional[SourceAdapter]) -> None:
     """Best-effort release of an adapter's resources (e.g. open file handles).
+
+    Public because :meth:`SourceRegistry.swap` hands the displaced adapter back
+    unclosed -- it may have to be restored rather than closed, so the choice is
+    the caller's -- and whoever swapped then needs this same never-raises close
+    for the branch where the replace committed.
 
     ``SourceAdapter.close()`` is declared on the ABC with a no-op default, so
     this calls it rather than sniffing for it: a wrapper that forwards every
@@ -33,21 +38,40 @@ def _close_adapter(adapter: Optional[SourceAdapter]) -> None:
     instead of a silent skip (biopb/biopb#71). Never raises -- shutdown and
     unregister must not fail on a balky adapter, and the registry also accepts
     non-inheriting test doubles.
+
+    **Releases what was attached to the source as well.** An uploaded field or
+    a label set holds a store of its own that the source knows nothing about.
+    Done here, the mirror of :meth:`SourceRegistry.register` where the
+    attaching happens, rather than in a ``close()`` override each adapter with
+    handles of its own would have to remember to chain up to.
     """
     if adapter is None:  # unregister of an id that was never registered
         return
+    for tensor in getattr(adapter, "attached_tensors", {}).values():
+        try:
+            tensor.close()
+        except Exception:  # cleanup must not fail
+            logger.debug("error closing attached tensor", exc_info=True)
     try:
         adapter.close()
-    except Exception:  # pragma: no cover - cleanup must not fail
+    except Exception:  # cleanup must not fail
         logger.debug("error closing source adapter", exc_info=True)
 
 
 class SourceRegistry:
     """The server's live ``source_id -> SourceAdapter`` map, thread-safe."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self, on_register: Optional[Callable[[str, SourceAdapter], None]] = None
+    ) -> None:
+        """*on_register* runs on every registered adapter before it is
+        published, for what has to happen at the one chokepoint but is not
+        the registry's to know -- attaching a source's uploaded label sets
+        (``adapters.labels.sidecar_attacher``). Its failure is logged, never
+        the registration's: a source is its pixels first."""
         self._sources: Dict[str, SourceAdapter] = {}
         self._lock = threading.RLock()
+        self._on_register = on_register
 
     def register(self, source_id: str, adapter: SourceAdapter) -> SourceAdapter:
         """Register a data source, in canonical axis order.
@@ -89,6 +113,13 @@ class SourceRegistry:
                 f"by splitting on the first '/'."
             )
         adapter = normalize_adapter(adapter)
+        if self._on_register is not None:
+            try:
+                self._on_register(source_id, adapter)
+            except Exception:
+                logger.warning(
+                    f"on_register hook failed for {source_id}", exc_info=True
+                )
         with self._lock:
             self._sources[source_id] = adapter
         logger.debug(f"Registered source: {source_id}")
@@ -98,12 +129,52 @@ class SourceRegistry:
         """Remove a source and release its adapter's resources.
 
         Returns the removed adapter (or ``None`` if it was not registered).
+
+        Closed here, where :meth:`swap` hands its displaced adapter back open:
+        the id is gone, so there is no rollback that could need this one back.
+        The reader that resolved it a moment ago and is still decoding from it
+        is ``SourceAdapter.close``'s concern, not this method's -- see
+        :meth:`swap` for why that is not what separates the two.
         """
         with self._lock:
             adapter = self._sources.pop(source_id, None)
-        _close_adapter(adapter)
+        close_adapter(adapter)
         logger.debug(f"Unregistered source: {source_id}")
         return adapter
+
+    def swap(
+        self, source_id: str, adapter: SourceAdapter
+    ) -> Tuple[SourceAdapter, Optional[SourceAdapter]]:
+        """Put *adapter* in place of ``source_id``'s current one, atomically.
+
+        Returns ``(registered, displaced)`` -- the adapter as registered (see
+        :meth:`register` on normalization) and the one it replaced, or None if
+        the id was free. That handback is this method's whole content -- a bare
+        :meth:`register` over a live id leaks what it overwrote.
+
+        **The displaced adapter is not closed, because the swap may be undone.**
+        A replace that fails after the swap -- the catalog upsert raises, say --
+        puts the displaced adapter back and goes on serving from it
+        (``Reconciler._restore_displaced_source``), so a registry that closed it
+        here would restore a source that is live in ListFlights and broken on
+        its first read. Ownership therefore passes to the caller, which either
+        closes with :func:`close_adapter` once the replace has committed, or
+        restores instead of closing.
+
+        What does *not* separate the two methods is draining in-flight readers.
+        :meth:`unregister` closes on the spot under exactly the same condition
+        -- a reader that resolved the adapter a moment earlier is still decoding
+        from it -- because that is ``SourceAdapter.close``'s own obligation in
+        both directions: ``OmeTiffAdapter`` drains on ``_active_reads``, mrc /
+        dv / qptiff defer to the reaper while a read is active, czi / nd2 /
+        ndtiff / bioio release under ``_io_lock``, and the default holds nothing.
+        No caller of either method owes a drain.
+        """
+        with self._lock:
+            displaced = self._sources.get(source_id)
+            registered = self.register(source_id, adapter)
+        logger.debug(f"Swapped source adapter: {source_id}")
+        return registered, displaced
 
     def get(self, source_id: str) -> Optional[SourceAdapter]:
         """Thread-safe source lookup."""
@@ -126,7 +197,7 @@ class SourceRegistry:
         with self._lock:
             adapters = list(self._sources.values())
         for adapter in adapters:
-            _close_adapter(adapter)
+            close_adapter(adapter)
 
     def replace(self, mapping: Dict[str, SourceAdapter]) -> None:
         """Atomically swap the whole map (used by tests to inject fixtures)."""

@@ -6,7 +6,7 @@ visible napari viewer.  Start it with the console script or module entry point::
     biopb-mcp        # console script
     python -m biopb_mcp.mcp
 
-Install the optional dependencies with ``pip install biopb-mcp[mcp]``.
+The viewer needs the ``napari`` extra: ``pip install biopb-mcp[napari]``.
 """
 
 from ._kernel import KernelHost

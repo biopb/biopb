@@ -19,7 +19,7 @@ import logging
 from mcp.server.transport_security import TransportSecurityMiddleware
 from starlette.responses import JSONResponse, PlainTextResponse
 
-from . import _app, _kernel_rpc
+from . import _app
 
 logger = logging.getLogger(__name__)
 
@@ -132,21 +132,3 @@ async def json_body(request):
     if not isinstance(payload, dict):
         return None, JSONResponse({"error": "invalid JSON body"}, status_code=400)
     return payload, None
-
-
-def kernel_error(res):
-    """Map a non-ok job round-trip to a response.
-
-    A ``busy`` kernel is transient (another quick call holds the lock) -> 200
-    with a ``busy`` marker the UI retries on; anything else -> 502.
-    """
-    status = res.get("status")
-    if status == "busy":
-        return JSONResponse({"busy": True, "jobs": []})
-    return JSONResponse(
-        {
-            "error": status or "kernel error",
-            "detail": _kernel_rpc._format_execute_result(res),
-        },
-        status_code=502,
-    )

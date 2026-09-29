@@ -25,8 +25,32 @@ from biopb_tensor_server.adapters.tiff import (
 from biopb_tensor_server.adapters.tifffile_adapter import LsmAdapter, TiffAdapter
 from biopb_tensor_server.adapters.zarr import ZarrAdapter
 
-# Optional bioio vendor-format adapters (installed via the [aics] extra)
+# Native phase-3 vendor adapters (biopb/biopb#799): each optional on its own
+# package (readlif / mrc / nd2), independent of the bioio extra below. The
+# reader is probed, not just the module -- see adapters/__init__.py.
 try:
+    import mrc  # noqa: F401
+
+    from biopb_tensor_server.adapters.dv import DeltaVisionAdapter
+except ImportError:
+    DeltaVisionAdapter = None  # type: ignore
+try:
+    import readlif  # noqa: F401
+
+    from biopb_tensor_server.adapters.lif import LifAdapter
+except ImportError:
+    LifAdapter = None  # type: ignore
+try:
+    import nd2  # noqa: F401
+
+    from biopb_tensor_server.adapters.nd2 import Nd2Adapter
+except ImportError:
+    Nd2Adapter = None  # type: ignore
+
+# Optional bioio vendor-format adapters ([aics]; not in the default install)
+try:
+    import bioio  # noqa: F401
+
     from biopb_tensor_server.adapters.bioio import (
         AicsImageIoAdapter,
         DvAdapter,
@@ -44,12 +68,10 @@ except ImportError:
     AicsImageIoAdapter = None  # type: ignore
 
 from biopb_tensor_server.cache import (
-    CacheBackend,
     CacheEntry,
     CacheManager,
     CacheStats,
     EntryState,
-    MemoryCacheBackend,
 )
 from biopb_tensor_server.core.adapter_base import (
     SourceAdapter,
@@ -90,6 +112,9 @@ __all__ = [
     "TiffAdapter",
     "LsmAdapter",
     "OmeTiffAdapter",
+    "LifAdapter",
+    "DeltaVisionAdapter",
+    "Nd2Adapter",
     "ZeissAdapter",
     "LeicaAdapter",
     "NikonAdapter",
@@ -100,10 +125,8 @@ __all__ = [
     "MicroManagerLegacyAdapter",
     "OmeZarrAdapter",
     "CacheManager",
-    "CacheBackend",
     "CacheEntry",
     "CacheStats",
-    "MemoryCacheBackend",
     "EntryState",
     "CacheConfig",
 ]

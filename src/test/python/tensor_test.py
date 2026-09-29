@@ -6,7 +6,8 @@ whose CI installs it. They were silently skipped here because the client-only CI
 job installs no server (biopb/biopb#579).
 """
 
-import time
+import pickle
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -14,209 +15,34 @@ from biopb.tensor import (
     TensorFlightClient,
 )
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
-from biopb.tensor.serialized_pb2 import SerializedTensor
 
 
-class TestTensorFlightClient:
-    """Client-side unit tests for TensorFlightClient (mock-backed)."""
+def _offline_client(raw_client=None):
+    """A wired TensorFlightClient with no connection opened.
 
-    def test_get_upload_status_pb_uses_tensor_descriptor_array_id(self):
-        client = TensorFlightClient("grpc://localhost:8890", cache_bytes=10_000_000)
-        # Upload lifecycle lives in the UploadSession collaborator (#278 item C),
-        # so the _pb conveniences resolve status through client._upload -- mock there.
-        client._upload.get_upload_status = Mock(
-            return_value={
-                "source_id": "cache_test",
-                "state": "PENDING",
-                "expected_chunks": 4,
-                "uploaded_chunks": 1,
-            }
-        )
+    Built without ``__init__`` so no socket is created: the shared state plus the
+    collaborators (#278 item C). ``protocol_checked`` skips the health probe a
+    real connect would run.
+    """
+    from biopb.tensor._session import CatalogClient, ChunkFetcher, _ClientState
 
-        pb = SerializedTensor(tensor_descriptor=TensorDescriptor(array_id="cache_test"))
-
-        try:
-            status = client.get_upload_status_pb(pb)
-        finally:
-            client.close()
-
-        client._upload.get_upload_status.assert_called_once_with("cache_test")
-        assert status["state"] == "PENDING"
-
-    def test_wait_for_upload_ready_pb_returns_when_ready(self):
-        client = TensorFlightClient("grpc://localhost:8890", cache_bytes=10_000_000)
-        client._upload.get_upload_status = Mock(
-            side_effect=[
-                {
-                    "source_id": "cache_test",
-                    "state": "PENDING",
-                    "expected_chunks": 4,
-                    "uploaded_chunks": 1,
-                },
-                {
-                    "source_id": "cache_test",
-                    "state": "READY",
-                    "expected_chunks": 4,
-                    "uploaded_chunks": 4,
-                },
-            ]
-        )
-
-        pb = SerializedTensor(tensor_descriptor=TensorDescriptor(array_id="cache_test"))
-
-        try:
-            status = client.wait_for_upload_ready_pb(
-                pb,
-                timeout_seconds=0.1,
-                poll_interval_seconds=0.0,
-            )
-        finally:
-            client.close()
-
-        assert status["state"] == "READY"
-        assert client._upload.get_upload_status.call_count == 2
-
-    def test_wait_for_upload_ready_pb_times_out(self):
-        client = TensorFlightClient("grpc://localhost:8890", cache_bytes=10_000_000)
-        client._upload.get_upload_status = Mock(
-            return_value={
-                "source_id": "cache_test",
-                "state": "PENDING",
-                "expected_chunks": 4,
-                "uploaded_chunks": 1,
-            }
-        )
-
-        pb = SerializedTensor(tensor_descriptor=TensorDescriptor(array_id="cache_test"))
-
-        try:
-            with pytest.raises(
-                TimeoutError, match="Timed out waiting for upload readiness"
-            ):
-                client.wait_for_upload_ready_pb(
-                    pb,
-                    timeout_seconds=0.0,
-                    poll_interval_seconds=0.0,
-                )
-        finally:
-            client.close()
-
-    def test_wait_for_upload_ready_pb_fails_fast_on_unknown(self):
-        """An UNKNOWN state is not an upload in progress -- don't poll to timeout.
-
-        Regression for biopb/biopb#109: a non-upload source (e.g. a catalog or
-        cloud source) reports UNKNOWN forever, so the old loop blocked for the
-        full timeout before raising a misleading TimeoutError.
-        """
-        client = TensorFlightClient("grpc://localhost:8890", cache_bytes=10_000_000)
-        client._upload.get_upload_status = Mock(
-            return_value={
-                "source_id": "ome-tiff_abc123",
-                "state": "UNKNOWN",
-                "expected_chunks": 0,
-                "uploaded_chunks": 0,
-            }
-        )
-
-        pb = SerializedTensor(
-            tensor_descriptor=TensorDescriptor(array_id="ome-tiff_abc123")
-        )
-
-        try:
-            started = time.monotonic()
-            with pytest.raises(ValueError, match="tracks no upload"):
-                client.wait_for_upload_ready_pb(
-                    pb,
-                    # Generous timeout: the point is that we return long before it.
-                    timeout_seconds=30.0,
-                    poll_interval_seconds=0.5,
-                )
-            elapsed = time.monotonic() - started
-        finally:
-            client.close()
-
-        assert elapsed < 1.0
-        assert client._upload.get_upload_status.call_count == 1
-
-    def test_wait_for_upload_ready_pb_stops_if_the_record_disappears(self):
-        """A tracked upload whose record vanishes mid-poll also fails fast.
-
-        The server forgets upload state when a source is unregistered (and loses
-        it entirely on restart), so PENDING -> UNKNOWN is just as terminal as
-        UNKNOWN on the first poll.
-        """
-        client = TensorFlightClient("grpc://localhost:8890", cache_bytes=10_000_000)
-        client._upload.get_upload_status = Mock(
-            side_effect=[
-                {
-                    "source_id": "cache_test",
-                    "state": "PENDING",
-                    "expected_chunks": 4,
-                    "uploaded_chunks": 1,
-                },
-                {
-                    "source_id": "cache_test",
-                    "state": "UNKNOWN",
-                    "expected_chunks": 0,
-                    "uploaded_chunks": 0,
-                },
-            ]
-        )
-
-        pb = SerializedTensor(tensor_descriptor=TensorDescriptor(array_id="cache_test"))
-
-        try:
-            with pytest.raises(ValueError, match="tracks no upload"):
-                client.wait_for_upload_ready_pb(
-                    pb,
-                    timeout_seconds=30.0,
-                    poll_interval_seconds=0.0,
-                )
-        finally:
-            client.close()
-
-        assert client._upload.get_upload_status.call_count == 2
-
-    def test_get_upload_status_pb_requires_array_id(self):
-        client = TensorFlightClient("grpc://localhost:8890", cache_bytes=10_000_000)
-        pb = SerializedTensor(tensor_descriptor=TensorDescriptor())
-
-        try:
-            with pytest.raises(
-                ValueError, match="tensor_descriptor.array_id is required"
-            ):
-                client.get_upload_status_pb(pb)
-        finally:
-            client.close()
-
-    def test_wait_for_upload_ready_pb_raises_on_failed_state(self):
-        client = TensorFlightClient("grpc://localhost:8890", cache_bytes=10_000_000)
-        client._upload.get_upload_status = Mock(
-            return_value={
-                "source_id": "cache_test",
-                "state": "FAILED",
-                "expected_chunks": 4,
-                "uploaded_chunks": 2,
-            }
-        )
-
-        pb = SerializedTensor(tensor_descriptor=TensorDescriptor(array_id="cache_test"))
-
-        try:
-            with pytest.raises(
-                RuntimeError, match="Upload failed for source 'cache_test'"
-            ):
-                client.wait_for_upload_ready_pb(
-                    pb,
-                    timeout_seconds=0.1,
-                    poll_interval_seconds=0.0,
-                )
-        finally:
-            client.close()
+    client = TensorFlightClient.__new__(TensorFlightClient)
+    state = _ClientState(
+        raw_client=raw_client,
+        call_options=None,
+        location="",
+        token=None,
+        cache_bytes=0,
+        protocol_checked=True,
+    )
+    client._state = state
+    client._catalog = CatalogClient(state)
+    client._fetcher = ChunkFetcher(state, client._catalog)
+    return client
 
 
 class TestQuerySourcesFormat:
-    """query_sources output-format conversion (server-free).
+    """query output-format conversion (server-free).
 
     Exercises TensorFlightClient._format_query_result directly. The default
     stays 'arrow' (pyarrow.Table) for backward compatibility; 'pandas' and
@@ -230,8 +56,11 @@ class TestQuerySourcesFormat:
         return pa.table(
             {
                 "source_id": ["a", "b"],
-                # list column mirrors the real `shape_summary` catalog field
-                "shape_summary": [[1, 4, 5734, 5734], [1, 5, 7616, 7616]],
+                # nested column, like the real `tensors` catalog field
+                "tensors": [
+                    [{"array_id": "a/t1", "shape": [1, 4, 5734, 5734]}],
+                    [{"array_id": "b/t1", "shape": [1, 5, 7616, 7616]}],
+                ],
             }
         )
 
@@ -241,9 +70,7 @@ class TestQuerySourcesFormat:
         import inspect
 
         default = (
-            inspect.signature(TensorFlightClient.query_sources)
-            .parameters["format"]
-            .default
+            inspect.signature(TensorFlightClient.query).parameters["format"].default
         )
         assert default == "arrow"
 
@@ -257,7 +84,7 @@ class TestQuerySourcesFormat:
         out = TensorFlightClient._format_query_result(t, "pandas")
         assert isinstance(out, pd.DataFrame)
         assert list(out["source_id"]) == ["a", "b"]
-        assert list(out["shape_summary"].iloc[0]) == [1, 4, 5734, 5734]
+        assert list(out["tensors"].iloc[0][0]["shape"]) == [1, 4, 5734, 5734]
 
     def test_pandas_string_nulls_become_none_not_nan(self):
         # issue #47: a NULL in a *string* column (e.g. metadata_json) coerces
@@ -298,91 +125,79 @@ class TestQuerySourcesFormat:
         t = self._table()
         out = TensorFlightClient._format_query_result(t, "records")
         assert out == [
-            {"source_id": "a", "shape_summary": [1, 4, 5734, 5734]},
-            {"source_id": "b", "shape_summary": [1, 5, 7616, 7616]},
+            {
+                "source_id": "a",
+                "tensors": [{"array_id": "a/t1", "shape": [1, 4, 5734, 5734]}],
+            },
+            {
+                "source_id": "b",
+                "tensors": [{"array_id": "b/t1", "shape": [1, 5, 7616, 7616]}],
+            },
         ]
 
     def test_unknown_format_rejected_before_network(self):
-        # Validated at the top of query_sources (now on CatalogClient, #278 item
+        # Validated at the top of query (now on CatalogClient, #278 item
         # C), so a bad format fails fast without a server / connection.
-        from biopb.tensor._session import CatalogClient, _ClientState
-
-        client = TensorFlightClient.__new__(TensorFlightClient)
-        client._catalog = CatalogClient(
-            _ClientState(
-                client=None, call_options=None, location="", token=None, cache_bytes=0
-            )
-        )
+        client = _offline_client()
         with pytest.raises(ValueError, match="unknown format"):
-            client.query_sources("SELECT 1", format="polars")
+            client.query("SELECT 1", format="polars")
+
+    def test_query_sources_is_a_deprecated_alias_for_query(self):
+        client = _offline_client()
+        with pytest.warns(DeprecationWarning, match="query_sources"):
+            with pytest.raises(ValueError, match="unknown format"):
+                client.query_sources("SELECT 1", format="polars")
 
 
 class TestGetPhysicalScale:
-    """get_physical_scale reads the descriptor summary (server-free).
+    """get_physical_scale describes the tensor, every call.
 
     Exercises the client accessor for the per-dim physical-scale summary the
-    server folds onto the descriptor (issue #31), driving the descriptor /
-    source caches directly so no connection is needed.
+    server folds onto the descriptor (issue #31), stubbing the fetch so no
+    connection is needed.
     """
 
     @staticmethod
     def _client():
-        # Build without __init__ (no connection): wire the shared state + the
-        # CatalogClient collaborator that now owns get_physical_scale (#278 item
-        # C). The method only touches the in-memory descriptor cache and (on a
-        # miss) the catalog's _fetch_tensor_descriptor, which we stub there.
-        from biopb.tensor._session import CatalogClient, ChunkFetcher, _ClientState
-
-        client = TensorFlightClient.__new__(TensorFlightClient)
-        state = _ClientState(
-            client=None, call_options=None, location="", token=None, cache_bytes=0
-        )
-        client._state = state
-        client._catalog = CatalogClient(state)
-        client._fetcher = ChunkFetcher(state, client._catalog)
+        # get_physical_scale lives on CatalogClient (#278 item C) and reaches
+        # the server only through _fetch_tensor_descriptor, stubbed here.
+        client = _offline_client()
         client._catalog._fetch_tensor_descriptor = Mock()
         return client
 
     @staticmethod
     def _desc(array_id, scale=None, unit=None):
-        from biopb.tensor.descriptor_pb2 import DataSourceDescriptor
-
         desc = TensorDescriptor(array_id=array_id, dim_labels=["z", "y", "x"])
         if scale is not None:
             desc.physical_scale[:] = scale
             desc.physical_unit[:] = unit
-        return desc, DataSourceDescriptor
+        return desc
 
-    def test_reads_cached_descriptor_without_rpc(self):
-        # A descriptor cached by a prior get_tensor() carries the summary, so
-        # get_physical_scale returns it with no extra fetch.
+    def test_it_asks_the_server_every_time(self):
+        # physical_scale is a GetFlightInfo field the catalog leaves empty, so
+        # only a fetched descriptor can answer it.
         client = self._client()
-        desc, _ = self._desc(
-            "t1", [2.0, 0.325, 0.325], ["micrometer", "micrometer", "micrometer"]
+        client._catalog._fetch_tensor_descriptor.return_value = self._desc(
+            "src/t1", [2.0, 0.325, 0.325], ["micrometer"] * 3
         )
-        client._descriptors["src/t1"] = desc
 
-        # Addressed by the qualified array_id; cache hit -> no fetch.
-        scale, unit = client.get_physical_scale("src/t1")
-        assert scale == [2.0, 0.325, 0.325]
-        assert unit == ["micrometer", "micrometer", "micrometer"]
-        client._catalog._fetch_tensor_descriptor.assert_not_called()
+        for _ in range(3):
+            assert client.get_physical_scale("src/t1")[0] == [2.0, 0.325, 0.325]
+        assert client._catalog._fetch_tensor_descriptor.call_count == 3
 
     def test_none_when_summary_empty(self):
         # Old server / no physical sizes -> empty repeated field -> None.
         client = self._client()
-        desc, _ = self._desc("t1")  # no physical_scale set
-        client._descriptors["src/t1"] = desc
+        client._catalog._fetch_tensor_descriptor.return_value = self._desc("src/t1")
 
         assert client.get_physical_scale("src/t1") is None
 
-    def test_fetches_descriptor_when_not_cached(self):
-        # Not in the descriptor cache: a GetFlightInfo fetch (stubbed here via
-        # _fetch_tensor_descriptor) supplies the summary. A bare source id
-        # resolves the source's default tensor. No get_source / _sources fallback
-        # (removed with the array_id-keyed accessor, #75).
+    def test_a_bare_id_fetches_the_sources_default_tensor(self):
+        # The property this holds that the test above does not: a bare source id
+        # is passed through to the server, which answers with the source's
+        # default tensor (#44), and the compact mask is what goes on the wire.
         client = self._client()
-        desc, _ = self._desc("t1", [1.0, 0.5, 0.5], ["", "micrometer", "micrometer"])
+        desc = self._desc("t1", [1.0, 0.5, 0.5], ["", "micrometer", "micrometer"])
         client._catalog._fetch_tensor_descriptor.return_value = desc
 
         scale, unit = client.get_physical_scale("src")  # bare source id -> default
@@ -409,30 +224,26 @@ class TestGetPhysicalScale:
 
 
 class TestGetDescriptorFieldMasks:
-    """get_descriptor sends describe-shaped GetFlightInfo field masks (#563).
+    """get_descriptor sends a describe-shaped field mask (#563).
 
-    The three response masks (with_metadata / with_pyramid / with_read_plan) are
-    opt-in per part. get_descriptor is a *describe* -- the stable per-tensor
-    facts, not a read -- so it defaults to with_metadata=False (opt in for the
-    heavy OME tree), with_pyramid=True (the describe consumer reads the levels),
-    and with_read_plan=False (skip the per-request plan a describe discards).
+    Every optional part is opt-in, so the mask on the wire *is* the request --
+    nothing is implied by omission any more. get_descriptor is a describe (the
+    stable per-tensor facts, not a read), so it asks for the pyramid its
+    consumer reads and nothing else: no `endpoints` (the per-request plan it
+    would discard), no `metadata_json` (the heavy OME tree).
 
-    The with_metadata default flip (True -> False) is the one intentional break
-    from the old always-metadata behavior, so guard the exact masks on the wire
-    here -- callers that need metadata now opt in, so a silent revert of the
-    default would otherwise go uncaught.
+    Guarded exactly, because both defaults are silent when wrong. A revert of
+    the metadata opt-in would quietly ship megabytes per call, and an
+    `endpoints` path creeping back in would turn every describe into an
+    O(chunks) enumeration.
     """
 
     @staticmethod
     def _client_capturing_read_opt():
         # Build without __init__ (no connection); mock the flight client so we can
-        # decode the FlightCmd the descriptor probe puts on the wire.
-        from biopb.tensor._session import CatalogClient, ChunkFetcher, _ClientState
-
-        client = TensorFlightClient.__new__(TensorFlightClient)
-        state = _ClientState(
-            client=Mock(), call_options=None, location="", token=None, cache_bytes=0
-        )
+        # decode the FlightRequest the descriptor probe puts on the wire.
+        client = _offline_client(raw_client=Mock())
+        state = client._state
         # get_flight_info returns a FlightInfo whose descriptor.command is a
         # serialized TensorDescriptor (what _fetch_tensor_descriptor parses back).
         info = Mock()
@@ -440,56 +251,55 @@ class TestGetDescriptorFieldMasks:
             array_id="src/A2"
         ).SerializeToString()
         state.client.get_flight_info.return_value = info
-        client._state = state
-        client._catalog = CatalogClient(state)
-        client._fetcher = ChunkFetcher(state, client._catalog)
         return client, state
 
     @staticmethod
     def _sent_read_opt(state):
-        from biopb.tensor.descriptor_pb2 import FlightCmd
+        from biopb.tensor.descriptor_pb2 import FlightRequest
 
         fd = state.client.get_flight_info.call_args.args[0]
-        return FlightCmd.FromString(fd.command).tensor_read
+        return FlightRequest.FromString(fd.command).tensor_read
 
     def test_defaults_are_describe_shaped(self):
         client, state = self._client_capturing_read_opt()
         client.get_descriptor("src/A2")
-        read_opt = self._sent_read_opt(state)
-        assert read_opt.with_metadata is False  # the intentional opt-in break
-        assert read_opt.with_pyramid is True
-        assert read_opt.HasField("with_read_plan")  # optional bool set explicitly
-        assert read_opt.with_read_plan is False
+        assert set(self._sent_read_opt(state).fields.paths) == {"pyramid"}
 
     def test_with_metadata_opt_in_is_forwarded(self):
         client, state = self._client_capturing_read_opt()
         client.get_descriptor("src/A2", with_metadata=True)
-        read_opt = self._sent_read_opt(state)
-        assert read_opt.with_metadata is True
+        assert "metadata_json" in set(self._sent_read_opt(state).fields.paths)
+
+    def test_residency_is_never_asked_for_by_default(self):
+        """The expensive one. It is a stat walk of the source, so a describe
+        that did not ask must not get it -- and must not pay for it."""
+        client, state = self._client_capturing_read_opt()
+        client.get_descriptor("src/A2")
+        assert "is_resident" not in set(self._sent_read_opt(state).fields.paths)
+
+    def test_residency_opt_in_is_forwarded(self):
+        client, state = self._client_capturing_read_opt()
+        client.get_descriptor("src/A2", with_residency=True)
+        assert "is_resident" in set(self._sent_read_opt(state).fields.paths)
+
+    def test_a_describe_never_asks_for_the_read_plan(self):
+        """`endpoints` is the O(chunks) enumeration. Under the bools this
+        replaced it was ON unless explicitly disabled, so a describe had to
+        remember to opt *out*; the default now costs nothing."""
+        client, state = self._client_capturing_read_opt()
+        client.get_descriptor("src/A2")
+        assert "endpoints" not in set(self._sent_read_opt(state).fields.paths)
 
 
-class TestDescriptorCacheStaysStructural:
-    """The descriptor cache holds addressing facts only (biopb/biopb#795).
-
-    Masked-off parts must never be stored: an entry that carried them would be
-    indistinguishable from one cached before anyone asked, and ``metadata_json``
-    is the full OME tree in a dict with no eviction and session lifetime.
-    """
+class TestDescriptorsAreNotCached:
+    """The SDK stores no descriptor; every describe is a round trip."""
 
     @staticmethod
     def _client(response: TensorDescriptor):
-        from biopb.tensor._session import CatalogClient, ChunkFetcher, _ClientState
-
-        client = TensorFlightClient.__new__(TensorFlightClient)
-        state = _ClientState(
-            client=Mock(), call_options=None, location="", token=None, cache_bytes=0
-        )
+        client = _offline_client(raw_client=Mock())
         info = Mock()
         info.descriptor.command = response.SerializeToString()
-        state.client.get_flight_info.return_value = info
-        client._state = state
-        client._catalog = CatalogClient(state)
-        client._fetcher = ChunkFetcher(state, client._catalog)
+        client._state.client.get_flight_info.return_value = info
         return client
 
     @staticmethod
@@ -518,43 +328,27 @@ class TestDescriptorCacheStaysStructural:
         assert returned.metadata_json  # the mask is honoured on the return value
         assert len(returned.pyramid) == 2
 
-    def test_heavy_fields_never_enter_the_cache(self):
+    def test_there_is_nowhere_to_cache_one(self):
+        # Gone, not merely unused: nothing can quietly start writing to it.
         client = self._client(self._fat_descriptor())
 
         client.get_descriptor("src/A2", with_metadata=True)
 
-        cached = client._descriptors["src/A2"]
-        assert cached.metadata_json == ""
-        assert list(cached.pyramid) == []
+        assert not hasattr(client, "_descriptors")
+        assert not hasattr(client._state, "descriptors")
 
-    def test_the_transfer_grid_never_enters_the_cache(self):
-        # The server answers a grid only on GetFlightInfo, for the tensor it
-        # bound; a list_flights entry carries none (biopb/biopb#812). Caching it
-        # would leave entries in two grades, and an empty one must never read as
-        # a usable grid -- so the cache keeps none and the caller describes.
+    def test_every_describe_round_trips(self):
         client = self._client(self._fat_descriptor())
 
-        returned = client.get_descriptor("src/A2")
+        for _ in range(3):
+            client.get_descriptor("src/A2")
 
-        assert list(returned.chunk_shape) == [1, 64, 64]  # honoured on the return
-        assert list(client._descriptors["src/A2"].chunk_shape) == []
-
-    def test_addressing_facts_do_enter_the_cache(self):
-        # Stripping must not take the fields the cache exists to serve --
-        # get_physical_scale reads its answer straight out of this entry.
-        client = self._client(self._fat_descriptor())
-
-        client.get_descriptor("src/A2")
-
-        cached = client._descriptors["src/A2"]
-        assert list(cached.shape) == [8, 64, 64]
-        assert cached.dtype == "uint16"
-        assert list(cached.physical_scale) == [2.0, 0.325, 0.325]
+        assert client._state.raw_client.get_flight_info.call_count == 3
 
     def test_masked_fetch_does_not_poison_a_later_full_fetch(self):
         # The regression #795 asks for: a pyramid-less fetch first, then a
         # default one. Every get_descriptor round-trips, so the second caller
-        # sees the pyramid regardless of what the first one cached.
+        # sees the pyramid regardless of what the first one asked for.
         client = self._client(self._fat_descriptor())
 
         client.get_descriptor("src/A2", with_pyramid=False)
@@ -563,5 +357,365 @@ class TestDescriptorCacheStaysStructural:
         assert len(second.pyramid) == 2
 
 
+class TestResolveDescriptorAddressing:
+    """The read path's addressing refusals, read off the catalog row."""
+
+    @staticmethod
+    def _client(row):
+        client = _offline_client(raw_client=Mock())
+        client._catalog._source_tensors_row = Mock(return_value=row)
+        # The row answers every case here; reaching the probe is the failure.
+        client._catalog._fetch_tensor_descriptor = Mock(
+            side_effect=AssertionError("the row should have answered")
+        )
+        return client
+
+    @staticmethod
+    def _row(*array_ids, is_resolved=True):
+        return {
+            "is_resolved": is_resolved,
+            "tensors": [
+                {
+                    "array_id": aid,
+                    "dim_labels": ["y", "x"],
+                    "shape": [4, 4],
+                    "dtype": "uint8",
+                }
+                for aid in array_ids
+            ],
+        }
+
+    def test_unresolved_steers_to_resolve(self):
+        client = self._client(self._row(is_resolved=False))
+
+        with pytest.raises(ValueError, match=r"call client\.resolve_source"):
+            client._catalog._resolve_descriptor("cloud_x")
+
+    def test_resolved_but_empty_does_not_steer_to_resolve(self):
+        # A source can resolve cleanly and hold nothing readable; the flag
+        # distinguishes that from unresolved, an empty tensor list cannot.
+        client = self._client(self._row())
+
+        with pytest.raises(ValueError, match="no readable tensors") as exc:
+            client._catalog._resolve_descriptor("empty_x")
+        assert "client.resolve_source(" not in str(exc.value)
+
+    def test_bare_id_on_a_multi_tensor_source_is_refused(self):
+        client = self._client(self._row("m/f0", "m/f1"))
+
+        with pytest.raises(ValueError, match="multiple tensors"):
+            client._catalog._resolve_descriptor("m")
+
+    def test_a_qualified_id_resolves_off_the_row(self):
+        client = self._client(self._row("m/f0", "m/f1"))
+
+        desc = client._catalog._resolve_descriptor("m/f1")
+
+        assert desc.array_id == "m/f1"
+        assert list(desc.shape) == [4, 4]
+
+    def test_a_bare_id_on_a_single_tensor_source_resolves(self):
+        client = self._client(self._row("solo"))
+
+        assert client._catalog._resolve_descriptor("solo").array_id == "solo"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestUploadRefused:
+    """The one typed exception a write path raises (biopb/biopb#1048 step 7)."""
+
+    def test_it_survives_a_trip_through_a_worker(self):
+        """Raised on a dask worker, it comes back as itself with its fields."""
+        from biopb.tensor import UploadRefused
+
+        exc = UploadRefused("cache_x", "DISCARDED", "job died")
+        back = pickle.loads(pickle.dumps(exc))
+        assert isinstance(back, UploadRefused)
+        assert (back.source_id, back.state, back.reason) == (
+            "cache_x",
+            "DISCARDED",
+            "job died",
+        )
+        assert "job died" in str(back)
+
+    def test_it_is_read_off_extra_info_not_the_message(self):
+        import json
+
+        import pyarrow.flight as flight
+        from biopb.tensor._upload import _refused_from
+
+        info = {
+            "code": "CANCELLED",
+            "reason": "upload_sealed",
+            "state": "READY",
+            "source_id": "cache_x",
+            "detail": "",
+        }
+        exc = flight.FlightCancelledError(
+            "whatever the message says", json.dumps(info).encode()
+        )
+        refused = _refused_from(exc)
+        assert refused is not None
+        assert refused.state == "READY"
+        assert refused.source_id == "cache_x"
+
+    def test_another_cancelled_call_passes_through(self):
+        """Only an upload refusal is translated; a cancel from anything else is
+        not this module's to reinterpret."""
+        import pyarrow.flight as flight
+        from biopb.tensor._upload import _refused_from
+
+        assert _refused_from(flight.FlightCancelledError("cancelled")) is None
+        assert _refused_from(flight.FlightCancelledError("x", b"not json")) is None
+        assert (
+            _refused_from(flight.FlightCancelledError("x", b'{"reason": "other"}'))
+            is None
+        )
+
+
+class TestCreateTensorGrid:
+    def test_a_dask_template_supplies_its_grid(self):
+        import dask.array as da
+        from biopb.tensor._upload import _uniform_chunk_shape
+
+        arr = da.zeros((10, 6), chunks=(4, 6))  # ragged trailing chunk on axis 0
+        assert _uniform_chunk_shape(arr) == (4, 6)
+
+    def test_an_irregular_chunking_yields_one_grid(self):
+        import dask.array as da
+        from biopb.tensor._upload import _uniform_chunk_shape
+
+        arr = da.zeros((10,), chunks=((3, 5, 2),))
+        assert _uniform_chunk_shape(arr) == (5,)
+
+
+class TestExportLocation:
+    """biopb/biopb#1158: anything minted for a *different* consumer -- a
+    forwarded SerializedTensor, or a dask chunk-fetch graph handed to a
+    distributed cluster -- must carry the server's advertised address (if it
+    published one), never just the address this client happened to dial."""
+
+    @pytest.mark.parametrize(
+        "location, advertised_location, expected",
+        [
+            # Nothing advertised -> fall back to the dial address verbatim.
+            ("grpc://localhost:8815", None, "grpc://localhost:8815"),
+            ("grpc://localhost:8815", "grpc://real-host:8815", "grpc://real-host:8815"),
+            # The server advertises the public grpcs:// spelling; a dask
+            # worker's FlightClient needs Arrow's own grpc+tls:// scheme.
+            (
+                "grpc+tls://localhost:8815",
+                "grpcs://real-host:8815",
+                "grpc+tls://real-host:8815",
+            ),
+        ],
+    )
+    def test_export_location_resolution(self, location, advertised_location, expected):
+        from biopb.tensor._session import _ClientState
+
+        state = _ClientState(
+            raw_client=None,
+            call_options=None,
+            location=location,
+            token=None,
+            cache_bytes=0,
+            advertised_location=advertised_location,
+        )
+        assert state.export_location == expected
+
+    def test_get_tensor_pb_mints_the_export_location(self):
+        # get_tensor(output="pb") bakes an address into SerializedTensor.location
+        # for a different process to dial later -- it must be the
+        # export_location, not the raw dial address, or a lazy remote op
+        # forwards a private loopback address off-box.
+        client = _offline_client(raw_client=Mock())
+        client._state.advertised_location = "grpc://real-host:8815"
+        client._fetcher._plan_read = Mock(
+            return_value=SimpleNamespace(serialize=lambda: b"fake-flight-info")
+        )
+
+        pb = client._fetcher.get_tensor("test-tensor", output="pb")
+
+        assert pb.location == "grpc://real-host:8815"
+
+    def test_get_tensor_pb_export_location_override_wins_over_advertised(self):
+        # A caller-supplied export_location beats both the server's advertised
+        # address and the dial address -- for the case where neither is
+        # reachable from wherever tensor_from_pb() will actually run.
+        client = _offline_client(raw_client=Mock())
+        client._state.advertised_location = "grpc://real-host:8815"
+        client._fetcher._plan_read = Mock(
+            return_value=SimpleNamespace(serialize=lambda: b"fake-flight-info")
+        )
+
+        pb = client._fetcher.get_tensor(
+            "test-tensor", output="pb", export_location="grpc://override-host:9999"
+        )
+
+        assert pb.location == "grpc://override-host:9999"
+
+    def test_get_tensor_pb_export_location_override_is_normalized(self):
+        # The override goes through the same grpcs:// -> grpc+tls:// scheme
+        # normalization as the dial address and the advertised address.
+        client = _offline_client(raw_client=Mock())
+        client._fetcher._plan_read = Mock(
+            return_value=SimpleNamespace(serialize=lambda: b"fake-flight-info")
+        )
+
+        pb = client._fetcher.get_tensor(
+            "test-tensor", output="pb", export_location="grpcs://override-host:9999"
+        )
+
+        assert pb.location == "grpc+tls://override-host:9999"
+
+    def test_get_tensor_builds_its_dask_graph_from_the_export_location(
+        self, monkeypatch
+    ):
+        # get_tensor's dask graph embeds the fetch address in every chunk task
+        # (biopb.tensor._pool); a graph handed to dask.distributed only works
+        # if that address is reachable from wherever the scheduler runs it.
+        from biopb.tensor import _session
+
+        client = _offline_client(raw_client=Mock())
+        client._state.advertised_location = "grpc://real-host:8815"
+        client._fetcher._plan_read = Mock(return_value=object())
+
+        captured = {}
+
+        def fake_dask_from_flight_info(
+            info, location, token, cache_bytes, tls_trust, requested=None
+        ):
+            captured["location"] = location
+            return "fake-array"
+
+        monkeypatch.setattr(
+            _session, "_dask_from_flight_info", fake_dask_from_flight_info
+        )
+
+        result = client._fetcher.get_tensor("test-tensor")
+
+        assert result == "fake-array"
+        assert captured["location"] == "grpc://real-host:8815"
+
+    def test_get_tensor_export_location_override_wins_over_advertised(
+        self, monkeypatch
+    ):
+        from biopb.tensor import _session
+
+        client = _offline_client(raw_client=Mock())
+        client._state.advertised_location = "grpc://real-host:8815"
+        client._fetcher._plan_read = Mock(return_value=object())
+
+        captured = {}
+
+        def fake_dask_from_flight_info(
+            info, location, token, cache_bytes, tls_trust, requested=None
+        ):
+            captured["location"] = location
+            return "fake-array"
+
+        monkeypatch.setattr(
+            _session, "_dask_from_flight_info", fake_dask_from_flight_info
+        )
+
+        result = client._fetcher.get_tensor(
+            "test-tensor", export_location="grpc://override-host:9999"
+        )
+
+        assert result == "fake-array"
+        assert captured["location"] == "grpc://override-host:9999"
+
+    def test_upload_graph_uses_the_export_location(self, monkeypatch):
+        from biopb.tensor import _upload
+        from biopb.tensor._upload import UploadSession
+
+        client = _offline_client(raw_client=Mock())
+        client._state.advertised_location = "grpc://real-host:8815"
+        captured = {}
+
+        class FakeTarget:
+            def __init__(self, location, *args, **kwargs):
+                captured["location"] = location
+
+        monkeypatch.setattr(_upload, "_UploadTarget", FakeTarget)
+        monkeypatch.setattr(_upload.da, "store", lambda *args, **kwargs: None)
+
+        UploadSession(client._state, client._catalog)._store_chunks(
+            "test-tensor",
+            SimpleNamespace(shape=(1,), dtype="float32"),
+            [],
+            (0,),
+        )
+
+        assert captured["location"] == "grpc://real-host:8815"
+
+
+class TestGetTensorOutputSwitch:
+    """get_tensor's output="da"/"pb" switch replaces the separate get_tensor_pb
+    method, so both forms share one signature and cannot drift apart."""
+
+    def test_unknown_output_rejected_before_network(self):
+        client = _offline_client()
+        with pytest.raises(ValueError, match="unknown output"):
+            client.get_tensor("test-tensor", output="numpy")
+
+    def test_get_tensor_pb_is_a_deprecated_alias(self):
+        client = _offline_client(raw_client=Mock())
+        client._fetcher._plan_read = Mock(
+            return_value=SimpleNamespace(serialize=lambda: b"fake-flight-info")
+        )
+
+        with pytest.warns(DeprecationWarning, match="get_tensor_pb"):
+            pb = client.get_tensor_pb("test-tensor")
+
+        from biopb.tensor.serialized_pb2 import SerializedTensor
+
+        assert isinstance(pb, SerializedTensor)
+
+    def test_get_tensor_pb_forwards_export_location(self):
+        client = _offline_client(raw_client=Mock())
+        client._fetcher._plan_read = Mock(
+            return_value=SimpleNamespace(serialize=lambda: b"fake-flight-info")
+        )
+
+        with pytest.warns(DeprecationWarning):
+            pb = client.get_tensor_pb(
+                "test-tensor", export_location="grpc://override-host:9999"
+            )
+
+        assert pb.location == "grpc://override-host:9999"
+
+
+class TestCheckFlightProtocolMalformedHealth:
+    """A non-biopb (or misbehaving) Flight server can answer `health` with
+    valid JSON that isn't an object -- a bare string, list, number, or null.
+    That must fall back to the same "server predates this SDK" refusal as an
+    object with no "protocol" key, not an unhandled AttributeError out of a
+    dict-only `.get()` call chain (regression: biopb/biopb#1158's parsing
+    split narrowed the second try/except's caught exceptions)."""
+
+    @staticmethod
+    def _client_answering(body_bytes: bytes):
+        class _FakeBody:
+            def to_pybytes(self):
+                return body_bytes
+
+        class _FakeResult:
+            body = _FakeBody()
+
+        class _FakeClient:
+            def do_action(self, action, options=None):
+                return [_FakeResult()]
+
+        return _FakeClient()
+
+    @pytest.mark.parametrize("payload", [b'"ok"', b"[]", b"null", b"42"])
+    def test_non_dict_json_health_is_treated_as_a_stale_v1_server(self, payload):
+        from biopb.tensor._session import _check_flight_protocol
+
+        client = self._client_answering(payload)
+        with pytest.raises(RuntimeError, match="Incompatible biopb Flight protocol"):
+            _check_flight_protocol(client, None, "grpc://x:1")
