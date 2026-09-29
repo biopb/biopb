@@ -46,6 +46,7 @@ import sys
 import threading
 import time
 from datetime import datetime, timezone
+from decimal import Decimal
 from functools import partial
 from typing import (
     Any,
@@ -1918,6 +1919,42 @@ async def list_sources(request: Request) -> JSONResponse:
         )
 
 
+def _query_json_default(value: Any) -> Any:
+    """Spell the Arrow value types `json.dumps` has no encoding for.
+
+    A TIMESTAMP column arrives as `datetime`. The metadata DB stores them as
+    naive server-local time, so a bare ISO string would be ambiguous: it is
+    written with the server's UTC offset instead. Anything else is refused, not
+    stringified, so a new column type fails loudly rather than reaching a client
+    in a shape nobody chose.
+    """
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.astimezone()
+        return value.isoformat()
+    if hasattr(value, "isoformat"):  # date, time
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return str(value)  # exact; a float would round it
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).hex()
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
+class _QueryJSONResponse(JSONResponse):
+    """`JSONResponse` for query rows, which can carry timestamps."""
+
+    def render(self, content: Any) -> bytes:
+        return json.dumps(
+            content,
+            ensure_ascii=False,
+            allow_nan=False,
+            indent=None,
+            separators=(",", ":"),
+            default=_query_json_default,
+        ).encode("utf-8")
+
+
 @_router.post("/api/sources/query")
 async def query_sources(req: QuerySourcesRequest, request: Request) -> Response:
     """Execute SQL query against source metadata database.
@@ -1927,7 +1964,9 @@ async def query_sources(req: QuerySourcesRequest, request: Request) -> Response:
       X-Total-Sources    — total matching (before truncation)
       X-Returned-Sources — actual rows returned
       X-Truncated        — "true" if truncated
-    Response body: JSON array of query results
+    Response body: JSON array of query results. A TIMESTAMP is an ISO-8601 string
+    with the server's UTC offset; a MAP is a list of [key, value] pairs, not an
+    object.
     """
     ctx = _sidecar(request)
     ctx.check_token(request)
@@ -1977,7 +2016,7 @@ async def query_sources(req: QuerySourcesRequest, request: Request) -> Response:
             "X-Truncated": str(truncated).lower(),
         }
 
-        return JSONResponse(result, headers=headers)
+        return _QueryJSONResponse(result, headers=headers)
 
     except ValueError as exc:
         # SQL validation error (forbidden keyword, disallowed table)
