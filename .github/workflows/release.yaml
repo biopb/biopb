@@ -3,8 +3,8 @@
 # set + mcp sdist + webapp + samples + installers — the installer's single
 # source of truth.
 # Docker images are NOT built here: biopb-tensor-server's image is built by
-# tensor-server-ci on this same `release-v*` tag, and biopb-image-base on the SDK
-# `v*` tag (image-runtime-ci). PyPI is likewise separate — biopb publishes to PyPI
+# tensor-server-ci on this same `release-v*` tag, and biopb-image-base by manual
+# dispatch of image-runtime-ci. PyPI is likewise separate — biopb publishes to PyPI
 # on its own `v*` tag (biopb-mcp is no longer on PyPI; it ships only as the wheel set here).
 name: Release (deployment)
 
@@ -440,7 +440,7 @@ jobs:
             ### Docker
             The Docker images are built by their own CI workflows, not by this
             release job: `biopb-tensor-server` on this same `release-v*` tag
-            (tensor-server-ci) and `biopb-image-base` on the SDK `v*` tag
+            (tensor-server-ci) and `biopb-image-base` by manual dispatch
             (image-runtime-ci).
         env:
           GITHUB_TOKEN: ${{ github.token }}
