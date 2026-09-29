@@ -10,7 +10,7 @@
 # release.
 #
 # Arguments go to the installer (`... | bash -s -- --uninstall`), and so does
-# the environment. The release is chosen the way the installer chooses it:
+# the environment, plus the release picked. The release is chosen the way the installer chooses it:
 #   BIOPB_INSTALL_VERSION=X.Y.Z  that exact release (release-vX.Y.Z, vX.Y.Z also work)
 #   BIOPB_INSTALL_RC=1           the latest release candidate
 #   otherwise                    the latest stable release
@@ -101,8 +101,10 @@ main() {
     fi
 
     # stdin is null, as it is after a `curl | bash`: the installer prompts on /dev/tty.
+    # It is told the tag we picked, so it installs that release and does not look
+    # again (a release cut in between, or the candidate channel, cannot change it).
     local status=0
-    bash "$dir/install.sh" "$@" </dev/null || status=$?
+    BIOPB_INSTALL_VERSION="$tag" bash "$dir/install.sh" "$@" </dev/null || status=$?
     rm -rf "$dir"
     return "$status"
 }

@@ -49,7 +49,7 @@ esac
 
 # Reports its arguments, whether it kept stdin, and one environment variable.
 INSTALLER = """#!/bin/bash
-echo "ran args=[$*] mark=[${BIOPB_MARK:-}]"
+echo "ran args=[$*] mark=[${BIOPB_MARK:-}] version=[${BIOPB_INSTALL_VERSION:-}]"
 exit ${INSTALLER_STATUS:-0}
 """
 
@@ -119,6 +119,19 @@ def test_an_exact_version_skips_the_listing(run, given):
 def test_arguments_and_environment_reach_the_installer(run):
     proc, _ = run("--uninstall", "--purge", env={"BIOPB_MARK": "x"})
     assert "ran args=[--uninstall --purge] mark=[x]" in proc.stdout
+
+
+@pytest.mark.parametrize(
+    "env, picked",
+    [
+        ({}, "release-v0.15.2"),
+        ({"BIOPB_INSTALL_RC": "1"}, "release-v0.16.0rc1"),
+        ({"BIOPB_INSTALL_VERSION": "0.15.1"}, "release-v0.15.1"),
+    ],
+)
+def test_the_installer_is_told_which_release_was_picked(run, env, picked):
+    proc, _ = run(env=env)
+    assert f"version=[{picked}]" in proc.stdout
 
 
 def test_the_installers_exit_status_is_ours(run):
