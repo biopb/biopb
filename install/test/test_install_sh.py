@@ -536,3 +536,36 @@ def test_mcp_unmerge_ignores_a_missing_file(tmp_path):
     missing = tmp_path / "not-there.json"
     assert _unmerge(missing) == ""
     assert not missing.exists()
+
+
+def _unassigned_names(script: str) -> set[str]:
+    """UPPERCASE names the script reads that nothing in it assigns."""
+    import re
+
+    code = "\n".join(
+        line for line in script.splitlines() if not line.lstrip().startswith("#")
+    )
+    name = r"[A-Z][A-Z0-9_]{3,}"
+    read = set(re.findall(rf"\$\{{?({name})", code))
+    assigned = set(re.findall(rf"(?:^|[\s;(])(?:\w+\s+)?({name})\+?=", code, re.M))
+    assigned |= set(re.findall(rf"\bfor\s+({name})\s+in\b", code))
+    assigned |= set(re.findall(rf"\bread\s+(?:-\w+\s+)*({name})", code))
+    for declared in re.findall(r"\blocal\s+([^\n#]*)", code):
+        assigned |= set(re.findall(rf"\b({name})\b", declared))
+    # BIOPB_* are the caller's inputs, read with a default.
+    return {n for n in read - assigned if not n.startswith("BIOPB_")}
+
+
+def test_no_variable_is_read_that_nothing_assigns():
+    """The script runs under `set -u`, so reading a name nothing sets is fatal.
+
+    shellcheck cannot say so: it treats an UPPERCASE name as environment. #1047
+    deleted `LEGACY_CONFIG=` and left the block that read it, and every install
+    that wrote a config -- every fresh one -- died there.
+    """
+    assert _unassigned_names(INSTALL_SH.read_text()) <= {"BASH_REMATCH"}
+
+
+def test_the_unassigned_read_check_catches_a_deleted_assignment():
+    script = 'main() {\n  if [ "$A" = "$LEGACY_CONFIG" ]; then :; fi\n  A=1\n}\n'
+    assert _unassigned_names(script) == {"LEGACY_CONFIG"}

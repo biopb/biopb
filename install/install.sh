@@ -165,10 +165,8 @@ PY
 # When <prior-config> exists, its settings (server/cache/...) are loaded and
 # *preserved*; only the `sources` list is replaced with the chosen data dir, so
 # re-running with a new folder no longer discards the user's tuning. A prior
-# JSON is read with the stdlib; a legacy TOML is read for migration when this
-# Python has a TOML parser (3.11+ stdlib `tomllib`, else `tomli`) and otherwise
-# falls back to fresh defaults. The caller retires the legacy TOML. Writes
-# atomically; returns non-zero on any error.
+# JSON is read with the stdlib; an unreadable one falls back to fresh defaults.
+# Writes atomically; returns non-zero on any error.
 _write_server_config() {
     local out="$1" data_dir="$2" monitor="$3" prior="${4:-}" alias="${5:-}"
     mkdir -p "$(dirname "$out")"
@@ -1674,13 +1672,6 @@ install_biopb() {
             exit 1
         fi
         ACTIVE_CONFIG="$CONFIG_FILE"
-        # Retire a legacy TOML we just superseded so the server does not warn
-        # about both files shadowing (find_config prefers biopb.json). Its
-        # settings were carried into the new JSON above.
-        if [ "$EXISTING_CONFIG" = "$LEGACY_CONFIG" ] && [ -f "$LEGACY_CONFIG" ]; then
-            mv "$LEGACY_CONFIG" "$LEGACY_CONFIG.bak.$(date +%Y%m%d%H%M%S)"
-            _info "Migrated legacy TOML config to JSON (old file backed up)"
-        fi
         if [ -n "$EXISTING_CONFIG" ]; then
             _ok "Updated: $CONFIG_FILE"
         else
