@@ -59,4 +59,29 @@ export default tseslint.config(
       ],
     },
   },
+  {
+    // A bare `fetch` carries no token, and a 401 body is valid JSON that
+    // callers read straight through (biopb/biopb#730). Everything past the
+    // unlock gate goes through `sessionFetch`; the files below are the calls
+    // that must stay bare.
+    files: ["src/**/*.{ts,tsx}"],
+    ignores: [
+      // Decide whether a token is needed at all.
+      "src/auth.ts",
+      // Waits for the sidecar's unauthenticated /readyz.
+      "src/ClientBootstrap.tsx",
+      // The wrapper itself.
+      "src/utils/sessionFetch.ts",
+      "src/**/*.test.{ts,tsx}",
+    ],
+    rules: {
+      "no-restricted-globals": [
+        "error",
+        {
+          name: "fetch",
+          message: "Use sessionFetch (utils/sessionFetch.ts): a bare fetch sends no token.",
+        },
+      ],
+    },
+  },
 );

@@ -12,7 +12,7 @@ import type {
   ConfigSchema,
 } from "@biopb/tensor-flight-client";
 import { useAppStore } from "../store";
-import { authHeaders, redirectToUnlock } from "../auth";
+import { sessionFetch } from "../utils/sessionFetch";
 import { SourcesEditor, type SourceEntry } from "../components/SourcesEditor";
 import { CredentialsEditor } from "../components/CredentialsEditor";
 import { Modal } from "../components/Modal";
@@ -38,14 +38,9 @@ const RESTART_TIMEOUT_MS = 60_000;
  * The control's verb blocks until the plane is back (or errors); the caller's
  * poll loop then confirms serving state. See biopb/biopb#418. */
 async function restartViaControl(): Promise<void> {
-  const r = await fetch(withBase("/api/data_plane/restart"), {
+  const r = await sessionFetch(withBase("/api/data_plane/restart"), {
     method: "POST",
-    headers: authHeaders(),
   });
-  if (r.status === 401) {
-    redirectToUnlock();
-    throw new Error("Session locked — re-enter the access token.");
-  }
   const body = await r.json().catch(() => ({}));
   if (!r.ok || body?.error) {
     throw new Error(body?.error || `Control restart failed (HTTP ${r.status}).`);
