@@ -10,6 +10,19 @@ authors = [ {name = "Ji Yu", email = "jyu@uchc.edu" } ]
 description = "BioPB Tensor Arrow Flight server for multi-dimensional array storage"
 readme = "README.md"
 license = "MIT"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
 dependencies = [
   # Floor: the server imports several stdlib-only primitives out of the SDK's
   # private core -- _lifecycle.file_lock, _locations, the _config_* validators,
