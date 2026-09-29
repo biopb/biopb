@@ -7,27 +7,15 @@ import tseslint from "typescript-eslint";
 /**
  * Store fields that are only correct through their selector.
  *
- * Each is scoped to something -- the tensor in view, the plane on screen, the
- * render mode -- and the scope lives in the selector, not the field. Reading the
- * field directly gets the previous tensor's annotations, a warning about a
- * tensor no longer on screen, or a draft the viewer has already dropped. Every
- * one of those has actually shipped and been fixed once.
+ * `views` holds one record per tensor, and which record is "the one in view"
+ * lives in the selectors (`selectView`, `selectRois`, `selectDraft`, ...).
+ * Reading it directly gets some other tensor's annotations. `selectedRoiId` is
+ * global but only meaningful once resolved against the rows in view.
  *
  * `getState()` and `setState()` are deliberately not matched: tests seed and
  * assert on raw state, which is the point of them.
  */
-const SELECTOR_ONLY_FIELDS = [
-  "rois",
-  "roisPending",
-  "roisTruncated",
-  "roisSkipped",
-  "roisError",
-  "hiddenSets",
-  "draft",
-  "selectedRoiId",
-  "broadcastAxes",
-  "tileInfo",
-];
+const SELECTOR_ONLY_FIELDS = ["views", "selectedRoiId"];
 
 export default tseslint.config(
   { ignores: ["dist", "node_modules", "app"] },
@@ -55,7 +43,7 @@ export default tseslint.config(
             "|",
           )})$/]`,
           message:
-            "This store field is only correct through its selector (selectRois, selectDraft, selectTileInfo, ...): the raw field is not scoped to the tensor, plane or render mode in view. See src/store.ts.",
+            "This store field is only correct through its selector (selectRois, selectDraft, selectView, ...): the raw field is not scoped to the tensor in view. See src/store.ts.",
         },
         {
           // zustand v5 reads the snapshot on every render and compares by

@@ -120,6 +120,116 @@ export interface ViewTarget {
 }
 
 /**
+ * What belongs to one tensor, held under its `ViewTarget.key`.
+ */
+export interface TensorView {
+  /**
+   * The rows held, across every scope that has landed. Filtered to the plane
+   * and to the visible sets at render time.
+   */
+  rois: RoiAnnotation[];
+  /**
+   * Every set on the tensor, server-owned ones included, with its stored row
+   * count. The discovery half of the listing: `rois` holds a server-owned set
+   * only once it was asked for by name.
+   */
+  roiSets: RoiSetInfo[];
+  /**
+   * The fetch scopes that have landed: `""` for the unqualified listing (the
+   * client-owned sets, all at once), a set name for a server-owned set fetched
+   * on its own. Presence is what makes `loadRois` idempotent, and that is
+   * load-bearing rather than an optimisation: switching to the 3-D viewer and
+   * back remounts the whole 2-D subtree (`ViewerPane` keys on the render mode),
+   * so without it a round trip through 3-D would refetch a set that can reach
+   * megabytes.
+   *
+   * A scope is dropped again when a later listing's counts disagree with the
+   * rows held for it -- the server rebuilds a reserved set on every
+   * registration -- so the next `loadRois` fetches it afresh. Opening the
+   * tensor drops them all, keeping the rows on screen while they are re-listed:
+   * someone else may have annotated it in the meantime.
+   */
+  roiScopes: Record<string, RoiScopeState>;
+  /** Scopes in flight. */
+  roisPending: string[];
+  roisError: string | null;
+  /**
+   * The sets on screen, by name, or `null` for this tensor's default: the
+   * client-owned sets shown, the server-owned ones not.
+   *
+   * A positive list rather than a hidden one because the default is not "all":
+   * a link has to be able to say *show* `@ome`, and a hidden list could only
+   * say the opposite. The default is materialised on the first toggle, as
+   * `broadcastAxes` is. A server-owned set on the list is what `loadRois`
+   * fetches by name -- visibility is what drives the lazy fetch.
+   */
+  visibleSets: string[] | null;
+  /**
+   * Axes a new annotation should NOT pin, i.e. broadcast across. `null` means
+   * "the default for this tensor" (see `selectBroadcastAxes`), which is not the
+   * same as "none" -- an empty array is a deliberate choice to pin everything.
+   */
+  broadcastAxes: number[] | null;
+  /** The shape being placed, and the slice position it is being drawn at. */
+  draft: { shape: RoiDraft; sliceKey: string } | null;
+  /**
+   * The widest window the data has shown so far, per channel.
+   *
+   * A float dtype names no range of its own, so the track a fixed window is
+   * chosen on is the levels that have actually appeared. Taking that from the
+   * plane in view alone would shrink the track on a dim plane -- exactly when a
+   * fixed window needs to reach the levels of a bright one. Per channel because
+   * two channels of one tensor need not share a scale.
+   */
+  observedLimits: Record<number, [number, number]>;
+  /** Logical clock of the last write, for eviction. */
+  used: number;
+}
+
+/** What a tensor with no record yet reads as. Stable, so selectors do not churn. */
+export const EMPTY_VIEW: TensorView = {
+  rois: [],
+  roiSets: [],
+  roiScopes: {},
+  roisPending: [],
+  roisError: null,
+  visibleSets: null,
+  broadcastAxes: null,
+  draft: null,
+  observedLimits: {},
+  used: 0,
+};
+
+/** Tensors whose record is kept. The one in view is never evicted. */
+const VIEW_LIMIT = 8;
+let viewClock = 0;
+
+/**
+ * A patch to `views` that updates `key`'s record, or nothing when there is no
+ * tensor to write to. Evicts the least recently written record past the limit.
+ */
+function withView(
+  s: AppState,
+  key: string | null,
+  patch: Partial<TensorView> | ((v: TensorView) => Partial<TensorView>),
+): Partial<AppState> {
+  if (!key) return {};
+  const current = s.views[key] ?? EMPTY_VIEW;
+  const views = {
+    ...s.views,
+    [key]: { ...current, ...(typeof patch === "function" ? patch(current) : patch), used: ++viewClock },
+  };
+  const keys = Object.keys(views);
+  if (keys.length > VIEW_LIMIT) {
+    const victim = keys
+      .filter((k) => k !== key && k !== s.target.key)
+      .sort((a, b) => (views[a]?.used ?? 0) - (views[b]?.used ?? 0))[0];
+    if (victim !== undefined) delete views[victim];
+  }
+  return { views };
+}
+
+/**
  * The 3-D camera, in `OrbitView`'s own terms.
  *
  * A mirror, not the source of truth: deck.gl owns the camera while the volume
@@ -211,45 +321,18 @@ export interface AppState {
   // Slice controls
   slice: SliceState;
 
-  // --- ROI annotations ----------------------------------------------------
+  // --- per-tensor state ---------------------------------------------------
   /**
-   * The rows held for the tensor in view, across every scope that has landed.
-   * Filtered to the plane and to the visible sets at render time.
-   */
-  rois: RoiAnnotation[];
-  /**
-   * Every set on the tensor, server-owned ones included, with its stored row
-   * count. The discovery half of the listing: `rois` holds a server-owned set
-   * only once it was asked for by name.
-   */
-  roiSets: RoiSetInfo[];
-  /**
-   * The tensor the rows and sets belong to, as its `target.key`.
+   * Everything that belongs to "the tensor in view", one record per tensor, keyed
+   * by `target.key`. A small LRU: leaving a tensor keeps its record, so coming
+   * back finds its annotation rows warm.
    *
-   * The unit of eviction is the tensor: the next tensor's first landing replaces
-   * everything below, and until then the selectors hide it.
+   * An async writer captures the key when it starts and writes into that
+   * record, so a landing for a tensor the user has left is harmless rather than
+   * something to guard against. Read through the selectors below, which resolve
+   * the tensor in view -- never `views` directly.
    */
-  roisFor: string | null;
-  /**
-   * The fetch scopes that have landed for `roisFor`: `""` for the unqualified
-   * listing (the client-owned sets, all at once), a set name for a server-owned
-   * set fetched on its own. Presence is what makes `loadRois` idempotent, and
-   * that is load-bearing rather than an optimisation: switching to the 3-D
-   * viewer and back remounts the whole 2-D subtree (`ViewerPane` keys on the
-   * render mode), so without it a round trip through 3-D would refetch a set
-   * that can reach megabytes.
-   *
-   * A scope is dropped again when a later listing's counts disagree with the
-   * rows held for it -- the server rebuilds a reserved set on every
-   * registration -- so the next `loadRois` fetches it afresh.
-   */
-  roiScopes: Record<string, RoiScopeState>;
-  /** Scopes in flight for `roisPendingFor`, so a superseded response is dropped. */
-  roisPending: string[];
-  roisPendingFor: string | null;
-  roisError: string | null;
-  /** The tensor `roisError` is about. See `selectRoisError`. */
-  roisErrorFor: string | null;
+  views: Record<string, TensorView>;
   /**
    * The server does not offer annotations at all (501: disabled, or no metadata
    * DB). Distinct from an error, because it is a fact about the deployment
@@ -258,32 +341,10 @@ export interface AppState {
   roisUnavailable: boolean;
   /** Overlay on/off. A view preference, so it outlives a tensor change. */
   showRois: boolean;
-  /**
-   * The sets on screen, by name, or `null` for this tensor's default: the
-   * client-owned sets shown, the server-owned ones not.
-   *
-   * A positive list rather than a hidden one because the default is not "all":
-   * a link has to be able to say *show* `@ome`, and a hidden list could only
-   * say the opposite. The default is materialised on the first toggle, as
-   * `broadcastAxes` is. A server-owned set on the list is what `loadRois`
-   * fetches by name -- visibility is what drives the lazy fetch.
-   *
-   * Read through `selectVisibleSets`: names mean nothing outside the tensor they
-   * were chosen in, and `visibleSetsFor` is what scopes them to it.
-   */
-  visibleSets: string[] | null;
-  /** The tensor `visibleSets` names sets of. See `selectVisibleSets`. */
-  visibleSetsFor: string | null;
 
   // --- authoring ----------------------------------------------------------
   /** Which tool the pointer carries. A preference: it outlives a tensor change. */
   tool: RoiTool;
-  /** The shape being placed. Read through `selectDraft`. */
-  draft: RoiDraft | null;
-  /** The tensor the draft is being drawn on. See `selectDraft`. */
-  draftFor: string | null;
-  /** The slice position it is being drawn at. See `selectDraft`. */
-  draftSliceKey: string | null;
   /** Selected annotation. Read through `selectSelectedRoi`, which validates it. */
   selectedRoiId: string | null;
   /** Label and set the next new annotation gets. Preferences, kept across tensors. */
@@ -295,14 +356,6 @@ export interface AppState {
    * stroke claims, so it is stored on the annotation and scales with the image.
    */
   newPolylineWidth: number;
-  /**
-   * Axes a new annotation should NOT pin, i.e. broadcast across. `null` means
-   * "the default for this tensor" (see `selectBroadcastAxes`), which is not the
-   * same as "none" -- an empty array is a deliberate choice to pin everything.
-   */
-  broadcastAxes: number[] | null;
-  /** The tensor `broadcastAxes` names axes of. */
-  broadcastAxesFor: string | null;
   /** A write that failed or lost a conditional put, for the panel to report. */
   roiWriteError: string | null;
 
@@ -355,22 +408,6 @@ export interface AppState {
    * the image actually in view.
    */
   planeLimits: [number, number] | null;
-  /**
-   * The widest window the data has shown so far, per channel, and the tensor it
-   * was sampled from.
-   *
-   * A float dtype names no range of its own, so the track a fixed window is
-   * chosen on is the levels that have actually appeared. Taking that from the
-   * plane in view alone would shrink the track on a dim plane -- exactly when a
-   * fixed window needs to reach the levels of a bright one. Per channel because
-   * two channels of one tensor need not share a scale.
-   *
-   * Read through `selectObservedLimits`, which hides a union sampled from
-   * another tensor rather than trusting a reset, for the reason `tileInfo` is
-   * read through `selectTileInfo`.
-   */
-  observedLimits: Record<number, [number, number]>;
-  observedLimitsFor: string | null;
   /**
    * The track a contrast window is chosen on -- the dtype's own range, or on a
    * float tensor the levels the data has shown -- published by whichever viewer
@@ -657,29 +694,15 @@ export const useAppStore = create<AppState>((set, get) => ({
     gamma: 1,
   },
 
-  rois: [],
-  roiSets: [],
-  roisFor: null,
-  roiScopes: {},
-  roisPending: [],
-  roisPendingFor: null,
-  roisError: null,
-  roisErrorFor: null,
+  views: {},
   roisUnavailable: false,
   showRois: true,
-  visibleSets: null,
-  visibleSetsFor: null,
 
   tool: "select",
-  draft: null,
-  draftFor: null,
-  draftSliceKey: null,
   selectedRoiId: null,
   newLabel: "",
   newSetName: "",
   newPolylineWidth: DEFAULT_POLYLINE_WIDTH,
-  broadcastAxes: null,
-  broadcastAxesFor: null,
   roiWriteError: null,
 
   labelOverlay: null,
@@ -689,8 +712,6 @@ export const useAppStore = create<AppState>((set, get) => ({
   planeReady: false,
   appliedLimits: null,
   planeLimits: null,
-  observedLimits: {},
-  observedLimitsFor: null,
   contrastTrack: null,
   contrastTrackFor: null,
 
@@ -853,13 +874,12 @@ export const useAppStore = create<AppState>((set, get) => ({
       camera3d: init?.camera3d ?? null,
       camera2d: init?.camera2d ?? null,
       labelOpacity: init?.labelOpacity ?? s.labelOpacity,
-      // Which sets to draw belongs to the tensor, so a link that names none
-      // opens on the tensor's default rather than on the last choice. A click
-      // leaves both alone: the choice is keyed to its tensor (`visibleSetsFor`)
-      // and the overlay's id names its image, so each is hidden where it does
-      // not apply and is still there on a return.
+      // A click leaves the overlay alone: its id names its image, so it is
+      // hidden where it does not apply and is still there on a return. A link
+      // replaces it, and the sets it names are written under the key when the
+      // target lands.
       ...(init
-        ? { labelOverlay: init.labelOverlay, visibleSets: null, visibleSetsFor: null }
+        ? { labelOverlay: init.labelOverlay }
         : {}),
       // A link to particular sets is a link to see them; with the overlay off
       // it would be a link to nothing.
@@ -924,22 +944,17 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   noteObservedLimits(value, channel) {
-    const forArrayId = get().target.key;
+    const key = get().target.key;
     set((s) => {
-      // A union carried over from another tensor is not narrowed back by a
-      // union, so the switch starts one rather than widening the old one.
-      const carried = s.observedLimitsFor === forArrayId;
-      const prev = carried ? s.observedLimits[channel] : undefined;
+      const v = key ? s.views[key] : undefined;
+      const prev = v?.observedLimits[channel];
       if (prev && prev[0] <= value[0] && prev[1] >= value[1]) return s;
       const next: [number, number] = prev
         ? [Math.min(prev[0], value[0]), Math.max(prev[1], value[1])]
         : [value[0], value[1]];
-      return {
-        observedLimits: carried
-          ? { ...s.observedLimits, [channel]: next }
-          : { [channel]: next },
-        observedLimitsFor: forArrayId,
-      };
+      return withView(s, key, (cur) => ({
+        observedLimits: { ...cur.observedLimits, [channel]: next },
+      }));
     });
   },
 
@@ -956,10 +971,9 @@ export const useAppStore = create<AppState>((set, get) => ({
     const key = target.key;
     const arrayId = target.info.array_id;
 
-    const { roisFor, roiScopes, roiSets, roisPendingFor, roisPending } = get();
-    const listed = roisFor === key;
-    const landed = listed ? roiScopes : {};
-    const pending = roisPendingFor === key ? roisPending : [];
+    const { roiScopes: landed, roiSets, roisPending: pending } = get().views[key] ?? EMPTY_VIEW;
+    // Any scope landing brings the whole listing of set names with it.
+    const listed = Object.keys(landed).length > 0;
     // The unqualified listing always; a server-owned set only while it is on
     // screen, which is what makes a set that can reach megabytes lazy. Once a
     // listing has landed it says which names are server-owned, so a link
@@ -976,34 +990,30 @@ export const useAppStore = create<AppState>((set, get) => ({
     // mount effect, and the 2-D subtree remounts on every render-mode flip.
     const scopes = wanted.filter((scope) => !(scope in landed) && !pending.includes(scope));
     if (scopes.length === 0) return;
-    set({ roisPendingFor: key, roisPending: [...pending, ...scopes], roisError: null });
+    set((s) =>
+      withView(s, key, (v) => ({ roisPending: [...v.roisPending, ...scopes], roisError: null })),
+    );
 
-    /** Still the fetch being waited for, i.e. not superseded by a tensor change. */
-    const stillPending = (scope: string) => {
-      const now = get();
-      return now.roisPendingFor === key && now.roisPending.includes(scope);
-    };
     const fetchScope = async (scope: string) => {
       try {
         const result = await client.http.listRois(arrayId, scope || undefined);
-        if (!stillPending(scope)) return;
-        set((s) => landRoiScope(s, key, scope, result));
+        set((s) => withView(s, key, (v) => landRoiScope(v, scope, result)));
       } catch (err) {
-        if (!stillPending(scope)) return;
         // 501 is the server saying it does not do annotations. Latched for the
         // session so every later tensor skips the round trip.
         if (err instanceof TensorApiError && err.status === 501) {
-          set({ roisPending: [], roisUnavailable: true });
+          set((s) => ({ roisUnavailable: true, ...withView(s, key, { roisPending: [] }) }));
           return;
         }
         // The scope deliberately stays un-landed so a remount or a tensor switch
         // can try again; the effect's own deps keep that from becoming a retry
         // loop.
-        set((s) => ({
-          roisPending: s.roisPending.filter((p) => p !== scope),
-          roisErrorFor: key,
-          roisError: err instanceof Error ? err.message : String(err),
-        }));
+        set((s) =>
+          withView(s, key, (v) => ({
+            roisPending: v.roisPending.filter((p) => p !== scope),
+            roisError: err instanceof Error ? err.message : String(err),
+          })),
+        );
       }
     };
     await Promise.all(scopes.map(fetchScope));
@@ -1013,16 +1023,23 @@ export const useAppStore = create<AppState>((set, get) => ({
     // A draft belongs to the tool that started it; switching abandons it rather
     // than reinterpreting placed vertices under different rules.
     set((s) =>
-      s.tool === tool ? s : { tool, draft: null, draftFor: null, draftSliceKey: null },
+      s.tool === tool
+        ? s
+        : {
+            tool,
+            views: Object.fromEntries(
+              Object.entries(s.views).map(([k, v]) => [k, v.draft ? { ...v, draft: null } : v]),
+            ),
+          },
     );
   },
 
   setDraft(draft) {
-    set({
-      draft,
-      draftFor: draft ? get().target.key : null,
-      draftSliceKey: draft ? sliceKey(get().slice) : null,
-    });
+    set((s) =>
+      withView(s, s.target.key, {
+        draft: draft ? { shape: draft, sliceKey: sliceKey(s.slice) } : null,
+      }),
+    );
   },
 
   setSelectedRoi(roiId) {
@@ -1043,18 +1060,15 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   toggleBroadcastAxis(axis, defaults) {
     set((s) => {
-      const arrayId = s.target.key;
       // `null` means "this tensor's default", so materialise that before
       // editing -- otherwise the first toggle would silently also pin whatever
       // the default was broadcasting.
-      const current =
-        s.broadcastAxesFor === arrayId && s.broadcastAxes !== null ? s.broadcastAxes : defaults;
-      return {
-        broadcastAxesFor: arrayId,
+      const current = selectBroadcastAxes(s, defaults);
+      return withView(s, s.target.key, {
         broadcastAxes: current.includes(axis)
           ? current.filter((a) => a !== axis)
           : [...current, axis],
-      };
+      });
     });
   },
 
@@ -1086,10 +1100,10 @@ export const useAppStore = create<AppState>((set, get) => ({
     };
     set((s) => ({
       roiWriteError: null,
-      rois: s.roisFor === key ? [...s.rois, provisional] : s.rois,
+      ...withView(s, key, (v) => ({ rois: [...v.rois, provisional] })),
     }));
 
-    /** Take the provisional row back out, wherever the list has moved on to. */
+    /** Take the provisional row back out of the list it was added to. */
     const withoutProvisional = (rois: RoiAnnotation[]) =>
       rois.filter((roi) => roi.roiId !== provisional.roiId);
 
@@ -1099,43 +1113,41 @@ export const useAppStore = create<AppState>((set, get) => ({
         [{ geometry, plane, label: newLabel, setName: newSetName || undefined }],
         { checkRev: true },
       );
-      // Dropped if the tensor moved on mid-write: the annotation is stored, and
-      // appending it to a list that now describes another tensor would put it
-      // on screen over the wrong image. The provisional row goes with it.
-      if (get().target.key !== key || get().roisFor !== key) {
-        set((s) => ({ rois: withoutProvisional(s.rois) }));
-        return;
-      }
       const stored = result.stored[0];
       if (!stored) {
         set((s) => ({
-          rois: withoutProvisional(s.rois),
           roiWriteError: "The server stored no annotation",
+          ...withView(s, key, (v) => ({ rois: withoutProvisional(v.rois) })),
         }));
         return;
       }
       // Swapped in place rather than appended, so the annotation does not jump
-      // to the end of a list it was already drawn in.
-      set((s) => {
-        const visible = selectVisibleSets(s);
-        return {
-          rois: s.rois.map((roi) => (roi.roiId === provisional.roiId ? stored : roi)),
-          selectedRoiId: stored.roiId,
-          // The listing's count follows the write, so a later listing does not
-          // read this row as someone else's change (see landRoiScope).
-          roiSets: withSetCount(s.roiSets, stored.setName, 1),
-          // Onto the screen it was drawn on. A materialised list is exactly
-          // the sets shown, so a new name -- or one switched off -- would
-          // otherwise swallow the shape the user just traced.
-          ...(visible !== null && !visible.includes(stored.setName)
-            ? { visibleSets: [...visible, stored.setName], visibleSetsFor: key }
-            : {}),
-        };
-      });
+      // to the end of a list it was already drawn in. Written into this tensor's
+      // record even if the user has left it: the annotation is stored, and its
+      // own record is the right place for it.
+      set((s) => ({
+        // Only selected while its tensor is the one in view.
+        ...(s.target.key === key ? { selectedRoiId: stored.roiId } : {}),
+        ...withView(s, key, (v) => {
+          const visible = v.visibleSets;
+          return {
+            rois: v.rois.map((roi) => (roi.roiId === provisional.roiId ? stored : roi)),
+            // The listing's count follows the write, so a later listing does not
+            // read this row as someone else's change (see landRoiScope).
+            roiSets: withSetCount(v.roiSets, stored.setName, 1),
+            // Onto the screen it was drawn on. A materialised list is exactly
+            // the sets shown, so a new name -- or one switched off -- would
+            // otherwise swallow the shape the user just traced.
+            ...(visible !== null && !visible.includes(stored.setName)
+              ? { visibleSets: [...visible, stored.setName] }
+              : {}),
+          };
+        }),
+      }));
     } catch (err) {
       set((s) => ({
-        rois: withoutProvisional(s.rois),
         roiWriteError: err instanceof Error ? err.message : String(err),
+        ...withView(s, key, (v) => ({ rois: withoutProvisional(v.rois) })),
       }));
     }
   },
@@ -1154,13 +1166,16 @@ export const useAppStore = create<AppState>((set, get) => ({
     // when Delete is pressed, so leaving it there for a round trip reads as the
     // key having missed -- and the far commoner outcome by far is that the
     // delete succeeds.
-    const index = get().rois.findIndex((roi) => roi.roiId === roiId);
-    const removed = get().rois[index];
+    const held = (get().views[key ?? ""] ?? EMPTY_VIEW).rois;
+    const index = held.findIndex((roi) => roi.roiId === roiId);
+    const removed = held[index];
     set((s) => ({
       roiWriteError: null,
-      rois: s.rois.filter((roi) => roi.roiId !== roiId),
-      roiSets: removed ? withSetCount(s.roiSets, removed.setName, -1) : s.roiSets,
       selectedRoiId: s.selectedRoiId === roiId ? null : s.selectedRoiId,
+      ...withView(s, key, (v) => ({
+        rois: v.rois.filter((roi) => roi.roiId !== roiId),
+        roiSets: removed ? withSetCount(v.roiSets, removed.setName, -1) : v.roiSets,
+      })),
     }));
 
     try {
@@ -1171,13 +1186,15 @@ export const useAppStore = create<AppState>((set, get) => ({
     } catch (err) {
       set((s) => {
         const failed = { roiWriteError: err instanceof Error ? err.message : String(err) };
-        // Only back into the list it came out of. After a tensor change the
-        // list describes another image, and restoring there would draw this
-        // annotation over it.
-        if (!removed || get().target.key !== key || s.roisFor !== key) return failed;
-        const rois = [...s.rois];
-        rois.splice(Math.min(index, rois.length), 0, removed);
-        return { ...failed, rois, roiSets: withSetCount(s.roiSets, removed.setName, 1) };
+        if (!removed) return failed;
+        return {
+          ...failed,
+          ...withView(s, key, (v) => {
+            const rois = [...v.rois];
+            rois.splice(Math.min(index, rois.length), 0, removed);
+            return { rois, roiSets: withSetCount(v.roiSets, removed.setName, 1) };
+          }),
+        };
       });
     }
   },
@@ -1192,27 +1209,28 @@ export const useAppStore = create<AppState>((set, get) => ({
       // No ids: the server drops the whole set in one transaction, so this is
       // not limited to the rows the cap let this client see.
       await client.http.deleteRois(arrayId, undefined, { setName });
-      if (get().target.key !== key || get().roisFor !== key) return;
       // Filtered by name rather than by the ids that came back, for the same
       // reason: what was deleted is the set, and the response enumerates only
       // what the server chose to list.
       set((s) => {
-        const visible = selectVisibleSets(s);
+        const held = (s.views[key ?? ""] ?? EMPTY_VIEW).rois;
         return {
-          rois: s.rois.filter((roi) => roi.setName !== setName),
-          // Gone from the listing too, as the server's own next listing would
-          // have it: it enumerates stored rows, and there are none.
-          roiSets: s.roiSets.filter((set) => set.setName !== setName),
           selectedRoiId:
-            s.rois.find((roi) => roi.roiId === s.selectedRoiId)?.setName === setName
+            held.find((roi) => roi.roiId === s.selectedRoiId)?.setName === setName
               ? null
               : s.selectedRoiId,
-          // The name means nothing once the set is gone, and leaving it on the
-          // list would pin a later set of the same name to whatever this one
-          // was toggled to.
-          ...(visible !== null && visible.includes(setName)
-            ? { visibleSets: visible.filter((name) => name !== setName) }
-            : {}),
+          ...withView(s, key, (v) => ({
+            rois: v.rois.filter((roi) => roi.setName !== setName),
+            // Gone from the listing too, as the server's own next listing would
+            // have it: it enumerates stored rows, and there are none.
+            roiSets: v.roiSets.filter((set) => set.setName !== setName),
+            // The name means nothing once the set is gone, and leaving it on the
+            // list would pin a later set of the same name to whatever this one
+            // was toggled to.
+            ...(v.visibleSets?.includes(setName)
+              ? { visibleSets: v.visibleSets.filter((name) => name !== setName) }
+              : {}),
+          })),
         };
       });
     } catch (err) {
@@ -1235,19 +1253,15 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   toggleSetVisible(setName) {
     set((s) => {
-      // Scoped to the tensor in view: a list carried over from another one is
-      // not "this tensor's default", it is a list of names that mean nothing
-      // here. `null` means the default, so materialise that before editing --
+      // `null` means the default, so materialise that before editing --
       // otherwise the first toggle would silently also hide every other
       // client-owned set.
-      const arrayId = s.target.key;
       const current = selectVisibleSets(s) ?? defaultVisibleSets(s);
-      return {
-        visibleSetsFor: arrayId,
+      return withView(s, s.target.key, {
         visibleSets: current.includes(setName)
           ? current.filter((name) => name !== setName)
           : [...current, setName],
-      };
+      });
     });
   },
 
@@ -1589,7 +1603,13 @@ async function resolveTarget(
         slice: clampSliceTo(s.slice, info),
         // A link's set names belong to the tensor it resolved to, so they are
         // written under its key rather than under whatever the link spelled.
-        ...(s.target.seedSets ? { visibleSets: s.target.seedSets, visibleSetsFor: key } : {}),
+        ...withView(s, key, {
+          // Which sets to draw belongs to the tensor, so a link that names none
+          // opens on the tensor's default rather than on the last choice.
+          ...(s.target.linked ? { visibleSets: s.target.seedSets } : {}),
+          // Rows kept from an earlier visit stay on screen, but are listed again.
+          ...(s.views[key] ? { roiScopes: {} } : {}),
+        }),
       }));
       return;
     } catch (err) {
@@ -1620,7 +1640,7 @@ export function selectTileInfo(s: AppState): TileInfo | null {
 /**
  * The label set to draw over the tensor in view, or null.
  *
- * Scoped by the id itself rather than by a companion `...For` field: a set's
+ * Scoped by the id itself rather than by a per-tensor record: a set's
  * `array_id` names its image, so the question "is this overlay about what is on
  * screen?" is answered by the two ids and nothing has to be kept in step.
  *
@@ -1635,10 +1655,19 @@ export function selectLabelOverlay(s: AppState): string | null {
   return address.imageArrayId === shown ? s.labelOverlay : null;
 }
 
+/**
+ * The record of the tensor in view, or an empty one while none has resolved.
+ *
+ * Every per-tensor read goes through here, so nothing compares an id: a tensor
+ * that is not in view simply is not the one this returns.
+ */
+export function selectView(s: AppState): TensorView {
+  return (s.target.key ? s.views[s.target.key] : undefined) ?? EMPTY_VIEW;
+}
+
 /** The levels this tensor's current channel has shown, or null if none yet. */
 export function selectObservedLimits(s: AppState): [number, number] | null {
-  if (s.observedLimitsFor !== s.target.key) return null;
-  return s.observedLimits[s.slice.c] ?? null;
+  return selectView(s).observedLimits[s.slice.c] ?? null;
 }
 
 /**
@@ -1693,34 +1722,27 @@ const DEFAULT_ROI_SET = "default";
 /** The scope of the unqualified listing: every client-owned set at once. */
 export const CLIENT_OWNED_SCOPE = "";
 
-const NO_ROIS: RoiAnnotation[] = [];
-const NO_SETS: string[] = [];
-const NO_SCOPES: Record<string, RoiScopeState> = {};
-
-/** This tensor's annotations, or none while another tensor's are still held. */
 export function selectRois(s: AppState): RoiAnnotation[] {
-  return s.roisFor === s.target.key ? s.rois : NO_ROIS;
+  return selectView(s).rois;
 }
-
-const NO_ROI_SETS: RoiSetInfo[] = [];
 
 /** Every set on the tensor in view, server-owned ones included. */
 export function selectRoiSets(s: AppState): RoiSetInfo[] {
-  return s.roisFor === s.target.key ? s.roiSets : NO_ROI_SETS;
+  return selectView(s).roiSets;
 }
 
 /** The scopes landed for the tensor in view, with what each fetch said. */
 export function selectRoiScopes(s: AppState): Record<string, RoiScopeState> {
-  return s.roisFor === s.target.key ? s.roiScopes : NO_SCOPES;
+  return selectView(s).roiScopes;
 }
 
 /** The scopes in flight for the tensor in view -- not one looked at earlier. */
 export function selectRoisPending(s: AppState): string[] {
-  return s.roisPendingFor === s.target.key ? s.roisPending : NO_SETS;
+  return selectView(s).roisPending;
 }
 
 export function selectRoisError(s: AppState): string | null {
-  return s.roisErrorFor === s.target.key ? s.roisError : null;
+  return selectView(s).roisError;
 }
 
 /**
@@ -1772,23 +1794,15 @@ function inScope(roi: RoiAnnotation, scope: string): boolean {
  * exact comparison and let the writes stop shadowing the counts.
  */
 function landRoiScope(
-  s: AppState,
-  arrayId: string,
+  v: TensorView,
   scope: string,
   result: RoiListResult,
-): Partial<AppState> {
-  const same = s.roisFor === arrayId;
-  const kept = same
-    ? s.rois.filter((roi) => !inScope(roi, scope) || isProvisionalRoiId(roi.roiId))
-    : [];
+): Partial<TensorView> {
+  const kept = v.rois.filter((roi) => !inScope(roi, scope) || isProvisionalRoiId(roi.roiId));
   const rois = [...kept, ...result.rois];
-  const scopes: Record<string, RoiScopeState> = same ? { ...s.roiScopes } : {};
+  const scopes: Record<string, RoiScopeState> = { ...v.roiScopes };
   scopes[scope] = { truncated: result.truncated, skipped: result.skipped };
 
-  // A row the decoder skipped is stored but not held, so it counts as held
-  // here; otherwise every sibling landing would refetch a scope with one.
-  // Per scope rather than per set, because the client-owned listing's skips
-  // cannot be attributed to a set.
   const stored = new Map(result.sets.map((set) => [set.setName, set.count]));
   const held = new Map(
     roiSetCounts(rois.filter((roi) => !isProvisionalRoiId(roi.roiId))).map((set) => [
@@ -1810,9 +1824,8 @@ function landRoiScope(
   return {
     rois,
     roiSets: result.sets,
-    roisFor: arrayId,
     roiScopes: scopes,
-    roisPending: s.roisPending.filter((p) => p !== scope),
+    roisPending: v.roisPending.filter((p) => p !== scope),
   };
 }
 
@@ -1831,7 +1844,7 @@ export function sliceKey(slice: SliceState): string {
  * carry across tensors.
  */
 export function selectVisibleSets(s: AppState): string[] | null {
-  return s.visibleSetsFor === s.target.key ? s.visibleSets : null;
+  return selectView(s).visibleSets;
 }
 
 /**
@@ -1848,13 +1861,14 @@ export function selectDraft(s: AppState): RoiDraft | null {
   // clutter while drawing, hide the noisy set instead; that is what the per-set
   // toggles are for.
   if (!s.showRois) return null;
-  if (s.draftFor !== s.target.key || s.render3d) return null;
+  if (s.render3d) return null;
+  const draft = selectView(s).draft;
   // Vertices were traced against the pixels of one plane. Navigating away --
   // the slider, a keyboard scroll, or play stepping an axis -- makes them a
   // shape drawn on an image nobody is looking at any more, and finishing there
   // would pin it to the plane it was NOT drawn on. Answered at the read, so
   // every route that moves the slice is covered without naming any of them.
-  return s.draftSliceKey === sliceKey(s.slice) ? s.draft : null;
+  return draft && draft.sliceKey === sliceKey(s.slice) ? draft.shape : null;
 }
 
 /**
@@ -1886,7 +1900,5 @@ export function selectSelectedRoiId(s: AppState): string | null {
  * `defaultBroadcastAxes`), because the store does not read `TileInfo`.
  */
 export function selectBroadcastAxes(s: AppState, defaults: number[]): number[] {
-  return s.broadcastAxesFor === s.target.key && s.broadcastAxes !== null
-    ? s.broadcastAxes
-    : defaults;
+  return selectView(s).broadcastAxes ?? defaults;
 }

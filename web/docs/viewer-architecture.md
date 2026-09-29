@@ -61,9 +61,10 @@ source of bugs (see *Scoping mechanisms*).
 | Selection | `activeSourceId`, `activeTensorId` (the stable address that was asked for) | `openTensor` |
 | Target | `target`: `epoch`, `requested`, `status`, `key`, `info` (the one `tile_info`), `error` | `openTensor`; landings are dropped when `epoch` moved on |
 | Per tensor, **reset** on open | `slice.t/z/c/axes`, `slice.fixedLimits`, `render3d`, `camera2d`, `camera3d`, `playAxis`, `planeReady`, `appliedLimits`, `planeLimits`; and from a link, `visibleSets` and `labelOverlay` | the one reset list in `openTensor` |
-| Per tensor, **guarded** at read | `rois`, `roiSets`, `roiScopes`, `roisPending`, `roisError` (`roisFor`, `roisPendingFor`, `roisErrorFor`); `visibleSets`/`visibleSetsFor`; `draft`/`draftFor`; `broadcastAxes`/`broadcastAxesFor`; `observedLimits`/`observedLimitsFor`; `contrastTrack`/`contrastTrackFor` | `select*` compares the `…For` field to `target.key` |
+| Per tensor, **one record each** | `views[key]`: `rois`, `roiSets`, `roiScopes`, `roisPending`, `roisError`, `visibleSets`, `broadcastAxes`, `draft` (with its slice key), `observedLimits`; a small LRU | the selectors read `views[target.key]`; writers capture the key and write into that record |
+| Per tensor, **guarded** at read | `contrastTrack`/`contrastTrackFor` | `selectContrastTrack` compares the `…For` field to `target.key` |
 | Per tensor, scoped by id content | `labelOverlay` (the set's id names its image) | `selectLabelOverlay` |
-| Per plane | `draftSliceKey`, and in `TileViewer` local state: `loadedKey`, `samples.key`, `labelLoadedKey` | key comparison |
+| Per plane | `views[key].draft.sliceKey`, and in `TileViewer` local state: `loadedKey`, `samples.key`, `labelLoadedKey` | key comparison |
 | Per mount (viewer-local) | pixel sources, samples, hover, draft cursor, tile error | `ViewerPane` remount key |
 | Session latch | ROI `roisUnavailable` (501) | — |
 
@@ -106,22 +107,23 @@ Two spellings remain, and each has one job:
 | `activeTensorId` | `src/field`, or bare `src` on a source click | SliceControls `sliderGrid` fallback, MetaPanel, TipBar |
 | `target.requested` | what was asked for: `src`, `src/field`, or a link's `src@pin/field` | the `tile_info` fetch; the URL while resolving |
 | `target.info.array_id` | `src@tok/field`: the resolved field plus the server's current version token (`_versioned_array_id`, #780) | address of ROI server calls; URL write-back |
-| `target.key` | `src/field`: resolved, never bare, never pinned, never changes while the tensor is open | every `…For` field and its selector, the label overlay, the tree highlight, the viewer's remount key |
+| `target.key` | `src/field`: resolved, never bare, never pinned, never changes while the tensor is open | the `views` record, `contrastTrackFor`, the label overlay, the tree highlight, the viewer's remount key |
 
 ## Scoping mechanisms
 
 "This state belongs to the tensor/plane on screen" is enforced five ways:
 
 1. **Explicit reset** in `openTensor`, one list for every entry path.
-2. **Read guard**: a `…For` companion field plus a selector. Writers stamp
-   `target.key` and every selector compares against it. A link's `rs=` sets
-   are written under the key when the target lands, so a bare or pinned
-   spelling cannot mis-key them. The `SELECTOR_ONLY_FIELDS` lint rule forces
-   reads through the selectors.
+2. **Keyed record**: `views[key]`. The selectors resolve the tensor in view;
+   an async writer captures the key when it starts, so a late landing writes
+   into its own tensor's record and nothing has to be compared. A link's
+   `rs=` sets are written under the key when the target lands. The
+   `SELECTOR_ONLY_FIELDS` lint rule forbids reading `views` directly.
+   `contrastTrack` is still a single slot with a `…For` companion.
 3. **Id content**: `labelOverlay`.
 4. **Remount**: `ViewerPane`'s key drops all viewer-local state.
 5. **Key comparison** for plane-scoped state: `loadedKey` vs `selectionKey`,
-   `draftSliceKey` vs `sliceKey(slice)`, `labelLoadedKey` vs the label plane key.
+   `draft.sliceKey` vs `sliceKey(slice)`, `labelLoadedKey` vs the label plane key.
 
 ## Viewer → store publish-back
 
