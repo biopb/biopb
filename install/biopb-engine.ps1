@@ -1027,15 +1027,20 @@ function Get-ToolPython {
     return $null
 }
 
+# The two per-user kernel specs biopb registers, and the names a first-time user
+# sees in a Jupyter kernel picker (the same texts as install.sh).
+$script:KernelSpecBiopb = @{ Name = 'biopb'; Title = 'biopb: start a new kernel in biopb''s environment' }
+$script:KernelSpecSession = @{ Name = 'biopb-session'; Title = 'biopb: connect to the running biopb session' }
+
 # The same program as install.sh's _kernelspec_state: prints absent | ours |
-# foreign, then the per-user "biopb" kernel spec dir, as the env's own
-# jupyter_core resolves it. Fed on stdin, so no quote survives PowerShell 5.1's
-# native command-line quoting to break it.
+# foreign, then the per-user kernel spec dir named by its argument, as the env's
+# own jupyter_core resolves it. Fed on stdin, so no quote survives PowerShell
+# 5.1's native command-line quoting to break it.
 $script:KernelSpecStateProgram = @'
 import json, os, sys
 from jupyter_core.paths import jupyter_data_dir
 
-spec = os.path.join(jupyter_data_dir(), "kernels", "biopb")
+spec = os.path.join(jupyter_data_dir(), "kernels", sys.argv[1])
 try:
     with open(os.path.join(spec, "kernel.json")) as f:
         argv0 = json.load(f)["argv"][0]
@@ -1051,16 +1056,37 @@ print(state)
 print(spec)
 '@
 
+# The same program as install.sh's _write_session_kernelspec: the biopb-session
+# spec, a proxy to the running session run by the env's own interpreter.
+$script:SessionKernelSpecProgram = @'
+import json, os, sys
+
+spec, title = sys.argv[1], sys.argv[2]
+os.makedirs(spec, exist_ok=True)
+with open(os.path.join(spec, "kernel.json"), "w") as f:
+    json.dump(
+        {
+            "argv": [sys.executable, "-m", "biopb_mcp.mcp._session_proxy", "-f", "{connection_file}"],
+            "display_name": title,
+            "language": "python",
+            "interrupt_mode": "message",
+        },
+        f,
+        indent=1,
+    )
+'@
+
 function Get-KernelSpecState {
-    param([string]$Python)
-    $out = @($script:KernelSpecStateProgram | & $Python - 2>$null)
+    param([string]$Python, [string]$Name)
+    $out = @($script:KernelSpecStateProgram | & $Python - $Name 2>$null)
     if ($LASTEXITCODE -ne 0 -or $out.Count -lt 2) { return $null }
     return @{ State = $out[0].Trim(); Dir = $out[1].Trim() }
 }
 
-# Register the biopb env as a Jupyter kernel, "Python (biopb)" (see install.sh's
-# _install_kernelspec). Best-effort; skip with BIOPB_INSTALL_KERNELSPEC=0.
-# -Python overrides the interpreter (tests).
+# Register the biopb env as two Jupyter kernels (see install.sh's
+# _install_kernelspec): "biopb" starts a standalone kernel in the env,
+# "biopb-session" connects to the running session kernel. Best-effort; skip with
+# BIOPB_INSTALL_KERNELSPEC=0. -Python overrides the interpreter (tests).
 function Install-KernelSpec {
     param([string]$Python = "")
     if ($env:BIOPB_INSTALL_KERNELSPEC -eq '0') {
@@ -1072,29 +1098,37 @@ function Install-KernelSpec {
         $ErrorActionPreference = 'Continue'
         if (-not $Python) { $Python = Get-ToolPython }
         if (-not $Python) { return }
-        $spec = Get-KernelSpecState -Python $Python
-        if (-not $spec) { return }
-        if ($spec.State -eq 'foreign') {
-            Report-Note "Kept the existing Jupyter kernel spec at $($spec.Dir)"
-            return
+        foreach ($k in @($script:KernelSpecBiopb, $script:KernelSpecSession)) {
+            $spec = Get-KernelSpecState -Python $Python -Name $k.Name
+            if (-not $spec) { continue }
+            if ($spec.State -eq 'foreign') {
+                Report-Note "Kept the existing Jupyter kernel spec at $($spec.Dir)"
+                continue
+            }
+            if ($k.Name -eq 'biopb') {
+                & $Python -m ipykernel install --user --name $k.Name --display-name $k.Title *> $null
+            } else {
+                $script:SessionKernelSpecProgram | & $Python - $spec.Dir $k.Title *> $null
+            }
+            if ($LASTEXITCODE -eq 0) { Report-Ok "Jupyter kernel `"$($k.Name)`" registered" }
+            else { Report-Note "Could not register the Jupyter kernel `"$($k.Name)`"; skipping" }
         }
-        & $Python -m ipykernel install --user --name biopb --display-name "Python (biopb)" *> $null
-        if ($LASTEXITCODE -eq 0) { Report-Ok 'Jupyter kernel "Python (biopb)" registered' }
-        else { Report-Note "Could not register the Jupyter kernel; skipping" }
     } catch { }
 }
 
-# Remove the kernel spec Install-KernelSpec wrote; needs the env still present.
+# Remove the kernel specs Install-KernelSpec wrote; needs the env still present.
 function Remove-KernelSpec {
     param([string]$Python = "")
     try {
         $ErrorActionPreference = 'Continue'
         if (-not $Python) { $Python = Get-ToolPython }
         if (-not $Python) { return }
-        $spec = Get-KernelSpecState -Python $Python
-        if (-not $spec -or $spec.State -ne 'ours') { return }
-        Remove-Item -LiteralPath $spec.Dir -Recurse -Force -ErrorAction SilentlyContinue
-        if (-not (Test-Path -LiteralPath $spec.Dir)) { Report-Ok "Removed the Jupyter kernel spec $($spec.Dir)" }
+        foreach ($k in @($script:KernelSpecBiopb, $script:KernelSpecSession)) {
+            $spec = Get-KernelSpecState -Python $Python -Name $k.Name
+            if (-not $spec -or $spec.State -ne 'ours') { continue }
+            Remove-Item -LiteralPath $spec.Dir -Recurse -Force -ErrorAction SilentlyContinue
+            if (-not (Test-Path -LiteralPath $spec.Dir)) { Report-Ok "Removed the Jupyter kernel spec $($spec.Dir)" }
+        }
     } catch { }
 }
 

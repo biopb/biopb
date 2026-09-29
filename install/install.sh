@@ -961,17 +961,24 @@ _tool_python() {
     printf '%s\n' "$tool_dir/biopb/bin/python"
 }
 
-# Where the per-user "biopb" kernel spec lives, and whose it is: prints a state
+# The two per-user kernel specs biopb registers, and the names a first-time user
+# sees in a Jupyter kernel picker. biopb-engine.ps1 carries the same texts.
+_KERNELSPEC_BIOPB_NAME="biopb"
+_KERNELSPEC_BIOPB_TITLE="biopb: start a new kernel in biopb's environment"
+_KERNELSPEC_SESSION_NAME="biopb-session"
+_KERNELSPEC_SESSION_TITLE="biopb: connect to the running biopb session"
+
+# Where the per-user kernel spec named $2 lives, and whose it is: prints a state
 # line (absent | ours | foreign) then the spec dir. Asks $1's own jupyter_core,
 # which resolves the same user dir any Jupyter of this user searches. "ours"
-# means the spec runs an interpreter inside $1's env; any other spec named biopb
+# means the spec runs an interpreter inside $1's env; any other spec of that name
 # is the user's. biopb-engine.ps1 carries the same program.
 _kernelspec_state() {
-    "$1" - <<'PY'
+    "$1" - "$2" <<'PY'
 import json, os, sys
 from jupyter_core.paths import jupyter_data_dir
 
-spec = os.path.join(jupyter_data_dir(), "kernels", "biopb")
+spec = os.path.join(jupyter_data_dir(), "kernels", sys.argv[1])
 try:
     with open(os.path.join(spec, "kernel.json")) as f:
         argv0 = json.load(f)["argv"][0]
@@ -988,43 +995,78 @@ print(spec)
 PY
 }
 
-# Register the biopb env as a Jupyter kernel, "Python (biopb)", so a Jupyter
-# installed anywhere else can run notebooks in it. A standalone kernel, not the
-# agent's session kernel. Rewritten on every install (the env path survives an
-# upgrade); a user's own spec named biopb is left alone. Best-effort; skip with
-# BIOPB_INSTALL_KERNELSPEC=0. $1 is the env's interpreter (_tool_python).
+# Write the biopb-session kernel spec: a kernel that is a proxy to the running
+# session (biopb_mcp.mcp._session_proxy), run by the env's own interpreter so
+# nothing is installed into a Jupyter. $1 the env's interpreter, $2 the spec dir,
+# $3 the display name. biopb-engine.ps1 carries the same program.
+_write_session_kernelspec() {
+    "$1" - "$2" "$3" <<'PY'
+import json, os, sys
+
+spec, title = sys.argv[1], sys.argv[2]
+os.makedirs(spec, exist_ok=True)
+with open(os.path.join(spec, "kernel.json"), "w") as f:
+    json.dump(
+        {
+            "argv": [sys.executable, "-m", "biopb_mcp.mcp._session_proxy", "-f", "{connection_file}"],
+            "display_name": title,
+            "language": "python",
+            "interrupt_mode": "message",
+        },
+        f,
+        indent=1,
+    )
+PY
+}
+
+# Register the biopb env as two Jupyter kernels, so a Jupyter installed anywhere
+# else can run notebooks against it: "biopb" starts a standalone kernel in the
+# env (not the agent's session), "biopb-session" connects to the session
+# kernel that is running. Rewritten on every install (the env path survives an
+# upgrade); a user's own spec of either name is left alone. Best-effort; skip
+# with BIOPB_INSTALL_KERNELSPEC=0. $1 is the env's interpreter (_tool_python).
 _install_kernelspec() {
     if [ "${BIOPB_INSTALL_KERNELSPEC:-1}" = "0" ]; then
         _note "Jupyter kernel skipped (BIOPB_INSTALL_KERNELSPEC=0)"
         return 0
     fi
-    local py state spec
+    local py state spec name
     py=${1:-}
     [ -n "$py" ] || return 0
-    { read -r state && read -r spec; } < <(_kernelspec_state "$py" 2>/dev/null) || return 0
-    if [ "$state" = "foreign" ]; then
-        _note "Kept the existing Jupyter kernel spec at $spec"
-        return 0
-    fi
-    if "$py" -m ipykernel install --user --name biopb --display-name "Python (biopb)" >/dev/null 2>&1; then
-        _ok "Jupyter kernel \"Python (biopb)\" registered"
-    else
-        _note "Could not register the Jupyter kernel; skipping"
-    fi
+    for name in "$_KERNELSPEC_BIOPB_NAME" "$_KERNELSPEC_SESSION_NAME"; do
+        { read -r state && read -r spec; } < <(_kernelspec_state "$py" "$name" 2>/dev/null) || continue
+        if [ "$state" = "foreign" ]; then
+            _note "Kept the existing Jupyter kernel spec at $spec"
+            continue
+        fi
+        if [ "$name" = "$_KERNELSPEC_BIOPB_NAME" ]; then
+            "$py" -m ipykernel install --user --name "$name" --display-name "$_KERNELSPEC_BIOPB_TITLE" >/dev/null 2>&1
+        else
+            _write_session_kernelspec "$py" "$spec" "$_KERNELSPEC_SESSION_TITLE" >/dev/null 2>&1
+        fi
+        # shellcheck disable=SC2181
+        if [ $? -eq 0 ]; then
+            _ok "Jupyter kernel \"$name\" registered"
+        else
+            _note "Could not register the Jupyter kernel \"$name\"; skipping"
+        fi
+    done
     return 0
 }
 
-# Remove the kernel spec _install_kernelspec wrote; $1 as there, so the env
+# Remove the kernel specs _install_kernelspec wrote; $1 as there, so the env
 # must still be present.
 _remove_kernelspec() {
-    local py state spec
+    local py state spec name
     py=${1:-}
     [ -n "$py" ] || return 0
-    { read -r state && read -r spec; } < <(_kernelspec_state "$py" 2>/dev/null) || return 0
-    [ "$state" = "ours" ] || return 0
-    if rm -rf "$spec" 2>/dev/null; then
-        _ok "Removed the Jupyter kernel spec $spec"
-    fi
+    for name in "$_KERNELSPEC_BIOPB_NAME" "$_KERNELSPEC_SESSION_NAME"; do
+        { read -r state && read -r spec; } < <(_kernelspec_state "$py" "$name" 2>/dev/null) || continue
+        [ "$state" = "ours" ] || continue
+        if rm -rf "$spec" 2>/dev/null; then
+            _ok "Removed the Jupyter kernel spec $spec"
+        fi
+    done
     return 0
 }
 

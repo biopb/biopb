@@ -1,4 +1,4 @@
-"""The Jupyter kernel spec both installers write and remove.
+"""The Jupyter kernel specs both installers write and remove.
 
 install.sh and biopb-engine.ps1 each carry the same ownership program, so the
 cases run against both. The test runner's interpreter stands in for the biopb
@@ -52,12 +52,32 @@ def spec(tmp_path):
     return tmp_path / "jupyter" / "kernels" / "biopb" / "kernel.json"
 
 
+@pytest.fixture
+def session_spec(tmp_path):
+    return tmp_path / "jupyter" / "kernels" / "biopb-session" / "kernel.json"
+
+
 @pytest.mark.parametrize("run", RUNNERS)
 def test_install_points_the_spec_at_the_env(run, env, spec):
     run("_install_kernelspec", sys.executable, env)
     written = json.loads(spec.read_text())
     assert written["argv"][0] == sys.executable
-    assert written["display_name"] == "Python (biopb)"
+    assert written["display_name"] == "biopb: start a new kernel in biopb's environment"
+
+
+@pytest.mark.parametrize("run", RUNNERS)
+def test_install_writes_a_session_proxy_spec(run, env, session_spec):
+    run("_install_kernelspec", sys.executable, env)
+    written = json.loads(session_spec.read_text())
+    assert written["argv"] == [
+        sys.executable,
+        "-m",
+        "biopb_mcp.mcp._session_proxy",
+        "-f",
+        "{connection_file}",
+    ]
+    assert written["display_name"] == "biopb: connect to the running biopb session"
+    assert written["interrupt_mode"] == "message"
 
 
 @pytest.mark.parametrize("run", RUNNERS)
@@ -65,33 +85,36 @@ def test_install_rewrites_its_own_spec(run, env, spec):
     spec.parent.mkdir(parents=True)
     spec.write_text(json.dumps({"argv": [sys.executable], "display_name": "stale"}))
     run("_install_kernelspec", sys.executable, env)
-    assert json.loads(spec.read_text())["display_name"] == "Python (biopb)"
+    assert json.loads(spec.read_text())["display_name"].startswith("biopb: start")
 
 
 @pytest.mark.parametrize("run", RUNNERS)
-def test_a_users_own_spec_is_left_alone(run, env, spec):
-    spec.parent.mkdir(parents=True)
+@pytest.mark.parametrize("which", ["spec", "session_spec"])
+def test_a_users_own_spec_is_left_alone(run, env, which, request):
+    own = request.getfixturevalue(which)
+    own.parent.mkdir(parents=True)
     original = json.dumps(
         {"argv": [os.path.join(os.sep, "opt", "elsewhere", "python")]}
     )
-    spec.write_text(original)
+    own.write_text(original)
     run("_install_kernelspec", sys.executable, env)
     run("_remove_kernelspec", sys.executable, env)
-    assert spec.read_text() == original
+    assert own.read_text() == original
 
 
 @pytest.mark.parametrize("run", RUNNERS)
-def test_remove_deletes_its_own_spec(run, env, spec):
+def test_remove_deletes_its_own_specs(run, env, spec, session_spec):
     run("_install_kernelspec", sys.executable, env)
-    assert spec.exists()
+    assert spec.exists() and session_spec.exists()
     run("_remove_kernelspec", sys.executable, env)
     assert not spec.parent.exists()
+    assert not session_spec.parent.exists()
 
 
 @pytest.mark.parametrize("run", RUNNERS)
-def test_install_can_be_skipped(run, env, spec):
+def test_install_can_be_skipped(run, env, spec, session_spec):
     run("_install_kernelspec", sys.executable, {**env, "BIOPB_INSTALL_KERNELSPEC": "0"})
-    assert not spec.exists()
+    assert not spec.exists() and not session_spec.exists()
 
 
 @pytest.mark.parametrize("run", RUNNERS)
