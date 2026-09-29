@@ -12,6 +12,10 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from conftest import requires_posix
+
+# bootstrap.sh never runs on Windows; that platform gets bootstrap.ps1.
+pytestmark = requires_posix
 
 BOOTSTRAP = Path(__file__).resolve().parent.parent / "bootstrap.sh"
 
