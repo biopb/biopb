@@ -275,8 +275,7 @@ jobs:
           echo "version=$VER" >> "$GITHUB_OUTPUT"
           # VER is the tag name suffix (this job only runs on refs/tags/release-v*),
           # so it is a clean version with no setuptools_scm '+local' segment and is
-          # already a valid Docker reference -- no sanitization needed (matches
-          # image-runtime-ci, which uses its tag name directly too).
+          # already a valid Docker reference -- no sanitization needed.
           owner="${{ github.repository_owner }}"
           {
             echo "tags<<TAGS_EOF"

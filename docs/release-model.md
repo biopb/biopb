@@ -11,7 +11,7 @@ The scheme is **two version lines, two tags**:
 
 | | Audience | Mechanism | Tag | Members |
 |---|---|---|---|---|
-| **SDK / library** | developers / integrators | **PyPI + Maven Central** + a Docker base image | `v*` | `biopb` (Python → PyPI, Java → Maven Central) and `biopb-image-base` (Python → PyPI, plus a Docker base image) |
+| **SDK / library** | developers / integrators | **PyPI + Maven Central** | `v*` | `biopb` (Python → PyPI, Java → Maven Central) and `biopb-image-base` (Python → PyPI) |
 | **Product / deployment** | end users (`install.sh`), operators | **GitHub release** + Docker | `release-v*` | `biopb-tensor-server` (wheel **and** Docker image), `biopb-mcp`, `biopb-control`, and the `web/` bundle |
 
 Each package reads exactly one tag prefix (setuptools_scm `tag_regex` +
@@ -32,9 +32,10 @@ publishes to PyPI (and Maven Central) on its own `v*` tag, on its own cadence.
 `biopb-mcp`, `biopb-tensor-server`, and `biopb-control` are **not** on PyPI — they
 only reach end users as the `release-v*` wheel bundle the installer
 `file://`-installs. `biopb-image-base` rides the SDK's `v*` tag too: `python-ci`'s
-`deploy` job publishes it to PyPI alongside `biopb`, and `image-runtime-ci`
-separately builds its Docker base image (it's the foundation others build
-compute servers on).
+`deploy` job publishes it to PyPI alongside `biopb`. Its Docker base image (the
+foundation others build compute servers on) is on **neither** tag: it bundles the
+in-repo `biopb-tensor-server`, so `image-runtime-ci` publishes it only by manual
+dispatch, tagged with the commit SHA (see "The image-base image" below).
 
 ## Cutting a release: up to two tags
 
@@ -42,7 +43,7 @@ Put whichever of the two tags apply on the release commit:
 
 | Tag | Cut it when | Drives |
 |---|---|---|
-| `v<A>` | the SDK changed (or you want image-base rebuilt) | `python-ci` → PyPI (`biopb` + `biopb-image-base`), `java-ci` → Maven Central, **`image-runtime-ci` → `biopb-image-base:<A>` Docker** |
+| `v<A>` | the SDK changed | `python-ci` → PyPI (`biopb` + `biopb-image-base`), `java-ci` → Maven Central |
 | `release-v<R>` | the product bundle or the tensor-server image changed | `release.yaml` → the GitHub release bundle (below) **and** `tensor-server-ci` → `biopb-tensor-server:<R>` Docker |
 
 The tags are independent: an SDK-only change is just `v<A>`; a product change
@@ -74,10 +75,6 @@ commit to validate before it lands on `main`.
   so publishing one would park unmerged code next to the real releases for nobody
   to consume. To try an RC image, build it locally from the tagged commit
   (`docker build -f biopb-tensor-server/Dockerfile .`).
-- **`v…rc1`** does the same for the SDK's `biopb-image-base` image:
-  `image-runtime-ci` tests and builds it, and publishes nothing. Derived services
-  build `FROM biopb-image-base` — `:latest` or a pinned stable `X.Y.Z` — which an
-  rc never moved anyway.
 
 The `v*` PyPI tag (biopb) follows PyPI's own prerelease rules: a `…rc1` version
 uploads as a prerelease, which `pip` ignores unless `--pre`.
@@ -117,19 +114,20 @@ installer published alongside it, so an installer carries no compatibility code
 for older releases. Bump it when a change
 to the release makes an earlier installer wrong for it.
 
-### `v*` → PyPI/Maven + the image-base image (`image-runtime-ci`)
+### The image-base image (`image-runtime-ci`, manual dispatch)
 
-On a `v*` tag, `python-ci`/`java-ci` publish `biopb` to PyPI/Maven, and
-`image-runtime-ci`'s `publish` job builds the `biopb-image-base` image (biopb +
-tensor-server wheels) and pushes it to **ghcr.io + Docker Hub `jiyuuchc/`**,
-tagged with the SDK version **and** `:latest`. Like the tensor-server image, it
-publishes **only on a final `vX.Y.Z`** — an rc tag tests and builds the image but
-publishes nothing.
+`image-runtime-ci` publishes nothing on a tag. Dispatch the workflow on a commit
+and its `publish` job builds the `biopb-image-base` image (biopb + tensor-server
+wheels from that tree) and pushes it to **ghcr.io + Docker Hub `jiyuuchc/`**,
+tagged `sha-<7 chars>` of the commit, and `:latest` unless the `latest` input is
+unticked. Image labels record the revision and the bundled `biopb` and
+`biopb-tensor-server` versions. Neither the SDK `v*` nor the product `release-v*`
+describes the image, because it carries the in-repo tensor server.
 
 ### Idempotent Docker publish (the "did the version change?" check)
 
 Each image `publish` job (tensor-server-ci, image-runtime-ci) is **idempotent**:
-it publishes only if that version tag is missing from **at least one** of the two
+it publishes only if that version tag (image-runtime-ci: the `sha-` tag) is missing from **at least one** of the two
 registries (ghcr.io, Docker Hub), so re-running a tag with both already present is
 a noop, while a partial prior publish (one registry pushed, the other failed)
 re-runs to fill the gap:
@@ -220,7 +218,7 @@ single source of truth.
 
 | Tag | Workflow | Publishes |
 |---|---|---|
-| `v*` | `python-ci`, `java-ci`, `image-runtime-ci` | PyPI (`biopb` + `biopb-image-base`) + Maven Central (`biopb` Java) — **and**, for a stable tag only, Docker `biopb-image-base:A` + `:latest` |
+| `v*` | `python-ci`, `java-ci` | PyPI (`biopb` + `biopb-image-base`) + Maven Central (`biopb` Java) |
 | `release-v*` | `release.yaml`, `tensor-server-ci` | GitHub release (wheel set + sdist + webapp + samples + installers) — **and**, for a stable tag only, Docker `biopb-tensor-server:R` + `:latest` |
 
 The canonical install scripts are published by a **step inside `release.yaml`**,
@@ -235,8 +233,8 @@ candidates on demand).
 
 `mcp-ci` and `control-ci` keep their PR test/build jobs but **do not publish**.
 `tensor-server-ci` publishes its Docker image on the product `release-v*` tag;
-`image-runtime-ci` publishes `biopb-image-base`'s Docker image on the SDK `v*`
-tag (its PyPI wheel ships from `python-ci`, alongside `biopb`). There are no
+`image-runtime-ci` publishes `biopb-image-base`'s Docker image only by manual
+dispatch (its PyPI wheel ships from `python-ci`, alongside `biopb`). There are no
 `server-v*` / `mcp-v*` / `control-v*` tags — the tensor server, mcp, control, and
 web all ship together on `release-v*`.
 
@@ -246,6 +244,6 @@ web all ship together on `release-v*`.
   installer was promoted to root post-first-release; the host-side copy/redirect
   should point at it).
 - Prerelease test tags (`release-v…rc1`, `v…rc1`) publish harmlessly: the
-  installer skips the GitHub release and **neither tag publishes a Docker image
-  at all**, so both `:latest` tags stay on the last stable image (see "Release
-  candidates" above).
+  installer skips the GitHub release and **neither publishes a Docker image
+  at all**, so the tensor-server `:latest` stays on the last stable image (see
+  "Release candidates" above).
