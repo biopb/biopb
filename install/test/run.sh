@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build and launch a test environment for install.sh.
-# Usage: ./run.sh [--assert] [scenario]
+# Usage: ./run.sh [--assert] [--bootstrap] [scenario]
 #
 # Scenarios:
 #   clean            Fresh Ubuntu, no uv, no Python extras  (default)
@@ -22,6 +22,12 @@
 # the reasoning); it takes minutes and needs network, so it is nightly /
 # pre-release, not per-PR. See biopb/biopb#653.
 #
+# With --bootstrap the install goes through bootstrap.sh, the script biopb.org
+# serves, instead of install.sh: it fetches and runs a RELEASE's installer, so what
+# is tested is that release, not this checkout. Pick it with BIOPB_INSTALL_VERSION
+# or BIOPB_INSTALL_RC in the environment (both are passed into the container);
+# otherwise it is the latest stable one.
+#
 # Mount a ZVI sample for the bioformats scenario:
 #   BIOPB_TEST_DATA=/dir/with/zvi ./run.sh bioformats
 
@@ -31,11 +37,13 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ALL_SCENARIOS=(clean uv-preinstalled old-python rerun bioformats)
 
 ASSERT=0
+BOOTSTRAP=0
 SCENARIO=""
 for arg in "$@"; do
     case "$arg" in
-        --assert)  ASSERT=1 ;;
-        -h|--help) sed -n '2,26p' "$0"; exit 0 ;;
+        --assert)    ASSERT=1 ;;
+        --bootstrap) BOOTSTRAP=1 ;;
+        -h|--help)   sed -n '2,32p' "$0"; exit 0 ;;
         -*)        echo "ERROR: Unknown option '$arg'" >&2; exit 2 ;;
         *)         SCENARIO="$arg" ;;
     esac
@@ -69,6 +77,19 @@ if [ -n "${BIOPB_TEST_DATA:-}" ]; then
     data_mount=(-v "$BIOPB_TEST_DATA:/data:ro")
 fi
 
+# Installing through bootstrap.sh: mount it, name it as the installer, and hand
+# the container the caller's release choice (-e VAR with no value copies it from
+# this shell, and passes nothing if it is unset).
+install_via=()
+if [ "$BOOTSTRAP" = "1" ]; then
+    install_via=(
+        -v "$SCRIPT_DIR/../bootstrap.sh:/bootstrap.sh:ro"
+        -e BIOPB_INSTALL_SH=/bootstrap.sh
+        -e BIOPB_INSTALL_VERSION
+        -e BIOPB_INSTALL_RC
+    )
+fi
+
 if [ "$ASSERT" = "1" ]; then
     scenarios=("$SCENARIO")
     [ "$SCENARIO" = "all" ] && scenarios=("${ALL_SCENARIOS[@]}")
@@ -81,7 +102,7 @@ if [ "$ASSERT" = "1" ]; then
         # would otherwise mean rebuilding five Dockerfiles to try it. `|| true`
         # via the if/else -- one failing scenario must not stop the rest, since
         # the point of `all` is to learn everything wrong in a single run.
-        if docker run --rm "${data_mount[@]}" \
+        if docker run --rm "${data_mount[@]}" "${install_via[@]}" \
                 -v "$SCRIPT_DIR/assert.sh:/assert.sh:ro" \
                 "biopb-install-test:$s" bash /assert.sh "$s"; then
             :
@@ -125,4 +146,4 @@ echo "Or run the same checks unattended, asserting instead of showing:"
 echo "  ./run.sh --assert $SCENARIO"
 echo ""
 
-docker run --rm -it "${data_mount[@]}" "biopb-install-test:$SCENARIO"
+docker run --rm -it "${data_mount[@]}" "${install_via[@]}" "biopb-install-test:$SCENARIO"
