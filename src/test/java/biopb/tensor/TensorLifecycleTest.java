@@ -699,6 +699,15 @@ public class TensorLifecycleTest {
         @Override
         public void close() throws Exception {
             server.close();
+            // A stream's last buffers are released after the client has its
+            // answer: the handler closes its root after completed(), and gRPC
+            // holds the serialized batch until it is written. Closing the
+            // allocator straight away reads that as a leak. A real one is
+            // still reported, once the wait runs out.
+            long deadline = System.currentTimeMillis() + 5_000;
+            while (allocator.getAllocatedMemory() > 0 && System.currentTimeMillis() < deadline) {
+                Thread.sleep(10);
+            }
             allocator.close();
         }
     }
