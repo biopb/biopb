@@ -125,6 +125,15 @@ class TestKernelControl:
             kernel.restart()
         assert kernel._connection is None
 
+    def test_restart_leaves_a_marker_and_ids_keep_counting(self, kernel):
+        assert kernel.jobs.restarts() == []  # the first start is not a restart
+        before = kernel.jobs.new_id()
+        kernel.restart()
+        assert [m["after"] for m in kernel.jobs.restarts()] == [
+            int(before.split("-")[1])
+        ]
+        assert int(kernel.jobs.new_id().split("-")[1]) > int(before.split("-")[1])
+
     def test_restart_clears_namespace(self, kernel):
         kernel.execute("survivor = 1")
         assert "1" in kernel.execute("print(survivor)")["stdout"]

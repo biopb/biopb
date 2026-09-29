@@ -95,8 +95,11 @@ never ends a task.
 
 Every read — `poll_job`, the observe list and detail, the notebook export, the
 foreign-activity digest — is a read of the host's memory, never a kernel round
-trip. Records outlive a kernel restart; one still running when its kernel goes
-ends as interrupted. `display_data` is not recorded: a record says what ran and
+trip. Records outlive a kernel restart, and ids keep counting; the restart is
+marked between the jobs of the two kernels (`JobLog.mark_restart`, by job
+number so pruning cannot lose it), which the observe list draws as a line and
+the notebook export prints as a note. One still running when its kernel goes
+ends as `kernel_lost`. `display_data` is not recorded: a record says what ran and
 how it ended, not what it drew.
 
 A verification runs the same way in a scratch kernel: each cell its own request,

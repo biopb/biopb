@@ -1,7 +1,8 @@
 """The job records, kept in the host from what the kernel publishes.
 
 Runs **in the MCP server process**, owned by ``KernelHost`` for its lifetime,
-so the records outlive any one kernel, and it names every job (``job-N``).
+so the records outlive any one kernel, and it names every job (``job-N``,
+never reused). A restart leaves a marker between the jobs of the two kernels.
 Built from iopub alone (``_kernel_io.KernelChannels`` hands every message
 here); every ``stream`` / ``execute_result`` / ``error`` under a job's request
 is the job's. Reading a record is a read of this process's memory, never a
@@ -31,6 +32,10 @@ import time
 # into a clean program (``verify_workflow``) reads the transcript, so eviction
 # takes away the source material for the one step nothing can automate.
 _MAX_RETAINED_JOBS = 200
+
+# Restart markers kept, oldest dropped first: one per kernel launch after the
+# first, so a session that restarts this often has bigger problems.
+_MAX_RESTART_MARKS = 100
 
 # Keep at most this many characters of one job's captured output. This is the
 # bound _MAX_RETAINED_JOBS is not: that caps how many records are kept, while a
@@ -274,6 +279,14 @@ def _verdict(rec):
     return status, error_text
 
 
+def _job_number(job_id):
+    """The N of ``job-N`` (0 for anything else)."""
+    try:
+        return int(job_id.rsplit("-", 1)[1])
+    except (IndexError, ValueError):
+        return 0
+
+
 class JobLog:
     """Every job the kernels of one host have announced, oldest first."""
 
@@ -287,6 +300,10 @@ class JobLog:
         # The last job number issued (_next_id): one counter for the host's
         # life, so ids never repeat across kernel restarts.
         self._seq = 0
+        # Where each kernel restart falls in the history: ``{"after": N, "at":
+        # wall time}``, N the last job number issued before it. By number, not
+        # by record, so a marker outlives the pruning of the jobs around it.
+        self._restarts = []
         # The host's client session: its requests are the host's own snippets,
         # never a cell to record. Set per kernel (KernelHost._launch).
         self.host_session = host_session
@@ -480,6 +497,18 @@ class JobLog:
                 )
                 self._detach(rec)
 
+    def mark_restart(self):
+        """Note that a new kernel begins here: jobs before it ran in another
+        namespace. Ids keep counting, so the records stay unambiguous."""
+        with self._lock:
+            self._restarts.append({"after": self._seq, "at": time.time()})
+            del self._restarts[:-_MAX_RESTART_MARKS]
+
+    def restarts(self):
+        """The restart markers, oldest first: ``[{"after": N, "at": time}]``."""
+        with self._lock:
+            return list(self._restarts)
+
     def kernel_gone(self, why=""):
         """End every running record: its kernel is going away."""
         text = _KERNEL_GONE + (f" ({why})." if why else ".")
@@ -569,9 +598,18 @@ class JobLog:
             return [r.summary() for r in self._records.values()]
 
     def export(self):
-        """Full snapshots of every retained job, for the notebook export."""
+        """Full snapshots of every retained job, for the notebook export, with a
+        ``{"restart": True, "at": time}`` entry where each kernel restart fell."""
         with self._lock:
-            return [r.snapshot() for r in self._records.values()]
+            marks = list(self._restarts)
+            out = []
+            for rec in self._records.values():
+                number = _job_number(rec.job_id)
+                while marks and marks[0]["after"] < number:
+                    out.append({"restart": True, "at": marks.pop(0)["at"]})
+                out.append(rec.snapshot())
+            out.extend({"restart": True, "at": m["at"]} for m in marks)
+            return out
 
     def running(self, prefer=None):
         """A running job's snapshot, or ``None``: one of origin *prefer* if

@@ -316,6 +316,53 @@ class TestLostAndGone:
         assert log.new_id() == "job-3"
 
 
+class TestRestartMarkers:
+    @staticmethod
+    def _run_job(log):
+        """A finished job numbered the way the host numbers one."""
+        job_id = log.new_id()
+        _start(log, job_id=job_id, request="r-" + job_id)
+        _end(log, job_id=job_id)
+        return job_id
+
+    def test_ids_keep_counting_and_the_marker_says_where(self):
+        log = JobLog()
+        self._run_job(log)
+        self._run_job(log)
+        log.mark_restart()
+        assert log.new_id() == "job-3"
+        marks = log.restarts()
+        assert [m["after"] for m in marks] == [2]
+        assert marks[0]["at"] > 0
+
+    def test_the_old_record_stays_pollable(self):
+        log = JobLog()
+        _start(log)
+        log.kernel_gone()
+        log.mark_restart()
+        assert log.poll("job-1")["status"] == "kernel_lost"
+
+    def test_export_puts_the_marker_between_the_jobs_around_it(self):
+        log = JobLog()
+        self._run_job(log)
+        log.mark_restart()
+        self._run_job(log)
+        out = log.export()
+        assert [e.get("job_id", "restart") for e in out] == [
+            "job-1",
+            "restart",
+            "job-2",
+        ]
+
+    def test_a_marker_outlives_the_pruning_of_the_jobs_around_it(self):
+        log = JobLog()
+        self._run_job(log)
+        log.mark_restart()
+        del log._records["job-1"]  # aged out
+        assert [m["after"] for m in log.restarts()] == [1]
+        assert [e.get("restart") for e in log.export()] == [True]
+
+
 class TestDigest:
     def test_reports_only_unseen_foreign_jobs(self):
         log = JobLog()
