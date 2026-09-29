@@ -1089,6 +1089,73 @@ class TestQuerySourcesEndpoint:
         assert r.headers["X-Returned-Sources"] == "2"
         assert r.headers["X-Truncated"] == "true"
 
+    def _query_returns(self, auth_client, table):
+        tc, mock_fc = auth_client
+        mock_fc.query.side_effect = lambda sql, **kw: table
+        return tc.post(
+            "/api/sources/query",
+            json={"sql": "SELECT * FROM rois"},
+            headers=_bearer(_TOKEN),
+        )
+
+    def test_query_sources_serves_a_timestamp_column(self, auth_client):
+        import datetime as dt
+
+        import pyarrow as pa
+
+        naive = dt.datetime(2026, 9, 13, 10, 0)
+        table = pa.table({"id": ["a", "b"], "created_at": [naive, None]})
+
+        r = self._query_returns(auth_client, table)
+
+        assert r.status_code == 200, r.text
+        rows = r.json()
+        # Naive server-local time is sent with its offset, so it names an instant.
+        assert rows[0]["created_at"] == naive.astimezone().isoformat()
+        assert dt.datetime.fromisoformat(rows[0]["created_at"]).tzinfo is not None
+        assert rows[1]["created_at"] is None
+
+    def test_query_sources_keeps_an_explicit_offset(self, auth_client):
+        import datetime as dt
+
+        import pyarrow as pa
+
+        aware = dt.datetime(2026, 9, 13, 10, 0, tzinfo=dt.timezone.utc)
+        table = pa.table({"at": pa.array([aware], pa.timestamp("us", tz="UTC"))})
+
+        r = self._query_returns(auth_client, table)
+
+        assert r.json() == [{"at": "2026-09-13T10:00:00+00:00"}]
+
+    def test_query_sources_serves_date_decimal_and_blob_columns(self, auth_client):
+        import datetime as dt
+        import decimal
+
+        import pyarrow as pa
+
+        table = pa.table(
+            {
+                "d": pa.array([dt.date(2026, 9, 13)]),
+                "n": pa.array([decimal.Decimal("1.10")], pa.decimal128(4, 2)),
+                "b": pa.array([b"\x00\xff"]),
+            }
+        )
+
+        r = self._query_returns(auth_client, table)
+
+        assert r.json() == [{"d": "2026-09-13", "n": "1.10", "b": "00ff"}]
+
+    def test_query_sources_map_column_is_a_list_of_pairs(self, auth_client):
+        import pyarrow as pa
+
+        table = pa.table(
+            {"plane": pa.array([[(2, 12)]], pa.map_(pa.int32(), pa.int32()))}
+        )
+
+        r = self._query_returns(auth_client, table)
+
+        assert r.json() == [{"plane": [[2, 12]]}]
+
     def test_query_sources_validation_error(self, auth_client):
         tc, mock_fc = auth_client
         mock_fc.query.side_effect = ValueError("forbidden keyword: INSERT")
