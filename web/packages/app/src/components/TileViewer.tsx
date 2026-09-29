@@ -9,74 +9,35 @@
  * replaced, which asked the server to re-render the whole region on every
  * interaction — fine on loopback, unusable across a WAN.
  *
+ * This component is composition: each concern is a hook with a narrow contract
+ * (`usePixelSources`, `usePlaneGate`, `useContrastSamples`, `useRoiOverlay`,
+ * `useRoiAuthoring`, `useLabelOverlayLayers`, `useHoverReadout`) and the render
+ * code is what is left. The deck.gl half is {@link VivStage}.
+ *
  * Default-exported so the route can `lazy()` it: deck.gl and luma.gl are by far
  * the largest thing the app depends on and no other page needs them.
  */
 
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import type { CSSProperties, RefObject } from "react";
-import { OrthographicView } from "@deck.gl/core";
-import {
-  ColorPaletteExtension,
-  DETAIL_VIEW_ID,
-  DetailView,
-  VivViewer,
-  getDefaultInitialViewState,
-} from "@hms-dbmi/viv";
-import {
-  labelSelection,
-  pixelSourcesFromInfo,
-  vivDtype,
-  type TileInfo,
-} from "@biopb/tensor-flight-client";
-import {
-  selectBroadcastAxes,
-  selectDraft,
-  selectLabelOverlay,
-  selectRoiScopes,
-  selectRois,
-  selectSelectedRoiId,
-  selectVisibleSets,
-  selectContrastWindow,
-  useAppStore,
-} from "../store";
-import {
-  closeDraft,
-  closesOnFirstVertex,
-  isCompletable,
-  isRealClick,
-  isTextEntryTarget,
-  placePoint,
-  undoPoint,
-} from "../utils/roiDraft";
-import { roiAt } from "../utils/roiHitTest";
-import { RoiToolStrip } from "./RoiToolStrip";
-import {
-  buildDraftLayers,
-  buildRoiLayers,
-  buildSelectionLayers,
-  defaultBroadcastAxes,
-  pinForNewRoi,
-  planeFromSelection,
-  visibleRois,
-  type XY,
-} from "../utils/roiLayers";
-import type { ViewerErrorKind } from "../store";
+import { useEffect, useMemo, useRef } from "react";
+import { vivDtype, type TileInfo } from "@biopb/tensor-flight-client";
 import { useShallow } from "zustand/react/shallow";
-import { GammaExtension } from "../utils/vivGamma";
-import { buildLabelLayers } from "../utils/labelLayers";
-import { useLabelOverlay } from "../hooks/useLabelOverlay";
-import {
-  clampGamma,
-  contrastSamples,
-  samplesPerPixel,
-  tileCacheSize,
-  vivColor,
-  vivSelection,
-  CAMERA_MIRROR_MS,
-} from "../utils/vivUtils";
-
-type PixelSources = ReturnType<typeof pixelSourcesFromInfo>;
+import { selectContrastWindow, useAppStore } from "../store";
+import type { ViewerErrorKind } from "../store";
+import { useContrastSamples } from "../hooks/useContrastSamples";
+import { useElementSize } from "../hooks/useElementSize";
+import { useHoverReadout } from "../hooks/useHoverReadout";
+import { useLabelOverlayLayers } from "../hooks/useLabelOverlayLayers";
+import { useMountEpoch, usePublishPlaneReady } from "../hooks/useMountEpoch";
+import { usePixelSources } from "../hooks/usePixelSources";
+import { usePlaneGate } from "../hooks/usePlaneGate";
+import { useRoiAuthoring } from "../hooks/useRoiAuthoring";
+import { useRoiOverlay } from "../hooks/useRoiOverlay";
+import { useSliceWheelNavigation } from "../hooks/useSliceWheelNavigation";
+import { clampGamma, samplesPerPixel, tileCacheSize, vivColor } from "../utils/vivUtils";
+import { HoverReadout } from "./HoverReadout";
+import { RoiToolStrip } from "./RoiToolStrip";
+import { VivStage } from "./VivStage";
+import { BADGE, OVERLAY_TEXT, greyLevel } from "./viewerStyles";
 
 interface TileViewerProps {
   sourceId: string;
@@ -90,660 +51,68 @@ interface TileViewerProps {
   onUnsupported: (reason: string, kind: ViewerErrorKind) => void;
 }
 
-/**
- * Slice navigation: hold one of these and scroll.
- *
- * Only the named axes get a key, because there is no letter to press for an
- * axis called `i` or `POS` that would not collide with something. Those are
- * navigated with their slider in {@link SliceControls}.
- */
-const SLICE_KEYS = ["t", "z", "c"] as const;
-const SLICE_WHEEL_QUIET_MS = 120;
-
-/**
- * Stops deck.gl holding every click for a third of a second.
- *
- * deck wires its click recognizer as `requireFailure(['dblclick'])`, and
- * mjolnir answers that by deferring the emit by the recognizer's `interval`
- * (300 ms by default) -- then cancelling that pending emit outright if another
- * press arrives first, because `TapRecognizer.process` opens with a `reset()`
- * that clears the timer and overwrites the input it would have reported. Three
- * vertices placed a tenth of a second apart therefore arrive as one click, at
- * the last position: the first two are cancelled, not queued.
- *
- * Zero here means the emit lands on the next task instead. Nothing else pushes
- * the recognizer through `process` in between -- mouse moves reach it only
- * while a button is down -- so the only thing that ever cancelled a click was
- * the next click. `dblclick` keeps its own recognizer and its own interval, so
- * double-click zoom is untouched.
- */
-const CLICK_OPTIONS = { click: { interval: 0 } };
-
-/**
- * Viv's detail view, with a say over whether a double click zooms.
- *
- * `VivView.getDeckGlView` hard-codes `controller: true`, which is deck's whole
- * default gesture set. That is the wrong set while a click places a vertex: the
- * two taps of a double click are two vertices, and zooming out from under them
- * on the same gesture moves everything already placed relative to what is on
- * screen. Suppressing the vertices instead would mean waiting to find out
- * whether a second tap is coming, which is the 300 ms {@link CLICK_OPTIONS}
- * exists to get rid of.
- *
- * Only the double click goes: scroll still zooms, and drag still pans, so the
- * gesture that is actually used to navigate while drawing is untouched.
- */
-class BiopbDetailView extends DetailView {
-  private readonly doubleClickZoom: boolean;
-
-  constructor(props: {
-    id: string;
-    height: number;
-    width: number;
-    doubleClickZoom: boolean;
-  }) {
-    super(props);
-    this.doubleClickZoom = props.doubleClickZoom;
-  }
-
-  getDeckGlView() {
-    return new OrthographicView({
-      controller: { doubleClickZoom: this.doubleClickZoom },
-      id: this.id,
-      height: this.height,
-      width: this.width,
-      x: this.x,
-      y: this.y,
-    });
-  }
-}
-
-/**
- * Viv's default palette plus gamma. Module-level because deck.gl treats a change
- * of this array as a change of extensions, which rebuilds every layer's shader:
- * a fresh array per render would recompile on every slider move.
- *
- * ColorPaletteExtension has to be listed explicitly — naming `extensions` at all
- * replaces Viv's default rather than adding to it, and dropping it would leave
- * the channel colour unapplied.
- */
-const VIV_EXTENSIONS = [new ColorPaletteExtension(), new GammaExtension()];
-
 /** The window before there is a grid to derive one from. */
 const FALLBACK_WINDOW: [number, number] = [0, 1];
 
 export default function TileViewer({ sourceId, info, onUnsupported }: TileViewerProps) {
-  const client = useAppStore((s) => s.client);
-  const position = useAppStore((s) => s.position);
-  const display = useAppStore((s) => s.display);
-  // The epoch this viewer was mounted under: what it tags its publications with.
-  // A viewer lives for exactly one epoch (`ViewerPane` keys on it).
-  const [epoch] = useState(() => useAppStore.getState().target.epoch);
-  const channelNames = useAppStore((s) => s.channelNames);
-  const channelColors = useAppStore((s) => s.channelColors);
-  // Scoped selectors, not raw fields: a set fetched for another tensor is held
-  // until this one's fetch lands, and drawing it over a new image would be
-  // worse than drawing nothing.
-  const rois = useAppStore(selectRois);
-  const showRois = useAppStore((s) => s.showRois);
-  const visibleSets = useAppStore(selectVisibleSets);
-  const roiScopes = useAppStore(selectRoiScopes);
-  const loadRois = useAppStore((s) => s.loadRois);
-  const roiKey = useAppStore((s) => s.target.key);
-  const tool = useAppStore((s) => s.tool);
-  const draft = useAppStore(selectDraft);
-  const selectedRoiId = useAppStore(selectSelectedRoiId);
-  const setDraft = useAppStore((s) => s.setDraft);
-  const setSelectedRoi = useAppStore((s) => s.setSelectedRoi);
-  const createRoi = useAppStore((s) => s.createRoi);
-  const deleteRoi = useAppStore((s) => s.deleteRoi);
-  const polylineWidth = useAppStore((s) => s.newPolylineWidth);
-
+  const epoch = useMountEpoch();
   const hostRef = useRef<HTMLDivElement | null>(null);
   const size = useElementSize(hostRef);
+  useSliceWheelNavigation(hostRef, info);
 
-  const [sources, setSources] = useState<PixelSources | null>(null);
-  const [tileError, setTileError] = useState<string | null>(null);
+  const { sources, tileError, clearTileError } = usePixelSources(info, onUnsupported);
+  const { selection, loadedSelection, dataValid, onViewportLoad } = usePlaneGate(info);
+  // Scoped to the plane that produced it, so a failed read cannot go on
+  // labelling later planes that loaded perfectly well.
+  useEffect(clearTileError, [selection, clearTileError]);
 
-  // Report upward through a ref: onUnsupported comes from the parent's render,
-  // and listing it as a dependency would re-run the source build on every
-  // parent re-render (i.e. on every slider move).
-  const onUnsupportedRef = useRef(onUnsupported);
-  onUnsupportedRef.current = onUnsupported;
+  const uniformValue = useContrastSamples(sources, info, selection);
+  // The same selector the panel's bar reads (biopb/biopb#955).
+  const contrastLimits = useAppStore(useShallow(selectContrastWindow)) ?? FALLBACK_WINDOW;
+  // Never trusted straight from the store: a persisted or hand-edited value of 0
+  // or below is a uniform white plane, not a dim one.
+  const gamma = useAppStore((s) => clampGamma(s.display.gamma));
 
-  // --- pixel sources ------------------------------------------------------
-  useEffect(() => {
-    if (!client) return;
-    let live = true;
-    setTileError(null);
-    try {
-      setSources(
-        pixelSourcesFromInfo(client.http, info, {
-          onTileError: (err) => {
-            if (live) setTileError(err.message);
-          },
-        }),
-      );
-    } catch (err) {
-      // A tensor whose axes this server's tile route cannot select: a fact
-      // about the tensor, not a bad moment.
-      setSources(null);
-      onUnsupportedRef.current(err instanceof Error ? err.message : String(err), "capability");
-    }
-    return () => {
-      live = false;
-    };
-  }, [client, info]);
+  // --- colour -------------------------------------------------------------
+  const channel = useAppStore((s) => s.position.c);
+  const channelNames = useAppStore((s) => s.channelNames);
+  const channelColors = useAppStore((s) => s.channelColors);
+  const color = useMemo(() => {
+    const stored = channelColors[sourceId]?.[channel] ?? "auto";
+    // `channelNames` is filled asynchronously, so this runs at least once with
+    // the name still unknown. `resolveAutoColor` answers grey then and grey
+    // again once an unrecognised name lands, which is what keeps the first
+    // frames from being a different colour than the settled one.
+    return vivColor(stored, channelNames[sourceId]?.[channel]);
+  }, [channelColors, channelNames, sourceId, channel]);
 
-  // Viv's ImageLayer refetches whenever `selections` is a new *reference*. It
-  // is derived from `position` alone, which only a move within the grid
-  // replaces (`setPosition` keeps the object when nothing changed), so a
-  // contrast drag or a colour change leaves this the same object.
-  const selection = useMemo<Record<string, number>>(
-    () => vivSelection(info, position),
-    [info, position],
+  const maxCacheSize = useMemo(
+    () => tileCacheSize(info.tile_size, vivDtype(info.dtype), samplesPerPixel(info), 1),
+    [info],
   );
 
-  // --- is what is on screen the plane that was asked for? ------------------
-  // Both Viv layers keep their previous raster until a new read resolves, so a
-  // t/c/z change leaves the old plane painted for exactly as long as the read
-  // takes -- with nothing on screen to say so. That is worse than a blank
-  // frame: a stale plane is indistinguishable from the right one, and a plane
-  // that never changed reads as a hung viewer rather than a slow one.
-  //
-  // deck.gl's TileLayer reports when the viewport's tiles have all landed.
-  // Reached through Viv, which forwards unknown props down to it and pins the
-  // background ImageLayer's own callback to null, so this fires once per
-  // completed viewport and not twice.
-  const [loadedSelection, setLoadedSelection] = useState<Record<string, number> | null>(null);
-  // Read through a ref: the callback's identity has to stay stable or every
-  // layerProps rebuild would look like a prop change to deck.gl.
-  const selectionRef = useRef(selection);
-  selectionRef.current = selection;
-  const onViewportLoad = useCallback((loaded?: unknown) => {
-    // Two different things call this. A pyramid gets Viv's MultiscaleImageLayer
-    // and deck.gl's TileLayer under it, which reports the array of tiles; an
-    // image small enough to need only one level gets Viv's plain ImageLayer,
-    // which reports the single raster it just read. Assuming the array shape
-    // leaves every single-level image permanently covered.
-    if (Array.isArray(loaded)) {
-      // A *failed* tile still counts as loaded to deck.gl -- `_isLoaded = true`
-      // with `content = null` -- so a viewport whose reads all errored reports
-      // itself complete. Taking that at face value would clear the cover over a
-      // canvas that never got the plane, which is the ambiguity this gate exists
-      // to remove. An aborted tile is not affected: deck.gl leaves that one
-      // unloaded, so it never reaches here.
-      if (loaded.some((tile: { content?: unknown } | null) => tile?.content == null)) return;
-    }
-    // The ImageLayer branch needs no such check: a raster that failed rejects,
-    // and it only calls this on the resolved path.
-    setLoadedSelection(selectionRef.current);
-  }, []);
-  // Zoom and pan never invalidate: they change which tiles are wanted, not
-  // which plane, so their partial state is legitimate progressive refinement.
-  const dataValid = loadedSelection !== null && loadedSelection === selection;
+  // --- annotations and overlays ---------------------------------------------
+  const { shownPlane, shown, roiLayers, selectionLayers } = useRoiOverlay(info, loadedSelection);
+  const authoring = useRoiAuthoring(info, shownPlane, shown);
+  const { hover, bindHover } = useHoverReadout(authoring.draftCursorSinkRef);
+  const label = useLabelOverlayLayers(info, selection, loadedSelection);
+
+  // Paced on the image *and* the overlay: see `useLabelOverlayLayers`.
+  usePublishPlaneReady(dataValid && label.ready, epoch);
 
   // Under play the cover is dropped: at 10 frames a second it would be on
   // screen for most of every frame, which is a flicker rather than a warning,
   // and the thing it guards against -- mistaking a stale plane for the one
   // asked for -- cannot happen while the planes are deliberately marching past.
   const playing = useAppStore((s) => s.playAxis !== null);
-
-  // Scoped to the plane that produced it, so a failed read cannot go on
-  // labelling later planes that loaded perfectly well.
-  useEffect(() => setTileError(null), [selection]);
-
-  // --- contrast limits ----------------------------------------------------
-  // Read the coarsest level once per selection and keep the sorted samples, so
-  // the intensity slider re-derives limits locally instead of refetching. The
-  // store holds them (`runtime.samples`), and the window and the track are
-  // selectors over that: sampling a plane and noting its levels is one action.
-  const samples = useAppStore((s) => s.runtime.samples);
-  const notePlaneSamples = useAppStore((s) => s.notePlaneSamples);
-  const channel = position.c;
-  useEffect(() => {
-    if (!sources) return;
-    // Interleaved RGB is rendered as colour, not through a contrast ramp.
-    if (info.plane.s !== null) return;
-    const overview = sources[sources.length - 1];
-    if (!overview) return;
-    const controller = new AbortController();
-    let live = true;
-    overview
-      .getRaster({ selection, signal: controller.signal })
-      .then((raster) => {
-        if (live) {
-          notePlaneSamples({ plane: selection, values: contrastSamples(raster.data) }, channel, epoch);
-        }
-      })
-      .catch(() => {
-        // Keep the previous limits: a failed histogram is a worse reason to
-        // blank the image than to show it with slightly stale contrast.
-      });
-    return () => {
-      live = false;
-      controller.abort();
-    };
-  }, [sources, info, selection, channel, epoch, notePlaneSamples]);
-
-  // The same selector the panel's bar reads (biopb/biopb#955).
-  const contrastLimits = useAppStore(useShallow(selectContrastWindow)) ?? FALLBACK_WINDOW;
-
-  // Never trusted straight from the store: a persisted or hand-edited value of 0
-  // or below is a uniform white plane, not a dim one.
-  const gamma = clampGamma(display.gamma);
-
-  // --- is there anything in this plane? ------------------------------------
-  // A featureless plane renders black, and so does one whose tiles have not
-  // arrived and one whose contrast window excludes everything. Black is the
-  // right rendering for an all-zero plane -- what was missing is saying so.
-  //
-  // Keyed to the selection because `samples` is deliberately kept across a
-  // plane change so the contrast does not flash: unkeyed, this label would
-  // describe the plane before last.
-  const uniformValue = useMemo(() => {
-    if (!samples || samples.plane !== selection) return null;
-    const v = samples.values;
-    if (v.length === 0) return null;
-    const first = v[0];
-    return first !== undefined && first === v[v.length - 1] ? first : null;
-  }, [samples, selection]);
-
-  // --- colour -------------------------------------------------------------
-  const color = useMemo(() => {
-    const stored = channelColors[sourceId]?.[position.c] ?? "auto";
-    // `channelNames` is filled asynchronously, so this runs at least once with
-    // the name still unknown. `resolveAutoColor` answers grey then and grey
-    // again once an unrecognised name lands, which is what keeps the first
-    // frames from being a different colour than the settled one.
-    return vivColor(stored, channelNames[sourceId]?.[position.c]);
-  }, [channelColors, channelNames, sourceId, position.c]);
-
-  const maxCacheSize = useMemo(
-    () =>
-      info
-        ? tileCacheSize(info.tile_size, vivDtype(info.dtype), samplesPerPixel(info), 1)
-        : 0,
-    [info],
-  );
-
-  useSliceWheelNavigation(hostRef, info);
-
-  // --- the value under the pointer -----------------------------------------
-  // Costs no read. Viv picks the value out of the tile deck.gl already has
-  // (`info.tile.content.data`) and gives up when there is none, so hovering
-  // over a tile that has not arrived reports nothing rather than fetching it.
-  //
-  // Fed to the badge through a ref instead of through this component's state:
-  // a pointer move at 60/s that re-rendered here would rebuild `VivStage` and,
-  // with it, every deck.gl layer.
-  const hoverSinkRef = useRef<((sample: HoverSample | null) => void) | null>(null);
-  // Null unless a draft is open, which is what keeps the hover handler from
-  // re-rendering this component on every pointer move the rest of the time.
-  const draftCursorSinkRef = useRef<((at: XY | null) => void) | null>(null);
-  const bindHover = useCallback((sink: ((sample: HoverSample | null) => void) | null) => {
-    hoverSinkRef.current = sink;
-  }, []);
-  const hover = useMemo(() => {
-    // Where the pointer is comes from deck.gl's own hover, which fires for
-    // every move; the value comes from Viv's hook, which fires only when there
-    // is a tile to read. Keeping them apart is what lets the readout go blank
-    // off-image instead of holding the last value it saw.
-    let at: HoverSample | null = null;
-    return {
-      onHover: (info: HoverInfo) => {
-        const c = info?.coordinate;
-        if (!c || !info.sourceLayer || c[0] === undefined || c[1] === undefined) {
-          at = null;
-          hoverSinkRef.current?.(null);
-          draftCursorSinkRef.current?.(null);
-          return;
-        }
-        // Viv reads `2 ** round(-z)` as the level's scale, so this is the same
-        // number the badge would need to explain a downsampled value.
-        const z = info.tile?.index?.z;
-        at = {
-          x: Math.floor(c[0]),
-          y: Math.floor(c[1]),
-          value: null,
-          scale: typeof z === "number" ? Math.max(1, 2 ** Math.round(-z)) : 1,
-        };
-        hoverSinkRef.current?.(at);
-        // The one place this component re-renders at pointer rate, and only
-        // while a shape is being placed: the trailing segment has to follow the
-        // pointer to be worth anything.
-        if (draftCursorSinkRef.current) draftCursorSinkRef.current([c[0], c[1]]);
-      },
-      hooks: {
-        handleValue: (values: number[]) => {
-          const v = values?.[0];
-          if (at && typeof v === "number" && Number.isFinite(v)) {
-            hoverSinkRef.current?.({ ...at, value: v });
-          }
-        },
-        // Never called: Viv 0.22 destructures this hook as `handleCoordnate`,
-        // so the coordinate comes from `onHover` above. Present because the
-        // prop's type requires it.
-        handleCoordinate: () => {},
-      },
-    };
-  }, []);
-
-  // --- ROI annotations -----------------------------------------------------
-  // Fetched from here rather than from the store's tensor-change path, so the
-  // 3-D viewer never pays for a set it cannot draw: this component does not
-  // exist in volume mode. `loadRois` is idempotent on what has landed, which is
-  // what keeps a 2-D -> 3-D -> 2-D round trip (a full remount, see ViewerPane's
-  // key) from refetching.
-  //
-  // Re-run on the visible sets, because a server-owned set is fetched only
-  // once it is switched on; and on the landed scopes, because a landing is
-  // what tells `loadRois` which named sets exist -- and a landing can also
-  // un-land a scope whose rows went stale, which is fetched again from here.
-  useEffect(() => {
-    if (!client || !roiKey) return;
-    void loadRois();
-  }, [client, roiKey, loadRois, visibleSets, roiScopes]);
-
-  // The plane the overlay is drawn for is the one ON SCREEN, not the one asked
-  // for. They are the same except while a read is outstanding -- and during
-  // play the cover is deliberately dropped, so the stale plane stays visible
-  // while `position` has already moved on. Driving the overlay from `position` there
-  // would put plane N+1's annotations over plane N's pixels for the whole of
-  // playback: a systematic off-by-one, not a flicker.
-  //
-  // Gating on `dataValid` instead would strobe: the play driver paces on
-  // exactly that flag, so it toggles ~10 times a second while playing.
-  const shownPlane = useMemo(() => {
-    if (loadedSelection === null) return null;
-    return planeFromSelection(info, loadedSelection);
-  }, [info, loadedSelection]);
-
-  // Selection is deliberately not a dependency: it would change this memo's
-  // output identity, and deck.gl answers a changed `data` by regenerating every
-  // attribute of every layer -- re-tessellating the whole set for a click. The
-  // emphasis is its own layer, over one annotation, below.
-  const roiLayers = useMemo(
-    () =>
-      buildRoiLayers({
-        rois,
-        currentPlane: shownPlane ?? {},
-        visibleSets,
-        // Nothing has landed yet, so no plane is on screen to annotate. An
-        // empty pin would match every unpinned annotation and draw them over a
-        // frame that is not there.
-        visible: showRois && shownPlane !== null,
-      }),
-    [rois, shownPlane, visibleSets, showRois],
-  );
-
-  // --- authoring -----------------------------------------------------------
-  // What a click can hit: exactly what is drawn, so selection cannot pick an
-  // annotation the user cannot see.
-  const shown = useMemo(
-    () => (showRois ? visibleRois(rois, shownPlane ?? {}, visibleSets) : []),
-    [rois, shownPlane, visibleSets, showRois],
-  );
-
-  // Where the pointer is, for the segment trailing an in-progress shape. State,
-  // not a ref, because a deck.gl layer reads it -- but written only while a
-  // draft is open, so an idle viewer pays nothing for it.
-  const [draftCursor, setDraftCursor] = useState<XY | null>(null);
-  const draftRef = useRef(draft);
-  draftRef.current = draft;
-  useEffect(() => {
-    if (!draft) {
-      setDraftCursor(null);
-      draftCursorSinkRef.current = null;
-      return;
-    }
-    draftCursorSinkRef.current = setDraftCursor;
-    return () => {
-      draftCursorSinkRef.current = null;
-    };
-  }, [draft]);
-
-  // Memoised because the selector hands `defaults` straight back when the store
-  // holds no per-tensor choice: computing it inside the selector would return a
-  // new array on every snapshot read, which zustand v5 reads as a changed slice
-  // and React turns into an unbounded re-render.
-  const broadcastDefaults = useMemo(() => defaultBroadcastAxes(info), [info]);
-  const broadcastAxes = useAppStore((s) => selectBroadcastAxes(s, broadcastDefaults));
-
-  const finishDraft = useCallback(() => {
-    const geometry = closeDraft(draftRef.current, polylineWidth);
-    if (!geometry) return;
-    setDraft(null);
-    void createRoi(geometry, pinForNewRoi(info, shownPlane ?? {}, broadcastAxes));
-  }, [setDraft, createRoi, info, shownPlane, broadcastAxes, polylineWidth]);
-
-  const onDeckClick = useCallback(
-    (
-      info_: { coordinate?: number[]; viewport?: { zoom?: number | number[] } },
-      event?: { type?: string },
-    ) => {
-      // deck reports the second tap of a double click twice -- once as a click,
-      // once as a dblclick -- and routes both here.
-      if (!isRealClick(event)) return;
-      // Nothing is drawn, so nothing is placeable or selectable: the toggle
-      // turns the surface off rather than only hiding what is stored.
-      if (!showRois) return;
-      const c = info_?.coordinate;
-      if (!c || c[0] === undefined || c[1] === undefined) return;
-      const at: XY = [c[0], c[1]];
-      // World units per screen pixel, so a tolerance stays constant on screen.
-      // Read off the viewport the click came through rather than the store's
-      // mirrored camera, which trails a gesture by CAMERA_MIRROR_MS.
-      const z = info_.viewport?.zoom;
-      const zoom = Array.isArray(z) ? (z[0] ?? 0) : (z ?? 0);
-      const scale = 2 ** -zoom;
-
-      if (tool === "select") {
-        setSelectedRoi(roiAt(shown, at, scale)?.roiId ?? null);
-        return;
-      }
-      // Clicking the first vertex closes the shape -- the one affordance saying
-      // an open-ended draft can end without reaching for the keyboard.
-      if (closesOnFirstVertex(draftRef.current, at, scale)) {
-        finishDraft();
-        return;
-      }
-      const { draft: next, completed } = placePoint(draftRef.current, tool, at);
-      setDraft(next);
-      if (completed) {
-        void createRoi(completed, pinForNewRoi(info, shownPlane ?? {}, broadcastAxes));
-      }
-    },
-    [
-      tool,
-      shown,
-      showRois,
-      setSelectedRoi,
-      finishDraft,
-      setDraft,
-      createRoi,
-      info,
-      shownPlane,
-      broadcastAxes,
-    ],
-  );
-
-  // Enter finishes, Escape abandons, Backspace takes back the last vertex.
-  // Bound only while a draft is open, so the viewer never swallows a key it has
-  // no use for.
-  useEffect(() => {
-    if (!draft) return;
-    const onKey = (event: KeyboardEvent) => {
-      // Mid-composition an IME owns Enter and Backspace -- committing a
-      // candidate is not finishing a polygon. `keyCode === 229` is the same
-      // state in browsers that do not set `isComposing` on keydown.
-      if (event.isComposing || event.keyCode === 229) return;
-      // Nor are they ours while someone is typing. These are window-level, so
-      // they reach the source search and every other field on the route.
-      if (isTextEntryTarget(event.target)) return;
-      if (event.key === "Enter") {
-        event.preventDefault();
-        finishDraft();
-      } else if (event.key === "Escape") {
-        event.preventDefault();
-        setDraft(null);
-      } else if (event.key === "Backspace") {
-        event.preventDefault();
-        setDraft(undoPoint(draftRef.current));
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [draft, finishDraft, setDraft]);
-
-  // Delete removes the selection -- the only way to, now that the panel says
-  // what is selected on one line and has no button.
-  //
-  // Bound only while the selection is one of the shapes actually drawn: the
-  // panel refuses to act on a selection the plane has moved off, and a key that
-  // ignored that would be the way around it.
-  //
-  // Delete alone, not Backspace: finishing a shape selects it, so Backspace
-  // would mean "take back the last vertex" and "delete the whole annotation"
-  // one keystroke apart.
-  useEffect(() => {
-    if (draft || !selectedRoiId) return;
-    if (!shown.some((roi) => roi.roiId === selectedRoiId)) return;
-    const onKey = (event: KeyboardEvent) => {
-      if (event.isComposing || event.keyCode === 229) return;
-      if (isTextEntryTarget(event.target)) return;
-      if (event.key !== "Delete") return;
-      event.preventDefault();
-      void deleteRoi(selectedRoiId);
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [draft, selectedRoiId, shown, deleteRoi]);
-
-  const draftLayers = useMemo(
-    () =>
-      buildDraftLayers({
-        draft,
-        cursor: draftCursor,
-        closeable: isCompletable(draft),
-        polylineWidth,
-      }),
-    [draft, draftCursor, polylineWidth],
-  );
-
-  // Only what is drawn can be emphasised, which is the same condition the panel
-  // and the Delete key use -- so a selection the plane has moved off is not
-  // marked on a shape that is not there.
-  const selectionLayers = useMemo(
-    () => buildSelectionLayers(shown.find((roi) => roi.roiId === selectedRoiId) ?? null),
-    [shown, selectedRoiId],
-  );
-
-  // --- label overlay -------------------------------------------------------
-  // Scoped, like the annotation state: a set chosen on the previous image is
-  // not this one's overlay, and drawing it here would be worse than drawing
-  // nothing.
-  const overlayId = useAppStore(selectLabelOverlay);
-  const labelOpacity = useAppStore((s) => s.labelOpacity);
-  const { overlay, error: labelError } = useLabelOverlay(client, overlayId);
-
-  // The overlay reads the plane the viewer has ASKED for, so its tiles load
-  // alongside the image's rather than behind them -- and it is *drawn* only
-  // once it holds the plane actually ON SCREEN. Two reads of two tensors land
-  // when they land, so for a moment after every plane change one of them has
-  // arrived and the other has not; during play the cover is deliberately
-  // dropped, and a mask of plane N+1 over plane N's pixels for the whole of a
-  // frame is a wrong picture that looks like a right one. This is the same rule
-  // the annotations follow through `shownPlane` -- draw the plane on screen --
-  // except that a set has to fetch its plane, so "cannot" means hidden rather
-  // than merely different.
-  //
-  // Both go through JSON keys: deck.gl refetches on a changed *reference*, and
-  // `labelSelection` builds a new object per call, so a memo keyed on that
-  // object would refetch every frame.
-  // `useCallback`, not a plain function: the two memos below take it as a
-  // dependency, and a fresh identity every render would rebuild them every
-  // render -- which is the refetch they exist to avoid.
-  const deriveLabelKey = useCallback(
-    (sel: Record<string, number> | null) => {
-      if (!overlay || !sel) return "";
-      return JSON.stringify(labelSelection(info, overlay.info, sel));
-    },
-    [info, overlay],
-  );
-  const labelSelectionKey = useMemo(
-    () => deriveLabelKey(selection),
-    [deriveLabelKey, selection],
-  );
-  const labelShownKey = useMemo(
-    () => deriveLabelKey(loadedSelection),
-    [deriveLabelKey, loadedSelection],
-  );
-
-  // "Which plane of which set". The set has to be in the key: two sets of one
-  // image produce identical selections, so the one switched off a moment ago
-  // would otherwise have its landing counted as this one's.
-  const labelPlaneKey = (selection: string) =>
-    overlay && selection ? `${overlay.arrayId}|${selection}` : "";
-  const [labelLoadedKey, setLabelLoadedKey] = useState<string | null>(null);
-  // Read through a ref for the reason `selectionRef` is: the callback's
-  // identity has to stay stable or every rebuild would look like a prop change.
-  const labelRequestedRef = useRef("");
-  labelRequestedRef.current = labelPlaneKey(labelSelectionKey);
-  const onLabelViewportLoad = useCallback((loaded?: unknown) => {
-    // A *failed* tile counts as loaded to deck.gl, so a viewport whose reads all
-    // errored reports itself complete -- the same check the image's own
-    // `onViewportLoad` makes, and for the same reason: taking it at face value
-    // would show a mask that is not there.
-    if (Array.isArray(loaded)) {
-      if (loaded.some((tile: { content?: unknown } | null) => tile?.content == null)) return;
-    }
-    setLabelLoadedKey(labelRequestedRef.current);
-  }, []);
-  // A key from a set that is no longer the overlay can never match, so switching
-  // sets hides the old one without a reset to remember.
-  const labelShowing =
-    labelLoadedKey !== null && labelLoadedKey === labelPlaneKey(labelShownKey);
-
-  // Published for the play driver, which paces its next frame on it -- the same
-  // fact the cover is drawn from, said where SliceControls can read it. Down
-  // here rather than beside `dataValid` because *the overlay is part of it*:
-  // paced on the image alone, play advances the moment the image's tiles land,
-  // so a set whose read is slower is asked for the next plane before it has
-  // finished the last and is out of step for the whole of playback. Waiting for
-  // both plays slower and shows both.
-  //
-  // Fails open, and deliberately: a set that errored, or none at all, must not
-  // hold the sequence. The driver's own PLAY_STALL_MS would release it in the
-  // end, but only after stalling on every single frame.
-  const labelReady = overlayId === null || labelError !== null || labelShowing;
-  const setPlaneReady = useAppStore((s) => s.setPlaneReady);
-  useEffect(() => {
-    setPlaneReady(dataValid && labelReady, epoch);
-  }, [dataValid, labelReady, epoch, setPlaneReady]);
-
-  const labelLayers = useMemo(() => {
-    // Keyed on the id it was loaded for: `useLabelOverlay` clears its state on a
-    // change, so this can only disagree in the harmless direction, and checking
-    // it is what makes that a property of the code rather than of the order two
-    // effects happen to run in.
-    if (!overlay || overlay.arrayId !== overlayId || !labelSelectionKey) return [];
-    return buildLabelLayers({
-      name: overlay.name,
-      sources: overlay.sources,
-      selection: JSON.parse(labelSelectionKey) as Record<string, number>,
-      opacity: labelOpacity,
-      showing: labelShowing,
-      onViewportLoad: onLabelViewportLoad,
-    });
-  }, [overlay, overlayId, labelSelectionKey, labelOpacity, labelShowing, onLabelViewportLoad]);
+  const showRois = useAppStore((s) => s.showRois);
 
   // The label fill goes under the annotations, which are line work a few pixels
   // wide: drawn over them it would cover them outright, drawn under it is the
   // background they are read against.
   const overlayLayers = useMemo(
-    () => [...labelLayers, ...roiLayers, ...selectionLayers, ...draftLayers],
-    [labelLayers, roiLayers, selectionLayers, draftLayers],
+    () => [...label.layers, ...roiLayers, ...selectionLayers, ...authoring.draftLayers],
+    [label.layers, roiLayers, selectionLayers, authoring.draftLayers],
   );
 
   return (
@@ -757,7 +126,7 @@ export default function TileViewer({ sourceId, info, onUnsupported }: TileViewer
         background: "#1a1a2e",
       }}
     >
-      {sources && selection && size ? (
+      {sources && size ? (
         <VivStage
           sources={sources}
           selection={selection}
@@ -769,23 +138,21 @@ export default function TileViewer({ sourceId, info, onUnsupported }: TileViewer
           onHover={hover.onHover}
           hoverHooks={hover.hooks}
           overlayLayers={overlayLayers}
-          onDeckClick={onDeckClick}
+          onDeckClick={authoring.onDeckClick}
           width={size.width}
           height={size.height}
         />
       ) : (
-        <div style={OVERLAY_TEXT}>
-          Loading tiles…
-        </div>
+        <div style={OVERLAY_TEXT}>Loading tiles…</div>
       )}
-      {sources && selection && size && !dataValid && !playing && (
+      {sources && size && !dataValid && !playing && (
         // Opaque, not a scrim: the point is that the stale plane stops being
         // visible, which a translucent overlay would not achieve.
         <div style={{ ...OVERLAY_TEXT, background: "#1a1a2e", zIndex: 1 }}>
           {tileError ? "Plane unavailable" : "Reading plane…"}
         </div>
       )}
-      {sources && selection && size && (dataValid || playing) && (
+      {sources && size && (dataValid || playing) && (
         <div style={{ position: "absolute", bottom: 10, left: 10, display: "grid", gap: 4, zIndex: 2 }}>
           {dataValid && uniformValue !== null && (
             <div
@@ -800,355 +167,24 @@ export default function TileViewer({ sourceId, info, onUnsupported }: TileViewer
           <HoverReadout bind={bindHover} />
         </div>
       )}
-      {sources && selection && size && showRois && (
+      {sources && size && showRois && (
         // Over the canvas, and above the "Reading plane" cover: switching tool
         // is a per-gesture action, and it should not disappear while a read is
         // outstanding.
         <div style={{ position: "absolute", top: 10, left: 10, zIndex: 2 }}>
-          <RoiToolStrip draft={draft} onFinish={finishDraft} />
+          <RoiToolStrip draft={authoring.draft} onFinish={authoring.finishDraft} />
         </div>
       )}
       {tileError && (
         <div style={{ ...BADGE, bottom: 10, right: 10, color: "#ff6b6b" }}>{tileError}</div>
       )}
-      {labelError && (
+      {label.error && (
         // Its own badge, above the image's: an overlay that failed says nothing
         // about the pixels on screen, and the two must not be read as one fault.
         <div style={{ ...BADGE, bottom: tileError ? 38 : 10, right: 10, color: "#fbbf24" }}>
-          Label overlay: {labelError}
+          Label overlay: {label.error}
         </div>
       )}
     </div>
   );
 }
-
-/** What the pointer is over: image coordinates and, once read, the value. */
-interface HoverSample {
-  x: number;
-  y: number;
-  /** Null until Viv reads it out of a loaded tile. */
-  value: number | null;
-  /** Reduction of the level the value came from; 1 is full resolution. */
-  scale: number;
-}
-
-/** The subset of deck.gl's picking info this reads. */
-interface HoverInfo {
-  coordinate?: number[];
-  sourceLayer?: unknown;
-  tile?: { index?: { z?: number } };
-}
-
-/** A grey level as the badges print it: whole, or four significant digits. */
-function greyLevel(value: number): string {
-  return Number.isInteger(value) ? String(value) : value.toPrecision(4);
-}
-
-/**
- * The value under the pointer, in its own component.
- *
- * Its own so that a pointer move repaints one badge rather than re-rendering
- * the viewer around the deck.gl stage. The parent hands it a sink through
- * `bind` and never holds the sample itself.
- */
-function HoverReadout({
-  bind,
-}: {
-  bind: (sink: ((sample: HoverSample | null) => void) | null) => void;
-}) {
-  const [sample, setSample] = useState<HoverSample | null>(null);
-  useEffect(() => {
-    bind(setSample);
-    return () => bind(null);
-  }, [bind]);
-  if (!sample) return null;
-  return (
-    <div
-      style={{ ...BADGE, position: "static" }}
-      title={
-        sample.scale > 1
-          ? "Read from the pyramid level on screen, not from the full-resolution pixel. Zoom in for the pixel's own value."
-          : "The pixel under the pointer, read from the tile already on screen."
-      }
-    >
-      {/* The coordinate is always there; the value is not, and saying which is
-          missing is the difference between "no tile here yet" and "zero". */}
-      ({sample.x}, {sample.y}){" "}
-      {sample.value === null ? "—" : greyLevel(sample.value)}
-      {sample.scale > 1 && ` · at 1/${sample.scale}`}
-    </div>
-  );
-}
-
-/**
- * The deck.gl half, mounted only once both the sources and the pane size exist.
- *
- * Separate because the initial view state must be computed exactly once: it is
- * derived from the pane size, and recomputing it on a resize would snap the
- * user's pan and zoom back to fit. Mounting with both values already known makes
- * "once" the natural thing to write.
- */
-function VivStage({
-  sources,
-  selection,
-  contrastLimits,
-  gamma,
-  color,
-  maxCacheSize,
-  onViewportLoad,
-  onHover,
-  hoverHooks,
-  overlayLayers,
-  onDeckClick,
-  width,
-  height,
-}: {
-  sources: PixelSources;
-  selection: Record<string, number>;
-  contrastLimits: [number, number];
-  gamma: number;
-  color: [number, number, number];
-  maxCacheSize: number;
-  onViewportLoad: (loaded?: unknown) => void;
-  onHover: (info: HoverInfo) => void;
-  hoverHooks: { handleValue: (values: number[]) => void; handleCoordinate: () => void };
-  /** Drawn over the image; see utils/roiLayers.ts for the id constraint. */
-  overlayLayers: unknown[];
-  /** Reaches DeckGL's root `onClick`, which Viv does not override. */
-  onDeckClick: (info: { coordinate?: number[]; viewport?: { zoom?: number | number[] } }) => void;
-  width: number;
-  height: number;
-}) {
-  const sizeRef = useRef({ width, height });
-  const setCamera2d = useAppStore((s) => s.setCamera2d);
-
-  const viewStates = useMemo(
-    () => {
-      // Read once, not subscribed. `VivViewer.componentDidUpdate` diffs this
-      // prop and overwrites its own view state when it differs, so a
-      // subscription would push every pan back at the viewport mid-gesture.
-      // Reading it is still right: a link that named a camera must open at it.
-      const seed = useAppStore.getState().camera2d;
-      const base = seed
-        // The stored target is [x, y]; an orthographic view wants the z back.
-        ? { target: [seed.target[0], seed.target[1], 0], zoom: seed.zoom }
-        : getDefaultInitialViewState(sources, sizeRef.current, 0.5);
-      return [{ ...base, id: DETAIL_VIEW_ID }];
-    },
-    // Deliberately not [width, height]: a resize must move the viewport, not
-    // reset it. VivViewer carries the current pan/zoom through the new size.
-    [sources],
-  );
-
-  // Trailing edge only, as in VolumeViewer: the resting viewport is what a link
-  // should carry, and the frames of a drag are noise that would otherwise reach
-  // the URL at pointer rate.
-  const mirrorRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  useEffect(() => () => {
-    if (mirrorRef.current) clearTimeout(mirrorRef.current);
-  }, []);
-
-  const onViewStateChange = useCallback(
-    // `object`, not a narrower shape: that is how Viv types the callback.
-    ({ viewState }: { viewState: object }) => {
-      if (mirrorRef.current) clearTimeout(mirrorRef.current);
-      const { target, zoom } = viewState as { target: number[]; zoom: number | number[] };
-      const [x = 0, y = 0] = target ?? [];
-      // deck.gl may report an orthographic zoom per axis; Viv's own initial
-      // state is scalar, and the views here are never anisotropic.
-      const z = Array.isArray(zoom) ? (zoom[0] ?? 0) : zoom;
-      mirrorRef.current = setTimeout(() => {
-        setCamera2d({ target: [x, y], zoom: z });
-      }, CAMERA_MIRROR_MS);
-      // Returns nothing on purpose: VivViewer falls back to the view state it
-      // already computed (`onViewStateChange?.(...) || viewState`), so the
-      // viewport stays Viv's to drive and this stays a mirror.
-    },
-    [setCamera2d],
-  );
-
-  // Only while a click would place something. With the overlay off, with no
-  // annotation support on the server, or with the select tool held, a double
-  // click has nothing to collide with and keeps deck's zoom.
-  const placing = useAppStore((s) => s.showRois && !s.roisUnavailable && s.tool !== "select");
-
-  // A new instance, but the same id, height and width -- which is all
-  // `VivViewer.getDerivedStateFromProps` looks at, so switching tools
-  // reconfigures the controller without touching the camera.
-  const views = useMemo(
-    () => [
-      new BiopbDetailView({
-        id: DETAIL_VIEW_ID,
-        height,
-        width,
-        doubleClickZoom: !placing,
-      }),
-    ],
-    [height, width, placing],
-  );
-
-  // Its own memo: this array's identity is what Viv's ImageLayer diffs on, so it
-  // must survive a contrast or colour change untouched.
-  const selections = useMemo(() => [selection], [selection]);
-
-  const layerProps = useMemo(
-    () => [
-      {
-        loader: sources,
-        selections,
-        contrastLimits: [contrastLimits],
-        colors: [color],
-        channelsVisible: [true],
-        // Costs no fetch: gamma is a uniform, so moving it recolours the tiles
-        // already on the GPU. Same for contrastLimits.
-        extensions: VIV_EXTENSIONS,
-        gamma,
-        // Reaches deck.gl's TileLayer: DetailView spreads these into the
-        // MultiscaleImageLayer, which spreads its own props into the TileLayer.
-        maxCacheSize,
-        onViewportLoad,
-      },
-    ],
-    [sources, selections, contrastLimits, gamma, color, maxCacheSize, onViewportLoad],
-  );
-
-  // VivViewer concatenates these after its own layers -- but only draws the
-  // ones whose id contains its view id, which is why they are built through
-  // `roiLayerId`. Memoised on the array itself: `deckProps` is spread into
-  // DeckGL, and a fresh object every render would be a prop change every frame.
-  //
-  // `onClick` rides the same object. Viv overrides `layerFilter`, `layers`,
-  // `onViewStateChange`, `views`, `viewState`, `useDevicePixels` and `getCursor`
-  // AFTER spreading deckProps -- but not the pointer callbacks, so this one
-  // survives. The overlay is unpickable, so it arrives with no picked layer and
-  // `coordinate` set, which is exactly what placing a vertex needs.
-  const deckProps = useMemo(
-    () => ({ layers: overlayLayers, onClick: onDeckClick, eventRecognizerOptions: CLICK_OPTIONS }),
-    [overlayLayers, onDeckClick],
-  );
-
-  return (
-    <VivViewer
-      views={views}
-      layerProps={layerProps}
-      viewStates={viewStates}
-      onViewStateChange={onViewStateChange}
-      onHover={onHover}
-      hoverHooks={hoverHooks}
-      deckProps={deckProps}
-    />
-  );
-}
-
-/** The pane's pixel size, or null before the first measurement. */
-function useElementSize(ref: RefObject<HTMLElement | null>) {
-  const [size, setSize] = useState<{ width: number; height: number } | null>(null);
-  useLayoutEffect(() => {
-    const el = ref.current;
-    if (!el) return;
-    const measure = () => {
-      const { clientWidth, clientHeight } = el;
-      if (clientWidth > 0 && clientHeight > 0) {
-        setSize((prev) =>
-          prev && prev.width === clientWidth && prev.height === clientHeight
-            ? prev
-            : { width: clientWidth, height: clientHeight },
-        );
-      }
-    };
-    measure();
-    const observer = new ResizeObserver(measure);
-    observer.observe(el);
-    return () => observer.disconnect();
-  }, [ref]);
-  return size;
-}
-
-/**
- * Hold t/z/c and scroll to step that axis.
- *
- * Capture phase on the pane: deck.gl listens on the canvas below, so stopping
- * the event here is what keeps a slice scroll from also zooming. The whole
- * gesture is accumulated and applied once it stops, rather than one store write
- * per wheel notch — each write costs a tile refetch.
- */
-function useSliceWheelNavigation(
-  ref: RefObject<HTMLElement | null>,
-  info: TileInfo | null,
-) {
-  useEffect(() => {
-    const el = ref.current;
-    if (!el || !info) return;
-
-    const held = new Set<string>();
-    const pending = { axis: null as (typeof SLICE_KEYS)[number] | null, steps: 0 };
-    let timer: ReturnType<typeof setTimeout> | null = null;
-
-    const flush = () => {
-      timer = null;
-      const { axis, steps } = pending;
-      pending.axis = null;
-      pending.steps = 0;
-      const wireAxis = axis === null ? null : info.selectable[axis];
-      if (axis === null || wireAxis === null || steps === 0) return;
-      const max = Math.max(0, (info.shape[wireAxis] ?? 1) - 1);
-      const current = useAppStore.getState().position[axis];
-      useAppStore
-        .getState()
-        .setPosition({ [axis]: Math.min(max, Math.max(0, current + steps)) });
-    };
-
-    const onWheel = (e: WheelEvent) => {
-      const axis = SLICE_KEYS.find((k) => held.has(k));
-      if (!axis || info.selectable[axis] === null) return;
-      e.preventDefault();
-      e.stopPropagation();
-      if (pending.axis !== axis) {
-        pending.axis = axis;
-        pending.steps = 0;
-      }
-      pending.steps += e.deltaY > 0 ? -1 : 1;
-      if (timer) clearTimeout(timer);
-      timer = setTimeout(flush, SLICE_WHEEL_QUIET_MS);
-    };
-    const onKeyDown = (e: KeyboardEvent) => {
-      const key = e.key.toLowerCase();
-      if ((SLICE_KEYS as readonly string[]).includes(key)) held.add(key);
-    };
-    const onKeyUp = (e: KeyboardEvent) => held.delete(e.key.toLowerCase());
-    const onBlur = () => held.clear();
-
-    el.addEventListener("wheel", onWheel, { capture: true, passive: false });
-    window.addEventListener("keydown", onKeyDown);
-    window.addEventListener("keyup", onKeyUp);
-    window.addEventListener("blur", onBlur);
-    return () => {
-      el.removeEventListener("wheel", onWheel, { capture: true });
-      window.removeEventListener("keydown", onKeyDown);
-      window.removeEventListener("keyup", onKeyUp);
-      window.removeEventListener("blur", onBlur);
-      if (timer) clearTimeout(timer);
-    };
-  }, [ref, info]);
-}
-
-const OVERLAY_TEXT: CSSProperties = {
-  position: "absolute",
-  inset: 0,
-  display: "flex",
-  alignItems: "center",
-  justifyContent: "center",
-  color: "#94a3b8",
-  fontSize: 13,
-};
-
-const BADGE: CSSProperties = {
-  position: "absolute",
-  padding: "4px 8px",
-  borderRadius: 4,
-  background: "rgba(0, 0, 0, 0.65)",
-  color: "#cbd5e1",
-  fontSize: 11,
-  pointerEvents: "none",
-  zIndex: 2,
-};

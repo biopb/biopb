@@ -7,6 +7,7 @@ import type {
   RoiGeometry,
   RoiListResult,
   RoiSetInfo,
+  SliderAxis,
   SourceJobStatus,
   TileInfo,
 } from "@biopb/tensor-flight-client";
@@ -571,6 +572,14 @@ export interface AppState {
    */
   applyViewerState: (params: URLSearchParams) => boolean;
   setPlayAxis: (key: string | null) => void;
+  /**
+   * Move one slider axis to `value`, under its name or into `axes`.
+   *
+   * Reads the state it writes into rather than a caller's copy: these writes are
+   * debounced and, under play, fired from a timer -- a stale `axes` map would
+   * silently drop a sibling axis's index.
+   */
+  setAxisIndex: (axis: Pick<SliderAxis, "named" | "key">, value: number) => void;
   /** Widen the tensor in view's observed levels on `channel`. */
   noteObservedLimits: (value: [number, number], channel: number) => void;
   /**
@@ -951,6 +960,15 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   setDisplay(partial) {
     set((s) => ({ display: { ...s.display, ...partial } }));
+  },
+
+  setAxisIndex(axis, value) {
+    set((s) => {
+      const next: PositionState = axis.named
+        ? { ...s.position, [axis.named]: value }
+        : { ...s.position, axes: { ...s.position.axes, [axis.key]: value } };
+      return samePosition(s.position, next) ? s : { position: next };
+    });
   },
 
   setPlayAxis(key) {

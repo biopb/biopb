@@ -19,8 +19,8 @@
  * {@link TileViewer} is.
  */
 
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import type { CSSProperties, RefObject } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { CSSProperties } from "react";
 import { OrbitView } from "@deck.gl/core";
 import DeckGL from "@deck.gl/react";
 import { Matrix4 } from "@math.gl/core";
@@ -33,12 +33,14 @@ import {
   type VolumeAvailable,
 } from "@biopb/tensor-flight-client";
 import { useShallow } from "zustand/react/shallow";
+import { useCameraMirror } from "../hooks/useCameraMirror";
+import { useElementSize } from "../hooks/useElementSize";
+import { useMountEpoch, usePublishPlaneReady } from "../hooks/useMountEpoch";
 import { selectContrastWindow, useAppStore } from "../store";
 import type { ViewerErrorKind } from "../store";
 import {
   contrastSamples,
   vivColor,
-  CAMERA_MIRROR_MS,
 } from "../utils/vivUtils";
 import {
   volumeCentre,
@@ -90,7 +92,7 @@ type XR3DLayerProps = ConstructorParameters<typeof XR3DLayer>[0];
 export default function VolumeViewer({ sourceId, info: tileInfo, onUnsupported }: VolumeViewerProps) {
   const client = useAppStore((s) => s.client);
   const position = useAppStore((s) => s.position);
-  const [epoch] = useState(() => useAppStore.getState().target.epoch);
+  const epoch = useMountEpoch();
   const notePlaneSamples = useAppStore((s) => s.notePlaneSamples);
   const channelNames = useAppStore((s) => s.channelNames);
   const channelColors = useAppStore((s) => s.channelColors);
@@ -172,10 +174,7 @@ export default function VolumeViewer({ sourceId, info: tileInfo, onUnsupported }
 
   // Published for the play driver; see TileViewer.
   const playing = useAppStore((s) => s.playAxis !== null);
-  const setPlaneReady = useAppStore((s) => s.setPlaneReady);
-  useEffect(() => {
-    setPlaneReady(current !== null, epoch);
-  }, [current, epoch, setPlaneReady]);
+  usePublishPlaneReady(current !== null, epoch);
 
   // Under play, keep the last volume on the canvas while the next read is in
   // flight. Unmounting the stage between frames -- which is what a null here
@@ -250,7 +249,7 @@ function VolumeStage({
   height: number;
 }) {
   const sizeRef = useRef({ width, height });
-  const setCamera3d = useAppStore((s) => s.setCamera3d);
+  const mirrorCamera = useCameraMirror("3d");
 
   // The anisotropy, and the only place it enters: `XR3DLayer` scales its unit
   // cube by `physicalSizeScalingMatrix.transformPoint([w, h, d])`, so this
@@ -287,17 +286,8 @@ function VolumeStage({
     [plan],
   );
 
-  // Trailing edge only: the resting camera is what a link should carry, and the
-  // intermediate frames of a drag are noise that would otherwise reach the URL
-  // at pointer rate.
-  const mirrorRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  useEffect(() => () => {
-    if (mirrorRef.current) clearTimeout(mirrorRef.current);
-  }, []);
-
   const onViewStateChange = useCallback(
     ({ viewState }: { viewState: Record<string, unknown> }) => {
-      if (mirrorRef.current) clearTimeout(mirrorRef.current);
       const { target, zoom, rotationX, rotationOrbit } = viewState as {
         target: number[];
         zoom: number;
@@ -305,14 +295,12 @@ function VolumeStage({
         rotationOrbit: number;
       };
       const [x = 0, y = 0, z = 0] = target;
-      mirrorRef.current = setTimeout(() => {
-        setCamera3d({ target: [x, y, z], zoom, rotationX, rotationOrbit });
-      }, CAMERA_MIRROR_MS);
+      mirrorCamera({ target: [x, y, z], zoom, rotationX, rotationOrbit });
       // Returns nothing on purpose: `Deck#_onViewStateChange` falls back to the
       // view state it already computed, so the camera stays deck.gl's to drive
       // and this stays a mirror.
     },
-    [setCamera3d],
+    [mirrorCamera],
   );
 
   const views = useMemo(
@@ -375,30 +363,6 @@ function VolumeStage({
       style={{ background: "#000" }}
     />
   );
-}
-
-/** The pane's pixel size, or null before the first measurement. */
-function useElementSize(ref: RefObject<HTMLElement | null>) {
-  const [size, setSize] = useState<{ width: number; height: number } | null>(null);
-  useLayoutEffect(() => {
-    const el = ref.current;
-    if (!el) return;
-    const measure = () => {
-      const { clientWidth, clientHeight } = el;
-      if (clientWidth > 0 && clientHeight > 0) {
-        setSize((prev) =>
-          prev && prev.width === clientWidth && prev.height === clientHeight
-            ? prev
-            : { width: clientWidth, height: clientHeight },
-        );
-      }
-    };
-    measure();
-    const observer = new ResizeObserver(measure);
-    observer.observe(el);
-    return () => observer.disconnect();
-  }, [ref]);
-  return size;
 }
 
 const HOST: CSSProperties = {

@@ -12,6 +12,7 @@ import { ResolveModal } from "../components/ResolveModal";
 import { TipBar } from "../components/TipBar";
 import { useDocumentTitle } from "../hooks/useDocumentTitle";
 import { useViewerUrlSync } from "../hooks/useViewerUrlSync";
+import { usePlayback } from "../hooks/usePlayback";
 import { withBase } from "../base";
 import {
   DEFAULT_CONTROL_WIDTH,
@@ -45,6 +46,7 @@ function storedWidth(key: string): number | null {
 export function HomePage() {
   useDocumentTitle("BioPB tensor - viewer");
   useViewerUrlSync();
+  usePlayback();
   const connectionState = useAppStore((s) => s.connectionState);
   const connectionError = useAppStore((s) => s.connectionError);
   const activeSourceId = useAppStore((s) => s.activeSourceId);

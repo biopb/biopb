@@ -3,6 +3,7 @@
 import { sliderAxes, vivDtype, type SliderAxis } from "@biopb/tensor-flight-client";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
+import { useDebouncedCommit } from "../hooks/useDebouncedCommit";
 import { useShallow } from "zustand/react/shallow";
 import {
   selectContrastTrack,
@@ -20,10 +21,6 @@ import {
 } from "../utils/colorUtils";
 import {
   PLAY_FPS,
-  PLAY_FRAME_MS,
-  PLAY_READY_POLL_MS,
-  PLAY_STALL_MS,
-  nextPlayIndex,
   orderSliderAxes,
   sliderThumbPx,
 } from "../utils/sliceUi";
@@ -51,29 +48,6 @@ interface SliceControlsProps {
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
-}
-
-/** This axis's index in the live store, whatever it is keyed under. */
-function axisIndex(axis: SliderAxis): number {
-  const { position } = useAppStore.getState();
-  return axis.named ? position[axis.named] : (position.axes[axis.key] ?? 0);
-}
-
-/**
- * Write a slider's new index back, under its name or into `axes`.
- *
- * Reads the store at commit time rather than closing over a render's copy:
- * these writes are debounced and, under play, fired from a timer — a stale
- * `axes` map here would silently drop a sibling axis's index. The named axes
- * have their own store fields and cannot collide this way.
- */
-function commitAxis(axis: SliderAxis, value: number) {
-  const { setPosition, position } = useAppStore.getState();
-  if (axis.named) {
-    setPosition({ [axis.named]: value });
-    return;
-  }
-  setPosition({ axes: { ...position.axes, [axis.key]: value } });
 }
 
 const CONTRAST_MODES = [
@@ -134,8 +108,10 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
   // Track custom color picker state (separate from preset dropdown)
   const [useCustomColor, setUseCustomColor] = useState(false);
 
-  // Debounce timer ref for slider updates
-  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // One debounce per slider: a shared timer dropped the first slider's commit
+  // when a second was moved inside the window.
+  const schedule = useDebouncedCommit(SLIDER_DEBOUNCE_MS);
+  const setAxisIndex = useAppStore((s) => s.setAxisIndex);
 
   // Local state for slider values (for immediate visual feedback), keyed by
   // SliderAxis.key so an axis with no name is held the same way as T/Z/C.
@@ -163,15 +139,6 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
     display.fixedLimits,
     display.gamma,
   ]);
-
-  // Cleanup debounce timer on unmount
-  useEffect(() => {
-    return () => {
-      if (debounceRef.current) {
-        clearTimeout(debounceRef.current);
-      }
-    };
-  }, []);
 
   // Load channel names when source changes
   useEffect(() => {
@@ -218,44 +185,6 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
     observer.observe(el);
     return () => observer.disconnect();
   }, [visibleAxes.length]);
-
-  // A play cannot outlive the slider driving it: switching to 3-D takes Z off
-  // the panel, and a tensor swap replaces the axes entirely.
-  useEffect(() => {
-    if (playAxis && !visibleAxes.some((axis) => axis.key === playAxis)) {
-      setPlayAxis(null);
-    }
-  }, [playAxis, visibleAxes, setPlayAxis]);
-
-  // Automatic scrubbing. Paced to the data plane rather than to the timer
-  // alone: the next frame is asked for once the last one is actually on the
-  // canvas, so a source that cannot deliver 10/s plays slower instead of
-  // queueing reads it will never catch up on. PLAY_STALL_MS is the escape --
-  // a plane that never loads must not stop the sequence.
-  useEffect(() => {
-    if (!playAxis) return;
-    const axis = visibleAxes.find((a) => a.key === playAxis);
-    if (!axis) return;
-    let timer: ReturnType<typeof setTimeout>;
-    let asked = Date.now();
-
-    const step = () => {
-      const store = useAppStore.getState();
-      if (!store.runtime.planeReady && Date.now() - asked < PLAY_STALL_MS) {
-        timer = setTimeout(step, PLAY_READY_POLL_MS);
-        return;
-      }
-      commitAxis(axis, nextPlayIndex(axisIndex(axis), axis.extent));
-      // Said here rather than waited for: the viewer publishes the same fact
-      // from an effect, and this timer is armed before that effect runs.
-      store.setPlaneReady(false, store.runtime.epoch);
-      asked = Date.now();
-      timer = setTimeout(step, PLAY_FRAME_MS);
-    };
-
-    timer = setTimeout(step, PLAY_FRAME_MS);
-    return () => clearTimeout(timer);
-  }, [playAxis, visibleAxes]);
 
   // Whether there is a second viewer to switch to. `volumeRefusal` answers for
   // the grid a viewer actually fetched, so this is null-when-unknown rather
@@ -466,10 +395,7 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
                   onChange={(e) => {
                     const val = Number(e.target.value);
                     setLocalAxes((prev) => ({ ...prev, [axis.key]: val }));
-                    if (debounceRef.current) clearTimeout(debounceRef.current);
-                    debounceRef.current = setTimeout(() => {
-                      commitAxis(axis, val);
-                    }, SLIDER_DEBOUNCE_MS);
+                    schedule(`axis:${axis.key}`, () => setAxisIndex(axis, val));
                   }}
                   // The grab handle is the axis's share of the track, as a
                   // scrollbar's is: two channels get half the bar, not the same
@@ -607,10 +533,7 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
               onChange={(e) => {
                 const val = Number(e.target.value);
                 setLocalPercentile(val);
-                if (debounceRef.current) clearTimeout(debounceRef.current);
-                debounceRef.current = setTimeout(() => {
-                  setDisplay({ percentileScale: val });
-                }, SLIDER_DEBOUNCE_MS);
+                schedule("percentile", () => setDisplay({ percentileScale: val }));
               }}
               style={{ flex: 1 }}
             />
@@ -654,10 +577,9 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
                       fixedStep,
                     );
                     setLocalFixed(next);
-                    if (debounceRef.current) clearTimeout(debounceRef.current);
-                    debounceRef.current = setTimeout(() => {
-                      setDisplay({ contrastMode: "fixed", fixedLimits: next });
-                    }, SLIDER_DEBOUNCE_MS);
+                    // Both handles share one key: each commit carries the whole
+                    // window, so the later one supersedes the earlier.
+                    schedule("fixed", () => setDisplay({ contrastMode: "fixed", fixedLimits: next }));
                   }}
                 />
               ))}
@@ -709,10 +631,7 @@ export function SliceControls({ sourceId, tensorId }: SliceControlsProps) {
             onChange={(e) => {
               const val = Number(e.target.value);
               setLocalOctaves(val);
-              if (debounceRef.current) clearTimeout(debounceRef.current);
-              debounceRef.current = setTimeout(() => {
-                setDisplay({ gamma: gammaFromOctaves(val) });
-              }, SLIDER_DEBOUNCE_MS);
+              schedule("gamma", () => setDisplay({ gamma: gammaFromOctaves(val) }));
             }}
             style={{ flex: 1 }}
           />

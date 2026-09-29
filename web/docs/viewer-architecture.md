@@ -10,13 +10,22 @@ refactor this audit motivates, [_viewer-refactor-proposal.md](_viewer-refactor-p
 
 | File | Lines | Role |
 |------|------:|------|
-| `store.ts` | 2000 | One zustand store: connection, catalog, recents, jobs, *and* the view target, viewer state, ROI actions, selectors |
-| `components/TileViewer.tsx` | 1200 | 2-D viewer: pixel sources, plane gate, contrast sampling, hover, ROI overlay + authoring, label overlay, camera mirror, wheel navigation |
-| `components/SliceControls.tsx` | 780 | Axis sliders, play driver, 2-D/3-D toggle, contrast/gamma/colour |
-| `components/VolumeViewer.tsx` | 460 | 3-D viewer (one server-scaled volume, `XR3DLayer`) |
+| `store.ts` | 2010 | One zustand store: connection, catalog, recents, jobs, *and* the view target, viewer state, ROI actions, selectors |
+| `components/TileViewer.tsx` | 190 | 2-D viewer: composes the hooks below and renders |
+| `components/VivStage.tsx` | 230 | The deck.gl half: view state, layers, camera mirror |
+| `components/SliceControls.tsx` | 700 | Axis sliders, 2-D/3-D toggle, contrast/gamma/colour |
+| `components/VolumeViewer.tsx` | 400 | 3-D viewer (one server-scaled volume, `XR3DLayer`) |
 | `components/RoiPanel.tsx`, `RoiToolStrip.tsx`, `LabelPanel.tsx` | 660 | Annotation and label-overlay controls |
 | `components/ViewerPane.tsx` | 200 | Waits for the target, picks 2-D/3-D viewer, error boundary, remount key |
-| `hooks/useLabelOverlay.ts` | 76 | Loads a label set's pixel sources |
+| `hooks/usePixelSources.ts` | 60 | Viv sources from the resolved grid, tile errors |
+| `hooks/usePlaneGate.ts` | 70 | `selection`, `loadedSelection`, `dataValid`, `onViewportLoad` |
+| `hooks/useContrastSamples.ts` | 80 | Overview raster → `notePlaneSamples`; uniform-plane value |
+| `hooks/useRoiOverlay.ts`, `useRoiAuthoring.ts` | 100, 200 | Stored annotations over the plane on screen; drawing, selecting, deleting |
+| `hooks/useLabelOverlayLayers.ts`, `useLabelOverlay.ts` | 110, 76 | Label overlay layers and gate; loads a set's pixel sources |
+| `hooks/useHoverReadout.ts`, `useSliceWheelNavigation.ts` | 90, 90 | Ref-fed hover badge; hold t/z/c and scroll |
+| `hooks/useElementSize.ts`, `useCameraMirror.ts`, `useMountEpoch.ts` | ~30 each | Shared by both viewers |
+| `hooks/usePlayback.ts` | 80 | Play, mounted once by the page |
+| `hooks/useDebouncedCommit.ts` | 50 | One debounce per slider |
 | `hooks/useViewerUrlSync.ts` | 100 | URL ⇄ store |
 | `utils/vivUtils.ts`, `roiLayers.ts`, `labelLayers.ts`, `viewerUrl.ts`, `roiDraft.ts`, `roiHitTest.ts`, `sliceUi.ts`, `volumeUtils.ts` | ~2000 | Pure helpers (well tested) |
 
@@ -149,6 +158,9 @@ component reads them through `useShallow`.
 
 ## Inside TileViewer
 
+The hooks named in the files table each own one concern; the notes below say
+what the plane-tracking ones guarantee.
+
 Viv and deck.gl diff by reference, so the plane is tracked by object identity:
 
 - `selection` = `vivSelection(info, position)`, memoised on `[info, position]`:
@@ -170,18 +182,19 @@ Viv and deck.gl diff by reference, so the plane is tracked by object identity:
   selection it was read for. It is deliberately kept across a plane change so
   contrast doesn't flash, and `uniformValue` checks the tag.
 
-Refs stand in for dependencies throughout: `selectionRef`, `labelRequestedRef`,
+Refs stand in for dependencies throughout the hooks: `selectionRef`, `requestedRef`,
 `draftRef`, `onUnsupportedRef`, `hoverSinkRef`, `draftCursorSinkRef`. That
 keeps callback identities stable for deck.gl, and it also means the effect
 dependency lists do not show the real data flow.
 
 ## Play
 
-The driver lives in `SliceControls` (a panel). A timer steps the axis, sets
-`runtime.planeReady=false` itself, then polls it every 25 ms, giving up
-after 5 s. The viewer computes readiness, the panel consumes it, and the only
-connection between them is a store boolean. If `SliceControls` unmounts,
-play stops.
+`usePlayback`, mounted once by `HomePage`. A timer steps the axis
+(`setAxisIndex`), sets `runtime.planeReady=false` itself, then polls it every
+25 ms, giving up after 5 s. The viewer computes readiness and the store boolean
+is the only connection between them. The playable axes come from the resolved
+grid, so play does not depend on the panel staying mounted: `SliceControls` only
+toggles `playAxis`.
 
 ## URL sync
 

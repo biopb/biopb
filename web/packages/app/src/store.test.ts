@@ -396,6 +396,22 @@ describe("the contrast track and window", () => {
 });
 
 describe("position and display", () => {
+  it("moves one axis by name or into axes, keeping its siblings", () => {
+    useAppStore.setState({ position: { ...BASE_POSITION, z: 1, axes: { a0: 4 } } });
+    useAppStore.getState().setAxisIndex({ named: "z", key: "z" }, 7);
+    useAppStore.getState().setAxisIndex({ named: null, key: "a3" }, 2);
+
+    expect(useAppStore.getState().position).toEqual({ t: 0, z: 7, c: 0, axes: { a0: 4, a3: 2 } });
+  });
+
+  it("keeps the position object when an axis is set to where it is", () => {
+    useAppStore.setState({ position: { ...BASE_POSITION, axes: { a0: 4 } } });
+    const before = useAppStore.getState().position;
+    useAppStore.getState().setAxisIndex({ named: null, key: "a0" }, 4);
+
+    expect(useAppStore.getState().position).toBe(before);
+  });
+
   it("keeps the position object when a write changes nothing", () => {
     // What a Viv selection is derived from: a fresh object refetches the plane.
     useAppStore.setState({ position: { ...BASE_POSITION, z: 3, axes: { a0: 1 } } });
