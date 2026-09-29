@@ -4,7 +4,7 @@ How the dataviewer route (`/viewer`, `HomePage`) is put together: which
 component owns what, what lives in the store and for how long, and the
 channels through which the parts depend on each other. For the ROI subsystem's
 own design see [roi-annotations-ui.md](roi-annotations-ui.md); for the
-refactor this audit motivates, [viewer-refactor-proposal.md](viewer-refactor-proposal.md).
+refactor this audit motivates, [_viewer-refactor-proposal.md](_viewer-refactor-proposal.md).
 
 ## Files
 
