@@ -242,8 +242,8 @@ export function RoiPanel() {
   const onToggleSet = useAppStore((s) => s.toggleSetVisible);
   const onClearSet = useAppStore((s) => s.clearRoiSet);
   const tileInfo = useAppStore(selectTileInfo);
-  const slice = useAppStore((s) => s.slice);
-  const currentPlane = useMemo(() => currentPlaneFor(tileInfo, slice), [tileInfo, slice]);
+  const position = useAppStore((s) => s.position);
+  const currentPlane = useMemo(() => currentPlaneFor(tileInfo, position), [tileInfo, position]);
 
   return (
     <RoiPanelView
@@ -393,7 +393,7 @@ function selectedSummary(roi: RoiAnnotation, axes: SliderAxis[]): string {
 
 export function RoiAuthor() {
   const tileInfo = useAppStore(selectTileInfo);
-  const slice = useAppStore((s) => s.slice);
+  const position = useAppStore((s) => s.position);
   const newLabel = useAppStore((s) => s.newLabel);
   const newSetName = useAppStore((s) => s.newSetName);
   const selected = useAppStore(selectSelectedRoi);
@@ -407,7 +407,7 @@ export function RoiAuthor() {
   const defaults = useMemo(() => defaultBroadcastAxes(tileInfo), [tileInfo]);
   const broadcastAxes = useAppStore((s) => selectBroadcastAxes(s, defaults));
   const axes = useMemo(() => (tileInfo ? pinnableAxes(tileInfo) : []), [tileInfo]);
-  const currentPlane = useMemo(() => currentPlaneFor(tileInfo, slice), [tileInfo, slice]);
+  const currentPlane = useMemo(() => currentPlaneFor(tileInfo, position), [tileInfo, position]);
 
   // With the overlay off there is nothing to author against and nothing drawn
   // to act on -- including a selection the user cannot see.

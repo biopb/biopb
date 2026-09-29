@@ -13,6 +13,7 @@ import {
   type TileInfo,
 } from "@biopb/tensor-flight-client";
 import { getColorMultipliers, type ColorValue } from "./colorUtils";
+import { axisIndexOf } from "./sliceUi";
 
 /**
  * How long a camera must rest before it reaches the store.
@@ -391,7 +392,7 @@ export function vivSelection(
 ): Record<string, number> {
   const selection: Record<string, number> = {};
   for (const axis of sliderAxes(info.dim_labels, info.shape)) {
-    const want = axis.named ? slice[axis.named] : slice.axes[axis.key] ?? 0;
+    const want = axisIndexOf(slice, axis);
     selection[axis.key] = Math.min(Math.max(0, want), Math.max(0, axis.extent - 1));
   }
   return selection;
@@ -441,8 +442,8 @@ export interface SliderGrid {
  * form -- see the identity policy in descriptor.proto) and resolves a bare
  * source_id to the field it binds as that source's default, so an equality test
  * would silently never hold. Whether the grid belongs to the tensor in view is
- * settled before this, by `selectTileInfo`, which compares the id the grid was
- * *fetched for* rather than the id it came back naming.
+ * settled before this: `selectTileInfo` is the open target's own grid, reset on
+ * every open.
  */
 export function sliderGrid(
   tileInfo: TileInfo | null,

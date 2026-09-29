@@ -136,12 +136,12 @@ pinned ROI are pixel-identical on the plane where they coincide.
 ## Known gaps and guardrails
 
 - **A lint rule (`no-restricted-syntax` in `eslint.config.mjs`) blocks reading
-  `rois`/`draft`/`selectedRoiId`/etc. directly off `useAppStore`**, forcing
-  every read through the tensor-scoped selectors (`selectRois`, `selectDraft`,
-  ...). Three prior bugs (a stale hidden-sets list, a truncation warning for
-  the wrong tensor, an enabled Finish for a dropped draft) came from a second
-  unguarded reader; the selector fixes the instance, the lint rule stops the
-  next one. `getState()`/`setState()` stay open for tests.
+  `views`/`selectedRoiId` directly off `useAppStore`**, forcing every read
+  through the selectors (`selectRois`, `selectDraft`, ...), which resolve the
+  tensor in view. Three prior bugs (a stale hidden-sets list, a truncation
+  warning for the wrong tensor, an enabled Finish for a dropped draft) came
+  from a second unguarded reader; the selector fixes the instance, the lint
+  rule stops the next one. `getState()`/`setState()` stay open for tests.
 - **The tool strip takes the draft as a prop, not a store read** — a second
   unguarded read there could show a status line and an enabled Finish for a
   draft the viewer already considers gone.
@@ -174,19 +174,26 @@ pinned ROI are pixel-identical on the plane where they coincide.
 
 ## State
 
-New store slice, cleared on tensor change:
+One `TensorView` record per tensor in `views`, keyed by the resolved tensor
+key (a small LRU, so coming back to a tensor finds its rows warm):
 
 ```
 rois: RoiAnnotation[]         // every row held, across the landed scopes
 roiSets: RoiSetInfo[]         // every set on the tensor, with its stored count
-roisFor: string | null        // which array_id they belong to
 roiScopes: Record<string, {truncated, skipped}>   // "" = client-owned listing; else a set name
 roisPending / roisError
 visibleSets: string[] | null  // the sets on screen; null = this tensor's default
-tool: "none" | "point" | "rect" | "polygon" | "polyline"
-draft: DraftShape | null
-selectedRoiId: string | null
+broadcastAxes: number[] | null
+draft: { shape, sliceKey } | null
 ```
+
+and globally `tool` and `selectedRoiId`, the latter resolved against the rows
+in view.
+
+An async write captures the tensor key when it starts and lands in that
+tensor's record, so a response for a tensor the user has left is harmless.
+Opening a tensor marks its scopes un-landed while keeping the rows shown, so
+the listing is refetched and annotations added meanwhile appear.
 
 **`visibleSets` is a positive list, or `null` for the tensor's default**
 (client-owned on, server-owned off) — a hidden-list shape couldn't express
@@ -202,9 +209,8 @@ Delete) is gone. Anything narrower would let a draft stay finishable while
 invisible.
 
 `tool` and the overlay toggle are viewer preferences and outlive a tensor
-change. Everything else is scoped by a selector rather than reset by a
-writer, because `applyViewerState` can change the active tensor straight from
-a URL without going through the write path a reset would otherwise hook.
+change. Everything else lives in the tensor's own record, so nothing needs a
+reset when the tensor changes.
 
 ## Not yet done
 

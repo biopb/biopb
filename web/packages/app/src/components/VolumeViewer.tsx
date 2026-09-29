@@ -19,8 +19,8 @@
  * {@link TileViewer} is.
  */
 
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import type { CSSProperties, RefObject } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { CSSProperties } from "react";
 import { OrbitView } from "@deck.gl/core";
 import DeckGL from "@deck.gl/react";
 import { Matrix4 } from "@math.gl/core";
@@ -28,18 +28,20 @@ import { ColorPalette3DExtensions, XR3DLayer } from "@hms-dbmi/viv";
 import {
   TensorAbortError,
   asTypedArray,
-  isTransportError,
   vivDtype,
   type TileInfo,
   type VolumeAvailable,
 } from "@biopb/tensor-flight-client";
-import { useAppStore } from "../store";
-import { useContrastWindow } from "../hooks/useContrastWindow";
-import type { ViewerErrorKind } from "./ViewerPane";
+import { useShallow } from "zustand/react/shallow";
+import { useCameraMirror } from "../hooks/useCameraMirror";
+import { BADGE, OVERLAY_TEXT } from "./viewerStyles";
+import { useElementSize } from "../hooks/useElementSize";
+import { useMountEpoch, usePublishPlaneReady } from "../hooks/useMountEpoch";
+import { selectContrastWindow, useAppStore } from "../store";
+import type { ViewerErrorKind } from "../store";
 import {
   contrastSamples,
   vivColor,
-  CAMERA_MIRROR_MS,
 } from "../utils/vivUtils";
 import {
   volumeCentre,
@@ -53,7 +55,8 @@ import {
 
 interface VolumeViewerProps {
   sourceId: string;
-  arrayId: string;
+  /** The resolved `tile_info`, fetched once by `openTensor`. */
+  info: TileInfo;
   /** Same contract as {@link TileViewer}: a settled fact vs. a bad moment. */
   onUnsupported: (reason: string, kind: ViewerErrorKind) => void;
 }
@@ -82,11 +85,16 @@ const ONE_CHANNEL = [{}];
 
 const VOLUME_VIEW_ID = "volume";
 
+/** The window before there is a grid to derive one from. */
+const FALLBACK_WINDOW: [number, number] = [0, 1];
+
 type XR3DLayerProps = ConstructorParameters<typeof XR3DLayer>[0];
 
-export default function VolumeViewer({ sourceId, arrayId, onUnsupported }: VolumeViewerProps) {
+export default function VolumeViewer({ sourceId, info: tileInfo, onUnsupported }: VolumeViewerProps) {
   const client = useAppStore((s) => s.client);
-  const slice = useAppStore((s) => s.slice);
+  const position = useAppStore((s) => s.position);
+  const epoch = useMountEpoch();
+  const notePlaneSamples = useAppStore((s) => s.notePlaneSamples);
   const channelNames = useAppStore((s) => s.channelNames);
   const channelColors = useAppStore((s) => s.channelColors);
   const renderMode = useAppStore((s) => s.volumeRenderMode);
@@ -94,51 +102,21 @@ export default function VolumeViewer({ sourceId, arrayId, onUnsupported }: Volum
   const hostRef = useRef<HTMLDivElement | null>(null);
   const size = useElementSize(hostRef);
 
-  const [info, setInfo] = useState<TileInfo | null>(null);
-
   // Reported through a ref for the reason TileViewer does it: this comes from
-  // the parent's render, and depending on it would re-run the load on every
+  // the parent's render, and depending on it would re-run the check on every
   // slider move.
   const onUnsupportedRef = useRef(onUnsupported);
   onUnsupportedRef.current = onUnsupported;
 
   // --- the tensor's volume plan -------------------------------------------
+  // A fact about the tensor, not a bad moment: no z axis and an oversized
+  // volume both fail the same way on a retry. A refused volume is not drawn,
+  // but its grid stays in the store for the sliders.
+  const refusal = useMemo(() => volumeRefusal(tileInfo), [tileInfo]);
   useEffect(() => {
-    if (!client) return;
-    const controller = new AbortController();
-    let live = true;
-    setInfo(null);
-    client.http
-      .tileInfo(arrayId, { signal: controller.signal })
-      .then((loaded) => {
-        if (!live) return;
-        const refusal = volumeRefusal(loaded);
-        if (refusal !== null) {
-          // A fact about the tensor, not a bad moment: no z axis and an
-          // oversized volume both fail the same way on a retry.
-          onUnsupportedRef.current(refusal, "capability");
-          return;
-        }
-        setInfo(loaded);
-      })
-      .catch((err: unknown) => {
-        if (!live || err instanceof TensorAbortError) return;
-        const message = err instanceof Error ? err.message : String(err);
-        onUnsupportedRef.current(message, isTransportError(err) ? "transport" : "capability");
-      });
-    return () => {
-      live = false;
-      controller.abort();
-    };
-  }, [client, arrayId]);
-
-  // Published for SliceControls, as in TileViewer. A refused volume never sets
-  // `info`, so the sliders fall back to the catalog rather than being bounded by
-  // a grid this viewer could not use.
-  const setTileInfo = useAppStore((s) => s.setTileInfo);
-  useEffect(() => {
-    setTileInfo(info, arrayId);
-  }, [info, arrayId, setTileInfo]);
+    if (refusal !== null) onUnsupportedRef.current(refusal, "capability");
+  }, [refusal]);
+  const info = refusal === null ? tileInfo : null;
 
   // `volumeRefusal` already established this is the available branch; the cast
   // is what lets the rest of the component read the plan without re-narrowing.
@@ -148,8 +126,8 @@ export default function VolumeViewer({ sourceId, arrayId, onUnsupported }: Volum
   // Keyed on the *request*, so a contrast drag or a colour change — neither of
   // which alters a byte of it — cannot re-issue a read of hundreds of MB.
   const request = useMemo(
-    () => (info && plan ? volumeRequest(info, plan, slice) : null),
-    [info, plan, slice],
+    () => (info && plan ? volumeRequest(info, plan, position) : null),
+    [info, plan, position],
   );
   const requestKey = request ? volumeKey(request) : "";
 
@@ -171,7 +149,14 @@ export default function VolumeViewer({ sourceId, arrayId, onUnsupported }: Volum
       })
       .then((arr) => {
         if (!live) return;
-        setVolume({ key: requestKey, data: asTypedArray(arr.buffer, vivDtype(arr.dtype)) });
+        const data = asTypedArray(arr.buffer, vivDtype(arr.dtype));
+        // Sampled from the volume itself: there is no coarser level to sample
+        // here the way the tiled viewer samples its overview -- this *is* the
+        // coarsest -- and the whole volume is already in memory, so a strided
+        // subsample of it costs nothing beyond the sort. Noted in the same
+        // batch as the volume, so the window and the pixels land together.
+        notePlaneSamples({ plane: data, values: contrastSamples(data) }, position.c, epoch);
+        setVolume({ key: requestKey, data });
       })
       .catch((err: unknown) => {
         if (!live || err instanceof TensorAbortError) return;
@@ -184,16 +169,13 @@ export default function VolumeViewer({ sourceId, arrayId, onUnsupported }: Volum
     // `requestKey` and not `request`: the object identity changes on every
     // store write, its content only when the pixels would.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [client, info, requestKey]);
+  }, [client, info, requestKey, epoch, notePlaneSamples]);
 
   const current = volume && volume.key === requestKey ? volume.data : null;
 
   // Published for the play driver; see TileViewer.
   const playing = useAppStore((s) => s.playAxis !== null);
-  const setPlaneReady = useAppStore((s) => s.setPlaneReady);
-  useEffect(() => {
-    setPlaneReady(current !== null);
-  }, [current, setPlaneReady]);
+  usePublishPlaneReady(current !== null, epoch);
 
   // Under play, keep the last volume on the canvas while the next read is in
   // flight. Unmounting the stage between frames -- which is what a null here
@@ -201,20 +183,13 @@ export default function VolumeViewer({ sourceId, arrayId, onUnsupported }: Volum
   const shown = current ?? (playing ? (volume?.data ?? null) : null);
 
   // --- contrast ------------------------------------------------------------
-  // Sampled from the volume itself. There is no coarser level to sample here
-  // the way the tiled viewer samples its overview — this *is* the coarsest —
-  // and the whole volume is already in memory, so a strided subsample of it
-  // costs nothing beyond the sort.
-  const samples = useMemo(() => (current ? contrastSamples(current) : null), [current]);
-
-  // Not only a derivation: this also publishes the plane limits, the track and
-  // the applied window that SliceControls reads.
-  const contrastLimits = useContrastWindow(info, samples, slice);
+  // The same selector the panel's bar reads (biopb/biopb#955).
+  const contrastLimits = useAppStore(useShallow(selectContrastWindow)) ?? FALLBACK_WINDOW;
 
   const color = useMemo(() => {
-    const stored = channelColors[sourceId]?.[slice.c] ?? "auto";
-    return vivColor(stored, channelNames[sourceId]?.[slice.c]);
-  }, [channelColors, channelNames, sourceId, slice.c]);
+    const stored = channelColors[sourceId]?.[position.c] ?? "auto";
+    return vivColor(stored, channelNames[sourceId]?.[position.c]);
+  }, [channelColors, channelNames, sourceId, position.c]);
 
   return (
     <div ref={hostRef} style={HOST}>
@@ -239,7 +214,7 @@ export default function VolumeViewer({ sourceId, arrayId, onUnsupported }: Volum
         </div>
       )}
       {plan && shown && size && (
-        <div style={BADGE} title="The scale the server keeps this volume warm at.">
+        <div style={{ ...BADGE, bottom: 10, left: 10 }} title="The scale the server keeps this volume warm at.">
           {plan.width}×{plan.height}×{plan.depth} at 1/{plan.scale_hint[plan.axes.x]}
           {plan.spacing === null && " · isotropic (no physical scale)"}
         </div>
@@ -275,7 +250,7 @@ function VolumeStage({
   height: number;
 }) {
   const sizeRef = useRef({ width, height });
-  const setCamera3d = useAppStore((s) => s.setCamera3d);
+  const mirrorCamera = useCameraMirror("3d");
 
   // The anisotropy, and the only place it enters: `XR3DLayer` scales its unit
   // cube by `physicalSizeScalingMatrix.transformPoint([w, h, d])`, so this
@@ -312,17 +287,8 @@ function VolumeStage({
     [plan],
   );
 
-  // Trailing edge only: the resting camera is what a link should carry, and the
-  // intermediate frames of a drag are noise that would otherwise reach the URL
-  // at pointer rate.
-  const mirrorRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  useEffect(() => () => {
-    if (mirrorRef.current) clearTimeout(mirrorRef.current);
-  }, []);
-
   const onViewStateChange = useCallback(
     ({ viewState }: { viewState: Record<string, unknown> }) => {
-      if (mirrorRef.current) clearTimeout(mirrorRef.current);
       const { target, zoom, rotationX, rotationOrbit } = viewState as {
         target: number[];
         zoom: number;
@@ -330,14 +296,12 @@ function VolumeStage({
         rotationOrbit: number;
       };
       const [x = 0, y = 0, z = 0] = target;
-      mirrorRef.current = setTimeout(() => {
-        setCamera3d({ target: [x, y, z], zoom, rotationX, rotationOrbit });
-      }, CAMERA_MIRROR_MS);
+      mirrorCamera({ target: [x, y, z], zoom, rotationX, rotationOrbit });
       // Returns nothing on purpose: `Deck#_onViewStateChange` falls back to the
       // view state it already computed, so the camera stays deck.gl's to drive
       // and this stays a mirror.
     },
-    [setCamera3d],
+    [mirrorCamera],
   );
 
   const views = useMemo(
@@ -402,57 +366,10 @@ function VolumeStage({
   );
 }
 
-/** The pane's pixel size, or null before the first measurement. */
-function useElementSize(ref: RefObject<HTMLElement | null>) {
-  const [size, setSize] = useState<{ width: number; height: number } | null>(null);
-  useLayoutEffect(() => {
-    const el = ref.current;
-    if (!el) return;
-    const measure = () => {
-      const { clientWidth, clientHeight } = el;
-      if (clientWidth > 0 && clientHeight > 0) {
-        setSize((prev) =>
-          prev && prev.width === clientWidth && prev.height === clientHeight
-            ? prev
-            : { width: clientWidth, height: clientHeight },
-        );
-      }
-    };
-    measure();
-    const observer = new ResizeObserver(measure);
-    observer.observe(el);
-    return () => observer.disconnect();
-  }, [ref]);
-  return size;
-}
-
 const HOST: CSSProperties = {
   position: "relative",
   width: "100%",
   height: "100%",
   overflow: "hidden",
   background: "#000",
-};
-
-const OVERLAY_TEXT: CSSProperties = {
-  position: "absolute",
-  inset: 0,
-  display: "flex",
-  alignItems: "center",
-  justifyContent: "center",
-  color: "#94a3b8",
-  fontSize: 13,
-};
-
-const BADGE: CSSProperties = {
-  position: "absolute",
-  bottom: 10,
-  left: 10,
-  padding: "4px 8px",
-  borderRadius: 4,
-  background: "rgba(0, 0, 0, 0.65)",
-  color: "#cbd5e1",
-  fontSize: 11,
-  pointerEvents: "none",
-  zIndex: 2,
 };

@@ -24,6 +24,9 @@
 import { Component, Suspense, lazy, useCallback, useEffect, useState } from "react";
 import type { ReactNode } from "react";
 import { useAppStore } from "../store";
+import type { ViewerErrorKind } from "../store";
+
+export type { ViewerErrorKind };
 
 // deck.gl + luma.gl are the app's largest dependency by a wide margin, and only
 // this pane uses them. Splitting them out keeps them off the admin and observe
@@ -36,7 +39,6 @@ const VolumeViewer = lazy(() => import("./VolumeViewer"));
 
 interface ViewerPaneProps {
   sourceId: string;
-  tensorId: string;
 }
 
 /**
@@ -87,15 +89,6 @@ class TileViewerBoundary extends Component<
   }
 }
 
-/**
- * Why the viewer could not start.
- *
- * `"capability"` is a settled fact about this browser or tensor, not worth
- * re-testing. `"transport"` is anything that might go the other way next time,
- * so it gets a retry.
- */
-export type ViewerErrorKind = "capability" | "transport";
-
 interface ViewerError {
   reason: string;
   kind: ViewerErrorKind;
@@ -106,31 +99,43 @@ const noWebGL2: ViewerError = {
   kind: "capability",
 };
 
-export function ViewerPane({ sourceId, tensorId }: ViewerPaneProps) {
+export function ViewerPane({ sourceId }: ViewerPaneProps) {
   const render3d = useAppStore((s) => s.render3d);
   const setRender3d = useAppStore((s) => s.setRender3d);
-  const [failure, setFailure] = useState<ViewerError | null>(
+  const target = useAppStore((s) => s.target);
+  const retryTarget = useAppStore((s) => s.retryTarget);
+  const [renderFailure, setFailure] = useState<ViewerError | null>(
     hasWebGL2() ? null : noWebGL2,
   );
-  // Bumped to remount the viewer on a manual retry. The tensor has not
-  // changed, so `key={tensorId}` alone would hand back the same instance.
+  // Bumped to remount the viewer on a manual retry of a render-time failure.
+  // The tensor has not changed, so `key` alone would hand back the same instance.
   const [attempt, setAttempt] = useState(0);
 
   // A new tensor, or a new render mode, gets a fresh verdict: the last one may
-  // have failed for a reason specific to it.
+  // have failed for a reason specific to it. Keyed on the epoch, which every
+  // open bumps, rather than on an address that may repeat.
   useEffect(() => {
     setFailure(hasWebGL2() ? null : noWebGL2);
-  }, [sourceId, tensorId, render3d]);
+  }, [sourceId, target.epoch, render3d]);
 
   const onUnsupported = useCallback(
     (reason: string, kind: ViewerErrorKind) => setFailure({ reason, kind }),
     [],
   );
 
+  // Two sources of failure, kept apart: resolving the tensor (owned by the
+  // store, retried by re-resolving) and rendering it (owned by the viewer,
+  // retried by remounting). A refusal by WebGL outranks a resolution failure,
+  // since re-resolving cannot help.
+  const failure = renderFailure ?? target.error;
   const retry = useCallback(() => {
+    if (renderFailure === null) {
+      retryTarget();
+      return;
+    }
     setFailure(null);
     setAttempt((n) => n + 1);
-  }, []);
+  }, [renderFailure, retryTarget]);
 
   if (failure !== null) {
     return (
@@ -142,7 +147,7 @@ export function ViewerPane({ sourceId, tensorId }: ViewerPaneProps) {
               Try again
             </button>
           </>
-        ) : render3d ? (
+        ) : render3d && renderFailure !== null ? (
           <>
             This tensor cannot be shown in 3-D — {failure.reason}{" "}
             <button
@@ -160,10 +165,24 @@ export function ViewerPane({ sourceId, tensorId }: ViewerPaneProps) {
     );
   }
 
+  // Nothing renders until the target has resolved: a viewer is handed the
+  // answer rather than asking for it, so the tensor it draws never changes
+  // spelling underneath it.
+  if (target.status !== "ready" || !target.info || !target.key) {
+    return (
+      <div className="loading-overlay">
+        {target.retrying
+          ? "Server did not answer in time — retrying…"
+          : "Loading tensor…"}
+      </div>
+    );
+  }
+
   // Keyed on the mode as well as the tensor: the two viewers hold different
   // state (a tile cache and a camera vs. a volume and an orbit), so switching
-  // mounts a fresh one rather than handing the old one different props.
-  const key = `${tensorId}#${render3d ? "3d" : "2d"}#${attempt}`;
+  // mounts a fresh one rather than handing the old one different props. The
+  // key is the resolved address, which does not change spelling.
+  const key = `${target.key}#${target.epoch}#${render3d ? "3d" : "2d"}#${attempt}`;
 
   return (
     <TileViewerBoundary key={key} onError={onUnsupported}>
@@ -172,7 +191,7 @@ export function ViewerPane({ sourceId, tensorId }: ViewerPaneProps) {
           <VolumeViewer
             key={key}
             sourceId={sourceId}
-            arrayId={tensorId}
+            info={target.info}
             onUnsupported={onUnsupported}
           />
         ) : (
@@ -182,7 +201,7 @@ export function ViewerPane({ sourceId, tensorId }: ViewerPaneProps) {
             // bookkeeping that goes stale.
             key={key}
             sourceId={sourceId}
-            arrayId={tensorId}
+            info={target.info}
             onUnsupported={onUnsupported}
           />
         )}

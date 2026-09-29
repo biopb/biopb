@@ -12,6 +12,7 @@ import { ResolveModal } from "../components/ResolveModal";
 import { TipBar } from "../components/TipBar";
 import { useDocumentTitle } from "../hooks/useDocumentTitle";
 import { useViewerUrlSync } from "../hooks/useViewerUrlSync";
+import { usePlayback } from "../hooks/usePlayback";
 import { withBase } from "../base";
 import {
   DEFAULT_CONTROL_WIDTH,
@@ -45,13 +46,11 @@ function storedWidth(key: string): number | null {
 export function HomePage() {
   useDocumentTitle("BioPB tensor - viewer");
   useViewerUrlSync();
+  usePlayback();
   const connectionState = useAppStore((s) => s.connectionState);
   const connectionError = useAppStore((s) => s.connectionError);
   const activeSourceId = useAppStore((s) => s.activeSourceId);
   const activeTensorId = useAppStore((s) => s.activeTensorId);
-  // What the render path fetches: the exact address a link asked for, which may
-  // be content-pinned, falling back to the selection for an ordinary click.
-  const requestedArrayId = useAppStore((s) => s.requestedArrayId);
   // The annotations and the label overlay are 2-D affordances: no panel in
   // volume mode, which is also what keeps the 3-D viewer from fetching a set it
   // cannot draw -- `TileViewer` is the only thing that loads either.
@@ -195,10 +194,7 @@ export function HomePage() {
           <>
             <div className="viewer-column">
               <div className="viewer-canvas-wrap">
-                <ViewerPane
-                  sourceId={activeSourceId}
-                  tensorId={requestedArrayId ?? activeTensorId}
-                />
+                <ViewerPane sourceId={activeSourceId} />
               </div>
             </div>
             {splitter("control", "Resize the control panel")}

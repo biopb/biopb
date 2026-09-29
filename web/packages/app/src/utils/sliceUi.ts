@@ -88,6 +88,14 @@ export const PLAY_READY_POLL_MS = 25;
  */
 export const PLAY_STALL_MS = 5_000;
 
+/** This axis's index in `position`, whatever it is keyed under. */
+export function axisIndexOf(
+  position: { t: number; z: number; c: number; axes: Record<string, number> },
+  axis: Pick<SliderAxis, "named" | "key">,
+): number {
+  return axis.named ? position[axis.named] : (position.axes[axis.key] ?? 0);
+}
+
 /** The next index in a looping scrub. */
 export function nextPlayIndex(current: number, extent: number): number {
   if (extent <= 1) return 0;

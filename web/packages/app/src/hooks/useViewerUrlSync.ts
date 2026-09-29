@@ -1,6 +1,11 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import { useSearchParams } from "react-router-dom";
-import { selectLabelOverlay, selectTileInfo, selectVisibleSets, useAppStore } from "../store";
+import {
+  selectTileInfo,
+  selectUrlLabelOverlay,
+  selectUrlVisibleSets,
+  useAppStore,
+} from "../store";
 import { DEFAULT_VIEWER_URL_STATE, encodeViewerState } from "../utils/viewerUrl";
 
 /**
@@ -21,19 +26,21 @@ export function useViewerUrlSync() {
   const client = useAppStore((s) => s.client);
   const applyViewerState = useAppStore((s) => s.applyViewerState);
   const activeTensorId = useAppStore((s) => s.activeTensorId);
-  const slice = useAppStore((s) => s.slice);
+  const position = useAppStore((s) => s.position);
+  const display = useAppStore((s) => s.display);
+  const slice = useMemo(() => ({ ...position, ...display }), [position, display]);
   const render3d = useAppStore((s) => s.render3d);
   const volumeRenderMode = useAppStore((s) => s.volumeRenderMode);
   const tileInfo = useAppStore(selectTileInfo);
-  const requestedArrayId = useAppStore((s) => s.requestedArrayId);
+  const requested = useAppStore((s) => s.target.requested);
   const camera3d = useAppStore((s) => s.camera3d);
   const camera2d = useAppStore((s) => s.camera2d);
   // Scoped: a list chosen on the previous tensor must not be written into a
   // link to this one.
-  const visibleSets = useAppStore(selectVisibleSets);
+  const visibleSets = useAppStore(selectUrlVisibleSets);
   // Scoped for the same reason: a set chosen on the previous image must not be
   // written into a link to this one.
-  const labelOverlay = useAppStore(selectLabelOverlay);
+  const labelOverlay = useAppStore(selectUrlLabelOverlay);
   const labelOpacity = useAppStore((s) => s.labelOpacity);
 
   const hydrated = useRef(false);
@@ -62,10 +69,10 @@ export function useViewerUrlSync() {
     // an unpinned link is upgraded in place once the grid answers, which is the
     // rewrite that makes a hand-written id legal input.
     //
-    // `requestedArrayId` sits between the two so a link whose version is gone
-    // keeps its token in the bar: the viewer's 404 is the answer, and quietly
-    // rewriting the URL to the current version would hide which one failed.
-    const arrayId = tileInfo?.array_id ?? requestedArrayId ?? activeTensorId;
+    // `requested` sits between the two so a link whose version is gone keeps
+    // its token in the bar: the 404 is the answer, and quietly rewriting the URL
+    // to the current version would hide which one failed.
+    const arrayId = tileInfo?.array_id ?? requested ?? activeTensorId;
     const next = encodeViewerState(
       paramsRef.current,
       {
@@ -88,7 +95,7 @@ export function useViewerUrlSync() {
     }
   }, [
     activeTensorId,
-    requestedArrayId,
+    requested,
     tileInfo,
     slice,
     render3d,

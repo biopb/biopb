@@ -7,17 +7,33 @@ import type {
   RoiGeometry,
   RoiListResult,
   RoiSetInfo,
+  SliderAxis,
   SourceJobStatus,
   TileInfo,
 } from "@biopb/tensor-flight-client";
 import { DEFAULT_POLYLINE_WIDTH, clampPolylineWidth } from "./utils/roiDraft";
 import type { RoiDraft, RoiTool } from "./utils/roiDraft";
 import { roiSetCounts } from "./utils/roiSets";
-import { TensorApiError, isReservedSetName } from "@biopb/tensor-flight-client";
+import {
+  TensorAbortError,
+  TensorApiError,
+  isReservedSetName,
+  isTransportError,
+  vivDtype,
+} from "@biopb/tensor-flight-client";
 import { withBase } from "./base";
 import { DEFAULT_VIEWER_URL_STATE, decodeViewerState } from "./utils/viewerUrl";
+import type { ViewerUrlState } from "./utils/viewerUrl";
 import { type ColorValue, extractChannelNames } from "./utils/colorUtils";
-import { DEFAULT_LABEL_OPACITY, clampLabelOpacity, clampSliceTo } from "./utils/vivUtils";
+import {
+  DEFAULT_LABEL_OPACITY,
+  clampContrastLimits,
+  clampLabelOpacity,
+  clampSliceTo,
+  contrastLimitsFrom,
+  contrastTrack,
+  percentileBounds,
+} from "./utils/vivUtils";
 import {
   descriptorFromTileInfo,
   forget as forgetRecents,
@@ -33,7 +49,18 @@ import {
 
 export type ConnectionState = "idle" | "connecting" | "connected" | "error";
 
-export interface SliceState {
+/**
+ * Where in the tensor's grid the view is. Per tensor: an index means "index of
+ * the tensor in view", so `openTensor` resets it.
+ *
+ * Separate from {@link DisplayState} because the two change for different
+ * reasons and cost differently: a new position asks the server for other
+ * pixels, a new display setting re-shades the same ones. Keeping the objects
+ * apart is what lets a contrast drag leave `position` -- and everything keyed
+ * on its identity: the Viv selection, the volume request, a draft's plane --
+ * untouched.
+ */
+export interface PositionState {
   t: number;
   z: number;
   c: number;
@@ -43,10 +70,17 @@ export interface SliceState {
    *
    * A TIFF sequence's `i`, a plate's `POS`, the second of two axes sharing a
    * label: navigable, but with no semantic name to hold them under. Reset with
-   * t/z/c on a source change, and for the same reason — a key means "axis 0 of
+   * t/z/c on a source change, and for the same reason -- a key means "axis 0 of
    * the tensor in view", so it does not survive one.
    */
   axes: Record<string, number>;
+}
+
+/**
+ * How the image is shaded. A preference that outlives a tensor, except
+ * `fixedLimits`, which is a value of one tensor's dtype.
+ */
+export interface DisplayState {
   /**
    * How the contrast window is chosen: from the plane's own histogram, or from
    * two grey levels the user fixed.
@@ -73,12 +107,217 @@ export interface SliceState {
 }
 
 /**
- * The 3-D camera, in `OrbitView`'s own terms.
- *
- * A mirror, not the source of truth: deck.gl owns the camera while the volume
- * is mounted and this trails it on a debounce, which is what keeps an orbit
- * smooth. It is read back only to seed the next mount -- see `VolumeViewer`.
+ * Position and display as one record. Only the URL codec uses it: a link names
+ * both in one flat set of parameters.
  */
+export type SliceState = PositionState & DisplayState;
+
+const pickPosition = ({ t, z, c, axes }: SliceState): PositionState => ({ t, z, c, axes });
+const pickDisplay = ({ contrastMode, percentileScale, fixedLimits, gamma }: SliceState): DisplayState => ({
+  contrastMode,
+  percentileScale,
+  fixedLimits,
+  gamma,
+});
+
+/**
+ * The patch for moving to `next`: nothing when it is where the view already is,
+ * else the new position with the plane marked not ready -- a new position always
+ * means the canvas is no longer showing the plane asked for, and saying so in the
+ * same write is what keeps a play timer from racing the viewer's own effect.
+ */
+function moved(s: AppState, next: PositionState): Partial<AppState> {
+  if (samePosition(s.position, next)) return {};
+  return { position: next, runtime: { ...s.runtime, planeReady: false } };
+}
+
+/** `next`, unless it holds the same indices as `current`, in which case `current`. */
+function samePositionOr(current: PositionState, next: PositionState): PositionState {
+  return samePosition(current, next) ? current : next;
+}
+
+/** Same indices, so a write that changes nothing can keep the object. */
+function samePosition(a: PositionState, b: PositionState): boolean {
+  if (a.t !== b.t || a.z !== b.z || a.c !== b.c) return false;
+  const keys = Object.keys(a.axes);
+  return keys.length === Object.keys(b.axes).length && keys.every((k) => a.axes[k] === b.axes[k]);
+}
+
+/**
+ * Why a viewer could not start.
+ *
+ * `"capability"` is a settled fact about this browser or tensor, not worth
+ * re-testing. `"transport"` is anything that might go the other way next time,
+ * so it gets a retry.
+ */
+export type ViewerErrorKind = "capability" | "transport";
+
+/** What a link carries beyond the address: the whole viewing state it names. */
+export type ViewInit = Omit<ViewerUrlState, "arrayId">;
+
+/**
+ * The tensor being opened, and the single answer to "which tensor is on screen".
+ *
+ * Resolved here, before any viewer mounts: `openTensor` fetches `tile_info`
+ * and only then does `key` exist, so nothing renders against a guess and the
+ * key never changes spelling. A viewer is handed `info` rather than fetching.
+ */
+export interface ViewTarget {
+  /** Bumped by every open. An async landing for an older epoch is dropped. */
+  epoch: number;
+  /** What the click or link named: bare, pinned, or a specific field. */
+  requested: string | null;
+  /**
+   * Opened from a link, which names its own source and so is not evicted when
+   * the catalog listing does not contain it.
+   */
+  linked: boolean;
+  status: "idle" | "resolving" | "ready" | "failed";
+  /** The resolved stable address, `src/field`: never bare, never pinned. Set when ready. */
+  key: string | null;
+  /** The one `tile_info`, shared by both viewers, the panels and the URL. */
+  info: TileInfo | null;
+  /** The first attempt failed with a transport error and another is coming. */
+  retrying: boolean;
+  error: { reason: string; kind: ViewerErrorKind } | null;
+  /** A link's `rs=` names, written under `key` when the target lands. */
+  seedSets: string[] | null;
+}
+
+/** The sampled grey levels of one plane. */
+export interface PlaneSamples {
+  /** The plane they were read for, by identity: the Viv selection, or the volume. */
+  plane: object;
+  /** Sorted ascending, as `contrastSamples` returns them. */
+  values: Float64Array;
+}
+
+/** Facts only a mounted viewer can observe. See {@link AppState.runtime}. */
+export interface Runtime {
+  /**
+   * Whether what is on the canvas is the plane that was last asked for. Play
+   * reads it to pace itself to the data plane rather than to a timer, and the
+   * tiled viewer reads its own copy of the same fact to cover a stale plane.
+   */
+  planeReady: boolean;
+  /**
+   * The last plane sampled, deliberately kept across a plane change so the
+   * contrast does not flash while the next read is in flight. Null before the
+   * first.
+   */
+  samples: PlaneSamples | null;
+}
+
+/**
+ * What belongs to one tensor, held under its `ViewTarget.key`.
+ */
+export interface TensorView {
+  /**
+   * The rows held, across every scope that has landed. Filtered to the plane
+   * and to the visible sets at render time.
+   */
+  rois: RoiAnnotation[];
+  /**
+   * Every set on the tensor, server-owned ones included, with its stored row
+   * count. The discovery half of the listing: `rois` holds a server-owned set
+   * only once it was asked for by name.
+   */
+  roiSets: RoiSetInfo[];
+  /**
+   * The fetch scopes that have landed: `""` for the unqualified listing (the
+   * client-owned sets, all at once), a set name for a server-owned set fetched
+   * on its own. Presence is what makes `loadRois` idempotent, and that is
+   * load-bearing rather than an optimisation: switching to the 3-D viewer and
+   * back remounts the whole 2-D subtree (`ViewerPane` keys on the render mode),
+   * so without it a round trip through 3-D would refetch a set that can reach
+   * megabytes.
+   *
+   * A scope is dropped again when a later listing's counts disagree with the
+   * rows held for it -- the server rebuilds a reserved set on every
+   * registration -- so the next `loadRois` fetches it afresh. Opening the
+   * tensor drops them all, keeping the rows on screen while they are re-listed:
+   * someone else may have annotated it in the meantime.
+   */
+  roiScopes: Record<string, RoiScopeState>;
+  /** Scopes in flight. */
+  roisPending: string[];
+  roisError: string | null;
+  /**
+   * The sets on screen, by name, or `null` for this tensor's default: the
+   * client-owned sets shown, the server-owned ones not.
+   *
+   * A positive list rather than a hidden one because the default is not "all":
+   * a link has to be able to say *show* `@ome`, and a hidden list could only
+   * say the opposite. The default is materialised on the first toggle, as
+   * `broadcastAxes` is. A server-owned set on the list is what `loadRois`
+   * fetches by name -- visibility is what drives the lazy fetch.
+   */
+  visibleSets: string[] | null;
+  /**
+   * Axes a new annotation should NOT pin, i.e. broadcast across. `null` means
+   * "the default for this tensor" (see `selectBroadcastAxes`), which is not the
+   * same as "none" -- an empty array is a deliberate choice to pin everything.
+   */
+  broadcastAxes: number[] | null;
+  /** The shape being placed, and the slice position it is being drawn at. */
+  draft: { shape: RoiDraft; sliceKey: string } | null;
+  /**
+   * The widest window the data has shown so far, per channel.
+   *
+   * A float dtype names no range of its own, so the track a fixed window is
+   * chosen on is the levels that have actually appeared. Taking that from the
+   * plane in view alone would shrink the track on a dim plane -- exactly when a
+   * fixed window needs to reach the levels of a bright one. Per channel because
+   * two channels of one tensor need not share a scale.
+   */
+  observedLimits: Record<number, [number, number]>;
+  /** Logical clock of the last write, for eviction. */
+  used: number;
+}
+
+/** What a tensor with no record yet reads as. Stable, so selectors do not churn. */
+export const EMPTY_VIEW: TensorView = {
+  rois: [],
+  roiSets: [],
+  roiScopes: {},
+  roisPending: [],
+  roisError: null,
+  visibleSets: null,
+  broadcastAxes: null,
+  draft: null,
+  observedLimits: {},
+  used: 0,
+};
+
+/** Tensors whose record is kept. The one in view is never evicted. */
+const VIEW_LIMIT = 8;
+let viewClock = 0;
+
+/**
+ * A patch to `views` that updates `key`'s record, or nothing when there is no
+ * tensor to write to. Evicts the least recently written record past the limit.
+ */
+function withView(
+  s: AppState,
+  key: string | null,
+  patch: Partial<TensorView> | ((v: TensorView) => Partial<TensorView>),
+): Partial<AppState> {
+  if (!key) return {};
+  const current = s.views[key] ?? EMPTY_VIEW;
+  const views = {
+    ...s.views,
+    [key]: { ...current, ...(typeof patch === "function" ? patch(current) : patch), used: ++viewClock },
+  };
+  const keys = Object.keys(views);
+  if (keys.length > VIEW_LIMIT) {
+    const victim = keys
+      .filter((k) => k !== key && k !== s.target.key)
+      .sort((a, b) => (views[a]?.used ?? 0) - (views[b]?.used ?? 0))[0];
+    if (victim !== undefined) delete views[victim];
+  }
+  return { views };
+}
+
 /**
  * The 2-D camera, in `DetailView`'s terms.
  *
@@ -97,6 +336,13 @@ export interface Camera2DState {
   zoom: number;
 }
 
+/**
+ * The 3-D camera, in `OrbitView`'s own terms.
+ *
+ * A mirror, not the source of truth: deck.gl owns the camera while the volume
+ * is mounted and this trails it on a debounce, which is what keeps an orbit
+ * smooth. It is read back only to seed the next mount -- see `VolumeViewer`.
+ */
 export interface Camera3DState {
   /** Orbit centre, in the scaled world space `volumeCentre` computes. */
   target: [number, number, number];
@@ -152,89 +398,31 @@ export interface AppState {
   activeSourceId: string | null;
   /**
    * The selection, always the *stable* address -- what the tree highlights and
-   * what `selectSource` sets. Never carries a version token.
+   * what `openTensor` sets. Never carries a version token.
    */
   activeTensorId: string | null;
   /**
-   * The exact address a link asked for, which may be content-pinned
-   * (`id@token`), or null when the selection came from a click.
-   *
-   * Separate from `activeTensorId` because the two answer different questions:
-   * this is what the render path fetches, that is what the catalog UI compares
-   * against. Folding them together would either break the tree's highlight (it
-   * matches catalog ids, which are never pinned) or force a click to resolve a
-   * token before it could select anything.
-   *
-   * Cleared by `selectSource`: a click supersedes whatever version a link named.
+   * The tensor being opened: what was asked for, whether it has resolved, and
+   * the one `tile_info` that answers for it. See {@link ViewTarget}.
    */
-  requestedArrayId: string | null;
+  target: ViewTarget;
 
   // Slice controls
-  slice: SliceState;
+  position: PositionState;
+  display: DisplayState;
 
+  // --- per-tensor state ---------------------------------------------------
   /**
-   * The transfer grid of the tensor in view, published by whichever viewer
-   * mounted it.
+   * Everything that belongs to "the tensor in view", one record per tensor, keyed
+   * by `target.key`. A small LRU: leaving a tensor keeps its record, so coming
+   * back finds its annotation rows warm.
    *
-   * The catalog's descriptor is not a substitute: `/api/sources` is a listing
-   * refreshed on a 60s poll, so a timelapse whose `T` grows keeps its old
-   * `shape` there until the next tick. Bounding a slider on that means a
-   * control that cannot reach frames the tensor has. `tile_info` is
-   * fetch-per-call and answers for the tensor as it is now.
-   *
-   * Null while nothing is loaded, and cleared on a source change so a stale
-   * grid can never bound the next tensor.
-   *
-   * Read it through `selectTileInfo`, not directly: a viewer keeps its previous
-   * grid until its next fetch answers, so this slot alone cannot say which
-   * tensor the grid in it describes.
+   * An async writer captures the key when it starts and writes into that
+   * record, so a landing for a tensor the user has left is harmless rather than
+   * something to guard against. Read through the selectors below, which resolve
+   * the tensor in view -- never `views` directly.
    */
-  tileInfo: TileInfo | null;
-  /**
-   * The `array_id` the grid above was fetched for -- the viewer's own `arrayId`
-   * prop, published back with it. See `selectTileInfo`.
-   */
-  tileInfoFor: string | null;
-
-  // --- ROI annotations ----------------------------------------------------
-  /**
-   * The rows held for the tensor in view, across every scope that has landed.
-   * Filtered to the plane and to the visible sets at render time.
-   */
-  rois: RoiAnnotation[];
-  /**
-   * Every set on the tensor, server-owned ones included, with its stored row
-   * count. The discovery half of the listing: `rois` holds a server-owned set
-   * only once it was asked for by name.
-   */
-  roiSets: RoiSetInfo[];
-  /**
-   * The tensor the rows and sets belong to, as its `viewKey`.
-   *
-   * The unit of eviction is the tensor: the next tensor's first landing replaces
-   * everything below, and until then the selectors hide it.
-   */
-  roisFor: string | null;
-  /**
-   * The fetch scopes that have landed for `roisFor`: `""` for the unqualified
-   * listing (the client-owned sets, all at once), a set name for a server-owned
-   * set fetched on its own. Presence is what makes `loadRois` idempotent, and
-   * that is load-bearing rather than an optimisation: switching to the 3-D
-   * viewer and back remounts the whole 2-D subtree (`ViewerPane` keys on the
-   * render mode), so without it a round trip through 3-D would refetch a set
-   * that can reach megabytes.
-   *
-   * A scope is dropped again when a later listing's counts disagree with the
-   * rows held for it -- the server rebuilds a reserved set on every
-   * registration -- so the next `loadRois` fetches it afresh.
-   */
-  roiScopes: Record<string, RoiScopeState>;
-  /** Scopes in flight for `roisPendingFor`, so a superseded response is dropped. */
-  roisPending: string[];
-  roisPendingFor: string | null;
-  roisError: string | null;
-  /** The tensor `roisError` is about. See `selectRoisError`. */
-  roisErrorFor: string | null;
+  views: Record<string, TensorView>;
   /**
    * The server does not offer annotations at all (501: disabled, or no metadata
    * DB). Distinct from an error, because it is a fact about the deployment
@@ -243,32 +431,10 @@ export interface AppState {
   roisUnavailable: boolean;
   /** Overlay on/off. A view preference, so it outlives a tensor change. */
   showRois: boolean;
-  /**
-   * The sets on screen, by name, or `null` for this tensor's default: the
-   * client-owned sets shown, the server-owned ones not.
-   *
-   * A positive list rather than a hidden one because the default is not "all":
-   * a link has to be able to say *show* `@ome`, and a hidden list could only
-   * say the opposite. The default is materialised on the first toggle, as
-   * `broadcastAxes` is. A server-owned set on the list is what `loadRois`
-   * fetches by name -- visibility is what drives the lazy fetch.
-   *
-   * Read through `selectVisibleSets`: names mean nothing outside the tensor they
-   * were chosen in, and `visibleSetsFor` is what scopes them to it.
-   */
-  visibleSets: string[] | null;
-  /** The tensor `visibleSets` names sets of. See `selectVisibleSets`. */
-  visibleSetsFor: string | null;
 
   // --- authoring ----------------------------------------------------------
   /** Which tool the pointer carries. A preference: it outlives a tensor change. */
   tool: RoiTool;
-  /** The shape being placed. Read through `selectDraft`. */
-  draft: RoiDraft | null;
-  /** The tensor the draft is being drawn on. See `selectDraft`. */
-  draftFor: string | null;
-  /** The slice position it is being drawn at. See `selectDraft`. */
-  draftSliceKey: string | null;
   /** Selected annotation. Read through `selectSelectedRoi`, which validates it. */
   selectedRoiId: string | null;
   /** Label and set the next new annotation gets. Preferences, kept across tensors. */
@@ -280,14 +446,6 @@ export interface AppState {
    * stroke claims, so it is stored on the annotation and scales with the image.
    */
   newPolylineWidth: number;
-  /**
-   * Axes a new annotation should NOT pin, i.e. broadcast across. `null` means
-   * "the default for this tensor" (see `selectBroadcastAxes`), which is not the
-   * same as "none" -- an empty array is a deliberate choice to pin everything.
-   */
-  broadcastAxes: number[] | null;
-  /** The tensor `broadcastAxes` names axes of. */
-  broadcastAxesFor: string | null;
   /** A write that failed or lost a conditional put, for the panel to report. */
   roiWriteError: string | null;
 
@@ -322,67 +480,17 @@ export interface AppState {
    */
   playAxis: string | null;
   /**
-   * The contrast window actually in use, published by whichever viewer is
-   * mounted -- automatic or fixed, whichever the slice asked for.
+   * What only the mounted viewer can observe, tagged with the `target.epoch` it
+   * was observed under. A write carrying another epoch is dropped, so a viewer
+   * that outlives its tensor for a commit cannot leak into the next one.
    *
-   * Read only to seed `fixedLimits` when the user turns fixed on: without it
-   * the panel would have to re-derive the histogram the viewer already has,
-   * and the image would jump the moment the mode changed.
+   * Everything else the contrast controls need is derived from this and from
+   * `target.info`, `views[key].observedLimits` and `display`, by
+   * {@link selectContrastTrack} and {@link selectContrastWindow}: the shader and
+   * the panel call the same selectors (biopb/biopb#955), so they cannot disagree
+   * and nothing derived is stored.
    */
-  appliedLimits: [number, number] | null;
-  /**
-   * The sampled min and max grey level of the plane on screen, or null before
-   * one has been sampled.
-   *
-   * What the automatic window would be with neither tail trimmed, published
-   * separately because in fixed mode `appliedLimits` is the user's window and
-   * no longer says anything about the data. Read to reset a fixed window onto
-   * the image actually in view.
-   */
-  planeLimits: [number, number] | null;
-  /**
-   * The widest window the data has shown so far, per channel, and the tensor it
-   * was sampled from.
-   *
-   * A float dtype names no range of its own, so the track a fixed window is
-   * chosen on is the levels that have actually appeared. Taking that from the
-   * plane in view alone would shrink the track on a dim plane -- exactly when a
-   * fixed window needs to reach the levels of a bright one. Per channel because
-   * two channels of one tensor need not share a scale.
-   *
-   * Read through `selectObservedLimits`, which hides a union sampled from
-   * another tensor rather than trusting a reset, for the reason `tileInfo` is
-   * read through `selectTileInfo`.
-   */
-  observedLimits: Record<number, [number, number]>;
-  observedLimitsFor: string | null;
-  /**
-   * The track a contrast window is chosen on -- the dtype's own range, or on a
-   * float tensor the levels the data has shown -- published by whichever viewer
-   * is mounted.
-   *
-   * Published rather than re-derived by the panel (biopb/biopb#955). The
-   * derivation takes the viewer's *local* plane limits, which reach this store
-   * one effect later, so a panel deriving its own drew the bar on a different
-   * track than the shader was clamping into for a render after every plane
-   * change. Publishing makes the viewer the single deriver, which is what the
-   * viewer already is for `appliedLimits`.
-   *
-   * Null while no viewer is mounted -- a WebGL failure, an unsupported tensor,
-   * the lazy chunk still loading. The panel falls back to the dtype's own range
-   * there; see `selectContrastTrack`.
-   */
-  contrastTrack: [number, number] | null;
-  /** The tensor (`viewKey`) the track above was derived for. See `selectContrastTrack`. */
-  contrastTrackFor: string | null;
-  /**
-   * Whether what is on the canvas is the slice that was last asked for.
-   *
-   * Published by whichever viewer is mounted. Play reads it to pace itself to
-   * the data plane rather than to a timer, and the tiled viewer reads its own
-   * copy of the same fact to cover a stale plane.
-   */
-  planeReady: boolean;
+  runtime: Runtime;
 
   // UI options
   showAdvancedOptions: boolean;
@@ -424,22 +532,35 @@ export interface AppState {
   initClient: (apiBase: string, token: string | null, devMode: boolean) => void;
   loadSources: () => Promise<void>;
   querySources: (sql: string) => Promise<QuerySourcesResult>;
-  selectSource: (sourceId: string | null, tensorId?: string) => void;
+  /**
+   * The only way the tensor in view changes: a tree click, a recent, a link, or
+   * (as `null`) the catalog poll dropping it.
+   *
+   * Bumps the epoch, resets everything that belongs to the previous tensor,
+   * and resolves `tile_info` in the background; `target` turns `ready` when it
+   * lands. `init` is a link's viewing state -- its presence is what marks the
+   * open as a link's. A click passes none, which resets the indices and
+   * cameras to their defaults; preferences carry across either way.
+   */
+  openTensor: (address: string | null, init?: ViewInit) => void;
+  /** Re-resolve a failed target, keeping everything else as it was. */
+  retryTarget: () => void;
   /** Record a source as just opened, and persist the list. */
   noteRecent: (sourceId: string) => void;
   /** Adopt a list written by another tab. Does not write it back. */
   syncRecents: (ids: readonly string[]) => void;
   /** Resolve `recentIds` into `recentSources`, dropping ids the server 404s. */
   hydrateRecents: () => Promise<void>;
-  setSlice: (partial: Partial<SliceState>) => void;
-  setTileInfo: (value: TileInfo | null, forArrayId: string) => void;
+  /** Move within the grid. A move to where the view already is keeps the object. */
+  setPosition: (partial: Partial<PositionState>) => void;
+  setDisplay: (partial: Partial<DisplayState>) => void;
   /**
    * Fetch what the tensor in view should hold and does not yet: the client-owned
    * sets, and every server-owned set that is visible. Idempotent on what has
    * landed and what is in flight, so callers fire it freely -- on mount, and
    * whenever the visible sets change.
    */
-  loadRois: (arrayId: string) => Promise<void>;
+  loadRois: () => Promise<void>;
   setShowRois: (value: boolean) => void;
   toggleSetVisible: (setName: string) => void;
   setTool: (tool: RoiTool) => void;
@@ -456,24 +577,27 @@ export interface AppState {
   setLabelOverlay: (arrayId: string | null) => void;
   setLabelOpacity: (value: number) => void;
   /**
-   * Adopt a whole viewing state at once, as decoded from the URL.
-   *
-   * One `set`, not a `selectSource` followed by a `setSlice`: `selectSource`
-   * resets the slice by design, so the two-call form would need the caller to
-   * know the order and would still flash the reset state through the viewer.
-   * Returns false when the catalog holds no such tensor -- a link to a source
-   * that has since been re-indexed -- which leaves the store untouched so the
-   * viewer opens empty rather than on a guess.
+   * Decode a link and `openTensor` it. Returns false when the link names no
+   * tensor, leaving the store untouched.
    */
   applyViewerState: (params: URLSearchParams) => boolean;
   setPlayAxis: (key: string | null) => void;
-  setAppliedLimits: (value: [number, number]) => void;
-  setPlaneLimits: (value: [number, number]) => void;
-  /** Publish the viewer's contrast track, for the tensor in view (`viewKey`). */
-  setContrastTrack: (value: [number, number]) => void;
+  /**
+   * Move one slider axis to `value`, under its name or into `axes`.
+   *
+   * Reads the state it writes into rather than a caller's copy: these writes are
+   * debounced and, under play, fired from a timer -- a stale `axes` map would
+   * silently drop a sibling axis's index.
+   */
+  setAxisIndex: (axis: Pick<SliderAxis, "named" | "key">, value: number) => void;
   /** Widen the tensor in view's observed levels on `channel`. */
   noteObservedLimits: (value: [number, number], channel: number) => void;
-  setPlaneReady: (value: boolean) => void;
+  /**
+   * A viewer sampled a plane: keep its values for the contrast window, and note
+   * their extremes as levels the tensor has shown, on `channel`.
+   */
+  notePlaneSamples: (samples: PlaneSamples, channel: number, epoch: number) => void;
+  setPlaneReady: (value: boolean, epoch: number) => void;
   setShowAdvancedOptions: (value: boolean) => void;
   setRender3d: (value: boolean) => void;
   setVolumeRenderMode: (value: VolumeRenderMode) => void;
@@ -593,6 +717,18 @@ function saveColorsToStorage(colors: Record<string, Record<number, ColorValue>>)
   }
 }
 
+const IDLE_TARGET: ViewTarget = {
+  epoch: 0,
+  requested: null,
+  linked: false,
+  status: "idle",
+  key: null,
+  info: null,
+  retrying: false,
+  error: null,
+  seedSets: null,
+};
+
 export const useAppStore = create<AppState>((set, get) => ({
   client: null,
   connectionState: "idle",
@@ -612,58 +748,32 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   activeSourceId: null,
   activeTensorId: null,
-  requestedArrayId: null,
+  target: IDLE_TARGET,
 
-  slice: {
-    t: 0,
-    z: 0,
-    c: 0,
-    axes: {},
+  position: { t: 0, z: 0, c: 0, axes: {} },
+  display: {
     contrastMode: "auto",
-    percentileScale: 1,  // Default 1-99 percentile
+    percentileScale: 1, // Default 1-99 percentile
     fixedLimits: null,
     gamma: 1,
   },
 
-  tileInfo: null,
-  tileInfoFor: null,
-
-  rois: [],
-  roiSets: [],
-  roisFor: null,
-  roiScopes: {},
-  roisPending: [],
-  roisPendingFor: null,
-  roisError: null,
-  roisErrorFor: null,
+  views: {},
   roisUnavailable: false,
   showRois: true,
-  visibleSets: null,
-  visibleSetsFor: null,
 
   tool: "select",
-  draft: null,
-  draftFor: null,
-  draftSliceKey: null,
   selectedRoiId: null,
   newLabel: "",
   newSetName: "",
   newPolylineWidth: DEFAULT_POLYLINE_WIDTH,
-  broadcastAxes: null,
-  broadcastAxesFor: null,
   roiWriteError: null,
 
   labelOverlay: null,
   labelOpacity: DEFAULT_LABEL_OPACITY,
 
   playAxis: null,
-  planeReady: false,
-  appliedLimits: null,
-  planeLimits: null,
-  observedLimits: {},
-  observedLimitsFor: null,
-  contrastTrack: null,
-  contrastTrackFor: null,
+  runtime: { planeReady: false, samples: null },
 
   showAdvancedOptions: false,
   render3d: false,
@@ -779,144 +889,141 @@ export const useAppStore = create<AppState>((set, get) => ({
     });
   },
 
-  selectSource(sourceId, tensorId) {
-    if (!sourceId) {
-      set({ activeSourceId: null, activeTensorId: null, requestedArrayId: null });
+  openTensor(address, init) {
+    const epoch = get().target.epoch + 1;
+    resolveController?.abort();
+    resolveController = null;
+    if (!address) {
+      set({ activeSourceId: null, activeTensorId: null, target: { ...IDLE_TARGET, epoch } });
       return;
     }
-    // No catalog lookup, and no `tensors[0]` guess. A bare source_id *is* a
-    // valid array_id (the identity policy in descriptor.proto), and the Flight
-    // server resolves it to whatever it binds as that source's default tensor.
-    // Guessing the first entry here is what biopb/biopb#75 was about: two
-    // derivations of one identity that can disagree, where the geometry came
-    // from tensors[0] and the read went somewhere else.
-    const tid = tensorId ?? sourceId;
+    // The link may name a pinned address; the selection is always the stable
+    // one, and `source_id` is the prefix before the first "/" by the identity
+    // policy. No catalog lookup and no `tensors[0]` guess: a bare source_id *is*
+    // a valid array_id, and the Flight server resolves it to whatever it binds
+    // as the default (biopb/biopb#75). It is also what lets a shared link open
+    // while the catalog is capped, still scanning, or missing the source; an id
+    // that names nothing fails at the fetch, which can say so.
+    const { arrayId: stable } = splitArrayVersion(address);
+    const sourceId = stable.split("/", 1)[0] ?? stable;
+    // A link counts as opening the source: reaching a `cache://` upload by its
+    // returned id is the case the list exists for. An id that names nothing is
+    // recorded too, then dropped by the first hydrate that 404s it.
     get().noteRecent(sourceId);
-    set({
+    // The one reset list. Nothing about the previous tensor is inherited:
+    // indices are in its grid and a camera is in its world space, so letting
+    // either survive frames the next tensor from a point nobody chose, and a
+    // `fixedLimits` grey level is a value of its dtype. What a link names
+    // replaces the default; without one it is the default. Contrast mode,
+    // percentile window, gamma, render mode and label opacity are preferences
+    // and carry across.
+    set((s) => ({
       activeSourceId: sourceId,
-      activeTensorId: tid,
-      requestedArrayId: null,
-      render3d: false,
-      // camera3d goes with render3d: it is in the previous volume's world
-      // space, so carrying it over would frame the next stack from an
-      // arbitrary point.
-      camera3d: null,
-      camera2d: null,
-      tileInfo: null,
-      tileInfoFor: null,
+      activeTensorId: stable,
+      target: {
+        ...IDLE_TARGET,
+        epoch,
+        requested: address,
+        linked: init !== undefined,
+        status: "resolving",
+        seedSets: init?.visibleSets ?? null,
+      },
+      position: init ? pickPosition(init.slice) : { t: 0, z: 0, c: 0, axes: {} },
+      display: init ? pickDisplay(init.slice) : { ...s.display, fixedLimits: null },
+      render3d: init?.render3d ?? false,
+      volumeRenderMode: init?.volumeRenderMode ?? s.volumeRenderMode,
+      camera3d: init?.camera3d ?? null,
+      camera2d: init?.camera2d ?? null,
+      labelOpacity: init?.labelOpacity ?? s.labelOpacity,
+      // A click leaves the overlay alone: its id names its image, so it is
+      // hidden where it does not apply and is still there on a return. A link
+      // replaces it, and the sets it names are written under the key when the
+      // target lands.
+      ...(init
+        ? { labelOverlay: init.labelOverlay }
+        : {}),
+      // A link to particular sets is a link to see them; with the overlay off
+      // it would be a link to nothing.
+      ...(init?.visibleSets ? { showRois: true } : {}),
       // An axis key means "axis of the tensor in view", so a play in progress
       // does not survive one either.
       playAxis: null,
-      planeReady: false,
-      appliedLimits: null,
-      planeLimits: null,
-      // Annotation state is deliberately NOT reset here. Every piece of it
-      // carries the tensor it belongs to and is read through a selector that
-      // hides it otherwise -- the same treatment `tileInfo` gets, and for a
-      // sharper reason: `applyViewerState` changes the tensor without coming
-      // through this function at all, so a reset written here would be missed
-      // by every link the app opens.
-    });
-    // `fixedLimits` goes with the tensor for the reason the indices do -- a
-    // grey level is a value of its dtype. The mode is a preference and stays,
-    // seeding itself from the next tensor's own window.
-    set((s) => ({ slice: { ...s.slice, t: 0, z: 0, c: 0, axes: {}, fixedLimits: null } }));
+      runtime: { planeReady: false, samples: null },
+    }));
+    void resolveTarget(get, set, epoch);
   },
 
-  setSlice(partial) {
-    set((s) => ({ slice: { ...s.slice, ...partial } }));
+  retryTarget() {
+    const { target } = get();
+    if (target.status !== "failed" || !target.requested) return;
+    const epoch = target.epoch + 1;
+    set({ target: { ...target, epoch, status: "resolving", error: null, retrying: false } });
+    void resolveTarget(get, set, epoch);
+  },
+
+  setPosition(partial) {
+    set((s) => {
+      const next = { ...s.position, ...partial };
+      return moved(s, next);
+    });
+  },
+
+  setDisplay(partial) {
+    set((s) => ({ display: { ...s.display, ...partial } }));
+  },
+
+  setAxisIndex(axis, value) {
+    set((s) => {
+      const next: PositionState = axis.named
+        ? { ...s.position, [axis.named]: value }
+        : { ...s.position, axes: { ...s.position.axes, [axis.key]: value } };
+      return moved(s, next);
+    });
   },
 
   setPlayAxis(key) {
     set({ playAxis: key });
   },
 
-  setAppliedLimits(value) {
-    // Compared by content: the viewers recompute this array every render, and
-    // storing a fresh identity each time would loop through their effect.
-    set((s) =>
-      s.appliedLimits && s.appliedLimits[0] === value[0] && s.appliedLimits[1] === value[1]
-        ? s
-        : { appliedLimits: value },
-    );
-  },
-
-  setPlaneLimits(value) {
-    set((s) =>
-      s.planeLimits && s.planeLimits[0] === value[0] && s.planeLimits[1] === value[1]
-        ? s
-        : { planeLimits: value },
-    );
-  },
-
-  setContrastTrack(value) {
-    const forArrayId = viewKey(get());
-    // Compared by content for the reason `setAppliedLimits` is: the viewer
-    // recomputes the track every render and a fresh identity each time would
-    // loop through its effect.
-    set((s) =>
-      s.contrastTrackFor === forArrayId &&
-      s.contrastTrack &&
-      s.contrastTrack[0] === value[0] &&
-      s.contrastTrack[1] === value[1]
-        ? s
-        : { contrastTrack: value, contrastTrackFor: forArrayId },
-    );
-  },
-
   noteObservedLimits(value, channel) {
-    const forArrayId = viewKey(get());
+    const key = get().target.key;
+    set((s) => widenObserved(s, key, value, channel));
+  },
+
+  notePlaneSamples(samples, channel, epoch) {
+    const key = get().target.key;
     set((s) => {
-      // A union carried over from another tensor is not narrowed back by a
-      // union, so the switch starts one rather than widening the old one.
-      const carried = s.observedLimitsFor === forArrayId;
-      const prev = carried ? s.observedLimits[channel] : undefined;
-      if (prev && prev[0] <= value[0] && prev[1] >= value[1]) return s;
-      const next: [number, number] = prev
-        ? [Math.min(prev[0], value[0]), Math.max(prev[1], value[1])]
-        : [value[0], value[1]];
+      if (s.target.epoch !== epoch) return s;
+      const { values } = samples;
       return {
-        observedLimits: carried
-          ? { ...s.observedLimits, [channel]: next }
-          : { [channel]: next },
-        observedLimitsFor: forArrayId,
+        runtime: { ...s.runtime, samples },
+        ...(values.length > 0
+          ? widenObserved(s, key, [values[0] as number, values[values.length - 1] as number], channel)
+          : {}),
       };
     });
   },
 
-  setPlaneReady(value) {
-    set((s) => (s.planeReady === value ? s : { planeReady: value }));
+  setPlaneReady(value, epoch) {
+    set((s) =>
+      s.target.epoch !== epoch || s.runtime.planeReady === value
+        ? s
+        : { runtime: { ...s.runtime, planeReady: value } },
+    );
   },
 
-  setTileInfo(value, forArrayId) {
-    // The grid is the first thing that can say what an index may be, so the
-    // slice is bounded here rather than where it was read -- see clampSliceTo.
-    set((s) => ({
-      tileInfo: value,
-      tileInfoFor: forArrayId,
-      slice: clampSliceTo(s.slice, value),
-      ...(value ? adoptResolution(s, forArrayId, value.array_id) : {}),
-    }));
-  },
-
-  async loadRois(arrayId) {
-    const { client } = get();
-    if (!client) return;
-    // Only the tensor in view is worth asking about. Every selector above hides
-    // a set belonging to another tensor, so a fetch for anything else could
-    // never be shown -- enforced here rather than trusted to the callers, the
-    // same way the reads are guarded rather than the writers.
-    if (currentArrayId(get()) !== arrayId) return;
+  async loadRois() {
+    const { client, target } = get();
+    if (!client || target.status !== "ready" || !target.info || !target.key) return;
     if (get().roisUnavailable) return;
-    // Held under the token-free key, fetched under the exact address: the
-    // version token changes as the grid lands, and a fetch for either
-    // spelling fills the same slot.
-    const key = splitArrayVersion(arrayId).arrayId;
+    // Held under the token-free key, fetched under the exact address, which
+    // carries the server's current version token.
+    const key = target.key;
+    const arrayId = target.info.array_id;
 
-    const { roisFor, roiScopes, roiSets, roisPendingFor, roisPending } = get();
-    const listed = roisFor === key;
-    const landed = listed ? roiScopes : {};
-    const pending = roisPendingFor === key ? roisPending : [];
+    const { roiScopes: landed, roiSets, roisPending: pending } = get().views[key] ?? EMPTY_VIEW;
+    // Any scope landing brings the whole listing of set names with it.
+    const listed = Object.keys(landed).length > 0;
     // The unqualified listing always; a server-owned set only while it is on
     // screen, which is what makes a set that can reach megabytes lazy. Once a
     // listing has landed it says which names are server-owned, so a link
@@ -933,34 +1040,30 @@ export const useAppStore = create<AppState>((set, get) => ({
     // mount effect, and the 2-D subtree remounts on every render-mode flip.
     const scopes = wanted.filter((scope) => !(scope in landed) && !pending.includes(scope));
     if (scopes.length === 0) return;
-    set({ roisPendingFor: key, roisPending: [...pending, ...scopes], roisError: null });
+    set((s) =>
+      withView(s, key, (v) => ({ roisPending: [...v.roisPending, ...scopes], roisError: null })),
+    );
 
-    /** Still the fetch being waited for, i.e. not superseded by a tensor change. */
-    const stillPending = (scope: string) => {
-      const now = get();
-      return now.roisPendingFor === key && now.roisPending.includes(scope);
-    };
     const fetchScope = async (scope: string) => {
       try {
         const result = await client.http.listRois(arrayId, scope || undefined);
-        if (!stillPending(scope)) return;
-        set((s) => landRoiScope(s, key, scope, result));
+        set((s) => withView(s, key, (v) => landRoiScope(v, scope, result)));
       } catch (err) {
-        if (!stillPending(scope)) return;
         // 501 is the server saying it does not do annotations. Latched for the
         // session so every later tensor skips the round trip.
         if (err instanceof TensorApiError && err.status === 501) {
-          set({ roisPending: [], roisUnavailable: true });
+          set((s) => ({ roisUnavailable: true, ...withView(s, key, { roisPending: [] }) }));
           return;
         }
         // The scope deliberately stays un-landed so a remount or a tensor switch
         // can try again; the effect's own deps keep that from becoming a retry
         // loop.
-        set((s) => ({
-          roisPending: s.roisPending.filter((p) => p !== scope),
-          roisErrorFor: key,
-          roisError: err instanceof Error ? err.message : String(err),
-        }));
+        set((s) =>
+          withView(s, key, (v) => ({
+            roisPending: v.roisPending.filter((p) => p !== scope),
+            roisError: err instanceof Error ? err.message : String(err),
+          })),
+        );
       }
     };
     await Promise.all(scopes.map(fetchScope));
@@ -970,16 +1073,23 @@ export const useAppStore = create<AppState>((set, get) => ({
     // A draft belongs to the tool that started it; switching abandons it rather
     // than reinterpreting placed vertices under different rules.
     set((s) =>
-      s.tool === tool ? s : { tool, draft: null, draftFor: null, draftSliceKey: null },
+      s.tool === tool
+        ? s
+        : {
+            tool,
+            views: Object.fromEntries(
+              Object.entries(s.views).map(([k, v]) => [k, v.draft ? { ...v, draft: null } : v]),
+            ),
+          },
     );
   },
 
   setDraft(draft) {
-    set({
-      draft,
-      draftFor: draft ? viewKey(get()) : null,
-      draftSliceKey: draft ? sliceKey(get().slice) : null,
-    });
+    set((s) =>
+      withView(s, s.target.key, {
+        draft: draft ? { shape: draft, sliceKey: sliceKey(s.position) } : null,
+      }),
+    );
   },
 
   setSelectedRoi(roiId) {
@@ -1000,25 +1110,22 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   toggleBroadcastAxis(axis, defaults) {
     set((s) => {
-      const arrayId = viewKey(s);
       // `null` means "this tensor's default", so materialise that before
       // editing -- otherwise the first toggle would silently also pin whatever
       // the default was broadcasting.
-      const current =
-        s.broadcastAxesFor === arrayId && s.broadcastAxes !== null ? s.broadcastAxes : defaults;
-      return {
-        broadcastAxesFor: arrayId,
+      const current = selectBroadcastAxes(s, defaults);
+      return withView(s, s.target.key, {
         broadcastAxes: current.includes(axis)
           ? current.filter((a) => a !== axis)
           : [...current, axis],
-      };
+      });
     });
   },
 
   async createRoi(geometry, plane) {
     const { client, newLabel, newSetName } = get();
-    const arrayId = currentArrayId(get());
-    const key = viewKey(get());
+    const arrayId = get().target.info?.array_id;
+    const key = get().target.key;
     if (!client || !arrayId) return;
 
     // Drawn before it is stored. The click that finishes a shape also clears
@@ -1043,10 +1150,10 @@ export const useAppStore = create<AppState>((set, get) => ({
     };
     set((s) => ({
       roiWriteError: null,
-      rois: s.roisFor === key ? [...s.rois, provisional] : s.rois,
+      ...withView(s, key, (v) => ({ rois: [...v.rois, provisional] })),
     }));
 
-    /** Take the provisional row back out, wherever the list has moved on to. */
+    /** Take the provisional row back out of the list it was added to. */
     const withoutProvisional = (rois: RoiAnnotation[]) =>
       rois.filter((roi) => roi.roiId !== provisional.roiId);
 
@@ -1056,51 +1163,49 @@ export const useAppStore = create<AppState>((set, get) => ({
         [{ geometry, plane, label: newLabel, setName: newSetName || undefined }],
         { checkRev: true },
       );
-      // Dropped if the tensor moved on mid-write: the annotation is stored, and
-      // appending it to a list that now describes another tensor would put it
-      // on screen over the wrong image. The provisional row goes with it.
-      if (viewKey(get()) !== key || get().roisFor !== key) {
-        set((s) => ({ rois: withoutProvisional(s.rois) }));
-        return;
-      }
       const stored = result.stored[0];
       if (!stored) {
         set((s) => ({
-          rois: withoutProvisional(s.rois),
           roiWriteError: "The server stored no annotation",
+          ...withView(s, key, (v) => ({ rois: withoutProvisional(v.rois) })),
         }));
         return;
       }
       // Swapped in place rather than appended, so the annotation does not jump
-      // to the end of a list it was already drawn in.
-      set((s) => {
-        const visible = selectVisibleSets(s);
-        return {
-          rois: s.rois.map((roi) => (roi.roiId === provisional.roiId ? stored : roi)),
-          selectedRoiId: stored.roiId,
-          // The listing's count follows the write, so a later listing does not
-          // read this row as someone else's change (see landRoiScope).
-          roiSets: withSetCount(s.roiSets, stored.setName, 1),
-          // Onto the screen it was drawn on. A materialised list is exactly
-          // the sets shown, so a new name -- or one switched off -- would
-          // otherwise swallow the shape the user just traced.
-          ...(visible !== null && !visible.includes(stored.setName)
-            ? { visibleSets: [...visible, stored.setName], visibleSetsFor: key }
-            : {}),
-        };
-      });
+      // to the end of a list it was already drawn in. Written into this tensor's
+      // record even if the user has left it: the annotation is stored, and its
+      // own record is the right place for it.
+      set((s) => ({
+        // Only selected while its tensor is the one in view.
+        ...(s.target.key === key ? { selectedRoiId: stored.roiId } : {}),
+        ...withView(s, key, (v) => {
+          const visible = v.visibleSets;
+          return {
+            rois: v.rois.map((roi) => (roi.roiId === provisional.roiId ? stored : roi)),
+            // The listing's count follows the write, so a later listing does not
+            // read this row as someone else's change (see landRoiScope).
+            roiSets: withSetCount(v.roiSets, stored.setName, 1),
+            // Onto the screen it was drawn on. A materialised list is exactly
+            // the sets shown, so a new name -- or one switched off -- would
+            // otherwise swallow the shape the user just traced.
+            ...(visible !== null && !visible.includes(stored.setName)
+              ? { visibleSets: [...visible, stored.setName] }
+              : {}),
+          };
+        }),
+      }));
     } catch (err) {
       set((s) => ({
-        rois: withoutProvisional(s.rois),
         roiWriteError: err instanceof Error ? err.message : String(err),
+        ...withView(s, key, (v) => ({ rois: withoutProvisional(v.rois) })),
       }));
     }
   },
 
   async deleteRoi(roiId) {
     const { client } = get();
-    const arrayId = currentArrayId(get());
-    const key = viewKey(get());
+    const arrayId = get().target.info?.array_id;
+    const key = get().target.key;
     if (!client || !arrayId) return;
     // Nothing to ask the server about: this row is a local placeholder for a
     // write still in flight, and its id is one this client invented. Left for
@@ -1111,13 +1216,16 @@ export const useAppStore = create<AppState>((set, get) => ({
     // when Delete is pressed, so leaving it there for a round trip reads as the
     // key having missed -- and the far commoner outcome by far is that the
     // delete succeeds.
-    const index = get().rois.findIndex((roi) => roi.roiId === roiId);
-    const removed = get().rois[index];
+    const held = (get().views[key ?? ""] ?? EMPTY_VIEW).rois;
+    const index = held.findIndex((roi) => roi.roiId === roiId);
+    const removed = held[index];
     set((s) => ({
       roiWriteError: null,
-      rois: s.rois.filter((roi) => roi.roiId !== roiId),
-      roiSets: removed ? withSetCount(s.roiSets, removed.setName, -1) : s.roiSets,
       selectedRoiId: s.selectedRoiId === roiId ? null : s.selectedRoiId,
+      ...withView(s, key, (v) => ({
+        rois: v.rois.filter((roi) => roi.roiId !== roiId),
+        roiSets: removed ? withSetCount(v.roiSets, removed.setName, -1) : v.roiSets,
+      })),
     }));
 
     try {
@@ -1128,48 +1236,51 @@ export const useAppStore = create<AppState>((set, get) => ({
     } catch (err) {
       set((s) => {
         const failed = { roiWriteError: err instanceof Error ? err.message : String(err) };
-        // Only back into the list it came out of. After a tensor change the
-        // list describes another image, and restoring there would draw this
-        // annotation over it.
-        if (!removed || viewKey(get()) !== key || s.roisFor !== key) return failed;
-        const rois = [...s.rois];
-        rois.splice(Math.min(index, rois.length), 0, removed);
-        return { ...failed, rois, roiSets: withSetCount(s.roiSets, removed.setName, 1) };
+        if (!removed) return failed;
+        return {
+          ...failed,
+          ...withView(s, key, (v) => {
+            const rois = [...v.rois];
+            rois.splice(Math.min(index, rois.length), 0, removed);
+            return { rois, roiSets: withSetCount(v.roiSets, removed.setName, 1) };
+          }),
+        };
       });
     }
   },
 
   async clearRoiSet(setName) {
     const { client } = get();
-    const arrayId = currentArrayId(get());
-    const key = viewKey(get());
+    const arrayId = get().target.info?.array_id;
+    const key = get().target.key;
     if (!client || !arrayId) return;
     set({ roiWriteError: null });
     try {
       // No ids: the server drops the whole set in one transaction, so this is
       // not limited to the rows the cap let this client see.
       await client.http.deleteRois(arrayId, undefined, { setName });
-      if (viewKey(get()) !== key || get().roisFor !== key) return;
       // Filtered by name rather than by the ids that came back, for the same
       // reason: what was deleted is the set, and the response enumerates only
       // what the server chose to list.
       set((s) => {
-        const visible = selectVisibleSets(s);
+        const held = (s.views[key ?? ""] ?? EMPTY_VIEW).rois;
         return {
-          rois: s.rois.filter((roi) => roi.setName !== setName),
-          // Gone from the listing too, as the server's own next listing would
-          // have it: it enumerates stored rows, and there are none.
-          roiSets: s.roiSets.filter((set) => set.setName !== setName),
           selectedRoiId:
-            s.rois.find((roi) => roi.roiId === s.selectedRoiId)?.setName === setName
+            held.find((roi) => roi.roiId === s.selectedRoiId)?.setName === setName
               ? null
               : s.selectedRoiId,
-          // The name means nothing once the set is gone, and leaving it on the
-          // list would pin a later set of the same name to whatever this one
-          // was toggled to.
-          ...(visible !== null && visible.includes(setName)
-            ? { visibleSets: visible.filter((name) => name !== setName) }
-            : {}),
+          ...withView(s, key, (v) => ({
+            rois: v.rois.filter((roi) => roi.setName !== setName),
+            // Gone from the listing too, as the server's own next listing would
+            // have it: it enumerates stored rows, and there are none.
+            roiSets: v.roiSets.filter((set) => set.setName !== setName),
+            // The name means nothing once the set is gone, and leaving it on the
+            // list would pin a later set of the same name to whatever this one
+            // was toggled to.
+            ...(v.visibleSets?.includes(setName)
+              ? { visibleSets: v.visibleSets.filter((name) => name !== setName) }
+              : {}),
+          })),
         };
       });
     } catch (err) {
@@ -1192,103 +1303,43 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   toggleSetVisible(setName) {
     set((s) => {
-      // Scoped to the tensor in view: a list carried over from another one is
-      // not "this tensor's default", it is a list of names that mean nothing
-      // here. `null` means the default, so materialise that before editing --
+      // `null` means the default, so materialise that before editing --
       // otherwise the first toggle would silently also hide every other
       // client-owned set.
-      const arrayId = viewKey(s);
       const current = selectVisibleSets(s) ?? defaultVisibleSets(s);
-      return {
-        visibleSetsFor: arrayId,
+      return withView(s, s.target.key, {
         visibleSets: current.includes(setName)
           ? current.filter((name) => name !== setName)
           : [...current, setName],
-      };
+      });
     });
   },
 
   applyViewerState(params) {
     const requested = params.get("id");
     if (!requested) return false;
-    // The link may name a pinned address; the selection is always the stable
-    // one, and `source_id` is the prefix before the first "/" by the identity
-    // policy -- so both come out of the id itself with no catalog lookup. That
-    // is what lets a shared link open while the catalog is capped, still
-    // scanning, or missing the source entirely; an id that names nothing then
-    // fails at the fetch, which can say so, rather than here in silence.
-    const { arrayId: stable } = splitArrayVersion(requested);
     const s = get();
-    // Nothing about the tensor in view is inherited. Indices are in its grid
-    // and a camera is in its world space, so letting either survive into a link
-    // that does not name one frames whatever opens next from a point nobody
-    // chose.
+    // Everything the link does not name is the default, not whatever the
+    // previous tensor left: `openTensor` resets, and this only supplies what
+    // the link chose. Encoding omits a field only when it is at the default
+    // used here, so a link this app wrote round-trips exactly.
     //
-    // There is deliberately no "unless it is the same tensor" exemption,
-    // because that cannot be decided here. A bare `source_id` and the
-    // `source_id/field` it resolves to are two spellings of one identity, and
-    // only the Flight server knows which field it binds as a source's default
-    // -- so an id comparison reports a tensor change for the catalog's own
-    // bare-source click, and reports it in one direction only, which is worse
-    // than not asking.
-    //
-    // Nothing is lost to that. `encodeViewerState` omits a field only when it
-    // is at the default used here, so a link this app wrote round-trips
-    // exactly; inheriting could only ever change what an *incomplete*
-    // hand-written link opens at, which is the case the previous tensor's
-    // framing is wrong for.
-    //
-    // The percentile window, gamma and the render mode do carry across: they
-    // are preferences that belong to the viewer rather than to any one tensor,
-    // which is how `selectSource` treats them too.
-    const next = decodeViewerState(params, {
+    // The percentile window and gamma are preferences rather than properties of
+    // the tensor, so they are the fallback for a link that names none, as are
+    // the render mode and the label overlay's opacity.
+    const init = decodeViewerState(params, {
       ...DEFAULT_VIEWER_URL_STATE,
-      arrayId: stable,
+      arrayId: requested,
       slice: {
         ...DEFAULT_VIEWER_URL_STATE.slice,
-        contrastMode: s.slice.contrastMode,
-        percentileScale: s.slice.percentileScale,
-        gamma: s.slice.gamma,
+        contrastMode: s.display.contrastMode,
+        percentileScale: s.display.percentileScale,
+        gamma: s.display.gamma,
       },
       volumeRenderMode: s.volumeRenderMode,
-      // A preference about the overlay rather than about any one set, so it
-      // carries across like gamma and the percentile window. *Which* set is
-      // drawn does not: that belongs to the image the link names.
       labelOpacity: s.labelOpacity,
     });
-    const sourceId = stable.split("/", 1)[0] ?? null;
-    // A link counts as opening the source: reaching a `cache://` upload by its
-    // returned id is the case the list exists for, and that arrives as a URL.
-    // An id that names nothing is recorded too, then dropped by the first
-    // hydrate that 404s it -- cheaper than resolving before recording, and the
-    // same answer.
-    if (sourceId) get().noteRecent(sourceId);
-    set({
-      activeSourceId: sourceId,
-      activeTensorId: stable,
-      requestedArrayId: requested,
-      slice: next.slice,
-      render3d: next.render3d,
-      volumeRenderMode: next.volumeRenderMode,
-      camera3d: next.camera3d,
-      camera2d: next.camera2d,
-      // Set names belong to the tensor, like the indices: a link that names
-      // none opens on the tensor's default rather than on the last choice.
-      visibleSets: next.visibleSets,
-      visibleSetsFor: stable,
-      // No `...For` companion: the set's own id names its image, so
-      // `selectLabelOverlay` decides whether it is about the tensor this link
-      // opened. A link that names no set clears any overlay left from the
-      // previous one, for the reason the indices are not inherited.
-      labelOverlay: next.labelOverlay,
-      labelOpacity: next.labelOpacity,
-      // A link to particular sets is a link to see them; with the overlay off
-      // it would be a link to nothing.
-      ...(next.visibleSets !== null ? { showRois: true } : {}),
-      // `tileInfo` is left alone: `selectTileInfo` already hides a grid fetched
-      // for another id, and clearing it here would depend on a viewer mounting
-      // afterwards to put one back.
-    });
+    get().openTensor(requested, init);
     return true;
   },
 
@@ -1356,7 +1407,7 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   startCatalogPolling() {
     const pollingTimerId = setInterval(async () => {
-      const { client, sources, activeSourceId, requestedArrayId, selectSource } = get();
+      const { client, sources, activeSourceId, target, openTensor } = get();
       if (!client || get().connectionState !== "connected") return;
 
       try {
@@ -1382,10 +1433,10 @@ export const useAppStore = create<AppState>((set, get) => ({
           // deliberately does not need to be present in the listing.
           if (
             activeSourceId &&
-            !requestedArrayId &&
+            !target.linked &&
             !sorted.find((s) => s.source_id === activeSourceId)
           ) {
-            selectSource(null);
+            openTensor(null);
           }
         }
       } catch (err) {
@@ -1547,106 +1598,99 @@ async function onJobSettled(get: Get, job: SourceJobStatus): Promise<void> {
   await Promise.all([get().loadSources(), get().startWarm(job.source_id)]);
 }
 
-/**
- * The address the viewer is actually rendering: the exact one a link asked for,
- * which may be content-pinned, else the selection.
- *
- * Single-sourced because every "is this state about the tensor in view?" guard
- * has to agree, and two spellings of that question would disagree exactly when
- * a pinned link is open.
- */
-function requestedTensorId(s: AppState): string | null {
-  return s.requestedArrayId ?? s.activeTensorId;
-}
+/** The epoch's in-flight `tile_info`, aborted when a newer open supersedes it. */
+let resolveController: AbortController | null = null;
 
 /**
- * `requestedTensorId` may be a bare source_id -- a link, or a source clicked
- * rather than one of its tensors -- which the Flight server resolves to a
- * specific field. Once `tile_info` answers for exactly that id, its own
- * `array_id` names the specific tensor being rendered, and every write scoped
- * by this function (ROI create/delete/list, draft, broadcast axes) has to
- * follow that resolution or it addresses a different tensor than the one on
- * screen.
+ * One slow response, from a cold catalog or a moment of load, must not cost the
+ * tensor its viewer -- but a server that blew an 8 s budget twice is not
+ * rescued by a third ask, and every attempt holds the pane empty.
  */
-export function currentArrayId(s: AppState): string | null {
-  const requested = requestedTensorId(s);
-  return requested && s.tileInfoFor === requested && s.tileInfo
-    ? s.tileInfo.array_id
-    : requested;
-}
+const TILE_INFO_RETRY_MS = [500];
 
 /**
- * `currentArrayId` without its version token: what every `...For` field is
- * stamped with and compared against.
- *
- * The token is not identity. `/api/tile_info` puts the tensor's current one
- * into `array_id` for any versioned source, so `currentArrayId` reads
- * `src/field` until the grid lands and `src@tok/field` after it; a key that
- * kept the token would hide everything written before the landing. A link's
- * pin says which bytes to render, not whose annotations or contrast to show.
+ * Fetch `tile_info` for the open target and land it, unless a newer open
+ * superseded this one.
  */
-export function viewKey(s: AppState): string | null {
-  const id = currentArrayId(s);
-  return id === null ? null : splitArrayVersion(id).arrayId;
-}
-
-/**
- * The `...For` fields keyed to a bare `source_id`, moved to the field it just
- * resolved to.
- *
- * A bare `source_id` and the field the server binds as its default are one
- * tensor under two keys, and only `tile_info` says which field. State written
- * before it answered -- a link's `rs=` sets, a listing that landed first -- is
- * keyed bare and would be hidden the moment `viewKey` resolves.
- *
- * `roisPendingFor` is left alone: the fetch in flight checks it against the
- * key it was issued under, and moving it would drop that response while
- * telling the next `loadRois` it is still coming. The bare fetch is abandoned
- * and the resolved key fetches afresh.
- */
-function adoptResolution(
-  s: AppState,
-  requested: string,
-  resolvedArrayId: string,
-): Partial<AppState> {
-  const from = splitArrayVersion(requested).arrayId;
-  const to = splitArrayVersion(resolvedArrayId).arrayId;
-  if (from === to) return {};
-  const move = (key: string | null) => (key === from ? to : key);
-  return {
-    roisFor: move(s.roisFor),
-    roisErrorFor: move(s.roisErrorFor),
-    visibleSetsFor: move(s.visibleSetsFor),
-    draftFor: move(s.draftFor),
-    broadcastAxesFor: move(s.broadcastAxesFor),
-    observedLimitsFor: move(s.observedLimitsFor),
-    contrastTrackFor: move(s.contrastTrackFor),
+async function resolveTarget(
+  get: () => AppState,
+  set: (partial: Partial<AppState> | ((s: AppState) => Partial<AppState>)) => void,
+  epoch: number,
+): Promise<void> {
+  const current = () => get().target.epoch === epoch;
+  const { client, target } = get();
+  const requested = target.requested;
+  if (!requested) return;
+  const fail = (reason: string, kind: ViewerErrorKind) => {
+    if (!current()) return;
+    set((s) => ({
+      target: { ...s.target, status: "failed", retrying: false, error: { reason, kind } },
+    }));
   };
+  if (!client) {
+    fail("not connected to a server", "transport");
+    return;
+  }
+  const controller = new AbortController();
+  resolveController = controller;
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      const info = await client.http.tileInfo(requested, { signal: controller.signal });
+      if (!current()) return;
+      const key = splitArrayVersion(info.array_id).arrayId;
+      set((s) => ({
+        target: {
+          ...s.target,
+          status: "ready",
+          key,
+          info,
+          retrying: false,
+          error: null,
+          seedSets: null,
+        },
+        // The grid is the first thing that can say what an index may be, so the
+        // slice is bounded here rather than where it was read -- see clampSliceTo.
+        position: samePositionOr(s.position, clampSliceTo(s.position, info)),
+        // A link's set names belong to the tensor it resolved to, so they are
+        // written under its key rather than under whatever the link spelled.
+        ...withView(s, key, {
+          // Which sets to draw belongs to the tensor, so a link that names none
+          // opens on the tensor's default rather than on the last choice.
+          ...(s.target.linked ? { visibleSets: s.target.seedSets } : {}),
+          // Rows kept from an earlier visit stay on screen, but are listed again.
+          ...(s.views[key] ? { roiScopes: {} } : {}),
+        }),
+      }));
+      return;
+    } catch (err) {
+      if (!current() || err instanceof TensorAbortError) return;
+      const transport = isTransportError(err);
+      const delay = transport ? TILE_INFO_RETRY_MS[attempt] : undefined;
+      if (delay === undefined) {
+        fail(err instanceof Error ? err.message : String(err), transport ? "transport" : "capability");
+        return;
+      }
+      set((s) => ({ target: { ...s.target, retrying: true } }));
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      if (!current()) return;
+    }
+  }
 }
 
 /**
- * The grid for what is currently addressed, or null while none has landed.
+ * The grid for the tensor in view, or null until it has resolved.
  *
- * `tileInfo` is whichever viewer last published one, and a viewer holds its
- * previous grid until its next fetch answers -- so between a new selection and
- * that answer the slot describes the tensor that just left. Pairing it with the
- * id it was fetched for makes that window invisible instead of wrong: the
- * sliders fall back to the catalog, and the URL write-back falls back to the id
- * it was asked for rather than stamping the previous tensor's into the bar.
- *
- * Paired against `requestedTensorId`, the id it was fetched for, not against
- * `currentArrayId`'s resolved answer -- both sides here are copies of a
- * single string, the `arrayId` prop the viewer was mounted with, rather than
- * two spellings of one identity.
+ * Nothing to pair against the request any more: the target resets it on every
+ * open, and a viewer is only mounted once it is there.
  */
 export function selectTileInfo(s: AppState): TileInfo | null {
-  return s.tileInfoFor === requestedTensorId(s) ? s.tileInfo : null;
+  return s.target.info;
 }
 
 /**
  * The label set to draw over the tensor in view, or null.
  *
- * Scoped by the id itself rather than by a companion `...For` field: a set's
+ * Scoped by the id itself rather than by a per-tensor record: a set's
  * `array_id` names its image, so the question "is this overlay about what is on
  * screen?" is answered by the two ids and nothing has to be kept in step.
  *
@@ -1654,42 +1698,105 @@ export function selectTileInfo(s: AppState): TileInfo | null {
  * (`id@token`) is the same tensor as the id the tree offered sets for.
  */
 export function selectLabelOverlay(s: AppState): string | null {
-  const shown = viewKey(s);
+  const shown = s.target.key;
   if (!shown || !s.labelOverlay) return null;
   const address = splitLabelArrayId(s.labelOverlay);
   if (!address) return null;
   return address.imageArrayId === shown ? s.labelOverlay : null;
 }
 
-/** The levels this tensor's current channel has shown, or null if none yet. */
-export function selectObservedLimits(s: AppState): [number, number] | null {
-  if (s.observedLimitsFor !== viewKey(s)) return null;
-  return s.observedLimits[s.slice.c] ?? null;
+/** A patch widening `key`'s observed union on `channel` to cover `value`, or none. */
+function widenObserved(
+  s: AppState,
+  key: string | null,
+  value: [number, number],
+  channel: number,
+): Partial<AppState> {
+  const prev = key ? s.views[key]?.observedLimits[channel] : undefined;
+  if (prev && prev[0] <= value[0] && prev[1] >= value[1]) return {};
+  const next: [number, number] = prev
+    ? [Math.min(prev[0], value[0]), Math.max(prev[1], value[1])]
+    : [value[0], value[1]];
+  return withView(s, key, (cur) => ({
+    observedLimits: { ...cur.observedLimits, [channel]: next },
+  }));
 }
 
 /**
- * The published contrast track, or null when none belongs to the tensor in view.
+ * The record of the tensor in view, or an empty one while none has resolved.
  *
- * Guarded rather than reset, for the reason `selectObservedLimits` is: a viewer
- * that errored out after publishing leaves its track behind, and
- * `applyViewerState` changes the tensor without passing through `selectSource`
- * at all. A caller treats null as "derive the dtype's own range" -- which is
- * exact for every dtype that has one, and the only honest answer for a float
- * tensor nothing has read yet.
+ * Every per-tensor read goes through here, so nothing compares an id: a tensor
+ * that is not in view simply is not the one this returns.
+ */
+export function selectView(s: AppState): TensorView {
+  return (s.target.key ? s.views[s.target.key] : undefined) ?? EMPTY_VIEW;
+}
+
+/** The levels this tensor's current channel has shown, or null if none yet. */
+export function selectObservedLimits(s: AppState): [number, number] | null {
+  return selectView(s).observedLimits[s.position.c] ?? null;
+}
+
+/**
+ * The sampled min and max grey level of the plane last sampled, or null before
+ * one has been. What the automatic window would be with neither tail trimmed;
+ * in fixed mode the window no longer says anything about the data, so this is
+ * what a fixed window is reset onto.
+ *
+ * Returns a fresh array: read it with `useShallow`.
+ */
+export function selectPlaneLimits(s: AppState): [number, number] | null {
+  const samples = s.runtime.samples;
+  return samples ? contrastLimitsFrom(samples.values, 0, 100) : null;
+}
+
+/**
+ * The track a contrast window is chosen on: the dtype's own range, or on a
+ * float tensor the levels the data has shown. Null until the grid is there --
+ * the panel then falls back to what the catalog says of the dtype.
+ *
+ * Derived, not published (biopb/biopb#955): the viewer's shader and the panel's
+ * bar both call this, so a plane change cannot leave the bar on a track the
+ * shader is not clamping into. Returns a fresh array: read it with `useShallow`.
  */
 export function selectContrastTrack(s: AppState): [number, number] | null {
-  if (s.contrastTrackFor !== viewKey(s)) return null;
-  return s.contrastTrack;
+  const info = s.target.info;
+  if (!info) return null;
+  return contrastTrack(
+    vivDtype(info.dtype),
+    selectObservedLimits(s),
+    selectPlaneLimits(s),
+    s.display.fixedLimits,
+  );
+}
+
+/**
+ * The contrast window the shader uses, and the panel seeds a fixed window from:
+ * the user's fixed levels brought inside the track, or the percentile window of
+ * the plane last sampled -- or the whole track while none has been. Null until
+ * the grid is there. Returns a fresh array: read it with `useShallow`.
+ */
+export function selectContrastWindow(s: AppState): [number, number] | null {
+  const info = s.target.info;
+  const track = selectContrastTrack(s);
+  if (!info || !track) return null;
+  const { contrastMode, fixedLimits, percentileScale } = s.display;
+  // A fixed window is the user's, not the plane's: it is not re-derived per
+  // plane, only brought inside the track it is being applied to.
+  if (contrastMode === "fixed") {
+    return fixedLimits ? clampContrastLimits(fixedLimits, track, vivDtype(info.dtype)) : track;
+  }
+  const samples = s.runtime.samples;
+  if (!samples) return track;
+  const [lo, hi] = percentileBounds(percentileScale);
+  return contrastLimitsFrom(samples.values, lo, hi);
 }
 
 // --- ROI annotations -------------------------------------------------------
 //
 // Every one of these hides state belonging to another tensor rather than
-// relying on someone having reset it. `selectSource` is not the only way the
-// tensor in view changes -- `applyViewerState` does it too, straight from a URL
-// -- so a reset would have to be written at every such site and kept in step
-// with the next one. Answering the question at the read instead makes that
-// impossible to get wrong, which is the same reason `tileInfo` is left alone.
+// relying on someone having reset it: an async writer can land after the tensor
+// changed, and a reset cannot catch that.
 //
 // Stable empty constants: a selector returning a fresh [] on every call would
 // re-render its subscriber on every unrelated store write.
@@ -1724,34 +1831,27 @@ const DEFAULT_ROI_SET = "default";
 /** The scope of the unqualified listing: every client-owned set at once. */
 export const CLIENT_OWNED_SCOPE = "";
 
-const NO_ROIS: RoiAnnotation[] = [];
-const NO_SETS: string[] = [];
-const NO_SCOPES: Record<string, RoiScopeState> = {};
-
-/** This tensor's annotations, or none while another tensor's are still held. */
 export function selectRois(s: AppState): RoiAnnotation[] {
-  return s.roisFor === viewKey(s) ? s.rois : NO_ROIS;
+  return selectView(s).rois;
 }
-
-const NO_ROI_SETS: RoiSetInfo[] = [];
 
 /** Every set on the tensor in view, server-owned ones included. */
 export function selectRoiSets(s: AppState): RoiSetInfo[] {
-  return s.roisFor === viewKey(s) ? s.roiSets : NO_ROI_SETS;
+  return selectView(s).roiSets;
 }
 
 /** The scopes landed for the tensor in view, with what each fetch said. */
 export function selectRoiScopes(s: AppState): Record<string, RoiScopeState> {
-  return s.roisFor === viewKey(s) ? s.roiScopes : NO_SCOPES;
+  return selectView(s).roiScopes;
 }
 
 /** The scopes in flight for the tensor in view -- not one looked at earlier. */
 export function selectRoisPending(s: AppState): string[] {
-  return s.roisPendingFor === viewKey(s) ? s.roisPending : NO_SETS;
+  return selectView(s).roisPending;
 }
 
 export function selectRoisError(s: AppState): string | null {
-  return s.roisErrorFor === viewKey(s) ? s.roisError : null;
+  return selectView(s).roisError;
 }
 
 /**
@@ -1803,23 +1903,15 @@ function inScope(roi: RoiAnnotation, scope: string): boolean {
  * exact comparison and let the writes stop shadowing the counts.
  */
 function landRoiScope(
-  s: AppState,
-  arrayId: string,
+  v: TensorView,
   scope: string,
   result: RoiListResult,
-): Partial<AppState> {
-  const same = s.roisFor === arrayId;
-  const kept = same
-    ? s.rois.filter((roi) => !inScope(roi, scope) || isProvisionalRoiId(roi.roiId))
-    : [];
+): Partial<TensorView> {
+  const kept = v.rois.filter((roi) => !inScope(roi, scope) || isProvisionalRoiId(roi.roiId));
   const rois = [...kept, ...result.rois];
-  const scopes: Record<string, RoiScopeState> = same ? { ...s.roiScopes } : {};
+  const scopes: Record<string, RoiScopeState> = { ...v.roiScopes };
   scopes[scope] = { truncated: result.truncated, skipped: result.skipped };
 
-  // A row the decoder skipped is stored but not held, so it counts as held
-  // here; otherwise every sibling landing would refetch a scope with one.
-  // Per scope rather than per set, because the client-owned listing's skips
-  // cannot be attributed to a set.
   const stored = new Map(result.sets.map((set) => [set.setName, set.count]));
   const held = new Map(
     roiSetCounts(rois.filter((roi) => !isProvisionalRoiId(roi.roiId))).map((set) => [
@@ -1841,9 +1933,8 @@ function landRoiScope(
   return {
     rois,
     roiSets: result.sets,
-    roisFor: arrayId,
     roiScopes: scopes,
-    roisPending: s.roisPending.filter((p) => p !== scope),
+    roisPending: v.roisPending.filter((p) => p !== scope),
   };
 }
 
@@ -1853,8 +1944,29 @@ function landRoiScope(
  * Only the indices: contrast, gamma and the percentile window ride `SliceState`
  * too, and none of them invalidate a shape being drawn.
  */
-export function sliceKey(slice: SliceState): string {
+export function sliceKey(slice: PositionState): string {
   return `${slice.t}|${slice.z}|${slice.c}|${JSON.stringify(slice.axes)}`;
+}
+
+/**
+ * A link's own set names while its target is not ready, or the resolved ones.
+ *
+ * For the URL writer. The scoped selectors answer null both for "the tensor's
+ * default" and for "no tensor resolved yet", and the writer reads null as
+ * "drop the param" -- so a link whose `tile_info` is slow or failed would have
+ * its `rs=` rewritten away, and a reload could no longer retry it. Until the
+ * target is ready, a linked open still says what the link named (`[]` being an
+ * explicit "none", null "no value").
+ */
+export function selectUrlVisibleSets(s: AppState): string[] | null {
+  const { target } = s;
+  return target.linked && target.status !== "ready" ? target.seedSets : selectVisibleSets(s);
+}
+
+/** A link's own label overlay while its target is not ready. See {@link selectUrlVisibleSets}. */
+export function selectUrlLabelOverlay(s: AppState): string | null {
+  const { target } = s;
+  return target.linked && target.status !== "ready" ? s.labelOverlay : selectLabelOverlay(s);
 }
 
 /**
@@ -1862,7 +1974,7 @@ export function sliceKey(slice: SliceState): string {
  * carry across tensors.
  */
 export function selectVisibleSets(s: AppState): string[] | null {
-  return s.visibleSetsFor === viewKey(s) ? s.visibleSets : null;
+  return selectView(s).visibleSets;
 }
 
 /**
@@ -1879,13 +1991,14 @@ export function selectDraft(s: AppState): RoiDraft | null {
   // clutter while drawing, hide the noisy set instead; that is what the per-set
   // toggles are for.
   if (!s.showRois) return null;
-  if (s.draftFor !== viewKey(s) || s.render3d) return null;
+  if (s.render3d) return null;
+  const draft = selectView(s).draft;
   // Vertices were traced against the pixels of one plane. Navigating away --
   // the slider, a keyboard scroll, or play stepping an axis -- makes them a
   // shape drawn on an image nobody is looking at any more, and finishing there
   // would pin it to the plane it was NOT drawn on. Answered at the read, so
   // every route that moves the slice is covered without naming any of them.
-  return s.draftSliceKey === sliceKey(s.slice) ? s.draft : null;
+  return draft && draft.sliceKey === sliceKey(s.position) ? draft.shape : null;
 }
 
 /**
@@ -1917,7 +2030,5 @@ export function selectSelectedRoiId(s: AppState): string | null {
  * `defaultBroadcastAxes`), because the store does not read `TileInfo`.
  */
 export function selectBroadcastAxes(s: AppState, defaults: number[]): number[] {
-  return s.broadcastAxesFor === viewKey(s) && s.broadcastAxes !== null
-    ? s.broadcastAxes
-    : defaults;
+  return selectView(s).broadcastAxes ?? defaults;
 }

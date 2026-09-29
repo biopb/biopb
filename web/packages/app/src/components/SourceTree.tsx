@@ -1,7 +1,7 @@
 "use client";
 
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useAppStore, viewKey } from "../store";
+import { useAppStore } from "../store";
 import type { DataSourceDescriptor } from "@biopb/tensor-flight-client";
 import { readRecents, subscribeRecents } from "../utils/recentSources";
 import { WarmTray } from "./WarmTray";
@@ -485,11 +485,17 @@ export function SourceTree() {
   const sourcesLoading = useAppStore((s) => s.sourcesLoading);
   const scanning = useAppStore((s) => s.scanning);
   const activeSourceId = useAppStore((s) => s.activeSourceId);
-  // Which tensor row to mark, in the catalog's own spelling: `viewKey` is the
-  // resolved, token-free key the tensor-scoped state is held under, and no row
-  // carries a token.
-  const activeTensorId = useAppStore(viewKey);
-  const selectSource = useAppStore((s) => s.selectSource);
+  // Which tensor row to mark, in the catalog's own spelling: the target's
+  // resolved, token-free key, and no row carries a token. Until it resolves,
+  // the address that was asked for.
+  const activeTensorId = useAppStore((s) => s.target.key ?? s.activeTensorId);
+  const openTensor = useAppStore((s) => s.openTensor);
+  // A source row opens the bare source, which the server resolves to its
+  // default tensor.
+  const selectSource = useCallback(
+    (sourceId: string, tensorId?: string) => openTensor(tensorId ?? sourceId),
+    [openTensor],
+  );
   const querySources = useAppStore((s) => s.querySources);
   const recentIds = useAppStore((s) => s.recentIds);
   const recentSources = useAppStore((s) => s.recentSources);
