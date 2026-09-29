@@ -1,8 +1,9 @@
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useMemo } from "react";
 import { labelSelection, type TileInfo } from "@biopb/tensor-flight-client";
 import { selectLabelOverlay, useAppStore } from "../store";
 import { buildLabelLayers } from "../utils/labelLayers";
 import { useLabelOverlay } from "./useLabelOverlay";
+import { useLoadedPlane } from "./useLoadedPlane";
 
 /**
  * The label set drawn over the image, and whether it holds the plane on screen.
@@ -56,21 +57,7 @@ export function useLabelOverlayLayers(
   // image produce identical selections, so the one switched off a moment ago
   // would otherwise have its landing counted as this one's.
   const planeKey = (key: string) => (overlay && key ? `${overlay.arrayId}|${key}` : "");
-  const [loadedKey, setLoadedKey] = useState<string | null>(null);
-  // Read through a ref: the callback's identity has to stay stable or every
-  // rebuild would look like a prop change.
-  const requestedRef = useRef("");
-  requestedRef.current = planeKey(selectionKey);
-  const onViewportLoad = useCallback((loaded?: unknown) => {
-    // A *failed* tile counts as loaded to deck.gl, so a viewport whose reads all
-    // errored reports itself complete -- the same check the image's own
-    // `onViewportLoad` makes, and for the same reason: taking it at face value
-    // would show a mask that is not there.
-    if (Array.isArray(loaded)) {
-      if (loaded.some((tile: { content?: unknown } | null) => tile?.content == null)) return;
-    }
-    setLoadedKey(requestedRef.current);
-  }, []);
+  const { loaded: loadedKey, onViewportLoad } = useLoadedPlane(planeKey(selectionKey));
   // A key from a set that is no longer the overlay can never match, so switching
   // sets hides the old one without a reset to remember.
   const showing = loadedKey !== null && loadedKey === planeKey(shownKey);
