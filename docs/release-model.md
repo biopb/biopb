@@ -184,6 +184,19 @@ came from, not "whatever is newest at run time"; re-fetching is how you move
 forward. A **raw / git-checkout** copy has an empty pin and tracks the **latest
 stable** release (prereleases skipped).
 
+**`biopb.org/install.sh` and `install.ps1` are not the installers but
+bootstraps** (`install/bootstrap.sh`, `install/bootstrap.ps1`, uploaded by hand to
+`/var/www/biopb.org/install/` when they change, which is rare; no workflow
+publishes them). Each checks for `curl`/`tar` (`tar` on Windows), picks the release the way the installer does
+(`BIOPB_INSTALL_VERSION`, `BIOPB_INSTALL_RC`, else the latest stable), downloads
+that release's pinned `install.sh` / `install.ps1` asset and runs it with the
+caller's arguments and environment (the Windows one, in memory, so a Restricted
+ExecutionPolicy does not block it). It carries no release logic, so it does not change per release
+and never pairs an installer with a release it was not written for (an older
+`BIOPB_INSTALL_VERSION` used to run the newest `install.ps1` over that release's
+engine); `INSTALL_SCHEMA` now only guards a raw or checked-out installer. It does not verify the asset: `SHA256SUMS` does
+not cover the install scripts, which are stamped after it is written.
+
 `install.ps1` is a thin bootstrapper that loads the install *engine*
 (`biopb-engine.ps1`) and drives it. When it is pinned (or `BIOPB_INSTALL_VERSION`
 is set) it fetches the engine **from that release's GitHub assets** — a versioned
@@ -208,7 +221,7 @@ single source of truth.
 | Tag | Workflow | Publishes |
 |---|---|---|
 | `v*` | `python-ci`, `java-ci`, `image-runtime-ci` | PyPI (`biopb` + `biopb-image-base`) + Maven Central (`biopb` Java) — **and**, for a stable tag only, Docker `biopb-image-base:A` + `:latest` |
-| `release-v*` | `release.yaml`, `tensor-server-ci` | GitHub release (wheel set + sdist + webapp + samples + installers) — **and**, for a stable tag only, Docker `biopb-tensor-server:R` + `:latest` and the canonical `biopb.org/{install.sh,install.ps1,biopb-engine.ps1}` |
+| `release-v*` | `release.yaml`, `tensor-server-ci` | GitHub release (wheel set + sdist + webapp + samples + installers) — **and**, for a stable tag only, Docker `biopb-tensor-server:R` + `:latest` |
 
 The canonical install scripts are published by a **step inside `release.yaml`**,
 after the GitHub release is created (formerly a standalone push-to-main
