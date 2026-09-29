@@ -10,7 +10,12 @@ refactor this audit motivates, [_viewer-refactor-proposal.md](_viewer-refactor-p
 
 | File | Lines | Role |
 |------|------:|------|
-| `store.ts` | 2010 | One zustand store: connection, catalog, recents, jobs, *and* the view target, viewer state, ROI actions, selectors |
+| `store/index.ts` | 30 | Composes the slices below into `useAppStore`; re-exports every slice's actions, types and selectors, so `from "../store"` is the one import |
+| `store/target.ts` | 440 | The view target, `openTensor`/`retryTarget`/`resolveTarget`, position, display, view mode, cameras |
+| `store/tensorView.ts`, `views.ts`, `roi.ts` | 130, 430, 260 | The per-tensor record and its LRU; ROI and label-overlay actions; ROI selectors and the scope-landing reducer |
+| `store/runtime.ts` | 170 | What only a mounted viewer observes, and the derived contrast selectors |
+| `store/slice.ts` | 105 | `PositionState`/`DisplayState`, `moved`, `sliceKey` |
+| `store/connection.ts`, `recents.ts`, `jobs.ts`, `preferences.ts` | 170, 110, 200, 100 | Client and catalog poll; recents; resolve/warm jobs; preferences and channel colours |
 | `components/TileViewer.tsx` | 190 | 2-D viewer: composes the hooks below and renders |
 | `components/VivStage.tsx` | 230 | The deck.gl half: view state, layers, camera mirror |
 | `components/SliceControls.tsx` | 700 | Axis sliders, 2-D/3-D toggle, contrast/gamma/colour |
@@ -29,7 +34,7 @@ refactor this audit motivates, [_viewer-refactor-proposal.md](_viewer-refactor-p
 | `hooks/useViewerUrlSync.ts` | 100 | URL ⇄ store |
 | `utils/vivUtils.ts`, `roiLayers.ts`, `labelLayers.ts`, `viewerUrl.ts`, `roiDraft.ts`, `roiHitTest.ts`, `sliceUi.ts`, `volumeUtils.ts` | ~2000 | Pure helpers (well tested) |
 
-The pure helpers are in good shape. The complexity is in `store.ts`,
+The pure helpers are in good shape. The complexity was in `store.ts`,
 `TileViewer.tsx` and `SliceControls.tsx`, and in how those three talk to each other.
 
 ## Component tree

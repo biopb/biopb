@@ -216,7 +216,7 @@ Steps 1–2 are the keystone. 3–5 are independent afterwards.
 | 2 (**done**) | `views: Record<TensorKey, TensorView>` + `selectView` (the existing named selectors read through it; a `useView(pick)` hook would trip the lint rule against computed selector args) | 9 `…For` fields (`contrastTrackFor` stays for step 3), `stillPending` checks, most of the lint list |
 | 3 (**done**; `runtime` holds `epoch`, `planeReady` and the plane's `samples`, with `planeLimits` derived from them; `shownSelection` waits for step 4's plane gate) | Derived contrast selectors + `runtime` slice; split `SliceState` | `contrastTrack`, `appliedLimits`, content-compare setters, JSON selection keys |
 | 4 (**done**; `VivStage` and `HoverReadout` are their own files, and the label overlay's keys stay JSON strings) | TileViewer hooks, shared hooks with VolumeViewer, `usePlayback`; one debounce per slider | TileViewer to ~400 lines; the debounce bug |
-| 5 | Store slice files | `store.ts` to about 6 × 300 lines |
+| 5 (**done**; `store/` holds one file per lifetime plus `tensorView.ts` and `roi.ts`, split out of `views.ts`; `store/index.ts` re-exports them all) | Store slice files | `store.ts` to about 6 × 300 lines |
 
 **On #1163:** step 0 covers its store-level fix, and step 1 supersedes its
 viewer-key machinery (`advanceViewerKey`/`sameStableAddress`), which would

@@ -13,7 +13,7 @@
 // which can be evicted or lost to a server restart -- so a descriptor
 // snapshotted here would render a row that cannot be opened. Re-reading each id
 // from the server is what keeps the list honest, and the re-read doubles as the
-// liveness check: see `hydrateRecents` in store.ts.
+// liveness check: see `hydrateRecents` in store/recents.ts.
 //
 // The list algebra below is pure and tested. The three functions that touch
 // `localStorage` are thin and untested, for the reason sessionFetch's are: this

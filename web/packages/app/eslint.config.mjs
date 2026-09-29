@@ -43,7 +43,7 @@ export default tseslint.config(
             "|",
           )})$/]`,
           message:
-            "This store field is only correct through its selector (selectRois, selectDraft, selectView, ...): the raw field is not scoped to the tensor in view. See src/store.ts.",
+            "This store field is only correct through its selector (selectRois, selectDraft, selectView, ...): the raw field is not scoped to the tensor in view. See src/store/.",
         },
         {
           // zustand v5 reads the snapshot on every render and compares by
