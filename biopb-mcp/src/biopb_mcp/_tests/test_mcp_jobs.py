@@ -531,13 +531,16 @@ class TestNapariJobs:
         assert "## Jobs" in status
         assert "running" in status
 
-    def test_restart_keeps_the_record_and_ends_it(self, napari_kernel):
+    def test_restart_clears_the_records_and_numbers_again(self, napari_kernel):
         job_id = napari_kernel.jobs.new_id()
         napari_kernel.run_cell("import time; time.sleep(30)", job_id, "mcp")
         deadline = time.monotonic() + 10.0
         while napari_kernel.jobs.stop_key(job_id) is None:
             assert time.monotonic() < deadline
             time.sleep(0.05)
+        epoch = napari_kernel.jobs.epoch
         napari_kernel.restart()  # respawns + re-bootstraps
-        # The host's record outlives the kernel.
-        assert napari_kernel.jobs.poll(job_id)["status"] == "kernel_lost"
+        # The records went with the namespace they described.
+        assert napari_kernel.jobs.epoch == epoch + 1
+        assert napari_kernel.jobs.poll(job_id)["status"] == "unknown"
+        assert napari_kernel.jobs.new_id() == "job-1"

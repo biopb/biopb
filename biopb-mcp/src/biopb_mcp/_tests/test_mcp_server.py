@@ -1945,3 +1945,40 @@ class TestPollJobWaits:
         desc = tool.parameters["properties"]["wait"]["description"]
         assert "ceiling" in desc and "0" in desc
         assert "do not poll it in a loop" in tool.description
+
+
+class TestAwaitAcrossARestart:
+    def test_a_wait_learns_its_job_was_lost_not_another_kernels(self):
+        """A restart empties the records and numbers again from job-1, so the id
+        a caller waits on can name a different kernel's job: it is told the job
+        is lost instead of reading that one."""
+        import asyncio
+        import types
+
+        from biopb_mcp.mcp._job_log import JobLog
+
+        log = JobLog()
+        host = types.SimpleNamespace(jobs=log)
+        log.on_iopub(_start_event("job-1"))
+
+        async def go():
+            waiter = asyncio.ensure_future(
+                _server._await_job(host, "job-1", budget=10.0)
+            )
+            await asyncio.sleep(0.3)
+            log.kernel_gone()
+            log.reset()
+            log.on_iopub(_start_event("job-1", request="req-2"))  # the new kernel's
+            return await asyncio.wait_for(waiter, timeout=3.0)
+
+        snap = asyncio.run(go())
+        assert snap["status"] == "kernel_lost"
+        assert snap["job_id"] == "job-1"
+
+
+def _start_event(job_id, request="req-1"):
+    from biopb_mcp._tests.test_mcp_job_log import _event
+
+    return _event(
+        event="start", job_id=job_id, request=request, origin="mcp", code="x = 1"
+    )

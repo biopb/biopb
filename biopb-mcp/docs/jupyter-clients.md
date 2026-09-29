@@ -72,9 +72,12 @@ seized by a second agent.
 ## Records
 
 The job records live in the host (`mcp/_job_log.py`), built from the protocol.
-The host names every job — `job-N`, one counter for the host's life, so ids
-never repeat across restarts — and every `stream`, `execute_result` and `error`
-under a job's request is that job's.
+The host names every job — `job-N`, counted per kernel — and every `stream`,
+`execute_result` and `error` under a job's request is that job's. A restart
+empties the records and numbers from `job-1` again, as a notebook's execution
+count starts over: they describe a namespace that is gone. A caller waiting on a
+job across the restart is told it was lost (`JobLog.epoch` changed), not left to
+read another kernel's `job-N`.
 
 - **A cell** starts at its `execute_input` (a foreign cell), or when the host
   sends it (the agent's, `JobLog.start_cell`) — but only *begins* at its own
@@ -95,8 +98,8 @@ never ends a task.
 
 Every read — `poll_job`, the observe list and detail, the notebook export, the
 foreign-activity digest — is a read of the host's memory, never a kernel round
-trip. Records outlive a kernel restart; one still running when its kernel goes
-ends as interrupted. `display_data` is not recorded: a record says what ran and
+trip. A job still running when its kernel goes ends as `kernel_lost`.
+`display_data` is not recorded: a record says what ran and
 how it ended, not what it drew.
 
 A verification runs the same way in a scratch kernel: each cell its own request,

@@ -1,7 +1,8 @@
 """The job records, kept in the host from what the kernel publishes.
 
-Runs **in the MCP server process**, owned by ``KernelHost`` for its lifetime,
-so the records outlive any one kernel, and it names every job (``job-N``).
+Runs **in the MCP server process**, owned by ``KernelHost``, and names every
+job (``job-N``). A kernel's records and numbering end with it: each launch
+starts an empty log, as a restarted notebook's execution count starts over.
 Built from iopub alone (``_kernel_io.KernelChannels`` hands every message
 here); every ``stream`` / ``execute_result`` / ``error`` under a job's request
 is the job's. Reading a record is a read of this process's memory, never a
@@ -284,9 +285,13 @@ class JobLog:
         # request msg_id -> the running cell under it, which its idle ends
         self._cells = {}
         self._lock = threading.Lock()
-        # The last job number issued (_next_id): one counter for the host's
-        # life, so ids never repeat across kernel restarts.
+        # The last job number issued (_next_id). Restarts with the kernel, as a
+        # notebook's execution count does (reset).
         self._seq = 0
+        # Which kernel's records these are, counted per reset. A caller that
+        # waits on a job across a restart reads it to tell its job is gone,
+        # since the id may by then name another kernel's job.
+        self.epoch = 0
         # The host's client session: its requests are the host's own snippets,
         # never a cell to record. Set per kernel (KernelHost._launch).
         self.host_session = host_session
@@ -479,6 +484,21 @@ class JobLog:
                     event.get("elapsed"),
                 )
                 self._detach(rec)
+
+    def reset(self):
+        """Forget every record and restart the numbering: a new kernel begins.
+
+        The records describe a namespace that no longer exists, so they go with
+        it, and ids start again at ``job-1`` as a notebook's execution count
+        does. Call after :meth:`kernel_gone` and before the new kernel can
+        publish anything.
+        """
+        with self._lock:
+            self._records.clear()
+            self._by_request.clear()
+            self._cells.clear()
+            self._seq = 0
+            self.epoch += 1
 
     def kernel_gone(self, why=""):
         """End every running record: its kernel is going away."""

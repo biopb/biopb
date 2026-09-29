@@ -216,6 +216,10 @@ export default function ObservePage() {
   expandedRef.current = expanded;
   const detailsRef = useRef(details);
   detailsRef.current = details;
+  // The kernel's epoch at the last poll. It changes when the kernel restarts,
+  // whoever restarted it, and job ids start over: rows and cached details keyed
+  // by id would then describe other jobs.
+  const epochRef = useRef<number | null>(null);
 
   const fetchDetail = useCallback(
     async (id: string) => {
@@ -245,11 +249,23 @@ export default function ObservePage() {
     // a good job list with the empty one an error body parses as.
     if (sessionVerdict(r.status) !== "live") return;
     const data: {
+      epoch?: number;
       jobs?: JobSummary[];
       verify_jobs?: JobSummary[];
       workflow?: WorkflowSummary | null;
     } = await r.json().catch(() => ({}));
     setWorkflow(data.workflow ?? null);
+    if (typeof data.epoch === "number") {
+      if (epochRef.current !== null && data.epoch !== epochRef.current) {
+        detailsRef.current = {};
+        expandedRef.current = new Set();
+        setDetails({});
+        setExpanded(new Set());
+        seen.current.session = null;
+        lastNewest.current.session = null;
+      }
+      epochRef.current = data.epoch;
+    }
     const list = data.jobs || [];
     // Absent on an older child, which is not the same as "none ran": an empty
     // list is the honest render either way, and the pane says so itself.

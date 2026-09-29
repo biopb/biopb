@@ -83,6 +83,14 @@ class TestKernelControl:
         assert not t.is_alive()
         assert results["res"]["status"] in ("error", "ok")
 
+    def test_restart_starts_the_job_records_over(self, kernel):
+        first = kernel.jobs.new_id()
+        assert first == "job-1"
+        kernel.execute("x = 1")
+        kernel.restart()
+        assert kernel.jobs.poll(first)["status"] == "unknown"
+        assert kernel.jobs.new_id() == "job-1"
+
     def test_restart_clears_namespace(self, kernel):
         kernel.execute("survivor = 1")
         assert "1" in kernel.execute("print(survivor)")["stdout"]
@@ -1532,14 +1540,15 @@ class TestHostRecords:
         assert _wait_until(lambda: host.jobs.poll(jid)["status"] == "error", timeout=5)
         assert "ZeroDivisionError" in host.jobs.poll(jid)["error_text"]
 
-    def test_records_survive_a_restart_and_ids_continue(self, host):
+    def test_a_restart_ends_the_running_job_then_clears_the_records(self, host):
         done = _submit(host, "print('kept')")
         assert _wait_until(lambda: host.jobs.poll(done)["status"] == "ok", timeout=5)
         running = _submit(host, "import time\ntime.sleep(30)")
+        epoch = host.jobs.epoch
         host.restart()
-        assert host.jobs.poll(done)["stdout"] == "kept\n"
-        snap = host.jobs.poll(running)
-        assert snap["status"] == "kernel_lost"
-        assert "kernel stopped" in snap["error_text"]
-        after = _submit(host, "1")
-        assert int(after.split("-")[1]) > int(running.split("-")[1])
+        # They described a namespace that is gone, so they go with it, and the
+        # numbering starts over as a notebook's execution count does.
+        assert host.jobs.epoch == epoch + 1
+        assert host.jobs.poll(done)["status"] == "unknown"
+        assert host.jobs.poll(running)["status"] == "unknown"
+        assert _submit(host, "1") == "job-1"

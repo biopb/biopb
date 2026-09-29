@@ -38,6 +38,7 @@ from pydantic import AnyUrl, Field
 from . import (
     _app,
     _docs,
+    _job_log,
     _kernel_rpc,
     _scratch,
     _workflow_doc,
@@ -382,9 +383,18 @@ async def _await_job(host, job_id, budget=None, submitted=False):
     """
     look = _poll_submitted if submitted else (lambda h, j: h.jobs.poll(j))
     deadline = time.monotonic() + (_app._promote_after if budget is None else budget)
+    epoch = host.jobs.epoch
     snap = look(host, job_id)
     while snap.get("status") == "running" and time.monotonic() < deadline:
         await asyncio.sleep(0.2)
+        # A restart empties the records, and the id may already name another
+        # kernel's job: the one waited on is gone with the namespace it ran in.
+        if host.jobs.epoch != epoch:
+            return {
+                "job_id": job_id,
+                "status": "kernel_lost",
+                "error_text": _job_log._KERNEL_GONE + ".",
+            }
         snap = look(host, job_id)
     return snap
 
@@ -1001,8 +1011,8 @@ async def poll_job(
     Returns the job's status (running/ok/error/interrupted/kernel_lost),
     elapsed time, and output so far (full output once terminal). `kernel_lost`:
     the kernel restarted or died under the job, and its variables are gone.
-    Records outlive restarts and ids are never reused (older terminal jobs are
-    eventually evicted), so a job from before a restart can still be polled.
+    A restart also clears every record and numbers jobs from `job-1` again, so
+    an id from before it is gone or names a new job.
 
     **This call already waits, so do not poll it in a loop.** A running job is
     watched here for up to `wait` seconds and answered the instant it ends;

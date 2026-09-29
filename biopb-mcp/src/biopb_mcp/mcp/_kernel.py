@@ -196,7 +196,7 @@ class KernelHost:
         self._km = None
         self._io = None  # KernelChannels, one per launched kernel
         # The job records, built from what each kernel publishes on iopub. One
-        # per host rather than per kernel, so they outlive a restart.
+        # log per host, emptied at each launch (JobLog.reset).
         self.jobs = JobLog()
         # Set once per _launch(), alongside self._km: the connection file (and
         # so the attach command) is fixed for the kernel's lifetime, and
@@ -392,6 +392,9 @@ class KernelHost:
         env = dict(env)
         env[ENV_HOST_SESSION] = self._km.session.session
         self.jobs.host_session = self._km.session.session
+        # Before the kernel exists to publish: nothing new can be lost. The old
+        # kernel's records already ended (kernel_gone) when it was torn down.
+        self.jobs.reset()
         self.generation += 1
         try:
             try:

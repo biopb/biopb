@@ -299,7 +299,7 @@ class TestLostAndGone:
         snap = log.poll("job-1")
         assert snap["status"] == "kernel_lost"
         assert "the user closed the window" in snap["error_text"]
-        # Kept: the record outlives its kernel.
+        # Kept until the next kernel begins (reset).
         assert snap["stdout"] == "partial\n"
 
     def test_a_late_end_does_not_reopen_a_record(self):
@@ -309,11 +309,40 @@ class TestLostAndGone:
         _end(log, status="ok")
         assert log.poll("job-1")["status"] == "kernel_lost"
 
-    def test_ids_are_the_hosts_and_never_repeat(self):
+    def test_ids_count_within_a_kernel(self):
         log = JobLog(host_session="host")
         assert log.new_id() == "job-1"
         _input(log, "x = 1", request="c1")
         assert log.new_id() == "job-3"
+
+
+class TestReset:
+    def test_a_new_kernel_starts_an_empty_log_numbered_from_one(self):
+        log = JobLog()
+        _start(log)
+        _end(log)
+        log.new_id()
+        before = log.epoch
+        log.reset()
+        assert log.poll("job-1")["status"] == "unknown"
+        assert log.summary() == []
+        assert log.new_id() == "job-1"
+        assert log.epoch == before + 1
+
+    def test_a_late_event_of_the_old_kernel_starts_no_record(self):
+        log = JobLog()
+        _start(log)
+        log.kernel_gone()
+        log.reset()
+        _end(log, status="ok")
+        assert log.summary() == []
+
+    def test_the_foreign_digest_is_empty_after_a_reset(self):
+        log = JobLog()
+        _start(log, job_id="job-1", request="r1", origin="user")
+        _end(log, job_id="job-1")
+        log.reset()
+        assert log.foreign_digest("mcp") == []
 
 
 class TestDigest:
