@@ -129,3 +129,26 @@ def test_relays_to_the_session_and_shutdown_only_detaches(proxy):
         assert host.execute("print(x)")["stdout"].strip() == "42"
     finally:
         host.shutdown()
+
+
+def test_a_session_restart_does_not_strand_the_proxy(proxy):
+    """The restarted kernel keeps its connection file, key and ports, so the
+    proxy's sockets reconnect and the notebook goes on without being restarted."""
+    _, kc = proxy
+    host = KernelHost(health_probe_code=None, startup_timeout=60.0)
+    host.start()
+    try:
+        path = host.connection_file
+        kc.wait_for_ready(timeout=30)
+        content, _ = _run(kc, "x = 1")
+        assert content["status"] == "ok"
+        host.restart()
+        assert host.connection_file == path
+        content, msgs = _run(kc, "print('after', 6 * 7)")
+        assert content["status"] == "ok"
+        assert any("after 42" in m["content"].get("text", "") for m in msgs)
+        # The namespace is the new kernel's: the restart cleared it.
+        content, _ = _run(kc, "x")
+        assert content["status"] == "error"
+    finally:
+        host.shutdown()

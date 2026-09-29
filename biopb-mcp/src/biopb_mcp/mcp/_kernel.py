@@ -203,6 +203,12 @@ class KernelHost:
         # health() is polled every few seconds, so it's cached rather than
         # rebuilt on each call.
         self._attach_command = None
+        # (path, info) of the connection file of the kernel last launched: a
+        # restart reuses both, as Jupyter's own does, so a client attached by
+        # file (qtconsole, a notebook through the session proxy) follows the
+        # restart instead of being left on a file that is gone. Dropped when a
+        # launch fails, so the retry picks fresh ports, and at shutdown.
+        self._connection = None
         self._lock = threading.RLock()
         # Set once the kernel has launched AND its bootstrap health probe has
         # passed. The kernel is started on demand (start_kernel -> ensure_started)
@@ -382,10 +388,12 @@ class KernelHost:
         if pass_fds:
             popen_kwargs["pass_fds"] = tuple(pass_fds)
 
-        self._km = KernelManager(
-            kernel_name=self._kernel_name,
-            connection_file=_runtime_connection_file(),
-        )
+        path, info = self._connection or (_runtime_connection_file(), None)
+        self._km = KernelManager(kernel_name=self._kernel_name, connection_file=path)
+        if info is not None:
+            self._km.load_connection_info(info)
+            # The provisioner would otherwise replace these with ports of its own.
+            self._km.cache_ports = False
         self._attach_command = attach_command(self._km.connection_file)
         # The client made below shares this session id, so the kernel knows
         # its host before anything can connect.
@@ -417,12 +425,17 @@ class KernelHost:
                             os.close(_fd)
                         except OSError:
                             pass
+            self._connection = (
+                self._km.connection_file,
+                self._km.get_connection_info(),
+            )
             self._pgid = self._capture_pgid()
             self._assign_kernel_to_job()
             self._io = KernelChannels(self._km, on_iopub=self.jobs.on_iopub)
             self._io.start(self._startup_timeout, self._km.is_alive)
             self._start_window_watch()
         except Exception:
+            self._connection = None  # the retry picks fresh ports
             self._shutdown_current()
             raise
 
@@ -800,6 +813,7 @@ class KernelHost:
             if self.is_alive():
                 self._close_session(timeout=2.0)
             self._shutdown_current()
+            self._connection = None
             # Terminal path only (restart() drives _shutdown_current directly and
             # must keep the job): drop the job handle so it doesn't leak and its
             # closure fires kill-on-close as a final backstop (biopb/biopb#403).
