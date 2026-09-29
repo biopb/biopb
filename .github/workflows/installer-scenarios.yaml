@@ -43,7 +43,7 @@ on:
           - installer
           - bootstrap
       version:
-        description: 'bootstrap only: release to install (X.Y.Z or an rc such as 0.15.0rc8); empty is the latest stable'
+        description: 'Release to install (X.Y.Z or an rc such as 0.15.0rc8); empty is the latest stable'
         default: ''
         type: string
 

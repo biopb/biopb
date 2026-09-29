@@ -24,9 +24,9 @@
 #
 # With --bootstrap the install goes through bootstrap.sh, the script biopb.org
 # serves, instead of install.sh: it fetches and runs a RELEASE's installer, so what
-# is tested is that release, not this checkout. Pick it with BIOPB_INSTALL_VERSION
-# or BIOPB_INSTALL_RC in the environment (both are passed into the container);
-# otherwise it is the latest stable one.
+# is tested is that release, not this checkout; otherwise it is the latest stable
+# one. BIOPB_INSTALL_VERSION and BIOPB_INSTALL_RC in the environment pick the
+# release for either installer (both are passed into the container).
 #
 # Mount a ZVI sample for the bioformats scenario:
 #   BIOPB_TEST_DATA=/dir/with/zvi ./run.sh bioformats
@@ -77,16 +77,14 @@ if [ -n "${BIOPB_TEST_DATA:-}" ]; then
     data_mount=(-v "$BIOPB_TEST_DATA:/data:ro")
 fi
 
-# Installing through bootstrap.sh: mount it, name it as the installer, and hand
-# the container the caller's release choice (-e VAR with no value copies it from
-# this shell, and passes nothing if it is unset).
-install_via=()
+# The caller's release choice goes into the container for either installer (-e VAR
+# with no value copies it from this shell, and passes nothing if it is unset).
+# Installing through bootstrap.sh also mounts it and names it as the installer.
+install_via=(-e BIOPB_INSTALL_VERSION -e BIOPB_INSTALL_RC)
 if [ "$BOOTSTRAP" = "1" ]; then
-    install_via=(
+    install_via+=(
         -v "$SCRIPT_DIR/../bootstrap.sh:/bootstrap.sh:ro"
         -e BIOPB_INSTALL_SH=/bootstrap.sh
-        -e BIOPB_INSTALL_VERSION
-        -e BIOPB_INSTALL_RC
     )
 fi
 
