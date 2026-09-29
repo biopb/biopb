@@ -163,7 +163,11 @@ read as idle while a cell still holds the main thread.
 
 The host names the connection file itself — `kernel-biopb-<uuid>.json` in
 `jupyter --runtime-dir`, private to the user — since left to `jupyter_client` it
-is a tempfile no Jupyter tool looks for. `KernelHost.health()` carries
+is a tempfile no Jupyter tool looks for. A restart keeps the
+file, key and ports, as Jupyter's own restart does (`KernelHost._connection`), so
+a client attached by it reconnects by itself; the file is gone only while the
+kernel is down, and a failed launch drops the reuse so the retry picks fresh
+ports. `KernelHost.health()` carries
 `connection_file` and `attach_command`; `server_status` prints both, and the
 observe page offers the command to copy:
 

@@ -83,6 +83,48 @@ class TestKernelControl:
         assert not t.is_alive()
         assert results["res"]["status"] in ("error", "ok")
 
+    def test_restart_keeps_the_connection_file_and_an_attached_client_follows(
+        self, kernel
+    ):
+        import json
+
+        from jupyter_client import BlockingKernelClient
+
+        path = kernel.connection_file
+        with open(path) as f:
+            before = json.load(f)
+        kc = BlockingKernelClient(connection_file=path)
+        kc.load_connection_file()
+        kc.start_channels()
+        try:
+            kc.wait_for_ready(timeout=30)
+            kernel.restart()
+            # The same file, key and ports, as Jupyter's own restart keeps.
+            assert kernel.connection_file == path
+            with open(path) as f:
+                assert json.load(f) == before
+            # A client attached before the restart reconnects by itself.
+            kc.wait_for_ready(timeout=30)
+            reply = kc.execute_interactive("1 + 1", timeout=30)
+            assert reply["content"]["status"] == "ok"
+        finally:
+            kc.stop_channels()
+
+    def test_a_failed_launch_drops_the_ports_the_retry_would_reuse(
+        self, kernel, monkeypatch
+    ):
+        assert kernel._connection is not None
+
+        def boom(self, **kw):
+            raise RuntimeError("address already in use")
+
+        from jupyter_client import KernelManager
+
+        monkeypatch.setattr(KernelManager, "start_kernel", boom)
+        with pytest.raises(RuntimeError):
+            kernel.restart()
+        assert kernel._connection is None
+
     def test_restart_clears_namespace(self, kernel):
         kernel.execute("survivor = 1")
         assert "1" in kernel.execute("print(survivor)")["stdout"]
