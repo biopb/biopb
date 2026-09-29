@@ -294,6 +294,12 @@ class TestTheTwoKernels:
         host.execute.assert_not_called()
 
 
+def test_api_jobs_reports_where_the_kernel_restarted(client, host):
+    host.jobs = ScriptedJobs(restarts=[{"after": 3, "at": 100.0}])
+    body = client.get("/api/jobs").json()
+    assert body["restarts"] == [{"after": 3, "at": 100.0}]
+
+
 def test_api_interrupt_stops_the_rows_job(client, host):
     host.interrupt_job.return_value = {"job_id": "job-1", "interrupted": True}
     r = client.post("/api/kernel/interrupt?job_id=job-1")

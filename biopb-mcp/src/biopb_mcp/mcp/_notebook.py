@@ -280,19 +280,34 @@ _INTRO = (
 )
 
 
+# Where the kernel restarted: the cells below ran in a namespace without what
+# the cells above defined, which a reader running them top to bottom would not
+# otherwise guess.
+_RESTART_NOTE = (
+    "---\n**Kernel restarted** at {ts}. The cells above ran in a namespace "
+    "that is gone; the cells below do not see their variables."
+)
+
+
 def build_notebook(jobs):
     """Build an nbformat-v4 notebook dict from a list of job snapshots.
 
-    *jobs* is the oldest-first list returned by ``JobLog.export()`` (each a
-    job snapshot dict). The result is a plain dict ready to
-    ``json.dumps`` into a ``.ipynb`` file.
+    *jobs* is the oldest-first list returned by ``JobLog.export()``: each a job
+    snapshot dict, or a ``{"restart": True, "at": time}`` marker. The result is
+    a plain dict ready to ``json.dumps`` into a ``.ipynb`` file.
     """
     jobs = jobs or []
-    intro = _INTRO.format(ts=_fmt_ts(_now_epoch()), n=len(jobs))
+    ran = [s for s in jobs if not s.get("restart")]
+    intro = _INTRO.format(ts=_fmt_ts(_now_epoch()), n=len(ran))
 
     cells = [_markdown_cell(_TITLE + "\n" + intro), _code_cell(BOOTSTRAP_SRC)]
-    if jobs:
+    if ran:
         for snap in jobs:
+            if snap.get("restart"):
+                cells.append(
+                    _markdown_cell(_RESTART_NOTE.format(ts=_fmt_ts(snap["at"])))
+                )
+                continue
             note = _intent_cell(snap)
             if note is not None:
                 cells.append(note)

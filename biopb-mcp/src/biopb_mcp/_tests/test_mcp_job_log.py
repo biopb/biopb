@@ -316,6 +316,101 @@ class TestLostAndGone:
         assert log.new_id() == "job-3"
 
 
+class TestRestartMarkers:
+    @staticmethod
+    def _run(log, job_id):
+        """A finished job, admitted to the log as the kernel's announcement does."""
+        _start(log, job_id=job_id, request="r-" + job_id)
+        _end(log, job_id=job_id)
+
+    def test_ids_keep_counting_and_the_marker_says_where(self):
+        log = JobLog()
+        self._run(log, log.new_id())
+        self._run(log, log.new_id())
+        log.mark_restart()
+        assert log.new_id() == "job-3"
+        marks = log.restarts()
+        assert [m["after"] for m in marks] == [2]  # the seq of the last record
+        assert marks[0]["at"] > 0
+
+    def test_the_old_record_stays_pollable(self):
+        log = JobLog()
+        _start(log)
+        log.kernel_gone()
+        log.mark_restart()
+        assert log.poll("job-1")["status"] == "kernel_lost"
+
+    def test_summary_rows_carry_their_seq(self):
+        log = JobLog()
+        self._run(log, "job-1")
+        self._run(log, "task-3fa2c1")
+        assert [r["seq"] for r in log.summary()] == [1, 2]
+
+    def test_export_puts_the_marker_between_the_jobs_around_it(self):
+        log = JobLog()
+        self._run(log, "job-1")
+        log.mark_restart()
+        self._run(log, "job-2")
+        out = log.export()
+        assert [e.get("job_id", "restart") for e in out] == [
+            "job-1",
+            "restart",
+            "job-2",
+        ]
+
+    def test_a_task_is_placed_by_when_it_ran_not_by_its_id(self):
+        # A task's id is random hex, which says nothing of its place.
+        log = JobLog()
+        self._run(log, "job-1")
+        self._run(log, "task-123456")
+        log.mark_restart()
+        self._run(log, "task-3fa2c1")
+        self._run(log, "job-2")
+        out = log.export()
+        assert [e.get("job_id", "restart") for e in out] == [
+            "job-1",
+            "task-123456",
+            "restart",
+            "task-3fa2c1",
+            "job-2",
+        ]
+
+    def test_no_marker_without_a_job_before_it_or_since_the_last(self):
+        # A launch that never produced a kernel, or a crash loop's failed
+        # respawns, would otherwise stack dividers over jobs that never had one.
+        log = JobLog()
+        log.mark_restart()
+        assert log.restarts() == []
+        self._run(log, "job-1")
+        log.mark_restart()
+        log.mark_restart()
+        assert [m["after"] for m in log.restarts()] == [1]
+        self._run(log, "job-2")
+        log.mark_restart()
+        assert [m["after"] for m in log.restarts()] == [1, 2]
+
+    def test_history_is_the_summary_with_the_marker_between(self):
+        log = JobLog()
+        self._run(log, "job-1")
+        log.mark_restart()
+        self._run(log, "task-3fa2c1")
+        rows = log.history()
+        assert [r.get("job_id", "restart") for r in rows] == [
+            "job-1",
+            "restart",
+            "task-3fa2c1",
+        ]
+        assert "status" in rows[0]  # a summary row, not a snapshot
+
+    def test_a_marker_outlives_the_pruning_of_the_jobs_around_it(self):
+        log = JobLog()
+        self._run(log, "job-1")
+        log.mark_restart()
+        del log._records["job-1"]  # aged out
+        assert [m["after"] for m in log.restarts()] == [1]
+        assert [e.get("restart") for e in log.export()] == [True]
+
+
 class TestDigest:
     def test_reports_only_unseen_foreign_jobs(self):
         log = JobLog()

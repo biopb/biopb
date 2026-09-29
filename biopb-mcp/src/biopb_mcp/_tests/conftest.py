@@ -59,6 +59,7 @@ class ScriptedJobs:
         digest=(),
         summary=(),
         export=(),
+        restarts=(),
         running=None,
         running_origin="mcp",
         window=None,
@@ -69,6 +70,7 @@ class ScriptedJobs:
         self._window = window
         self._summary = list(summary)
         self._export = list(export)
+        self._restarts = list(restarts)
         self.polled = 0
         self._digest = list(digest)
         self.acked = []
@@ -109,6 +111,12 @@ class ScriptedJobs:
         return len(job_ids)
 
     def summary(self):
+        return list(self._summary)
+
+    def restarts(self):
+        return list(self._restarts)
+
+    def history(self):
         return list(self._summary)
 
     def export(self):

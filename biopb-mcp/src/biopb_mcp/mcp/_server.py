@@ -1413,8 +1413,13 @@ async def server_status() -> str:
     # From the host's records, so the list survives a kernel that is busy.
     lines.append("")
     lines.append("## Jobs")
-    jobs = host.jobs.summary()
+    jobs = host.jobs.history()
     for j in jobs:
+        if j.get("restart"):
+            lines.append(
+                "  -- kernel restarted: the jobs above ran in a namespace that is gone --"
+            )
+            continue
         lines.append(
             f"  - {j['job_id']}: {j['status']} ({j['elapsed']}s, "
             f"stdout {j['stdout_len']}b)"

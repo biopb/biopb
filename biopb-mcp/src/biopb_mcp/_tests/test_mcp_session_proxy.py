@@ -144,6 +144,10 @@ def test_a_session_restart_does_not_strand_the_proxy(proxy):
         assert content["status"] == "ok"
         host.restart()
         assert host.connection_file == path
+        # Ready, as any client waits: a kernel_info round trip that also needs
+        # the proxy's iopub subscription back, since ZeroMQ drops what a SUB
+        # was not yet connected for.
+        kc.wait_for_ready(timeout=30)
         content, msgs = _run(kc, "print('after', 6 * 7)")
         assert content["status"] == "ok"
         assert any("after 42" in m["content"].get("text", "") for m in msgs)

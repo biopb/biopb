@@ -400,6 +400,8 @@ class KernelHost:
         env = dict(env)
         env[ENV_HOST_SESSION] = self._km.session.session
         self.jobs.host_session = self._km.session.session
+        if self.generation:  # not the first kernel: what ran before is gone
+            self.jobs.mark_restart()
         self.generation += 1
         try:
             try:

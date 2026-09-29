@@ -11,6 +11,7 @@ import ChatPane from "../components/ChatPane";
 import { Modal } from "../components/Modal";
 import { fetchChatStatus, type ChatStatus } from "../utils/chatClient";
 import { arrivals } from "../utils/jobArrivals";
+import { type Restart, withRestarts } from "../utils/jobRestarts";
 import {
   SessionLocked,
   sessionFetch,
@@ -55,6 +56,9 @@ const CHAT_WIDTH_KEY = "biopb.observe.chatWidth";
 
 interface JobSummary {
   job_id: string;
+  /** Its place in the history, which the id does not give (a task's is random).
+   * Absent on a verification row, whose kernel is never restarted. */
+  seq?: number;
   status: string; // running | ok | error | interrupted | kernel_lost
   origin?: string; // mcp | user | chat — which surface submitted the cell
   elapsed: number;
@@ -127,6 +131,7 @@ export default function ObservePage() {
   );
 
   const [jobs, setJobs] = useState<JobSummary[] | null>(null);
+  const [restarts, setRestarts] = useState<Restart[]>([]);
   const [verifyJobs, setVerifyJobs] = useState<JobSummary[]>([]);
   const [pane, setPane] = useState<Pane>("session");
   const [workflow, setWorkflow] = useState<WorkflowSummary | null>(null);
@@ -246,6 +251,7 @@ export default function ObservePage() {
     if (sessionVerdict(r.status) !== "live") return;
     const data: {
       jobs?: JobSummary[];
+      restarts?: Restart[];
       verify_jobs?: JobSummary[];
       workflow?: WorkflowSummary | null;
     } = await r.json().catch(() => ({}));
@@ -255,6 +261,7 @@ export default function ObservePage() {
     // list is the honest render either way, and the pane says so itself.
     const verifyList = data.verify_jobs || [];
     setJobs(list);
+    setRestarts(data.restarts ?? []);
     setVerifyJobs(verifyList);
     // Autocollapse, per list: a new job opens itself and closes its siblings,
     // and leaves the other kernel's open row alone. The panes do not share a
@@ -476,6 +483,8 @@ export default function ObservePage() {
   // `jobs` is null until the first poll lands; the verification list is not,
   // because "none" is its ordinary state and is worth saying at once.
   const rows: JobSummary[] | null = pane === "session" ? jobs : verifyJobs;
+  // The session's only: a verification's kernel is always fresh.
+  const marks = pane === "session" ? restarts : [];
 
   // Ways to attach a client to the session kernel; the child supplies the
   // command for each it can offer.
@@ -671,18 +680,25 @@ export default function ObservePage() {
                   : "nothing verified in this session yet"}
               </div>
             ) : (
-              // newest-first
-              [...rows].reverse().map((j) => (
-                <JobRow
-                  key={j.job_id}
-                  job={j}
-                  open={expanded.has(j.job_id)}
-                  fresh={fresh.has(j.job_id)}
-                  detail={details[j.job_id]}
-                  onToggle={() => toggle(j.job_id)}
-                  onInterrupt={() => interrupt(j.job_id)}
-                />
-              ))
+              // newest-first, with a line where the kernel restarted
+              withRestarts([...rows].reverse(), marks).map((e) =>
+                e.kind === "restart" ? (
+                  <div key={"restart-" + e.after} className="restart-mark">
+                    kernel restarted · {new Date(e.at * 1000).toLocaleTimeString()}
+                    {" "}— jobs below ran in a namespace that is gone
+                  </div>
+                ) : (
+                  <JobRow
+                    key={e.job.job_id}
+                    job={e.job}
+                    open={expanded.has(e.job.job_id)}
+                    fresh={fresh.has(e.job.job_id)}
+                    detail={details[e.job.job_id]}
+                    onToggle={() => toggle(e.job.job_id)}
+                    onInterrupt={() => interrupt(e.job.job_id)}
+                  />
+                ),
+              )
             )}
           </div>
         </div>
@@ -946,6 +962,8 @@ const OBS_CSS = `
      anything louder would be in the way by the third cell. */
   .obs-page .job.enter { animation: obs-row-in .3s ease-out; }
   @keyframes obs-row-in { from { opacity: 0; transform: translateY(-6px); } }
+  .obs-page .restart-mark { text-align: center; font-size: 11px; color: #9a9a9a;
+    border-top: 1px dashed #555; margin: 4px 0 12px; padding-top: 4px; }
   /* The card the kernel is busy with, findable without reading any of them. */
   .obs-page .job.busy { border-color: #2a5; }
   .obs-page .row { display: flex; gap: 10px; align-items: center; padding: 8px 12px; cursor: pointer; }

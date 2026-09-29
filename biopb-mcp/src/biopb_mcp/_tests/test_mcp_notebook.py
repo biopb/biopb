@@ -263,3 +263,17 @@ def test_the_bootstrap_cell_is_valid_python():
     # It is shipped as a string and never imported, so nothing else would catch
     # a syntax error in it until someone opened the notebook.
     compile(_notebook.BOOTSTRAP_SRC, "<bootstrap>", "exec")
+
+
+def test_a_restart_marker_becomes_a_note_between_the_cells():
+    nb = _notebook.build_notebook(
+        [_snap(job_id="job-1"), {"restart": True, "at": 100.0}, _snap(job_id="job-2")]
+    )
+    kinds = [c["cell_type"] for c in nb["cells"]]
+    marker = next(c for c in nb["cells"] if "Kernel restarted" in "".join(c["source"]))
+    assert marker["cell_type"] == "markdown"
+    at = nb["cells"].index(marker)
+    # A code cell for each job, one on each side of the note.
+    assert kinds[at - 1] == "code" and kinds[at + 1] == "code"
+    assert "1 job" not in "".join(nb["cells"][0]["source"])  # counts jobs, not markers
+    assert "2 job(s)" in "".join(nb["cells"][0]["source"])

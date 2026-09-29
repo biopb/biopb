@@ -1,7 +1,8 @@
 """The job records, kept in the host from what the kernel publishes.
 
 Runs **in the MCP server process**, owned by ``KernelHost`` for its lifetime,
-so the records outlive any one kernel, and it names every job (``job-N``).
+so the records outlive any one kernel, and it names every job (``job-N``,
+never reused). A restart leaves a marker between the jobs of the two kernels.
 Built from iopub alone (``_kernel_io.KernelChannels`` hands every message
 here); every ``stream`` / ``execute_result`` / ``error`` under a job's request
 is the job's. Reading a record is a read of this process's memory, never a
@@ -31,6 +32,10 @@ import time
 # into a clean program (``verify_workflow``) reads the transcript, so eviction
 # takes away the source material for the one step nothing can automate.
 _MAX_RETAINED_JOBS = 200
+
+# Restart markers kept, oldest dropped first: one per kernel launch after the
+# first, so a session that restarts this often has bigger problems.
+_MAX_RESTART_MARKS = 100
 
 # Keep at most this many characters of one job's captured output. This is the
 # bound _MAX_RETAINED_JOBS is not: that caps how many records are kept, while a
@@ -93,6 +98,7 @@ class _Record:
         "code",
         "origin",
         "intent",
+        "seq",
         "status",
         "error_text",
         "traceback",
@@ -114,6 +120,7 @@ class _Record:
     )
 
     def __init__(self, event, kind="task"):
+        self.seq = 0  # its place in the history (JobLog._admit)
         self.stdout = io.StringIO()
         # Characters the cap has discarded from the front of `stdout`. Kept so
         # the record can say it is partial and so a reader tracking growth has
@@ -251,6 +258,7 @@ class _Record:
     def summary(self):
         return {
             "job_id": self.job_id,
+            "seq": self.seq,
             "status": self.status,
             "origin": self.origin,
             "elapsed": self.elapsed(),
@@ -287,6 +295,14 @@ class JobLog:
         # The last job number issued (_next_id): one counter for the host's
         # life, so ids never repeat across kernel restarts.
         self._seq = 0
+        # The `seq` of the last record admitted (_admit): each record's place in
+        # the history, whatever its id (a task's is random).
+        self._last_seq = 0
+        # Where each kernel restart falls in that history: ``{"after": N, "at":
+        # wall time}``, N the `seq` of the last record admitted before it. By
+        # number, not by record, so a marker outlives the pruning of the jobs
+        # around it.
+        self._restarts = []
         # The host's client session: its requests are the host's own snippets,
         # never a cell to record. Set per kernel (KernelHost._launch).
         self.host_session = host_session
@@ -413,9 +429,16 @@ class JobLog:
                 )
             )
 
+    def _admit(self, rec):
+        """Put *rec* in the log, in its place in the history. Call with `_lock`
+        held."""
+        self._last_seq += 1
+        rec.seq = self._last_seq
+        self._records[rec.job_id] = rec
+
     def _add_cell(self, rec):
         """Call with `_lock` held."""
-        self._records[rec.job_id] = rec
+        self._admit(rec)
         self._cells[rec.request] = rec
         self._by_request[rec.request] = rec
         self._prune()
@@ -460,7 +483,7 @@ class JobLog:
                 cell = self._cells.get(rec.request)
                 if cell is not None:
                     rec.origin = cell.origin
-                self._records[job_id] = rec
+                self._admit(rec)
                 if rec.request:
                     self._by_request[rec.request] = rec
                 if rec.origin != "user":
@@ -479,6 +502,28 @@ class JobLog:
                     event.get("elapsed"),
                 )
                 self._detach(rec)
+
+    def mark_restart(self):
+        """Note that a new kernel begins here: jobs before it ran in another
+        namespace. Ids keep counting, so the records stay unambiguous.
+
+        A marker says something only between jobs, so one with nothing admitted
+        since the last (or ever) is dropped: a launch that never produced a
+        kernel, or a crash loop's failed respawns, would otherwise stack
+        dividers that claim a namespace is gone above jobs that never had one.
+        """
+        with self._lock:
+            since = self._restarts[-1]["after"] if self._restarts else 0
+            if self._last_seq == since:
+                return
+            self._restarts.append({"after": self._last_seq, "at": time.time()})
+            del self._restarts[:-_MAX_RESTART_MARKS]
+
+    def restarts(self):
+        """The restart markers, oldest first: ``[{"after": seq, "at": time}]``,
+        each after the record with that `seq` and before the next."""
+        with self._lock:
+            return list(self._restarts)
 
     def kernel_gone(self, why=""):
         """End every running record: its kernel is going away."""
@@ -568,10 +613,30 @@ class JobLog:
         with self._lock:
             return [r.summary() for r in self._records.values()]
 
-    def export(self):
-        """Full snapshots of every retained job, for the notebook export."""
+    def history(self):
+        """The observe list's light rows with a ``{"restart": True, "at": time}``
+        entry where each kernel restart fell: what the agent's ``server_status``
+        shows, so it can tell which jobs share the namespace it has now."""
         with self._lock:
-            return [r.snapshot() for r in self._records.values()]
+            return self._interleaved(lambda rec: rec.summary())
+
+    def export(self):
+        """Full snapshots of every retained job, for the notebook export, with a
+        ``{"restart": True, "at": time}`` entry where each kernel restart fell."""
+        with self._lock:
+            return self._interleaved(lambda rec: rec.snapshot())
+
+    def _interleaved(self, render):
+        """The records, oldest first and *render*ed, with the restart markers
+        between them. Call with `_lock` held."""
+        marks = list(self._restarts)
+        out = []
+        for rec in self._records.values():
+            while marks and marks[0]["after"] < rec.seq:
+                out.append({"restart": True, "at": marks.pop(0)["at"]})
+            out.append(render(rec))
+        out.extend({"restart": True, "at": m["at"]} for m in marks)
+        return out
 
     def running(self, prefer=None):
         """A running job's snapshot, or ``None``: one of origin *prefer* if

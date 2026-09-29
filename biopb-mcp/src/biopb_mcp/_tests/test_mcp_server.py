@@ -1218,6 +1218,21 @@ class TestServerStatus:
         assert "System" in result
         assert "not initialized" in result
 
+    def test_the_job_list_shows_where_the_kernel_restarted(self, server_with_host):
+        row = {"elapsed": 0.1, "stdout_len": 0, "status": "ok"}
+        server_with_host.jobs = ScriptedJobs(
+            summary=[
+                {"job_id": "job-1", **row},
+                {"restart": True, "at": 100.0},
+                {"job_id": "job-2", **row},
+            ]
+        )
+        jobs = _tool(_server.server_status).split("## Jobs")[1]
+        lines = [line.strip() for line in jobs.splitlines() if line.strip()]
+        assert lines[0].startswith("- job-1")
+        assert "kernel restarted" in lines[1]
+        assert lines[2].startswith("- job-2")
+
     def test_reports_system_info(self, server_with_host):
         result = _tool(_server.server_status)
         assert "cpu_usage" in result
