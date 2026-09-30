@@ -125,6 +125,76 @@ class TestKernelControl:
             kernel.restart()
         assert kernel._connection is None
 
+    @staticmethod
+    def _hold_port_after_kill(kernel, monkeypatch, release_after):
+        """Make the old kernel's control port still taken when the restart
+        rebinds it: a socket of ours grabs it as the kernel is killed, and lets
+        go `release_after` seconds later (never, when None)."""
+        import socket
+
+        port = kernel._connection[1]["control_port"]
+        held = socket.socket()
+        # As ZeroMQ binds, so the killed kernel's TIME-WAIT does not stop it.
+        held.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        shutdown = kernel._shutdown_current
+
+        def shutdown_then_hold():
+            shutdown()
+            if held.fileno() < 0 or held.getsockname()[1]:  # already holding
+                return
+            held.bind(("127.0.0.1", port))
+            held.listen()
+            if release_after is not None:
+                threading.Timer(release_after, held.close).start()
+
+        monkeypatch.setattr(kernel, "_shutdown_current", shutdown_then_hold)
+        monkeypatch.setattr(_kernel, "_LAUNCH_RETRY_DELAYS", (0.4, 0.4))
+        return held
+
+    def test_a_restart_that_finds_its_port_taken_retries_on_the_same_ones(
+        self, kernel, monkeypatch
+    ):
+        before = kernel._connection
+        self._hold_port_after_kill(kernel, monkeypatch, release_after=0.6)
+        kernel.restart()
+        assert kernel.connection_file == before[0]
+        assert kernel._connection[1] == before[1]
+        assert kernel.execute("print(6 * 7)")["stdout"].strip() == "42"
+
+    def test_a_restart_that_never_gets_its_ports_back_takes_new_ones(
+        self, kernel, monkeypatch
+    ):
+        before = kernel._connection
+        held = self._hold_port_after_kill(kernel, monkeypatch, release_after=None)
+        try:
+            kernel.restart()
+        finally:
+            held.close()
+        assert kernel._connection[1]["control_port"] != before[1]["control_port"]
+        assert kernel.execute("print(6 * 7)")["stdout"].strip() == "42"
+
+    def test_a_first_start_that_loses_a_port_race_picks_new_ones(self, monkeypatch):
+        from biopb_mcp.mcp import _kernel_io
+
+        real = _kernel_io.KernelChannels.start
+        calls = []
+
+        def die_once(self, timeout, is_alive):
+            calls.append(1)
+            if len(calls) == 1:
+                raise _kernel_io.KernelDied("Kernel died before replying")
+            return real(self, timeout, is_alive)
+
+        monkeypatch.setattr(_kernel_io.KernelChannels, "start", die_once)
+        monkeypatch.setattr(_kernel, "_LAUNCH_RETRY_DELAYS", (0.1,))
+        host = KernelHost(health_probe_code=None, startup_timeout=60.0)
+        try:
+            host.start()
+            assert len(calls) == 2
+            assert host.execute("print(6 * 7)")["stdout"].strip() == "42"
+        finally:
+            host.shutdown()
+
     def test_restart_leaves_a_marker_and_ids_keep_counting(self, kernel):
         assert kernel.jobs.restarts() == []  # the first start is not a restart
         before = kernel.jobs.new_id()

@@ -22,7 +22,7 @@ from typing import List, Optional
 from biopb.lifecycle import deathwatch as _deathwatch, winjob as _winjob
 
 from ._job_log import JobLog
-from ._kernel_io import _IDLE_GRACE, KernelChannels, KernelGone
+from ._kernel_io import _IDLE_GRACE, KernelChannels, KernelDied, KernelGone
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +151,12 @@ _KERNEL_CLASS_ARG = "--IPKernelApp.kernel_class=biopb_mcp.mcp._kernel_gate.Gated
 
 # How long a control op may take in the kernel, unless its caller says.
 _CONTROL_TIMEOUT = 5.0
+
+# A kernel that dies before it first answers has usually lost the race for a
+# port: jupyter_client picks them by probing and closing, and a restart binds the
+# previous kernel's again straight after killing it. The waits between attempts
+# on the same connection give whatever holds a port time to let go.
+_LAUNCH_RETRY_DELAYS = (0.5, 1.0, 2.0)
 
 
 def _strip_ansi(text: str) -> str:
@@ -347,6 +353,33 @@ class KernelHost:
             return {"state": "ready"}
 
     def _launch(self):
+        """Launch a kernel, retrying a start that dies before it answers.
+
+        A restart retries on the *same* connection: clients attached by file
+        follow it only if the ports are unchanged. Only when that runs out does
+        it take fresh ports, since a kernel on new ports beats none. A first
+        start has nothing to keep, so every attempt picks new ones.
+        """
+        reused = self._connection
+        for delay in _LAUNCH_RETRY_DELAYS:
+            try:
+                return self._launch_once()
+            except KernelDied as exc:
+                logger.warning(
+                    "Kernel died on launch (%s); retrying in %gs", exc, delay
+                )
+                # A failed launch drops the connection; put it back.
+                self._connection = reused
+                time.sleep(delay)
+        if reused is not None:
+            logger.warning(
+                "Kernel would not start on its previous ports; using new ones, "
+                "so clients attached by connection file must reconnect."
+            )
+            self._connection = None
+        self._launch_once()
+
+    def _launch_once(self):
         from jupyter_client import KernelManager
 
         env = self._env if self._env is not None else os.environ.copy()
