@@ -1550,7 +1550,9 @@ class TestJupyterClientGate:
         assert _wait_until(gated.is_busy, timeout=5, interval=0.01)
         reply, _ = self._run(foreign, "y = 1")
         assert reply["status"] == "ok"
-        assert gated.jobs.poll(job)["status"] == "ok"
+        # The host learns the agent's cell ended from iopub, which can trail the
+        # foreign client's reply.
+        assert _wait_until(lambda: gated.jobs.poll(job)["status"] == "ok")
         assert gated.execute("print(y)")["stdout"].strip() == "1"
         assert [j["origin"] for j in self._jobs(gated)] == ["mcp", "user"]
 
