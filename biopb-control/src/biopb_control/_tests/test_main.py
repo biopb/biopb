@@ -233,59 +233,42 @@ def test_url_prefix_reaches_the_spec_normalized():
     assert spec.url_prefix == "/node/h/29847"
 
 
-def test_public_origin_flag_reaches_the_spec():
-    rc, spec, _ = _capture(
-        _BASE_ARGV + ["--public-origin", "https://portal.example.edu"], {}
-    )
+@pytest.mark.parametrize(
+    "argv, env, expected",
+    [
+        (["--public-origin", "https://p.example.edu"], {}, "https://p.example.edu"),
+        ([], {"BIOPB_PUBLIC_ORIGIN": "https://p.example.edu"}, "https://p.example.edu"),
+        (  # the flag wins over the env
+            ["--public-origin", "https://flag.example.edu"],
+            {"BIOPB_PUBLIC_ORIGIN": "https://env.example.edu"},
+            "https://flag.example.edu",
+        ),
+        (  # canonicalized on the way in
+            ["--public-origin", "HTTPS://Portal.Example.edu:8443/"],
+            {},
+            "https://portal.example.edu:8443",
+        ),
+        ([], {}, None),
+    ],
+)
+def test_public_origin_reaches_the_spec(argv, env, expected):
+    rc, spec, _ = _capture(_BASE_ARGV + argv, env)
     assert rc == 0
-    assert spec.public_origin == "https://portal.example.edu"
+    assert spec.public_origin == expected
 
 
-def test_public_origin_falls_back_to_the_env():
-    rc, spec, _ = _capture(
-        _BASE_ARGV, {"BIOPB_PUBLIC_ORIGIN": "https://portal.example.edu"}
-    )
-    assert rc == 0
-    assert spec.public_origin == "https://portal.example.edu"
-
-
-def test_public_origin_flag_wins_over_env():
-    rc, spec, _ = _capture(
-        _BASE_ARGV + ["--public-origin", "https://flag.example.edu"],
-        {"BIOPB_PUBLIC_ORIGIN": "https://env.example.edu"},
-    )
-    assert rc == 0
-    assert spec.public_origin == "https://flag.example.edu"
-
-
-def test_public_origin_reaches_the_spec_normalized():
-    rc, spec, _ = _capture(
-        _BASE_ARGV + ["--public-origin", "HTTPS://Portal.Example.edu:8443/"], {}
-    )
-    assert rc == 0
-    assert spec.public_origin == "https://portal.example.edu:8443"
-
-
-def test_no_public_origin_anywhere_is_none():
-    rc, spec, _ = _capture(_BASE_ARGV, {})
-    assert rc == 0
-    assert spec.public_origin is None
-
-
-def test_a_bad_public_origin_is_refused_before_start():
-    # It ends up in a link an agent hands a person to click, so a value that is
-    # not a plain origin is a configuration error, not something to publish.
-    rc, spec, _ = _capture(_BASE_ARGV + ["--public-origin", "portal.example.edu"], {})
+@pytest.mark.parametrize(
+    "argv, env",
+    [
+        (["--public-origin", "portal.example.edu"], {}),
+        ([], {"BIOPB_PUBLIC_ORIGIN": "https://u:p@portal.example.edu"}),
+    ],
+)
+def test_a_bad_public_origin_is_refused_before_start(argv, env):
+    # It ends up in a link an agent hands a person to click.
+    rc, spec, _ = _capture(_BASE_ARGV + argv, env)
     assert rc == 2
     assert spec is None  # run_control never reached
-
-
-def test_a_bad_public_origin_from_the_env_is_refused_too():
-    rc, spec, _ = _capture(
-        _BASE_ARGV, {"BIOPB_PUBLIC_ORIGIN": "https://u:p@portal.example.edu"}
-    )
-    assert rc == 2
-    assert spec is None
 
 
 def test_grpc_external_location_flag_reaches_the_spec():

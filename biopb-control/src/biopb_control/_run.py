@@ -148,8 +148,7 @@ def run_control(
             control_host,
             control_port,
             os.getpid(),
-            url_prefix=spec.url_prefix,
-            public_origin=spec.public_origin,
+            user_url=f"{spec.public_origin or ''}{spec.url_prefix or ''}" or None,
         )
     except (OSError, RuntimeError) as exc:
         logger.warning("could not publish the control endpoint: %s", exc)

@@ -39,9 +39,6 @@ def _isolated_state(tmp_path, monkeypatch):
     monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path))
     monkeypatch.delenv("BIOPB_CONTROL_PORT", raising=False)
     monkeypatch.delenv("BIOPB_CONTROL_HOST", raising=False)
-    # Same reason, for how the user's browser reaches the control.
-    monkeypatch.delenv("BIOPB_URL_PREFIX", raising=False)
-    monkeypatch.delenv("BIOPB_PUBLIC_ORIGIN", raising=False)
 
 
 class TestBasePortConvention:
@@ -241,77 +238,38 @@ class TestConnectHost:
 
 
 class TestUserBaseUrl:
-    """How the *user's browser* reaches the control (biopb/biopb#1195)."""
+    """How the user's browser reaches the control: what the control publishes."""
 
     def test_a_plain_control_is_reached_where_this_machine_connects(self):
         _endpoints.write_runtime_record("127.0.0.1", 9003, 4242)
+        assert "user_url" not in _endpoints.read_runtime_record()
         assert _endpoints.user_base_url() == "http://127.0.0.1:9003"
-        assert _endpoints.user_base_url() == _endpoints.control_base_url()
 
     def test_no_record_at_all_is_the_default(self):
         assert _endpoints.user_base_url() == _endpoints.control_base_url()
 
-    def test_the_record_carries_neither_field_unless_set(self):
-        _endpoints.write_runtime_record("127.0.0.1", 9003, 4242)
-        record = _endpoints.read_runtime_record()
-        assert "url_prefix" not in record and "public_origin" not in record
-
-    def test_a_prefix_alone_is_a_path(self):
-        _endpoints.write_runtime_record(
-            "0.0.0.0", 9003, 4242, url_prefix="/node/h/9003"
-        )
-        assert _endpoints.public_url_prefix() == "/node/h/9003"
-        assert _endpoints.public_origin() == ""
-        assert _endpoints.user_base_url() == "/node/h/9003"
-        # ...and the machine's own address is unaffected.
+    @pytest.mark.parametrize(
+        "published, expected",
+        [
+            ("https://p.example.edu/node/h/9003", "https://p.example.edu/node/h/9003"),
+            ("/node/h/9003", "/node/h/9003"),  # a prefix alone is a path
+            ("https://viewer.example.edu", "https://viewer.example.edu"),
+            ("https://p.example.edu/node/h/9003/", "https://p.example.edu/node/h/9003"),
+        ],
+    )
+    def test_a_published_url_is_what_a_client_hands_out(self, published, expected):
+        _endpoints.write_runtime_record("0.0.0.0", 9003, 4242, user_url=published)
+        assert _endpoints.user_base_url() == expected
+        # The machine's own address is unaffected.
         assert _endpoints.control_base_url() == "http://127.0.0.1:9003"
 
-    def test_prefix_and_origin_make_an_absolute_link(self):
-        _endpoints.write_runtime_record(
-            "0.0.0.0",
-            9003,
-            4242,
-            url_prefix="/node/h/9003",
-            public_origin="https://portal.example.edu",
-        )
-        assert _endpoints.user_base_url() == "https://portal.example.edu/node/h/9003"
-
-    def test_an_origin_without_a_prefix_is_a_root_published_control(self):
-        _endpoints.write_runtime_record(
-            "127.0.0.1", 9003, 4242, public_origin="https://viewer.example.edu"
-        )
-        assert _endpoints.user_base_url() == "https://viewer.example.edu"
-
-    def test_env_outranks_the_record(self, monkeypatch):
-        _endpoints.write_runtime_record(
-            "127.0.0.1",
-            9003,
-            4242,
-            url_prefix="/from-record",
-            public_origin="https://record.example.edu",
-        )
-        monkeypatch.setenv("BIOPB_URL_PREFIX", "/from-env")
-        monkeypatch.setenv("BIOPB_PUBLIC_ORIGIN", "https://env.example.edu")
-        assert _endpoints.user_base_url() == "https://env.example.edu/from-env"
-
-    def test_slashes_are_tidied(self, monkeypatch):
-        monkeypatch.setenv("BIOPB_URL_PREFIX", "node//h/9003/")
-        monkeypatch.setenv("BIOPB_PUBLIC_ORIGIN", "https://p.example.edu/")
-        assert _endpoints.user_base_url() == "https://p.example.edu/node/h/9003"
-
-    def test_a_root_prefix_is_no_prefix(self, monkeypatch):
-        monkeypatch.setenv("BIOPB_URL_PREFIX", "/")
-        assert _endpoints.public_url_prefix() == ""
-        assert _endpoints.user_base_url() == _endpoints.control_base_url()
-
-    @pytest.mark.parametrize("junk", [None, 7, ["a"], {"x": 1}])
+    @pytest.mark.parametrize("junk", [None, "", "  ", 7, ["a"], {"x": 1}])
     def test_a_malformed_record_field_is_ignored(self, junk):
         from biopb._locations import control_runtime_file
 
         _endpoints.write_runtime_record("127.0.0.1", 9003, 4242)
         path = control_runtime_file()
         record = json.loads(path.read_text())
-        record["url_prefix"] = junk
-        record["public_origin"] = junk
+        record["user_url"] = junk
         path.write_text(json.dumps(record))
         assert _endpoints.user_base_url() == _endpoints.control_base_url()

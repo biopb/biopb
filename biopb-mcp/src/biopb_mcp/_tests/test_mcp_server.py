@@ -1310,68 +1310,57 @@ class TestServerStatus:
         monkeypatch.setattr(_server, "_viewer_base_url", lambda: "http://host:9999")
         assert "http://host:9999/viewer?id=" in _tool(_server.server_status)
 
-    def test_a_proxied_control_gives_the_user_their_own_link(
-        self, server_with_host, monkeypatch
+    @pytest.mark.parametrize(
+        "user, present, absent",
+        [
+            (  # behind a proxy: labelled, and the loopback one says it is not theirs
+                "https://portal.example.edu/node/h/9003",
+                [
+                    "give the user: https://portal.example.edu/node/h/9003/viewer?id=",
+                    "your own requests: http://127.0.0.1:9003/viewer?id=",
+                    "cannot reach",
+                ],
+                ["a path on the portal"],
+            ),
+            (  # a prefix alone is only a path
+                "/node/h/9003",
+                ["give the user: /node/h/9003/viewer?id=", "a path on the portal"],
+                [],
+            ),
+            (  # a plain control keeps one url
+                "http://127.0.0.1:9003",
+                ["  url: http://127.0.0.1:9003/viewer?id="],
+                ["give the user"],
+            ),
+        ],
+    )
+    def test_the_web_viewer_labels_the_users_link(
+        self, server_with_host, monkeypatch, user, present, absent
     ):
-        """Behind a reverse proxy the loopback link is a dead end for the person
-        who has to click it, so the two are labelled, not merged
-        (biopb/biopb#1195)."""
+        """A loopback link handed to someone behind a proxy is a dead end, so the
+        two are labelled and not merged."""
         monkeypatch.setattr(
             _server, "_viewer_base_url", lambda: "http://127.0.0.1:9003"
         )
-        monkeypatch.setattr(
-            _server,
-            "_viewer_user_url",
-            lambda: "https://portal.example.edu/node/h/9003",
-        )
+        monkeypatch.setattr(_server, "_viewer_user_url", lambda: user)
         result = _tool(_server.server_status)
-        assert (
-            "give the user: https://portal.example.edu/node/h/9003/viewer?id=" in result
-        )
-        assert "your own requests: http://127.0.0.1:9003/viewer?id=" in result
-        assert "cannot reach" in result
-
-    def test_a_bare_prefix_is_flagged_as_a_path(self, server_with_host, monkeypatch):
-        monkeypatch.setattr(
-            _server, "_viewer_base_url", lambda: "http://127.0.0.1:9003"
-        )
-        monkeypatch.setattr(_server, "_viewer_user_url", lambda: "/node/h/9003")
-        result = _tool(_server.server_status)
-        assert "give the user: /node/h/9003/viewer?id=" in result
-        assert "a path on the portal" in result
-
-    def test_a_plain_control_keeps_one_url(self, server_with_host, monkeypatch):
-        monkeypatch.setattr(
-            _server, "_viewer_base_url", lambda: "http://127.0.0.1:9003"
-        )
-        monkeypatch.setattr(
-            _server, "_viewer_user_url", lambda: "http://127.0.0.1:9003"
-        )
-        result = _tool(_server.server_status)
-        assert "  url: http://127.0.0.1:9003/viewer?id=" in result
-        assert "give the user" not in result
+        for text in present:
+            assert text in result
+        for text in absent:
+            assert text not in result
 
     def test_the_user_url_comes_from_the_controls_record(
         self, server_with_host, tmp_path, monkeypatch
     ):
-        """End to end through the real helper: what a proxied control publishes
-        is what the session tells the agent to hand out."""
+        """End to end through the real helper: what a proxied control publishes is
+        what the session tells the agent to hand out."""
         from biopb._control import _endpoints
 
         monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path))
-        for name in (
-            "BIOPB_CONTROL_HOST",
-            "BIOPB_CONTROL_PORT",
-            "BIOPB_URL_PREFIX",
-            "BIOPB_PUBLIC_ORIGIN",
-        ):
-            monkeypatch.delenv(name, raising=False)
+        monkeypatch.delenv("BIOPB_CONTROL_HOST", raising=False)
+        monkeypatch.delenv("BIOPB_CONTROL_PORT", raising=False)
         _endpoints.write_runtime_record(
-            "0.0.0.0",
-            9003,
-            4242,
-            url_prefix="/node/h/9003",
-            public_origin="https://portal.example.edu",
+            "0.0.0.0", 9003, 4242, user_url="https://portal.example.edu/node/h/9003"
         )
         result = _tool(_server.server_status)
         assert (

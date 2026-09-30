@@ -476,19 +476,11 @@ def _viewer_base_url() -> str:
 
 
 def _viewer_user_url() -> str:
-    """Where the *user's* browser reaches the control, for a link handed to them.
+    """Where the *user's* browser reaches the control, for a link handed to them
+    (the proxied form behind a reverse proxy, else :func:`_viewer_base_url`)."""
+    from biopb import user_base_url
 
-    The control publishes its prefix (and, when it was told, its public origin),
-    so this is the proxied form when there is one and :func:`_viewer_base_url`
-    otherwise.
-    """
-    try:
-        from biopb import user_base_url
-
-        return user_base_url()
-    except Exception:  # pragma: no cover - core SDK always present in practice
-        logger.debug("status: user base url unresolvable", exc_info=True)
-        return _viewer_base_url()
+    return user_base_url()
 
 
 def _format_job_status(snap: dict) -> str:
@@ -1353,16 +1345,15 @@ async def server_status() -> str:
     if user == own:
         lines.append(f"  url: {own}/viewer?id=<array_id>")
     else:
-        # The control is published behind a proxy: the link the user can open is
-        # not the one this machine connects to, and a loopback link handed to
-        # them is a dead end.
-        lines.append(f"  give the user: {user}/viewer?id=<array_id>")
-        if user.startswith("/"):
-            lines.append("    a path on the portal the user opened; tell them so, or")
-            lines.append("    ask for its origin. Not a link that works pasted alone.")
-        lines.append(f"  your own requests: {own}/viewer?id=<array_id>")
+        # Behind a proxy the link the user can open is not the one this machine
+        # connects to; the web-viewer doc carries the caveats.
+        hint = (
+            " (a path on the portal the user opened; say so)" if user[:1] == "/" else ""
+        )
+        lines.append(f"  give the user: {user}/viewer?id=<array_id>{hint}")
         lines.append(
-            "    loopback on this machine; the user's browser cannot reach it."
+            f"  your own requests: {own}/viewer?id=<array_id>"
+            " (loopback; the user's browser cannot reach it)"
         )
     lines.append("    Served by the control. Works with no napari window; shows")
     lines.append("    what is in the catalog, so a result has to be uploaded")

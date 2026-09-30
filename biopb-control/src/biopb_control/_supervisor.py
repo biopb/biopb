@@ -407,9 +407,8 @@ class DataPlaneSpec:
     # Open OnDemand `/node/<host>/<port>` route, biopb/biopb#728). Consumed only
     # by the web front (_control.build_app normalizes it); None = root origin.
     url_prefix: Optional[str] = None
-    # The origin (`https://portal.example.edu`) that same proxy answers on. Not
-    # used to route or authorize anything: it is published in the discovery record
-    # so a session can hand the user an absolute link (`biopb.user_base_url`).
+    # The origin (`https://portal.example.edu`) that same proxy answers on;
+    # published with the prefix, never used to route or authorize.
     public_origin: Optional[str] = None
     # The address a remote client should dial to reach the data plane, forwarded
     # verbatim to `launch --external-location` (biopb/biopb#1158). The plane
