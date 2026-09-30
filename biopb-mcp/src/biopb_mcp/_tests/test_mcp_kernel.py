@@ -134,14 +134,18 @@ class TestKernelControl:
 
         port = kernel._connection[1]["control_port"]
         held = socket.socket()
-        # As ZeroMQ binds, so the killed kernel's TIME-WAIT does not stop it.
-        held.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if os.name == "nt":  # REUSEADDR there would let the kernel bind it too
+            held.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        else:  # as ZeroMQ binds, so the killed kernel's TIME-WAIT does not stop it
+            held.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        holding = []
         shutdown = kernel._shutdown_current
 
         def shutdown_then_hold():
             shutdown()
-            if held.fileno() < 0 or held.getsockname()[1]:  # already holding
+            if holding:  # the failed launch tears down again
                 return
+            holding.append(1)
             held.bind(("127.0.0.1", port))
             held.listen()
             if release_after is not None:
