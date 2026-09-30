@@ -42,6 +42,7 @@ from ._data_plane import (
     resolve_data_plane,
     resolve_data_plane_token,
 )
+from ._endpoints import user_base_url
 
 __all__ = [
     "ENV_TENSOR_TLS_CA",
@@ -67,4 +68,5 @@ __all__ = [
     "resolve_data_plane_token",
     "restart_algorithm",
     "stop_algorithm",
+    "user_base_url",
 ]

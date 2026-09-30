@@ -16,7 +16,16 @@ dials what it returns.
 Host and port, each resolved on its own: `BIOPB_CONTROL_HOST` /
 `BIOPB_CONTROL_PORT`, then `control.json` in the state directory
 (`{"host", "port", …}`, written by a serving control and left behind by a
-crashed one, so a hint to probe, not proof), then `127.0.0.1:8813`.
+crashed one, so a hint to probe, not proof), then `127.0.0.1:8813`. A client
+connects to a wildcard bind (`0.0.0.0`, `::`) over loopback.
+
+A control behind a reverse proxy also publishes how the *user's browser* reaches
+it, which is not the address above, as `user_url`: the origin (`--public-origin` /
+`BIOPB_PUBLIC_ORIGIN`, e.g. `https://portal.example.edu`) followed by the path
+prefix (`--url-prefix` / `BIOPB_URL_PREFIX`, e.g. `/node/<host>/<port>`), or the
+bare prefix when no origin was given. `biopb.user_base_url()` returns it, else
+the connect URL: a link to hand a person, where `base_url()` is for this
+machine's own requests. Nothing routes or authorizes on it.
 
 ## The plane's address
 

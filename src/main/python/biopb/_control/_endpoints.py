@@ -70,8 +70,17 @@ def _runtime_record() -> dict:
         return {}
 
 
-def write_runtime_record(host: str, port: int, pid: int) -> None:
+def write_runtime_record(
+    host: str,
+    port: int,
+    pid: int,
+    user_url: str | None = None,
+) -> None:
     """Publish the endpoint a control just bound. Best-effort.
+
+    ``user_url`` is how the user's browser reaches it when that is not the bound
+    address (behind a reverse proxy); written only when set. See
+    :func:`user_base_url`.
 
     ``pid`` lets ``biopb control status`` tell a live foreground control from a
     record a crashed one left behind -- the distinction the pid file draws for
@@ -87,14 +96,15 @@ def write_runtime_record(host: str, port: int, pid: int) -> None:
 
     path = control_runtime_file()
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(
-        {
-            "host": host,
-            "port": port,
-            "pid": pid,
-            "create_time": process_create_time(pid),
-        }
-    )
+    record = {
+        "host": host,
+        "port": port,
+        "pid": pid,
+        "create_time": process_create_time(pid),
+    }
+    if user_url:
+        record["user_url"] = user_url
+    payload = json.dumps(record)
     fd, tmp = tempfile.mkstemp(
         prefix=f".{path.name}-", suffix=".tmp", dir=str(path.parent)
     )
@@ -158,6 +168,37 @@ def control_port() -> int:
     return CONTROL_DEFAULT_PORT
 
 
+def connect_url(host: str, port: int, scheme: str = "http") -> str:
+    """A base URL a client on this machine can connect to.
+
+    A server bound to a wildcard (``0.0.0.0``, ``::``) is dialed over loopback:
+    the address it is *bound* to is not one a client can dial (0.0.0.0 is not
+    dialable on Windows). An explicit host is used as given, and an IPv6 literal
+    is bracketed so the ``:port`` suffix stays unambiguous.
+    """
+    host = {"0.0.0.0": "127.0.0.1", "::": "::1", "": "127.0.0.1"}.get(host, host)
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    return f"{scheme}://{host}:{port}"
+
+
 def control_base_url() -> str:
-    """The control-API base URL, e.g. ``http://127.0.0.1:8813``."""
-    return f"http://{control_host()}:{control_port()}"
+    """The control-API base URL a client on this machine connects to, e.g.
+    ``http://127.0.0.1:8813``."""
+    return connect_url(control_host(), control_port())
+
+
+def user_base_url() -> str:
+    """Where the *user's browser* reaches the control, for a link handed to them.
+
+    :func:`control_base_url` is where this machine connects, and behind a reverse
+    proxy (an Open OnDemand ``/node/<host>/<port>`` route) that is a loopback
+    address the user's browser cannot reach. A control told its public form
+    (``--url-prefix``, ``--public-origin``) publishes it in its record: origin plus
+    prefix, or the bare path when only the prefix is set (a path on whatever site
+    the user opened the session from). Otherwise the two are the same.
+    """
+    published = _runtime_record().get("user_url")
+    if isinstance(published, str) and published.strip():
+        return published.strip().rstrip("/")
+    return control_base_url()

@@ -233,6 +233,44 @@ def test_url_prefix_reaches_the_spec_normalized():
     assert spec.url_prefix == "/node/h/29847"
 
 
+@pytest.mark.parametrize(
+    "argv, env, expected",
+    [
+        (["--public-origin", "https://p.example.edu"], {}, "https://p.example.edu"),
+        ([], {"BIOPB_PUBLIC_ORIGIN": "https://p.example.edu"}, "https://p.example.edu"),
+        (  # the flag wins over the env
+            ["--public-origin", "https://flag.example.edu"],
+            {"BIOPB_PUBLIC_ORIGIN": "https://env.example.edu"},
+            "https://flag.example.edu",
+        ),
+        (  # canonicalized on the way in
+            ["--public-origin", "HTTPS://Portal.Example.edu:8443/"],
+            {},
+            "https://portal.example.edu:8443",
+        ),
+        ([], {}, None),
+    ],
+)
+def test_public_origin_reaches_the_spec(argv, env, expected):
+    rc, spec, _ = _capture(_BASE_ARGV + argv, env)
+    assert rc == 0
+    assert spec.public_origin == expected
+
+
+@pytest.mark.parametrize(
+    "argv, env",
+    [
+        (["--public-origin", "portal.example.edu"], {}),
+        ([], {"BIOPB_PUBLIC_ORIGIN": "https://u:p@portal.example.edu"}),
+    ],
+)
+def test_a_bad_public_origin_is_refused_before_start(argv, env):
+    # It ends up in a link an agent hands a person to click.
+    rc, spec, _ = _capture(_BASE_ARGV + argv, env)
+    assert rc == 2
+    assert spec is None  # run_control never reached
+
+
 def test_grpc_external_location_flag_reaches_the_spec():
     rc, spec, _ = _capture(
         _BASE_ARGV + ["--grpc-external-location", "grpc://real-host:8815"], {}

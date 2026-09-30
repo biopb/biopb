@@ -64,6 +64,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "Configuration only -- never inferred from a request header.",
     )
     run.add_argument(
+        "--public-origin",
+        default=None,
+        help="origin a reverse proxy answers on, e.g. https://portal.example.edu "
+        "(or BIOPB_PUBLIC_ORIGIN). Published so a client can give the user an "
+        "absolute link to the viewer, which --url-prefix alone cannot make. "
+        "Display only: it changes nothing about routing or access.",
+    )
+    run.add_argument(
         "--grpc-external-location",
         default=None,
         help="address a remote client should dial to reach the data plane, "
@@ -200,6 +208,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"biopb-control: {exc}", file=sys.stderr)
         return 2
 
+    from ._control import normalize_public_origin
+
+    try:
+        public_origin = normalize_public_origin(
+            args.public_origin or os.environ.get("BIOPB_PUBLIC_ORIGIN") or None
+        )
+    except ValueError as exc:
+        print(f"biopb-control: {exc}", file=sys.stderr)
+        return 2
+
     grpc_external_location = (
         args.grpc_external_location
         or os.environ.get("BIOPB_GRPC_EXTERNAL_LOCATION")
@@ -226,6 +244,7 @@ def main(argv: list[str] | None = None) -> int:
         # Env fallback for a direct `python -m biopb_control run`; `biopb control
         # start` passes it explicitly (and inherits the env anyway).
         url_prefix=url_prefix,
+        public_origin=public_origin,
         external_location=grpc_external_location,
     )
     return run_control(

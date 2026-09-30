@@ -1310,6 +1310,64 @@ class TestServerStatus:
         monkeypatch.setattr(_server, "_viewer_base_url", lambda: "http://host:9999")
         assert "http://host:9999/viewer?id=" in _tool(_server.server_status)
 
+    @pytest.mark.parametrize(
+        "user, present, absent",
+        [
+            (  # behind a proxy: labelled, and the loopback one says it is not theirs
+                "https://portal.example.edu/node/h/9003",
+                [
+                    "give the user: https://portal.example.edu/node/h/9003/viewer?id=",
+                    "your own requests: http://127.0.0.1:9003/viewer?id=",
+                    "cannot reach",
+                ],
+                ["a path on the portal"],
+            ),
+            (  # a prefix alone is only a path
+                "/node/h/9003",
+                ["give the user: /node/h/9003/viewer?id=", "a path on the portal"],
+                [],
+            ),
+            (  # a plain control keeps one url
+                "http://127.0.0.1:9003",
+                ["  url: http://127.0.0.1:9003/viewer?id="],
+                ["give the user"],
+            ),
+        ],
+    )
+    def test_the_web_viewer_labels_the_users_link(
+        self, server_with_host, monkeypatch, user, present, absent
+    ):
+        """A loopback link handed to someone behind a proxy is a dead end, so the
+        two are labelled and not merged."""
+        monkeypatch.setattr(
+            _server, "_viewer_base_url", lambda: "http://127.0.0.1:9003"
+        )
+        monkeypatch.setattr(_server, "_viewer_user_url", lambda: user)
+        result = _tool(_server.server_status)
+        for text in present:
+            assert text in result
+        for text in absent:
+            assert text not in result
+
+    def test_the_user_url_comes_from_the_controls_record(
+        self, server_with_host, tmp_path, monkeypatch
+    ):
+        """End to end through the real helper: what a proxied control publishes is
+        what the session tells the agent to hand out."""
+        from biopb._control import _endpoints
+
+        monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path))
+        monkeypatch.delenv("BIOPB_CONTROL_HOST", raising=False)
+        monkeypatch.delenv("BIOPB_CONTROL_PORT", raising=False)
+        _endpoints.write_runtime_record(
+            "0.0.0.0", 9003, 4242, user_url="https://portal.example.edu/node/h/9003"
+        )
+        result = _tool(_server.server_status)
+        assert (
+            "give the user: https://portal.example.edu/node/h/9003/viewer?id=" in result
+        )
+        assert "your own requests: http://127.0.0.1:9003/viewer?id=" in result
+
     def test_the_web_viewer_is_reported_without_probing_the_control(
         self, server_with_host, monkeypatch
     ):

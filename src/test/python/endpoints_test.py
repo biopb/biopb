@@ -212,3 +212,64 @@ class TestRuntimeRecord:
         with pytest.raises(OSError):
             _endpoints.write_runtime_record("127.0.0.1", 9003, 4242)
         assert not list(path.parent.glob("*.tmp"))
+
+
+class TestConnectHost:
+    """A control bound to a wildcard is *dialed* over loopback."""
+
+    @pytest.mark.parametrize(
+        "bound, dialed",
+        [
+            ("0.0.0.0", "http://127.0.0.1:9003"),
+            ("::", "http://[::1]:9003"),
+            ("::1", "http://[::1]:9003"),
+            ("10.1.2.3", "http://10.1.2.3:9003"),
+        ],
+    )
+    def test_a_wildcard_bind_is_dialed_over_loopback(self, bound, dialed):
+        _endpoints.write_runtime_record(bound, 9003, 4242)
+        assert _endpoints.control_base_url() == dialed
+
+    def test_the_bind_address_itself_is_still_what_the_record_says(self):
+        """Only the connect URL is rewritten: control_host() is also what a
+        control binds by default, where a wildcard must stay a wildcard."""
+        _endpoints.write_runtime_record("0.0.0.0", 9003, 4242)
+        assert _endpoints.control_host() == "0.0.0.0"
+
+
+class TestUserBaseUrl:
+    """How the user's browser reaches the control: what the control publishes."""
+
+    def test_a_plain_control_is_reached_where_this_machine_connects(self):
+        _endpoints.write_runtime_record("127.0.0.1", 9003, 4242)
+        assert "user_url" not in _endpoints.read_runtime_record()
+        assert _endpoints.user_base_url() == "http://127.0.0.1:9003"
+
+    def test_no_record_at_all_is_the_default(self):
+        assert _endpoints.user_base_url() == _endpoints.control_base_url()
+
+    @pytest.mark.parametrize(
+        "published, expected",
+        [
+            ("https://p.example.edu/node/h/9003", "https://p.example.edu/node/h/9003"),
+            ("/node/h/9003", "/node/h/9003"),  # a prefix alone is a path
+            ("https://viewer.example.edu", "https://viewer.example.edu"),
+            ("https://p.example.edu/node/h/9003/", "https://p.example.edu/node/h/9003"),
+        ],
+    )
+    def test_a_published_url_is_what_a_client_hands_out(self, published, expected):
+        _endpoints.write_runtime_record("0.0.0.0", 9003, 4242, user_url=published)
+        assert _endpoints.user_base_url() == expected
+        # The machine's own address is unaffected.
+        assert _endpoints.control_base_url() == "http://127.0.0.1:9003"
+
+    @pytest.mark.parametrize("junk", [None, "", "  ", 7, ["a"], {"x": 1}])
+    def test_a_malformed_record_field_is_ignored(self, junk):
+        from biopb._locations import control_runtime_file
+
+        _endpoints.write_runtime_record("127.0.0.1", 9003, 4242)
+        path = control_runtime_file()
+        record = json.loads(path.read_text())
+        record["user_url"] = junk
+        path.write_text(json.dumps(record))
+        assert _endpoints.user_base_url() == _endpoints.control_base_url()

@@ -53,6 +53,7 @@ from ._control import (
     resolve_data_plane_token,
     restart_algorithm,
     stop_algorithm,
+    user_base_url,
 )
 
 __all__ = [
@@ -79,4 +80,5 @@ __all__ = [
     "resolve_data_plane_token",
     "restart_algorithm",
     "stop_algorithm",
+    "user_base_url",
 ]
