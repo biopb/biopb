@@ -65,6 +65,10 @@ class KernelGone(Exception):
     down (shutdown, restart, respawn)."""
 
 
+class KernelDied(RuntimeError):
+    """The kernel process exited before it answered its first request."""
+
+
 class _Call:
     """What one request has received so far."""
 
@@ -143,7 +147,7 @@ class KernelChannels:
             finally:
                 self._forget(call)
             if not is_alive():
-                raise RuntimeError("Kernel died before replying to kernel_info")
+                raise KernelDied("Kernel died before replying to kernel_info")
             if time.monotonic() > deadline:
                 raise RuntimeError(f"Kernel didn't respond in {timeout:g} seconds")
 
