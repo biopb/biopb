@@ -70,8 +70,20 @@ def _runtime_record() -> dict:
         return {}
 
 
-def write_runtime_record(host: str, port: int, pid: int) -> None:
+def write_runtime_record(
+    host: str,
+    port: int,
+    pid: int,
+    url_prefix: str | None = None,
+    public_origin: str | None = None,
+) -> None:
     """Publish the endpoint a control just bound. Best-effort.
+
+    ``url_prefix`` and ``public_origin`` say how the *user's browser* reaches this
+    control when that is not the address it bound: the path a reverse proxy
+    publishes it under, and the origin (scheme, host, port) the proxy answers on.
+    They are written only when set, so a plain local control's record is what it
+    always was. See :func:`user_base_url`.
 
     ``pid`` lets ``biopb control status`` tell a live foreground control from a
     record a crashed one left behind -- the distinction the pid file draws for
@@ -87,14 +99,17 @@ def write_runtime_record(host: str, port: int, pid: int) -> None:
 
     path = control_runtime_file()
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(
-        {
-            "host": host,
-            "port": port,
-            "pid": pid,
-            "create_time": process_create_time(pid),
-        }
-    )
+    record = {
+        "host": host,
+        "port": port,
+        "pid": pid,
+        "create_time": process_create_time(pid),
+    }
+    if url_prefix:
+        record["url_prefix"] = url_prefix
+    if public_origin:
+        record["public_origin"] = public_origin
+    payload = json.dumps(record)
     fd, tmp = tempfile.mkstemp(
         prefix=f".{path.name}-", suffix=".tmp", dir=str(path.parent)
     )
@@ -158,6 +173,56 @@ def control_port() -> int:
     return CONTROL_DEFAULT_PORT
 
 
+# A control bound to a wildcard address is published under that address, which
+# names where it listens, not somewhere a client can connect to (0.0.0.0 is not
+# dialable on Windows, and reads as a mistake everywhere).
+_WILDCARD_CONNECT = {"0.0.0.0": "127.0.0.1", "::": "::1", "[::]": "::1"}
+
+
 def control_base_url() -> str:
-    """The control-API base URL, e.g. ``http://127.0.0.1:8813``."""
-    return f"http://{control_host()}:{control_port()}"
+    """The control-API base URL a client on this machine connects to, e.g.
+    ``http://127.0.0.1:8813``. A wildcard bind is dialed over loopback."""
+    host = control_host()
+    host = _WILDCARD_CONNECT.get(host, host)
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    return f"http://{host}:{control_port()}"
+
+
+def _published(env_name: str, record_key: str) -> str:
+    """A published string, ``$env`` outranking the serving control's record."""
+    value = os.environ.get(env_name) or _runtime_record().get(record_key)
+    return value.strip() if isinstance(value, str) else ""
+
+
+def public_url_prefix() -> str:
+    """The path prefix the user's browser reaches the control under, or ``""``.
+
+    ``BIOPB_URL_PREFIX`` (what the control itself reads), then the serving
+    control's record. Canonicalized to ``/a/b``: the control validated it before
+    publishing, so this only tidies slashes.
+    """
+    segments = [s for s in _published("BIOPB_URL_PREFIX", "url_prefix").split("/") if s]
+    return "/" + "/".join(segments) if segments else ""
+
+
+def public_origin() -> str:
+    """The origin (``https://host[:port]``) the user's browser reaches the
+    control on, or ``""``. ``BIOPB_PUBLIC_ORIGIN``, then the record."""
+    return _published("BIOPB_PUBLIC_ORIGIN", "public_origin").rstrip("/")
+
+
+def user_base_url() -> str:
+    """Where the *user's browser* reaches the control, for a link handed to them.
+
+    :func:`control_base_url` is where this machine connects, and behind a reverse
+    proxy (an Open OnDemand ``/node/<host>/<port>`` route) it is a loopback
+    address the user's browser cannot reach. The control knows the public form
+    because it was told it, so it publishes it: origin plus prefix when both are
+    set, the bare path when only the prefix is (a path on whatever origin the user
+    reached the portal at), and the connect URL when neither is.
+    """
+    prefix, origin = public_url_prefix(), public_origin()
+    if prefix or origin:
+        return f"{origin}{prefix}"
+    return control_base_url()

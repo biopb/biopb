@@ -144,7 +144,13 @@ def run_control(
     # the environment has no USERPROFILE/HOMEPATH, so even locating the file can
     # fail.
     try:
-        _endpoints.write_runtime_record(control_host, control_port, os.getpid())
+        _endpoints.write_runtime_record(
+            control_host,
+            control_port,
+            os.getpid(),
+            url_prefix=spec.url_prefix,
+            public_origin=spec.public_origin,
+        )
     except (OSError, RuntimeError) as exc:
         logger.warning("could not publish the control endpoint: %s", exc)
 

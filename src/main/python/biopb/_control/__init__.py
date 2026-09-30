@@ -25,7 +25,7 @@ from ._algorithms import (
     restart_algorithm,
     stop_algorithm,
 )
-from ._client import base_url, ensure_data_plane, find_data_plane
+from ._client import base_url, ensure_data_plane, find_data_plane, user_base_url
 from ._data_plane import (
     ENV_TENSOR_TLS_CA,
     ENV_TENSOR_TLS_FINGERPRINT,
@@ -67,4 +67,5 @@ __all__ = [
     "resolve_data_plane_token",
     "restart_algorithm",
     "stop_algorithm",
+    "user_base_url",
 ]

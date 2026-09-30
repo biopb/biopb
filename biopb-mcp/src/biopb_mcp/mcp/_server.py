@@ -458,12 +458,13 @@ def _format_verification(record: dict, job_id: str, saved_path=None) -> str:
 
 
 def _viewer_base_url() -> str:
-    """The control's origin, which is where the web viewer is served.
+    """The control's origin as *this machine* reaches it, for this session's own
+    requests. Resolved per call because the port is configurable and a control
+    that restarts elsewhere republishes it.
 
-    Resolved per call because the port is configurable and a control that
-    restarts elsewhere republishes it. A control published below the root
-    (``--url-prefix``) still answers here; what carries the prefix is the URL
-    the *user's* browser reaches it by, which nothing in this process can know.
+    Behind a reverse proxy (``--url-prefix``, an Open OnDemand job) this is a
+    loopback address the user's browser cannot reach; see
+    :func:`_viewer_user_url` for the link to give them.
     """
     try:
         from biopb import base_url
@@ -472,6 +473,22 @@ def _viewer_base_url() -> str:
     except Exception:  # pragma: no cover - core SDK always present in practice
         logger.debug("status: control base url unresolvable", exc_info=True)
         return "http://127.0.0.1:8813"
+
+
+def _viewer_user_url() -> str:
+    """Where the *user's* browser reaches the control, for a link handed to them.
+
+    The control publishes its prefix (and, when it was told, its public origin),
+    so this is the proxied form when there is one and :func:`_viewer_base_url`
+    otherwise.
+    """
+    try:
+        from biopb import user_base_url
+
+        return user_base_url()
+    except Exception:  # pragma: no cover - core SDK always present in practice
+        logger.debug("status: user base url unresolvable", exc_info=True)
+        return _viewer_base_url()
 
 
 def _format_job_status(snap: dict) -> str:
@@ -1332,7 +1349,21 @@ async def server_status() -> str:
     # plane, so "## Tensor Server: connected" already answers whether it is up,
     # and a probe here would put a network round trip on every status call.
     lines.append("## Web viewer")
-    lines.append(f"  url: {_viewer_base_url()}/viewer?id=<array_id>")
+    own, user = _viewer_base_url(), _viewer_user_url()
+    if user == own:
+        lines.append(f"  url: {own}/viewer?id=<array_id>")
+    else:
+        # The control is published behind a proxy: the link the user can open is
+        # not the one this machine connects to, and a loopback link handed to
+        # them is a dead end.
+        lines.append(f"  give the user: {user}/viewer?id=<array_id>")
+        if user.startswith("/"):
+            lines.append("    a path on the portal the user opened; tell them so, or")
+            lines.append("    ask for its origin. Not a link that works pasted alone.")
+        lines.append(f"  your own requests: {own}/viewer?id=<array_id>")
+        lines.append(
+            "    loopback on this machine; the user's browser cannot reach it."
+        )
     lines.append("    Served by the control. Works with no napari window; shows")
     lines.append("    what is in the catalog, so a result has to be uploaded")
     lines.append('    first. read_doc("web-viewer") has the parameters.')

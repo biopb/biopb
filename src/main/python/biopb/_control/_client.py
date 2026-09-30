@@ -9,7 +9,7 @@ from typing import Optional
 from urllib.parse import urlencode
 
 from . import _data_plane
-from ._endpoints import control_base_url
+from ._endpoints import control_base_url, user_base_url  # noqa: F401
 
 logger = logging.getLogger(__name__)
 

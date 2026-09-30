@@ -98,6 +98,7 @@ import threading
 import time
 from html import escape as _escape_html
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx
 import uvicorn
@@ -320,6 +321,43 @@ def normalize_url_prefix(value: str | None) -> str | None:
                 "._~-!$&'()*+,;=@ per segment)"
             )
     return "/" + "/".join(segments)
+
+
+def normalize_public_origin(value: str | None) -> str | None:
+    """Canonicalize a configured public origin to ``scheme://host[:port]``, or
+    ``None`` for none.
+
+    The origin a reverse proxy answers on, which the control publishes so that a
+    client can hand the user a link that works (``biopb.user_base_url``). Only
+    ever *shown*, never used to route or to decide who may connect, but it ends up
+    in text an agent gives a person to click, so it must be a plain origin: http
+    or https, a host, an optional port, no credentials, no path (the prefix is its
+    own setting), query or fragment. Raises :class:`ValueError` otherwise.
+    """
+    if not value or not value.strip():
+        return None
+    raw = value.strip()
+    parts = urlsplit(raw)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise ValueError(
+            f"invalid public origin {raw!r}: expected http(s)://host[:port]"
+        )
+    if (
+        parts.username is not None
+        or parts.password is not None
+        or parts.path not in ("", "/")
+        or parts.query
+        or parts.fragment
+    ):
+        raise ValueError(
+            f"invalid public origin {raw!r}: an origin has no credentials, path, "
+            "query or fragment (the path prefix is --url-prefix)"
+        )
+    try:
+        parts.port  # noqa: B018 - raises ValueError on a malformed port
+    except ValueError:
+        raise ValueError(f"invalid public origin {raw!r}: bad port") from None
+    return f"{parts.scheme}://{parts.netloc.lower()}"
 
 
 class _URLPrefixMiddleware:
