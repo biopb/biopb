@@ -1920,7 +1920,7 @@ app.add_typer(agents_app, name="agents")
 
 
 # ---------------------------------------------------------------------------
-# quick-start: Windows Defender exclusion for the biopb install (issue #384)
+# skip-windows-defender: Windows Defender exclusion for the biopb install (issue #384)
 # ---------------------------------------------------------------------------
 # Windows Defender real-time scanning of biopb's DLLs / .pyd / .pyc on every
 # launch is the single largest first-start tax on Windows (see #384). Excluding
@@ -2106,12 +2106,12 @@ def _defender_status(targets: List[str]) -> None:
     if out == "ON":
         console.print("[green]Defender exclusion is enabled[/green] for:")
         console.print(joined)
-        console.print("  Remove it with: biopb quick-start --disable")
+        console.print("  Remove it with: biopb skip-windows-defender --disable")
     elif out == "OFF":
         console.print("Defender exclusion is [yellow]not set[/yellow] for:")
         console.print(joined)
         console.print(
-            "  Enable it for a faster startup (needs admin): biopb quick-start --enable"
+            "  Enable it for a faster startup (needs admin): biopb skip-windows-defender --enable"
         )
     elif out == "PARTIAL":
         console.print(
@@ -2119,20 +2119,22 @@ def _defender_status(targets: List[str]) -> None:
             "-- some biopb trees are excluded, some aren't:"
         )
         console.print(joined)
-        console.print("  Complete it (needs admin): biopb quick-start --enable")
+        console.print(
+            "  Complete it (needs admin): biopb skip-windows-defender --enable"
+        )
     else:
         console.print(
             "[yellow]Could not read the Defender exclusion state[/yellow] "
-            "(Get-MpPreference unavailable). Enable with: biopb quick-start --enable"
+            "(Get-MpPreference unavailable). Enable with: biopb skip-windows-defender --enable"
         )
 
 
 @app.command(
-    "quick-start",
+    "skip-windows-defender",
     hidden=not _is_windows(),
     help="Speed up biopb startup on Windows with a Defender exclusion.",
 )
-def quick_start(
+def skip_windows_defender(
     enabled: Optional[bool] = typer.Option(
         None,
         "--enable/--disable",
@@ -2151,7 +2153,7 @@ def quick_start(
     """
     if not _is_windows():
         console.print(
-            "[yellow]quick-start is Windows-only[/yellow] -- Defender exclusions "
+            "[yellow]skip-windows-defender is Windows-only[/yellow] -- Defender exclusions "
             "don't apply on this platform (nothing to do)."
         )
         raise typer.Exit(0)

@@ -224,7 +224,7 @@ function Show-Summary {
     # win that needs one UAC prompt, so we only point at it rather than doing it.
     Write-Inf "Faster startup (optional): exclude the biopb install from Windows"
     Write-Inf "Defender real-time scanning (needs admin - one UAC prompt):"
-    Write-Cmd "  biopb quick-start --enable"
+    Write-Cmd "  biopb skip-windows-defender --enable"
     Write-Host ""
 
     if (-not $Result.WebappInstalled) {
