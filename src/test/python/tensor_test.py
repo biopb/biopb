@@ -590,6 +590,96 @@ class TestExportLocation:
         assert captured["location"] == client._state.location
 
 
+class TestExportedTrust:
+    """An address the connection does not dial gets its anchor, unresolved, for
+    the consumer to apply (biopb/biopb#1201)."""
+
+    LEAF = b"-----BEGIN CERTIFICATE-----\nleaf\n-----END CERTIFICATE-----\n"
+
+    def _tls_client(self):
+        from biopb.tensor._tls import TlsTrust
+
+        client = _offline_client(raw_client=Mock())
+        client._state.location = "grpc+tls://localhost:8815"
+        client._state.tls_trust = TlsTrust(self.LEAF, None, "k")
+        return client
+
+    def test_the_dialed_address_keeps_its_resolved_trust(self):
+        state = self._tls_client()._state
+        assert state.trust_for("grpc+tls://localhost:8815") is state.tls_trust
+
+    def test_another_tls_address_carries_the_anchor_unresolved(self):
+        trust = self._tls_client()._state.trust_for("grpc+tls://node.example:8815")
+        assert trust.root_certs == self.LEAF and trust.reresolve
+        assert trust.override_hostname is None
+
+    def test_a_plaintext_export_needs_no_trust(self):
+        from biopb.tensor._tls import NO_TLS
+
+        state = self._tls_client()._state
+        assert state.trust_for("grpc://node.example:8815") is NO_TLS
+
+    def test_the_graph_gets_the_exported_trust(self, monkeypatch):
+        from biopb.tensor import _session
+
+        client = self._tls_client()
+        client._fetcher._plan_read = Mock(return_value=object())
+        seen = {}
+
+        def fake(info, location, token, cache_bytes, tls_trust, requested=None):
+            seen["trust"] = tls_trust
+            return "fake-array"
+
+        monkeypatch.setattr(_session, "_dask_from_flight_info", fake)
+        client._fetcher.get_tensor(
+            "test-tensor", export_location="grpcs://node.example:8815"
+        )
+        assert seen["trust"].reresolve and seen["trust"].root_certs == self.LEAF
+
+    def test_pb_carries_the_anchor_for_a_tls_location_only(self):
+        client = self._tls_client()
+        client._fetcher._plan_read = Mock(
+            return_value=SimpleNamespace(serialize=lambda: b"fake-flight-info")
+        )
+        pb = client._fetcher.get_tensor("test-tensor", output="pb")
+        assert pb.tls_anchor == self.LEAF
+        plain = client._fetcher.get_tensor(
+            "test-tensor", output="pb", export_location="grpc://node.example:8815"
+        )
+        assert plain.tls_anchor == b""
+
+    def test_tensor_from_pb_applies_the_senders_anchor(self, monkeypatch):
+        from biopb.tensor import client as client_mod
+        from biopb.tensor.serialized_pb2 import SerializedTensor
+
+        seen = {}
+        monkeypatch.setattr(
+            client_mod,
+            "flight",
+            SimpleNamespace(
+                FlightInfo=SimpleNamespace(deserialize=lambda b: Mock(endpoints=[1]))
+            ),
+        )
+        monkeypatch.setattr(client_mod, "_requested_slice", lambda info: None)
+        monkeypatch.setattr(
+            client_mod,
+            "_dask_from_flight_info",
+            lambda info, loc, tok, cb, trust, req: seen.update(trust=trust) or "arr",
+        )
+        monkeypatch.setattr(
+            client_mod,
+            "resolve_tls_trust",
+            lambda loc: pytest.fail("TOFU must not run when an anchor was sent"),
+        )
+        pb = SerializedTensor(
+            location="grpcs://node.example:8815",
+            flight_info=b"x",
+            tls_anchor=self.LEAF,
+        )
+        _offline_client(raw_client=Mock()).tensor_from_pb(pb, cache_bytes=1)
+        assert seen["trust"].reresolve and seen["trust"].root_certs == self.LEAF
+
+
 class TestGetTensorOutputSwitch:
     """get_tensor's output="da"/"pb" switch replaces the separate get_tensor_pb
     method, so both forms share one signature and cannot drift apart."""

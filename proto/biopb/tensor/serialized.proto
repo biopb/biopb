@@ -34,4 +34,11 @@ message SerializedTensor {
 
   // Serialized arrow.flight.protocol.FlightInfo; see above.
   bytes flight_info = 7;
+
+  // PEM trust anchor the sender verified the server with: the pinned leaf or a
+  // configured CA. Public material. The consumer applies it to `location`
+  // itself, deriving any hostname override on its own network, instead of
+  // trusting the first certificate it sees. Empty for a plaintext location or
+  // a sender that trusted the system store.
+  bytes tls_anchor = 8;
 }

@@ -775,3 +775,71 @@ class TestExplainHandshakeFailure:
     def test_a_plaintext_client_has_no_trust_to_explain(self):
         original, explained = self._explain(self.OPAQUE, None)
         assert explained is original
+
+
+# --- an anchor handed to another process (biopb/biopb#1201) -------------------
+
+
+def test_anchored_trust_never_touches_the_network():
+    """The sender only carries the anchor; the consumer does the name check."""
+    trust = _tls.anchored_trust(CERT_A)
+    assert trust.root_certs == CERT_A and trust.reresolve
+    assert trust.override_hostname is None
+    assert _tls.anchored_trust(None) is _tls.NO_TLS
+
+
+def test_a_leaf_anchor_is_rescued_for_the_name_dialed_here(monkeypatch):
+    """The sender's loopback trust has no override; the name this consumer dials
+    is not in the cert, so the override is derived here, for that name."""
+    monkeypatch.setattr(_tls, "_resolve_hostname_override", _REAL_OVERRIDE)
+    calls = _stub_probe(
+        monkeypatch,
+        strict=_hostname_mismatch(),
+        lenient=({"subjectAltName": SANS}, DER_A),
+    )
+    loc = "grpc+tls://node.example:8815"
+
+    trust = _tls.concrete_trust(loc, _tls.anchored_trust(CERT_A))
+
+    assert trust.root_certs == CERT_A
+    assert trust.override_hostname == "wrong.example"
+    assert not trust.reresolve
+    assert _tls.concrete_trust(loc, _tls.anchored_trust(CERT_A)) == trust
+    assert calls == [True, False]  # memoized: one probe per host:port and anchor
+
+
+def test_a_ca_anchor_keeps_the_name_check(monkeypatch):
+    """A CA is not the presented leaf, so the SAN check stays load-bearing."""
+    monkeypatch.setattr(_tls, "_resolve_hostname_override", _REAL_OVERRIDE)
+    _stub_probe(
+        monkeypatch,
+        strict=_hostname_mismatch(),
+        lenient=({"subjectAltName": SANS}, DER_B),
+    )
+    trust = _tls.concrete_trust(
+        "grpc+tls://ca-node.example:8815", _tls.anchored_trust(CERT_A)
+    )
+    assert trust.override_hostname is None
+
+
+def test_an_anchored_resolution_is_not_the_configured_ca_memo(monkeypatch):
+    """`ca_pem` never overrides; the same PEM and endpoint resolved as an
+    anchor must not be answered from (or poison) that entry."""
+    monkeypatch.setattr(_tls, "_resolve_hostname_override", _REAL_OVERRIDE)
+    _stub_probe(
+        monkeypatch,
+        strict=_hostname_mismatch(),
+        lenient=({"subjectAltName": SANS}, DER_A),
+    )
+    loc = "grpc+tls://shared.example:8815"
+    ca = _tls.resolve_tls_trust(loc, ca_pem=CERT_A)
+    anchored = _tls.resolve_anchored_trust(loc, CERT_A)
+    assert ca.override_hostname is None
+    assert anchored.override_hostname == "wrong.example"
+    assert ca.key_id != anchored.key_id
+
+
+def test_a_plain_trust_is_left_alone():
+    plain = _tls.TlsTrust(root_certs=CERT_A, override_hostname="x", key_id="k")
+    assert _tls.concrete_trust("grpc+tls://h:1", plain) is plain
+    assert _tls.concrete_trust("grpc+tls://h:1", None) is None

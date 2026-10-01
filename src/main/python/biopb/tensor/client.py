@@ -52,7 +52,7 @@ from biopb.tensor._session import (
     _requested_slice,
     split_array_id as split_array_id,
 )
-from biopb.tensor._tls import resolve_tls_trust
+from biopb.tensor._tls import anchored_trust, resolve_tls_trust
 from biopb.tensor._upload import UploadRefused as UploadRefused, UploadSession
 from biopb.tensor.descriptor_pb2 import (
     AddSourceProgress,
@@ -824,6 +824,10 @@ class TensorFlightClient:
                 a dask worker actually dials. Set it when the result leaves
                 this process and the dial address is not reachable from there;
                 ``advertised_location`` is the server's own answer for that.
+                The result carries the trust anchor this connection verified
+                the server with, not a resolved trust: whoever dials the new
+                address applies it to that name, so a leaf-pinned certificate
+                that omits the name still connects (a CA keeps its SAN check).
 
         Returns:
             A ``dask.array`` (``output="da"``) or a ``SerializedTensor``
@@ -919,17 +923,27 @@ class TensorFlightClient:
         location = normalize_flight_location(pb.location)
         info = flight.FlightInfo.deserialize(pb.flight_info)
         requested = _requested_slice(info)
+        # The sender's anchor, applied to the name dialed here; a sender that
+        # predates the field sends none, and this falls back to TOFU.
+        trust = (
+            anchored_trust(pb.tls_anchor)
+            if pb.tls_anchor and location.startswith("grpc+tls://")
+            else resolve_tls_trust(location)
+        )
         if not info.endpoints:
             logger.debug("tensor_from_pb: no endpoints, calling GetFlightInfo")
             info = _refetch_flight_info(
-                TensorDescriptor.FromString(info.descriptor.command), location, token
+                TensorDescriptor.FromString(info.descriptor.command),
+                location,
+                token,
+                trust,
             )
         return _dask_from_flight_info(
             info,
             location,
             token,
             cache_bytes,
-            resolve_tls_trust(location),
+            trust,
             requested,
         )
 

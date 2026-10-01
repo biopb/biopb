@@ -66,7 +66,14 @@ from biopb.tensor._roi_rows import (
     rois_to_table,
     table_to_rois,
 )
-from biopb.tensor._tls import TlsTrust, handshake_failure_reason, resolve_tls_trust
+from biopb.tensor._tls import (
+    NO_TLS,
+    TlsTrust,
+    anchored_trust,
+    concrete_trust,
+    handshake_failure_reason,
+    resolve_tls_trust,
+)
 from biopb.tensor.descriptor_pb2 import (
     AddSourceProgress,
     AddSourceRequest,
@@ -158,6 +165,26 @@ class _ClientState:
         is how tests inject a double, and a double has no health to probe."""
         self.raw_client = value
         self.protocol_checked = True
+
+    def trust_for(self, location: str) -> TlsTrust:
+        """The trust a consumer dialing *location* is handed.
+
+        This connection's own, resolved, when *location* is the one it dials.
+        For any other address, the same anchor carried unresolved
+        (:func:`anchored_trust`): the consumer derives the name check on the
+        network it dials from, so the sender never probes an address it may not
+        reach.
+        """
+        if location == self.location:
+            return self.tls_trust or NO_TLS
+        if not location.startswith("grpc+tls://"):
+            return NO_TLS
+        return anchored_trust(self.tls_trust.root_certs if self.tls_trust else None)
+
+    @property
+    def tls_anchor(self) -> bytes:
+        """The PEM this connection verified its server with, for a handoff."""
+        return (self.tls_trust.root_certs if self.tls_trust else None) or b""
 
 
 class ResolveCancelled(Exception):
@@ -255,7 +282,10 @@ def _parse_flight_endpoints(
 
 
 def _refetch_flight_info(
-    descriptor: TensorDescriptor, location: str, token: Optional[str]
+    descriptor: TensorDescriptor,
+    location: str,
+    token: Optional[str],
+    tls_trust: Optional[TlsTrust] = None,
 ) -> "flight.FlightInfo":
     """GetFlightInfo for the read a descriptor already describes.
 
@@ -282,7 +312,12 @@ def _refetch_flight_info(
         read_opt.reduction_method = descriptor.reduction_method
     cmd = _tensor_read_cmd(descriptor.array_id, read_opt)
 
-    client = _get_thread_client(location, token, resolve_tls_trust(location))
+    trust = (
+        concrete_trust(location, tls_trust)
+        if tls_trust
+        else resolve_tls_trust(location)
+    )
+    client = _get_thread_client(location, token, trust)
     call_options = _get_shared_call_options(location, token)
     flight_desc = flight.FlightDescriptor.for_command(cmd.SerializeToString())
     info = client.get_flight_info(flight_desc, options=call_options)
@@ -1370,11 +1405,16 @@ class ChunkFetcher:
                 location=location,
                 auth_token=self._state.token or "",
                 flight_info=info.serialize(),
+                tls_anchor=(
+                    self._state.tls_anchor
+                    if location.startswith("grpc+tls://")
+                    else b""
+                ),
             )
         return _dask_from_flight_info(
             info,
             location,
             self._state.token,
             self._state.cache_bytes,
-            self._state.tls_trust,
+            self._state.trust_for(location),
         )
