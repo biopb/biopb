@@ -14,6 +14,7 @@ host's health probe detects via the absence of ``_jobs`` in the namespace.
 
 import logging
 import os
+import threading
 import traceback
 
 logger = logging.getLogger(__name__)
@@ -393,6 +394,13 @@ def _bootstrap_impl():
             ip.user_ns["client"] = conn.client
 
         ip.events.register("pre_run_cell", _refresh_client)
+        if viewer is None:
+            # The Tensor Browser connects `conn` in a viewer session; with none,
+            # nothing else will. Off-thread: connect() can wait on the control,
+            # and _refresh_client picks the result up on the next cell.
+            threading.Thread(
+                target=conn.connect, name="biopb-connect", daemon=True
+            ).start()
     if viewer is not None:
         # The agent-facing `viewer` is a main-thread marshaling proxy so
         # arbitrary job-thread code (viewer/layers/dims/camera mutations) can't

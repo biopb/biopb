@@ -852,6 +852,9 @@ class TestParentDeathPipe:
 # ---------------------------------------------------------------------------
 
 
+_UNREACHABLE_PLANE = "grpc://127.0.0.1:1"
+
+
 @pytest.fixture(scope="module")
 def viewerless_kernel(tmp_path_factory):
     line = "import biopb_mcp.mcp._bootstrap as _b; _b.bootstrap()"
@@ -862,6 +865,9 @@ def viewerless_kernel(tmp_path_factory):
             os.environ,
             BIOPB_CONFIG_HOME=str(tmp_path_factory.mktemp("config")),
             BIOPB_NO_VIEWER="the viewer is off in the config",
+            # Nothing listens here: the connection is attempted and refused,
+            # without the test starting a control.
+            BIOPB_TENSOR_URL=_UNREACHABLE_PLANE,
         ),
         watchdog_interval=0,
         window_close_pipe=False,
@@ -892,6 +898,18 @@ class TestViewerlessBootstrap:
 
     def test_the_host_reports_why(self, viewerless_kernel):
         assert viewerless_kernel.no_viewer_reason == "the viewer is off in the config"
+
+    def test_the_session_dials_its_own_connection(self, viewerless_kernel):
+        # #1205: no Tensor Browser exists to connect it, so the bootstrap does.
+        # The plane is unreachable, so `url` set with a message is the proof of
+        # an attempt; before, both stayed empty forever.
+        def _attempted():
+            res = viewerless_kernel.execute(
+                "print(_conn.url, bool(_conn.last_message))"
+            )
+            return f"{_UNREACHABLE_PLANE} True" in res["stdout"]
+
+        assert _wait_until(_attempted)
 
     def test_client_tracks_the_connection_before_each_cell(self, viewerless_kernel):
         # The connection lands asynchronously; the next cell sees it.
