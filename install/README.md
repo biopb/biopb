@@ -172,11 +172,16 @@ data is never touched**.
 
 ```sh
 # Remove the stack, keep config + cached data
-~/.local/share/biopb/uninstall/uninstall.sh
+biopb uninstall
 
 # Remove everything biopb owns, including config and cache
-~/.local/share/biopb/uninstall/uninstall.sh --purge
+biopb uninstall --purge
 ```
+
+`biopb uninstall` asks first (`--yes` skips the prompt) and then hands over to the
+saved uninstaller, which you can also run directly:
+`~/.local/share/biopb/uninstall/uninstall.sh [--purge]`. Use that form when the
+`biopb` command itself is broken.
 
 `--purge` deletes `~/.config/biopb`, `~/.local/state/biopb` (logs, session
 registry, pids), and `~/.local/share/biopb` (samples). `uv` and any AI

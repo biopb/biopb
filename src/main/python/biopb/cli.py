@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1919,7 +1920,7 @@ app.add_typer(agents_app, name="agents")
 
 
 # ---------------------------------------------------------------------------
-# quick-start: Windows Defender exclusion for the biopb install (issue #384)
+# skip-windows-defender: Windows Defender exclusion for the biopb install (issue #384)
 # ---------------------------------------------------------------------------
 # Windows Defender real-time scanning of biopb's DLLs / .pyd / .pyc on every
 # launch is the single largest first-start tax on Windows (see #384). Excluding
@@ -2105,12 +2106,12 @@ def _defender_status(targets: List[str]) -> None:
     if out == "ON":
         console.print("[green]Defender exclusion is enabled[/green] for:")
         console.print(joined)
-        console.print("  Remove it with: biopb quick-start --disable")
+        console.print("  Remove it with: biopb skip-windows-defender --disable")
     elif out == "OFF":
         console.print("Defender exclusion is [yellow]not set[/yellow] for:")
         console.print(joined)
         console.print(
-            "  Enable it for a faster startup (needs admin): biopb quick-start --enable"
+            "  Enable it for a faster startup (needs admin): biopb skip-windows-defender --enable"
         )
     elif out == "PARTIAL":
         console.print(
@@ -2118,20 +2119,22 @@ def _defender_status(targets: List[str]) -> None:
             "-- some biopb trees are excluded, some aren't:"
         )
         console.print(joined)
-        console.print("  Complete it (needs admin): biopb quick-start --enable")
+        console.print(
+            "  Complete it (needs admin): biopb skip-windows-defender --enable"
+        )
     else:
         console.print(
             "[yellow]Could not read the Defender exclusion state[/yellow] "
-            "(Get-MpPreference unavailable). Enable with: biopb quick-start --enable"
+            "(Get-MpPreference unavailable). Enable with: biopb skip-windows-defender --enable"
         )
 
 
 @app.command(
-    "quick-start",
+    "skip-windows-defender",
     hidden=not _is_windows(),
     help="Speed up biopb startup on Windows with a Defender exclusion.",
 )
-def quick_start(
+def skip_windows_defender(
     enabled: Optional[bool] = typer.Option(
         None,
         "--enable/--disable",
@@ -2150,7 +2153,7 @@ def quick_start(
     """
     if not _is_windows():
         console.print(
-            "[yellow]quick-start is Windows-only[/yellow] -- Defender exclusions "
+            "[yellow]skip-windows-defender is Windows-only[/yellow] -- Defender exclusions "
             "don't apply on this platform (nothing to do)."
         )
         raise typer.Exit(0)
@@ -2160,6 +2163,63 @@ def quick_start(
         _defender_status(targets)
         return
     _defender_exclusion(targets, add=enabled)
+
+
+def _saved_uninstaller() -> Path:
+    """The uninstaller the installer saved for the release that installed biopb."""
+    name = "uninstall.cmd" if _is_windows() else "uninstall.sh"
+    return _locations.data_dir() / "uninstall" / name
+
+
+@app.command(
+    help="Remove biopb: stop services, unregister from agents, delete the install."
+)
+def uninstall(
+    purge: bool = typer.Option(
+        False,
+        "--purge",
+        help="Also delete biopb's config and cached/state data. Your image data "
+        "is never touched.",
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Don't ask for confirmation."),
+):
+    """Uninstall biopb by running the uninstaller saved by the install.
+
+    Each install saves its own release's uninstaller under the data tree, so the
+    code that installed biopb is the code that removes it; this command only hands
+    over to it. The uninstaller deletes the tool environment this process runs
+    from, so it replaces the process (POSIX) or outlives it in its own console
+    (Windows) rather than running as a child that holds the environment open.
+    """
+    script = _saved_uninstaller()
+    if not script.is_file():
+        console.print(
+            f"[red]No saved uninstaller at {script}.[/red] An install older than "
+            "this has none: run its release's `install.sh --uninstall` (POSIX) or "
+            "`install.ps1 -Uninstall` (Windows)."
+        )
+        raise typer.Exit(1)
+
+    what = "biopb, including its config and cached data" if purge else "biopb"
+    if not yes and not typer.confirm(f"Uninstall {what}?"):
+        raise typer.Exit(1)
+
+    if _is_windows():
+        # uninstall.ps1 asks about config/cache unless told; answer for the user.
+        args = [str(script), "-Purge" if purge else "-KeepData"]
+        subprocess.Popen(  # noqa: S603 - our own saved script
+            args, creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+        )
+        console.print("Uninstaller started in a new window.")
+        return
+
+    bash = shutil.which("bash")
+    if bash is None:
+        console.print("[red]bash not found; cannot run the uninstaller.[/red]")
+        raise typer.Exit(1)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.execv(bash, [bash, str(script), *(["--purge"] if purge else [])])
 
 
 if __name__ == "__main__":
