@@ -179,14 +179,17 @@ class _Client:
     """The kernel's tensor client, as far as ops touches it."""
 
     location = PLANE
+    advertised_location = "grpc://plane.example:8815"
 
     def __init__(self):
+        self.exports = []
         self.uploads = []
         self.arrays = {}
         self.labels = {}
 
-    def get_tensor(self, array_id, output="da"):
+    def get_tensor(self, array_id, output="da", export_location=None):
         if output == "pb":
+            self.exports.append(export_location)
             return _reference(array_id, PLANE).lazy
         return self.arrays.get(array_id, da.ones((2, 2), np.uint8, chunks=2))
 
@@ -341,6 +344,9 @@ def test_an_array_id_to_a_lazy_op_goes_as_a_reference(client, serve):
     assert servicer.seen == {"image": "lazy"}
     assert result.startswith("cache://scratch/@fields/lazy_double-")
     assert client.uploads[0][0] == result
+    # The op server dials the reference from elsewhere: the plane's advertised
+    # address goes out, not the one this session dials.
+    assert client.exports == [client.advertised_location]
 
 
 def test_an_array_id_to_an_eager_op_is_read_here_and_sent_inline(client, serve):

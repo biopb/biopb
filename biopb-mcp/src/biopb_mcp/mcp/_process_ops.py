@@ -223,7 +223,13 @@ class _OpCall:
                 )
             if self.mode == "EAGER":
                 return self._read_whole(name, value, client)
-            return proto.Arg(lazy=client.get_tensor(value, output="pb"))
+            # The op server dials this handle from another host, so it carries
+            # the plane's advertised address, not the one this session dials.
+            return proto.Arg(
+                lazy=client.get_tensor(
+                    value, output="pb", export_location=client.advertised_location
+                )
+            )
         arr = np.asarray(value)
         if isinstance(labels, dict):
             labels = labels.get(name)
