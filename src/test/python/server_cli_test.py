@@ -1072,6 +1072,28 @@ class TestLiveForegroundControl:
         live = cli._live_foreground_control()
         assert live is not None and live[1] == os.getpid()
 
+    def test_start_reports_a_live_foreground_control_instead_of_spawning(
+        self, tmp_path, monkeypatch
+    ):
+        """`control start` is idempotent: a `control run` has no pid file, so the
+        record is the only thing that says one is up, and starting a second
+        control on the default ports would overwrite it."""
+        pytest.importorskip("biopb_control")
+        # CONTROL_PID_FILE is a module constant, so the state-home fixture does not
+        # reach it: without this a real daemon on the box answers instead.
+        monkeypatch.setattr(cli, "CONTROL_PID_FILE", tmp_path / "control.pid")
+        cli._endpoints.write_runtime_record("0.0.0.0", 39164, os.getpid())
+        spawned = MagicMock()
+        monkeypatch.setattr(cli.subprocess, "Popen", spawned)
+        monkeypatch.setattr(cli, "_guard_ports_free", spawned)
+        res = CliRunner().invoke(cli.app, ["control", "start", "--no-data-plane"])
+        assert res.exit_code == 0, res.output + repr(res.exception)
+        assert "already running" in res.output and "foreground" in res.output
+        spawned.assert_not_called()
+        assert (
+            json.loads(_locations.control_runtime_file().read_text())["port"] == 39164
+        )
+
 
 class TestTlsExtraPreflight:
     """`--tls` is checked before anything is spawned (biopb/biopb#604).
