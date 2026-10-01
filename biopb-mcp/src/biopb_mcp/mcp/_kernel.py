@@ -159,6 +159,38 @@ _CONTROL_TIMEOUT = 5.0
 _LAUNCH_RETRY_DELAYS = (0.5, 1.0, 2.0)
 
 
+def _interpreter_kernel_specs():
+    """Kernel specs for a kernel in *this* interpreter, found by no search.
+
+    A named spec is looked up on the user's Jupyter path, where their own
+    ``python3`` (a bare ``python`` on PATH, a conda env, a pyenv shim) wins over
+    ipykernel's, and the kernel then runs in some other Python or none. This
+    answers every name with the interpreter biopb-mcp is running in.
+    """
+    import sys
+
+    from jupyter_client.kernelspec import KernelSpec, KernelSpecManager
+
+    class InterpreterSpecs(KernelSpecManager):
+        def get_kernel_spec(self, kernel_name):
+            return KernelSpec(
+                argv=[
+                    sys.executable,
+                    "-m",
+                    "ipykernel_launcher",
+                    "-f",
+                    "{connection_file}",
+                ],
+                display_name="biopb",
+                language="python",
+            )
+
+        def find_kernel_specs(self):
+            return {}
+
+    return InterpreterSpecs()
+
+
 def _strip_ansi(text: str) -> str:
     return _ANSI_RE.sub("", text)
 
@@ -169,7 +201,7 @@ class KernelHost:
     def __init__(
         self,
         extra_arguments: Optional[List[str]] = None,
-        kernel_name: str = "python3",
+        kernel_name: str = "",
         startup_timeout: float = 60.0,
         execute_timeout: float = 120.0,
         health_probe_code: Optional[str] = "print('_jobs' in dir())",
@@ -352,6 +384,17 @@ class KernelHost:
                 return {"state": "error", "error": str(exc) or repr(exc)}
             return {"state": "ready"}
 
+    def _launched_as(self):
+        """What the kernel was started as, for an error: a bare "died" names
+        neither the spec nor the interpreter, so a wrong one reads as a timeout."""
+        try:
+            argv0 = self._km.kernel_spec.argv[0]
+        except Exception:  # a named spec that does not exist: start_kernel says so
+            argv0 = "?"
+        if not self._kernel_name:
+            return f"in this interpreter, {argv0}"
+        return f"from kernel spec {self._kernel_name!r}, which runs {argv0!r}"
+
     def _launch(self):
         """Launch a kernel, retrying a start that dies before it answers.
 
@@ -377,7 +420,10 @@ class KernelHost:
                 "so clients attached by connection file must reconnect."
             )
             self._connection = None
-        self._launch_once()
+        try:
+            self._launch_once()
+        except KernelDied as exc:
+            raise KernelDied(f"{exc} (kernel {self._launch_desc})") from exc
 
     def _launch_once(self):
         from jupyter_client import KernelManager
@@ -422,7 +468,15 @@ class KernelHost:
             popen_kwargs["pass_fds"] = tuple(pass_fds)
 
         path, info = self._connection or (_runtime_connection_file(), None)
-        self._km = KernelManager(kernel_name=self._kernel_name, connection_file=path)
+        if self._kernel_name:
+            self._km = KernelManager(
+                kernel_name=self._kernel_name, connection_file=path
+            )
+        else:
+            self._km = KernelManager(
+                kernel_spec_manager=_interpreter_kernel_specs(), connection_file=path
+            )
+        self._launch_desc = self._launched_as()
         if info is not None:
             self._km.load_connection_info(info)
             # The provisioner would otherwise replace these with ports of its own.

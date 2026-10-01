@@ -152,7 +152,11 @@ class TransportConfig:
 class KernelConfig:
     """The child Jupyter kernel that runs agent code (separate process)."""
 
-    name: str = _h("python3", "Jupyter kernel name to launch.")
+    name: str = _h(
+        "",
+        "Jupyter kernel spec to launch. Empty: a kernel in the interpreter "
+        "biopb-mcp itself runs in, whatever kernel specs the user has installed.",
+    )
     startup_timeout: float = _h(
         _DEFAULT_STARTUP_TIMEOUT,
         "Seconds to wait for kernel bring-up. 60 on POSIX; 120 on Windows, where "
