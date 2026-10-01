@@ -393,7 +393,7 @@ class KernelHost:
             argv0 = "?"
         if not self._kernel_name:
             return f"in this interpreter, {argv0}"
-        return f"from kernel spec {self._kernel_name!r}, which runs {argv0!r}"
+        return f"from kernel spec '{self._kernel_name}', which runs {argv0}"
 
     def _launch(self):
         """Launch a kernel, retrying a start that dies before it answers.
