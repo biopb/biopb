@@ -2047,10 +2047,25 @@ uninstall_biopb() {
     if command -v uv &>/dev/null; then
         # The spec's owner is judged by the env's interpreter, so before it goes.
         _remove_kernelspec "$(_tool_python)"
-        if uv tool uninstall biopb &>/dev/null; then
+        # uv takes a lock on the tool dir and waits for it forever; on an NFS home a
+        # lock orphaned by a killed uv (possibly on another node) never clears, so
+        # bound the wait and say so rather than hang silently. No `timeout` (stock
+        # macOS): run uv unbounded, as before.
+        local uv_out uv_rc _tmo=""
+        command -v timeout &>/dev/null && _tmo="timeout 60"
+        uv_out=$($_tmo uv tool uninstall biopb 2>&1) && uv_rc=0 || uv_rc=$?
+        if [ "$uv_rc" = "0" ]; then
             _ok "Removed the biopb tool environment (biopb, biopb-tensor-server, biopb-mcp)"
-        else
+        elif [ "$uv_rc" = "124" ]; then
+            _warn "uv did not finish within 60s; it is probably waiting on a stale lock"
+            _info "  If no uv process is running (check other nodes too), replace the lock:"
+            _info "    ${CYAN}cd \"\$(uv tool dir)\" && mv .lock .lock.stale && touch .lock${RESET}"
+            _info "  then rerun this uninstall."
+        elif printf '%s' "$uv_out" | grep -qi "not installed"; then
             _info "biopb tool environment not present (already removed?)"
+        else
+            _warn "uv tool uninstall biopb failed (exit $uv_rc)"
+            [ -z "$uv_out" ] || _info "  $uv_out"
         fi
     else
         _warn "uv not found; cannot remove the biopb tool environment"
