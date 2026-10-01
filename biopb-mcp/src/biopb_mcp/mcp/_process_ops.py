@@ -71,6 +71,12 @@ _PROGRESS_EVERY_S = 5.0
 #: How long ``ensure`` may take: a first start installs, and may pull torch.
 _ENSURE_TIMEOUT = 900.0
 
+# A miss on `ops` re-reads the control's registry, since a server built after
+# the kernel started binds nothing until then. At most one read per interval,
+# and a short one: an introspecting library probes attributes freely.
+_REREAD_INTERVAL_S = 2.0
+_REREAD_TIMEOUT_S = 3.0
+
 
 def _make_channel(url: str, options=None) -> grpc.Channel:
     """Build a gRPC channel from a ``grpc://`` or ``grpcs://`` URL."""
@@ -464,10 +470,16 @@ class Ops:
         self._inactivity_timeout = inactivity_timeout
         self._options = channel_options
         self._ops: Dict[str, Callable] = {}
+        # Servers with no ops to bind yet: still `new` or `installing` when the
+        # rows were last read.
+        self._pending: List[str] = []
+        self._last_reread = float("-inf")
 
     # --- by name --------------------------------------------------------- #
 
     def __getitem__(self, name):
+        if name not in self._ops:
+            self._reread()
         return self._ops[name]
 
     def __iter__(self):
@@ -481,24 +493,35 @@ class Ops:
 
     def __getattr__(self, name):
         ops = self.__dict__.get("_ops", {})
+        if name not in ops and not name.startswith("_"):
+            self._reread()
+            ops = self._ops
         if name in ops:
             return ops[name]
+        pending = self.__dict__.get("_pending")
         raise AttributeError(
-            f"no op {name!r}; ops has {sorted(ops)}. After adding a server file, "
-            "call ops.refresh()."
+            f"no op {name!r}; ops has {sorted(ops)}."
+            + (f" Not built yet: {', '.join(pending)}." if pending else "")
+            + " After adding or building a server, call ops.refresh()."
         )
 
     def __dir__(self):
         return sorted(set(super().__dir__()) | set(self._ops))
 
     def __repr__(self):
-        return f"<ops: {', '.join(sorted(self._ops)) or 'none'}>"
+        text = ", ".join(sorted(self._ops)) or "none"
+        if self._pending:
+            text += f"; not built yet: {', '.join(self._pending)}"
+        return f"<ops: {text}>"
 
     # --- binding --------------------------------------------------------- #
 
     def bind(self, rows: Optional[List[dict]]) -> None:
         """Bind every op the rows advertise. An op name two servers share is
         bound as ``<server>_<op>`` for both."""
+        self._pending = [
+            r["name"] for r in rows or [] if r.get("state") in ("new", "installing")
+        ]
         entries = []
         for row in rows or []:
             if not row.get("ops"):
@@ -517,6 +540,26 @@ class Ops:
             call = _OpCall(server, info, self._client_getter, self._inactivity_timeout)
             ops[key] = _build_op(call)
         self._ops = ops
+
+    def _reread(self) -> None:
+        """Rebind from the control's registry, if it has not been read lately.
+
+        Read-only: it installs nothing, so it picks up a server the control
+        built after this kernel bound its ops, and leaves ``refresh()`` to start
+        a build.
+        """
+        now = time.monotonic()
+        if now - self._last_reread < _REREAD_INTERVAL_S:
+            return
+        self._last_reread = now
+        from biopb import algorithms
+
+        try:
+            rows = algorithms(timeout=_REREAD_TIMEOUT_S)
+        except Exception:  # noqa: BLE001 - a miss must still raise its own error
+            return
+        if rows is not None:
+            self.bind(rows)
 
     # --- the control's verbs --------------------------------------------- #
 
@@ -560,10 +603,14 @@ class Ops:
                 "No algorithm servers. Add a server file to "
                 "~/.config/biopb/algorithms/ and call ops.refresh()."
             )
+        bound = {(op.server, op.op_name) for op in self._ops.values()}
         lines = []
         for r in rows:
             names = ", ".join(o["name"] for o in r["ops"]) or "-"
-            lines.append(f"{r['name']} ({r['kind']}): {r['state']}; ops: {names}")
+            line = f"{r['name']} ({r['kind']}): {r['state']}; ops: {names}"
+            if any((r["name"], o["name"]) not in bound for o in r["ops"]):
+                line += " (not bound in this kernel: call ops.refresh())"
+            lines.append(line)
             if r.get("error"):
                 lines.append("  error: " + r["error"].strip().splitlines()[0])
         return "\n".join(lines)
