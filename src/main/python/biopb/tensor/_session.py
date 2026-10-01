@@ -122,8 +122,10 @@ class _ClientState:
     # the check is bypassed, e.g. for a test double).
     protocol_checked: bool = False
     # The server's own ``health.external_location`` (biopb/biopb#1158), read
-    # the same time as ``protocol``. None if the server didn't advertise one
-    # (an old server, a loopback deployment, or the check was bypassed).
+    # the same time as ``protocol``. Informational: the SDK never dials it on
+    # its own, a caller that wants it passes it as ``export_location``. None
+    # if the server didn't advertise one (an old server, a loopback
+    # deployment, or the check was bypassed).
     advertised_location: Optional[str] = None
 
     @property
@@ -156,21 +158,6 @@ class _ClientState:
         is how tests inject a double, and a double has no health to probe."""
         self.raw_client = value
         self.protocol_checked = True
-
-    @property
-    def export_location(self) -> str:
-        """The address to bake into anything handed to a different process.
-
-        The server's advertised address if it published one, else this
-        connection's own dial address (today's behavior, unchanged for a
-        server that hasn't upgraded). Use this -- never ``location`` directly
-        -- at any point that mints an address for a *different* consumer:
-        ``SerializedTensor.location``, or a dask chunk-fetch graph handed to a
-        distributed cluster (biopb/biopb#1158).
-        """
-        if self.advertised_location:
-            return normalize_flight_location(self.advertised_location)
-        return self.location
 
 
 class ResolveCancelled(Exception):
@@ -1376,7 +1363,7 @@ class ChunkFetcher:
         location = (
             normalize_flight_location(export_location)
             if export_location
-            else self._state.export_location
+            else self._state.location
         )
         if output == "pb":
             return SerializedTensor(

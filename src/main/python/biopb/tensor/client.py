@@ -173,6 +173,21 @@ class TensorFlightClient:
         for a TLS location)."""
         return self._location
 
+    @property
+    def advertised_location(self) -> Optional[str]:
+        """The address the server says it is reachable at
+        (``health.external_location``, biopb/biopb#1158), or None if it
+        published none.
+
+        Nothing in the SDK dials it for you. Pass it as ``export_location`` to
+        ``get_tensor`` when the result goes to a process that cannot reach this
+        connection's own address. Reading it runs the one ``health`` check if no
+        call has yet.
+        """
+        _ = self._state.client
+        loc = self._state.advertised_location
+        return normalize_flight_location(loc) if loc else None
+
     # ---- Catalog / metadata / source lifecycle (delegated to CatalogClient) ----
 
     def list_sources(self) -> Dict[str, DataSourceDescriptor]:
@@ -803,14 +818,12 @@ class TensorFlightClient:
                   the lazy dask array.
             export_location: Address to bake into the result -- the array's
                 per-chunk fetch closures for ``output="da"``, the message's
-                ``location`` for ``output="pb"`` -- instead of the server's
-                advertised ``health.external_location`` (biopb/biopb#1158) or,
-                absent that, this connection's own dial address. A
-                ``"da"`` array is pickle-safe and reconnects lazily wherever
-                it is computed, so this is what a dask worker actually dials
-                too. Set it when neither the server's guess nor your own dial
-                address is reachable from there (e.g. a worker pool behind a
-                second NAT layer the server has no way to know about).
+                ``location`` for ``output="pb"`` -- instead of this
+                connection's own dial address. A ``"da"`` array is pickle-safe
+                and reconnects lazily wherever it is computed, so this is what
+                a dask worker actually dials. Set it when the result leaves
+                this process and the dial address is not reachable from there;
+                ``advertised_location`` is the server's own answer for that.
 
         Returns:
             A ``dask.array`` (``output="da"``) or a ``SerializedTensor``

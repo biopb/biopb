@@ -493,142 +493,79 @@ class TestCreateTensorGrid:
 
 
 class TestExportLocation:
-    """biopb/biopb#1158: anything minted for a *different* consumer -- a
-    forwarded SerializedTensor, or a dask chunk-fetch graph handed to a
-    distributed cluster -- must carry the server's advertised address (if it
-    published one), never just the address this client happened to dial."""
+    """The SDK dials the address the caller gave it, and nothing else. A result
+    that leaves the process carries another address only when the caller passes
+    ``export_location``; the server's advertised address
+    (biopb/biopb#1158) is available as ``advertised_location`` but is never
+    dialed on the SDK's own initiative (biopb/biopb#1201)."""
 
-    @pytest.mark.parametrize(
-        "location, advertised_location, expected",
-        [
-            # Nothing advertised -> fall back to the dial address verbatim.
-            ("grpc://localhost:8815", None, "grpc://localhost:8815"),
-            ("grpc://localhost:8815", "grpc://real-host:8815", "grpc://real-host:8815"),
-            # The server advertises the public grpcs:// spelling; a dask
-            # worker's FlightClient needs Arrow's own grpc+tls:// scheme.
-            (
-                "grpc+tls://localhost:8815",
-                "grpcs://real-host:8815",
-                "grpc+tls://real-host:8815",
-            ),
-        ],
-    )
-    def test_export_location_resolution(self, location, advertised_location, expected):
-        from biopb.tensor._session import _ClientState
+    @staticmethod
+    def _capture_dask_location(monkeypatch):
+        from biopb.tensor import _session
 
-        state = _ClientState(
-            raw_client=None,
-            call_options=None,
-            location=location,
-            token=None,
-            cache_bytes=0,
-            advertised_location=advertised_location,
+        captured = {}
+
+        def fake_dask_from_flight_info(
+            info, location, token, cache_bytes, tls_trust, requested=None
+        ):
+            captured["location"] = location
+            return "fake-array"
+
+        monkeypatch.setattr(
+            _session, "_dask_from_flight_info", fake_dask_from_flight_info
         )
-        assert state.export_location == expected
+        return captured
 
-    def test_get_tensor_pb_mints_the_export_location(self):
-        # get_tensor(output="pb") bakes an address into SerializedTensor.location
-        # for a different process to dial later -- it must be the
-        # export_location, not the raw dial address, or a lazy remote op
-        # forwards a private loopback address off-box.
+    @staticmethod
+    def _pb_client():
         client = _offline_client(raw_client=Mock())
         client._state.advertised_location = "grpc://real-host:8815"
         client._fetcher._plan_read = Mock(
             return_value=SimpleNamespace(serialize=lambda: b"fake-flight-info")
         )
+        return client
 
+    def test_advertised_location_is_exposed_normalized(self):
+        client = _offline_client(raw_client=Mock())
+        client._state.protocol_checked = True
+        assert client.advertised_location is None
+        client._state.advertised_location = "grpcs://real-host:8815"
+        assert client.advertised_location == "grpc+tls://real-host:8815"
+
+    def test_get_tensor_graph_dials_the_connection_address(self, monkeypatch):
+        # An in-process read must stay on the address (and the trust) it
+        # connected with, whatever the server advertises.
+        client = _offline_client(raw_client=Mock())
+        client._state.advertised_location = "grpc://real-host:8815"
+        client._fetcher._plan_read = Mock(return_value=object())
+        captured = self._capture_dask_location(monkeypatch)
+
+        assert client._fetcher.get_tensor("test-tensor") == "fake-array"
+        assert captured["location"] == client._state.location
+
+    def test_get_tensor_graph_export_location_override(self, monkeypatch):
+        client = _offline_client(raw_client=Mock())
+        client._fetcher._plan_read = Mock(return_value=object())
+        captured = self._capture_dask_location(monkeypatch)
+
+        client._fetcher.get_tensor(
+            "test-tensor", export_location="grpc://override-host:9999"
+        )
+        assert captured["location"] == "grpc://override-host:9999"
+
+    def test_get_tensor_pb_carries_the_connection_address(self):
+        client = self._pb_client()
         pb = client._fetcher.get_tensor("test-tensor", output="pb")
-
-        assert pb.location == "grpc://real-host:8815"
-
-    def test_get_tensor_pb_export_location_override_wins_over_advertised(self):
-        # A caller-supplied export_location beats both the server's advertised
-        # address and the dial address -- for the case where neither is
-        # reachable from wherever tensor_from_pb() will actually run.
-        client = _offline_client(raw_client=Mock())
-        client._state.advertised_location = "grpc://real-host:8815"
-        client._fetcher._plan_read = Mock(
-            return_value=SimpleNamespace(serialize=lambda: b"fake-flight-info")
-        )
-
-        pb = client._fetcher.get_tensor(
-            "test-tensor", output="pb", export_location="grpc://override-host:9999"
-        )
-
-        assert pb.location == "grpc://override-host:9999"
+        assert pb.location == client._state.location
 
     def test_get_tensor_pb_export_location_override_is_normalized(self):
-        # The override goes through the same grpcs:// -> grpc+tls:// scheme
-        # normalization as the dial address and the advertised address.
-        client = _offline_client(raw_client=Mock())
-        client._fetcher._plan_read = Mock(
-            return_value=SimpleNamespace(serialize=lambda: b"fake-flight-info")
-        )
-
+        client = self._pb_client()
         pb = client._fetcher.get_tensor(
             "test-tensor", output="pb", export_location="grpcs://override-host:9999"
         )
-
         assert pb.location == "grpc+tls://override-host:9999"
 
-    def test_get_tensor_builds_its_dask_graph_from_the_export_location(
-        self, monkeypatch
-    ):
-        # get_tensor's dask graph embeds the fetch address in every chunk task
-        # (biopb.tensor._pool); a graph handed to dask.distributed only works
-        # if that address is reachable from wherever the scheduler runs it.
-        from biopb.tensor import _session
-
-        client = _offline_client(raw_client=Mock())
-        client._state.advertised_location = "grpc://real-host:8815"
-        client._fetcher._plan_read = Mock(return_value=object())
-
-        captured = {}
-
-        def fake_dask_from_flight_info(
-            info, location, token, cache_bytes, tls_trust, requested=None
-        ):
-            captured["location"] = location
-            return "fake-array"
-
-        monkeypatch.setattr(
-            _session, "_dask_from_flight_info", fake_dask_from_flight_info
-        )
-
-        result = client._fetcher.get_tensor("test-tensor")
-
-        assert result == "fake-array"
-        assert captured["location"] == "grpc://real-host:8815"
-
-    def test_get_tensor_export_location_override_wins_over_advertised(
-        self, monkeypatch
-    ):
-        from biopb.tensor import _session
-
-        client = _offline_client(raw_client=Mock())
-        client._state.advertised_location = "grpc://real-host:8815"
-        client._fetcher._plan_read = Mock(return_value=object())
-
-        captured = {}
-
-        def fake_dask_from_flight_info(
-            info, location, token, cache_bytes, tls_trust, requested=None
-        ):
-            captured["location"] = location
-            return "fake-array"
-
-        monkeypatch.setattr(
-            _session, "_dask_from_flight_info", fake_dask_from_flight_info
-        )
-
-        result = client._fetcher.get_tensor(
-            "test-tensor", export_location="grpc://override-host:9999"
-        )
-
-        assert result == "fake-array"
-        assert captured["location"] == "grpc://override-host:9999"
-
-    def test_upload_graph_uses_the_export_location(self, monkeypatch):
+    def test_upload_graph_dials_the_connection_address(self, monkeypatch):
         from biopb.tensor import _upload
         from biopb.tensor._upload import UploadSession
 
@@ -650,7 +587,7 @@ class TestExportLocation:
             (0,),
         )
 
-        assert captured["location"] == "grpc://real-host:8815"
+        assert captured["location"] == client._state.location
 
 
 class TestGetTensorOutputSwitch:
