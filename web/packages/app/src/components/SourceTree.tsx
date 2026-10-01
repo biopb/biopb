@@ -2,20 +2,18 @@
 
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useAppStore } from "../store";
-import type { DataSourceDescriptor } from "@biopb/tensor-flight-client";
 import { readRecents, subscribeRecents } from "../utils/recentSources";
 import { WarmTray } from "./WarmTray";
 import {
   type TreeNode,
   UNRESOLVED_GLYPH,
   UNRESOLVED_TOOLTIP,
-  getPathParts,
+  buildTree,
   groupTensors,
   isEmptySource,
   isUnresolved,
   matchesQuery,
   recentNode,
-  sourceLabel,
 } from "../utils/sourceTree";
 
 // Threshold for switching to server-side SQL query
@@ -32,108 +30,6 @@ const LABEL_OFF_GLYPH = "\u25cb";
 
 function formatShape(shape: number[]): string {
   return shape.join("×");
-}
-
-function buildTree(sources: DataSourceDescriptor[]): TreeNode {
-  const root: TreeNode = { id: "", name: "", type: "folder", children: [], depth: 0 };
-
-  // Build initial tree from sources
-  for (const src of sources) {
-    const parts = getPathParts(src.source_url);
-    if (parts.length === 0) {
-      // No path parts, add directly to root
-      root.children.push({
-        id: src.source_id,
-        name: sourceLabel(src),
-        type: "source",
-        children: [],
-        source: src,
-        depth: 1,
-      });
-      continue;
-    }
-
-    // Navigate/create folder path
-    let current = root;
-    for (let i = 0; i < parts.length - 1; i++) {
-      const part = parts[i]!;
-      let child = current.children.find((c) => c.type === "folder" && c.name === part);
-      if (!child) {
-        child = {
-          id: current.id + "/" + part,
-          name: part,
-          type: "folder",
-          children: [],
-          depth: current.depth + 1,
-        };
-        current.children.push(child);
-      }
-      current = child;
-    }
-
-    // Add source as leaf
-    current.children.push({
-      id: src.source_id,
-      name: sourceLabel(src),
-      type: "source",
-      children: [],
-      source: src,
-      depth: current.depth + 1,
-    });
-  }
-
-  // Sort children: folders first, then sources, both alphabetically
-  function sortChildren(node: TreeNode) {
-    node.children.sort((a, b) => {
-      if (a.type !== b.type) return a.type === "folder" ? -1 : 1;
-      return a.name.localeCompare(b.name);
-    });
-    for (const child of node.children) {
-      sortChildren(child);
-    }
-  }
-  sortChildren(root);
-
-  // Flatten paths: merge folders that have only one folder child
-  function flattenPaths(node: TreeNode): void {
-    for (const child of node.children) {
-      if (child.type === "folder") {
-        // Recursively flatten first
-        flattenPaths(child);
-
-        // Check if this folder should be flattened
-        // Condition: exactly one child, and that child is a folder
-        while (
-          child.children.length === 1 &&
-          child.children[0]?.type === "folder"
-        ) {
-          const grandchild = child.children[0];
-          // Merge: append grandchild name to child name
-          child.name = child.name + "/" + grandchild.name;
-          child.id = grandchild.id;
-          child.children = grandchild.children;
-        }
-
-        // Continue flattening in case new structure allows more flattening
-        flattenPaths(child);
-      }
-    }
-  }
-  flattenPaths(root);
-
-  // Flattening rewires parent/child links but leaves stale depths behind (a
-  // merged node's deeper descendants keep their pre-merge level), which shows up
-  // as a subtree indented one extra step. Recompute every depth from the final
-  // tree level in one pass so indentation is exactly the nesting depth.
-  function recomputeDepths(node: TreeNode, depth: number): void {
-    node.depth = depth;
-    for (const child of node.children) {
-      recomputeDepths(child, depth + 1);
-    }
-  }
-  recomputeDepths(root, 0);
-
-  return root;
 }
 
 // Filter tree to show only matching sources, auto-expand folders with matches
@@ -547,12 +443,17 @@ export function SourceTree() {
   // Determine if we should use server-side queries
   const useServerQuery = sources.length > SERVER_QUERY_THRESHOLD;
 
-  // Debounce server queries
+  // The box itself stays on `query` so typing is never held up; everything
+  // derived from it -- the server query, the match, the tree rebuild and its
+  // re-render -- follows the debounced value, so a burst of keystrokes costs
+  // one pass over the catalog instead of one per key. A small catalog filters
+  // locally for next to nothing, so it keeps following every key.
   const [debouncedQuery, setDebouncedQuery] = useState("");
   useEffect(() => {
     const timer = setTimeout(() => setDebouncedQuery(query), 300);
     return () => clearTimeout(timer);
   }, [query]);
+  const activeQuery = useServerQuery ? debouncedQuery : query;
 
   // Server-side filtering
   useEffect(() => {
@@ -568,18 +469,26 @@ export function SourceTree() {
       LOWER(source_url) LIKE '%${escaped}%' OR
       LOWER(source_type) LIKE '%${escaped}%'`;
 
+    // A query superseded while in flight must not land over the newer one: the
+    // answers can arrive out of order.
+    let stale = false;
     setServerQueryLoading(true);
     querySources(sql)
       .then((result) => {
+        if (stale) return;
         const ids = new Set(result.rows.map((r) => r.source_id as string));
         setServerFilteredIds(ids);
         setServerQueryLoading(false);
       })
       .catch((err) => {
+        if (stale) return;
         console.warn("Server query failed:", err);
         setServerFilteredIds(null);
         setServerQueryLoading(false);
       });
+    return () => {
+      stale = true;
+    };
   }, [debouncedQuery, useServerQuery, querySources]);
 
   // Client-side filter. Empty sources are dropped unconditionally, before the
@@ -587,7 +496,7 @@ export function SourceTree() {
   // worth a row, matching or not.
   const filteredSources = useMemo(() => {
     const visible = sources.filter((s) => !isEmptySource(s));
-    const q = query.trim().toLowerCase();
+    const q = activeQuery.trim().toLowerCase();
     if (!q) return visible;
 
     if (serverFilteredIds) {
@@ -595,7 +504,7 @@ export function SourceTree() {
     }
 
     return visible.filter((s) => matchesQuery(s, q));
-  }, [query, sources, serverFilteredIds]);
+  }, [activeQuery, sources, serverFilteredIds]);
 
   // Build tree from filtered sources
   const tree = useMemo(() => buildTree(filteredSources), [filteredSources]);
@@ -604,19 +513,19 @@ export function SourceTree() {
   // server-side query: that query is SQL against the catalog, which by
   // construction does not hold the uploads this node exists to show.
   const recent = useMemo(() => {
-    const q = query.trim().toLowerCase();
+    const q = activeQuery.trim().toLowerCase();
     const visible = recentSources.filter((s) => !isEmptySource(s));
     const matching = q ? visible.filter((s) => matchesQuery(s, q)) : visible;
     return recentNode(matching);
-  }, [recentSources, query]);
+  }, [recentSources, activeQuery]);
 
   // Filter tree when search is active (client-side only)
   const displayTree = useMemo(() => {
-    if (!query.trim() || serverFilteredIds) {
+    if (!activeQuery.trim() || serverFilteredIds) {
       return tree;
     }
 
-    const q = query.trim().toLowerCase();
+    const q = activeQuery.trim().toLowerCase();
     const matchingIds = new Set(
       filteredSources
         .filter((s) => `${s.source_id} ${s.source_url} ${s.source_type}`.toLowerCase().includes(q))
@@ -629,7 +538,7 @@ export function SourceTree() {
       setExpandedFolders(newExpanded);
     }
     return filtered ?? tree;
-  }, [tree, query, filteredSources, serverFilteredIds, expandedFolders]);
+  }, [tree, activeQuery, filteredSources, serverFilteredIds, expandedFolders]);
 
   const listRef = useRef<HTMLDivElement | null>(null);
   // The selection this has already revealed. Latched so a later catalog poll --
@@ -720,15 +629,18 @@ export function SourceTree() {
         {useServerQuery && (
           <div style={{ fontSize: 11, color: "#64748b", marginTop: 4 }}>
             {sources.length.toLocaleString()} sources • Server-side filter
+            {serverQueryLoading && " • Searching…"}
           </div>
         )}
       </div>
 
       <div ref={listRef} style={{ overflow: "auto" }}>
-        {sourcesLoading || serverQueryLoading ? (
-          <div style={{ padding: "0.5rem 1rem", opacity: 0.8 }}>
-            {serverQueryLoading ? "Searching..." : "Loading sources..."}
-          </div>
+        {/* A search leaves the list up (the header says it is under way):
+            swapping it for a notice unmounted every row and mounted them all
+            again when the answer landed, which is most of what a big
+            catalog's filter cost. */}
+        {sourcesLoading ? (
+          <div style={{ padding: "0.5rem 1rem", opacity: 0.8 }}>Loading sources...</div>
         ) : (
           <>
             {recent && (

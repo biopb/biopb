@@ -5,6 +5,7 @@ import { TreeRow } from "./SourceTree";
 import {
   UNRESOLVED_GLYPH,
   type TreeNode,
+  buildTree,
   recentNode,
 } from "../utils/sourceTree";
 
@@ -313,5 +314,39 @@ describe("TreeRow with more than one image", () => {
     expect(html).toContain("tensor-item");
     expect(html).toContain("well1");
     expect(html).toContain("well2");
+  });
+});
+
+describe("buildTree", () => {
+  const src = (id: string, url: string): DataSourceDescriptor => ({
+    ...LISTED,
+    source_id: id,
+    source_url: url,
+  });
+
+  it("groups sources under their shared folders", () => {
+    const root = buildTree([
+      src("a", "file:///data/x/one.tif"),
+      src("b", "file:///data/x/two.tif"),
+      src("c", "file:///data/y/three.tif"),
+    ]);
+    // `data` has two folder children, so nothing above them merges.
+    const data = root.children[0]!;
+    expect(data.children.map((c) => c.name)).toEqual(["x", "y"]);
+    expect(data.children[0]!.children).toHaveLength(2);
+    expect(data.children[1]!.children).toHaveLength(1);
+  });
+
+  it("builds 100k single-image folders in one directory promptly", () => {
+    // Finding each folder by scanning its parent's children is quadratic in a
+    // directory's width: this took ~22 s that way, and the build reruns on every
+    // filter change. The bound is generous; the regression is orders of magnitude.
+    const many = Array.from({ length: 100_000 }, (_, i) =>
+      src(`s${i}`, `file:///data/exp${i}/img.tif`),
+    );
+    const t = performance.now();
+    const root = buildTree(many);
+    expect(performance.now() - t).toBeLessThan(3000);
+    expect(root.children[0]!.children).toHaveLength(100_000);
   });
 });
