@@ -995,6 +995,11 @@ print(spec)
 PY
 }
 
+# Both specs run the env's interpreter with -E. A Jupyter from an environment
+# module exports a PYTHONPATH of its own Python's packages, which every kernel it
+# starts inherits, and the env's interpreter would import those ahead of its own.
+# -E ignores PYTHON* variables, so the kernel is the env's however it is started.
+
 # Write the biopb-session kernel spec: a kernel that is a proxy to the running
 # session (biopb_mcp.mcp._session_proxy), run by the env's own interpreter so
 # nothing is installed into a Jupyter. $1 the env's interpreter, $2 the spec dir,
@@ -1008,7 +1013,7 @@ os.makedirs(spec, exist_ok=True)
 with open(os.path.join(spec, "kernel.json"), "w") as f:
     json.dump(
         {
-            "argv": [sys.executable, "-m", "biopb_mcp.mcp._session_proxy", "-f", "{connection_file}"],
+            "argv": [sys.executable, "-E", "-m", "biopb_mcp.mcp._session_proxy", "-f", "{connection_file}"],
             "display_name": title,
             "language": "python",
             "interrupt_mode": "message",
@@ -1016,6 +1021,23 @@ with open(os.path.join(spec, "kernel.json"), "w") as f:
         f,
         indent=1,
     )
+PY
+}
+
+# Put -E after the interpreter in the kernel spec `ipykernel install` wrote (it has
+# no flag for it). $1 the env's interpreter, $2 the spec dir. Nothing changes if
+# the spec already has it. biopb-engine.ps1 carries the same program.
+_isolate_kernelspec() {
+    "$1" - "$2" <<'PY'
+import json, os, sys
+
+path = os.path.join(sys.argv[1], "kernel.json")
+with open(path) as f:
+    spec = json.load(f)
+if "-E" not in spec["argv"][1:2]:
+    spec["argv"].insert(1, "-E")
+    with open(path, "w") as f:
+        json.dump(spec, f, indent=1)
 PY
 }
 
@@ -1040,7 +1062,8 @@ _install_kernelspec() {
             continue
         fi
         if [ "$name" = "$_KERNELSPEC_BIOPB_NAME" ]; then
-            "$py" -m ipykernel install --user --name "$name" --display-name "$_KERNELSPEC_BIOPB_TITLE" >/dev/null 2>&1
+            "$py" -m ipykernel install --user --name "$name" --display-name "$_KERNELSPEC_BIOPB_TITLE" >/dev/null 2>&1 \
+                && _isolate_kernelspec "$py" "$spec" >/dev/null 2>&1
         else
             _write_session_kernelspec "$py" "$spec" "$_KERNELSPEC_SESSION_TITLE" >/dev/null 2>&1
         fi

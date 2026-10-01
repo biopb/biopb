@@ -1066,7 +1066,7 @@ os.makedirs(spec, exist_ok=True)
 with open(os.path.join(spec, "kernel.json"), "w") as f:
     json.dump(
         {
-            "argv": [sys.executable, "-m", "biopb_mcp.mcp._session_proxy", "-f", "{connection_file}"],
+            "argv": [sys.executable, "-E", "-m", "biopb_mcp.mcp._session_proxy", "-f", "{connection_file}"],
             "display_name": title,
             "language": "python",
             "interrupt_mode": "message",
@@ -1074,6 +1074,20 @@ with open(os.path.join(spec, "kernel.json"), "w") as f:
         f,
         indent=1,
     )
+'@
+
+# The same program as install.sh's _isolate_kernelspec: -E after the interpreter
+# in the spec `ipykernel install` wrote, so a foreign PYTHONPATH is not imported.
+$script:IsolateKernelSpecProgram = @'
+import json, os, sys
+
+path = os.path.join(sys.argv[1], "kernel.json")
+with open(path) as f:
+    spec = json.load(f)
+if "-E" not in spec["argv"][1:2]:
+    spec["argv"].insert(1, "-E")
+    with open(path, "w") as f:
+        json.dump(spec, f, indent=1)
 '@
 
 function Get-KernelSpecState {
@@ -1107,6 +1121,9 @@ function Install-KernelSpec {
             }
             if ($k.Name -eq 'biopb') {
                 & $Python -m ipykernel install --user --name $k.Name --display-name $k.Title *> $null
+                if ($LASTEXITCODE -eq 0) {
+                    $script:IsolateKernelSpecProgram | & $Python - $spec.Dir *> $null
+                }
             } else {
                 $script:SessionKernelSpecProgram | & $Python - $spec.Dir $k.Title *> $null
             }
