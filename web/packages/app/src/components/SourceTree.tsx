@@ -18,6 +18,11 @@ import {
 
 // Threshold for switching to server-side SQL query
 const SERVER_QUERY_THRESHOLD = 1000;
+// Most matches a search shows. The server's own cap (100k rows by default) is a
+// safety valve, not a page size: every row is an id to ship, a tree node to build
+// and a row to render, and nobody reads a hundred thousand results. One more than
+// this is asked for, so "there were more" is known without a count.
+const SERVER_QUERY_LIMIT = 2000;
 
 function tensorShortName(arrayId: string): string {
   const parts = arrayId.split("/").filter(Boolean);
@@ -32,7 +37,14 @@ function formatShape(shape: number[]): string {
   return shape.join("×");
 }
 
-// Filter tree to show only matching sources, auto-expand folders with matches
+// Deepest folder level a search opens by itself. A match deep in a big tree
+// would otherwise open every folder on the way down, and a result list of
+// thousands of rows is no longer a list anyone reads: the top level shows where
+// the matches are, and the user opens what they want.
+const AUTO_EXPAND_DEPTH = 1;
+
+// Filter tree to show only matching sources, auto-expand the top-level folders
+// holding matches
 function filterTree(
   node: TreeNode,
   matchingSourceIds: Set<string>,
@@ -52,7 +64,10 @@ function filterTree(
     if (filtered) {
       filteredChildren.push(filtered);
       // Auto-expand folders containing matches
-      if (filtered.type === "source" || filtered.children.length > 0) {
+      if (
+        node.depth <= AUTO_EXPAND_DEPTH &&
+        (filtered.type === "source" || filtered.children.length > 0)
+      ) {
         expandedFolders.add(node.id);
       }
     }
@@ -421,6 +436,8 @@ export function SourceTree() {
   const [query, setQuery] = useState("");
   const [serverFilteredIds, setServerFilteredIds] = useState<Set<string> | null>(null);
   const [serverQueryLoading, setServerQueryLoading] = useState(false);
+  // More sources matched than `SERVER_QUERY_LIMIT` lets through.
+  const [serverMoreMatches, setServerMoreMatches] = useState(false);
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(
     () => new Set(),
   );
@@ -459,6 +476,7 @@ export function SourceTree() {
   useEffect(() => {
     if (!useServerQuery || !debouncedQuery.trim()) {
       setServerFilteredIds(null);
+      setServerMoreMatches(false);
       return;
     }
 
@@ -467,7 +485,8 @@ export function SourceTree() {
     const sql = `SELECT source_id FROM sources WHERE
       LOWER(source_id) LIKE '%${escaped}%' OR
       LOWER(source_url) LIKE '%${escaped}%' OR
-      LOWER(source_type) LIKE '%${escaped}%'`;
+      LOWER(source_type) LIKE '%${escaped}%'
+      ORDER BY source_url LIMIT ${SERVER_QUERY_LIMIT + 1}`;
 
     // A query superseded while in flight must not land over the newer one: the
     // answers can arrive out of order.
@@ -476,14 +495,16 @@ export function SourceTree() {
     querySources(sql)
       .then((result) => {
         if (stale) return;
-        const ids = new Set(result.rows.map((r) => r.source_id as string));
-        setServerFilteredIds(ids);
+        const ids = result.rows.slice(0, SERVER_QUERY_LIMIT).map((r) => r.source_id as string);
+        setServerFilteredIds(new Set(ids));
+        setServerMoreMatches(result.rows.length > SERVER_QUERY_LIMIT);
         setServerQueryLoading(false);
       })
       .catch((err) => {
         if (stale) return;
         console.warn("Server query failed:", err);
         setServerFilteredIds(null);
+        setServerMoreMatches(false);
         setServerQueryLoading(false);
       });
     return () => {
@@ -630,6 +651,9 @@ export function SourceTree() {
           <div style={{ fontSize: 11, color: "#64748b", marginTop: 4 }}>
             {sources.length.toLocaleString()} sources • Server-side filter
             {serverQueryLoading && " • Searching…"}
+            {serverMoreMatches &&
+              !serverQueryLoading &&
+              ` • First ${SERVER_QUERY_LIMIT.toLocaleString()} matches shown, refine the search`}
           </div>
         )}
       </div>
