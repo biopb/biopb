@@ -1356,6 +1356,18 @@ def control_start(
                 )
                 _remove_control_pid()
 
+            # A foreground `control run` writes no pid file, only the endpoint
+            # record; without this a second control would start on the default
+            # ports and overwrite that record.
+            live = _live_foreground_control()
+            if live:
+                record, live_pid = live
+                console.print(
+                    f"[yellow]biopb control already running (PID {live_pid}, foreground, "
+                    f"{record.get('host')}:{record.get('port')})[/yellow]"
+                )
+                raise typer.Exit(0)
+
             control_host, control_port = _control_bind_endpoint(base_port)
             _guard_ports_free(base_port, grpc_bind, data_plane)
 
