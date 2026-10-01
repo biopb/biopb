@@ -66,11 +66,28 @@ def test_install_points_the_spec_at_the_env(run, env, spec):
 
 
 @pytest.mark.parametrize("run", RUNNERS)
+def test_the_kernel_ignores_the_launching_jupyters_python_variables(
+    run, env, spec, session_spec
+):
+    """A Jupyter from an environment module exports a PYTHONPATH of its own
+    Python's packages, and the env's interpreter would import those first."""
+    run("_install_kernelspec", sys.executable, env)
+    standalone = json.loads(spec.read_text())["argv"]
+    assert standalone[:2] == [sys.executable, "-E"]
+    assert "ipykernel_launcher" in standalone
+    assert json.loads(session_spec.read_text())["argv"][:2] == [sys.executable, "-E"]
+    # Installing again does not stack the flag.
+    run("_install_kernelspec", sys.executable, env)
+    assert json.loads(spec.read_text())["argv"].count("-E") == 1
+
+
+@pytest.mark.parametrize("run", RUNNERS)
 def test_install_writes_a_session_proxy_spec(run, env, session_spec):
     run("_install_kernelspec", sys.executable, env)
     written = json.loads(session_spec.read_text())
     assert written["argv"] == [
         sys.executable,
+        "-E",
         "-m",
         "biopb_mcp.mcp._session_proxy",
         "-f",
