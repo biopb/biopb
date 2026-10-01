@@ -52,7 +52,7 @@ from biopb.tensor._session import (
     _requested_slice,
     split_array_id as split_array_id,
 )
-from biopb.tensor._tls import resolve_tls_trust
+from biopb.tensor._tls import anchored_trust, is_tls_location, resolve_tls_trust
 from biopb.tensor._upload import UploadRefused as UploadRefused, UploadSession
 from biopb.tensor.descriptor_pb2 import (
     AddSourceProgress,
@@ -172,6 +172,21 @@ class TensorFlightClient:
         """The server this client dials, as Arrow names it (``grpc+tls://``
         for a TLS location)."""
         return self._location
+
+    @property
+    def advertised_location(self) -> Optional[str]:
+        """The address the server says it is reachable at
+        (``health.external_location``, biopb/biopb#1158), or None if it
+        published none.
+
+        Nothing in the SDK dials it for you. Pass it as ``export_location`` to
+        ``get_tensor`` when the result goes to a process that cannot reach this
+        connection's own address. Reading it runs the one ``health`` check if no
+        call has yet.
+        """
+        _ = self._state.client
+        loc = self._state.advertised_location
+        return normalize_flight_location(loc) if loc else None
 
     # ---- Catalog / metadata / source lifecycle (delegated to CatalogClient) ----
 
@@ -803,14 +818,16 @@ class TensorFlightClient:
                   the lazy dask array.
             export_location: Address to bake into the result -- the array's
                 per-chunk fetch closures for ``output="da"``, the message's
-                ``location`` for ``output="pb"`` -- instead of the server's
-                advertised ``health.external_location`` (biopb/biopb#1158) or,
-                absent that, this connection's own dial address. A
-                ``"da"`` array is pickle-safe and reconnects lazily wherever
-                it is computed, so this is what a dask worker actually dials
-                too. Set it when neither the server's guess nor your own dial
-                address is reachable from there (e.g. a worker pool behind a
-                second NAT layer the server has no way to know about).
+                ``location`` for ``output="pb"`` -- instead of this
+                connection's own dial address. A ``"da"`` array is pickle-safe
+                and reconnects lazily wherever it is computed, so this is what
+                a dask worker actually dials. Set it when the result leaves
+                this process and the dial address is not reachable from there;
+                ``advertised_location`` is the server's own answer for that.
+                The result carries the trust anchor this connection verified
+                the server with, not a resolved trust: whoever dials the new
+                address applies it to that name, so a leaf-pinned certificate
+                that omits the name still connects (a CA keeps its SAN check).
 
         Returns:
             A ``dask.array`` (``output="da"``) or a ``SerializedTensor``
@@ -906,17 +923,27 @@ class TensorFlightClient:
         location = normalize_flight_location(pb.location)
         info = flight.FlightInfo.deserialize(pb.flight_info)
         requested = _requested_slice(info)
+        # The sender's anchor, applied to the name dialed here; a sender that
+        # predates the field sends none, and this falls back to TOFU.
+        trust = (
+            anchored_trust(pb.tls_anchor)
+            if pb.tls_anchor and is_tls_location(location)
+            else resolve_tls_trust(location)
+        )
         if not info.endpoints:
             logger.debug("tensor_from_pb: no endpoints, calling GetFlightInfo")
             info = _refetch_flight_info(
-                TensorDescriptor.FromString(info.descriptor.command), location, token
+                TensorDescriptor.FromString(info.descriptor.command),
+                location,
+                token,
+                trust,
             )
         return _dask_from_flight_info(
             info,
             location,
             token,
             cache_bytes,
-            resolve_tls_trust(location),
+            trust,
             requested,
         )
 

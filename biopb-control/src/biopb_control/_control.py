@@ -98,6 +98,7 @@ import threading
 import time
 from html import escape as _escape_html
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx
 import uvicorn
@@ -107,6 +108,7 @@ from biopb import (
     _sessions,
     _web_auth,
 )
+from biopb._control import _endpoints
 from biopb.lifecycle.daemon import detach_kwargs
 from starlette.applications import Starlette
 from starlette.background import BackgroundTask
@@ -320,6 +322,41 @@ def normalize_url_prefix(value: str | None) -> str | None:
                 "._~-!$&'()*+,;=@ per segment)"
             )
     return "/" + "/".join(segments)
+
+
+def normalize_public_origin(value: str | None) -> str | None:
+    """Canonicalize a configured public origin to ``scheme://host[:port]``, or
+    ``None`` for none.
+
+    Only ever shown, never used to route or authorize, but it ends up in a link an
+    agent hands a person to click, so it must be a plain http(s) origin: no
+    credentials, path (that is the prefix), query or fragment. Raises
+    :class:`ValueError` otherwise.
+    """
+    if not value or not value.strip():
+        return None
+    raw = value.strip()
+    parts = urlsplit(raw)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise ValueError(
+            f"invalid public origin {raw!r}: expected http(s)://host[:port]"
+        )
+    if (
+        parts.username is not None
+        or parts.password is not None
+        or parts.path not in ("", "/")
+        or parts.query
+        or parts.fragment
+    ):
+        raise ValueError(
+            f"invalid public origin {raw!r}: an origin has no credentials, path, "
+            "query or fragment (the path prefix is --url-prefix)"
+        )
+    try:
+        parts.port  # noqa: B018 - raises ValueError on a malformed port
+    except ValueError:
+        raise ValueError(f"invalid public origin {raw!r}: bad port") from None
+    return f"{parts.scheme}://{parts.netloc.lower()}"
 
 
 class _URLPrefixMiddleware:
@@ -554,10 +591,7 @@ def _loopback_url(host: str, port: int, scheme: str = "http") -> str:
     is bracketed so the ``:port`` suffix stays unambiguous. Mirrors the
     supervisor's liveness-probe convention.
     """
-    reachable = {"0.0.0.0": "127.0.0.1", "::": "::1", "": "127.0.0.1"}.get(host, host)
-    if ":" in reachable:  # IPv6 literal must be bracketed in a URL (e.g. [::1])
-        reachable = f"[{reachable}]"
-    return f"{scheme}://{reachable}:{port}"
+    return _endpoints.connect_url(host, port, scheme)
 
 
 # How long each per-session kernel probe may take. The dashboard polls the

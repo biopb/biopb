@@ -34,6 +34,7 @@ from biopb_control._control import (
     _rewrite_shell_html,
     _session_proxy_roots,
     build_app,
+    normalize_public_origin,
     normalize_url_prefix,
     serve_control_api,
 )
@@ -1570,6 +1571,44 @@ _PREFIX = "/node/mantis-051/29847"
 )
 def test_normalize_url_prefix(raw, expected):
     assert normalize_url_prefix(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("https://portal.example.edu", "https://portal.example.edu"),
+        ("https://portal.example.edu/", "https://portal.example.edu"),
+        ("  http://portal.example.edu:8080  ", "http://portal.example.edu:8080"),
+        ("HTTPS://Portal.Example.EDU", "https://portal.example.edu"),
+        ("https://[::1]:8443", "https://[::1]:8443"),
+        ("", None),
+        ("   ", None),
+        (None, None),
+    ],
+)
+def test_normalize_public_origin(raw, expected):
+    assert normalize_public_origin(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "portal.example.edu",  # no scheme
+        "//portal.example.edu",
+        "ftp://portal.example.edu",
+        "javascript:alert(1)",
+        "https://",
+        "https://user@portal.example.edu",
+        "https://user:pw@portal.example.edu",
+        "https://portal.example.edu/node/h/1",  # the path is --url-prefix
+        "https://portal.example.edu?x=1",
+        "https://portal.example.edu#frag",
+        "https://portal.example.edu:notaport",
+    ],
+)
+def test_normalize_public_origin_rejects_non_origins(bad):
+    with pytest.raises(ValueError):
+        normalize_public_origin(bad)
 
 
 @pytest.mark.parametrize(

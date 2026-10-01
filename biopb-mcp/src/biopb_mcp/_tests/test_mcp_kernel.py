@@ -5,6 +5,7 @@ and exercise execute/interrupt/restart/shutdown.  A separate, display-gated
 test runs the real napari bootstrap end-to-end.
 """
 
+import json
 import os
 import signal
 import sys
@@ -109,6 +110,51 @@ class TestKernelControl:
             assert reply["content"]["status"] == "ok"
         finally:
             kc.stop_channels()
+
+    @pytest.fixture
+    def users_own_python3(self, tmp_path, monkeypatch):
+        """What a user's earlier `ipykernel install --user` can leave behind: a
+        `python3` spec that does not run biopb's interpreter."""
+        spec = tmp_path / "jupyter" / "kernels" / "python3"
+        spec.mkdir(parents=True)
+        (spec / "kernel.json").write_text(
+            json.dumps(
+                {
+                    "argv": [sys.executable, "-c", "raise SystemExit(3)"],
+                    "display_name": "theirs",
+                    "language": "python",
+                }
+            )
+        )
+        monkeypatch.setenv("JUPYTER_DATA_DIR", str(tmp_path / "jupyter"))
+        monkeypatch.setenv(
+            "JUPYTER_PREFER_ENV_PATH", "0"
+        )  # theirs wins, as at the reporter's
+
+    def test_the_default_kernel_is_this_interpreters_whatever_specs_are_installed(
+        self, users_own_python3
+    ):
+        host = KernelHost(health_probe_code=None, startup_timeout=60.0)
+        try:
+            host.start()
+            ran = host.execute("import sys; print(sys.executable)")["stdout"].strip()
+            assert os.path.samefile(ran, sys.executable)
+        finally:
+            host.shutdown()
+
+    def test_naming_a_spec_still_picks_it_and_a_failure_says_what_ran(
+        self, users_own_python3, monkeypatch
+    ):
+        monkeypatch.setattr(_kernel, "_LAUNCH_RETRY_DELAYS", ())
+        host = KernelHost(
+            kernel_name="python3", health_probe_code=None, startup_timeout=60.0
+        )
+        try:
+            with pytest.raises(RuntimeError) as err:
+                host.start()
+            assert "'python3'" in str(err.value) and sys.executable in str(err.value)
+        finally:
+            host.shutdown()
 
     def test_a_failed_launch_drops_the_ports_the_retry_would_reuse(
         self, kernel, monkeypatch
@@ -852,6 +898,9 @@ class TestParentDeathPipe:
 # ---------------------------------------------------------------------------
 
 
+_UNREACHABLE_PLANE = "grpc://127.0.0.1:1"
+
+
 @pytest.fixture(scope="module")
 def viewerless_kernel(tmp_path_factory):
     line = "import biopb_mcp.mcp._bootstrap as _b; _b.bootstrap()"
@@ -862,6 +911,9 @@ def viewerless_kernel(tmp_path_factory):
             os.environ,
             BIOPB_CONFIG_HOME=str(tmp_path_factory.mktemp("config")),
             BIOPB_NO_VIEWER="the viewer is off in the config",
+            # Nothing listens here: the connection is attempted and refused,
+            # without the test starting a control.
+            BIOPB_TENSOR_URL=_UNREACHABLE_PLANE,
         ),
         watchdog_interval=0,
         window_close_pipe=False,
@@ -892,6 +944,18 @@ class TestViewerlessBootstrap:
 
     def test_the_host_reports_why(self, viewerless_kernel):
         assert viewerless_kernel.no_viewer_reason == "the viewer is off in the config"
+
+    def test_the_session_dials_its_own_connection(self, viewerless_kernel):
+        # #1205: no Tensor Browser exists to connect it, so the bootstrap does.
+        # The plane is unreachable, so `url` set with a message is the proof of
+        # an attempt; before, both stayed empty forever.
+        def _attempted():
+            res = viewerless_kernel.execute(
+                "print(_conn.url, bool(_conn.last_message))"
+            )
+            return f"{_UNREACHABLE_PLANE} True" in res["stdout"]
+
+        assert _wait_until(_attempted)
 
     def test_client_tracks_the_connection_before_each_cell(self, viewerless_kernel):
         # The connection lands asynchronously; the next cell sees it.
@@ -1550,7 +1614,9 @@ class TestJupyterClientGate:
         assert _wait_until(gated.is_busy, timeout=5, interval=0.01)
         reply, _ = self._run(foreign, "y = 1")
         assert reply["status"] == "ok"
-        assert gated.jobs.poll(job)["status"] == "ok"
+        # The host learns the agent's cell ended from iopub, which can trail the
+        # foreign client's reply.
+        assert _wait_until(lambda: gated.jobs.poll(job)["status"] == "ok")
         assert gated.execute("print(y)")["stdout"].strip() == "1"
         assert [j["origin"] for j in self._jobs(gated)] == ["mcp", "user"]
 

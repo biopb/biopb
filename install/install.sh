@@ -995,6 +995,11 @@ print(spec)
 PY
 }
 
+# Both specs run the env's interpreter with -E. A Jupyter from an environment
+# module exports a PYTHONPATH of its own Python's packages, which every kernel it
+# starts inherits, and the env's interpreter would import those ahead of its own.
+# -E ignores PYTHON* variables, so the kernel is the env's however it is started.
+
 # Write the biopb-session kernel spec: a kernel that is a proxy to the running
 # session (biopb_mcp.mcp._session_proxy), run by the env's own interpreter so
 # nothing is installed into a Jupyter. $1 the env's interpreter, $2 the spec dir,
@@ -1008,7 +1013,7 @@ os.makedirs(spec, exist_ok=True)
 with open(os.path.join(spec, "kernel.json"), "w") as f:
     json.dump(
         {
-            "argv": [sys.executable, "-m", "biopb_mcp.mcp._session_proxy", "-f", "{connection_file}"],
+            "argv": [sys.executable, "-E", "-m", "biopb_mcp.mcp._session_proxy", "-f", "{connection_file}"],
             "display_name": title,
             "language": "python",
             "interrupt_mode": "message",
@@ -1016,6 +1021,23 @@ with open(os.path.join(spec, "kernel.json"), "w") as f:
         f,
         indent=1,
     )
+PY
+}
+
+# Put -E after the interpreter in the kernel spec `ipykernel install` wrote (it has
+# no flag for it). $1 the env's interpreter, $2 the spec dir. Nothing changes if
+# the spec already has it. biopb-engine.ps1 carries the same program.
+_isolate_kernelspec() {
+    "$1" - "$2" <<'PY'
+import json, os, sys
+
+path = os.path.join(sys.argv[1], "kernel.json")
+with open(path) as f:
+    spec = json.load(f)
+if "-E" not in spec["argv"][1:2]:
+    spec["argv"].insert(1, "-E")
+    with open(path, "w") as f:
+        json.dump(spec, f, indent=1)
 PY
 }
 
@@ -1040,7 +1062,8 @@ _install_kernelspec() {
             continue
         fi
         if [ "$name" = "$_KERNELSPEC_BIOPB_NAME" ]; then
-            "$py" -m ipykernel install --user --name "$name" --display-name "$_KERNELSPEC_BIOPB_TITLE" >/dev/null 2>&1
+            "$py" -m ipykernel install --user --name "$name" --display-name "$_KERNELSPEC_BIOPB_TITLE" >/dev/null 2>&1 \
+                && _isolate_kernelspec "$py" "$spec" >/dev/null 2>&1
         else
             _write_session_kernelspec "$py" "$spec" "$_KERNELSPEC_SESSION_TITLE" >/dev/null 2>&1
         fi
@@ -2024,10 +2047,25 @@ uninstall_biopb() {
     if command -v uv &>/dev/null; then
         # The spec's owner is judged by the env's interpreter, so before it goes.
         _remove_kernelspec "$(_tool_python)"
-        if uv tool uninstall biopb &>/dev/null; then
+        # uv takes a lock on the tool dir and waits for it forever; on an NFS home a
+        # lock orphaned by a killed uv (possibly on another node) never clears, so
+        # bound the wait and say so rather than hang silently. No `timeout` (stock
+        # macOS): run uv unbounded, as before.
+        local uv_out uv_rc _tmo=""
+        command -v timeout &>/dev/null && _tmo="timeout 60"
+        uv_out=$($_tmo uv tool uninstall biopb 2>&1) && uv_rc=0 || uv_rc=$?
+        if [ "$uv_rc" = "0" ]; then
             _ok "Removed the biopb tool environment (biopb, biopb-tensor-server, biopb-mcp)"
-        else
+        elif [ "$uv_rc" = "124" ]; then
+            _warn "uv did not finish within 60s; it is probably waiting on a stale lock"
+            _info "  If no uv process is running (check other nodes too), replace the lock:"
+            _info "    ${CYAN}cd \"\$(uv tool dir)\" && mv .lock .lock.stale && touch .lock${RESET}"
+            _info "  then rerun this uninstall."
+        elif printf '%s' "$uv_out" | grep -qi "not installed"; then
             _info "biopb tool environment not present (already removed?)"
+        else
+            _warn "uv tool uninstall biopb failed (exit $uv_rc)"
+            [ -z "$uv_out" ] || _info "  $uv_out"
         fi
     else
         _warn "uv not found; cannot remove the biopb tool environment"

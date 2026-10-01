@@ -179,14 +179,17 @@ class _Client:
     """The kernel's tensor client, as far as ops touches it."""
 
     location = PLANE
+    advertised_location = "grpc://plane.example:8815"
 
     def __init__(self):
+        self.exports = []
         self.uploads = []
         self.arrays = {}
         self.labels = {}
 
-    def get_tensor(self, array_id, output="da"):
+    def get_tensor(self, array_id, output="da", export_location=None):
         if output == "pb":
+            self.exports.append(export_location)
             return _reference(array_id, PLANE).lazy
         return self.arrays.get(array_id, da.ones((2, 2), np.uint8, chunks=2))
 
@@ -341,6 +344,9 @@ def test_an_array_id_to_a_lazy_op_goes_as_a_reference(client, serve):
     assert servicer.seen == {"image": "lazy"}
     assert result.startswith("cache://scratch/@fields/lazy_double-")
     assert client.uploads[0][0] == result
+    # The op server dials the reference from elsewhere: the plane's advertised
+    # address goes out, not the one this session dials.
+    assert client.exports == [client.advertised_location]
 
 
 def test_an_array_id_to_an_eager_op_is_read_here_and_sent_inline(client, serve):
@@ -500,13 +506,74 @@ def test_status_logs_restart(monkeypatch):
         "biopb.restart_algorithm",
         lambda name, timeout: {"state": "up", "error": None},
     )
-    ops = _ops(None)
+    ops = _ops(rows)
     assert (
         ops.status() == "a (script): failed; ops: seg\n  error: exited before serving"
     )
     assert ops.logs("a") == "l1\nl2"
     assert ops.restart("a") == "a: up"
     assert list(ops) == ["seg"]
+
+
+# --------------------------------------------------------------------------- #
+# A server built after the kernel bound its ops (#1206)
+# --------------------------------------------------------------------------- #
+
+_NEW = {"name": "a", "kind": "script", "state": "new", "ops": []}
+_BUILT = {"name": "a", "kind": "script", "state": "stopped", "ops": [_info("seg")]}
+
+
+def test_a_miss_rereads_the_registry_once_the_server_is_built(monkeypatch):
+    ops = _ops([_NEW])
+    assert repr(ops) == "<ops: none; not built yet: a>"
+    monkeypatch.setattr("biopb.algorithms", lambda timeout: [_BUILT])
+    assert ops.seg.op_name == "seg"
+    assert ops["seg"] is ops.seg
+    assert repr(ops) == "<ops: seg>"
+
+
+def test_a_miss_names_the_servers_not_built_yet(monkeypatch):
+    ops = _ops([_NEW])
+    monkeypatch.setattr("biopb.algorithms", lambda timeout: [_NEW])
+    with pytest.raises(AttributeError, match="Not built yet: a"):
+        _ = ops.seg
+
+
+def test_misses_reread_at_most_once_per_interval(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "biopb.algorithms", lambda timeout: calls.append(timeout) or [_NEW]
+    )
+    ops = _ops([_NEW])
+    for _ in range(3):
+        assert not hasattr(ops, "seg")
+    assert len(calls) == 1
+
+
+def test_an_underscore_probe_does_not_reread(monkeypatch):
+    monkeypatch.setattr(
+        "biopb.algorithms", lambda timeout: pytest.fail("a probe must not read")
+    )
+    assert not hasattr(_ops([_NEW]), "_repr_html_")
+
+
+def test_a_failed_reread_still_raises_the_miss(monkeypatch):
+    def boom(timeout):
+        raise OSError("no control")
+
+    monkeypatch.setattr("biopb.algorithms", boom)
+    with pytest.raises(AttributeError, match="no op 'seg'"):
+        _ = _ops([_NEW]).seg
+    with pytest.raises(KeyError):
+        _ = _ops([_NEW])["seg"]
+
+
+def test_status_says_when_the_control_has_ops_this_kernel_lacks(monkeypatch):
+    ops = _ops([_NEW])
+    monkeypatch.setattr("biopb.algorithms", lambda: [_BUILT])
+    assert "(not bound in this kernel: call ops.refresh())" in ops.status()
+    ops.bind([_BUILT])
+    assert "not bound" not in ops.status()
 
 
 # --------------------------------------------------------------------------- #

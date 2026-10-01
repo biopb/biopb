@@ -45,7 +45,7 @@ from dask.utils import parse_bytes
 from biopb.tensor import _diskcache
 from biopb.tensor._labels import split_label_array_id
 from biopb.tensor._location import location_host
-from biopb.tensor._tls import NO_TLS, TlsTrust
+from biopb.tensor._tls import NO_TLS, TlsTrust, concrete_trust
 from biopb.tensor.ticket_pb2 import TensorTicket
 
 logger = logging.getLogger(__name__)
@@ -720,7 +720,7 @@ def _get_thread_client(
     # host:port under different configured anchors (biopb/biopb#604 item 4), and
     # each carries its own hostname override -- so keying on (location, token)
     # would hand one upstream a connection built with the other's trust.
-    trust = tls_trust or NO_TLS
+    trust = concrete_trust(location, tls_trust) or NO_TLS
     key = (location, token, trust.key_id)
 
     # Fast path: thread already has client for this location (no lock)

@@ -409,11 +409,15 @@ export default function DashboardPage() {
             >
               Stop
             </button>
+            {/* These same-origin links keep rel="opener" on purpose: a new tab
+                copies sessionStorage from its opener, which is how the unlock
+                token reaches it; noopener (the target=_blank default) would
+                make each one ask for the token again. */}
             <a
               className={"link" + (linksOff ? " off" : "")}
               href={withBase("/viewer")}
               target="_blank"
-              rel="noopener"
+              rel="opener"
             >
               View Data →
             </a>
@@ -421,14 +425,14 @@ export default function DashboardPage() {
               className={"link" + (linksOff ? " off" : "")}
               href={withBase("/admin")}
               target="_blank"
-              rel="noopener"
+              rel="opener"
             >
               Config →
             </a>
             {/* The data-plane log tail. Available regardless of plane state (a
                 crashed plane's log is exactly what you want to read), so unlike
                 the viewer/config links it is never disabled. */}
-            <a className="link" href={withBase("/logs")} target="_blank" rel="noopener">
+            <a className="link" href={withBase("/logs")} target="_blank" rel="opener">
               Logs →
             </a>
           </div>
@@ -505,7 +509,7 @@ export default function DashboardPage() {
               className="gear-link"
               href={withBase("/mcp/admin")}
               target="_blank"
-              rel="noopener"
+              rel="opener"
             >
               <svg
                 className="gear-icon"
@@ -543,9 +547,9 @@ export default function DashboardPage() {
                     </span>
                     <a
                       className="obs"
-                      href={s.observe_url}
+                      href={withBase(s.observe_url)}
                       target="_blank"
-                      rel="noopener"
+                      rel="opener"
                     >
                       {s.chat ? "chat →" : "observe →"}
                     </a>

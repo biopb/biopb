@@ -1,4 +1,4 @@
-"""Unit tests for `biopb quick-start` -- the opt-in Windows Defender exclusion
+"""Unit tests for `biopb skip-windows-defender` -- the opt-in Windows Defender exclusion
 (issue #384).
 
 The exclusion covers every tree the interpreter reads at startup: the uv tool env
@@ -29,7 +29,7 @@ class TestQuickStartDispatch:
     def test_enable_adds_exclusion(self, monkeypatch):
         _win(monkeypatch)
         with patch.object(cli, "_defender_exclusion") as excl:
-            res = runner.invoke(cli.app, ["quick-start", "--enable"])
+            res = runner.invoke(cli.app, ["skip-windows-defender", "--enable"])
         assert res.exit_code == 0
         excl.assert_called_once()
         assert excl.call_args.kwargs == {"add": True}
@@ -37,7 +37,7 @@ class TestQuickStartDispatch:
     def test_disable_removes_exclusion(self, monkeypatch):
         _win(monkeypatch)
         with patch.object(cli, "_defender_exclusion") as excl:
-            res = runner.invoke(cli.app, ["quick-start", "--disable"])
+            res = runner.invoke(cli.app, ["skip-windows-defender", "--disable"])
         assert res.exit_code == 0
         excl.assert_called_once()
         assert excl.call_args.kwargs == {"add": False}
@@ -48,7 +48,7 @@ class TestQuickStartDispatch:
             patch.object(cli, "_defender_status") as status,
             patch.object(cli, "_defender_exclusion") as excl,
         ):
-            res = runner.invoke(cli.app, ["quick-start"])
+            res = runner.invoke(cli.app, ["skip-windows-defender"])
         assert res.exit_code == 0
         status.assert_called_once()
         excl.assert_not_called()
@@ -56,14 +56,16 @@ class TestQuickStartDispatch:
     def test_non_windows_is_a_noop(self, monkeypatch):
         monkeypatch.setattr(cli, "_is_windows", lambda: False)
         with patch.object(cli, "_defender_exclusion") as excl:
-            res = runner.invoke(cli.app, ["quick-start", "--enable"])
+            res = runner.invoke(cli.app, ["skip-windows-defender", "--enable"])
         assert res.exit_code == 0
         assert "Windows-only" in res.output
         excl.assert_not_called()
 
     def test_hidden_matches_platform(self):
         """Registered everywhere, but hidden from help off Windows."""
-        qs = next(c for c in cli.app.registered_commands if c.name == "quick-start")
+        qs = next(
+            c for c in cli.app.registered_commands if c.name == "skip-windows-defender"
+        )
         # hidden is fixed at import from the real platform: shown on Windows,
         # hidden elsewhere. Assert the relationship, not a hardcoded value.
         assert qs.hidden == (not cli._is_windows())

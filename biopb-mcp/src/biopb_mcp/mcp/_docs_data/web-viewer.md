@@ -25,20 +25,28 @@ both:
 ## Building the link
 
 ```python
-from biopb import base_url
-url = f"{base_url()}/viewer?id={array_id}"
+from biopb import user_base_url
+url = f"{user_base_url()}/viewer?id={array_id}"
 ```
 
-`base_url()` is the loopback origin, `http://127.0.0.1:8813` unless the
-control was moved. Take it from there rather than writing it out: the port is
-configurable and `server_status` reports the resolved value under
-`## Web viewer`.
+Two addresses reach the same page, for two audiences:
 
-A control published below the root (`--url-prefix`, an Open OnDemand job) still
-answers at its own origin, so the link above works. What changes is the URL
-*the user's browser* reaches it by — theirs carries the proxy's prefix before
-`/viewer`. Ask them for it rather than guessing; nothing in this session can
-discover it.
+- **`user_base_url()`** is where the *user's browser* reaches it: the link to give
+  them. Take it from there rather than writing it out — the port is configurable,
+  and behind a reverse proxy (`--url-prefix`, an Open OnDemand job) the address
+  is not the one this machine connects to.
+- **`base_url()`** is where *this machine* connects, `http://127.0.0.1:8813`
+  unless the control was moved. Use it for your own requests, never in a link
+  for the user: behind a proxy it is loopback, which their browser cannot reach.
+
+On a plain local session the two are equal. `server_status` prints both under
+`## Web viewer` when they differ.
+
+`user_base_url()` can be a bare path (`/node/<host>/<port>`) when the proxy's
+public origin was not configured: a path on whatever site the user opened this
+session from. Say so in what you give them, or give the origin if you know it. It
+never carries the access token; the page asks the user to unlock it if needed,
+and a link that had one would end up in transcripts.
 
 ## Parameters
 
@@ -87,7 +95,7 @@ each has a parameter that draws it:
 ```python
 desc = client.setup_array_upload(f"zarr://{image_id}/@labels/nuclei", labels)
 client.upload_array(desc, labels)
-url = f"{control_base_url()}/viewer?id={image_id}&lb={desc.array_id}&lo=0.5"
+url = f"{user_base_url()}/viewer?id={image_id}&lb={desc.array_id}&lo=0.5"
 ```
 
 [[upload]] is how each one gets there, and which to pick — a segmentation
