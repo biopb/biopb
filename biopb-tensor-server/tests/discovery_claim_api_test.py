@@ -195,13 +195,11 @@ class _ClaimsGoodPathAdapter:
 
 
 class TestDiscoveryFailureIsolation:
-    def test_discover_sources_continues_after_claim_exception_on_one_path(self):
+    def test_discover_under_continues_after_claim_exception_on_one_path(self):
         from pathlib import Path
 
-        from biopb_tensor_server.core.discovery import (
-            AdapterRegistry,
-            discover_sources as discover_tree_sources,
-        )
+        from biopb_tensor_server.core.discovery import AdapterRegistry
+        from biopb_tensor_server.sources.scan_root import discover_under
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -212,7 +210,7 @@ class TestDiscoveryFailureIsolation:
             registry.register(_RaisingOnBadPathAdapter)
             registry.register(_ClaimsGoodPathAdapter)
 
-            state = discover_tree_sources(root, registry)
+            state = discover_under(root, registry)
 
             assert len(state.claims) == 1
             claim = next(iter(state.claims.values()))

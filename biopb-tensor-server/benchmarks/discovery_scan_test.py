@@ -1,24 +1,20 @@
-"""Full-scan (discovery walk) benchmark — biopb/biopb#55.
+"""One-shot discovery scan benchmark -- biopb/biopb#55, #344.
 
-`discover_sources` walks a directory tree asking adapters to claim paths. Before
-#55 the walk had no claim feedback: once a container store (e.g. an OME-Zarr
-plate) was claimed at its root, the walk still recursed into it and probed every
-interior **chunk file** for a claim that can never fire. That made full-scan cost
-scale with the number of chunk files rather than with the number of logical
-sources.
+`discover_under` is the walk behind a drag-drop and a ``monitor = false``
+directory: one :class:`TreeScanner` snapshot of the root, then claims off it. Its
+cost is the number of *entries* stat-ed, so a tree dominated by the chunk files of
+an OME-Zarr plate is the worst case -- the claim phase prunes the plate's
+interior (#55), but the snapshot has already paid a stat for every chunk by then.
 
-This benchmark builds a tree dominated by chunk files and times the full scan two
-ways on the *same* tree:
+Two shapes, on the same plate:
 
-- ``naive``  — the pre-#55 behavior: descend into claimed directories too
-  (probe every interior path).
-- ``pruned`` — the shipped behavior: stop descending below a directory-level
-  claim (what ``discover_sources`` now does).
+- ``tree``  -- a folder holding the plate and a few sibling tiffs: the whole
+  interior is stat-ed.
+- ``root``  -- the plate itself dropped: the root is claimed before any walk, so
+  the cost does not depend on the chunk count at all.
 
-Both produce the identical set of claims; the gap between them is exactly the
-work #55 removed. Each benchmark records the interior file count, the number of
-adapter probes, and the number of sources found in ``extra_info`` so the
-probe-count reduction is visible alongside the wall-clock number.
+Each records the interior file count, the adapter probes and the sources found in
+``extra_info`` so the probe-count reduction is visible beside the wall clock.
 
 Run:
     pytest benchmarks/discovery_scan_test.py --benchmark-only
@@ -29,19 +25,13 @@ from pathlib import Path
 
 import pytest
 from biopb_tensor_server.adapters import get_default_registry
-from biopb_tensor_server.core.discovery import (
-    ClaimContext,
-    DiscoveryState,
-    discover_sources,
-    walk_with_identity_tracking,
-)
+from biopb_tensor_server.sources.scan_root import discover_under
 
 from benchmarks.utils import generate_synthetic_hcs_plate, generate_synthetic_tiff
 
 # Tree "scale": (wells, fields, chunks). Smaller chunks => more chunk files per
-# field array, which is what amplifies the pre-#55 cost. Logical source count is
-# fixed (one plate + a few sibling tiffs) across scales, so any growth in scan
-# cost under `naive` comes purely from chunk-file fan-out.
+# field array. Logical source count is fixed (one plate + a few sibling tiffs)
+# across scales, so any growth in scan cost comes purely from chunk-file fan-out.
 SCALES = {
     "small": {"wells": 8, "fields": 2, "shape": (512, 512), "chunks": (64, 64)},
     "medium": {"wells": 24, "fields": 4, "shape": (512, 512), "chunks": (32, 32)},
@@ -69,59 +59,20 @@ class _CountingRegistry:
         return self._registry.get_adapter_for_type(source_type)
 
 
-def _scan(root: Path, registry, *, prune: bool) -> DiscoveryState:
-    """Run a full discovery scan, toggling the #55 claim-feedback.
-
-    With ``prune=True`` this mirrors the shipped ``discover_sources`` (don't
-    descend below a directory-level claim). With ``prune=False`` it reproduces
-    the pre-#55 behavior (descend into claimed stores and probe every interior
-    file). Both share the identical root-claim short-circuit and per-path claim
-    loop, so the only difference measured is the descent policy.
-    """
-    state = DiscoveryState()
-
-    try:
-        state.visited_identities.add(_identity(root))
-    except OSError:
-        return state
-
-    # Root-claim short-circuit (identical to discover_sources).
-    ctx = ClaimContext(root)
-    claims = registry.get_claims_for_path(ctx, state)
-    if claims:
-        state.add_claim(claims[0])
-        return state
-
-    should_descend = (lambda p: not state.is_path_claimed(str(p))) if prune else None
-    for path in walk_with_identity_tracking(
-        root, state.visited_identities, should_descend=should_descend
-    ):
-        path_str = str(path)
-        if state.is_path_claimed(path_str):
-            continue
-        claims = registry.get_claims_for_path(ClaimContext(path), state)
-        if claims:
-            state.add_claim(claims[0])
-    return state
-
-
-def _identity(path: Path) -> str:
-    from biopb_tensor_server.core.discovery import get_file_identity
-
-    return get_file_identity(path)
-
-
 def _count_interior_files(root: Path) -> int:
     return sum(len(files) for _, _, files in os.walk(root))
 
 
 @pytest.fixture(params=list(SCALES), ids=list(SCALES))
 def scan_tree(request, tmp_path_factory):
-    """Build a tree: one HCS OME-Zarr plate (many chunk files) + sibling tiffs."""
+    """Build a folder: one HCS OME-Zarr plate (many chunk files) + sibling tiffs.
+
+    Returns ``(folder, plate, interior_file_count)``.
+    """
     spec = SCALES[request.param]
     root = tmp_path_factory.mktemp(f"scan_{request.param}")
 
-    generate_synthetic_hcs_plate(
+    plate, _, _ = generate_synthetic_hcs_plate(
         str(root),
         wells=spec["wells"],
         fields=spec["fields"],
@@ -134,64 +85,40 @@ def scan_tree(request, tmp_path_factory):
         extra.mkdir()
         generate_synthetic_tiff(str(extra), shape=(256, 256))
 
-    return root, _count_interior_files(root)
+    return root, Path(plate), _count_interior_files(root)
 
 
-class TestFullScan:
-    """Time the full discovery scan; compare pre-#55 vs shipped behavior."""
-
-    def test_scan_pruned(self, benchmark, scan_tree):
-        """Shipped behavior: scan cost is independent of chunk-file count."""
-        root, n_files = scan_tree
+class TestOneShotScan:
+    def test_scan_a_folder(self, benchmark, scan_tree):
+        """The whole tree is stat-ed; only the claim phase prunes the interior."""
+        root, _, n_files = scan_tree
 
         def run():
             reg = _CountingRegistry()
-            state = _scan(root, reg, prune=True)
+            state = discover_under(root, reg)
             return reg.probes, len(state.claims)
 
         probes, n_sources = benchmark(run)
 
         benchmark.extra_info.update(
-            interior_files=n_files, probes=probes, sources=n_sources, mode="pruned"
+            interior_files=n_files, probes=probes, sources=n_sources, shape="tree"
         )
         # The claimed plate's chunk files are never probed: probe count is on the
         # order of the directory/leaf-source count, far below the file count.
         assert probes < n_files
 
-    def test_scan_naive(self, benchmark, scan_tree):
-        """Pre-#55 behavior: scan probes every interior chunk file (the regression)."""
-        root, n_files = scan_tree
+    def test_scan_a_dataset_root(self, benchmark, scan_tree):
+        """A claimed root is never walked: cost is independent of chunk count."""
+        _, plate, n_files = scan_tree
 
         def run():
             reg = _CountingRegistry()
-            state = _scan(root, reg, prune=False)
+            state = discover_under(plate, reg)
             return reg.probes, len(state.claims)
 
         probes, n_sources = benchmark(run)
 
         benchmark.extra_info.update(
-            interior_files=n_files, probes=probes, sources=n_sources, mode="naive"
+            interior_files=n_files, probes=probes, sources=n_sources, shape="root"
         )
-
-    def test_pruned_and_naive_find_same_sources(self, scan_tree):
-        """Sanity: the optimization changes cost, not the discovered catalog."""
-        root, _ = scan_tree
-
-        pruned = _scan(root, get_default_registry(), prune=True)
-        naive = _scan(root, get_default_registry(), prune=False)
-
-        assert {c.primary_path for c in pruned.claims.values()} == {
-            c.primary_path for c in naive.claims.values()
-        }
-
-
-class TestDiscoverSourcesScan:
-    """Time the real ``discover_sources`` entry point (shipped path end-to-end)."""
-
-    def test_discover_sources(self, benchmark, scan_tree):
-        root, n_files = scan_tree
-        registry = get_default_registry()
-
-        state = benchmark(lambda: discover_sources(root, registry))
-
-        benchmark.extra_info.update(interior_files=n_files, sources=len(state.claims))
+        assert (probes, n_sources) == (1, 1)

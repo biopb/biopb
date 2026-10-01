@@ -1,10 +1,10 @@
 """Snapshot-driven claim discovery (biopb/biopb#56 item 4).
 
-`discover_sources_from_entries` reproduces `discover_sources`'s claim protocol from
-the (path, is_dir) snapshot the state walk already built, instead of re-walking the
-filesystem. These tests pin that it (a) yields the same claims as a real walk, (b)
-prunes a claimed directory's subtree (#55) and a skipped/filtered subtree, and (c)
-answers is_dir/is_file from the cached flag without stat'ing the entry (the item-3
+`discover_sources_from_entries` claims off the (path, is_dir) snapshot the state walk
+already built, instead of re-walking the filesystem. These tests pin that it (a)
+yields the claims `discover_under` does over the same tree, (b) prunes a claimed
+directory's subtree (#55) and a skipped/filtered subtree, and (c) answers
+is_dir/is_file from the cached flag without stat'ing the entry (the item-3
 mechanism that stops every adapter re-stat'ing).
 """
 
@@ -15,10 +15,10 @@ import pytest
 from biopb_tensor_server.adapters import get_default_registry
 from biopb_tensor_server.core.discovery import (
     ClaimContext,
-    discover_sources,
     discover_sources_from_entries,
 )
 from biopb_tensor_server.fixtures import create_multiresolution_ome_zarr
+from biopb_tensor_server.sources.scan_root import discover_under
 
 
 def _sig(stat_result, is_dir):
@@ -73,16 +73,16 @@ def _spy_registry(seen_paths):
     return registry
 
 
-class TestEquivalenceWithWalk:
-    def test_same_claims_as_discover_sources(self, tmp_path):
-        """The snapshot path discovers exactly the sources a real walk does."""
+class TestEquivalenceWithOneShotScan:
+    def test_same_claims_as_discover_under(self, tmp_path):
+        """A hand-built snapshot discovers exactly what the one-shot scan does."""
         pytest.importorskip("zarr")
         store, _, _ = create_multiresolution_ome_zarr(
             str(tmp_path / "plate"), base_shape=(256, 256), chunk_size=(64, 64)
         )
         nested, _, _ = create_multiresolution_ome_zarr(str(tmp_path / "a" / "b"))
 
-        walked = discover_sources(tmp_path, get_default_registry())
+        walked = discover_under(tmp_path, get_default_registry())
         snap = discover_sources_from_entries(
             _snapshot(tmp_path), get_default_registry()
         )

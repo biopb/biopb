@@ -18,8 +18,8 @@ from biopb_tensor_server.core.discovery import (
     _is_offline_placeholder,
     _is_skippable_system_dir,
     directory_is_resident,
-    walk_with_identity_tracking,
 )
+from biopb_tensor_server.sources.scan_root import _ONE_SHOT_SCANNER
 
 # Native Windows ``os.stat`` has no ``st_blocks``, so the POSIX zero-block
 # placeholder heuristic — and the tests that exercise it — only apply where
@@ -172,8 +172,8 @@ class TestWalkPruning:
         # sub-check below is simply skipped there while name-pruning still runs.
         offline_supported = getattr(os.stat(stub), "st_blocks", None) == 0
 
-        visited: set = set()
-        walked = {str(p) for p in walk_with_identity_tracking(tmp_path, visited)}
+        snapshot = _ONE_SHOT_SCANNER.scan_once(tmp_path)
+        walked = set(snapshot.entry_states)
 
         assert str(tmp_path / "Microscopy") in walked
         assert str(tmp_path / "Microscopy" / "good.tif") in walked

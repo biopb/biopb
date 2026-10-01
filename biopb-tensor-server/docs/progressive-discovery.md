@@ -40,8 +40,10 @@ compute and every claim is a pure add. `_initial_scan_done` marks the
 boundary: it flips once, at the end of the first successful full scan, and
 gates the behavior below. Steady-state rescans keep the ordinary
 snapshot-diff model (`removed = current − discovered`), since only they need
-to detect removals; they do not stream. Static, explicitly-configured sources
-are seeded synchronously and never go through this path.
+to detect removals; they do not stream. Static sources -- nothing to discover:
+a typed entry, a file, one remote source -- are seeded synchronously and never go
+through this path. A `monitor = false` directory is scanned once by the first
+tick, ahead of the monitored walk (so it is startup set too), and never again.
 
 Every `health`/catalog consumer tolerates a partial, growing catalog:
 `biopb-mcp`'s `_source_watch_loop` re-lists when `source_count` changes, and
@@ -73,7 +75,9 @@ show "Indexing... (N so far)" instead.
   with no watcher, so the event loop never runs; `cli.py` drives the
   completion path directly (stamp the timestamp, seed the backlog) so a
   purely static config still reports freshness, and falls back to a
-  synchronous scan if the watcher failed to start.
+  synchronous scan if the watcher failed to start. A config whose only
+  directories are one-shot still starts the loop, and its first tick completes
+  the startup protocol.
 - **A consumer that reads `SERVING` as "catalog complete" is wrong** and will
   flash an empty catalog; gate "no data" UI on `full_scan_in_progress`
   instead.
@@ -84,8 +88,6 @@ show "Indexing... (N so far)" instead.
   monitored tree, not scoped per root, so a multi-root config's steady-state
   staleness is bounded by the slowest root rather than surfacing sources
   root-by-root as each finishes.
-- **`resolve_all_sources` (static directory expansion) is still synchronous**
-  at startup.
 - **The catalog itself is not persisted.** `MetadataDatabase`'s `sources`
   table is truncated on open (only `rois` and `decode_rates` survive a
   restart), so every boot re-discovers from disk; a persisted catalog would

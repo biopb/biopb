@@ -148,9 +148,9 @@ time.
   a placeholder's mtime is untrustworthy, so it could never age into
   eligibility, and archived dehydrated data is never mid-write anyway.
 - **`cloud` controls gating only, not monitoring.** A `monitor=false` cloud
-  root is still scanned once at startup via the static-expand path, which
-  threads the same `admit_nonresident` + `cloud_root` behavior from
-  `source.cloud`.
+  root is still scanned once, by the first rescan tick, through the same
+  one-shot scan (`discover_under`) that threads `cloud` into both the
+  placeholder admission and the multi-file ban.
 - **Shape-presence doesn't protect pre-cache.** An unresolved source
   auto-skips (empty shape), but once resolved-and-persisted it returns with a
   concrete shape, so a naive backlog would re-warm it on restart. Residency

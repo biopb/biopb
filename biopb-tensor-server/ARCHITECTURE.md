@@ -285,13 +285,17 @@ ASAP and runs the monitored bootstrap scan in the background; the catalog grows
 *within* that scan as each source is claimed (see Directory Monitoring below).
 See **[docs/progressive-discovery.md](docs/progressive-discovery.md)**.
 
-### Directory monitoring (`sources.watcher`, `sources.source_manager`)
+### Directory scanning (`sources.tree_scanner`, `sources.source_manager`)
 
-`PeriodicRescanWatcher` emits a `RESCAN` on a fixed interval; per rescan the
-`SourceManager` delegates the filesystem-signature walk to `TreeScanner` (a fs
-walker gated on the stability window, returning an immutable `ScanSnapshot`), runs
-discovery on the snapshot's paths, and diffs the result against the confirmed
-catalog.
+There is one walker, `TreeScanner`, returning an immutable `ScanSnapshot`;
+discovery claims off the snapshot's paths. Per rescan the `SourceManager` walks
+the monitored roots incrementally (gated on the stability window) and diffs the
+result against the confirmed catalog. A drag-dropped folder and a `monitor =
+false` directory take the one-shot shape (`scan_once`, via
+`sources.scan_root.discover_under`): no previous snapshot, nothing pruned, then
+refresh-or-add per claim and removal of what is gone under that root. Only an
+entry with nothing to discover (a typed source, a file, one remote source) is
+registered without a walk.
 
 **Moves** within a monitored dir preserve `source_id`; a move out is a delete,
 a move in a create.
@@ -367,7 +371,7 @@ and *where to expose it* is the launch command.
 4. Initialize the chunk cache. The server refuses to start when the cache dir
    cannot be mmapped safely (network mount, cloud-synced folder) or isn't
    writable — the on-disk cache is required infrastructure, not optional.
-5. Resolve config sources into *static* and *monitored* sets, and build the
+5. Partition config sources into *static*, *monitored* and *scan-once* sets, and build the
    metadata DB (mandatory — it backs `query`). An empty catalog is a
    valid state and boots: sources can still arrive via `add_source`, DoPut, or a
    monitored dir that fills later. The cache's measured per-tensor decode

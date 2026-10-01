@@ -35,14 +35,11 @@ from biopb_tensor_server.core.config import (
 )
 from biopb_tensor_server.core.discovery import (
     AdapterRegistry,
-    ClaimContext,
-    DiscoveryState,
     SourceClaim,
-    discover_sources as claim_based_discover,
     generate_source_id,
-    get_file_identity,
 )
 from biopb_tensor_server.core.errors import UpstreamConfigError
+from biopb_tensor_server.sources.scan_root import discover_under
 
 logger = logging.getLogger(__name__)
 
@@ -218,8 +215,8 @@ def _alias_catalog_url(alias: str, root_path: str, primary_path: str) -> str:
         alias "exp", configure folder /data/exp/ with
             .../exp/a.tif, .../exp/sub/b.tif -> "exp/a.tif", "exp/sub/b.tif"
 
-    Display-only (never touches ``source_id``). Applied on the static / one-shot
-    expand path; a monitored directory's alias is dropped upstream (its rescan
+    Display-only (never touches ``source_id``). Applied to a configured source that
+    is not rescanned; a monitored directory's alias is dropped upstream (its rescan
     re-discovers native paths), so this is never fed a live-monitored source.
     """
     return _reroot_catalog_url(alias, root_path, primary_path)
@@ -292,59 +289,22 @@ def discover_sources(
     if source.type and source.source_id:
         return [source]
 
-    # Case 2: File with no type - try claim-based detection
-    if local_path.is_file():
-        # Try claim-based detection first. cloud_root carries the multi-file ban
-        # (OME-TIFF/DICOM-series -> single file) onto a directly-configured cloud
-        # file, matching the monitored path.
-        ctx = ClaimContext(local_path, cloud_root=source.cloud)
-        state = DiscoveryState()
-        try:
-            identity = get_file_identity(local_path)
-            state.visited_identities.add(identity)
-        except OSError:
-            pass
+    # Cases 2-3: no type -- the adapters' claim() protocol decides, through the one
+    # walker. A file or a dataset directory is claimed in place; a plain folder is
+    # walked. ``cloud`` admits dehydrated placeholders and carries the multi-file
+    # OME-TIFF / DICOM-series ban onto the scan, the same gating the monitored
+    # rescan applies (cloud-storage phase 2).
+    claims = discover_under(local_path, registry, cloud=source.cloud).get_all_claims()
 
-        claims = registry.get_claims_for_path(ctx, state)
-        if claims:
-            claim = claims[0]
-            return [_claim_to_source_config(claim, source)]
-
-        # No adapter recognized the file. There is no legacy fallback: format
-        # detection lives only in the adapters (biopb/biopb#277 item B), so an
-        # unclaimed file is a hard error rather than a guessed (often wrong) type.
+    # No adapter recognized the file. There is no legacy fallback: format
+    # detection lives only in the adapters (biopb/biopb#277 item B), so an
+    # unclaimed file is a hard error rather than a guessed (often wrong) type.
+    if not claims and local_path.is_file():
         raise ValueError(
             f"Could not detect type for file: {local_path}. "
             f"Please specify 'type' explicitly in config."
         )
-
-    # Case 3: Directory with no type - use claim-based discovery.
-    # First check if the directory itself is a data source
-    ctx = ClaimContext(local_path, cloud_root=source.cloud)
-    state = DiscoveryState()
-    try:
-        identity = get_file_identity(local_path)
-        state.visited_identities.add(identity)
-    except OSError:
-        pass
-
-    claims = registry.get_claims_for_path(ctx, state)
-    if claims:
-        claim = claims[0]
-        return [_claim_to_source_config(claim, source)]
-
-    # Directory is not itself a data source - do recursive claim-based scan. Under
-    # a cloud root, admit dehydrated placeholders so the one-shot startup scan of a
-    # monitor=false cloud directory still catalogues offline data as unresolved
-    # sources, and set cloud_root so the multi-file OME-TIFF / DICOM-series ban
-    # applies -- the same gating the monitored rescan uses (cloud-storage phase 2).
-    state = claim_based_discover(
-        local_path,
-        registry,
-        admit_nonresident=source.cloud,
-        cloud_root=source.cloud,
-    )
-    return [_claim_to_source_config(claim, source) for claim in state.get_all_claims()]
+    return [_claim_to_source_config(claim, source) for claim in claims]
 
 
 def _claim_to_source_config(
@@ -452,9 +412,10 @@ def resolve_all_sources(
         # display source_url now, while both the configured root and each concrete
         # child are in hand. Skipped for remote entries: a tensor-server upstream's
         # alias means the source_id namespace (handled by the proxy adapter's own
-        # display authority), not a tree root. A monitored local *directory* never
-        # reaches here (it is discovered by the rescan, not expanded), so its alias
-        # is correctly never applied -- see _resolve_serve_sources's warning.
+        # display authority), not a tree root. On the serve path a local *directory*
+        # never reaches here (the manager discovers it: re-rooted by
+        # ``SourceManager._scan_configured_root`` if unwatched, its alias ignored
+        # with a warning if monitored), so this serves ``validate`` and friends.
         reroot = bool(source.alias) and not source.is_remote
         root_path = source.local_path if reroot else None
         for src in discovered:

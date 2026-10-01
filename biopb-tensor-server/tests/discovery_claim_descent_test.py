@@ -1,24 +1,22 @@
-"""Discovery must not descend into a directory it just claimed (biopb/biopb#55).
+"""Discovery must not probe the interior of a directory it claimed (biopb/biopb#55).
 
-`walk_with_identity_tracking` used to recurse into every directory unconditionally,
-so when `discover_sources` claimed a container store mid-walk (e.g. a `.zarr`),
-the walk still yielded every interior chunk file and the registry probed each one
-for a claim that can never fire. For a chunked store that makes the walk's cost
-proportional to the number of chunk *files* rather than logical sources.
+When a container store (e.g. a `.zarr`) is claimed, everything under it belongs to
+it. Probing each interior chunk file for a claim that can never fire would make a
+scan's cost proportional to the number of chunk *files* rather than logical
+sources, and for a root that is itself a store, even stat-ing them is a visible
+hang on a drop.
 
-These tests pin the new claim-feedback behavior: once a directory is claimed,
-its subtree is never walked or probed.
+These tests pin that for ``discover_under``, the one-shot walk behind a drop and a
+``monitor = false`` directory.
 """
 
 from pathlib import Path
 
 import pytest
 from biopb_tensor_server.adapters import get_default_registry
-from biopb_tensor_server.core.discovery import (
-    discover_sources,
-    walk_with_identity_tracking,
-)
 from biopb_tensor_server.fixtures import create_multiresolution_ome_zarr
+from biopb_tensor_server.sources import scan_root
+from biopb_tensor_server.sources.scan_root import discover_under
 
 
 def _spy_registry(seen_paths):
@@ -34,13 +32,9 @@ def _spy_registry(seen_paths):
     return registry
 
 
-class TestClaimedDirsAreNotWalked:
+class TestClaimedDirsAreNotProbed:
     def test_chunk_files_under_claimed_store_are_not_probed(self, tmp_path):
-        """A claimed OME-Zarr store's interior chunk files are never probed.
-
-        Before the fix, every chunk file under the store was yielded by the walk
-        and passed to get_claims_for_path; after it, only the store directory is.
-        """
+        """A claimed OME-Zarr store's interior chunk files are never probed."""
         pytest.importorskip("zarr")
         # Small chunks => hundreds of interior chunk files, so an accidental
         # descent would be unmistakable.
@@ -50,69 +44,75 @@ class TestClaimedDirsAreNotWalked:
         store = Path(store)
 
         seen = []
-        registry = _spy_registry(seen)
-        state = discover_sources(tmp_path, registry)
+        state = discover_under(tmp_path, _spy_registry(seen))
 
-        # Exactly the store was claimed.
-        claim_paths = {c.primary_path for c in state.claims.values()}
-        assert claim_paths == {str(store)}
-
-        # No path *inside* the store was ever probed for a claim.
+        assert {c.primary_path for c in state.claims.values()} == {str(store)}
         inside = [p for p in seen if store in Path(p).parents]
         assert inside == [], f"probed interior store paths: {inside[:5]} ..."
 
     def test_unclaimed_dirs_are_still_descended(self, tmp_path):
-        """Plain subdirectories (no claim) keep being walked into.
-
-        Guards against the callback over-pruning: a store nested under ordinary
-        directories must still be discovered.
-        """
+        """Plain subdirectories (no claim) keep being walked into."""
         pytest.importorskip("zarr")
         nested = tmp_path / "a" / "b"
         nested.mkdir(parents=True)
         store, _, _ = create_multiresolution_ome_zarr(str(nested))
 
-        state = discover_sources(tmp_path, get_default_registry())
+        state = discover_under(tmp_path, get_default_registry())
 
-        claim_paths = {c.primary_path for c in state.claims.values()}
-        assert claim_paths == {str(Path(store))}
+        assert {c.primary_path for c in state.claims.values()} == {str(Path(store))}
 
 
-class TestShouldDescendCallback:
-    def test_should_descend_false_skips_subtree(self, tmp_path):
-        """should_descend=False for a dir prunes its entire subtree from the walk."""
-        keep = tmp_path / "keep"
-        skip = tmp_path / "skip"
-        keep.mkdir()
-        skip.mkdir()
-        (keep / "a.txt").write_text("a")
-        (skip / "deep").mkdir()
-        (skip / "deep" / "b.txt").write_text("b")
+class TestRootThatIsADataset:
+    def test_a_claimed_root_is_not_walked(self, tmp_path, monkeypatch):
+        """Dropping a store itself claims it without stat-ing its interior.
 
-        visited = set()
-        walked = {
-            str(p)
-            for p in walk_with_identity_tracking(
-                tmp_path, visited, should_descend=lambda p: p.name != "skip"
-            )
-        }
+        The snapshot walk stats every entry; for a 20k-chunk store that is the
+        difference between ~0.2 ms and ~200 ms, on the most common drop there is.
+        """
+        pytest.importorskip("zarr")
+        store, _, _ = create_multiresolution_ome_zarr(
+            str(tmp_path / "plate"), base_shape=(256, 256), chunk_size=(32, 32)
+        )
 
-        # The skip dir is yielded (so the consumer can claim it) but nothing
-        # under it is.
-        assert str(skip) in walked
-        assert str(skip / "deep") not in walked
-        assert str(skip / "deep" / "b.txt") not in walked
-        # The sibling subtree is untouched by the prune.
-        assert str(keep / "a.txt") in walked
+        def _no_walk(*args, **kwargs):
+            raise AssertionError("a claimed root must not be walked")
 
-    def test_no_callback_descends_everywhere(self, tmp_path):
-        """Omitting should_descend preserves the original full-walk behavior."""
+        monkeypatch.setattr(scan_root._ONE_SHOT_SCANNER, "scan_once", _no_walk)
+
+        state = discover_under(Path(store), get_default_registry())
+
+        assert {c.primary_path for c in state.claims.values()} == {str(Path(store))}
+
+    def test_a_single_file_is_claimed_in_place(self, tmp_path):
+        tifffile = pytest.importorskip("tifffile")
+        import numpy as np
+
+        path = tmp_path / "a.tif"
+        tifffile.imwrite(path, np.zeros((8, 8), dtype=np.uint16))
+
+        state = discover_under(path, get_default_registry())
+
+        assert {c.primary_path for c in state.claims.values()} == {str(path)}
+
+    def test_an_unrecognized_file_claims_nothing(self, tmp_path):
+        path = tmp_path / "notes.txt"
+        path.write_text("hello")
+
+        assert discover_under(path, get_default_registry()).claims == {}
+
+
+class TestLoopsAreBounded:
+    def test_a_symlink_cycle_does_not_recurse(self, tmp_path):
+        """A directory symlinked back to its parent is not followed."""
+        pytest.importorskip("zarr")
         sub = tmp_path / "sub"
         sub.mkdir()
-        (sub / "x.txt").write_text("x")
+        store, _, _ = create_multiresolution_ome_zarr(str(sub / "plate"))
+        try:
+            (sub / "loop").symlink_to(tmp_path, target_is_directory=True)
+        except OSError:
+            pytest.skip("symlinks unavailable")
 
-        visited = set()
-        walked = {str(p) for p in walk_with_identity_tracking(tmp_path, visited)}
+        state = discover_under(tmp_path, get_default_registry())
 
-        assert str(sub) in walked
-        assert str(sub / "x.txt") in walked
+        assert {c.primary_path for c in state.claims.values()} == {str(Path(store))}

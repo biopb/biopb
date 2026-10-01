@@ -377,6 +377,166 @@ class TestRescanLoop:
         assert manager.is_running() is False
 
 
+class TestScanOnceRoots:
+    """A ``monitor = false`` directory is discovered by the first tick, once."""
+
+    @staticmethod
+    def _manager(server, root, state, **kwargs):
+        from biopb_tensor_server.core.config import SourceConfig
+
+        sources = [SourceConfig(url=str(root), monitor=False, **kwargs)]
+        return _make_manager(
+            server,
+            registry=_FakeRegistry(),
+            discovery_state=state,
+            monitored_dirs=set(),
+            scan_once_sources=sources,
+            stability_window=0.0,
+        )
+
+    def test_first_tick_registers_and_completes_the_startup_protocol(self, tmp_path):
+        root = tmp_path / "data"
+        root.mkdir()
+        (root / "a.dat").write_text("a")
+        server = _FakeServer()
+        state = DiscoveryState()
+        manager = self._manager(server, root, state)
+
+        manager._handle_rescan()
+
+        assert len(state.claims) == 1
+        assert len(server.registered) == 1
+        # Nothing else in this config completes a scan, so this tick must.
+        assert manager._initial_scan_done is True
+        assert server.last_full_scan_at is not None
+        assert server.full_scan_in_progress is False
+
+    def test_it_is_never_scanned_again(self, tmp_path):
+        root = tmp_path / "data"
+        root.mkdir()
+        (root / "a.dat").write_text("a")
+        server = _FakeServer()
+        state = DiscoveryState()
+        manager = self._manager(server, root, state)
+        manager._handle_rescan()
+
+        (root / "b.dat").write_text("b")
+        manager._handle_rescan()
+
+        assert len(state.claims) == 1
+
+    def test_what_it_registered_survives_a_rescan_that_did_not_see_it(self, tmp_path):
+        """Its claims sit outside every monitored root, so a monitored walk's
+        removal diff never reaches them."""
+        root = tmp_path / "data"
+        other = tmp_path / "watched"
+        root.mkdir()
+        other.mkdir()
+        (root / "a.dat").write_text("a")
+        (other / "w.dat").write_text("w")
+        server = _FakeServer()
+        state = DiscoveryState()
+        from biopb_tensor_server.core.config import SourceConfig
+
+        manager = _make_manager(
+            server,
+            registry=_FakeRegistry(),
+            discovery_state=state,
+            monitored_dirs={other},
+            scan_once_sources=[SourceConfig(url=str(root), monitor=False)],
+            stability_window=0.0,
+        )
+
+        manager._handle_rescan()
+        manager._handle_rescan()
+
+        assert len(state.claims) == 2
+        assert server.unregistered == []
+
+    def test_a_vanished_root_is_skipped_and_the_rest_still_scan(self, tmp_path):
+        good = tmp_path / "good"
+        good.mkdir()
+        (good / "a.dat").write_text("a")
+        from biopb_tensor_server.core.config import SourceConfig
+
+        server = _FakeServer()
+        state = DiscoveryState()
+        manager = _make_manager(
+            server,
+            registry=_FakeRegistry(),
+            discovery_state=state,
+            monitored_dirs=set(),
+            scan_once_sources=[
+                SourceConfig(url=str(tmp_path / "gone"), monitor=False),
+                SourceConfig(url=str(good), monitor=False),
+            ],
+            stability_window=0.0,
+        )
+
+        manager._handle_rescan()
+
+        assert len(state.claims) == 1
+
+    def test_alias_re_roots_what_is_found_under_it(self, tmp_path):
+        from types import SimpleNamespace
+
+        class _Registry(_FakeRegistry):
+            def get_adapter_for_type(self, source_type):
+                return SimpleNamespace(
+                    create_from_config=lambda config, creds=None: SimpleNamespace()
+                )
+
+        from biopb_tensor_server.core.config import SourceConfig
+        from biopb_tensor_server.sources.resolve import _alias_catalog_url
+
+        root = tmp_path / "data"
+        (root / "sub").mkdir(parents=True)
+        (root / "sub" / "a.dat").write_text("a")
+        server = _FakeServer()
+        state = DiscoveryState()
+        manager = _make_manager(
+            server,
+            registry=_Registry(),
+            discovery_state=state,
+            monitored_dirs=set(),
+            scan_once_sources=[SourceConfig(url=str(root), monitor=False, alias="lab")],
+            stability_window=0.0,
+        )
+
+        manager._handle_rescan()
+
+        claim = next(iter(state.claims.values()))
+        adapter = server.sources[claim.source_id]
+        assert adapter._catalog_url == _alias_catalog_url(
+            "lab", str(root.resolve()), claim.primary_path
+        )
+        assert adapter._catalog_url.startswith("lab")
+
+    def test_the_loop_starts_for_a_config_that_has_only_one_shot_roots(self, tmp_path):
+        root = tmp_path / "data"
+        root.mkdir()
+        manager = self._manager(_FakeServer(), root, DiscoveryState())
+        manager._rescan_interval = 3600.0
+        try:
+            manager.start()
+            assert manager.is_running()
+        finally:
+            manager.stop()
+
+    def test_fallback_scans_synchronously_when_there_is_no_loop(self, tmp_path):
+        root = tmp_path / "data"
+        root.mkdir()
+        (root / "a.dat").write_text("a")
+        server = _FakeServer()
+        state = DiscoveryState()
+        manager = self._manager(server, root, state)
+
+        manager.run_bootstrap_fallback()
+
+        assert len(state.claims) == 1
+        assert manager._initial_scan_done is True
+
+
 class TestSourceManagerRegressions:
     def setup_method(self):
         _FlakyAdapter.calls = 0
@@ -1456,8 +1616,8 @@ class TestSignatureScanLoopAndSkip:
         assert str((outside / "secret.dat").resolve()) not in next_state
 
     def test_prunes_system_and_offline_entries(self, tmp_path):
-        # Parity with walk_with_identity_tracking: the signature scan must also
-        # skip system/cloud dirs and offline placeholders, by the same policy.
+        # The signature scan must skip system/cloud dirs and offline placeholders
+        # (shared skip policy).
         root = tmp_path / "monitored"
         (root / "Microscopy").mkdir(parents=True)
         (root / "Microscopy" / "good.dat").write_text("data")

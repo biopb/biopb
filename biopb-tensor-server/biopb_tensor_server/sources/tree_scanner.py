@@ -251,6 +251,36 @@ class TreeScanner:
             skipped_dirs=ctx.skipped_dirs,
         )
 
+    def scan_once(self, root: Path, *, cloud: bool = False) -> ScanSnapshot:
+        """Walk one root with nothing carried over: the snapshot of a drop or a
+        one-shot configured directory.
+
+        A call shape of its own rather than :meth:`scan` with empty ``prev``
+        arguments, because ``prev`` is what turns the stability prune on: handed
+        the live caches, a scan of a subtree that looks stable would skip it, and
+        the claim phase would find nothing in it. Here nothing can be pruned --
+        no previous snapshot, force-full -- so every entry under ``root`` is
+        walked and the root is honored the way :meth:`scan` honors a monitored
+        one.
+        """
+        ctx = _WalkContext(
+            now=time.time(),
+            prev_entry_states={},
+            prev_cloud_entry_states={},
+            next_state={},
+            next_cloud={},
+            skipped_dirs=set(),
+            force_full=True,
+            visited_identities=set(),
+        )
+        resolved = root.resolve()
+        self._scan_tree_state(resolved, ctx, is_root=True, cloud=cloud)
+        return ScanSnapshot(
+            entry_states=ctx.next_state,
+            cloud_by_path=ctx.next_cloud,
+            skipped_dirs=ctx.skipped_dirs,
+        )
+
     def _scan_tree_state(
         self,
         path: Path,
