@@ -5,6 +5,7 @@ and exercise execute/interrupt/restart/shutdown.  A separate, display-gated
 test runs the real napari bootstrap end-to-end.
 """
 
+import json
 import os
 import signal
 import sys
@@ -109,6 +110,51 @@ class TestKernelControl:
             assert reply["content"]["status"] == "ok"
         finally:
             kc.stop_channels()
+
+    @pytest.fixture
+    def users_own_python3(self, tmp_path, monkeypatch):
+        """What a user's earlier `ipykernel install --user` can leave behind: a
+        `python3` spec that does not run biopb's interpreter."""
+        spec = tmp_path / "jupyter" / "kernels" / "python3"
+        spec.mkdir(parents=True)
+        (spec / "kernel.json").write_text(
+            json.dumps(
+                {
+                    "argv": [sys.executable, "-c", "raise SystemExit(3)"],
+                    "display_name": "theirs",
+                    "language": "python",
+                }
+            )
+        )
+        monkeypatch.setenv("JUPYTER_DATA_DIR", str(tmp_path / "jupyter"))
+        monkeypatch.setenv(
+            "JUPYTER_PREFER_ENV_PATH", "0"
+        )  # theirs wins, as at the reporter's
+
+    def test_the_default_kernel_is_this_interpreters_whatever_specs_are_installed(
+        self, users_own_python3
+    ):
+        host = KernelHost(health_probe_code=None, startup_timeout=60.0)
+        try:
+            host.start()
+            ran = host.execute("import sys; print(sys.executable)")["stdout"].strip()
+            assert os.path.samefile(ran, sys.executable)
+        finally:
+            host.shutdown()
+
+    def test_naming_a_spec_still_picks_it_and_a_failure_says_what_ran(
+        self, users_own_python3, monkeypatch
+    ):
+        monkeypatch.setattr(_kernel, "_LAUNCH_RETRY_DELAYS", ())
+        host = KernelHost(
+            kernel_name="python3", health_probe_code=None, startup_timeout=60.0
+        )
+        try:
+            with pytest.raises(RuntimeError) as err:
+                host.start()
+            assert "'python3'" in str(err.value) and sys.executable in str(err.value)
+        finally:
+            host.shutdown()
 
     def test_a_failed_launch_drops_the_ports_the_retry_would_reuse(
         self, kernel, monkeypatch

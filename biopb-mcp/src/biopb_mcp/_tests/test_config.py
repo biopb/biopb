@@ -68,7 +68,7 @@ class TestLoadConfig:
 
         assert config["kernel"]["promote_after"] == 30.0
         # Sibling kernel defaults and other sections are intact.
-        assert config["kernel"]["name"] == "python3"
+        assert config["kernel"]["name"] == ""
         assert config["transport"]["kind"] == "stdio"
 
     def test_handles_malformed_json(self, mock_config_dir):
@@ -243,11 +243,11 @@ class TestGetSetting:
 
     def test_missing_falls_back_to_default_config(self):
         assert get_setting({}, "transport.port") == 8765
-        assert get_setting({}, "kernel.name") == "python3"
+        assert get_setting({}, "kernel.name") == ""
 
     def test_partial_path_falls_back(self):
         config = {"kernel": {"promote_after": 30.0}}
-        assert get_setting(config, "kernel.name") == "python3"
+        assert get_setting(config, "kernel.name") == ""
         assert get_setting(config, "kernel.promote_after") == 30.0
 
     def test_explicit_default_wins_over_default_config(self):
@@ -295,7 +295,7 @@ class TestConfigSingleton:
 
     def test_get_falls_back_to_default_config(self):
         assert CONFIG.get("transport.port") == 8765
-        assert CONFIG.get("kernel.name") == "python3"
+        assert CONFIG.get("kernel.name") == ""
 
     def test_set_persist_updates_cache_and_file(self):
         """set() with persist=True updates the cache AND the file."""
@@ -323,13 +323,13 @@ class TestConfigSingleton:
         assert CONFIG.get("brandnew.section.leaf") == 5
 
     def test_reload_picks_up_external_edit(self):
-        assert CONFIG.get("kernel.name") == "python3"
+        assert CONFIG.get("kernel.name") == ""
 
         path = get_config_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("w") as f:
             json.dump({"kernel": {"name": "ext"}}, f)
-        assert CONFIG.get("kernel.name") == "python3"
+        assert CONFIG.get("kernel.name") == ""
 
         CONFIG.reload()
         assert CONFIG.get("kernel.name") == "ext"
