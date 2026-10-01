@@ -145,11 +145,17 @@ class TlsTrust(NamedTuple):
             ``host:port`` but not an anchor cannot be served each other's
             connection. It is the memo key itself, so pool and memo partition the
             world identically rather than by coincidence.
+        reresolve: ``root_certs`` is an anchor another process verified with,
+            handed over to be applied to *whatever name the consumer dials*.
+            :func:`concrete_trust` turns it into a real trust at the point of
+            use, deriving the hostname override on the consumer's own network.
+            Only ever set by :func:`anchored_trust`.
     """
 
     root_certs: Optional[bytes] = None
     override_hostname: Optional[str] = None
     key_id: Optional[str] = None
+    reresolve: bool = False
 
     def client_kwargs(self) -> Dict[str, object]:
         """TLS keyword arguments for ``pyarrow.flight.FlightClient``.
@@ -724,6 +730,58 @@ def resolve_tls_trust(
     trust = TlsTrust(resolved, override, key_id)
     with _memo_lock:
         _memo[key_id] = trust
+    return trust
+
+
+def is_tls_location(location: str) -> bool:
+    """Whether *location* is a ``grpc+tls://`` address, so trust applies."""
+    return _host_port(location) is not None
+
+
+def anchored_trust(anchor_pem: Optional[bytes]) -> TlsTrust:
+    """A trust that carries *anchor_pem* to a consumer to resolve for itself.
+
+    No network here, so the sender never has to reach the address the consumer
+    will dial. ``None`` (the sender trusted the system store) is the system
+    store again.
+    """
+    if not anchor_pem:
+        return NO_TLS
+    return TlsTrust(root_certs=anchor_pem, reresolve=True)
+
+
+def resolve_anchored_trust(location: str, anchor_pem: bytes) -> TlsTrust:
+    """Trust *location* with *anchor_pem*, which another process verified with.
+
+    The anchor is the sender's trust decision; the name check is this
+    process's, because it depends on the name dialed. When the anchor is the
+    leaf the server presents, a name the certificate does not list is rescued
+    with an ``override_hostname`` (see :func:`_resolve_hostname_override`); a CA
+    anchor keeps the SAN check. A probe that cannot run leaves no override, so a
+    working connection never breaks here.
+
+    Memoized per ``host:port`` and anchor, like :func:`resolve_tls_trust`.
+    """
+    hp = _host_port(location)
+    if hp is None:
+        return NO_TLS
+    host, port = hp
+    key_id = _trust_key_id(f"{host}:{port}", anchor_pem, None) + "|anchored"
+    with _memo_lock:
+        memoized = _memo.get(key_id)
+    if memoized is not None:
+        return memoized
+    override = _resolve_hostname_override(host, port, anchor_pem, tofu=False)
+    trust = TlsTrust(anchor_pem, override, key_id)
+    with _memo_lock:
+        _memo[key_id] = trust
+    return trust
+
+
+def concrete_trust(location: str, trust: Optional[TlsTrust]) -> Optional[TlsTrust]:
+    """*trust* as something a ``FlightClient`` can use for *location*."""
+    if trust is not None and trust.reresolve:
+        return resolve_anchored_trust(location, trust.root_certs)
     return trust
 
 

@@ -727,3 +727,47 @@ def test_a_cert_that_lists_the_dialed_name_gets_no_override(
         client.close()
     finally:
         server.shutdown()
+
+
+@pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+@pytest.mark.skipif(not _crypto_available(), reason="cryptography not available")
+def test_a_read_exported_under_a_name_the_cert_omits_still_connects(simple_zarr_array):
+    """biopb/biopb#1201: the dial address is covered by the cert's SANs, the
+    advertised one is not. The graph and the handle carry the dialer's anchor, and
+    the consumer derives the name check for the address it dials, so both read."""
+    import numpy as np
+    import zarr
+    from biopb.tensor import TensorFlightClient
+    from biopb_tensor_server import ZarrAdapter
+
+    zarr_path, _, _ = simple_zarr_array
+    arr = zarr.open_array(zarr_path, mode="r")
+    # The leaf names 127.0.0.1 and nothing that `localhost` could match.
+    cert_pem, key_pem = _self_signed_cert(
+        dns_names=("other.example",), ip_addresses=("127.0.0.1",)
+    )
+    server = catalog_server(
+        "grpc://localhost:0", tls_cert_chain=cert_pem, tls_private_key=key_pem
+    )
+    register_and_catalog(server, "img", ZarrAdapter(arr, "img", ["y", "x"]))
+    server.mark_ready()
+    _serve(server)
+    try:
+        client = TensorFlightClient(
+            f"grpcs://127.0.0.1:{server.port}", tls_ca_pem=cert_pem
+        )
+        export = f"grpcs://localhost:{server.port}"
+
+        # In-process: the connection's own address and trust, never the export.
+        np.testing.assert_array_equal(client.get_tensor("img").compute(), arr[:])
+
+        # Handed to workers under the other name.
+        graph = client.get_tensor("img", export_location=export)
+        np.testing.assert_array_equal(graph.compute(), arr[:])
+
+        pb = client.get_tensor("img", output="pb", export_location=export)
+        assert pb.tls_anchor == cert_pem
+        np.testing.assert_array_equal(client.tensor_from_pb(pb).compute(), arr[:])
+        client.close()
+    finally:
+        server.shutdown()

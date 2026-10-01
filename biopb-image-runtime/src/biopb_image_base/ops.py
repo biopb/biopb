@@ -581,7 +581,11 @@ class _PlaneSink(_InlineSink):
         else:
             with dask.config.set(scheduler="threads", num_workers=_UPLOAD_WORKERS):
                 client.upload_array(desc, array)
-        return client.get_tensor(desc.array_id, output="pb")
+        # The caller reads this from elsewhere: hand it the plane's advertised
+        # address, not the one this process dials.
+        return client.get_tensor(
+            desc.array_id, output="pb", export_location=client.advertised_location
+        )
 
 
 class _EmbeddedSink(_PlaneSink):

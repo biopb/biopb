@@ -66,7 +66,14 @@ from biopb.tensor._roi_rows import (
     rois_to_table,
     table_to_rois,
 )
-from biopb.tensor._tls import TlsTrust, handshake_failure_reason, resolve_tls_trust
+from biopb.tensor._tls import (
+    NO_TLS,
+    TlsTrust,
+    anchored_trust,
+    handshake_failure_reason,
+    is_tls_location,
+    resolve_tls_trust,
+)
 from biopb.tensor.descriptor_pb2 import (
     AddSourceProgress,
     AddSourceRequest,
@@ -122,8 +129,10 @@ class _ClientState:
     # the check is bypassed, e.g. for a test double).
     protocol_checked: bool = False
     # The server's own ``health.external_location`` (biopb/biopb#1158), read
-    # the same time as ``protocol``. None if the server didn't advertise one
-    # (an old server, a loopback deployment, or the check was bypassed).
+    # the same time as ``protocol``. Informational: the SDK never dials it on
+    # its own, a caller that wants it passes it as ``export_location``. None
+    # if the server didn't advertise one (an old server, a loopback
+    # deployment, or the check was bypassed).
     advertised_location: Optional[str] = None
 
     @property
@@ -157,20 +166,23 @@ class _ClientState:
         self.raw_client = value
         self.protocol_checked = True
 
-    @property
-    def export_location(self) -> str:
-        """The address to bake into anything handed to a different process.
+    def trust_for(self, location: str) -> TlsTrust:
+        """The trust a consumer dialing *location* is handed.
 
-        The server's advertised address if it published one, else this
-        connection's own dial address (today's behavior, unchanged for a
-        server that hasn't upgraded). Use this -- never ``location`` directly
-        -- at any point that mints an address for a *different* consumer:
-        ``SerializedTensor.location``, or a dask chunk-fetch graph handed to a
-        distributed cluster (biopb/biopb#1158).
+        This connection's own, resolved, when *location* is the one it dials.
+        For any other address, the same anchor carried unresolved
+        (:func:`anchored_trust`): the consumer derives the name check on the
+        network it dials from, so the sender never probes an address it may not
+        reach.
         """
-        if self.advertised_location:
-            return normalize_flight_location(self.advertised_location)
-        return self.location
+        if location == self.location:
+            return self.tls_trust or NO_TLS
+        return anchored_trust(self.tls_anchor) if is_tls_location(location) else NO_TLS
+
+    @property
+    def tls_anchor(self) -> bytes:
+        """The PEM this connection verified its server with, for a handoff."""
+        return (self.tls_trust.root_certs if self.tls_trust else None) or b""
 
 
 class ResolveCancelled(Exception):
@@ -268,7 +280,10 @@ def _parse_flight_endpoints(
 
 
 def _refetch_flight_info(
-    descriptor: TensorDescriptor, location: str, token: Optional[str]
+    descriptor: TensorDescriptor,
+    location: str,
+    token: Optional[str],
+    tls_trust: Optional[TlsTrust] = None,
 ) -> "flight.FlightInfo":
     """GetFlightInfo for the read a descriptor already describes.
 
@@ -295,7 +310,9 @@ def _refetch_flight_info(
         read_opt.reduction_method = descriptor.reduction_method
     cmd = _tensor_read_cmd(descriptor.array_id, read_opt)
 
-    client = _get_thread_client(location, token, resolve_tls_trust(location))
+    client = _get_thread_client(
+        location, token, tls_trust or resolve_tls_trust(location)
+    )
     call_options = _get_shared_call_options(location, token)
     flight_desc = flight.FlightDescriptor.for_command(cmd.SerializeToString())
     info = client.get_flight_info(flight_desc, options=call_options)
@@ -1376,18 +1393,19 @@ class ChunkFetcher:
         location = (
             normalize_flight_location(export_location)
             if export_location
-            else self._state.export_location
+            else self._state.location
         )
         if output == "pb":
             return SerializedTensor(
                 location=location,
                 auth_token=self._state.token or "",
                 flight_info=info.serialize(),
+                tls_anchor=self._state.tls_anchor if is_tls_location(location) else b"",
             )
         return _dask_from_flight_info(
             info,
             location,
             self._state.token,
             self._state.cache_bytes,
-            self._state.tls_trust,
+            self._state.trust_for(location),
         )
