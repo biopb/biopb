@@ -733,6 +733,11 @@ def resolve_tls_trust(
     return trust
 
 
+def is_tls_location(location: str) -> bool:
+    """Whether *location* is a ``grpc+tls://`` address, so trust applies."""
+    return _host_port(location) is not None
+
+
 def anchored_trust(anchor_pem: Optional[bytes]) -> TlsTrust:
     """A trust that carries *anchor_pem* to a consumer to resolve for itself.
 

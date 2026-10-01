@@ -52,7 +52,7 @@ from biopb.tensor._session import (
     _requested_slice,
     split_array_id as split_array_id,
 )
-from biopb.tensor._tls import anchored_trust, resolve_tls_trust
+from biopb.tensor._tls import anchored_trust, is_tls_location, resolve_tls_trust
 from biopb.tensor._upload import UploadRefused as UploadRefused, UploadSession
 from biopb.tensor.descriptor_pb2 import (
     AddSourceProgress,
@@ -927,7 +927,7 @@ class TensorFlightClient:
         # predates the field sends none, and this falls back to TOFU.
         trust = (
             anchored_trust(pb.tls_anchor)
-            if pb.tls_anchor and location.startswith("grpc+tls://")
+            if pb.tls_anchor and is_tls_location(location)
             else resolve_tls_trust(location)
         )
         if not info.endpoints:

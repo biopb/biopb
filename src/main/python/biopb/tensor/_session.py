@@ -70,9 +70,8 @@ from biopb.tensor._tls import (
     NO_TLS,
     TlsTrust,
     anchored_trust,
-    concrete_trust,
     handshake_failure_reason,
-    resolve_tls_trust,
+    is_tls_location,
 )
 from biopb.tensor.descriptor_pb2 import (
     AddSourceProgress,
@@ -177,9 +176,7 @@ class _ClientState:
         """
         if location == self.location:
             return self.tls_trust or NO_TLS
-        if not location.startswith("grpc+tls://"):
-            return NO_TLS
-        return anchored_trust(self.tls_trust.root_certs if self.tls_trust else None)
+        return anchored_trust(self.tls_anchor) if is_tls_location(location) else NO_TLS
 
     @property
     def tls_anchor(self) -> bytes:
@@ -285,7 +282,7 @@ def _refetch_flight_info(
     descriptor: TensorDescriptor,
     location: str,
     token: Optional[str],
-    tls_trust: Optional[TlsTrust] = None,
+    tls_trust: Optional[TlsTrust],
 ) -> "flight.FlightInfo":
     """GetFlightInfo for the read a descriptor already describes.
 
@@ -312,12 +309,7 @@ def _refetch_flight_info(
         read_opt.reduction_method = descriptor.reduction_method
     cmd = _tensor_read_cmd(descriptor.array_id, read_opt)
 
-    trust = (
-        concrete_trust(location, tls_trust)
-        if tls_trust
-        else resolve_tls_trust(location)
-    )
-    client = _get_thread_client(location, token, trust)
+    client = _get_thread_client(location, token, tls_trust)
     call_options = _get_shared_call_options(location, token)
     flight_desc = flight.FlightDescriptor.for_command(cmd.SerializeToString())
     info = client.get_flight_info(flight_desc, options=call_options)
@@ -1405,11 +1397,7 @@ class ChunkFetcher:
                 location=location,
                 auth_token=self._state.token or "",
                 flight_info=info.serialize(),
-                tls_anchor=(
-                    self._state.tls_anchor
-                    if location.startswith("grpc+tls://")
-                    else b""
-                ),
+                tls_anchor=self._state.tls_anchor if is_tls_location(location) else b"",
             )
         return _dask_from_flight_info(
             info,
