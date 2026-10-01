@@ -72,6 +72,7 @@ from biopb.tensor._tls import (
     anchored_trust,
     handshake_failure_reason,
     is_tls_location,
+    resolve_tls_trust,
 )
 from biopb.tensor.descriptor_pb2 import (
     AddSourceProgress,
@@ -282,7 +283,7 @@ def _refetch_flight_info(
     descriptor: TensorDescriptor,
     location: str,
     token: Optional[str],
-    tls_trust: Optional[TlsTrust],
+    tls_trust: Optional[TlsTrust] = None,
 ) -> "flight.FlightInfo":
     """GetFlightInfo for the read a descriptor already describes.
 
@@ -309,7 +310,9 @@ def _refetch_flight_info(
         read_opt.reduction_method = descriptor.reduction_method
     cmd = _tensor_read_cmd(descriptor.array_id, read_opt)
 
-    client = _get_thread_client(location, token, tls_trust)
+    client = _get_thread_client(
+        location, token, tls_trust or resolve_tls_trust(location)
+    )
     call_options = _get_shared_call_options(location, token)
     flight_desc = flight.FlightDescriptor.for_command(cmd.SerializeToString())
     info = client.get_flight_info(flight_desc, options=call_options)
