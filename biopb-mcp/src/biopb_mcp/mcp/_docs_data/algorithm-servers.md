@@ -15,7 +15,9 @@ functions become ops in [[ops]]. No packaging, no container.
    server's name; a stem starting with `_` is ignored.
 2. `print(ops.refresh())`. The control installs the file's dependencies and
    asks it for its ops, once per version of the file. The first install can
-   take minutes (a torch); an entry still installing binds on a later refresh.
+   take minutes (a torch); an entry still installing binds on a later refresh. `repr(ops)` lists the
+   servers not built yet, and a server the control built since this kernel
+   started is picked up the first time you name one of its ops.
 3. Call the op. The first call starts the server.
 4. On failure, `ops.status()` and `ops.logs("<name>")`; after an edit,
    `ops.restart("<name>")` (a changed file also restarts on its next call).
