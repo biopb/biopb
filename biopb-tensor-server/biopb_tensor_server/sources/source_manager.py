@@ -335,10 +335,8 @@ class SourceManager:
         """Publish that a full scan just finished, and run the orphan clock.
 
         The paths that can complete one -- the first tick, a later forced full
-        rescan, and a later upstream re-list pass -- all end here, which is what
-        lets the clock be driven by the event rather than by a timer that would
-        have to re-derive it. "Complete" is not
-        checked here; at this point it is held.
+        rescan, and a later upstream re-list pass -- all end here, so the clock is
+        driven by the event, not by a timer.
 
         Auto-prune is armed only once this process has been up longer than the
         threshold it would delete on. Until then it cannot have watched anything
@@ -499,8 +497,6 @@ class SourceManager:
         Caller holds ``_catalog_lock``.
         """
         pending, self._scan_once_pending = self._scan_once_pending, []
-        if not pending:
-            return
         for source in pending:
             try:
                 self._scan_configured_root(source)
@@ -554,6 +550,7 @@ class SourceManager:
         # leaves both to complete_initial_scan; a later one resets them in the
         # outer finally.
         startup = not self._initial_scan_done
+        completes_here = force_full_rescan and not startup
         if force_full_rescan:
             self._server.set_full_scan_in_progress(True)
         try:
@@ -566,7 +563,7 @@ class SourceManager:
             # entries are never claimed and therefore never streamed; the next
             # rescan picks them up. The end-of-walk reconcile below still runs and
             # is idempotent for streamed adds.
-            stream_first_scan = force_full_rescan and not self._initial_scan_done
+            stream_first_scan = force_full_rescan and startup
             discovered_state = DiscoveryState()
             if stream_first_scan:
                 discovered_state.on_source_added = (
@@ -604,10 +601,10 @@ class SourceManager:
                 discovered_state, force_full=force_full_rescan
             )
 
-            if force_full_rescan and not startup:
+            if completes_here:
                 self._mark_catalog_complete()
         finally:
-            if force_full_rescan and not startup:
+            if completes_here:
                 self._server.set_full_scan_in_progress(False)
 
     def _fire_initial_scan_complete(self) -> None:
@@ -670,7 +667,7 @@ class SourceManager:
             )
 
     def _should_force_full_rescan(self) -> bool:
-        """Return True when a full tree walk should bypass subtree pruning."""
+        """Whether a full pass (the only one that walks cloud roots) is due."""
         if self._full_rescan_interval <= 0:
             return False
         return time.time() - self._last_full_rescan_at >= self._full_rescan_interval
@@ -1303,7 +1300,11 @@ class SourceManager:
         """Whether an adapter claims ``claim``'s primary path right now."""
         try:
             again = self._registry.get_claims_for_path(
-                ClaimContext(Path(claim.primary_path)), DiscoveryState()
+                ClaimContext(
+                    Path(claim.primary_path),
+                    cloud_root=self._is_under_cloud_root(claim.primary_path),
+                ),
+                DiscoveryState(),
             )
         except Exception:
             return False

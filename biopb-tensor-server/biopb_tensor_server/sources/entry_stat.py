@@ -27,11 +27,8 @@ def build_entry_signature(
     untrustworthy anyway, so identity is the right key there. Non-cloud
     entries keep the full mtime/size-sensitive signature.
 
-    Load-bearing for the cloud inode-backfill skip in ``_scan_tree_state``
-    (biopb/biopb#190): because this branch is identity-only, a zeroed cloud
-    inode degrades it to a constant ``(0, 0)`` that is still residency-
-    invariant and per-path. If you add size/mtime back to the cloud
-    signature, you must restore that backfill (and reintroduce the flap).
+    Identity-only, so a zeroed cloud inode degrades it to a constant ``(0, 0)``
+    that is still residency-invariant and per-path.
     """
     if cloud:
         return (stat_result.st_dev, stat_result.st_ino)
@@ -69,21 +66,15 @@ def entry_change_time(stat_result: Any, now: float) -> float:
 def entry_is_quiet(last_changed: float, now: float, stability_window: float) -> bool:
     """Has this path been unchanged long enough to be acted on?
 
-    The single stability predicate. Three callers ask the same question of it
-    and must keep getting the same answer:
+    The single stability predicate, asked from two sides that must keep getting
+    the same answer:
 
-    * the walk, to decide ``EntryState.pending_scan`` (is a descendant still
-      settling, so its parent subtree must not be pruned -- biopb/biopb#53);
-    * the claim gate (``SourceManager._should_scan_resolved``), to decide
-      whether a path may be claimed -- claiming a half-written file registers a
-      wrong descriptor, and for a format whose type marker is written last
-      (OME-TIFF) a wrong ``source_type``, hence a different ``source_id``;
+    * the claim gate (``SourceManager._should_claim``), to decide whether a path
+      may be claimed -- claiming a half-written file registers a wrong
+      descriptor, and for a format whose type marker is written last (OME-TIFF) a
+      wrong ``source_type``, hence a different ``source_id``;
     * the removal shield (``Reconciler._claim_is_quiet``), to decide whether a
       claim missing from a walk is really gone or merely churning.
-
-    Keeping the last two on one predicate is the point: they are the same
-    question asked from two sides, and two implementations of it drifted apart
-    once already (biopb/biopb#1042).
 
     ``last_changed`` is ``entry_change_time``'s value -- max(mtime, ctime),
     clamped to now.

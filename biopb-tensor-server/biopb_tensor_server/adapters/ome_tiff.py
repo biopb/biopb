@@ -158,15 +158,26 @@ def _probe_ome_metadata_from_tiff(path: Path) -> Optional[str]:
     return None
 
 
+def _file_signature(path: Path) -> Optional[Tuple]:
+    """Identity of a file's current bytes, for memoizing a content probe."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+
 def _get_ome_metadata_from_tiff(
     path: Path, signature: Optional[Tuple] = None
 ) -> Optional[str]:
     """Extract OME-XML metadata from a TIFF file if present.
 
-    When ``signature`` (the discovery walk's content-identity signature) is given,
-    the probe result is memoized on ``(path, signature)`` so an unchanged file is
-    not reopened on the next rescan. When ``None`` the probe runs uncached.
+    The probe result is memoized on ``(path, signature)`` -- the file's own stat
+    unless ``signature`` is given -- so an unchanged file is not reopened on the
+    next rescan. A file that cannot be stat-ed is probed uncached.
     """
+    if signature is None:
+        signature = _file_signature(path)
     if signature is None:
         return _probe_ome_metadata_from_tiff(path)
 
@@ -1267,7 +1278,7 @@ class OmeTiffAdapter(TensorAdapter):
             # claims the .tif as an unresolved image.
             and ctx.is_resident()
         ):
-            ome_metadata = _get_ome_metadata_from_tiff(ctx._path, ctx.signature)
+            ome_metadata = _get_ome_metadata_from_tiff(ctx._path)
 
             if ome_metadata:
                 related_files = _extract_files_from_ome_xml(

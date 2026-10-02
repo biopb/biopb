@@ -56,7 +56,7 @@ The `biopb_tensor_server` package is organized into layered subpackages:
   `decode_rates` tables back the surfaces they expose), `tls` (the listener's
   self-signed leaf) and `activity` (in-flight read tracking). Builds on `core`.
 - **`sources/`** — source lifecycle: `resolve` (config entries -> concrete
-  sources), `source_manager` + `tree_scanner` + `watcher` (scan orchestration)
+  sources), `source_manager` (scan orchestration)
   and `reconciler` (the confirmed-catalog single writer). Builds on `core` and
   `adapters`; it names `serving`'s server and `metadata_db` only in type
   annotations, never importing them at runtime.
