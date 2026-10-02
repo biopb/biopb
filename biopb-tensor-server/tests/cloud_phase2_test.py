@@ -1681,6 +1681,33 @@ class TestDropCloudFolder:
         assert mgr._is_under_cloud_root(str(folder / "scan.nii"))
         assert mgr._reconciler._is_under_cloud_root(str(folder / "scan.nii"))
 
+    def test_deregistering_the_drop_takes_the_cloud_root_with_it(
+        self, tmp_path, force_nonresident
+    ):
+        folder = self._folder(tmp_path)
+        mgr = _make_manager(_FakeServer())
+        _drop(mgr, folder, cloud=True)
+        assert mgr._is_under_cloud_root(str(folder / "scan.nii"))
+
+        mgr.remove_dropped_root("dnd://synced")
+
+        assert not mgr._is_under_cloud_root(str(folder / "scan.nii"))
+        assert not mgr._reconciler._is_under_cloud_root(str(folder / "scan.nii"))
+
+    def test_a_configured_cloud_root_survives_a_drop_being_deregistered(
+        self, tmp_path, force_nonresident
+    ):
+        root = tmp_path / "configured"
+        sub = root / "sub"
+        sub.mkdir(parents=True)
+        (sub / "scan.nii").write_bytes(b"payload")
+        mgr = _make_manager(_FakeServer(), cloud_roots={root.resolve()})
+        _drop(mgr, sub)
+
+        mgr.remove_dropped_root("dnd://sub")
+
+        assert mgr._is_under_cloud_root(str(sub / "scan.nii"))
+
     def test_a_drop_under_a_configured_cloud_root_needs_no_flag(
         self, tmp_path, force_nonresident
     ):

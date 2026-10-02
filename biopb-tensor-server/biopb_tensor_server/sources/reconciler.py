@@ -271,8 +271,16 @@ class Reconciler:
 
         # Removal: not rediscovered on _MISSES_BEFORE_REMOVAL consecutive scans, and
         # quiet. A claim found again, or no longer a candidate, forfeits its count.
+        # A cloud source on an incremental tick is neither: it was not walked, so
+        # the tick says nothing about it and its count waits for the next full pass
+        # (the only one that can count a miss for it).
         absent_ids = current_ids - discovered_ids
-        for source_id in [sid for sid in self._missed_scans if sid not in absent_ids]:
+        unwalked_ids = set() if force_full else self._cloud_source_ids
+        for source_id in [
+            sid
+            for sid in self._missed_scans
+            if sid not in absent_ids and sid not in unwalked_ids
+        ]:
             del self._missed_scans[source_id]
         removed_ids = []
         for source_id in sorted(absent_ids):

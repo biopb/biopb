@@ -170,6 +170,9 @@ class SourceManager:
         # source discovered under it is registered beneath.
         self._monitored_aliases: Dict[Path, str] = monitored_aliases or {}
         self._cloud_roots: Set[Path] = cloud_roots or set()
+        # Cloud roots a drop added at runtime, by the ``dnd://`` display root of
+        # that drop, so deregistering the drop takes the consent back with it.
+        self._dropped_cloud_roots: Dict[str, Path] = {}
         self._monitored_upstreams: List[SourceConfig] = monitored_upstreams or []
         # Configured directories that are catalogued but not watched
         # (``monitor = false``): each is scanned once, by the first tick, and
@@ -381,16 +384,16 @@ class SourceManager:
         return time.monotonic() - self._started_at >= self._prune_unseen_days * 86400
 
     def complete_initial_scan(self) -> None:
-        """Advance the startup protocol: clear ``full_scan_in_progress``, stamp
-        catalog freshness, flip the precache startup gate, and fire the
+        """Advance the startup protocol: stamp catalog freshness, clear
+        ``full_scan_in_progress``, flip the precache startup gate, and fire the
         first-scan-complete hook.
 
         Called at the end of the first tick, whatever it scanned (nothing, for a
         config of static sources only). Idempotent: the hook fires only on the
         transition to done.
         """
-        self._server.set_full_scan_in_progress(False)
         self._mark_catalog_complete()
+        self._server.set_full_scan_in_progress(False)
         if not self._initial_scan_done:
             self._initial_scan_done = True
             self._fire_initial_scan_complete()
@@ -786,6 +789,11 @@ class SourceManager:
                     removed.append(source_id)
                 else:
                     failed.append((source_id, "not present (already removed?)"))
+            # Taking the drop away takes its cloud consent too; a later plain drop
+            # of the same folder must not inherit it.
+            cloud_root = self._dropped_cloud_roots.pop(root_url.rstrip("/"), None)
+            if cloud_root is not None:
+                self._cloud_roots.discard(cloud_root)
         return removed, failed
 
     def _reconcile_due_upstreams(self) -> None:
@@ -1064,10 +1072,13 @@ class SourceManager:
             # cloud, the stability gate, the deferred registration, the precache
             # residency check and the reconcile's cloud scoping all ask the same
             # question of every path under it. So a consented drop records its
-            # root, and it stays cloud for the life of the server. A path already
-            # under a configured cloud root is cloud whatever the request says.
+            # root, and it stays cloud until that drop is deregistered. A path
+            # already under a configured cloud root is cloud whatever the request
+            # says.
             if cloud and not self._is_under_cloud_root(url):
-                self._cloud_roots.add(Path(url).resolve())
+                cloud_root = Path(url).resolve()
+                self._cloud_roots.add(cloud_root)
+                self._dropped_cloud_roots[_drop_catalog_url(url, url)] = cloud_root
             cloud = self._is_under_cloud_root(url)
             # Re-rooting (own display root) and the ``dnd://`` origin marker are
             # decoupled: a drop under a monitored root still gets a tidy display

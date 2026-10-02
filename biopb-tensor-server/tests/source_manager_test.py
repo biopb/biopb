@@ -856,6 +856,38 @@ class TestSourceManagerRegressions:
         assert list(state.claims) == [source_id]
         assert server.unregistered == []
 
+    def test_cloud_misses_count_on_full_passes_only(self, tmp_path, monkeypatch):
+        """An incremental tick does not walk a cloud root, so it neither counts a
+        miss for its sources nor wipes the count a full pass left."""
+        monitored_dir = tmp_path / "monitored"
+        monitored_dir.mkdir()
+        data_path = monitored_dir / "sample.dat"
+        data_path.write_text("hello")
+        server = _FakeServer()
+        state = DiscoveryState()
+        manager = _make_manager(
+            server,
+            registry=_FakeRegistry(),
+            discovery_state=state,
+            monitored_dirs={monitored_dir},
+            cloud_roots={monitored_dir.resolve()},
+            stability_window=0.0,
+        )
+        manager._handle_rescan()
+        source_id = next(iter(state.claims))
+        data_path.unlink()
+
+        full = iter([True, False, False, True])
+        monkeypatch.setattr(manager, "_should_force_full_rescan", lambda: next(full))
+        manager._handle_rescan()  # full: first miss
+        manager._handle_rescan()  # incremental: says nothing
+        manager._handle_rescan()  # incremental: says nothing
+        assert list(state.claims) == [source_id]
+
+        manager._handle_rescan()  # full: second miss
+        assert state.claims == {}
+        assert server.unregistered == [source_id]
+
     def test_a_read_only_file_is_not_refused(self, tmp_path):
         """biopb/biopb#1042: the append probe could not tell "not allowed to
         write" from "still being written", so a file the server can read but not
