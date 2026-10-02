@@ -51,7 +51,6 @@ import argparse
 import hashlib
 import inspect
 import logging
-import math
 import os
 import re
 import sys
@@ -344,37 +343,18 @@ def describe(definitions: Sequence[_OpDef]) -> proto.OpList:
 # =============================================================================
 
 
-#: The key `_jsonable` carries a non-finite float under, and `_from_json` (the
-#: kernel's `ops` client, `_process_ops.py`) reads it back from. JSON has no
-#: literal for nan/inf/-inf, and `google.protobuf.Value` refuses to serialize
-#: one to JSON text (`MessageToDict` raises) -- so a measurement that
-#: legitimately returns nan (an empty-input rate, "undefined" not "zero") or
-#: inf (an unbounded resolution) would otherwise crash decoding the result,
-#: not just lose precision.
-NON_FINITE_FLOAT_KEY = "__float__"
-
-
 def _jsonable(value: Any) -> Any:
-    """*value* as plain JSON types: numpy values converted, tables as columns,
-    a non-finite float carried as ``{"__float__": "nan"}`` (see
-    :data:`NON_FINITE_FLOAT_KEY`)."""
+    """*value* as plain JSON types: numpy values converted, tables as columns."""
     if value is None or isinstance(value, (bool, str)):
         return value
-    if isinstance(value, float) and not math.isfinite(value):
-        return {NON_FINITE_FLOAT_KEY: str(value)}
     if isinstance(value, (int, float)):
         return value
     if isinstance(value, np.generic):
         return _jsonable(value.item())
     if isinstance(value, np.ndarray):
-        # Only a float array can hold a non-finite value; skip the per-element
-        # walk below unless one is actually there. Complex still falls
-        # through it, since a bare complex scalar isn't JSON either.
-        if value.dtype.kind == "f" and np.isfinite(value).all():
-            return value.tolist()
-        if value.dtype.kind not in "fc":
-            return value.tolist()
-        return _jsonable(value.tolist())
+        # Only complex needs the element walk: a bare complex isn't JSON.
+        items = value.tolist()
+        return _jsonable(items) if value.dtype.kind == "c" else items
     if isinstance(value, dict):
         return {str(k): _jsonable(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
@@ -388,8 +368,51 @@ def _jsonable(value: Any) -> Any:
     raise TypeError(f"an output of type {type(value).__name__} is not JSON")
 
 
+def _fill_value(target: struct_pb2.Value, value: Any) -> None:
+    """Set *target* from plain JSON types, field by field.
+
+    Not ``json_format.ParseDict``/``MessageToDict``: those are JSON *text*
+    guards, and a ``Value`` on the wire is protobuf binary, where
+    ``number_value`` is a double that carries nan and inf unchanged -- a
+    measurement may legitimately be either.
+    """
+    if value is None:
+        target.null_value = struct_pb2.NULL_VALUE
+    elif isinstance(value, bool):
+        target.bool_value = value
+    elif isinstance(value, (int, float)):
+        target.number_value = value
+    elif isinstance(value, str):
+        target.string_value = value
+    elif isinstance(value, dict):
+        target.struct_value.Clear()
+        for key, item in value.items():
+            _fill_value(target.struct_value.fields[key], item)
+    else:
+        target.list_value.Clear()
+        for item in value:
+            _fill_value(target.list_value.values.add(), item)
+
+
+def _read_value(value: struct_pb2.Value) -> Any:
+    kind = value.WhichOneof("kind")
+    if kind == "number_value":
+        return value.number_value
+    if kind == "string_value":
+        return value.string_value
+    if kind == "bool_value":
+        return value.bool_value
+    if kind == "struct_value":
+        return {k: _read_value(v) for k, v in value.struct_value.fields.items()}
+    if kind == "list_value":
+        return [_read_value(v) for v in value.list_value.values]
+    return None
+
+
 def _json_arg(value: Any) -> proto.Arg:
-    return proto.Arg(json=json_format.ParseDict(_jsonable(value), struct_pb2.Value()))
+    arg = proto.Arg()
+    _fill_value(arg.json, _jsonable(value))
+    return arg
 
 
 @dataclass
@@ -429,21 +452,10 @@ def _decode_pixels(name: str, arg: proto.Arg) -> _Pixels:
     return _Pixels(array, list(labels))
 
 
-def _undo_non_finite(value: Any) -> Any:
-    """Restore a `NON_FINITE_FLOAT_KEY`-carried nan/inf/-inf to a real float."""
-    if isinstance(value, dict) and set(value) == {NON_FINITE_FLOAT_KEY}:
-        return float(value[NON_FINITE_FLOAT_KEY])
-    if isinstance(value, list):
-        return [_undo_non_finite(v) for v in value]
-    if isinstance(value, dict):
-        return {k: _undo_non_finite(v) for k, v in value.items()}
-    return value
-
-
 def _decode_kwarg(definition: _OpDef, name: str, arg: proto.Arg) -> Any:
     if arg.WhichOneof("kind") != "json":
         raise ValueError(f"{name} is not a tensor argument of {definition.name}")
-    value = _undo_non_finite(json_format.MessageToDict(arg.json))
+    value = _read_value(arg.json)
     if (
         name in definition.int_kwargs
         and isinstance(value, float)
