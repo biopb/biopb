@@ -294,7 +294,10 @@ def list_upstream_versions(client) -> Dict[str, UpstreamVersion]:
     One narrow query (no ``tensors`` or ``metadata_json`` payload), so it stays
     cheap on a six-figure catalog and is what a re-list diffs against:
     ``indexed_at`` is the upstream's register timestamp, which changes whenever
-    the source is re-registered (including unresolved -> resolved). Complete -- the
+    the source is re-registered (including unresolved -> resolved). Every write to
+    a catalog row is ``sync_source_added``, an upsert that re-stamps it -- an upload,
+    a detach or a reaped upload changes ``tensors`` only by re-syncing the parent --
+    so a changed row always carries a new ``indexed_at``. Complete -- the
     server-side DuckDB catalog is not truncated like ``list_sources()`` -- so a
     caller may reconcile destructively against it.
 
