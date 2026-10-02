@@ -449,6 +449,29 @@ class TestDropRules:
         assert sorted(removed) == sorted(a + added)
         assert added[0] not in server.sources
 
+    def test_a_drop_sees_a_root_removed_while_it_waited_for_the_lock(
+        self, tmp_path, monkeypatch
+    ):
+        from biopb_tensor_server.sources import source_manager
+
+        monkeypatch.setattr(source_manager, "_ADD_SOURCE_ACQUIRE_HEARTBEAT", 0.01)
+        manager, server = _make_manager()
+        root = self._folder(tmp_path, "proj")
+        _drain(manager.add_local_source(str(root)))
+        _make_zarr(str(root), "b.zarr")
+
+        manager._catalog_lock.acquire()  # a rescan holds it
+        drop = manager.add_local_source(str(root / "b.zarr"))
+        assert next(drop)[0] == "progress"  # waiting
+        manager._catalog_lock.release()
+        manager.remove_dropped_root("dnd://proj")  # the root goes first
+
+        added, _, failed = _drain(drop)
+
+        # No longer inside a known root: its own marked root, not a crash.
+        assert not failed and len(added) == 1
+        assert _url(server, added[0]) == "dnd://b.zarr"
+
     def test_a_drop_in_a_monitored_root_takes_the_roots_alias(self, tmp_path):
         root = self._folder(tmp_path, "data", "a.zarr")
         manager, server = _make_manager(

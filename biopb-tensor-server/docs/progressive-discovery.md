@@ -244,7 +244,8 @@ source.
 
 A drop that arrives before the first tick finishes is refused, not queued. Once it has
 finished, a drop waits on `_catalog_lock` if a rescan is running (heart-beating to its
-caller) and runs as a live addition.
+caller) and runs as a live addition. Where it lands (known root or not, which label) is
+decided after the lock is taken, so a removal or an earlier drop that went first is seen.
 
 ## 7. SERVING versus freshness
 

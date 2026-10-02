@@ -1037,8 +1037,10 @@ class SourceManager:
         Whole-request problems raise before the first yield:
         ``FileNotFoundError`` / ``PermissionError`` (server-side path check) or
         ``ValueError`` (a remote URL -- runtime add is local-only for now -- a
-        relative path, which has no anchor on this side of the wire, a first scan
-        still running, or cloud mode asked for inside a known root).
+        relative path, which has no anchor on this side of the wire, or a first scan
+        still running). Cloud mode asked for inside a known root is refused the same
+        way, but only once the catalog lock is held, since where the drop lands is
+        read under it; a wait that heart-beat first yields progress before it.
         """
         if not self._initial_scan_done:
             raise ValueError(
@@ -1075,15 +1077,6 @@ class SourceManager:
         url = real
 
         root_path = Path(url)
-        known = self._known_root(root_path)
-        if known is not None and cloud and not self._is_under_cloud_root(url):
-            # Cloud is a property of a root, set where the root is first added; a
-            # subfolder cannot turn it on afterwards, and there would be no drop
-            # to deregister to take it back.
-            raise ValueError(
-                f"Cannot switch cloud mode on inside {known[1]}: it is set where "
-                "the folder is first added, or in the config"
-            )
 
         # Acquire the catalog lock, heart-beating while a rescan holds it so a
         # long wait does not sit silent long enough to trip a proxy timeout.
@@ -1092,6 +1085,17 @@ class SourceManager:
         consented = False
         committed = False
         try:
+            # Where the drop lands is read under the lock: a drop or a removal that
+            # held it first may have added or taken away the root this lands in.
+            known = self._known_root(root_path)
+            if known is not None and cloud and not self._is_under_cloud_root(url):
+                # Cloud is a property of a root, set where the root is first added;
+                # a subfolder cannot turn it on afterwards, and there would be no
+                # drop to deregister to take it back.
+                raise ValueError(
+                    f"Cannot switch cloud mode on inside {known[1]}: it is set "
+                    "where the folder is first added, or in the config"
+                )
             # Cloud-ness belongs to the root, not to this call: once a root is
             # cloud, the stability gate, the deferred registration, the precache
             # residency check and the reconcile's cloud scoping all ask the same
