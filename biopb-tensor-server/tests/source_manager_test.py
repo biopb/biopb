@@ -696,6 +696,95 @@ class TestMonitoredRescanSeesDepth:
         assert server.unregistered == []
 
 
+class _NamespaceRegistry(_FakeRegistry):
+    """Builds adapters that can carry a ``_catalog_url``."""
+
+    def get_adapter_for_type(self, source_type):
+        from types import SimpleNamespace
+
+        if source_type == "fake":
+            return SimpleNamespace(
+                create_from_config=lambda config, creds=None: SimpleNamespace()
+            )
+        return None
+
+
+class TestMonitoredAlias:
+    """A monitored directory's ``alias`` is the display root of what its walk finds."""
+
+    def _manager(self, tmp_path, aliases):
+        root = tmp_path / "data"
+        (root / "sub").mkdir(parents=True)
+        server = _FakeServer()
+        adapters = {}
+        register = server.register_source
+        server.register_source = lambda sid, adapter: (
+            adapters.__setitem__(sid, adapter),
+            register(sid, adapter),
+        )[1]
+        manager = _make_manager(
+            server,
+            registry=_NamespaceRegistry(),
+            discovery_state=DiscoveryState(),
+            monitored_dirs={root},
+            stability_window=0.0,
+            monitored_aliases={root.resolve(): aliases} if aliases else None,
+        )
+        return root, manager, adapters
+
+    def test_walk_registers_sources_under_the_alias(self, tmp_path):
+        root, manager, adapters = self._manager(tmp_path, "lab")
+        (root / "a.dat").write_text("a")
+        (root / "sub" / "b.dat").write_text("b")
+
+        manager._handle_rescan()
+
+        urls = sorted(a._catalog_url for a in adapters.values())
+        assert urls == ["lab/a.dat", "lab/sub/b.dat"]
+
+    def test_a_later_addition_gets_the_alias_too(self, tmp_path, monkeypatch):
+        root, manager, adapters = self._manager(tmp_path, "lab")
+        (root / "a.dat").write_text("a")
+        manager._handle_rescan()
+        monkeypatch.setattr(manager, "_should_force_full_rescan", lambda: False)
+
+        (root / "sub" / "b.dat").write_text("b")
+        manager._handle_rescan()
+
+        assert sorted(a._catalog_url for a in adapters.values()) == [
+            "lab/a.dat",
+            "lab/sub/b.dat",
+        ]
+
+    def test_without_an_alias_the_url_is_native(self, tmp_path):
+        root, manager, adapters = self._manager(tmp_path, None)
+        (root / "a.dat").write_text("a")
+
+        manager._handle_rescan()
+
+        assert all(getattr(a, "_catalog_url", None) is None for a in adapters.values())
+
+    def test_the_innermost_aliased_root_wins(self, tmp_path):
+        from types import SimpleNamespace
+
+        outer = tmp_path / "outer"
+        inner = outer / "inner"
+        inner.mkdir(parents=True)
+        manager = _make_manager(
+            _FakeServer(),
+            registry=_FakeRegistry(),
+            discovery_state=DiscoveryState(),
+            monitored_dirs={outer, inner},
+            monitored_aliases={outer.resolve(): "o", inner.resolve(): "i"},
+        )
+        claim = SimpleNamespace(primary_path=str(inner / "x.dat"))
+        assert manager._monitored_catalog_url(claim) == "i/x.dat"
+        claim = SimpleNamespace(primary_path=str(outer / "y.dat"))
+        assert manager._monitored_catalog_url(claim) == "o/y.dat"
+        claim = SimpleNamespace(primary_path=str(tmp_path / "z.dat"))
+        assert manager._monitored_catalog_url(claim) is None
+
+
 class TestSourceManagerRegressions:
     def setup_method(self):
         _FlakyAdapter.calls = 0
@@ -1441,8 +1530,8 @@ class TestProgressiveDiscoveryFreshness:
 
         manager.complete_initial_scan()
 
-        # No force-full pass ran, so in_progress was never toggled.
-        assert server.scan_in_progress_history == []
+        # No walk ran; completing the protocol only clears the flag.
+        assert server.scan_in_progress_history == [False]
         assert server.last_full_scan_at is not None
         assert manager._initial_scan_done is True
         assert fired == [True]

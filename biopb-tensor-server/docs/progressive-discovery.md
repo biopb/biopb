@@ -37,8 +37,9 @@ Within the first scan, each source registers the moment the walk claims it
 one batch at end-of-walk. This is safe because the first scan is add-only --
 the catalog starts empty and force-full, so there is no removal diff to
 compute and every claim is a pure add. `_initial_scan_done` marks the
-boundary: it flips once, at the end of the first successful full scan, and
-gates the behavior below. Steady-state rescans keep the ordinary
+boundary: it flips once, at the end of the first tick -- after the one-shot
+directories, the monitored walk and the upstream mirror have each had their
+first pass -- and gates the behavior below. Steady-state rescans keep the ordinary
 snapshot-diff model (`removed = current − discovered`), since only they need
 to detect removals; they do not stream. Static sources -- nothing to discover:
 a typed entry, a file, one remote source -- are seeded synchronously and never go
@@ -67,15 +68,18 @@ show "Indexing... (N so far)" instead.
   duplicate add, so a retried first scan (after a partial failure) would
   otherwise delete already-streamed sources. `_stream_first_scan_add` guards
   with a presence check, making re-streaming a no-op.
-- **End-of-first-scan reconcile still runs**, idempotently for
-  already-streamed adds, to stamp the freshness timestamp, clear
-  `full_scan_in_progress` and flip `_initial_scan_done`.
-- **The loop always runs.** `SourceManager.start()` starts it for every config,
-  and the first tick completes the startup protocol: after the one-shot
-  directories, the monitored walk and the upstream pass have each run, a tick that
-  has not yet flipped `_initial_scan_done` (a config of static or one-shot
-  sources only) stamps the freshness timestamp, flips the precache gate and fires
-  the completion hook itself. There is no launcher-driven fallback path.
+- **End-of-walk reconcile still runs**, idempotently for already-streamed
+  adds. On the first tick it does not stamp freshness or clear
+  `full_scan_in_progress`; the tick does that once, at its end.
+- **The loop always runs.** `SourceManager.start()` starts it for every config.
+  The first tick runs the one-shot directories, the monitored walk and the
+  upstream pass, then completes the startup protocol itself: clears
+  `full_scan_in_progress`, stamps the freshness timestamp, flips the precache gate
+  and fires the completion hook -- also for a config of static sources only. The
+  upstream mirror is therefore startup set and routes to the precache backlog;
+  an unreachable upstream delays the flip by one failed attempt. A first tick
+  that raises clears `full_scan_in_progress` and the next tick retries. There is
+  no launcher-driven fallback path.
 - **A consumer that reads `SERVING` as "catalog complete" is wrong** and will
   flash an empty catalog; gate "no data" UI on `full_scan_in_progress`
   instead.

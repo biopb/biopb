@@ -150,6 +150,7 @@ class Reconciler:
         monitored_dirs: Set[Path],
         cloud_roots: Set[Path],
         notify_source_committed: Callable[[str], None],
+        catalog_url_for: Callable[[SourceClaim], Optional[str]] = lambda claim: None,
         stability_window: float = 30.0,
     ):
         self._server = server
@@ -163,6 +164,9 @@ class Reconciler:
         self._cloud_roots = cloud_roots
         # Injected SourceManager seam (see module docstring).
         self._notify_source_committed = notify_source_committed
+        # Display root for a newly discovered claim (a monitored root's alias);
+        # None leaves the native url.
+        self._catalog_url_for = catalog_url_for
         # Quiet period a claim must have had before this reconcile will remove or
         # rebuild it -- the same window, and the same predicate, the claim gate
         # applies on the way in (see ``_claim_is_quiet``).
@@ -452,8 +456,11 @@ class Reconciler:
         ``catalog_seed`` is forwarded to ``_register_source_claim`` (biopb/biopb#266,
         remote bulk-seed); ``None`` for local sources. ``catalog_url`` overrides the
         descriptor's display ``source_url`` (drag-drop re-rooting, see
-        ``_drop_catalog_url``); ``None`` for the discovery/watcher path.
+        ``_drop_catalog_url``); ``None`` falls back to the display root of the
+        monitored directory the claim sits under, if that has one.
         """
+        if catalog_url is None:
+            catalog_url = self._catalog_url_for(claim)
         if not self._register_source_claim(
             claim, catalog_seed=catalog_seed, catalog_url=catalog_url
         ):

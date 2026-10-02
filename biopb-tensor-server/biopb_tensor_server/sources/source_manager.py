@@ -149,6 +149,7 @@ class SourceManager:
         cloud_roots: Optional[Set[Path]] = None,
         monitored_upstreams: Optional[List[SourceConfig]] = None,
         scan_once_sources: Optional[List[SourceConfig]] = None,
+        monitored_aliases: Optional[Dict[Path, str]] = None,
         prune_unseen_days: int = 0,
     ):
         # Collaborators. The registry is kept for ``add_local_source``'s own
@@ -165,6 +166,9 @@ class SourceManager:
         # single-source ``grpc://host/<id>`` entry is not here, having nothing to
         # re-list.
         self._monitored_dirs = monitored_dirs
+        # Resolved monitored root -> configured ``alias``: the display root every
+        # source discovered under it is registered beneath.
+        self._monitored_aliases: Dict[Path, str] = monitored_aliases or {}
         self._cloud_roots: Set[Path] = cloud_roots or set()
         self._monitored_upstreams: List[SourceConfig] = monitored_upstreams or []
         # Configured directories that are catalogued but not watched
@@ -215,17 +219,14 @@ class SourceManager:
         self._thread: Optional[threading.Thread] = None
 
         # Startup protocol, and the precache routing gate it drives.
-        # ``_initial_scan_done`` flips at the end of the first successful full
-        # rescan -- which under progressive discovery runs in the event loop
-        # *after* start(), so it, not "are we past start()", is the
-        # startup/runtime boundary. Sources committed before it route to the slow
-        # precache backlog; after it, ``_on_source_committed`` prompt-enqueues
-        # them. ``_suppress_live_precache`` holds that backlog routing across the
-        # boot tick's upstream re-list, which the local walk in the same tick has
-        # already flipped the boundary for. Event-loop thread only, so plain
-        # flags are safe.
+        # ``_initial_scan_done`` flips at the end of the first tick -- after every
+        # configured source (one-shot directories, monitored walk, upstream
+        # mirror) has had its first pass -- which runs in the event loop *after*
+        # start(), so it, not "are we past start()", is the startup/runtime
+        # boundary. Sources committed before it route to the slow precache
+        # backlog; after it, ``_on_source_committed`` prompt-enqueues them.
+        # Event-loop thread only, so a plain flag is safe.
         self._initial_scan_done = False
-        self._suppress_live_precache = False
         self._on_source_committed: Optional[Callable[[str], None]] = None
         self._on_initial_scan_complete: Optional[Callable[[], None]] = None
 
@@ -250,7 +251,29 @@ class SourceManager:
             monitored_dirs=monitored_dirs,
             cloud_roots=self._cloud_roots,
             notify_source_committed=self._notify_source_committed,
+            catalog_url_for=self._monitored_catalog_url,
             stability_window=stability_window,
+        )
+
+    def _monitored_catalog_url(self, claim: SourceClaim) -> Optional[str]:
+        """Display ``source_url`` for a source discovered under a monitored root
+        that has an ``alias``; ``None`` when there is none.
+
+        The innermost aliased root wins. Display-only, like a drop's re-root: the
+        source id still hashes the native path.
+        """
+        if not self._monitored_aliases:
+            return None
+        path = Path(claim.primary_path).resolve()
+        best = max(
+            (r for r in self._monitored_aliases if r == path or r in path.parents),
+            key=lambda r: len(r.parts),
+            default=None,
+        )
+        if best is None:
+            return None
+        return _alias_catalog_url(
+            self._monitored_aliases[best], str(best), claim.primary_path
         )
 
     def start(self) -> None:
@@ -308,10 +331,10 @@ class SourceManager:
     def _mark_catalog_complete(self) -> None:
         """Publish that a full scan just finished, and run the orphan clock.
 
-        The three paths that can complete one -- a forced full rescan, an
-        upstream re-list pass, and a static-only config with nothing to walk --
-        all end here, which is what lets the clock be driven by the event rather
-        than by a timer that would have to re-derive it. "Complete" is not
+        The paths that can complete one -- the first tick, a later forced full
+        rescan, and a later upstream re-list pass -- all end here, which is what
+        lets the clock be driven by the event rather than by a timer that would
+        have to re-derive it. "Complete" is not
         checked here; at this point it is held.
 
         Auto-prune is armed only once this process has been up longer than the
@@ -358,13 +381,15 @@ class SourceManager:
         return time.monotonic() - self._started_at >= self._prune_unseen_days * 86400
 
     def complete_initial_scan(self) -> None:
-        """Advance the startup protocol: stamp catalog freshness, flip the precache
-        startup gate, and fire the first-scan-complete hook.
+        """Advance the startup protocol: clear ``full_scan_in_progress``, stamp
+        catalog freshness, flip the precache startup gate, and fire the
+        first-scan-complete hook.
 
-        Called by the first tick when no pass of its own completes the scan -- a
-        config of static or one-shot sources only. Idempotent: the hook fires
-        only on the transition to done.
+        Called at the end of the first tick, whatever it scanned (nothing, for a
+        config of static sources only). Idempotent: the hook fires only on the
+        transition to done.
         """
+        self._server.set_full_scan_in_progress(False)
         self._mark_catalog_complete()
         if not self._initial_scan_done:
             self._initial_scan_done = True
@@ -427,46 +452,35 @@ class SourceManager:
             self._next_rescan_at = time.monotonic() + self._rescan_interval
 
     def _handle_rescan(self) -> None:
-        """Run one periodic rescan: walk monitored dirs first, then re-list upstreams.
+        """Run one tick: the one-shot directories, the monitored walk, then the
+        due upstream re-lists.
 
-        Local directory sources are discovered *before* the tensor-server upstream
-        re-list so a slow/large upstream (hundreds of mirrored sources, each a
-        network round-trip) cannot delay the local catalog from appearing: the
-        local walk streams its sources first and the upstream mirror fills in
-        behind it on the same tick.
-
-        Precache routing subtlety: on the boot tick the local walk flips
-        ``_initial_scan_done`` True *before* the upstream re-list runs, which
-        would otherwise make ``_commit_add_claim`` prompt-enqueue the entire
-        startup upstream mirror at the precache worker's un-idle-gated live tier
-        (hundreds of upstream chunk fetches competing with serving -- the very
-        thing this reorder protects the local catalog from). The whole tick is a
-        startup tick if the scan had not completed when it began, so the upstream
-        mirror it registers is startup set and must route to the slow backlog. We
-        suppress the live enqueue across just that re-list.
+        The first tick is the first scan. It leaves ``full_scan_in_progress`` set
+        (the launcher raised it before :meth:`start`) and ends by completing the
+        startup protocol, so the flag clears, the precache gate opens and the
+        freshness stamp advances only once every source has had its first pass --
+        an unreachable upstream delays that by one failed attempt, not
+        indefinitely. Everything registered before then, the upstream mirror
+        included, is startup set and routes to the precache backlog.
         """
         # Serialize the whole pass against a concurrent runtime add_local_source
         # (Flight thread) so the two never mutate the confirmed catalog at once.
         with self._catalog_lock:
-            startup_tick = not self._initial_scan_done
-            self._scan_pending_roots()
-            self._rescan_monitored_dirs()
-            # tensor-server upstream re-list (biopb/biopb#178): adaptive per-upstream
-            # cadence -- fast (every tick) while changing/failing, backing off toward
-            # full_rescan_interval while a source set stays stable. Runs AFTER the
-            # local walk (see docstring).
-            if startup_tick:
-                self._suppress_live_precache = True
-                try:
-                    self._reconcile_due_upstreams()
-                finally:
-                    self._suppress_live_precache = False
-            else:
+            try:
+                self._scan_pending_roots()
+                self._rescan_monitored_dirs()
+                # tensor-server upstream re-list (biopb/biopb#178): adaptive
+                # per-upstream cadence -- fast (every tick) while changing/failing,
+                # backing off toward full_rescan_interval while a source set stays
+                # stable.
                 self._reconcile_due_upstreams()
+            except BaseException:
+                if not self._initial_scan_done:
+                    # The next tick retries the first scan; until it completes
+                    # nothing is scanning, so do not leave the flag claiming so.
+                    self._server.set_full_scan_in_progress(False)
+                raise
             if not self._initial_scan_done:
-                # The monitored walk and the upstream pass each complete the scan
-                # themselves. A config with neither (static or one-shot sources
-                # only) is done once this tick has run.
                 self.complete_initial_scan()
 
     def _scan_pending_roots(self) -> None:
@@ -484,23 +498,12 @@ class SourceManager:
         pending, self._scan_once_pending = self._scan_once_pending, []
         if not pending:
             return
-        # The monitored and upstream passes own the "scan in progress" flag when
-        # they run; only a config with neither has to clear it here.
-        alone = not self._monitored_dirs and not self._monitored_upstreams
-        if alone:
-            self._server.set_full_scan_in_progress(True)
-        try:
-            for source in pending:
-                try:
-                    self._scan_configured_root(source)
-                except Exception:
-                    # One bad root must not cost the others.
-                    logger.exception(
-                        "Could not scan configured directory %s", source.url
-                    )
-        finally:
-            if alone:
-                self._server.set_full_scan_in_progress(False)
+        for source in pending:
+            try:
+                self._scan_configured_root(source)
+            except Exception:
+                # One bad root must not cost the others.
+                logger.exception("Could not scan configured directory %s", source.url)
 
     def _scan_configured_root(self, source: SourceConfig) -> None:
         """Register everything under one configured directory (see
@@ -528,8 +531,9 @@ class SourceManager:
     def _rescan_monitored_dirs(self) -> None:
         """Walk the monitored directories and reconcile the discovered catalog.
 
-        No-op for an upstream-only config (no monitored dirs); that case's
-        freshness signals + first-scan gate are driven by _reconcile_due_upstreams.
+        No-op for an upstream-only config (no monitored dirs). On the first tick
+        the progress flag and freshness stamp are left to
+        :meth:`complete_initial_scan`, which runs after the upstream pass.
         """
         if not self._monitored_dirs:
             return
@@ -543,7 +547,10 @@ class SourceManager:
         # the health action reports full_scan_in_progress=True; on success it
         # advances last_full_scan_finished_at. Incremental rescans leave both
         # untouched (they skip cloud roots, so they are not a whole-catalog
-        # reconcile). Guaranteed reset in the outer finally.
+        # reconcile). The first tick's pass is only part of the first scan, so it
+        # leaves both to complete_initial_scan; a later one resets them in the
+        # outer finally.
+        startup = not self._initial_scan_done
         if force_full_rescan:
             self._server.set_full_scan_in_progress(True)
         try:
@@ -594,16 +601,10 @@ class SourceManager:
                 discovered_state, force_full=force_full_rescan
             )
 
-            if force_full_rescan:
+            if force_full_rescan and not startup:
                 self._mark_catalog_complete()
-                # First full scan done: flip the precache gate (live additions
-                # now prompt-enqueue) and let the launcher seed the backlog with
-                # the established catalog. Fired once, best-effort.
-                if not self._initial_scan_done:
-                    self._initial_scan_done = True
-                    self._fire_initial_scan_complete()
         finally:
-            if force_full_rescan:
+            if force_full_rescan and not startup:
                 self._server.set_full_scan_in_progress(False)
 
     def _fire_initial_scan_complete(self) -> None:
@@ -710,18 +711,13 @@ class SourceManager:
         """Precache routing gate for a freshly committed source (injected into
         the Reconciler as ``notify_source_committed``).
 
-        Only live additions -- those committed after the initial scan completes,
-        and outside the boot-tick upstream re-list guarded by
-        ``_suppress_live_precache`` -- are prompt-enqueued; the startup set routes
-        to the slow backlog instead. This manager owns the startup/suppress state
-        that decides that, so the gate lives here rather than in the Reconciler.
-        Best-effort: a hook failure must never abort a source commit.
+        Only live additions -- those committed after the initial scan completes --
+        are prompt-enqueued; the startup set routes to the slow backlog instead.
+        This manager owns the startup state that decides that, so the gate lives
+        here rather than in the Reconciler. Best-effort: a hook failure must never
+        abort a source commit.
         """
-        if (
-            self._initial_scan_done
-            and not self._suppress_live_precache
-            and self._on_source_committed is not None
-        ):
+        if self._initial_scan_done and self._on_source_committed is not None:
             try:
                 self._on_source_committed(source_id)
             except Exception:
@@ -799,9 +795,8 @@ class SourceManager:
         failing, and backs off (period doubles per unchanged re-list, capped at
         full_rescan_interval) while it is stable -- so a stable lab store is not
         queried every 30s forever, yet a new source / a recovered upstream is
-        mirrored within ~one tick. When there are no monitored *dirs* this is the
-        sole reconcile, so the first pass also drives the progressive-discovery
-        freshness signals + first-scan gate the dir path would otherwise own.
+        mirrored within ~one tick. When there are no monitored *dirs* each pass
+        is the whole reconcile, so a later one advances catalog freshness itself.
         """
         if not self._monitored_upstreams:
             return
@@ -816,22 +811,14 @@ class SourceManager:
         if not due:
             return
 
-        upstream_only = not self._monitored_dirs
-        first_pass = upstream_only and not self._initial_scan_done
-        if first_pass:
-            self._server.set_full_scan_in_progress(True)
         try:
             for upstream in due:
                 self._reconcile_and_reschedule(upstream)
         finally:
-            if upstream_only:
+            if not self._monitored_dirs and self._initial_scan_done:
                 # Each completed pass re-verifies the (remote) catalog -> advance
-                # freshness. in_progress / the first-scan gate fire once, on boot.
+                # freshness. The first tick leaves that to complete_initial_scan.
                 self._mark_catalog_complete()
-                if first_pass:
-                    self._server.set_full_scan_in_progress(False)
-                    self._initial_scan_done = True
-                    self._fire_initial_scan_complete()
 
     def _log_upstream_config_error(self, url: str, exc: Exception) -> None:
         """Report a broken upstream config once, until it changes or clears.
@@ -1374,14 +1361,9 @@ def create_source_manager(
     scan_once_sources = scan_once_sources or []
 
     # ``monitored_sources`` holds the watched local directories and the bare-host
-    # tensor-server upstreams ("mirror everything", biopb/biopb#178). An upstream
-    # is monitored -- its catalog is re-listed and reconciled in the background --
-    # but not *filesystem*-watched. Every one qualifies regardless of `monitor`
-    # (cli._route_source sends them all here, never to inline expansion), so a
-    # large upstream neither blocks SERVING nor pays a per-source get_descriptor
-    # RPC; `monitor=false` only makes the adaptive cadence back off after the
-    # boot-tick reconcile.
+    # tensor-server upstreams ("mirror everything", biopb/biopb#178).
     monitored_dirs: Set[Path] = set()
+    monitored_aliases: Dict[Path, str] = {}
     monitored_upstreams: List[SourceConfig] = []
     for source in monitored_sources:
         if source.is_remote:
@@ -1410,29 +1392,23 @@ def create_source_manager(
             continue
 
         monitored_dirs.add(local_path)
+        if source.alias:
+            monitored_aliases[local_path.resolve()] = source.alias
 
-    # An unreachable monitored upstream contributes no static sources at startup
-    # (its bare-host expansion was skipped), but the re-list populates it once it
-    # is reachable -- so it counts as "something to serve" and the catalog is not
-    # reported as empty on its account.
     if (
         not monitored_dirs
         and not static_sources
         and not scan_once_sources
         and not monitored_upstreams
     ):
-        logger.warning("No sources configured yet; serving an empty catalog")
+        logger.info("No sources configured yet; serving an empty catalog")
 
-    # Resolved roots opted into cloud/synced-folder handling (config cloud=true),
-    # across both monitored and static sources. Under a monitored cloud root the
-    # walk admits dehydrated entries; for any cloud source the registration path
-    # defers a non-resident dataset to lazy resolution (cloud-storage phase 2).
+    # EXPERIMENTAL: cloud/synced-folder mode. The walk admits dehydrated entries,
+    # and register placeholder adapters resolved lazily on first access.
     cloud_roots: Set[Path] = set()
     for source in (*monitored_sources, *static_sources, *scan_once_sources):
         if source.cloud:
-            # EXPERIMENTAL: cloud/synced-folder mode (offline placeholders resolved
-            # lazily on first access) is not yet stable. Warned once per configured
-            # cloud source at startup.
+            # Warned once per configured cloud source at startup.
             logger.warning(
                 "Source %r uses the EXPERIMENTAL 'cloud' mode (offline/synced-folder "
                 "placeholders resolved lazily on first access): its behavior and "
@@ -1461,59 +1437,40 @@ def create_source_manager(
         cloud_roots=cloud_roots,
         monitored_upstreams=monitored_upstreams,
         scan_once_sources=scan_once_sources,
+        monitored_aliases=monitored_aliases,
         prune_unseen_days=prune_unseen_days,
     )
 
     # Seed static sources as direct claims (explicit config, no filesystem walk)
     # These are added first so monitored discovery skips paths already claimed.
     for source in static_sources:
+        # claim->SourceConfig drops most configs, so we carry some through to call
+        # create_from_config.
         extra_config = {}
         if source.dataset:
             extra_config["dataset"] = source.dataset
-        # credentials_profile is dropped by the claim->SourceConfig rebuild in
-        # _register_source_claim; carry it here so a tensor-server proxy's
-        # per-upstream token (and any remote source's profile) reaches
-        # create_from_config.
         if source.credentials_profile:
             extra_config["credentials_profile"] = source.credentials_profile
-        # Same rebuild drops `alias`, which a tensor-server proxy needs as the
-        # display authority of its catalog source_url (biopb/biopb#788). The
-        # source_id is already namespaced by then, so this is display-only.
-        if source.alias:
+        if source.alias:  # display-only
             extra_config["alias"] = source.alias
-        # Store the canonical resolved form of a local config path (the same
-        # resolve_local_path the source_id hash, the containment guard, and the
-        # drop path all use) so its claim key compares equal to a drop that lands
-        # inside it. Otherwise a source configured through a symlink/junction
-        # (e.g. /data/current -> /data/2026-07, or a Windows junction / mapped
-        # drive) keeps its raw path, so a drop *inside* it -- whose resolved form
-        # differs -- evades the "already part of <source>" guard and double-
-        # registers. Monitored sources reach the same form via the walk's
-        # Path.resolve. A remote URL is left verbatim -- is_remote_url is
-        # prefix-based, so a Windows drive letter (C:\...) stays a local path.
-        primary_path = source.url
+        # Store the canonical resolved form of a local config path, so Claim can
+        # be keyed on it.
+        primary_path = source.url  # initial assignment; may be resolved if local
+        # A remote URL is left verbatim. Aliasing is intentional because the server may
+        # use different address/port but serving the same data.
         if not is_remote_url(source.url):
             primary_path = resolve_local_path(source.url)
         claim = SourceClaim(
             source_type=source.type,
-            primary_path=primary_path,  # resolved local path; remote URL verbatim
+            primary_path=primary_path,
             source_id=source.source_id,
             extra_config=extra_config,
             # A static source explicitly flagged cloud is always deferred: the
-            # user said "don't open it eagerly". If it is in fact resident, the
             # first access still resolves it cheaply.
             unresolved=bool(source.cloud),
         )
         # source._catalog_url is the alias-derived display tree-root for a local
-        # source (resolve.resolve_all_sources), or None. Threaded as the descriptor's
-        # source_url override, exactly like the drag-drop re-rooting path.
+        # source (resolve.resolve_all_sources), or None.
         manager._reconciler._commit_add_claim(claim, catalog_url=source._catalog_url)
 
-    # Directory discovery is NOT run synchronously here: under progressive
-    # discovery the launcher starts the manager's rescan loop, whose first tick
-    # fires immediately, so the (possibly slow) bootstrap scan -- monitored and
-    # one-shot directories alike -- happens in the background while the server
-    # already reports SERVING. A static-only config has nothing to scan -- the
-    # launcher drives the first-scan-complete path directly so it still reports a
-    # freshness timestamp and seeds the backlog.
     return manager

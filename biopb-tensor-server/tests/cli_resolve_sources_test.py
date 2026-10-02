@@ -513,10 +513,11 @@ class TestAliasTreeRoot:
         assert resolved[0]._catalog_url is None
         assert resolved[0].alias == "x"  # untouched
 
-    def test_monitored_dir_alias_is_ignored_with_warning(self, tmp_path, caplog):
-        """A monitored *directory* re-merges into the shared path tree on rescan,
-        so its alias tree-root cannot hold: it is dropped with a warning and never
-        applied (the monitored entry is not expanded, so catalog_url stays None)."""
+    def test_monitored_dir_keeps_its_alias_for_the_walk_to_apply(
+        self, tmp_path, caplog
+    ):
+        """A monitored directory is not expanded here; its alias travels with it
+        and the walk's registrations apply it (see source_manager_test)."""
         root = tmp_path / "watched"
         root.mkdir()
         _write_tiff(str(root / "image.tif"))
@@ -527,9 +528,8 @@ class TestAliasTreeRoot:
                 _resolve_serve_sources(cfg)
             )
 
-        assert [s.url for s in monitored_sources] == [str(root)]
-        assert all(s._catalog_url is None for s in monitored_sources)
-        assert any("alias" in r.message and "live" in r.message for r in caplog.records)
+        assert [(s.url, s.alias) for s in monitored_sources] == [(str(root), "live")]
+        assert not caplog.records
 
     def test_monitored_single_file_alias_is_honored(self, tmp_path):
         """A ``monitor=true`` single *file* cannot be live-monitored, so it is

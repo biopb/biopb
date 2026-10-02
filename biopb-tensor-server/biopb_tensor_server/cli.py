@@ -460,14 +460,6 @@ def _route_source(s: SourceConfig) -> _Route:
                 "appears: %s",
                 s.url,
             )
-        if s.alias:
-            logger.warning(
-                "Ignoring 'alias' tree-root %r on monitored directory %s: a "
-                "monitored root re-merges into the shared path tree on rescan. "
-                "Drop 'monitor' to keep the alias as its own catalog root.",
-                s.alias,
-                s.url,
-            )
         return _Route.MONITORED
 
     # Not watched, but a directory still has to be discovered, once. A typed entry
@@ -845,9 +837,6 @@ def _setup_flight_server(
 
     Returns:
         Tuple of (flight_server, source_manager, precache_worker)
-
-    Raises:
-        typer.Exit: If no sources configured or no sources loaded successfully
     """
     effective_writable = writable if writable is not None else server_config.writable
     write_dir = server_config.write_dir
@@ -900,23 +889,18 @@ def _setup_flight_server(
     static_sources, monitored_sources, scan_once_sources = _resolve_serve_sources(
         server_config, registry
     )
-    if not static_sources and not monitored_sources and not scan_once_sources:
-        console.print(
-            "[yellow]No data sources configured; serving an empty catalog "
-            "(sources can be added at runtime).[/yellow]"
-        )
-    else:
+    if static_sources:
         console.print(
             f"[green]Loading {len(static_sources)} static data source(s)...[/green]"
         )
-        if monitored_sources:
-            console.print(
-                f"[green]Monitoring {len(monitored_sources)} directory(s) for live updates[/green]"
-            )
-        if scan_once_sources:
-            console.print(
-                f"[green]Scanning {len(scan_once_sources)} unwatched directory(s) once, in the background[/green]"
-            )
+    if monitored_sources:
+        console.print(
+            f"[green]Monitoring {len(monitored_sources)} directory(s) for live updates[/green]"
+        )
+    if scan_once_sources:
+        console.print(
+            f"[green]Scanning {len(scan_once_sources)} unwatched directory(s) once, in the background[/green]"
+        )
 
     # metadata_db _is_ the client-facing catalog
     metadata_db = _open_catalog(
@@ -1755,10 +1739,7 @@ def launch(
     )
 
     if effective_token is not None:
-        # The web app lives outside this package, so we can only show the token
-        # against the sidecar's own origin; a browser app appends it there (or
-        # carries it however that app expects). Normalize a wildcard bind to a
-        # dialable loopback host for display.
+        # Normalize a wildcard bind to a dialable loopback host for display.
         _display_host = web_host
         if _display_host in ("0.0.0.0", ""):
             _display_host = "127.0.0.1"
@@ -1768,9 +1749,6 @@ def launch(
             "\n[bold green]Access token (shown once — do not share):[/bold green]"
         )
         # soft_wrap keeps the URL on one line so the token stays copy-pasteable
-        # even in a narrow / non-TTY log (e.g. `docker logs`, where Rich would
-        # otherwise hard-wrap to width 80 and split the token). markup=False so
-        # nothing in the URL is interpreted as Rich markup.
         console.print(
             f"http://{_display_host}:{web_port}/?token={effective_token}",
             soft_wrap=True,
@@ -1783,21 +1761,18 @@ def launch(
         )
 
     # --- Start Flight server + HTTP sidecar ---
+    tls_cert_chain, tls_private_key = _resolve_tls_material(tls, tls_cert, tls_key, san)
+    effective_external_location = _resolve_external_location(
+        effective_host, port, tls_cert_chain, external_location
+    )
     # Pre-bind so the `finally` runs graceful shutdown -- which releases the file
-    # cache process lock -- on EVERY exit path after cache init, not just a clean
-    # uvicorn return. _setup_flight_server acquires the lock during cache init and
+    # cache process lock. _setup_flight_server acquires the lock during cache init and
     # can still raise afterwards (e.g. a bad static source, or a bind failure
     # starting the flight thread below), so keeping the whole startup body inside
     # the try means such an early exit no longer orphans the lock as a stale lock
     # (biopb/biopb#515). uvicorn also installs its own SIGINT/SIGTERM handlers and
     # returns normally on shutdown (it does not re-raise), so cleanup must run in
     # `finally` rather than an except block regardless.
-    tls_cert_chain, tls_private_key = _resolve_tls_material(tls, tls_cert, tls_key, san)
-
-    effective_external_location = _resolve_external_location(
-        effective_host, port, tls_cert_chain, external_location
-    )
-
     flight_server = source_manager = precache_worker = None
     try:
         flight_server, source_manager, precache_worker = _setup_flight_server(
@@ -1850,11 +1825,6 @@ def launch(
         if cors_origins:
             effective_cors = list(cors_origins)
         else:
-            # No web app is bundled here, so there is no frontend origin to derive
-            # by default. The control front reaches this sidecar over loopback for
-            # the data API, so allow all loopback variants of the server's own
-            # address; a browser app on any other origin must be allowed
-            # explicitly via --cors.
             from urllib.parse import urlparse as _urlparse
 
             _loopback_aliases: dict = {
@@ -1891,13 +1861,14 @@ def launch(
             config_path=str(config),
             tls_fingerprint=flight_fingerprint,
         )
+
     except AnnotationStoreError as exc:
-        # Operator-actionable and the message is the whole point of raising;
-        # a traceback would bury it.
         console.print(f"[red]{_rich_escape(str(exc))}[/red]")
         raise typer.Exit(1) from None
+
     except KeyboardInterrupt:
         console.print("\n[yellow]Shutting down...[/yellow]")
+
     finally:
         _graceful_shutdown(source_manager, flight_server, precache_worker)
 
@@ -1905,6 +1876,7 @@ def launch(
         from biopb_tensor_server import __version__
 
         console.print(f"TensorFlight server (using biopb-tensor-server {__version__})")
+
     except ImportError:
         console.print("TensorFlight server")
 
