@@ -284,20 +284,31 @@ class TestRescanLoop:
             **kwargs,
         )
 
-    def test_start_is_a_no_op_with_nothing_to_rescan(self, tmp_path):
-        """A static-only config has no tree to walk, so no thread is spawned."""
-        manager = self._manager(_FakeServer(), set())
-        manager.start()
-        assert manager.is_running() is False
+    def test_a_config_with_nothing_to_scan_still_completes_on_the_first_tick(
+        self, tmp_path
+    ):
+        """A static-only config has no tree to walk, but the loop still starts and
+        its first tick completes the startup protocol (freshness, precache gate,
+        completion hook) -- there is no separate launcher path for it."""
+        server = _FakeServer()
+        manager = self._manager(server, set())
+        fired = threading.Event()
+        manager.set_initial_scan_complete_hook(fired.set)
+        manager._rescan_interval = 3600.0
+        try:
+            manager.start()
+            assert manager.is_running() is True
+            assert fired.wait(5)
+        finally:
+            manager.stop()
+        assert manager._initial_scan_done is True
+        assert server.last_full_scan_at is not None
 
-    def test_start_is_a_no_op_when_rescanning_is_off(self, tmp_path):
-        """`monitor_mode = "off"` reaches here as a non-positive interval; the
-        sources stay configured and the launcher scans them once itself."""
-        monitored_dir = tmp_path / "monitored"
-        monitored_dir.mkdir()
-        manager = self._manager(_FakeServer(), {monitored_dir}, rescan_interval=0)
-        manager.start()
-        assert manager.is_running() is False
+    def test_a_non_positive_interval_is_floored_not_a_hot_loop_or_off(self, tmp_path):
+        """The loop always runs; an interval at or below zero is the same mistake
+        as a tiny positive one, and is floored the same way."""
+        manager = self._manager(_FakeServer(), set(), rescan_interval=0)
+        assert manager._rescan_interval == 0.1
 
     def test_the_loop_rescans_on_the_interval(self, tmp_path, monkeypatch):
         """First tick immediately, then one per interval."""
@@ -499,19 +510,6 @@ class TestScanOnceRoots:
             assert manager.is_running()
         finally:
             manager.stop()
-
-    def test_fallback_scans_synchronously_when_there_is_no_loop(self, tmp_path):
-        root = tmp_path / "data"
-        root.mkdir()
-        (root / "a.dat").write_text("a")
-        server = _FakeServer()
-        state = DiscoveryState()
-        manager = self._manager(server, root, state)
-
-        manager.run_bootstrap_fallback()
-
-        assert len(state.claims) == 1
-        assert manager._initial_scan_done is True
 
 
 class _ScriptedRegistry(_FakeRegistry):
@@ -1421,14 +1419,12 @@ class TestProgressiveDiscoveryFreshness:
         assert server.last_full_scan_at is not None
         assert fired == [True]
 
-    def test_run_initial_scan_drives_the_bootstrap_scan(self, tmp_path):
-        # The launcher's public seam for the rescan-less path
-        # runs one full rescan: same effect as the internal _handle_rescan.
+    def test_the_first_tick_drives_the_bootstrap_scan(self, tmp_path):
         server, manager = self._manager_with_source(tmp_path)
         fired = []
         manager.set_initial_scan_complete_hook(lambda: fired.append(True))
 
-        manager.run_initial_scan()
+        manager._handle_rescan()
 
         assert server.scan_in_progress_history == [True, False]
         assert server.last_full_scan_at is not None
@@ -1436,9 +1432,9 @@ class TestProgressiveDiscoveryFreshness:
         assert fired == [True]
 
     def test_complete_initial_scan_advances_protocol_without_walking(self, tmp_path):
-        # The static-only launcher path (biopb/biopb#277 C): no bootstrap scan,
-        # but the startup protocol still stamps freshness, flips the gate, and
-        # fires the one-shot completion hook.
+        # A config with no scan of its own (static sources only): the startup
+        # protocol still stamps freshness, flips the gate, and fires the one-shot
+        # completion hook.
         server, manager = self._manager_with_source(tmp_path)
         fired = []
         manager.set_initial_scan_complete_hook(lambda: fired.append(True))

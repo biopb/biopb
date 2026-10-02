@@ -852,13 +852,6 @@ class ServerConfig:
             "third-party libraries (grpc, numpy, ...) at their defaults."
         },
     )
-    monitor_mode: str = field(
-        default="periodic",
-        metadata={
-            "help": "How monitored folders are watched: 'periodic' rescans, or "
-            "'off' to stop background rescans after initial discovery."
-        },
-    )
     rescan_interval: float = field(
         default=30.0,
         metadata={
@@ -1327,13 +1320,15 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
     _carry(server_kwargs, "log_level", server_data)
     _carry(server_kwargs, "log_scope_to_biopb", server_data)
 
-    # monitor_mode: honor the value directly, else derive it from the legacy
-    # `watcher_type` alias; if neither is set, ServerConfig's default applies.
-    monitor_mode = server_data.get("monitor_mode")
-    if monitor_mode is None and "watcher_type" in server_data:
-        monitor_mode = "off" if server_data.get("watcher_type") == "off" else "periodic"
-    if monitor_mode is not None:
-        server_kwargs["monitor_mode"] = monitor_mode
+    # Monitoring is always on. `monitor_mode` (and its legacy alias `watcher_type`)
+    # is still accepted so an old config loads, but "off" no longer does anything.
+    for key in ("monitor_mode", "watcher_type"):
+        if server_data.get(key) == "off":
+            logger.warning(
+                "server.%s = 'off' is ignored: monitored folders are always "
+                "rescanned. Drop 'monitor' from a source to stop watching it.",
+                key,
+            )
 
     # rescan_interval: `poll_interval` is the legacy alias.
     _carry(server_kwargs, "rescan_interval", server_data, cast=float)

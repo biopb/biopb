@@ -193,10 +193,9 @@ class TestResolveServeSources:
         assert [s.url for s in monitored_sources] == [str(root)]
         assert [s.local_path for s in static_sources] == [outside.resolve()]
 
-    def test_remote_monitor_is_static_and_monitored(self, tmp_path):
-        """Remote monitor=true entries keep current behavior: registered
-        statically AND passed through as monitored (the manager logs the
-        no-monitor notice)."""
+    def test_remote_monitor_is_static_only(self, tmp_path):
+        """A remote monitor=true entry (not a bare-host upstream) has nothing to
+        watch or re-list, so it is registered statically and only that."""
         remote = SourceConfig(url="s3://bucket/data.zarr", type="zarr", monitor=True)
         cfg = _config(remote)
 
@@ -204,7 +203,7 @@ class TestResolveServeSources:
             cfg
         )
 
-        assert [s.url for s in monitored_sources] == ["s3://bucket/data.zarr"]
+        assert monitored_sources == []
         assert [s.url for s in static_sources] == ["s3://bucket/data.zarr"]
 
     def test_monitored_bare_host_upstream_is_not_expanded(self, monkeypatch):
@@ -282,7 +281,7 @@ class TestResolveServeSources:
             cfg
         )
 
-        assert [s.url for s in monitored_sources] == ["grpc://host:8815/raw"]
+        assert monitored_sources == []  # nothing to watch or re-list
         assert [s.url for s in static_sources] == ["grpc://host:8815/raw"]
         # Namespaced under the alias by the single-source expansion path.
         assert static_sources[0].source_id == "hpc__raw"
@@ -546,3 +545,41 @@ class TestAliasTreeRoot:
 
         assert monitored_sources == []
         assert [s._catalog_url for s in static_sources] == ["solo"]
+
+
+class TestWriteDirInsideASourceDirectory:
+    """upload stores are declined by the claims, but the walk still goes through
+    them, so a write_dir inside a scanned directory is worth saying so."""
+
+    @staticmethod
+    def _warnings(caplog):
+        return [r.message for r in caplog.records if "write_dir" in r.message]
+
+    @pytest.mark.parametrize("monitor", [True, False])
+    def test_a_write_dir_inside_a_source_directory_warns(
+        self, tmp_path, caplog, monitor
+    ):
+        root = tmp_path / "data"
+        (root / "uploads").mkdir(parents=True)
+        cfg = ServerConfig(
+            sources=[SourceConfig(url=str(root), monitor=monitor)],
+            write_dir=root / "uploads",
+        )
+
+        _resolve_serve_sources(cfg)
+
+        assert len(self._warnings(caplog)) == 1
+
+    def test_a_write_dir_outside_every_source_directory_is_quiet(
+        self, tmp_path, caplog
+    ):
+        root = tmp_path / "data"
+        root.mkdir()
+        cfg = ServerConfig(
+            sources=[SourceConfig(url=str(root), monitor=True)],
+            write_dir=tmp_path / "uploads",
+        )
+
+        _resolve_serve_sources(cfg)
+
+        assert self._warnings(caplog) == []

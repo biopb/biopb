@@ -93,7 +93,6 @@ class TestTensorConfig:
         config = parse_config(
             {
                 "server": {
-                    "monitor_mode": "periodic",
                     "rescan_interval": 12,
                     "full_rescan_interval": 120,
                     "stability_window": 45,
@@ -103,7 +102,6 @@ class TestTensorConfig:
             }
         )
 
-        assert config.monitor_mode == "periodic"
         assert config.rescan_interval == 12.0
         assert config.full_rescan_interval == 120.0
         assert config.stability_window == 45.0
@@ -120,11 +118,25 @@ class TestTensorConfig:
             }
         )
 
-        assert config.monitor_mode == "off"
+        assert not hasattr(config, "monitor_mode")  # retired: always on
         assert config.rescan_interval == 9.0
         assert config.full_rescan_interval == 3600.0
         assert config.stability_window == 30.0
         assert config.aggressive_dir_pruning is False
+
+    @pytest.mark.parametrize("key", ["monitor_mode", "watcher_type"])
+    def test_retired_monitor_off_loads_but_warns(self, key, caplog):
+        """Monitoring is always on: the old key is tolerated, never obeyed."""
+        from biopb_tensor_server.core.config import validate_config_dict
+
+        data = {"server": {key: "off"}, "sources": []}
+
+        assert not validate_config_dict(data)  # not flagged as an unknown key
+        with caplog.at_level("WARNING"):
+            config = parse_config(data)
+
+        assert not hasattr(config, "monitor_mode")
+        assert f"server.{key} = 'off' is ignored" in caplog.text
 
     def test_claim_generic_images_defaults_off(self):
         config = parse_config({"server": {}, "sources": []})

@@ -13,6 +13,7 @@ import secrets
 import signal
 import threading
 from datetime import datetime, timedelta
+from enum import Enum
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -29,6 +30,7 @@ from rich.table import Table
 from biopb_tensor_server.adapters import AdapterRegistry, get_default_registry
 from biopb_tensor_server.adapters._handle_reaper import set_handle_reaper_ttl
 from biopb_tensor_server.adapters.bioio import set_claim_generic_images
+from biopb_tensor_server.adapters.remote_tensor import is_bare_host_upstream_url
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.core.config import (
     ServerConfig,
@@ -414,21 +416,66 @@ def _graceful_shutdown(source_manager, flight_server, precache_worker=None) -> N
             console.print(f"[yellow]Error stopping {label}: {e}[/yellow]")
 
 
-def _is_bare_host_upstream(source: SourceConfig) -> bool:
-    """True for a bare-host ``grpc://host:port`` tensor-server upstream (no ``/<id>``).
+class _Route(Enum):
+    """Where one configured source goes on the serve path."""
 
-    Only the bare-host "mirror everything" form has an upstream catalog to
-    re-list; a single-source ``grpc://host:port/<id>`` names exactly one source
-    and is registered directly. Mirrors the ``monitored_upstreams`` filter in
-    ``source_manager.create_source_manager``.
+    STATIC = "static"  # nothing to discover: expanded and registered as it is
+    # Owned by the manager's rescan loop: a watched directory, or a bare-host
+    # tensor-server upstream, which is re-listed rather than walked.
+    MONITORED = "monitored"
+    SCAN_ONCE = "scan_once"  # a directory the first tick walks, then never again
+
+
+def _route_source(s: SourceConfig) -> _Route:
+    """Decide where a configured source goes; log why when that is not what the
+    entry asked for.
+
+    Every local directory is discovered by the manager after the server is SERVING,
+    never expanded here: that would walk the tree an extra time before the server
+    binds, and crash on a not-yet-mounted directory (biopb/biopb#54).
     """
-    if not source.is_remote:
-        return False
-    if not source.url.lower().startswith(("grpc://", "grpc+tls://", "grpcs://")):
-        return False
-    from biopb_tensor_server.adapters.remote_tensor import _split_grpc_url
+    if s.is_remote:
+        # A bare-host tensor-server upstream ("mirror everything") holds many
+        # sources of its own, so it always goes to the manager's background
+        # re-list. Every other remote (s3://, ...) names a single source.
+        return _Route.MONITORED if is_bare_host_upstream_url(s.url) else _Route.STATIC
 
-    return _split_grpc_url(source.url)[1] is None
+    path = s.local_path
+    if path is None:  # unreachable: a local url always resolves to a path
+        return _Route.STATIC
+
+    if path.is_file():
+        if s.monitor:
+            logger.warning(
+                "Cannot live-monitor a single file; registering it as a static "
+                "source: %s",
+                s.url,
+            )
+        return _Route.STATIC
+
+    if s.monitor:
+        if not path.exists():
+            logger.warning(
+                "Monitored path does not exist yet; will start monitoring when it "
+                "appears: %s",
+                s.url,
+            )
+        if s.alias:
+            logger.warning(
+                "Ignoring 'alias' tree-root %r on monitored directory %s: a "
+                "monitored root re-merges into the shared path tree on rescan. "
+                "Drop 'monitor' to keep the alias as its own catalog root.",
+                s.alias,
+                s.url,
+            )
+        return _Route.MONITORED
+
+    # Not watched, but a directory still has to be discovered, once. A typed entry
+    # (a zarr directory given as such) has nothing to discover, and a path that is
+    # not there is left to the expansion, which warns and skips it.
+    if not s.type and path.is_dir():
+        return _Route.SCAN_ONCE
+    return _Route.STATIC
 
 
 def _resolve_serve_sources(
@@ -437,129 +484,69 @@ def _resolve_serve_sources(
 ) -> Tuple[List[SourceConfig], List[SourceConfig], List[SourceConfig]]:
     """Partition configured sources for the serve path.
 
-    Returns ``(static_sources, monitored_sources, scan_once_sources)``.
-
-    A static source is one with nothing to discover -- a typed entry, a file, a
-    single remote source -- so resolving it walks nothing. Every local directory
-    is discovered by the manager's first rescan tick instead, after the server is
-    SERVING: watched thereafter if ``monitor = true``, scanned once if not.
-    Expanding a directory here would walk the tree an extra time before the
-    server binds, and crash on a not-yet-mounted directory (biopb/biopb#54).
-    Remote monitor entries and the rest are expanded as before; a single-file
-    ``monitor=true`` entry is registered statically (with a warning) instead of
-    being silently dropped, and a missing/broken static source is
-    warned-and-skipped rather than aborting startup.
+    Returns ``(static_sources, monitored_sources, scan_once_sources)``. Static
+    sources are expanded here (a file, a typed entry, one remote source -- nothing
+    to walk); ``monitored_sources`` holds the watched directories and the bare-host
+    upstreams, and ``scan_once_sources`` the unwatched directories, all discovered
+    by the manager after SERVING. See :func:`_route_source`.
     """
-    to_expand: List[SourceConfig] = []  # entries run through discover_sources
+    to_expand: List[SourceConfig] = []
     monitored_sources: List[SourceConfig] = []
     scan_once_sources: List[SourceConfig] = []
 
     for s in server_config.sources:
-        # The ``monitor`` flag alone decides live monitoring -- identically for
-        # cloud and non-cloud roots. ``cloud`` only controls *gating* (admit
-        # dehydrated placeholders as unresolved sources); it no longer forces a
-        # root onto the monitored pipeline. So a cloud root with monitor=false is
-        # scanned once at startup via the static-expand path (cloud-gated there
-        # too), exactly like any other monitor=false directory.
-        if s.monitor and not s.is_remote:
-            local_path = s.local_path
-            # local_path cannot be None here -- both is_remote and local_path
-            # derive from _is_remote_url(url), so `not is_remote` guarantees a
-            # resolved path. Guard anyway: if that invariant ever broke, a None
-            # path must NOT be registered as a monitored directory. Route it to
-            # the expansion path, which validates it (and skips under tolerant).
-            if local_path is None:
-                to_expand.append(s)
-                continue
-            if local_path.is_file():
-                # Files cannot be live-monitored: register as a static source
-                # instead of silently dropping it.
-                logger.warning(
-                    "Cannot live-monitor a single file; registering it as a "
-                    "static source: %s",
-                    s.url,
-                )
-                to_expand.append(s)
-                continue
-            if not local_path.exists():
-                # Not-yet-mounted dir: skip the (crashing) expansion. The
-                # periodic rescan picks it up when it appears (self-healing).
-                logger.warning(
-                    "Monitored path does not exist yet; will start monitoring "
-                    "when it appears: %s",
-                    s.url,
-                )
-            # A local `alias` sets a catalog tree-root, but that override is
-            # display-only and non-durable: a monitored directory is re-discovered
-            # under its native path on every rescan and re-merges into the shared
-            # tree, so the alias root would flicker away on the first rescan. Ignore
-            # it loudly rather than pretend it holds. (Honored fine for a static /
-            # monitor=false root, and for a monitor=true single *file* -- which is
-            # registered static, above -- neither of which is rescanned.)
-            if s.alias:
-                logger.warning(
-                    "Ignoring 'alias' tree-root %r on monitored directory %s: a "
-                    "monitored root re-merges into the shared path tree on rescan. "
-                    "Drop 'monitor' to keep the alias as its own catalog root.",
-                    s.alias,
-                    s.url,
-                )
-            monitored_sources.append(s)  # directory (or not-yet-mounted dir)
-            continue
-
-        # A local directory that is not watched is still discovered by the manager,
-        # once. Typed entries (a zarr directory given as such) have nothing to
-        # discover and stay static; a missing path stays on the expansion path so
-        # it is warned about and skipped there.
-        if not s.is_remote and not s.type:
-            local_path = s.local_path
-            if local_path is not None and local_path.is_dir():
-                scan_once_sources.append(s)
-                continue
-
-        # A bare-host tensor-server upstream ("mirror everything") is ALWAYS routed
-        # to the background seeded re-list, regardless of `monitor`. Inline
-        # expansion registers every mirrored source through a blocking per-source
-        # upstream get_descriptor RPC *before* mark_ready(), which both keeps the
-        # server STARTING until it finishes (observed ~1h / 900s+ stuck registering
-        # hundreds of hpc__* proxies -- each descriptor an expensive OME-TIFF open
-        # on the upstream) and bypasses the bulk-seed fast path. The re-list instead
-        # seeds the entire catalog in ONE upstream query (no per-source RPC,
-        # biopb/biopb#266) and runs in the background, so the server reaches SERVING
-        # immediately and the mirror fills progressively -- exactly like a monitored
-        # local directory. `monitor=false` on a bare-host upstream is not "static":
-        # it just means the adaptive cadence reconciles once at the boot tick and
-        # then backs off toward full_rescan_interval, rather than never mirroring
-        # the upstream at all (biopb/biopb#178).
-        if _is_bare_host_upstream(s):
+        route = _route_source(s)
+        if route is _Route.STATIC:
+            to_expand.append(s)
+        elif route is _Route.SCAN_ONCE:
+            scan_once_sources.append(s)
+        else:
             monitored_sources.append(s)
-            continue
-        # Remote monitor entries are also handed to create_source_manager.
-        if s.monitor:
-            monitored_sources.append(s)
-        to_expand.append(s)
 
-    # Expand only the entries with nothing to walk. tolerant=True so one missing or
-    # broken static source is warned-and-skipped rather than killing the server.
-    sources = resolve_all_sources(
+    # tolerant=True so one missing or broken static source is warned-and-skipped
+    # rather than killing the server.
+    expanded = resolve_all_sources(
         server_config, registry, sources=to_expand, tolerant=True
     )
 
-    # Static sources: those NOT under a monitored directory (or remote sources).
-    # Still needed when a non-monitored entry's expansion lands under a
-    # monitored root. Remote sources are always static (no filesystem monitoring).
+    # A source an entry expands to may still land under a monitored root (a file
+    # listed inside it); the rescan owns those. Remote sources are never under one.
     monitored_dirs = {
         ms.local_path for ms in monitored_sources if not ms.is_remote and ms.local_path
     }
     static_sources = [
         s
-        for s in sources
+        for s in expanded
         if s.is_remote
         or (
             s.local_path
             and not any(s.local_path.is_relative_to(md) for md in monitored_dirs)
         )
     ]
+
+    # Upload stores are registered by the upload path, and the adapters decline
+    # them if discovery reaches one, so a write_dir inside a scanned directory is
+    # not catalogued twice -- but the walk still descends into every store and
+    # stats its chunk files, and a store being written keeps its directory busy.
+    scanned_dirs = (
+        monitored_dirs
+        | {s.local_path for s in scan_once_sources if s.local_path}
+        | {
+            s.local_path
+            for s in static_sources
+            if s.local_path and s.local_path.is_dir()
+        }
+    )
+    inside = write_dir_under_root(server_config.write_dir, scanned_dirs)
+    if inside is not None:
+        logger.warning(
+            "write_dir %s lies inside the source directory %s: its upload stores "
+            "are walked whenever that directory is scanned (every rescan, if it "
+            "is monitored). Keep write_dir outside every source directory.",
+            server_config.write_dir,
+            inside,
+        )
+
     return static_sources, monitored_sources, scan_once_sources
 
 
@@ -846,6 +833,7 @@ def _setup_flight_server(
         server_config: Loaded server configuration
         host: Override host
         port: Override port
+        writable: Override the writable setting from the config file. If None, the config file decides.
         token: Access token for Flight server authentication
         tls_cert_chain: PEM cert chain -- serves TLS (grpc+tls://) when supplied
             together with ``tls_private_key`` (see ``TensorFlightServer``).
@@ -861,13 +849,6 @@ def _setup_flight_server(
     Raises:
         typer.Exit: If no sources configured or no sources loaded successfully
     """
-    # Apply overrides. `writable` is deliberately three-state: None means the
-    # caller expressed no opinion and the config file decides. Declaring the CLI
-    # option as a plain `bool` instead makes its absence indistinguishable from
-    # `--no-writable`, which silently pinned every config-driven deployment to
-    # read-only -- `server.writable: true` in the config had no effect at all,
-    # including for the control plane's supervised data plane, which passes no
-    # flag by design (biopb#1085).
     effective_writable = writable if writable is not None else server_config.writable
     write_dir = server_config.write_dir
 
@@ -879,16 +860,9 @@ def _setup_flight_server(
     # before any source registers, so it fully takes effect (biopb/biopb#71).
     set_handle_reaper_ttl(server_config.handle_reaper_ttl)
 
-    # Initialize cache manager for virtual chunks. The file cache mmaps its
-    # segments and assumes local-POSIX semantics (unlinked-but-mapped inodes
-    # stay alive, mapped pages never vanish). A network mount (NFS/CIFS) can
-    # SIGBUS/ESTALE a mapping to an evicted segment, and a cloud
-    # Files-On-Demand folder recalls a dehydrated segment on mmap read -- so
-    # classify the cache dir once and refuse to start rather than serve unsafe
-    # reads (biopb/biopb#571 follow-up). A cache dir that is not writable
-    # (e.g. read-only HPC scratch) fails the same way: the on-disk cache is
-    # required infrastructure now, not an optional accelerator with an
-    # in-memory fallback.
+    # The file cache needs safe mmaps semantics and be local. Check here once to
+    # reject network mounts (NFS/CIFS), cloud folders and unwritable directories
+    # before initializing the cache manager.
     cache_config = server_config.cache
     unsafe = unsafe_cache_dir_reason(cache_config.file_cache_dir)
     if unsafe:
@@ -912,7 +886,6 @@ def _setup_flight_server(
         f"max_segment_mb={cache_config.file_max_segment_bytes // (1024 * 1024)}, "
         f"max_total_gb={cache_config.file_max_total_bytes // (1024 * 1024 * 1024)}"
     )
-    # Check for recovery status. CacheManager is always file-backed now.
     recovery_status = manager.get_recovery_status()
     if recovery_status:
         console.print(
@@ -921,50 +894,36 @@ def _setup_flight_server(
             f"({recovery_status.recovered_bytes // (1024 * 1024)}MB), "
             f"lost={recovery_status.lost_entries} entries"
         )
-        # (No per-segment error list here: recovery no longer scans segment
-        # bodies -- biopb/biopb#300 -- so it surfaces no read errors. Corrupt
-        # segments are detected, logged, and dropped by
-        # _rebuild_index_from_segments' own logger.error instead.)
-    console.print("[green]Raw chunk cache: OS page cache[/green]")
 
     # Resolve and separate sources (see _resolve_serve_sources)
     registry = get_default_registry()
     static_sources, monitored_sources, scan_once_sources = _resolve_serve_sources(
         server_config, registry
     )
-
     if not static_sources and not monitored_sources and not scan_once_sources:
-        # An empty catalog is a valid state -- start and serve it (health SERVING,
-        # empty list_flights) rather than exiting. Sources can arrive after
-        # startup: runtime add_source (napari drag-drop), DoPut uploads, or a
-        # monitored dir that is currently empty but fills later. Refusing to boot
-        # would also make the control-plane data-plane supervisor read a healthy
-        # empty server as a crash -> backoff/restart loop (biopb/biopb#515).
         console.print(
             "[yellow]No data sources configured; serving an empty catalog "
             "(sources can be added at runtime).[/yellow]"
         )
-
-    console.print(
-        f"[green]Loading {len(static_sources)} static data source(s)...[/green]"
-    )
-    if monitored_sources:
+    else:
         console.print(
-            f"[green]Monitoring {len(monitored_sources)} directory(s) for live updates[/green]"
+            f"[green]Loading {len(static_sources)} static data source(s)...[/green]"
         )
-    if scan_once_sources:
-        console.print(
-            f"[green]Scanning {len(scan_once_sources)} unwatched directory(s) once, in the background[/green]"
-        )
+        if monitored_sources:
+            console.print(
+                f"[green]Monitoring {len(monitored_sources)} directory(s) for live updates[/green]"
+            )
+        if scan_once_sources:
+            console.print(
+                f"[green]Scanning {len(scan_once_sources)} unwatched directory(s) once, in the background[/green]"
+            )
 
-    # The metadata database is mandatory (biopb/biopb#225): always constructed --
-    # it is the canonical source-browsing surface (`client.query`).
+    # metadata_db _is_ the client-facing catalog
     metadata_db = _open_catalog(
         server_config, _catalog_store_path(server_config, config_path)
     )
-    # Decode measurements live in the catalog, not beside the cache segments:
-    # the cache directory is the operator's to delete. Attached after open() so
-    # the table exists, and after CacheManager.initialize() above, which built
+    # Decode measurements live in the `decode_rates` table. Attached after open()
+    # so the table exists, and after CacheManager.initialize() above, which built
     # the object this installs a store on.
     active_decode_rates().attach(metadata_db)
     console.print(
@@ -974,9 +933,8 @@ def _setup_flight_server(
         f"catalog={metadata_db.store_path or 'in-memory (not persisted)'}"
     )
 
-    # Create and start server with gRPC message size tuned for 64MB chunks
+    # 80MB max message size (slightly above 64MB transfer chunk threshold)
     location = _grpc_location(host, port)
-    # 80MB max message size (slightly above 64MB chunk threshold)
     server = TensorFlightServer(
         location,
         token=token,
@@ -993,46 +951,15 @@ def _setup_flight_server(
         external_location=external_location,
     )
 
+    # Publish TLS fingerprint for any local clients.
     if tls_cert_chain is not None:
-        # Say what we serve, so a client on this machine verifies against the
-        # certificate this plane actually presents rather than guessing at the
-        # one it would have minted -- which a `--tls-cert` never is
-        # (biopb/biopb#916). Keyed by the bound port, since `--port 0` picks one
-        # and two planes can share a state tree.
         _tls_record.publish(
             getattr(server, "port", port) or port,
             _tls_material.fingerprint(_tls_material.leaf_pem(tls_cert_chain)),
         )
 
-    # Monitored local directories, and whether they are rescanned at all.
-    # `monitor_mode = "off"` keeps the sources but drops the periodic loop, so
-    # they are scanned once at startup and never again.
-    monitored_dirs = {
-        ms.local_path for ms in monitored_sources if not ms.is_remote and ms.local_path
-    }
-    # An uploaded store is registered by the upload path; a write_dir that
-    # discovery also walks gets it claimed a second time under another id.
-    discovered_dirs = (
-        monitored_dirs
-        | {s.local_path for s in scan_once_sources if s.local_path}
-        | {
-            s.local_path
-            for s in static_sources
-            if not s.is_remote and s.local_path and s.local_path.is_dir()
-        }
-    )
-    inside = write_dir_under_root(write_dir, discovered_dirs)
-    if inside is not None:
-        console.print(
-            f"[yellow]⚠ write_dir {write_dir} lies inside the discovered "
-            f"directory {inside}: uploaded stores will be catalogued twice. "
-            "Point write_dir outside every source directory.[/yellow]"
-        )
-    rescan_interval = (
-        0.0 if server_config.monitor_mode == "off" else server_config.rescan_interval
-    )
-
-    # Register all sources (both static and monitored) through unified discovery
+    # Register all sources (both static and monitored) through unified discovery.
+    # Note: Static sources are already seeded after this (see _commit_add_claim).
     source_manager = create_source_manager(
         server=server,
         registry=registry,
@@ -1044,80 +971,52 @@ def _setup_flight_server(
         stability_window=server_config.stability_window,
         full_rescan_interval=server_config.full_rescan_interval,
         prune_unseen_days=server_config.annotations.prune_unseen_days,
-        rescan_interval=rescan_interval,
+        rescan_interval=server_config.rescan_interval,
     )
 
-    # Wire the runtime add_source handler (tensor-browser drag-drop): the server
-    # holds no SourceManager reference, so inject the entrypoint that routes a
-    # dropped path into the same claim -> adapter -> catalog pipeline. Its
-    # counterpart removes a dropped (dnd://) branch.
+    # Register hooks for `(de)register_local_path` actions: the server
+    # holds no SourceManager reference.
     server.set_add_source_handler(source_manager.add_local_source)
     server.set_remove_source_handler(source_manager.remove_dropped_root)
 
-    # Note: the metadata DB is already populated at this point. Static sources
-    # are seeded via SourceManager._commit_add_claim -> _register_source_claim
-    # (which syncs each), and monitored sources stream in through the background
-    # first scan -- both before this line. No separate initial_sync is needed.
-
-    # Background precache worker: warm the file cache for sources added live.
-    # Wire the commit hook BEFORE source_manager.start(). Under progressive
-    # discovery the startup set is committed by the *background* scan (after
-    # start); the manager gates it out of the prompt enqueue via
-    # _initial_scan_done and seeds it into the backlog through the first-scan
-    # callback below. The worker no-ops on a memory backend.
     precache_worker = None
     if server_config.precache.enabled:
         precache_worker = PrecacheWorker(
             server, server_config.precache, server_config.pyramid
         )
+        # need to setup commit hook before source_manager.start()
         source_manager.set_source_committed_hook(precache_worker.enqueue)
-        # Residency gate (#174): let the worker re-check, at warm time, that a
-        # cloud-root source's files are still resident before reading them, so a
-        # backlog/live pass never recalls bytes OneDrive has re-dehydrated since
-        # registration.
+        # wire should_warm() into precache_worker so it can avoid cloud-root
+        # source.
         precache_worker.should_warm = source_manager.should_warm
-
-    # Seed the precache backlog with the startup catalog the moment the first
-    # full scan establishes it (newest first; warmed when the server is idle).
-    # Wired before start() so the background scan's completion finds it.
-    def _seed_backlog_on_first_scan() -> None:
-        if precache_worker is not None and server_config.precache.backlog_enabled:
-            precache_worker.seed_backlog(source_manager.iter_local_source_mtimes())
-
-    source_manager.set_initial_scan_complete_hook(_seed_backlog_on_first_scan)
-
-    # Report "a full scan is running" from the first SERVING moment. The
-    # background scan sets this itself on entry, but pre-setting here closes the
-    # brief window between mark_ready() and the event loop picking up the first
-    # rescan, so a client never sees "SERVING, not scanning, never scanned".
-    if monitored_dirs or scan_once_sources:
-        server.set_full_scan_in_progress(True)
-
-    background_scan_running = False
-    try:
-        source_manager.start()
-        background_scan_running = source_manager.is_running()
-        if background_scan_running and monitored_dirs:
-            console.print(f"[green]Started monitoring: {list(monitored_dirs)}[/green]")
-    except Exception as e:
-        console.print(f"[red]Failed to start monitoring: {e}[/red]")
-
-    if precache_worker is not None:
+        # seed precache backlog after the initial scan completes
+        if server_config.precache.backlog_enabled:
+            source_manager.set_initial_scan_complete_hook(
+                lambda: precache_worker.seed_backlog(
+                    source_manager.iter_local_source_mtimes()
+                )
+            )
         precache_worker.start()
 
-    # Progressive discovery: reach SERVING immediately. The monitored bootstrap
-    # scan runs in the background; the catalog populates live and the health
-    # action carries its freshness (full_scan_in_progress /
-    # last_full_scan_finished_at). A client needing a complete catalog waits on
-    # those fields, not on SERVING.
-    server.mark_ready()
+    # Report "a full scan is running" from the first SERVING moment. The scan sets
+    # this itself on entry; pre-setting it closes the window between mark_ready()
+    # and the loop's first tick, so a client never sees "SERVING, not scanning,
+    # never scanned".
+    if monitored_sources or scan_once_sources:
+        server.set_full_scan_in_progress(True)
 
-    if not background_scan_running:
-        # No rescan loop is driving the bootstrap scan (rescanning is off, the
-        # loop failed to start, or there was nothing to monitor). The manager
-        # knows which fallback that calls for -- a synchronous scan, or just
-        # advancing the completion protocol for a static-only config.
-        source_manager.run_bootstrap_fallback()
+    # The first scan runs in this loop's first tick, in the background, and its
+    # tick also completes the startup protocol when there is nothing to scan.
+    source_manager.start()
+    if monitored_sources:
+        console.print(
+            f"[green]Started monitoring: {[ms.url for ms in monitored_sources]}[/green]"
+        )
+
+    # Progressive discovery: reach SERVING now. The catalog fills as the scan runs;
+    # a client that needs it complete waits on the health action's
+    # full_scan_in_progress / last_full_scan_finished_at, not on SERVING.
+    server.mark_ready()
 
     console.print(f"[green]Flight server ready at {location}[/green]")
 

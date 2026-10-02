@@ -366,16 +366,22 @@ class TestRuntimePhaseGating:
         )
         return server, sm
 
-    def test_initial_scan_done_default_false_and_start_does_not_flip(self):
+    def test_initial_scan_done_default_false_and_the_first_tick_flips_it(self):
+        import threading
+
         server, sm = self._bare_source_manager()
         try:
             assert sm._initial_scan_done is False
-            # start() no longer flips the precache gate -- only the first full
-            # scan completing does. With nothing to rescan, start() is a no-op
-            # and leaves it False.
+            # start() itself does not flip the precache gate -- the first tick of
+            # the loop it starts does, once that tick has run. With nothing to
+            # scan, that is the whole of the first scan.
+            done = threading.Event()
+            sm.set_initial_scan_complete_hook(done.set)
             sm.start()
-            assert sm._initial_scan_done is False
+            assert done.wait(5)
+            assert sm._initial_scan_done is True
         finally:
+            sm.stop()
             server.shutdown()
 
     def test_commit_hook_fires_only_after_initial_scan(self, monkeypatch):

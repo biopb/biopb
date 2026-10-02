@@ -17,6 +17,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
 
+from biopb_tensor_server.adapters.remote_tensor import is_bare_host_upstream_url
 from biopb_tensor_server.core.config import SourceConfig
 from biopb_tensor_server.core.discovery import (
     AdapterRegistry,
@@ -204,14 +205,11 @@ class SourceManager:
         # the loop's wait condition and its wake signal (the ``precache``
         # worker's idiom), so :meth:`stop` returns at once instead of running
         # out the current interval, and no separate running flag has to be kept
-        # in step with it. A ``rescan_interval`` of 0 or less means no loop at
-        # all (config ``monitor_mode = "off"``); the launcher then drives a
-        # single scan itself. A positive one is floored at 0.1s -- a config
-        # value below that is almost certainly a mistake, and without a floor
-        # it would drive back-to-back full tree walks.
-        self._rescan_interval = (
-            rescan_interval if rescan_interval <= 0 else max(0.1, rescan_interval)
-        )
+        # in step with it. The loop always runs: the first scan, and the startup
+        # protocol it completes, happen on its first tick. The interval is floored
+        # at 0.1s -- a config value below that is almost certainly a mistake, and
+        # without a floor it would drive back-to-back full tree walks.
+        self._rescan_interval = max(0.1, rescan_interval)
         self._next_rescan_at: float = 0.0
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -256,26 +254,14 @@ class SourceManager:
         )
 
     def start(self) -> None:
-        """Start the periodic rescan loop, if there is anything for it to do.
+        """Start the rescan loop.
 
-        A no-op when rescanning is disabled (``rescan_interval <= 0``), or
-        neither a monitored directory nor a monitored upstream is configured;
-        callers check :meth:`is_running` afterward to tell.
-
-        The bootstrap scan runs in this loop, whose first tick fires
-        immediately. Until it completes, ``_initial_scan_done`` stays False so
-        its sources route to the precache backlog rather than the prompt
+        The first scan runs in this loop, whose first tick fires immediately --
+        even for a config with nothing to scan, where that tick just completes
+        the startup protocol. Until it does, ``_initial_scan_done`` stays False
+        so its sources route to the precache backlog rather than the prompt
         enqueue.
         """
-        if self._rescan_interval <= 0:
-            return
-        if (
-            not self._monitored_dirs
-            and not self._monitored_upstreams
-            and not self._scan_once_pending
-        ):
-            return
-
         if self._thread is not None and self._thread.is_alive():
             logger.warning("SourceManager already running")
             return
@@ -291,22 +277,6 @@ class SourceManager:
         logger.info(
             "SourceManager started; rescanning every %.1fs", self._rescan_interval
         )
-
-    def run_bootstrap_fallback(self) -> None:
-        """Run the startup scan the caller must drive itself, when :meth:`start`
-        didn't (call only after checking :meth:`is_running` is False).
-
-        Centralizes the branch a launcher would otherwise have to re-derive from
-        ``monitored_dirs`` -- this manager already knows which case it is: a
-        monitored tree or a one-shot directory with rescanning off still needs one
-        synchronous walk (:meth:`run_initial_scan`); a static-only config has
-        nothing to walk, so the startup protocol is advanced directly
-        (:meth:`complete_initial_scan`).
-        """
-        if self._monitored_dirs or self._scan_once_pending:
-            self.run_initial_scan()
-        else:
-            self.complete_initial_scan()
 
     # --- Startup-protocol seam ------------------------------------------------
     # The launcher drives startup through these public methods rather than the
@@ -331,22 +301,9 @@ class SourceManager:
         """Register the hook fired once when the first full scan completes.
 
         The launcher uses it to seed the precache backlog from the established
-        startup catalog. Fired from the event-loop thread (or from
-        :meth:`complete_initial_scan` on a static-only config).
+        startup catalog. Fired from the event-loop thread.
         """
         self._on_initial_scan_complete = callback
-
-    def run_initial_scan(self) -> None:
-        """Run the bootstrap scan synchronously (public seam for the launcher).
-
-        Under progressive discovery the bootstrap scan normally runs in the
-        rescan loop after :meth:`start`. When no loop will drive it -- rescanning
-        is off but monitored dirs exist -- the launcher calls this to run one
-        full rescan inline. Being the first pass, it force-fulls,
-        stamps freshness, flips the startup gate, and fires the completion hook,
-        exactly as the background path would.
-        """
-        self._handle_rescan()
 
     def _mark_catalog_complete(self) -> None:
         """Publish that a full scan just finished, and run the orphan clock.
@@ -401,12 +358,12 @@ class SourceManager:
         return time.monotonic() - self._started_at >= self._prune_unseen_days * 86400
 
     def complete_initial_scan(self) -> None:
-        """Advance the startup protocol when there is nothing to walk.
+        """Advance the startup protocol: stamp catalog freshness, flip the precache
+        startup gate, and fire the first-scan-complete hook.
 
-        A static-only config (no monitored dirs) has no bootstrap scan, but the
-        startup protocol must still complete: stamp catalog freshness, flip the
-        precache startup gate, and fire the first-scan-complete hook. Idempotent:
-        the hook fires only on the transition to done.
+        Called by the first tick when no pass of its own completes the scan -- a
+        config of static or one-shot sources only. Idempotent: the hook fires
+        only on the transition to done.
         """
         self._mark_catalog_complete()
         if not self._initial_scan_done:
@@ -492,7 +449,7 @@ class SourceManager:
         # (Flight thread) so the two never mutate the confirmed catalog at once.
         with self._catalog_lock:
             startup_tick = not self._initial_scan_done
-            scanned_once = self._scan_pending_roots()
+            self._scan_pending_roots()
             self._rescan_monitored_dirs()
             # tensor-server upstream re-list (biopb/biopb#178): adaptive per-upstream
             # cadence -- fast (every tick) while changing/failing, backing off toward
@@ -506,16 +463,13 @@ class SourceManager:
                     self._suppress_live_precache = False
             else:
                 self._reconcile_due_upstreams()
-            if (
-                scanned_once
-                and not self._monitored_dirs
-                and not self._monitored_upstreams
-            ):
-                # Nothing else in this config completes a scan: the one-shot
-                # roots were the whole catalog.
+            if not self._initial_scan_done:
+                # The monitored walk and the upstream pass each complete the scan
+                # themselves. A config with neither (static or one-shot sources
+                # only) is done once this tick has run.
                 self.complete_initial_scan()
 
-    def _scan_pending_roots(self) -> bool:
+    def _scan_pending_roots(self) -> None:
         """Scan the configured ``monitor = false`` directories, each once.
 
         Runs ahead of the monitored walk on the first tick, so what it registers
@@ -525,12 +479,11 @@ class SourceManager:
         removal diff never sees it; a later drop of the directory picks up
         changes, as it does for any root.
 
-        Returns whether there was anything to scan. Caller holds
-        ``_catalog_lock``.
+        Caller holds ``_catalog_lock``.
         """
         pending, self._scan_once_pending = self._scan_once_pending, []
         if not pending:
-            return False
+            return
         # The monitored and upstream passes own the "scan in progress" flag when
         # they run; only a config with neither has to clear it here.
         alone = not self._monitored_dirs and not self._monitored_upstreams
@@ -548,7 +501,6 @@ class SourceManager:
         finally:
             if alone:
                 self._server.set_full_scan_in_progress(False)
-        return True
 
     def _scan_configured_root(self, source: SourceConfig) -> None:
         """Register everything under one configured directory (see
@@ -1412,9 +1364,7 @@ def create_source_manager(
             walk a cloud root. <= 0 disables force-full.
         prune_unseen_days: Days of absence after which annotations for a missing
             source are auto-pruned; 0 disables auto-prune.
-        rescan_interval: Seconds between rescans. <= 0 leaves the manager with
-            no rescan loop, so :meth:`SourceManager.start` no-ops and the caller
-            drives any scan itself (config ``monitor_mode = "off"``).
+        rescan_interval: Seconds between rescans (floored at 0.1s).
 
     Returns:
         A SourceManager, empty if no source is usable.
@@ -1423,34 +1373,29 @@ def create_source_manager(
     static_sources = static_sources or []
     scan_once_sources = scan_once_sources or []
 
-    # A bare-host tensor-server upstream ("mirror everything") IS monitored -- its
-    # catalog is re-listed/reconciled in the background (biopb/biopb#178) -- it just
-    # is not *filesystem*-watched. Distinguished here so the log line below is not
-    # misleading, and reused for the monitored_upstreams filter.
-    from biopb_tensor_server.adapters.remote_tensor import _split_grpc_url
-
-    def _is_bare_host_upstream_url(url: str) -> bool:
-        return (
-            url.lower().startswith(("grpc://", "grpc+tls://", "grpcs://"))
-            and _split_grpc_url(url)[1] is None
-        )
-
-    # Extract monitored directories. Remote sources are never filesystem-watched;
-    # a bare-host upstream is still monitored via the background re-list, whereas
-    # any other remote source (a single-source grpc://host/<id>, or an s3://...
-    # entry) is registered statically.
+    # ``monitored_sources`` holds the watched local directories and the bare-host
+    # tensor-server upstreams ("mirror everything", biopb/biopb#178). An upstream
+    # is monitored -- its catalog is re-listed and reconciled in the background --
+    # but not *filesystem*-watched. Every one qualifies regardless of `monitor`
+    # (cli._route_source sends them all here, never to inline expansion), so a
+    # large upstream neither blocks SERVING nor pays a per-source get_descriptor
+    # RPC; `monitor=false` only makes the adaptive cadence back off after the
+    # boot-tick reconcile.
     monitored_dirs: Set[Path] = set()
+    monitored_upstreams: List[SourceConfig] = []
     for source in monitored_sources:
         if source.is_remote:
-            if _is_bare_host_upstream_url(source.url):
+            if is_bare_host_upstream_url(source.url):
                 logger.info(
                     "Tensor-server upstream %s: catalog re-listed in the background, "
                     "not filesystem-watched",
                     source.url,
                 )
+                monitored_upstreams.append(source)
             else:
-                logger.info(
-                    "Remote source %s is registered statically, not monitored",
+                # Nothing to re-list or watch; the caller should have registered it.
+                logger.warning(
+                    "Remote source %s is not a bare-host upstream; not monitored",
                     source.url,
                 )
             continue
@@ -1465,20 +1410,6 @@ def create_source_manager(
             continue
 
         monitored_dirs.add(local_path)
-
-    # Tensor-server upstreams (bare-host grpc://) whose catalog is re-listed and
-    # reconciled in the background (biopb/biopb#178). Every bare-host upstream
-    # qualifies regardless of `monitor`: cli._resolve_serve_sources routes them all
-    # here (never to inline static expansion) so a large upstream neither blocks
-    # SERVING nor pays a per-source get_descriptor RPC -- `monitor=false` only makes
-    # the adaptive cadence back off after the boot-tick reconcile. A single-source
-    # grpc://host/<id> entry has nothing to re-list, so it is excluded -- only the
-    # bare-host "mirror everything" form qualifies.
-    monitored_upstreams = [
-        ms
-        for ms in monitored_sources
-        if ms.is_remote and _is_bare_host_upstream_url(ms.url)
-    ]
 
     # An unreachable monitored upstream contributes no static sources at startup
     # (its bare-host expansion was skipped), but the re-list populates it once it

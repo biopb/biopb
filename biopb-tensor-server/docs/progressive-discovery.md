@@ -69,15 +69,13 @@ show "Indexing... (N so far)" instead.
   with a presence check, making re-streaming a no-op.
 - **End-of-first-scan reconcile still runs**, idempotently for
   already-streamed adds, to stamp the freshness timestamp, clear
-  `full_scan_in_progress`, flip `_initial_scan_done`, and establish the
-  snapshot steady-state diffs against from then on.
-- **Static-only / no-watcher configs.** `SourceManager.start()` returns early
-  with no watcher, so the event loop never runs; `cli.py` drives the
-  completion path directly (stamp the timestamp, seed the backlog) so a
-  purely static config still reports freshness, and falls back to a
-  synchronous scan if the watcher failed to start. A config whose only
-  directories are one-shot still starts the loop, and its first tick completes
-  the startup protocol.
+  `full_scan_in_progress` and flip `_initial_scan_done`.
+- **The loop always runs.** `SourceManager.start()` starts it for every config,
+  and the first tick completes the startup protocol: after the one-shot
+  directories, the monitored walk and the upstream pass have each run, a tick that
+  has not yet flipped `_initial_scan_done` (a config of static or one-shot
+  sources only) stamps the freshness timestamp, flips the precache gate and fires
+  the completion hook itself. There is no launcher-driven fallback path.
 - **A consumer that reads `SERVING` as "catalog complete" is wrong** and will
   flash an empty catalog; gate "no data" UI on `full_scan_in_progress`
   instead.
