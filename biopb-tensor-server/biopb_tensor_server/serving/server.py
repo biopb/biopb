@@ -1676,6 +1676,7 @@ class TensorFlightServer(flight.FlightServerBase):
                 req.url,
                 source_type=req.source_type,
                 should_cancel=_should_cancel,
+                cloud=req.cloud,
             )
             for event in events:
                 kind = event[0]
@@ -1693,6 +1694,7 @@ class TensorFlightServer(flight.FlightServerBase):
                         already_present=tally.already_present,
                         refreshed=tally.refreshed,
                         removed=tally.removed,
+                        skipped_offline=tally.skipped_offline,
                     )
                     for path, reason in tally.failed:
                         result.failed.add(path=path, reason=reason)

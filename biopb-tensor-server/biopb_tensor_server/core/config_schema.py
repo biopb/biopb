@@ -81,8 +81,17 @@ _ONDISK_OVERRIDES: Dict[Tuple[str, str], Tuple[str, str]] = {
 # alias, and the deprecated metadata_db.enabled flag are handled in build_*.
 _DEPRECATED_ALIASES: Dict[str, Dict[str, Tuple[str, str]]] = {
     "server": {
-        "watcher_type": ("string", "Deprecated alias for monitor_mode."),
+        "monitor_mode": (
+            "string",
+            "Removed: monitored folders are always rescanned; this setting is "
+            "ignored. Drop it from your config.",
+        ),
+        "watcher_type": ("string", "Removed, like monitor_mode; ignored."),
         "poll_interval": ("number", "Deprecated alias for rescan_interval."),
+        "aggressive_dir_pruning": (
+            "boolean",
+            "Removed: rescans keep no snapshot to prune against; ignored.",
+        ),
     },
     "metadata_db": {
         # Removed (biopb/biopb#225): the metadata DB is mandatory. Kept in the

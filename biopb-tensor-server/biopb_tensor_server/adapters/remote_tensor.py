@@ -205,6 +205,18 @@ def _split_grpc_url(url: str) -> tuple[str, Optional[str]]:
     return endpoint, source_id
 
 
+def is_bare_host_upstream_url(url: str) -> bool:
+    """True for a bare-host ``grpc://host:port`` tensor-server URL (no ``/<id>``).
+
+    Only the bare-host "mirror everything" form has an upstream catalog to re-list;
+    ``grpc://host:port/<id>`` names exactly one source and is registered directly.
+    """
+    return (
+        url.lower().startswith(("grpc://", "grpc+tls://", "grpcs://"))
+        and _split_grpc_url(url)[1] is None
+    )
+
+
 def mirrorable_upstream_id(source_id: str) -> bool:
     """Whether an upstream source is one this server mirrors.
 

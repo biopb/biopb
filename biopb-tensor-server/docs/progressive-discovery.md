@@ -37,11 +37,14 @@ Within the first scan, each source registers the moment the walk claims it
 one batch at end-of-walk. This is safe because the first scan is add-only --
 the catalog starts empty and force-full, so there is no removal diff to
 compute and every claim is a pure add. `_initial_scan_done` marks the
-boundary: it flips once, at the end of the first successful full scan, and
-gates the behavior below. Steady-state rescans keep the ordinary
+boundary: it flips once, at the end of the first tick -- after the one-shot
+directories, the monitored walk and the upstream mirror have each had their
+first pass -- and gates the behavior below. Steady-state rescans keep the ordinary
 snapshot-diff model (`removed = current − discovered`), since only they need
-to detect removals; they do not stream. Static, explicitly-configured sources
-are seeded synchronously and never go through this path.
+to detect removals; they do not stream. Static sources -- nothing to discover:
+a typed entry, a file, one remote source -- are seeded synchronously and never go
+through this path. A `monitor = false` directory is scanned once by the first
+tick, ahead of the monitored walk (so it is startup set too), and never again.
 
 Every `health`/catalog consumer tolerates a partial, growing catalog:
 `biopb-mcp`'s `_source_watch_loop` re-lists when `source_count` changes, and
@@ -65,15 +68,18 @@ show "Indexing... (N so far)" instead.
   duplicate add, so a retried first scan (after a partial failure) would
   otherwise delete already-streamed sources. `_stream_first_scan_add` guards
   with a presence check, making re-streaming a no-op.
-- **End-of-first-scan reconcile still runs**, idempotently for
-  already-streamed adds, to stamp the freshness timestamp, clear
-  `full_scan_in_progress`, flip `_initial_scan_done`, and establish the
-  snapshot steady-state diffs against from then on.
-- **Static-only / no-watcher configs.** `SourceManager.start()` returns early
-  with no watcher, so the event loop never runs; `cli.py` drives the
-  completion path directly (stamp the timestamp, seed the backlog) so a
-  purely static config still reports freshness, and falls back to a
-  synchronous scan if the watcher failed to start.
+- **End-of-walk reconcile still runs**, idempotently for already-streamed
+  adds. On the first tick it does not stamp freshness or clear
+  `full_scan_in_progress`; the tick does that once, at its end.
+- **The loop always runs.** `SourceManager.start()` starts it for every config.
+  The first tick runs the one-shot directories, the monitored walk and the
+  upstream pass, then completes the startup protocol itself: clears
+  `full_scan_in_progress`, stamps the freshness timestamp, flips the precache gate
+  and fires the completion hook -- also for a config of static sources only. The
+  upstream mirror is therefore startup set and routes to the precache backlog;
+  an unreachable upstream delays the flip by one failed attempt. A first tick
+  that raises clears `full_scan_in_progress` and the next tick retries. There is
+  no launcher-driven fallback path.
 - **A consumer that reads `SERVING` as "catalog complete" is wrong** and will
   flash an empty catalog; gate "no data" UI on `full_scan_in_progress`
   instead.
@@ -84,8 +90,6 @@ show "Indexing... (N so far)" instead.
   monitored tree, not scoped per root, so a multi-root config's steady-state
   staleness is bounded by the slowest root rather than surfacing sources
   root-by-root as each finishes.
-- **`resolve_all_sources` (static directory expansion) is still synchronous**
-  at startup.
 - **The catalog itself is not persisted.** `MetadataDatabase`'s `sources`
   table is truncated on open (only `rois` and `decode_rates` survive a
   restart), so every boot re-discovers from disk; a persisted catalog would

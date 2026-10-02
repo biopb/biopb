@@ -56,7 +56,7 @@ The `biopb_tensor_server` package is organized into layered subpackages:
   `decode_rates` tables back the surfaces they expose), `tls` (the listener's
   self-signed leaf) and `activity` (in-flight read tracking). Builds on `core`.
 - **`sources/`** — source lifecycle: `resolve` (config entries -> concrete
-  sources), `source_manager` + `tree_scanner` + `watcher` (scan orchestration)
+  sources), `source_manager` (scan orchestration)
   and `reconciler` (the confirmed-catalog single writer). Builds on `core` and
   `adapters`; it names `serving`'s server and `metadata_db` only in type
   annotations, never importing them at runtime.
@@ -285,13 +285,18 @@ ASAP and runs the monitored bootstrap scan in the background; the catalog grows
 *within* that scan as each source is claimed (see Directory Monitoring below).
 See **[docs/progressive-discovery.md](docs/progressive-discovery.md)**.
 
-### Directory monitoring (`sources.watcher`, `sources.source_manager`)
+### Directory scanning (`core.discovery`, `sources.source_manager`)
 
-`PeriodicRescanWatcher` emits a `RESCAN` on a fixed interval; per rescan the
-`SourceManager` delegates the filesystem-signature walk to `TreeScanner` (a fs
-walker gated on the stability window, returning an immutable `ScanSnapshot`), runs
-discovery on the snapshot's paths, and diffs the result against the confirmed
-catalog.
+There is one walker, `discover_sources`, which claims as it goes and stops at a
+claimed directory. A drag-dropped folder, a `monitor = false` directory and each
+rescan of a monitored root all call it. It keeps nothing between calls, so a
+rescan stats every entry under each monitored root every tick (cloud roots only on
+the hourly full pass): monitor directories of a sane size, not a whole archive.
+The result is diffed against the confirmed catalog under the root: add what is
+new, refresh what is known, remove what is gone -- guarded by the stability
+window, by the directories the walk declined, and (for a monitored source) by
+having been missed on two consecutive scans. Only an entry with nothing to
+discover (a typed source, a file, one remote source) is registered without a walk.
 
 **Moves** within a monitored dir preserve `source_id`; a move out is a delete,
 a move in a create.
@@ -367,7 +372,7 @@ and *where to expose it* is the launch command.
 4. Initialize the chunk cache. The server refuses to start when the cache dir
    cannot be mmapped safely (network mount, cloud-synced folder) or isn't
    writable — the on-disk cache is required infrastructure, not optional.
-5. Resolve config sources into *static* and *monitored* sets, and build the
+5. Partition config sources into *static*, *monitored* and *scan-once* sets, and build the
    metadata DB (mandatory — it backs `query`). An empty catalog is a
    valid state and boots: sources can still arrive via `add_source`, DoPut, or a
    monitored dir that fills later. The cache's measured per-tensor decode

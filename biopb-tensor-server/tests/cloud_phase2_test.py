@@ -29,7 +29,7 @@ from biopb_tensor_server.core.discovery import (
     should_skip_walk_entry,
 )
 from biopb_tensor_server.sources import reconciler as rec_mod
-from biopb_tensor_server.sources.tree_scanner import build_entry_signature
+from biopb_tensor_server.sources.entry_stat import build_entry_signature
 
 from tests import catalog_server, register_and_catalog
 
@@ -836,7 +836,6 @@ class TestCloudRescanGating:
         # mtime is untrustworthy, so it could never age into eligibility. Set a
         # window no local entry could satisfy -- the cloud source must still register.
         mgr._stability_window = 10**9
-        mgr._scanner._stability_window = 10**9
 
         mgr._handle_rescan()
 
@@ -869,14 +868,28 @@ class TestCloudRescanGating:
         mgr._handle_rescan()
         assert server.registered == {}
 
+    @staticmethod
+    def _spy_walks(monkeypatch):
+        """Record every root the rescan hands to the walker."""
+        from biopb_tensor_server.sources import source_manager as sm
+
+        walked = []
+        real = sm.discover_sources
+
+        def spy(root, *args, **kwargs):
+            walked.append(str(root))
+            return real(root, *args, **kwargs)
+
+        monkeypatch.setattr(sm, "discover_sources", spy)
+        return walked
+
     def test_incremental_rescan_skips_cloud_force_full_rewalks(
         self, tmp_path, force_nonresident, monkeypatch
     ):
-        # A cloud subtree is scanned only on a force_full pass: the first rescan
+        # A cloud subtree is walked only on a force_full pass: the first rescan
         # (last-full == -inf) is force_full and registers it; a subsequent
-        # incremental rescan silently SKIPS the cloud root (recorded in
-        # _skipped_stable_dirs) and preserves the claim untouched; a later
-        # force_full rescan re-walks it.
+        # incremental rescan does not walk the cloud root and leaves the claim
+        # untouched; a later force_full rescan walks it again.
         root = tmp_path / "cloudroot"
         root.mkdir()
         store = root / "img.zarr"
@@ -887,23 +900,24 @@ class TestCloudRescanGating:
         server = _FakeServer()
         mgr = _make_manager(server, cloud_roots={root.resolve()}, monitored={root})
         root_key = str(root.resolve())
+        walked = self._spy_walks(monkeypatch)
 
         # First rescan: force_full -> cloud walked and registered.
         mgr._handle_rescan()
         assert len(server.registered) == 1
         sid = next(iter(server.registered))
-        assert root_key not in mgr._skipped_stable_dirs
+        assert walked == [root_key]
 
-        # Incremental (non-force_full) rescan: cloud subtree skipped, claim kept.
+        # Incremental (non-force_full) rescan: cloud root not walked, claim kept.
         monkeypatch.setattr(mgr, "_should_force_full_rescan", lambda: False)
         mgr._handle_rescan()
-        assert root_key in mgr._skipped_stable_dirs
+        assert walked == [root_key]
         assert set(server.registered) == {sid}  # preserved, not torn down/re-added
 
-        # force_full rescan: cloud re-walked (no longer skipped), claim stable.
+        # force_full rescan: cloud walked again, claim stable.
         monkeypatch.setattr(mgr, "_should_force_full_rescan", lambda: True)
         mgr._handle_rescan()
-        assert root_key not in mgr._skipped_stable_dirs
+        assert walked == [root_key, root_key]
         assert set(server.registered) == {sid}
 
     @staticmethod
@@ -914,42 +928,29 @@ class TestCloudRescanGating:
         (store / ".zattrs").write_text(json.dumps({"multiscales": [{"datasets": []}]}))
         return store
 
-    def test_incremental_does_no_cloud_entry_work(
+    def test_incremental_does_no_cloud_work(
         self, tmp_path, force_nonresident, monkeypatch
     ):
-        # After the startup force_full, cloud entries live in the cloud partition,
-        # NOT in _entry_states, and an incremental rescan touches none of them: the
-        # per-entry carry-forward must never run, and the partition is carried
-        # forward by reference (unchanged), while the cloud source stays registered.
+        # After the startup force_full, an incremental rescan neither walks the
+        # cloud root nor touches its source: it stays registered, and the
+        # reconcile scopes it out by id rather than diffing it.
         root = tmp_path / "cloudroot"
         root.mkdir()
         self._make_cloud_store(root)
         server = _FakeServer()
         mgr = _make_manager(server, cloud_roots={root.resolve()}, monitored={root})
-        root_key = str(root.resolve())
 
         mgr._handle_rescan()  # force_full
         sid = next(iter(server.registered))
-        assert mgr._cloud_entry_states  # cloud entries partitioned out
-        assert root_key in mgr._cloud_entry_states
-        # Nothing under the cloud root lingers in _entry_states.
-        assert not any(
-            p == root_key or p.startswith(root_key + os.sep) for p in mgr._entry_states
-        )
         assert sid in mgr._reconciler._cloud_source_ids
 
-        # Incremental: the per-entry cloud carry-forward must never be invoked.
-        def _boom(*a, **k):
-            raise AssertionError("incremental must not iterate cloud entries")
-
-        monkeypatch.setattr(mgr._scanner, "_copy_cached_subtree_entries", _boom)
+        walked = self._spy_walks(monkeypatch)
         monkeypatch.setattr(mgr, "_should_force_full_rescan", lambda: False)
-        partition_before = dict(mgr._cloud_entry_states)
 
-        mgr._handle_rescan()  # must not raise
+        mgr._handle_rescan()
 
+        assert walked == []  # the cloud root was not enumerated
         assert set(server.registered) == {sid}  # preserved
-        assert mgr._cloud_entry_states == partition_before  # carried, not rebuilt
 
     def test_incremental_preserves_cloud_without_diff_or_churn(
         self, tmp_path, force_nonresident, monkeypatch
@@ -1592,14 +1593,10 @@ class TestCloudRootFlag:
         assert ClaimContext(tmp_path, cloud_root=True).cloud_root is True
         assert ClaimContext(tmp_path).cloud_root is False
 
-    def test_discover_from_entries_sets_cloud_root_per_entry(self, tmp_path):
-        # cloud_by_path carries the per-path cloud flag the walk computed once; it
-        # must reach the adapter's claim() via its ClaimContext. A path absent from
-        # the map defaults to False.
-        from biopb_tensor_server.core.discovery import (
-            AdapterRegistry,
-            discover_sources_from_entries,
-        )
+    def test_discover_sources_sets_cloud_root_on_every_probe(self, tmp_path):
+        # The walk's ``cloud_root`` must reach each adapter's claim() through its
+        # ClaimContext -- for the root and for every entry found under it.
+        from biopb_tensor_server.core.discovery import AdapterRegistry, discover_sources
 
         seen = {}
 
@@ -1611,17 +1608,133 @@ class TestCloudRootFlag:
 
         registry = AdapterRegistry()
         registry.register(_Recorder, "recorder")
+        (tmp_path / "sub").mkdir()
+        (tmp_path / "sub" / "a.bin").write_text("x")
 
-        cloud_dir = str(tmp_path / "cloud")
-        plain_dir = str(tmp_path / "plain")
-        entries = [(cloud_dir, True, None), (plain_dir, True, None)]
-        discover_sources_from_entries(
-            entries,
-            registry,
-            cloud_by_path={cloud_dir: True},  # plain_dir absent -> defaults False
-        )
-        assert seen[cloud_dir] is True
-        assert seen[plain_dir] is False
+        discover_sources(tmp_path, registry, cloud_root=True, admit_nonresident=True)
+
+        assert seen and all(seen.values())
+        discover_sources(tmp_path, registry)
+        assert not any(seen.values())
+
+
+# --------------------------------------------------------------------------- #
+# Drag-drop of a cloud folder (biopb/biopb#310)
+# --------------------------------------------------------------------------- #
+
+
+def _drop(mgr, path, **kwargs):
+    result = None
+    for event in mgr.add_local_source(str(path), **kwargs):
+        if event[0] == "result":
+            result = event[1]
+    return result
+
+
+class TestDropCloudFolder:
+    """A drop is a root like any other: ``cloud`` is a property of it."""
+
+    @staticmethod
+    def _folder(tmp_path):
+        folder = tmp_path / "synced"
+        folder.mkdir()
+        (folder / "scan.nii").write_bytes(b"payload")
+        return folder
+
+    def test_without_cloud_placeholders_are_skipped_and_counted(
+        self, tmp_path, force_nonresident
+    ):
+        folder = self._folder(tmp_path)
+        server = _FakeServer()
+        mgr = _make_manager(server)
+
+        result = _drop(mgr, folder)
+
+        assert result.added == []
+        assert result.skipped_offline == 1
+        assert server.registered == {}
+
+    def test_consented_drop_registers_placeholders_unresolved(
+        self, tmp_path, force_nonresident
+    ):
+        from biopb_tensor_server.adapters.unresolved import UnresolvedSourceAdapter
+
+        folder = self._folder(tmp_path)
+        server = _FakeServer()
+        mgr = _make_manager(server)
+
+        result = _drop(mgr, folder, cloud=True)
+
+        assert len(result.added) == 1
+        assert result.skipped_offline == 0
+        adapter = server.registered[result.added[0]]
+        assert isinstance(adapter, UnresolvedSourceAdapter)
+
+    def test_the_root_stays_cloud_for_the_later_checks(
+        self, tmp_path, force_nonresident
+    ):
+        folder = self._folder(tmp_path)
+        mgr = _make_manager(_FakeServer())
+
+        _drop(mgr, folder, cloud=True)
+
+        assert mgr._is_under_cloud_root(str(folder / "scan.nii"))
+        assert mgr._reconciler._is_under_cloud_root(str(folder / "scan.nii"))
+
+    def test_deregistering_the_drop_takes_the_cloud_root_with_it(
+        self, tmp_path, force_nonresident
+    ):
+        folder = self._folder(tmp_path)
+        mgr = _make_manager(_FakeServer())
+        _drop(mgr, folder, cloud=True)
+        assert mgr._is_under_cloud_root(str(folder / "scan.nii"))
+
+        mgr.remove_dropped_root("dnd://synced")
+
+        assert not mgr._is_under_cloud_root(str(folder / "scan.nii"))
+        assert not mgr._reconciler._is_under_cloud_root(str(folder / "scan.nii"))
+
+    def test_a_configured_cloud_root_survives_a_drop_being_deregistered(
+        self, tmp_path, force_nonresident
+    ):
+        root = tmp_path / "configured"
+        sub = root / "sub"
+        sub.mkdir(parents=True)
+        (sub / "scan.nii").write_bytes(b"payload")
+        mgr = _make_manager(_FakeServer(), cloud_roots={root.resolve()})
+        _drop(mgr, sub)
+
+        mgr.remove_dropped_root("dnd://sub")
+
+        assert mgr._is_under_cloud_root(str(sub / "scan.nii"))
+
+    def test_a_drop_under_a_configured_cloud_root_needs_no_flag(
+        self, tmp_path, force_nonresident
+    ):
+        from biopb_tensor_server.adapters.unresolved import UnresolvedSourceAdapter
+
+        root = tmp_path / "configured"
+        sub = root / "sub"
+        sub.mkdir(parents=True)
+        (sub / "scan.nii").write_bytes(b"payload")
+        server = _FakeServer()
+        mgr = _make_manager(server, cloud_roots={root.resolve()})
+
+        result = _drop(mgr, sub)  # no cloud flag
+
+        assert len(result.added) == 1
+        assert isinstance(server.registered[result.added[0]], UnresolvedSourceAdapter)
+
+    def test_a_resident_folder_reports_nothing_skipped_and_is_not_cloud(self, tmp_path):
+        folder = self._folder(tmp_path)
+        mgr = _make_manager(_FakeServer())
+
+        result = _drop(mgr, folder)
+
+        # (The payload is not a real NIfTI, so registration may fail; what is
+        # pinned is that the walk skipped nothing and the root was not made cloud.)
+        assert result.skipped_offline == 0
+        assert not mgr._is_under_cloud_root(str(folder))
 
 
 # --------------------------------------------------------------------------- #

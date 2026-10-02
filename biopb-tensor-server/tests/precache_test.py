@@ -366,16 +366,22 @@ class TestRuntimePhaseGating:
         )
         return server, sm
 
-    def test_initial_scan_done_default_false_and_start_does_not_flip(self):
+    def test_initial_scan_done_default_false_and_the_first_tick_flips_it(self):
+        import threading
+
         server, sm = self._bare_source_manager()
         try:
             assert sm._initial_scan_done is False
-            # start() no longer flips the precache gate -- only the first full
-            # scan completing does. With nothing to rescan, start() is a no-op
-            # and leaves it False.
+            # start() itself does not flip the precache gate -- the first tick of
+            # the loop it starts does, once that tick has run. With nothing to
+            # scan, that is the whole of the first scan.
+            done = threading.Event()
+            sm.set_initial_scan_complete_hook(done.set)
             sm.start()
-            assert sm._initial_scan_done is False
+            assert done.wait(5)
+            assert sm._initial_scan_done is True
         finally:
+            sm.stop()
             server.shutdown()
 
     def test_commit_hook_fires_only_after_initial_scan(self, monkeypatch):
@@ -413,50 +419,6 @@ class TestRuntimePhaseGating:
             sm._initial_scan_done = True
             assert sm._reconciler._commit_add_claim(claim) is True
             assert fired == ["s1"]
-        finally:
-            server.shutdown()
-
-    def test_suppress_live_precache_overrides_the_gate(self, monkeypatch):
-        """A commit during the boot-tick upstream re-list stays off the prompt
-        enqueue even though the initial scan is already done.
-
-        On the both-present boot tick the local walk flips _initial_scan_done
-        True before the upstream re-list runs; _suppress_live_precache keeps that
-        startup upstream mirror routed to the slow backlog (see _handle_rescan)."""
-        from types import SimpleNamespace
-
-        server, sm = self._bare_source_manager()
-        try:
-            monkeypatch.setattr(
-                sm._reconciler,
-                "_register_source_claim",
-                lambda claim, catalog_seed=None, catalog_url=None: True,
-            )
-            monkeypatch.setattr(
-                sm._reconciler._state, "add_claim", lambda claim, notify=False: True
-            )
-            monkeypatch.setattr(
-                sm._reconciler, "_build_claim_signatures", lambda claim: {}
-            )
-            monkeypatch.setattr(
-                sm._reconciler, "_clear_failed_source_attempt", lambda sid: None
-            )
-
-            fired = []
-            sm.set_source_committed_hook(fired.append)
-            sm._initial_scan_done = True
-            claim = SimpleNamespace(source_id="up1", primary_path="grpc://lab/up1")
-
-            # Suppressed: initial scan done, but this is the boot-tick upstream
-            # re-list -> backlog, not prompt enqueue.
-            sm._suppress_live_precache = True
-            assert sm._reconciler._commit_add_claim(claim) is True
-            assert fired == []
-
-            # Not suppressed (a later live delta): the hook fires as usual.
-            sm._suppress_live_precache = False
-            assert sm._reconciler._commit_add_claim(claim) is True
-            assert fired == ["up1"]
         finally:
             server.shutdown()
 

@@ -181,7 +181,7 @@ proxy's cached chunks for it instead of leaking through them.
 
 **Refresh via `monitor=true`.** For a bare-host upstream, `monitor=true`
 generalizes the filesystem rescan into a periodic re-list: each upstream has
-its own adaptive cadence, re-listing every rescan tick (default 30s) while
+its own adaptive cadence, re-listing every rescan tick (default 120s) while
 changing or failing, with the period doubling per unchanged re-list up to
 about an hour. Any change or connectivity failure resets it back to
 every-tick, so a new or recovered upstream is mirrored within about one tick.

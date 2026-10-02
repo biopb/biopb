@@ -219,8 +219,7 @@ def _alias_catalog_url(alias: str, root_path: str, primary_path: str) -> str:
             .../exp/a.tif, .../exp/sub/b.tif -> "exp/a.tif", "exp/sub/b.tif"
 
     Display-only (never touches ``source_id``). Applied on the static / one-shot
-    expand path; a monitored directory's alias is dropped upstream (its rescan
-    re-discovers native paths), so this is never fed a live-monitored source.
+    expand path, and to what a monitored directory's walk discovers.
     """
     return _reroot_catalog_url(alias, root_path, primary_path)
 

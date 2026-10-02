@@ -1434,11 +1434,10 @@ def test_handle_rescan_walks_local_dirs_before_upstream_relist(tmp_path):
     assert order == ["local", "upstream"]
 
 
-def test_handle_rescan_suppresses_live_precache_for_boot_tick_upstream(tmp_path):
-    """On the boot tick the local walk flips _initial_scan_done True before the
-    upstream re-list; _handle_rescan suppresses the live-precache enqueue across
-    that re-list so the startup upstream mirror routes to the slow backlog, not
-    the un-idle-gated prompt tier. Steady-state ticks never suppress."""
+def test_boot_tick_opens_the_precache_gate_after_the_upstream_relist(tmp_path):
+    """The first tick registers the upstream mirror while the startup gate is
+    still closed (so it routes to the slow backlog), and opens it only once every
+    source has had its first pass. Later ticks leave it open."""
     from unittest.mock import MagicMock
 
     from biopb_tensor_server.adapters import get_default_registry
@@ -1456,29 +1455,21 @@ def test_handle_rescan_suppresses_live_precache_for_boot_tick_upstream(tmp_path)
     )
 
     seen = {}
-
-    # The local walk flips the gate mid-tick, exactly as the first full scan does.
-    def _walk():
-        seen["during_local"] = manager._suppress_live_precache
-        manager._initial_scan_done = True
-
-    manager._rescan_monitored_dirs = _walk
+    manager._rescan_monitored_dirs = lambda: seen.update(
+        during_local=manager._initial_scan_done
+    )
     manager._reconcile_due_upstreams = lambda: seen.update(
-        during_upstream=manager._suppress_live_precache
+        during_upstream=manager._initial_scan_done
     )
 
-    # Boot tick: initial scan not yet done at tick start.
-    manager._initial_scan_done = False
     manager._handle_rescan()
-    assert seen["during_local"] is False  # local walk is not suppressed
-    assert seen["during_upstream"] is True  # startup upstream mirror is
-    assert manager._suppress_live_precache is False  # reset after the re-list
+    assert seen["during_local"] is False
+    assert seen["during_upstream"] is False  # the mirror is startup set
+    assert manager._initial_scan_done is True  # opened at the end of the tick
 
-    # Steady-state tick: initial scan already done at tick start -> no suppression.
     seen.clear()
     manager._handle_rescan()
-    assert seen["during_upstream"] is False
-    assert manager._suppress_live_precache is False
+    assert seen["during_upstream"] is True  # steady state: live additions prompt
 
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")

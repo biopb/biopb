@@ -121,12 +121,13 @@ def write_dir_under_root(
     """The discovery root that contains *write_dir*, if any.
 
     A store minted under ``write_dir`` is registered by the upload path under
-    its own id. If discovery also walks that directory, a finished store is
-    claimed a second time under discovery's id -- listed twice, served twice --
-    and an unfinished one is only kept out by the claims checking the upload
-    marker. So ``write_dir`` belongs outside every discovered directory; the
-    launcher warns when it is not (biopb/biopb#1059). Compared resolved, so a
-    symlinked root still matches.
+    its own id. The zarr and ome-zarr claims decline anything carrying the
+    upload subsystem's ``biopb`` block (``is_upload_subsystem_store``), so a
+    discovery walk does not catalogue it a second time -- but it still descends
+    into the store and stats its chunk files, and one being written keeps its
+    directory busy. So ``write_dir`` belongs outside every discovered directory;
+    ``_resolve_serve_sources`` warns when it is not (biopb/biopb#1059). Compared
+    resolved, so a symlinked root still matches.
     """
     if write_dir is None:
         return None

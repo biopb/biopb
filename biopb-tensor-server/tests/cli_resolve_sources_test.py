@@ -46,7 +46,9 @@ class TestResolveServeSources:
         missing = tmp_path / "nfs_root_not_mounted_yet"
         cfg = _config(SourceConfig(url=str(missing), monitor=True))
 
-        static_sources, monitored_sources = _resolve_serve_sources(cfg)
+        static_sources, monitored_sources, scan_once_sources = _resolve_serve_sources(
+            cfg
+        )
 
         assert static_sources == []
         assert len(monitored_sources) == 1
@@ -73,7 +75,9 @@ class TestResolveServeSources:
 
         monkeypatch.setattr(resolve_mod, "discover_sources", spy)
 
-        static_sources, monitored_sources = _resolve_serve_sources(cfg)
+        static_sources, monitored_sources, scan_once_sources = _resolve_serve_sources(
+            cfg
+        )
 
         assert str(root) not in seen_urls  # the dir was not walked
         assert static_sources == []
@@ -90,11 +94,63 @@ class TestResolveServeSources:
         _write_tiff(str(tiff))
         cfg = _config(SourceConfig(url=str(tiff), monitor=True))
 
-        static_sources, monitored_sources = _resolve_serve_sources(cfg)
+        static_sources, monitored_sources, scan_once_sources = _resolve_serve_sources(
+            cfg
+        )
 
         assert monitored_sources == []
         assert len(static_sources) == 1
         assert static_sources[0].local_path == tiff.resolve()
+
+    def test_unwatched_directory_is_scanned_once_not_expanded(
+        self, tmp_path, monkeypatch
+    ):
+        """A monitor=false directory is handed to the manager, never walked here."""
+        root = tmp_path / "plain"
+        root.mkdir()
+        _write_tiff(str(root / "image.tif"))
+        cfg = _config(SourceConfig(url=str(root), monitor=False, alias="lab"))
+
+        seen_urls = []
+        real_discover = resolve_mod.discover_sources
+
+        def spy(source, registry=None, credentials_config=None):
+            seen_urls.append(source.url)
+            return real_discover(source, registry, credentials_config)
+
+        monkeypatch.setattr(resolve_mod, "discover_sources", spy)
+
+        static_sources, monitored_sources, scan_once_sources = _resolve_serve_sources(
+            cfg
+        )
+
+        assert str(root) not in seen_urls
+        assert static_sources == [] and monitored_sources == []
+        assert [s.url for s in scan_once_sources] == [str(root)]
+        assert scan_once_sources[0].alias == "lab"
+
+    def test_typed_directory_stays_static(self, tmp_path):
+        """A directory given an explicit type has nothing to discover: no scan."""
+        root = tmp_path / "plate.zarr"
+        root.mkdir()
+        cfg = _config(SourceConfig(url=str(root), type="zarr"))
+
+        static_sources, monitored_sources, scan_once_sources = _resolve_serve_sources(
+            cfg
+        )
+
+        assert [s.url for s in static_sources] == [str(root)]
+        assert scan_once_sources == []
+
+    def test_missing_unwatched_path_is_skipped_not_scanned(self, tmp_path):
+        """A path that is not there cannot be scanned; it is warned-and-skipped."""
+        cfg = _config(SourceConfig(url=str(tmp_path / "gone"), monitor=False))
+
+        static_sources, monitored_sources, scan_once_sources = _resolve_serve_sources(
+            cfg
+        )
+
+        assert static_sources == [] and scan_once_sources == []
 
     def test_non_monitored_under_monitored_root_is_filtered(self, tmp_path):
         """A non-monitored entry whose expansion lands under a monitored root
@@ -109,7 +165,9 @@ class TestResolveServeSources:
             SourceConfig(url=str(tiff)),  # non-monitored, but under root
         )
 
-        static_sources, monitored_sources = _resolve_serve_sources(cfg)
+        static_sources, monitored_sources, scan_once_sources = _resolve_serve_sources(
+            cfg
+        )
 
         assert [s.url for s in monitored_sources] == [str(root)]
         assert static_sources == []  # the inside.tif expansion is filtered out
@@ -128,21 +186,24 @@ class TestResolveServeSources:
             SourceConfig(url=str(outside)),
         )
 
-        static_sources, monitored_sources = _resolve_serve_sources(cfg)
+        static_sources, monitored_sources, scan_once_sources = _resolve_serve_sources(
+            cfg
+        )
 
         assert [s.url for s in monitored_sources] == [str(root)]
         assert [s.local_path for s in static_sources] == [outside.resolve()]
 
-    def test_remote_monitor_is_static_and_monitored(self, tmp_path):
-        """Remote monitor=true entries keep current behavior: registered
-        statically AND passed through as monitored (the manager logs the
-        no-monitor notice)."""
+    def test_remote_monitor_is_static_only(self, tmp_path):
+        """A remote monitor=true entry (not a bare-host upstream) has nothing to
+        watch or re-list, so it is registered statically and only that."""
         remote = SourceConfig(url="s3://bucket/data.zarr", type="zarr", monitor=True)
         cfg = _config(remote)
 
-        static_sources, monitored_sources = _resolve_serve_sources(cfg)
+        static_sources, monitored_sources, scan_once_sources = _resolve_serve_sources(
+            cfg
+        )
 
-        assert [s.url for s in monitored_sources] == ["s3://bucket/data.zarr"]
+        assert monitored_sources == []
         assert [s.url for s in static_sources] == ["s3://bucket/data.zarr"]
 
     def test_monitored_bare_host_upstream_is_not_expanded(self, monkeypatch):
@@ -170,7 +231,9 @@ class TestResolveServeSources:
         upstream = SourceConfig(url="grpc://host:8815", alias="hpc", monitor=True)
         cfg = _config(upstream)
 
-        static_sources, monitored_sources = _resolve_serve_sources(cfg)
+        static_sources, monitored_sources, scan_once_sources = _resolve_serve_sources(
+            cfg
+        )
 
         assert [s.url for s in monitored_sources] == ["grpc://host:8815"]
         assert static_sources == []
@@ -200,7 +263,9 @@ class TestResolveServeSources:
         upstream = SourceConfig(url="grpc://host:8815", alias="hpc", monitor=False)
         cfg = _config(upstream)
 
-        static_sources, monitored_sources = _resolve_serve_sources(cfg)
+        static_sources, monitored_sources, scan_once_sources = _resolve_serve_sources(
+            cfg
+        )
 
         assert [s.url for s in monitored_sources] == ["grpc://host:8815"]
         assert static_sources == []
@@ -212,9 +277,11 @@ class TestResolveServeSources:
         upstream = SourceConfig(url="grpc://host:8815/raw", alias="hpc", monitor=True)
         cfg = _config(upstream)
 
-        static_sources, monitored_sources = _resolve_serve_sources(cfg)
+        static_sources, monitored_sources, scan_once_sources = _resolve_serve_sources(
+            cfg
+        )
 
-        assert [s.url for s in monitored_sources] == ["grpc://host:8815/raw"]
+        assert monitored_sources == []  # nothing to watch or re-list
         assert [s.url for s in static_sources] == ["grpc://host:8815/raw"]
         # Namespaced under the alias by the single-source expansion path.
         assert static_sources[0].source_id == "hpc__raw"
@@ -234,30 +301,43 @@ class TestResolveServeSources:
             SourceConfig(url=str(good)),
         )
 
-        static_sources, monitored_sources = _resolve_serve_sources(cfg)
+        static_sources, monitored_sources, scan_once_sources = _resolve_serve_sources(
+            cfg
+        )
 
         assert monitored_sources == []
         assert [s.local_path for s in static_sources] == [good.resolve()]
 
-    def test_cloud_without_monitor_is_static_not_monitored(self, tmp_path):
+    def test_cloud_without_monitor_is_scanned_once_not_monitored(
+        self, tmp_path, monkeypatch
+    ):
         """`cloud = true` no longer forces monitoring: with monitor unset (false),
-        a cloud directory is scanned once via the static-expand path, exactly like
-        any other monitor=false directory. The monitor flag is the only switch."""
+        a cloud directory is scanned once, exactly like any other monitor=false
+        directory -- by the manager, after SERVING, not walked here. The monitor
+        flag is the only switch."""
         root = tmp_path / "cloudroot"
         root.mkdir()
         _write_tiff(str(root / "image.tif"))
-
         cfg = _config(SourceConfig(url=str(root), cloud=True, monitor=False))
 
-        static_sources, monitored_sources = _resolve_serve_sources(cfg)
+        seen_urls = []
+        real_discover = resolve_mod.discover_sources
+
+        def spy(source, registry=None, credentials_config=None):
+            seen_urls.append(source.url)
+            return real_discover(source, registry, credentials_config)
+
+        monkeypatch.setattr(resolve_mod, "discover_sources", spy)
+
+        static_sources, monitored_sources, scan_once_sources = _resolve_serve_sources(
+            cfg
+        )
 
         assert monitored_sources == []  # cloud alone does NOT monitor anymore
-        assert [s.local_path for s in static_sources] == [
-            (root / "image.tif").resolve()
-        ]
-        # cloud gating rides along: the expanded source keeps cloud=True so it is
-        # still deferred as an unresolved source downstream.
-        assert all(s.cloud for s in static_sources)
+        assert static_sources == []
+        assert str(root) not in seen_urls  # not walked before the server binds
+        # The cloud flag rides along so the scan admits placeholders.
+        assert [(s.url, s.cloud) for s in scan_once_sources] == [(str(root), True)]
 
     def test_cloud_with_monitor_is_monitored_not_expanded(self, tmp_path, monkeypatch):
         """`cloud = true, monitor = true` follows the same monitored path as any
@@ -276,7 +356,9 @@ class TestResolveServeSources:
 
         monkeypatch.setattr(resolve_mod, "discover_sources", spy)
 
-        static_sources, monitored_sources = _resolve_serve_sources(cfg)
+        static_sources, monitored_sources, scan_once_sources = _resolve_serve_sources(
+            cfg
+        )
 
         assert str(root) not in seen_urls  # not pre-walked
         assert static_sources == []
@@ -431,21 +513,23 @@ class TestAliasTreeRoot:
         assert resolved[0]._catalog_url is None
         assert resolved[0].alias == "x"  # untouched
 
-    def test_monitored_dir_alias_is_ignored_with_warning(self, tmp_path, caplog):
-        """A monitored *directory* re-merges into the shared path tree on rescan,
-        so its alias tree-root cannot hold: it is dropped with a warning and never
-        applied (the monitored entry is not expanded, so catalog_url stays None)."""
+    def test_monitored_dir_keeps_its_alias_for_the_walk_to_apply(
+        self, tmp_path, caplog
+    ):
+        """A monitored directory is not expanded here; its alias travels with it
+        and the walk's registrations apply it (see source_manager_test)."""
         root = tmp_path / "watched"
         root.mkdir()
         _write_tiff(str(root / "image.tif"))
         cfg = _config(SourceConfig(url=str(root), alias="live", monitor=True))
 
         with caplog.at_level("WARNING", logger="biopb_tensor_server.cli"):
-            static_sources, monitored_sources = _resolve_serve_sources(cfg)
+            static_sources, monitored_sources, scan_once_sources = (
+                _resolve_serve_sources(cfg)
+            )
 
-        assert [s.url for s in monitored_sources] == [str(root)]
-        assert all(s._catalog_url is None for s in monitored_sources)
-        assert any("alias" in r.message and "live" in r.message for r in caplog.records)
+        assert [(s.url, s.alias) for s in monitored_sources] == [(str(root), "live")]
+        assert not caplog.records
 
     def test_monitored_single_file_alias_is_honored(self, tmp_path):
         """A ``monitor=true`` single *file* cannot be live-monitored, so it is
@@ -455,7 +539,47 @@ class TestAliasTreeRoot:
         _write_tiff(str(f))
         cfg = _config(SourceConfig(url=str(f), alias="solo", monitor=True))
 
-        static_sources, monitored_sources = _resolve_serve_sources(cfg)
+        static_sources, monitored_sources, scan_once_sources = _resolve_serve_sources(
+            cfg
+        )
 
         assert monitored_sources == []
         assert [s._catalog_url for s in static_sources] == ["solo"]
+
+
+class TestWriteDirInsideASourceDirectory:
+    """upload stores are declined by the claims, but the walk still goes through
+    them, so a write_dir inside a scanned directory is worth saying so."""
+
+    @staticmethod
+    def _warnings(caplog):
+        return [r.message for r in caplog.records if "write_dir" in r.message]
+
+    @pytest.mark.parametrize("monitor", [True, False])
+    def test_a_write_dir_inside_a_source_directory_warns(
+        self, tmp_path, caplog, monitor
+    ):
+        root = tmp_path / "data"
+        (root / "uploads").mkdir(parents=True)
+        cfg = ServerConfig(
+            sources=[SourceConfig(url=str(root), monitor=monitor)],
+            write_dir=root / "uploads",
+        )
+
+        _resolve_serve_sources(cfg)
+
+        assert len(self._warnings(caplog)) == 1
+
+    def test_a_write_dir_outside_every_source_directory_is_quiet(
+        self, tmp_path, caplog
+    ):
+        root = tmp_path / "data"
+        root.mkdir()
+        cfg = ServerConfig(
+            sources=[SourceConfig(url=str(root), monitor=True)],
+            write_dir=tmp_path / "uploads",
+        )
+
+        _resolve_serve_sources(cfg)
+
+        assert self._warnings(caplog) == []

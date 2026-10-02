@@ -852,22 +852,20 @@ class ServerConfig:
             "third-party libraries (grpc, numpy, ...) at their defaults."
         },
     )
-    monitor_mode: str = field(
-        default="periodic",
-        metadata={
-            "help": "How monitored folders are watched: 'periodic' rescans, or "
-            "'off' to stop background rescans after initial discovery."
-        },
-    )
     rescan_interval: float = field(
-        default=30.0,
-        metadata={"help": "Seconds between background rescans of monitored folders."},
+        default=120.0,
+        metadata={
+            "help": "Seconds between background rescans of monitored folders. Each "
+            "rescan walks every monitored folder in full, so a very large folder "
+            "should not be monitored."
+        },
     )
     full_rescan_interval: float = field(
         default=3600.0,
         metadata={
-            "help": "Seconds between forced full rescans that bypass subtree "
-            "pruning (<= 0 disables this backstop)."
+            "help": "Seconds between full rescans, the only ones that walk a cloud "
+            "folder; every other rescan walks the non-cloud folders only "
+            "(<= 0 disables the full pass)."
         },
     )
     handle_reaper_ttl: float = field(
@@ -907,14 +905,10 @@ class ServerConfig:
             "help": "Minimum quiet period before a path is eligible for discovery "
             "or removal (seconds). Raise it above the interval at which a slow "
             "acquisition touches its files, or a dataset can be claimed between "
-            "writes; it only ever delays, never drops."
-        },
-    )
-    aggressive_dir_pruning: bool = field(
-        default=False,
-        metadata={
-            "help": "Also prune unchanged monitored roots (faster scans; may "
-            "defer root-level file updates to a later scan)."
+            "writes; it only ever delays, never drops. A directory touched within "
+            "the window is not entered, so a folder written to more often than "
+            "this is not catalogued until it goes quiet. 0 turns the gate off, "
+            "for removal and rebuild as well as discovery."
         },
     )
     claim_generic_images: bool = field(
@@ -1321,13 +1315,15 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
     _carry(server_kwargs, "log_level", server_data)
     _carry(server_kwargs, "log_scope_to_biopb", server_data)
 
-    # monitor_mode: honor the value directly, else derive it from the legacy
-    # `watcher_type` alias; if neither is set, ServerConfig's default applies.
-    monitor_mode = server_data.get("monitor_mode")
-    if monitor_mode is None and "watcher_type" in server_data:
-        monitor_mode = "off" if server_data.get("watcher_type") == "off" else "periodic"
-    if monitor_mode is not None:
-        server_kwargs["monitor_mode"] = monitor_mode
+    # Monitoring is always on. `monitor_mode` (and its legacy alias `watcher_type`)
+    # is still accepted so an old config loads, but "off" no longer does anything.
+    for key in ("monitor_mode", "watcher_type"):
+        if server_data.get(key) == "off":
+            logger.warning(
+                "server.%s = 'off' is ignored: monitored folders are always "
+                "rescanned. Drop 'monitor' from a source to stop watching it.",
+                key,
+            )
 
     # rescan_interval: `poll_interval` is the legacy alias.
     _carry(server_kwargs, "rescan_interval", server_data, cast=float)
@@ -1341,7 +1337,6 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
     _carry(server_kwargs, "upload_ttl", server_data, cast=float)
     _carry(server_kwargs, "scratch_ttl", server_data, cast=float)
     _carry(server_kwargs, "stability_window", server_data, cast=float)
-    _carry(server_kwargs, "aggressive_dir_pruning", server_data, cast=bool)
     _carry(server_kwargs, "claim_generic_images", server_data, cast=bool)
     _carry(server_kwargs, "writable", server_data)
     write_dir_str = server_data.get("write_dir")
