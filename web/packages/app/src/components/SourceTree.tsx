@@ -647,6 +647,11 @@ export function SourceTree() {
           aria-label="Search sources"
           style={{ width: "100%" }}
         />
+        {scanning && sources.length > 0 && (
+          <div style={{ fontSize: 11, color: "#64748b", marginTop: 4 }}>
+            Still indexing the data folder; more sources may appear
+          </div>
+        )}
         {useServerQuery && (
           <div style={{ fontSize: 11, color: "#64748b", marginTop: 4 }}>
             {sources.length.toLocaleString()} sources • Server-side filter

@@ -109,6 +109,13 @@ export default function DashboardPage() {
   // empty (biopb/biopb#1028), so the badge is downgraded to "starting" until
   // this independently confirms the backend's own readyz.
   const [backendReady, setBackendReady] = useState<boolean | null>(null);
+  // The catalog's own state, from the same readyz: a monitored directory can
+  // keep indexing for hours after the plane answers SERVING.
+  const [catalog, setCatalog] = useState<{
+    scanning: boolean;
+    count: number;
+    finishedAt: number | null;
+  } | null>(null);
 
   const pollStatus = useCallback(async () => {
     try {
@@ -133,6 +140,16 @@ export default function DashboardPage() {
       const r = await fetch(withBase("/data_plane/readyz"));
       const j = await r.json().catch(() => null);
       setBackendReady(!!j && j.ready === true);
+      const h = j?.backend_health;
+      setCatalog(
+        h
+          ? {
+              scanning: !!h.full_scan_in_progress,
+              count: j.source_count ?? 0,
+              finishedAt: h.last_full_scan_finished_at ?? null,
+            }
+          : null,
+      );
     } catch {
       setBackendReady(false);
     }
@@ -368,6 +385,22 @@ export default function DashboardPage() {
             >
               {displayState}
             </span>
+            {catalog &&
+              dpState === "serving" &&
+              (catalog.scanning ? (
+                <span style={{ opacity: 0.7, fontSize: 12 }} title="The catalog is still being indexed.">
+                  {" "}
+                  indexing… {catalog.count.toLocaleString()} sources so far
+                </span>
+              ) : (
+                catalog.finishedAt && (
+                  <span style={{ opacity: 0.7, fontSize: 12 }}>
+                    {" "}
+                    {catalog.count.toLocaleString()} sources, indexed{" "}
+                    {new Date(catalog.finishedAt * 1000).toLocaleString()}
+                  </span>
+                )
+              ))}
           </div>
           <dl>
             <dt>gRPC</dt>

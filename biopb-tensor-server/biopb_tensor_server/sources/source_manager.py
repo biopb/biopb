@@ -397,6 +397,11 @@ class SourceManager:
         self._server.set_full_scan_in_progress(False)
         if not self._initial_scan_done:
             self._initial_scan_done = True
+            logger.info(
+                "Initial scan complete: %d sources, %.0f s after start",
+                len(self._server.sources),
+                time.monotonic() - self._started_at,
+            )
             self._fire_initial_scan_complete()
 
     def iter_local_source_mtimes(self) -> List[Tuple[str, float]]:
