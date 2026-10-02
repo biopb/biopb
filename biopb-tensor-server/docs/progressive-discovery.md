@@ -162,7 +162,7 @@ ordinary batched diff, not a streamed scan.
 
 ### Drops and scan-once roots
 
-`_register_root` walks the root into a scratch state, then `_remove_unclaimed_under`
+`_register_root` walks the root into a scratch state with **no stability gate**, so a file finished a moment before the drop is claimed; the user asked for it now. The gate applies to claiming only in the monitored rescan. Then `_remove_unclaimed_under`
 removes what is gone **under that root only** (the periodic diff is whole-catalog, so it
 cannot be reused on a subtree). A source is removed when it is under the root, is not
 under a monitored root (the rescan does that, with its two-miss rule), is not under a
