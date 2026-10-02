@@ -96,7 +96,6 @@ class TestTensorConfig:
                     "rescan_interval": 12,
                     "full_rescan_interval": 120,
                     "stability_window": 45,
-                    "aggressive_dir_pruning": True,
                 },
                 "sources": [],
             }
@@ -105,7 +104,6 @@ class TestTensorConfig:
         assert config.rescan_interval == 12.0
         assert config.full_rescan_interval == 120.0
         assert config.stability_window == 45.0
-        assert config.aggressive_dir_pruning is True
 
     def test_parse_legacy_monitor_aliases(self):
         config = parse_config(
@@ -122,7 +120,7 @@ class TestTensorConfig:
         assert config.rescan_interval == 9.0
         assert config.full_rescan_interval == 3600.0
         assert config.stability_window == 30.0
-        assert config.aggressive_dir_pruning is False
+        assert not hasattr(config, "aggressive_dir_pruning")  # retired
 
     @pytest.mark.parametrize("key", ["monitor_mode", "watcher_type"])
     def test_retired_monitor_off_loads_but_warns(self, key, caplog):

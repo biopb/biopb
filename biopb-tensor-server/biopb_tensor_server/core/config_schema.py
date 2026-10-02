@@ -88,6 +88,10 @@ _DEPRECATED_ALIASES: Dict[str, Dict[str, Tuple[str, str]]] = {
         ),
         "watcher_type": ("string", "Removed, like monitor_mode; ignored."),
         "poll_interval": ("number", "Deprecated alias for rescan_interval."),
+        "aggressive_dir_pruning": (
+            "boolean",
+            "Removed: rescans keep no snapshot to prune against; ignored.",
+        ),
     },
     "metadata_db": {
         # Removed (biopb/biopb#225): the metadata DB is mandatory. Kept in the

@@ -1717,10 +1717,6 @@ def launch(
     effective_log_level = (
         log_level or get_log_level_from_env() or server_config.log_level
     )
-    # Same three-state rule as `writable` below, and for the same reason: the
-    # config field existed, was documented in the JSON Schema (so the settings
-    # editor offered it), and nothing read it -- the flag's default won every
-    # time (biopb#1085).
     effective_log_scope = (
         log_scope_biopb
         if log_scope_biopb is not None
@@ -1736,12 +1732,11 @@ def launch(
     # reverts SIGTERM to the default (terminate) disposition -- so the process is
     # signal-killed (exit 143) before control reaches `_graceful_shutdown`, and
     # the file-cache process lock is left behind as a stale lock on every control
-    # stop/restart (biopb/biopb#516; #512's lock-release-first reorder is moot on
-    # this path until the finally actually runs). Owning the handler here routes
-    # SIGTERM through `except KeyboardInterrupt`/`finally` instead. Harmless no-op
-    # on Windows, which uses the sentinel-file path in
-    # http_server._install_windows_shutdown_listener.
+    # stop/restart. Owning the handler here routes SIGTERM through
+    # `except KeyboardInterrupt`/`finally` instead. No-op on Windows, which uses
+    # the sentinel-file path in http_server._install_windows_shutdown_listener.
     _install_sigterm_handler()
+
     # If launched under the control supervisor, self-terminate when it dies
     # uncatchably so a crashed/killed control never orphans this plane into a
     # port-holding conflict (no-op standalone; see biopb.lifecycle.deathwatch).
@@ -1750,8 +1745,6 @@ def launch(
     # --- Token management ---
     # The flight bind (--host) is the mode switch; the
     # sidecar's own bind (--web-host) must never be public-and-unauthenticated.
-    # _resolve_launch_token decides the enforced token fail-closed (and refuses a
-    # public sidecar with no token). There is no separate dev flag.
     effective_host = host
     effective_token = _resolve_launch_token(
         effective_host,

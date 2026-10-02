@@ -908,14 +908,6 @@ class ServerConfig:
             "writes; it only ever delays, never drops."
         },
     )
-    aggressive_dir_pruning: bool = field(
-        default=False,
-        metadata={
-            "help": "Ignored. Rescans no longer prune unchanged folders (nothing is "
-            "kept between scans to prune against); accepted so existing configs "
-            "still load."
-        },
-    )
     claim_generic_images: bool = field(
         default=False,
         metadata={
@@ -1342,7 +1334,6 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
     _carry(server_kwargs, "upload_ttl", server_data, cast=float)
     _carry(server_kwargs, "scratch_ttl", server_data, cast=float)
     _carry(server_kwargs, "stability_window", server_data, cast=float)
-    _carry(server_kwargs, "aggressive_dir_pruning", server_data, cast=bool)
     _carry(server_kwargs, "claim_generic_images", server_data, cast=bool)
     _carry(server_kwargs, "writable", server_data)
     write_dir_str = server_data.get("write_dir")
