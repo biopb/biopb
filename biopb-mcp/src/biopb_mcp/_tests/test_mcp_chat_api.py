@@ -243,7 +243,27 @@ class TestTurn:
         # Nothing was recorded: the user's message is not half-accepted.
         assert _chat.history() == []
 
-    def test_a_busy_session_is_409_not_a_queue(self, client, monkeypatch):
+    def test_a_message_during_a_running_turn_is_queued(self, client, monkeypatch):
+        async def scenario():
+            async def idle():
+                await asyncio.sleep(3600)
+
+            task = asyncio.create_task(idle())
+            monkeypatch.setattr(_chat_api, "_turn_task", task)
+            try:
+                r = client.post("/chat/turn", json={"text": "also this"})
+                assert r.status_code == 202
+                assert r.json() == {"queued": True}
+                assert _chat.queued() == ["also this"]
+                assert client.get("/api/chat/history").json()["queued"] == ["also this"]
+                # Held, not stored: it is not in the thread until a boundary.
+                assert _chat.history() == []
+            finally:
+                task.cancel()
+
+        asyncio.run(scenario())
+
+    def test_a_busy_session_without_a_turn_is_409(self, client, monkeypatch):
         monkeypatch.setattr(_chat, "busy", lambda: True)
         reply = client.post("/chat/turn", json={"text": "hello"})
         assert reply.status_code == 409
