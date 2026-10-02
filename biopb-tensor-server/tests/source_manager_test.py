@@ -785,6 +785,73 @@ class TestMonitoredAlias:
         assert manager._monitored_catalog_url(claim) is None
 
 
+class TestUnavailableMonitoredRoot:
+    """A root that cannot be listed keeps its sources and is walked again later."""
+
+    def _setup(self, tmp_path):
+        monitored_dir = tmp_path / "monitored"
+        monitored_dir.mkdir()
+        (monitored_dir / "sample.dat").write_text("hello")
+        server = _FakeServer()
+        state = DiscoveryState()
+        manager = _make_manager(
+            server,
+            registry=_FakeRegistry(),
+            discovery_state=state,
+            monitored_dirs={monitored_dir},
+            stability_window=0.0,
+        )
+        return monitored_dir, server, state, manager
+
+    def test_an_unmounted_root_keeps_its_sources_and_stays_monitored(
+        self, tmp_path, caplog
+    ):
+        monitored_dir, server, state, manager = self._setup(tmp_path)
+        manager._handle_rescan()
+        source_id = next(iter(state.claims))
+
+        away = tmp_path / "away"
+        monitored_dir.rename(away)
+        with caplog.at_level("WARNING"):
+            for _ in range(4):  # well past the two-miss rule
+                manager._handle_rescan()
+
+        assert list(state.claims) == [source_id]
+        assert server.unregistered == []
+        assert monitored_dir in manager._monitored_dirs
+        assert caplog.text.count("is not available") == 1  # once, not per tick
+
+        away.rename(monitored_dir)
+        manager._handle_rescan()
+
+        assert list(state.claims) == [source_id]
+        assert server.unregistered == []
+        assert server.registered == [source_id]  # nothing was re-registered
+
+    def test_a_root_missing_at_start_is_picked_up_when_it_appears(self, tmp_path):
+        monitored_dir, server, state, manager = self._setup(tmp_path)
+        away = tmp_path / "away"
+        monitored_dir.rename(away)
+
+        manager._handle_rescan()
+        assert state.claims == {}
+
+        away.rename(monitored_dir)
+        manager._handle_rescan()
+
+        assert len(state.claims) == 1
+
+    def test_a_source_deleted_inside_an_available_root_is_still_removed(self, tmp_path):
+        monitored_dir, server, state, manager = self._setup(tmp_path)
+        manager._handle_rescan()
+        (monitored_dir / "sample.dat").unlink()
+
+        manager._handle_rescan()
+        manager._handle_rescan()
+
+        assert state.claims == {}
+
+
 class TestSourceManagerRegressions:
     def setup_method(self):
         _FlakyAdapter.calls = 0
@@ -993,36 +1060,6 @@ class TestSourceManagerRegressions:
         assert server.registered == []
         assert server._metadata_db.added == []
         assert server._metadata_db.removed == []
-
-    def test_deleted_monitored_root_removes_claims_and_stops_monitoring(self, tmp_path):
-        monitored_dir = tmp_path / "monitored"
-        monitored_dir.mkdir()
-        data_path = monitored_dir / "sample.dat"
-        data_path.write_text("hello")
-
-        server = _FakeServer()
-        state = DiscoveryState()
-        manager = _make_manager(
-            server,
-            registry=_FakeRegistry(),
-            discovery_state=state,
-            monitored_dirs={monitored_dir},
-            stability_window=0.0,
-            full_rescan_interval=0.0,
-        )
-
-        manager._handle_rescan()
-        source_id = next(iter(state.claims))
-
-        data_path.unlink()
-        monitored_dir.rmdir()
-
-        manager._handle_rescan()
-
-        assert source_id not in state.claims
-        assert monitored_dir not in manager._monitored_dirs
-        assert server.unregistered == [source_id]
-        assert server._metadata_db.removed == [source_id]
 
     def test_reconcile_keeps_unstable_missing_source(self, tmp_path):
         monitored_dir = tmp_path / "monitored"

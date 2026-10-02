@@ -853,7 +853,7 @@ class ServerConfig:
         },
     )
     rescan_interval: float = field(
-        default=30.0,
+        default=120.0,
         metadata={
             "help": "Seconds between background rescans of monitored folders. Each "
             "rescan walks every monitored folder in full, so a very large folder "

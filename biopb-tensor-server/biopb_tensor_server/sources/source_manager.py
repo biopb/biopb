@@ -141,7 +141,7 @@ class SourceManager:
         registry: AdapterRegistry,
         discovery_state: DiscoveryState,
         monitored_dirs: Set[Path],
-        rescan_interval: float = 30.0,
+        rescan_interval: float = 120.0,
         metadata_db: Optional[MetadataDatabase] = None,
         credentials_config: Optional[Any] = None,
         stability_window: float = 30.0,
@@ -166,6 +166,9 @@ class SourceManager:
         # single-source ``grpc://host/<id>`` entry is not here, having nothing to
         # re-list.
         self._monitored_dirs = monitored_dirs
+        # Monitored roots that could not be listed on the last walk, so a change
+        # of state is logged once, not every tick.
+        self._unavailable_roots: Set[Path] = set()
         # Resolved monitored root -> configured ``alias``: the display root every
         # source discovered under it is registered beneath.
         self._monitored_aliases: Dict[Path, str] = monitored_aliases or {}
@@ -537,10 +540,6 @@ class SourceManager:
         if not self._monitored_dirs:
             return
 
-        self._cleanup_deleted_monitored_dirs()
-        if not self._monitored_dirs:
-            return
-
         force_full_rescan = self._should_force_full_rescan()
         # Progressive-discovery freshness signals: while a *full* reconcile runs,
         # the health action reports full_scan_in_progress=True; on success it
@@ -582,6 +581,9 @@ class SourceManager:
                 cloud = root in self._cloud_roots
                 if cloud and not force_full_rescan:
                     continue
+                if not self._root_is_listable(root):
+                    report.declined_dirs.add(str(root))
+                    continue
                 discover_sources(
                     root,
                     self._registry,
@@ -621,50 +623,27 @@ class SourceManager:
         except Exception:
             logger.exception("on_initial_scan_complete callback failed")
 
-    def _cleanup_deleted_monitored_dirs(self) -> None:
-        """Remove claims for monitored roots that no longer exist."""
-        deleted_dirs = []
-        for monitored_dir in sorted(self._monitored_dirs):
-            try:
-                exists = monitored_dir.exists()
-            except OSError:
-                exists = False
-            if not exists:
-                deleted_dirs.append(monitored_dir)
+    def _root_is_listable(self, root: Path) -> bool:
+        """Whether a monitored root can be walked now; logs each change of state.
 
-        for deleted_dir in deleted_dirs:
-            self._cleanup_deleted_monitored_dir(deleted_dir)
-
-    def _cleanup_deleted_monitored_dir(self, deleted_dir: Path) -> None:
-        """Remove sources and cache state for a monitored root that disappeared."""
-        removed_source_ids = []
-        deleted_root = deleted_dir.resolve(strict=False)
-
-        for source_id, claim in self._reconciler.claim_items():
-            if is_remote_url(claim.primary_path):
-                continue
-            try:
-                claim_path = Path(claim.primary_path).resolve(strict=False)
-            except OSError:
-                continue
-            if (
-                claim_path == deleted_root or claim_path.is_relative_to(deleted_root)
-            ) and self._reconciler._commit_remove_source(source_id):
-                removed_source_ids.append(source_id)
-
-        self._monitored_dirs.discard(deleted_dir)
-
-        if removed_source_ids:
+        An unmounted drive, a share that is down and a deleted directory look the
+        same from here, so a root that cannot be listed is not evidence that what
+        is registered under it is gone: the caller records it as declined, its
+        sources stay, and it is walked again as soon as it is back.
+        """
+        if root.is_dir():
+            if root in self._unavailable_roots:
+                self._unavailable_roots.discard(root)
+                logger.info("Monitored directory is available again: %s", root)
+            return True
+        if root not in self._unavailable_roots:
+            self._unavailable_roots.add(root)
             logger.warning(
-                "Removed %d sources after monitored directory disappeared: %s",
-                len(removed_source_ids),
-                deleted_dir,
+                "Monitored directory is not available; keeping its sources until it "
+                "is back: %s",
+                root,
             )
-        else:
-            logger.warning(
-                "Stopped monitoring deleted directory with no active sources: %s",
-                deleted_dir,
-            )
+        return False
 
     def _should_force_full_rescan(self) -> bool:
         """Whether a full pass (the only one that walks cloud roots) is due."""
@@ -1327,7 +1306,7 @@ def create_source_manager(
     stability_window: float = 30.0,
     full_rescan_interval: float = 3600.0,
     prune_unseen_days: int = 0,
-    rescan_interval: float = 30.0,
+    rescan_interval: float = 120.0,
 ) -> SourceManager:
     """Create a SourceManager for all configured sources.
 
@@ -1395,10 +1374,12 @@ def create_source_manager(
             continue
 
         local_path = source.local_path
-        if local_path is None or not local_path.exists():
-            logger.warning(f"Cannot monitor non-existent path: {source.url}")
+        if local_path is None:
+            logger.warning(f"Cannot monitor path: {source.url}")
             continue
 
+        # A path that is not there yet stays: the walk keeps it and picks it up
+        # when it appears.
         if local_path.is_file():
             logger.warning(f"Cannot monitor single file: {source.url}")
             continue

@@ -23,7 +23,7 @@ here. The seam is deliberately narrow:
     reads.
   * Reconciler -> SourceManager: one injected callable,
     ``notify_source_committed`` (the precache routing gate, owned by the startup
-    state), plus the shared, in-place-mutated ``monitored_dirs`` and
+    state), plus the shared ``monitored_dirs`` and
     ``cloud_roots`` sets.
 
 The coarse single-writer mutex (a runtime add vs the periodic rescan) stays in
@@ -158,8 +158,7 @@ class Reconciler:
         self._state = discovery_state
         self._metadata_db = metadata_db
         self._credentials_config = credentials_config
-        # Shared with SourceManager (in-place-mutated there on directory delete);
-        # read-only here for the monitored-claim scoping.
+        # Shared with SourceManager; read-only here for the monitored-claim scoping.
         self._monitored_dirs = monitored_dirs
         self._cloud_roots = cloud_roots
         # Injected SourceManager seam (see module docstring).
