@@ -18,7 +18,7 @@ from biopb.tensor import SerializedTensor, TensorDescriptor
 from biopb_mcp.mcp import _process_ops
 from biopb_mcp.mcp._process_ops import (
     Ops,
-    _fill_value,
+    _json_arg,
     _make_channel,
     _read_value,
     _same_plane,
@@ -34,9 +34,7 @@ def _eager(arr, labels=None) -> proto.Arg:
 
 
 def _json(value) -> proto.Arg:
-    arg = proto.Arg()
-    _fill_value(arg.json, value)
-    return arg
+    return _json_arg(value)
 
 
 def _reference(array_id: str, location: str) -> proto.Arg:

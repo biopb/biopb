@@ -101,11 +101,9 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, np.generic):
         return _jsonable(value.item())
     if isinstance(value, np.ndarray):
-        # Complex still goes through the element walk, since a bare complex
-        # scalar isn't JSON either.
-        if value.dtype.kind != "c":
-            return value.tolist()
-        return _jsonable(value.tolist())
+        # Only complex needs the element walk: a bare complex isn't JSON.
+        items = value.tolist()
+        return _jsonable(items) if value.dtype.kind == "c" else items
     if isinstance(value, dict):
         return {str(k): _jsonable(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
@@ -137,6 +135,12 @@ def _fill_value(target: struct_pb2.Value, value: Any) -> None:
         target.list_value.Clear()
         for item in value:
             _fill_value(target.list_value.values.add(), item)
+
+
+def _json_arg(value: Any) -> proto.Arg:
+    arg = proto.Arg()
+    _fill_value(arg.json, _jsonable(value))
+    return arg
 
 
 def _read_value(value: struct_pb2.Value) -> Any:
@@ -290,8 +294,7 @@ class _OpCall:
                 by_id = by_id or isinstance(value, str)
                 encoded[name] = self._tensor(name, value, dim_labels, client)
             else:
-                arg = encoded[name] = proto.Arg()
-                _fill_value(arg.json, _jsonable(value))
+                encoded[name] = _json_arg(value)
         return encoded, by_id
 
     # --- the stream ------------------------------------------------------ #

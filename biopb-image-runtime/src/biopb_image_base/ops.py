@@ -352,11 +352,9 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, np.generic):
         return _jsonable(value.item())
     if isinstance(value, np.ndarray):
-        # Complex still goes through the element walk, since a bare complex
-        # scalar isn't JSON either.
-        if value.dtype.kind != "c":
-            return value.tolist()
-        return _jsonable(value.tolist())
+        # Only complex needs the element walk: a bare complex isn't JSON.
+        items = value.tolist()
+        return _jsonable(items) if value.dtype.kind == "c" else items
     if isinstance(value, dict):
         return {str(k): _jsonable(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):

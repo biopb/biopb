@@ -20,7 +20,7 @@ from biopb_image_base.ops import (
     _ambient_scheduler_configured,
     _EmbeddedSink,
     _InlineSink,
-    _json_arg,
+    _json_arg as _json,
     _PlaneSink,
     _read_value,
     build_server,
@@ -148,10 +148,6 @@ def _eager(array, labels=None) -> proto.Arg:
     return proto.Arg(
         eager=serialize_from_numpy_to_image_data(array, dim_labels=labels).eager_data
     )
-
-
-def _json(value) -> proto.Arg:
-    return _json_arg(value)
 
 
 def _value(arg: proto.Arg):
