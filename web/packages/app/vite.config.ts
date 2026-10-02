@@ -69,6 +69,17 @@ const control = { target: "http://localhost:8813", changeOrigin: true };
 
 export default defineConfig({
   base: urlPrefix ? `${urlPrefix}/` : "/",
+  experimental: {
+    // Assets named from inside a chunk -- the CSS and JS a lazy `import()`
+    // preloads -- become relative to that chunk's own URL. With base "/" they are
+    // literal root-absolute paths, which neither `<base href>` nor the control's
+    // rewrite of the HTML shell reaches, so behind `--url-prefix` the preload
+    // went to the portal root and failed (#1224). The shell's own tags stay
+    // root-absolute, which the control does rewrite.
+    renderBuiltUrl(_filename, { hostType }) {
+      return hostType === "js" ? { relative: true } : undefined;
+    },
+  },
   plugins: [react(), injectBaseGlobal(urlPrefix)],
   resolve: {
     dedupe: ["react", "react-dom"],
