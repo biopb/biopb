@@ -12,6 +12,7 @@ import threading
 import time
 
 import numpy as np
+import pyarrow as pa
 import pytest
 from google.protobuf.field_mask_pb2 import FieldMask
 
@@ -1900,7 +1901,7 @@ def test_unreachable_bulk_fetch_raises_without_logging_the_outage(caplog):
     per-source sync against the upstream that is down."""
     import logging
 
-    from biopb_tensor_server.adapters.remote_tensor import fetch_upstream_catalog
+    from biopb_tensor_server.adapters.remote_tensor import list_upstream_versions
     from pyarrow import flight
 
     class _DeadClient:
@@ -1909,7 +1910,7 @@ def test_unreachable_bulk_fetch_raises_without_logging_the_outage(caplog):
 
     with caplog.at_level(logging.WARNING):
         with pytest.raises(flight.FlightUnavailableError):
-            fetch_upstream_catalog(_DeadClient())
+            list_upstream_versions(_DeadClient())
 
     assert caplog.text == ""
 
@@ -2436,38 +2437,164 @@ def test_seed_catalog_empty_metadata_normalizes_to_dict():
     assert adapter._client is None
 
 
-def test_fetch_upstream_catalog_returns_the_rows():
-    from biopb_tensor_server.adapters.remote_tensor import fetch_upstream_catalog
+def test_list_upstream_versions_is_one_narrow_query():
+    from biopb_tensor_server.adapters.remote_tensor import list_upstream_versions
+
+    seen = []
 
     class _FakeClient:
         def query(self, sql, format="records"):  # noqa: A002 - fakes the real client's public `format` signature
-            # source_url is now fetched so the mirror can be treed by path (#297).
-            assert "tensors" in sql and "source_url" in sql and format == "records"
-            return [
-                {
-                    "source_id": "a",
-                    "source_url": "file:///d/a.zarr",
-                    "tensors": [],
-                    "metadata_json": None,
-                }
-            ]
+            seen.append(sql)
+            return pa.Table.from_pylist(
+                [
+                    {"source_id": "a", "indexed_at": 7, "metadata_size": 300},
+                    {"source_id": "b"},
+                ]
+            )
 
-    rows = fetch_upstream_catalog(_FakeClient())
-    assert rows[0]["source_url"] == "file:///d/a.zarr"
+    versions = list_upstream_versions(_FakeClient())
+
+    assert versions["a"] == (7, 300)
+    assert versions["b"] == (None, 0)
+    assert len(seen) == 1
+    assert "tensors" not in seen[0] and "SELECT metadata_json" not in seen[0]
 
 
-def test_fetch_upstream_catalog_raises_rather_than_degrading():
-    """A failed bulk query is an upstream that is down, slow or refusing us -- not
-    a catalog-less one (every server owns a catalog). Falling back to ids plus a
+def test_list_upstream_versions_raises_rather_than_degrading():
+    """A failed query is an upstream that is down, slow or refusing us -- not a
+    catalog-less one (every server owns a catalog). Falling back to ids plus a
     per-source sync would put two round trips per source on that upstream."""
-    from biopb_tensor_server.adapters.remote_tensor import fetch_upstream_catalog
+    from biopb_tensor_server.adapters.remote_tensor import list_upstream_versions
 
     class _FakeClient:
         def query(self, sql, format="records"):  # noqa: A002 - fakes the real client's public `format` signature
             raise RuntimeError("query timed out")
 
     with pytest.raises(RuntimeError, match="query timed out"):
-        fetch_upstream_catalog(_FakeClient())
+        list_upstream_versions(_FakeClient())
+
+
+class TestAnUpstreamRowCap:
+    """An upstream caps one query's rows (``max_query_results``). The mirror
+    reconciles destructively against what it lists, so a result cut at the cap
+    must never read as the whole catalog."""
+
+    N = 8
+    CAP = 3
+
+    @staticmethod
+    def _upstream(n, cap):
+        from biopb_tensor_server import TensorFlightServer
+        from biopb_tensor_server.serving.metadata_db import MetadataDatabase
+
+        db = MetadataDatabase(max_query_results=cap)
+        upstream = TensorFlightServer("grpc://localhost:0", metadata_db=db)
+        for i in range(n):
+            sid = f"s{i}"
+            db.sync_source_added(sid, _CatalogRowAdapter(sid, tensors=_tensor_row(sid)))
+        _serve(upstream)
+        return upstream
+
+    def test_the_version_list_is_complete_past_the_cap(self):
+        from biopb.tensor import TensorFlightClient
+        from biopb_tensor_server.adapters.remote_tensor import list_upstream_versions
+
+        upstream = self._upstream(self.N, self.CAP)
+        try:
+            client = TensorFlightClient(f"grpc://localhost:{upstream.port}")
+            versions = list_upstream_versions(client)
+        finally:
+            upstream.shutdown()
+
+        assert sorted(versions) == [f"s{i}" for i in range(self.N)]
+
+    def test_the_id_list_is_complete_past_the_cap(self):
+        from biopb.tensor import TensorFlightClient
+        from biopb_tensor_server.adapters.remote_tensor import list_upstream_source_ids
+
+        upstream = self._upstream(self.N, self.CAP)
+        try:
+            client = TensorFlightClient(f"grpc://localhost:{upstream.port}")
+            ids = list_upstream_source_ids(client, "grpc://x")
+        finally:
+            upstream.shutdown()
+
+        assert ids == [f"s{i}" for i in range(self.N)]
+
+    def test_a_batch_wider_than_the_cap_comes_back_whole(self):
+        from biopb.tensor import TensorFlightClient
+        from biopb_tensor_server.adapters.remote_tensor import fetch_upstream_rows
+
+        upstream = self._upstream(self.N, self.CAP)
+        try:
+            client = TensorFlightClient(f"grpc://localhost:{upstream.port}")
+            ids = [f"s{i}" for i in range(self.N)]
+            rows = [r for page in fetch_upstream_rows(client, ids, {}) for r in page]
+        finally:
+            upstream.shutdown()
+
+        assert [r["source_id"] for r in rows] == ids
+
+    def test_a_catalog_that_is_an_exact_multiple_of_the_page_ends(self, monkeypatch):
+        from biopb.tensor import TensorFlightClient
+        from biopb_tensor_server.adapters import remote_tensor
+
+        monkeypatch.setattr(remote_tensor, "CATALOG_PAGE_ROWS", 4)
+        upstream = self._upstream(8, 100)
+        try:
+            client = TensorFlightClient(f"grpc://localhost:{upstream.port}")
+            versions = remote_tensor.list_upstream_versions(client)
+        finally:
+            upstream.shutdown()
+
+        assert len(versions) == 8
+
+
+class TestFetchUpstreamRows:
+    class _Client:
+        def __init__(self):
+            self.sqls = []
+
+        def query(self, sql, format="records"):  # noqa: A002 - fakes the real client's public `format` signature
+            self.sqls.append(sql)
+            return pa.Table.from_pylist([{"source_id": "x"}])
+
+    def test_ids_are_quoted(self):
+        from biopb_tensor_server.adapters.remote_tensor import fetch_upstream_rows
+
+        client = self._Client()
+        list(fetch_upstream_rows(client, ["s0", "it's"], {}))
+
+        assert "'it''s'" in client.sqls[0] and "'s0'" in client.sqls[0]
+        assert "source_url" in client.sqls[0] and "tensors" in client.sqls[0]
+
+    def test_batches_are_cut_by_bytes_and_a_huge_row_goes_alone(self):
+        from biopb_tensor_server.adapters import remote_tensor
+
+        sizes = {"a": 10, "b": 10, "huge": remote_tensor.FETCH_BYTES * 2, "c": 10}
+        batches = list(remote_tensor._fetch_batches(["a", "b", "huge", "c"], sizes))
+
+        assert batches == [["a", "b"], ["huge"], ["c"]]
+
+    def test_batches_are_capped_by_count(self, monkeypatch):
+        from biopb_tensor_server.adapters import remote_tensor
+
+        monkeypatch.setattr(remote_tensor, "FETCH_MAX_IDS", 2)
+
+        assert list(remote_tensor._fetch_batches(list("abcde"), {})) == [
+            ["a", "b"],
+            ["c", "d"],
+            ["e"],
+        ]
+
+    def test_nothing_wanted_asks_nothing(self):
+        from biopb_tensor_server.adapters.remote_tensor import fetch_upstream_rows
+
+        class _Never:
+            def query(self, *_a, **_k):
+                raise AssertionError("no query for an empty id list")
+
+        assert list(fetch_upstream_rows(_Never(), [], {})) == []
 
 
 class TestAnUpstreamScratchIsNotMirrored:
@@ -2496,15 +2623,17 @@ class TestAnUpstreamScratchIsNotMirrored:
 
         def query(self, sql, format="records"):  # noqa: A002 - fakes the real client's public `format` signature
             if "source_url" in sql:
-                return [dict(r) for r in self._rows]
-            return [{"source_id": r["source_id"]} for r in self._rows]
+                return pa.Table.from_pylist([dict(r) for r in self._rows])
+            return pa.Table.from_pylist(
+                [{"source_id": r["source_id"]} for r in self._rows]
+            )
 
-    def test_the_bulk_catalog_leaves_it_out(self):
-        from biopb_tensor_server.adapters.remote_tensor import fetch_upstream_catalog
+    def test_the_version_list_leaves_it_out(self):
+        from biopb_tensor_server.adapters.remote_tensor import list_upstream_versions
 
-        rows = fetch_upstream_catalog(self._FakeClient(self.ROWS))
+        versions = list_upstream_versions(self._FakeClient(self.ROWS))
 
-        assert [r["source_id"] for r in rows] == ["zarr_a1b2c3", "aics_ff00"]
+        assert list(versions) == ["zarr_a1b2c3", "aics_ff00"]
 
     def test_the_id_enumerator_leaves_it_out_too(self):
         """Both enumerators: the inline expansion (``validate``) lists ids alone."""
@@ -2684,7 +2813,7 @@ def test_a_failed_bulk_query_leaves_the_mirror_alone_and_syncs_nothing(
             def _must_not_run(*args, **kwargs):
                 raise AssertionError("no id-only enumeration fallback")
 
-            monkeypatch.setattr(remote_tensor, "fetch_upstream_catalog", _fails)
+            monkeypatch.setattr(remote_tensor, "list_upstream_versions", _fails)
             monkeypatch.setattr(
                 remote_tensor, "list_upstream_source_ids", _must_not_run
             )
@@ -2890,6 +3019,95 @@ def test_reconcile_mirrors_unresolved_then_refreshes_on_resolve():
             assert len(tensors) == 1
             assert tensors[0]["array_id"] == "lab__cloud"  # localized
             assert proxy.sources.get("lab__cloud").is_resolved() is True
+        finally:
+            proxy.shutdown()
+    finally:
+        upstream.shutdown()
+
+
+def _tensor_row(sid, shape=(8, 8)):
+    return [
+        {
+            "array_id": sid,
+            "dim_labels": ["y", "x"],
+            "shape": list(shape),
+            "chunk_shape": list(shape),
+            "dtype": "uint8",
+        }
+    ]
+
+
+def test_relist_reads_full_rows_only_for_new_or_reregistered_sources(monkeypatch):
+    """The first sync pulls the catalog in bounded batches; a steady re-list moves
+    two columns and no rows; a re-registered source alone is read again."""
+    from biopb.tensor import TensorFlightClient
+    from biopb_tensor_server import TensorFlightServer
+    from biopb_tensor_server.adapters import get_default_registry, remote_tensor
+    from biopb_tensor_server.core.config import SourceConfig
+    from biopb_tensor_server.core.discovery import DiscoveryState
+    from biopb_tensor_server.serving.metadata_db import MetadataDatabase
+    from biopb_tensor_server.sources.source_manager import SourceManager
+
+    monkeypatch.setattr(remote_tensor, "FETCH_MAX_IDS", 2)
+    queries = []
+    real_query = TensorFlightClient.query
+
+    def _recording(self, sql, **kwargs):
+        queries.append(sql)
+        return real_query(self, sql, **kwargs)
+
+    monkeypatch.setattr(TensorFlightClient, "query", _recording)
+
+    def _full_row_queries():
+        return [q for q in queries if "WHERE source_id IN" in q]
+
+    up_db = MetadataDatabase()
+    upstream = TensorFlightServer("grpc://localhost:0", metadata_db=up_db)
+    ids = [f"s{i}" for i in range(5)]
+    for sid in ids:
+        up_db.sync_source_added(sid, _CatalogRowAdapter(sid, tensors=_tensor_row(sid)))
+    _serve(upstream)
+    try:
+        local_db = MetadataDatabase()
+        proxy = TensorFlightServer("grpc://localhost:0", metadata_db=local_db)
+        _serve(proxy)
+        try:
+            manager = SourceManager(
+                server=proxy,
+                registry=get_default_registry(),
+                discovery_state=DiscoveryState(),
+                monitored_dirs=set(),
+                metadata_db=local_db,
+                monitored_upstreams=[
+                    SourceConfig(url=f"grpc://localhost:{upstream.port}", alias="lab")
+                ],
+            )
+
+            manager._reconcile_upstreams()
+
+            assert set(proxy.sources) == {f"lab__{sid}" for sid in ids}
+            assert len(_full_row_queries()) == 3  # 5 ids, 2 per batch
+
+            queries.clear()
+            manager._reconcile_upstreams()
+            assert _full_row_queries() == []  # steady: ids + indexed_at only
+            assert len(queries) == 1
+
+            time.sleep(0.05)  # indexed_at is a timestamp; let it move
+            up_db.sync_source_added(
+                "s3", _CatalogRowAdapter("s3", tensors=_tensor_row("s3", (16, 16)))
+            )
+            queries.clear()
+            manager._reconcile_upstreams()
+
+            rows = _full_row_queries()
+            assert len(rows) == 1 and "'s3'" in rows[0] and "'s2'" not in rows[0]
+            shape = (
+                local_db._get_connection()
+                .execute("SELECT tensors FROM sources WHERE source_id='lab__s3'")
+                .fetchone()[0][0]["shape"]
+            )
+            assert list(shape) == [16, 16]
         finally:
             proxy.shutdown()
     finally:

@@ -162,11 +162,18 @@ The upstream's own **scratch** source is never mirrored: it is a temp store
 whose tensors have a deadline set by that server's policy, not a catalog worth
 carrying.
 
-**Enumeration and seeding are one bulk query.** `fetch_upstream_catalog` reads
-every upstream source's id, tensors, metadata, `is_resolved` and `indexed_at`
-in a single server-side `query`, which is not truncated (unlike
-`list_sources()`), so mirroring costs one upstream RPC regardless of catalog
-size and a re-list can safely remove sources that disappeared. There is no
+**A re-list reads two columns, then only what changed.** `list_upstream_versions`
+reads every upstream source's id, `indexed_at` and `metadata_json` length with
+server-side `query` calls. An upstream caps one query's rows
+(`max_query_results`) and flags the cut only in the result's metadata, so the read
+is keyset-paged (`ORDER BY source_id LIMIT n`, resuming after the last id, and
+continuing past any page the server flags `truncated`); the result is complete,
+so a re-list can safely remove sources that disappeared. Full rows (tensors, metadata, `is_resolved`) are then
+fetched by `fetch_upstream_rows`, in batches cut by that length (`FETCH_BYTES`;
+`metadata_json` is wildly uneven, so a count would not bound memory), for sources
+that are new or whose `indexed_at` differs from the mirrored adapter's
+`content_version`. A steady re-list of a six-figure catalog therefore moves a
+few MB, and a first sync never holds more than one batch. There is no
 fallback: if the query fails the re-list raises, the mirrored catalog is left as
 it is, and the next tick retries. Enumerating ids and syncing each source over
 its own RPC would put two round trips per source on an upstream that is already

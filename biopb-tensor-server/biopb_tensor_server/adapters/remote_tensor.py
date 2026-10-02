@@ -33,7 +33,18 @@ import logging
 import os
 import threading
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    Iterator,
+    List,
+    Mapping,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Tuple,
+)
 from urllib.parse import urlsplit
 
 import numpy as np
@@ -235,6 +246,50 @@ def mirrorable_upstream_id(source_id: str) -> bool:
     return source_id != SCRATCH_SOURCE_ID
 
 
+#: Rows asked for per catalog page. An upstream caps one query's rows
+#: (``max_query_results``); a page the cap cuts short is detected from the
+#: server's ``truncated`` flag and the next page resumes after its last row.
+CATALOG_PAGE_ROWS = 20000
+
+
+def _query_catalog_pages(
+    client,
+    select: str,
+    *,
+    where: Optional[str] = None,
+    page_rows: Optional[int] = None,
+) -> Iterator[List[dict]]:
+    """Rows of ``select ... FROM sources`` a page at a time, in ``source_id`` order.
+
+    The upstream's query cap truncates a long result silently, and a caller that
+    reconciles against the result would then treat the sources past the cut as
+    gone. So the read is keyset-paged instead: each page is ``LIMIT page_rows``
+    after the last ``source_id`` seen, and the loop ends on a page that is short
+    *and* not flagged ``truncated`` (a cap below ``page_rows`` flags it, and the
+    next page resumes after the rows that did arrive). ``select`` must include
+    ``source_id``.
+    """
+    page_rows = page_rows or CATALOG_PAGE_ROWS
+    last = None
+    while True:
+        conds = [where] if where else []
+        if last is not None:
+            conds.append(f"source_id > {sql_literal(last)}")
+        sql = (
+            f"{select} FROM sources"
+            + (f" WHERE {' AND '.join(conds)}" if conds else "")
+            + f" ORDER BY source_id LIMIT {page_rows}"
+        )
+        table = client.query(sql, format="arrow")
+        rows = table.to_pylist()
+        if rows:
+            yield rows
+        flagged = (table.schema.metadata or {}).get(b"truncated") == b"True"
+        if len(rows) < page_rows and not flagged:
+            return
+        last = rows[-1]["source_id"]
+
+
 def list_upstream_source_ids(client, location: str) -> List[str]:
     """Every source_id on an upstream tensor server that we mirror.
 
@@ -245,54 +300,125 @@ def list_upstream_source_ids(client, location: str) -> List[str]:
     private state to recover a value that was in scope (biopb/biopb#529).
 
     Queries the ids alone (``query`` on one narrow column, the
-    canonical browse surface, biopb/biopb#225) -- an untruncated read, so the
-    result is always complete and a caller (e.g. the monitor re-list) may
-    reconcile destructively against it.
+    canonical browse surface, biopb/biopb#225), paged past the upstream's row cap,
+    so the result is complete and a caller may reconcile destructively against it.
 
     An upstream with no readable catalog raises rather than degrading: the only
     fallback there ever was is ``list_sources()``, which in protocol v2 runs
     this same query and so fails identically.
     """
-    rows = client.query("SELECT source_id FROM sources", format="records")
     return [
-        row["source_id"] for row in rows if mirrorable_upstream_id(row["source_id"])
+        row["source_id"]
+        for rows in _query_catalog_pages(client, "SELECT source_id")
+        for row in rows
+        if mirrorable_upstream_id(row["source_id"])
     ]
 
 
-def fetch_upstream_catalog(client) -> List[dict]:
-    """Bulk-fetch an upstream's full catalog rows in ONE ``query``.
+def content_version_for(indexed_at: object) -> Optional[bytes]:
+    """The mirror's ``content_version`` for an upstream ``indexed_at``.
+
+    ``None`` for an unversioned upstream, which therefore never compares equal to
+    anything and is re-read on every re-list.
+    """
+    return b"iat:" + str(indexed_at).encode() if indexed_at is not None else None
+
+
+class UpstreamVersion(NamedTuple):
+    """What the narrow pass learns about one upstream source."""
+
+    indexed_at: object
+    #: ``length(metadata_json)``: the bulk of a row, and wildly uneven (measured
+    #: on one lab catalog: median 0.7 KB, p99 128 KB, max 14 MB).
+    size: int
+
+
+def list_upstream_versions(client) -> Dict[str, UpstreamVersion]:
+    """``{source_id: UpstreamVersion}`` for every mirrorable source upstream.
+
+    One narrow query (no ``tensors`` or ``metadata_json`` payload), so it stays
+    cheap on a six-figure catalog and is what a re-list diffs against:
+    ``indexed_at`` is the upstream's register timestamp, which changes whenever
+    the source is re-registered (including unresolved -> resolved). Every write to
+    a catalog row is ``sync_source_added``, an upsert that re-stamps it -- an upload,
+    a detach or a reaped upload changes ``tensors`` only by re-syncing the parent --
+    so a changed row always carries a new ``indexed_at``. Paged past the
+    upstream's row cap, so the result is complete and a caller may reconcile
+    destructively against it.
+
+    Raises when the query fails. There is no degraded mode: every server owns a
+    catalog (protocol v2), so a failure is an upstream that is down, slow or
+    refusing us, and enumerating ids and syncing each source over its own RPC
+    would only multiply the load on exactly that upstream. The caller keeps the
+    catalog it has and retries on the next tick.
+    """
+    return {
+        r["source_id"]: UpstreamVersion(
+            r.get("indexed_at"), r.get("metadata_size") or 0
+        )
+        for rows in _query_catalog_pages(
+            client,
+            "SELECT source_id, indexed_at, length(metadata_json) AS metadata_size",
+        )
+        for r in rows
+        if mirrorable_upstream_id(r["source_id"])
+    }
+
+
+#: What one ``fetch_upstream_rows`` query may hold: a byte budget (a row's
+#: ``metadata_json`` plus ``FETCH_ROW_OVERHEAD`` for the rest) and an id cap that
+#: keeps the SQL short. A single row larger than the budget goes alone.
+FETCH_BYTES = 8 << 20
+FETCH_ROW_OVERHEAD = 2048
+FETCH_MAX_IDS = 500
+
+
+def _fetch_batches(
+    source_ids: Sequence[str], sizes: Mapping[str, int]
+) -> Iterator[List[str]]:
+    batch: List[str] = []
+    held = 0
+    for sid in source_ids:
+        cost = sizes.get(sid, 0) + FETCH_ROW_OVERHEAD
+        if batch and (held + cost > FETCH_BYTES or len(batch) >= FETCH_MAX_IDS):
+            yield batch
+            batch, held = [], 0
+        batch.append(sid)
+        held += cost
+    if batch:
+        yield batch
+
+
+def fetch_upstream_rows(
+    client, source_ids: Sequence[str], sizes: Mapping[str, int]
+) -> Iterator[List[dict]]:
+    """Full catalog rows for ``source_ids``, a bounded batch at a time.
 
     Each row is a dict with ``source_id``, ``source_url``, ``source_type``,
     ``metadata_json``, ``is_resolved``, the per-tensor ``tensors`` STRUCT[]
-    (biopb/biopb#224), and ``indexed_at`` (the upstream's per-source register
-    timestamp) -- everything needed to seed a mirrored source's catalog entry
-    without a per-source upstream RPC (biopb/biopb#266). ``source_url`` carries
-    the upstream's real path so the mirror can be treed by filepath in the
-    browser (biopb/biopb#297). ``indexed_at`` becomes the mirror's
-    content_version (biopb/biopb#178): it changes when the upstream re-registers
-    the source, so the proxy's chunk cache re-namespaces instead of serving stale
-    chunks. ``is_resolved`` is carried so an unresolved upstream source
-    (``is_resolved=false``, empty ``tensors``) mirrors as unresolved rather than
-    being advertised as a readable source.
+    (biopb/biopb#224) and ``indexed_at`` -- everything needed to seed a mirrored
+    source's catalog entry without a per-source upstream RPC (biopb/biopb#266).
+    ``source_url`` carries the upstream's real path so the mirror can be treed by
+    filepath in the browser (biopb/biopb#297); ``is_resolved`` lets an unresolved
+    upstream source mirror as unresolved.
 
-    The result is complete: the server-side DuckDB catalog is not truncated like
-    ``list_sources()``, so a caller may reconcile destructively against it. The
-    upstream's scratch source is left out, as it is from
-    :func:`list_upstream_source_ids`; see :func:`mirrorable_upstream_id`.
-
-    Raises when the query fails. There is no degraded mode to fall back to: every
-    server owns a catalog (protocol v2), so a failure here is an upstream that is
-    down, slow or refusing us, and enumerating its ids and syncing each source
-    over its own RPC would only multiply the load on exactly that upstream -- two
-    round trips per source, on the rescan thread, with the catalog lock held. The
-    caller keeps the catalog it has and retries on the next tick.
+    ``sizes`` is each id's ``metadata_json`` length from
+    :func:`list_upstream_versions`; batches are cut by it, so a first sync of a
+    large catalog holds a few MB however large the catalog or one row. A
+    generator: a source that disappeared since the ids were listed is simply
+    absent from its batch, and a failed query raises after the earlier batches
+    were consumed. A batch an upstream's row cap cuts short comes back as more
+    than one list.
     """
-    rows = client.query(
-        "SELECT source_id, source_url, source_type, metadata_json, "
-        "is_resolved, tensors, indexed_at FROM sources",
-        format="records",
-    )
-    return [r for r in rows if mirrorable_upstream_id(r["source_id"])]
+    for batch in _fetch_batches(source_ids, sizes):
+        ids = ", ".join(sql_literal(sid) for sid in batch)
+        yield from _query_catalog_pages(
+            client,
+            "SELECT source_id, source_url, source_type, metadata_json, "
+            "is_resolved, tensors, indexed_at",
+            where=f"source_id IN ({ids})",
+            page_rows=len(batch) + 1,  # a complete batch never fills it
+        )
 
 
 class RemoteTensorAdapter(TensorAdapter):
@@ -520,6 +646,13 @@ class RemoteTensorAdapter(TensorAdapter):
                 return f"{self._scheme}://{self._authority}/{remote}"
         return f"{self._scheme}://{self._authority}:{self._upstream_source_id}"
 
+    def is_current(self, indexed_at: object) -> bool:
+        """Whether this mirror was last seeded from an upstream row stamped
+        ``indexed_at``. An unversioned upstream is never current, so it is
+        re-read on every re-list."""
+        version = content_version_for(indexed_at)
+        return version is not None and version == self._content_version
+
     def seed_catalog(
         self,
         upstream_tensors: List[dict],
@@ -542,9 +675,9 @@ class RemoteTensorAdapter(TensorAdapter):
         ``is_resolved`` is the upstream *source*'s own flag (from its row): an
         unresolved upstream source (``is_resolved=false``, empty tensors) must
         mirror as unresolved, not be advertised as readable. Idempotent and
-        re-appliable: the reconcile re-seeds every mirrored source each re-list,
-        so an in-place upstream resolution (empty -> populated tensors,
-        false -> true) refreshes here rather than going stale.
+        re-appliable: the reconcile re-seeds a mirrored source whenever its upstream
+        ``indexed_at`` moves, so an in-place upstream resolution (empty ->
+        populated tensors, false -> true) refreshes here rather than going stale.
 
         ``source_url`` is the upstream source's own catalog url; it is folded into
         the mirror's display url so the browser can tree it by the remote path
@@ -553,8 +686,7 @@ class RemoteTensorAdapter(TensorAdapter):
         ``indexed_at`` is the upstream source's register timestamp; it becomes this
         mirror's ``content_version`` (``b"iat:<ts>"``, biopb/biopb#178), folded into
         every minted proxy envelope so the chunk cache re-namespaces when the
-        upstream re-registers the source. It is set unconditionally (every reconcile
-        refreshes it) and deliberately NOT part of the ``changed`` result: a re-sync
+        upstream re-registers the source. It is set unconditionally and deliberately NOT part of the ``changed`` result: a re-sync
         re-stamps the LOCAL ``indexed_at``, so gating re-sync on it would churn; the
         content_version only needs to ride the adapter for minting, not the catalog.
 
@@ -565,9 +697,7 @@ class RemoteTensorAdapter(TensorAdapter):
         # The upstream register timestamp is this mirror's content_version. An
         # unversioned upstream (no indexed_at) leaves the proxy unversioned -> the
         # envelope carries an empty cv, exactly as before this plumbing.
-        self._content_version = (
-            b"iat:" + str(indexed_at).encode() if indexed_at is not None else None
-        )
+        self._content_version = content_version_for(indexed_at)
         descs: List[TensorDescriptor] = []
         for t in upstream_tensors or []:
             descs.append(
