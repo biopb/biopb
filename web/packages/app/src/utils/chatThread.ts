@@ -30,6 +30,8 @@ export interface MessageItem {
   error?: boolean;
   /** The turn was stopped on purpose. */
   cancelled?: boolean;
+  /** Not something the user typed: the loop's note that cells ran elsewhere. */
+  note?: boolean;
 }
 
 export interface ToolCallItem {
@@ -76,6 +78,7 @@ export interface ChatMessage {
   name?: string;
   error?: boolean;
   cancelled?: boolean;
+  note?: boolean;
   image?: string;
   mime?: string;
 }
@@ -215,6 +218,7 @@ export function fromChatHistory(
       id: m.id,
       role: "user",
       blocks: textBlocks(m.content),
+      ...(m.note ? { note: true } : {}),
     });
   }
 

@@ -214,6 +214,8 @@ async def _api_chat_history(request):
     the session, so a header that learned the model once at mount would go on
     naming the one it was switched off.
     """
+    if not _in_flight():
+        _chat.sync_activity()
     messages = _chat.history()
     after = request.query_params.get("after")
     full = True
@@ -235,6 +237,7 @@ async def _api_chat_history(request):
             # nothing said since looks like.
             "full": full,
             "busy": _chat.busy(),
+            "queued": _chat.queued(),
             "model": get_setting(_config, "chat.model"),
             "partial": _partial(),
         }
@@ -317,7 +320,13 @@ def _in_flight():
 
 
 async def _chat_turn(request):
-    """Accept a message and start the turn; the view polls for the answer."""
+    """Accept a message and start the turn; the view polls for the answer.
+
+    Sent while a turn runs, the message is queued and enters the thread at the
+    turn's next round boundary (``{"queued": true}``) -- after the current
+    round's cell finishes, not during it.
+    """
+    global _turn_task
     err = _not_ready_503()
     if err is not None:
         return err
@@ -329,9 +338,13 @@ async def _chat_turn(request):
         return JSONResponse({"error": "missing 'text'"}, status_code=400)
 
     if _in_flight():
+        # A running *turn* takes the message at its next round boundary. Anything
+        # else holding the lock (a compaction) has no boundary to deliver at.
+        if _turn_task is not None and not _turn_task.done():
+            _chat.queue_user(text)
+            return JSONResponse({"queued": True}, status_code=202)
         return _busy_409()
 
-    global _turn_task
     _turn_task = asyncio.create_task(_run_turn(text))
     return JSONResponse({"accepted": True}, status_code=202)
 
