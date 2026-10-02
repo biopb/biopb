@@ -171,11 +171,10 @@ class SourceManager:
         # source discovered under it is registered beneath.
         self._monitored_aliases: Dict[Path, str] = monitored_aliases or {}
         self._cloud_roots: Set[Path] = cloud_roots or set()
-        # Drops from outside every known root: ``dnd://`` label -> the dropped
-        # path, and the cloud roots such a drop consented to, so deregistering the
-        # drop takes its consent back with it.
-        self._dropped_roots: Dict[str, Path] = {}
-        self._drop_cloud_consent: Set[Path] = set()
+        # Drops from outside every known root: ``dnd://`` label -> (the dropped
+        # path, whether the drop made it a cloud root), so deregistering the drop
+        # takes its consent back with it.
+        self._dropped_roots: Dict[str, Tuple[Path, bool]] = {}
         self._monitored_upstreams: List[SourceConfig] = monitored_upstreams or []
         # Configured directories that are catalogued but not watched
         # (``monitor = false``): each is scanned once, by the first tick, and
@@ -785,9 +784,8 @@ class SourceManager:
             dropped = self._dropped_roots.pop(
                 root_url[len(DND_URL_PREFIX) :].strip("/\\"), None
             )
-            if dropped is not None and dropped in self._drop_cloud_consent:
-                self._drop_cloud_consent.discard(dropped)
-                self._cloud_roots.discard(dropped)
+            if dropped is not None and dropped[1]:
+                self._cloud_roots.discard(dropped[0])
         return removed, failed
 
     def _reconcile_due_upstreams(self) -> None:
@@ -1100,7 +1098,6 @@ class SourceManager:
             # says.
             if cloud and not self._is_under_cloud_root(url):
                 self._cloud_roots.add(root_path)
-                self._drop_cloud_consent.add(root_path)
                 consented = True
             cloud = self._is_under_cloud_root(url)
 
@@ -1123,9 +1120,8 @@ class SourceManager:
         finally:
             if known is None:
                 if committed:
-                    self._dropped_roots[label] = root_path
+                    self._dropped_roots[label] = (root_path, consented)
                 elif consented:
-                    self._drop_cloud_consent.discard(root_path)
                     self._cloud_roots.discard(root_path)
             self._catalog_lock.release()
 
@@ -1139,7 +1135,7 @@ class SourceManager:
         roots = [
             *(("monitored", r) for r in self._monitored_dirs),
             *(("scan_once", r) for r in self._scan_once_roots),
-            *(("dropped", r) for r in self._dropped_roots.values()),
+            *(("dropped", r) for r, _ in self._dropped_roots.values()),
         ]
         inside = [(kind, root) for kind, root in roots if path.is_relative_to(root)]
         return max(inside, key=lambda kr: len(kr[1].parts), default=None)
@@ -1179,7 +1175,9 @@ class SourceManager:
         if kind == "monitored":
             return self._monitored_catalog_url(claim)
         if kind == "dropped":
-            earlier = next(lab for lab, r in self._dropped_roots.items() if r == root)
+            earlier = next(
+                lab for lab, (r, _) in self._dropped_roots.items() if r == root
+            )
             return _reroot_catalog_url(earlier, str(root), claim.primary_path)
         alias = self._scan_once_roots.get(root)
         if alias:

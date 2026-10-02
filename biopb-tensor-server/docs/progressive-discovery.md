@@ -48,7 +48,7 @@ string is used where**, and how the first scan differs from every later one.
 | `DiscoveryState` (scratch and confirmed) | `claims`, `path_to_source`, `source_to_paths`, `consumed_paths`, `visited_identities` | `source_id`; claim path strings; file identities |
 | `Reconciler` | `_source_signatures`, `_missed_scans`, `_cloud_source_ids`, `_failed_sources`, `_path_to_source_id` | `source_id`; for the last, `claim.primary_path` |
 | `SourceManager` | `_monitored_dirs`, `_scan_once_roots`, `_cloud_roots`, `_monitored_aliases`, `_unavailable_roots`, the pending scan-once list | Resolved root `Path`s (`_scan_once_roots` maps to its alias) |
-| `SourceManager` (drops) | `_dropped_roots`, `_drop_cloud_consent` | `dnd://` label to the dropped `Path`; the roots a drop made cloud |
+| `SourceManager` (drops) | `_dropped_roots` | `dnd://` label to the dropped `Path` and whether the drop made it a cloud root |
 | Adapter | `_source_url` (the raw claim path, or the library's own filename for hdf5 / nifti / bioio / dicom), `catalog_url` | Opens files with the raw path |
 | Catalog (`sources` table) | `source_url` (display only), `tensors`, `metadata_json`, `indexed_at` | `source_id` |
 
