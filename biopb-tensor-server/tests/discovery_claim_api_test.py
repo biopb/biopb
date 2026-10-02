@@ -202,7 +202,8 @@ class TestDiscoveryFailureIsolation:
         from biopb_tensor_server.sources.scan_root import discover_under
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
+            # The scan keys on resolved paths (/var -> /private/var, 8.3 names).
+            root = Path(tmpdir).resolve()
             (root / "bad.dat").write_text("bad")
             (root / "good.dat").write_text("good")
 
