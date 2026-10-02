@@ -20,11 +20,13 @@ from biopb_image_base.ops import (
     _ambient_scheduler_configured,
     _EmbeddedSink,
     _InlineSink,
+    _json_arg,
     _PlaneSink,
+    _read_value,
     build_server,
     describe,
 )
-from google.protobuf import empty_pb2, json_format, struct_pb2
+from google.protobuf import empty_pb2
 
 
 @op(description="Mean intensity and area per label", labels=["measurement"])
@@ -149,13 +151,13 @@ def _eager(array, labels=None) -> proto.Arg:
 
 
 def _json(value) -> proto.Arg:
-    return proto.Arg(json=json_format.ParseDict(value, struct_pb2.Value()))
+    return _json_arg(value)
 
 
 def _value(arg: proto.Arg):
     kind = arg.WhichOneof("kind")
     if kind == "json":
-        return json_format.MessageToDict(arg.json)
+        return _read_value(arg.json)
     if kind == "eager":
         return deserialize_image_data(proto.ImageData(eager_data=arg.eager))
     from biopb.tensor.client import TensorFlightClient
@@ -249,21 +251,22 @@ def test_non_finite_default_is_just_text_in_the_schema():
 
 
 def test_non_finite_result_round_trips(server):
-    from biopb_image_base.ops import _undo_non_finite
-
     (event,) = server.call("non_finite_result")
-    restored = _undo_non_finite(_value(event.outputs["result"]))
+    restored = _value(event.outputs["result"])
     assert restored["a_nan"] != restored["a_nan"]  # nan != nan
     assert restored["an_inf"] == float("inf")
     assert restored["a_neg_inf"] == float("-inf")
 
 
-def test_non_finite_kwarg_is_restored_server_side(server):
-    from biopb_image_base.ops import NON_FINITE_FLOAT_KEY, _undo_non_finite
+def test_non_finite_kwarg_reaches_the_op(server):
+    (event,) = server.call("echo_kwarg", value=_json(float("inf")))
+    assert _value(event.outputs["result"])["got"] == float("inf")
 
-    (event,) = server.call("echo_kwarg", value=_json({NON_FINITE_FLOAT_KEY: "inf"}))
-    restored = _undo_non_finite(_value(event.outputs["result"]))
-    assert restored["got"] == float("inf")
+
+def test_a_single_key_dict_is_data_not_an_encoding(server):
+    # The former sentinel's shape: it is an ordinary result now.
+    (event,) = server.call("echo_kwarg", value=_json({"__float__": "inf"}))
+    assert _value(event.outputs["result"])["got"] == {"__float__": "inf"}
 
 
 def test_two_tensor_arguments_and_json_result(server):

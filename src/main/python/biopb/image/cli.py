@@ -210,6 +210,17 @@ def _write_tensor(arg: Arg, output: str, format: Literal["pb", "pickle"]) -> Non
         stderr_console.print(f"[green]Pickled saved to:[/green] {output}")
 
 
+def _plain(value) -> object:
+    """A ``google.protobuf.Value`` as Python. Not ``MessageToDict``, which raises
+    on nan/inf, and a measurement may legitimately be either."""
+    kind = value.WhichOneof("kind")
+    if kind == "struct_value":
+        return {k: _plain(v) for k, v in value.struct_value.fields.items()}
+    if kind == "list_value":
+        return [_plain(v) for v in value.list_value.values]
+    return getattr(value, kind) if kind and kind != "null_value" else None
+
+
 def _write_outputs(outputs, output: str, format: Literal["pb", "pickle"]) -> None:  # noqa: A002 - mirrors the --format option
     """Tensor outputs to *output*; JSON outputs printed plain, one per line,
     to stdout, or to stderr when a tensor goes to stdout. With more than one
@@ -219,7 +230,7 @@ def _write_outputs(outputs, output: str, format: Literal["pb", "pickle"]) -> Non
     for key in sorted(outputs):
         arg = outputs[key]
         if arg.WhichOneof("kind") == "json":
-            text = json.dumps(json_format.MessageToDict(arg.json))
+            text = json.dumps(_plain(arg.json))
             print(text if len(outputs) == 1 else f"{key}: {text}", file=stream)
         else:
             _write_tensor(arg, _output_path(output, key, len(tensors)), format)

@@ -21,7 +21,6 @@ without an event, and a Stop cancels it on the server.
 from __future__ import annotations
 
 import logging
-import math
 import os
 import queue
 import re
@@ -40,7 +39,7 @@ from biopb.image import (
     serialize_from_numpy_to_image_data,
 )
 from biopb.tensor._location import same_location
-from google.protobuf import json_format, struct_pb2
+from google.protobuf import struct_pb2
 
 from .._config import get_setting
 
@@ -98,27 +97,13 @@ def _sanitize_name(name: str) -> str:
     return re.sub(r"\W", "_", name) or "op"
 
 
-# The sentinel a non-finite float (nan/inf/-inf) is carried under -- JSON has
-# no literal for one, and `google.protobuf.Value` refuses to serialize one to
-# JSON text at all (`MessageToDict` raises), so an argument or a result that
-# legitimately is one would otherwise crash rather than lose precision. Mirrors
-# `biopb_image_base.ops.NON_FINITE_FLOAT_KEY`, on the server side of this same
-# wire protocol; not imported from there; the two sides share no Python code.
-_NON_FINITE_FLOAT_KEY = "__float__"
-
-
 def _jsonable(value: Any) -> Any:
-    if isinstance(value, float) and not math.isfinite(value):
-        return {_NON_FINITE_FLOAT_KEY: str(value)}
     if isinstance(value, np.generic):
         return _jsonable(value.item())
     if isinstance(value, np.ndarray):
-        # Only a float array can hold a non-finite value; skip the per-element
-        # walk below unless one is actually there. Complex still falls
-        # through it, since a bare complex scalar isn't JSON either.
-        if value.dtype.kind == "f" and np.isfinite(value).all():
-            return value.tolist()
-        if value.dtype.kind not in "fc":
+        # Complex still goes through the element walk, since a bare complex
+        # scalar isn't JSON either.
+        if value.dtype.kind != "c":
             return value.tolist()
         return _jsonable(value.tolist())
     if isinstance(value, dict):
@@ -128,19 +113,48 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
-def _from_json(value: Any) -> Any:
-    """A JSON result with its integral numbers as ints: JSON has only doubles,
-    so a count the server sent as 6 arrives as 6.0. Also restores a
-    `_NON_FINITE_FLOAT_KEY`-carried nan/inf/-inf to a real float."""
-    if isinstance(value, dict) and set(value) == {_NON_FINITE_FLOAT_KEY}:
-        return float(value[_NON_FINITE_FLOAT_KEY])
-    if isinstance(value, float) and value.is_integer():
-        return int(value)
-    if isinstance(value, list):
-        return [_from_json(v) for v in value]
-    if isinstance(value, dict):
-        return {k: _from_json(v) for k, v in value.items()}
-    return value
+def _fill_value(target: struct_pb2.Value, value: Any) -> None:
+    """Set *target* from plain JSON types, field by field.
+
+    Not ``json_format.ParseDict``/``MessageToDict``: those are JSON *text*
+    guards, and a ``Value`` on the wire is protobuf binary, where
+    ``number_value`` is a double that carries nan and inf unchanged -- an
+    argument or a result may legitimately be either.
+    """
+    if value is None:
+        target.null_value = struct_pb2.NULL_VALUE
+    elif isinstance(value, bool):
+        target.bool_value = value
+    elif isinstance(value, (int, float)):
+        target.number_value = value
+    elif isinstance(value, str):
+        target.string_value = value
+    elif isinstance(value, dict):
+        target.struct_value.Clear()
+        for key, item in value.items():
+            _fill_value(target.struct_value.fields[key], item)
+    else:
+        target.list_value.Clear()
+        for item in value:
+            _fill_value(target.list_value.values.add(), item)
+
+
+def _read_value(value: struct_pb2.Value) -> Any:
+    """A ``Value`` as Python, its integral numbers as ints: a protobuf number is
+    always a double, so a count the server sent as 6 arrives as 6.0."""
+    kind = value.WhichOneof("kind")
+    if kind == "number_value":
+        number = value.number_value
+        return int(number) if number.is_integer() else number
+    if kind == "string_value":
+        return value.string_value
+    if kind == "bool_value":
+        return value.bool_value
+    if kind == "struct_value":
+        return {k: _read_value(v) for k, v in value.struct_value.fields.items()}
+    if kind == "list_value":
+        return [_read_value(v) for v in value.list_value.values]
+    return None
 
 
 def _refusal(name: str, exc: grpc.RpcError) -> Exception:
@@ -276,9 +290,8 @@ class _OpCall:
                 by_id = by_id or isinstance(value, str)
                 encoded[name] = self._tensor(name, value, dim_labels, client)
             else:
-                encoded[name] = proto.Arg(
-                    json=json_format.ParseDict(_jsonable(value), struct_pb2.Value())
-                )
+                arg = encoded[name] = proto.Arg()
+                _fill_value(arg.json, _jsonable(value))
         return encoded, by_id
 
     # --- the stream ------------------------------------------------------ #
@@ -360,7 +373,7 @@ class _OpCall:
     def value(self, arg: proto.Arg, by_id: bool):
         kind = arg.WhichOneof("kind")
         if kind == "json":
-            return _from_json(json_format.MessageToDict(arg.json))
+            return _read_value(arg.json)
         client = self.client_getter()
         if kind == "eager":
             array = deserialize_image_data(proto.ImageData(eager_data=arg.eager))
