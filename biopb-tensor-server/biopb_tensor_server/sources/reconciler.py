@@ -606,13 +606,13 @@ class Reconciler:
         path signature): desired = the alias-namespaced ids the upstream lists now;
         current = the tensor-server claims already mirrored from this endpoint.
         """
-        import json
-
         from biopb.tensor import TensorFlightClient
 
         from biopb_tensor_server.adapters.remote_tensor import (
             _split_grpc_url,
-            fetch_upstream_catalog,
+            content_version_for,
+            fetch_upstream_rows,
+            list_upstream_versions,
             resolve_upstream_credentials,
         )
         from biopb_tensor_server.sources.resolve import _namespaced_source_id
@@ -633,105 +633,76 @@ class Reconciler:
             tls_fingerprint=credentials.tls_fingerprint,
         )
         try:
-            # ONE bulk query fetches every upstream source's id AND its
-            # seed data (tensors + metadata), so mirroring is O(1) upstream RPCs
-            # instead of one per added source at registration (biopb/biopb#266).
-            # Complete: the server-side DuckDB catalog is not truncated like
-            # list_sources() (which would both miss sources AND spuriously remove
-            # the ones past the cap below).
-            seed_by_up_id = {r["source_id"]: r for r in fetch_upstream_catalog(client)}
-            upstream_ids = list(seed_by_up_id)
+            # A narrow id + indexed_at pass decides everything that follows, so a
+            # steady re-list of a six-figure catalog moves two columns, not every
+            # source's metadata. Complete (the server-side DuckDB catalog is not
+            # truncated like list_sources()), so what it no longer lists is gone.
+            versions = list_upstream_versions(client)
+            desired = {_namespaced_source_id(alias, up): up for up in versions}
+
+            prefix = f"{endpoint}/"
+            alias_prefix = f"{alias}__" if alias else None
+            with self._lock:
+                current = {
+                    source_id
+                    for source_id, claim in self._state.claims.items()
+                    if claim.source_type == "tensor-server"
+                    and str(claim.primary_path).startswith(prefix)
+                    and (alias_prefix is None or source_id.startswith(alias_prefix))
+                }
+
+            added = set(desired) - current
+            # A failed query raised above, leaving the mirrored catalog untouched.
+            removed = current - set(desired)
+
+            for source_id in sorted(removed):
+                self._commit_remove_source(source_id)
+
+            # A mirrored source needs its row again only when the upstream
+            # re-registered it (indexed_at moved) -- notably unresolved -> resolved
+            # -- or when it was never seeded. An unversioned upstream has no
+            # indexed_at to compare, so it is re-read every time.
+            stale = set()
+            for source_id in current & set(desired):
+                adapter = self._server.sources.get(source_id)
+                if adapter is None or not hasattr(adapter, "seed_catalog"):
+                    continue
+                version = content_version_for(versions[desired[source_id]].indexed_at)
+                if version is None or version != getattr(
+                    adapter, "_content_version", None
+                ):
+                    stale.add(source_id)
+
+            extra_config = {}
+            if upstream.credentials_profile:
+                extra_config["credentials_profile"] = upstream.credentials_profile
+            # The proxy's display authority; without it every mirrored source_url
+            # exposes the upstream host:port instead of the alias (biopb/biopb#788).
+            if alias:
+                extra_config["alias"] = alias
+
+            # One bounded batch of full rows at a time, so the first sync of a large
+            # catalog never holds it whole.
+            wanted = [desired[sid] for sid in sorted(added | stale)]
+            sizes = {up: versions[up].size for up in wanted}
+            for rows in fetch_upstream_rows(client, wanted, sizes):
+                for row in rows:
+                    source_id = _namespaced_source_id(alias, row["source_id"])
+                    seed = self._row_to_seed(row)
+                    if source_id in added:
+                        self._commit_add_claim(
+                            SourceClaim(
+                                source_type="tensor-server",
+                                primary_path=f"{endpoint}/{row['source_id']}",
+                                source_id=source_id,
+                                extra_config=dict(extra_config),
+                            ),
+                            catalog_seed=seed,
+                        )
+                    elif source_id in stale:
+                        self._refresh_mirrored_source(source_id, seed)
         finally:
-            # An exception here would replace whatever is propagating out of the
-            # try: body -- and a broken channel is exactly when both an upstream
-            # failure and a failing close() happen together (biopb/biopb#529).
-            try:
-                client.close()
-            except Exception:
-                logger.debug("error closing upstream client", exc_info=True)
-
-        desired = {_namespaced_source_id(alias, up_id): up_id for up_id in upstream_ids}
-
-        prefix = f"{endpoint}/"
-        alias_prefix = f"{alias}__" if alias else None
-        with self._lock:
-            current = {
-                source_id
-                for source_id, claim in self._state.claims.items()
-                if claim.source_type == "tensor-server"
-                and str(claim.primary_path).startswith(prefix)
-                and (alias_prefix is None or source_id.startswith(alias_prefix))
-            }
-
-        added = set(desired) - current
-        # The bulk query is complete, so what it no longer lists is gone. (A failed
-        # query raised above, leaving the mirrored catalog untouched.)
-        removed = current - set(desired)
-
-        for source_id in sorted(removed):
-            self._commit_remove_source(source_id)
-
-        def _row_to_seed(row):
-            """(tensors, metadata, is_resolved, source_url, indexed_at) for
-            seed_catalog, or None."""
-            if row is None:
-                return None
-            raw = row.get("metadata_json")
-            try:
-                metadata = json.loads(raw) if raw else {}
-            except (json.JSONDecodeError, TypeError, ValueError):
-                metadata = {}
-            return (
-                row.get("tensors") or [],
-                metadata,
-                # Whether that row describes a real source yet. True for an
-                # upstream predating the column.
-                bool(row.get("is_resolved", True)),
-                row.get("source_url"),
-                row.get("indexed_at"),  # -> proxy content_version (biopb/biopb#178)
-            )
-
-        extra_config = {}
-        if upstream.credentials_profile:
-            extra_config["credentials_profile"] = upstream.credentials_profile
-        # The proxy's display authority; without it every mirrored source_url
-        # exposes the upstream host:port instead of the alias (biopb/biopb#788).
-        if alias:
-            extra_config["alias"] = alias
-        for source_id in sorted(added):
-            up_id = desired[source_id]
-            self._commit_add_claim(
-                SourceClaim(
-                    source_type="tensor-server",
-                    primary_path=f"{endpoint}/{up_id}",
-                    source_id=source_id,
-                    extra_config=dict(extra_config),
-                ),
-                catalog_seed=_row_to_seed(seed_by_up_id.get(up_id)),
-            )
-
-        # Refresh already-mirrored sources from the same bulk result, so an
-        # in-place upstream change -- notably unresolved -> resolved (empty ->
-        # populated tensors, is_resolved false -> true) -- is reflected on the
-        # catalog surface without a per-source RPC (biopb/biopb#266). Re-sync the
-        # DuckDB row only when the seed actually changed, so a steady re-list does
-        # not churn indexed_at.
-        for source_id in sorted(current & set(desired)):
-            seed = _row_to_seed(seed_by_up_id.get(desired[source_id]))
-            if seed is None:
-                continue
-            adapter = self._server.sources.get(source_id)
-            if adapter is None or not hasattr(adapter, "seed_catalog"):
-                continue
-            if adapter.seed_catalog(*seed) and self._metadata_db is not None:
-                try:
-                    self._metadata_db.sync_source_added(source_id, adapter)
-                except Exception:
-                    logger.warning(
-                        "failed to refresh mirrored catalog row for %s",
-                        source_id,
-                        exc_info=True,
-                    )
+            self._close_upstream_client(client)
 
         if added or removed:
             logger.info(
@@ -742,6 +713,53 @@ class Reconciler:
             )
         # Whether the mirrored set moved -- drives the adaptive re-list cadence.
         return bool(added or removed)
+
+    @staticmethod
+    def _row_to_seed(row: dict) -> tuple:
+        """(tensors, metadata, is_resolved, source_url, indexed_at) for
+        ``seed_catalog``."""
+        import json
+
+        raw = row.get("metadata_json")
+        try:
+            metadata = json.loads(raw) if raw else {}
+        except (json.JSONDecodeError, TypeError, ValueError):
+            metadata = {}
+        return (
+            row.get("tensors") or [],
+            metadata,
+            # Whether that row describes a real source yet. True for an upstream
+            # predating the column.
+            bool(row.get("is_resolved", True)),
+            row.get("source_url"),
+            row.get("indexed_at"),  # -> proxy content_version (biopb/biopb#178)
+        )
+
+    def _refresh_mirrored_source(self, source_id: str, seed: tuple) -> None:
+        """Re-seed an already-mirrored source and re-sync its catalog row if the
+        seed changed (so a steady re-list does not churn ``indexed_at``)."""
+        adapter = self._server.sources.get(source_id)
+        if adapter is None or not hasattr(adapter, "seed_catalog"):
+            return
+        if adapter.seed_catalog(*seed) and self._metadata_db is not None:
+            try:
+                self._metadata_db.sync_source_added(source_id, adapter)
+            except Exception:
+                logger.warning(
+                    "failed to refresh mirrored catalog row for %s",
+                    source_id,
+                    exc_info=True,
+                )
+
+    @staticmethod
+    def _close_upstream_client(client) -> None:
+        # An exception here would replace whatever is propagating out of the
+        # caller's try: body -- and a broken channel is exactly when both an
+        # upstream failure and a failing close() happen together (biopb/biopb#529).
+        try:
+            client.close()
+        except Exception:
+            logger.debug("error closing upstream client", exc_info=True)
 
     def _should_retry_source(self, source_id: str) -> bool:
         """Return True when a failed source is eligible for another add attempt."""
