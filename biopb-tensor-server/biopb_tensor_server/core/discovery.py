@@ -12,7 +12,8 @@ Key components:
 - SourceClaim: Represents a claimed data source (str paths for URL support)
 - AdapterRegistry: Registry of all adapter backends with remote claim support
 - DiscoveryState: Persistent state for incremental discovery
-- discover_sources(): Main discovery function (local + remote)
+- discover_sources(): the one filesystem walker (drop, one-shot dir, rescan)
+- discover_remote_source(): claim a remote URL
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ import fnmatch
 import hashlib
 import logging
 import os
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import (
     IO,
@@ -654,12 +656,30 @@ class SnapshotContext(_LocalContext):
         return [LiveLocalContext(p) for p in self._path.glob(pattern)]
 
 
+@dataclass
+class WalkReport:
+    """What a walk declined to look at, for a caller that must tell "not found"
+    from "not looked at".
+
+    ``declined_dirs`` are the directories not entered -- by the skip policy or by
+    the caller's ``path_filter``; directories only, because a skipped file is a
+    leaf and recording every placeholder would make the set O(files).
+    ``offline_files`` counts the non-resident placeholder *files* the skip policy
+    passed over (it is zero under a cloud root, which admits them), so a caller can
+    say "N offline files were skipped" instead of reporting an empty folder.
+    """
+
+    declined_dirs: Set[str] = field(default_factory=set)
+    offline_files: int = 0
+
+
 def walk_with_identity_tracking(
     root: Path,
     visited_identities: Set[str],
     path_filter: Optional[Callable[[Path], bool]] = None,
     should_descend: Optional[Callable[[Path], bool]] = None,
     admit_nonresident: bool = False,
+    report: Optional[WalkReport] = None,
 ) -> Iterator[Path]:
     """Walk filesystem with cross-platform identity tracking.
 
@@ -676,6 +696,7 @@ def walk_with_identity_tracking(
             the consumer stop the walk from descending below a directory-level
             claim — e.g. a ``.zarr`` store — whose interior files can never produce
             a claim of their own (biopb/biopb#55).
+        report: Optional :class:`WalkReport` filled in as the walk goes.
 
     Yields:
         Paths to files/directories (not yet claimed)
@@ -695,9 +716,18 @@ def walk_with_identity_tracking(
                 path, is_dir, admit_nonresident=admit_nonresident
             ):
                 logger.debug("walk: skipping %s", path)
+                if report is not None:
+                    if is_dir:
+                        report.declined_dirs.add(str(path))
+                    elif not path.name.startswith(".") and _is_offline_placeholder(
+                        path
+                    ):
+                        report.offline_files += 1
                 continue
 
             if path_filter is not None and not path_filter(path):
+                if is_dir and report is not None:
+                    report.declined_dirs.add(str(path))
                 continue
 
             try:
@@ -727,6 +757,7 @@ def walk_with_identity_tracking(
                     path_filter=path_filter,
                     should_descend=should_descend,
                     admit_nonresident=admit_nonresident,
+                    report=report,
                 )
     except OSError:
         # Permission issue reading directory
@@ -1225,16 +1256,24 @@ def discover_sources(
     path_filter: Optional[Callable[[Path], bool]] = None,
     admit_nonresident: bool = False,
     cloud_root: bool = False,
+    report: Optional[WalkReport] = None,
 ) -> DiscoveryState:
     """Recursive filesystem discovery with claim protocol.
 
-    Walks the filesystem recursively, asking each registered adapter
-    to claim paths it recognizes.
+    The one walker: a drop, a one-shot directory and the periodic rescan of a
+    monitored root all come through here. Walks the filesystem recursively,
+    asking each registered adapter to claim paths it recognizes, and stops
+    descending at a claimed directory. It keeps nothing between calls, so every
+    call stats the whole tree under ``root`` that it does not prune.
 
     Args:
-        root: Root directory to scan
+        root: Root directory to scan. Honored unconditionally -- ``path_filter``
+            and the skip policy apply only to what is found inside it.
         registry: Adapter registry for claims
         state: Existing DiscoveryState to update (creates new if None)
+        path_filter: Entry gate (the rescan's stability window); a directory it
+            rejects is not entered.
+        report: Filled with what the walk declined (:class:`WalkReport`).
         admit_nonresident: Under a cloud root, admit dehydrated placeholders
             instead of skipping them.
         cloud_root: Under a cloud root, set ``ClaimContext.cloud_root`` so the
@@ -1250,10 +1289,6 @@ def discover_sources(
         state = DiscoveryState()
 
     logger.debug(f"discover_sources: scanning {root}")
-
-    if path_filter is not None and not path_filter(root):
-        logger.debug(f"discover_sources: skipping filtered root {root}")
-        return state
 
     # Get identity for root itself
     try:
@@ -1282,6 +1317,7 @@ def discover_sources(
         # (biopb/biopb#55).
         should_descend=lambda p: not state.is_path_claimed(str(p)),
         admit_nonresident=admit_nonresident,
+        report=report,
     ):
         paths_scanned += 1
         path_str = str(path)
@@ -1294,110 +1330,6 @@ def discover_sources(
     logger.debug(
         f"discover_sources: scanned {paths_scanned} paths, found {len(state.claims)} sources"
     )
-    return state
-
-
-def discover_sources_from_entries(
-    entries: Iterable[Tuple[str, bool, Optional[Tuple]]],
-    registry: AdapterRegistry,
-    state: Optional[DiscoveryState] = None,
-    path_filter: Optional[Callable[[str], bool]] = None,
-    skipped_dirs: Optional[Set[str]] = None,
-    cloud_by_path: Optional[Dict[str, bool]] = None,
-) -> DiscoveryState:
-    """Claim discovery driven by a pre-built entry snapshot — no filesystem walk.
-
-    The periodic rescan already walks every monitored tree once to capture
-    stat-signatures (``TreeScanner._scan_tree_state``). That walk holds everything
-    the claim phase needs — each entry's resolved path and whether it is a directory —
-    so re-walking the filesystem a second time just to probe adapters is pure
-    duplication (it was ~96% of the post-#61 rescan syscalls). This drives the same
-    claim protocol as :func:`discover_sources` straight off that snapshot
-    (biopb/biopb#56, item 4).
-
-    ``entries`` is an ordered ``(resolved_path_str, is_dir, signature)`` stream in
-    **DFS parent-first order** (the order ``TreeScanner._scan_tree_state`` inserts into its state
-    dict), which is what lets a directory-level claim or skip prune its whole subtree
-    before any interior entry is probed. ``signature`` is the state walk's content
-    identity for the entry, carried onto the ``ClaimContext`` so content-probing
-    adapters can memoize on it (biopb/biopb#56, item 6); it may be ``None``.
-
-    Behavior is kept identical to a :func:`discover_sources` walk over the same tree:
-
-    - ``skipped_dirs`` (stable subtrees the state walk pruned) and any directory that
-      fails ``path_filter`` prune their entire subtree — mirroring how the walk does
-      not descend past a filtered/skipped directory. ``skipped_dirs`` descendants are
-      carried forward in the snapshot, so without this they would be re-probed; their
-      claims are preserved separately (``SourceManager._preserve_skipped_claims``).
-    - a claimed directory prunes its subtree (interior zarr chunk files etc. belong to
-      it by construction — biopb/biopb#55).
-    - ``path_filter`` (the stability gate) receives the already-resolved path string.
-
-    The prune set is maintained as a stack, exploiting the parent-first ordering: a
-    prefix is pushed when its subtree must be skipped and popped as soon as an entry
-    falls outside it, so the per-entry prune check stays O(1) amortized rather than
-    O(entries × prefixes).
-    """
-    if state is None:
-        state = DiscoveryState()
-
-    # Group the snapshot into each directory's recorded children once (O(n) by
-    # parent path) so a directory's ClaimContext can serve its claim globs from
-    # memory instead of re-reading the directory — the largest remaining per-cycle
-    # cost in the claim phase, and on cloud storage a per-glob round-trip
-    # (biopb/biopb#65). The state walk emits entries parent-first, so a directory
-    # is processed before its children stream in; build the full map up front.
-    entries = list(entries)
-    children_by_dir: Dict[str, List[str]] = {}
-    for path_str, _is_dir, _signature in entries:
-        children_by_dir.setdefault(os.path.dirname(path_str), []).append(path_str)
-
-    skipped = skipped_dirs or set()
-    cloud_by_path = cloud_by_path or {}
-    prune_stack: List[str] = []
-
-    def _under(path_str: str, prefix: str) -> bool:
-        return path_str == prefix or path_str.startswith(prefix + os.sep)
-
-    for path_str, is_dir, signature in entries:
-        # Drop prune prefixes we have walked out of (DFS contiguity), then skip
-        # anything still beneath an active one (a claimed source or a skipped subtree).
-        while prune_stack and not _under(path_str, prune_stack[-1]):
-            prune_stack.pop()
-        if prune_stack:
-            continue
-
-        # A stable skipped subtree: prune the root and everything beneath it.
-        if path_str in skipped:
-            prune_stack.append(path_str)
-            continue
-
-        # Consumed as a member of an already-recorded multi-file claim (companion
-        # OME, tiff/dicom series siblings) — same skip the walk applies.
-        if state.is_path_claimed(path_str):
-            continue
-
-        # Stability gate. A directory that is not yet eligible is not descended —
-        # exactly as the walk's path_filter short-circuits its recursion.
-        if path_filter is not None and not path_filter(path_str):
-            if is_dir:
-                prune_stack.append(path_str)
-            continue
-
-        ctx = ClaimContext(
-            Path(path_str),
-            is_dir=is_dir,
-            signature=signature,
-            cloud_root=cloud_by_path.get(path_str, False),
-            # Only directories glob (every claim glob is maxdepth-1 over a dir's
-            # children); files carry no listing.
-            child_listing=children_by_dir.get(path_str) if is_dir else None,
-        )
-        claim = _record_claim(state, registry.get_claims_for_path(ctx, state))
-        if claim is not None and is_dir:
-            prune_stack.append(path_str)
-
-    logger.debug("discover_sources_from_entries: found %d sources", len(state.claims))
     return state
 
 

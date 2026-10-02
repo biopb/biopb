@@ -141,16 +141,23 @@ time.
   residency, not page-cache warmth. Both still expose a manual warm trigger
   (napari's "Hydrate all files…", the SPA's `WarmTray`). Flip the flags back
   once `warm` has a retention policy.
-- **Cloud subtrees are walked only on a `force_full` rescan.**
-  `TreeScanner._scan_tree_state` skips a cloud subtree on an incremental
-  rescan (carrying cached claims forward) and re-walks it only on the
-  periodic `force_full` pass. When walked, the stability window is bypassed —
+- **Cloud roots are walked only on a `force_full` rescan.**
+  `SourceManager._rescan_monitored_dirs` does not walk a cloud root on an
+  incremental rescan (the reconcile leaves its sources registered) and walks it
+  only on the periodic `force_full` pass. When walked, the stability window is bypassed —
   a placeholder's mtime is untrustworthy, so it could never age into
   eligibility, and archived dehydrated data is never mid-write anyway.
 - **`cloud` controls gating only, not monitoring.** A `monitor=false` cloud
-  root is still scanned once at startup via the static-expand path, which
-  threads the same `admit_nonresident` + `cloud_root` behavior from
-  `source.cloud`.
+  root is still scanned once, by the first rescan tick, through the same
+  walker, which threads `admit_nonresident` + `cloud_root` from `source.cloud`.
+- **A drop can be a cloud root.** `add_source` takes a `cloud` flag (the
+  client sets it with the user's consent); a path already under a configured
+  cloud root is treated as cloud without it. A consented root is added to the
+  server's cloud-root set for the life of the process, because the stability
+  gate, deferred registration, residency check and reconcile scoping all ask
+  "is this path under a cloud root" later. Without the flag the walk skips
+  placeholders and the result's `skipped_offline` count says the import is
+  incomplete, so a client can offer to resend with `cloud` set.
 - **Shape-presence doesn't protect pre-cache.** An unresolved source
   auto-skips (empty shape), but once resolved-and-persisted it returns with a
   concrete shape, so a naive backlog would re-warm it on restart. Residency

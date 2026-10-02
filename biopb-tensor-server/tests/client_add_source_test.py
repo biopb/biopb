@@ -182,3 +182,37 @@ class TestAddSource:
         out = client.register_local_path("/drop", should_cancel=_flip_after(1))
 
         assert list(out.added) == [] and list(out.already_present) == []
+
+
+class TestCloudFlag:
+    """``cloud`` rides on the request; ``skipped_offline`` rides on the result."""
+
+    def test_the_flag_is_sent_and_the_count_is_returned(self):
+        from biopb.tensor.descriptor_pb2 import AddSourceRequest
+
+        body = AddSourceStreamMessage(
+            result=AddSourceResult(skipped_offline=3)
+        ).SerializeToString()
+        client = _bare_client()
+        fake = _FakeFlight(results=[_FakeResult(body)])
+        client._state.client = fake
+
+        result = client.register_local_path("/data/synced", cloud=True)
+
+        sent = AddSourceRequest()
+        sent.ParseFromString(fake.action.body.to_pybytes())
+        assert sent.url == "/data/synced" and sent.cloud is True
+        assert result.skipped_offline == 3
+
+    def test_cloud_defaults_to_off(self):
+        from biopb.tensor.descriptor_pb2 import AddSourceRequest
+
+        client = _bare_client()
+        fake = _FakeFlight(results=[_FakeResult(_result_body())])
+        client._state.client = fake
+
+        client.register_local_path("/data/x")
+
+        sent = AddSourceRequest()
+        sent.ParseFromString(fake.action.body.to_pybytes())
+        assert sent.cloud is False

@@ -13,20 +13,18 @@ add/refresh/remove/register primitives:
     :meth:`_refresh_claim` (driven by ``SourceManager.add_local_source``);
   * a tensor-server upstream re-list -> :meth:`_reconcile_one_upstream`.
 
-``SourceManager`` owns the *rescan machinery* (event loop, the filesystem walk
-via ``TreeScanner``, the stability gate, the cloud partition, the startup
-protocol) and delegates every catalog mutation here. The seam is deliberately
-narrow:
+``SourceManager`` owns the *rescan machinery* (event loop, the filesystem walk,
+the stability gate, the startup protocol) and delegates every catalog mutation
+here. The seam is deliberately narrow:
 
   * SourceManager -> Reconciler: the reconcile/commit calls above, plus four
     claim-snapshot accessors (:meth:`claim_items` / :meth:`claim_ids` /
     :meth:`has_claim` / :meth:`local_claim_paths`) for its cleanup and precache
     reads.
-  * Reconciler -> SourceManager: two injected callables -- ``entry_for`` (the
-    cached filesystem-signature lookup, owned by the scan caches) and
+  * Reconciler -> SourceManager: one injected callable,
     ``notify_source_committed`` (the precache routing gate, owned by the startup
-    state) -- plus the shared, in-place-mutated ``monitored_dirs`` set and the
-    immutable ``cloud_roots`` set.
+    state), plus the shared, in-place-mutated ``monitored_dirs`` and
+    ``cloud_roots`` sets.
 
 The coarse single-writer mutex (a runtime add vs the periodic rescan) stays in
 ``SourceManager`` (``_catalog_lock``); the fine-grained state RLock (``_lock``,
@@ -57,8 +55,7 @@ from biopb_tensor_server.core.errors import UpstreamConfigError
 from biopb_tensor_server.core.normalize import normalize_adapter
 from biopb_tensor_server.core.remote import is_remote_url
 from biopb_tensor_server.core.source_registry import close_adapter
-from biopb_tensor_server.sources.tree_scanner import (
-    EntryState,
+from biopb_tensor_server.sources.entry_stat import (
     build_entry_signature,
     entry_change_time,
     entry_is_quiet,
@@ -87,8 +84,14 @@ def is_under_cloud_root(cloud_roots: Set[Path], path: str) -> bool:
         resolved = Path(path).resolve()
     except OSError:
         return False
-    return any(resolved == root or root in resolved.parents for root in cloud_roots)
+    # A snapshot: a drop can add a root while another thread is asking.
+    return any(
+        resolved == root or root in resolved.parents for root in tuple(cloud_roots)
+    )
 
+
+# Consecutive rescans a monitored source may go undiscovered before it is removed.
+_MISSES_BEFORE_REMOVAL = 2
 
 # Remote/cloud source families are EXPERIMENTAL. Warn once per family per process
 # (registration runs per source) so an operator sees the maturity caveat without
@@ -146,7 +149,6 @@ class Reconciler:
         credentials_config: Optional[Any],
         monitored_dirs: Set[Path],
         cloud_roots: Set[Path],
-        entry_for: Callable[[str], Optional[EntryState]],
         notify_source_committed: Callable[[str], None],
         stability_window: float = 30.0,
     ):
@@ -159,8 +161,7 @@ class Reconciler:
         # read-only here for the monitored-claim scoping.
         self._monitored_dirs = monitored_dirs
         self._cloud_roots = cloud_roots
-        # Injected SourceManager seams (see module docstring).
-        self._entry_for = entry_for
+        # Injected SourceManager seam (see module docstring).
         self._notify_source_committed = notify_source_committed
         # Quiet period a claim must have had before this reconcile will remove or
         # rebuild it -- the same window, and the same predicate, the claim gate
@@ -182,6 +183,11 @@ class Reconciler:
         # time (O(1) per source). Lets the incremental reconcile preserve cloud
         # sources by a hash-set check instead of resolving every cloud member path.
         self._cloud_source_ids: Set[str] = set()
+        # source_id -> consecutive rescans that did not find it. A source that was
+        # claimed can briefly stop being claimable with its files still in place (a
+        # sidecar rewritten in place, a locked header); removing it on the first
+        # miss would unregister a working source and rebuild it a tick later.
+        self._missed_scans: Dict[str, int] = {}
 
         # Initialize path tracking from existing claims.
         for source_id, claim in self._state.claims.items():
@@ -259,11 +265,19 @@ class Reconciler:
             if existing_signatures != new_signatures:
                 changed_ids.add(source_id)
 
-        removed_ids = [
-            source_id
-            for source_id in sorted(current_ids - discovered_ids)
-            if self._claim_is_quiet(current_claims[source_id])
-        ]
+        # Removal: not rediscovered on _MISSES_BEFORE_REMOVAL consecutive scans, and
+        # quiet. A claim found again, or no longer a candidate, forfeits its count.
+        absent_ids = current_ids - discovered_ids
+        for source_id in [sid for sid in self._missed_scans if sid not in absent_ids]:
+            del self._missed_scans[source_id]
+        removed_ids = []
+        for source_id in sorted(absent_ids):
+            misses = self._missed_scans.get(source_id, 0) + 1
+            self._missed_scans[source_id] = misses
+            if misses >= _MISSES_BEFORE_REMOVAL and self._claim_is_quiet(
+                current_claims[source_id]
+            ):
+                removed_ids.append(source_id)
         added_claims = [
             discovered_claims[source_id]
             for source_id in sorted(discovered_ids - current_ids)
@@ -312,68 +326,41 @@ class Reconciler:
         are one question asked from two sides, and answering it in two places is
         what let them drift apart (biopb/biopb#1042).
 
-        Asks the claim's own member paths rather than scanning the walk
-        snapshot for unstable paths. Three reasons:
-
-        * it is the question actually being asked -- is *this source* churning
-          -- instead of "does it overlap anything that is";
-        * it is O(members), not O(catalog) with a ``Path.resolve()`` per member
-          per unstable path;
-        * it needs no snapshot, so a member the walk skipped this pass (a
-          pruned subtree, or a claim just added) still gets a real answer
-          instead of "not in the snapshot, so not unstable".
-
-        Prefers ``_entry_for``'s cached signature over a live stat, same as
-        ``_build_claim_signatures`` -- the walk that ran this pass already paid
-        for it, and for a cloud member skipping the cache means a network
-        round-trip. A member that cannot be stat'd on a cache miss is not
-        churning: it is gone, which is the case removal exists to act on.
+        Asks the claim's own member paths, so it is O(members) and needs no walk.
+        A member that cannot be stat'd is not churning: it is gone, which is the
+        case removal exists to act on. A cloud source bypasses the window, as the
+        claim gate does -- a placeholder's mtime is not evidence of a write.
         """
+        if claim.source_id in self._cloud_source_ids or self._is_under_cloud_root(
+            claim.primary_path
+        ):
+            return True
         now = time.time()
         for member_path in {claim.primary_path, *claim.member_paths}:
             if is_remote_url(member_path):
                 continue
-            entry = self._entry_for(member_path)
-            if entry is not None:
-                last_changed = entry.last_changed
-            else:
-                try:
-                    stat_result = os.stat(member_path)
-                except OSError:
-                    continue
-                last_changed = entry_change_time(stat_result, now)
-            if not entry_is_quiet(last_changed, now, self._stability_window):
+            try:
+                stat_result = os.stat(member_path)
+            except OSError:
+                continue
+            if not entry_is_quiet(
+                entry_change_time(stat_result, now), now, self._stability_window
+            ):
                 return False
         return True
 
-    def _build_claim_signatures(
-        self,
-        claim: SourceClaim,
-        use_cache: bool = True,
-    ) -> Dict[str, Tuple[Any, ...]]:
-        """Collect member-path signatures for a claim.
+    def _build_claim_signatures(self, claim: SourceClaim) -> Dict[str, Tuple[Any, ...]]:
+        """Stat every member of a claim into a signature map.
 
-        ``use_cache=False`` stats every member instead of reading the scan
-        cache. The cache is the right source on the periodic path -- the walk
-        that just populated it is where the signatures came from -- and the
-        wrong one for a refresh fired between passes, which would compare
-        against the previous pass's entry and see nothing.
+        Compared between scans to detect an in-place change. Cloud-root
+        membership is a property of the *source* -- every member lives under
+        ``claim.primary_path`` -- so it is resolved once and the whole source gets
+        one cloud-invariance policy (identity only, so hydration and eviction do
+        not flap a resolved source).
         """
         signatures: Dict[str, Tuple[Any, ...]] = {}
-        # Cloud-root membership is a property of the *source*, not the individual
-        # member: every member lives under ``claim.primary_path``, so they share
-        # one cloud status. Resolve it once -- both to skip a redundant
-        # ``Path.resolve()`` + roots scan per member, and so the whole source's
-        # signatures use one uniform cloud-invariance policy (matching the cached
-        # branch, whose signatures ``TreeScanner._scan_tree_state`` built with a per-tree
-        # ``cloud`` flag).
         cloud = self._is_under_cloud_root(claim.primary_path)
         for member_path in sorted(claim.member_paths):
-            entry = self._entry_for(member_path) if use_cache else None
-            if entry is not None:
-                signatures[member_path] = entry.signature
-                continue
-
             try:
                 # `stat` follows symlinks, so it lands where an explicit
                 # `resolve()` would -- and the mode it returns answers is_dir
@@ -381,10 +368,6 @@ class Reconciler:
                 stat_result = Path(member_path).stat()
             except OSError:
                 continue
-
-            # The cached-entry path above already carries the cloud-invariant
-            # signature. This re-stat fallback has no cloud context, so reuse the
-            # per-claim flag so hydration/eviction does not flap a resolved source.
             signatures[member_path] = build_entry_signature(
                 stat_result,
                 stat.S_ISDIR(stat_result.st_mode),
@@ -507,9 +490,7 @@ class Reconciler:
             self._cloud_source_ids.add(claim.source_id)
         self._clear_failed_source_attempt(claim.source_id)
 
-    def _refresh_claim(
-        self, claim: SourceClaim, fresh_signatures: bool = False
-    ) -> bool:
+    def _refresh_claim(self, claim: SourceClaim) -> bool:
         """Re-register an already-confirmed source against its bytes as they are now.
 
         A source's descriptor and its ``content_version`` are both sampled in the
@@ -521,10 +502,6 @@ class Reconciler:
         Registration goes through ``replace=True``, which swaps the new adapter
         in over the old one and closes the old one only afterwards; see
         :meth:`_register_source_claim`.
-
-        ``fresh_signatures`` re-stats the members rather than reading the scan
-        cache -- what a refresh fired outside the periodic pass needs, since the
-        cache still holds what the last pass saw.
         """
         with self._lock:
             previous = self._state.claims.get(claim.source_id)
@@ -555,9 +532,9 @@ class Reconciler:
                 self._commit_remove_source(claim.source_id)
             return False
 
-        # Outside the lock: with fresh_signatures this stats every member, and
-        # the lock it would otherwise hold also serializes the rescan's reconcile.
-        signatures = self._build_claim_signatures(claim, use_cache=not fresh_signatures)
+        # Outside the lock: this stats every member, and the lock it would
+        # otherwise hold also serializes the rescan's reconcile.
+        signatures = self._build_claim_signatures(claim)
 
         with self._lock:
             # Membership moves under a source (a file added to a sequence dir),
@@ -601,6 +578,7 @@ class Reconciler:
             self._state.remove_claim(claim.primary_path, notify=False)
             self._source_signatures.pop(source_id, None)
             self._cloud_source_ids.discard(source_id)
+            self._missed_scans.pop(source_id, None)
             self._clear_failed_source_attempt(source_id)
         return True
 

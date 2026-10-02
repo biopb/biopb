@@ -1138,6 +1138,7 @@ class CatalogClient:
         url: str,
         *,
         source_type: str = "",
+        cloud: bool = False,
         on_progress: Optional[Callable[["AddSourceProgress"], None]] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
     ) -> "AddSourceResult":
@@ -1146,6 +1147,7 @@ class CatalogClient:
         req = AddSourceRequest(
             url=url,
             source_type=source_type,
+            cloud=cloud,
         )
         action = flight.Action("add_source", req.SerializeToString())
         unknown = (

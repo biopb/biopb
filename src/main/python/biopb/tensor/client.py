@@ -542,6 +542,7 @@ class TensorFlightClient:
         url: str,
         *,
         source_type: str = "",
+        cloud: bool = False,
         on_progress: Optional[Callable[[AddSourceProgress], None]] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
     ) -> AddSourceResult:
@@ -563,6 +564,12 @@ class TensorFlightClient:
             url: Absolute path (or directory) on the server's filesystem.
             source_type: Explicit adapter type (e.g. ``"zarr"``, ``"ome-zarr"``);
                 empty means auto-detect via the adapters' claim protocol.
+            cloud: Treat the path as a cloud / synced folder (OneDrive, Dropbox,
+                iCloud "Files On Demand"): offline placeholders are registered as
+                sources whose content is read on first access instead of being
+                skipped. Set it only with the user's consent -- a wrong guess
+                turns off multi-file grouping. A path already under a configured
+                ``cloud`` root is treated as cloud regardless.
             on_progress: Optional callback invoked with an ``AddSourceProgress``
                 (count + current path) per source as it registers. Called on the
                 calling thread; keep it cheap.
@@ -587,6 +594,10 @@ class TensorFlightClient:
             sources under the path whose files are gone are deregistered and
             listed in ``removed``.
 
+            ``skipped_offline`` counts offline placeholder files the walk passed
+            over because ``cloud`` was not set; when it is non-zero the import
+            is incomplete, and a second call with ``cloud=True`` includes them.
+
         Raises:
             flight.FlightServerError: whole-request failure (path not found /
                 unreadable on the server, or the server declines the request).
@@ -596,6 +607,7 @@ class TensorFlightClient:
         return self._catalog.register_local_path(
             url,
             source_type=source_type,
+            cloud=cloud,
             on_progress=on_progress,
             should_cancel=should_cancel,
         )
@@ -605,6 +617,7 @@ class TensorFlightClient:
         url: str,
         *,
         source_type: str = "",
+        cloud: bool = False,
         on_progress: Optional[Callable[[AddSourceProgress], None]] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
     ) -> AddSourceResult:
@@ -625,6 +638,7 @@ class TensorFlightClient:
         return self.register_local_path(
             url,
             source_type=source_type,
+            cloud=cloud,
             on_progress=on_progress,
             should_cancel=should_cancel,
         )

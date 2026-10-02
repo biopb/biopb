@@ -434,22 +434,25 @@ def _is_bare_host_upstream(source: SourceConfig) -> bool:
 def _resolve_serve_sources(
     server_config: ServerConfig,
     registry: Optional[AdapterRegistry] = None,
-) -> Tuple[List[SourceConfig], List[SourceConfig]]:
+) -> Tuple[List[SourceConfig], List[SourceConfig], List[SourceConfig]]:
     """Partition configured sources for the serve path.
 
-    Returns ``(static_sources, monitored_sources)``.
+    Returns ``(static_sources, monitored_sources, scan_once_sources)``.
 
-    Local ``monitor = true`` directories are NOT expanded here: they are
-    (re)discovered by the bootstrap rescan, so expanding them at startup only
-    walks the tree an extra time before the server binds and crashes on a
-    not-yet-mounted directory (biopb/biopb#54). Remote monitor entries and
-    non-monitored entries are expanded as before; a single-file ``monitor=true``
-    entry is registered statically (with a warning) instead of being silently
-    dropped, and a missing/broken static source is warned-and-skipped rather
-    than aborting startup.
+    A static source is one with nothing to discover -- a typed entry, a file, a
+    single remote source -- so resolving it walks nothing. Every local directory
+    is discovered by the manager's first rescan tick instead, after the server is
+    SERVING: watched thereafter if ``monitor = true``, scanned once if not.
+    Expanding a directory here would walk the tree an extra time before the
+    server binds, and crash on a not-yet-mounted directory (biopb/biopb#54).
+    Remote monitor entries and the rest are expanded as before; a single-file
+    ``monitor=true`` entry is registered statically (with a warning) instead of
+    being silently dropped, and a missing/broken static source is
+    warned-and-skipped rather than aborting startup.
     """
     to_expand: List[SourceConfig] = []  # entries run through discover_sources
     monitored_sources: List[SourceConfig] = []
+    scan_once_sources: List[SourceConfig] = []
 
     for s in server_config.sources:
         # The ``monitor`` flag alone decides live monitoring -- identically for
@@ -504,6 +507,16 @@ def _resolve_serve_sources(
             monitored_sources.append(s)  # directory (or not-yet-mounted dir)
             continue
 
+        # A local directory that is not watched is still discovered by the manager,
+        # once. Typed entries (a zarr directory given as such) have nothing to
+        # discover and stay static; a missing path stays on the expansion path so
+        # it is warned about and skipped there.
+        if not s.is_remote and not s.type:
+            local_path = s.local_path
+            if local_path is not None and local_path.is_dir():
+                scan_once_sources.append(s)
+                continue
+
         # A bare-host tensor-server upstream ("mirror everything") is ALWAYS routed
         # to the background seeded re-list, regardless of `monitor`. Inline
         # expansion registers every mirrored source through a blocking per-source
@@ -526,7 +539,7 @@ def _resolve_serve_sources(
             monitored_sources.append(s)
         to_expand.append(s)
 
-    # Expand only the non-monitored-dir entries. tolerant=True so one missing or
+    # Expand only the entries with nothing to walk. tolerant=True so one missing or
     # broken static source is warned-and-skipped rather than killing the server.
     sources = resolve_all_sources(
         server_config, registry, sources=to_expand, tolerant=True
@@ -547,7 +560,7 @@ def _resolve_serve_sources(
             and not any(s.local_path.is_relative_to(md) for md in monitored_dirs)
         )
     ]
-    return static_sources, monitored_sources
+    return static_sources, monitored_sources, scan_once_sources
 
 
 def _grpc_location(host: str, port: int) -> str:
@@ -916,9 +929,11 @@ def _setup_flight_server(
 
     # Resolve and separate sources (see _resolve_serve_sources)
     registry = get_default_registry()
-    static_sources, monitored_sources = _resolve_serve_sources(server_config, registry)
+    static_sources, monitored_sources, scan_once_sources = _resolve_serve_sources(
+        server_config, registry
+    )
 
-    if not static_sources and not monitored_sources:
+    if not static_sources and not monitored_sources and not scan_once_sources:
         # An empty catalog is a valid state -- start and serve it (health SERVING,
         # empty list_flights) rather than exiting. Sources can arrive after
         # startup: runtime add_source (napari drag-drop), DoPut uploads, or a
@@ -936,6 +951,10 @@ def _setup_flight_server(
     if monitored_sources:
         console.print(
             f"[green]Monitoring {len(monitored_sources)} directory(s) for live updates[/green]"
+        )
+    if scan_once_sources:
+        console.print(
+            f"[green]Scanning {len(scan_once_sources)} unwatched directory(s) once, in the background[/green]"
         )
 
     # The metadata database is mandatory (biopb/biopb#225): always constructed --
@@ -993,11 +1012,15 @@ def _setup_flight_server(
     }
     # An uploaded store is registered by the upload path; a write_dir that
     # discovery also walks gets it claimed a second time under another id.
-    discovered_dirs = monitored_dirs | {
-        s.local_path
-        for s in static_sources
-        if not s.is_remote and s.local_path and s.local_path.is_dir()
-    }
+    discovered_dirs = (
+        monitored_dirs
+        | {s.local_path for s in scan_once_sources if s.local_path}
+        | {
+            s.local_path
+            for s in static_sources
+            if not s.is_remote and s.local_path and s.local_path.is_dir()
+        }
+    )
     inside = write_dir_under_root(write_dir, discovered_dirs)
     if inside is not None:
         console.print(
@@ -1015,11 +1038,11 @@ def _setup_flight_server(
         registry=registry,
         monitored_sources=monitored_sources,
         static_sources=static_sources,
+        scan_once_sources=scan_once_sources,
         metadata_db=metadata_db,
         credentials_config=server_config.credentials,
         stability_window=server_config.stability_window,
         full_rescan_interval=server_config.full_rescan_interval,
-        aggressive_dir_pruning=server_config.aggressive_dir_pruning,
         prune_unseen_days=server_config.annotations.prune_unseen_days,
         rescan_interval=rescan_interval,
     )
@@ -1067,14 +1090,14 @@ def _setup_flight_server(
     # background scan sets this itself on entry, but pre-setting here closes the
     # brief window between mark_ready() and the event loop picking up the first
     # rescan, so a client never sees "SERVING, not scanning, never scanned".
-    if monitored_dirs:
+    if monitored_dirs or scan_once_sources:
         server.set_full_scan_in_progress(True)
 
     background_scan_running = False
     try:
         source_manager.start()
         background_scan_running = source_manager.is_running()
-        if background_scan_running:
+        if background_scan_running and monitored_dirs:
             console.print(f"[green]Started monitoring: {list(monitored_dirs)}[/green]")
     except Exception as e:
         console.print(f"[red]Failed to start monitoring: {e}[/red]")

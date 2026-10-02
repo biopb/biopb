@@ -861,13 +861,18 @@ class ServerConfig:
     )
     rescan_interval: float = field(
         default=30.0,
-        metadata={"help": "Seconds between background rescans of monitored folders."},
+        metadata={
+            "help": "Seconds between background rescans of monitored folders. Each "
+            "rescan walks every monitored folder in full, so a very large folder "
+            "should not be monitored."
+        },
     )
     full_rescan_interval: float = field(
         default=3600.0,
         metadata={
-            "help": "Seconds between forced full rescans that bypass subtree "
-            "pruning (<= 0 disables this backstop)."
+            "help": "Seconds between full rescans, the only ones that walk a cloud "
+            "folder; every other rescan walks the non-cloud folders only "
+            "(<= 0 disables the full pass)."
         },
     )
     handle_reaper_ttl: float = field(
@@ -913,8 +918,9 @@ class ServerConfig:
     aggressive_dir_pruning: bool = field(
         default=False,
         metadata={
-            "help": "Also prune unchanged monitored roots (faster scans; may "
-            "defer root-level file updates to a later scan)."
+            "help": "Ignored. Rescans no longer prune unchanged folders (nothing is "
+            "kept between scans to prune against); accepted so existing configs "
+            "still load."
         },
     )
     claim_generic_images: bool = field(

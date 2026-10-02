@@ -514,6 +514,15 @@ message AddSourceRequest {
   // the tag is not reused.
   reserved 4;
   reserved "monitor";
+
+  // Treat `url` as a cloud / synced folder (OneDrive, Dropbox, iCloud "Files On
+  // Demand"): offline placeholders are admitted and registered as unresolved
+  // sources whose content is read on first access, instead of being skipped. Set
+  // only with the user's consent -- a dropped path cannot be assumed to be
+  // cloud-backed, and a wrong guess turns off multi-file grouping (OME-TIFF and
+  // DICOM series come in as single files). A path already under a configured
+  // `cloud` root is treated as cloud whatever this says.
+  bool cloud = 5;
 }
 
 // Progress heartbeat for an in-flight "add_source" action: one emitted per
@@ -568,6 +577,11 @@ message AddSourceResult {
   // source_ids deregistered because their files are gone from under the
   // dropped path.
   repeated string removed = 5;
+
+  // Offline placeholder files skipped because the request was not for a cloud
+  // folder. Non-zero means the import is incomplete: resend with `cloud` set to
+  // include them (their content is not read until first access).
+  int32 skipped_offline = 7;
 }
 
 // One message in the "add_source" action's result stream: zero or more
