@@ -905,7 +905,10 @@ class ServerConfig:
             "help": "Minimum quiet period before a path is eligible for discovery "
             "or removal (seconds). Raise it above the interval at which a slow "
             "acquisition touches its files, or a dataset can be claimed between "
-            "writes; it only ever delays, never drops."
+            "writes; it only ever delays, never drops. A directory touched within "
+            "the window is not entered, so a folder written to more often than "
+            "this is not catalogued until it goes quiet. 0 turns the gate off, "
+            "for removal and rebuild as well as discovery."
         },
     )
     claim_generic_images: bool = field(
