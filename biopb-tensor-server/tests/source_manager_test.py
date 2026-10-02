@@ -1609,6 +1609,18 @@ class TestProgressiveDiscoveryFreshness:
         manager.complete_initial_scan()
         assert fired == [True]
 
+    def test_initial_scan_completion_is_logged_once(self, tmp_path, caplog):
+        # A log-only reader has no other way to tell the first scan is done.
+        server, manager = self._manager_with_source(tmp_path)
+        with caplog.at_level("INFO"):
+            manager.complete_initial_scan()
+            manager.complete_initial_scan()
+        lines = [
+            r.message for r in caplog.records if "Initial scan complete" in r.message
+        ]
+        assert len(lines) == 1
+        assert f"{len(server.sources)} sources" in lines[0]
+
 
 class TestProgressiveStreaming:
     """Option B: the first scan streams adds within the walk (progressive #212)."""
