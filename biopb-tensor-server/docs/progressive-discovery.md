@@ -62,8 +62,9 @@ it. No adapter `claim()` normalizes the path it returns.
 
 1. **A root is canonical, and becomes canonical once.** Config roots (`local_path`),
    drops and static seeds go through `resolve_local_path` (folds `file://`,
-   symlinks, `..`, case, trailing separators). The monitored scan resolves each
-   root again before walking it.
+   symlinks, `..`, case, trailing separators). The monitored scan calls `resolve()`
+   on each stored root again before walking it, which is a no-op unless the stored
+   path has since become a link (see §8).
 2. **A claim path is never resolved to key or look it up.** All of
    `DiscoveryState.claims` / `path_to_source` / `source_to_paths` /
    `consumed_paths`, `_path_to_source_id` and the signature maps use the claim
@@ -251,8 +252,13 @@ consumer that reads `SERVING` as "catalog complete" will flash an empty catalog;
   component, which makes the removal scan O(catalog) per directory drop (#960).
 - **`dnd://<basename>` is not unique.** Two drops with the same folder name share a
   `_dropped_cloud_roots` key and a `remove_source` prefix, so removing one removes both.
-- **A retargeted root.** Monitored roots are resolved at config time and again at scan time;
-  a root whose own symlink is retargeted at runtime would be compared against the old target.
+- **Root drift.** `_monitored_dirs`, `_monitored_aliases` and `_cloud_roots` hold roots
+  resolved at config time, and the scan resolves each root again. If the stored path later
+  becomes a link (a migration that moves it and leaves a link), the walk spells claims under
+  the new target while the roots still name the old path, so those claims are never
+  diffed, refreshed or removed and are re-added every pass. Walking the stored root as-is
+  removes the mismatch. A configured symlink that is retargeted is not followed until restart,
+  since only its first target was stored.
 - **Per-root reconcile.** The removal diff covers all monitored roots at once, so
   steady-state staleness is bounded by the slowest root, not surfaced root by root.
 - **The catalog is not persisted.** A persisted catalog would let startup serve at once and
