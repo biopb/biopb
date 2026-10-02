@@ -12,6 +12,7 @@ import threading
 import time
 
 import numpy as np
+import pyarrow as pa
 import pytest
 from google.protobuf.field_mask_pb2 import FieldMask
 
@@ -2444,10 +2445,12 @@ def test_list_upstream_versions_is_one_narrow_query():
     class _FakeClient:
         def query(self, sql, format="records"):  # noqa: A002 - fakes the real client's public `format` signature
             seen.append(sql)
-            return [
-                {"source_id": "a", "indexed_at": 7, "metadata_size": 300},
-                {"source_id": "b"},
-            ]
+            return pa.Table.from_pylist(
+                [
+                    {"source_id": "a", "indexed_at": 7, "metadata_size": 300},
+                    {"source_id": "b"},
+                ]
+            )
 
     versions = list_upstream_versions(_FakeClient())
 
@@ -2471,6 +2474,82 @@ def test_list_upstream_versions_raises_rather_than_degrading():
         list_upstream_versions(_FakeClient())
 
 
+class TestAnUpstreamRowCap:
+    """An upstream caps one query's rows (``max_query_results``). The mirror
+    reconciles destructively against what it lists, so a result cut at the cap
+    must never read as the whole catalog."""
+
+    N = 8
+    CAP = 3
+
+    @staticmethod
+    def _upstream(n, cap):
+        from biopb_tensor_server import TensorFlightServer
+        from biopb_tensor_server.serving.metadata_db import MetadataDatabase
+
+        db = MetadataDatabase(max_query_results=cap)
+        upstream = TensorFlightServer("grpc://localhost:0", metadata_db=db)
+        for i in range(n):
+            sid = f"s{i}"
+            db.sync_source_added(sid, _CatalogRowAdapter(sid, tensors=_tensor_row(sid)))
+        _serve(upstream)
+        return upstream
+
+    def test_the_version_list_is_complete_past_the_cap(self):
+        from biopb.tensor import TensorFlightClient
+        from biopb_tensor_server.adapters.remote_tensor import list_upstream_versions
+
+        upstream = self._upstream(self.N, self.CAP)
+        try:
+            client = TensorFlightClient(f"grpc://localhost:{upstream.port}")
+            versions = list_upstream_versions(client)
+        finally:
+            upstream.shutdown()
+
+        assert sorted(versions) == [f"s{i}" for i in range(self.N)]
+
+    def test_the_id_list_is_complete_past_the_cap(self):
+        from biopb.tensor import TensorFlightClient
+        from biopb_tensor_server.adapters.remote_tensor import list_upstream_source_ids
+
+        upstream = self._upstream(self.N, self.CAP)
+        try:
+            client = TensorFlightClient(f"grpc://localhost:{upstream.port}")
+            ids = list_upstream_source_ids(client, "grpc://x")
+        finally:
+            upstream.shutdown()
+
+        assert ids == [f"s{i}" for i in range(self.N)]
+
+    def test_a_batch_wider_than_the_cap_comes_back_whole(self):
+        from biopb.tensor import TensorFlightClient
+        from biopb_tensor_server.adapters.remote_tensor import fetch_upstream_rows
+
+        upstream = self._upstream(self.N, self.CAP)
+        try:
+            client = TensorFlightClient(f"grpc://localhost:{upstream.port}")
+            ids = [f"s{i}" for i in range(self.N)]
+            rows = [r for page in fetch_upstream_rows(client, ids, {}) for r in page]
+        finally:
+            upstream.shutdown()
+
+        assert [r["source_id"] for r in rows] == ids
+
+    def test_a_catalog_that_is_an_exact_multiple_of_the_page_ends(self, monkeypatch):
+        from biopb.tensor import TensorFlightClient
+        from biopb_tensor_server.adapters import remote_tensor
+
+        monkeypatch.setattr(remote_tensor, "CATALOG_PAGE_ROWS", 4)
+        upstream = self._upstream(8, 100)
+        try:
+            client = TensorFlightClient(f"grpc://localhost:{upstream.port}")
+            versions = remote_tensor.list_upstream_versions(client)
+        finally:
+            upstream.shutdown()
+
+        assert len(versions) == 8
+
+
 class TestFetchUpstreamRows:
     class _Client:
         def __init__(self):
@@ -2478,7 +2557,7 @@ class TestFetchUpstreamRows:
 
         def query(self, sql, format="records"):  # noqa: A002 - fakes the real client's public `format` signature
             self.sqls.append(sql)
-            return [{"source_id": "x"}]
+            return pa.Table.from_pylist([{"source_id": "x"}])
 
     def test_ids_are_quoted(self):
         from biopb_tensor_server.adapters.remote_tensor import fetch_upstream_rows
@@ -2544,8 +2623,10 @@ class TestAnUpstreamScratchIsNotMirrored:
 
         def query(self, sql, format="records"):  # noqa: A002 - fakes the real client's public `format` signature
             if "source_url" in sql:
-                return [dict(r) for r in self._rows]
-            return [{"source_id": r["source_id"]} for r in self._rows]
+                return pa.Table.from_pylist([dict(r) for r in self._rows])
+            return pa.Table.from_pylist(
+                [{"source_id": r["source_id"]} for r in self._rows]
+            )
 
     def test_the_version_list_leaves_it_out(self):
         from biopb_tensor_server.adapters.remote_tensor import list_upstream_versions

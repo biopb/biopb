@@ -246,6 +246,50 @@ def mirrorable_upstream_id(source_id: str) -> bool:
     return source_id != SCRATCH_SOURCE_ID
 
 
+#: Rows asked for per catalog page. An upstream caps one query's rows
+#: (``max_query_results``); a page the cap cuts short is detected from the
+#: server's ``truncated`` flag and the next page resumes after its last row.
+CATALOG_PAGE_ROWS = 20000
+
+
+def _query_catalog_pages(
+    client,
+    select: str,
+    *,
+    where: Optional[str] = None,
+    page_rows: Optional[int] = None,
+) -> Iterator[List[dict]]:
+    """Rows of ``select ... FROM sources`` a page at a time, in ``source_id`` order.
+
+    The upstream's query cap truncates a long result silently, and a caller that
+    reconciles against the result would then treat the sources past the cut as
+    gone. So the read is keyset-paged instead: each page is ``LIMIT page_rows``
+    after the last ``source_id`` seen, and the loop ends on a page that is short
+    *and* not flagged ``truncated`` (a cap below ``page_rows`` flags it, and the
+    next page resumes after the rows that did arrive). ``select`` must include
+    ``source_id``.
+    """
+    page_rows = page_rows or CATALOG_PAGE_ROWS
+    last = None
+    while True:
+        conds = [where] if where else []
+        if last is not None:
+            conds.append(f"source_id > {sql_literal(last)}")
+        sql = (
+            f"{select} FROM sources"
+            + (f" WHERE {' AND '.join(conds)}" if conds else "")
+            + f" ORDER BY source_id LIMIT {page_rows}"
+        )
+        table = client.query(sql, format="arrow")
+        rows = table.to_pylist()
+        if rows:
+            yield rows
+        flagged = (table.schema.metadata or {}).get(b"truncated") == b"True"
+        if len(rows) < page_rows and not flagged:
+            return
+        last = rows[-1]["source_id"]
+
+
 def list_upstream_source_ids(client, location: str) -> List[str]:
     """Every source_id on an upstream tensor server that we mirror.
 
@@ -256,17 +300,18 @@ def list_upstream_source_ids(client, location: str) -> List[str]:
     private state to recover a value that was in scope (biopb/biopb#529).
 
     Queries the ids alone (``query`` on one narrow column, the
-    canonical browse surface, biopb/biopb#225) -- an untruncated read, so the
-    result is always complete and a caller (e.g. the monitor re-list) may
-    reconcile destructively against it.
+    canonical browse surface, biopb/biopb#225), paged past the upstream's row cap,
+    so the result is complete and a caller may reconcile destructively against it.
 
     An upstream with no readable catalog raises rather than degrading: the only
     fallback there ever was is ``list_sources()``, which in protocol v2 runs
     this same query and so fails identically.
     """
-    rows = client.query("SELECT source_id FROM sources", format="records")
     return [
-        row["source_id"] for row in rows if mirrorable_upstream_id(row["source_id"])
+        row["source_id"]
+        for rows in _query_catalog_pages(client, "SELECT source_id")
+        for row in rows
+        if mirrorable_upstream_id(row["source_id"])
     ]
 
 
@@ -297,9 +342,9 @@ def list_upstream_versions(client) -> Dict[str, UpstreamVersion]:
     the source is re-registered (including unresolved -> resolved). Every write to
     a catalog row is ``sync_source_added``, an upsert that re-stamps it -- an upload,
     a detach or a reaped upload changes ``tensors`` only by re-syncing the parent --
-    so a changed row always carries a new ``indexed_at``. Complete -- the
-    server-side DuckDB catalog is not truncated like ``list_sources()`` -- so a
-    caller may reconcile destructively against it.
+    so a changed row always carries a new ``indexed_at``. Paged past the
+    upstream's row cap, so the result is complete and a caller may reconcile
+    destructively against it.
 
     Raises when the query fails. There is no degraded mode: every server owns a
     catalog (protocol v2), so a failure is an upstream that is down, slow or
@@ -307,14 +352,13 @@ def list_upstream_versions(client) -> Dict[str, UpstreamVersion]:
     would only multiply the load on exactly that upstream. The caller keeps the
     catalog it has and retries on the next tick.
     """
-    rows = client.query(
-        "SELECT source_id, indexed_at, length(metadata_json) AS metadata_size "
-        "FROM sources",
-        format="records",
-    )
     return {
         r["source_id"]: UpstreamVersion(
             r.get("indexed_at"), r.get("metadata_size") or 0
+        )
+        for rows in _query_catalog_pages(
+            client,
+            "SELECT source_id, indexed_at, length(metadata_json) AS metadata_size",
         )
         for r in rows
         if mirrorable_upstream_id(r["source_id"])
@@ -363,15 +407,17 @@ def fetch_upstream_rows(
     large catalog holds a few MB however large the catalog or one row. A
     generator: a source that disappeared since the ids were listed is simply
     absent from its batch, and a failed query raises after the earlier batches
-    were consumed.
+    were consumed. A batch an upstream's row cap cuts short comes back as more
+    than one list.
     """
     for batch in _fetch_batches(source_ids, sizes):
         ids = ", ".join(sql_literal(sid) for sid in batch)
-        yield client.query(
+        yield from _query_catalog_pages(
+            client,
             "SELECT source_id, source_url, source_type, metadata_json, "
-            "is_resolved, tensors, indexed_at FROM sources "
-            f"WHERE source_id IN ({ids})",
-            format="records",
+            "is_resolved, tensors, indexed_at",
+            where=f"source_id IN ({ids})",
+            page_rows=len(batch) + 1,  # a complete batch never fills it
         )
 
 

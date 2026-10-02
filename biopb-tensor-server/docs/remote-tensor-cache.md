@@ -163,10 +163,12 @@ whose tensors have a deadline set by that server's policy, not a catalog worth
 carrying.
 
 **A re-list reads two columns, then only what changed.** `list_upstream_versions`
-reads every upstream source's id, `indexed_at` and `metadata_json` length in one
-server-side `query`,
-which is not truncated (unlike `list_sources()`), so a re-list can safely remove
-sources that disappeared. Full rows (tensors, metadata, `is_resolved`) are then
+reads every upstream source's id, `indexed_at` and `metadata_json` length with
+server-side `query` calls. An upstream caps one query's rows
+(`max_query_results`) and flags the cut only in the result's metadata, so the read
+is keyset-paged (`ORDER BY source_id LIMIT n`, resuming after the last id, and
+continuing past any page the server flags `truncated`); the result is complete,
+so a re-list can safely remove sources that disappeared. Full rows (tensors, metadata, `is_resolved`) are then
 fetched by `fetch_upstream_rows`, in batches cut by that length (`FETCH_BYTES`;
 `metadata_json` is wildly uneven, so a count would not bound memory), for sources
 that are new or whose `indexed_at` differs from the mirrored adapter's
