@@ -362,7 +362,8 @@ class TestDropRules:
     """Where a drop lands decides what it may do.
 
     Inside a known root (monitored, ``monitor = false``, or an earlier drop's root)
-    it registers like a rescan of that root, with no new ``dnd://`` mark. Outside
+    it registers like a rescan of that root; a drop's root keeps its own ``dnd://``
+    mark and the configured roots get none. Outside
     every root it is a root of its own with a unique marked label, if it overlaps
     nothing. Before the first scan finishes it is refused.
     """
@@ -432,7 +433,7 @@ class TestDropRules:
 
         assert manager._cloud_roots == set()
 
-    def test_a_redrop_inside_a_drop_adds_no_new_mark(self, tmp_path):
+    def test_a_redrop_inside_a_drop_keeps_the_drops_mark(self, tmp_path):
         manager, server = _make_manager()
         root = self._folder(tmp_path, "proj")
         a, *_ = _drain(manager.add_local_source(str(root)))
@@ -441,12 +442,12 @@ class TestDropRules:
         added, already, failed = _drain(manager.add_local_source(str(root)))
 
         assert not failed and already == a and len(added) == 1
-        # The new source joins the drop's display tree; the scheme (the removal
-        # key) is not stamped on it, and the old source keeps its mark.
+        # The new source carries the drop's mark, so removing the drop takes it too.
         assert _url(server, a[0]) == "dnd://proj/a.zarr"
-        assert _url(server, added[0]) == "proj/b.zarr"
+        assert _url(server, added[0]) == "dnd://proj/b.zarr"
         removed, _ = manager.remove_dropped_root("dnd://proj")
-        assert removed == a and added[0] in server.sources
+        assert sorted(removed) == sorted(a + added)
+        assert added[0] not in server.sources
 
     def test_a_drop_in_a_monitored_root_takes_the_roots_alias(self, tmp_path):
         root = self._folder(tmp_path, "data", "a.zarr")

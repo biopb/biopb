@@ -92,8 +92,10 @@ def _drop_catalog_url(
                                                  "dnd://exp/sub/b.tif"
 
     The marker means "user-added from outside every configured root, so nothing
-    will re-add it": it is what ``remove_source`` authorizes on, and it is stamped
-    only on a drop that lands outside every known root and overlaps nothing.
+    will re-add it": it is what ``remove_source`` authorizes on. It is stamped on a
+    drop from outside every configured root that overlaps nothing, and on what a
+    re-drop inside such a drop adds; never under a monitored or ``monitor = false``
+    root.
 
     Display-only (never ``source_id``, nor the raw ``_source_url`` the filesystem
     uses); the client tree builders strip the scheme for display. The
@@ -1025,8 +1027,9 @@ class SourceManager:
         monitored directory, a configured ``monitor = false`` directory, or an
         earlier drop's root, the root itself included -- it registers and refreshes
         as a rescan of that root would, in that root's display tree (its alias if
-        it has one) and with **no new** ``dnd://`` mark; marks already on sources
-        stay. **Outside every known root** it becomes a root of its own, with
+        it has one). A monitored or ``monitor = false`` root gets no ``dnd://`` mark
+        (its rescan owns the sources); an earlier drop's root keeps its own, so a
+        source a re-drop adds is removed with the drop. **Outside every known root** it becomes a root of its own, with
         a unique ``dnd://`` label, but only if it overlaps nothing already
         registered; otherwise it is refused. Drops are refused until the first scan
         has finished, since both checks need the whole catalog.
@@ -1162,12 +1165,11 @@ class SourceManager:
     ) -> Optional[str]:
         """Display ``source_url`` for a source a drop adds.
 
-        Inside a known root it joins that root's display tree, with no new mark:
-        the monitored root's alias, the ``monitor = false`` root's alias, or an
-        earlier drop's label without its ``dnd://`` scheme (the clients strip the
-        scheme for display, so it sits beside the marked sources; the scheme is the
-        removal key, so only those stay removable). With no alias it is None, which
-        leaves the plain file url. Outside, the drop's own marked ``dnd://`` root.
+        Inside a known root it joins that root's display tree: the monitored root's
+        alias or the ``monitor = false`` root's alias (None without one, which
+        leaves the plain file url, and never marked: the rescan owns those), or an
+        earlier drop's own marked ``dnd://`` label, so the source is removed with
+        that drop. Outside, the new drop's own marked ``dnd://`` root.
         """
         if known is None:
             return _drop_catalog_url(url, claim.primary_path, label=label)
@@ -1178,7 +1180,7 @@ class SourceManager:
             earlier = next(
                 lab for lab, (r, _) in self._dropped_roots.items() if r == root
             )
-            return _reroot_catalog_url(earlier, str(root), claim.primary_path)
+            return _drop_catalog_url(str(root), claim.primary_path, label=earlier)
         alias = self._scan_once_roots.get(root)
         if alias:
             return _alias_catalog_url(alias, str(root), claim.primary_path)

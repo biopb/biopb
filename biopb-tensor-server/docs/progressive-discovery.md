@@ -173,16 +173,16 @@ the resolved drop path (rule 3).
 
 | The drop lands | Result | Display tree of new sources | `dnd://` mark |
 |---|---|---|---|
-| Inside a known root, the root itself included | Registers and refreshes as a rescan of that root would | The root's own: its alias if it has one (monitored or `monitor = false`); an earlier drop's label *without* the scheme; otherwise the file url | None added; marks already on sources stay |
+| Inside a known root, the root itself included | Registers and refreshes as a rescan of that root would | The root's own: its alias if it has one (monitored or `monitor = false`); an earlier drop's label; otherwise the file url | An earlier drop's mark carries over to what the re-drop adds; a monitored or `monitor = false` root gets none |
 | Outside every known root | Allowed if it overlaps nothing, otherwise refused | Its own root, labeled by the folder name (`exp`, then `exp (2)` for a second folder of that name) | Stamped |
 
 Overlap means the walk found a source that is already registered, or an existing source lies
 under the dropped path. It is refused before anything is removed or committed, and a cloud
 consent that drop gave is taken back. Cloud mode cannot be switched on inside a known root:
 it is set where a folder is first added, or in the config. The scheme is the removal key
-(`remove_source("dnd://<label>")`), so a source added to a marked drop later shares its
-display tree but is not removable that way. Removing a drop frees its label and its cloud
-consent.
+(`remove_source("dnd://<label>")`), so a re-drop inside a marked drop stamps what it adds
+with the same label and removing the drop takes it too. Removing a drop frees its label and
+its cloud consent.
 
 Drops are refused until the first scan has finished (a `ValueError`, which the server maps to
 a clean error): both checks above need the whole catalog.
