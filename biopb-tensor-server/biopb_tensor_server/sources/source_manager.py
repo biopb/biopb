@@ -279,7 +279,7 @@ class SourceManager:
             return None
         path = Path(claim.primary_path)
         best = max(
-            (r for r in self._monitored_aliases if r == path or r in path.parents),
+            (r for r in self._monitored_aliases if path.is_relative_to(r)),
             key=lambda r: len(r.parts),
             default=None,
         )
