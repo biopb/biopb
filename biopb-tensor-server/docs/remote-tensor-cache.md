@@ -166,10 +166,11 @@ carrying.
 every upstream source's id, tensors, metadata, `is_resolved` and `indexed_at`
 in a single server-side `query`, which is not truncated (unlike
 `list_sources()`), so mirroring costs one upstream RPC regardless of catalog
-size and a re-list can safely remove sources that disappeared. An upstream
-with no SQL catalog falls back to id-only enumeration, and removals are then
-skipped — a truncated or degraded list must never be treated as a complete
-one, or a re-list would drop sources it simply failed to see.
+size and a re-list can safely remove sources that disappeared. There is no
+fallback: if the query fails the re-list raises, the mirrored catalog is left as
+it is, and the next tick retries. Enumerating ids and syncing each source over
+its own RPC would put two round trips per source on an upstream that is already
+down, slow or refusing us.
 
 **Cache staleness is versioned, not open.** The upstream's `indexed_at`
 becomes this mirror's `content_version`, folded into every chunk_id's proxy

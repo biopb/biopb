@@ -1903,11 +1903,10 @@ class TestUnreachableUpstreamIsReportedOnAWindow:
         assert "reachable again" not in caplog.text
 
 
-def test_unreachable_bulk_fetch_does_not_duplicate_the_outage_warning(caplog):
-    """The re-list scheduler reports an outage on a window; the bulk fetch used to
-    report the same one every tick, at WARNING, from the other end. Only a genuine
-    no-SQL-catalog upstream (where the fallback is the story) still warns -- see
-    ``test_fallback_warning_names_the_upstream_from_its_location_argument``."""
+def test_unreachable_bulk_fetch_raises_without_logging_the_outage(caplog):
+    """The re-list scheduler reports an outage on a window; the bulk fetch must
+    not report the same one every tick from the other end, nor degrade into a
+    per-source sync against the upstream that is down."""
     import logging
 
     from biopb_tensor_server.adapters.remote_tensor import fetch_upstream_catalog
@@ -1918,9 +1917,9 @@ def test_unreachable_bulk_fetch_does_not_duplicate_the_outage_warning(caplog):
             raise flight.FlightUnavailableError("failed to connect to all addresses")
 
     with caplog.at_level(logging.WARNING):
-        rows, complete = fetch_upstream_catalog(_DeadClient(), "grpc://lab:8815")
+        with pytest.raises(flight.FlightUnavailableError):
+            fetch_upstream_catalog(_DeadClient())
 
-    assert (rows, complete) == (None, False)
     assert caplog.text == ""
 
 
@@ -2446,7 +2445,7 @@ def test_seed_catalog_empty_metadata_normalizes_to_dict():
     assert adapter._client is None
 
 
-def test_fetch_upstream_catalog_returns_rows_and_complete():
+def test_fetch_upstream_catalog_returns_the_rows():
     from biopb_tensor_server.adapters.remote_tensor import fetch_upstream_catalog
 
     class _FakeClient:
@@ -2462,21 +2461,22 @@ def test_fetch_upstream_catalog_returns_rows_and_complete():
                 }
             ]
 
-    rows, complete = fetch_upstream_catalog(_FakeClient(), "grpc://fake")
-    assert complete is True
+    rows = fetch_upstream_catalog(_FakeClient())
     assert rows[0]["source_url"] == "file:///d/a.zarr"
 
 
-def test_fetch_upstream_catalog_none_on_no_sql_catalog():
+def test_fetch_upstream_catalog_raises_rather_than_degrading():
+    """A failed bulk query is an upstream that is down, slow or refusing us -- not
+    a catalog-less one (every server owns a catalog). Falling back to ids plus a
+    per-source sync would put two round trips per source on that upstream."""
     from biopb_tensor_server.adapters.remote_tensor import fetch_upstream_catalog
 
     class _FakeClient:
         def query(self, sql, format="records"):  # noqa: A002 - fakes the real client's public `format` signature
-            raise RuntimeError("no metadata DB")
+            raise RuntimeError("query timed out")
 
-    rows, complete = fetch_upstream_catalog(_FakeClient(), "grpc://fake")
-    assert rows is None
-    assert complete is False
+    with pytest.raises(RuntimeError, match="query timed out"):
+        fetch_upstream_catalog(_FakeClient())
 
 
 class TestAnUpstreamScratchIsNotMirrored:
@@ -2511,16 +2511,12 @@ class TestAnUpstreamScratchIsNotMirrored:
     def test_the_bulk_catalog_leaves_it_out(self):
         from biopb_tensor_server.adapters.remote_tensor import fetch_upstream_catalog
 
-        rows, complete = fetch_upstream_catalog(
-            self._FakeClient(self.ROWS), "grpc://lab:8815"
-        )
+        rows = fetch_upstream_catalog(self._FakeClient(self.ROWS))
 
-        assert complete is True
         assert [r["source_id"] for r in rows] == ["zarr_a1b2c3", "aics_ff00"]
 
-    def test_the_id_only_fallback_leaves_it_out_too(self):
-        """Both enumerators, because the fallback runs exactly when the bulk
-        fetch could not -- which is no reason to start mirroring it."""
+    def test_the_id_enumerator_leaves_it_out_too(self):
+        """Both enumerators: the inline expansion (``validate``) lists ids alone."""
         from biopb_tensor_server.adapters.remote_tensor import (
             list_upstream_source_ids,
         )
@@ -2649,6 +2645,62 @@ def test_reconcile_bulk_seeds_adapters_without_per_source_rpc(simple_zarr_array)
                 .fetchall()
             )
             assert [r[0] for r in rows] == ["lab__img", "lab__img2"]
+        finally:
+            proxy.shutdown()
+    finally:
+        upstream.shutdown()
+
+
+@pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+def test_a_failed_bulk_query_leaves_the_mirror_alone_and_syncs_nothing(
+    simple_zarr_array, monkeypatch
+):
+    """When the one bulk query fails, the re-list gives up for this tick: the
+    mirrored sources stay, and nothing falls back to enumerating ids and syncing
+    each source over its own RPC (two round trips per source on an upstream that
+    is already struggling)."""
+    from biopb_tensor_server import TensorFlightServer
+    from biopb_tensor_server.adapters import get_default_registry, remote_tensor
+    from biopb_tensor_server.core.config import SourceConfig
+    from biopb_tensor_server.core.discovery import DiscoveryState
+    from biopb_tensor_server.serving.metadata_db import MetadataDatabase
+    from biopb_tensor_server.sources.source_manager import SourceManager
+
+    zarr_path, _, _ = simple_zarr_array
+    upstream, _, _ = _db_upstream(zarr_path, ["img", "img2"])
+    _serve(upstream)
+    try:
+        local_db = MetadataDatabase()
+        proxy = TensorFlightServer("grpc://localhost:0", metadata_db=local_db)
+        _serve(proxy)
+        try:
+            manager = SourceManager(
+                server=proxy,
+                registry=get_default_registry(),
+                discovery_state=DiscoveryState(),
+                monitored_dirs=set(),
+                metadata_db=local_db,
+                monitored_upstreams=[
+                    SourceConfig(url=f"grpc://localhost:{upstream.port}", alias="lab")
+                ],
+            )
+            manager._reconcile_upstreams()
+            assert set(proxy.sources) == {"lab__img", "lab__img2"}
+
+            def _fails(client):
+                raise RuntimeError("query timed out")
+
+            def _must_not_run(*args, **kwargs):
+                raise AssertionError("no id-only enumeration fallback")
+
+            monkeypatch.setattr(remote_tensor, "fetch_upstream_catalog", _fails)
+            monkeypatch.setattr(
+                remote_tensor, "list_upstream_source_ids", _must_not_run
+            )
+
+            manager._reconcile_upstreams()
+
+            assert set(proxy.sources) == {"lab__img", "lab__img2"}  # nothing removed
         finally:
             proxy.shutdown()
     finally:

@@ -621,7 +621,6 @@ class Reconciler:
         from biopb_tensor_server.adapters.remote_tensor import (
             _split_grpc_url,
             fetch_upstream_catalog,
-            list_upstream_source_ids,
             resolve_upstream_credentials,
         )
         from biopb_tensor_server.sources.resolve import _namespaced_source_id
@@ -648,18 +647,8 @@ class Reconciler:
             # Complete: the server-side DuckDB catalog is not truncated like
             # list_sources() (which would both miss sources AND spuriously remove
             # the ones past the cap below).
-            rows, complete = fetch_upstream_catalog(client, endpoint)
-            if rows is not None:
-                seed_by_up_id = {r["source_id"]: r for r in rows}
-                upstream_ids = list(seed_by_up_id.keys())
-            else:
-                # Legacy upstream without a SQL catalog: id-only enumeration, no
-                # seed -> each added source syncs via a live per-source RPC.
-                # Complete: list_upstream_source_ids raises rather than
-                # returning a truncated list.
-                upstream_ids = list_upstream_source_ids(client, endpoint)
-                complete = True
-                seed_by_up_id = {}
+            seed_by_up_id = {r["source_id"]: r for r in fetch_upstream_catalog(client)}
+            upstream_ids = list(seed_by_up_id)
         finally:
             # An exception here would replace whatever is propagating out of the
             # try: body -- and a broken channel is exactly when both an upstream
@@ -683,9 +672,9 @@ class Reconciler:
             }
 
         added = set(desired) - current
-        # Only remove when the upstream list is COMPLETE: a truncated/incomplete
-        # enumeration must never drop a mirrored source it simply failed to see.
-        removed = (current - set(desired)) if complete else set()
+        # The bulk query is complete, so what it no longer lists is gone. (A failed
+        # query raised above, leaving the mirrored catalog untouched.)
+        removed = current - set(desired)
 
         for source_id in sorted(removed):
             self._commit_remove_source(source_id)

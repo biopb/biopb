@@ -226,12 +226,11 @@ def mirrorable_upstream_id(source_id: str) -> bool:
 def list_upstream_source_ids(client, location: str) -> List[str]:
     """Every source_id on an upstream tensor server that we mirror.
 
-    ``location`` is the upstream endpoint, named in the fallback warning. It is a
-    parameter rather than something read off the client because the callers
-    already computed it (``_split_grpc_url``) to build the client, and the SDK
-    exposes no public accessor -- reaching for ``client._location`` was borrowing
-    another package's private state to recover a value that was in scope
-    (biopb/biopb#529).
+    ``location`` is the upstream endpoint. It is a parameter rather than something
+    read off the client because the callers already computed it
+    (``_split_grpc_url``) to build the client, and the SDK exposes no public
+    accessor -- reaching for ``client._location`` was borrowing another package's
+    private state to recover a value that was in scope (biopb/biopb#529).
 
     Queries the ids alone (``query`` on one narrow column, the
     canonical browse surface, biopb/biopb#225) -- an untruncated read, so the
@@ -248,62 +247,40 @@ def list_upstream_source_ids(client, location: str) -> List[str]:
     ]
 
 
-# Transport failures, as opposed to "this upstream has no SQL catalog". The
-# id-only fallback dials the same endpoint and fails identically, so these mean
-# the upstream is down -- which the re-list scheduler already reports, on a
-# window. Logging them here too only doubles an already-repeating traceback.
-_UNREACHABLE_ERRORS = (
-    flight.FlightUnavailableError,
-    flight.FlightTimedOutError,
-    flight.FlightUnauthenticatedError,
-    OSError,
-)
-
-
-def fetch_upstream_catalog(client, location: str) -> tuple[Optional[List[dict]], bool]:
+def fetch_upstream_catalog(client) -> List[dict]:
     """Bulk-fetch an upstream's full catalog rows in ONE ``query``.
 
-    Returns ``(rows, complete)``. Each row is a dict with ``source_id``,
-    ``source_url``, ``source_type``, ``metadata_json``, ``is_resolved``, the
-    per-tensor ``tensors`` STRUCT[] (biopb/biopb#224), and ``indexed_at`` (the
-    upstream's per-source register timestamp) -- everything needed to seed a
-    mirrored source's catalog entry without a per-source upstream RPC
-    (biopb/biopb#266). ``source_url`` carries the upstream's real path so the
-    mirror can be treed by filepath in the browser (biopb/biopb#297).
-    ``indexed_at`` becomes the mirror's content_version (biopb/biopb#178): it
-    changes when the upstream re-registers the source, so the proxy's chunk cache
-    re-namespaces instead of serving stale chunks.
-    ``is_resolved`` is carried so an unresolved upstream source
+    Each row is a dict with ``source_id``, ``source_url``, ``source_type``,
+    ``metadata_json``, ``is_resolved``, the per-tensor ``tensors`` STRUCT[]
+    (biopb/biopb#224), and ``indexed_at`` (the upstream's per-source register
+    timestamp) -- everything needed to seed a mirrored source's catalog entry
+    without a per-source upstream RPC (biopb/biopb#266). ``source_url`` carries
+    the upstream's real path so the mirror can be treed by filepath in the
+    browser (biopb/biopb#297). ``indexed_at`` becomes the mirror's
+    content_version (biopb/biopb#178): it changes when the upstream re-registers
+    the source, so the proxy's chunk cache re-namespaces instead of serving stale
+    chunks. ``is_resolved`` is carried so an unresolved upstream source
     (``is_resolved=false``, empty ``tensors``) mirrors as unresolved rather than
-    being advertised as a readable source. ``complete`` is True because the
-    server-side DuckDB catalog is not truncated like ``list_sources()``.
+    being advertised as a readable source.
 
-    The upstream's scratch source is left out, as it is from
+    The result is complete: the server-side DuckDB catalog is not truncated like
+    ``list_sources()``, so a caller may reconcile destructively against it. The
+    upstream's scratch source is left out, as it is from
     :func:`list_upstream_source_ids`; see :func:`mirrorable_upstream_id`.
 
-    ``rows`` is ``None`` when the upstream has no SQL catalog (``query``
-    errors) -- the caller then falls back to id-only enumeration
-    (``list_upstream_source_ids``) and the per-source live sync path.
-
-    ``location`` names the upstream in the fallback warning; see
-    :func:`list_upstream_source_ids` for why it is a parameter.
+    Raises when the query fails. There is no degraded mode to fall back to: every
+    server owns a catalog (protocol v2), so a failure here is an upstream that is
+    down, slow or refusing us, and enumerating its ids and syncing each source
+    over its own RPC would only multiply the load on exactly that upstream -- two
+    round trips per source, on the rescan thread, with the catalog lock held. The
+    caller keeps the catalog it has and retries on the next tick.
     """
-    try:
-        rows = client.query(
-            "SELECT source_id, source_url, source_type, metadata_json, "
-            "is_resolved, tensors, indexed_at FROM sources",
-            format="records",
-        )
-        return [r for r in rows if mirrorable_upstream_id(r["source_id"])], True
-    except Exception as exc:
-        logger.log(
-            logging.DEBUG if isinstance(exc, _UNREACHABLE_ERRORS) else logging.WARNING,
-            "upstream %s bulk catalog fetch failed (%s); falling back to id-only "
-            "enumeration + per-source sync",
-            location,
-            exc,
-        )
-        return None, False
+    rows = client.query(
+        "SELECT source_id, source_url, source_type, metadata_json, "
+        "is_resolved, tensors, indexed_at FROM sources",
+        format="records",
+    )
+    return [r for r in rows if mirrorable_upstream_id(r["source_id"])]
 
 
 class RemoteTensorAdapter(TensorAdapter):
