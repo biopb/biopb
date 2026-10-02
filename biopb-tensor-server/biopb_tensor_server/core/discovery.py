@@ -673,6 +673,25 @@ class WalkReport:
     offline_files: int = 0
 
 
+# Directory levels a walk descends below its root before it stops. No real
+# acquisition tree is this deep; a tree that is has a loop the other guards missed
+# (a shortcut a cloud provider exposes as an ordinary directory, a filesystem
+# whose inode numbers are synthetic), and every further level is a listing.
+MAX_WALK_DEPTH = 64
+
+
+def _real_dir(path: Path) -> str:
+    try:
+        return os.path.realpath(path)
+    except OSError:
+        return str(path)
+
+
+def _leads_back_up(real: str, current: str) -> bool:
+    """True when the directory ``real`` is ``current`` or one of its ancestors."""
+    return current == real or current.startswith(real.rstrip(os.sep) + os.sep)
+
+
 def walk_with_identity_tracking(
     root: Path,
     visited_identities: Set[str],
@@ -680,11 +699,21 @@ def walk_with_identity_tracking(
     should_descend: Optional[Callable[[Path], bool]] = None,
     admit_nonresident: bool = False,
     report: Optional[WalkReport] = None,
+    max_depth: int = MAX_WALK_DEPTH,
+    _depth: int = 0,
+    _root_real: Optional[str] = None,
 ) -> Iterator[Path]:
     """Walk filesystem with cross-platform identity tracking.
 
-    Prevents infinite loops from symlink cycles and duplicate processing
-    from hardlinks.
+    Three guards stop a walk from running away on a loop or duplicating work: a
+    directory that is a symlink is never entered; an entry whose identity
+    (device and inode, else resolved path) was already visited is skipped, which
+    also drops hardlink duplicates; and a directory that resolves to itself or an
+    ancestor (a junction or mount that ``is_symlink`` does not report) is not
+    entered. None of the first two helps where inode numbers are synthetic or the
+    loop is an ordinary directory, so the walk also stops ``max_depth`` levels
+    below the root. A directory refused for either reason is recorded as declined,
+    so what is registered below it is not taken for gone.
 
     Args:
         root: Root directory to walk
@@ -697,10 +726,12 @@ def walk_with_identity_tracking(
             claim — e.g. a ``.zarr`` store — whose interior files can never produce
             a claim of their own (biopb/biopb#55).
         report: Optional :class:`WalkReport` filled in as the walk goes.
+        max_depth: Directory levels to descend below ``root``.
 
     Yields:
         Paths to files/directories (not yet claimed)
     """
+    current_real = _root_real if _root_real is not None else _real_dir(root)
     try:
         for path in root.iterdir():
             try:
@@ -751,14 +782,32 @@ def walk_with_identity_tracking(
                 and not path.is_symlink()
                 and (should_descend is None or should_descend(path))
             ):
-                yield from walk_with_identity_tracking(
-                    path,
-                    visited_identities,
-                    path_filter=path_filter,
-                    should_descend=should_descend,
-                    admit_nonresident=admit_nonresident,
-                    report=report,
-                )
+                child_real = _real_dir(path)
+                if _leads_back_up(child_real, current_real):
+                    logger.warning(
+                        "walk: not entering %s: it leads back to %s", path, current_real
+                    )
+                elif _depth >= max_depth:
+                    logger.warning(
+                        "walk: not entering %s: more than %d levels below the root",
+                        path,
+                        max_depth,
+                    )
+                else:
+                    yield from walk_with_identity_tracking(
+                        path,
+                        visited_identities,
+                        path_filter=path_filter,
+                        should_descend=should_descend,
+                        admit_nonresident=admit_nonresident,
+                        report=report,
+                        max_depth=max_depth,
+                        _depth=_depth + 1,
+                        _root_real=child_real,
+                    )
+                    continue
+                if report is not None:
+                    report.declined_dirs.add(str(path))
     except OSError:
         # Permission issue reading directory
         pass
