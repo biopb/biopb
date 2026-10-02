@@ -551,9 +551,11 @@ class TestDropRemoval:
         kwargs.setdefault("stability_window", 0.0)
         kwargs.setdefault("monitored_dirs", set())
         server = _FakeServer()
-        return server, _make_manager(
+        manager = _make_manager(
             server, registry=registry, discovery_state=DiscoveryState(), **kwargs
         )
+        manager.complete_initial_scan()  # drops wait for the first scan
+        return server, manager
 
     def test_a_claim_an_adapter_now_declines_is_removed_though_its_path_exists(
         self, tmp_path
@@ -624,12 +626,18 @@ class TestDropRemoval:
     def test_a_source_in_a_directory_the_walk_declined_is_kept(self, tmp_path):
         # The skip policy never enters a system/cloud directory, so a source
         # registered there (by dropping it directly) is not "gone" when a later
-        # drop of its parent does not find it.
+        # drop of its parent does not find it. Both drops are inside a configured
+        # root, which is what lets the parent be dropped over its own child.
+        from biopb_tensor_server.core.config import SourceConfig
+
         hidden = tmp_path / "OneDrive - Lab"
         hidden.mkdir()
         (hidden / "x.dat").write_text("x")
         registry = _ScriptedRegistry()
-        server, manager = self._manager(registry)
+        server, manager = self._manager(
+            registry,
+            scan_once_sources=[SourceConfig(url=str(tmp_path), monitor=False)],
+        )
         assert _drain_drop(manager, hidden).added
 
         result = _drain_drop(manager, tmp_path)
@@ -981,6 +989,7 @@ class TestClaimSpelling:
             monitored_dirs=set(),
             stability_window=0.0,
         )
+        manager.complete_initial_scan()
         assert len(_drain_drop(manager, drop).added) == 2
 
         (tmp_path / "outside" / "x.dat").unlink()  # the link now dangles

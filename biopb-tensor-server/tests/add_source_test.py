@@ -51,17 +51,20 @@ def _make_zarr(parent, name, shape=(4, 8, 8)):
     return path
 
 
-def _make_manager():
+def _make_manager(scanned=True, **kwargs):
     # One catalog, threaded into both halves -- the wiring cli.py does for a
     # real deployment. The reconciler is the only thing that writes it.
     server = catalog_server("grpc://localhost:0")
+    kwargs.setdefault("monitored_dirs", set())
     manager = SourceManager(
         server=server,
         registry=get_default_registry(),
         discovery_state=DiscoveryState(),
-        monitored_dirs=set(),
         metadata_db=server.metadata_db,
+        **kwargs,
     )
+    if scanned:
+        manager.complete_initial_scan()  # drops wait for the first scan
     return manager, server
 
 
@@ -105,12 +108,9 @@ class TestDropCatalogUrl:
             == "dnd://exp/sub/b.tif"
         )
 
-    def test_mark_dnd_false_reroots_without_scheme(self):
-        # A drop under a monitored root: tidy display root, but no removable
-        # marker (the periodic rescan governs it).
-        url = _drop_catalog_url("/data/exp.zarr", "/data/exp.zarr", mark_dnd=False)
-        assert url == "exp.zarr"
-        assert not url.startswith(DND_URL_PREFIX)
+    def test_a_chosen_label_replaces_the_basename(self):
+        url = _drop_catalog_url("/data/exp", "/data/exp/a.tif", label="exp (2)")
+        assert url == "dnd://exp (2)/a.tif"
 
 
 class TestAddLocalSource:
@@ -154,29 +154,6 @@ class TestAddLocalSource:
         urls = sorted(_url(server, sid) for sid in added)
         assert urls == ["dnd://my_experiment/a.zarr", "dnd://my_experiment/b.zarr"]
 
-    def test_overlapping_drop_keeps_native_url_no_reroot(self, tmp_path):
-        """A drop that overlaps an already-registered source (e.g. re-dropping a
-        monitor=false config dir to pick up new files) is a rescan of a known
-        location, so new siblings keep their native source_url -- they must NOT
-        re-root into a separate tree root and split the dir across two places."""
-        manager, server = _make_manager()
-        root = tmp_path / "proj"
-        root.mkdir()
-        a = _make_zarr(str(root), "a.zarr")
-
-        # a.zarr registered first (stands in for the startup config scan).
-        _drain(manager.add_local_source(a))
-        # A new dataset lands, then the dir is dropped to force a rescan.
-        _make_zarr(str(root), "b.zarr")
-        added, already, failed = _drain(manager.add_local_source(str(root)))
-
-        assert not failed and len(added) == 1  # only b.zarr is new
-        assert len(already) == 1  # a.zarr already present
-        # The overlap suppressed re-rooting: b.zarr keeps a native file:// url,
-        # coherent with a.zarr, instead of a bare "proj/b.zarr" own-root url.
-        assert _url(server, added[0]).startswith("file://")
-        assert _url(server, added[0]).endswith("/proj/b.zarr")
-
     def test_static_config_via_symlink_containment(self, tmp_path):
         """A static-config source configured through a symlinked path still
         catches a drop that lands inside it. The containment guard keys on
@@ -201,6 +178,7 @@ class TestAddLocalSource:
             static_sources=[SourceConfig(url=str(link / "exp.zarr"), type="zarr")],
         )
         assert manager is not None
+        manager.complete_initial_scan()
 
         # Drop a subdir inside the source, reached via the real (resolved) path.
         sub = os.path.join(zpath, "sub")
@@ -268,8 +246,16 @@ class TestAddLocalSource:
         assert "already part of" in failed[0][1]
 
     def test_parent_dir_adds_new_keeps_existing(self, tmp_path):
-        """Case 5: dropping a parent adds new siblings, existing -> already_present."""
-        manager, _ = _make_manager()
+        """Case 5: dropping a parent adds new siblings, existing -> already_present.
+
+        Inside a configured root; the same drop from outside every root overlaps the
+        existing source and is refused (TestDropRules).
+        """
+        from biopb_tensor_server.core.config import SourceConfig
+
+        manager, _ = _make_manager(
+            scan_once_sources=[SourceConfig(url=str(tmp_path), monitor=False)]
+        )
         z1 = _make_zarr(str(tmp_path), "a.zarr")
         _make_zarr(str(tmp_path), "b.zarr")
         added1, *_ = _drain(manager.add_local_source(z1))
@@ -370,6 +356,126 @@ class TestAddLocalSource:
         assert 1 <= len(added) < 3  # stopped early, kept what was registered
         for source_id in added:
             assert source_id in server.sources
+
+
+class TestDropRules:
+    """Where a drop lands decides what it may do.
+
+    Inside a known root (monitored, ``monitor = false``, or an earlier drop's root)
+    it registers like a rescan of that root, with no new ``dnd://`` mark. Outside
+    every root it is a root of its own with a unique marked label, if it overlaps
+    nothing. Before the first scan finishes it is refused.
+    """
+
+    @staticmethod
+    def _folder(parent, name="exp", *zarrs):
+        root = parent / name
+        root.mkdir(parents=True)
+        for z in zarrs or ("a.zarr",):
+            _make_zarr(str(root), z)
+        return root
+
+    def test_a_drop_waits_for_the_first_scan(self, tmp_path):
+        manager, _ = _make_manager(scanned=False)
+        root = self._folder(tmp_path)
+
+        with pytest.raises(ValueError, match="still being indexed"):
+            _drain(manager.add_local_source(str(root)))
+
+        manager.complete_initial_scan()
+        added, _, failed = _drain(manager.add_local_source(str(root)))
+        assert len(added) == 1 and not failed
+
+    def test_two_same_named_folders_are_two_roots(self, tmp_path):
+        manager, server = _make_manager()
+        first = self._folder(tmp_path / "run1")
+        second = self._folder(tmp_path / "run2")
+
+        a1, *_ = _drain(manager.add_local_source(str(first)))
+        a2, *_ = _drain(manager.add_local_source(str(second)))
+
+        assert _url(server, a1[0]) == "dnd://exp/a.zarr"
+        assert _url(server, a2[0]) == "dnd://exp (2)/a.zarr"
+
+        removed, _ = manager.remove_dropped_root("dnd://exp")
+        assert removed == a1 and a2[0] in server.sources
+
+    def test_removing_a_drop_frees_its_label(self, tmp_path):
+        manager, server = _make_manager()
+        first = self._folder(tmp_path / "run1")
+        second = self._folder(tmp_path / "run2")
+        _drain(manager.add_local_source(str(first)))
+        manager.remove_dropped_root("dnd://exp")
+
+        a2, *_ = _drain(manager.add_local_source(str(second)))
+
+        assert _url(server, a2[0]) == "dnd://exp/a.zarr"
+
+    def test_a_drop_that_overlaps_an_earlier_one_is_refused(self, tmp_path):
+        manager, server = _make_manager()
+        root = self._folder(tmp_path, "proj", "a.zarr", "b.zarr")
+        _drain(manager.add_local_source(str(root / "a.zarr")))
+        before = set(server.sources)
+
+        added, already, failed = _drain(manager.add_local_source(str(root)))
+
+        assert added == [] and already == []
+        assert len(failed) == 1 and "overlaps" in failed[0][1]
+        assert set(server.sources) == before
+
+    def test_a_refused_cloud_drop_does_not_keep_its_consent(self, tmp_path):
+        manager, _ = _make_manager()
+        root = self._folder(tmp_path, "proj", "a.zarr", "b.zarr")
+        _drain(manager.add_local_source(str(root / "a.zarr")))
+
+        _drain(manager.add_local_source(str(root), cloud=True))
+
+        assert manager._cloud_roots == set()
+
+    def test_a_redrop_inside_a_drop_adds_no_new_mark(self, tmp_path):
+        manager, server = _make_manager()
+        root = self._folder(tmp_path, "proj")
+        a, *_ = _drain(manager.add_local_source(str(root)))
+        _make_zarr(str(root), "b.zarr")
+
+        added, already, failed = _drain(manager.add_local_source(str(root)))
+
+        assert not failed and already == a and len(added) == 1
+        # The new source joins the drop's display tree; the scheme (the removal
+        # key) is not stamped on it, and the old source keeps its mark.
+        assert _url(server, a[0]) == "dnd://proj/a.zarr"
+        assert _url(server, added[0]) == "proj/b.zarr"
+        removed, _ = manager.remove_dropped_root("dnd://proj")
+        assert removed == a and added[0] in server.sources
+
+    def test_a_drop_in_a_monitored_root_takes_the_roots_alias(self, tmp_path):
+        root = self._folder(tmp_path, "data", "a.zarr")
+        manager, server = _make_manager(
+            monitored_dirs={root}, monitored_aliases={root: "lab"}
+        )
+
+        added, *_ = _drain(manager.add_local_source(str(root / "a.zarr")))
+
+        assert _url(server, added[0]) == "lab/a.zarr"
+
+    def test_a_drop_in_a_scan_once_root_takes_the_roots_alias(self, tmp_path):
+        from biopb_tensor_server.core.config import SourceConfig
+
+        root = self._folder(tmp_path, "data", "a.zarr")
+        manager, server = _make_manager(
+            scan_once_sources=[SourceConfig(url=str(root), monitor=False, alias="exp")]
+        )
+
+        added, *_ = _drain(manager.add_local_source(str(root)))
+
+        assert _url(server, added[0]) == "exp/a.zarr"
+
+    def test_cloud_mode_cannot_be_switched_on_inside_a_known_root(self, tmp_path):
+        root = self._folder(tmp_path, "data", "a.zarr")
+        manager, _ = _make_manager(monitored_dirs={root})
+
+        with pytest.raises(ValueError, match="Cannot switch cloud mode"):
+            _drain(manager.add_local_source(str(root / "a.zarr"), cloud=True))
 
 
 class TestAddSourceRoundtrip:
@@ -583,6 +689,7 @@ class TestAddedSourceSurvivesRescanUnderSkippedDir:
             metadata_db=None,
             stability_window=0.0,
         )
+        manager.complete_initial_scan()
         return manager, server
 
     def test_monitor_false_drop_under_onedrive_survives_rescan(self, tmp_path):
@@ -599,10 +706,10 @@ class TestAddedSourceSurvivesRescanUnderSkippedDir:
         assert len(added) == 1 and not failed
         sid = added[0]
         assert sid in server.sources
-        # Re-rooted for a tidy display root, but NOT stamped ``dnd://``: it sits
-        # under a monitored root, so the rescan re-discovers it -- it is not
-        # safely removable, so it must not carry the removable marker.
-        assert _url(server, added[0]) == "samples/exp.zarr"
+        # Inside a known root: no ``dnd://`` marker (the rescan re-discovers it,
+        # so it is not safely removable) and no re-rooting either.
+        assert _url(server, added[0]).startswith("file://")
+        assert not _url(server, added[0]).startswith(DND_URL_PREFIX)
 
         # First rescan is force_full; the second is the steady-state incremental
         # that actually reaped the source before the fix (~20 s after the drop).

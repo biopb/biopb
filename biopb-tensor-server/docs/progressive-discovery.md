@@ -38,7 +38,7 @@ string is used where**, and how the first scan differs from every later one.
 | Static (typed entry, a file, one remote source) | Seeded as a claim, no walk | Once, at construction | Never (config change) |
 | Scan-once directory (`monitor = false`) | Walker, `_register_root` | First tick only, then again on a drop of it | A drop of the same root |
 | Monitored directory | Walker, `_rescan_monitored_dirs` | Every tick | The reconcile diff (§5) |
-| Dropped path (`add_local_source`) | Walker, `_register_root` | On request | A re-drop of the root, or `remove_source` for `dnd://` roots |
+| Dropped path (`add_local_source`) | Walker, `_register_root` | On request, once the first scan is done | A re-drop of the root (what vanished), or `remove_source` for a marked drop |
 | Upstream tensor-server mirror | Upstream catalog query, not the walker | Adaptive cadence per upstream | The upstream re-list |
 
 ## 2. Where state lives
@@ -47,7 +47,8 @@ string is used where**, and how the first scan differs from every later one.
 |---|---|---|
 | `DiscoveryState` (scratch and confirmed) | `claims`, `path_to_source`, `source_to_paths`, `consumed_paths`, `visited_identities` | `source_id`; claim path strings; file identities |
 | `Reconciler` | `_source_signatures`, `_missed_scans`, `_cloud_source_ids`, `_failed_sources`, `_path_to_source_id` | `source_id`; for the last, `claim.primary_path` |
-| `SourceManager` | `_monitored_dirs`, `_cloud_roots`, `_dropped_cloud_roots`, `_monitored_aliases`, `_unavailable_roots`, the pending scan-once list | Resolved root `Path`s; for `_dropped_cloud_roots` a `dnd://<basename>` string |
+| `SourceManager` | `_monitored_dirs`, `_scan_once_roots`, `_cloud_roots`, `_monitored_aliases`, `_unavailable_roots`, the pending scan-once list | Resolved root `Path`s (`_scan_once_roots` maps to its alias) |
+| `SourceManager` (drops) | `_dropped_roots`, `_drop_cloud_consent` | `dnd://` label to the dropped `Path`; the roots a drop made cloud |
 | Adapter | `_source_url` (the raw claim path, or the library's own filename for hdf5 / nifti / bioio / dicom), `catalog_url` | Opens files with the raw path |
 | Catalog (`sources` table) | `source_url` (display only), `tensors`, `metadata_json`, `indexed_at` | `source_id` |
 
@@ -93,11 +94,11 @@ it. No adapter `claim()` normalizes the path it returns.
    so a link claim reads and signs its target. Quietness and change signatures stat
    the spelled path (`entry_is_quiet`, `build_entry_signature`).
 7. **The catalog `source_url` is display, never an input.** It is
-   `to_catalog_url(raw)` (forward slashes, `file://`) or an override: `dnd://<name>`
-   for a drop, an alias root, `cache://`, `scratch://`, `grpc://<alias>/…` for a
+   `to_catalog_url(raw)` (forward slashes, `file://`) or an override: `dnd://<label>`
+   for a drop from outside every known root, an alias root, `cache://`, `scratch://`, `grpc://<alias>/…` for a
    mirror. It is not fed to the filesystem or to `generate_source_id`, and rows are
    found and removed by `source_id`. The one lookup by url is `remove_source`,
-   which matches the `dnd://` prefix.
+   which matches a `dnd://<label>/` prefix.
 8. **A remote claim is a URL.** `is_remote_url` claims are never resolved and are
    skipped by every path comparison.
 
@@ -166,16 +167,37 @@ ordinary batched diff, not a streamed scan.
 
 ### Drops and scan-once roots
 
-`_register_root` walks the root into a scratch state with **no stability gate**, so a file finished a moment before the drop is claimed; the user asked for it now. The gate applies to claiming only in the monitored rescan. Then `_remove_unclaimed_under`
-removes what is gone **under that root only** (the periodic diff is whole-catalog, so it
-cannot be reused on a subtree). A source is removed when it is under the root, is not
-under a monitored root (the rescan does that, with its two-miss rule), is not under a
-declined directory, is quiet, and is not claimed again by an adapter on a second look
-(a drop has no later pass, so a transient decline must not cost a working source).
-A single-file drop skips this scan. Then each claim is refreshed if known, else added.
-A drop whose path lies inside an already-owned directory source is rejected
-(`_find_containing_source` resolves the dropped path and looks each ancestor up in
-`path_to_source`).
+Where a drop lands decides what it may do. A **known root** is a monitored directory, a
+`monitor = false` directory, or the root of an earlier marked drop; the test is lexical on
+the resolved drop path (rule 3).
+
+| The drop lands | Result | Display tree of new sources | `dnd://` mark |
+|---|---|---|---|
+| Inside a known root, the root itself included | Registers and refreshes as a rescan of that root would | The root's own: its alias if it has one (monitored or `monitor = false`); an earlier drop's label *without* the scheme; otherwise the file url | None added; marks already on sources stay |
+| Outside every known root | Allowed if it overlaps nothing, otherwise refused | Its own root, labeled by the folder name (`exp`, then `exp (2)` for a second folder of that name) | Stamped |
+
+Overlap means the walk found a source that is already registered, or an existing source lies
+under the dropped path. It is refused before anything is removed or committed, and a cloud
+consent that drop gave is taken back. Cloud mode cannot be switched on inside a known root:
+it is set where a folder is first added, or in the config. The scheme is the removal key
+(`remove_source("dnd://<label>")`), so a source added to a marked drop later shares its
+display tree but is not removable that way. Removing a drop frees its label and its cloud
+consent.
+
+Drops are refused until the first scan has finished (a `ValueError`, which the server maps to
+a clean error): both checks above need the whole catalog.
+
+`_register_root` walks the root into a scratch state with **no stability gate**, so a file
+finished a moment before the drop is claimed; the user asked for it now. The gate applies to
+claiming only in the monitored rescan. Then `_remove_unclaimed_under` removes what is gone
+**under that root only** (the periodic diff is whole-catalog, so it cannot be reused on a
+subtree). A source is removed when it is under the root, is not under a monitored root (the
+rescan does that, with its two-miss rule), is not under a declined directory, is quiet, and
+is not claimed again by an adapter on a second look (a drop has no later pass, so a transient
+decline must not cost a working source). A single-file drop skips this scan. Then each claim
+is refreshed if known, else added. A drop whose path lies inside an already-owned directory
+source is rejected (`_find_containing_source` resolves the dropped path and looks each
+ancestor up in `path_to_source`).
 
 ## 6. First scan versus re-scan
 
@@ -220,8 +242,9 @@ tick raises, `full_scan_in_progress` is cleared and the next tick retries the fi
 `start()`, so the runtime flag is already true and would prompt-enqueue every startup
 source.
 
-A drop that arrives before the first tick finishes waits on `_catalog_lock`, heart-beating
-to its caller, then runs as a live addition.
+A drop that arrives before the first tick finishes is refused, not queued. Once it has
+finished, a drop waits on `_catalog_lock` if a rescan is running (heart-beating to its
+caller) and runs as a live addition.
 
 ## 7. SERVING versus freshness
 
@@ -247,8 +270,8 @@ consumer that reads `SERVING` as "catalog complete" will flash an empty catalog;
 
 ## 8. Limits and open items
 
-- **`dnd://<basename>` is not unique.** Two drops with the same folder name share a
-  `_dropped_cloud_roots` key and a `remove_source` prefix, so removing one removes both.
+- **Marked drops are remembered in memory only.** After a restart an earlier drop's sources
+  are gone with the catalog, so its folder is an ordinary outside drop again.
 - **A retargeted configured symlink is not followed until restart.** Only its first
   target was stored as the root.
 - **Per-root reconcile.** The removal diff covers all monitored roots at once, so
