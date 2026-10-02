@@ -42,10 +42,7 @@ createRoot(root).render(
             path="/session/:sessionId/observe"
             element={<ObservePage />}
           />
-          {/* Outside ViewerLayout on purpose: ClientBootstrap runs once per mount
-              and sends a tokenless visit here, so if this page shared its
-              layout the bootstrap would stay mounted across the unlock and
-              never connect -- an empty source pane until a reload. */}
+          {/* Outside ViewerLayout so ClientBootstrap remounts after unlock. */}
           <Route path="/unlock" element={<UnlockPage />} />
           <Route element={<ViewerLayout />}>
             <Route path="/viewer" element={<HomePage />} />
