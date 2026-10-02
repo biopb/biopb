@@ -366,7 +366,7 @@ def fetch_upstream_rows(
     were consumed.
     """
     for batch in _fetch_batches(source_ids, sizes):
-        ids = ", ".join("'" + sid.replace("'", "''") + "'" for sid in batch)
+        ids = ", ".join(sql_literal(sid) for sid in batch)
         yield client.query(
             "SELECT source_id, source_url, source_type, metadata_json, "
             "is_resolved, tensors, indexed_at FROM sources "
@@ -600,6 +600,13 @@ class RemoteTensorAdapter(TensorAdapter):
                 return f"{self._scheme}://{self._authority}/{remote}"
         return f"{self._scheme}://{self._authority}:{self._upstream_source_id}"
 
+    def is_current(self, indexed_at: object) -> bool:
+        """Whether this mirror was last seeded from an upstream row stamped
+        ``indexed_at``. An unversioned upstream is never current, so it is
+        re-read on every re-list."""
+        version = content_version_for(indexed_at)
+        return version is not None and version == self._content_version
+
     def seed_catalog(
         self,
         upstream_tensors: List[dict],
@@ -633,8 +640,7 @@ class RemoteTensorAdapter(TensorAdapter):
         ``indexed_at`` is the upstream source's register timestamp; it becomes this
         mirror's ``content_version`` (``b"iat:<ts>"``, biopb/biopb#178), folded into
         every minted proxy envelope so the chunk cache re-namespaces when the
-        upstream re-registers the source. It is set unconditionally (every reconcile
-        refreshes it) and deliberately NOT part of the ``changed`` result: a re-sync
+        upstream re-registers the source. It is set unconditionally and deliberately NOT part of the ``changed`` result: a re-sync
         re-stamps the LOCAL ``indexed_at``, so gating re-sync on it would churn; the
         content_version only needs to ride the adapter for minting, not the catalog.
 

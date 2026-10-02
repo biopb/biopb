@@ -33,6 +33,7 @@ taken by the commit primitives) lives here.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import stat
@@ -610,7 +611,6 @@ class Reconciler:
 
         from biopb_tensor_server.adapters.remote_tensor import (
             _split_grpc_url,
-            content_version_for,
             fetch_upstream_rows,
             list_upstream_versions,
             resolve_upstream_credentials,
@@ -651,9 +651,9 @@ class Reconciler:
                     and (alias_prefix is None or source_id.startswith(alias_prefix))
                 }
 
-            added = set(desired) - current
+            added = desired.keys() - current
             # A failed query raised above, leaving the mirrored catalog untouched.
-            removed = current - set(desired)
+            removed = current - desired.keys()
 
             for source_id in sorted(removed):
                 self._commit_remove_source(source_id)
@@ -662,16 +662,13 @@ class Reconciler:
             # re-registered it (indexed_at moved) -- notably unresolved -> resolved
             # -- or when it was never seeded. An unversioned upstream has no
             # indexed_at to compare, so it is re-read every time.
-            stale = set()
-            for source_id in current & set(desired):
+            stale = {}
+            for source_id in current & desired.keys():
                 adapter = self._server.sources.get(source_id)
                 if adapter is None or not hasattr(adapter, "seed_catalog"):
                     continue
-                version = content_version_for(versions[desired[source_id]].indexed_at)
-                if version is None or version != getattr(
-                    adapter, "_content_version", None
-                ):
-                    stale.add(source_id)
+                if not adapter.is_current(versions[desired[source_id]].indexed_at):
+                    stale[source_id] = adapter
 
             extra_config = {}
             if upstream.credentials_profile:
@@ -683,7 +680,7 @@ class Reconciler:
 
             # One bounded batch of full rows at a time, so the first sync of a large
             # catalog never holds it whole.
-            wanted = [desired[sid] for sid in sorted(added | stale)]
+            wanted = [desired[sid] for sid in sorted(added | stale.keys())]
             sizes = {up: versions[up].size for up in wanted}
             for rows in fetch_upstream_rows(client, wanted, sizes):
                 for row in rows:
@@ -700,7 +697,7 @@ class Reconciler:
                             catalog_seed=seed,
                         )
                     elif source_id in stale:
-                        self._refresh_mirrored_source(source_id, seed)
+                        self._refresh_mirrored_source(source_id, stale[source_id], seed)
         finally:
             self._close_upstream_client(client)
 
@@ -718,8 +715,6 @@ class Reconciler:
     def _row_to_seed(row: dict) -> tuple:
         """(tensors, metadata, is_resolved, source_url, indexed_at) for
         ``seed_catalog``."""
-        import json
-
         raw = row.get("metadata_json")
         try:
             metadata = json.loads(raw) if raw else {}
@@ -735,12 +730,11 @@ class Reconciler:
             row.get("indexed_at"),  # -> proxy content_version (biopb/biopb#178)
         )
 
-    def _refresh_mirrored_source(self, source_id: str, seed: tuple) -> None:
+    def _refresh_mirrored_source(
+        self, source_id: str, adapter: Any, seed: tuple
+    ) -> None:
         """Re-seed an already-mirrored source and re-sync its catalog row if the
         seed changed (so a steady re-list does not churn ``indexed_at``)."""
-        adapter = self._server.sources.get(source_id)
-        if adapter is None or not hasattr(adapter, "seed_catalog"):
-            return
         if adapter.seed_catalog(*seed) and self._metadata_db is not None:
             try:
                 self._metadata_db.sync_source_added(source_id, adapter)
