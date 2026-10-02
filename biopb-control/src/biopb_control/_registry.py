@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import shutil
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
@@ -157,6 +158,78 @@ def migrate_from_mcp_config(directory: Optional[Path] = None) -> list[str]:
     if written:
         logger.info("algorithm registry: migrated %s from the mcp config", written)
     return written
+
+
+def _new_name(name: str, directory: Path) -> str:
+    """*name* made safe for a file stem; ValueError when empty, reserved or taken."""
+    name = _UNSAFE_IN_A_NAME.sub("-", name).strip("-")
+    if not name or name.startswith("_"):
+        raise ValueError(
+            "name must be letters, digits, '-' or '_', not starting with '_'"
+        )
+    if any((directory / f"{name}{ext}").exists() for ext in (".py", ".json")):
+        raise ValueError(f"an entry named {name!r} already exists")
+    return name
+
+
+def register_url(
+    url: str, name: Optional[str] = None, directory: Optional[Path] = None
+) -> str:
+    """Add a url entry for a server someone else runs; answer its name.
+
+    Raises ValueError for a bad URL or a name that is unusable or taken.
+    """
+    url = url.strip()
+    parsed = urlparse(url)
+    if parsed.scheme.lower() not in ("grpc", "grpcs") or not parsed.netloc:
+        raise ValueError("URL must be grpc://host:port or grpcs://host:port")
+    directory = directory or registry_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    name = _new_name(name or _name_for(url), directory)
+    with open(directory / f"{name}.json", "x", encoding="utf-8") as f:
+        f.write(json.dumps({"url": url}) + "\n")
+    return name
+
+
+def register_script(
+    source: str, name: Optional[str] = None, directory: Optional[Path] = None
+) -> str:
+    """Add a script entry for the server file at *source*; answer its name.
+
+    The entry is a symlink, so edits to the file take effect; a copy where
+    symlinks are unavailable. Raises ValueError when *source* is not a ``.py``
+    file or the name is unusable or taken.
+    """
+    path = Path(source).expanduser()
+    if path.suffix != ".py" or not path.is_file():
+        raise ValueError(f"{source} is not a .py file")
+    directory = directory or registry_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    name = _new_name(name or path.stem, directory)
+    link = directory / f"{name}.py"
+    try:
+        link.symlink_to(path.resolve())
+    except OSError:
+        shutil.copyfile(path, link)
+    return name
+
+
+def deregister(name: str, directory: Optional[Path] = None) -> None:
+    """Remove the entry named *name*; KeyError when there is none.
+
+    Removes only the registry file (the link, for a script entry), never the
+    server file it points at.
+    """
+    directory = directory or registry_dir()
+    paths = [
+        p
+        for p in (directory / f"{name}.py", directory / f"{name}.json")
+        if p.is_symlink() or p.exists()
+    ]
+    if name.startswith("_") or not paths:
+        raise KeyError(name)
+    for p in paths:
+        p.unlink()
 
 
 # --------------------------------------------------------------------------- #
