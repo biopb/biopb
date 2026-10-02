@@ -270,7 +270,7 @@ class SourceManager:
         """
         if not self._monitored_aliases:
             return None
-        path = Path(claim.primary_path).resolve()
+        path = Path(claim.primary_path)
         best = max(
             (r for r in self._monitored_aliases if r == path or r in path.parents),
             key=lambda r: len(r.parts),
@@ -582,7 +582,10 @@ class SourceManager:
             # than re-walking it.
             report = WalkReport()
             for monitored_dir in sorted(self._monitored_dirs):
-                root = monitored_dir.resolve()
+                # Walked as stored, not resolved again: the root is canonical
+                # from config, so its claims are spelled under it however the
+                # path has changed since (a migration may have left a link).
+                root = monitored_dir
                 cloud = root in self._cloud_roots
                 if cloud and not force_full_rescan:
                     continue
@@ -1057,7 +1060,7 @@ class SourceManager:
             # already under a configured cloud root is cloud whatever the request
             # says.
             if cloud and not self._is_under_cloud_root(url):
-                cloud_root = Path(url).resolve()
+                cloud_root = Path(url)
                 self._cloud_roots.add(cloud_root)
                 self._dropped_cloud_roots[_drop_catalog_url(url, url)] = cloud_root
             cloud = self._is_under_cloud_root(url)
@@ -1257,12 +1260,10 @@ class SourceManager:
         for source_id, claim in self._reconciler.claim_items():
             if source_id in discovered_ids or is_remote_url(claim.primary_path):
                 continue
-            # A cheap rejection first: nearly every source in the catalog is
-            # elsewhere, and resolve() is an lstat per path component.
-            try:
-                primary = Path(claim.primary_path).resolve(strict=False)
-            except OSError:
-                continue
+            # Lexical, so nearly every source in the catalog is rejected
+            # without touching the filesystem, and a link is under the root it was
+            # found in wherever it points.
+            primary = Path(claim.primary_path)
             if not primary.is_relative_to(root_path):
                 continue
             if self._reconciler._is_monitored_claim(claim):
@@ -1391,7 +1392,7 @@ def create_source_manager(
 
         monitored_dirs.add(local_path)
         if source.alias:
-            monitored_aliases[local_path.resolve()] = source.alias
+            monitored_aliases[local_path] = source.alias
 
     if (
         not monitored_dirs

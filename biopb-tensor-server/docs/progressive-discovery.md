@@ -62,9 +62,11 @@ it. No adapter `claim()` normalizes the path it returns.
 
 1. **A root is canonical, and becomes canonical once.** Config roots (`local_path`),
    drops and static seeds go through `resolve_local_path` (folds `file://`,
-   symlinks, `..`, case, trailing separators). The monitored scan calls `resolve()`
-   on each stored root again before walking it, which is a no-op unless the stored
-   path has since become a link (see §8).
+   symlinks, `..`, case, trailing separators). The monitored scan walks each stored
+   root as given and never resolves it again, so its claims are spelled under the
+   stored root even if that path later becomes a link (a migration that leaves one
+   behind). `_monitored_dirs`, `_monitored_aliases` and `_cloud_roots` hold the same
+   strings the walk uses.
 2. **A claim path is never resolved to key or look it up.** All of
    `DiscoveryState.claims` / `path_to_source` / `source_to_paths` /
    `consumed_paths`, `_path_to_source_id` and the signature maps use the claim
@@ -78,8 +80,10 @@ it. No adapter `claim()` normalizes the path it returns.
    device and inode (resolved-path hash where the inode is synthetic), computed on
    the resolved target. The walk's `visited_identities` drops hardlinks and a
    file reached by two links. `generate_source_id` hashes the resolved path, so a
-   link and its target are one `source_id` however the claim is spelled. A remote
-   URL is hashed as written, minus trailing `/`.
+   link and its target are one `source_id` however the claim is spelled. Moving
+   the data therefore gives it a new id: the old one goes by the two-miss rule and
+   the new one is added behind it. A remote URL is hashed as written, minus
+   trailing `/`.
 5. **Cycle guards use real paths and decide entry only.** `_real_dir`
    (`realpath`), the identity set, `_leads_back_up` and `MAX_WALK_DEPTH` stop the
    walk from entering a directory. They never change how a path is spelled. A
@@ -241,24 +245,12 @@ changes, and the webapp polls the source list. The napari tensor-browser and the
 consumer that reads `SERVING` as "catalog complete" will flash an empty catalog; gate
 "no data" on `full_scan_in_progress` instead.
 
-## 8. Known deviations and open items
+## 8. Limits and open items
 
-- **Claims are still resolved for containment in several places.** Rules 2 and 3 are the
-  invariant; today `_remove_unclaimed_under`, `_is_monitored_claim`,
-  `_claim_overlaps_skipped_subtree`, `is_under_cloud_root` and `_monitored_catalog_url`
-  call `resolve()` on a claim. For a symlinked file leaf that sends the claim to its
-  target, outside every monitored root, so in a monitored root such a source gets no
-  refresh, no removal and no alias root. Each `resolve()` also costs an `lstat` per path
-  component, which makes the removal scan O(catalog) per directory drop (#960).
 - **`dnd://<basename>` is not unique.** Two drops with the same folder name share a
   `_dropped_cloud_roots` key and a `remove_source` prefix, so removing one removes both.
-- **Root drift.** `_monitored_dirs`, `_monitored_aliases` and `_cloud_roots` hold roots
-  resolved at config time, and the scan resolves each root again. If the stored path later
-  becomes a link (a migration that moves it and leaves a link), the walk spells claims under
-  the new target while the roots still name the old path, so those claims are never
-  diffed, refreshed or removed and are re-added every pass. Walking the stored root as-is
-  removes the mismatch. A configured symlink that is retargeted is not followed until restart,
-  since only its first target was stored.
+- **A retargeted configured symlink is not followed until restart.** Only its first
+  target was stored as the root.
 - **Per-root reconcile.** The removal diff covers all monitored roots at once, so
   steady-state staleness is bounded by the slowest root, not surfaced root by root.
 - **The catalog is not persisted.** A persisted catalog would let startup serve at once and
