@@ -75,20 +75,19 @@ logger = logging.getLogger(__name__)
 def is_under_cloud_root(cloud_roots: Set[Path], path: str) -> bool:
     """True when *path* is one of *cloud_roots* or lives under one.
 
+    Lexical: *path* is a claim (or walk) path, spelled under the root it was found
+    in, so it is never resolved -- a link under a cloud root is under it wherever it
+    points.
+
     A free function so both the Reconciler (registration / signature policy) and
     the SourceManager stability gate share one cloud-membership rule without
     either object depending on the other.
     """
     if not cloud_roots:
         return False
-    try:
-        resolved = Path(path).resolve()
-    except OSError:
-        return False
+    claim_path = Path(path)
     # A snapshot: a drop can add a root while another thread is asking.
-    return any(
-        resolved == root or root in resolved.parents for root in tuple(cloud_roots)
-    )
+    return any(claim_path.is_relative_to(root) for root in tuple(cloud_roots))
 
 
 # Consecutive rescans a monitored source may go undiscovered before it is removed.
@@ -315,15 +314,16 @@ class Reconciler:
             self._refresh_claim(discovered_claims[source_id])
 
     def _is_monitored_claim(self, claim: SourceClaim) -> bool:
-        """Check if a claim belongs to one of the monitored local roots."""
+        """Check if a claim belongs to one of the monitored local roots.
+
+        Lexical, like every containment test on a claim: the walk spelled it under
+        the root it found it in, so a symlinked file is under that root wherever
+        the link points.
+        """
         if is_remote_url(claim.primary_path):
             return False
 
-        try:
-            claim_path = Path(claim.primary_path).resolve(strict=False)
-        except OSError:
-            return False
-
+        claim_path = Path(claim.primary_path)
         return any(
             claim_path.is_relative_to(monitored_dir)
             for monitored_dir in self._monitored_dirs
@@ -425,10 +425,7 @@ class Reconciler:
         for claim_path_str in claim_paths:
             if is_remote_url(claim_path_str):
                 continue
-            try:
-                claim_path = Path(claim_path_str).resolve(strict=False)
-            except OSError:
-                continue
+            claim_path = Path(claim_path_str)
             for skipped_dir in skipped_dirs:
                 if claim_path == skipped_dir or claim_path.is_relative_to(skipped_dir):
                     return True

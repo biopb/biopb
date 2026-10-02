@@ -551,9 +551,11 @@ class TestDropRemoval:
         kwargs.setdefault("stability_window", 0.0)
         kwargs.setdefault("monitored_dirs", set())
         server = _FakeServer()
-        return server, _make_manager(
+        manager = _make_manager(
             server, registry=registry, discovery_state=DiscoveryState(), **kwargs
         )
+        manager.complete_initial_scan()  # drops wait for the first scan
+        return server, manager
 
     def test_a_claim_an_adapter_now_declines_is_removed_though_its_path_exists(
         self, tmp_path
@@ -624,12 +626,18 @@ class TestDropRemoval:
     def test_a_source_in_a_directory_the_walk_declined_is_kept(self, tmp_path):
         # The skip policy never enters a system/cloud directory, so a source
         # registered there (by dropping it directly) is not "gone" when a later
-        # drop of its parent does not find it.
+        # drop of its parent does not find it. Both drops are inside a configured
+        # root, which is what lets the parent be dropped over its own child.
+        from biopb_tensor_server.core.config import SourceConfig
+
         hidden = tmp_path / "OneDrive - Lab"
         hidden.mkdir()
         (hidden / "x.dat").write_text("x")
         registry = _ScriptedRegistry()
-        server, manager = self._manager(registry)
+        server, manager = self._manager(
+            registry,
+            scan_once_sources=[SourceConfig(url=str(tmp_path), monitor=False)],
+        )
         assert _drain_drop(manager, hidden).added
 
         result = _drain_drop(manager, tmp_path)
@@ -850,6 +858,145 @@ class TestUnavailableMonitoredRoot:
         manager._handle_rescan()
 
         assert state.claims == {}
+
+
+class TestClaimSpelling:
+    """A claim stays under the root its walk found it in, wherever a link points.
+
+    Containment is lexical on the walk's own spelling (a claim is never resolved to
+    ask it), and the scan walks a stored root as given, so neither a symlinked file
+    nor a root that later becomes a link takes a claim out from under its root.
+    """
+
+    @staticmethod
+    def _manager(root, **kwargs):
+        server = _FakeServer()
+        state = DiscoveryState()
+        manager = _make_manager(
+            server,
+            registry=_FakeRegistry(),
+            discovery_state=state,
+            monitored_dirs={root},
+            stability_window=0.0,
+            **kwargs,
+        )
+        return server, state, manager
+
+    @staticmethod
+    def _link_into(root, tmp_path):
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "x.dat").write_text("x")
+        os.symlink(outside / "x.dat", root / "link.dat")
+
+    def test_a_symlinked_file_is_reconciled_like_any_other(self, tmp_path, monkeypatch):
+        root = tmp_path / "data"
+        root.mkdir()
+        (root / "real.dat").write_text("r")
+        self._link_into(root, tmp_path)
+        server, state, manager = self._manager(root)
+
+        manager._handle_rescan()
+        link_claim = next(c for c in state.claims.values() if "link" in c.primary_path)
+        assert manager._reconciler._is_monitored_claim(link_claim)
+        registered = list(server.registered)
+        assert len(registered) == 2
+
+        monkeypatch.setattr(manager, "_should_force_full_rescan", lambda: False)
+        manager._handle_rescan()
+        manager._handle_rescan()
+
+        assert server.registered == registered  # not re-added every pass
+        assert server.unregistered == []
+
+    def test_a_symlinked_file_that_goes_away_is_removed(self, tmp_path, monkeypatch):
+        root = tmp_path / "data"
+        root.mkdir()
+        self._link_into(root, tmp_path)
+        server, state, manager = self._manager(root)
+        manager._handle_rescan()
+        assert len(state.claims) == 1
+
+        monkeypatch.setattr(manager, "_should_force_full_rescan", lambda: False)
+        (root / "link.dat").unlink()
+        manager._handle_rescan()
+        manager._handle_rescan()
+
+        assert state.claims == {}
+
+    def test_a_root_that_becomes_a_link_stays_monitored(self, tmp_path, monkeypatch):
+        root = tmp_path / "data"
+        root.mkdir()
+        (root / "a.dat").write_text("a")
+        server, state, manager = self._manager(root)
+        manager._handle_rescan()
+        old_id = generate_source_id(str(root / "a.dat"), "fake")
+        assert list(state.claims) == [old_id]
+
+        # A migration moves the directory and leaves a link where it was. The id
+        # hashes the resolved location, so the moved file is a new source: the old
+        # one is dropped by the two-miss rule and the new one added behind it. A
+        # claim the reconcile no longer saw as monitored would never converge.
+        moved = tmp_path / "moved"
+        root.rename(moved)
+        os.symlink(moved, root)
+        new_id = generate_source_id(str(root / "a.dat"), "fake")
+        assert new_id != old_id
+        monkeypatch.setattr(manager, "_should_force_full_rescan", lambda: False)
+        for _ in range(4):
+            manager._reconciler._failed_sources.clear()  # not the retry gate's test
+            manager._handle_rescan()
+
+        assert list(state.claims) == [new_id]
+        assert set(server.sources) == {new_id}
+
+        (root / "a.dat").unlink()  # and it is still monitored
+        manager._handle_rescan()
+        manager._handle_rescan()
+        assert state.claims == {}
+
+    def test_a_symlinked_file_gets_its_roots_alias(self, tmp_path):
+        from types import SimpleNamespace
+
+        root = tmp_path / "data"
+        root.mkdir()
+        self._link_into(root, tmp_path)
+        _, _, manager = self._manager(root, monitored_aliases={root: "lab"})
+
+        claim = SimpleNamespace(primary_path=str(root / "link.dat"))
+
+        assert manager._monitored_catalog_url(claim) == "lab/link.dat"
+
+    def test_a_symlinked_file_under_a_cloud_root_is_cloud(self, tmp_path):
+        root = tmp_path / "data"
+        root.mkdir()
+        self._link_into(root, tmp_path)
+        _, _, manager = self._manager(root, cloud_roots={root})
+
+        assert manager._is_under_cloud_root(str(root / "link.dat"))
+        assert manager._reconciler._is_under_cloud_root(str(root / "link.dat"))
+
+    def test_a_dropped_link_whose_target_is_gone_is_removed(self, tmp_path):
+        drop = tmp_path / "drop"
+        drop.mkdir()
+        (drop / "keep.dat").write_text("k")
+        self._link_into(drop, tmp_path)
+        server = _FakeServer()
+        manager = _make_manager(
+            server,
+            registry=_ScriptedRegistry(),
+            discovery_state=DiscoveryState(),
+            monitored_dirs=set(),
+            stability_window=0.0,
+        )
+        manager.complete_initial_scan()
+        assert len(_drain_drop(manager, drop).added) == 2
+
+        (tmp_path / "outside" / "x.dat").unlink()  # the link now dangles
+        result = _drain_drop(manager, drop)
+
+        assert len(result.removed) == 1
+        assert len(server.sources) == 1
 
 
 class TestSourceManagerRegressions:

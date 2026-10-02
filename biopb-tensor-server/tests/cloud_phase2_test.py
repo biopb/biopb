@@ -1624,6 +1624,7 @@ class TestCloudRootFlag:
 
 
 def _drop(mgr, path, **kwargs):
+    mgr.complete_initial_scan()  # drops wait for the first scan
     result = None
     for event in mgr.add_local_source(str(path), **kwargs):
         if event[0] == "result":
