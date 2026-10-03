@@ -43,7 +43,7 @@ def test_a_single_file_registers_once(tmp_path):
 
     ((sid, adapter),) = _registered(server).items()
     assert type(adapter).__name__ == "TiffAdapter"
-    assert adapter.catalog_url == f"file://{f}"
+    assert adapter.catalog_url == f.as_uri()
 
 
 def test_a_single_file_keeps_its_alias_as_the_tree_root(tmp_path):
