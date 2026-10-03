@@ -793,7 +793,9 @@ def _setup_flight_server(
         full_rescan_interval=server_config.full_rescan_interval,
         prune_unseen_days=server_config.annotations.prune_unseen_days,
         rescan_interval=server_config.rescan_interval,
+        registration_workers=server_config.registration_workers,
     )
+    server.set_registration_pending_provider(source_manager.pending_registrations)
 
     roots = source_manager.roots
     monitored = roots.of_kind(RootKind.MONITORED)
@@ -827,6 +829,12 @@ def _setup_flight_server(
         # wire should_warm() into precache_worker so it can avoid cloud-root
         # source.
         precache_worker.should_warm = source_manager.should_warm
+        # Warming waits for the background registration it would compete with.
+        precache_worker.backlog_gate = source_manager.registration_idle
+        # A source whose registration was deferred reaches the backlog when it
+        # registers; the seed below skips it (it had nothing to warm).
+        if server_config.precache.backlog_enabled:
+            source_manager.set_source_registered_hook(precache_worker.enqueue_backlog)
         # seed precache backlog after the initial scan completes
         if server_config.precache.backlog_enabled:
             source_manager.set_initial_scan_complete_hook(

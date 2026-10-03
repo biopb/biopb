@@ -505,6 +505,46 @@ class TestSourcesEndpoints:
                 r = tc.get("/api/sources", headers=_bearer(_TOKEN))
         assert r.json()[0]["is_resolved"] is False
 
+    def test_list_sources_carries_why_a_source_is_unresolved(self, auth_client):
+        tc, mock_fc = auth_client
+        row = _source_row(_make_source_desc(tensors=[], is_resolved=False))
+
+        def query(sql, format="arrow"):  # noqa: A002
+            if "unresolved_reason" in sql:
+                return [{"source_id": "src0", "unresolved_reason": "pending"}]
+            return [row]
+
+        mock_fc.query.side_effect = query
+        r = tc.get("/api/sources", headers=_bearer(_TOKEN))
+        assert r.json()[0]["unresolved_reason"] == "pending"
+
+    def test_list_sources_still_lists_against_a_server_without_the_column(
+        self, auth_client
+    ):
+        # The reason is a second, narrow query: a server older than the column
+        # refuses it, and the listing must not go with it.
+        tc, mock_fc = auth_client
+        row = _source_row(_make_source_desc(tensors=[], is_resolved=False))
+
+        def query(sql, format="arrow"):  # noqa: A002
+            if "unresolved_reason" in sql:
+                raise RuntimeError("Binder Error: column not found")
+            return [row]
+
+        mock_fc.query.side_effect = query
+        r = tc.get("/api/sources", headers=_bearer(_TOKEN))
+        assert r.status_code == 200
+        assert r.json()[0]["is_resolved"] is False
+        assert "unresolved_reason" not in r.json()[0]
+
+    def test_a_resolved_source_carries_no_reason(self, auth_client):
+        tc, mock_fc = auth_client
+        mock_fc.query.side_effect = lambda sql, format="arrow": [  # noqa: A006
+            _source_row(_make_source_desc())
+        ]
+        r = tc.get("/api/sources", headers=_bearer(_TOKEN))
+        assert "unresolved_reason" not in r.json()[0]
+
     def test_list_sources_is_resolved_defaults_true_on_missing_column(
         self, auth_client
     ):

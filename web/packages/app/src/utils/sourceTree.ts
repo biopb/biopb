@@ -116,6 +116,32 @@ export function isUnresolved(src: DataSourceDescriptor): boolean {
 }
 
 /**
+ * Why an unresolved source is unresolved, as the row says.
+ *
+ * `recall`: a cloud placeholder, and resolving it downloads it. `pending`: the
+ * server found it and has not read it yet; opening it reads it now, locally, at
+ * no cost, so the UI must not talk about downloads. `failed`: the server could
+ * not read it, and says why on resolve. A row without the field is the cloud
+ * case, which is all an unresolved row was before it existed.
+ */
+export type UnresolvedKind = "recall" | "pending" | "failed";
+
+export function unresolvedKind(src: DataSourceDescriptor): UnresolvedKind {
+  const reason = src.unresolved_reason;
+  return reason === "pending" || reason === "failed" ? reason : "recall";
+}
+
+/** Hover copy for a source the server has found but not read yet. */
+export const PENDING_TOOLTIP =
+  "Loading \u2014 the server has found this source and has not read its " +
+  "metadata yet. Opening it reads it now.";
+
+/** Hover copy for a source the server could not read. */
+export const FAILED_TOOLTIP =
+  "Could not be read \u2014 the server retries on its own, and the server log " +
+  "says why. Opening it shows the reason.";
+
+/**
  * A resolved source with nothing on it -- browsing into it would open an
  * empty list, so the tree leaves it out rather than rendering a dead end.
  *

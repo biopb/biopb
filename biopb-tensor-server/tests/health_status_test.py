@@ -48,6 +48,7 @@ def test_health_payload_shape_unchanged():
         "uptime_seconds",
         "full_scan_in_progress",
         "last_full_scan_finished_at",
+        "registration_pending",
     ):
         assert key in payload
 
@@ -93,6 +94,19 @@ def test_health_reflects_scan_status_setters():
     payload = _health(server)
     assert payload["full_scan_in_progress"] is False
     assert payload["last_full_scan_finished_at"] == 1234.5
+
+
+def test_health_reports_sources_still_awaiting_registration():
+    """Nothing defers registration until a provider says otherwise."""
+    server = TensorFlightServer("grpc://localhost:0")
+    assert _health(server)["registration_pending"] == 0
+
+    pending = [3]
+    server.set_registration_pending_provider(lambda: pending[0])
+    assert _health(server)["registration_pending"] == 3
+
+    pending[0] = 0
+    assert _health(server)["registration_pending"] == 0
 
 
 def test_health_starting_over_the_wire_before_ready():

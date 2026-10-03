@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { useDocumentTitle } from "../hooks/useDocumentTitle";
 import { withBase } from "../base";
+import { catalogIsFilling } from "../utils/catalogHealth";
 import { sessionFetch } from "../utils/sessionFetch";
 import {
   authRequired,
@@ -144,7 +145,7 @@ export default function DashboardPage() {
       setCatalog(
         h
           ? {
-              scanning: !!h.full_scan_in_progress,
+              scanning: catalogIsFilling(h),
               count: j.source_count ?? 0,
               finishedAt: h.last_full_scan_finished_at ?? null,
             }

@@ -761,7 +761,11 @@ async def execute_code(
       1-indexed, unlike `tensors[0]` in Python/TS code). An unresolved (cloud)
       source has an empty `tensors`, so any such predicate hides it; use
       `is_resolved` to filter on them on purpose (e.g. `WHERE NOT is_resolved`
-      to list what hasn't been resolved yet).
+      to list what hasn't been resolved yet). Right after a server start many
+      sources are `is_resolved = false` with `unresolved_reason = 'pending'`:
+      found, not read yet, filling in (`client.health_check()
+      ["registration_pending"]` counts them). Reading one registers it at once,
+      and until they are done an empty structural search means "not known yet".
     - resolved is not the same as local. Assume a cloud or synced-folder
       source's bytes may not be on the serving machine, so its first read can
       be slow or fail offline -- say so before starting one, not after.
