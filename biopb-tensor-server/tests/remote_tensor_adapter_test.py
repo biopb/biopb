@@ -1397,8 +1397,8 @@ def test_create_source_manager_captures_bare_host_monitored_upstream(simple_zarr
         server=server,
         registry=get_default_registry(),
         # a local static source so there is something to serve (else it bails)
-        static_sources=[SourceConfig(type="zarr", url=zarr_path, source_id="local")],
-        monitored_sources=[
+        sources=[
+            SourceConfig(type="zarr", url=zarr_path, source_id="local"),
             SourceConfig(url="grpc://lab:8815", alias="lab", monitor=True),
         ],
         metadata_db=server.metadata_db,
@@ -2010,10 +2010,7 @@ def test_unreachable_sole_monitored_upstream_does_not_block_startup():
     manager = create_source_manager(
         server=server,
         registry=get_default_registry(),
-        static_sources=[],  # expansion of the down upstream yielded nothing
-        monitored_sources=[
-            SourceConfig(url="grpc://localhost:59599", alias="lab", monitor=True)
-        ],
+        sources=[SourceConfig(url="grpc://localhost:59599", alias="lab", monitor=True)],
         metadata_db=server.metadata_db,
     )
     assert manager is not None  # would have been None (hard-fail) before the fix
@@ -3126,22 +3123,19 @@ def _register_static_proxy(url, alias):
     Instantiating RemoteTensorAdapter(alias=...) directly would prove nothing: the
     bug was that `alias` never reached the adapter, because the
     SourceConfig -> SourceClaim -> SourceConfig rebuild dropped it. So go through
-    discover_sources + create_source_manager and read the adapter the server ended
+    create_source_manager and read the adapter the server ended
     up holding. The upstream is never dialed here -- registration is offline, and
     the display url is what is under test.
     """
     from biopb_tensor_server.adapters import get_default_registry
     from biopb_tensor_server.core.config import SourceConfig
-    from biopb_tensor_server.sources.resolve import discover_sources
     from biopb_tensor_server.sources.source_manager import create_source_manager
 
-    expanded = discover_sources(SourceConfig(url=url, alias=alias))
     server = catalog_server("grpc://localhost:0")
     create_source_manager(
         server=server,
         registry=get_default_registry(),
-        static_sources=expanded,
-        monitored_sources=[],
+        sources=[SourceConfig(url=url, alias=alias)],
         metadata_db=server.metadata_db,
     )
     return server

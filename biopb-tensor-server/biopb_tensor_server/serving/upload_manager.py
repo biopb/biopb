@@ -126,7 +126,7 @@ def write_dir_under_root(
     discovery walk does not catalogue it a second time -- but it still descends
     into the store and stats its chunk files, and one being written keeps its
     directory busy. So ``write_dir`` belongs outside every discovered directory;
-    ``_resolve_serve_sources`` warns when it is not (biopb/biopb#1059). Compared
+    ``partition_sources`` warns when it is not (biopb/biopb#1059). Compared
     resolved, so a symlinked root still matches.
     """
     if write_dir is None:

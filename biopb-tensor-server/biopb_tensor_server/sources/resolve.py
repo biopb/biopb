@@ -453,7 +453,7 @@ def resolve_all_sources(
         # alias means the source_id namespace (handled by the proxy adapter's own
         # display authority), not a tree root. A monitored local *directory* never
         # reaches here (it is discovered by the rescan, not expanded), so its alias
-        # is correctly never applied -- see _resolve_serve_sources's warning.
+        # is correctly never applied -- see partition_sources's warning.
         reroot = bool(source.alias) and not source.is_remote
         root_path = source.local_path if reroot else None
         for src in discovered:

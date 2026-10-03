@@ -19,11 +19,11 @@ import biopb_tensor_server.sources.resolve as resolve_mod
 import numpy as np
 import pytest
 import tifffile
-from biopb_tensor_server.cli import _resolve_serve_sources
 from biopb_tensor_server.core.config import (
     ServerConfig,
     SourceConfig,
 )
+from biopb_tensor_server.sources.partition import partition_sources
 from biopb_tensor_server.sources.resolve import resolve_all_sources
 
 
@@ -34,6 +34,15 @@ def _write_tiff(path: str) -> None:
 
 def _config(*sources: SourceConfig) -> ServerConfig:
     return ServerConfig(sources=list(sources))
+
+
+def _resolve_serve_sources(cfg: ServerConfig, registry=None):
+    return partition_sources(
+        cfg.sources,
+        registry,
+        credentials_config=cfg.credentials,
+        write_dir=cfg.write_dir,
+    )
 
 
 class TestResolveServeSources:

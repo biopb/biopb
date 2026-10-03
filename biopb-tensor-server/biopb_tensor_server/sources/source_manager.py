@@ -32,6 +32,7 @@ from biopb_tensor_server.core.discovery import (
 from biopb_tensor_server.core.errors import UpstreamConfigError
 from biopb_tensor_server.core.remote import is_remote_url
 from biopb_tensor_server.sources.entry_stat import entry_change_time, entry_is_quiet
+from biopb_tensor_server.sources.partition import partition_sources
 from biopb_tensor_server.sources.reconciler import Reconciler, is_under_cloud_root
 from biopb_tensor_server.sources.resolve import _alias_catalog_url, _reroot_catalog_url
 
@@ -1426,9 +1427,8 @@ class SourceManager:
 def create_source_manager(
     server: TensorFlightServer,
     registry: AdapterRegistry,
-    monitored_sources: Optional[List[SourceConfig]] = None,
-    static_sources: Optional[List[SourceConfig]] = None,
-    scan_once_sources: Optional[List[SourceConfig]] = None,
+    sources: Optional[List[SourceConfig]] = None,
+    write_dir: Optional[Path] = None,
     metadata_db: Optional[MetadataDatabase] = None,
     credentials_config: Optional[Any] = None,
     stability_window: float = 30.0,
@@ -1438,13 +1438,14 @@ def create_source_manager(
 ) -> SourceManager:
     """Create a SourceManager for all configured sources.
 
-    Handles static sources (explicit config, registered once, nothing to walk),
-    monitored sources (filesystem-discovered, kept live by the rescan loop) and
-    one-shot directories (discovered by the first tick, then left alone). All
-    three use the same DiscoveryState/callback machinery. Remote sources are never
-    filesystem-watched: a bare-host ``grpc://`` upstream is monitored through the
-    background catalog re-list, and any other remote source is registered
-    statically during initial discovery.
+    Sorts ``sources`` once (:func:`partition_sources`) into static sources
+    (explicit config, registered once, nothing to walk), monitored sources
+    (filesystem-discovered, kept live by the rescan loop) and one-shot directories
+    (discovered by the first tick, then left alone). All three use the same
+    DiscoveryState/callback machinery. Remote sources are never filesystem-watched:
+    a bare-host ``grpc://`` upstream is monitored through the background catalog
+    re-list, and any other remote source is registered statically. The sort is
+    left on the manager as ``manager.partition``.
 
     Always returns a manager. An empty catalog is a valid runtime state --
     sources arrive later through runtime add_source (napari drag-drop), DoPut
@@ -1455,11 +1456,9 @@ def create_source_manager(
     Args:
         server: TensorFlightServer the sources are registered into.
         registry: AdapterRegistry used for claim detection and adapter creation.
-        monitored_sources: SourceConfig entries with monitor=True.
-        static_sources: Explicit SourceConfig entries (a typed source, a file, a
-            single remote source): nothing to discover, so nothing to walk.
-        scan_once_sources: Local directories with ``monitor=False``; each is
-            walked once by the first rescan tick and never rescanned.
+        sources: The configured ``[[sources]]`` entries, as written.
+        write_dir: The upload directory; warned about when it lies inside a
+            scanned source directory.
         metadata_db: the catalog this manager writes as sources are added and
             removed. It is the only writer: the server registers, the reconciler
             catalogues. None leaves registered sources absent from every browse.
@@ -1475,9 +1474,13 @@ def create_source_manager(
     Returns:
         A SourceManager, empty if no source is usable.
     """
-    monitored_sources = monitored_sources or []
-    static_sources = static_sources or []
-    scan_once_sources = scan_once_sources or []
+    partition = partition_sources(
+        sources or [],
+        registry,
+        credentials_config=credentials_config,
+        write_dir=write_dir,
+    )
+    static_sources, monitored_sources, scan_once_sources = partition
 
     # ``monitored_sources`` holds the watched local directories and the bare-host
     # tensor-server upstreams ("mirror everything", biopb/biopb#178).
@@ -1548,4 +1551,5 @@ def create_source_manager(
     for source in static_sources:
         manager.register_static_source(source)
 
+    manager.partition = partition
     return manager

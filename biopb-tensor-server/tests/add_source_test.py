@@ -175,7 +175,7 @@ class TestAddLocalSource:
         manager = create_source_manager(
             server=server,
             registry=get_default_registry(),
-            static_sources=[SourceConfig(url=str(link / "exp.zarr"), type="zarr")],
+            sources=[SourceConfig(url=str(link / "exp.zarr"), type="zarr")],
         )
         assert manager is not None
         manager.complete_initial_scan()
@@ -213,7 +213,7 @@ class TestAddLocalSource:
         manager = create_source_manager(
             server=server,
             registry=get_default_registry(),
-            static_sources=static_sources,
+            sources=static_sources,
         )
         assert manager is not None
 

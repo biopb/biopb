@@ -1991,12 +1991,13 @@ class TestStaticCatalogSeeding:
 
         db = MetadataDatabase()
         server = _FakeServer()
+        (tmp_path / "plate.zarr").mkdir()
         static = SourceConfig(url=str(tmp_path / "plate.zarr"), type="zarr")
 
         manager = create_source_manager(
             server=server,
             registry=_CatalogStubRegistry(),
-            static_sources=[static],
+            sources=[static],
             metadata_db=db,
         )
 
