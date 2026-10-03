@@ -24,6 +24,7 @@ import io
 import logging
 import os
 import re
+import struct
 import threading
 import time
 import xml.etree.ElementTree as ET
@@ -82,80 +83,137 @@ def _get_namespace(root) -> dict:
     return {"ome": "http://www.openmicroscopy.org/Schemas/OME/2016-06"}
 
 
-def _extract_files_from_ome_xml(
-    ome_metadata: str,
+_UUID_FILENAME = re.compile(rb'FileName="([^"]*)"')
+
+
+def _files_from_ome_xml(xml: bytes) -> Tuple[str, ...]:
+    """The distinct ``<UUID FileName=...>`` values of an OME-XML, in document order.
+
+    A literal scan, not an XML parse: a Micro-Manager stack's XML runs to tens of
+    MB and repeats a file name per plane, so the parse cost ~25x the scan for the
+    same answer. A value with an entity or single quotes goes through the parser.
+    """
+    names = list(dict.fromkeys(_UUID_FILENAME.findall(xml)))
+    if b"FileName='" in xml or any(b"&" in n for n in names):
+        return _files_from_ome_xml_parsed(xml)
+    return tuple(n.decode("utf-8", "replace") for n in names)
+
+
+def _files_from_ome_xml_parsed(xml: bytes) -> Tuple[str, ...]:
+    try:
+        root = ET.fromstring(xml)
+    except ET.ParseError:
+        return ()
+    names: Dict[str, None] = {}
+    for uuid_elem in root.iter():
+        if uuid_elem.tag.rsplit("}", 1)[-1] == "UUID":
+            filename = uuid_elem.get("FileName")
+            if filename:
+                names[filename] = None
+    return tuple(names)
+
+
+def _existing_files(
+    names: Tuple[str, ...],
     source_dir: "Path | str",
     store: Optional["RemoteStore"] = None,
-) -> "Optional[List[Path] | List[str]]":
-    """Extract the ordered TIFF file list from OME-XML ``TiffData`` elements.
+) -> "List[Path] | List[str]":
+    """The files *names* refer to that exist beside the master, in order."""
+    files = []
+    for filename in names:
+        if store is not None:
+            if source_dir:
+                file_path = store._join(str(source_dir) + "/" + filename)
+            else:
+                file_path = store._join(filename)
+            exists = store.isfile(file_path)
+        else:
+            file_path = Path(source_dir) / filename
+            exists = file_path.exists()
+        if exists:
+            files.append(file_path)
+    return files
 
-    Files are returned in order with the first TiffData's file as master. Returns
-    ``None`` if parsing fails or no referenced file exists.
+
+# Process-wide memo of the claim's content probe: the file names an OME-TIFF's
+# OME-XML refers to (``()`` for a single-file one), or ``None`` for a TIFF with no
+# OME-XML. Keyed on the walk's content-identity signature (st_dev, st_ino, st_size,
+# st_mtime_ns, st_ctime_ns), so a hit means identical bytes; ``None`` is a result
+# too, so membership decides a hit. Values are small, so the bound covers a large
+# catalog's steady-state rescan -- an LRU smaller than the scan evicts every entry
+# before the next pass reaches it. The lock covers a live walk sharing the memo.
+_OME_PROBE_CACHE: "OrderedDict[Tuple[str, Tuple], Optional[Tuple[str, ...]]]" = (
+    OrderedDict()
+)
+_OME_PROBE_CACHE_MAX = 100_000
+_OME_PROBE_CACHE_LOCK = threading.Lock()
+
+_TIFF_DESCRIPTION_TAG = 270
+_TIFF_ASCII = 2
+_OME_TAIL = b"OME>"
+
+
+def _read_ome_xml(path: Path) -> Optional[bytes]:
+    """The first IFD's ImageDescription if it is OME-XML, else ``None``.
+
+    Reads the header, the first IFD and the description, and only the last bytes
+    of a description that is not OME-XML. Raises for a layout it does not handle.
     """
-    try:
-        root = ET.fromstring(ome_metadata)
-        namespace = _get_namespace(root)
-
-        files = []
-        seen_files = set()
-
-        for tiff_data in root.findall(".//ome:TiffData", namespace):
-            uuid_elem = tiff_data.find("ome:UUID", namespace)
-            if uuid_elem is None:
-                for child in tiff_data:
-                    if child.tag.endswith("UUID") or child.tag == "UUID":
-                        uuid_elem = child
-                        break
-
-            if uuid_elem is not None:
-                filename = uuid_elem.get("FileName")
-                if filename and filename not in seen_files:
-                    if store is not None:
-                        if source_dir:
-                            file_path = store._join(str(source_dir) + "/" + filename)
-                        else:
-                            file_path = store._join(filename)
-                        exists = store.isfile(file_path)
-                    else:
-                        file_path = Path(source_dir) / filename
-                        exists = file_path.exists()
-
-                    if exists:
-                        files.append(file_path)
-                        seen_files.add(filename)
-
-        return files if files else None
-    except ET.ParseError:
-        return None
-
-
-# Process-wide memoization of the embedded-OME-XML probe (biopb/biopb#56, item 6).
-# A steady-state rescan opens every monitored .tif through tifffile just to learn
-# whether it carries OME-XML -- the dominant cost of the post-#63 claim phase
-# (~100 ms / 64 tiffs on a real tree). The result is a pure function of the file's
-# bytes, so it is cached keyed on the state walk's content-identity signature
-# (st_dev, st_ino, st_size, st_mtime_ns, st_ctime_ns): any byte change bumps the
-# signature, so a hit provably means identical content. A cached value of ``None``
-# ("no OME-XML") is meaningful and is stored too, so membership -- not truthiness --
-# decides a hit. Bounded LRU; only the snapshot-driven path passes a signature, so
-# the single-threaded watcher is the only writer, but the lock keeps it safe if a
-# concurrent live walk ever supplies one.
-_OME_META_CACHE: "OrderedDict[Tuple[str, Tuple], Optional[str]]" = OrderedDict()
-_OME_META_CACHE_MAX = 4096
-_OME_META_CACHE_LOCK = threading.Lock()
+    with open(path, "rb") as f:
+        head = f.read(16)
+        order = {b"II": "<", b"MM": ">"}[head[:2]]
+        magic = struct.unpack(order + "H", head[2:4])[0]
+        if magic == 42:
+            (ifd,) = struct.unpack(order + "I", head[4:8])
+            count_fmt, count_size, entry_size, offset_fmt, slot = "H", 2, 12, "I", 4
+        elif magic == 43:
+            (ifd,) = struct.unpack(order + "Q", head[8:16])
+            count_fmt, count_size, entry_size, offset_fmt, slot = "Q", 8, 20, "Q", 8
+        else:
+            raise ValueError("not a TIFF")
+        f.seek(ifd)
+        (n,) = struct.unpack(order + count_fmt, f.read(count_size))
+        table = f.read(n * entry_size)
+        for i in range(n):
+            entry = table[i * entry_size : (i + 1) * entry_size]
+            tag, kind = struct.unpack(order + "HH", entry[:4])
+            if tag != _TIFF_DESCRIPTION_TAG:
+                continue
+            if kind != _TIFF_ASCII:
+                raise ValueError("unexpected description type")
+            (size,) = struct.unpack(order + offset_fmt, entry[4 : 4 + slot])
+            value = entry[4 + slot : 4 + 2 * slot]
+            if size <= slot:
+                data = value[:size]
+            else:
+                (offset,) = struct.unpack(order + offset_fmt, value)
+                f.seek(offset + max(0, size - 16))
+                if not f.read(16).rstrip(b"\x00 \t\r\n").endswith(_OME_TAIL):
+                    return None
+                f.seek(offset)
+                data = f.read(size)
+            return data if data.rstrip(b"\x00 \t\r\n").endswith(_OME_TAIL) else None
+    return None
 
 
-def _probe_ome_metadata_from_tiff(path: Path) -> Optional[str]:
-    """Open the TIFF and return its embedded OME-XML, or None. No caching."""
+def _read_ome_xml_tifffile(path: Path) -> Optional[bytes]:
     import tifffile
 
     try:
         with tifffile.TiffFile(str(path)) as tf:
-            if hasattr(tf, "ome_metadata") and tf.ome_metadata is not None:
-                return tf.ome_metadata
+            xml = tf.ome_metadata
     except Exception:
         return None
-    return None
+    return xml.encode("utf-8") if xml else None
+
+
+def _probe_ome_files(path: Path) -> Optional[Tuple[str, ...]]:
+    """What the file's OME-XML refers to, or ``None`` without OME-XML. No caching."""
+    try:
+        xml = _read_ome_xml(path)
+    except Exception:
+        xml = _read_ome_xml_tifffile(path)
+    return None if xml is None else _files_from_ome_xml(xml)
 
 
 def _file_signature(path: Path) -> Optional[Tuple]:
@@ -167,33 +225,33 @@ def _file_signature(path: Path) -> Optional[Tuple]:
     return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
 
 
-def _get_ome_metadata_from_tiff(
+def _get_ome_files(
     path: Path, signature: Optional[Tuple] = None
-) -> Optional[str]:
-    """Extract OME-XML metadata from a TIFF file if present.
+) -> Optional[Tuple[str, ...]]:
+    """What a TIFF's OME-XML refers to (see :func:`_probe_ome_files`), memoized.
 
-    The probe result is memoized on ``(path, signature)`` -- the file's own stat
-    unless ``signature`` is given -- so an unchanged file is not reopened on the
-    next rescan. A file that cannot be stat-ed is probed uncached.
+    Keyed on ``(path, signature)`` -- the file's own stat unless ``signature`` is
+    given -- so an unchanged file is not reopened on the next rescan. A file that
+    cannot be stat-ed is probed uncached.
     """
     if signature is None:
         signature = _file_signature(path)
     if signature is None:
-        return _probe_ome_metadata_from_tiff(path)
+        return _probe_ome_files(path)
 
     key = (str(path), signature)
-    with _OME_META_CACHE_LOCK:
-        if key in _OME_META_CACHE:
-            _OME_META_CACHE.move_to_end(key)
-            return _OME_META_CACHE[key]
+    with _OME_PROBE_CACHE_LOCK:
+        if key in _OME_PROBE_CACHE:
+            _OME_PROBE_CACHE.move_to_end(key)
+            return _OME_PROBE_CACHE[key]
 
-    result = _probe_ome_metadata_from_tiff(path)
+    result = _probe_ome_files(path)
 
-    with _OME_META_CACHE_LOCK:
-        _OME_META_CACHE[key] = result
-        _OME_META_CACHE.move_to_end(key)
-        while len(_OME_META_CACHE) > _OME_META_CACHE_MAX:
-            _OME_META_CACHE.popitem(last=False)
+    with _OME_PROBE_CACHE_LOCK:
+        _OME_PROBE_CACHE[key] = result
+        _OME_PROBE_CACHE.move_to_end(key)
+        while len(_OME_PROBE_CACHE) > _OME_PROBE_CACHE_MAX:
+            _OME_PROBE_CACHE.popitem(last=False)
     return result
 
 
@@ -1278,11 +1336,11 @@ class OmeTiffAdapter(TensorAdapter):
             # claims the .tif as an unresolved image.
             and ctx.is_resident()
         ):
-            ome_metadata = _get_ome_metadata_from_tiff(ctx._path)
+            referenced = _get_ome_files(ctx._path)
 
-            if ome_metadata:
-                related_files = _extract_files_from_ome_xml(
-                    ome_metadata, ctx.parent.path_str, ctx.store
+            if referenced is not None:
+                related_files = _existing_files(
+                    referenced, ctx.parent.path_str, ctx.store
                 )
                 if related_files:
                     primary_path = related_files[0]
