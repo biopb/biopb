@@ -9,6 +9,7 @@ from biopb_tensor_server.adapters.ome_tiff import (
     _existing_files,
     _files_from_ome_xml,
     _files_from_ome_xml_parsed,
+    _get_ome_files,
     _probe_ome_files,
 )
 from biopb_tensor_server.core.discovery import ClaimContext, DiscoveryState
@@ -108,7 +109,11 @@ def test_probe_tolerates_junk(tmp_path):
     junk = tmp_path / "junk.tif"
     junk.write_bytes(b"not a tiff at all")
     assert _probe_ome_files(junk) is None
-    assert _probe_ome_files(tmp_path / "missing.tif") is None
+    # An unreadable file says nothing about its content: the probe raises, and
+    # the memoized getter reads it as having none without remembering that.
+    with pytest.raises(OSError):
+        _probe_ome_files(tmp_path / "missing.tif")
+    assert _get_ome_files(tmp_path / "missing.tif") is None
     cut = tmp_path / "cut.tif"
     _write(cut, _xml("a.tif").decode())
     cut.write_bytes(cut.read_bytes()[:20])

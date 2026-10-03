@@ -28,7 +28,6 @@ import struct
 import threading
 import time
 import xml.etree.ElementTree as ET
-from collections import OrderedDict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
@@ -57,6 +56,7 @@ from biopb_tensor_server.core.chunk import (
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import TensorNotFound
 from biopb_tensor_server.core.labels import label_extent, label_field
+from biopb_tensor_server.core.signature_memo import Signature, SignatureMemo
 
 logger = logging.getLogger(__name__)
 
@@ -138,18 +138,9 @@ def _existing_files(
     return files
 
 
-# Process-wide memo of the claim's content probe: the file names an OME-TIFF's
-# OME-XML refers to (``()`` for a single-file one), or ``None`` for a TIFF with no
-# OME-XML. Keyed on the walk's content-identity signature (st_dev, st_ino, st_size,
-# st_mtime_ns, st_ctime_ns), so a hit means identical bytes; ``None`` is a result
-# too, so membership decides a hit. Values are small, so the bound covers a large
-# catalog's steady-state rescan -- an LRU smaller than the scan evicts every entry
-# before the next pass reaches it. The lock covers a live walk sharing the memo.
-_OME_PROBE_CACHE: "OrderedDict[Tuple[str, Tuple], Optional[Tuple[str, ...]]]" = (
-    OrderedDict()
-)
-_OME_PROBE_CACHE_MAX = 100_000
-_OME_PROBE_CACHE_LOCK = threading.Lock()
+# The claim's content probe, memoized: the file names an OME-TIFF's OME-XML refers
+# to (``()`` for a single-file one), or ``None`` for a TIFF with no OME-XML.
+_OME_PROBE_MEMO = SignatureMemo(100_000)
 
 _TIFF_DESCRIPTION_TAG = 270
 _TIFF_ASCII = 2
@@ -205,57 +196,38 @@ def _read_ome_xml_tifffile(path: Path) -> Optional[bytes]:
     try:
         with tifffile.TiffFile(str(path)) as tf:
             xml = tf.ome_metadata
+    except OSError:
+        raise
     except Exception:
         return None
     return xml.encode("utf-8") if xml else None
 
 
 def _probe_ome_files(path: Path) -> Optional[Tuple[str, ...]]:
-    """What the file's OME-XML refers to, or ``None`` without OME-XML. No caching."""
+    """What the file's OME-XML refers to, or ``None`` without OME-XML.
+
+    Raises ``OSError`` when the file cannot be read, which says nothing about its
+    content.
+    """
     try:
         xml = _read_ome_xml(path)
+    except OSError:
+        raise
     except Exception:
         xml = _read_ome_xml_tifffile(path)
     return None if xml is None else _files_from_ome_xml(xml)
 
 
-def _file_signature(path: Path) -> Optional[Tuple]:
-    """Identity of a file's current bytes, for memoizing a content probe."""
+def _get_ome_files(
+    path: Path, signature: Optional[Signature] = None
+) -> Optional[Tuple[str, ...]]:
+    """What a TIFF's OME-XML refers to (see :func:`_probe_ome_files`), memoized on
+    the file's identity so an unchanged file is not reopened on the next rescan.
+    An unreadable file reads as having none, and is not memoized."""
     try:
-        st = os.stat(path)
+        return _OME_PROBE_MEMO.get(path, lambda: _probe_ome_files(path), signature)
     except OSError:
         return None
-    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
-
-
-def _get_ome_files(
-    path: Path, signature: Optional[Tuple] = None
-) -> Optional[Tuple[str, ...]]:
-    """What a TIFF's OME-XML refers to (see :func:`_probe_ome_files`), memoized.
-
-    Keyed on ``(path, signature)`` -- the file's own stat unless ``signature`` is
-    given -- so an unchanged file is not reopened on the next rescan. A file that
-    cannot be stat-ed is probed uncached.
-    """
-    if signature is None:
-        signature = _file_signature(path)
-    if signature is None:
-        return _probe_ome_files(path)
-
-    key = (str(path), signature)
-    with _OME_PROBE_CACHE_LOCK:
-        if key in _OME_PROBE_CACHE:
-            _OME_PROBE_CACHE.move_to_end(key)
-            return _OME_PROBE_CACHE[key]
-
-    result = _probe_ome_files(path)
-
-    with _OME_PROBE_CACHE_LOCK:
-        _OME_PROBE_CACHE[key] = result
-        _OME_PROBE_CACHE.move_to_end(key)
-        while len(_OME_PROBE_CACHE) > _OME_PROBE_CACHE_MAX:
-            _OME_PROBE_CACHE.popitem(last=False)
-    return result
 
 
 # OME dimension order is always a permutation of XYZCT (plus an optional samples

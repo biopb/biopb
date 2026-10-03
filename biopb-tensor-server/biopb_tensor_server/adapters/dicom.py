@@ -3,6 +3,7 @@
 Handles single DICOM files and multi-file DICOM series using pydicom.
 """
 
+import sys
 import threading
 from contextlib import contextmanager
 from pathlib import Path
@@ -25,10 +26,46 @@ from biopb_tensor_server.core.discovery import (
     ClaimContext,
     SourceClaim,
 )
+from biopb_tensor_server.core.signature_memo import SignatureMemo
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import SourceConfig
     from biopb_tensor_server.core.discovery import DiscoveryState
+
+
+# The claims' header probe, memoized per local file: ``(has Rows and Columns,
+# SeriesInstanceUID)``. A series directory costs one header parse per slice, so
+# without the memo every rescan pays it again.
+_HEADER_MEMO = SignatureMemo(500_000)
+
+
+def _read_header_summary(path: str) -> Tuple[bool, Optional[str]]:
+    """``(image-capable, SeriesInstanceUID)`` from a slice's header.
+
+    A file that is not DICOM reads as ``(False, None)``. Raises ``OSError`` when
+    the file cannot be read, which says nothing about its content.
+    """
+    import pydicom
+
+    try:
+        ds = pydicom.dcmread(path, stop_before_pixels=True)
+    except OSError:
+        raise
+    except Exception:
+        return False, None
+    uid = getattr(ds, "SeriesInstanceUID", None)
+    image = hasattr(ds, "Rows") and hasattr(ds, "Columns")
+    # One string per series, not one per slice.
+    return image, (sys.intern(str(uid)) if uid is not None else None)
+
+
+def _header_summary(path: str) -> Optional[Tuple[bool, Optional[str]]]:
+    """:func:`_read_header_summary`, memoized on the file's identity; ``None``
+    for an unreadable file, which is not memoized."""
+    try:
+        return _HEADER_MEMO.get(path, lambda: _read_header_summary(path))
+    except OSError:
+        return None
 
 
 # =============================================================================
@@ -365,17 +402,23 @@ class DicomAdapter(TensorAdapter):
             )
 
         try:
-            import pydicom
+            if not ctx.is_remote and ctx._path is not None:
+                # A local file: the memoized header probe (shared with the series
+                # claim, which reads the same headers).
+                summary = _header_summary(str(ctx._path))
+                if summary is None or not summary[0]:
+                    return None
+            else:
+                import pydicom
 
-            # Read metadata only (no pixel data). ctx.open() is the shape-agnostic
-            # read seam -- a local Path handle or a remote store handle -- so this
-            # stays blind to whether the context is local or remote.
-            with ctx.open("rb") as fobj:
-                ds = pydicom.dcmread(fobj, stop_before_pixels=True)
+                # Read metadata only (no pixel data) through ctx.open(), the read
+                # seam for a remote store handle.
+                with ctx.open("rb") as fobj:
+                    ds = pydicom.dcmread(fobj, stop_before_pixels=True)
 
-            # Check for image-related tags (indicating pixel data capability)
-            if not (hasattr(ds, "Rows") and hasattr(ds, "Columns")):
-                return None
+                # Check for image-related tags (indicating pixel data capability)
+                if not (hasattr(ds, "Rows") and hasattr(ds, "Columns")):
+                    return None
 
             state.try_claim_path(ctx.path_str)
 
@@ -646,8 +689,6 @@ class DicomSeriesAdapter(TensorAdapter):
             return None
 
         try:
-            import pydicom
-
             # Group the image-capable files by SeriesInstanceUID. Keying off the
             # first globbed file's series (the old approach) made the result depend
             # on glob order: a directory holding a singleton series ahead of a real
@@ -656,17 +697,14 @@ class DicomSeriesAdapter(TensorAdapter):
             # decision independent of discovery order.
             series_to_files = {}
             for f in dcm_files:
-                try:
-                    ds = pydicom.dcmread(str(f), stop_before_pixels=True)
-                except Exception:
+                summary = _header_summary(str(f))
+                if summary is None:
                     continue
-                series_uid = getattr(ds, "SeriesInstanceUID", None)
+                image, series_uid = summary
                 # Rows/Columns indicate pixel-data capability.
-                if series_uid is None or not (
-                    hasattr(ds, "Rows") and hasattr(ds, "Columns")
-                ):
+                if series_uid is None or not image:
                     continue
-                series_to_files.setdefault(str(series_uid), []).append(f)
+                series_to_files.setdefault(series_uid, []).append(f)
 
             # Claim the largest series with at least two slices.
             series_uid, series_files = max(

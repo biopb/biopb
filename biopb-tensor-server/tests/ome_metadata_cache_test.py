@@ -18,9 +18,9 @@ from biopb_tensor_server.adapters.ome_tiff import _get_ome_files
 
 @pytest.fixture(autouse=True)
 def _clear_cache():
-    ome_tiff_mod._OME_PROBE_CACHE.clear()
+    ome_tiff_mod._OME_PROBE_MEMO.clear()
     yield
-    ome_tiff_mod._OME_PROBE_CACHE.clear()
+    ome_tiff_mod._OME_PROBE_MEMO.clear()
 
 
 @pytest.fixture
@@ -80,7 +80,7 @@ def test_signature_none_never_caches(counting_probe):
     _get_ome_files(p, None)
 
     assert calls["paths"] == [str(p), str(p)]  # uncached: probed every time
-    assert len(ome_tiff_mod._OME_PROBE_CACHE) == 0
+    assert len(ome_tiff_mod._OME_PROBE_MEMO) == 0
 
 
 def test_distinct_paths_are_independent(counting_probe):
@@ -97,12 +97,12 @@ def test_distinct_paths_are_independent(counting_probe):
 
 def test_cache_is_bounded(counting_probe, monkeypatch):
     calls, _ = counting_probe
-    monkeypatch.setattr(ome_tiff_mod, "_OME_PROBE_CACHE_MAX", 4)
+    monkeypatch.setattr(ome_tiff_mod._OME_PROBE_MEMO, "max_entries", 4)
 
     for i in range(6):
         _get_ome_files(Path(f"/data/f{i}.tif"), (1, i, 0, 0, 0))
 
-    assert len(ome_tiff_mod._OME_PROBE_CACHE) == 4  # capped
+    assert len(ome_tiff_mod._OME_PROBE_MEMO) == 4  # capped
 
     # The two oldest were evicted, so re-requesting f0 re-probes.
     n_before = len(calls["paths"])
