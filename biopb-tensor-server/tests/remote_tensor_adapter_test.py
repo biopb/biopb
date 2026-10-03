@@ -1385,7 +1385,8 @@ def test_monitored_upstream_relist_adds_and_removes(simple_zarr_array):
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
 def test_create_source_manager_captures_bare_host_monitored_upstream(simple_zarr_array):
     """create_source_manager records a monitored bare-host grpc:// source as a
-    re-list upstream, and excludes the single-source grpc://host/<id> form."""
+    re-list upstream. (Keeping the single-source grpc://host/<id> form out of
+    the monitored list is the router's job: cli_resolve_sources_test.)"""
     from biopb_tensor_server.adapters import get_default_registry
     from biopb_tensor_server.core.config import SourceConfig
     from biopb_tensor_server.sources.source_manager import create_source_manager
@@ -1399,15 +1400,10 @@ def test_create_source_manager_captures_bare_host_monitored_upstream(simple_zarr
         static_sources=[SourceConfig(type="zarr", url=zarr_path, source_id="local")],
         monitored_sources=[
             SourceConfig(url="grpc://lab:8815", alias="lab", monitor=True),
-            SourceConfig(url="grpc://lab:8815/one", alias="lab", monitor=True),
         ],
         metadata_db=server.metadata_db,
     )
-    urls = [u.url for u in manager._monitored_upstreams]
-    assert "grpc://lab:8815" in urls
-    assert (
-        "grpc://lab:8815/one" not in urls
-    )  # single-source form has nothing to re-list
+    assert [u.url for u in manager._monitored_upstreams] == ["grpc://lab:8815"]
 
 
 def test_handle_rescan_walks_local_dirs_before_upstream_relist(tmp_path):

@@ -943,7 +943,7 @@ def _setup_flight_server(
         )
 
     # Register all sources (both static and monitored) through unified discovery.
-    # Note: Static sources are already seeded after this (see _commit_add_claim).
+    # Static sources are seeded by the factory (register_static_source).
     source_manager = create_source_manager(
         server=server,
         registry=registry,

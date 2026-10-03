@@ -17,7 +17,6 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
 
-from biopb_tensor_server.adapters.remote_tensor import is_bare_host_upstream_url
 from biopb_tensor_server.core.config import SourceConfig
 from biopb_tensor_server.core.discovery import (
     AdapterRegistry,
@@ -947,6 +946,41 @@ class SourceManager:
             state["period"] = min(state["period"] * 2, self._upstream_max_period)
         state["countdown"] = state["period"]
 
+    def register_static_source(self, source: SourceConfig) -> bool:
+        """Register one explicitly configured source as it is: nothing to walk.
+
+        Returns whether it was committed.
+        """
+        # claim->SourceConfig drops most configs, so we carry some through to call
+        # create_from_config.
+        extra_config = {}
+        if source.dataset:
+            extra_config["dataset"] = source.dataset
+        if source.credentials_profile:
+            extra_config["credentials_profile"] = source.credentials_profile
+        if source.alias:  # display-only
+            extra_config["alias"] = source.alias
+        # Store the canonical resolved form of a local config path, so Claim can
+        # be keyed on it. A remote URL is left verbatim: aliasing is intentional
+        # because the server may use a different address/port for the same data.
+        primary_path = source.url
+        if not is_remote_url(source.url):
+            primary_path = resolve_local_path(source.url)
+        claim = SourceClaim(
+            source_type=source.type,
+            primary_path=primary_path,
+            source_id=source.source_id,
+            extra_config=extra_config,
+            # A static source explicitly flagged cloud is always deferred: the
+            # first access still resolves it cheaply.
+            unresolved=bool(source.cloud),
+        )
+        # source._catalog_url is the alias-derived display tree-root for a local
+        # source (resolve.resolve_all_sources), or None.
+        return self._reconciler._commit_add_claim(
+            claim, catalog_url=source._catalog_url
+        )
+
     def add_local_source(
         self,
         url: str,
@@ -1451,33 +1485,15 @@ def create_source_manager(
     monitored_aliases: Dict[Path, str] = {}
     monitored_upstreams: List[SourceConfig] = []
     for source in monitored_sources:
-        if source.is_remote:
-            if is_bare_host_upstream_url(source.url):
-                logger.info(
-                    "Tensor-server upstream %s: catalog re-listed in the background, "
-                    "not filesystem-watched",
-                    source.url,
-                )
-                monitored_upstreams.append(source)
-            else:
-                # Nothing to re-list or watch; the caller should have registered it.
-                logger.warning(
-                    "Remote source %s is not a bare-host upstream; not monitored",
-                    source.url,
-                )
-            continue
-
         local_path = source.local_path
-        if local_path is None:
-            logger.warning(f"Cannot monitor path: {source.url}")
+        if source.is_remote or local_path is None:
+            logger.info(
+                "Tensor-server upstream %s: catalog re-listed in the background, "
+                "not filesystem-watched",
+                source.url,
+            )
+            monitored_upstreams.append(source)
             continue
-
-        # A path that is not there yet stays: the walk keeps it and picks it up
-        # when it appears.
-        if local_path.is_file():
-            logger.warning(f"Cannot monitor single file: {source.url}")
-            continue
-
         monitored_dirs.add(local_path)
         if source.alias:
             monitored_aliases[local_path] = source.alias
@@ -1528,36 +1544,8 @@ def create_source_manager(
         prune_unseen_days=prune_unseen_days,
     )
 
-    # Seed static sources as direct claims (explicit config, no filesystem walk)
-    # These are added first so monitored discovery skips paths already claimed.
+    # Added first so monitored discovery skips paths already claimed.
     for source in static_sources:
-        # claim->SourceConfig drops most configs, so we carry some through to call
-        # create_from_config.
-        extra_config = {}
-        if source.dataset:
-            extra_config["dataset"] = source.dataset
-        if source.credentials_profile:
-            extra_config["credentials_profile"] = source.credentials_profile
-        if source.alias:  # display-only
-            extra_config["alias"] = source.alias
-        # Store the canonical resolved form of a local config path, so Claim can
-        # be keyed on it.
-        primary_path = source.url  # initial assignment; may be resolved if local
-        # A remote URL is left verbatim. Aliasing is intentional because the server may
-        # use different address/port but serving the same data.
-        if not is_remote_url(source.url):
-            primary_path = resolve_local_path(source.url)
-        claim = SourceClaim(
-            source_type=source.type,
-            primary_path=primary_path,
-            source_id=source.source_id,
-            extra_config=extra_config,
-            # A static source explicitly flagged cloud is always deferred: the
-            # first access still resolves it cheaply.
-            unresolved=bool(source.cloud),
-        )
-        # source._catalog_url is the alias-derived display tree-root for a local
-        # source (resolve.resolve_all_sources), or None.
-        manager._reconciler._commit_add_claim(claim, catalog_url=source._catalog_url)
+        manager.register_static_source(source)
 
     return manager
