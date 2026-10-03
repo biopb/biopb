@@ -146,10 +146,12 @@ def label_forms(
     because it is a pixel's colour components, which a mask has none of, and a
     trailing singleton would shift the spatial axes of a right-aligned viewer.
 
-    **The earlier rule** -- the channel axis dropped altogether -- is still
-    accepted, second, so a set written under it (an upload, a sidecar from an
-    earlier server, a native NGFF group) keeps being served. It is the same list
-    when the image has no channel axis. Axes come back as the image spells them,
+    **The earlier rule** -- the channel axis dropped altogether -- is listed
+    second, and only a read accepts it: a native NGFF group (a file we cannot
+    rewrite, and one the spec allows to omit ``c``) and a sidecar an earlier server
+    wrote keep being served. A new set must have the preferred form
+    (``extent_mismatch(..., allow_earlier=False)``). It is the same list when the
+    image has no channel axis. Axes come back as the image spells them,
     which for the normalized descriptors the callers hand in is canonical.
     """
     if len(image_labels) != len(image_shape):
@@ -219,15 +221,20 @@ def extent_mismatch(
     label_shape: Sequence[int],
     image_labels: Sequence[str],
     image_shape: Sequence[int],
+    *,
+    allow_earlier: bool = True,
 ) -> Optional[str]:
     """Why a set of *label_shape* over *label_labels* does not span the image,
     or None when it does.
 
     The rule is :func:`label_forms`; this is the comparison, against each form
-    in turn. Axes are matched by canonical name, so ``"Z"`` and ``"depth"``
-    agree.
+    in turn, or against the preferred one alone when *allow_earlier* is false (a
+    set being created). Axes are matched by canonical name, so ``"Z"`` and
+    ``"depth"`` agree.
     """
     forms = label_forms(image_labels, image_shape)
+    if not allow_earlier:
+        forms = forms[:1]
     axes = [_axis_key(label) for label in label_labels]
     shape = [int(s) for s in label_shape]
     for form in forms:

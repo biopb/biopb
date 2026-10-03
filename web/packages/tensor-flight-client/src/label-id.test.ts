@@ -183,39 +183,16 @@ describe("labelSelection", () => {
     expect(labelSelection(IMAGE, short, { t: 7, z: 4 })).toEqual({ t: 7, z: 0 });
   });
 
-  describe("against a server that states nothing", () => {
+  describe("against a set that states nothing", () => {
     const unstated = (over: Partial<TileInfo>) => {
       const info = grid(over);
       delete info.image_axes;
       return info;
     };
 
-    it("re-derives the extent rule, reaching the same answer", () => {
+    it("matches the axes by key, exact for an ordinary TZYX set", () => {
       const set = unstated({ ...SET });
       expect(labelSelection(IMAGE, set, { t: 7, z: 4, c: 2 })).toEqual({ t: 7, z: 4 });
-    });
-
-    it("falls back to matching by key when the rank rule does not hold", () => {
-      // Four non-channel image axes, three in the set: nothing to align, so `z`
-      // is read by its name rather than by an index that would name `t`.
-      const odd = unstated({
-        dim_labels: ["z", "y", "x"],
-        shape: [20, 64, 64],
-        selectable: { t: null, z: 0, c: null },
-        plane: { y: 1, x: 2, s: null },
-      });
-      expect(labelSelection(IMAGE, odd, { t: 7, z: 4 })).toEqual({ z: 4 });
-    });
-
-    it("re-derives a same-rank set and an RGB set the same way", () => {
-      const same = unstated({ ...SET_SAME_RANK });
-      expect(labelSelection(IMAGE, same, { t: 7, z: 4, c: 2 })).toEqual({
-        t: 7,
-        c: 0,
-        z: 4,
-      });
-      const rgb = unstated({ ...RGB_SET });
-      expect(labelSelection(RGB_IMAGE, rgb, { t: 7 })).toEqual({ t: 7 });
     });
 
     it("handles an image with no channel axis at all", () => {

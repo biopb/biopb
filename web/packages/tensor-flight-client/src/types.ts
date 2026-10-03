@@ -344,11 +344,10 @@ export interface TileInfo {
    * that, which has no channel axis. The server states it because a client
    * matching the two by name gets `t`/`z` right and an unnamed axis wrong on
    * such a set, which reads frame 0 of a timelapse where frame 40 was asked
-   * for. That is a picture rather than an error, so it is not a rule worth
-   * re-deriving.
+   * for. That is a picture rather than an error, so clients read it and never
+   * derive it.
    *
-   * Absent on an image, and on a server that predates the field; see
-   * {@link labelSelection}, which falls back to the extent rule there.
+   * Absent on an image; {@link labelSelection} matches by key without it.
    */
   image_axes?: number[];
   /**

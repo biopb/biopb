@@ -160,8 +160,10 @@ other two, the request's `array_id` *is* the final one. The kind:
 - refuses a non-unsigned-integer dtype, a reserved name, a name that would not
   stay inside the sidecar directory (`unsafe_store_name`), or a shape /
   `dim_labels` that is not the parent's extent (above) -- a request naming no
-  `dim_labels` is filled in from the image, in the form whose rank the shape
-  has, rather than refused;
+  `dim_labels` is filled in from the image rather than refused. Only a
+  *listing* accepts the earlier shape without the channel axis (a native NGFF
+  group, or a sidecar an earlier server wrote); a set being created must have
+  the current one;
 - refuses a name already attached, finished or pending (biopb/biopb#1054,
   per parent);
 - creates the sidecar array with the pending marker and the minted
@@ -251,8 +253,8 @@ background and fully transparent. `contrastLimits = [0, 1]` is left at
 identity, which is what delivers the stored id to the palette.
 
 `labelSelection` (in `@biopb/tensor-flight-client`) reads the server's
-`image_axes` rather than re-deriving it, falling back to the extent rule only
-against a server that does not state it. The set's channel axis is a single
+`image_axes` and never derives it; without one that fits the set's rank it
+matches the axes by key. The set's channel axis is a single
 plane, so the selection's channel clamps to 0 and the mask shows on every
 channel.
 

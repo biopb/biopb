@@ -85,11 +85,11 @@ export function isReservedLabelName(name: string): boolean {
  * set's `a2`, and reading frame 0 of a timelapse instead of frame 40 is a
  * silently wrong picture rather than a visible failure.
  *
- * So the mapping is **read, not derived**: `TileInfo.image_axes` is the
- * server's own statement of which image axis each of the set's indexes. A
- * server that predates the field leaves it undefined, and the extent rule is
- * re-derived here as the fallback -- the same answer, from the one place that
- * still has to know the rule.
+ * So the mapping is **read, never derived**: `TileInfo.image_axes` is the
+ * server's own statement of which image axis each of the set's indexes, and
+ * every server that serves label sets states it. Without one that fits the
+ * set's rank the axes are matched by key, which is exact for an ordinary TZYX
+ * set and the best answer left otherwise.
  */
 export function labelSelection(
   imageInfo: TileInfo,
@@ -98,9 +98,7 @@ export function labelSelection(
 ): Record<string, number> {
   const stated = labelInfo.image_axes;
   const mapping =
-    stated !== undefined && stated.length === labelInfo.shape.length
-      ? stated
-      : derivedImageAxes(imageInfo, labelInfo);
+    stated !== undefined && stated.length === labelInfo.shape.length ? stated : null;
 
   const byImageAxis: Record<number, number> = {};
   for (const axis of sliderAxes(imageInfo.dim_labels, imageInfo.shape)) {
@@ -120,19 +118,4 @@ export function labelSelection(
     out[axis.key] = Math.min(Math.max(0, want), Math.max(0, axis.extent - 1));
   }
   return out;
-}
-
-/**
- * The extent rule, re-derived: the set's axes are the image's, minus an RGB
- * samples axis, and the set's axis *j* is the image's *j*-th of those. A set
- * written before the channel became a singleton lacks the channel axis too, and
- * is told apart by its rank. Only for a server that does not state `image_axes`;
- * null when the ranks say the set does not span the image at all, which sends
- * {@link labelSelection} to matching by key -- the best answer left, and exact
- * for an ordinary TZYX set.
- */
-function derivedImageAxes(imageInfo: TileInfo, labelInfo: TileInfo): number[] | null {
-  const kept = imageInfo.shape.map((_, i) => i).filter((i) => i !== imageInfo.plane.s);
-  const earlier = kept.filter((i) => i !== imageInfo.selectable.c);
-  return [kept, earlier].find((axes) => axes.length === labelInfo.shape.length) ?? null;
 }

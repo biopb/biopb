@@ -161,6 +161,14 @@ class TestTheFieldShape:
             ["c", "y", "x"], [3, 64, 64], ["c", "y", "x"], [3, 64, 64]
         )
 
+    def test_only_a_listing_accepts_the_earlier_shape(self):
+        # A native group or a sidecar from an earlier server may lack the channel
+        # axis; a set being created may not.
+        image = (["t", "c", "z", "y", "x"], [5, 3, 4, 64, 64])
+        old = (["t", "z", "y", "x"], [5, 4, 64, 64])
+        assert extent_mismatch(*old, *image) is None
+        assert "axes" in extent_mismatch(*old, *image, allow_earlier=False)
+
     def test_a_set_has_the_images_rank_with_a_singleton_channel(self):
         image = (["t", "c", "z", "y", "x"], [5, 3, 4, 64, 64])
         assert (
@@ -523,44 +531,34 @@ class TestTheSdkReadsTheSameRule:
         assert reserved("nuclei") is False
         assert RESERVED_PREFIX == "@"
 
-    def test_derives_the_same_axes_the_server_states(self):
+    @staticmethod
+    def _stated(axes):
+        return json.dumps({"metadata": {"biopb": {"labels": {"image_axes": axes}}}})
+
+    def test_reads_the_axes_the_server_states(self):
         _, sdk_axes, _ = self._sdk()
         image_labels = ["t", "c", "z", "y", "x"]
         image = self._desc([5, 3, 4, 64, 64], image_labels)
-        for label_labels, label_shape, expected in (
-            (["t", "c", "z", "y", "x"], [5, 1, 4, 64, 64], [0, 1, 2, 3, 4]),
-            # written before the channel became a singleton
-            (["t", "z", "y", "x"], [5, 4, 64, 64], [0, 2, 3, 4]),
+        for label_labels, label_shape in (
+            (["t", "c", "z", "y", "x"], [5, 1, 4, 64, 64]),
+            # from before the channel became a singleton
+            (["t", "z", "y", "x"], [5, 4, 64, 64]),
         ):
-            label = self._desc(label_shape, label_labels)
-            assert sdk_axes(label, image) == label_image_axes(
-                label_labels, image_labels, image.shape
-            )
-            assert sdk_axes(label, image) == expected
+            stated = label_image_axes(label_labels, image_labels, image.shape)
+            label = self._desc(label_shape, label_labels, self._stated(stated))
+            assert sdk_axes(label, image) == stated
 
-    def test_an_rgb_set_has_no_samples_axis_on_either_side(self):
+    def test_a_descriptor_without_the_statement_has_no_mapping(self):
+        # Never derived: a client re-deriving the rule is the third copy of it.
         _, sdk_axes, _ = self._sdk()
-        image = self._desc([2, 64, 64, 3], ["t", "y", "x", "s"])
-        label = self._desc([2, 64, 64], ["t", "y", "x"])
-        assert sdk_axes(label, image) == [0, 1, 2]
-        assert sdk_axes(label, image) == label_image_axes(
-            label.dim_labels, image.dim_labels, image.shape
-        )
-
-    def test_a_stated_mapping_wins_over_the_derivation(self):
-        # The point of the server stating it (biopb/biopb#1059): a client that
-        # re-derives cannot know about a binding the rule stops describing.
-        _, sdk_axes, _ = self._sdk()
-        stated = json.dumps(
-            {"metadata": {"biopb": {"labels": {"image_axes": [1, 2, 3, 4]}}}}
-        )
-        label = self._desc([3, 4, 64, 64], ["c", "z", "y", "x"], stated)
         image = self._desc([5, 3, 4, 64, 64], ["t", "c", "z", "y", "x"])
-        assert sdk_axes(label, image) == [1, 2, 3, 4]
-
-    def test_a_set_that_spans_nothing_has_no_mapping(self):
-        _, sdk_axes, _ = self._sdk()
-        label = self._desc([4, 64, 64], ["z", "y", "x"])
-        image = self._desc([5, 3, 4, 64, 64], ["t", "c", "z", "y", "x"])
+        label = self._desc([5, 1, 4, 64, 64], ["t", "c", "z", "y", "x"])
         assert sdk_axes(label, image) is None
-        assert label_image_axes(label.dim_labels, image.dim_labels, image.shape) is None
+        assert sdk_axes(label) is None  # the image is no longer needed
+
+    def test_a_statement_that_does_not_fit_the_rank_is_ignored(self):
+        _, sdk_axes, _ = self._sdk()
+        label = self._desc(
+            [5, 4, 64, 64], ["t", "z", "y", "x"], self._stated([0, 1, 2, 3, 4])
+        )
+        assert sdk_axes(label) is None

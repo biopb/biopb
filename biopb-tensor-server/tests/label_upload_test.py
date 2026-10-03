@@ -205,19 +205,36 @@ class TestTheExtentOfASet:
         assert self._image_axes(client, "img/@labels/n") == [0, 1, 2, 3]
         np.testing.assert_array_equal(client.get_tensor("img/@labels/n").compute(), arr)
 
-    def test_the_earlier_shape_without_the_channel_axis_is_still_taken(
+    def test_create_refuses_the_earlier_shape_without_the_channel_axis(
         self, writable_server, client, tmp_path
     ):
+        import pyarrow.flight as flight
+
         self._serve(writable_server, tmp_path, "tcyx", (2, 3, 64, 64))
-        arr = np.zeros((2, 64, 64), "uint32")
 
-        desc = client.setup_array_upload(
-            "zarr://img/@labels/old", arr, chunk_shape=(1, 32, 32)
+        with pytest.raises(flight.FlightServerError, match="does not span"):
+            client.setup_array_upload(
+                "zarr://img/@labels/old",
+                np.zeros((2, 64, 64), "uint32"),
+                chunk_shape=(1, 32, 32),
+            )
+
+    def test_a_listing_still_takes_it_and_states_the_old_mapping(
+        self, writable_server, tmp_path
+    ):
+        # A native NGFF group or an earlier server's sidecar, which cannot be
+        # rewritten, keeps being served.
+        from types import SimpleNamespace
+
+        store = _image_with_axes(tmp_path, "tcyx", (2, 3, 64, 64))
+        adapter = _adapter(store, "img")
+        old = SimpleNamespace(dim_labels=["t", "y", "x"], shape=[2, 64, 64])
+
+        assert adapter.label_binding_error("@labels/old", old) is None
+        assert adapter.label_image_axes("@labels/old", old) == [0, 2, 3]
+        assert "does not span" in adapter.label_binding_error(
+            "@labels/old", old, allow_earlier=False
         )
-        client.upload_array(desc, arr)
-
-        assert list(desc.dim_labels) == ["t", "y", "x"]
-        assert self._image_axes(client, "img/@labels/old") == [0, 2, 3]
 
     def test_a_channel_axis_at_the_images_length_is_refused(
         self, writable_server, client, tmp_path
