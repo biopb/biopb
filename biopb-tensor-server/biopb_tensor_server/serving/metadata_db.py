@@ -1375,6 +1375,7 @@ class MetadataDatabase:
             logger.debug(
                 "release_registration_cache failed for %s", source_id, exc_info=True
             )
+        logger.debug(f"Synced source to metadata database: {source_id}")
         return SyncCost(
             metadata_s=metadata_s,
             upsert_s=upsert_s,
@@ -1382,8 +1383,6 @@ class MetadataDatabase:
             tensors_bytes=len(json.dumps(tensors)),
             descriptor_bytes=sum(t.ByteSize() for t in catalog),
         )
-
-        logger.debug(f"Synced source to metadata database: {source_id}")
 
     def _replace_imported(
         self,
