@@ -39,12 +39,6 @@ LABELS_SEGMENT = "@labels"
 #: they never upload or delete one.
 RESERVED_LABEL_PREFIX = "@"
 
-# The channel-axis vocabulary, mirroring the server's ``core.axes.AXIS_C_LABELS``.
-# Duplicated rather than imported: biopb-tensor-server is not a dependency of
-# the SDK (nor installable from PyPI), and this is the one axis question the
-# extent rule asks.
-_CHANNEL_LABELS = frozenset({"c", "channel", "channels", "band", "bands"})
-
 
 class LabelAddress(NamedTuple):
     """A label set's ``array_id``, taken apart."""
@@ -80,36 +74,28 @@ def is_reserved_label_name(name: str) -> bool:
     return name.startswith(RESERVED_LABEL_PREFIX)
 
 
-def label_image_axes(label_desc: Any, image_desc: Any) -> Optional[List[int]]:
+def label_image_axes(label_desc: Any, image_desc: Any = None) -> Optional[List[int]]:
     """For each axis of a set, the index of the image axis it indexes.
 
-    ``[0, 2, 3, 4]`` for a ``T Z Y X`` set of a ``T C Z Y X`` image: a set spans
-    the image's **non-channel** extent, so every axis after the image's ``c``
-    sits one place to the left in the set. A client that instead matched axes by
-    position reads frame 0 of a timelapse where frame 40 was asked for, which is
-    a picture rather than an error.
+    ``[0, 1, 2, 3, 4]`` for a ``T C Z Y X`` set of a ``T C Z Y X`` image: a set
+    has the image's axes at the image's lengths, with the channel axis a
+    singleton and an RGB samples axis left out. A set from before that rule has no
+    channel axis and maps ``[0, 2, 3, 4]``, every axis after the image's ``c`` one
+    place to the left. A client that instead matched axes by position reads frame
+    0 of a timelapse where frame 40 was asked for, which is a picture rather than
+    an error.
 
-    **Read, not derived, when the server says.** ``biopb.labels.image_axes`` in
-    the set's ``metadata_json`` is the server's own statement of the mapping;
-    a descriptor fetched without metadata, or from a server that predates the
-    field, has none, and the extent rule is re-derived here instead -- the same
-    answer, from the one place that still has to know the rule.
-
-    ``None`` when the set does not span the image at all, which leaves the
-    caller nothing to align and is the server's own answer in that case too.
+    **Read, never derived**: ``biopb.labels.image_axes`` in the set's
+    ``metadata_json`` is the server's own statement of the mapping, so the
+    descriptor must have been fetched with metadata. ``None`` when it is absent
+    or does not fit the set's rank, which leaves the caller nothing to align. Every
+    server that serves label sets states it. *image_desc* is accepted and unused,
+    for callers written when the SDK derived the mapping from the image.
     """
     stated = _stated_image_axes(label_desc)
     if stated is not None and len(stated) == len(label_desc.shape):
         return stated
-    non_channel = [
-        i
-        for i, label in enumerate(image_desc.dim_labels)
-        if str(label).lower() not in _CHANNEL_LABELS
-    ]
-    # Ranks are the check. An image whose labels went missing derives an empty
-    # or over-long list, which cannot match a real set and so answers None --
-    # the same "nothing to align" the server gives.
-    return non_channel if len(non_channel) == len(label_desc.shape) else None
+    return None
 
 
 def _stated_image_axes(label_desc: Any) -> Optional[List[int]]:

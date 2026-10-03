@@ -1346,8 +1346,9 @@ public class TensorFlightClient implements AutoCloseable {
      *        the file's own tensors, so a bare {@code "<source_id>/<field>"}
      *        is a native tensor id and is refused here. The one other form is
      *        {@code "zarr://<image array_id>/@labels/<name>"}, a label set of an
-     *        image the server already serves. A set is unsigned-integer, spans
-     *        its image's non-channel axes at full length, and its all-zero
+     *        image the server already serves. A set is unsigned-integer, has
+     *        its image's axes at the image's lengths (a channel axis is a
+     *        singleton, an RGB samples axis is left out), and its all-zero
      *        chunks are skipped by {@link #uploadArray}. The scheme names the
      *        store format and nothing else: the answered id carries none
      * @param shape the tensor's shape

@@ -142,8 +142,9 @@ A label set names the image it belongs to rather than a source, so it lands
 beside an image the server **discovered** just as readily as beside one on
 scratch — and it inherits that image's axes and scale.
 
-A set is **unsigned-integer**, spans its image's non-channel axes at full
-length, and its all-zero chunks are skipped by `upload_array` — so a sparse mask
+A set is **unsigned-integer**, has its image's axes at the image's lengths
+(a channel axis is a singleton, an RGB samples axis is left out), and its
+all-zero chunks are skipped by `upload_array` — so a sparse mask
 is cheap to send.
 
 Its `array_id` is the request's own minus the scheme, and its descriptor

@@ -31,7 +31,9 @@ from biopb_tensor_server.core.errors import TensorNotFound, WriteNotSupportedErr
 from biopb_tensor_server.core.labels import (
     RESERVED_PREFIX,
     extent_mismatch,
+    label_extent,
     label_field,
+    label_forms,
     label_image_axes,
     split_label_field,
 )
@@ -154,36 +156,83 @@ class TestTheFieldShape:
         assert "axes" in extent_mismatch(
             ["y", "x"], [64, 64], ["z", "y", "x"], [2, 64, 64]
         )
-        assert "axes" in extent_mismatch(
+        # The channel axis is a singleton in a set, not the image's length.
+        assert "shape" in extent_mismatch(
             ["c", "y", "x"], [3, 64, 64], ["c", "y", "x"], [3, 64, 64]
+        )
+
+    def test_only_a_listing_accepts_the_earlier_shape(self):
+        # A native group or a sidecar from an earlier server may lack the channel
+        # axis; a set being created may not.
+        image = (["t", "c", "z", "y", "x"], [5, 3, 4, 64, 64])
+        old = (["t", "z", "y", "x"], [5, 4, 64, 64])
+        assert extent_mismatch(*old, *image) is None
+        assert "axes" in extent_mismatch(*old, *image, allow_earlier=False)
+        # A wrong length on an earlier-form set quotes the form it matched.
+        wrong = (["t", "z", "y", "x"], [5, 4, 32, 64])
+        assert "[5, 4, 64, 64]" in extent_mismatch(*wrong, *image)
+
+    def test_a_set_has_the_images_rank_with_a_singleton_channel(self):
+        image = (["t", "c", "z", "y", "x"], [5, 3, 4, 64, 64])
+        assert (
+            extent_mismatch(["t", "c", "z", "y", "x"], [5, 1, 4, 64, 64], *image)
+            is None
+        )
+        # ... and a set written before that rule, without the channel axis, is
+        # still one.
+        assert extent_mismatch(["t", "z", "y", "x"], [5, 4, 64, 64], *image) is None
+        assert [list(f.labels) for f in label_forms(*image)] == [
+            ["t", "c", "z", "y", "x"],
+            ["t", "z", "y", "x"],
+        ]
+        # An image with no channel axis has one form.
+        assert len(label_forms(["z", "y", "x"], [4, 64, 64])) == 1
+
+    def test_an_rgb_image_has_a_set_without_the_samples_axis(self):
+        # A mask indexes pixels, not a pixel's colour components, and a trailing
+        # singleton would shift the spatial axes of a right-aligned viewer.
+        rgb = (["y", "x", "s"], [64, 64, 3])
+        assert extent_mismatch(["y", "x"], [64, 64], *rgb) is None
+        assert "axes" in extent_mismatch(["y", "x", "s"], [64, 64, 3], *rgb)
+        assert label_extent(*rgb) == (["y", "x"], [64, 64])
+        # The aics shape, a singleton C beside the samples axis.
+        aics = (["t", "c", "z", "y", "x", "s"], [2, 1, 4, 64, 64, 3])
+        assert label_extent(*aics) == (["t", "c", "z", "y", "x"], [2, 1, 4, 64, 64])
+        # Only the size-3/4 axis is samples; another `s` is an ordinary axis.
+        assert label_extent(["y", "x", "s"], [64, 64, 5]) == (
+            ["y", "x", "s"],
+            [64, 64, 5],
         )
 
     def test_image_axes_states_what_the_extent_rule_implies(self):
         # The mapping a client would otherwise re-derive. Matching by NAME gets
         # t/z right and an unnamed axis wrong, which is the whole reason the
         # server says it out loud (biopb/biopb#1059).
-        assert label_image_axes(["t", "z", "y", "x"], ["t", "c", "z", "y", "x"]) == [
-            0,
-            2,
-            3,
-            4,
-        ]
-        assert label_image_axes(["y", "x"], ["y", "x"]) == [0, 1]
-        # An interleaved samples axis is NOT dropped -- `label_extent` drops only
-        # the channel -- so it maps like any other axis.
-        assert label_image_axes(["t", "y", "x", "s"], ["t", "c", "y", "x", "s"]) == [
-            0,
-            2,
-            3,
-            4,
-        ]
-        # An unnamed axis keeps its place; the set's `a0` is the image's axis 0
-        # even though the image spells the same slider `a1`.
-        assert label_image_axes(["", "y", "x"], ["", "c", "y", "x"]) == [0, 2, 3]
+        five = (["t", "c", "z", "y", "x"], [5, 3, 4, 64, 64])
+        assert label_image_axes(["t", "c", "z", "y", "x"], *five) == [0, 1, 2, 3, 4]
+        # A set written before the rule is told apart by its rank.
+        assert label_image_axes(["t", "z", "y", "x"], *five) == [0, 2, 3, 4]
+        assert label_image_axes(["y", "x"], ["y", "x"], [64, 64]) == [0, 1]
+        # An RGB samples axis is left out of the set, so it is not mapped.
+        assert label_image_axes(
+            ["t", "y", "x"], ["t", "y", "x", "s"], [2, 64, 64, 3]
+        ) == [0, 1, 2]
+        # An unnamed axis keeps its place.
+        assert label_image_axes(
+            ["", "c", "y", "x"], ["", "c", "y", "x"], [2, 3, 64, 64]
+        ) == [0, 1, 2, 3]
+        assert label_image_axes(
+            ["", "y", "x"], ["", "c", "y", "x"], [2, 3, 64, 64]
+        ) == [0, 2, 3]
 
     def test_image_axes_is_none_for_a_set_that_does_not_span(self):
         # Nothing to state, and the same set `label_sets` drops.
-        assert label_image_axes(["z", "y", "x"], ["t", "c", "z", "y", "x"]) is None
+        assert (
+            label_image_axes(
+                ["z", "y", "x"], ["t", "c", "z", "y", "x"], [5, 3, 4, 64, 64]
+            )
+            is None
+        )
 
 
 class TestANativeSetIsATensorOfItsImage:
@@ -485,30 +534,34 @@ class TestTheSdkReadsTheSameRule:
         assert reserved("nuclei") is False
         assert RESERVED_PREFIX == "@"
 
-    def test_derives_the_same_axes_the_server_states(self):
+    @staticmethod
+    def _stated(axes):
+        return json.dumps({"metadata": {"biopb": {"labels": {"image_axes": axes}}}})
+
+    def test_reads_the_axes_the_server_states(self):
         _, sdk_axes, _ = self._sdk()
         image_labels = ["t", "c", "z", "y", "x"]
-        label = self._desc([5, 4, 64, 64], ["t", "z", "y", "x"])
         image = self._desc([5, 3, 4, 64, 64], image_labels)
-        assert sdk_axes(label, image) == label_image_axes(
-            label.dim_labels, image_labels
-        )
-        assert sdk_axes(label, image) == [0, 2, 3, 4]
+        for label_labels, label_shape in (
+            (["t", "c", "z", "y", "x"], [5, 1, 4, 64, 64]),
+            # from before the channel became a singleton
+            (["t", "z", "y", "x"], [5, 4, 64, 64]),
+        ):
+            stated = label_image_axes(label_labels, image_labels, image.shape)
+            label = self._desc(label_shape, label_labels, self._stated(stated))
+            assert sdk_axes(label, image) == stated
 
-    def test_a_stated_mapping_wins_over_the_derivation(self):
-        # The point of the server stating it (biopb/biopb#1059): a client that
-        # re-derives cannot know about a binding the rule stops describing.
+    def test_a_descriptor_without_the_statement_has_no_mapping(self):
+        # Never derived: a client re-deriving the rule is the third copy of it.
         _, sdk_axes, _ = self._sdk()
-        stated = json.dumps(
-            {"metadata": {"biopb": {"labels": {"image_axes": [1, 2, 3, 4]}}}}
-        )
-        label = self._desc([3, 4, 64, 64], ["c", "z", "y", "x"], stated)
         image = self._desc([5, 3, 4, 64, 64], ["t", "c", "z", "y", "x"])
-        assert sdk_axes(label, image) == [1, 2, 3, 4]
-
-    def test_a_set_that_spans_nothing_has_no_mapping(self):
-        _, sdk_axes, _ = self._sdk()
-        label = self._desc([4, 64, 64], ["z", "y", "x"])
-        image = self._desc([5, 3, 4, 64, 64], ["t", "c", "z", "y", "x"])
+        label = self._desc([5, 1, 4, 64, 64], ["t", "c", "z", "y", "x"])
         assert sdk_axes(label, image) is None
-        assert label_image_axes(label.dim_labels, image.dim_labels) is None
+        assert sdk_axes(label) is None  # the image is no longer needed
+
+    def test_a_statement_that_does_not_fit_the_rank_is_ignored(self):
+        _, sdk_axes, _ = self._sdk()
+        label = self._desc(
+            [5, 4, 64, 64], ["t", "z", "y", "x"], self._stated([0, 1, 2, 3, 4])
+        )
+        assert sdk_axes(label) is None

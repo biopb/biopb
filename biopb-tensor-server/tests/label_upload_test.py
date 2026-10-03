@@ -144,6 +144,143 @@ class TestTheRoundTrip:
         assert meta["image-label"]["source"] == {"image": "oz1"}
 
 
+def _image_with_axes(root, axes, shape, source_id="img"):
+    """A one-level OME-Zarr image whose axes are *axes* (``"tcyx"``, ``"yxs"``...)."""
+    import zarr
+
+    types = {"t": "time", "c": "channel", "z": "space", "y": "space", "x": "space"}
+    store = Path(root) / f"{source_id}.ome.zarr"
+    group = zarr.open_group(str(store), mode="w")
+    group.create_dataset("0", shape=shape, chunks=shape, dtype="uint8")
+    meta = {
+        "multiscales": [
+            {
+                "version": "0.4",
+                "axes": [
+                    {"name": a, **({"type": types[a]} if a in types else {})}
+                    for a in axes
+                ],
+                "datasets": [
+                    {
+                        "path": "0",
+                        "coordinateTransformations": [
+                            {"type": "scale", "scale": [1.0] * len(axes)}
+                        ],
+                    }
+                ],
+            }
+        ]
+    }
+    (store / ".zattrs").write_text(json.dumps(meta))
+    return store
+
+
+class TestTheExtentOfASet:
+    """A set has the image's axes at the image's lengths: the channel axis a
+    singleton, an RGB samples axis left out. A set written before that rule,
+    without the channel axis, is still taken."""
+
+    @staticmethod
+    def _serve(server, tmp_path, axes, shape):
+        store = _image_with_axes(tmp_path, axes, shape)
+        register_and_catalog(server, "img", _adapter(store, "img"))
+
+    @staticmethod
+    def _image_axes(client, array_id):
+        got = client.get_descriptor(array_id, with_metadata=True)
+        meta = json.loads(got.metadata_json)["metadata"]
+        return meta["biopb"]["labels"]["image_axes"]
+
+    def test_a_channel_axis_is_a_singleton(self, writable_server, client, tmp_path):
+        self._serve(writable_server, tmp_path, "tcyx", (2, 3, 64, 64))
+        arr = np.zeros((2, 1, 64, 64), "uint32")
+        arr[1, 0, :8, :8] = 7
+
+        desc = client.setup_array_upload(
+            "zarr://img/@labels/n", arr, chunk_shape=(1, 1, 32, 32)
+        )
+        client.upload_array(desc, arr)
+
+        assert list(desc.dim_labels) == ["t", "c", "y", "x"]
+        assert self._image_axes(client, "img/@labels/n") == [0, 1, 2, 3]
+        np.testing.assert_array_equal(client.get_tensor("img/@labels/n").compute(), arr)
+
+    def test_create_refuses_the_earlier_shape_without_the_channel_axis(
+        self, writable_server, client, tmp_path
+    ):
+        import pyarrow.flight as flight
+
+        self._serve(writable_server, tmp_path, "tcyx", (2, 3, 64, 64))
+
+        with pytest.raises(flight.FlightServerError, match="does not span"):
+            client.setup_array_upload(
+                "zarr://img/@labels/old",
+                np.zeros((2, 64, 64), "uint32"),
+                chunk_shape=(1, 32, 32),
+            )
+
+    def test_a_listing_still_takes_it_and_states_the_old_mapping(
+        self, writable_server, tmp_path
+    ):
+        # A native NGFF group or an earlier server's sidecar, which cannot be
+        # rewritten, keeps being served.
+        from types import SimpleNamespace
+
+        store = _image_with_axes(tmp_path, "tcyx", (2, 3, 64, 64))
+        adapter = _adapter(store, "img")
+        old = SimpleNamespace(dim_labels=["t", "y", "x"], shape=[2, 64, 64])
+
+        assert adapter.label_binding_error("@labels/old", old) is None
+        assert adapter.label_image_axes("@labels/old", old) == [0, 2, 3]
+        assert "does not span" in adapter.label_binding_error(
+            "@labels/old", old, allow_earlier=False
+        )
+
+    def test_a_channel_axis_at_the_images_length_is_refused(
+        self, writable_server, client, tmp_path
+    ):
+        import pyarrow.flight as flight
+
+        self._serve(writable_server, tmp_path, "tcyx", (2, 3, 64, 64))
+
+        with pytest.raises(flight.FlightServerError, match="does not span"):
+            client.setup_array_upload(
+                "zarr://img/@labels/n",
+                np.zeros((2, 3, 64, 64), "uint32"),
+                chunk_shape=(1, 1, 32, 32),
+            )
+
+    def test_an_rgb_image_has_a_set_without_the_samples_axis(
+        self, writable_server, client, tmp_path
+    ):
+        self._serve(writable_server, tmp_path, "yxs", (64, 64, 3))
+        arr = np.zeros((64, 64), "uint32")
+        arr[:8, :8] = 4
+
+        desc = client.setup_array_upload(
+            "zarr://img/@labels/n", arr, chunk_shape=(32, 32)
+        )
+        client.upload_array(desc, arr)
+
+        assert list(desc.dim_labels) == ["y", "x"]
+        assert self._image_axes(client, "img/@labels/n") == [0, 1]
+        np.testing.assert_array_equal(client.get_tensor("img/@labels/n").compute(), arr)
+
+    def test_a_mask_with_a_colour_axis_is_refused_for_an_rgb_image(
+        self, writable_server, client, tmp_path
+    ):
+        import pyarrow.flight as flight
+
+        self._serve(writable_server, tmp_path, "yxs", (64, 64, 3))
+
+        with pytest.raises(flight.FlightServerError, match="does not span"):
+            client.setup_array_upload(
+                "zarr://img/@labels/n",
+                np.zeros((64, 64, 3), "uint32"),
+                chunk_shape=(32, 32, 3),
+            )
+
+
 class TestWhatTheKindRefuses:
     @pytest.mark.parametrize(
         "array_id,arr,why",

@@ -446,7 +446,8 @@ def create_label_upload(
         image = parent.label_image_descriptor(field, images=images)
         if image is not None:
             desc.dim_labels.extend(label_extent(image.dim_labels, image.shape)[0])
-    why = parent.label_binding_error(field, desc, images=images)
+    # A new set has the current extent; only a listing accepts an older one.
+    why = parent.label_binding_error(field, desc, images=images, allow_earlier=False)
     if why is not None:
         raise ValueError(f"{array_id!r} {why}")
 

@@ -657,6 +657,8 @@ class SourceAdapter(ABC):
         field: str,
         desc: TensorDescriptor,
         images: Optional[Dict[str, TensorDescriptor]] = None,
+        *,
+        allow_earlier: bool = True,
     ) -> Optional[str]:
         """Why a set of *desc* cannot be served at label *field*, or None.
 
@@ -666,6 +668,8 @@ class SourceAdapter(ABC):
         from an earlier server life never passed through the upload. *desc* is
         in canonical order (both callers normalize first), and *images* is
         :meth:`_normalized_tensors` when the caller already holds it.
+        *allow_earlier* is false at create: a new set has the current extent, while
+        a listed one may predate it (``label_forms``).
         """
         if split_label_field(field) is None:
             return f"{field!r} does not name a label set"
@@ -673,7 +677,11 @@ class SourceAdapter(ABC):
         if image is None:
             return "binds to no tensor of the source"
         why = extent_mismatch(
-            desc.dim_labels, desc.shape, image.dim_labels, image.shape
+            desc.dim_labels,
+            desc.shape,
+            image.dim_labels,
+            image.shape,
+            allow_earlier=allow_earlier,
         )
         return f"does not span its image: {why}" if why is not None else None
 
@@ -701,7 +709,7 @@ class SourceAdapter(ABC):
         image = self.label_image_descriptor(field, images=images)
         if image is None:
             return None
-        return label_image_axes(desc.dim_labels, image.dim_labels)
+        return label_image_axes(desc.dim_labels, image.dim_labels, image.shape)
 
     def label_image_descriptor(
         self,
