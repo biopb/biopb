@@ -17,6 +17,8 @@ import os
 import threading
 import traceback
 
+from ._kernel_env import ENV_SCRATCH, ENV_WINDOW_CLOSE_FD, ViewerMode
+
 logger = logging.getLogger(__name__)
 
 
@@ -34,12 +36,8 @@ def is_scratch_kernel():
     No Qt either, so it needs no display at all. A hidden
     ``napari.Viewer(show=False)`` is no substitute: its screenshots come back
     black, and under an offscreen Qt platform it renders nothing at all.
-
-    The literal mirrors ``_kernel.ENV_SCRATCH``, which is where the launcher
-    sets it; spelled out rather than imported because ``_kernel`` belongs to the
-    session child and this module runs in the kernel.
     """
-    return bool(os.environ.get("BIOPB_SCRATCH_KERNEL"))
+    return bool(os.environ.get(ENV_SCRATCH))
 
 
 def no_viewer_reason():
@@ -49,11 +47,11 @@ def no_viewer_reason():
     to a person, and a verification has no person in it. Any other kernel has
     none when the launcher says so -- it decides (config, whether napari is
     installed, whether there is a display) and hands the kernel its reason in
-    ``BIOPB_NO_VIEWER``; the literal mirrors ``_kernel.ENV_NO_VIEWER``.
+    ``ENV_NO_VIEWER``.
     """
     if is_scratch_kernel():
         return "a scratch kernel verifies a workflow and has no viewer"
-    return os.environ.get("BIOPB_NO_VIEWER") or None
+    return ViewerMode.from_env(os.environ).reason
 
 
 def _set_windows_app_id():
@@ -145,8 +143,8 @@ _GCLP_HICON, _GCLP_HICONSM = -14, -34
 def _install_window_close_hook(viewer):
     """Signal the launcher when the user closes the napari window.
 
-    The launcher inherits the *write* end of a pipe via ``BIOPB_WINDOW_CLOSE_FD``
-    (set by ``KernelHost._launch``, name = ``_kernel.ENV_WINDOW_CLOSE_FD``); a
+    The launcher inherits the *write* end of a pipe via ``ENV_WINDOW_CLOSE_FD``
+    (set by ``KernelHost._launch``); a
     reader thread there reaps this kernel back to idle on the byte we write. We
     connect to the Qt main window's ``destroyed`` signal — the same
     ``viewer.window._qt_window`` the closed-window probe (``viewer_window_alive``)
@@ -154,7 +152,7 @@ def _install_window_close_hook(viewer):
     it). Idempotent and fully best-effort: a missing fd, an absent window, or any
     wiring/IO failure must never break the bootstrap.
     """
-    fd_str = os.environ.get("BIOPB_WINDOW_CLOSE_FD")
+    fd_str = os.environ.get(ENV_WINDOW_CLOSE_FD)
     if not fd_str:
         return
     try:

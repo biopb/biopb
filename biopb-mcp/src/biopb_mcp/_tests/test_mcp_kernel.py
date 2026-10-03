@@ -20,6 +20,7 @@ pytest.importorskip("jupyter_client")
 
 from biopb_mcp.mcp import _kernel  # noqa: E402
 from biopb_mcp.mcp._kernel import KernelHost  # noqa: E402
+from biopb_mcp.mcp._kernel_env import ViewerMode  # noqa: E402
 
 
 @pytest.fixture
@@ -910,13 +911,12 @@ def viewerless_kernel(tmp_path_factory):
         env=dict(
             os.environ,
             BIOPB_CONFIG_HOME=str(tmp_path_factory.mktemp("config")),
-            BIOPB_NO_VIEWER="the viewer is off in the config",
             # Nothing listens here: the connection is attempted and refused,
             # without the test starting a control.
             BIOPB_TENSOR_URL=_UNREACHABLE_PLANE,
         ),
         watchdog_interval=0,
-        window_close_pipe=False,
+        viewer=ViewerMode.none("the viewer is off in the config"),
     )
     host.start()  # the default probe: raises unless the bootstrap finished
     yield host
@@ -943,7 +943,7 @@ class TestViewerlessBootstrap:
         assert "[]" in res["stdout"]
 
     def test_the_host_reports_why(self, viewerless_kernel):
-        assert viewerless_kernel.no_viewer_reason == "the viewer is off in the config"
+        assert viewerless_kernel.viewer.reason == "the viewer is off in the config"
 
     def test_the_session_dials_its_own_connection(self, viewerless_kernel):
         # #1205: no Tensor Browser exists to connect it, so the bootstrap does.
@@ -1106,9 +1106,7 @@ class TestWindowClosePipe:
     """The reverse kernel->server pipe reaps the kernel when the window closes."""
 
     def test_window_close_byte_tears_down_to_idle(self):
-        host = KernelHost(
-            health_probe_code=None, window_close_pipe=True, watchdog_interval=0
-        )
+        host = KernelHost(health_probe_code=None, watchdog_interval=0)
         try:
             host.start()
             assert host._window_r is not None
@@ -1135,9 +1133,7 @@ class TestWindowClosePipe:
     def test_normal_shutdown_is_not_attributed_to_window_close(self):
         # The reader thread's EOF path (kernel died via another teardown) must
         # not misfire as a window close.
-        host = KernelHost(
-            health_probe_code=None, window_close_pipe=True, watchdog_interval=0
-        )
+        host = KernelHost(health_probe_code=None, watchdog_interval=0)
         host.start()
         host.shutdown()
         assert host._teardown_reason is None
@@ -1145,7 +1141,7 @@ class TestWindowClosePipe:
     def test_disabled_pipe_has_no_read_fd(self):
         host = KernelHost(
             health_probe_code=None,
-            window_close_pipe=False,
+            viewer=ViewerMode.none("no window in this test"),
             watchdog_interval=0,
         )
         try:
@@ -1163,9 +1159,7 @@ class TestWindowClosePoll:
     plain kernel with the probe symbol injected."""
 
     def _host(self):
-        host = KernelHost(
-            health_probe_code=None, window_close_pipe=True, watchdog_interval=0
-        )
+        host = KernelHost(health_probe_code=None, watchdog_interval=0)
         # Force the Windows poll path regardless of the test platform.
         host._window_close_poll = True
         return host
@@ -1419,7 +1413,7 @@ class TestJupyterClientGate:
             extra_arguments=_GATED_ARGS,
             health_probe_code="print('_jobs' in dir())",
             parent_death_pipe=False,
-            window_close_pipe=False,
+            viewer=ViewerMode.none("no window in this test"),
             watchdog_interval=0,
         )
         host.start()
@@ -1555,7 +1549,7 @@ class TestJupyterClientGate:
             extra_arguments=_GATED_ARGS,
             health_probe_code=None,
             parent_death_pipe=False,
-            window_close_pipe=False,
+            viewer=ViewerMode.none("no window in this test"),
             watchdog_interval=0,
         )
         host.start()
@@ -1699,7 +1693,7 @@ class TestHostRecords:
             extra_arguments=_GATED_ARGS,
             health_probe_code="print('_jobs' in dir())",
             parent_death_pipe=False,
-            window_close_pipe=False,
+            viewer=ViewerMode.none("no window in this test"),
             watchdog_interval=0,
         )
         host.start()
