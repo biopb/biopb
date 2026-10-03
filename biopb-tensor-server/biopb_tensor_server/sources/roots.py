@@ -10,16 +10,11 @@ this path under, is it cloud, what is its display root" is answered in one place
 Reads are lock-free over an immutable snapshot; writes replace the snapshot under
 a lock, so the rescan thread can ask while a drop adds or removes a root.
 
-:func:`partition_sources` is where the configured ``[[sources]]`` become roots: the
-one place that decides whether an entry is kept live by the manager's rescan loop
-(monitored, or an upstream), registered once by its first tick (scan-once: a local
-directory, file or typed dataset), or a single remote source registered as it is
-(static), and the only one to warn about an entry that is not what it asked for.
+How the configured ``[[sources]]`` become roots is :mod:`~biopb_tensor_server.sources.resolve`.
 """
 
 from __future__ import annotations
 
-import logging
 import os
 import threading
 from dataclasses import dataclass, field
@@ -27,18 +22,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Iterable, List, NamedTuple, Optional, Tuple
 
-from biopb_tensor_server.adapters.remote_tensor import is_bare_host_upstream_url
-from biopb_tensor_server.core.config import ServerConfig, SourceConfig
-from biopb_tensor_server.core.discovery import AdapterRegistry
+from biopb_tensor_server.core.config import SourceConfig
 from biopb_tensor_server.core.remote import is_remote_url
-from biopb_tensor_server.serving.upload_manager import write_dir_under_root
-from biopb_tensor_server.sources.resolve import (
-    _alias_catalog_url,
-    _reroot_catalog_url,
-    resolve_all_sources,
-)
-
-logger = logging.getLogger(__name__)
 
 # Display-only origin scheme on the ``source_url`` of a drag-dropped source. The
 # drop path only stamps it when the drop is entirely new AND outside every known
@@ -54,6 +39,34 @@ OVERLAP_MESSAGE = (
 )
 
 
+def reroot_catalog_url(label: str, root_path: str, primary_path: str) -> str:
+    """Re-root ``primary_path`` under ``label``, preserving its position beneath
+    ``root_path``. Shared core of the two re-rooting entry points -- drag-drop
+    (``roots._drop_catalog_url``, ``label`` = the dropped item's basename) and a
+    configured ``alias`` (``label`` = the alias).
+
+    The tensor-browser (and web viewer) build their tree by splitting each
+    source's ``source_url`` on ``/``, so ``label`` becomes the top-level root and
+    the sub-structure beneath ``root_path`` is preserved under it:
+
+        root /data/exp, primary /data/exp            -> "<label>"
+        root /data/exp, primary /data/exp/sub/b.tif  -> "<label>/sub/b.tif"
+
+    Display-only: it feeds the descriptor's ``source_url`` and never the
+    ``source_id`` (which hashes the raw path), so a bare virtual path with no
+    scheme is fine.
+    """
+    try:
+        rel = os.path.relpath(str(primary_path), str(root_path)).replace("\\", "/")
+    except ValueError:  # different drive on Windows, etc. -- can't relativize
+        rel = "."
+    if rel in (".", "") or rel.startswith("../"):
+        # primary IS the root (single file / dataset dir), or (defensively) not
+        # under it -- keep the whole thing as one root, never emit a "../" url.
+        return label
+    return f"{label}/{rel}"
+
+
 def _drop_catalog_url(
     dropped_root: str, primary_path: str, *, label: Optional[str] = None
 ) -> str:
@@ -62,7 +75,7 @@ def _drop_catalog_url(
 
     The label is the dropped item's basename unless the caller picked another (a
     second drop of a same-named folder gets a distinct one, see
-    :meth:`Roots.unique_label`). The shared ``_reroot_catalog_url`` keeps the
+    :meth:`Roots.unique_label`). The shared ``reroot_catalog_url`` keeps the
     source's place beneath the drop::
 
         drop /home/u/data/exp.zarr           -> "dnd://exp.zarr"        (own root)
@@ -75,13 +88,13 @@ def _drop_catalog_url(
     monitored or ``monitor = false`` root.
 
     Display-only; the client tree builders strip the scheme. The configured-alias
-    re-root shares ``_reroot_catalog_url`` but is always scheme-less, so the two
+    re-root shares ``reroot_catalog_url`` but is always scheme-less, so the two
     stay distinguishable.
     """
     dropped_root = str(dropped_root).rstrip("/\\")
     if label is None:
         label = os.path.basename(dropped_root) or dropped_root
-    return DND_URL_PREFIX + _reroot_catalog_url(label, dropped_root, primary_path)
+    return DND_URL_PREFIX + reroot_catalog_url(label, dropped_root, primary_path)
 
 
 class RootKind(Enum):
@@ -268,7 +281,7 @@ class Roots:
             )
         if alias_root is None:
             return None
-        return _alias_catalog_url(alias_root.alias, alias_root.url, claim_path)
+        return reroot_catalog_url(alias_root.alias, alias_root.url, claim_path)
 
     def check_overlap(
         self,
@@ -296,112 +309,3 @@ class Roots:
         ):
             return OVERLAP_MESSAGE
         return None
-
-
-def route_source(s: SourceConfig) -> Optional[RootKind]:
-    """Where a configured source goes on the serve path: the kind of root it
-    becomes, or None for a single remote source, which is registered as it is.
-    Logs why when that is not what the entry asked for.
-
-    Every local path is discovered by the manager after the server is SERVING, never
-    expanded here: that would walk the tree an extra time before the server binds,
-    and crash on a not-yet-mounted directory (biopb/biopb#54).
-    """
-    if s.is_remote:
-        # A bare-host tensor-server upstream ("mirror everything") holds many
-        # sources of its own, so it always goes to the manager's background
-        # re-list. Every other remote (s3://, ...) names a single source.
-        return RootKind.UPSTREAM if is_bare_host_upstream_url(s.url) else None
-
-    path = s.local_path
-    if path is None:  # unreachable: a local url always resolves to a path
-        return None
-
-    if path.is_file():
-        if s.monitor:
-            logger.warning(
-                "Cannot live-monitor a single file; registering it once instead: %s",
-                s.url,
-            )
-        return RootKind.SCAN_ONCE
-
-    if s.monitor:
-        if not path.exists():
-            logger.warning(
-                "Monitored path does not exist yet; will start monitoring when it "
-                "appears: %s",
-                s.url,
-            )
-        return RootKind.MONITORED
-
-    # Not watched, but still registered once. A path that is not there is left to
-    # that pass, which warns and skips it.
-    return RootKind.SCAN_ONCE
-
-
-def partition_sources(
-    sources: List[SourceConfig],
-    registry: Optional[AdapterRegistry] = None,
-    *,
-    credentials_config=None,
-    write_dir: Optional[Path] = None,
-) -> Tuple[List[SourceConfig], Roots]:
-    """Partition configured sources for the serve path: ``(static, roots)``.
-
-    ``static`` is the single remote sources, expanded here. Everything the manager
-    registers after SERVING (watched directories, scan-once paths, upstreams) is a
-    root. See :func:`route_source`.
-    """
-    to_expand: List[SourceConfig] = []
-    scan_once: List[SourceConfig] = []
-    roots = Roots()
-
-    for s in sources:
-        kind = route_source(s)
-        if kind is None:
-            to_expand.append(s)
-        elif kind is RootKind.SCAN_ONCE:
-            scan_once.append(s)
-        else:
-            roots.add(Root.from_config(s, kind))
-
-    # A file or typed dataset listed inside a monitored directory is the rescan's:
-    # registering it again here would claim it twice.
-    scan_once = [
-        s
-        for s in scan_once
-        if not (
-            (s.local_path.is_file() or s.type) and roots.is_monitored(str(s.local_path))
-        )
-    ]
-    for s in scan_once:
-        roots.add(Root.from_config(s, RootKind.SCAN_ONCE))
-
-    # tolerant=True so one missing or broken static source is warned-and-skipped
-    # rather than killing the server.
-    static_sources = resolve_all_sources(
-        ServerConfig(sources=to_expand, credentials=credentials_config),
-        registry,
-        tolerant=True,
-    )
-
-    # Upload stores are registered by the upload path, and the adapters decline
-    # them if discovery reaches one, so a write_dir inside a scanned directory is
-    # not catalogued twice -- but the walk still descends into every store and
-    # stats its chunk files, and a store being written keeps its directory busy.
-    scanned_dirs = {
-        r.path
-        for r in roots.of_kind(RootKind.MONITORED, RootKind.SCAN_ONCE)
-        if r.kind is RootKind.MONITORED or r.path.is_dir()
-    }
-    inside = write_dir_under_root(write_dir, scanned_dirs)
-    if inside is not None:
-        logger.warning(
-            "write_dir %s lies inside the source directory %s: its upload stores "
-            "are walked whenever that directory is scanned (every rescan, if it "
-            "is monitored). Keep write_dir outside every source directory.",
-            write_dir,
-            inside,
-        )
-
-    return static_sources, roots

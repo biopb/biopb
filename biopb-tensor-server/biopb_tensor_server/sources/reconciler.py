@@ -573,7 +573,7 @@ class Reconciler:
             list_upstream_versions,
             resolve_upstream_credentials,
         )
-        from biopb_tensor_server.sources.resolve import _namespaced_source_id
+        from biopb_tensor_server.sources.resolve import namespaced_source_id
 
         endpoint, _ = _split_grpc_url(upstream.url)
         alias = upstream.alias
@@ -596,7 +596,7 @@ class Reconciler:
             # source's metadata. Complete (the server-side DuckDB catalog is not
             # truncated like list_sources()), so what it no longer lists is gone.
             versions = list_upstream_versions(client)
-            desired = {_namespaced_source_id(alias, up): up for up in versions}
+            desired = {namespaced_source_id(alias, up): up for up in versions}
 
             prefix = f"{endpoint}/"
             alias_prefix = f"{alias}__" if alias else None
@@ -642,7 +642,7 @@ class Reconciler:
             sizes = {up: versions[up].size for up in wanted}
             for rows in fetch_upstream_rows(client, wanted, sizes):
                 for row in rows:
-                    source_id = _namespaced_source_id(alias, row["source_id"])
+                    source_id = namespaced_source_id(alias, row["source_id"])
                     seed = self._row_to_seed(row)
                     if source_id in added:
                         self._commit_add_claim(

@@ -233,7 +233,7 @@ def mirrorable_upstream_id(source_id: str) -> bool:
 
     Everything but the upstream's **scratch** source, for either of two
     reasons. Its id is fixed, so a lone upstream with no alias -- which keeps
-    the verbatim id (``_namespaced_source_id``) -- registers it locally as
+    the verbatim id (``namespaced_source_id``) -- registers it locally as
     ``scratch``, the id this server's own scratch source holds, and
     ``SourceRegistry.register`` overwrites in silence. And everything on it
     carries a deadline set by *that* server's policy, so the mirror would be a

@@ -33,12 +33,12 @@ from biopb_tensor_server.core.errors import UpstreamConfigError
 from biopb_tensor_server.core.remote import is_remote_url
 from biopb_tensor_server.sources.entry_stat import entry_change_time, entry_is_quiet
 from biopb_tensor_server.sources.reconciler import Reconciler
+from biopb_tensor_server.sources.resolve import partition_sources
 from biopb_tensor_server.sources.roots import (
     DND_URL_PREFIX,
     Root,
     RootKind,
     Roots,
-    partition_sources,
 )
 
 if TYPE_CHECKING:

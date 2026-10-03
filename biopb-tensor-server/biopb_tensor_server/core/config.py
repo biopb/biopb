@@ -475,7 +475,7 @@ class SourceConfig:
         # it -- so whatever enters the hash becomes something a user cannot change
         # without detaching their data. Url-derivation's known cost is that `mv`
         # re-keys a local source. Supplying an id explicitly is how the
-        # tensor-server proxy opts out: `sources.resolve._namespaced_source_id`
+        # tensor-server proxy opts out: `sources.resolve.namespaced_source_id`
         # builds one from (alias, upstream_source_id) with no endpoint in it, so a
         # moved upstream keeps its cache and its annotations. Config never reaches
         # this branch -- `sources.source_id` is ignored with a warning

@@ -21,8 +21,8 @@ import tifffile
 from biopb_tensor_server.adapters import get_default_registry
 from biopb_tensor_server.core.config import SourceConfig, parse_config
 from biopb_tensor_server.sources.resolve import (
-    _namespaced_source_id,
     discover_sources,
+    namespaced_source_id,
     resolve_all_sources,
 )
 
@@ -138,8 +138,8 @@ class TestTensorServerExpansion:
         assert out[0].source_id == "experiment1"
 
     def test_namespaced_source_id_helper(self):
-        assert _namespaced_source_id("lab", "img") == "lab__img"
-        assert _namespaced_source_id(None, "img") == "img"
+        assert namespaced_source_id("lab", "img") == "lab__img"
+        assert namespaced_source_id(None, "img") == "img"
 
     def test_alias_clash_collision_is_tolerated(self, caplog):
         # Two upstreams sharing alias "lab", each mirroring a same-named source
@@ -154,7 +154,7 @@ class TestTensorServerExpansion:
             }
         )
         with caplog.at_level(logging.WARNING):
-            resolved = resolve_all_sources(cfg)
+            resolved = resolve_all_sources(cfg.sources)
         # one survivor (the first), not an exception
         assert [s.source_id for s in resolved] == ["lab__img"]
         assert resolved[0].url == "grpc://a:8815/img"
@@ -172,7 +172,7 @@ class TestTensorServerExpansion:
                 ]
             }
         )
-        ids = [s.source_id for s in resolve_all_sources(cfg)]
+        ids = [s.source_id for s in resolve_all_sources(cfg.sources)]
         assert ids == ["lab__img", "arc__other"]
 
     def test_distinct_aliases_do_not_collide(self):
@@ -184,5 +184,5 @@ class TestTensorServerExpansion:
                 ]
             }
         )
-        ids = {s.source_id for s in resolve_all_sources(cfg)}
+        ids = {s.source_id for s in resolve_all_sources(cfg.sources)}
         assert ids == {"lab__img", "arc__img"}
