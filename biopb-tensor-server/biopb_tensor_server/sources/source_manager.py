@@ -203,7 +203,6 @@ class SourceManager:
             credentials_config=credentials_config,
             roots=self._roots,
             notify_source_committed=self._notify_source_committed,
-            notify_source_registered=self._notify_source_registered,
             catalog_url_for=self._display_url_for,
             stability_window=stability_window,
         )
@@ -216,8 +215,12 @@ class SourceManager:
             self._registration_worker = RegistrationWorker(
                 self._reconciler.ensure_registered, registration_workers
             )
-            self._reconciler.set_pending_hook(self._enqueue_pending)
-        self._on_source_registered: Optional[Callable[[str, float], None]] = None
+        self._reconciler.set_pending_hook(self._enqueue_pending)
+        self._on_startup_source: Optional[Callable[[str, float], None]] = None
+        # Sources committed pending, until their registration completes. They
+        # were found by the first scan, so they are startup set whenever that
+        # registration happens to finish (see ``_notify_source_committed``).
+        self._deferred: Set[str] = set()
         if hasattr(registry, "claim_timer"):
             registry.claim_timer = self._reconciler.stats.record_claim
         set_materializer = getattr(server.sources, "set_materializer", None)
@@ -274,30 +277,29 @@ class SourceManager:
         committed *after* the initial scan (a live addition).
 
         The launcher wires this to the precache worker's prompt-enqueue. Startup
-        sources are gated out of it (they route to the slow backlog) until the
-        first full scan flips the startup boundary -- see ``_commit_add_claim``.
+        sources are gated out of it (see :meth:`set_startup_source_hook`) until the
+        first full scan flips the startup boundary.
         """
         self._on_source_committed = callback
 
-    def set_source_registered_hook(
+    def set_startup_source_hook(
         self, callback: Optional[Callable[[str, float], None]]
     ) -> None:
-        """Register the hook called with ``(source_id, mtime)`` when a source whose
-        registration was deferred has been registered.
+        """Register the hook called with ``(source_id, mtime)`` when a *local*
+        source from the first scan has been registered.
 
-        The launcher wires this to the precache worker's backlog: such a source
-        is part of the startup set, but could not be seeded from the claims when
-        the first scan completed because it had nothing to warm yet.
+        The launcher wires this to the precache worker's backlog. It fires when
+        the registration completes, not when the scan claims the source: a source
+        whose registration is deferred has nothing to warm until then.
         """
-        self._on_source_registered = callback
+        self._on_startup_source = callback
 
     def set_initial_scan_complete_hook(
         self, callback: Optional[Callable[[], None]]
     ) -> None:
         """Register the hook fired once when the first full scan completes.
 
-        The launcher uses it to seed the precache backlog from the established
-        startup catalog. Fired from the event-loop thread.
+        Fired from the event-loop thread.
         """
         self._on_initial_scan_complete = callback
 
@@ -378,28 +380,6 @@ class SourceManager:
                 self._reconciler.stats.log_summary()
             self._fire_initial_scan_complete()
 
-    def iter_local_source_mtimes(self) -> List[Tuple[str, float]]:
-        """Return ``(source_id, mtime)`` for every currently-registered *local*
-        source, for seeding the precache backlog (newest first).
-
-        Remote sources are skipped (no ``os.stat`` mtime), as are any whose path
-        can't be stat-ed (e.g. removed between commit and this call). A source
-        whose registration is still pending is skipped too: it is routed to the
-        backlog when it registers (:meth:`_notify_source_registered`).
-        """
-        # The Reconciler snapshots claims under its state lock (the rescan
-        # thread adds/removes claims concurrently); we stat() outside
-        # that lock (I/O).
-        snapshot = self._reconciler.registered_claim_paths()
-        out: List[Tuple[str, float]] = []
-        for source_id, primary_path in snapshot:
-            try:
-                mtime = os.stat(primary_path).st_mtime
-            except OSError:
-                continue
-            out.append((source_id, mtime))
-        return out
-
     def pending_registrations(self) -> int:
         """How many claimed sources are still waiting to be registered."""
         return self._reconciler.pending_count()
@@ -414,6 +394,7 @@ class SourceManager:
 
     def _enqueue_pending(self, source_id: str) -> None:
         """Queue a source the reconciler committed pending, newest file first."""
+        self._deferred.add(source_id)
         worker = self._registration_worker
         if worker is not None:
             worker.enqueue(source_id, self._claim_mtime(source_id))
@@ -705,41 +686,31 @@ class SourceManager:
         )
 
     def _notify_source_committed(self, source_id: str) -> None:
-        """Precache routing gate for a freshly committed source (injected into
+        """Route a source that has just been registered to precache (injected into
         the Reconciler as ``notify_source_committed``).
 
-        Only live additions -- those committed after the initial scan completes --
-        are prompt-enqueued; the startup set routes to the slow backlog instead.
-        This manager owns the startup state that decides that, so the gate lives
-        here rather than in the Reconciler. Best-effort: a hook failure must never
-        abort a source commit.
+        A startup source -- one the first scan found, whether it registered as it
+        was claimed or afterwards (``_deferred``) -- goes to the slow backlog, with
+        its mtime; a later addition is prompt-enqueued. This manager owns the
+        startup state that decides that, so the routing lives here rather than in
+        the Reconciler. A remote source is not enqueued as startup: precache does
+        not warm those. Best-effort: a hook failure must never abort a commit.
         """
-        if self._initial_scan_done and self._on_source_committed is not None:
-            try:
-                self._on_source_committed(source_id)
-            except Exception:
-                logger.exception(
-                    "precache on_source_committed hook failed for %s",
-                    source_id,
-                )
-
-    def _notify_source_registered(self, source_id: str) -> None:
-        """Route a deferred source to the precache backlog once it is registered
-        (injected into the Reconciler as ``notify_source_registered``).
-
-        Always the backlog: it was claimed during the first scan, so it is startup
-        set whenever its registration happens to finish. Best-effort, like
-        :meth:`_notify_source_committed`.
-        """
-        callback = self._on_source_registered
-        if callback is None:
-            return
+        startup = source_id in self._deferred or not self._initial_scan_done
+        self._deferred.discard(source_id)
         try:
-            callback(source_id, self._claim_mtime(source_id))
+            if startup:
+                path = self._reconciler.claim_primary_path(source_id)
+                if (
+                    self._on_startup_source is not None
+                    and path is not None
+                    and not is_remote_url(path)
+                ):
+                    self._on_startup_source(source_id, self._claim_mtime(source_id))
+            elif self._on_source_committed is not None:
+                self._on_source_committed(source_id)
         except Exception:
-            logger.exception(
-                "precache on_source_registered hook failed for %s", source_id
-            )
+            logger.exception("precache routing hook failed for %s", source_id)
 
     def should_warm(self, source_id: str) -> bool:
         """Whether the precache worker may warm *source_id* right now.

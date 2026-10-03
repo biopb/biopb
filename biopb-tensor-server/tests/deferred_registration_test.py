@@ -461,24 +461,11 @@ class TestWhilePending:
 
 
 class TestPrecacheRouting:
-    def test_the_backlog_seed_skips_what_is_pending(self, tmp_path):
-        for name in ("a.zarr", "b.zarr"):
-            _make_zarr(tmp_path, name)
-        manager, server = _manager(tmp_path)
-        _first_scan(manager)
-        first, second = _only_ids(server)
-        assert manager.iter_local_source_mtimes() == []
-
-        server.sources.get_registered(first)
-        assert [sid for sid, _ in manager.iter_local_source_mtimes()] == [first]
-
     def test_a_registered_source_reaches_the_backlog_hook(self, tmp_path):
         _make_zarr(tmp_path, "a.zarr")
         manager, server = _manager(tmp_path)
         routed = []
-        manager.set_source_registered_hook(
-            lambda sid, mtime: routed.append((sid, mtime))
-        )
+        manager.set_startup_source_hook(lambda sid, mtime: routed.append((sid, mtime)))
         live = []
         manager.set_source_committed_hook(live.append)
         _first_scan(manager)

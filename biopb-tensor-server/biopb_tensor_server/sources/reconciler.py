@@ -138,7 +138,6 @@ class Reconciler:
         credentials_config: Optional[Any],
         roots: Roots,
         notify_source_committed: Callable[[str], None],
-        notify_source_registered: Callable[[str], None] = lambda source_id: None,
         catalog_url_for: Callable[[SourceClaim], Optional[str]] = lambda claim: None,
         stability_window: float = 30.0,
     ):
@@ -152,10 +151,6 @@ class Reconciler:
         self._roots = roots
         # Injected SourceManager seam (see module docstring).
         self._notify_source_committed = notify_source_committed
-        # The same, for a source whose registration was deferred and has now run
-        # (see ``_commit_pending_claim``): it was claimed before the commit hook
-        # would have routed it, so it takes the startup path.
-        self._notify_source_registered = notify_source_registered
         # Display root for a newly discovered claim (a monitored root's alias);
         # None leaves the native url.
         self._catalog_url_for = catalog_url_for
@@ -246,19 +241,6 @@ class Reconciler:
         with self._lock:
             claim = self._state.claims.get(source_id)
             return claim.primary_path if claim is not None else None
-
-    def registered_claim_paths(self) -> List[Tuple[str, str]]:
-        """:meth:`local_claim_paths` without the sources still pending.
-
-        What the precache backlog is seeded from: a pending source has nothing to
-        warm yet, and is routed there when its registration completes.
-        """
-        with self._lock:
-            return [
-                (claim.source_id, claim.primary_path)
-                for claim in self._state.claims.values()
-                if not claim.is_remote and claim.source_id not in self._pending
-            ]
 
     # --- Deferred registration ---------------------------------------------
 
@@ -382,7 +364,7 @@ class Reconciler:
                 self._registration_locks.pop(source_id, None)
             self._clear_failed_source_attempt(source_id)
             drained = not self._defer_registration and not self._pending
-        self._notify_source_registered(source_id)
+        self._notify_source_committed(source_id)
         if drained:
             self.stats.log_summary()
         return True
@@ -767,7 +749,6 @@ class Reconciler:
             self._commit_claim_bookkeeping(claim, signatures)
             # A source that was still pending is registered now: this rebuild is
             # the registration the worker would have run.
-            was_pending = claim.source_id in self._pending
             self._pending.discard(claim.source_id)
             self._pending_failed.discard(claim.source_id)
 
@@ -776,10 +757,7 @@ class Reconciler:
         # cache evicts under LRU, so an unchanged source can still have holes.
         # Cheap when it has none -- an unmoved token leaves every cache key
         # identical, and resolve_chunk_data calls compute_fn only on a miss.
-        if was_pending:
-            self._notify_source_registered(claim.source_id)
-        else:
-            self._notify_source_committed(claim.source_id)
+        self._notify_source_committed(claim.source_id)
         return True
 
     def _commit_remove_source(self, source_id: str) -> bool:

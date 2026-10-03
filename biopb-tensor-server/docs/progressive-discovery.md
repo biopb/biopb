@@ -254,9 +254,12 @@ the placeholder. From then on the source is served exactly as a source registere
   registration), removal drops it and a registration never registers a removed source back
   (a per-source lock orders the three). The upload attacher runs on the real adapter when
   it is swapped in, not on the placeholder.
-- **Precache.** The backlog is no longer seeded from every claim: a pending source has
-  nothing to warm. It is routed to the backlog (`enqueue_backlog`) when its registration
-  completes, and the backlog tier waits for `registration_idle` (first scan over, nothing
+- **Precache.** One callback after every registration (`_notify_source_committed`) routes
+  the source: a startup source, one the first scan found, whether it registered as claimed
+  or afterwards, goes to the backlog (`enqueue_backlog`, with its mtime); a later one is
+  prompt-enqueued. There is no bulk seed from the claims, which a pending source could not
+  be part of anyway, and a remote source is not enqueued as startup (precache does not warm
+  those). The backlog tier waits for `registration_idle` (first scan over, nothing
   pending), because registration is the critical path and reads the same files. The live
   tier is not held.
 - **Cost.** `RegistrationStats` logs, once registration has drained, per source type the
