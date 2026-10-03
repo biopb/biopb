@@ -36,7 +36,7 @@ if TYPE_CHECKING:
 # The claims' header probe, memoized per local file: ``(has Rows and Columns,
 # SeriesInstanceUID)``. A series directory costs one header parse per slice, so
 # without the memo every rescan pays it again.
-_HEADER_MEMO = SignatureMemo(500_000)
+_HEADER_MEMO = SignatureMemo(200_000)
 
 
 def _read_header_summary(path: str) -> Tuple[bool, Optional[str]]:

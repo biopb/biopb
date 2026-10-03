@@ -10,6 +10,7 @@ steady-state rescan. An LRU smaller than the scan evicts every entry before the
 next pass reaches it.
 """
 
+import hashlib
 import os
 import threading
 from collections import OrderedDict
@@ -30,6 +31,14 @@ def file_signature(path: "Path | str") -> Optional[Signature]:
     return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
 
 
+def _key(path: "Path | str", signature: Signature) -> bytes:
+    """A 128-bit digest of the path and the whole signature: a fraction of the
+    memory of keeping both, and a collision is not a practical concern."""
+    return hashlib.blake2b(
+        f"{path}\0{signature}".encode("utf-8", "surrogateescape"), digest_size=16
+    ).digest()
+
+
 class SignatureMemo:
     """Bounded LRU of ``compute(path)`` results per ``(path, signature)``.
 
@@ -40,7 +49,7 @@ class SignatureMemo:
 
     def __init__(self, max_entries: int):
         self.max_entries = max_entries
-        self._entries: OrderedDict[Tuple[str, Signature], object] = OrderedDict()
+        self._entries: OrderedDict[bytes, object] = OrderedDict()
         self._lock = threading.Lock()
 
     def __len__(self) -> int:
@@ -63,7 +72,7 @@ class SignatureMemo:
         if signature is None:
             return compute()
 
-        key = (str(path), signature)
+        key = _key(path, signature)
         with self._lock:
             if key in self._entries:
                 self._entries.move_to_end(key)

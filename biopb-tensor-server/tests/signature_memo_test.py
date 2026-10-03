@@ -34,6 +34,13 @@ def test_changed_signature_recomputes():
     assert len(calls) == 2
 
 
+def test_paths_sharing_a_signature_are_independent():
+    memo = SignatureMemo(10)
+    assert memo.get("/a", lambda: "a", SIG_A) == "a"
+    assert memo.get("/b", lambda: "b", SIG_A) == "b"
+    assert memo.get("/a", lambda: "stale", SIG_A) == "a"
+
+
 def test_none_is_a_result():
     memo = SignatureMemo(10)
     calls, compute = counting(None)
