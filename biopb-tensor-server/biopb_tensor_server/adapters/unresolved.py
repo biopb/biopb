@@ -348,9 +348,11 @@ class PendingSourceAdapter(SourceAdapter):
     #: Read by ``SourceRegistry`` (duck-typed: core does not import adapters).
     registration_pending = True
 
-    def __init__(self, claim: "SourceClaim"):
+    def __init__(self, claim: "SourceClaim", catalog_url: Optional[str] = None):
         # Identity only. What registration is built from is the claim the
         # reconciler holds, which a refresh can replace; this keeps no copy.
+        if catalog_url:
+            self._catalog_url = catalog_url
         self.source_id = claim.source_id
         self._source_url = str(claim.primary_path)
         self._source_type = claim.source_type or "unknown"

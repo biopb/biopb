@@ -224,48 +224,38 @@ complete_initial_scan      first tick only
 
 ### Registration after the walk
 
-Registering a source opens and parses its file, which is most of the time a large site
-takes to start. While `registration_workers` is above zero, the first scan therefore only
-*claims*: `_commit_add_claim` commits each deferrable claim with a placeholder
-(`PendingSourceAdapter`) through `_commit_pending_claim`. The source is in the registry
-and the catalog at once, `is_resolved` false with `unresolved_reason` `pending` and no
-tensors, and its claim and signatures are in the confirmed state, so the reconcile diff,
-removal and refresh treat it like any other source. A `RegistrationWorker` pool then
-calls `Reconciler.ensure_registered` for each, newest file first, which runs the ordinary
-registration (`_register_source_claim(replace=True)`) and swaps the real adapter in over
-the placeholder. From then on the source is served exactly as a source registered inline.
+Registering a source opens and parses its file, which is most of a large site's start.
+While `registration_workers` is above zero the first scan therefore only *claims*:
+`_commit_pending_claim` commits each deferrable claim with a placeholder
+(`PendingSourceAdapter`). The source is in the registry and the catalog at once
+(`is_resolved` false, `unresolved_reason` `pending`, no tensors), and its claim and
+signatures are in the confirmed state, so the diff, removal and refresh treat it like any
+other source. A `RegistrationWorker` pool then calls `Reconciler.ensure_registered`,
+newest file first, which runs the ordinary registration and swaps the real adapter in.
 
-- **A read registers it at once.** `SourceRegistry.get_registered` is what the server's
-  read paths and the upload manager use instead of `get`: it calls the materializer
-  (`ensure_registered`) first when the adapter is a placeholder. `ensure_registered` is
-  single-flight per source, so a read racing the worker shares one registration. Internal
-  callers that only ask whether a source exists keep `get` and never pay for one. The
-  `resolve` action on a pending source registers it and returns the filled row.
-- **Not deferred:** remote proxies (they register from a bulk seed), cloud sources (they
-  already register as unresolved without opening anything), static config sources
-  (committed before the loop starts), and everything claimed after the first scan, which
-  is registered as it is claimed, as a drop is.
-- **`unresolved_reason`** (`sources` column) says why a row is not resolved:
-  `needs_recall` (a cloud placeholder; resolving downloads it), `pending` (queued; any
-  read registers it, no download), `failed` (registration raised; `metadata_json` holds
-  `registration_error`, reads raise `SourceRegistrationError`, and a tick re-queues it once
-  its backoff has passed).
-- **While pending a source is a source.** Refresh registers it (the rebuild is the
-  registration), removal drops it and a registration never registers a removed source back
-  (a per-source lock orders the three). The upload attacher runs on the real adapter when
-  it is swapped in, not on the placeholder.
+- **A read registers it at once.** The server's read paths and the upload manager use
+  `SourceRegistry.get_registered`, which calls `ensure_registered` first when the adapter
+  is a placeholder; it is single-flight per source, so a read racing the worker shares one
+  registration. Callers that only ask whether a source exists keep `get`. `resolve` on a
+  pending source registers it and returns the filled row.
+- **Not deferred:** remote proxies (bulk-seeded), cloud sources (already registered
+  unresolved), static sources, and everything claimed after the first scan.
+- **`unresolved_reason`** says why a row is not resolved: `needs_recall` (a cloud
+  placeholder; resolving downloads it), `pending` (queued; a read registers it, no
+  download), `failed` (registration raised; `metadata_json` holds `registration_error`,
+  reads raise `SourceRegistrationError`, and a tick retries it after its backoff).
+- **While pending** a source can be refreshed (the rebuild is the registration) or removed,
+  and a registration never registers a removed source back (a per-source lock orders the
+  three). The upload attacher runs on the real adapter, not the placeholder.
 - **Precache.** One callback after every registration (`_notify_source_committed`) routes
-  the source: a startup source, one the first scan found, whether it registered as claimed
-  or afterwards, goes to the backlog (`enqueue_backlog`, with its mtime); a later one is
-  prompt-enqueued. There is no bulk seed from the claims, which a pending source could not
-  be part of anyway, and a remote source is not enqueued as startup (precache does not warm
-  those). The backlog tier waits for `registration_idle` (first scan over, nothing
-  pending), because registration is the critical path and reads the same files. The live
+  the source: one the first scan found goes to the backlog (`enqueue_backlog`, with its
+  mtime), a later one is prompt-enqueued, a remote one is not enqueued as startup. The
+  backlog tier waits for `registration_idle` (first scan over, nothing pending); the live
   tier is not held.
 - **Cost.** `RegistrationStats` logs, once registration has drained, per source type the
-  time spent in `create_from_config`, `normalize_adapter`, the metadata read and the row
-  write, the sizes of `metadata_json`, `tensors` and the lean descriptors, and the member
-  count, plus the time each adapter's `claim` took in the walk.
+  time in `create_from_config`, `normalize_adapter`, the metadata read and the row write,
+  the sizes of `metadata_json`, `tensors` and the lean descriptors, and the member count,
+  plus the time each adapter's `claim` took in the walk.
 
 Streaming is safe only because the first scan is add-only. It is idempotent
 against a retry: `_stream_first_scan_add` skips a claim already in the confirmed state,

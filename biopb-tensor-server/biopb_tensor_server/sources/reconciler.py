@@ -269,6 +269,11 @@ class Reconciler:
         with self._lock:
             return source_id in self._pending
 
+    def _clear_pending(self, source_id: str) -> None:
+        """Forget a source's placeholder state. Caller holds ``self._lock``."""
+        self._pending.discard(source_id)
+        self._pending_failed.discard(source_id)
+
     def _registration_lock(self, source_id: str) -> threading.RLock:
         with self._lock:
             return self._registration_locks.setdefault(source_id, threading.RLock())
@@ -295,9 +300,7 @@ class Reconciler:
         are in state, so the rescan diff, removal and refresh treat it as any
         confirmed source. :meth:`ensure_registered` finishes the job.
         """
-        adapter = PendingSourceAdapter(claim)
-        if catalog_url:
-            adapter._catalog_url = catalog_url
+        adapter = PendingSourceAdapter(claim, catalog_url)
         try:
             self._server.register_source(claim.source_id, adapter)
             if self._metadata_db is not None:
@@ -359,8 +362,7 @@ class Reconciler:
                 return False
 
             with self._lock:
-                self._pending.discard(source_id)
-                self._pending_failed.discard(source_id)
+                self._clear_pending(source_id)
                 self._registration_locks.pop(source_id, None)
             self._clear_failed_source_attempt(source_id)
             drained = not self._defer_registration and not self._pending
@@ -396,7 +398,7 @@ class Reconciler:
     def failed_pending_due(self) -> List[str]:
         """Pending sources whose registration failed and may be tried again."""
         with self._lock:
-            failed = sorted(self._pending_failed)
+            failed = list(self._pending_failed)
         return [sid for sid in failed if self._should_retry_source(sid)]
 
     def _on_pending(self, source_id: str) -> None:
@@ -749,8 +751,7 @@ class Reconciler:
             self._commit_claim_bookkeeping(claim, signatures)
             # A source that was still pending is registered now: this rebuild is
             # the registration the worker would have run.
-            self._pending.discard(claim.source_id)
-            self._pending_failed.discard(claim.source_id)
+            self._clear_pending(claim.source_id)
 
         logger.info(f"Refreshed source: {claim.source_id}")
         # Warm as a fresh add does, not only when the content_version moved: the
@@ -781,8 +782,7 @@ class Reconciler:
             self._source_signatures.pop(source_id, None)
             self._cloud_source_ids.discard(source_id)
             self._missed_scans.pop(source_id, None)
-            self._pending.discard(source_id)
-            self._pending_failed.discard(source_id)
+            self._clear_pending(source_id)
             self._registration_locks.pop(source_id, None)
             self._clear_failed_source_attempt(source_id)
         return True

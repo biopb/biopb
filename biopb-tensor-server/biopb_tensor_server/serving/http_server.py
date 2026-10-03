@@ -64,7 +64,7 @@ import numpy as np
 import pyarrow.flight as flight
 from biopb import _web_auth
 from biopb.image.annotation_pb2 import RoiAnnotation
-from biopb.tensor._catalog_rows import sql_literal
+from biopb.tensor._catalog_rows import sql_literal, unresolved_reasons
 from biopb.tensor._session import ResolveCancelled
 from biopb.tensor.client import TensorFlightClient
 from biopb.tensor.ticket_pb2 import TensorTicket
@@ -3331,29 +3331,16 @@ _SOURCE_LIST_SQL = (
 def _add_unresolved_reasons(
     client: Any, rows: List[Dict[str, Any]], where: str = ""
 ) -> None:
-    """Set ``unresolved_reason`` on the rows that are not resolved.
-
-    A second, narrow query rather than a column of the listing: this sidecar can
-    front a server older than the column, which would refuse the whole listing.
-    Without the answer the key stays absent, which a client reads as the cloud
-    case it always was.
-    """
+    """Set ``unresolved_reason`` on the rows that are not resolved. Without an
+    answer (a server older than the column) the key stays absent, which a client
+    reads as the cloud case it always was."""
     unresolved = [row for row in rows if not row.get("is_resolved", True)]
     if not unresolved:
         return
-    try:
-        reasons = {
-            r["source_id"]: r["unresolved_reason"]
-            for r in client.query(
-                "SELECT source_id, unresolved_reason FROM sources "
-                f"WHERE NOT is_resolved {where}",
-                format="records",
-            )
-        }
-    except Exception:
-        return
+    reasons = unresolved_reasons(lambda sql: client.query(sql, format="records"), where)
     for row in unresolved:
-        row["unresolved_reason"] = reasons.get(row["source_id"])
+        if row["source_id"] in reasons:
+            row["unresolved_reason"] = reasons[row["source_id"]]
 
 
 def _source_row_to_dict(row: Dict[str, Any]) -> Dict[str, Any]:

@@ -217,10 +217,11 @@ class SourceManager:
             )
         self._reconciler.set_pending_hook(self._enqueue_pending)
         self._on_startup_source: Optional[Callable[[str, float], None]] = None
-        # Sources committed pending, until their registration completes. They
-        # were found by the first scan, so they are startup set whenever that
-        # registration happens to finish (see ``_notify_source_committed``).
-        self._deferred: Set[str] = set()
+        # Sources committed pending -> their mtime, until their registration
+        # completes. They were found by the first scan, so they are startup set
+        # whenever that registration happens to finish (see
+        # ``_notify_source_committed``).
+        self._deferred: Dict[str, float] = {}
         if hasattr(registry, "claim_timer"):
             registry.claim_timer = self._reconciler.stats.record_claim
         set_materializer = getattr(server.sources, "set_materializer", None)
@@ -394,16 +395,18 @@ class SourceManager:
 
     def _enqueue_pending(self, source_id: str) -> None:
         """Queue a source the reconciler committed pending, newest file first."""
-        self._deferred.add(source_id)
+        mtime = self._claim_mtime(source_id) or 0.0
+        self._deferred[source_id] = mtime
         worker = self._registration_worker
         if worker is not None:
-            worker.enqueue(source_id, self._claim_mtime(source_id))
+            worker.enqueue(source_id, mtime)
 
-    def _claim_mtime(self, source_id: str) -> float:
-        """The modification time of a claimed source's primary path (0 if unknown)."""
+    def _claim_mtime(self, source_id: str) -> Optional[float]:
+        """The modification time of a claimed local source's primary path (0.0 if
+        it cannot be stat-ed), or None when it has no claim or is remote."""
         primary_path = self._reconciler.claim_primary_path(source_id)
         if primary_path is None or is_remote_url(primary_path):
-            return 0.0
+            return None
         try:
             return os.stat(primary_path).st_mtime
         except OSError:
@@ -488,7 +491,7 @@ class SourceManager:
         if worker is None:
             return
         for source_id in self._reconciler.failed_pending_due():
-            worker.enqueue(source_id, self._claim_mtime(source_id))
+            worker.enqueue(source_id, self._claim_mtime(source_id) or 0.0)
 
     def _scan_pending_roots(self) -> None:
         """Scan the configured ``monitor = false`` directories, each once.
@@ -697,16 +700,14 @@ class SourceManager:
         not warm those. Best-effort: a hook failure must never abort a commit.
         """
         startup = source_id in self._deferred or not self._initial_scan_done
-        self._deferred.discard(source_id)
+        mtime = self._deferred.pop(source_id, None)
         try:
             if startup:
-                path = self._reconciler.claim_primary_path(source_id)
-                if (
-                    self._on_startup_source is not None
-                    and path is not None
-                    and not is_remote_url(path)
-                ):
-                    self._on_startup_source(source_id, self._claim_mtime(source_id))
+                if self._on_startup_source is not None:
+                    if mtime is None:
+                        mtime = self._claim_mtime(source_id)
+                    if mtime is not None:
+                        self._on_startup_source(source_id, mtime)
             elif self._on_source_committed is not None:
                 self._on_source_committed(source_id)
         except Exception:

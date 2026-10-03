@@ -33,7 +33,7 @@ from biopb import (
     LocalTrustError,
     resolve_data_plane,
 )
-from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS
+from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS, unresolved_reasons
 from biopb.tensor.client import TensorFlightClient
 
 app = typer.Typer(
@@ -85,22 +85,6 @@ def _browse(client) -> dict:
         format="records",
     )
     return {row["source_id"]: row for row in rows}
-
-
-def _unresolved_reasons(client) -> dict:
-    """``{source_id: reason}`` for the sources that are not resolved.
-
-    Asked for apart from the listing: a server older than the column refuses the
-    query, and the listing must still print.
-    """
-    try:
-        rows = client.query(
-            "SELECT source_id, unresolved_reason FROM sources WHERE NOT is_resolved",
-            format="records",
-        )
-        return {row["source_id"]: row["unresolved_reason"] for row in rows}
-    except Exception:
-        return {}
 
 
 def _log_timing(start_time: float) -> None:
@@ -299,7 +283,7 @@ def query(
         table.add_column("Dtype", style="blue")
 
         reasons = (
-            _unresolved_reasons(client)
+            unresolved_reasons(lambda sql: client.query(sql, format="records"))
             if any(not row.get("is_resolved", True) for row in sources.values())
             else {}
         )

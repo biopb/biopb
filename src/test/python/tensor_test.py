@@ -441,11 +441,10 @@ class TestPendingRegistration:
         return catalog
 
     @staticmethod
-    def _reasons(catalog, reason):
+    def _reasons(catalog, reason, source_id="solo"):
+        rows = [{"source_id": source_id, "unresolved_reason": reason}]
         catalog._query_table = Mock(
-            return_value=Mock(
-                to_pylist=Mock(return_value=[{"unresolved_reason": reason}])
-            )
+            return_value=Mock(to_pylist=Mock(return_value=rows))
         )
 
     @staticmethod
@@ -479,7 +478,7 @@ class TestPendingRegistration:
 
     def test_a_cloud_placeholder_is_never_resolved_implicitly(self):
         catalog = self._client([self._row(False)])
-        self._reasons(catalog, "needs_recall")
+        self._reasons(catalog, "needs_recall", "cloud_x")
 
         with pytest.raises(ValueError, match=r"call client\.resolve_source"):
             catalog._resolve_descriptor("cloud_x")
@@ -504,7 +503,7 @@ class TestPendingRegistration:
 
         def query(sql):
             if "unresolved_reason" in sql:
-                rows = [{"unresolved_reason": "pending"}]
+                rows = [{"source_id": "solo", "unresolved_reason": "pending"}]
             else:
                 rows = tables.pop(0)
             return Mock(to_pylist=Mock(return_value=rows))
