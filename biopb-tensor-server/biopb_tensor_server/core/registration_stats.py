@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from array import array
 from collections import defaultdict
 from typing import Dict, List, NamedTuple, Sequence
 
@@ -43,8 +44,10 @@ class RegistrationStats:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._samples: Dict[str, Dict[str, List[float]]] = defaultdict(
-            lambda: defaultdict(list)
+        # 8 bytes a sample, not a boxed float: a site of 100k sources keeps nine
+        # per source for the life of the process.
+        self._samples: Dict[str, Dict[str, array]] = defaultdict(
+            lambda: defaultdict(lambda: array("d"))
         )
         # adapter -> [probes, seconds, claimed]. Updated without the lock: the
         # walk is one thread, and a count off by a race would not matter.

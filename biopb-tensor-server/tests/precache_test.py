@@ -735,10 +735,11 @@ class TestStartupRouting:
         server, sm, startup, live = self._sm()
         try:
             self._claim(sm, "local", str(tmp_path))
-            sm._deferred.add("local")  # claimed by the first scan, registered later
+            sm._deferred["local"] = 123.0  # claimed by the first scan, registered later
             sm._initial_scan_done = True
             sm._notify_source_committed("local")
-            assert [sid for sid, _ in startup] == ["local"] and live == []
+            # With the mtime it was claimed with, not a second stat.
+            assert startup == [("local", 123.0)] and live == []
             # It is startup once: a refresh of it afterwards is a live addition.
             sm._notify_source_committed("local")
             assert live == ["local"]

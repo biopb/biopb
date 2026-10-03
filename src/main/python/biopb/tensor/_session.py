@@ -50,6 +50,7 @@ from biopb.tensor._catalog_rows import (
     _descriptor_from_row,
     sql_literal,
     tensor_descriptors_from_row,
+    unresolved_reasons,
 )
 from biopb.tensor._labels import LABELS_SEGMENT
 from biopb.tensor._location import normalize_flight_location
@@ -970,25 +971,18 @@ class CatalogClient:
     def _register_if_pending(self, source_id: str) -> bool:
         """Have the server register a source it has claimed but not yet opened.
 
-        A catalog row that is unresolved because its registration is still queued
-        (``unresolved_reason`` ``pending``) or failed is a local source, so
-        registering it costs no download and needs no consent: the server does it
-        for any read, and this does it before the catalog-side check that would
-        otherwise refuse. A failed one raises here with the server's reason.
-
-        False for anything else -- a cloud placeholder, or a server too old to
-        have the column (which refuses the query) -- so the caller's own refusal
-        stands. The column is asked for separately, never as part of a shared row
-        projection, for that reason.
+        A row that is unresolved because its registration is queued (``pending``)
+        or failed is a local source: registering it costs no download and needs no
+        consent, so this does it before the catalog-side check that would refuse.
+        A failed one raises here with the server's reason. False for a cloud
+        placeholder, or a server too old to say, so the caller's refusal stands.
         """
-        try:
-            rows = self._query_table(
-                "SELECT unresolved_reason FROM sources "
-                f"WHERE source_id = {sql_literal(source_id)}"
-            ).to_pylist()
-        except flight.FlightError:
-            return False
-        if not rows or rows[0].get("unresolved_reason") not in ("pending", "failed"):
+        reasons = unresolved_reasons(
+            lambda sql: self._query_table(sql).to_pylist(),
+            f"AND source_id = {sql_literal(source_id)}",
+            errors=flight.FlightError,
+        )
+        if reasons.get(source_id) not in ("pending", "failed"):
             return False
         self.resolve_source(source_id)
         return True

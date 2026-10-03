@@ -195,21 +195,21 @@ class PrecacheWorker:
                     continue
                 if self.backlog_gate is not None and not self.backlog_gate():
                     # Held; a live addition is still taken as it arrives.
-                    try:
-                        source_id = self._queue.get(timeout=1.0)
-                    except queue.Empty:
-                        continue
-                    self._process_live(source_id)
+                    self._wait_live(1.0)
                     continue
                 self._drain_one_backlog()
                 continue
 
             # 3. Idle: block briefly for the next live addition.
-            try:
-                source_id = self._queue.get(timeout=0.5)
-            except queue.Empty:
-                continue
-            self._process_live(source_id)
+            self._wait_live(0.5)
+
+    def _wait_live(self, timeout: float) -> None:
+        """Block up to *timeout* for a live addition, and warm it if one arrives."""
+        try:
+            source_id = self._queue.get(timeout=timeout)
+        except queue.Empty:
+            return
+        self._process_live(source_id)
 
     def _process_live(self, source_id: str) -> None:
         # Drop the dedup marker before processing: a commit that arrives while

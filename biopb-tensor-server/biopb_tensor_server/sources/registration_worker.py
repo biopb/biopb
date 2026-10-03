@@ -19,9 +19,6 @@ from typing import Callable, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
-# How long an idle worker sleeps before it looks at the stop flag again.
-_IDLE_WAIT = 0.5
-
 
 class RegistrationWorker:
     """A pool of threads that register queued sources, newest mtime first.
@@ -87,7 +84,7 @@ class RegistrationWorker:
             while not self._heap:
                 if self._stop.is_set():
                     return None
-                self._cond.wait(timeout=_IDLE_WAIT)
+                self._cond.wait()
             if self._stop.is_set():
                 return None
             _, _, source_id = heapq.heappop(self._heap)
