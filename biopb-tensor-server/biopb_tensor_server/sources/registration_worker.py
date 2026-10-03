@@ -14,6 +14,7 @@ from __future__ import annotations
 import heapq
 import logging
 import threading
+import time
 from typing import Callable, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
@@ -53,11 +54,18 @@ class RegistrationWorker:
             self._threads.append(thread)
 
     def stop(self, join_timeout: float = 5.0) -> None:
+        """Stop the pool, waiting at most *join_timeout* in all.
+
+        A worker in the middle of opening a large file cannot be interrupted, so
+        one deadline is shared rather than one per thread: they are daemons, and
+        what is not done by then is left to die with the process.
+        """
         self._stop.set()
         with self._cond:
             self._cond.notify_all()
+        deadline = time.monotonic() + join_timeout
         for thread in self._threads:
-            thread.join(timeout=join_timeout)
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
         self._threads = []
 
     def enqueue(self, source_id: str, mtime: float = 0.0) -> None:

@@ -280,6 +280,21 @@ class TestTheWorker:
         for row in _rows(server).values():
             assert row["is_resolved"] is True and row["tensors"] == 1
 
+    def test_stop_waits_one_deadline_for_the_whole_pool(self):
+        release = threading.Event()
+        worker = RegistrationWorker(lambda sid: release.wait(30) or True, workers=3)
+        for sid in "abc":
+            worker.enqueue(sid)
+        worker.start()
+        _wait_until(lambda: worker.queued() == 0)
+        started = time.monotonic()
+        try:
+            worker.stop(join_timeout=0.5)
+            # Three threads stuck in a file open: one deadline, not three.
+            assert time.monotonic() - started < 1.2
+        finally:
+            release.set()
+
     def test_a_queued_source_is_not_queued_twice(self):
         seen = []
         worker = RegistrationWorker(lambda sid: seen.append(sid) or True, workers=1)
