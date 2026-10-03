@@ -608,6 +608,7 @@ class SourceManager:
                     admit_nonresident=cloud,
                     cloud_root=cloud,
                     report=report,
+                    monitored=True,
                 )
 
             # A directory the walk declined (the stability gate, or the skip

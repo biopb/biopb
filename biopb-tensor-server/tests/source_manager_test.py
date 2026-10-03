@@ -284,6 +284,30 @@ class TestRescanLoop:
             **kwargs,
         )
 
+    def test_the_monitored_walk_tells_claims_it_is_monitored(
+        self, tmp_path, monkeypatch
+    ):
+        """A monitored root is walked again every tick, so its claims may keep
+        their content probes."""
+        import biopb_tensor_server.sources.source_manager as sm
+
+        seen = []
+        real = sm.discover_sources
+
+        def spy(*args, **kwargs):
+            seen.append(kwargs.get("monitored"))
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(sm, "discover_sources", spy)
+        root = tmp_path / "data"
+        root.mkdir()
+        (root / "a.dat").write_text("a")
+        manager = self._manager(_FakeServer(), {root})
+
+        manager._handle_rescan()
+
+        assert seen == [True]
+
     def test_a_config_with_nothing_to_scan_still_completes_on_the_first_tick(
         self, tmp_path
     ):
@@ -398,6 +422,27 @@ class TestScanOnceRoots:
         assert manager._initial_scan_done is True
         assert server.last_full_scan_at is not None
         assert server.full_scan_in_progress is False
+
+    def test_it_is_not_told_it_is_monitored(self, tmp_path, monkeypatch):
+        """It is walked once, so its claims keep no content probes."""
+        import biopb_tensor_server.sources.source_manager as sm
+
+        seen = []
+        real = sm.discover_sources
+
+        def spy(*args, **kwargs):
+            seen.append(kwargs.get("monitored", False))
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(sm, "discover_sources", spy)
+        root = tmp_path / "data"
+        root.mkdir()
+        (root / "a.dat").write_text("a")
+        manager = self._manager(_FakeServer(), root, DiscoveryState())
+
+        manager._handle_rescan()
+
+        assert seen == [False]
 
     def test_it_is_never_scanned_again(self, tmp_path):
         root = tmp_path / "data"

@@ -298,6 +298,7 @@ class ClaimContext(abc.ABC):
         path: Path | str = "",
         store: Optional[RemoteStore] = None,
         cloud_root: bool = False,
+        monitored: bool = False,
     ) -> ClaimContext:
         if cls is not ClaimContext:
             return object.__new__(cls)
@@ -318,6 +319,13 @@ class ClaimContext(abc.ABC):
     @property
     def cloud_root(self) -> bool:
         """Whether this path is under a configured ``cloud = true`` root."""
+        return False
+
+    @property
+    def monitored(self) -> bool:
+        """Whether this path is under a monitored root, which is walked again
+        every rescan. A claim memoizes its content probe only then: a one-shot
+        scan never revisits a file."""
         return False
 
     # --- path operations (each concrete shape implements these) ---
@@ -467,8 +475,11 @@ class LiveLocalContext(ClaimContext):
     ``join`` / ``parent`` return the same shape.
     """
 
-    def __init__(self, path: Path | str, cloud_root: bool = False):
+    def __init__(
+        self, path: Path | str, cloud_root: bool = False, monitored: bool = False
+    ):
         self._path = Path(path)
+        self._monitored = monitored
         # True when this entry lives under a ``cloud = true`` root. Lets an
         # adapter's ``claim()`` (and the resolve-time re-claim) suppress
         # content-membership multi-file grouping under cloud regardless of
@@ -479,6 +490,10 @@ class LiveLocalContext(ClaimContext):
     @property
     def cloud_root(self) -> bool:
         return self._cloud_root
+
+    @property
+    def monitored(self) -> bool:
+        return self._monitored
 
     def read_text(self, subpath: str = "") -> str:
         target = self._path / subpath if subpath else self._path
@@ -1179,6 +1194,7 @@ def discover_sources(
     admit_nonresident: bool = False,
     cloud_root: bool = False,
     report: Optional[WalkReport] = None,
+    monitored: bool = False,
 ) -> DiscoveryState:
     """Recursive filesystem discovery with claim protocol.
 
@@ -1203,6 +1219,9 @@ def discover_sources(
             back to single-file sources instead of grouping -- the same ban the
             monitored rescan applies. Keeps the static one-shot scan of a
             ``monitor=false`` cloud directory consistent with the monitored path.
+        monitored: The walk is a monitored root's rescan, which visits the same
+            files again every tick, so claims memoize their content probes
+            (``ClaimContext.monitored``). A one-shot walk does not.
 
     Returns:
         DiscoveryState with all discovered sources
@@ -1221,7 +1240,7 @@ def discover_sources(
         return state
 
     # Check if root itself is a data source (e.g., a .zarr directory)
-    ctx = ClaimContext(root, cloud_root=cloud_root)
+    ctx = ClaimContext(root, cloud_root=cloud_root, monitored=monitored)
     claim = _record_claim(state, registry.get_claims_for_path(ctx, state))
     if claim is not None:
         logger.info(f"discover_sources: root {root} claimed as {claim.source_type}")
@@ -1246,7 +1265,7 @@ def discover_sources(
         if state.is_path_claimed(path_str):
             continue
 
-        ctx = ClaimContext(path, cloud_root=cloud_root)
+        ctx = ClaimContext(path, cloud_root=cloud_root, monitored=monitored)
         _record_claim(state, registry.get_claims_for_path(ctx, state))
 
     logger.debug(
