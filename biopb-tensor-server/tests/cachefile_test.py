@@ -621,7 +621,7 @@ class TestFormatVersionEnforcement:
 
 class TestChunkLocateAction:
     def test_chunk_locate_listed(self):
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         threading.Thread(target=server.serve, daemon=True).start()
         time.sleep(0.8)
         try:
@@ -639,7 +639,7 @@ class TestChunkLocateAction:
         looks idle for the whole of a localhost read and the precache worker
         warms straight through it.
         """
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         CacheManager.reset()
         CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
         try:
@@ -686,7 +686,7 @@ class TestChunkLocateAction:
         refused. Proven here by making a cache lookup fail the test outright:
         the rejection must land before ``locate_entry`` is ever consulted.
         """
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         CacheManager.reset()
         CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
         try:
@@ -730,7 +730,7 @@ class TestChunkLocateAction:
         from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
         from biopb_tensor_server.core.chunk import encode_chunk_id as _encode
 
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         CacheManager.reset()
         CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
         try:
@@ -761,7 +761,7 @@ class TestChunkLocateAction:
     def test_locate_releases_the_activity_slot_on_error(self, tmp_path):
         """A failing locate must not leak an in-flight count (precache would
         then never run again)."""
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         CacheManager.reset()
         CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
         try:
@@ -1133,7 +1133,7 @@ class TestCachefileIntegration:
             zpath, mode="w", shape=src.shape, chunks=(48, 48), dtype=src.dtype
         )
         z[:] = src
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         server.register_source(
             "z", ZarrAdapter(zarr.open_array(zpath, mode="r"), "z", ["y", "x"])
         )

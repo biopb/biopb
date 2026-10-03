@@ -711,7 +711,7 @@ class TestFlightActions:
         from biopb.tensor import TensorFlightClient
 
         db = MetadataDatabase()
-        server = TensorFlightServer("grpc://localhost:0", metadata_db=db)
+        server = TensorFlightServer("localhost:0", metadata_db=db)
         server.mark_ready()
         threading.Thread(target=server.serve, daemon=True).start()
         time.sleep(1)
@@ -747,7 +747,7 @@ class TestFlightActions:
         from biopb.tensor import TensorFlightClient
 
         server = TensorFlightServer(
-            "grpc://localhost:0",
+            "localhost:0",
             metadata_db=MetadataDatabase(),
             annotations_enabled=False,
         )
@@ -1186,7 +1186,7 @@ class TestPersistence:
         with the annotation actions off keeps a file for those alone, so
         `annotations_persisted` False no longer means nothing is persisted."""
         server = TensorFlightServer(
-            "grpc://localhost:0",
+            "localhost:0",
             metadata_db=MetadataDatabase(
                 store_path=tmp_path / "catalog.duckdb", annotations_enabled=False
             ),

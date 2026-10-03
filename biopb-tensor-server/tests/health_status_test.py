@@ -23,7 +23,7 @@ def _health(server) -> dict:
 
 def test_health_reports_starting_until_marked_ready():
     """Status flips STARTING -> SERVING only after mark_ready()."""
-    server = TensorFlightServer("grpc://localhost:0")
+    server = TensorFlightServer("localhost:0")
 
     assert server.is_ready is False
     assert _health(server)["status"] == "STARTING"
@@ -36,7 +36,7 @@ def test_health_reports_starting_until_marked_ready():
 
 def test_health_payload_shape_unchanged():
     """The readiness change leaves the other health fields intact."""
-    server = TensorFlightServer("grpc://localhost:0")
+    server = TensorFlightServer("localhost:0")
     server.mark_ready()
 
     payload = _health(server)
@@ -60,22 +60,20 @@ def test_metadata_db_enabled_tracks_whether_there_is_a_catalog():
     """
     from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 
-    catalog_less = TensorFlightServer("grpc://localhost:0")
+    catalog_less = TensorFlightServer("localhost:0")
     catalog_less.mark_ready()
     assert _health(catalog_less)["metadata_db_enabled"] is False
     assert _health(catalog_less)["annotations_persisted"] is False
     assert _health(catalog_less)["catalog_persisted"] is False
 
-    catalogued = TensorFlightServer(
-        "grpc://localhost:0", metadata_db=MetadataDatabase()
-    )
+    catalogued = TensorFlightServer("localhost:0", metadata_db=MetadataDatabase())
     catalogued.mark_ready()
     assert _health(catalogued)["metadata_db_enabled"] is True
 
 
 def test_health_freshness_fields_default_inert():
     """A fresh server reports no scan running and no full scan yet."""
-    server = TensorFlightServer("grpc://localhost:0")
+    server = TensorFlightServer("localhost:0")
 
     payload = _health(server)
     assert payload["full_scan_in_progress"] is False
@@ -84,7 +82,7 @@ def test_health_freshness_fields_default_inert():
 
 def test_health_reflects_scan_status_setters():
     """The SourceManager-facing setters surface on the next health payload."""
-    server = TensorFlightServer("grpc://localhost:0")
+    server = TensorFlightServer("localhost:0")
 
     server.set_full_scan_in_progress(True)
     assert _health(server)["full_scan_in_progress"] is True
@@ -104,7 +102,7 @@ def test_health_starting_over_the_wire_before_ready():
     though mark_ready() has not been called yet -- this is the whole point of
     the signal.
     """
-    server = TensorFlightServer("grpc://localhost:0")
+    server = TensorFlightServer("localhost:0")
     threading.Thread(target=server.serve, daemon=True).start()
     try:
         with flight.FlightClient(f"grpc://localhost:{server.port}") as client:
@@ -133,7 +131,7 @@ def test_external_location_omitted_when_unset():
     """biopb/biopb#1158: no key at all, not a null, when nothing was configured
     -- an old client that never looks for it and a new one against an old
     server both see the same shape."""
-    server = TensorFlightServer("grpc://localhost:0")
+    server = TensorFlightServer("localhost:0")
     server.mark_ready()
 
     assert "external_location" not in _health(server)
@@ -142,7 +140,7 @@ def test_external_location_omitted_when_unset():
 def test_external_location_advertised_when_set():
     """biopb/biopb#1158: whatever the caller configured comes back verbatim."""
     server = TensorFlightServer(
-        "grpc://localhost:0", external_location="grpc://real-host:8815"
+        "localhost:0", external_location="grpc://real-host:8815"
     )
     server.mark_ready()
 

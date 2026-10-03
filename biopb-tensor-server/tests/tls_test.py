@@ -83,22 +83,21 @@ def _serve(server):
     return t
 
 
-def test_ensure_tls_scheme_normalizes_shorthands():
-    from biopb_tensor_server.serving.server import _ensure_tls_scheme
+@pytest.mark.parametrize("location", ["grpc://localhost:0", "grpcs://localhost:0"])
+def test_a_schemed_location_is_rejected(location):
+    from biopb_tensor_server import TensorFlightServer
 
-    assert _ensure_tls_scheme("grpc://0.0.0.0:8815") == "grpc+tls://0.0.0.0:8815"
-    assert _ensure_tls_scheme("grpcs://host:8815") == "grpc+tls://host:8815"
-    # Already the TLS form -- left untouched.
-    assert _ensure_tls_scheme("grpc+tls://host:8815") == "grpc+tls://host:8815"
+    with pytest.raises(ValueError, match="without a scheme"):
+        TensorFlightServer(location)
 
 
 def test_tls_cert_without_key_is_rejected():
     from biopb_tensor_server import TensorFlightServer
 
     with pytest.raises(ValueError, match="together"):
-        TensorFlightServer("grpc://localhost:0", tls_cert_chain=b"cert")
+        TensorFlightServer("localhost:0", tls_cert_chain=b"cert")
     with pytest.raises(ValueError, match="together"):
-        TensorFlightServer("grpc://localhost:0", tls_private_key=b"key")
+        TensorFlightServer("localhost:0", tls_private_key=b"key")
 
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
@@ -112,7 +111,7 @@ def test_trusting_client_reads_over_tls(simple_zarr_array):
     cert_pem, key_pem = _self_signed_cert()
 
     server = catalog_server(
-        "grpc://localhost:0",
+        "localhost:0",
         tls_cert_chain=cert_pem,
         tls_private_key=key_pem,
     )
@@ -148,7 +147,7 @@ def test_plaintext_client_is_refused_by_tls_server(simple_zarr_array):
     cert_pem, key_pem = _self_signed_cert()
 
     server = catalog_server(
-        "grpc://localhost:0",
+        "localhost:0",
         tls_cert_chain=cert_pem,
         tls_private_key=key_pem,
     )
@@ -188,7 +187,7 @@ def test_sdk_client_tofu_roundtrip(simple_zarr_array, tmp_path, monkeypatch):
     cert_pem, key_pem = _self_signed_cert()
 
     server = catalog_server(
-        "grpc://localhost:0",
+        "localhost:0",
         tls_cert_chain=cert_pem,
         tls_private_key=key_pem,
     )
@@ -227,7 +226,7 @@ def test_expired_cert_fails_with_its_actual_reason(tmp_path, monkeypatch):
 
     cert_pem, key_pem = _self_signed_cert(valid_days=-30)
     server = TensorFlightServer(
-        "grpc://localhost:0", tls_cert_chain=cert_pem, tls_private_key=key_pem
+        "localhost:0", tls_cert_chain=cert_pem, tls_private_key=key_pem
     )
     server.mark_ready()
     _serve(server)
@@ -255,9 +254,9 @@ def test_health_reports_when_the_certificate_expires():
 
     cert_pem, key_pem = _self_signed_cert(valid_days=90)
     tls = TensorFlightServer(
-        "grpc://localhost:0", tls_cert_chain=cert_pem, tls_private_key=key_pem
+        "localhost:0", tls_cert_chain=cert_pem, tls_private_key=key_pem
     )
-    plain = TensorFlightServer("grpc://localhost:0")
+    plain = TensorFlightServer("localhost:0")
     for server in (tls, plain):
         server.mark_ready()
         _serve(server)
@@ -301,7 +300,7 @@ def test_a_handshake_failure_names_its_reason():
     served, key_pem = _self_signed_cert()
     stranger, _ = _self_signed_cert()
     server = TensorFlightServer(
-        "grpc://localhost:0", tls_cert_chain=served, tls_private_key=key_pem
+        "localhost:0", tls_cert_chain=served, tls_private_key=key_pem
     )
     server.mark_ready()
     _serve(server)
@@ -355,7 +354,7 @@ def test_sidecar_reads_over_tls_without_pinning(
     cert_pem, key_pem = _self_signed_cert()
 
     server = catalog_server(
-        "grpc://localhost:0", tls_cert_chain=cert_pem, tls_private_key=key_pem
+        "localhost:0", tls_cert_chain=cert_pem, tls_private_key=key_pem
     )
     register_and_catalog(server, "img", ZarrAdapter(arr, "img", ["y", "x"]))
     server.mark_ready()
@@ -407,7 +406,7 @@ def test_sidecar_reads_over_a_cert_that_does_not_name_loopback(
     )
 
     server = catalog_server(
-        "grpc://127.0.0.1:0", tls_cert_chain=cert_pem, tls_private_key=key_pem
+        "127.0.0.1:0", tls_cert_chain=cert_pem, tls_private_key=key_pem
     )
     register_and_catalog(server, "img", ZarrAdapter(arr, "img", ["y", "x"]))
     server.mark_ready()
@@ -457,7 +456,7 @@ def test_sidecar_refuses_a_plane_presenting_a_different_certificate(
     other, _ = _self_signed_cert()  # a different cert with the same names
 
     server = catalog_server(
-        "grpc://127.0.0.1:0", tls_cert_chain=served, tls_private_key=key_pem
+        "127.0.0.1:0", tls_cert_chain=served, tls_private_key=key_pem
     )
     register_and_catalog(server, "img", ZarrAdapter(arr, "img", ["y", "x"]))
     server.mark_ready()
@@ -510,7 +509,7 @@ def test_a_local_sdk_client_reads_a_plane_serving_a_byo_cert(
     )
 
     server = catalog_server(
-        "grpc://127.0.0.1:0", tls_cert_chain=cert_pem, tls_private_key=key_pem
+        "127.0.0.1:0", tls_cert_chain=cert_pem, tls_private_key=key_pem
     )
     register_and_catalog(server, "img", ZarrAdapter(arr, "img", ["y", "x"]))
     server.mark_ready()
@@ -552,7 +551,7 @@ def test_sidecar_dialing_plaintext_at_a_tls_plane_fails(simple_zarr_array):
     cert_pem, key_pem = _self_signed_cert()
 
     server = catalog_server(
-        "grpc://localhost:0", tls_cert_chain=cert_pem, tls_private_key=key_pem
+        "localhost:0", tls_cert_chain=cert_pem, tls_private_key=key_pem
     )
     register_and_catalog(server, "img", ZarrAdapter(arr, "img", ["y", "x"]))
     server.mark_ready()
@@ -626,7 +625,7 @@ def test_override_hostname_is_what_makes_a_mismatched_cert_connect(simple_zarr_a
     cert_pem, key_pem = _cert_with_sans("wrong.example", "alt.example")
 
     server = catalog_server(
-        "grpc://localhost:0", tls_cert_chain=cert_pem, tls_private_key=key_pem
+        "localhost:0", tls_cert_chain=cert_pem, tls_private_key=key_pem
     )
     register_and_catalog(server, "img", ZarrAdapter(arr, "img", ["y", "x"]))
     server.mark_ready()
@@ -685,7 +684,7 @@ def test_sdk_client_derives_the_override_and_reads(
     cert_pem, key_pem = _cert_with_sans("wrong.example", "alt.example")
 
     server = catalog_server(
-        "grpc://localhost:0", tls_cert_chain=cert_pem, tls_private_key=key_pem
+        "localhost:0", tls_cert_chain=cert_pem, tls_private_key=key_pem
     )
     register_and_catalog(server, "img", ZarrAdapter(arr, "img", ["y", "x"]))
     server.mark_ready()
@@ -716,7 +715,7 @@ def test_a_cert_that_lists_the_dialed_name_gets_no_override(
     cert_pem, key_pem = _self_signed_cert()  # SANs: localhost + 127.0.0.1
 
     server = catalog_server(
-        "grpc://localhost:0", tls_cert_chain=cert_pem, tls_private_key=key_pem
+        "localhost:0", tls_cert_chain=cert_pem, tls_private_key=key_pem
     )
     register_and_catalog(server, "img", ZarrAdapter(arr, "img", ["y", "x"]))
     server.mark_ready()
@@ -747,7 +746,7 @@ def test_a_read_exported_under_a_name_the_cert_omits_still_connects(simple_zarr_
         dns_names=("other.example",), ip_addresses=("127.0.0.1",)
     )
     server = catalog_server(
-        "grpc://localhost:0", tls_cert_chain=cert_pem, tls_private_key=key_pem
+        "localhost:0", tls_cert_chain=cert_pem, tls_private_key=key_pem
     )
     register_and_catalog(server, "img", ZarrAdapter(arr, "img", ["y", "x"]))
     server.mark_ready()

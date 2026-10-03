@@ -126,20 +126,11 @@ def _resolve_flight_token(
     """Resolve the token the Flight (gRPC) server enforces, fail-closed on a
     public bind.
 
-    The flight bind (``--host``, loopback by default) is the mode switch: a
-    loopback bind is **local mode** (tokenless, same-machine only); any
-    public bind is **remote mode** and MUST carry a token, so a public bind with
-    none supplied auto-generates one rather than serving the data API open.
-
     ``allow_no_token`` (from ``BIOPB_TENSOR_ALLOW_NO_TOKEN``) is the deliberate,
     insecure escape hatch: it forces **tokenless** operation even on a public bind
     -- for a host-loopback-published Docker container (or any trusted network)
     where the token is pure friction. It only takes effect when no token is
-    otherwise supplied; a real ``--token`` / env token still wins. Off by default,
-    so the fail-closed guarantee is unchanged unless it is explicitly set.
-
-    Shared by ``serve`` and ``launch``; ``launch`` layers its sidecar fail-closed
-    check on top of the returned token (see ``_resolve_launch_token``).
+    otherwise supplied.
 
     Returns the effective token (``None`` = local mode).
     """
@@ -228,12 +219,7 @@ def _resolve_external_location(
 ) -> Optional[str]:
     """Resolve the address advertised via ``health`` (biopb/biopb#1158).
 
-    Required/fail-loud on a public bind, mirroring the embedded cache's own
-    rule (``_resolve_tensor_external_location`` in
-    ``biopb_image_base/server.py``) -- there is no way to guess a reachable
-    address for a wildcard bind. A loopback bind advertises nothing: the
-    fallback (a client uses whatever address it dialed) is already correct
-    for local mode, where every consumer is on this machine.
+    Required/fail-loud on a public bind. A loopback bind advertises nothing.
 
     ``port`` is for the error message's example address (the actual bind
     location). ``tls_cert_chain`` also keeps a supplied shorthand scheme aligned
@@ -255,9 +241,7 @@ def _resolve_external_location(
         return aligned
     if not _host_is_public(host):
         return None
-    example = _grpc_location(host, port)
-    if tls_cert_chain is not None:
-        example = example.replace("grpc://", "grpcs://", 1)
+    example = _flight_url(host, port, tls_cert_chain is not None)
     console.print(
         f"[red]--external-location is required when --host is a public bind "
         f"({host!r}). Set it to the externally reachable address a remote "
@@ -405,16 +389,21 @@ def _graceful_shutdown(source_manager, flight_server, precache_worker=None) -> N
             console.print(f"[yellow]Error stopping {label}: {e}[/yellow]")
 
 
-def _grpc_location(host: str, port: int) -> str:
-    """Build a ``grpc://`` URL, bracketing an IPv6 literal in the authority.
+def _host_port(host: str, port: int) -> str:
+    """``host:port``, bracketing an IPv6 literal in the authority.
 
     An IPv6 address contains ``:`` and must be wrapped in brackets to be a valid
-    URL authority, e.g. ``grpc://[::1]:8815``; IPv4 addresses and hostnames pass
-    through unchanged. Used for both the server bind location and the sidecar's
-    connect target so neither emits a malformed URL for an IPv6 host.
+    URL authority, e.g. ``[::1]:8815``; IPv4 addresses and hostnames pass through
+    unchanged. The server binds this form (it adds the scheme itself), and
+    :func:`_flight_url` prefixes the scheme a client dials.
     """
     authority = f"[{host}]" if isinstance(host, str) and ":" in host else host
-    return f"grpc://{authority}:{port}"
+    return f"{authority}:{port}"
+
+
+def _flight_url(host: str, port: int, tls: bool) -> str:
+    """The URL a client dials: ``grpcs://`` for a TLS server, else ``grpc://``."""
+    return f"{'grpcs' if tls else 'grpc'}://{_host_port(host, port)}"
 
 
 def _cert_expiry_date(cert_pem: bytes) -> str:
@@ -765,7 +754,7 @@ def _setup_flight_server(
     )
 
     # 80MB max message size (slightly above 64MB transfer chunk threshold)
-    location = _grpc_location(host, port)
+    location = _host_port(host, port)
     server = TensorFlightServer(
         location,
         token=token,
@@ -1081,10 +1070,8 @@ def serve(
             external_location=effective_external_location,
         )
 
-        location = _grpc_location(effective_host, port)
-        if tls_cert_chain is not None:
-            # Advertise the scheme clients actually dial for a TLS server.
-            location = location.replace("grpc://", "grpcs://", 1)
+        # Advertise the scheme clients actually dial.
+        location = _flight_url(effective_host, port, tls_cert_chain is not None)
         console.print(f"\n[green]Starting TensorFlight server at {location}[/green]")
         console.print("Press Ctrl+C to stop\n")
 
@@ -1658,7 +1645,9 @@ def launch(
             _flight_connect_host = "127.0.0.1"
         elif _flight_connect_host == "::":
             _flight_connect_host = "::1"
-        flight_location = _grpc_location(_flight_connect_host, port)
+        flight_location = _flight_url(
+            _flight_connect_host, port, tls_cert_chain is not None
+        )
         flight_fingerprint = None
         if tls_cert_chain is not None:
             from biopb_tensor_server.serving.tls import cert_fingerprint, leaf_pem
@@ -1677,7 +1666,6 @@ def launch(
             # not in peer certificate". Resolving by fingerprint ends with the
             # presented leaf as the anchor, which is what earns the override.
             flight_fingerprint = cert_fingerprint(leaf_pem(tls_cert_chain))
-            flight_location = flight_location.replace("grpc://", "grpcs://", 1)
         flight_thread = threading.Thread(target=flight_server.serve, daemon=True)
         flight_thread.start()
 

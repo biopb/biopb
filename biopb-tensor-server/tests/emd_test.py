@@ -167,7 +167,7 @@ class TestEmdAdapterIntegration:
             expected = np.asarray(_emd_expected(p))
             array_id = adapter.list_tensor_descriptors()[0].array_id
 
-            server = catalog_server("grpc://localhost:0")
+            server = catalog_server("localhost:0")
             register_and_catalog(server, source_id, adapter)
             server.mark_ready()
             t = threading.Thread(target=server.serve, daemon=True)

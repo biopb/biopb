@@ -77,7 +77,7 @@ def writable_server(tmp_path):
     CacheManager.reset()
     CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
     server = catalog_server(
-        location="grpc://localhost:0", writable=True, write_dir=Path(tmp_path)
+        location="localhost:0", writable=True, write_dir=Path(tmp_path)
     )
     server.mark_ready()
     threading.Thread(target=server.serve, daemon=True).start()
@@ -646,9 +646,7 @@ class TestAddTensor:
         from biopb_tensor_server.serving.server import TensorFlightServer
 
         kwargs.setdefault("write_dir", Path(tmp_path))
-        return TensorFlightServer(
-            location="grpc://localhost:0", writable=True, **kwargs
-        )
+        return TensorFlightServer(location="localhost:0", writable=True, **kwargs)
 
     def test_a_cache_tensor_is_attached_to_its_source(self, tmp_path):
         server = self._server(tmp_path)
@@ -826,7 +824,7 @@ class TestAddTensor:
         from biopb_tensor_server.serving.server import TensorFlightServer
 
         server = TensorFlightServer(
-            location="grpc://localhost:0", writable=True, write_dir=None
+            location="localhost:0", writable=True, write_dir=None
         )
         with pytest.raises(
             flight.FlightServerError, match="write_dir is not configured"
@@ -846,7 +844,7 @@ class TestAddTensor:
         from biopb_tensor_server.serving.server import TensorFlightServer
 
         server = TensorFlightServer(
-            location="grpc://localhost:0", writable=False, write_dir=Path(tmp_path)
+            location="localhost:0", writable=False, write_dir=Path(tmp_path)
         )
         # A read-only server serves no scratch source -- nothing may be added
         # to it over the wire -- so the in-process caller installs one.
@@ -868,7 +866,7 @@ class TestAddTensor:
         CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
 
         server = TensorFlightServer(
-            location="grpc://127.0.0.1:0", writable=True, write_dir=tmp_path / "w"
+            location="127.0.0.1:0", writable=True, write_dir=tmp_path / "w"
         )
         threading.Thread(target=server.serve, daemon=True).start()
 
@@ -911,9 +909,7 @@ class TestDoPutErrorTranslation:
         from biopb_tensor_server.serving.server import TensorFlightServer
 
         kwargs.setdefault("write_dir", Path(tmp_path))
-        return TensorFlightServer(
-            location="grpc://localhost:0", writable=True, **kwargs
-        )
+        return TensorFlightServer(location="localhost:0", writable=True, **kwargs)
 
     def _action(self, server, req_desc):
         action = flight.Action("add_tensor", req_desc.SerializeToString())
@@ -1040,7 +1036,7 @@ class TestChunkUpload:
         CacheManager.initialize(config)
 
         server = TensorFlightServer(
-            location="grpc://localhost:0", writable=True, write_dir=tmp_path / "w"
+            location="localhost:0", writable=True, write_dir=tmp_path / "w"
         )
 
         source = SCRATCH_SOURCE_ID
@@ -1079,7 +1075,7 @@ class TestChunkUpload:
         CacheManager.initialize(config)
 
         server = TensorFlightServer(
-            location="grpc://localhost:0", writable=True, write_dir=tmp_path / "w"
+            location="localhost:0", writable=True, write_dir=tmp_path / "w"
         )
 
         source = SCRATCH_SOURCE_ID
@@ -1131,7 +1127,7 @@ class TestChunkUpload:
         from biopb_tensor_server.serving.server import TensorFlightServer
 
         server = TensorFlightServer(
-            location="grpc://localhost:0",
+            location="localhost:0",
             writable=True,
         )
 
@@ -1146,7 +1142,7 @@ class TestChunkUpload:
         from biopb_tensor_server.serving.server import TensorFlightServer
 
         server = TensorFlightServer(
-            location="grpc://localhost:0",
+            location="localhost:0",
             writable=True,
         )
 
@@ -1162,7 +1158,7 @@ class TestChunkUpload:
         from biopb_tensor_server.serving.server import TensorFlightServer
 
         server = TensorFlightServer(
-            location="grpc://localhost:0",
+            location="localhost:0",
             writable=True,
         )
 
@@ -1178,7 +1174,7 @@ class TestChunkUpload:
         CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
 
         server = TensorFlightServer(
-            location="grpc://localhost:0", writable=True, write_dir=tmp_path / "w"
+            location="localhost:0", writable=True, write_dir=tmp_path / "w"
         )
         source = SCRATCH_SOURCE_ID
         server.uploads.add_tensor(
@@ -1216,7 +1212,7 @@ class TestZarrChunkAlignment:
             CacheManager.initialize(config)
 
             server = TensorFlightServer(
-                location="grpc://localhost:0",
+                location="localhost:0",
                 writable=True,
                 write_dir=Path(tmpdir),
             )
@@ -1261,7 +1257,7 @@ class TestZarrChunkAlignment:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             server = TensorFlightServer(
-                location="grpc://localhost:0",
+                location="localhost:0",
                 writable=True,
                 write_dir=Path(tmpdir),
             )
@@ -2023,7 +2019,7 @@ def test_a_registered_source_lands_in_the_servers_catalog():
     ride in that one row."""
     with tempfile.TemporaryDirectory() as tmpdir:
         server = catalog_server(
-            location="grpc://localhost:0", writable=True, write_dir=Path(tmpdir)
+            location="localhost:0", writable=True, write_dir=Path(tmpdir)
         )
         try:
             source_id, desc = _durable_upload(server)
@@ -2045,7 +2041,7 @@ def test_an_upload_to_a_catalog_less_server_is_addressable_not_listed():
 
     with tempfile.TemporaryDirectory() as tmpdir:
         server = TensorFlightServer(
-            location="grpc://localhost:0", writable=True, write_dir=Path(tmpdir)
+            location="localhost:0", writable=True, write_dir=Path(tmpdir)
         )
         try:
             source_id, desc = _durable_upload(server)

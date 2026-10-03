@@ -270,7 +270,7 @@ class TestItSurvivesARestart:
     @staticmethod
     def _serve(tmp_path):
         server = catalog_server(
-            location="grpc://localhost:0", writable=True, write_dir=Path(tmp_path)
+            location="localhost:0", writable=True, write_dir=Path(tmp_path)
         )
         server.mark_ready()
         threading.Thread(target=server.serve, daemon=True).start()

@@ -1030,7 +1030,7 @@ class TestResolveAction:
         what the terminal row read at the end of the resolve stream needs. The
         action refuses outright on a catalog-less server: the row IS its
         terminal message."""
-        server = catalog_server("grpc://localhost:0")
+        server = catalog_server("localhost:0")
         register_and_catalog(server, source_id, adapter)
         return server
 
@@ -1069,7 +1069,7 @@ class TestResolveAction:
             proxy = UnresolvedSourceAdapter(
                 cfg, get_default_registry(), on_resolved=db.sync_source_added
             )
-            server = TensorFlightServer("grpc://localhost:0", metadata_db=db)
+            server = TensorFlightServer("localhost:0", metadata_db=db)
             db.sync_source_added("cloud1", server.register_source("cloud1", proxy))
 
             action = flight.Action("resolve", b"cloud1")
@@ -1236,7 +1236,7 @@ class TestResolveAction:
 
         # Registry only, no catalog row: the sentinel is never described, and
         # the id under test is a *missing* one.
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         server.register_source("cloud1", _SlowSentinel())
         action = flight.Action("resolve", b"missing")
         with pytest.raises(flight.FlightServerError, match="Source not found"):
@@ -1299,7 +1299,7 @@ class TestWarmAction:
         # catalog because that one IS about the row.
         from biopb_tensor_server.serving.server import TensorFlightServer
 
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         server.register_source(source_id, adapter)
         return server
 

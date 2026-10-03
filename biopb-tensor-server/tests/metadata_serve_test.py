@@ -59,7 +59,7 @@ def test_serve_reads_metadata_from_catalog_without_recompute(simple_zarr_array):
     _MetaZarr = _meta_zarr_cls()
 
     db = MetadataDatabase()
-    server = TensorFlightServer("grpc://localhost:0", metadata_db=db)
+    server = TensorFlightServer("localhost:0", metadata_db=db)
     adapter = _MetaZarr(arr, "img", ["y", "x"], meta={"ome": {"channel": "DAPI"}})
     server.register_source("img", adapter)
     db.sync_source_added("img", adapter)  # stores the metadata in the catalog
@@ -94,7 +94,7 @@ def test_serve_null_row_yields_empty_metadata_no_adapter_recompute(simple_zarr_a
     _MetaZarr = _meta_zarr_cls()
 
     db = MetadataDatabase()
-    server = TensorFlightServer("grpc://localhost:0", metadata_db=db)
+    server = TensorFlightServer("localhost:0", metadata_db=db)
     adapter = _MetaZarr(arr, "img", ["y", "x"], meta={})  # empty -> NULL row
     server.register_source("img", adapter)
     db.sync_source_added("img", adapter)
@@ -123,7 +123,7 @@ def test_the_catalog_row_is_the_metadata_cache(simple_zarr_array):
     arr = zarr.open_array(zarr_path, mode="r")
     _MetaZarr = _meta_zarr_cls()
 
-    server = catalog_server("grpc://localhost:0")
+    server = catalog_server("localhost:0")
     adapter = _MetaZarr(arr, "img", ["y", "x"], meta={"ome": {"channel": "GFP"}})
     register_and_catalog(server, "img", adapter)
     _serve(server)
@@ -156,7 +156,7 @@ def test_a_catalog_less_server_reads_metadata_off_the_adapter(simple_zarr_array)
     arr = zarr.open_array(zarr_path, mode="r")
     _MetaZarr = _meta_zarr_cls()
 
-    server = TensorFlightServer("grpc://localhost:0")
+    server = TensorFlightServer("localhost:0")
     adapter = _MetaZarr(arr, "img", ["y", "x"], meta={"ome": {"channel": "GFP"}})
     server.register_source("img", adapter)
     _serve(server)
@@ -207,7 +207,7 @@ def test_serve_merges_per_tensor_delta_over_catalog(simple_zarr_array):
             return self._field_meta  # per-tensor delta, merged over the row
 
     db = MetadataDatabase()
-    server = TensorFlightServer("grpc://localhost:0", metadata_db=db)
+    server = TensorFlightServer("localhost:0", metadata_db=db)
     adapter = _PerTensorZarr(arr, "plate", ["y", "x"], field_meta={"ome": "field"})
     server.register_source("plate", adapter)
     db.sync_source_added("plate", adapter)  # catalog holds the plate metadata
@@ -247,7 +247,7 @@ def test_source_metadata_excludes_the_per_tensor_delta(simple_zarr_array):
             return {"ome": "field"}
 
     db = MetadataDatabase()
-    server = TensorFlightServer("grpc://localhost:0", metadata_db=db)
+    server = TensorFlightServer("localhost:0", metadata_db=db)
     adapter = _PerTensorZarr(arr, "plate", ["y", "x"])
     server.register_source("plate", adapter)
     db.sync_source_added("plate", adapter)
@@ -280,7 +280,7 @@ def test_serve_no_delta_serves_catalog_row(simple_zarr_array):
         # get_tensor_metadata inherits the None default -> no delta
 
     db = MetadataDatabase()
-    server = TensorFlightServer("grpc://localhost:0", metadata_db=db)
+    server = TensorFlightServer("localhost:0", metadata_db=db)
     adapter = _RowOnlyZarr(arr, "plate", ["y", "x"])
     server.register_source("plate", adapter)
     db.sync_source_added("plate", adapter)

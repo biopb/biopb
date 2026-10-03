@@ -57,7 +57,7 @@ class TestTensorFlightClientRoundTrip:
             zarr_arr = zarr.open_array(zarr_path, mode="r")
             adapter = ZarrAdapter(zarr_arr, "test-tensor", ["y", "x"])
 
-            server = catalog_server("grpc://localhost:8890")
+            server = catalog_server("localhost:8890")
             register_and_catalog(server, "test-tensor", adapter)
 
             # Start server in background
@@ -266,7 +266,7 @@ class TestTensorFlightClientRoundTrip:
             adapter = ZarrAdapter(
                 zarr.open_array(zarr_path, mode="r"), "mean-preserve", ["y", "x"]
             )
-            server = TensorFlightServer("grpc://localhost:8893")
+            server = TensorFlightServer("localhost:8893")
             server.register_source("mean-preserve", adapter)
 
             server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -314,7 +314,7 @@ class TestTensorFlightClientRoundTrip:
             adapter = ZarrAdapter(
                 zarr.open_array(zarr_path, mode="r"), "linear", ["y", "x"]
             )
-            server = TensorFlightServer("grpc://localhost:8894")
+            server = TensorFlightServer("localhost:8894")
             server.register_source("linear", adapter)
 
             server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -354,7 +354,7 @@ class TestTensorFlightClientRoundTrip:
             adapter = ZarrAdapter(
                 zarr.open_array(zarr_path, mode="r"), "nearest-edge", ["y", "x"]
             )
-            server = TensorFlightServer("grpc://localhost:8892")
+            server = TensorFlightServer("localhost:8892")
             server.register_source("nearest-edge", adapter)
 
             server_thread = threading.Thread(target=server.serve, daemon=True)

@@ -52,7 +52,7 @@ def _add(client, source, name, scheme="zarr", arr=None, **kw):
 def _serve(tmp_path):
     """A fresh server on *tmp_path*'s ``write_dir`` -- a restart, in-process."""
     server = catalog_server(
-        location="grpc://localhost:0", writable=True, write_dir=Path(tmp_path)
+        location="localhost:0", writable=True, write_dir=Path(tmp_path)
     )
     server.mark_ready()
     threading.Thread(target=server.serve, daemon=True).start()

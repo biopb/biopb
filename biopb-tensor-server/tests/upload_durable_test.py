@@ -547,7 +547,7 @@ def _restart_server(tmp_path):
     CacheManager.reset()
     CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
     server = catalog_server(
-        location="grpc://localhost:0", writable=True, write_dir=tmp_path / "w"
+        location="localhost:0", writable=True, write_dir=tmp_path / "w"
     )
     server.mark_ready()
     threading.Thread(target=server.serve, daemon=True).start()

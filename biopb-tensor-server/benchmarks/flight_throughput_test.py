@@ -148,7 +148,7 @@ def bench_real_server(
         level_arr = grp["0"]
         adapter = OmeZarrAdapter(level_arr, "test")
 
-        server = catalog_server(location)
+        server = catalog_server(location.removeprefix("grpc://"))
         register_and_catalog(server, "test", adapter)
         server_thread = threading.Thread(target=server.serve, daemon=True)
         server_thread.start()

@@ -24,7 +24,7 @@ class TestRegisterSourceValidation:
     def _server():
         # Bind to an ephemeral port but never serve(); we only exercise the
         # in-process registration guard.
-        return TensorFlightServer("grpc://localhost:0")
+        return TensorFlightServer("localhost:0")
 
     def test_rejects_source_id_with_slash(self):
         server = self._server()

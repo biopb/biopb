@@ -79,7 +79,7 @@ class TestZarrIntegration:
         adapter = ZarrAdapter(arr, "zarr-integration", ["y", "x"])
 
         # Start server
-        server = catalog_server("grpc://localhost:0")
+        server = catalog_server("localhost:0")
         register_and_catalog(server, "zarr-integration", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -136,7 +136,7 @@ class TestZarrIntegration:
             adapter = ZarrAdapter(
                 zarr.open_array(zarr_path, mode="r"), "be", ["y", "x"]
             )
-            server = TensorFlightServer("grpc://localhost:0")
+            server = TensorFlightServer("localhost:0")
             server.register_source("be", adapter)
             server_thread = threading.Thread(target=server.serve, daemon=True)
             server_thread.start()
@@ -165,7 +165,7 @@ class TestZarrIntegration:
         arr = zarr.open_array(zarr_path, mode="r")
         adapter = ZarrAdapter(arr, "zarr-scaled", ["y", "x"])
 
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         server.register_source("zarr-scaled", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -210,7 +210,7 @@ class TestOmeZarrIntegration:
 
         adapter = OmeZarrAdapter(arr, "ome-zarr-integration")
 
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         server.register_source("ome-zarr-integration", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -257,7 +257,7 @@ class TestOmeZarrIntegration:
 
         adapter = OmeZarrAdapter(arr, "ome-zarr-virtual")
 
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         server.register_source("ome-zarr-virtual", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -330,7 +330,7 @@ class TestOmeZarrIntegration:
         root = zarr.open_group(zarr_path, mode="r")
         adapter = OmeZarrAdapter(root["0"], "phys")
 
-        server = catalog_server("grpc://localhost:0")
+        server = catalog_server("localhost:0")
         register_and_catalog(server, "phys", adapter)
         server.mark_ready()
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -376,7 +376,7 @@ class TestOmeZarrIntegration:
         arr = zarr.open_array(zarr_path, mode="r")
         adapter = ZarrAdapter(arr, "plain", ["y", "x"])
 
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         server.register_source("plain", adapter)
         server.mark_ready()
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -409,7 +409,7 @@ class TestOmeTiffIntegration:
         descriptors = adapter.list_tensor_descriptors()
         scene_id = descriptors[0].array_id
 
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         server.register_source("ome-tiff-integration", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -454,7 +454,7 @@ class TestOmeTiffIntegration:
         descriptors = adapter.list_tensor_descriptors()
         scene_id = descriptors[0].array_id
 
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         server.register_source("ome-tiff-channels", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -523,7 +523,7 @@ class TestOmeTiffIntegration:
         adapter = OmeTiffAdapter(path, "ome213")
         array_id = adapter.list_tensor_descriptors()[0].array_id  # registration
 
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         server.register_source("ome213", adapter)
         server.mark_ready()
         adapter._bio_image = _Tripwire()  # any OME parse from here is a failure
@@ -595,7 +595,7 @@ class TestMultiSeriesOmeTiffIntegration:
 
         adapter = OmeTiffAdapter(tiff_path, "multi-series-server")
 
-        server = catalog_server("grpc://localhost:0")
+        server = catalog_server("localhost:0")
         register_and_catalog(server, "multi-series-server", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -689,7 +689,7 @@ class TestHdf5Integration:
             dataset = f["data"]
             adapter = Hdf5Adapter(dataset, "hdf5-integration")
 
-            server = TensorFlightServer("grpc://localhost:0")
+            server = TensorFlightServer("localhost:0")
             server.register_source("hdf5-integration", adapter)
 
             server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -731,7 +731,7 @@ class TestHdf5Integration:
         with h5py.File(h5_path, "r") as f:
             adapter = Hdf5Adapter(f["data"], "cal")
 
-            server = TensorFlightServer("grpc://localhost:0")
+            server = TensorFlightServer("localhost:0")
             server.register_source("cal", adapter)
             server.mark_ready()
             server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -774,7 +774,7 @@ class TestCacheIntegration:
         arr = zarr.open_array(zarr_path, mode="r")
         adapter = ZarrAdapter(arr, "cache-test", ["y", "x"])
 
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         server.register_source("cache-test", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -827,7 +827,7 @@ class TestCacheIntegration:
         arr = zarr.open_array(zarr_path, mode="r")
         adapter = ZarrAdapter(arr, "cache-regions", ["y", "x"])
 
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         server.register_source("cache-regions", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -872,7 +872,7 @@ class TestConcurrentAccess:
         arr = zarr.open_array(zarr_path, mode="r")
         adapter = ZarrAdapter(arr, "concurrent-test", ["y", "x"])
 
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         server.register_source("concurrent-test", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)

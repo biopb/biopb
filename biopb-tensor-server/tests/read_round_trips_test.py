@@ -57,7 +57,7 @@ def counted_server(tmp_path):
     )
     arr[:] = 5
 
-    server = catalog_server("grpc://localhost:0")
+    server = catalog_server("localhost:0")
     # array_id == source_id: a bare id echoes back unchanged.
     register_and_catalog(
         server,

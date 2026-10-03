@@ -54,7 +54,7 @@ def _make_zarr(parent, name, shape=(4, 8, 8)):
 def _make_manager(scanned=True, **kwargs):
     # One catalog, threaded into both halves -- the wiring cli.py does for a
     # real deployment. The reconciler is the only thing that writes it.
-    server = catalog_server("grpc://localhost:0")
+    server = catalog_server("localhost:0")
     kwargs.setdefault("monitored_dirs", set())
     manager = SourceManager(
         server=server,
@@ -171,7 +171,7 @@ class TestAddLocalSource:
         except (OSError, NotImplementedError):
             pytest.skip("cannot create symlinks (e.g. Windows without privilege)")
 
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         manager = create_source_manager(
             server=server,
             registry=get_default_registry(),
@@ -209,7 +209,7 @@ class TestAddLocalSource:
         cfg = ServerConfig(sources=[SourceConfig(url=str(root), alias="exp")])
         static_sources = resolve_all_sources(cfg)
 
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         manager = create_source_manager(
             server=server,
             registry=get_default_registry(),
@@ -704,7 +704,7 @@ class TestAddedSourceSurvivesRescanUnderSkippedDir:
     """
 
     def _manager(self, monitored_dirs):
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         manager = SourceManager(
             server=server,
             registry=get_default_registry(),

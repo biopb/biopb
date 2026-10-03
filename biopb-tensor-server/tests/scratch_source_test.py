@@ -30,9 +30,7 @@ CHUNK = (2, 2)
 
 
 def _serve(tmp_path, **kwargs):
-    server = catalog_server(
-        location="grpc://localhost:0", write_dir=Path(tmp_path), **kwargs
-    )
+    server = catalog_server(location="localhost:0", write_dir=Path(tmp_path), **kwargs)
     server.mark_ready()
     threading.Thread(target=server.serve, daemon=True).start()
     return server
@@ -64,7 +62,7 @@ class TestItIsThereBeforeAnythingAsks:
     def test_a_server_with_nowhere_to_write_has_none(self, tmp_path):
         """``write_dir`` is the switch, not ``writable``: with nowhere to put a
         tensor a scratch source is one nothing can be added to."""
-        server = catalog_server(location="grpc://localhost:0", writable=True)
+        server = catalog_server(location="localhost:0", writable=True)
         server.mark_ready()
         try:
             assert server.sources.get(SCRATCH_SOURCE_ID) is None
