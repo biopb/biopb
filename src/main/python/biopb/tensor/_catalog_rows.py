@@ -137,7 +137,11 @@ def unresolved_reasons(
         rows = query(
             f"SELECT source_id, unresolved_reason FROM sources WHERE NOT is_resolved {where}"
         )
-        return {row["source_id"]: row["unresolved_reason"] for row in rows}
+        return {
+            row["source_id"]: row.get("unresolved_reason")
+            for row in rows
+            if "source_id" in row
+        }
     except errors:
         return {}
 
