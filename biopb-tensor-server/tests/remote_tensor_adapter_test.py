@@ -102,6 +102,13 @@ def _serve(server):
     return t
 
 
+def _relist(manager):
+    """Re-list every monitored upstream now, through the rescan tick's own path."""
+    for upstream in manager._monitored_upstreams:
+        manager._upstream_relist.setdefault(upstream.url, {"period": 1, "countdown": 0})
+        manager._reconcile_and_reschedule(upstream)
+
+
 def _db_upstream(zarr_path, source_ids):
     """An upstream with a populated metadata DB (so query is complete).
 
@@ -1354,18 +1361,18 @@ def test_monitored_upstream_relist_adds_and_removes(simple_zarr_array):
             client = TensorFlightClient(f"grpc://localhost:{proxy.port}")
 
             # initial re-list mirrors the upstream's single source
-            manager._reconcile_upstreams()
+            _relist(manager)
             assert set(client.list_sources()) == {"lab__img"}
 
             # a new upstream source appears -> mirrored on the next re-list
             up_register("img2")
-            manager._reconcile_upstreams()
+            _relist(manager)
             assert set(client.list_sources()) == {"lab__img", "lab__img2"}
             assert client.get_tensor("lab__img2").shape == shape
 
             # an upstream source disappears -> dropped on the next re-list
             up_unregister("img")
-            manager._reconcile_upstreams()
+            _relist(manager)
             assert set(client.list_sources()) == {"lab__img2"}
 
             client.close()
@@ -2744,7 +2751,7 @@ def test_reconcile_bulk_seeds_adapters_without_per_source_rpc(simple_zarr_array)
                 ],
             )
 
-            manager._reconcile_upstreams()
+            _relist(manager)
 
             assert set(proxy.sources) == {"lab__img", "lab__img2"}
             for sid in ("lab__img", "lab__img2"):
@@ -2804,7 +2811,7 @@ def test_a_failed_bulk_query_leaves_the_mirror_alone_and_syncs_nothing(
                     SourceConfig(url=f"grpc://localhost:{upstream.port}", alias="lab")
                 ],
             )
-            manager._reconcile_upstreams()
+            _relist(manager)
             assert set(proxy.sources) == {"lab__img", "lab__img2"}
 
             def _fails(client):
@@ -2818,7 +2825,7 @@ def test_a_failed_bulk_query_leaves_the_mirror_alone_and_syncs_nothing(
                 remote_tensor, "list_upstream_source_ids", _must_not_run
             )
 
-            manager._reconcile_upstreams()
+            _relist(manager)
 
             assert set(proxy.sources) == {"lab__img", "lab__img2"}  # nothing removed
         finally:
@@ -2977,7 +2984,7 @@ def test_reconcile_mirrors_unresolved_then_refreshes_on_resolve():
                 ],
             )
 
-            manager._reconcile_upstreams()
+            _relist(manager)
 
             def _row():
                 return (
@@ -3012,7 +3019,7 @@ def test_reconcile_mirrors_unresolved_then_refreshes_on_resolve():
                 ),
             )
 
-            manager._reconcile_upstreams()
+            _relist(manager)
 
             resolved, tensors = _row()
             assert resolved is True  # refreshed from the bulk re-list
@@ -3083,13 +3090,13 @@ def test_relist_reads_full_rows_only_for_new_or_reregistered_sources(monkeypatch
                 ],
             )
 
-            manager._reconcile_upstreams()
+            _relist(manager)
 
             assert set(proxy.sources) == {f"lab__{sid}" for sid in ids}
             assert len(_full_row_queries()) == 3  # 5 ids, 2 per batch
 
             queries.clear()
-            manager._reconcile_upstreams()
+            _relist(manager)
             assert _full_row_queries() == []  # steady: ids + indexed_at only
             assert len(queries) == 1
 
@@ -3098,7 +3105,7 @@ def test_relist_reads_full_rows_only_for_new_or_reregistered_sources(monkeypatch
                 "s3", _CatalogRowAdapter("s3", tensors=_tensor_row("s3", (16, 16)))
             )
             queries.clear()
-            manager._reconcile_upstreams()
+            _relist(manager)
 
             rows = _full_row_queries()
             assert len(rows) == 1 and "'s3'" in rows[0] and "'s2'" not in rows[0]
@@ -3215,7 +3222,7 @@ class TestAliasAndSchemeSurviveRegistration:
                     SourceConfig(url=f"grpc://localhost:{upstream.port}", alias="lab")
                 ],
             )
-            manager._reconcile_upstreams()
+            _relist(manager)
 
             url = proxy.sources.get("lab__img")._source_url
             # seeded from the upstream catalog row: the alias is the authority and

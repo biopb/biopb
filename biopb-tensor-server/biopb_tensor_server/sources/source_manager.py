@@ -947,35 +947,6 @@ class SourceManager:
             state["period"] = min(state["period"] * 2, self._upstream_max_period)
         state["countdown"] = state["period"]
 
-    def _reconcile_upstreams(
-        self, upstreams: Optional[List[SourceConfig]] = None
-    ) -> None:
-        """Re-list each given tensor-server upstream now (ignoring the backoff
-        schedule); used by tests and any caller that wants an immediate pass.
-
-        Best-effort per upstream: an unreachable upstream leaves its currently
-        mirrored sources in place (no spurious removals) and is marked failed.
-        """
-        if upstreams is None:
-            upstreams = self._monitored_upstreams
-        for upstream in upstreams:
-            try:
-                self._reconciler._reconcile_one_upstream(upstream)
-            except UpstreamConfigError as exc:
-                self._failed_upstreams.add(upstream.url)
-                self._log_upstream_config_error(upstream.url, exc)
-            except Exception:
-                self._failed_upstreams.add(upstream.url)
-                logger.warning(
-                    "Upstream re-list failed for %s; keeping its current catalog "
-                    "(will retry on the next rescan)",
-                    upstream.url,
-                    exc_info=True,
-                )
-            else:
-                self._failed_upstreams.discard(upstream.url)
-                self._clear_upstream_config_error(upstream.url)
-
     def add_local_source(
         self,
         url: str,
