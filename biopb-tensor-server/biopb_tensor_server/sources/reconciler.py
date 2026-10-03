@@ -307,7 +307,7 @@ class Reconciler:
         are in state, so the rescan diff, removal and refresh treat it as any
         confirmed source. :meth:`ensure_registered` finishes the job.
         """
-        adapter = PendingSourceAdapter(self._source_config_for(claim))
+        adapter = PendingSourceAdapter(claim)
         if catalog_url:
             adapter._catalog_url = catalog_url
         try:
