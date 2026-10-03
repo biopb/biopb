@@ -548,6 +548,19 @@ class AlgorithmPlane:
             script.start_install(retry_failed=False)
         return self.rows(entries=listed)
 
+    def register_url(self, url: str, name: Optional[str] = None) -> str:
+        """Add a url entry; answer its name. ValueError for a bad URL or name."""
+        return _algorithms.register_url(url, name, self._directory)
+
+    def register_script(self, source: str, name: Optional[str] = None) -> str:
+        """Add a script entry for the server file *source*; answer its name."""
+        return _algorithms.register_script(source, name, self._directory)
+
+    def deregister(self, name: str) -> None:
+        """Remove an entry; a script entry's server is stopped. KeyError if unknown."""
+        _algorithms.deregister(name, self._directory)
+        self._entries()
+
     def _find(self, name: str) -> tuple[Optional[dict], Optional[ScriptEntry]]:
         entry = next((e for e in self._entries() if e["name"] == name), None)
         with self._lock:

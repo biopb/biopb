@@ -375,3 +375,103 @@ def test_no_control_is_none(monkeypatch):
     assert client.algorithms(timeout=1) is None
     with pytest.raises(RuntimeError, match="no control"):
         client.ensure_algorithm("x", timeout=1)
+
+
+# --------------------------------------------------------------------------- #
+# Adding and removing entries
+# --------------------------------------------------------------------------- #
+
+
+def test_register_url_writes_an_entry(registry):
+    name = _algorithms.register_url("grpc://host:50051", directory=registry)
+    assert name == "host-50051"
+    assert json.loads((registry / "host-50051.json").read_text()) == {
+        "url": "grpc://host:50051"
+    }
+    assert _algorithms.entries(registry)[0]["url"] == "grpc://host:50051"
+
+
+@pytest.mark.parametrize("url", ["http://host:1", "host:1", "grpc://", ""])
+def test_register_url_rejects_a_bad_url(registry, url):
+    with pytest.raises(ValueError, match="grpc"):
+        _algorithms.register_url(url, directory=registry)
+
+
+def test_register_refuses_a_taken_or_reserved_name(registry):
+    (registry / "seg.py").write_text(_server())
+    with pytest.raises(ValueError, match="already exists"):
+        _algorithms.register_url("grpc://h:1", "seg", directory=registry)
+    with pytest.raises(ValueError, match="name"):
+        _algorithms.register_url("grpc://h:1", "_x", directory=registry)
+
+
+def test_register_script_links_the_file(tmp_path, registry):
+    src = tmp_path / "elsewhere" / "seg.py"
+    src.parent.mkdir()
+    src.write_text(_server())
+    assert _algorithms.register_script(str(src), directory=registry) == "seg"
+    assert (registry / "seg.py").read_text() == src.read_text()
+    assert [e["kind"] for e in _algorithms.entries(registry)] == ["script"]
+    with pytest.raises(ValueError, match=".py file"):
+        _algorithms.register_script(str(tmp_path / "nope.py"), directory=registry)
+
+
+def test_deregister_removes_the_entry_not_the_server_file(tmp_path, registry):
+    src = tmp_path / "seg.py"
+    src.write_text(_server())
+    _algorithms.register_script(str(src), directory=registry)
+    _algorithms.deregister("seg", directory=registry)
+    assert _algorithms.entries(registry) == []
+    assert src.exists()
+    with pytest.raises(KeyError):
+        _algorithms.deregister("seg", directory=registry)
+
+
+def test_deregister_stops_a_running_script(plane, registry):
+    (registry / "seg.py").write_text(_server())
+    assert plane.ensure("seg", wait=60.0)["state"] == "up"
+    plane.deregister("seg")
+    assert plane.rows() == []
+    assert not (registry / "seg.py").exists()
+
+
+def _post_json(path, body):
+    import urllib.error
+    import urllib.request
+
+    from biopb._control import _client
+
+    req = urllib.request.Request(
+        _client.control_base_url() + path,
+        data=json.dumps(body).encode(),
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status, json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read())
+
+
+def test_register_and_deregister_over_http(control, tmp_path, registry):
+    src = tmp_path / "seg.py"
+    src.write_text(_server())
+    assert _post_json("/api/algorithms/register", {"url": "grpc://h:1"}) == (
+        200,
+        {"name": "h-1"},
+    )
+    assert _post_json("/api/algorithms/register", {"path": str(src)}) == (
+        200,
+        {"name": "seg"},
+    )
+    assert _post_json("/api/algorithms/register", {"url": "http://h:1"})[0] == 400
+    assert _post_json("/api/algorithms/register", {"url": "grpc://h:1"})[0] == 400
+    assert _post_json("/api/algorithms/register", {})[0] == 400
+
+    import biopb as client
+
+    assert {r["name"] for r in client.algorithms()} == {"h-1", "seg"}
+    assert _post_json("/api/algorithms/deregister?name=h-1", {})[0] == 200
+    assert _post_json("/api/algorithms/deregister?name=h-1", {})[0] == 404
+    assert {r["name"] for r in client.algorithms()} == {"seg"}
