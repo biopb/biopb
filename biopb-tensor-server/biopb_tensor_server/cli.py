@@ -800,7 +800,7 @@ def _setup_flight_server(
     scan_once = partition.roots.of_kind(RootKind.SCAN_ONCE)
     if partition.static:
         console.print(
-            f"[green]Loaded {len(partition.static)} static data source(s)[/green]"
+            f"[green]Loaded {len(partition.static)} remote data source(s)[/green]"
         )
     if monitored:
         console.print(
@@ -812,7 +812,7 @@ def _setup_flight_server(
         )
     if scan_once:
         console.print(
-            f"[green]Scanning {len(scan_once)} unwatched directory(s) once, in the background[/green]"
+            f"[green]Registering {len(scan_once)} unwatched path(s) once, in the background[/green]"
         )
 
     # Register hooks for `(de)register_local_path` actions: the server

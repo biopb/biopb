@@ -48,7 +48,7 @@ def make_manager(
 
     ``monitored_dirs`` are watched directories; ``monitored_aliases`` gives some
     of them a display root; ``cloud_roots`` marks paths cloud (a monitored
-    directory becomes a cloud directory, any other path a cloud root of its own);
+    directory becomes a cloud directory, any other path a consented, dropped cloud root of its own);
     ``monitored_upstreams`` and ``scan_once_sources`` are config entries.
     """
     from biopb_tensor_server.sources.roots import Root, RootKind, Roots
@@ -69,7 +69,7 @@ def make_manager(
     monitored = {p.resolve() for p in monitored_dirs}
     for path in cloud_roots:
         if path.resolve() not in monitored:
-            roots.add(Root(RootKind.STATIC, str(path), cloud=True))
+            roots.add(Root(RootKind.DROPPED, str(path), cloud=True, label=path.name))
     for source in scan_once_sources:
         roots.add(Root.from_config(source, RootKind.SCAN_ONCE))
     for source in monitored_upstreams:

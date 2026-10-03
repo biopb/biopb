@@ -31,13 +31,8 @@ class TestContaining:
 
         assert Roots([known]).containing(Path("/data")) is known
 
-    def test_an_upstream_and_a_static_cloud_source_are_not_containers(self):
-        roots = Roots(
-            [
-                _root(RootKind.UPSTREAM, "grpc://lab:8815"),
-                _root(RootKind.STATIC, "/data/one.zarr", cloud=True),
-            ]
-        )
+    def test_an_upstream_is_not_a_container(self):
+        roots = Roots([_root(RootKind.UPSTREAM, "grpc://lab:8815")])
 
         assert roots.containing(Path("/data/one.zarr")) is None
 

@@ -47,7 +47,7 @@ string is used where**, and how the first scan differs from every later one.
 |---|---|---|
 | `DiscoveryState` (scratch and confirmed) | `claims`, `path_to_source`, `source_to_paths`, `consumed_paths`, `visited_identities` | `source_id`; claim path strings; file identities |
 | `Reconciler` | `_source_signatures`, `_missed_scans`, `_cloud_source_ids`, `_failed_sources`, `_path_to_source_id` | `source_id`; for the last, `claim.primary_path` |
-| `Roots` (shared by `SourceManager` and `Reconciler`) | every known root: kind (monitored, scan-once, dropped, upstream, cloud static), alias, cloud, `dnd://` label | Resolved root `Path`s; a drop's label |
+| `Roots` (shared by `SourceManager` and `Reconciler`) | every known root: kind (monitored, scan-once, dropped, upstream), alias, cloud, `dnd://` label | Resolved root `Path`s; a drop's label |
 | `SourceManager` | `_unavailable_roots` | Resolved root `Path`s |
 | Adapter | `_source_url` (the raw claim path, or the library's own filename for hdf5 / nifti / bioio / dicom), `catalog_url` | Opens files with the raw path |
 | Catalog (`sources` table) | `source_url` (display only), `tensors`, `metadata_json`, `indexed_at` | `source_id` |
@@ -62,7 +62,7 @@ produced**: the root as given to `discover_sources`, plus the names walked below
 it. No adapter `claim()` normalizes the path it returns.
 
 1. **A root is canonical, and becomes canonical once.** Config roots (`local_path`),
-   drops and static seeds go through `resolve_local_path` (folds `file://`,
+   drops and configured paths go through `resolve_local_path` (folds `file://`,
    symlinks, `..`, case, trailing separators). The monitored scan walks each stored
    root as given and never resolves it again, so its claims are spelled under the
    stored root even if that path later becomes a link (a migration that leaves one
@@ -230,7 +230,7 @@ is a no-op for streamed claims. The stability gate holds while streaming, so an 
 entry is never claimed or streamed and is picked up by a later tick.
 
 **`complete_initial_scan` runs at the end of the first tick**, whatever it scanned,
-including nothing (a config of static sources only). It stamps `last_full_scan_finished_at`
+including nothing (a config of single remote sources only). It stamps `last_full_scan_finished_at`
 (`_mark_catalog_complete`, which also advances the orphan clock), clears
 `full_scan_in_progress`, flips `_initial_scan_done` and fires the completion hook, once.
 It is last on purpose: the scan-once directories, the monitored walk and the upstream

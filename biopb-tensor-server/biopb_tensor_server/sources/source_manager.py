@@ -440,25 +440,28 @@ class SourceManager:
                 logger.exception("Could not scan configured directory %s", root.url)
 
     def _scan_configured_root(self, root: Root) -> None:
-        """Register everything under one configured directory (see
-        :meth:`_register_root`)."""
+        """Register everything at or under one configured path (see
+        :meth:`_register_root`): a directory is walked, a file or typed dataset is
+        claimed in place."""
         url = root.url
-        if not os.path.isdir(url):
-            logger.warning("Configured directory does not exist: %s", url)
+        if not os.path.exists(url):
+            logger.warning("Configured path does not exist: %s", url)
             return
+        source = root.source
         # The config-line analogue of a drag-dropped folder becoming its own root:
         # an `alias` re-roots everything found under it (``Roots.display_url``).
         # Persistent here, because nothing rescans the root to re-merge it into the
         # shared path tree.
         for event in self._register_root(
             url,
+            source_type=source.type or "",
             catalog_url_for=lambda claim: self._roots.display_url(claim.primary_path),
             cloud=root.cloud,
-            dataset=root.source.dataset if root.source else None,
+            dataset=source.dataset,
         ):
             if event[0] == "result":
                 for path, reason in event[1].failed:
-                    logger.warning("Configured directory %s: %s: %s", url, path, reason)
+                    logger.warning("Configured path %s: %s: %s", url, path, reason)
 
     def _rescan_monitored_dirs(self) -> None:
         """Walk the monitored directories and reconcile the discovered catalog.
@@ -855,7 +858,7 @@ class SourceManager:
         state["countdown"] = state["period"]
 
     def register_static_source(self, source: SourceConfig) -> bool:
-        """Register one explicitly configured source as it is: nothing to walk.
+        """Register one remote single source as it is: nothing to walk.
 
         Returns whether it was committed.
         """
@@ -868,23 +871,15 @@ class SourceManager:
             extra_config["credentials_profile"] = source.credentials_profile
         if source.alias:  # display-only
             extra_config["alias"] = source.alias
-        # Store the canonical resolved form of a local config path, so Claim can
-        # be keyed on it. A remote URL is left verbatim: aliasing is intentional
-        # because the server may use a different address/port for the same data.
-        primary_path = source.url
-        if not is_remote_url(source.url):
-            primary_path = resolve_local_path(source.url)
+        # The URL is left verbatim: aliasing is intentional because the server may
+        # use a different address/port for the same data.
         claim = SourceClaim(
             source_type=source.type,
-            primary_path=primary_path,
+            primary_path=source.url,
             source_id=source.source_id,
             extra_config=extra_config,
-            # A static source explicitly flagged cloud is always deferred: the
-            # first access still resolves it cheaply.
             unresolved=bool(source.cloud),
         )
-        # source._catalog_url is the alias-derived display tree-root for a local
-        # source (resolve.resolve_all_sources), or None.
         return self._reconciler._commit_add_claim(
             claim, catalog_url=source._catalog_url
         )
@@ -1336,7 +1331,7 @@ def create_source_manager(
     # EXPERIMENTAL: cloud/synced-folder mode. The walk admits dehydrated entries,
     # and register placeholder adapters resolved lazily on first access.
     for source in (
-        *(r.source for r in roots if r.kind is not RootKind.STATIC),
+        *(r.source for r in roots),
         *partition.static,
     ):
         if source.cloud:

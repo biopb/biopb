@@ -1976,15 +1976,14 @@ class TestStaticCatalogSeeding:
     the normal registration path, so the vestigial initial_sync is unnecessary.
     """
 
-    def test_static_sources_populate_catalog_without_initial_sync(self, tmp_path):
+    def test_static_sources_populate_catalog_without_initial_sync(self):
         from biopb_tensor_server.core.config import SourceConfig
         from biopb_tensor_server.serving.metadata_db import MetadataDatabase
         from biopb_tensor_server.sources.source_manager import create_source_manager
 
         db = MetadataDatabase()
         server = _FakeServer()
-        (tmp_path / "plate.zarr").mkdir()
-        static = SourceConfig(url=str(tmp_path / "plate.zarr"), type="zarr")
+        static = SourceConfig(url="s3://bucket/plate.zarr", type="zarr")
 
         manager = create_source_manager(
             server=server,

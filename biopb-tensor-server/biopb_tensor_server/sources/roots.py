@@ -73,12 +73,11 @@ def _drop_catalog_url(
 
 class RootKind(Enum):
     MONITORED = "monitored"  # watched local directory
-    SCAN_ONCE = "scan_once"  # local directory walked once, then left alone
+    SCAN_ONCE = (
+        "scan_once"  # local path (directory, file, typed dataset) registered once
+    )
     DROPPED = "dropped"  # added at runtime (drag-drop / register_local_path)
     UPSTREAM = "upstream"  # bare-host tensor server, re-listed rather than walked
-    # A configured single source that is cloud: nothing to walk, but its path is a
-    # cloud root, so the cloud policy applies to it like to any path under one.
-    STATIC = "static"
 
 
 @dataclass(frozen=True, eq=False)

@@ -104,12 +104,12 @@ class TestResolveServeSources:
         assert static_sources == []
         assert [s.url for s in monitored_sources] == [str(root)]
 
-    def test_single_file_monitor_becomes_static(self, tmp_path):
-        """A monitor=true entry pointing at a FILE is registered statically.
+    def test_single_file_monitor_is_registered_once(self, tmp_path):
+        """A monitor=true entry pointing at a FILE cannot be watched, so it is
+        registered once, as a scan-once root.
 
         Previously the file path entered the monitored-dirs filter set, its own
-        expansion was dropped by the overlap filter, and create_source_manager
-        refused to monitor a file -- so the source vanished. Now it is static.
+        expansion was dropped by the overlap filter, and the file vanished.
         """
         tiff = tmp_path / "single.tif"
         _write_tiff(str(tiff))
@@ -120,8 +120,8 @@ class TestResolveServeSources:
         )
 
         assert monitored_sources == []
-        assert len(static_sources) == 1
-        assert static_sources[0].local_path == tiff.resolve()
+        assert static_sources == []
+        assert [s.local_path for s in scan_once_sources] == [tiff.resolve()]
 
     def test_unwatched_directory_is_scanned_once_not_expanded(
         self, tmp_path, monkeypatch
@@ -150,8 +150,8 @@ class TestResolveServeSources:
         assert [s.url for s in scan_once_sources] == [str(root)]
         assert scan_once_sources[0].alias == "lab"
 
-    def test_typed_directory_stays_static(self, tmp_path):
-        """A directory given an explicit type has nothing to discover: no scan."""
+    def test_typed_directory_is_registered_once(self, tmp_path):
+        """A directory given an explicit type is claimed in place, as one root."""
         root = tmp_path / "plate.zarr"
         root.mkdir()
         cfg = _config(SourceConfig(url=str(root), type="zarr"))
@@ -160,22 +160,24 @@ class TestResolveServeSources:
             _resolve_serve_sources(cfg)
         )
 
-        assert [s.url for s in static_sources] == [str(root)]
-        assert scan_once_sources == []
+        assert static_sources == []
+        assert [s.url for s in scan_once_sources] == [str(root)]
 
-    def test_missing_unwatched_path_is_skipped_not_scanned(self, tmp_path):
-        """A path that is not there cannot be scanned; it is warned-and-skipped."""
+    def test_missing_unwatched_path_is_left_to_the_scan_once_pass(self, tmp_path):
+        """A path that is not there is still a root: the manager's pass warns and
+        skips it, so a not-yet-mounted path never stops startup."""
         cfg = _config(SourceConfig(url=str(tmp_path / "gone"), monitor=False))
 
         static_sources, upstream_sources, monitored_sources, scan_once_sources = (
             _resolve_serve_sources(cfg)
         )
 
-        assert static_sources == [] and scan_once_sources == []
+        assert static_sources == []
+        assert [s.url for s in scan_once_sources] == [str(tmp_path / "gone")]
 
     def test_non_monitored_under_monitored_root_is_filtered(self, tmp_path):
-        """A non-monitored entry whose expansion lands under a monitored root
-        is dropped from static_sources (overlap filter still applies)."""
+        """A non-monitored file inside a monitored root is the rescan's, so it is
+        not also registered once."""
         root = tmp_path / "monitored"
         root.mkdir()
         tiff = root / "inside.tif"
@@ -191,10 +193,10 @@ class TestResolveServeSources:
         )
 
         assert [s.url for s in monitored_sources] == [str(root)]
-        assert static_sources == []  # the inside.tif expansion is filtered out
+        assert static_sources == [] and scan_once_sources == []
 
     def test_non_monitored_outside_monitored_root_survives(self, tmp_path):
-        """A non-monitored entry outside every monitored root stays static."""
+        """A non-monitored entry outside every monitored root stays its own root."""
         root = tmp_path / "monitored"
         root.mkdir()
         _write_tiff(str(root / "inside.tif"))
@@ -212,7 +214,7 @@ class TestResolveServeSources:
         )
 
         assert [s.url for s in monitored_sources] == [str(root)]
-        assert [s.local_path for s in static_sources] == [outside.resolve()]
+        assert [s.local_path for s in scan_once_sources] == [outside.resolve()]
 
     def test_remote_monitor_is_static_only(self, tmp_path):
         """A remote monitor=true entry (not a bare-host upstream) has nothing to
@@ -309,8 +311,8 @@ class TestResolveServeSources:
         # Namespaced under the alias by the single-source expansion path.
         assert static_sources[0].source_id == "hpc__raw"
 
-    def test_missing_static_source_is_skipped_not_fatal(self, tmp_path):
-        """A missing non-monitored source is warned-and-skipped; the rest serve.
+    def test_a_missing_path_does_not_stop_the_rest(self, tmp_path):
+        """A missing non-monitored path is warned-and-skipped later; the rest serve.
 
         (biopb/biopb#54 extension: the same ValueError that crashed on a missing
         monitored dir also crashed on a missing static path.)
@@ -329,7 +331,10 @@ class TestResolveServeSources:
         )
 
         assert monitored_sources == []
-        assert [s.local_path for s in static_sources] == [good.resolve()]
+        assert [s.local_path for s in scan_once_sources] == [
+            missing.resolve(),
+            good.resolve(),
+        ]
 
     def test_cloud_without_monitor_is_scanned_once_not_monitored(
         self, tmp_path, monkeypatch
@@ -556,8 +561,8 @@ class TestAliasTreeRoot:
 
     def test_monitored_single_file_alias_is_honored(self, tmp_path):
         """A ``monitor=true`` single *file* cannot be live-monitored, so it is
-        registered static -- and being static, its alias tree-root IS honored (it
-        is never rescanned). No ignore-warning applies to it."""
+        registered once -- and its alias tree-root IS honored (it is never
+        rescanned). No ignore-warning applies to it."""
         f = tmp_path / "img.tif"
         _write_tiff(str(f))
         cfg = _config(SourceConfig(url=str(f), alias="solo", monitor=True))
@@ -567,7 +572,7 @@ class TestAliasTreeRoot:
         )
 
         assert monitored_sources == []
-        assert [s._catalog_url for s in static_sources] == ["solo"]
+        assert [s.alias for s in scan_once_sources] == ["solo"]
 
 
 class TestWriteDirInsideASourceDirectory:
