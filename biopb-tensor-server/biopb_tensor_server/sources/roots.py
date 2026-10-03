@@ -144,6 +144,14 @@ class Root:
         )
 
 
+def _under_any(path: str, roots: Tuple[Path, ...]) -> bool:
+    """True when the local *path* is at or under any of *roots* (lexical)."""
+    if not roots or is_remote_url(path):
+        return False
+    claim_path = Path(path)
+    return any(claim_path.is_relative_to(root) for root in roots)
+
+
 def _innermost(roots: Iterable[Root]) -> Optional[Root]:
     return max(roots, key=lambda r: r.depth, default=None)
 
@@ -232,10 +240,6 @@ class Roots:
         """
         return _innermost(r for r in self._snap.local if path.is_relative_to(r.path))
 
-    def cloud_roots(self) -> frozenset:
-        """The paths of the cloud roots, for a consumer that wants the raw set."""
-        return frozenset(self._snap.cloud)
-
     def is_cloud(self, path: str) -> bool:
         """True when *path* is a cloud root or lives under one.
 
@@ -243,19 +247,11 @@ class Roots:
         found in, so it is never resolved -- a link under a cloud root is under it
         wherever it points.
         """
-        cloud = self._snap.cloud
-        if not cloud or is_remote_url(path):
-            return False
-        claim_path = Path(path)
-        return any(claim_path.is_relative_to(root) for root in cloud)
+        return _under_any(path, self._snap.cloud)
 
     def is_monitored(self, path: str) -> bool:
         """True when *path* lives under a monitored directory (lexical, local only)."""
-        monitored = self._snap.monitored
-        if not monitored or is_remote_url(path):
-            return False
-        claim_path = Path(path)
-        return any(claim_path.is_relative_to(root) for root in monitored)
+        return _under_any(path, self._snap.monitored)
 
     def display_url(self, claim_path: str) -> Optional[str]:
         """The display ``source_url`` for a source found at ``claim_path``, or None.

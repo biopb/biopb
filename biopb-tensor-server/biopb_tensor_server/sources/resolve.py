@@ -442,9 +442,6 @@ def route_source(s: SourceConfig) -> Optional[RootKind]:
         return RootKind.UPSTREAM if is_bare_host_upstream_url(s.url) else None
 
     path = s.local_path
-    if path is None:  # unreachable: a local url always resolves to a path
-        return None
-
     if path.is_file():
         if s.monitor:
             logger.warning(
@@ -471,7 +468,7 @@ def partition_sources(
     sources: List[SourceConfig],
     registry: Optional[AdapterRegistry] = None,
     *,
-    credentials_config=None,
+    credentials_config: Optional[Any] = None,
     write_dir: Optional[Path] = None,
 ) -> Tuple[List[SourceConfig], Roots]:
     """Partition configured sources for the serve path: ``(static, roots)``.
@@ -495,14 +492,10 @@ def partition_sources(
 
     # A file or typed dataset listed inside a monitored directory is the rescan's:
     # registering it again here would claim it twice.
-    scan_once = [
-        s
-        for s in scan_once
-        if not (
-            (s.local_path.is_file() or s.type) and roots.is_monitored(str(s.local_path))
-        )
-    ]
     for s in scan_once:
+        path = s.local_path
+        if (path.is_file() or s.type) and roots.is_monitored(str(path)):
+            continue
         roots.add(Root.from_config(s, RootKind.SCAN_ONCE))
 
     # tolerant=True so one missing or broken static source is warned-and-skipped
