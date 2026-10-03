@@ -794,14 +794,10 @@ def _setup_flight_server(
         rescan_interval=server_config.rescan_interval,
     )
 
-    partition = source_manager.partition
-    monitored = partition.roots.of_kind(RootKind.MONITORED)
-    upstreams = partition.roots.of_kind(RootKind.UPSTREAM)
-    scan_once = partition.roots.of_kind(RootKind.SCAN_ONCE)
-    if partition.static:
-        console.print(
-            f"[green]Loaded {len(partition.static)} remote data source(s)[/green]"
-        )
+    roots = source_manager.roots
+    monitored = roots.of_kind(RootKind.MONITORED)
+    upstreams = roots.of_kind(RootKind.UPSTREAM)
+    scan_once = roots.of_kind(RootKind.SCAN_ONCE)
     if monitored:
         console.print(
             f"[green]Monitoring {len(monitored)} directory(s) for live updates[/green]"

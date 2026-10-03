@@ -19,10 +19,7 @@ from biopb_tensor_server import TensorFlightServer
 from biopb_tensor_server.adapters import get_default_registry
 from biopb_tensor_server.core.adapter_base import catalog_tensors
 from biopb_tensor_server.core.discovery import DiscoveryState
-from biopb_tensor_server.sources.source_manager import (
-    DND_URL_PREFIX,
-    _drop_catalog_url,
-)
+from biopb_tensor_server.sources.roots import DND_URL_PREFIX, _drop_catalog_url
 
 from tests import catalog_server, make_manager
 

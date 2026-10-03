@@ -947,7 +947,7 @@ class TestClaimSpelling:
 
         manager._handle_rescan()
         link_claim = next(c for c in state.claims.values() if "link" in c.primary_path)
-        assert manager._reconciler._is_monitored_claim(link_claim)
+        assert manager._roots.is_monitored(link_claim.primary_path)
         registered = list(server.registered)
         assert len(registered) == 2
 

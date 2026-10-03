@@ -511,10 +511,8 @@ class TensorFlightServer(flight.FlightServerBase):
                 f"location is 'host:port' without a scheme, got {location!r}: the "
                 "scheme follows from tls_cert_chain"
             )
-        if tls_cert_chain is None:
-            location = f"grpc://{location}"
-        else:
-            location = f"grpc+tls://{location}"
+        location = f"{'grpc' if tls_cert_chain is None else 'grpc+tls'}://{location}"
+        if tls_cert_chain is not None:
             kwargs["tls_certificates"] = [(tls_cert_chain, tls_private_key)]
             self._tls_not_after = cert_not_after(tls_cert_chain)
 

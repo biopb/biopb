@@ -22,7 +22,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Iterable, List, NamedTuple, Optional, Tuple
@@ -86,11 +86,14 @@ def _drop_catalog_url(
 
 class RootKind(Enum):
     MONITORED = "monitored"  # watched local directory
-    SCAN_ONCE = (
-        "scan_once"  # local path (directory, file, typed dataset) registered once
-    )
+    # A local path (directory, file, typed dataset) the first tick registers, then
+    # never rescans: a directory is walked, a file or typed dataset claimed in place.
+    SCAN_ONCE = "scan_once"
     DROPPED = "dropped"  # added at runtime (drag-drop / register_local_path)
     UPSTREAM = "upstream"  # bare-host tensor server, re-listed rather than walked
+
+
+_LOCAL_KINDS = (RootKind.MONITORED, RootKind.SCAN_ONCE, RootKind.DROPPED)
 
 
 @dataclass(frozen=True, eq=False)
@@ -105,19 +108,48 @@ class Root:
     # The config entry a configured root came from: an upstream is re-listed with
     # its credentials profile, a scan-once directory with its HDF5 ``dataset``.
     source: Optional[SourceConfig] = None
+    # Derived once: queried per claim on every walk.
+    path: Optional[Path] = field(init=False, default=None, repr=False)
+    depth: int = field(init=False, default=0, repr=False)
 
-    @property
-    def path(self) -> Optional[Path]:
-        """The local path; None for an upstream."""
-        return None if self.kind is RootKind.UPSTREAM else Path(self.url)
+    def __post_init__(self):
+        if self.kind is not RootKind.UPSTREAM:
+            path = Path(self.url)
+            object.__setattr__(self, "path", path)
+            object.__setattr__(self, "depth", len(path.parts))
 
     @classmethod
     def from_config(cls, source: SourceConfig, kind: RootKind) -> Root:
-        local_path = source.local_path
-        if kind is RootKind.UPSTREAM or local_path is None:
-            return cls(RootKind.UPSTREAM, source.url, source.alias, source=source)
+        if kind is RootKind.UPSTREAM:
+            return cls(kind, source.url, source.alias, source=source)
         return cls(
-            kind, str(local_path), source.alias, bool(source.cloud), source=source
+            kind,
+            str(source.local_path),
+            source.alias,
+            bool(source.cloud),
+            source=source,
+        )
+
+
+def _innermost(roots: Iterable[Root]) -> Optional[Root]:
+    return max(roots, key=lambda r: r.depth, default=None)
+
+
+class _Snapshot(NamedTuple):
+    """What the queries read, rebuilt whole on every change."""
+
+    roots: Tuple[Root, ...]
+    local: Tuple[Root, ...]  # the roots a path can be under
+    cloud: Tuple[Path, ...]
+    monitored: Tuple[Path, ...]
+
+    @classmethod
+    def of(cls, roots: Tuple[Root, ...]) -> _Snapshot:
+        return cls(
+            roots,
+            tuple(r for r in roots if r.kind in _LOCAL_KINDS),
+            tuple(r.path for r in roots if r.cloud and r.path is not None),
+            tuple(r.path for r in roots if r.kind is RootKind.MONITORED),
         )
 
 
@@ -126,44 +158,46 @@ class Roots:
 
     def __init__(self, roots: Iterable[Root] = ()):
         self._lock = threading.Lock()
-        self._roots: Tuple[Root, ...] = ()
-        self._unscanned: set = set()  # scan-once roots not yet handed out
-        for root in roots:
-            self.add(root)
+        self._snap = _Snapshot.of(tuple(roots))
+        self._unscanned: set = {
+            r for r in self._snap.roots if r.kind is RootKind.SCAN_ONCE
+        }
 
     def __iter__(self):
-        return iter(self._roots)
+        return iter(self._snap.roots)
 
     def __len__(self) -> int:
-        return len(self._roots)
+        return len(self._snap.roots)
 
     # -- mutation ---------------------------------------------------------
 
     def add(self, root: Root) -> None:
         with self._lock:
-            self._roots = (*self._roots, root)
+            self._snap = _Snapshot.of((*self._snap.roots, root))
             if root.kind is RootKind.SCAN_ONCE:
                 self._unscanned.add(root)
 
     def remove(self, root: Root) -> None:
         with self._lock:
-            self._roots = tuple(r for r in self._roots if r is not root)
+            self._snap = _Snapshot.of(
+                tuple(r for r in self._snap.roots if r is not root)
+            )
             self._unscanned.discard(root)
 
     def take_unscanned(self) -> List[Root]:
         """The scan-once roots not yet handed out, marked as handed out."""
         with self._lock:
-            taken = [r for r in self._roots if r in self._unscanned]
+            taken = [r for r in self._snap.roots if r in self._unscanned]
             self._unscanned.clear()
         return taken
 
     # -- queries ----------------------------------------------------------
 
     def of_kind(self, *kinds: RootKind) -> List[Root]:
-        return [r for r in self._roots if r.kind in kinds]
+        return [r for r in self._snap.roots if r.kind in kinds]
 
     def by_label(self, label: str) -> Optional[Root]:
-        return next((r for r in self._roots if r.label == label), None)
+        return next((r for r in self._snap.roots if r.label == label), None)
 
     def unique_label(self, path: Path) -> str:
         """The ``dnd://`` label for a drop from outside every known root.
@@ -178,28 +212,16 @@ class Roots:
             label, n = f"{base} ({n})", n + 1
         return label
 
-    def _containing(self, path: Path, kinds: Tuple[RootKind, ...]) -> List[Root]:
-        return [
-            r
-            for r in self._roots
-            if r.kind in kinds
-            and (rp := r.path) is not None
-            and path.is_relative_to(rp)
-        ]
-
     def containing(self, path: Path) -> Optional[Root]:
         """The innermost local root ``path`` is at or under, or None.
 
         Lexical, on the resolved path against roots resolved once.
         """
-        inside = self._containing(
-            path, (RootKind.MONITORED, RootKind.SCAN_ONCE, RootKind.DROPPED)
-        )
-        return max(inside, key=lambda r: len(r.path.parts), default=None)
+        return _innermost(r for r in self._snap.local if path.is_relative_to(r.path))
 
     def cloud_roots(self) -> frozenset:
         """The paths of the cloud roots, for a consumer that wants the raw set."""
-        return frozenset(r.path for r in self._roots if r.cloud and r.path)
+        return frozenset(self._snap.cloud)
 
     def is_cloud(self, path: str) -> bool:
         """True when *path* is a cloud root or lives under one.
@@ -208,7 +230,7 @@ class Roots:
         found in, so it is never resolved -- a link under a cloud root is under it
         wherever it points.
         """
-        cloud = self.cloud_roots()
+        cloud = self._snap.cloud
         if not cloud or is_remote_url(path):
             return False
         claim_path = Path(path)
@@ -216,10 +238,11 @@ class Roots:
 
     def is_monitored(self, path: str) -> bool:
         """True when *path* lives under a monitored directory (lexical, local only)."""
-        if is_remote_url(path):
+        monitored = self._snap.monitored
+        if not monitored or is_remote_url(path):
             return False
         claim_path = Path(path)
-        return bool(self._containing(claim_path, (RootKind.MONITORED,)))
+        return any(claim_path.is_relative_to(root) for root in monitored)
 
     def display_url(self, claim_path: str) -> Optional[str]:
         """The display ``source_url`` for a source found at ``claim_path``, or None.
@@ -230,7 +253,8 @@ class Roots:
         Display-only: the source id still hashes the native path.
         """
         path = Path(claim_path)
-        root = self.containing(path)
+        inside = [r for r in self._snap.local if path.is_relative_to(r.path)]
+        root = _innermost(inside)
         if root is None:
             return None
         if root.kind is RootKind.DROPPED:
@@ -239,10 +263,9 @@ class Roots:
             # Persistent: nothing rescans the root to re-merge it into the tree.
             alias_root = root if root.alias else None
         else:
-            aliased = [
-                r for r in self._containing(path, (RootKind.MONITORED,)) if r.alias
-            ]
-            alias_root = max(aliased, key=lambda r: len(r.path.parts), default=None)
+            alias_root = _innermost(
+                r for r in inside if r.kind is RootKind.MONITORED and r.alias
+            )
         if alias_root is None:
             return None
         return _alias_catalog_url(alias_root.alias, alias_root.url, claim_path)
@@ -267,34 +290,18 @@ class Roots:
             already_registered
             or any(Path(p).is_relative_to(path) for p in registered_paths)
             or any(
-                r is not exclude
-                and (rp := r.path) is not None
-                and rp.is_relative_to(path)
-                for r in self._roots
+                r is not exclude and r.path is not None and r.path.is_relative_to(path)
+                for r in self._snap.roots
             )
         ):
             return OVERLAP_MESSAGE
         return None
 
 
-class Route(Enum):
-    """Where one configured source goes on the serve path."""
-
-    STATIC = (
-        "static"  # one remote source (s3://, grpc://host/<id>): registered as it is
-    )
-    # Both owned by the manager's rescan loop: a watched directory is walked, a
-    # bare-host tensor-server upstream is re-listed.
-    MONITORED = "monitored"
-    UPSTREAM = "upstream"
-    # A local path the first tick registers, then never rescans: a directory is
-    # walked, a file or typed dataset is claimed in place.
-    SCAN_ONCE = "scan_once"
-
-
-def route_source(s: SourceConfig) -> Route:
-    """Decide where a configured source goes; log why when that is not what the
-    entry asked for.
+def route_source(s: SourceConfig) -> Optional[RootKind]:
+    """Where a configured source goes on the serve path: the kind of root it
+    becomes, or None for a single remote source, which is registered as it is.
+    Logs why when that is not what the entry asked for.
 
     Every local path is discovered by the manager after the server is SERVING, never
     expanded here: that would walk the tree an extra time before the server binds,
@@ -304,11 +311,11 @@ def route_source(s: SourceConfig) -> Route:
         # A bare-host tensor-server upstream ("mirror everything") holds many
         # sources of its own, so it always goes to the manager's background
         # re-list. Every other remote (s3://, ...) names a single source.
-        return Route.UPSTREAM if is_bare_host_upstream_url(s.url) else Route.STATIC
+        return RootKind.UPSTREAM if is_bare_host_upstream_url(s.url) else None
 
     path = s.local_path
     if path is None:  # unreachable: a local url always resolves to a path
-        return Route.STATIC
+        return None
 
     if path.is_file():
         if s.monitor:
@@ -316,7 +323,7 @@ def route_source(s: SourceConfig) -> Route:
                 "Cannot live-monitor a single file; registering it once instead: %s",
                 s.url,
             )
-        return Route.SCAN_ONCE
+        return RootKind.SCAN_ONCE
 
     if s.monitor:
         if not path.exists():
@@ -325,30 +332,11 @@ def route_source(s: SourceConfig) -> Route:
                 "appears: %s",
                 s.url,
             )
-        return Route.MONITORED
+        return RootKind.MONITORED
 
     # Not watched, but still registered once. A path that is not there is left to
     # that pass, which warns and skips it.
-    return Route.SCAN_ONCE
-
-
-_ROOT_KIND = {
-    Route.MONITORED: RootKind.MONITORED,
-    Route.UPSTREAM: RootKind.UPSTREAM,
-    Route.SCAN_ONCE: RootKind.SCAN_ONCE,
-}
-
-
-class SourcePartition(NamedTuple):
-    """The configured sources by route.
-
-    ``static`` is the single remote sources, already expanded. Everything the
-    manager registers after SERVING (watched directories, scan-once paths,
-    upstreams) is a root in ``roots``.
-    """
-
-    static: List[SourceConfig]
-    roots: Roots
+    return RootKind.SCAN_ONCE
 
 
 def partition_sources(
@@ -357,21 +345,37 @@ def partition_sources(
     *,
     credentials_config=None,
     write_dir: Optional[Path] = None,
-) -> SourcePartition:
-    """Partition configured sources for the serve path.
+) -> Tuple[List[SourceConfig], Roots]:
+    """Partition configured sources for the serve path: ``(static, roots)``.
 
-    A single remote source is expanded here; every local path and upstream is left
-    for the manager, as a root. See :func:`route_source`.
+    ``static`` is the single remote sources, expanded here. Everything the manager
+    registers after SERVING (watched directories, scan-once paths, upstreams) is a
+    root. See :func:`route_source`.
     """
     to_expand: List[SourceConfig] = []
+    scan_once: List[SourceConfig] = []
     roots = Roots()
 
     for s in sources:
-        route = route_source(s)
-        if route is Route.STATIC:
+        kind = route_source(s)
+        if kind is None:
             to_expand.append(s)
+        elif kind is RootKind.SCAN_ONCE:
+            scan_once.append(s)
         else:
-            roots.add(Root.from_config(s, _ROOT_KIND[route]))
+            roots.add(Root.from_config(s, kind))
+
+    # A file or typed dataset listed inside a monitored directory is the rescan's:
+    # registering it again here would claim it twice.
+    scan_once = [
+        s
+        for s in scan_once
+        if not (
+            (s.local_path.is_file() or s.type) and roots.is_monitored(str(s.local_path))
+        )
+    ]
+    for s in scan_once:
+        roots.add(Root.from_config(s, RootKind.SCAN_ONCE))
 
     # tolerant=True so one missing or broken static source is warned-and-skipped
     # rather than killing the server.
@@ -381,21 +385,14 @@ def partition_sources(
         tolerant=True,
     )
 
-    # A file or typed dataset listed inside a monitored directory is the rescan's:
-    # registering it again here would claim it twice.
-    monitored_dirs = {r.path for r in roots.of_kind(RootKind.MONITORED)}
-    for root in roots.of_kind(RootKind.SCAN_ONCE):
-        if (root.path.is_file() or root.source.type) and any(
-            root.path.is_relative_to(md) for md in monitored_dirs
-        ):
-            roots.remove(root)
-
     # Upload stores are registered by the upload path, and the adapters decline
     # them if discovery reaches one, so a write_dir inside a scanned directory is
     # not catalogued twice -- but the walk still descends into every store and
     # stats its chunk files, and a store being written keeps its directory busy.
-    scanned_dirs = monitored_dirs | {
-        r.path for r in roots.of_kind(RootKind.SCAN_ONCE) if r.path.is_dir()
+    scanned_dirs = {
+        r.path
+        for r in roots.of_kind(RootKind.MONITORED, RootKind.SCAN_ONCE)
+        if r.kind is RootKind.MONITORED or r.path.is_dir()
     }
     inside = write_dir_under_root(write_dir, scanned_dirs)
     if inside is not None:
@@ -407,4 +404,4 @@ def partition_sources(
             inside,
         )
 
-    return SourcePartition(static_sources, roots)
+    return static_sources, roots

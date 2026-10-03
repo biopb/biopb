@@ -33,12 +33,11 @@ from biopb_tensor_server.core.errors import UpstreamConfigError
 from biopb_tensor_server.core.remote import is_remote_url
 from biopb_tensor_server.sources.entry_stat import entry_change_time, entry_is_quiet
 from biopb_tensor_server.sources.reconciler import Reconciler
-from biopb_tensor_server.sources.roots import (  # noqa: F401  (re-exported)
+from biopb_tensor_server.sources.roots import (
     DND_URL_PREFIX,
     Root,
     RootKind,
     Roots,
-    _drop_catalog_url,
     partition_sources,
 )
 
@@ -205,6 +204,11 @@ class SourceManager:
             catalog_url_for=lambda claim: self._roots.display_url(claim.primary_path),
             stability_window=stability_window,
         )
+
+    @property
+    def roots(self) -> Roots:
+        """Every root this manager scans, re-lists or was dropped into."""
+        return self._roots
 
     @property
     def _monitored_upstreams(self) -> List[SourceConfig]:
@@ -711,8 +715,6 @@ class SourceManager:
         mirrored within ~one tick. When there are no monitored *dirs* each pass
         is the whole reconcile, so a later one advances catalog freshness itself.
         """
-        if not self._monitored_upstreams:
-            return
         due: List[SourceConfig] = []
         for upstream in self._monitored_upstreams:
             state = self._upstream_relist.setdefault(
@@ -1226,7 +1228,7 @@ class SourceManager:
             primary = Path(claim.primary_path)
             if not primary.is_relative_to(root_path):
                 continue
-            if self._reconciler._is_monitored_claim(claim):
+            if self._roots.is_monitored(claim.primary_path):
                 continue
             if any(primary.is_relative_to(d) for d in declined):
                 continue
@@ -1275,14 +1277,12 @@ def create_source_manager(
 ) -> SourceManager:
     """Create a SourceManager for all configured sources.
 
-    Sorts ``sources`` once (:func:`partition_sources`) into static sources
-    (explicit config, registered once, nothing to walk), monitored sources
-    (filesystem-discovered, kept live by the rescan loop) and one-shot directories
-    (discovered by the first tick, then left alone). All three use the same
-    DiscoveryState/callback machinery. Remote sources are never filesystem-watched:
-    a bare-host ``grpc://`` upstream is monitored through the background catalog
-    re-list, and any other remote source is registered statically. The sort is
-    left on the manager as ``manager.partition``.
+    Sorts ``sources`` once (:func:`partition_sources`) into roots -- monitored
+    directories (kept live by the rescan loop), scan-once paths (registered by the
+    first tick, then left alone) and bare-host ``grpc://`` upstreams (re-listed in
+    the background) -- and single remote sources, registered as they are. All use
+    the same DiscoveryState/callback machinery. The roots are left on the manager
+    as ``manager.roots``.
 
     Always returns a manager. An empty catalog is a valid runtime state --
     sources arrive later through runtime add_source (napari drag-drop), DoPut
@@ -1311,13 +1311,12 @@ def create_source_manager(
     Returns:
         A SourceManager, empty if no source is usable.
     """
-    partition = partition_sources(
+    static_sources, roots = partition_sources(
         sources or [],
         registry,
         credentials_config=credentials_config,
         write_dir=write_dir,
     )
-    roots = partition.roots
     for root in roots.of_kind(RootKind.UPSTREAM):
         logger.info(
             "Tensor-server upstream %s: catalog re-listed in the background, "
@@ -1325,14 +1324,14 @@ def create_source_manager(
             root.url,
         )
 
-    if not partition.static and not roots:
+    if not static_sources and not roots:
         logger.info("No sources configured yet; serving an empty catalog")
 
     # EXPERIMENTAL: cloud/synced-folder mode. The walk admits dehydrated entries,
     # and register placeholder adapters resolved lazily on first access.
     for source in (
         *(r.source for r in roots),
-        *partition.static,
+        *static_sources,
     ):
         if source.cloud:
             # Warned once per configured cloud source at startup.
@@ -1361,8 +1360,9 @@ def create_source_manager(
     )
 
     # Added first so monitored discovery skips paths already claimed.
-    for source in partition.static:
+    for source in static_sources:
         manager.register_static_source(source)
+    if static_sources:
+        logger.info("Loaded %d remote data source(s)", len(static_sources))
 
-    manager.partition = partition
     return manager

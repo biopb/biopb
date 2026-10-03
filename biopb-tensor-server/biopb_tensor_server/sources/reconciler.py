@@ -227,7 +227,7 @@ class Reconciler:
             current_claims = {
                 source_id: claim
                 for source_id, claim in self._state.claims.items()
-                if self._is_monitored_claim(claim)
+                if self._roots.is_monitored(claim.primary_path)
                 and (force_full or source_id not in self._cloud_source_ids)
             }
 
@@ -289,15 +289,6 @@ class Reconciler:
             self._commit_add_claim(claim)
         for source_id in refreshed_ids:
             self._refresh_claim(discovered_claims[source_id])
-
-    def _is_monitored_claim(self, claim: SourceClaim) -> bool:
-        """Check if a claim belongs to one of the monitored local roots.
-
-        Lexical, like every containment test on a claim: the walk spelled it under
-        the root it found it in, so a symlinked file is under that root wherever
-        the link points.
-        """
-        return self._roots.is_monitored(claim.primary_path)
 
     def _claim_is_quiet(self, claim: SourceClaim) -> bool:
         """Has this claim stopped changing long enough to remove or rebuild it?
@@ -378,7 +369,7 @@ class Reconciler:
                 # drops them from ``current_ids`` -> a spurious re-add every cycle.
                 # Skipping also retires the per-cloud-claim ``Path.resolve()`` loop.
                 continue
-            if not self._is_monitored_claim(claim):
+            if not self._roots.is_monitored(claim.primary_path):
                 continue
             if claim.source_id in discovered_state.claims:
                 continue
