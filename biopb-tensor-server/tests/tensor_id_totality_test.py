@@ -217,7 +217,7 @@ class TestAdapterLookupFallback:
         from biopb.tensor.ticket_pb2 import TensorTicket
         from biopb_tensor_server.core.chunk import encode_chunk_id
 
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         server.register_source("legacy", _LegacyMissAdapter("legacy"))
         chunk_id = encode_chunk_id(
             "legacy/@bad", ChunkBounds(start=[0, 0], stop=[4, 4])
@@ -237,7 +237,7 @@ class TestAdapterLookupFallback:
         from biopb.tensor.ticket_pb2 import TensorTicket
         from biopb_tensor_server.core.chunk import encode_chunk_id
 
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         chunk_id = encode_chunk_id("ghost", ChunkBounds(start=[0, 0], stop=[4, 4]))
         ticket = flight.Ticket(TensorTicket(chunk_id=chunk_id).SerializeToString())
         with pytest.raises(flight.FlightServerError) as ei:
@@ -258,7 +258,7 @@ class TestAdapterLookupFallback:
         # manager exists, so give it one to reach the adapter-is-None fallthrough.
         CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
         try:
-            server = TensorFlightServer("grpc://localhost:0")
+            server = TensorFlightServer("localhost:0")
             chunk_id = encode_chunk_id("ghost", ChunkBounds(start=[0, 0], stop=[4, 4]))
             with pytest.raises(flight.FlightServerError) as ei:
                 server._handle_chunk_locate(chunk_id)
@@ -430,7 +430,7 @@ def _flight_info_for(server, source_id, tensor_id):
 
 class TestGetFlightInfoBoundary:
     def test_unknown_field_is_terminal_not_internal_with_code(self):
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         server.register_source("src", _SingleTensorAdapter("src"))
 
         with pytest.raises(flight.FlightServerError) as ei:
@@ -440,14 +440,14 @@ class TestGetFlightInfoBoundary:
         assert json.loads(ei.value.extra_info)["code"] == "NOT_FOUND"
 
     def test_unknown_source_is_terminal_not_found(self):
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         with pytest.raises(flight.FlightServerError) as ei:
             _flight_info_for(server, "ghost", "ghost/x")
         assert not isinstance(ei.value, flight.FlightInternalError)
         assert json.loads(ei.value.extra_info)["code"] == "NOT_FOUND"
 
     def test_valid_default_still_resolves(self):
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         server.register_source("src", _SingleTensorAdapter("src"))
         info = _flight_info_for(server, "src", "")  # bare/default -> sole tensor
         assert isinstance(info, flight.FlightInfo)
@@ -455,7 +455,7 @@ class TestGetFlightInfoBoundary:
     def test_bare_source_id_resolves_default_single_tensor(self):
         # A bare source_id (the #44 back-compat default) resolves to the sole
         # tensor, same as the empty form -- both reduce to field None.
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         server.register_source("src", _SingleTensorAdapter("src"))
         info = _flight_info_for(server, "src", "src")
         assert isinstance(info, flight.FlightInfo)
@@ -470,7 +470,7 @@ class TestGetFlightInfoBoundary:
         from biopb_tensor_server.fixtures import create_multi_series_ome_tiff
 
         path, _, _ = create_multi_series_ome_tiff(str(tmp_path), n_series=3)
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         adapter = OmeTiffAdapter(path, "idx")
         adapter.list_tensor_descriptors()
         server.register_source("idx", adapter)

@@ -19,13 +19,9 @@ from biopb_tensor_server import TensorFlightServer
 from biopb_tensor_server.adapters import get_default_registry
 from biopb_tensor_server.core.adapter_base import catalog_tensors
 from biopb_tensor_server.core.discovery import DiscoveryState
-from biopb_tensor_server.sources.source_manager import (
-    DND_URL_PREFIX,
-    SourceManager,
-    _drop_catalog_url,
-)
+from biopb_tensor_server.sources.roots import DND_URL_PREFIX, _drop_catalog_url
 
-from tests import catalog_server
+from tests import catalog_server, make_manager
 
 
 def _zarr_available() -> bool:
@@ -54,9 +50,9 @@ def _make_zarr(parent, name, shape=(4, 8, 8)):
 def _make_manager(scanned=True, **kwargs):
     # One catalog, threaded into both halves -- the wiring cli.py does for a
     # real deployment. The reconciler is the only thing that writes it.
-    server = catalog_server("grpc://localhost:0")
+    server = catalog_server("localhost:0")
     kwargs.setdefault("monitored_dirs", set())
-    manager = SourceManager(
+    manager = make_manager(
         server=server,
         registry=get_default_registry(),
         discovery_state=DiscoveryState(),
@@ -154,8 +150,8 @@ class TestAddLocalSource:
         urls = sorted(_url(server, sid) for sid in added)
         assert urls == ["dnd://my_experiment/a.zarr", "dnd://my_experiment/b.zarr"]
 
-    def test_static_config_via_symlink_containment(self, tmp_path):
-        """A static-config source configured through a symlinked path still
+    def test_configured_path_via_symlink_containment(self, tmp_path):
+        """A configured source given through a symlinked path still
         catches a drop that lands inside it. The containment guard keys on
         os.path.realpath, so the seeded claim must store the resolved path (case
         4 over a symlinked config path)."""
@@ -171,14 +167,14 @@ class TestAddLocalSource:
         except (OSError, NotImplementedError):
             pytest.skip("cannot create symlinks (e.g. Windows without privilege)")
 
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         manager = create_source_manager(
             server=server,
             registry=get_default_registry(),
-            static_sources=[SourceConfig(url=str(link / "exp.zarr"), type="zarr")],
+            sources=[SourceConfig(url=str(link / "exp.zarr"), type="zarr")],
         )
         assert manager is not None
-        manager.complete_initial_scan()
+        manager._handle_rescan()  # the first tick registers the configured path
 
         # Drop a subdir inside the source, reached via the real (resolved) path.
         sub = os.path.join(zpath, "sub")
@@ -188,17 +184,13 @@ class TestAddLocalSource:
         assert added == [] and len(failed) == 1
         assert "already part of" in failed[0][1]
 
-    def test_static_config_alias_reroots_descriptor_source_url(self, tmp_path):
+    def test_configured_alias_reroots_descriptor_source_url(self, tmp_path):
         """A configured local source with an ``alias`` surfaces that alias as its
         catalog tree root -- the config-line analogue of a drag-dropped folder
-        getting its own root. End-to-end: resolve_all_sources computes the
-        catalog_url from the alias, create_source_manager threads it as the
-        descriptor's display source_url override (never the source_id)."""
-        from biopb_tensor_server.core.config import (
-            ServerConfig,
-            SourceConfig,
-        )
-        from biopb_tensor_server.sources.resolve import resolve_all_sources
+        getting its own root. End-to-end: the manager's first tick registers the
+        directory, and ``Roots.display_url`` gives each source its display
+        source_url override (never the source_id)."""
+        from biopb_tensor_server.core.config import SourceConfig
         from biopb_tensor_server.sources.source_manager import create_source_manager
 
         root = tmp_path / "acquisition"
@@ -206,16 +198,13 @@ class TestAddLocalSource:
         _make_zarr(str(root), "a.zarr")
         _make_zarr(str(root), "b.zarr")
 
-        cfg = ServerConfig(sources=[SourceConfig(url=str(root), alias="exp")])
-        static_sources = resolve_all_sources(cfg)
-
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         manager = create_source_manager(
             server=server,
             registry=get_default_registry(),
-            static_sources=static_sources,
+            sources=[SourceConfig(url=str(root), alias="exp")],
         )
-        assert manager is not None
+        manager._handle_rescan()
 
         urls = sorted(adapter.catalog_url for adapter in server.sources.values())
         assert urls == ["exp/a.zarr", "exp/b.zarr"]
@@ -431,7 +420,7 @@ class TestDropRules:
 
         _drain(manager.add_local_source(str(root), cloud=True))
 
-        assert manager._cloud_roots == set()
+        assert manager._roots.cloud_roots() == frozenset()
 
     def test_a_redrop_inside_a_drop_keeps_the_drops_mark(self, tmp_path):
         manager, server = _make_manager()
@@ -704,8 +693,8 @@ class TestAddedSourceSurvivesRescanUnderSkippedDir:
     """
 
     def _manager(self, monitored_dirs):
-        server = TensorFlightServer("grpc://localhost:0")
-        manager = SourceManager(
+        server = TensorFlightServer("localhost:0")
+        manager = make_manager(
             server=server,
             registry=get_default_registry(),
             discovery_state=DiscoveryState(),

@@ -491,7 +491,7 @@ def plane(tmp_path: Path):
     CacheManager.reset()
     CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
     server = TensorFlightServer(
-        location="grpc://localhost:0",
+        location="localhost:0",
         writable=True,
         write_dir=tmp_path,
         metadata_db=MetadataDatabase(),

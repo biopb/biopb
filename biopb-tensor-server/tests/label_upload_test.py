@@ -405,7 +405,7 @@ class TestTheSidecar:
         served.shutdown()
 
         fresh = catalog_server(
-            location="grpc://localhost:0", writable=True, write_dir=Path(tmp_path)
+            location="localhost:0", writable=True, write_dir=Path(tmp_path)
         )
         try:
             registered = register_and_catalog(fresh, "oz1", _adapter(image))
@@ -530,7 +530,7 @@ class TestTheSweep:
         from tests import catalog_server
 
         fresh = catalog_server(
-            location="grpc://localhost:0", writable=True, write_dir=Path(tmp_path)
+            location="localhost:0", writable=True, write_dir=Path(tmp_path)
         )
         try:
             assert not store.exists()

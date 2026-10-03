@@ -80,7 +80,7 @@ def _run_server_process(
             )
         )
 
-        server = TensorFlightServer(location)
+        server = TensorFlightServer(location.removeprefix("grpc://"))
         for spec in source_specs:
             _register_source_with_server(spec, spec["path"], server)
 

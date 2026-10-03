@@ -1,3 +1,4 @@
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -835,13 +836,13 @@ class TestResolveExternalLocation:
         assert exc.value.exit_code == 2
 
 
-def test_setup_static_only_serves_immediately_with_freshness(tmp_path):
-    """A static-only config reaches SERVING and reports a freshness timestamp.
+def test_setup_a_configured_path_serves_then_registers_with_freshness(tmp_path):
+    """A config of one local typed source reaches SERVING, then registers it.
 
-    Progressive discovery: _setup_flight_server no longer blocks on a scan. With
-    no monitored dirs there is nothing to background, so the launcher drives the
-    first-scan-complete path directly -- the server is SERVING, not scanning, and
-    last_full_scan_finished_at is stamped so a client sees an established catalog.
+    Progressive discovery: _setup_flight_server no longer blocks on a scan. The
+    configured path is registered by the manager's first tick, in the background;
+    once that tick finishes the server is not scanning and
+    last_full_scan_finished_at is stamped, so a client sees an established catalog.
     """
     import json
 
@@ -871,8 +872,15 @@ def test_setup_static_only_serves_immediately_with_freshness(tmp_path):
     try:
         assert server.is_ready is True
 
-        (raw,) = list(server.do_action(None, flight.Action("health", b"")))
-        health = json.loads(bytes(raw))
+        def _health():
+            (raw,) = list(server.do_action(None, flight.Action("health", b"")))
+            return json.loads(bytes(raw))
+
+        deadline = time.time() + 30
+        health = _health()
+        while health["last_full_scan_finished_at"] is None and time.time() < deadline:
+            time.sleep(0.1)
+            health = _health()
         assert health["status"] == "SERVING"
         assert health["full_scan_in_progress"] is False
         assert health["last_full_scan_finished_at"] is not None

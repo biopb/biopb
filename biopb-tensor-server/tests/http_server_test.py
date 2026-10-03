@@ -936,7 +936,7 @@ class TestIntegration:
 
         # Bind to port 0 so the OS assigns a free port, avoiding flaky
         # "Address already in use" collisions when the suite runs back-to-back.
-        server = catalog_server("grpc://127.0.0.1:0")
+        server = catalog_server("127.0.0.1:0")
         # Register under the same name as the adapter's array_id so that
         # the source_id returned by the server matches the tensor_id.
         register_and_catalog(server, "int-tensor", adapter)
@@ -2892,7 +2892,7 @@ class TestIntegrationLoneQualifiedTensor:
         # One tensor, carrying a name: array_id becomes "lone/Image:0".
         adapter._tensor_name = "Image:0"
 
-        server = catalog_server("grpc://127.0.0.1:0")
+        server = catalog_server("127.0.0.1:0")
         register_and_catalog(server, "lone", adapter)
         threading.Thread(target=server.serve, daemon=True).start()
         time.sleep(0.5)
@@ -3593,7 +3593,7 @@ class TestSingleSourceIsNotCappedByTheListing:
         # Query cap of 1 against 3 sources: "c" sorts last, so it is the one
         # clipped from the listing (which is a catalog query).
         db = MetadataDatabase(max_query_results=1)
-        server = TensorFlightServer("grpc://127.0.0.1:0", metadata_db=db)
+        server = TensorFlightServer("127.0.0.1:0", metadata_db=db)
         for sid in ("a", "b", "c"):
             z = zarr.open_array(
                 str(tmp_path / f"{sid}.zarr"),

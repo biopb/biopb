@@ -39,7 +39,7 @@ def embedded_cache(tmp_path: Path) -> EmbeddedTensorCache:
     # Production's shape: the Flight write path refused, a write_dir anyway --
     # that is what gives the server the scratch source results are added to.
     tensor_server = TensorFlightServer(
-        location="grpc://0.0.0.0:0",
+        location="0.0.0.0:0",
         writable=False,
         write_dir=tmp_path / "uploads",
         scratch_ttl=RESULT_TTL_S,
@@ -77,7 +77,7 @@ def served_embedded_cache(tmp_path: Path):
     # token nobody is given -- there so `_authorize` fails closed.
     server_token = secrets.token_urlsafe(16)
     tensor_server = TensorFlightServer(
-        location=location,
+        location=location.removeprefix("grpc://"),
         token=server_token,
         writable=False,
         write_dir=tmp_path / "uploads",

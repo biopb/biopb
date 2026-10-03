@@ -384,7 +384,7 @@ def _start_embedded_tensor_cache(
     CacheManager.initialize(cache_config)
 
     # Bind to specified host (0.0.0.0 for external access)
-    location = f"grpc://{tensor_host}:{tensor_port}"
+    location = f"{tensor_host}:{tensor_port}"
 
     # The server-wide token is minted and *kept*. It exists so ``_authorize``
     # fails closed on every action arm except ``health`` and ``chunk_locate``.
@@ -412,13 +412,13 @@ def _start_embedded_tensor_cache(
 
     # Start in background thread
     def _run_tensor_server():
-        logger.info(f"Embedded tensor cache server started at {location}")
+        logger.info(f"Embedded tensor cache server started at grpc://{location}")
         tensor_server.serve()
 
     thread = threading.Thread(target=_run_tensor_server, daemon=True)
     thread.start()
 
-    return tensor_server, location
+    return tensor_server, f"grpc://{location}"
 
 
 def start_embedded_cache(

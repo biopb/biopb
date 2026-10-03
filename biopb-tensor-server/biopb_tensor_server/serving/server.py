@@ -157,20 +157,6 @@ def _peer_is_remote(peer: str) -> bool:
     return not addr.is_loopback
 
 
-def _ensure_tls_scheme(location: str) -> str:
-    """Rewrite a location to Arrow Flight's TLS scheme (``grpc+tls://``).
-
-    A TLS server binds a ``grpc+tls://`` location; callers commonly pass the
-    plaintext ``grpc://`` (default) or the client-facing ``grpcs://`` shorthand,
-    so accept either and normalize. An already-``grpc+tls://`` location is left
-    untouched.
-    """
-    for prefix in ("grpc://", "grpcs://"):
-        if location.startswith(prefix):
-            return "grpc+tls://" + location[len(prefix) :]
-    return location
-
-
 def to_flight_error(exc: Exception) -> flight.FlightError:
     """Map a tensor-server domain error to a typed Flight error at the boundary.
 
@@ -441,7 +427,7 @@ class TensorFlightServer(flight.FlightServerBase):
         # registration is the registry, cataloguing is a separate second step
         # and the registering caller's job (see ``metadata_db``).
         db = MetadataDatabase()
-        server = TensorFlightServer('grpc://0.0.0.0:8815', metadata_db=db)
+        server = TensorFlightServer('0.0.0.0:8815', metadata_db=db)
         db.sync_source_added('my-tensor', server.register_source('my-tensor', adapter))
         server.mark_ready()  # registration done -> health reports SERVING
         server.serve()
@@ -449,7 +435,7 @@ class TensorFlightServer(flight.FlightServerBase):
 
     def __init__(
         self,
-        location: str = "grpc://0.0.0.0:8815",
+        location: str = "0.0.0.0:8815",
         token: Optional[str] = None,
         writable: bool = False,
         write_dir: Optional[Path] = None,
@@ -467,7 +453,8 @@ class TensorFlightServer(flight.FlightServerBase):
         """Initialize the Flight server.
 
         Args:
-            location: Server location (e.g., 'grpc://0.0.0.0:8815')
+            location: ``host:port`` to bind, without a scheme (e.g.
+                '0.0.0.0:8815'); the scheme follows from ``tls_cert_chain``.
             token: The server-wide Bearer token (the catalog tier, and the
                 fallback for every source without a capability token of its
                 own). ``None`` disables it.
@@ -503,11 +490,10 @@ class TensorFlightServer(flight.FlightServerBase):
                 strictly read-only catalog.
             grpc_max_message_size: gRPC max message size in bytes (default: 16MB)
             tls_cert_chain: PEM-encoded server certificate chain. When supplied
-                together with ``tls_private_key`` the server serves TLS: the
-                location scheme is forced to ``grpc+tls://`` and clients must
-                connect with ``grpcs://`` (see ``TensorFlightClient``). Pass
-                neither for a plaintext ``grpc://`` server; passing exactly one
-                is an error.
+                together with ``tls_private_key`` the server serves TLS (bound as
+                ``grpc+tls://``) and clients must connect with ``grpcs://`` (see
+                ``TensorFlightClient``). Pass neither for a plaintext ``grpc://``
+                server; passing exactly one is an error.
             tls_private_key: PEM-encoded private key matching ``tls_cert_chain``.
             **kwargs: Additional arguments passed to FlightServerBase
         """
@@ -520,8 +506,13 @@ class TensorFlightServer(flight.FlightServerBase):
         # When the served certificate runs out, reported on ``health`` so a
         # caller can poll it (biopb/biopb#1117). None without TLS.
         self._tls_not_after: Optional[float] = None
+        if "://" in location:
+            raise ValueError(
+                f"location is 'host:port' without a scheme, got {location!r}: the "
+                "scheme follows from tls_cert_chain"
+            )
+        location = f"{'grpc' if tls_cert_chain is None else 'grpc+tls'}://{location}"
         if tls_cert_chain is not None:
-            location = _ensure_tls_scheme(location)
             kwargs["tls_certificates"] = [(tls_cert_chain, tls_private_key)]
             self._tls_not_after = cert_not_after(tls_cert_chain)
 
@@ -2222,13 +2213,13 @@ class TensorFlightServer(flight.FlightServerBase):
 
 
 def serve(
-    adapters: Dict[str, SourceAdapter], location: str = "grpc://0.0.0.0:8815", **kwargs
+    adapters: Dict[str, SourceAdapter], location: str = "0.0.0.0:8815", **kwargs
 ) -> None:
     """Start a Flight server with the given adapters.
 
     Args:
         adapters: Dictionary mapping source_id to SourceAdapter
-        location: Server location
+        location: ``host:port`` to bind, without a scheme
         **kwargs: Additional arguments passed to FlightServerBase
     """
     server = TensorFlightServer(location, **kwargs)

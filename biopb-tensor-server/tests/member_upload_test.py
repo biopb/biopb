@@ -131,7 +131,7 @@ class TestItSurvivesARestart:
         CacheManager.reset()
         CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
         server = catalog_server(
-            location="grpc://localhost:0", writable=True, write_dir=tmp_path / "w"
+            location="localhost:0", writable=True, write_dir=tmp_path / "w"
         )
         server.mark_ready()
         threading.Thread(target=server.serve, daemon=True).start()
@@ -175,9 +175,7 @@ class TestItSurvivesARestart:
         (tmp_path / "w").rename(moved)
         CacheManager.reset()
         CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
-        second = catalog_server(
-            location="grpc://localhost:0", writable=True, write_dir=moved
-        )
+        second = catalog_server(location="localhost:0", writable=True, write_dir=moved)
         try:
             assert second.sources.get(source) is not None
             assert [

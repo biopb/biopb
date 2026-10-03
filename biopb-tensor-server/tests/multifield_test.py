@@ -211,7 +211,7 @@ class TestMultifieldServerClient:
         ]
         adapter = MockMultifieldAdapter("multifield-test", tensor_specs)
 
-        server = catalog_server("grpc://localhost:0")
+        server = catalog_server("localhost:0")
         register_and_catalog(server, "multifield-test", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -242,7 +242,7 @@ class TestMultifieldServerClient:
         ]
         adapter = MockMultifieldAdapter("multifield-access", tensor_specs)
 
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         server.register_source("multifield-access", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -285,7 +285,7 @@ class TestMultifieldServerClient:
         ]
         adapter = MockMultifieldAdapter("multifield-default", tensor_specs)
 
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         server.register_source("multifield-default", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -325,7 +325,7 @@ class TestMultifieldServerClient:
         ]
         adapter = MockMultifieldAdapter("multi", tensor_specs)
 
-        server = catalog_server("grpc://localhost:0")
+        server = catalog_server("localhost:0")
         register_and_catalog(server, "multi", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -377,7 +377,7 @@ class TestMultifieldServerClient:
         ]
         adapter = MockMultifieldAdapter("mf-liberal", tensor_specs)
 
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         server.register_source("mf-liberal", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -410,7 +410,7 @@ class TestMultifieldServerClient:
         ]
         adapter = MockMultifieldAdapter("mf", tensor_specs)
 
-        server = catalog_server("grpc://localhost:0")
+        server = catalog_server("localhost:0")
         register_and_catalog(server, "mf", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -450,7 +450,7 @@ class TestMultifieldServerClient:
         ]
         adapter = MockMultifieldAdapter("mf-fetch", tensor_specs)
 
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         server.register_source("mf-fetch", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -483,7 +483,7 @@ class TestMultifieldServerClient:
         ]
         adapter = MockMultifieldAdapter("single-source", tensor_specs)
 
-        server = catalog_server("grpc://localhost:0")
+        server = catalog_server("localhost:0")
         register_and_catalog(server, "single-source", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)
@@ -661,7 +661,7 @@ class TestSameBareFieldNameAcrossSources:
             "aics_bbb", (181, 1024, 1024), [4.0, 0.1, 0.1], ["um", "um", "um"]
         )
 
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         server.register_source("aics_aaa", srcA)
         server.register_source("aics_bbb", srcB)
 

@@ -23,8 +23,7 @@ here. The seam is deliberately narrow:
     reads.
   * Reconciler -> SourceManager: one injected callable,
     ``notify_source_committed`` (the precache routing gate, owned by the startup
-    state), plus the shared ``monitored_dirs`` and
-    ``cloud_roots`` sets.
+    state), plus the shared :class:`~biopb_tensor_server.sources.roots.Roots`.
 
 The coarse single-writer mutex (a runtime add vs the periodic rescan) stays in
 ``SourceManager`` (``_catalog_lock``); the fine-grained state RLock (``_lock``,
@@ -61,6 +60,7 @@ from biopb_tensor_server.sources.entry_stat import (
     entry_change_time,
     entry_is_quiet,
 )
+from biopb_tensor_server.sources.roots import Roots
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import (
@@ -70,24 +70,6 @@ if TYPE_CHECKING:
     from biopb_tensor_server.serving.server import TensorFlightServer
 
 logger = logging.getLogger(__name__)
-
-
-def is_under_cloud_root(cloud_roots: Set[Path], path: str) -> bool:
-    """True when *path* is one of *cloud_roots* or lives under one.
-
-    Lexical: *path* is a claim (or walk) path, spelled under the root it was found
-    in, so it is never resolved -- a link under a cloud root is under it wherever it
-    points.
-
-    A free function so both the Reconciler (registration / signature policy) and
-    the SourceManager stability gate share one cloud-membership rule without
-    either object depending on the other.
-    """
-    if not cloud_roots:
-        return False
-    claim_path = Path(path)
-    # A snapshot: a drop can add a root while another thread is asking.
-    return any(claim_path.is_relative_to(root) for root in tuple(cloud_roots))
 
 
 # Consecutive rescans a monitored source may go undiscovered before it is removed.
@@ -147,8 +129,7 @@ class Reconciler:
         discovery_state: DiscoveryState,
         metadata_db: Optional[MetadataDatabase],
         credentials_config: Optional[Any],
-        monitored_dirs: Set[Path],
-        cloud_roots: Set[Path],
+        roots: Roots,
         notify_source_committed: Callable[[str], None],
         catalog_url_for: Callable[[SourceClaim], Optional[str]] = lambda claim: None,
         stability_window: float = 30.0,
@@ -158,9 +139,9 @@ class Reconciler:
         self._state = discovery_state
         self._metadata_db = metadata_db
         self._credentials_config = credentials_config
-        # Shared with SourceManager; read-only here for the monitored-claim scoping.
-        self._monitored_dirs = monitored_dirs
-        self._cloud_roots = cloud_roots
+        # Shared with SourceManager; read-only here (monitored-claim scoping, cloud
+        # policy).
+        self._roots = roots
         # Injected SourceManager seam (see module docstring).
         self._notify_source_committed = notify_source_committed
         # Display root for a newly discovered claim (a monitored root's alias);
@@ -227,10 +208,6 @@ class Reconciler:
                 if not claim.is_remote
             ]
 
-    def _is_under_cloud_root(self, path: str) -> bool:
-        """True when *path* is a cloud-opted root or lives under one."""
-        return is_under_cloud_root(self._cloud_roots, path)
-
     def _reconcile_discovered_state(
         self,
         discovered_state: DiscoveryState,
@@ -250,7 +227,7 @@ class Reconciler:
             current_claims = {
                 source_id: claim
                 for source_id, claim in self._state.claims.items()
-                if self._is_monitored_claim(claim)
+                if self._roots.is_monitored(claim.primary_path)
                 and (force_full or source_id not in self._cloud_source_ids)
             }
 
@@ -313,22 +290,6 @@ class Reconciler:
         for source_id in refreshed_ids:
             self._refresh_claim(discovered_claims[source_id])
 
-    def _is_monitored_claim(self, claim: SourceClaim) -> bool:
-        """Check if a claim belongs to one of the monitored local roots.
-
-        Lexical, like every containment test on a claim: the walk spelled it under
-        the root it found it in, so a symlinked file is under that root wherever
-        the link points.
-        """
-        if is_remote_url(claim.primary_path):
-            return False
-
-        claim_path = Path(claim.primary_path)
-        return any(
-            claim_path.is_relative_to(monitored_dir)
-            for monitored_dir in self._monitored_dirs
-        )
-
     def _claim_is_quiet(self, claim: SourceClaim) -> bool:
         """Has this claim stopped changing long enough to remove or rebuild it?
 
@@ -343,7 +304,7 @@ class Reconciler:
         case removal exists to act on. A cloud source bypasses the window, as the
         claim gate does -- a placeholder's mtime is not evidence of a write.
         """
-        if claim.source_id in self._cloud_source_ids or self._is_under_cloud_root(
+        if claim.source_id in self._cloud_source_ids or self._roots.is_cloud(
             claim.primary_path
         ):
             return True
@@ -371,7 +332,7 @@ class Reconciler:
         not flap a resolved source).
         """
         signatures: Dict[str, Tuple[Any, ...]] = {}
-        cloud = self._is_under_cloud_root(claim.primary_path)
+        cloud = self._roots.is_cloud(claim.primary_path)
         for member_path in sorted(claim.member_paths):
             try:
                 # `stat` follows symlinks, so it lands where an explicit
@@ -408,7 +369,7 @@ class Reconciler:
                 # drops them from ``current_ids`` -> a spurious re-add every cycle.
                 # Skipping also retires the per-cloud-claim ``Path.resolve()`` loop.
                 continue
-            if not self._is_monitored_claim(claim):
+            if not self._roots.is_monitored(claim.primary_path):
                 continue
             if claim.source_id in discovered_state.claims:
                 continue
@@ -498,7 +459,7 @@ class Reconciler:
         cloud-root source by a hash-set check (see _reconcile_discovered_state).
         """
         self._source_signatures[claim.source_id] = signatures
-        if self._is_under_cloud_root(claim.primary_path):
+        if self._roots.is_cloud(claim.primary_path):
             self._cloud_source_ids.add(claim.source_id)
         self._clear_failed_source_attempt(claim.source_id)
 
@@ -829,7 +790,7 @@ class Reconciler:
         """
         if claim.unresolved:
             return True
-        if not self._is_under_cloud_root(claim.primary_path):
+        if not self._roots.is_cloud(claim.primary_path):
             return False
         return self._claim_has_dehydrated_member(claim)
 
@@ -880,7 +841,7 @@ class Reconciler:
             claim = self._state.claims.get(source_id)
         if claim is None:
             return False
-        if not self._is_under_cloud_root(claim.primary_path):
+        if not self._roots.is_cloud(claim.primary_path):
             return True
         adapter = self._server.sources.get(source_id)
         if adapter is None:
@@ -931,7 +892,7 @@ class Reconciler:
         """
         if claim.source_type == "tensor-server":
             family = "tensor-server"
-        elif claim.unresolved or self._is_under_cloud_root(claim.primary_path):
+        elif claim.unresolved or self._roots.is_cloud(claim.primary_path):
             family = "cloud"
         elif is_remote_url(claim.primary_path):
             family = "remote-url"
@@ -983,7 +944,7 @@ class Reconciler:
                     self._registry,
                     credentials_config=self._credentials_config,
                     on_resolved=self._on_source_resolved,
-                    cloud_root=self._is_under_cloud_root(claim.primary_path),
+                    cloud_root=self._roots.is_cloud(claim.primary_path),
                 )
             else:
                 adapter_cls = self._registry.get_adapter_for_type(claim.source_type)

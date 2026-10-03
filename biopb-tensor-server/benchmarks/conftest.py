@@ -408,7 +408,7 @@ def bench_server(
     if existing_url:
         # Connect to existing server - no setup/teardown needed
         # Return a mock object with the URL for client fixtures
-        server = TensorFlightServer(existing_url)
+        server = TensorFlightServer(existing_url.removeprefix("grpc://"))
         server._bench_port = int(existing_url.split(":")[-1])
         server._bench_backend = "production"
         server._bench_cache_dir = temp_cache_dir
@@ -428,9 +428,7 @@ def bench_server(
     import random
 
     port = random.randint(8900, 8999)
-    server = TensorFlightServer(
-        f"grpc://localhost:{port}", metadata_db=MetadataDatabase()
-    )
+    server = TensorFlightServer(f"localhost:{port}", metadata_db=MetadataDatabase())
     server._bench_port = port
     server._bench_backend = "file"
     server._bench_cache_dir = temp_cache_dir

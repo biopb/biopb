@@ -269,7 +269,7 @@ def test_registering_on_a_bare_server_releases_into_its_own_catalog(per_plane_ti
 
     adapter = OmeTiffAdapter(per_plane_tiff, "perplane")
     adapter.list_tensor_descriptors()
-    server = catalog_server(location="grpc://localhost:0", writable=False)
+    server = catalog_server(location="localhost:0", writable=False)
     try:
         register_and_catalog(server, "perplane", adapter)
         assert adapter._raw_ome_xml_released is True

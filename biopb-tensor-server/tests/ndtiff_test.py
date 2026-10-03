@@ -413,7 +413,7 @@ class TestNdTiffServerClient:
         )
 
         # Start server
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         server.register_source("ndtiff-test", adapter)
 
         server_thread = threading.Thread(target=server.serve, daemon=True)

@@ -77,7 +77,7 @@ GATED = "gated/@fields/result"
 
 
 def _server(token):
-    server = TensorFlightServer("grpc://localhost:0", token=token)
+    server = TensorFlightServer("localhost:0", token=token)
     server.sources.register("open", _Adapter("open"))
     server.sources.register(
         "gated", _Adapter("gated", tensor_tokens={GATED: CAPABILITY})

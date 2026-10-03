@@ -60,9 +60,7 @@ class _Context:
 
 
 def _server(db, token=None):
-    return TensorFlightServer(
-        location="grpc://localhost:0", metadata_db=db, token=token
-    )
+    return TensorFlightServer(location="localhost:0", metadata_db=db, token=token)
 
 
 def test_one_flight_per_public_table_with_its_schema():
@@ -119,7 +117,7 @@ def test_a_catalog_less_server_serves_its_sources_but_lists_nothing():
     """``metadata_db=None`` is the embedded in-process cache's shape: the source
     registers and is addressable by id, and every catalog surface refuses with
     Unavailable rather than pretending the catalog is empty."""
-    server = TensorFlightServer(location="grpc://localhost:0")
+    server = TensorFlightServer(location="localhost:0")
     server.register_source("x", _CatalogAdapter("x"))
     assert server.metadata_db is None
     assert server.sources.get("x") is not None  # addressable by source_id
@@ -134,7 +132,7 @@ def test_registration_and_cataloguing_are_two_steps():
     """``register_source`` is the registry; the row is the registering caller's
     own second call, and ``unregister_source`` mirrors it."""
     db = MetadataDatabase()
-    server = TensorFlightServer(location="grpc://localhost:0", metadata_db=db)
+    server = TensorFlightServer(location="localhost:0", metadata_db=db)
     registered = server.register_source("x", _CatalogAdapter("x"))
     paths = {tuple(i.descriptor.path) for i in server.list_flights(_Context(), b"")}
     assert (b"sources",) in paths

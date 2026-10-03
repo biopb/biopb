@@ -300,7 +300,7 @@ def test_the_catalog_is_structural_and_get_flight_info_carries_the_grid(
     )
     db = MetadataDatabase()
     db.sync_source_added("oz", adapter)
-    server = TensorFlightServer(location="grpc://localhost:0", metadata_db=db)
+    server = TensorFlightServer(location="localhost:0", metadata_db=db)
     server.sources.replace({"oz": adapter})
 
     from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS

@@ -481,7 +481,7 @@ def test_generated_cert_serves_and_tofu_client_reads(simple_zarr_array):
     cert_pem, key_pem = ensure_server_cert()  # into the isolated state tree
 
     server = TensorFlightServer(
-        "grpc://localhost:0", tls_cert_chain=cert_pem, tls_private_key=key_pem
+        "localhost:0", tls_cert_chain=cert_pem, tls_private_key=key_pem
     )
     server.register_source("img", ZarrAdapter(arr, "img", ["y", "x"]))
     server.mark_ready()

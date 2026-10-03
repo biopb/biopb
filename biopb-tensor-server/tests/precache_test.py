@@ -15,7 +15,7 @@ from biopb_tensor_server.serving.precache import PrecacheWorker
 from biopb_tensor_server.serving.server import TensorFlightServer
 from google.protobuf.field_mask_pb2 import FieldMask
 
-from tests import catalog_server, register_and_catalog
+from tests import catalog_server, make_manager, register_and_catalog
 
 
 def _zarr_available() -> bool:
@@ -139,7 +139,7 @@ class TestAdvertisedPlanIsWhatIsWarmed:
 
 class TestFlightIdleProbe:
     def test_idle_when_no_traffic(self):
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         try:
             # last_active defaults to 0.0, monotonic() is large -> idle.
             assert server.flight_idle_for(0.0) is True
@@ -147,7 +147,7 @@ class TestFlightIdleProbe:
             server.shutdown()
 
     def test_not_idle_while_in_flight(self):
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         try:
             entered = threading.Event()
             release = threading.Event()
@@ -170,7 +170,7 @@ class TestFlightIdleProbe:
             server.shutdown()
 
     def test_debounce_window(self):
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         try:
             with server.activity.serving_request():
                 pass
@@ -203,7 +203,7 @@ class TestWarming:
         arr[:] = np.arange(int(np.prod(shape)), dtype="uint16").reshape(shape) % 1000
         labels = ["y", "x"]
         adapter = ZarrAdapter(arr, "warm-src", labels)
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         server.register_source("warm-src", adapter)
         return server
 
@@ -355,10 +355,9 @@ class TestWarming:
 class TestRuntimePhaseGating:
     def _bare_source_manager(self):
         from biopb_tensor_server.core.discovery import AdapterRegistry, DiscoveryState
-        from biopb_tensor_server.sources.source_manager import SourceManager
 
-        server = TensorFlightServer("grpc://localhost:0")
-        sm = SourceManager(
+        server = TensorFlightServer("localhost:0")
+        sm = make_manager(
             server=server,
             registry=AdapterRegistry(),
             discovery_state=DiscoveryState(),
@@ -479,7 +478,7 @@ class TestPreemptionAndLifecycle:
             )
             arr[:] = 7
             adapter = ZarrAdapter(arr, "pre-src", ["y", "x"])
-            server = TensorFlightServer("grpc://localhost:0")
+            server = TensorFlightServer("localhost:0")
             server.register_source("pre-src", adapter)
 
             worker = PrecacheWorker(server, PrecacheConfig(idle_debounce_seconds=0.05))
@@ -520,7 +519,7 @@ class TestPreemptionAndLifecycle:
             CacheManager.reset()
 
     def test_enqueue_dedup(self):
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         try:
             worker = PrecacheWorker(server, PrecacheConfig())
             worker.enqueue("a")
@@ -663,10 +662,9 @@ class TestBacklogSeeding:
 class TestIterLocalSourceMtimes:
     def _bare_sm(self):
         from biopb_tensor_server.core.discovery import AdapterRegistry, DiscoveryState
-        from biopb_tensor_server.sources.source_manager import SourceManager
 
-        server = TensorFlightServer("grpc://localhost:0")
-        sm = SourceManager(
+        server = TensorFlightServer("localhost:0")
+        sm = make_manager(
             server=server,
             registry=AdapterRegistry(),
             discovery_state=DiscoveryState(),
@@ -752,7 +750,7 @@ class TestBacklogWarming:
         from biopb_tensor_server.cache import CacheManager
 
         self._init_file_cache(tmp_path)
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         try:
             _register_zarr(server, tmp_path, "s-old")
             _register_zarr(server, tmp_path, "s-new")
@@ -776,7 +774,7 @@ class TestBacklogWarming:
         from biopb_tensor_server.cache import CacheManager
 
         self._init_file_cache(tmp_path)
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         try:
             _register_zarr(server, tmp_path, "live")
             _register_zarr(server, tmp_path, "backlog")
@@ -801,7 +799,7 @@ class TestBacklogWarming:
         from biopb_tensor_server.cache import CacheManager
 
         self._init_file_cache(tmp_path)
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         try:
             _register_zarr(server, tmp_path, "src")
             worker = PrecacheWorker(server, PrecacheConfig(idle_debounce_seconds=0.0))
@@ -823,7 +821,7 @@ class TestBacklogWarming:
         from biopb_tensor_server.cache import CacheManager
 
         self._init_file_cache(tmp_path)
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         try:
             _register_zarr(server, tmp_path, "src")
             worker = PrecacheWorker(server, PrecacheConfig(idle_debounce_seconds=0.0))
@@ -843,7 +841,7 @@ class TestBacklogWarming:
         from biopb_tensor_server.cache import CacheManager
 
         self._init_file_cache(tmp_path)
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         try:
             _register_zarr(server, tmp_path, "src")
             worker = PrecacheWorker(server, PrecacheConfig(idle_debounce_seconds=0.0))
@@ -863,7 +861,7 @@ class TestBacklogWarming:
         from biopb_tensor_server.cache import CacheManager
 
         self._init_file_cache(tmp_path)
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         try:
             _register_zarr(server, tmp_path, "src")
             worker = PrecacheWorker(
@@ -926,7 +924,7 @@ class TestSkipNativePyramid:
 
         CacheManager.reset()
         CacheManager.initialize(CacheConfig(file_cache_dir=tmp_path / "cache"))
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         try:
             adapter = self._ome_adapter(multires_ome_zarr)
             server.register_source("ome-native", adapter)
@@ -965,7 +963,7 @@ class TestSkipUnscaledCoarsestLevel:
         from biopb_tensor_server.cache import CacheManager
 
         self._init_file_cache(tmp_path)
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         try:
             adapter = _register_zarr(
                 server, tmp_path, "src", shape=shape, labels=labels, chunks=chunks
@@ -1486,7 +1484,7 @@ class TestAdvertisedPyramidDescriptor:
         return ZarrAdapter(arr, "big", ["y", "x"])
 
     def test_get_flight_info_advertises_computed_pyramid(self, tmp_path):
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         try:
             server.register_source("big", self._big_zarr_adapter(tmp_path))
             desc = self._descriptor(self._flight_info(server, "big", "big"))
@@ -1505,7 +1503,7 @@ class TestAdvertisedPyramidDescriptor:
 
         zarr_path, _lp, _z = multires_ome_zarr
         root = zarr.open_group(zarr_path, mode="r")
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         try:
             server.register_source("ome", OmeZarrAdapter(root["0"], "ome"))
             desc = self._descriptor(self._flight_info(server, "ome", "ome"))
@@ -1528,7 +1526,7 @@ class TestAdvertisedPyramidDescriptor:
             chunks=(8192,),
             dtype="uint8",
         )
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         try:
             server.register_source("line", ZarrAdapter(arr, "line", ["x"]))
             desc = self._descriptor(self._flight_info(server, "line", "line"))
@@ -1541,7 +1539,7 @@ class TestAdvertisedPyramidDescriptor:
     def test_the_catalog_leaves_pyramid_empty(self, tmp_path):
         from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS
 
-        server = catalog_server("grpc://localhost:0")
+        server = catalog_server("localhost:0")
         try:
             register_and_catalog(server, "big", self._big_zarr_adapter(tmp_path))
             rows = server.metadata_db.query(
@@ -1572,7 +1570,7 @@ class TestAdvertisedPyramidDescriptor:
         # set => the computed pyramid rides the descriptor.
         from biopb.tensor.descriptor_pb2 import TensorReadOption
 
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         try:
             server.register_source("big", self._big_zarr_adapter(tmp_path))
             bare = self._descriptor(
@@ -1598,7 +1596,7 @@ class TestAdvertisedPyramidDescriptor:
         # cheap call is the default and a read asks for "endpoints".
         from biopb.tensor.descriptor_pb2 import TensorReadOption
 
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         try:
             server.register_source("big", self._big_zarr_adapter(tmp_path))
             info = self._flight_info_opt(server, TensorReadOption(array_id="big"))
@@ -1616,7 +1614,7 @@ class TestAdvertisedPyramidDescriptor:
         # pyramid still honors its own mask, so describe+pyramid works without a plan.
         from biopb.tensor.descriptor_pb2 import TensorReadOption
 
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         try:
             server.register_source("big", self._big_zarr_adapter(tmp_path))
             info = self._flight_info_opt(
@@ -1648,7 +1646,7 @@ class TestPrecacheAdvertisedAlignment:
             dtype="uint8",
         )
         adapter = ZarrAdapter(arr, "big", ["y", "x"])
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         try:
             server.register_source("big", adapter)
             base_desc = adapter.get_tensor_descriptor()

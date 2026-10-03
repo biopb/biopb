@@ -1947,7 +1947,7 @@ class TestGetLevelAdapterContract:
                 .chunk_id
             )
 
-            server = TensorFlightServer("grpc://localhost:0")
+            server = TensorFlightServer("localhost:0")
             server.register_source("plate", plate)
             resolved = server._get_adapter_for_chunk(chunk_id)
             assert resolved.get_tensor_descriptor().array_id == field_id

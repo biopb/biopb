@@ -359,7 +359,7 @@ class TestRgbSamplesDescriptor:
 
         path = self._write_rgb_ome_tiff(tmp_path)
         adapter = OmeTiffAdapter(path, "rgb")
-        server = TensorFlightServer("grpc://localhost:0")
+        server = TensorFlightServer("localhost:0")
         server.register_source("rgb", adapter)
         server.mark_ready()
         try:
