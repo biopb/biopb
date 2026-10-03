@@ -219,12 +219,14 @@ def _probe_ome_files(path: Path) -> Optional[Tuple[str, ...]]:
 
 
 def _get_ome_files(
-    path: Path, signature: Optional[Signature] = None
+    path: Path, signature: Optional[Signature] = None, *, memoize: bool = True
 ) -> Optional[Tuple[str, ...]]:
     """What a TIFF's OME-XML refers to (see :func:`_probe_ome_files`), memoized on
     the file's identity so an unchanged file is not reopened on the next rescan.
     An unreadable file reads as having none, and is not memoized."""
     try:
+        if not memoize:
+            return _probe_ome_files(path)
         return _OME_PROBE_MEMO.get(path, lambda: _probe_ome_files(path), signature)
     except OSError:
         return None
@@ -1311,7 +1313,8 @@ class OmeTiffAdapter(TensorAdapter):
             # claims the .tif as an unresolved image.
             and ctx.is_resident()
         ):
-            referenced = _get_ome_files(ctx._path)
+            # Only a monitored root is walked again, so only its probes are kept.
+            referenced = _get_ome_files(ctx._path, memoize=ctx.monitored)
 
             if referenced is not None:
                 related_files = _existing_files(

@@ -59,10 +59,14 @@ def _read_header_summary(path: str) -> Tuple[bool, Optional[str]]:
     return image, (sys.intern(str(uid)) if uid is not None else None)
 
 
-def _header_summary(path: str) -> Optional[Tuple[bool, Optional[str]]]:
+def _header_summary(
+    path: str, *, memoize: bool = True
+) -> Optional[Tuple[bool, Optional[str]]]:
     """:func:`_read_header_summary`, memoized on the file's identity; ``None``
     for an unreadable file, which is not memoized."""
     try:
+        if not memoize:
+            return _read_header_summary(path)
         return _HEADER_MEMO.get(path, lambda: _read_header_summary(path))
     except OSError:
         return None
@@ -405,7 +409,7 @@ class DicomAdapter(TensorAdapter):
             if not ctx.is_remote and ctx._path is not None:
                 # A local file: the memoized header probe (shared with the series
                 # claim, which reads the same headers).
-                summary = _header_summary(str(ctx._path))
+                summary = _header_summary(str(ctx._path), memoize=ctx.monitored)
                 if summary is None or not summary[0]:
                     return None
             else:
@@ -697,7 +701,7 @@ class DicomSeriesAdapter(TensorAdapter):
             # decision independent of discovery order.
             series_to_files = {}
             for f in dcm_files:
-                summary = _header_summary(str(f))
+                summary = _header_summary(str(f), memoize=ctx.monitored)
                 if summary is None:
                     continue
                 image, series_uid = summary

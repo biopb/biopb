@@ -44,9 +44,10 @@ def _slices(directory, series_sizes):
             n += 1
 
 
-def _claim(directory):
+def _claim(directory, monitored=True):
     state = DiscoveryState()
-    return DicomSeriesAdapter.claim(ClaimContext(directory), state), state
+    ctx = ClaimContext(directory, monitored=monitored)
+    return DicomSeriesAdapter.claim(ctx, state), state
 
 
 def test_series_claim_takes_the_largest_series(tmp_path):
@@ -113,11 +114,22 @@ def test_single_file_claim_shares_the_memo(tmp_path, reads):
     _slices(tmp_path, [1])
     del reads[:]
     p = tmp_path / "s000.dcm"
-    claim = DicomAdapter.claim(ClaimContext(p), DiscoveryState())
+    claim = DicomAdapter.claim(ClaimContext(p, monitored=True), DiscoveryState())
     assert claim.source_type == "dicom"
     assert len(reads) == 1
-    DicomAdapter.claim(ClaimContext(p), DiscoveryState())
+    DicomAdapter.claim(ClaimContext(p, monitored=True), DiscoveryState())
     assert len(reads) == 1
+
+
+def test_only_a_monitored_root_is_memoized(tmp_path, reads):
+    _slices(tmp_path, [3])
+    del reads[:]
+    _claim(tmp_path, monitored=False)
+    _claim(tmp_path, monitored=False)
+    assert len(reads) == 6  # read every time
+    assert len(dicom_mod._HEADER_MEMO) == 0
+    _claim(tmp_path, monitored=True)
+    assert len(dicom_mod._HEADER_MEMO) == 3
 
 
 def test_single_file_claim_declines_non_dicom(tmp_path):
