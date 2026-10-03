@@ -26,13 +26,17 @@ def _xml(*refs, prefix="", quote='"'):
 @pytest.mark.parametrize(
     "xml, expected",
     [
-        (_xml("a.ome.tif", "b.ome.tif", "a.ome.tif"), ("a.ome.tif", "b.ome.tif")),
-        (_xml("z.tif", "a.tif"), ("z.tif", "a.tif")),  # document order, not sorted
-        (_xml("x.tif", prefix="ome:"), ("x.tif",)),
-        (_xml("x.tif", quote="'"), ("x.tif",)),
-        (_xml("a&amp;b.tif"), ("a&b.tif",)),
-        (b"<OME><Image/></OME>", ()),
-        (b"<OME><broken", ()),
+        pytest.param(
+            _xml("a.ome.tif", "b.ome.tif", "a.ome.tif"),
+            ("a.ome.tif", "b.ome.tif"),
+            id="distinct",
+        ),
+        pytest.param(_xml("z.tif", "a.tif"), ("z.tif", "a.tif"), id="document-order"),
+        pytest.param(_xml("x.tif", prefix="ome:"), ("x.tif",), id="namespaced"),
+        pytest.param(_xml("x.tif", quote="'"), ("x.tif",), id="single-quoted"),
+        pytest.param(_xml("a&amp;b.tif"), ("a&b.tif",), id="entity"),
+        pytest.param(b"<OME><Image/></OME>", (), id="no-references"),
+        pytest.param(b"<OME><broken", (), id="malformed"),
     ],
 )
 def test_files_from_ome_xml(xml, expected):
@@ -63,7 +67,15 @@ def test_probe_single_file_ome_has_no_references(tmp_path):
     assert _probe_ome_files(p) == ()
 
 
-@pytest.mark.parametrize("description", [None, "plain text", "x" * 100_000])
+# Short ids: pytest puts the id in an environment variable, which Windows caps.
+@pytest.mark.parametrize(
+    "description",
+    [
+        pytest.param(None, id="none"),
+        pytest.param("plain text", id="text"),
+        pytest.param("x" * 100_000, id="long"),
+    ],
+)
 def test_probe_none_without_ome_xml(tmp_path, description):
     p = tmp_path / "plain.tif"
     _write(p, description)
