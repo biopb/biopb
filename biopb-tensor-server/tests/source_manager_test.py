@@ -11,7 +11,9 @@ from biopb_tensor_server.core.discovery import (
     SourceClaim,
     generate_source_id,
 )
-from biopb_tensor_server.sources.source_manager import SourceManager
+from biopb_tensor_server.sources.roots import RootKind
+
+from tests import make_manager
 
 
 class _FakeAdapter:
@@ -194,7 +196,7 @@ def _make_manager(server, **kwargs):
     Centralizes the ``metadata_db=server._metadata_db`` injection so individual
     tests don't repeat it; all other SourceManager kwargs pass straight through.
     """
-    return SourceManager(server=server, metadata_db=server._metadata_db, **kwargs)
+    return make_manager(server=server, metadata_db=server._metadata_db, **kwargs)
 
 
 class TestOrphanClockSeam:
@@ -831,11 +833,11 @@ class TestMonitoredAlias:
             monitored_aliases={outer.resolve(): "o", inner.resolve(): "i"},
         )
         claim = SimpleNamespace(primary_path=str(inner / "x.dat"))
-        assert manager._monitored_catalog_url(claim) == "i/x.dat"
+        assert manager._roots.display_url(claim.primary_path) == "i/x.dat"
         claim = SimpleNamespace(primary_path=str(outer / "y.dat"))
-        assert manager._monitored_catalog_url(claim) == "o/y.dat"
+        assert manager._roots.display_url(claim.primary_path) == "o/y.dat"
         claim = SimpleNamespace(primary_path=str(tmp_path / "z.dat"))
-        assert manager._monitored_catalog_url(claim) is None
+        assert manager._roots.display_url(claim.primary_path) is None
 
 
 class TestUnavailableMonitoredRoot:
@@ -871,7 +873,9 @@ class TestUnavailableMonitoredRoot:
 
         assert list(state.claims) == [source_id]
         assert server.unregistered == []
-        assert monitored_dir in manager._monitored_dirs
+        assert monitored_dir in [
+            r.path for r in manager._roots.of_kind(RootKind.MONITORED)
+        ]
         assert caplog.text.count("is not available") == 1  # once, not per tick
 
         away.rename(monitored_dir)
@@ -1010,7 +1014,7 @@ class TestClaimSpelling:
 
         claim = SimpleNamespace(primary_path=str(root / "link.dat"))
 
-        assert manager._monitored_catalog_url(claim) == "lab/link.dat"
+        assert manager._roots.display_url(claim.primary_path) == "lab/link.dat"
 
     def test_a_symlinked_file_under_a_cloud_root_is_cloud(self, tmp_path):
         root = tmp_path / "data"
@@ -1018,8 +1022,8 @@ class TestClaimSpelling:
         self._link_into(root, tmp_path)
         _, _, manager = self._manager(root, cloud_roots={root})
 
-        assert manager._is_under_cloud_root(str(root / "link.dat"))
-        assert manager._reconciler._is_under_cloud_root(str(root / "link.dat"))
+        assert manager._roots.is_cloud(str(root / "link.dat"))
+        assert manager._reconciler._roots.is_cloud(str(root / "link.dat"))
 
     def test_a_dropped_link_whose_target_is_gone_is_removed(self, tmp_path):
         drop = tmp_path / "drop"
@@ -1662,18 +1666,6 @@ class TestSourceManagerRegressions:
             if "Failed to create adapter for source" in record.message
         ]
         assert len(error_records) == 2
-
-
-def _scan(manager):
-    """Run one signature refresh and return its {resolved_path_str: EntryState} map."""
-    snapshot = manager._scanner.scan(
-        monitored_dirs=manager._monitored_dirs,
-        cloud_roots=manager._cloud_roots,
-        force_full=True,
-        prev_entry_states=manager._entry_states,
-        prev_cloud_entry_states=manager._cloud_entry_states,
-    )
-    return snapshot.entry_states
 
 
 def test_get_file_identity_path_hash_fallback_distinguishes_zero_inode(tmp_path):

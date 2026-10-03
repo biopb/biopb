@@ -31,7 +31,7 @@ from biopb_tensor_server.core.discovery import (
 from biopb_tensor_server.sources import reconciler as rec_mod
 from biopb_tensor_server.sources.entry_stat import build_entry_signature
 
-from tests import catalog_server, register_and_catalog
+from tests import catalog_server, make_manager, register_and_catalog
 
 
 def _zarr_available():
@@ -567,9 +567,8 @@ class _FakeServer:
 
 def _make_manager(server, cloud_roots=None, monitored=None):
     from biopb_tensor_server.adapters import get_default_registry
-    from biopb_tensor_server.sources.source_manager import SourceManager
 
-    return SourceManager(
+    return make_manager(
         server=server,
         metadata_db=server._metadata_db,
         registry=get_default_registry(),
@@ -1679,8 +1678,8 @@ class TestDropCloudFolder:
 
         _drop(mgr, folder, cloud=True)
 
-        assert mgr._is_under_cloud_root(str(folder / "scan.nii"))
-        assert mgr._reconciler._is_under_cloud_root(str(folder / "scan.nii"))
+        assert mgr._roots.is_cloud(str(folder / "scan.nii"))
+        assert mgr._reconciler._roots.is_cloud(str(folder / "scan.nii"))
 
     def test_deregistering_the_drop_takes_the_cloud_root_with_it(
         self, tmp_path, force_nonresident
@@ -1688,12 +1687,12 @@ class TestDropCloudFolder:
         folder = self._folder(tmp_path)
         mgr = _make_manager(_FakeServer())
         _drop(mgr, folder, cloud=True)
-        assert mgr._is_under_cloud_root(str(folder / "scan.nii"))
+        assert mgr._roots.is_cloud(str(folder / "scan.nii"))
 
         mgr.remove_dropped_root("dnd://synced")
 
-        assert not mgr._is_under_cloud_root(str(folder / "scan.nii"))
-        assert not mgr._reconciler._is_under_cloud_root(str(folder / "scan.nii"))
+        assert not mgr._roots.is_cloud(str(folder / "scan.nii"))
+        assert not mgr._reconciler._roots.is_cloud(str(folder / "scan.nii"))
 
     def test_a_configured_cloud_root_survives_a_drop_being_deregistered(
         self, tmp_path, force_nonresident
@@ -1707,7 +1706,7 @@ class TestDropCloudFolder:
 
         mgr.remove_dropped_root("dnd://sub")
 
-        assert mgr._is_under_cloud_root(str(sub / "scan.nii"))
+        assert mgr._roots.is_cloud(str(sub / "scan.nii"))
 
     def test_a_drop_under_a_configured_cloud_root_needs_no_flag(
         self, tmp_path, force_nonresident
@@ -1735,7 +1734,7 @@ class TestDropCloudFolder:
         # (The payload is not a real NIfTI, so registration may fail; what is
         # pinned is that the walk skipped nothing and the root was not made cloud.)
         assert result.skipped_offline == 0
-        assert not mgr._is_under_cloud_root(str(folder))
+        assert not mgr._roots.is_cloud(str(folder))
 
 
 # --------------------------------------------------------------------------- #

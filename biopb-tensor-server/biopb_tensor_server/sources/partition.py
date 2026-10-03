@@ -18,6 +18,7 @@ from biopb_tensor_server.core.config import ServerConfig, SourceConfig
 from biopb_tensor_server.core.discovery import AdapterRegistry
 from biopb_tensor_server.serving.upload_manager import write_dir_under_root
 from biopb_tensor_server.sources.resolve import resolve_all_sources
+from biopb_tensor_server.sources.roots import Root, RootKind, Roots
 
 logger = logging.getLogger(__name__)
 
@@ -77,14 +78,22 @@ def route_source(s: SourceConfig) -> Route:
     return Route.STATIC
 
 
+_ROOT_KIND = {
+    Route.MONITORED: RootKind.MONITORED,
+    Route.UPSTREAM: RootKind.UPSTREAM,
+    Route.SCAN_ONCE: RootKind.SCAN_ONCE,
+}
+
+
 class SourcePartition(NamedTuple):
-    """The configured sources by route; ``static`` is already expanded."""
+    """The configured sources by route.
+
+    ``static`` is already expanded; everything the manager discovers after SERVING
+    (watched directories, scan-once directories, upstreams) is a root in ``roots``.
+    """
 
     static: List[SourceConfig]
-    # The rest are discovered by the manager after SERVING.
-    upstreams: List[SourceConfig]  # bare-host tensor servers, re-listed
-    monitored: List[SourceConfig]  # watched local directories
-    scan_once: List[SourceConfig]  # unwatched directories, walked once
+    roots: Roots
 
 
 def partition_sources(
@@ -101,20 +110,14 @@ def partition_sources(
     rescan. See :func:`route_source`.
     """
     to_expand: List[SourceConfig] = []
-    upstream_sources: List[SourceConfig] = []
-    monitored_sources: List[SourceConfig] = []
-    scan_once_sources: List[SourceConfig] = []
+    roots = Roots()
 
     for s in sources:
         route = route_source(s)
         if route is Route.STATIC:
             to_expand.append(s)
-        elif route is Route.UPSTREAM:
-            upstream_sources.append(s)
-        elif route is Route.SCAN_ONCE:
-            scan_once_sources.append(s)
         else:
-            monitored_sources.append(s)
+            roots.add(Root.from_config(s, _ROOT_KIND[route]))
 
     # tolerant=True so one missing or broken static source is warned-and-skipped
     # rather than killing the server.
@@ -126,7 +129,7 @@ def partition_sources(
 
     # A source an entry expands to may still land under a monitored root (a file
     # listed inside it); the rescan owns those. Remote sources are never under one.
-    monitored_dirs = {ms.local_path for ms in monitored_sources if ms.local_path}
+    monitored_dirs = {r.path for r in roots.of_kind(RootKind.MONITORED)}
     static_sources = [
         s
         for s in expanded
@@ -143,7 +146,7 @@ def partition_sources(
     # stats its chunk files, and a store being written keeps its directory busy.
     scanned_dirs = (
         monitored_dirs
-        | {s.local_path for s in scan_once_sources if s.local_path}
+        | {r.path for r in roots.of_kind(RootKind.SCAN_ONCE)}
         | {
             s.local_path
             for s in static_sources
@@ -160,6 +163,8 @@ def partition_sources(
             inside,
         )
 
-    return SourcePartition(
-        static_sources, upstream_sources, monitored_sources, scan_once_sources
-    )
+    for s in static_sources:
+        if s.cloud and s.local_path is not None:
+            roots.add(Root.from_config(s, RootKind.STATIC))
+
+    return SourcePartition(static_sources, roots)

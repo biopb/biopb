@@ -8,7 +8,6 @@ walked and diffed, so there are no per-path filesystem events to handle.
 
 from __future__ import annotations
 
-import itertools
 import logging
 import os
 import threading
@@ -34,8 +33,14 @@ from biopb_tensor_server.core.errors import UpstreamConfigError
 from biopb_tensor_server.core.remote import is_remote_url
 from biopb_tensor_server.sources.entry_stat import entry_change_time, entry_is_quiet
 from biopb_tensor_server.sources.partition import partition_sources
-from biopb_tensor_server.sources.reconciler import Reconciler, is_under_cloud_root
-from biopb_tensor_server.sources.resolve import _alias_catalog_url, _reroot_catalog_url
+from biopb_tensor_server.sources.reconciler import Reconciler
+from biopb_tensor_server.sources.roots import (  # noqa: F401  (re-exported)
+    DND_URL_PREFIX,
+    Root,
+    RootKind,
+    Roots,
+    _drop_catalog_url,
+)
 
 if TYPE_CHECKING:
     from biopb_tensor_server.serving.metadata_db import MetadataDatabase
@@ -62,51 +67,6 @@ _UPSTREAM_FAILURE_LOG_INTERVAL = 300.0
 # emits a heartbeat this often so the streamed action does not sit silent long
 # enough to trip a proxy idle read timeout.
 _ADD_SOURCE_ACQUIRE_HEARTBEAT = 5.0
-
-
-# Virtual scheme stamped on the catalog ``source_url`` of a drag-dropped source.
-# It marks the source's *origin* (a runtime drop, not config/discovery) and is the
-# key a future "remove dropped source" feature authorizes on: the drop re-root
-# guard below only stamps it when the drop is entirely new AND outside every
-# monitored root, so its presence means "user-added and nothing will re-add it."
-# It is a display-only scheme (like ``cache://``) — never touches ``source_id`` or
-# the raw ``_source_url`` used for I/O. Keep in sync with the client tree builders
-# that strip it: ``_get_path_parts`` (biopb-mcp ``tensor_browser/_widget.py``) and
-# ``getPathParts`` (web ``SourceTree.tsx``).
-DND_URL_PREFIX = "dnd://"
-
-
-def _drop_catalog_url(
-    dropped_root: str, primary_path: str, *, label: Optional[str] = None
-) -> str:
-    """Catalog ``source_url`` that re-roots a drag-dropped source under its drop's
-    label, under the ``dnd://`` origin scheme.
-
-    The label is the dropped item's basename unless the caller picked another (a
-    second drop of a same-named folder gets a distinct one, see
-    ``SourceManager._unique_drop_label``). The shared ``_reroot_catalog_url`` keeps
-    the source's place beneath the drop::
-
-        drop /home/u/data/exp.zarr           -> "dnd://exp.zarr"        (own root)
-        drop /home/u/data/exp/ (a folder) with
-             .../exp/a.tif, .../exp/sub/b.tif -> "dnd://exp/a.tif",
-                                                 "dnd://exp/sub/b.tif"
-
-    The marker means "user-added from outside every configured root, so nothing
-    will re-add it": it is what ``remove_source`` authorizes on. It is stamped on a
-    drop from outside every configured root that overlaps nothing, and on what a
-    re-drop inside such a drop adds; never under a monitored or ``monitor = false``
-    root.
-
-    Display-only (never ``source_id``, nor the raw ``_source_url`` the filesystem
-    uses); the client tree builders strip the scheme for display. The
-    configured-``alias`` re-root shares ``_reroot_catalog_url`` but is always
-    scheme-less, so the two re-root paths stay distinguishable.
-    """
-    dropped_root = str(dropped_root).rstrip("/\\")
-    if label is None:
-        label = os.path.basename(dropped_root) or dropped_root
-    return DND_URL_PREFIX + _reroot_catalog_url(label, dropped_root, primary_path)
 
 
 @dataclass
@@ -141,16 +101,12 @@ class SourceManager:
         server: TensorFlightServer,
         registry: AdapterRegistry,
         discovery_state: DiscoveryState,
-        monitored_dirs: Set[Path],
+        roots: Optional[Roots] = None,
         rescan_interval: float = 120.0,
         metadata_db: Optional[MetadataDatabase] = None,
         credentials_config: Optional[Any] = None,
         stability_window: float = 30.0,
         full_rescan_interval: float = 3600.0,
-        cloud_roots: Optional[Set[Path]] = None,
-        monitored_upstreams: Optional[List[SourceConfig]] = None,
-        scan_once_sources: Optional[List[SourceConfig]] = None,
-        monitored_aliases: Optional[Dict[Path, str]] = None,
         prune_unseen_days: int = 0,
     ):
         # Collaborators. The registry is kept for ``add_local_source``'s own
@@ -160,36 +116,17 @@ class SourceManager:
         self._registry = registry
         self._metadata_db = metadata_db
 
-        # What is watched. Under a cloud root (config ``cloud=true``) dehydrated
-        # entries are admitted and registered as unresolved sources that resolve
-        # on first access. Upstreams are bare-host ``grpc://`` tensor servers
-        # whose catalog is re-listed and reconciled like a directory walk; a
-        # single-source ``grpc://host/<id>`` entry is not here, having nothing to
-        # re-list.
-        self._monitored_dirs = monitored_dirs
+        # Every root, and what is true of each (alias, cloud, kind). Under a cloud
+        # root (config ``cloud=true``) dehydrated entries are admitted and
+        # registered as unresolved sources that resolve on first access. Upstreams
+        # are bare-host ``grpc://`` tensor servers whose catalog is re-listed and
+        # reconciled like a directory walk; a single-source ``grpc://host/<id>``
+        # entry is not a root, having nothing to re-list. Shared with the
+        # Reconciler.
+        self._roots = roots if roots is not None else Roots()
         # Monitored roots that could not be listed on the last walk, so a change
         # of state is logged once, not every tick.
         self._unavailable_roots: Set[Path] = set()
-        # Resolved monitored root -> configured ``alias``: the display root every
-        # source discovered under it is registered beneath.
-        self._monitored_aliases: Dict[Path, str] = monitored_aliases or {}
-        self._cloud_roots: Set[Path] = cloud_roots or set()
-        # Drops from outside every known root: ``dnd://`` label -> (the dropped
-        # path, whether the drop made it a cloud root), so deregistering the drop
-        # takes its consent back with it.
-        self._dropped_roots: Dict[str, Tuple[Path, bool]] = {}
-        self._monitored_upstreams: List[SourceConfig] = monitored_upstreams or []
-        # Configured directories that are catalogued but not watched
-        # (``monitor = false``): each is scanned once, by the first tick, and
-        # never again. Consumed by :meth:`_scan_pending_roots`.
-        self._scan_once_pending: List[SourceConfig] = scan_once_sources or []
-        # The same directories as persistent roots (path -> ``alias``), so a drop
-        # inside one is recognized after the first tick has consumed the list.
-        self._scan_once_roots: Dict[Path, Optional[str]] = {
-            source.local_path: source.alias
-            for source in (scan_once_sources or [])
-            if source.local_path is not None
-        }
 
         # Scan tuning. Nothing is kept between scans: every rescan walks the
         # monitored roots afresh (the one walker, ``discover_sources``), so a root
@@ -263,33 +200,15 @@ class SourceManager:
             discovery_state=discovery_state,
             metadata_db=metadata_db,
             credentials_config=credentials_config,
-            monitored_dirs=monitored_dirs,
-            cloud_roots=self._cloud_roots,
+            roots=self._roots,
             notify_source_committed=self._notify_source_committed,
-            catalog_url_for=self._monitored_catalog_url,
+            catalog_url_for=lambda claim: self._roots.display_url(claim.primary_path),
             stability_window=stability_window,
         )
 
-    def _monitored_catalog_url(self, claim: SourceClaim) -> Optional[str]:
-        """Display ``source_url`` for a source discovered under a monitored root
-        that has an ``alias``; ``None`` when there is none.
-
-        The innermost aliased root wins. Display-only, like a drop's re-root: the
-        source id still hashes the native path.
-        """
-        if not self._monitored_aliases:
-            return None
-        path = Path(claim.primary_path)
-        best = max(
-            (r for r in self._monitored_aliases if path.is_relative_to(r)),
-            key=lambda r: len(r.parts),
-            default=None,
-        )
-        if best is None:
-            return None
-        return _alias_catalog_url(
-            self._monitored_aliases[best], str(best), claim.primary_path
-        )
+    @property
+    def _monitored_upstreams(self) -> List[SourceConfig]:
+        return [r.source for r in self._roots.of_kind(RootKind.UPSTREAM)]
 
     def start(self) -> None:
         """Start the rescan loop.
@@ -513,32 +432,29 @@ class SourceManager:
 
         Caller holds ``_catalog_lock``.
         """
-        pending, self._scan_once_pending = self._scan_once_pending, []
-        for source in pending:
+        for root in self._roots.take_unscanned():
             try:
-                self._scan_configured_root(source)
+                self._scan_configured_root(root)
             except Exception:
                 # One bad root must not cost the others.
-                logger.exception("Could not scan configured directory %s", source.url)
+                logger.exception("Could not scan configured directory %s", root.url)
 
-    def _scan_configured_root(self, source: SourceConfig) -> None:
+    def _scan_configured_root(self, root: Root) -> None:
         """Register everything under one configured directory (see
         :meth:`_register_root`)."""
-        url = resolve_local_path(source.url)
+        url = root.url
         if not os.path.isdir(url):
-            logger.warning("Configured directory does not exist: %s", source.url)
+            logger.warning("Configured directory does not exist: %s", url)
             return
         # The config-line analogue of a drag-dropped folder becoming its own root:
-        # an `alias` re-roots everything found under it. Persistent here, because
-        # nothing rescans the root to re-merge it into the shared path tree.
-        alias = source.alias
+        # an `alias` re-roots everything found under it (``Roots.display_url``).
+        # Persistent here, because nothing rescans the root to re-merge it into the
+        # shared path tree.
         for event in self._register_root(
             url,
-            catalog_url_for=lambda claim: (
-                _alias_catalog_url(alias, url, claim.primary_path) if alias else None
-            ),
-            cloud=source.cloud,
-            dataset=source.dataset,
+            catalog_url_for=lambda claim: self._roots.display_url(claim.primary_path),
+            cloud=root.cloud,
+            dataset=root.source.dataset if root.source else None,
         ):
             if event[0] == "result":
                 for path, reason in event[1].failed:
@@ -551,7 +467,8 @@ class SourceManager:
         the progress flag and freshness stamp are left to
         :meth:`complete_initial_scan`, which runs after the upstream pass.
         """
-        if not self._monitored_dirs:
+        monitored = self._roots.of_kind(RootKind.MONITORED)
+        if not monitored:
             return
 
         force_full_rescan = self._should_force_full_rescan()
@@ -590,12 +507,12 @@ class SourceManager:
             # leave its sources registered (the reconcile scopes them out) rather
             # than re-walking it.
             report = WalkReport()
-            for monitored_dir in sorted(self._monitored_dirs):
+            for monitored_root in sorted(monitored, key=lambda r: r.url):
                 # Walked as stored, not resolved again: the root is canonical
                 # from config, so its claims are spelled under it however the
                 # path has changed since (a migration may have left a link).
-                root = monitored_dir
-                cloud = root in self._cloud_roots
+                root = monitored_root.path
+                cloud = monitored_root.cloud
                 if cloud and not force_full_rescan:
                     continue
                 if not self._root_is_listable(root):
@@ -684,7 +601,7 @@ class SourceManager:
         phase 2): mtime/ctime age is unreliable there (doc S1.2), so a placeholder
         could never stabilize, and archived dehydrated data is never mid-write.
         """
-        if self._is_under_cloud_root(str(path)):
+        if self._roots.is_cloud(str(path)):
             return True
         try:
             stat_result = os.stat(path)
@@ -694,15 +611,6 @@ class SourceManager:
         return entry_is_quiet(
             entry_change_time(stat_result, now), now, self._stability_window
         )
-
-    def _is_under_cloud_root(self, path: str) -> bool:
-        """True when *path* is a cloud-opted root or lives under one.
-
-        Consulted by the stability gate (:meth:`_should_claim`); shares
-        the cloud-membership rule with the Reconciler via the module free
-        function so neither object depends on the other.
-        """
-        return is_under_cloud_root(self._cloud_roots, path)
 
     def _notify_source_committed(self, source_id: str) -> None:
         """Precache routing gate for a freshly committed source (injected into
@@ -785,11 +693,9 @@ class SourceManager:
                     failed.append((source_id, "not present (already removed?)"))
             # Taking the drop away takes its label and its cloud consent too; a
             # later plain drop of the same folder must not inherit either.
-            dropped = self._dropped_roots.pop(
-                root_url[len(DND_URL_PREFIX) :].strip("/\\"), None
-            )
-            if dropped is not None and dropped[1]:
-                self._cloud_roots.discard(dropped[0])
+            dropped = self._roots.by_label(root_url[len(DND_URL_PREFIX) :].strip("/\\"))
+            if dropped is not None:
+                self._roots.remove(dropped)
         return removed, failed
 
     def _reconcile_due_upstreams(self) -> None:
@@ -819,7 +725,7 @@ class SourceManager:
             for upstream in due:
                 self._reconcile_and_reschedule(upstream)
         finally:
-            if not self._monitored_dirs and self._initial_scan_done:
+            if not self._roots.of_kind(RootKind.MONITORED) and self._initial_scan_done:
                 # Each completed pass re-verifies the (remote) catalog -> advance
                 # freshness. The first tick leaves that to complete_initial_scan.
                 self._mark_catalog_complete()
@@ -1090,42 +996,44 @@ class SourceManager:
         # long wait does not sit silent long enough to trip a proxy timeout.
         while not self._catalog_lock.acquire(timeout=_ADD_SOURCE_ACQUIRE_HEARTBEAT):
             yield ("progress", 0, "waiting for catalog scan to finish")
-        consented = False
         committed = False
+        new_root: Optional[Root] = None
         try:
             # Where the drop lands is read under the lock: a drop or a removal that
             # held it first may have added or taken away the root this lands in.
-            known = self._known_root(root_path)
-            if known is not None and cloud and not self._is_under_cloud_root(url):
+            known = self._roots.containing(root_path)
+            if known is not None and cloud and not self._roots.is_cloud(url):
                 # Cloud is a property of a root, set where the root is first added;
                 # a subfolder cannot turn it on afterwards, and there would be no
                 # drop to deregister to take it back.
                 raise ValueError(
-                    f"Cannot switch cloud mode on inside {known[1]}: it is set "
+                    f"Cannot switch cloud mode on inside {known.url}: it is set "
                     "where the folder is first added, or in the config"
                 )
-            # Cloud-ness belongs to the root, not to this call: once a root is
-            # cloud, the stability gate, the deferred registration, the precache
-            # residency check and the reconcile's cloud scoping all ask the same
-            # question of every path under it. So a consented drop records its
-            # root, and it stays cloud until that drop is deregistered. A path
-            # already under a configured cloud root is cloud whatever the request
-            # says.
-            if cloud and not self._is_under_cloud_root(url):
-                self._cloud_roots.add(root_path)
-                consented = True
-            cloud = self._is_under_cloud_root(url)
-
-            label = None if known is not None else self._unique_drop_label(root_path)
+            if known is None:
+                # Outside every known root, so a root of its own. Cloud-ness belongs
+                # to the root, not to this call: once a root is cloud, the stability
+                # gate, the deferred registration, the precache residency check and
+                # the reconcile's cloud scoping all ask the same question of every
+                # path under it. So a consented drop is a cloud root until that drop
+                # is deregistered. Added before registering, so the drop's own
+                # claims see it; taken back below if nothing is committed.
+                new_root = Root(
+                    RootKind.DROPPED,
+                    url,
+                    cloud=cloud,
+                    label=self._roots.unique_label(root_path),
+                )
+                self._roots.add(new_root)
             for event in self._register_root(
                 url,
                 source_type=source_type,
                 should_cancel=should_cancel,
-                catalog_url_for=lambda claim: self._drop_catalog_url_for(
-                    known, label, url, claim
+                catalog_url_for=lambda claim: self._roots.display_url(
+                    claim.primary_path
                 ),
-                cloud=cloud,
-                reject_overlap=known is None,
+                cloud=self._roots.is_cloud(url),
+                new_root=new_root,
             ):
                 if event[0] == "progress":
                     committed = committed or event[1] > 0
@@ -1133,70 +1041,9 @@ class SourceManager:
                     committed = bool(event[1].added)
                 yield event
         finally:
-            if known is None:
-                if committed:
-                    self._dropped_roots[label] = (root_path, consented)
-                elif consented:
-                    self._cloud_roots.discard(root_path)
+            if new_root is not None and not committed:
+                self._roots.remove(new_root)
             self._catalog_lock.release()
-
-    def _known_root(self, path: Path) -> Optional[Tuple[str, Path]]:
-        """The innermost configured or dropped root that ``path`` is at or under.
-
-        Lexical, on the resolved drop path against roots resolved once: a monitored
-        directory, a ``monitor = false`` directory, or the root of an earlier drop.
-        Returns ``(kind, root)`` or None.
-        """
-        roots = [
-            *(("monitored", r) for r in self._monitored_dirs),
-            *(("scan_once", r) for r in self._scan_once_roots),
-            *(("dropped", r) for r, _ in self._dropped_roots.values()),
-        ]
-        inside = [(kind, root) for kind, root in roots if path.is_relative_to(root)]
-        return max(inside, key=lambda kr: len(kr[1].parts), default=None)
-
-    def _unique_drop_label(self, root: Path) -> str:
-        """The ``dnd://`` label for a drop from outside every known root.
-
-        The basename, with a counter when another drop already holds it, so two
-        same-named folders from different parents are two roots, not one. No ``/``,
-        so one label is never a prefix of another's urls.
-        """
-        base = root.name or str(root)
-        label, n = base, 2
-        while label in self._dropped_roots:
-            label, n = f"{base} ({n})", n + 1
-        return label
-
-    def _drop_catalog_url_for(
-        self,
-        known: Optional[Tuple[str, Path]],
-        label: Optional[str],
-        url: str,
-        claim: SourceClaim,
-    ) -> Optional[str]:
-        """Display ``source_url`` for a source a drop adds.
-
-        Inside a known root it joins that root's display tree: the monitored root's
-        alias or the ``monitor = false`` root's alias (None without one, which
-        leaves the plain file url, and never marked: the rescan owns those), or an
-        earlier drop's own marked ``dnd://`` label, so the source is removed with
-        that drop. Outside, the new drop's own marked ``dnd://`` root.
-        """
-        if known is None:
-            return _drop_catalog_url(url, claim.primary_path, label=label)
-        kind, root = known
-        if kind == "monitored":
-            return self._monitored_catalog_url(claim)
-        if kind == "dropped":
-            earlier = next(
-                lab for lab, (r, _) in self._dropped_roots.items() if r == root
-            )
-            return _drop_catalog_url(str(root), claim.primary_path, label=earlier)
-        alias = self._scan_once_roots.get(root)
-        if alias:
-            return _alias_catalog_url(alias, str(root), claim.primary_path)
-        return None
 
     def _register_root(
         self,
@@ -1207,7 +1054,7 @@ class SourceManager:
         catalog_url_for: Callable[[SourceClaim], Optional[str]],
         cloud: bool = False,
         dataset: Optional[str] = None,
-        reject_overlap: bool = False,
+        new_root: Optional[Root] = None,
     ):
         """Claim everything at or under ``url`` and bring the catalog in line.
 
@@ -1219,10 +1066,9 @@ class SourceManager:
 
         ``catalog_url_for`` gives a NEW claim its display ``source_url`` override,
         or None. ``cloud`` scans ``url`` as a cloud root; ``dataset`` fills in an
-        HDF5 claim that needs one. ``reject_overlap`` refuses the whole root, before
-        anything is removed or committed, when it holds a source that is already
-        registered or an existing source lies under it: a root that is its own
-        display root must not share sources with another.
+        HDF5 claim that needs one. ``new_root`` is the root a drop has just added
+        for itself: it is refused whole, before anything is removed or committed,
+        when :meth:`Roots.check_overlap` finds it shares sources with another root.
         """
         is_dir = os.path.isdir(url)
         tally = AddSourceTally()
@@ -1279,20 +1125,15 @@ class SourceManager:
             if self._reconciler.has_claim(claim.source_id)
         }
 
-        if reject_overlap:
-            root_path = Path(url)
-            overlapping = already_ids or any(
-                Path(path).is_relative_to(root_path)
-                for _, path in self._reconciler.local_claim_paths()
+        if new_root is not None:
+            overlap = self._roots.check_overlap(
+                Path(url),
+                (path for _, path in self._reconciler.local_claim_paths()),
+                already_registered=bool(already_ids),
+                exclude=new_root,
             )
-            if overlapping:
-                tally.failed.append(
-                    (
-                        url,
-                        "overlaps sources that are already registered; drop a "
-                        "narrower path, or remove them first",
-                    )
-                )
+            if overlap:
+                tally.failed.append((url, overlap))
                 yield ("result", tally)
                 return
 
@@ -1411,7 +1252,7 @@ class SourceManager:
             again = self._registry.get_claims_for_path(
                 ClaimContext(
                     Path(claim.primary_path),
-                    cloud_root=self._is_under_cloud_root(claim.primary_path),
+                    cloud_root=self._roots.is_cloud(claim.primary_path),
                 ),
                 DiscoveryState(),
             )
@@ -1481,27 +1322,23 @@ def create_source_manager(
         credentials_config=credentials_config,
         write_dir=write_dir,
     )
-    monitored_dirs: Set[Path] = set()
-    monitored_aliases: Dict[Path, str] = {}
-    for source in partition.monitored:
-        local_path = source.local_path
-        monitored_dirs.add(local_path)
-        if source.alias:
-            monitored_aliases[local_path] = source.alias
-    for source in partition.upstreams:
+    roots = partition.roots
+    for root in roots.of_kind(RootKind.UPSTREAM):
         logger.info(
             "Tensor-server upstream %s: catalog re-listed in the background, "
             "not filesystem-watched",
-            source.url,
+            root.url,
         )
 
-    if not any(partition):
+    if not partition.static and not roots:
         logger.info("No sources configured yet; serving an empty catalog")
 
     # EXPERIMENTAL: cloud/synced-folder mode. The walk admits dehydrated entries,
     # and register placeholder adapters resolved lazily on first access.
-    cloud_roots: Set[Path] = set()
-    for source in itertools.chain.from_iterable(partition):
+    for source in (
+        *(r.source for r in roots if r.kind is not RootKind.STATIC),
+        *partition.static,
+    ):
         if source.cloud:
             # Warned once per configured cloud source at startup.
             logger.warning(
@@ -1510,10 +1347,6 @@ def create_source_manager(
                 "config surface may change without notice in a future release.",
                 source.url,
             )
-        if source.cloud and not source.is_remote:
-            local_path = source.local_path
-            if local_path is not None:
-                cloud_roots.add(local_path)
 
     # Create discovery state (empty - will be populated after SourceManager is created)
     discovery_state = DiscoveryState()
@@ -1523,16 +1356,12 @@ def create_source_manager(
         server=server,
         registry=registry,
         discovery_state=discovery_state,
-        monitored_dirs=monitored_dirs,
+        roots=roots,
         rescan_interval=rescan_interval,
         metadata_db=metadata_db,
         credentials_config=credentials_config,
         stability_window=stability_window,
         full_rescan_interval=full_rescan_interval,
-        cloud_roots=cloud_roots,
-        monitored_upstreams=partition.upstreams,
-        scan_once_sources=partition.scan_once,
-        monitored_aliases=monitored_aliases,
         prune_unseen_days=prune_unseen_days,
     )
 

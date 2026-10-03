@@ -25,6 +25,7 @@ from biopb_tensor_server.core.config import (
 )
 from biopb_tensor_server.sources.partition import partition_sources
 from biopb_tensor_server.sources.resolve import resolve_all_sources
+from biopb_tensor_server.sources.roots import RootKind
 
 
 def _write_tiff(path: str) -> None:
@@ -37,11 +38,22 @@ def _config(*sources: SourceConfig) -> ServerConfig:
 
 
 def _resolve_serve_sources(cfg: ServerConfig, registry=None):
-    return partition_sources(
+    """``(static, upstreams, monitored, scan_once)`` as config entries."""
+    static, roots = partition_sources(
         cfg.sources,
         registry,
         credentials_config=cfg.credentials,
         write_dir=cfg.write_dir,
+    )
+
+    def sources(kind):
+        return [r.source for r in roots.of_kind(kind)]
+
+    return (
+        static,
+        sources(RootKind.UPSTREAM),
+        sources(RootKind.MONITORED),
+        sources(RootKind.SCAN_ONCE),
     )
 
 

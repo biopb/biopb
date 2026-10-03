@@ -15,7 +15,7 @@ from biopb_tensor_server.serving.precache import PrecacheWorker
 from biopb_tensor_server.serving.server import TensorFlightServer
 from google.protobuf.field_mask_pb2 import FieldMask
 
-from tests import catalog_server, register_and_catalog
+from tests import catalog_server, make_manager, register_and_catalog
 
 
 def _zarr_available() -> bool:
@@ -355,10 +355,9 @@ class TestWarming:
 class TestRuntimePhaseGating:
     def _bare_source_manager(self):
         from biopb_tensor_server.core.discovery import AdapterRegistry, DiscoveryState
-        from biopb_tensor_server.sources.source_manager import SourceManager
 
         server = TensorFlightServer("localhost:0")
-        sm = SourceManager(
+        sm = make_manager(
             server=server,
             registry=AdapterRegistry(),
             discovery_state=DiscoveryState(),
@@ -663,10 +662,9 @@ class TestBacklogSeeding:
 class TestIterLocalSourceMtimes:
     def _bare_sm(self):
         from biopb_tensor_server.core.discovery import AdapterRegistry, DiscoveryState
-        from biopb_tensor_server.sources.source_manager import SourceManager
 
         server = TensorFlightServer("localhost:0")
-        sm = SourceManager(
+        sm = make_manager(
             server=server,
             registry=AdapterRegistry(),
             discovery_state=DiscoveryState(),

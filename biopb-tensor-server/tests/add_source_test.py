@@ -21,11 +21,10 @@ from biopb_tensor_server.core.adapter_base import catalog_tensors
 from biopb_tensor_server.core.discovery import DiscoveryState
 from biopb_tensor_server.sources.source_manager import (
     DND_URL_PREFIX,
-    SourceManager,
     _drop_catalog_url,
 )
 
-from tests import catalog_server
+from tests import catalog_server, make_manager
 
 
 def _zarr_available() -> bool:
@@ -56,7 +55,7 @@ def _make_manager(scanned=True, **kwargs):
     # real deployment. The reconciler is the only thing that writes it.
     server = catalog_server("localhost:0")
     kwargs.setdefault("monitored_dirs", set())
-    manager = SourceManager(
+    manager = make_manager(
         server=server,
         registry=get_default_registry(),
         discovery_state=DiscoveryState(),
@@ -431,7 +430,7 @@ class TestDropRules:
 
         _drain(manager.add_local_source(str(root), cloud=True))
 
-        assert manager._cloud_roots == set()
+        assert manager._roots.cloud_roots() == frozenset()
 
     def test_a_redrop_inside_a_drop_keeps_the_drops_mark(self, tmp_path):
         manager, server = _make_manager()
@@ -705,7 +704,7 @@ class TestAddedSourceSurvivesRescanUnderSkippedDir:
 
     def _manager(self, monitored_dirs):
         server = TensorFlightServer("localhost:0")
-        manager = SourceManager(
+        manager = make_manager(
             server=server,
             registry=get_default_registry(),
             discovery_state=DiscoveryState(),

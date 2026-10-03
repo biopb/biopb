@@ -48,6 +48,7 @@ from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 from biopb_tensor_server.serving.precache import PrecacheWorker
 from biopb_tensor_server.serving.server import TensorFlightServer
 from biopb_tensor_server.sources.resolve import resolve_all_sources
+from biopb_tensor_server.sources.roots import RootKind
 from biopb_tensor_server.sources.source_manager import create_source_manager
 
 app = typer.Typer(
@@ -794,21 +795,24 @@ def _setup_flight_server(
     )
 
     partition = source_manager.partition
+    monitored = partition.roots.of_kind(RootKind.MONITORED)
+    upstreams = partition.roots.of_kind(RootKind.UPSTREAM)
+    scan_once = partition.roots.of_kind(RootKind.SCAN_ONCE)
     if partition.static:
         console.print(
             f"[green]Loaded {len(partition.static)} static data source(s)[/green]"
         )
-    if partition.monitored:
+    if monitored:
         console.print(
-            f"[green]Monitoring {len(partition.monitored)} directory(s) for live updates[/green]"
+            f"[green]Monitoring {len(monitored)} directory(s) for live updates[/green]"
         )
-    if partition.upstreams:
+    if upstreams:
         console.print(
-            f"[green]Mirroring {len(partition.upstreams)} upstream tensor server(s)[/green]"
+            f"[green]Mirroring {len(upstreams)} upstream tensor server(s)[/green]"
         )
-    if partition.scan_once:
+    if scan_once:
         console.print(
-            f"[green]Scanning {len(partition.scan_once)} unwatched directory(s) once, in the background[/green]"
+            f"[green]Scanning {len(scan_once)} unwatched directory(s) once, in the background[/green]"
         )
 
     # Register hooks for `(de)register_local_path` actions: the server
@@ -839,13 +843,13 @@ def _setup_flight_server(
     # this itself on entry; pre-setting it closes the window between mark_ready()
     # and the loop's first tick, so a client never sees "SERVING, not scanning,
     # never scanned".
-    if partition.monitored or partition.upstreams or partition.scan_once:
+    if monitored or upstreams or scan_once:
         server.set_full_scan_in_progress(True)
 
     # The first scan runs in this loop's first tick, in the background, and its
     # tick also completes the startup protocol when there is nothing to scan.
     source_manager.start()
-    monitoring = [ms.url for ms in (*partition.monitored, *partition.upstreams)]
+    monitoring = [r.url for r in (*monitored, *upstreams)]
     if monitoring:
         console.print(f"[green]Started monitoring: {monitoring}[/green]")
 

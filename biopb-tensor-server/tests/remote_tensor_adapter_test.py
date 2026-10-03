@@ -16,7 +16,7 @@ import pyarrow as pa
 import pytest
 from google.protobuf.field_mask_pb2 import FieldMask
 
-from tests import catalog_server, register_and_catalog
+from tests import catalog_server, make_manager, register_and_catalog
 
 
 def _zarr_available() -> bool:
@@ -1339,7 +1339,6 @@ def test_monitored_upstream_relist_adds_and_removes(simple_zarr_array):
     from biopb_tensor_server.adapters import get_default_registry
     from biopb_tensor_server.core.config import SourceConfig
     from biopb_tensor_server.core.discovery import DiscoveryState
-    from biopb_tensor_server.sources.source_manager import SourceManager
 
     zarr_path, shape, _ = simple_zarr_array
     upstream, up_register, up_unregister = _db_upstream(zarr_path, ["img"])
@@ -1348,7 +1347,7 @@ def test_monitored_upstream_relist_adds_and_removes(simple_zarr_array):
         proxy = catalog_server("localhost:0")
         _serve(proxy)
         try:
-            manager = SourceManager(
+            manager = make_manager(
                 server=proxy,
                 registry=get_default_registry(),
                 discovery_state=DiscoveryState(),
@@ -1418,9 +1417,8 @@ def test_handle_rescan_walks_local_dirs_before_upstream_relist(tmp_path):
     from biopb_tensor_server.adapters import get_default_registry
     from biopb_tensor_server.core.config import SourceConfig
     from biopb_tensor_server.core.discovery import DiscoveryState
-    from biopb_tensor_server.sources.source_manager import SourceManager
 
-    manager = SourceManager(
+    manager = make_manager(
         server=MagicMock(),
         registry=get_default_registry(),
         discovery_state=DiscoveryState(),
@@ -1447,9 +1445,8 @@ def test_boot_tick_opens_the_precache_gate_after_the_upstream_relist(tmp_path):
     from biopb_tensor_server.adapters import get_default_registry
     from biopb_tensor_server.core.config import SourceConfig
     from biopb_tensor_server.core.discovery import DiscoveryState
-    from biopb_tensor_server.sources.source_manager import SourceManager
 
-    manager = SourceManager(
+    manager = make_manager(
         server=MagicMock(),
         registry=get_default_registry(),
         discovery_state=DiscoveryState(),
@@ -1488,7 +1485,6 @@ def test_failed_upstream_retried_on_fast_incremental_cadence(simple_zarr_array):
     from biopb_tensor_server.core.config import SourceConfig
     from biopb_tensor_server.core.discovery import DiscoveryState
     from biopb_tensor_server.serving.metadata_db import MetadataDatabase
-    from biopb_tensor_server.sources.source_manager import SourceManager
 
     zarr_path, _, _ = simple_zarr_array
     arr = zarr.open_array(zarr_path, mode="r")
@@ -1502,7 +1498,7 @@ def test_failed_upstream_retried_on_fast_incremental_cadence(simple_zarr_array):
     proxy = catalog_server("localhost:0")
     _serve(proxy)
     try:
-        manager = SourceManager(
+        manager = make_manager(
             server=proxy,
             registry=get_default_registry(),
             discovery_state=DiscoveryState(),
@@ -1548,7 +1544,6 @@ def test_stable_upstream_backs_off_then_resets_on_change(simple_zarr_array):
     from biopb_tensor_server.adapters import get_default_registry
     from biopb_tensor_server.core.config import SourceConfig
     from biopb_tensor_server.core.discovery import DiscoveryState
-    from biopb_tensor_server.sources.source_manager import SourceManager
 
     zarr_path, _, _ = simple_zarr_array
     upstream, up_register, _ = _db_upstream(zarr_path, ["img"])
@@ -1558,7 +1553,7 @@ def test_stable_upstream_backs_off_then_resets_on_change(simple_zarr_array):
         proxy = catalog_server("localhost:0")
         _serve(proxy)
         try:
-            manager = SourceManager(
+            manager = make_manager(
                 server=proxy,
                 registry=get_default_registry(),
                 discovery_state=DiscoveryState(),
@@ -1608,11 +1603,10 @@ class TestMisconfiguredUpstreamIsNotUnreachable:
         from biopb_tensor_server.adapters import get_default_registry
         from biopb_tensor_server.core.config import SourceConfig
         from biopb_tensor_server.core.discovery import DiscoveryState
-        from biopb_tensor_server.sources.source_manager import SourceManager
 
         upstream = SourceConfig(url=url, alias="lab", credentials_profile="lab-store")
         proxy = TensorFlightServer("localhost:0")
-        manager = SourceManager(
+        manager = make_manager(
             server=proxy,
             registry=get_default_registry(),
             discovery_state=DiscoveryState(),
@@ -1783,11 +1777,10 @@ class TestUnreachableUpstreamIsReportedOnAWindow:
         from biopb_tensor_server.adapters import get_default_registry
         from biopb_tensor_server.core.config import SourceConfig
         from biopb_tensor_server.core.discovery import DiscoveryState
-        from biopb_tensor_server.sources.source_manager import SourceManager
 
         upstream = SourceConfig(url=url, alias="lab")
         proxy = TensorFlightServer("localhost:0")
-        manager = SourceManager(
+        manager = make_manager(
             server=proxy,
             registry=get_default_registry(),
             discovery_state=DiscoveryState(),
@@ -2723,7 +2716,6 @@ def test_reconcile_bulk_seeds_adapters_without_per_source_rpc(simple_zarr_array)
     from biopb_tensor_server.core.config import SourceConfig
     from biopb_tensor_server.core.discovery import DiscoveryState
     from biopb_tensor_server.serving.metadata_db import MetadataDatabase
-    from biopb_tensor_server.sources.source_manager import SourceManager
 
     zarr_path, _, _ = simple_zarr_array
     upstream, _, _ = _db_upstream(zarr_path, ["img", "img2"])
@@ -2733,7 +2725,7 @@ def test_reconcile_bulk_seeds_adapters_without_per_source_rpc(simple_zarr_array)
         proxy = TensorFlightServer("localhost:0", metadata_db=local_db)
         _serve(proxy)
         try:
-            manager = SourceManager(
+            manager = make_manager(
                 server=proxy,
                 registry=get_default_registry(),
                 discovery_state=DiscoveryState(),
@@ -2784,7 +2776,6 @@ def test_a_failed_bulk_query_leaves_the_mirror_alone_and_syncs_nothing(
     from biopb_tensor_server.core.config import SourceConfig
     from biopb_tensor_server.core.discovery import DiscoveryState
     from biopb_tensor_server.serving.metadata_db import MetadataDatabase
-    from biopb_tensor_server.sources.source_manager import SourceManager
 
     zarr_path, _, _ = simple_zarr_array
     upstream, _, _ = _db_upstream(zarr_path, ["img", "img2"])
@@ -2794,7 +2785,7 @@ def test_a_failed_bulk_query_leaves_the_mirror_alone_and_syncs_nothing(
         proxy = TensorFlightServer("localhost:0", metadata_db=local_db)
         _serve(proxy)
         try:
-            manager = SourceManager(
+            manager = make_manager(
                 server=proxy,
                 registry=get_default_registry(),
                 discovery_state=DiscoveryState(),
@@ -2953,7 +2944,6 @@ def test_reconcile_mirrors_unresolved_then_refreshes_on_resolve():
     from biopb_tensor_server.core.config import SourceConfig
     from biopb_tensor_server.core.discovery import DiscoveryState
     from biopb_tensor_server.serving.metadata_db import MetadataDatabase
-    from biopb_tensor_server.sources.source_manager import SourceManager
 
     up_db = MetadataDatabase()
     upstream = TensorFlightServer("localhost:0", metadata_db=up_db)
@@ -2966,7 +2956,7 @@ def test_reconcile_mirrors_unresolved_then_refreshes_on_resolve():
         proxy = TensorFlightServer("localhost:0", metadata_db=local_db)
         _serve(proxy)
         try:
-            manager = SourceManager(
+            manager = make_manager(
                 server=proxy,
                 registry=get_default_registry(),
                 discovery_state=DiscoveryState(),
@@ -3046,7 +3036,6 @@ def test_relist_reads_full_rows_only_for_new_or_reregistered_sources(monkeypatch
     from biopb_tensor_server.core.config import SourceConfig
     from biopb_tensor_server.core.discovery import DiscoveryState
     from biopb_tensor_server.serving.metadata_db import MetadataDatabase
-    from biopb_tensor_server.sources.source_manager import SourceManager
 
     monkeypatch.setattr(remote_tensor, "FETCH_MAX_IDS", 2)
     queries = []
@@ -3072,7 +3061,7 @@ def test_relist_reads_full_rows_only_for_new_or_reregistered_sources(monkeypatch
         proxy = TensorFlightServer("localhost:0", metadata_db=local_db)
         _serve(proxy)
         try:
-            manager = SourceManager(
+            manager = make_manager(
                 server=proxy,
                 registry=get_default_registry(),
                 discovery_state=DiscoveryState(),
@@ -3195,14 +3184,13 @@ class TestAliasAndSchemeSurviveRegistration:
         from biopb_tensor_server.adapters import get_default_registry
         from biopb_tensor_server.core.config import SourceConfig
         from biopb_tensor_server.core.discovery import DiscoveryState
-        from biopb_tensor_server.sources.source_manager import SourceManager
 
         zarr_path, _, _ = simple_zarr_array
         upstream, _, _ = _db_upstream(zarr_path, ["img"])
         _serve(upstream)
         try:
             proxy = catalog_server("localhost:0")
-            manager = SourceManager(
+            manager = make_manager(
                 server=proxy,
                 registry=get_default_registry(),
                 discovery_state=DiscoveryState(),
