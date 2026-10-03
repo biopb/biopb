@@ -11,7 +11,7 @@ on a not-yet-mounted monitored directory. These tests pin the new behavior:
 - a single-file `monitor = true` entry becomes a static source;
 - the overlap filter still drops non-monitored expansions under a monitored root;
 - remote `monitor = true` stays both static and monitored;
-- `resolve_all_sources(sources=..., tolerant=...)` expands only the given subset
+- `resolve_all_sources(sources, tolerant=...)` expands only the given subset
   and skips unresolvable entries only when asked.
 """
 
@@ -23,8 +23,8 @@ from biopb_tensor_server.core.config import (
     ServerConfig,
     SourceConfig,
 )
-from biopb_tensor_server.sources.resolve import resolve_all_sources
-from biopb_tensor_server.sources.roots import RootKind, partition_sources
+from biopb_tensor_server.sources.resolve import partition_sources, resolve_all_sources
+from biopb_tensor_server.sources.roots import RootKind
 
 
 def _write_tiff(path: str) -> None:
@@ -405,11 +405,11 @@ class TestResolveAllSourcesOverrides:
         src_b = SourceConfig(url=str(b))
         cfg = _config(src_a, src_b)
 
-        only_a = resolve_all_sources(cfg, sources=[src_a])
+        only_a = resolve_all_sources([src_a])
         assert [s.local_path for s in only_a] == [a.resolve()]
 
         # No-arg call is unchanged: expands every config source.
-        both = resolve_all_sources(cfg)
+        both = resolve_all_sources(cfg.sources)
         assert {s.local_path for s in both} == {a.resolve(), b.resolve()}
 
     def test_tolerant_skips_unresolvable_entry(self, tmp_path):
@@ -421,11 +421,13 @@ class TestResolveAllSourcesOverrides:
         good_src = SourceConfig(url=str(good))
         cfg = _config(missing, good_src)
 
-        resolved = resolve_all_sources(cfg, tolerant=True)
+        resolved = resolve_all_sources(
+            cfg.sources, credentials_config=cfg.credentials, tolerant=True
+        )
         assert [s.local_path for s in resolved] == [good.resolve()]
 
         with pytest.raises(ValueError):
-            resolve_all_sources(cfg, tolerant=False)
+            resolve_all_sources(cfg.sources, tolerant=False)
 
     def test_a_broken_trust_anchor_is_reported_as_config_not_a_missing_path(
         self, tmp_path, caplog
@@ -460,7 +462,9 @@ class TestResolveAllSourcesOverrides:
         )
 
         with caplog.at_level("ERROR"):
-            resolved = resolve_all_sources(cfg, tolerant=True)
+            resolved = resolve_all_sources(
+                cfg.sources, credentials_config=cfg.credentials, tolerant=True
+            )
 
         # The healthy source is still served; the broken one is named loudly.
         assert [s.local_path for s in resolved] == [good.resolve()]
@@ -475,33 +479,33 @@ class TestAliasTreeRoot:
     The override is display-only and honored on the static/expand path only.
     """
 
-    def test_alias_catalog_url_single_source_is_bare_root(self):
-        from biopb_tensor_server.sources.resolve import _alias_catalog_url
+    def testreroot_catalog_url_single_source_is_bare_root(self):
+        from biopb_tensor_server.sources.roots import reroot_catalog_url
 
         # Configured entry IS the source (file / dataset dir): alias is the root.
-        assert _alias_catalog_url("exp", "/data/exp.zarr", "/data/exp.zarr") == "exp"
+        assert reroot_catalog_url("exp", "/data/exp.zarr", "/data/exp.zarr") == "exp"
 
-    def test_alias_catalog_url_preserves_subtree(self):
-        from biopb_tensor_server.sources.resolve import _alias_catalog_url
+    def testreroot_catalog_url_preserves_subtree(self):
+        from biopb_tensor_server.sources.roots import reroot_catalog_url
 
-        assert _alias_catalog_url("exp", "/data/exp", "/data/exp/a.tif") == "exp/a.tif"
+        assert reroot_catalog_url("exp", "/data/exp", "/data/exp/a.tif") == "exp/a.tif"
         assert (
-            _alias_catalog_url("exp", "/data/exp", "/data/exp/sub/b.tif")
+            reroot_catalog_url("exp", "/data/exp", "/data/exp/sub/b.tif")
             == "exp/sub/b.tif"
         )
 
-    def test_alias_catalog_url_non_relativizable_is_bare_root(self):
-        from biopb_tensor_server.sources.resolve import _alias_catalog_url
+    def testreroot_catalog_url_non_relativizable_is_bare_root(self):
+        from biopb_tensor_server.sources.roots import reroot_catalog_url
 
         # Primary not under the root (defensive) -> alias-only root, never "../".
-        assert _alias_catalog_url("exp", "/data/exp", "/elsewhere/x.tif") == "exp"
+        assert reroot_catalog_url("exp", "/data/exp", "/elsewhere/x.tif") == "exp"
 
     def test_single_file_alias_sets_catalog_url(self, tmp_path):
         f = tmp_path / "img.tif"
         _write_tiff(str(f))
         cfg = _config(SourceConfig(url=str(f), alias="myroot"))
 
-        resolved = resolve_all_sources(cfg)
+        resolved = resolve_all_sources(cfg.sources)
 
         assert len(resolved) == 1
         assert resolved[0]._catalog_url == "myroot"
@@ -514,7 +518,7 @@ class TestAliasTreeRoot:
         _write_tiff(str(root / "sub" / "b.tif"))
         cfg = _config(SourceConfig(url=str(root), alias="exp"))
 
-        resolved = resolve_all_sources(cfg)
+        resolved = resolve_all_sources(cfg.sources)
 
         assert sorted(s._catalog_url for s in resolved) == [
             "exp/a.tif",
@@ -526,7 +530,7 @@ class TestAliasTreeRoot:
         _write_tiff(str(f))
         cfg = _config(SourceConfig(url=str(f)))
 
-        resolved = resolve_all_sources(cfg)
+        resolved = resolve_all_sources(cfg.sources)
 
         assert resolved[0]._catalog_url is None
 
@@ -535,7 +539,7 @@ class TestAliasTreeRoot:
         namespace meaning -- it is NOT turned into a display tree-root override."""
         cfg = _config(SourceConfig(url="s3://bucket/k.zarr", type="zarr", alias="x"))
 
-        resolved = resolve_all_sources(cfg)
+        resolved = resolve_all_sources(cfg.sources)
 
         assert resolved[0]._catalog_url is None
         assert resolved[0].alias == "x"  # untouched

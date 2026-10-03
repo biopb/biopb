@@ -1161,7 +1161,9 @@ def validate(
 
     try:
         server_config = load_config(config)
-        sources = resolve_all_sources(server_config)
+        sources = resolve_all_sources(
+            server_config.sources, credentials_config=server_config.credentials
+        )
         trust_problems = _unreadable_trust_anchors(server_config)
     except Exception as e:
         # Escaped: a validation message names its section as "[pyramid]", which
@@ -1202,7 +1204,9 @@ def list_tensors(
     """
     try:
         server_config = load_config(config)
-        sources = resolve_all_sources(server_config)
+        sources = resolve_all_sources(
+            server_config.sources, credentials_config=server_config.credentials
+        )
 
         table = Table(title="Data Sources and Tensors")
         table.add_column("Source ID", style="cyan")

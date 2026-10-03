@@ -2,10 +2,11 @@
 
 A config entry is a request -- "serve /data", "mirror grpc://lab:8815" -- not a
 source. This is where it becomes a list of concrete :class:`SourceConfig`
-objects: directories walked through the adapters' ``claim()`` protocol, grpc
+objects (and, on the serve path, the :class:`~.roots.Roots` that are not expanded
+here but registered after the server is SERVING): directories walked through the adapters' ``claim()`` protocol, grpc
 endpoints expanded by listing the upstream catalog.
 
-Layering: resolution sits *above* the adapters, which is why it is not in
+Layering: resolution sits *above* the adapters and :mod:`.roots`, which is why it is not in
 ``core.config``. The dataclasses there are imported by ``cache``, ``adapters``,
 ``serving`` and ``sources``, so ``core.config`` has to stay below all of them and
 could only reach the adapter registry through a deferred import -- one that
@@ -17,19 +18,19 @@ validate boot path only, so it lives here and imports the registry outright.
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import replace
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 from biopb_tensor_server.adapters import get_default_registry
 from biopb_tensor_server.adapters.remote_tensor import (
     _split_grpc_url,
+    is_bare_host_upstream_url,
     list_upstream_source_ids,
     mirrorable_upstream_id,
     resolve_upstream_credentials,
 )
 from biopb_tensor_server.core.config import (
-    ServerConfig,
     SourceConfig,
     detect_source_type,
 )
@@ -43,11 +44,18 @@ from biopb_tensor_server.core.discovery import (
     get_file_identity,
 )
 from biopb_tensor_server.core.errors import UpstreamConfigError
+from biopb_tensor_server.serving.upload_manager import write_dir_under_root
+from biopb_tensor_server.sources.roots import (
+    Root,
+    RootKind,
+    Roots,
+    reroot_catalog_url,
+)
 
 logger = logging.getLogger(__name__)
 
 
-def _namespaced_source_id(alias: Optional[str], upstream_source_id: str) -> str:
+def namespaced_source_id(alias: Optional[str], upstream_source_id: str) -> str:
     """Local source_id for a mirrored upstream source.
 
     The proxy serves many upstreams + local sources from one flat, source_id-keyed
@@ -105,7 +113,7 @@ def _discover_tensor_server(
                 f"has a deadline set by that server. Upload what you need to "
                 f"keep onto a source of its own."
             )
-        local_id = _namespaced_source_id(source.alias, upstream_source_id)
+        local_id = namespaced_source_id(source.alias, upstream_source_id)
         return [replace(source, source_id=local_id)]
 
     # Bare-host form: mirror every source on the upstream. Enumerate via the
@@ -133,7 +141,7 @@ def _discover_tensor_server(
 
     expanded = []
     for upstream_id in upstream_ids:
-        local_id = _namespaced_source_id(source.alias, upstream_id)
+        local_id = namespaced_source_id(source.alias, upstream_id)
         expanded.append(
             replace(
                 source,
@@ -176,52 +184,6 @@ def _resolve_tensor_server_id_collisions(
         seen.setdefault(src.source_id, src)
         result.append(src)
     return result
-
-
-def _reroot_catalog_url(label: str, root_path: str, primary_path: str) -> str:
-    """Re-root ``primary_path`` under ``label``, preserving its position beneath
-    ``root_path``. Shared core of the two re-rooting entry points -- drag-drop
-    (``SourceManager._drop_catalog_url``, ``label`` = the dropped item's basename)
-    and a configured ``alias`` (``_alias_catalog_url``, ``label`` = the alias).
-
-    The tensor-browser (and web viewer) build their tree by splitting each
-    source's ``source_url`` on ``/``, so ``label`` becomes the top-level root and
-    the sub-structure beneath ``root_path`` is preserved under it:
-
-        root /data/exp, primary /data/exp            -> "<label>"
-        root /data/exp, primary /data/exp/sub/b.tif  -> "<label>/sub/b.tif"
-
-    Display-only: it feeds the descriptor's ``source_url`` and never the
-    ``source_id`` (which hashes the raw path), so a bare virtual path with no
-    scheme is fine.
-    """
-    try:
-        rel = os.path.relpath(str(primary_path), str(root_path)).replace("\\", "/")
-    except ValueError:  # different drive on Windows, etc. -- can't relativize
-        rel = "."
-    if rel in (".", "") or rel.startswith("../"):
-        # primary IS the root (single file / dataset dir), or (defensively) not
-        # under it -- keep the whole thing as one root, never emit a "../" url.
-        return label
-    return f"{label}/{rel}"
-
-
-def _alias_catalog_url(alias: str, root_path: str, primary_path: str) -> str:
-    """Catalog ``source_url`` that re-roots a configured local source under ``alias``.
-
-    The config-line analogue of ``SourceManager._drop_catalog_url``: the root
-    label is the configured ``alias`` (rather than a dropped item's basename), and
-    the sub-structure of a configured folder is preserved relative to it:
-
-        alias "exp", configure /data/exp/            (root_path == primary_path)
-            -> "exp"
-        alias "exp", configure folder /data/exp/ with
-            .../exp/a.tif, .../exp/sub/b.tif -> "exp/a.tif", "exp/sub/b.tif"
-
-    Display-only (never touches ``source_id``). Applied on the static / one-shot
-    expand path, and to what a monitored directory's walk discovers.
-    """
-    return _reroot_catalog_url(alias, root_path, primary_path)
 
 
 def discover_sources(
@@ -291,24 +253,22 @@ def discover_sources(
     if source.type and source.source_id:
         return [source]
 
-    # Case 2: File with no type - try claim-based detection
+    # Case 2/3: no type -> claim-based detection. A file, or a directory that is
+    # itself a data source, is claimed whole; cloud_root carries the multi-file ban
+    # (OME-TIFF/DICOM-series -> single file) onto a directly-configured cloud path,
+    # matching the monitored path.
+    ctx = ClaimContext(local_path, cloud_root=source.cloud)
+    state = DiscoveryState()
+    try:
+        state.visited_identities.add(get_file_identity(local_path))
+    except OSError:
+        pass
+
+    claims = registry.get_claims_for_path(ctx, state)
+    if claims:
+        return [_claim_to_source_config(claims[0], source)]
+
     if local_path.is_file():
-        # Try claim-based detection first. cloud_root carries the multi-file ban
-        # (OME-TIFF/DICOM-series -> single file) onto a directly-configured cloud
-        # file, matching the monitored path.
-        ctx = ClaimContext(local_path, cloud_root=source.cloud)
-        state = DiscoveryState()
-        try:
-            identity = get_file_identity(local_path)
-            state.visited_identities.add(identity)
-        except OSError:
-            pass
-
-        claims = registry.get_claims_for_path(ctx, state)
-        if claims:
-            claim = claims[0]
-            return [_claim_to_source_config(claim, source)]
-
         # No adapter recognized the file. There is no legacy fallback: format
         # detection lives only in the adapters (biopb/biopb#277 item B), so an
         # unclaimed file is a hard error rather than a guessed (often wrong) type.
@@ -316,21 +276,6 @@ def discover_sources(
             f"Could not detect type for file: {local_path}. "
             f"Please specify 'type' explicitly in config."
         )
-
-    # Case 3: Directory with no type - use claim-based discovery.
-    # First check if the directory itself is a data source
-    ctx = ClaimContext(local_path, cloud_root=source.cloud)
-    state = DiscoveryState()
-    try:
-        identity = get_file_identity(local_path)
-        state.visited_identities.add(identity)
-    except OSError:
-        pass
-
-    claims = registry.get_claims_for_path(ctx, state)
-    if claims:
-        claim = claims[0]
-        return [_claim_to_source_config(claim, source)]
 
     # Directory is not itself a data source - do recursive claim-based scan. Under
     # a cloud root, admit dehydrated placeholders so the one-shot startup scan of a
@@ -381,24 +326,21 @@ def _claim_to_source_config(
 
 
 def resolve_all_sources(
-    config: ServerConfig,
+    sources: List[SourceConfig],
     registry: Optional[AdapterRegistry] = None,
     *,
-    sources: Optional[List[SourceConfig]] = None,
+    credentials_config: Optional[Any] = None,
     tolerant: bool = False,
 ) -> List[SourceConfig]:
-    """Resolve all sources in config, expanding directories.
+    """Expand configured source entries into concrete sources.
 
     Uses claim-based discovery for automatic source detection.
 
     Args:
-        config: Server configuration
+        sources: The configured ``[[sources]]`` entries.
         registry: Optional adapter registry (uses default if None)
-        sources: Optional explicit list of source entries to expand. When None,
-            ``config.sources`` is used. The serve path passes a filtered subset
-            (local ``monitor=true`` directories are discovered by the rescan
-            instead, not expanded here) to avoid an extra pre-bind walk that also
-            crashes on a not-yet-mounted directory (biopb/biopb#54).
+        credentials_config: Optional CredentialsConfig, to authenticate an
+            upstream listing.
         tolerant: When True, a source that fails to resolve (e.g. a missing
             static path) is logged and skipped instead of aborting the whole
             expansion. Used by the serve path so one bad entry cannot take down
@@ -411,13 +353,10 @@ def resolve_all_sources(
     if registry is None:
         registry = get_default_registry()
 
-    source_list = sources if sources is not None else config.sources
-    credentials_config = getattr(config, "credentials", None)
-
     all_sources = []
     hdf5_warnings = []
 
-    for source in source_list:
+    for source in sources:
         try:
             discovered = discover_sources(source, registry, credentials_config)
         except UpstreamConfigError as e:
@@ -455,16 +394,15 @@ def resolve_all_sources(
         # reaches here (it is discovered by the rescan, not expanded), so its alias
         # is correctly never applied -- see partition_sources's warning.
         reroot = bool(source.alias) and not source.is_remote
-        root_path = source.local_path if reroot else None
         for src in discovered:
             # Track HDF5 sources that need dataset config
             if src.type == "hdf5" and src.dataset is None:
                 hdf5_warnings.append(src.url)
-            if reroot and root_path is not None:
+            if reroot:
                 src = replace(
                     src,
-                    _catalog_url=_alias_catalog_url(
-                        source.alias, str(root_path), src.url
+                    _catalog_url=reroot_catalog_url(
+                        source.alias, str(source.local_path), src.url
                     ),
                 )
             all_sources.append(src)
@@ -486,3 +424,106 @@ def resolve_all_sources(
             print(f"  ... and {len(hdf5_warnings) - 5} more")
 
     return all_sources
+
+
+def route_source(s: SourceConfig) -> Optional[RootKind]:
+    """Where a configured source goes on the serve path: the kind of root it
+    becomes, or None for a single remote source, which is registered as it is.
+    Logs why when that is not what the entry asked for.
+
+    Every local path is discovered by the manager after the server is SERVING, never
+    expanded here: that would walk the tree an extra time before the server binds,
+    and crash on a not-yet-mounted directory (biopb/biopb#54).
+    """
+    if s.is_remote:
+        # A bare-host tensor-server upstream ("mirror everything") holds many
+        # sources of its own, so it always goes to the manager's background
+        # re-list. Every other remote (s3://, ...) names a single source.
+        return RootKind.UPSTREAM if is_bare_host_upstream_url(s.url) else None
+
+    path = s.local_path
+    if path.is_file():
+        if s.monitor:
+            logger.warning(
+                "Cannot live-monitor a single file; registering it once instead: %s",
+                s.url,
+            )
+        return RootKind.SCAN_ONCE
+
+    if s.monitor:
+        if not path.exists():
+            logger.warning(
+                "Monitored path does not exist yet; will start monitoring when it "
+                "appears: %s",
+                s.url,
+            )
+        return RootKind.MONITORED
+
+    # Not watched, but still registered once. A path that is not there is left to
+    # that pass, which warns and skips it.
+    return RootKind.SCAN_ONCE
+
+
+def partition_sources(
+    sources: List[SourceConfig],
+    registry: Optional[AdapterRegistry] = None,
+    *,
+    credentials_config: Optional[Any] = None,
+    write_dir: Optional[Path] = None,
+) -> Tuple[List[SourceConfig], Roots]:
+    """Partition configured sources for the serve path: ``(static, roots)``.
+
+    ``static`` is the single remote sources, expanded here. Everything the manager
+    registers after SERVING (watched directories, scan-once paths, upstreams) is a
+    root. See :func:`route_source`.
+    """
+    to_expand: List[SourceConfig] = []
+    scan_once: List[SourceConfig] = []
+    roots = Roots()
+
+    for s in sources:
+        kind = route_source(s)
+        if kind is None:
+            to_expand.append(s)
+        elif kind is RootKind.SCAN_ONCE:
+            scan_once.append(s)
+        else:
+            roots.add(Root.from_config(s, kind))
+
+    # A file or typed dataset listed inside a monitored directory is the rescan's:
+    # registering it again here would claim it twice.
+    for s in scan_once:
+        path = s.local_path
+        if (path.is_file() or s.type) and roots.is_monitored(str(path)):
+            continue
+        roots.add(Root.from_config(s, RootKind.SCAN_ONCE))
+
+    # tolerant=True so one missing or broken static source is warned-and-skipped
+    # rather than killing the server.
+    static_sources = resolve_all_sources(
+        to_expand,
+        registry,
+        credentials_config=credentials_config,
+        tolerant=True,
+    )
+
+    # Upload stores are registered by the upload path, and the adapters decline
+    # them if discovery reaches one, so a write_dir inside a scanned directory is
+    # not catalogued twice -- but the walk still descends into every store and
+    # stats its chunk files, and a store being written keeps its directory busy.
+    scanned_dirs = {
+        r.path
+        for r in roots.of_kind(RootKind.MONITORED, RootKind.SCAN_ONCE)
+        if r.kind is RootKind.MONITORED or r.path.is_dir()
+    }
+    inside = write_dir_under_root(write_dir, scanned_dirs)
+    if inside is not None:
+        logger.warning(
+            "write_dir %s lies inside the source directory %s: its upload stores "
+            "are walked whenever that directory is scanned (every rescan, if it "
+            "is monitored). Keep write_dir outside every source directory.",
+            write_dir,
+            inside,
+        )
+
+    return static_sources, roots

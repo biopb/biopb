@@ -50,7 +50,6 @@ class TestCloud:
         assert roots.is_cloud("/cloud/a/b.tif")
         assert not roots.is_cloud("/local/a.tif")
         assert not roots.is_cloud("s3://bucket/a")
-        assert roots.cloud_roots() == frozenset({Path("/cloud")})
 
     def test_removing_a_root_takes_its_cloud_status_with_it(self):
         drop = _root(RootKind.DROPPED, "/drop", cloud=True, label="drop")
@@ -60,7 +59,6 @@ class TestCloud:
         roots.remove(drop)
 
         assert not roots.is_cloud("/drop/a.tif")
-        assert roots.cloud_roots() == frozenset()
 
 
 class TestDisplayUrl:

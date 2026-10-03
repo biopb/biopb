@@ -33,12 +33,12 @@ from biopb_tensor_server.core.errors import UpstreamConfigError
 from biopb_tensor_server.core.remote import is_remote_url
 from biopb_tensor_server.sources.entry_stat import entry_change_time, entry_is_quiet
 from biopb_tensor_server.sources.reconciler import Reconciler
+from biopb_tensor_server.sources.resolve import partition_sources
 from biopb_tensor_server.sources.roots import (
     DND_URL_PREFIX,
     Root,
     RootKind,
     Roots,
-    partition_sources,
 )
 
 if TYPE_CHECKING:
@@ -201,7 +201,7 @@ class SourceManager:
             credentials_config=credentials_config,
             roots=self._roots,
             notify_source_committed=self._notify_source_committed,
-            catalog_url_for=lambda claim: self._roots.display_url(claim.primary_path),
+            catalog_url_for=self._display_url_for,
             stability_window=stability_window,
         )
 
@@ -459,7 +459,7 @@ class SourceManager:
         for event in self._register_root(
             url,
             source_type=source.type or "",
-            catalog_url_for=lambda claim: self._roots.display_url(claim.primary_path),
+            catalog_url_for=self._display_url_for,
             cloud=root.cloud,
             dataset=source.dataset,
         ):
@@ -1026,9 +1026,7 @@ class SourceManager:
                 url,
                 source_type=source_type,
                 should_cancel=should_cancel,
-                catalog_url_for=lambda claim: self._roots.display_url(
-                    claim.primary_path
-                ),
+                catalog_url_for=self._display_url_for,
                 cloud=self._roots.is_cloud(url),
                 new_root=new_root,
             ):
@@ -1256,6 +1254,10 @@ class SourceManager:
         except Exception:
             return False
         return any(c.primary_path == claim.primary_path for c in again)
+
+    def _display_url_for(self, claim: SourceClaim) -> Optional[str]:
+        """The display ``source_url`` the roots give a claim (None leaves it plain)."""
+        return self._roots.display_url(claim.primary_path)
 
     def _catalog_url_for(self, source_id: str) -> Optional[str]:
         """The registered source's catalog ``source_url`` (None if missing)."""

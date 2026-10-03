@@ -522,7 +522,7 @@ class TestScanOnceRoots:
                 )
 
         from biopb_tensor_server.core.config import SourceConfig
-        from biopb_tensor_server.sources.resolve import _alias_catalog_url
+        from biopb_tensor_server.sources.roots import reroot_catalog_url
 
         root = tmp_path / "data"
         (root / "sub").mkdir(parents=True)
@@ -542,7 +542,7 @@ class TestScanOnceRoots:
 
         claim = next(iter(state.claims.values()))
         adapter = server.sources[claim.source_id]
-        assert adapter._catalog_url == _alias_catalog_url(
+        assert adapter._catalog_url == reroot_catalog_url(
             "lab", str(root.resolve()), claim.primary_path
         )
         assert adapter._catalog_url.startswith("lab")

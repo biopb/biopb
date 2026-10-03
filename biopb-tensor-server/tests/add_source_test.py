@@ -420,7 +420,7 @@ class TestDropRules:
 
         _drain(manager.add_local_source(str(root), cloud=True))
 
-        assert manager._roots.cloud_roots() == frozenset()
+        assert not manager._roots.is_cloud(str(root))
 
     def test_a_redrop_inside_a_drop_keeps_the_drops_mark(self, tmp_path):
         manager, server = _make_manager()
