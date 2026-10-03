@@ -282,9 +282,7 @@ def _drain_pending():
 
 
 def _render_activity(digest):
-    origins = {(d.get("origin") or "user") for d in digest}
-    who = "The user" if origins == {"user"} else "Another writer"
-    listed = ", ".join(f"{d['job_id']} ({d.get('status')})" for d in digest)
+    who, listed = _writers._attribute_foreign(digest)
     return (
         f"{who} ran code in this kernel since your last turn: {listed}. "
         "Variables and layers may have changed -- re-check with dir() / "
@@ -337,9 +335,14 @@ def history():
     ]
 
 
+def _is_typed_turn(msg):
+    """A user message someone typed: not a screenshot, not an activity note."""
+    return msg["role"] == "user" and not msg.get("image") and not msg.get("note")
+
+
 def _last_user_text():
     for msg in reversed(_messages):
-        if msg["role"] == "user" and not msg.get("image") and not msg.get("note"):
+        if _is_typed_turn(msg):
             return msg["content"]
     return ""
 
@@ -713,12 +716,7 @@ def _cut_point(keep_turns):
     summary.
     """
     starts = [
-        i
-        for i, m in enumerate(_messages)
-        if i >= _compacted
-        and m["role"] == "user"
-        and not m.get("image")
-        and not m.get("note")
+        i for i, m in enumerate(_messages) if i >= _compacted and _is_typed_turn(m)
     ]
     if len(starts) <= keep_turns:
         return 0

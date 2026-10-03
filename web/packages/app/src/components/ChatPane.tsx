@@ -112,7 +112,12 @@ export default function ChatPane({
     }
     if (!page) return; // unreachable; keep what is on screen
     setBusy(page.busy);
-    setQueued(page.queued);
+    // Kept when unchanged: a fresh array every poll would re-render the pane.
+    setQueued((prev) =>
+      prev.length === page.queued.length && prev.every((t, i) => t === page.queued[i])
+        ? prev
+        : page.queued,
+    );
     setLive(page.live);
     // Empty only from a child too old to send it; keeping what we have beats
     // blanking the header.
