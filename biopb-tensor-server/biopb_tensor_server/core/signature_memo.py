@@ -64,9 +64,14 @@ class SignatureMemo:
         path: "Path | str",
         compute: Callable[[], T],
         signature: Optional[Signature] = None,
+        *,
+        memoize: bool = True,
     ) -> T:
         """The memoized ``compute()`` for *path*; the file's own stat unless
-        *signature* is given. A file that cannot be stat-ed is not memoized."""
+        *signature* is given. A file that cannot be stat-ed is not memoized, and
+        ``memoize=False`` (a file that will not be probed again) is a plain call."""
+        if not memoize:
+            return compute()
         if signature is None:
             signature = file_signature(path)
         if signature is None:

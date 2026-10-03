@@ -50,7 +50,13 @@ def _xml(*refs, prefix="", quote='"'):
             b'<OME><TiffData><UUID FileName="a.tif">u</UUID></TiffData>'
             b"<Key>FileName</Key></OME>",
             ("a.tif",),
-            id="token-elsewhere",
+            id="token-in-text",
+        ),
+        pytest.param(
+            b'<OME><TiffData><UUID FileName="a.tif">u</UUID></TiffData>'
+            b'<Annotation FileName="other.tif"/></OME>',
+            ("a.tif",),
+            id="other-elements-attribute",
         ),
         pytest.param(b"<OME><Image/></OME>", (), id="no-references"),
         pytest.param(b"<OME><broken", (), id="malformed"),

@@ -65,9 +65,9 @@ def _header_summary(
     """:func:`_read_header_summary`, memoized on the file's identity; ``None``
     for an unreadable file, which is not memoized."""
     try:
-        if not memoize:
-            return _read_header_summary(path)
-        return _HEADER_MEMO.get(path, lambda: _read_header_summary(path))
+        return _HEADER_MEMO.get(
+            path, lambda: _read_header_summary(path), memoize=memoize
+        )
     except OSError:
         return None
 

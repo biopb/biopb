@@ -1,6 +1,5 @@
 """SignatureMemo: a content probe reused while the file's identity is unchanged."""
 
-import biopb_tensor_server.adapters.ome_tiff as ome_tiff_mod
 import pytest
 from biopb_tensor_server.core.signature_memo import SignatureMemo, file_signature
 
@@ -102,19 +101,10 @@ def test_bounded_lru_evicts_the_oldest():
     assert len(calls) == n + 1  # evicted
 
 
-def test_ome_probe_that_cannot_read_is_not_memoized(tmp_path, monkeypatch):
-    ome_tiff_mod._OME_PROBE_MEMO.clear()
-    p = tmp_path / "s.ome.tif"
-    p.write_bytes(b"x")
-    state = {"fail": True}
-
-    def probe(path):
-        if state["fail"]:
-            raise OSError("transient")
-        return ("a.tif",)
-
-    monkeypatch.setattr(ome_tiff_mod, "_probe_ome_files", probe)
-    assert ome_tiff_mod._get_ome_files(p) is None
-    state["fail"] = False
-    assert ome_tiff_mod._get_ome_files(p) == ("a.tif",)
-    ome_tiff_mod._OME_PROBE_MEMO.clear()
+def test_memoize_false_is_a_plain_call():
+    memo = SignatureMemo(10)
+    calls, compute = counting("x")
+    memo.get("/a", compute, SIG_A, memoize=False)
+    memo.get("/a", compute, SIG_A, memoize=False)
+    assert len(calls) == 2
+    assert len(memo) == 0

@@ -25,6 +25,7 @@ import logging
 import os
 import re
 import struct
+import sys
 import threading
 import time
 import xml.etree.ElementTree as ET
@@ -71,19 +72,12 @@ if TYPE_CHECKING:
 # =============================================================================
 
 
-def _get_namespace(root) -> dict:
-    """Extract namespace from root element tag.
-
-    Returns a dict with the OME schema namespace mapping.
-    """
-    tag = root.tag
-    if tag.startswith("{"):
-        namespace = tag.split("}")[0].strip("{")
-        return {"ome": namespace}
-    return {"ome": "http://www.openmicroscopy.org/Schemas/OME/2016-06"}
+def _tag_name(tag: str) -> str:
+    """An element's tag without its ``{namespace}``."""
+    return tag.rsplit("}", 1)[-1]
 
 
-_UUID_FILENAME = re.compile(rb'FileName="([^"]*)"')
+_UUID_FILENAME = re.compile(rb'UUID FileName="([^"]*)"')
 
 
 def _files_from_ome_xml(xml: bytes) -> Tuple[str, ...]:
@@ -91,15 +85,16 @@ def _files_from_ome_xml(xml: bytes) -> Tuple[str, ...]:
 
     A literal scan, not an XML parse: a Micro-Manager stack's XML runs to tens of
     MB and repeats a file name per plane, so the parse cost ~25x the scan for the
-    same answer. The scan only knows ``FileName="..."``, so the parser decides
-    whenever a ``FileName`` token went unmatched (single quotes, spaces around
-    ``=``) or a name has an entity.
+    same answer. The scan only knows ``UUID FileName="..."``, so the parser decides
+    whenever a ``FileName`` token is anything else (another element's attribute,
+    single quotes, spaces around ``=``) or a name has an entity.
     """
     found = _UUID_FILENAME.findall(xml)
     names = list(dict.fromkeys(found))
     if len(found) != xml.count(b"FileName") or any(b"&" in n for n in names):
         return _files_from_ome_xml_parsed(xml)
-    return tuple(n.decode("utf-8", "replace") for n in names)
+    # Interned: the members of a multi-file set each cache the same names.
+    return tuple(sys.intern(n.decode("utf-8", "replace")) for n in names)
 
 
 def _files_from_ome_xml_parsed(xml: bytes) -> Tuple[str, ...]:
@@ -108,11 +103,12 @@ def _files_from_ome_xml_parsed(xml: bytes) -> Tuple[str, ...]:
     except ET.ParseError:
         return ()
     names: Dict[str, None] = {}
-    for uuid_elem in root.iter():
-        if uuid_elem.tag.rsplit("}", 1)[-1] == "UUID":
-            filename = uuid_elem.get("FileName")
-            if filename:
-                names[filename] = None
+    for tiff_data in root.iter():
+        if _tag_name(tiff_data.tag) != "TiffData":
+            continue
+        for child in tiff_data:
+            if _tag_name(child.tag) == "UUID" and child.get("FileName"):
+                names[sys.intern(child.get("FileName"))] = None
     return tuple(names)
 
 
@@ -225,9 +221,9 @@ def _get_ome_files(
     the file's identity so an unchanged file is not reopened on the next rescan.
     An unreadable file reads as having none, and is not memoized."""
     try:
-        if not memoize:
-            return _probe_ome_files(path)
-        return _OME_PROBE_MEMO.get(path, lambda: _probe_ome_files(path), signature)
+        return _OME_PROBE_MEMO.get(
+            path, lambda: _probe_ome_files(path), signature, memoize=memoize
+        )
     except OSError:
         return None
 
