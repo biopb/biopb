@@ -1011,9 +1011,9 @@ class TensorFlightClient:
 
                 The one other form is ``"zarr://<image array_id>/@labels/<name>"``,
                 a label set of an image the server already serves. A set is
-                unsigned-integer, spans its image's non-channel axes at full
-                length, and its all-zero chunks are skipped by
-                ``upload_array``.
+                unsigned-integer, has its image's axes at the image's lengths
+                (a channel axis is a singleton, an RGB samples axis is left
+                out), and its all-zero chunks are skipped by ``upload_array``.
 
                 The scheme names the store format and nothing else: the
                 answered ``array_id`` carries none.

@@ -701,7 +701,7 @@ class SourceAdapter(ABC):
         image = self.label_image_descriptor(field, images=images)
         if image is None:
             return None
-        return label_image_axes(desc.dim_labels, image.dim_labels)
+        return label_image_axes(desc.dim_labels, image.dim_labels, image.shape)
 
     def label_image_descriptor(
         self,

@@ -94,7 +94,47 @@ const SET = grid({
   image_axes: [0, 2, 3, 4],
 });
 
+/** The set of the same image under the rule: its rank, the channel a singleton. */
+const SET_SAME_RANK = grid({
+  array_id: "src0/@labels/nuclei",
+  dim_labels: ["t", "c", "z", "y", "x"],
+  shape: [50, 1, 20, 64, 64],
+  selectable: { t: 0, z: 2, c: 1 },
+  plane: { y: 3, x: 4, s: null },
+  dtype: "uint32",
+  image_axes: [0, 1, 2, 3, 4],
+});
+
+/** An RGB image `T Y X S` and its set: the samples axis is left out. */
+const RGB_IMAGE = grid({
+  dim_labels: ["t", "y", "x", "s"],
+  shape: [50, 64, 64, 3],
+  selectable: { t: 0, z: null, c: null },
+  plane: { y: 1, x: 2, s: 3 },
+});
+const RGB_SET = grid({
+  array_id: "src0/@labels/nuclei",
+  dim_labels: ["t", "y", "x"],
+  shape: [50, 64, 64],
+  selectable: { t: 0, z: null, c: null },
+  plane: { y: 1, x: 2, s: null },
+  dtype: "uint32",
+  image_axes: [0, 1, 2],
+});
+
 describe("labelSelection", () => {
+  it("lines a same-rank set up by position, the channel clamped to its one plane", () => {
+    expect(labelSelection(IMAGE, SET_SAME_RANK, { t: 7, z: 4, c: 2 })).toEqual({
+      t: 7,
+      c: 0,
+      z: 4,
+    });
+  });
+
+  it("reads an RGB image's plane without a samples axis on either side", () => {
+    expect(labelSelection(RGB_IMAGE, RGB_SET, { t: 7 })).toEqual({ t: 7 });
+  });
+
   it("carries the named axes across, and drops the channel", () => {
     expect(labelSelection(IMAGE, SET, { t: 7, z: 4, c: 2 })).toEqual({ t: 7, z: 4 });
   });
@@ -165,6 +205,17 @@ describe("labelSelection", () => {
         plane: { y: 1, x: 2, s: null },
       });
       expect(labelSelection(IMAGE, odd, { t: 7, z: 4 })).toEqual({ z: 4 });
+    });
+
+    it("re-derives a same-rank set and an RGB set the same way", () => {
+      const same = unstated({ ...SET_SAME_RANK });
+      expect(labelSelection(IMAGE, same, { t: 7, z: 4, c: 2 })).toEqual({
+        t: 7,
+        c: 0,
+        z: 4,
+      });
+      const rgb = unstated({ ...RGB_SET });
+      expect(labelSelection(RGB_IMAGE, rgb, { t: 7 })).toEqual({ t: 7 });
     });
 
     it("handles an image with no channel axis at all", () => {

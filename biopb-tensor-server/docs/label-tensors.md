@@ -37,8 +37,13 @@ else. `uint32` is the recommendation, `uint16` is fine for small counts.
 
 ### Extent
 
-A set's axes are the image's canonical axes with the channel axis dropped,
-each at the image's full length. A label pixel and its image pixel share an
+A set has the image's canonical axes at the image's lengths, except that a
+channel axis is a singleton and an RGB samples axis (`S`, size 3 or 4) is left
+out. The set therefore has the image's rank and lines up with it by position.
+The channel axis stays so that a right-aligned viewer (napari) does not slide
+the set's `T` onto the image's `C`; the samples axis goes because it is a
+pixel's colour components, which a mask does not have, and a trailing
+singleton would shift the spatial axes. A label pixel and its image pixel share an
 index -- the same contract the ROI store runs on ("level-0 pixels, the server
 never rescales geometry") -- which is what lets a viewer overlay a set with no
 transform.
@@ -154,9 +159,9 @@ other two, the request's `array_id` *is* the final one. The kind:
   parent is absent, unresolved, or does not serve pixels;
 - refuses a non-unsigned-integer dtype, a reserved name, a name that would not
   stay inside the sidecar directory (`unsafe_store_name`), or a shape /
-  `dim_labels` that is not the parent's canonical non-channel extent -- a
-  request naming no `dim_labels` is filled in from the image rather than
-  refused, since the extent rule leaves exactly one legal answer;
+  `dim_labels` that is not the parent's extent (above) -- a request naming no
+  `dim_labels` is filled in from the image, in the form whose rank the shape
+  has, rather than refused;
 - refuses a name already attached, finished or pending (biopb/biopb#1054,
   per parent);
 - creates the sidecar array with the pending marker and the minted
@@ -245,10 +250,11 @@ consecutive ids land far apart rather than running a gradient; `0` is
 background and fully transparent. `contrastLimits = [0, 1]` is left at
 identity, which is what delivers the stored id to the palette.
 
-A set spans the image's non-channel extent, so `labelSelection` (in
-`@biopb/tensor-flight-client`) reads the server's `image_axes` rather than
-re-deriving it, falling back to the extent rule only against a server that
-does not state it.
+`labelSelection` (in `@biopb/tensor-flight-client`) reads the server's
+`image_axes` rather than re-deriving it, falling back to the extent rule only
+against a server that does not state it. The set's channel axis is a single
+plane, so the selection's channel clamps to 0 and the mask shows on every
+channel.
 
 Playback paces on both layers landing: paced on the image alone, a set whose
 read is slower (no native pyramid, every coarse tile a full-resolution read
@@ -284,8 +290,9 @@ layer is `editable = False`, matching a write-once set.
 **The set is given the image's rank before it is added.** napari aligns
 layers of differing rank from the right, so a `T Z Y X` set added beside a
 `T C Z Y X` image would otherwise land its `T` on the image's `C`. The channel
-axes the set does not have are inserted from `image_axes` and broadcast to the
-image's length rather than left singleton -- a singleton axis would put the
+axes the set does not have are inserted from `image_axes`, and a singleton
+channel axis it does have is broadcast the same way, to the image's length
+rather than left singleton -- a singleton axis would put the
 layer outside its own extent at every channel but the first, blanking as the
 channel slider moves; a broadcast axis is a view onto the one underlying chunk,
 so the mask shows on every channel for a single read. Alignment inserts and

@@ -235,9 +235,9 @@ class RasterizedMaskAdapter(NearestPyramidMixin, TensorAdapter):
     adapter's life. Read-only: replacing the set means re-registering the file.
 
     ``dim_labels`` / ``shape`` are the image's own canonical axes with the
-    channel axis dropped. Y/X are located by *label*
-    (:func:`~biopb_tensor_server.core.axes.labeled_axis_index`) and an interleaved
-    RGB(A) source keeps its trailing samples axis (``S``) here.
+    channel axis a singleton and an RGB samples axis left out. Y/X are located by
+    *label* (:func:`~biopb_tensor_server.core.axes.labeled_axis_index`), so the
+    singleton channel is just another axis painted across.
     """
 
     _normalizable_axes = False

@@ -339,12 +339,13 @@ export interface TileInfo {
   /**
    * A label set only: which of its image's axes each of its own indexes.
    *
-   * `[0, 2, 3, 4]` for a `T Z Y X` set of a `T C Z Y X` image. The server
-   * states it because the two tensors do not number their axes alike -- a set
-   * spans the image's *non-channel* extent -- and a client matching them by
-   * name gets `t`/`z` right and an unnamed axis wrong, which reads frame 0 of
-   * a timelapse where frame 40 was asked for. That is a picture rather than an
-   * error, so it is not a rule worth re-deriving.
+   * `[0, 1, 2, 3, 4]` for a `T C Z Y X` set of a `T C Z Y X` image (the
+   * channel axis a singleton), and `[0, 2, 3, 4]` for a set written before
+   * that, which has no channel axis. The server states it because a client
+   * matching the two by name gets `t`/`z` right and an unnamed axis wrong on
+   * such a set, which reads frame 0 of a timelapse where frame 40 was asked
+   * for. That is a picture rather than an error, so it is not a rule worth
+   * re-deriving.
    *
    * Absent on an image, and on a server that predates the field; see
    * {@link labelSelection}, which falls back to the extent rule there.

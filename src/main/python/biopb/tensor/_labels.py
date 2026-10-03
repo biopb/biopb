@@ -39,11 +39,12 @@ LABELS_SEGMENT = "@labels"
 #: they never upload or delete one.
 RESERVED_LABEL_PREFIX = "@"
 
-# The channel-axis vocabulary, mirroring the server's ``core.axes.AXIS_C_LABELS``.
-# Duplicated rather than imported: biopb-tensor-server is not a dependency of
-# the SDK (nor installable from PyPI), and this is the one axis question the
-# extent rule asks.
+# The axis vocabulary the extent rule asks about, mirroring the server's
+# ``core.axes.AXIS_C_LABELS`` / ``AXIS_S_LABELS``. Duplicated rather than
+# imported: biopb-tensor-server is not a dependency of the SDK (nor installable
+# from PyPI).
 _CHANNEL_LABELS = frozenset({"c", "channel", "channels", "band", "bands"})
+_SAMPLES_LABELS = frozenset({"s", "samples"})
 
 
 class LabelAddress(NamedTuple):
@@ -83,16 +84,18 @@ def is_reserved_label_name(name: str) -> bool:
 def label_image_axes(label_desc: Any, image_desc: Any) -> Optional[List[int]]:
     """For each axis of a set, the index of the image axis it indexes.
 
-    ``[0, 2, 3, 4]`` for a ``T Z Y X`` set of a ``T C Z Y X`` image: a set spans
-    the image's **non-channel** extent, so every axis after the image's ``c``
-    sits one place to the left in the set. A client that instead matched axes by
-    position reads frame 0 of a timelapse where frame 40 was asked for, which is
-    a picture rather than an error.
+    ``[0, 1, 2, 3, 4]`` for a ``T C Z Y X`` set of a ``T C Z Y X`` image: a set
+    has the image's axes at the image's lengths, with the channel axis a
+    singleton and an RGB samples axis left out. A set written under the earlier
+    rule (no channel axis) is told apart by its rank and maps ``[0, 2, 3, 4]``,
+    every axis after the image's ``c`` one place to the left. A client that
+    instead matched axes by position reads frame 0 of a timelapse where frame 40
+    was asked for, which is a picture rather than an error.
 
     **Read, not derived, when the server says.** ``biopb.labels.image_axes`` in
     the set's ``metadata_json`` is the server's own statement of the mapping;
     a descriptor fetched without metadata, or from a server that predates the
-    field, has none, and the extent rule is re-derived here instead -- the same
+    field, has none, and the rule is re-derived here instead -- the same
     answer, from the one place that still has to know the rule.
 
     ``None`` when the set does not span the image at all, which leaves the
@@ -101,15 +104,22 @@ def label_image_axes(label_desc: Any, image_desc: Any) -> Optional[List[int]]:
     stated = _stated_image_axes(label_desc)
     if stated is not None and len(stated) == len(label_desc.shape):
         return stated
-    non_channel = [
-        i
-        for i, label in enumerate(image_desc.dim_labels)
-        if str(label).lower() not in _CHANNEL_LABELS
-    ]
-    # Ranks are the check. An image whose labels went missing derives an empty
-    # or over-long list, which cannot match a real set and so answers None --
-    # the same "nothing to align" the server gives.
-    return non_channel if len(non_channel) == len(label_desc.shape) else None
+    labels = [str(label).lower() for label in image_desc.dim_labels]
+    shape = list(image_desc.shape)
+    samples = next(
+        (
+            i
+            for i, label in enumerate(labels)
+            if label in _SAMPLES_LABELS and i < len(shape) and shape[i] in (3, 4)
+        ),
+        None,
+    )
+    kept = [i for i in range(len(labels)) if i != samples]
+    earlier = [i for i in kept if labels[i] not in _CHANNEL_LABELS]
+    # Ranks are the check. An image whose labels went missing derives a list that
+    # cannot match a real set and so answers None -- the same "nothing to align"
+    # the server gives.
+    return next((f for f in (kept, earlier) if len(f) == len(label_desc.shape)), None)
 
 
 def _stated_image_axes(label_desc: Any) -> Optional[List[int]]:

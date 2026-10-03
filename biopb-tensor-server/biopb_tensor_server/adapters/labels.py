@@ -72,8 +72,8 @@ from biopb_tensor_server.core.labels import (
     LABELS_SEGMENT,
     RESERVED_PREFIX,
     join_fields,
-    label_extent,
     label_field,
+    label_forms,
     split_label_field,
 )
 
@@ -445,7 +445,14 @@ def create_label_upload(
         # client's own later calls) is built from that descriptor.
         image = parent.label_image_descriptor(field, images=images)
         if image is not None:
-            desc.dim_labels.extend(label_extent(image.dim_labels, image.shape)[0])
+            # The form whose rank the request's shape has, so a client still
+            # writing the earlier (channel-less) shape is not refused for want of
+            # axes; with no such shape, the preferred form.
+            forms = label_forms(image.dim_labels, image.shape)
+            form = next(
+                (f for f in forms if len(f.labels) == len(desc.shape)), forms[0]
+            )
+            desc.dim_labels.extend(form.labels)
     why = parent.label_binding_error(field, desc, images=images)
     if why is not None:
         raise ValueError(f"{array_id!r} {why}")

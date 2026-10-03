@@ -76,12 +76,14 @@ export function isReservedLabelName(name: string): boolean {
  * for -- a caller that conflates the two draws a mask of the wrong frame while
  * a read is outstanding.
  *
- * The two tensors do not number their axes alike: a set spans the image's
- * **non-channel** extent (biopb/biopb#1059), so every axis after the image's
- * `c` sits one place to the left in the set. Matching by Viv's selection *key*
- * would therefore be right for named axes and wrong for unnamed ones -- an
- * image's `a3` is the set's `a2`, and reading frame 0 of a timelapse instead
- * of frame 40 is a silently wrong picture rather than a visible failure.
+ * A set has the image's axes at the image's lengths, with the channel axis a
+ * singleton and an RGB samples axis left out (biopb/biopb#1059), so its axes
+ * line up with the image's by position. A set written before that rule has no
+ * channel axis at all, and there every axis after the image's `c` sits one place
+ * to the left in the set. Matching by Viv's selection *key* would be right for
+ * named axes and wrong for unnamed ones in that case -- an image's `a3` is the
+ * set's `a2`, and reading frame 0 of a timelapse instead of frame 40 is a
+ * silently wrong picture rather than a visible failure.
  *
  * So the mapping is **read, not derived**: `TileInfo.image_axes` is the
  * server's own statement of which image axis each of the set's indexes. A
@@ -121,15 +123,16 @@ export function labelSelection(
 }
 
 /**
- * The extent rule, re-derived: the set's axis *j* is the image's *j*-th
- * non-channel axis. Only for a server that does not state `image_axes`; null
- * when the ranks say the set does not span the image at all, which sends
+ * The extent rule, re-derived: the set's axes are the image's, minus an RGB
+ * samples axis, and the set's axis *j* is the image's *j*-th of those. A set
+ * written before the channel became a singleton lacks the channel axis too, and
+ * is told apart by its rank. Only for a server that does not state `image_axes`;
+ * null when the ranks say the set does not span the image at all, which sends
  * {@link labelSelection} to matching by key -- the best answer left, and exact
  * for an ordinary TZYX set.
  */
 function derivedImageAxes(imageInfo: TileInfo, labelInfo: TileInfo): number[] | null {
-  const nonChannel = imageInfo.shape
-    .map((_, i) => i)
-    .filter((i) => i !== imageInfo.selectable.c);
-  return nonChannel.length === labelInfo.shape.length ? nonChannel : null;
+  const kept = imageInfo.shape.map((_, i) => i).filter((i) => i !== imageInfo.plane.s);
+  const earlier = kept.filter((i) => i !== imageInfo.selectable.c);
+  return [kept, earlier].find((axes) => axes.length === labelInfo.shape.length) ?? null;
 }
