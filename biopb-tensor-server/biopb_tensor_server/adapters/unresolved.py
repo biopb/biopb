@@ -43,7 +43,7 @@ if TYPE_CHECKING:
     from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
     from biopb_tensor_server.core.config import SourceConfig
-    from biopb_tensor_server.core.discovery import AdapterRegistry
+    from biopb_tensor_server.core.discovery import AdapterRegistry, SourceClaim
 
 logger = logging.getLogger(__name__)
 
@@ -348,11 +348,12 @@ class PendingSourceAdapter(SourceAdapter):
     #: Read by ``SourceRegistry`` (duck-typed: core does not import adapters).
     registration_pending = True
 
-    def __init__(self, source_config: "SourceConfig"):
-        self._config = source_config
-        self.source_id = source_config.source_id
-        self._source_url = source_config.url
-        self._source_type = source_config.type or "unknown"
+    def __init__(self, claim: "SourceClaim"):
+        # Identity only. What registration is built from is the claim the
+        # reconciler holds, which a refresh can replace; this keeps no copy.
+        self.source_id = claim.source_id
+        self._source_url = str(claim.primary_path)
+        self._source_type = claim.source_type or "unknown"
         self._tensor_name = None
         self.error: Optional[str] = None
 

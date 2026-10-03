@@ -15,7 +15,7 @@ import numpy as np
 import pytest
 from biopb_tensor_server.adapters import get_default_registry
 from biopb_tensor_server.adapters.unresolved import PendingSourceAdapter
-from biopb_tensor_server.core.discovery import DiscoveryState
+from biopb_tensor_server.core.discovery import DiscoveryState, SourceClaim
 from biopb_tensor_server.core.errors import SourceRegistrationError
 from biopb_tensor_server.core.source_registry import SourceRegistry
 from biopb_tensor_server.sources.registration_worker import RegistrationWorker
@@ -180,7 +180,13 @@ class TestReadRegistersTheSource:
     def test_the_placeholder_does_not_get_uploaded_tensors_attached(self, tmp_path):
         attached = []
         registry = SourceRegistry(on_register=lambda sid, a: attached.append(a))
-        stub = PendingSourceAdapter(_config("x", str(tmp_path / "x.zarr")))
+        stub = PendingSourceAdapter(
+            SourceClaim(
+                source_type="zarr",
+                primary_path=str(tmp_path / "x.zarr"),
+                source_id="x",
+            )
+        )
         registry.register("x", stub)
         assert attached == []
 
@@ -700,12 +706,6 @@ class TestStats:
         logged = [r for r in caplog.records if "Registration cost" in r.getMessage()]
         assert len(logged) == 1
         assert "(2 sources)" in logged[0].getMessage()
-
-
-def _config(source_id, url):
-    from biopb_tensor_server.core.config import SourceConfig
-
-    return SourceConfig(type="zarr", url=url, source_id=source_id)
 
 
 def _wait_until(predicate, timeout=10.0):
