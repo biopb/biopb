@@ -168,6 +168,9 @@ class TestTheFieldShape:
         old = (["t", "z", "y", "x"], [5, 4, 64, 64])
         assert extent_mismatch(*old, *image) is None
         assert "axes" in extent_mismatch(*old, *image, allow_earlier=False)
+        # A wrong length on an earlier-form set quotes the form it matched.
+        wrong = (["t", "z", "y", "x"], [5, 4, 32, 64])
+        assert "[5, 4, 64, 64]" in extent_mismatch(*wrong, *image)
 
     def test_a_set_has_the_images_rank_with_a_singleton_channel(self):
         image = (["t", "c", "z", "y", "x"], [5, 3, 4, 64, 64])

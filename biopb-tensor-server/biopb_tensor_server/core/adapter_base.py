@@ -657,6 +657,7 @@ class SourceAdapter(ABC):
         field: str,
         desc: TensorDescriptor,
         images: Optional[Dict[str, TensorDescriptor]] = None,
+        *,
         allow_earlier: bool = True,
     ) -> Optional[str]:
         """Why a set of *desc* cannot be served at label *field*, or None.

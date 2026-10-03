@@ -162,20 +162,20 @@ def label_forms(
     samples = samples_axis([str(x) for x in image_labels], tuple(image_shape))
     kept = [i for i in range(len(image_labels)) if i != samples]
 
-    def form(indices: List[int], channel_length: Optional[int]) -> LabelForm:
-        return LabelForm(
-            [str(image_labels[i]) for i in indices],
-            [
-                channel_length
-                if channel_length is not None and canonical_axis(image_labels[i]) == "c"
-                else int(image_shape[i])
-                for i in indices
-            ],
-            indices,
-        )
-
-    preferred = form(kept, 1)
-    earlier = form([i for i in kept if canonical_axis(image_labels[i]) != "c"], None)
+    is_channel = [canonical_axis(label) == "c" for label in image_labels]
+    preferred = LabelForm(
+        [str(image_labels[i]) for i in kept],
+        [1 if is_channel[i] else int(image_shape[i]) for i in kept],
+        kept,
+    )
+    without_channel = [i for i in kept if not is_channel[i]]
+    earlier = LabelForm(
+        [str(image_labels[i]) for i in without_channel],
+        [int(image_shape[i]) for i in without_channel],
+        without_channel,
+    )
+    # The forms differ in rank exactly when the image has a channel axis, which is
+    # what lets `label_image_axes` tell them apart by rank.
     return [preferred] if earlier == preferred else [preferred, earlier]
 
 
@@ -237,14 +237,13 @@ def extent_mismatch(
         forms = forms[:1]
     axes = [_axis_key(label) for label in label_labels]
     shape = [int(s) for s in label_shape]
-    for form in forms:
-        if axes == [_axis_key(label) for label in form.labels] and shape == form.shape:
-            return None
-    preferred = forms[0]
-    if all(axes != [_axis_key(label) for label in f.labels] for f in forms):
+    same_axes = [f for f in forms if axes == [_axis_key(label) for label in f.labels]]
+    if not same_axes:
         return (
             f"axes {list(label_labels)} do not match the image's "
-            f"{[_axis_key(label) for label in preferred.labels]} (the channel "
+            f"{[_axis_key(label) for label in forms[0].labels]} (the channel "
             "axis a singleton, an RGB samples axis left out)"
         )
-    return f"shape {shape} does not match the image's {preferred.shape}"
+    if any(shape == f.shape for f in same_axes):
+        return None
+    return f"shape {shape} does not match the image's {same_axes[0].shape}"
