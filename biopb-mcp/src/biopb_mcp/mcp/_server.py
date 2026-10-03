@@ -174,6 +174,7 @@ print("## Viewer")
 import os as _os
 import sys as _sys
 from biopb_mcp.mcp._bootstrap import no_viewer_reason as _no_viewer_reason
+from biopb_mcp.mcp._kernel_env import ViewerMode as _ViewerMode
 _no_viewer = _no_viewer_reason()
 if _no_viewer:
     print("  none -- " + _no_viewer)
@@ -183,7 +184,7 @@ else:
         # Mirrors _has_display(): the native window server is ambient, so $DISPLAY
         # (XQuartz, VcXsrv) says nothing about where Qt actually renders.
         print("  display: (host window server)")
-    elif _os.environ.get("BIOPB_VIRTUAL_DISPLAY"):
+    elif _ViewerMode.from_env(_os.environ).virtual_display:
         # Launcher-owned Xvfb (#90). A silent degradation: every tool below still
         # works, so the agent relaying it is the only thing that reaches the user
         # (#892). Kept as loud as start_kernel's — a session can reach here without
@@ -640,13 +641,13 @@ async def take_screenshot(canvas_only: bool = True) -> list:
     host, err = _app._require_kernel_host()
     if err is not None:
         return [TextContent(type="text", text=err)]
-    if host.no_viewer_reason:
+    if host.viewer.kind == "none":
         return [
             TextContent(
                 type="text",
                 text=(
                     "No screenshot: this session has no napari viewer "
-                    f"({host.no_viewer_reason}): {_NO_VIEWER_HINT}."
+                    f"({host.viewer.reason}): {_NO_VIEWER_HINT}."
                 ),
             )
         ]
@@ -1205,11 +1206,11 @@ async def start_kernel() -> str:
         return err
     result = await asyncio.to_thread(host.ensure_started)
     if result.get("state") == "ready":
-        if host.no_viewer_reason:
+        if host.viewer.kind == "none":
             return (
                 "Kernel ready: the tensor client (`client`) and `ops` are up; "
                 "use execute_code now. This session has no napari "
-                f"viewer ({host.no_viewer_reason}): {_NO_VIEWER_HINT}."
+                f"viewer ({host.viewer.reason}): {_NO_VIEWER_HINT}."
             )
         ready = (
             "Kernel ready. The tensor client, `ops` and the "
@@ -1219,7 +1220,7 @@ async def start_kernel() -> str:
         # nothing downstream notices, but the user is watching a window that
         # does not exist and paying software GL for it. Only they can fix it, so
         # the agent has to be told to say so (#892).
-        display = host.virtual_display
+        display = host.viewer.virtual_display
         if display:
             ready += (
                 "\n\nWARNING: no display was detected, so the napari window is "
@@ -1288,7 +1289,7 @@ async def restart_kernel() -> str:
     if refusal is not None:
         return refusal
     note = f" Verification {discarded} was discarded with it." if discarded else ""
-    rebuilt = "" if host.no_viewer_reason else " Viewer rebuilt;"
+    rebuilt = " Viewer rebuilt;" if host.viewer.has_window else ""
     return f"Kernel restarted.{rebuilt} Previous variables are gone." + note
 
 

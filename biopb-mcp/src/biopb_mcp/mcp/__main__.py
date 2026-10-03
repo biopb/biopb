@@ -178,10 +178,10 @@ def _has_display():
 def _decide_viewer(config, view=False):
     """Whether this session gets a napari viewer, and where it renders.
 
-    Returns ``(reason, virtual)``: *reason* says why there is no viewer (None
-    when there is one), and *virtual* whether it renders on a launcher-owned
-    Xvfb. A viewer needs the config to want one, napari to be installed, and a
-    display -- or, on a display-less host, ``viewer.virtual_display``, which
+    Returns a :class:`ViewerMode`: ``none`` (with the reason), ``virtual`` (on
+    a launcher-owned Xvfb, whose display is filled in once it is started) or
+    ``real``. A viewer needs the config to want one, napari to be installed, and
+    a display -- or, on a display-less host, ``viewer.virtual_display``, which
     tests use. ``view`` (`biopb mcp view`) is a request for a window a person
     will look at, so it overrides the config and raises RuntimeError where it
     cannot have one instead of degrading.
@@ -189,16 +189,19 @@ def _decide_viewer(config, view=False):
     import importlib.util
 
     from .._config import get_setting
+    from ._kernel_env import ViewerMode
 
     if not view and not get_setting(config, "viewer.enabled"):
-        return "the viewer is off in the biopb-mcp config (viewer.enabled)", False
+        return ViewerMode.none(
+            "the viewer is off in the biopb-mcp config (viewer.enabled)"
+        )
     if not all(importlib.util.find_spec(m) for m in ("napari", "biopb_napari_widget")):
         reason = "napari is not installed (pip install 'biopb-mcp[napari]')"
         if view:
             raise RuntimeError(reason)
-        return reason, False
+        return ViewerMode.none(reason)
     if _has_display():
-        return None, False
+        return ViewerMode.real()
     if view:
         raise RuntimeError(
             "no display detected ($DISPLAY/$WAYLAND_DISPLAY are unset); "
@@ -206,11 +209,10 @@ def _decide_viewer(config, view=False):
             "real X/Wayland session."
         )
     if get_setting(config, "viewer.virtual_display"):
-        return None, True
-    return (
+        return ViewerMode.virtual(None)
+    return ViewerMode.none(
         "no display detected: $DISPLAY and $WAYLAND_DISPLAY are unset, which "
-        "an MCP client can cause by dropping them on the way in, as Codex CLI does",
-        False,
+        "an MCP client can cause by dropping them on the way in, as Codex CLI does"
     )
 
 
@@ -373,7 +375,8 @@ def _serve_http(config, port, view=False, start_kernel=False):
     """
     from .._config import get_setting
     from . import _app, _scratch, _server, _xvfb
-    from ._kernel import ENV_NO_VIEWER, ENV_SCRATCH, KernelHost
+    from ._kernel import ENV_SCRATCH, KernelHost
+    from ._kernel_env import ViewerMode
 
     # What our launcher handed *this* process, taken out of the environment the
     # kernel inherits so a session started from a cell is not mistaken for us.
@@ -403,27 +406,27 @@ def _serve_http(config, port, view=False, start_kernel=False):
     # hard-aborts the kernel (SIGABRT, not a catchable error). An Xvfb the
     # config asked for fails fast when the binary is missing.
     try:
-        no_viewer, virtual = _decide_viewer(config, view)
+        viewer = _decide_viewer(config, view)
     except RuntimeError as exc:
         logger.error("Cannot open the napari viewer: %s", exc)
         return 2
     xvfb_proc = None
-    virtual_display = None
-    if virtual:
+    if viewer.kind == "virtual":
         try:
-            xvfb_proc, virtual_display = _xvfb.start()
+            xvfb_proc, display = _xvfb.start()
         except RuntimeError as exc:
             logger.error("Cannot start the napari viewer: %s", exc)
             return 2
+        viewer = ViewerMode.virtual(display)
         # Backstop for exits that skip _shutdown; _xvfb.stop is idempotent.
         atexit.register(_xvfb.stop, xvfb_proc)
         logger.info(
             "No display detected; the napari viewer will render on virtual "
             "display %s (screenshots work; no visible window).",
-            virtual_display,
+            display,
         )
-    elif no_viewer:
-        logger.info("This session has no napari viewer: %s.", no_viewer)
+    elif viewer.kind == "none":
+        logger.info("This session has no napari viewer: %s.", viewer.reason)
 
     bootstrap_line = "import biopb_mcp.mcp._bootstrap as _b; _b.bootstrap()"
     extra_arguments = [f"--IPKernelApp.exec_lines={bootstrap_line}"]
@@ -440,16 +443,6 @@ def _serve_http(config, port, view=False, start_kernel=False):
     kernel_env.setdefault("OPENBLAS_NUM_THREADS", "1")
     kernel_env.setdefault("OMP_NUM_THREADS", "1")
 
-    # Point the kernel's Qt at the launcher-owned Xvfb. BIOPB_VIRTUAL_DISPLAY
-    # lets the in-kernel server_status report that the window, while real, is
-    # not visible to the user.
-    if virtual_display:
-        kernel_env["DISPLAY"] = virtual_display
-        kernel_env["BIOPB_VIRTUAL_DISPLAY"] = "1"
-    # No viewer: the kernel skips Qt and napari, and the tools report why.
-    if no_viewer:
-        kernel_env[ENV_NO_VIEWER] = no_viewer
-
     # The kernel inherits this process' fds. fd 1 is not a protocol channel
     # under http, so native Qt/GL/dask/gRPC output is harmless: it lands on
     # the launcher's stdout/stderr — which, for a shim-spawned session child, is
@@ -461,12 +454,11 @@ def _serve_http(config, port, view=False, start_kernel=False):
         startup_timeout=get_setting(config, "kernel.startup_timeout"),
         execute_timeout=get_setting(config, "kernel.execute_timeout"),
         env=kernel_env,
+        viewer=viewer,
         watchdog_interval=get_setting(config, "kernel.watchdog_interval"),
         watchdog_max_respawns=get_setting(config, "kernel.watchdog_max_respawns"),
         watchdog_respawn_window=get_setting(config, "kernel.watchdog_respawn_window"),
         parent_death_pipe=get_setting(config, "kernel.parent_death_pipe"),
-        # The window-close signal needs a window.
-        window_close_pipe=not no_viewer,
     )
 
     # How to build the scratch kernel a verification runs in: the same config
@@ -478,18 +470,20 @@ def _serve_http(config, port, view=False, start_kernel=False):
     def _scratch_host():
         scratch_env = dict(kernel_env or os.environ)
         scratch_env[ENV_SCRATCH] = "1"
-        scratch_env[ENV_NO_VIEWER] = "a scratch kernel verifies a workflow"
         return KernelHost(
             extra_arguments=extra_arguments,
             kernel_name=get_setting(config, "kernel.name"),
             startup_timeout=get_setting(config, "kernel.startup_timeout"),
             execute_timeout=get_setting(config, "kernel.execute_timeout"),
             env=scratch_env,
+            # No viewer, but the session's own display (and its real GPU).
+            viewer=ViewerMode.none(
+                "a scratch kernel verifies a workflow", display=viewer.display
+            ),
             # No watchdog: for the session kernel a respawn is recovery, for
             # this one death is the verdict (an OOM means the workflow does not
-            # fit). No window-close pipe: there is no window.
+            # fit).
             watchdog_interval=0,
-            window_close_pipe=False,
             parent_death_pipe=get_setting(config, "kernel.parent_death_pipe"),
         )
 

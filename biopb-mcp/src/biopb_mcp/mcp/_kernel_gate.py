@@ -20,18 +20,16 @@ import os
 from ipykernel.ipkernel import IPythonKernel
 
 from . import _jobs
+from ._kernel_env import ENV_HOST_SESSION
 
-# Env var carrying the host client's session id, set by KernelHost._launch
-# (literal mirrored there as ENV_HOST_SESSION, kept in sync by this comment).
-# Handed over at launch rather than learned from a request, so the gate is armed
+# The host client's session id (``_kernel_env.ENV_HOST_SESSION``), set by
+# KernelHost._launch. Handed over at launch rather than learned from a request, so the gate is armed
 # before the connection file lets anyone in, and no cell can re-adopt it.
 #
 # Not a security boundary: the id rides every iopub message's parent header,
 # and a client holding the connection file can already run anything. The gate
 # keeps honest clients from writing over each other; it does not stop a
 # hostile one.
-ENV_HOST_SESSION = "BIOPB_HOST_SESSION"
-
 # ``None`` when the kernel was launched without one, which gates nothing: there
 # is no host to tell apart from anyone else.
 _host_session = os.environ.get(ENV_HOST_SESSION) or None

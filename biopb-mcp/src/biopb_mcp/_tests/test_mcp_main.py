@@ -216,28 +216,27 @@ class TestDecideViewer:
         return {"viewer": viewer}
 
     def test_a_viewer_by_default(self, host):
-        assert _decide_viewer(self._config()) == (None, False)
+        assert _decide_viewer(self._config()).kind == "real"
 
     def test_config_turns_it_off(self, host):
-        reason, virtual = _decide_viewer(self._config(enabled=False))
-        assert "viewer.enabled" in reason and virtual is False
+        mode = _decide_viewer(self._config(enabled=False))
+        assert mode.kind == "none" and "viewer.enabled" in mode.reason
 
     def test_none_without_napari(self, host):
         host["napari"] = False
-        reason, _ = _decide_viewer(self._config())
-        assert "biopb-mcp[napari]" in reason
+        assert "biopb-mcp[napari]" in _decide_viewer(self._config()).reason
 
     def test_no_display_means_no_viewer_not_xvfb(self, host):
         host["display"] = False
-        reason, virtual = _decide_viewer(self._config())
-        assert "no display" in reason and virtual is False
+        mode = _decide_viewer(self._config())
+        assert mode.kind == "none" and "no display" in mode.reason
 
     def test_xvfb_only_when_the_config_opts_in(self, host):
         host["display"] = False
-        assert _decide_viewer(self._config(virtual_display=True)) == (None, True)
+        assert _decide_viewer(self._config(virtual_display=True)).kind == "virtual"
 
     def test_view_overrides_the_config(self, host):
-        assert _decide_viewer(self._config(enabled=False), view=True) == (None, False)
+        assert _decide_viewer(self._config(enabled=False), view=True).kind == "real"
 
     @pytest.mark.parametrize("missing", ["napari", "display"])
     def test_view_fails_where_it_cannot_have_a_window(self, host, missing):

@@ -14,6 +14,7 @@ import pytest
 
 from biopb_mcp._tests.conftest import rpc_reply
 from biopb_mcp.mcp import _app, _chat, _kernel_rpc, _server, _writers
+from biopb_mcp.mcp._kernel_env import ViewerMode
 
 _PNG = base64.b64encode(b"\x89PNG\r\n\x1a\n").decode()
 
@@ -102,7 +103,7 @@ def chat_host():
         "watchdog_running": True,
     }
     host._running = None
-    host.no_viewer_reason = None
+    host.viewer = ViewerMode.real()
     host._states = [("ok", "")]
     host.interrupts = []
     # What another writer has run and the loop has not been told about, and the
