@@ -23,9 +23,8 @@ from biopb_tensor_server.core.config import (
     ServerConfig,
     SourceConfig,
 )
-from biopb_tensor_server.sources.partition import partition_sources
 from biopb_tensor_server.sources.resolve import resolve_all_sources
-from biopb_tensor_server.sources.roots import RootKind
+from biopb_tensor_server.sources.roots import RootKind, partition_sources
 
 
 def _write_tiff(path: str) -> None:
@@ -551,7 +550,7 @@ class TestAliasTreeRoot:
         _write_tiff(str(root / "image.tif"))
         cfg = _config(SourceConfig(url=str(root), alias="live", monitor=True))
 
-        with caplog.at_level("WARNING", logger="biopb_tensor_server.sources.partition"):
+        with caplog.at_level("WARNING", logger="biopb_tensor_server.sources.roots"):
             static_sources, upstream_sources, monitored_sources, scan_once_sources = (
                 _resolve_serve_sources(cfg)
             )

@@ -32,7 +32,6 @@ from biopb_tensor_server.core.discovery import (
 from biopb_tensor_server.core.errors import UpstreamConfigError
 from biopb_tensor_server.core.remote import is_remote_url
 from biopb_tensor_server.sources.entry_stat import entry_change_time, entry_is_quiet
-from biopb_tensor_server.sources.partition import partition_sources
 from biopb_tensor_server.sources.reconciler import Reconciler
 from biopb_tensor_server.sources.roots import (  # noqa: F401  (re-exported)
     DND_URL_PREFIX,
@@ -40,6 +39,7 @@ from biopb_tensor_server.sources.roots import (  # noqa: F401  (re-exported)
     RootKind,
     Roots,
     _drop_catalog_url,
+    partition_sources,
 )
 
 if TYPE_CHECKING:
