@@ -19,9 +19,8 @@ from biopb_tensor_server.core.discovery import DiscoveryState
 from biopb_tensor_server.core.errors import SourceRegistrationError
 from biopb_tensor_server.core.source_registry import SourceRegistry
 from biopb_tensor_server.sources.registration_worker import RegistrationWorker
-from biopb_tensor_server.sources.source_manager import SourceManager
 
-from tests import catalog_server
+from tests import catalog_server, make_manager
 
 zarr = pytest.importorskip("zarr")
 
@@ -36,8 +35,8 @@ def _make_zarr(parent, name, shape=(2, 8, 8)):
 
 
 def _manager(root, workers=0):
-    server = catalog_server("grpc://localhost:0")
-    manager = SourceManager(
+    server = catalog_server("localhost:0")
+    manager = make_manager(
         server=server,
         registry=get_default_registry(),
         discovery_state=DiscoveryState(),

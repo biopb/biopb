@@ -98,7 +98,7 @@ def test_health_reflects_scan_status_setters():
 
 def test_health_reports_sources_still_awaiting_registration():
     """Nothing defers registration until a provider says otherwise."""
-    server = TensorFlightServer("grpc://localhost:0")
+    server = TensorFlightServer("localhost:0")
     assert _health(server)["registration_pending"] == 0
 
     pending = [3]
