@@ -22,13 +22,7 @@ from typing import List, Optional
 from biopb.lifecycle import deathwatch as _deathwatch, winjob as _winjob
 
 from ._job_log import JobLog
-from ._kernel_env import (  # noqa: F401 - re-exported: tests and __main__ name them here
-    ENV_HOST_SESSION,
-    ENV_NO_VIEWER,
-    ENV_SCRATCH,
-    ENV_WINDOW_CLOSE_FD,
-    ViewerMode,
-)
+from ._kernel_env import ENV_HOST_SESSION, ENV_WINDOW_CLOSE_FD, ViewerMode
 from ._kernel_io import _IDLE_GRACE, KernelChannels, KernelDied, KernelGone
 
 logger = logging.getLogger(__name__)
@@ -206,7 +200,6 @@ class KernelHost:
         self._env = env
         # Where the viewer is: given by the launcher, or read back from *env*.
         self.viewer = viewer or ViewerMode.from_env(env or {})
-        window_close_pipe = self.viewer.has_window
         # Where the kernel subprocess' native stdout/stderr fds go. None ->
         # inherit the launcher's fds (http mode). In stdio mode the launcher
         # passes a log file so native kernel output (Qt/GL/dask/gRPC) never
@@ -278,7 +271,7 @@ class KernelHost:
         # write end and writes a byte when the user closes the napari window; the
         # launcher holds this read end and a reader thread reaps the kernel back
         # to idle on the signal.
-        self._window_close_pipe = window_close_pipe and os.name == "posix"
+        self._window_close_pipe = self.viewer.has_window and os.name == "posix"
         self._window_r = None
         self._window_thread = None
         # Windows can't inherit the pipe fd (subprocess has no pass_fds there),
@@ -286,7 +279,7 @@ class KernelHost:
         # in-kernel _viewer_window_alive() probe on a thread and tearing the
         # kernel down to idle once the user closes the napari window. Same
         # feature flag, same teardown path -- only the transport differs by OS.
-        self._window_close_poll = window_close_pipe and os.name == "nt"
+        self._window_close_poll = self.viewer.has_window and os.name == "nt"
         self._window_poll_interval = window_poll_interval
         self._window_poll_stop = threading.Event()
         # Liveness watchdog (failure mode 2): respawn an unexpectedly-dead

@@ -2,7 +2,7 @@
 
 import pytest
 
-from biopb_mcp.mcp import _bootstrap, _kernel, _kernel_gate
+from biopb_mcp.mcp import _bootstrap, _kernel_gate
 from biopb_mcp.mcp._kernel_env import (
     ENV_HOST_SESSION,
     ENV_NO_VIEWER,
@@ -13,9 +13,9 @@ from biopb_mcp.mcp._kernel_env import (
 
 
 def test_every_side_names_the_same_variable():
-    assert _kernel.ENV_HOST_SESSION is _kernel_gate.ENV_HOST_SESSION
-    assert _kernel.ENV_SCRATCH == ENV_SCRATCH == "BIOPB_SCRATCH_KERNEL"
-    assert _kernel.ENV_NO_VIEWER == ENV_NO_VIEWER == "BIOPB_NO_VIEWER"
+    assert _kernel_gate.ENV_HOST_SESSION is ENV_HOST_SESSION
+    assert ENV_SCRATCH == "BIOPB_SCRATCH_KERNEL"
+    assert ENV_NO_VIEWER == "BIOPB_NO_VIEWER"
     assert ENV_HOST_SESSION == "BIOPB_HOST_SESSION"
     assert ENV_VIRTUAL_DISPLAY == "BIOPB_VIRTUAL_DISPLAY"
 

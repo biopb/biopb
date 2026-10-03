@@ -36,7 +36,6 @@ def is_scratch_kernel():
     No Qt either, so it needs no display at all. A hidden
     ``napari.Viewer(show=False)`` is no substitute: its screenshots come back
     black, and under an offscreen Qt platform it renders nothing at all.
-
     """
     return bool(os.environ.get(ENV_SCRATCH))
 

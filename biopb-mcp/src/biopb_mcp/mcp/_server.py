@@ -641,7 +641,7 @@ async def take_screenshot(canvas_only: bool = True) -> list:
     host, err = _app._require_kernel_host()
     if err is not None:
         return [TextContent(type="text", text=err)]
-    if host.viewer.kind == "none":
+    if not host.viewer.has_window:
         return [
             TextContent(
                 type="text",
@@ -1206,7 +1206,7 @@ async def start_kernel() -> str:
         return err
     result = await asyncio.to_thread(host.ensure_started)
     if result.get("state") == "ready":
-        if host.viewer.kind == "none":
+        if not host.viewer.has_window:
             return (
                 "Kernel ready: the tensor client (`client`) and `ops` are up; "
                 "use execute_code now. This session has no napari "

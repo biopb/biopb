@@ -12,7 +12,7 @@ workflow leaning on session state would verify green and fail on a fresh kernel.
 Three things live here, and they are one module because they are one decision.
 
 * **The kernel.** A full bootstrap with the user-facing parts left out
-  (``_bootstrap.ENV_SCRATCH``), no watchdog, and no window-close pipe. The
+  (``_kernel_env.ENV_SCRATCH``), no watchdog, and no window-close pipe. The
   watchdog is off deliberately: for the session kernel a respawn is recovery,
   but for this one **death is the verdict**. An OOM means "this workflow does
   not fit", and respawning would re-run a workflow that just killed a process,

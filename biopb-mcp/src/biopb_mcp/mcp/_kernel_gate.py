@@ -23,8 +23,9 @@ from . import _jobs
 from ._kernel_env import ENV_HOST_SESSION
 
 # The host client's session id (``_kernel_env.ENV_HOST_SESSION``), set by
-# KernelHost._launch. Handed over at launch rather than learned from a request, so the gate is armed
-# before the connection file lets anyone in, and no cell can re-adopt it.
+# KernelHost._launch. Handed over at launch rather than learned from a request,
+# so the gate is armed before the connection file lets anyone in, and no cell
+# can re-adopt it.
 #
 # Not a security boundary: the id rides every iopub message's parent header,
 # and a client holding the connection file can already run anything. The gate

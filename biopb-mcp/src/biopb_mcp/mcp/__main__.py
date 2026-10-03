@@ -375,8 +375,8 @@ def _serve_http(config, port, view=False, start_kernel=False):
     """
     from .._config import get_setting
     from . import _app, _scratch, _server, _xvfb
-    from ._kernel import ENV_SCRATCH, KernelHost
-    from ._kernel_env import ViewerMode
+    from ._kernel import KernelHost
+    from ._kernel_env import ENV_SCRATCH, ViewerMode
 
     # What our launcher handed *this* process, taken out of the environment the
     # kernel inherits so a session started from a cell is not mistaken for us.
