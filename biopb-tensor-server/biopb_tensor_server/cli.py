@@ -802,6 +802,10 @@ def _setup_flight_server(
         console.print(
             f"[green]Monitoring {len(partition.monitored)} directory(s) for live updates[/green]"
         )
+    if partition.upstreams:
+        console.print(
+            f"[green]Mirroring {len(partition.upstreams)} upstream tensor server(s)[/green]"
+        )
     if partition.scan_once:
         console.print(
             f"[green]Scanning {len(partition.scan_once)} unwatched directory(s) once, in the background[/green]"
@@ -835,16 +839,15 @@ def _setup_flight_server(
     # this itself on entry; pre-setting it closes the window between mark_ready()
     # and the loop's first tick, so a client never sees "SERVING, not scanning,
     # never scanned".
-    if partition.monitored or partition.scan_once:
+    if partition.monitored or partition.upstreams or partition.scan_once:
         server.set_full_scan_in_progress(True)
 
     # The first scan runs in this loop's first tick, in the background, and its
     # tick also completes the startup protocol when there is nothing to scan.
     source_manager.start()
-    if partition.monitored:
-        console.print(
-            f"[green]Started monitoring: {[ms.url for ms in partition.monitored]}[/green]"
-        )
+    monitoring = [ms.url for ms in (*partition.monitored, *partition.upstreams)]
+    if monitoring:
+        console.print(f"[green]Started monitoring: {monitoring}[/green]")
 
     # Progressive discovery: reach SERVING now. The catalog fills as the scan runs;
     # a client that needs it complete waits on the health action's

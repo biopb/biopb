@@ -8,6 +8,7 @@ walked and diffed, so there are no per-path filesystem events to handle.
 
 from __future__ import annotations
 
+import itertools
 import logging
 import os
 import threading
@@ -1480,39 +1481,27 @@ def create_source_manager(
         credentials_config=credentials_config,
         write_dir=write_dir,
     )
-    static_sources, monitored_sources, scan_once_sources = partition
-
-    # ``monitored_sources`` holds the watched local directories and the bare-host
-    # tensor-server upstreams ("mirror everything", biopb/biopb#178).
     monitored_dirs: Set[Path] = set()
     monitored_aliases: Dict[Path, str] = {}
-    monitored_upstreams: List[SourceConfig] = []
-    for source in monitored_sources:
+    for source in partition.monitored:
         local_path = source.local_path
-        if source.is_remote or local_path is None:
-            logger.info(
-                "Tensor-server upstream %s: catalog re-listed in the background, "
-                "not filesystem-watched",
-                source.url,
-            )
-            monitored_upstreams.append(source)
-            continue
         monitored_dirs.add(local_path)
         if source.alias:
             monitored_aliases[local_path] = source.alias
+    for source in partition.upstreams:
+        logger.info(
+            "Tensor-server upstream %s: catalog re-listed in the background, "
+            "not filesystem-watched",
+            source.url,
+        )
 
-    if (
-        not monitored_dirs
-        and not static_sources
-        and not scan_once_sources
-        and not monitored_upstreams
-    ):
+    if not any(partition):
         logger.info("No sources configured yet; serving an empty catalog")
 
     # EXPERIMENTAL: cloud/synced-folder mode. The walk admits dehydrated entries,
     # and register placeholder adapters resolved lazily on first access.
     cloud_roots: Set[Path] = set()
-    for source in (*monitored_sources, *static_sources, *scan_once_sources):
+    for source in itertools.chain.from_iterable(partition):
         if source.cloud:
             # Warned once per configured cloud source at startup.
             logger.warning(
@@ -1541,14 +1530,14 @@ def create_source_manager(
         stability_window=stability_window,
         full_rescan_interval=full_rescan_interval,
         cloud_roots=cloud_roots,
-        monitored_upstreams=monitored_upstreams,
-        scan_once_sources=scan_once_sources,
+        monitored_upstreams=partition.upstreams,
+        scan_once_sources=partition.scan_once,
         monitored_aliases=monitored_aliases,
         prune_unseen_days=prune_unseen_days,
     )
 
     # Added first so monitored discovery skips paths already claimed.
-    for source in static_sources:
+    for source in partition.static:
         manager.register_static_source(source)
 
     manager.partition = partition

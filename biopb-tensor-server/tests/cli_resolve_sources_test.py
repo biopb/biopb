@@ -55,8 +55,8 @@ class TestResolveServeSources:
         missing = tmp_path / "nfs_root_not_mounted_yet"
         cfg = _config(SourceConfig(url=str(missing), monitor=True))
 
-        static_sources, monitored_sources, scan_once_sources = _resolve_serve_sources(
-            cfg
+        static_sources, upstream_sources, monitored_sources, scan_once_sources = (
+            _resolve_serve_sources(cfg)
         )
 
         assert static_sources == []
@@ -84,8 +84,8 @@ class TestResolveServeSources:
 
         monkeypatch.setattr(resolve_mod, "discover_sources", spy)
 
-        static_sources, monitored_sources, scan_once_sources = _resolve_serve_sources(
-            cfg
+        static_sources, upstream_sources, monitored_sources, scan_once_sources = (
+            _resolve_serve_sources(cfg)
         )
 
         assert str(root) not in seen_urls  # the dir was not walked
@@ -103,8 +103,8 @@ class TestResolveServeSources:
         _write_tiff(str(tiff))
         cfg = _config(SourceConfig(url=str(tiff), monitor=True))
 
-        static_sources, monitored_sources, scan_once_sources = _resolve_serve_sources(
-            cfg
+        static_sources, upstream_sources, monitored_sources, scan_once_sources = (
+            _resolve_serve_sources(cfg)
         )
 
         assert monitored_sources == []
@@ -129,8 +129,8 @@ class TestResolveServeSources:
 
         monkeypatch.setattr(resolve_mod, "discover_sources", spy)
 
-        static_sources, monitored_sources, scan_once_sources = _resolve_serve_sources(
-            cfg
+        static_sources, upstream_sources, monitored_sources, scan_once_sources = (
+            _resolve_serve_sources(cfg)
         )
 
         assert str(root) not in seen_urls
@@ -144,8 +144,8 @@ class TestResolveServeSources:
         root.mkdir()
         cfg = _config(SourceConfig(url=str(root), type="zarr"))
 
-        static_sources, monitored_sources, scan_once_sources = _resolve_serve_sources(
-            cfg
+        static_sources, upstream_sources, monitored_sources, scan_once_sources = (
+            _resolve_serve_sources(cfg)
         )
 
         assert [s.url for s in static_sources] == [str(root)]
@@ -155,8 +155,8 @@ class TestResolveServeSources:
         """A path that is not there cannot be scanned; it is warned-and-skipped."""
         cfg = _config(SourceConfig(url=str(tmp_path / "gone"), monitor=False))
 
-        static_sources, monitored_sources, scan_once_sources = _resolve_serve_sources(
-            cfg
+        static_sources, upstream_sources, monitored_sources, scan_once_sources = (
+            _resolve_serve_sources(cfg)
         )
 
         assert static_sources == [] and scan_once_sources == []
@@ -174,8 +174,8 @@ class TestResolveServeSources:
             SourceConfig(url=str(tiff)),  # non-monitored, but under root
         )
 
-        static_sources, monitored_sources, scan_once_sources = _resolve_serve_sources(
-            cfg
+        static_sources, upstream_sources, monitored_sources, scan_once_sources = (
+            _resolve_serve_sources(cfg)
         )
 
         assert [s.url for s in monitored_sources] == [str(root)]
@@ -195,8 +195,8 @@ class TestResolveServeSources:
             SourceConfig(url=str(outside)),
         )
 
-        static_sources, monitored_sources, scan_once_sources = _resolve_serve_sources(
-            cfg
+        static_sources, upstream_sources, monitored_sources, scan_once_sources = (
+            _resolve_serve_sources(cfg)
         )
 
         assert [s.url for s in monitored_sources] == [str(root)]
@@ -208,8 +208,8 @@ class TestResolveServeSources:
         remote = SourceConfig(url="s3://bucket/data.zarr", type="zarr", monitor=True)
         cfg = _config(remote)
 
-        static_sources, monitored_sources, scan_once_sources = _resolve_serve_sources(
-            cfg
+        static_sources, upstream_sources, monitored_sources, scan_once_sources = (
+            _resolve_serve_sources(cfg)
         )
 
         assert monitored_sources == []
@@ -217,7 +217,7 @@ class TestResolveServeSources:
 
     def test_monitored_bare_host_upstream_is_not_expanded(self, monkeypatch):
         """A monitored bare-host ``grpc://host:port`` tensor-server upstream is
-        routed to monitored_sources ONLY -- never expanded into static sources.
+        routed to upstream_sources ONLY -- never expanded into static sources.
 
         Inline expansion would run one blocking upstream RPC per mirrored source
         before mark_ready(), stalling startup for a large upstream. The
@@ -240,11 +240,12 @@ class TestResolveServeSources:
         upstream = SourceConfig(url="grpc://host:8815", alias="hpc", monitor=True)
         cfg = _config(upstream)
 
-        static_sources, monitored_sources, scan_once_sources = _resolve_serve_sources(
-            cfg
+        static_sources, upstream_sources, monitored_sources, scan_once_sources = (
+            _resolve_serve_sources(cfg)
         )
 
-        assert [s.url for s in monitored_sources] == ["grpc://host:8815"]
+        assert [s.url for s in upstream_sources] == ["grpc://host:8815"]
+        assert monitored_sources == []
         assert static_sources == []
 
     def test_unmonitored_bare_host_upstream_is_not_expanded(self, monkeypatch):
@@ -272,11 +273,12 @@ class TestResolveServeSources:
         upstream = SourceConfig(url="grpc://host:8815", alias="hpc", monitor=False)
         cfg = _config(upstream)
 
-        static_sources, monitored_sources, scan_once_sources = _resolve_serve_sources(
-            cfg
+        static_sources, upstream_sources, monitored_sources, scan_once_sources = (
+            _resolve_serve_sources(cfg)
         )
 
-        assert [s.url for s in monitored_sources] == ["grpc://host:8815"]
+        assert [s.url for s in upstream_sources] == ["grpc://host:8815"]
+        assert monitored_sources == []
         assert static_sources == []
 
     def test_monitored_single_source_upstream_is_static(self):
@@ -286,8 +288,8 @@ class TestResolveServeSources:
         upstream = SourceConfig(url="grpc://host:8815/raw", alias="hpc", monitor=True)
         cfg = _config(upstream)
 
-        static_sources, monitored_sources, scan_once_sources = _resolve_serve_sources(
-            cfg
+        static_sources, upstream_sources, monitored_sources, scan_once_sources = (
+            _resolve_serve_sources(cfg)
         )
 
         assert monitored_sources == []  # nothing to watch or re-list
@@ -310,8 +312,8 @@ class TestResolveServeSources:
             SourceConfig(url=str(good)),
         )
 
-        static_sources, monitored_sources, scan_once_sources = _resolve_serve_sources(
-            cfg
+        static_sources, upstream_sources, monitored_sources, scan_once_sources = (
+            _resolve_serve_sources(cfg)
         )
 
         assert monitored_sources == []
@@ -338,8 +340,8 @@ class TestResolveServeSources:
 
         monkeypatch.setattr(resolve_mod, "discover_sources", spy)
 
-        static_sources, monitored_sources, scan_once_sources = _resolve_serve_sources(
-            cfg
+        static_sources, upstream_sources, monitored_sources, scan_once_sources = (
+            _resolve_serve_sources(cfg)
         )
 
         assert monitored_sources == []  # cloud alone does NOT monitor anymore
@@ -365,8 +367,8 @@ class TestResolveServeSources:
 
         monkeypatch.setattr(resolve_mod, "discover_sources", spy)
 
-        static_sources, monitored_sources, scan_once_sources = _resolve_serve_sources(
-            cfg
+        static_sources, upstream_sources, monitored_sources, scan_once_sources = (
+            _resolve_serve_sources(cfg)
         )
 
         assert str(root) not in seen_urls  # not pre-walked
@@ -532,8 +534,8 @@ class TestAliasTreeRoot:
         _write_tiff(str(root / "image.tif"))
         cfg = _config(SourceConfig(url=str(root), alias="live", monitor=True))
 
-        with caplog.at_level("WARNING", logger="biopb_tensor_server.cli"):
-            static_sources, monitored_sources, scan_once_sources = (
+        with caplog.at_level("WARNING", logger="biopb_tensor_server.sources.partition"):
+            static_sources, upstream_sources, monitored_sources, scan_once_sources = (
                 _resolve_serve_sources(cfg)
             )
 
@@ -548,8 +550,8 @@ class TestAliasTreeRoot:
         _write_tiff(str(f))
         cfg = _config(SourceConfig(url=str(f), alias="solo", monitor=True))
 
-        static_sources, monitored_sources, scan_once_sources = _resolve_serve_sources(
-            cfg
+        static_sources, upstream_sources, monitored_sources, scan_once_sources = (
+            _resolve_serve_sources(cfg)
         )
 
         assert monitored_sources == []

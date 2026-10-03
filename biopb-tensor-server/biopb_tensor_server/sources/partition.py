@@ -2,7 +2,7 @@
 
 One classifier: :func:`partition_sources` is the only place that decides whether
 an entry is registered as it is (static), kept live by the manager's rescan loop
-(monitored), or walked once (scan-once), and it is the only one to warn about an
+(monitored, or an upstream), or walked once (scan-once), and it is the only one to warn about an
 entry that is not what it asked for.
 """
 
@@ -26,9 +26,10 @@ class Route(Enum):
     """Where one configured source goes on the serve path."""
 
     STATIC = "static"  # nothing to discover: expanded and registered as it is
-    # Owned by the manager's rescan loop: a watched directory, or a bare-host
-    # tensor-server upstream, which is re-listed rather than walked.
+    # Both owned by the manager's rescan loop: a watched directory is walked, a
+    # bare-host tensor-server upstream is re-listed.
     MONITORED = "monitored"
+    UPSTREAM = "upstream"
     SCAN_ONCE = "scan_once"  # a directory the first tick walks, then never again
 
 
@@ -44,7 +45,7 @@ def route_source(s: SourceConfig) -> Route:
         # A bare-host tensor-server upstream ("mirror everything") holds many
         # sources of its own, so it always goes to the manager's background
         # re-list. Every other remote (s3://, ...) names a single source.
-        return Route.MONITORED if is_bare_host_upstream_url(s.url) else Route.STATIC
+        return Route.UPSTREAM if is_bare_host_upstream_url(s.url) else Route.STATIC
 
     path = s.local_path
     if path is None:  # unreachable: a local url always resolves to a path
@@ -80,10 +81,10 @@ class SourcePartition(NamedTuple):
     """The configured sources by route; ``static`` is already expanded."""
 
     static: List[SourceConfig]
-    # Watched local directories and bare-host upstreams, all discovered by the
-    # manager after SERVING.
-    monitored: List[SourceConfig]
-    scan_once: List[SourceConfig]
+    # The rest are discovered by the manager after SERVING.
+    upstreams: List[SourceConfig]  # bare-host tensor servers, re-listed
+    monitored: List[SourceConfig]  # watched local directories
+    scan_once: List[SourceConfig]  # unwatched directories, walked once
 
 
 def partition_sources(
@@ -100,6 +101,7 @@ def partition_sources(
     rescan. See :func:`route_source`.
     """
     to_expand: List[SourceConfig] = []
+    upstream_sources: List[SourceConfig] = []
     monitored_sources: List[SourceConfig] = []
     scan_once_sources: List[SourceConfig] = []
 
@@ -107,6 +109,8 @@ def partition_sources(
         route = route_source(s)
         if route is Route.STATIC:
             to_expand.append(s)
+        elif route is Route.UPSTREAM:
+            upstream_sources.append(s)
         elif route is Route.SCAN_ONCE:
             scan_once_sources.append(s)
         else:
@@ -122,9 +126,7 @@ def partition_sources(
 
     # A source an entry expands to may still land under a monitored root (a file
     # listed inside it); the rescan owns those. Remote sources are never under one.
-    monitored_dirs = {
-        ms.local_path for ms in monitored_sources if not ms.is_remote and ms.local_path
-    }
+    monitored_dirs = {ms.local_path for ms in monitored_sources if ms.local_path}
     static_sources = [
         s
         for s in expanded
@@ -158,4 +160,6 @@ def partition_sources(
             inside,
         )
 
-    return SourcePartition(static_sources, monitored_sources, scan_once_sources)
+    return SourcePartition(
+        static_sources, upstream_sources, monitored_sources, scan_once_sources
+    )
