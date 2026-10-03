@@ -72,6 +72,11 @@ class SourceRegistry:
         self._sources: Dict[str, SourceAdapter] = {}
         self._lock = threading.RLock()
         self._on_register = on_register
+        self._materializer: Optional[Callable[[str], None]] = None
+
+    def set_materializer(self, materializer: Optional[Callable[[str], None]]) -> None:
+        """Register what :meth:`get_registered` calls to register a pending source."""
+        self._materializer = materializer
 
     def register(self, source_id: str, adapter: SourceAdapter) -> SourceAdapter:
         """Register a data source, in canonical axis order.
@@ -113,7 +118,11 @@ class SourceRegistry:
                 f"by splitting on the first '/'."
             )
         adapter = normalize_adapter(adapter)
-        if self._on_register is not None:
+        # A pending placeholder is not the source: the hook attaches uploaded
+        # tensors to what will serve them, which is the adapter that replaces it.
+        if self._on_register is not None and not getattr(
+            adapter, "registration_pending", False
+        ):
             try:
                 self._on_register(source_id, adapter)
             except Exception:
@@ -180,6 +189,22 @@ class SourceRegistry:
         """Thread-safe source lookup."""
         with self._lock:
             return self._sources.get(source_id)
+
+    def get_registered(self, source_id: str) -> Optional[SourceAdapter]:
+        """:meth:`get`, registering the source first if it is still pending.
+
+        What a reader of the source's data or tensors uses. The internal callers
+        that only ask whether it exists, or read its url, use :meth:`get`: they
+        must not pay for a registration. Returns the placeholder when the
+        registration failed, which refuses the read with its error.
+        """
+        adapter = self.get(source_id)
+        if getattr(adapter, "registration_pending", False):
+            materializer = self._materializer
+            if materializer is not None:
+                materializer(source_id)
+                adapter = self.get(source_id)
+        return adapter
 
     def snapshot(self) -> List[Tuple[str, SourceAdapter]]:
         """Return a stable snapshot of registered sources for iteration."""

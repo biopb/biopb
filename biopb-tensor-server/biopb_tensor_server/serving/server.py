@@ -583,6 +583,9 @@ class TensorFlightServer(flight.FlightServerBase):
         self._scan_status_lock = threading.Lock()
         self._full_scan_in_progress = False
         self._last_full_scan_at: Optional[float] = None
+        # How many claimed sources still await registration (see
+        # ``set_registration_pending_provider``); 0 when nothing defers it.
+        self._registration_pending: Callable[[], int] = lambda: 0
 
         # Runtime source registration (the "add_source/remove_source" action).
         # The SourceManager injects its ``add_local_source``/``remove_dropped_root``
@@ -624,6 +627,15 @@ class TensorFlightServer(flight.FlightServerBase):
         """
         with self._scan_status_lock:
             self._full_scan_in_progress = bool(in_progress)
+
+    def set_registration_pending_provider(self, provider: Callable[[], int]) -> None:
+        """Report how many claimed sources are still waiting to be registered.
+
+        The first scan claims every source before registering them in the
+        background, so a catalog can be complete in its rows and still be filling
+        in their tensors. Surfaced on ``health`` as ``registration_pending``.
+        """
+        self._registration_pending = provider
 
     def set_last_full_scan(self, timestamp: float) -> None:
         """Record the epoch-seconds time a full catalog rescan last succeeded.
@@ -763,7 +775,7 @@ class TensorFlightServer(flight.FlightServerBase):
         themselves.
         """
         source_id, _ = split_array_id(array_id)
-        adapter = self.sources.get(source_id)
+        adapter = self.sources.get_registered(source_id)
         if adapter is None:
             return None
         expected = adapter.tensor_capability_token(array_id)
@@ -924,7 +936,7 @@ class TensorFlightServer(flight.FlightServerBase):
         Returns:
             TensorAdapter for the specified tensor, or None if not found
         """
-        source_adapter = self.sources.get(source_id)
+        source_adapter = self.sources.get_registered(source_id)
         if source_adapter is None:
             return None
 
@@ -971,7 +983,7 @@ class TensorFlightServer(flight.FlightServerBase):
             rest = "/".join(rest) if rest else None
 
             adapter = None
-            source_adapter = self.sources.get(source_id)
+            source_adapter = self.sources.get_registered(source_id)
             if source_adapter is not None:
                 # A within-source suffix names a native pyramid level, a tensor
                 # field, or a label set (and a level under it); the source
@@ -1181,6 +1193,11 @@ class TensorFlightServer(flight.FlightServerBase):
                 # null until the first full scan succeeds). See biopb/biopb#212.
                 "full_scan_in_progress": full_scan_in_progress,
                 "last_full_scan_finished_at": last_full_scan_at,
+                # Sources claimed but not yet registered: their rows exist with
+                # ``is_resolved`` false and ``unresolved_reason`` "pending", and
+                # fill in as the background registration reaches them (or at
+                # once, when a read asks for one). 0 means the catalog is whole.
+                "registration_pending": self._registration_pending(),
                 # Whether drawn ROIs survive a restart. A store that was asked
                 # for and could not be opened is fatal at startup, so this is
                 # False for a deliberately session-only server, or one with no
@@ -1297,7 +1314,7 @@ class TensorFlightServer(flight.FlightServerBase):
         the result on the adapter, so a retry coalesces onto the finished work
         rather than downloading again.
         """
-        adapter = self.sources.get(source_id)
+        adapter = self.sources.get_registered(source_id)
         if adapter is None:
             raise flight.FlightServerError(f"Source not found: {source_id}")
         # The terminal message IS the catalog row, so refuse before the recall
@@ -1411,7 +1428,7 @@ class TensorFlightServer(flight.FlightServerBase):
           filesystem reads, concurrency-safe with real reads, so warming never
           blocks a live viewer read.
         """
-        adapter = self.sources.get(source_id)
+        adapter = self.sources.get_registered(source_id)
         if adapter is None:
             raise flight.FlightServerError(f"Source not found: {source_id}")
 
@@ -1775,7 +1792,7 @@ class TensorFlightServer(flight.FlightServerBase):
         # crashing on None.split), so honor the documented default in this one
         # chokepoint rather than at every adapter call site.
         if field is None:
-            default_adapter = self.sources.get(source_id)
+            default_adapter = self.sources.get_registered(source_id)
             if default_adapter is not None:
                 descriptors = default_adapter.list_tensor_descriptors()
                 if descriptors:
@@ -1835,7 +1852,7 @@ class TensorFlightServer(flight.FlightServerBase):
 
             schema = tensor_adapter.get_arrow_schema(read_plan.descriptor)
 
-            source_adapter = self.sources.get(source_id)
+            source_adapter = self.sources.get_registered(source_id)
 
             # A serving field, filled from the bound adapter (biopb/biopb#780).
             # Deliberately here rather than on the catalog listing: consumers use

@@ -113,6 +113,12 @@ class PrecacheWorker:
         # there is no manager (e.g. static-only deployments), in which case the
         # gate is a no-op and warming proceeds as before.
         self.should_warm: Optional[Callable[[str], bool]] = None
+        # Holds the backlog tier while it returns False. Wired from
+        # SourceManager.registration_idle: registering the sources a first scan
+        # claimed is the critical path of a start and reads the same files, so
+        # warming them waits for it. The live tier is not gated by this. None
+        # leaves the backlog ungated.
+        self.backlog_gate: Optional[Callable[[], bool]] = None
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -146,6 +152,24 @@ class PrecacheWorker:
                 return
             self._seen.add(source_id)
         self._queue.put(source_id)
+
+    def enqueue_backlog(self, source_id: str, mtime: float) -> None:
+        """Add one source to the backlog, newest mtime first.
+
+        For a startup source that could not be seeded in :meth:`seed_backlog`
+        because it had nothing to warm yet (its registration was deferred), and
+        so reaches the backlog when that registration completes. Skipped if
+        already queued in either tier.
+        """
+        with self._seen_lock:
+            if source_id in self._seen:
+                return
+        with self._backlog_lock:
+            if source_id in self._backlog_ids:
+                return
+            self._backlog_seq += 1
+            heapq.heappush(self._backlog, (-mtime, self._backlog_seq, source_id))
+            self._backlog_ids.add(source_id)
 
     def seed_backlog(self, items: Sequence[Tuple[str, float]]) -> None:
         """Seed the secondary backlog with ``(source_id, mtime)`` pairs.
@@ -194,6 +218,14 @@ class PrecacheWorker:
                     # Cache is full; warming would evict live data. Nap and
                     # re-check (live eviction may free room later).
                     self._stop.wait(self._cfg.backlog_idle_recheck_seconds)
+                    continue
+                if self.backlog_gate is not None and not self.backlog_gate():
+                    # Held; a live addition is still taken as it arrives.
+                    try:
+                        source_id = self._queue.get(timeout=1.0)
+                    except queue.Empty:
+                        continue
+                    self._process_live(source_id)
                     continue
                 self._drain_one_backlog()
                 continue

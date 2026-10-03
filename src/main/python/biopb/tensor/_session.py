@@ -774,14 +774,16 @@ class CatalogClient:
         # tensor-bound GetFlightInfo instead used to overlay the *first* field's
         # get_tensor_metadata() delta, so a multi-field source reported one
         # arbitrary field's extras as the source's metadata.
-        table = self._query_table(
+        query = (
             "SELECT is_resolved, metadata_json FROM sources "
             f"WHERE source_id = {sql_literal(source_id)}"
         )
-        rows = table.to_pylist()
+        rows = self._query_table(query).to_pylist()
         if not rows:
             raise ValueError(f"Source not found: {source_id}")
         row = rows[0]
+        if not row.get("is_resolved", True) and self._register_if_pending(source_id):
+            row = self._query_table(query).to_pylist()[0]
 
         if not row.get("is_resolved", True):
             # Unresolved (cloud / synced-folder) source: tensors are unknown
@@ -910,6 +912,12 @@ class CatalogClient:
         """
         source_id, tensor_id = split_array_id(array_id)
         row = self._source_tensors_row(source_id)
+        if (
+            row is not None
+            and not row.get("is_resolved", True)
+            and self._register_if_pending(source_id)
+        ):
+            row = self._source_tensors_row(source_id)
 
         if row is not None:
             # The flag, not an empty tensor list: a source can resolve cleanly
@@ -958,6 +966,32 @@ class CatalogClient:
         cannot say -- no row matched, or there is no catalog to ask."""
         row = self._addressed_row("len(tensors) AS tensor_count", source_id)
         return row["tensor_count"] if row else None
+
+    def _register_if_pending(self, source_id: str) -> bool:
+        """Have the server register a source it has claimed but not yet opened.
+
+        A catalog row that is unresolved because its registration is still queued
+        (``unresolved_reason`` ``pending``) or failed is a local source, so
+        registering it costs no download and needs no consent: the server does it
+        for any read, and this does it before the catalog-side check that would
+        otherwise refuse. A failed one raises here with the server's reason.
+
+        False for anything else -- a cloud placeholder, or a server too old to
+        have the column (which refuses the query) -- so the caller's own refusal
+        stands. The column is asked for separately, never as part of a shared row
+        projection, for that reason.
+        """
+        try:
+            rows = self._query_table(
+                "SELECT unresolved_reason FROM sources "
+                f"WHERE source_id = {sql_literal(source_id)}"
+            ).to_pylist()
+        except flight.FlightError:
+            return False
+        if not rows or rows[0].get("unresolved_reason") not in ("pending", "failed"):
+            return False
+        self.resolve_source(source_id)
+        return True
 
     def _source_tensors_row(self, source_id: str) -> Optional[Mapping[str, Any]]:
         """One source's addressing columns: the resolved flag and the tensor list.

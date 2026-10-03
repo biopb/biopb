@@ -87,6 +87,22 @@ def _browse(client) -> dict:
     return {row["source_id"]: row for row in rows}
 
 
+def _unresolved_reasons(client) -> dict:
+    """``{source_id: reason}`` for the sources that are not resolved.
+
+    Asked for apart from the listing: a server older than the column refuses the
+    query, and the listing must still print.
+    """
+    try:
+        rows = client.query(
+            "SELECT source_id, unresolved_reason FROM sources WHERE NOT is_resolved",
+            format="records",
+        )
+        return {row["source_id"]: row["unresolved_reason"] for row in rows}
+    except Exception:
+        return {}
+
+
 def _log_timing(start_time: float) -> None:
     """Print elapsed time since start_time to stderr."""
     elapsed = time.time() - start_time
@@ -282,13 +298,21 @@ def query(
         table.add_column("Shape", style="green")
         table.add_column("Dtype", style="blue")
 
+        reasons = (
+            _unresolved_reasons(client)
+            if any(not row.get("is_resolved", True) for row in sources.values())
+            else {}
+        )
         for source_id, row in sources.items():
             tensors = row.get("tensors") or []
             if not tensors:
                 # Two different states, and only one of them is actionable:
                 # an unresolved source has tensors the server has not looked
                 # for yet (biopb/biopb#1032).
-                why = "<no tensors>" if row.get("is_resolved", True) else "<unresolved>"
+                if row.get("is_resolved", True):
+                    why = "<no tensors>"
+                else:
+                    why = f"<{reasons.get(source_id) or 'unresolved'}>"
                 table.add_row(source_id, why, "-", "-")
                 continue
             for tensor in tensors:

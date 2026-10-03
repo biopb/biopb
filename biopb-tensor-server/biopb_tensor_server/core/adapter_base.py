@@ -928,6 +928,17 @@ class SourceAdapter(ABC):
         """
         return True
 
+    def unresolved_reason(self) -> Optional[str]:
+        """Why this source is not resolved, or None when it is.
+
+        ``"needs_recall"``: its bytes are a cloud placeholder and opening it is
+        a consented download. ``"pending"``: a local source whose registration
+        has not run yet; any read, or ``resolve``, runs it. ``"failed"``: its
+        registration raised, and ``metadata_json`` carries the error. A client
+        offers a download for the first only.
+        """
+        return None
+
     def resolve(self) -> None:
         """Hydrate this source if needed.
 
@@ -2082,6 +2093,7 @@ _SOURCE_SCOPED_API = frozenset(
         "resolve",
         "is_resident",
         "is_resolved",
+        "unresolved_reason",
         "get_tensor_adapter",
         "put_chunk",
         "close",

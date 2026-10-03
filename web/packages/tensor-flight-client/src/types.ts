@@ -24,11 +24,20 @@ export interface DataSourceDescriptor {
   metadata_json: string | null;
   /**
    * Deterministic: does a real, hydrated adapter back this source right now?
-   * False only for an unresolved cloud/synced-folder source awaiting an
-   * explicit `resolve`. Unlike a residency/warm-state flag, this never flips
+   * False for an unresolved cloud/synced-folder source awaiting an explicit
+   * `resolve`, and for a local source whose registration has not run yet (see
+   * `unresolved_reason`). Unlike a residency/warm-state flag, this never flips
    * back to false once true for the life of the server process.
    */
   is_resolved: boolean;
+  /**
+   * Why `is_resolved` is false, or null when it is true. `needs_recall`: a
+   * cloud placeholder, opening it downloads it, so ask first. `pending`: a
+   * local source whose registration is still queued; reading it, or `resolve`,
+   * registers it at once and costs no download. `failed`: registration raised,
+   * and `metadata_json` carries the error. Absent from an older server's rows.
+   */
+  unresolved_reason?: "needs_recall" | "pending" | "failed" | null;
   /** Structural entry per tensor: array_id, dim_labels, shape, dtype. */
   tensors: TensorDescriptor[];
 }
@@ -171,6 +180,11 @@ export interface BackendHealth {
   full_scan_in_progress?: boolean;
   /** Epoch seconds of the last successful full scan, or null until the first. */
   last_full_scan_finished_at?: number | null;
+  /**
+   * Claimed sources still waiting for their registration. Their rows are in the
+   * catalog with `unresolved_reason` "pending" and no tensors; 0 means whole.
+   */
+  registration_pending?: number;
 }
 
 export interface ReadyzSnapshot {
@@ -251,6 +265,8 @@ export interface AdminStatus {
   uptime_seconds: number | null;
   full_scan_in_progress: boolean | null;
   last_full_scan_finished_at: number | null;
+  /** Claimed sources still waiting for their registration; absent on an older server. */
+  registration_pending?: number | null;
   /** True in local mode (no token enforced, loopback-only). The admin UI shows
    * the server-side file/dir chooser only when this is true — in local mode the
    * server's filesystem is the user's own machine (biopb/biopb#244). Absent on an

@@ -1904,6 +1904,7 @@ async def list_sources(request: Request) -> JSONResponse:
     try:
         client = ctx.get_client()
         rows = client.query(_SOURCE_LIST_SQL + " ORDER BY source_id", format="records")
+        _add_unresolved_reasons(client, rows)
         result = [_source_row_to_dict(row) for row in rows]
         elapsed = (time.monotonic() - t0) * 1000
         ctx.diag.latency.record(elapsed)
@@ -2340,6 +2341,9 @@ async def get_source(source_id: str, request: Request) -> JSONResponse:
             raise HTTPException(
                 status_code=404, detail=f"Source not found: {source_id}"
             )
+        _add_unresolved_reasons(
+            client, rows, f"AND source_id = {sql_literal(source_id)}"
+        )
         ctx.diag.latency.record((time.monotonic() - t0) * 1000)
         return JSONResponse(_source_row_to_dict(rows[0]))
     except HTTPException:
@@ -3127,6 +3131,7 @@ async def admin_status(request: Request) -> JSONResponse:
             "uptime_seconds": _h("uptime_seconds"),
             "full_scan_in_progress": _h("full_scan_in_progress"),
             "last_full_scan_finished_at": _h("last_full_scan_finished_at"),
+            "registration_pending": _h("registration_pending"),
             "annotations_persisted": _h("annotations_persisted"),
             "catalog_persisted": _h("catalog_persisted"),
         }
@@ -3323,6 +3328,34 @@ _SOURCE_LIST_SQL = (
 )
 
 
+def _add_unresolved_reasons(
+    client: Any, rows: List[Dict[str, Any]], where: str = ""
+) -> None:
+    """Set ``unresolved_reason`` on the rows that are not resolved.
+
+    A second, narrow query rather than a column of the listing: this sidecar can
+    front a server older than the column, which would refuse the whole listing.
+    Without the answer the key stays absent, which a client reads as the cloud
+    case it always was.
+    """
+    unresolved = [row for row in rows if not row.get("is_resolved", True)]
+    if not unresolved:
+        return
+    try:
+        reasons = {
+            r["source_id"]: r["unresolved_reason"]
+            for r in client.query(
+                "SELECT source_id, unresolved_reason FROM sources "
+                f"WHERE NOT is_resolved {where}",
+                format="records",
+            )
+        }
+    except Exception:
+        return
+    for row in unresolved:
+        row["unresolved_reason"] = reasons.get(row["source_id"])
+
+
 def _source_row_to_dict(row: Dict[str, Any]) -> Dict[str, Any]:
     """One ``sources`` catalog row as the TS ``DataSourceDescriptor`` JSON."""
     return {
@@ -3339,6 +3372,13 @@ def _source_row_to_dict(row: Dict[str, Any]) -> Dict[str, Any]:
         # server predating the column, the right reading for every pre-existing
         # source.
         "is_resolved": bool(row.get("is_resolved", True)),
+        # Why it is not resolved (cloud recall, queued registration, a failed
+        # one); absent for a resolved row and for a server that predates it.
+        **(
+            {"unresolved_reason": row["unresolved_reason"]}
+            if row.get("unresolved_reason")
+            else {}
+        ),
         "tensors": [_tensor_row_to_dict(t) for t in (row.get("tensors") or [])],
     }
 

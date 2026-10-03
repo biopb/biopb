@@ -164,6 +164,27 @@ class StaleChunkError(TensorResolutionError):
     grpc_code = "NOT_FOUND"
 
 
+class SourceRegistrationError(TensorResolutionError):
+    """A read of a source whose registration failed.
+
+    The server claims a source on the first scan and registers it afterwards; when
+    that registration raises (a corrupt or unreadable file), the source stays in
+    the catalog marked ``failed`` and every read says why. Canonical
+    ``FAILED_PRECONDITION``: terminal, unlike the retriable "open to resolve" of a
+    cloud source -- the file has to change (the server retries the registration
+    on its own schedule), not the request.
+    """
+
+    grpc_code = "FAILED_PRECONDITION"
+
+    def __init__(self, source_id: str, error: str) -> None:
+        super().__init__(
+            f"source {source_id!r} could not be registered: {error}",
+            reason="registration_failed",
+        )
+        self.source_id = source_id
+
+
 class UploadNotPublishedError(TensorResolutionError):
     """A read of an upload whose producer has not published it yet (PENDING).
 
