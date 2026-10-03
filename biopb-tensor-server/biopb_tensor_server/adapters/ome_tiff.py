@@ -91,10 +91,13 @@ def _files_from_ome_xml(xml: bytes) -> Tuple[str, ...]:
 
     A literal scan, not an XML parse: a Micro-Manager stack's XML runs to tens of
     MB and repeats a file name per plane, so the parse cost ~25x the scan for the
-    same answer. A value with an entity or single quotes goes through the parser.
+    same answer. The scan only knows ``FileName="..."``, so the parser decides
+    whenever a ``FileName`` token went unmatched (single quotes, spaces around
+    ``=``) or a name has an entity.
     """
-    names = list(dict.fromkeys(_UUID_FILENAME.findall(xml)))
-    if b"FileName='" in xml or any(b"&" in n for n in names):
+    found = _UUID_FILENAME.findall(xml)
+    names = list(dict.fromkeys(found))
+    if len(found) != xml.count(b"FileName") or any(b"&" in n for n in names):
         return _files_from_ome_xml_parsed(xml)
     return tuple(n.decode("utf-8", "replace") for n in names)
 

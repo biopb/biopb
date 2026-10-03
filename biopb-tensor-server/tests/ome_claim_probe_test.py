@@ -35,6 +35,22 @@ def _xml(*refs, prefix="", quote='"'):
         pytest.param(_xml("x.tif", prefix="ome:"), ("x.tif",), id="namespaced"),
         pytest.param(_xml("x.tif", quote="'"), ("x.tif",), id="single-quoted"),
         pytest.param(_xml("a&amp;b.tif"), ("a&b.tif",), id="entity"),
+        pytest.param(
+            b'<OME><TiffData><UUID FileName = "b.tif">u</UUID></TiffData></OME>',
+            ("b.tif",),
+            id="spaced",
+        ),
+        pytest.param(
+            b"<OME><TiffData><UUID FileName ='b.tif'>u</UUID></TiffData></OME>",
+            ("b.tif",),
+            id="spaced-single-quoted",
+        ),
+        pytest.param(
+            b'<OME><TiffData><UUID FileName="a.tif">u</UUID></TiffData>'
+            b"<Key>FileName</Key></OME>",
+            ("a.tif",),
+            id="token-elsewhere",
+        ),
         pytest.param(b"<OME><Image/></OME>", (), id="no-references"),
         pytest.param(b"<OME><broken", (), id="malformed"),
     ],
