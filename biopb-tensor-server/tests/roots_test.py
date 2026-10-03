@@ -25,6 +25,12 @@ class TestContaining:
         assert roots.containing(Path("/data/y.tif")) is outer
         assert roots.containing(Path("/elsewhere/z.tif")) is None
 
+    def test_a_known_root_contains_itself(self):
+        """A drop of a known root is a rescan of it, not a new root."""
+        known = _root(RootKind.MONITORED, "/data")
+
+        assert Roots([known]).containing(Path("/data")) is known
+
     def test_an_upstream_and_a_static_cloud_source_are_not_containers(self):
         roots = Roots(
             [
