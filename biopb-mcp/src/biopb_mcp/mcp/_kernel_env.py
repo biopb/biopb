@@ -50,10 +50,8 @@ class ViewerMode:
         return cls("virtual", display=display)
 
     @classmethod
-    def none(cls, reason, display=None):
-        """No viewer. *display* is the Xvfb a viewerless kernel may still be
-        pointed at (a scratch kernel on a virtual-display host)."""
-        return cls("none", reason=reason, display=display)
+    def none(cls, reason):
+        return cls("none", reason=reason)
 
     @property
     def has_window(self) -> bool:
@@ -67,9 +65,8 @@ class ViewerMode:
     def env(self) -> dict:
         """The kernel env entries this mode implies."""
         out = {}
-        if self.display:
-            out["DISPLAY"] = self.display
         if self.kind == "virtual":
+            out["DISPLAY"] = self.display
             out[ENV_VIRTUAL_DISPLAY] = "1"
         elif self.kind == "none":
             out[ENV_NO_VIEWER] = self.reason or "no viewer"

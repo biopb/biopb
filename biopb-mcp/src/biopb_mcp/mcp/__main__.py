@@ -476,10 +476,8 @@ def _serve_http(config, port, view=False, start_kernel=False):
             startup_timeout=get_setting(config, "kernel.startup_timeout"),
             execute_timeout=get_setting(config, "kernel.execute_timeout"),
             env=scratch_env,
-            # No viewer, but the session's own display (and its real GPU).
-            viewer=ViewerMode.none(
-                "a scratch kernel verifies a workflow", display=viewer.display
-            ),
+            # No viewer, so no Qt and no display needed.
+            viewer=ViewerMode.none("a scratch kernel verifies a workflow"),
             # No watchdog: for the session kernel a respawn is recovery, for
             # this one death is the verdict (an OOM means the workflow does not
             # fit).

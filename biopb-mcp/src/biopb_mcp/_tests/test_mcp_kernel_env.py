@@ -38,11 +38,6 @@ def test_the_window_pipe_follows_the_mode():
     assert not ViewerMode.none("x").has_window
 
 
-def test_a_viewerless_kernel_may_still_take_the_session_display():
-    assert ViewerMode.none("x", display=":9").env()["DISPLAY"] == ":9"
-    assert ViewerMode.none("x", display=":9").virtual_display is None
-
-
 def test_the_kernel_reads_its_reason_from_the_same_env(monkeypatch):
     monkeypatch.delenv(ENV_SCRATCH, raising=False)
     monkeypatch.setenv(ENV_NO_VIEWER, "off")
