@@ -74,7 +74,8 @@ bottom are never started here** — the session is a pure client of them, and on
 The chain is split where it is because of **fd-1 corruption**. Under stdio MCP,
 **fd 1 *is* the JSON-RPC channel**, so any stray stdout from a heavy process
 (uvicorn/Qt/dask/kernel) corrupts it. Hence the **shim/heavy split**: a
-featherweight shim owns fd 1 and imports only the mcp SDK, and all heavy work runs
+featherweight shim (`biopb._shim` in the SDK, run as `biopb-shim`) owns fd 1 and
+imports only the mcp SDK, and all heavy work runs
 in a separate child it bridges to over http — making fd-1 corruption structurally
 impossible.
 

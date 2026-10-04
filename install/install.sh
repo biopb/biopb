@@ -431,11 +431,11 @@ _seed_algorithm_registry() {
 # Always drops a canonical, client-agnostic definition at $CONFIG_DIR/mcp.json.
 # If nothing is detected, prints guidance so the user can wire it up themselves.
 _setup_mcp() {
-    # Resolve the absolute biopb-mcp path for the canonical mcp.json fallback
+    # Resolve the absolute biopb-shim path for the canonical mcp.json fallback
     # (per-client registration resolves its own path inside `biopb agents`). GUI
     # agents don't inherit the shell PATH, so the absolute path is what works.
     local mcp_cmd
-    mcp_cmd=$(command -v biopb-mcp 2>/dev/null || echo "biopb-mcp")
+    mcp_cmd=$(command -v biopb-shim 2>/dev/null || echo "biopb-shim")
 
     mkdir -p "$CONFIG_DIR"
 
@@ -462,7 +462,7 @@ _setup_mcp() {
   "mcpServers": {
     "biopb": {
       "command": "$mcp_cmd",
-      "args": ["--transport", "stdio"]
+      "args": []
     }
   }
 }
@@ -471,7 +471,7 @@ EOF
 
     # Register with every detected client through the single source of truth:
     # `biopb agents` (core biopb._agents), the same catalog + write logic the
-    # control-plane dashboard uses. It resolves the absolute biopb-mcp path and
+    # control-plane dashboard uses. It resolves the absolute biopb-shim path and
     # writes each client's own config (Claude Code via its CLI, the rest via an
     # atomic JSON merge that preserves the user's other servers), so this installer
     # no longer carries a second copy. `|| true`: a per-client failure must never

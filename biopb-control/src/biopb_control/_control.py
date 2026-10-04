@@ -7,7 +7,7 @@ same port**, and routes by namespace so no two upstreams share a path prefix:
 
 - ``GET  /health``                -> ``{"control": "ok", "data_plane": {...}}`` —
                                      the control's own liveness (what
-                                     ``_control_client`` and the installer poll).
+                                     ``_control_launch`` and the installer poll).
                                      Bare, kept byte-for-byte.
 - ``POST /api/data_plane/{ensure,stop,restart}`` -> supervisor verbs: ensure the
                                      plane is up (bounded wait), stop it, or bounce
@@ -212,13 +212,13 @@ def _session_proxy_roots(loopback_bound: bool) -> frozenset[str]:
 _UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
 # Every /api/ route is now gated, `/api/data_plane/ensure` included. It used to be
-# exempted (biopb/biopb#424 item 2) because biopb-mcp's _control_client had no way
+# exempted (biopb/biopb#424 item 2) because biopb._control_launch had no way
 # to obtain the token — the control handed back the plane's endpoint but never a
 # credential — so gating this idempotent route would have locked the mcp client out
 # of a token-gated deployment. That exemption was an unauthenticated state-change,
 # safe only while a local control was necessarily tokenless; #468's optional local
 # token falsified that. The credential handoff (biopb/biopb#470) unblocks the fix:
-# the control writes the token to an owner-only file and _control_client carries it,
+# the control writes the token to an owner-only file and _control_launch carries it,
 # so this route can be gated like the rest and the exemption is gone.
 
 # Data-plane log tail (the dashboard /logs page polls it). Bound BOTH the returned
@@ -378,7 +378,7 @@ class _URLPrefixMiddleware:
       ``/node/h/p/api/data_plane/restart`` would sail past its
       ``startswith("/api/")`` check — an auth bypass, not merely a 404.
     - An unprefixed request must pass through **untouched**, not 404: biopb-mcp's
-      ``_control_client`` and the installer poll ``http://127.0.0.1:8813/health``
+      ``_control_launch`` and the installer poll ``http://127.0.0.1:8813/health``
       over loopback with no prefix, and they keep working while a prefix is
       configured for the portal.
 

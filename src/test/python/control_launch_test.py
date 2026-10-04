@@ -9,7 +9,7 @@ class TestStartControlDetached:
     def test_spawns_detached_no_data_plane_and_returns_true(self, monkeypatch):
         import os
 
-        from biopb_mcp import _control_client
+        from biopb import _control_launch as _control_client
 
         monkeypatch.setattr(_control_client, "_biopb_executable", lambda: "/opt/biopb")
         captured = {}
@@ -35,7 +35,7 @@ class TestStartControlDetached:
             assert captured["kwargs"]["start_new_session"] is True
 
     def test_returns_false_and_does_not_spawn_when_cli_missing(self, monkeypatch):
-        from biopb_mcp import _control_client
+        from biopb import _control_launch as _control_client
 
         monkeypatch.setattr(_control_client, "_biopb_executable", lambda: None)
 
@@ -46,7 +46,7 @@ class TestStartControlDetached:
         assert _control_client.start_control_detached() is False
 
     def test_returns_false_on_spawn_oserror(self, monkeypatch):
-        from biopb_mcp import _control_client
+        from biopb import _control_launch as _control_client
 
         monkeypatch.setattr(_control_client, "_biopb_executable", lambda: "/opt/biopb")
 
@@ -61,7 +61,7 @@ class TestBiopbExecutable:
     def test_prefers_sibling_of_interpreter(self, tmp_path, monkeypatch):
         import os
 
-        from biopb_mcp import _control_client
+        from biopb import _control_launch as _control_client
 
         bindir = tmp_path / "bin"
         bindir.mkdir()
@@ -80,7 +80,7 @@ class TestBiopbExecutable:
         import os
         import shutil
 
-        from biopb_mcp import _control_client
+        from biopb import _control_launch as _control_client
 
         base_bin = tmp_path / "base"
         base_bin.mkdir()
@@ -102,7 +102,7 @@ class TestBiopbExecutable:
     def test_falls_back_to_path_when_no_sibling(self, tmp_path, monkeypatch):
         import shutil
 
-        from biopb_mcp import _control_client
+        from biopb import _control_launch as _control_client
 
         # An interpreter dir with no biopb sibling -> resolution falls to PATH.
         monkeypatch.setattr(_control_client.sys, "executable", str(tmp_path / "python"))

@@ -677,14 +677,14 @@ function Set-McpClients {
     # the install; we gate on $LASTEXITCODE explicitly below.
     $ErrorActionPreference = 'SilentlyContinue'
 
-    $mcpCmd = (Get-Command biopb-mcp -ErrorAction SilentlyContinue).Source
-    if (-not $mcpCmd) { $mcpCmd = "biopb-mcp" }
+    $mcpCmd = (Get-Command biopb-shim -ErrorAction SilentlyContinue).Source
+    if (-not $mcpCmd) { $mcpCmd = "biopb-shim" }
 
-    # biopb-mcp speaks MCP over stdio: the AI agent spawns it as a child process
-    # (`biopb-mcp --transport stdio`). We register the resolved absolute path so
+    # biopb-shim speaks MCP over stdio: the AI agent spawns it as a child process
+    # and it attaches to a biopb-mcp session. We register the resolved absolute path so
     # GUI agents (e.g. Claude Desktop), which don't inherit the shell PATH, can
     # still find it.
-    $mcpArgs = @("--transport", "stdio")
+    $mcpArgs = @()
 
     if (-not (Test-Path -LiteralPath $ConfigDir)) { New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null }
 

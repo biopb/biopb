@@ -31,7 +31,7 @@ on the *existing* FastMCP Starlette app via ``mcp.custom_route``, so they share
 the MCP loop and port (``transport.port``) with ``/mcp``. The server is
 http-only (ARCHITECTURE.md, Lifecycle), so the API is always
 available — stdio clients reach it too: they connect through the launcher's
-stdio→http bridge (``mcp/_shim.py``) and so hit ``/api/*`` on the shared daemon
+stdio→http bridge (``biopb._shim``) and so hit ``/api/*`` on the shared daemon
 like any other http client. (It was once skipped under a stdio-*serving*
 launcher, where standing a second uvicorn up inside the protocol process risked
 the fd-1 JSON-RPC channel and raced the one ``KernelHost`` — that launcher no

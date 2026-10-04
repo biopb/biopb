@@ -7,6 +7,17 @@ own. The control launches the session and the user ends it; the stdio shim
 becomes a stateless attach client. Local attach comes first. Remote attach
 follows once the security model for `/mcp` is settled.
 
+## Where the shim lives
+
+The shim is part of the SDK: `biopb._shim`, run as `biopb-shim` (extra
+`biopb[shim]`, which needs only the `mcp` package). It imports no session code, so
+an agent host needs the SDK and not the kernel stack. `biopb-mcp --transport stdio`
+runs the same code. The registration helper (`biopb._agents`) registers
+`biopb-shim`. Shim and session meet only over HTTP and the session registry:
+`/api/lease` (acquire, renew, release), `/api/status`, `/mcp`, the control's
+`/api/sessions` and `/api/sessions/new`, and the records in `biopb._sessions`. A
+change to any of them is a change to both packages.
+
 ## Rules
 
 - **One agent per session.** A session accepts one attach at a time.
@@ -93,9 +104,9 @@ and when an attachment ends.
 
 **Clients that do not follow `list_changed`.** Claude Code and opencode refresh
 their tool list after `attach`; Codex does not, within a turn. For such a client
-the registration passes `--session` (`biopb agents register` writes `--session
-auto` into Codex's entry and nothing extra into the others; an entry registered
-before that reads as drifted, so the dashboard offers a Re-register): the shim binds *before* it answers
+the registration passes `--session` (`biopb agents register` writes `--session auto` into Codex's entry and nothing
+extra into the others; an entry registered before that, or for `biopb-mcp`, reads
+as drifted, so the dashboard offers a Re-register): the shim binds *before* it answers
 `initialize`, so the answer carries the session's own instructions -- in the slot
 a client puts in front of the model from the first turn -- and its tools, and
 nothing needs refreshing. `auto` takes the newest free session, else has the

@@ -1,7 +1,7 @@
-"""Register biopb-mcp with local AI agent clients — shared, stdlib-only.
+"""Register biopb-shim with local AI agent clients — shared, stdlib-only.
 
 An MCP client (Claude Code, Claude Desktop, Cursor, opencode, …) spawns
-``biopb-mcp`` over stdio; wiring biopb into a client means writing a small MCP
+``biopb-shim`` over stdio; wiring biopb into a client means writing a small MCP
 server entry into that client's config. The installer already does this once at
 install time (``install/install.sh`` + ``install/biopb-engine.ps1``); this module
 is the same knowledge as an importable Python API so the control-plane dashboard
@@ -27,7 +27,7 @@ Three things it does per client:
 - **status** — a subprocess-free read (``not_installed`` / ``installed`` /
   ``registered``, plus ``drifted``). Deliberately never spawns anything: it is
   polled by the dashboard, and (for Claude Code) ``claude mcp get``/``list`` run a
-  *live connection test* that would launch ``biopb-mcp`` on every refresh. So
+  *live connection test* that would launch ``biopb-shim`` on every refresh. So
   status is always a plain config-file read.
 - **register** — write the biopb entry. The calm JSON configs (Claude Desktop,
   Cursor, opencode) get an atomic read-merge-replace that preserves every other
@@ -39,9 +39,9 @@ Three things it does per client:
   have no TOML writer and want none (see :func:`_read_toml_entry`).
 - **unregister** — the inverse; idempotent (removing an absent entry is fine).
 
-The registered command is the **absolute path** to ``biopb-mcp`` (resolved beside
+The registered command is the **absolute path** to ``biopb-shim`` (resolved beside
 this interpreter, then PATH), because GUI clients launch it without inheriting a
-shell PATH (the same reason ``_control_client._biopb_executable`` resolves
+shell PATH (the same reason ``_control_launch._biopb_executable`` resolves
 absolutely). That absolute path is also the drift signal: if biopb is reinstalled
 elsewhere, the stored command no longer matches the freshly resolved one, and the
 client's status comes back ``registered`` with ``drifted=True`` so the UI can
@@ -70,11 +70,11 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# The invocation a client registers: `biopb-mcp --transport stdio`, plus whatever
+# The invocation a client registers: `biopb-shim`, plus whatever
 # that client needs on top (`ClientBackend.mcp_args`). The command itself is
-# resolved per call (_mcp_command) so a reinstall that moves biopb-mcp is
+# resolved per call (_mcp_command) so a reinstall that moves biopb-shim is
 # reflected as drift rather than baked in here.
-_MCP_ARGS = ("--transport", "stdio")
+_MCP_ARGS = ()
 
 
 class AgentError(Exception):
@@ -83,34 +83,34 @@ class AgentError(Exception):
 
 
 # --------------------------------------------------------------------------- #
-# Resolving the biopb-mcp command to register
+# Resolving the biopb-shim command to register
 # --------------------------------------------------------------------------- #
 
 
 def _mcp_executable() -> Optional[str]:
-    """Absolute path to the ``biopb-mcp`` console script, or ``None`` if not found.
+    """Absolute path to the ``biopb-shim`` console script, or ``None`` if not found.
 
     Prefer the script installed beside this interpreter (the venv / uv-tool
-    ``Scripts``/``bin`` dir where ``biopb-mcp`` lands), so we register the same
+    ``Scripts``/``bin`` dir where ``biopb-shim`` lands), so we register the same
     environment that shipped biopb even when PATH is not inherited; fall back to
-    PATH. Mirrors ``biopb_mcp._control_client._biopb_executable`` — do NOT
+    PATH. Mirrors ``biopb._control_launch._biopb_executable`` — do NOT
     ``resolve()`` ``sys.executable`` first, or a symlinked venv python would lead
     the sibling lookup out of the venv bin dir.
     """
-    name = "biopb-mcp.exe" if os.name == "nt" else "biopb-mcp"
+    name = "biopb-shim.exe" if os.name == "nt" else "biopb-shim"
     sibling = Path(sys.executable).parent / name
     if sibling.exists():
         return str(sibling)
-    return shutil.which("biopb-mcp")
+    return shutil.which("biopb-shim")
 
 
 def _mcp_command() -> str:
     """The command to register. Falls back to the bare name when the console
     script cannot be located, so a client still gets a working entry if PATH
-    resolves ``biopb-mcp`` at launch — the sibling/PATH resolution above only
+    resolves ``biopb-shim`` at launch — the sibling/PATH resolution above only
     fails when neither is present, which is also when the bare name is the best
     we can offer."""
-    return _mcp_executable() or "biopb-mcp"
+    return _mcp_executable() or "biopb-shim"
 
 
 # --------------------------------------------------------------------------- #
@@ -424,7 +424,7 @@ def _run_client_cli(
     Code runs before an add to stay idempotent (``False`` → tolerate a non-zero
     code, i.e. "wasn't registered"). We never call either client's ``mcp
     get``/``list`` — those run a live connection test that would spawn
-    ``biopb-mcp``.
+    ``biopb-shim``.
     """
     exe = shutil.which(exe_name)
     if exe is None:
@@ -477,7 +477,7 @@ class ClientBackend(ABC):
     config_format: str = "json"
     #: a key of :data:`_SHAPES` -- the entry's shape, written and read back out
     entry_style: str = "stdio"
-    #: what the client launches ``biopb-mcp`` with. Per client because a client
+    #: what the client launches ``biopb-shim`` with. Per client because a client
     #: that cannot follow ``tools/list_changed`` needs the shim to bind a session
     #: before its handshake (Codex: ``--session auto``); drift covers it, so a
     #: registration made before a client needed it is offered a Re-register.
@@ -615,7 +615,7 @@ class CliManagedClient(ClientBackend):
     and Codex's config is TOML whose comments and sibling servers only its own
     editor keeps intact. Status is still a plain config read -- never
     ``mcp get``/``list``, which run a live connection test that would spawn
-    ``biopb-mcp`` on every dashboard poll.
+    ``biopb-shim`` on every dashboard poll.
     """
 
     #: the binary to shell out to
@@ -807,7 +807,7 @@ def status(client_id: str) -> dict:
     ``state`` is ``registered`` if the biopb entry is present (regardless of
     detection -- the entry is ground truth), else ``installed`` if the client is
     detected, else ``not_installed``. ``drifted`` is set only when ``registered``
-    and the stored command no longer matches the freshly resolved ``biopb-mcp``
+    and the stored command no longer matches the freshly resolved ``biopb-shim``
     path (a moved/reinstalled biopb), or its arguments no longer match what this
     client is registered with (a client that has since needed one), so the UI can
     offer a Re-register.

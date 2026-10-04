@@ -22,9 +22,11 @@ from types import SimpleNamespace
 
 import anyio
 import pytest
-from mcp import types
 
-from biopb_mcp.mcp import _shim
+pytest.importorskip("mcp")
+
+from biopb import _shim  # noqa: E402
+from mcp import types  # noqa: E402
 
 
 def _free_port():
@@ -56,6 +58,14 @@ def _fake_psutil(me):
 
     mod = _types.SimpleNamespace(Process=lambda *a, **k: me)
     return mod
+
+
+class TestIsOurs:
+    def test_the_shim_command_and_the_older_stdio_launcher_are_ours(self):
+        assert _shim._is_ours("/venv/bin/biopb-shim --session auto")
+        assert _shim._is_ours("python -m biopb._shim")
+        assert _shim._is_ours("biopb-mcp --transport stdio")
+        assert not _shim._is_ours(r"c:\claude.exe mcp")
 
 
 class TestFindClientProcess:
@@ -446,7 +456,7 @@ class TestBinding:
         env.launch_answer = None
         env.launches = []
         monkeypatch.setattr(
-            _shim._control_client, "ensure_control", lambda wait: env.control_up
+            _shim._control_launch, "ensure_control", lambda wait: env.control_up
         )
 
         def _launch(**kw):
@@ -455,7 +465,7 @@ class TestBinding:
                 raise env.launch_answer
             return env.launch_answer
 
-        monkeypatch.setattr(_shim._control_client, "launch_session", _launch)
+        monkeypatch.setattr(_shim._control_launch, "launch_session", _launch)
 
         def use_control(up=True):
             env.control_up = up
@@ -911,6 +921,7 @@ class TestControlLaunchedSession:
         # biopb-control is not a dependency of biopb-mcp; where it is not
         # installed there is no control for the shim to start.
         pytest.importorskip("biopb_control")
+        pytest.importorskip("biopb_mcp")
         env = _home_env(tmp_path)
         env.pop("BIOPB_TENSOR_URL", None)
         # A control of this test's own, on a port that is not the user's.
@@ -920,7 +931,7 @@ class TestControlLaunchedSession:
 
         def start_shim():
             return subprocess.Popen(
-                [sys.executable, "-m", "biopb_mcp.mcp", "--transport", "stdio"],
+                [sys.executable, "-m", "biopb._shim"],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
@@ -997,6 +1008,7 @@ class TestImmediateAttach:
 
     def test_the_handshake_is_the_sessions_own(self, tmp_path):
         pytest.importorskip("biopb_control")
+        pytest.importorskip("biopb_mcp")
         env = _home_env(tmp_path)
         env.pop("BIOPB_TENSOR_URL", None)
         env["BIOPB_CONTROL_PORT"] = str(_free_port())
@@ -1007,9 +1019,7 @@ class TestImmediateAttach:
                 [
                     sys.executable,
                     "-m",
-                    "biopb_mcp.mcp",
-                    "--transport",
-                    "stdio",
+                    "biopb._shim",
                     "--session",
                     "auto",
                 ],

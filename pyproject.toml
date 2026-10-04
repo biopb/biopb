@@ -44,6 +44,11 @@ dependencies = [
     # the CLI launches in a child process, not in-test).
     "biopb-mcp",
   ]
+  # The stdio shim agents spawn (`biopb-shim`): attaches to a biopb-mcp session.
+  shim = [
+    "mcp >= 1.20, < 2",
+    "psutil; sys_platform == 'win32'",
+  ]
   tensor = [
     # Floor verified for the tensor-server file cache's Windows zero-copy
     # segment read (#572): it hands out mmap-aliasing batches and unlinks the
@@ -82,6 +87,7 @@ dependencies = [
 
 [project.scripts]
   biopb = "biopb.cli:app"
+  biopb-shim = "biopb._shim:main"
 
 [project.urls]
 Homepage = "https://github.com/biopb/biopb"

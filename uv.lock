@@ -554,6 +554,10 @@ doc = [
     { name = "mkdocs-typer2", extra = ["mkdocs"] },
     { name = "mkdocstrings", extra = ["python"] },
 ]
+shim = [
+    { name = "mcp" },
+    { name = "psutil", marker = "sys_platform == 'win32'" },
+]
 tensor = [
     { name = "cachey" },
     { name = "dask", extra = ["array"] },
@@ -578,6 +582,7 @@ requires-dist = [
     { name = "dask", extras = ["array"], marker = "extra == 'tensor'", specifier = ">=2024.0.0" },
     { name = "grpcio" },
     { name = "imageio" },
+    { name = "mcp", marker = "extra == 'shim'", specifier = ">=1.20,<2" },
     { name = "mkdocs-gen-files", marker = "extra == 'doc'", specifier = ">=0.5" },
     { name = "mkdocs-literate-nav", marker = "extra == 'doc'", specifier = ">=0.6" },
     { name = "mkdocs-material", marker = "extra == 'doc'", specifier = "==9.5.49" },
@@ -587,13 +592,14 @@ requires-dist = [
     { name = "ome-zarr", marker = "extra == 'tensor'", specifier = ">=0.6.1" },
     { name = "opencv-python-headless", marker = "extra == 'test'", specifier = "==4.10.0.84" },
     { name = "protobuf", specifier = ">=6.32.1" },
+    { name = "psutil", marker = "sys_platform == 'win32' and extra == 'shim'" },
     { name = "pyarrow", marker = "extra == 'tensor'", specifier = ">=14.0.0" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=7.0" },
     { name = "pytest-timeout", marker = "extra == 'test'", specifier = ">=2.1.0" },
     { name = "typer", specifier = ">=0.12.0" },
     { name = "zarr", marker = "extra == 'tensor'", specifier = ">=2.0.0,<3" },
 ]
-provides-extras = ["test", "tensor", "doc"]
+provides-extras = ["test", "shim", "tensor", "doc"]
 
 [[package]]
 name = "biopb-control"
@@ -673,7 +679,7 @@ provides-extras = ["lazy", "stitch", "test"]
 name = "biopb-mcp"
 source = { editable = "biopb-mcp" }
 dependencies = [
-    { name = "biopb", extra = ["tensor"] },
+    { name = "biopb", extra = ["shim", "tensor"] },
     { name = "distributed" },
     { name = "ipykernel" },
     { name = "jupyter-client" },
@@ -725,7 +731,7 @@ testing = [
 
 [package.metadata]
 requires-dist = [
-    { name = "biopb", extras = ["tensor"], editable = "." },
+    { name = "biopb", extras = ["shim", "tensor"], editable = "." },
     { name = "biopb-napari-widget", marker = "extra == 'napari'", specifier = ">=0.1.0" },
     { name = "distributed", specifier = ">=2023.9.0" },
     { name = "ipykernel" },

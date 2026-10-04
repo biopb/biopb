@@ -196,7 +196,7 @@ function Show-Summary {
     Write-Host "=== Installation Complete ===" -ForegroundColor Yellow
     Write-Host ""
 
-    Write-Inf "Your AI agent launches biopb-mcp over stdio - just start your agent"
+    Write-Inf "Your AI agent launches biopb-shim over stdio - just start your agent"
     Write-Inf "(Claude Code/Desktop, Cursor, opencode), then prompt it:"
     Write-Cmd "  start biopb and report status"
     Write-Inf "That brings up the napari viewer and the data plane."

@@ -1,7 +1,8 @@
 """stdio bridge ("shim") to a biopb-mcp http session.
 
-``biopb-mcp --transport stdio`` does not serve MCP over fd 0/1 from the heavy
-launcher process. Instead the launcher runs this module, which
+``biopb-shim`` (``biopb-mcp --transport stdio`` runs the same code) does not serve
+MCP over fd 0/1 from a session. It is the SDK's own light process, needing only
+the ``mcp`` package (``biopb[shim]``), and it
 
 1. starts **unbound**, answering ``initialize`` with a paragraph that says to call
    the local ``attach`` tool, which is the only tool it lists, so a client that
@@ -25,7 +26,9 @@ choosing a session in exchange.
 
 The process that owns fd 1 as a protocol channel imports nothing that could write
 to stdout (no Qt, dask, uvicorn, kernel, or session code -- only the mcp SDK), so
-the fd-1 corruption class is structurally impossible here.
+the fd-1 corruption class is structurally impossible here. The session reaches the
+shim only over HTTP: ``/api/lease``, ``/api/status``, ``/api/sessions`` and the
+session registry are the contract (docs/session-attach.md).
 
 The shim owns no session. Every session is a detached process the control
 launched, or a person did (``biopb mcp view``, the dashboard), and it runs until
@@ -56,6 +59,7 @@ import json
 import logging
 import os
 import signal
+import sys
 import threading
 import urllib.error
 import urllib.request
@@ -63,15 +67,14 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 import anyio
-from biopb import _locations, _sessions
-from biopb.lifecycle import winjob as _winjob
 from mcp import types
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 from mcp.server.lowlevel.server import NotificationOptions, Server, request_ctx
 from mcp.server.stdio import stdio_server
 
-from .. import _control_client
+from . import _control_launch, _locations, _sessions
+from .lifecycle import winjob as _winjob
 
 logger = logging.getLogger(__name__)
 
@@ -104,13 +107,14 @@ def _install_release_on_signal(release):
             pass
 
 
-# Substrings that mark a process in *our own* stdio launcher chain (the shim and
-# any interpreter-launcher stubs above it), as opposed to the MCP client that
-# spawned it. The whole chain shares the argv the client invoked us with
-# (``... biopb[-_]mcp ... --transport stdio``), and re-exec launchers (e.g. a
-# venv built on Microsoft Store Python inserts one) preserve it. The client's own
-# cmdline (claude.exe, an editor, a shell) matches neither.
-_OURS_MARKERS = ("biopb", "stdio")
+# A process in *our own* launcher chain (the shim and any interpreter-launcher
+# stubs above it), as opposed to the MCP client that spawned it, shares the argv
+# the client invoked us with (``biopb-shim ...``, or the older ``biopb-mcp
+# --transport stdio``), and re-exec launchers (e.g. a venv built on Microsoft
+# Store Python inserts one) preserve it. The client's own cmdline (claude.exe, an
+# editor, a shell) matches neither.
+def _is_ours(cmdline):
+    return "biopb" in cmdline and ("shim" in cmdline or "stdio" in cmdline)
 
 
 def _find_client_process():
@@ -120,7 +124,7 @@ def _find_client_process():
     between us and it — the case that made a naive parent-watch useless: on a
     venv built on Store Python the stub *outlives* the client (it only waits on
     us), so watching it never fires. We instead climb ancestors while their
-    cmdline looks like our chain (:data:`_OURS_MARKERS`) and return the first
+    cmdline looks like our chain (:func:`_is_ours`) and return the first
     foreign one — the real client. ``None`` if it can't be determined (psutil
     missing, an unreadable/inaccessible ancestor, or the chain reaches the top),
     in which case the watchdog simply does not arm.
@@ -133,7 +137,7 @@ def _find_client_process():
         node = psutil.Process().parent()
         while node is not None:
             cl = " ".join(node.cmdline()).lower()
-            if not all(m in cl for m in _OURS_MARKERS):
+            if not _is_ours(cl):
                 return node  # first ancestor not in our chain == the client
             node = node.parent()
     except Exception:
@@ -489,12 +493,12 @@ class _Binding:
         log = getattr(_locations, "control_log", None)
         where = f" (its log: {log()})" if log is not None else ""
         try:
-            if not _control_client.ensure_control(CONTROL_WAIT):
+            if not _control_launch.ensure_control(CONTROL_WAIT):
                 raise AttachError(
                     f"no control answered within {CONTROL_WAIT:.0f}s{where}. "
                     "Retry, or start it with `biopb control start`."
                 )
-            answer = _control_client.launch_session(
+            answer = _control_launch.launch_session(
                 display={k: os.environ[k] for k in _DISPLAY_ENV if k in os.environ},
                 timeout=CONTROL_LAUNCH_TIMEOUT,
             )
@@ -799,8 +803,7 @@ async def _serve_stdio(binding):
 
 
 def serve(session=None):
-    """Launcher entry point for ``--transport stdio``: bridge, attach on request,
-    release.
+    """Bridge stdio to a session: attach on request, release on the way out.
 
     The shim starts unbound; the agent's ``attach`` tool picks a session. Or
     *session* (``--session`` / ``$BIOPB_SESSION``) binds one before the
@@ -821,3 +824,32 @@ def serve(session=None):
         anyio.run(_serve_stdio, binding)
     finally:
         binding.release()
+
+
+def main(argv=None):
+    """``biopb-shim [--session <id|new|auto>]``: the entry a client spawns."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="biopb-shim",
+        description="stdio bridge to a biopb-mcp session an agent attaches to.",
+    )
+    parser.add_argument(
+        "--session",
+        default=os.environ.get("BIOPB_SESSION") or None,
+        help="Bind a session before the handshake: an id, 'new' (the control "
+        "launches one) or 'auto' (the newest free session, else a new one). For a "
+        "client that cannot follow tools/list_changed; default: attach on request.",
+    )
+    opts = parser.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, stream=sys.stderr)
+    try:
+        serve(session=opts.session)
+    except Exception:
+        logger.exception("stdio bridge failed")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

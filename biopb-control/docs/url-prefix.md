@@ -41,7 +41,7 @@ matters: the auth middleware decides what to gate by reading `scope["path"]`
 directly, so a still-prefixed `/node/h/p/api/data_plane/restart` would sail
 past its `startswith("/api/")` check if the prefix weren't already stripped —
 an auth bypass, not just a 404. Unprefixed requests (biopb-mcp's
-`_control_client`, the installer polling `/health` over loopback) pass
+`biopb._control_launch`, the installer polling `/health` over loopback) pass
 through untouched.
 
 It strips the path outright rather than using ASGI's `root_path` convention,

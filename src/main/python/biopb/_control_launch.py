@@ -138,7 +138,7 @@ def ensure_control(wait: float) -> bool:
 
 
 def launch_session(
-    *, display: dict, timeout: float, ephemeral: bool = True, start_kernel: bool = False
+    *, display: dict, timeout: float, start_kernel: bool = False
 ) -> dict:
     """Ask the control to launch a session; its answer (``{"state", ...}``).
 
@@ -154,7 +154,6 @@ def launch_session(
     import biopb
 
     params = {
-        "ephemeral": int(ephemeral),
         "start_kernel": int(start_kernel),
         "display": json.dumps(display),
         # Bounds the control's own wait under ours, so a slow start comes back

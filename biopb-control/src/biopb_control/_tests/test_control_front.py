@@ -577,7 +577,7 @@ def test_control_api_requires_token_when_configured(tokened_control):
 
 def test_ensure_verb_is_token_gated(tmp_path, upstream):
     # /api/data_plane/ensure is gated like every other /api/* route now that the
-    # credential handoff (biopb/biopb#470) lets _control_client carry the token: no
+    # credential handoff (biopb/biopb#470) lets _control_launch carry the token: no
     # token -> 401, correct token -> 200. Spy the supervisor so the gate is
     # exercised without actually launching a plane.
     spec = DataPlaneSpec(
@@ -1768,7 +1768,7 @@ def test_bare_prefix_with_no_trailing_slash_serves_the_shell(prefixed_control):
 
 
 def test_unprefixed_requests_still_work(prefixed_control):
-    # biopb-mcp's _control_client and the installer poll /health over loopback
+    # biopb._control_launch and the installer poll /health over loopback
     # with no prefix; configuring one for the portal must not break them.
     status, _headers, body = _get(f"{prefixed_control}/health")
     assert status == 200

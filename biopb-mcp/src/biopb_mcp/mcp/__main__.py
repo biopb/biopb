@@ -5,7 +5,7 @@ Jupyter kernel that holds the agent's namespace and, when the session has one,
 a napari viewer on the user's display (or, opted into by config, on a
 launcher-owned Xvfb virtual display; see ``_xvfb``).  Under the (deprecated) stdio transport it is
 instead a thin bridge: it attaches to an http session the control launched, or
-a person did, and pumps stdio JSON-RPC to it (see ``_shim``).  Run it with::
+a person did, and pumps stdio JSON-RPC to it (see ``biopb._shim``).  Run it with::
 
     biopb-mcp        # console script
     python -m biopb_mcp.mcp
@@ -324,7 +324,7 @@ def main(argv=None):
         # (FastMCP/uvicorn/kernel plumbing) is only imported by the owned session
         # child it spawns. Any bridge failure exits nonzero so the client sees EOF
         # rather than a hung server entry.
-        from . import _shim
+        from biopb import _shim
 
         try:
             _shim.serve(session=opts.session)
