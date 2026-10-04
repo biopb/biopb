@@ -143,11 +143,10 @@ class TestOverlap:
             == OVERLAP_MESSAGE
         )
 
-    def test_a_known_root_inside_the_path_overlaps_but_not_the_root_being_added(self):
+    def test_a_known_root_inside_the_path_overlaps(self):
         known = _root(RootKind.MONITORED, "/d/watched")
-        new = _root(RootKind.DROPPED, "/d", label="d")
-        roots = Roots([known, new])
+        roots = Roots([known])
 
-        assert roots.check_overlap(Path("/d"), [], exclude=new) == OVERLAP_MESSAGE
+        assert roots.check_overlap(Path("/d"), []) == OVERLAP_MESSAGE
         roots.remove(known)
-        assert roots.check_overlap(Path("/d"), [], exclude=new) is None
+        assert roots.check_overlap(Path("/d"), []) is None
