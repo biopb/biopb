@@ -355,17 +355,25 @@ class Reconciler:
             ):
                 self._record_failed_source_attempt(source_id)
                 self._mark_registration_failed(source_id, errors)
+                self._log_summary_if_drained()
                 return False
 
             with self._lock:
                 self._clear_pending(source_id)
                 self._registration_locks.pop(source_id, None)
             self._clear_failed_source_attempt(source_id)
-            drained = not self._defer_registration and not self._pending
         self._notify_source_committed(source_id)
-        if drained:
-            self.stats.log_summary()
+        self._log_summary_if_drained()
         return True
+
+    def _log_summary_if_drained(self) -> None:
+        """Log the registration cost once nothing is left waiting.
+
+        A failed source is not waiting (see :meth:`pending_count`), so a site
+        with sources that cannot register still gets its summary.
+        """
+        if not self._defer_registration and self.pending_count() == 0:
+            self.stats.log_summary()
 
     def _mark_registration_failed(self, source_id: str, errors: List[str]) -> None:
         """Leave a placeholder that says why it did not register.

@@ -746,6 +746,29 @@ class TestStats:
         assert len(logged) == 1
         assert "(2 sources)" in logged[0].getMessage()
 
+    @pytest.mark.parametrize("failing_last", [False, True])
+    def test_the_summary_is_logged_though_a_source_failed(
+        self, tmp_path, caplog, failing_last
+    ):
+        import logging
+
+        good = _make_zarr(tmp_path, "a.zarr")
+        bad = _make_zarr(tmp_path, "b.zarr")
+        TestFailure()._break(bad)
+        manager, server = _manager(tmp_path, stats=True)
+        _first_scan(manager)
+        ids = {
+            os.path.basename(server.sources.get(sid).source_url): sid
+            for sid in _only_ids(server)
+        }
+        order = ("a.zarr", "b.zarr") if failing_last else ("b.zarr", "a.zarr")
+        with caplog.at_level(logging.INFO):
+            for name in order:
+                server.sources.get_registered(ids[name])
+        assert good and manager.pending_registrations() == 0
+        logged = [r for r in caplog.records if "Registration cost" in r.getMessage()]
+        assert len(logged) == 1
+
 
 class TestStatsAreOptIn:
     def test_off_by_default_in_the_config(self):
