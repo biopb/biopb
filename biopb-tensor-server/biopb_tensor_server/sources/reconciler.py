@@ -324,7 +324,6 @@ class Reconciler:
         try:
             if self._metadata_db is not None:
                 self._metadata_db.sync_pending_source(claim, catalog_url)
-            self._path_to_source_id[claim.primary_path] = claim.source_id
         except Exception as e:
             self._log_source_failure(
                 claim.source_id,
