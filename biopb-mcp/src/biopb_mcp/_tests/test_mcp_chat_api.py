@@ -553,18 +553,16 @@ def test_chat_follows_the_page_it_lives_on():
     assert _chat_api.configure(cfg, mode="durable") is False
 
 
-def test_a_harness_driven_session_gets_no_chat():
-    # A shim's child is serving an MCP client that cannot share its kernel with
-    # a chat. Config alone cannot express this: both switches are on here, and
-    # the surface is still withheld, because the deciding fact is how the
-    # session was launched. Every other mode serves it, an ephemeral session
-    # included -- the lease, not the mode, keeps it off an attached agent.
+def test_a_direct_http_server_gets_no_chat():
+    # A `direct` http server is one an MCP client connects to by itself. Config
+    # alone cannot express this: both switches are on here, and the surface is
+    # still withheld, because the deciding fact is how the session was launched.
+    # A durable session serves it -- the lease, not the mode, keeps it off an
+    # attached agent.
     cfg = chat_config()
     cfg["chat"] = {"model": "test-model"}
-    assert _chat_api.configure(cfg, mode="shim") is False
     assert _chat_api.configure(cfg, mode="direct") is False
     assert _chat_api.configure(cfg, mode="durable") is True
-    assert _chat_api.configure(cfg, mode="ephemeral") is True
 
 
 def test_chat_cannot_be_configured_on_by_accident():

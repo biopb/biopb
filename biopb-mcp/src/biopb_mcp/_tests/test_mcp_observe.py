@@ -452,39 +452,31 @@ def test_status_advertises_whether_chat_is_mounted(host):
         _observe.set_chat_enabled(old)
 
 
-def test_status_advertises_its_mode_and_whether_it_can_be_stopped(host):
-    # The control's dashboard offers a stop only where something other than a
-    # shim ends the session. Distinct from chat_enabled: chat is a config
-    # switch, and a viewer with chat off still serves a stop.
-    old = (_observe._mode, _observe._shutdown_hook)
+def test_status_advertises_its_mode(host):
+    old = _observe._mode
     try:
-        for mode, can_stop in (
-            ("durable", True),
-            ("ephemeral", True),
-            ("shim", False),
-            ("direct", False),
-        ):
-            _observe.set_session_mode(mode, on_shutdown=lambda: None)
-            body = _app_client().get("/api/status").json()
-            assert body["mode"] == mode
-            assert body["can_stop"] is can_stop
+        for mode in ("durable", "direct"):
+            _observe.set_session_mode(mode)
+            assert _app_client().get("/api/status").json()["mode"] == mode
     finally:
-        _observe._mode, _observe._shutdown_hook = old
+        _observe._mode = old
 
 
-def test_shutdown_route_absent_for_a_shim_owned_child(host):
-    # Not a refusing route -- no route. Ending a shim's child would leave that
-    # shim bridging to a dead process, so the verb must not exist there at all.
-    _observe.set_session_mode("shim")
-    try:
-        client = _app_client()
-        assert client.post("/api/shutdown").status_code == 404
-        assert client.get("/api/jobs").status_code == 200  # untouched
-    finally:
-        _observe.set_session_mode("shim")
+def test_shutdown_route_is_on_every_session(host):
+    # Every session can be stopped from the dashboard, whatever started it: a
+    # shim whose session is stopped sees it stop answering and unbinds, so the
+    # shim's own child needs no exemption.
+    paths = {p for p, _, _ in _observe._routes()}
+    assert "/api/shutdown" in paths
 
 
-@pytest.mark.parametrize("mode", ["durable", "ephemeral"])
+def test_shutdown_without_a_wired_teardown_is_a_404(host):
+    # Only the standalone test app has none; the launcher always wires one.
+    _observe.set_session_mode("durable")
+    assert _app_client().post("/api/shutdown").status_code == 404
+
+
+@pytest.mark.parametrize("mode", ["durable", "direct"])
 def test_shutdown_runs_the_session_teardown_after_answering(host, mode):
     # The stop is the session ending itself on the launcher's own `_shutdown`
     # path -- so the hook is what runs, and it runs only once the response is
@@ -496,7 +488,7 @@ def test_shutdown_runs_the_session_teardown_after_answering(host, mode):
         assert r.status_code == 200
         assert r.json()["stopping"] is True
     finally:
-        _observe.set_session_mode("shim")
+        _observe.set_session_mode("direct")
     # TestClient runs background tasks before returning, so by here it has run.
     assert calls == [1]
 

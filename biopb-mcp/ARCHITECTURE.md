@@ -28,11 +28,12 @@ agreement on what a layer is (label sets, axes, pyramids).
 
 ## Process structure
 
-Everything the package runs is a chain of four processes, each spawned and reaped
-by the one above it. A session a shim spawns itself is **client-scoped**: it comes
-up when an MCP client attaches to `new` and is gone when that client disconnects.
-A session the control launched for the client is ended by the control once it has
-been free for a grace period, and one someone else started outlives the client.
+Everything the package runs is a chain of processes, but not one that ends
+together. The shim is **client-scoped**: it comes up when an MCP client connects
+and is gone when that client disconnects. It owns no session. A session is a
+detached process the control launched (or a person did, with `biopb mcp view`),
+and it outlives the client: it runs until a person stops it from the dashboard,
+and the next agent can attach to it.
 
 ```
               AI agent / MCP client
@@ -45,7 +46,7 @@ been free for a grace period, and one someone else started outlives the client.
                             │  http → /mcp, dynamic port
                             ▼
    ┌──────────────────────────────────────────────────┐
-   │ session child            shim- or control-owned  │
+   │ session child            detached, user-stopped  │
    │   FastMCP / uvicorn  — tools + resources         │
    │   KernelHost         — owns the kernel           │
    │   observe UI         — job history + cancel      │
@@ -64,9 +65,9 @@ been free for a grace period, and one someone else started outlives the client.
       (outside this package — see ../development.md)
 ```
 
-One ownership fact deliberately does not follow the spawn chain: the **planes at
-the bottom are never started here** — the session is a pure client of them, and
-only *registers* itself with the control.
+One ownership fact deliberately does not follow the chain: the **planes at the
+bottom are never started here** — the session is a pure client of them, and only
+*registers* itself with the control.
 
 ### Why this shape
 
@@ -103,18 +104,21 @@ starts **unbound** and owns nothing until the agent calls its local `attach` too
    not the shim's: the shim renews the lease on a short beat and releases it on
    the way out, and never stops the session. A lease that is lost (another
    holder forced it, or the session stopped answering) unbinds the shim.
-3. `attach(session='new')` asks the **control** to launch an ephemeral session for
-   this client (`POST /api/sessions/new?ephemeral=1`, with the client's display
-   variables), starting the control first if need be, and leases it from birth.
-   The control owns its end: it stops the session once nothing has held it for a
-   grace period, so the shim only releases it. No control is an error, not a
-   fallback: a session without one has no data plane. A client that pins its data
-   plane in its environment is running without the control's, and gets a
-   **session child** its shim spawns on a dynamic OS-assigned port and reaps as a
-   tree (POSIX process group + parent-death pipe; Windows Job Object, #403) on the
-   way out; that child registers itself under an id the shim mints.
+3. `attach(session='new')` asks the **control** to launch a session for this
+   client (`POST /api/sessions/new`, with the client's display variables),
+   starting the control first if need be, and leases it from birth. The session
+   is the user's, not the shim's: it runs until stopped from the dashboard, and
+   the next agent can attach to it, so the shim only releases it. No control is
+   an error, not a fallback: a session without one has no data plane, so one
+   started without it would attach and then fail on first use.
    `--session new` (or `$BIOPB_SESSION`) does this on the first request that
    needs a session, with no `attach` call.
+
+What the shim does own is itself: a shim that outlived its client would go on
+renewing its lease and keep the session locked, so it releases and exits on stdin
+EOF, on SIGTERM/SIGHUP, and -- where a multi-process client can keep the stdin
+handle open after it is gone (Windows, #403) -- when a watchdog sees the client
+exit.
 
 A session answers to one holder at a time, an `agent` or the built-in `chat`
 (`mcp/_lease.py`); the other kind is refused while the lease lives.

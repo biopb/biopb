@@ -66,8 +66,8 @@ def configure(config, *, mode):
     ``observe.enabled`` because that page is how anyone reaches these routes.
 
     *mode* is the third term, and the one that is not configuration: a session
-    whose mode serves no chat (a shim's child, which is serving an MCP client)
-    gets no pane. An agent attached to a session that does serve it is kept off
+    whose mode serves no chat (a `direct` http server, which an MCP client
+    connects to by itself) gets no pane. An agent attached to a session that does serve it is kept off
     by the lease, so the pane answers questions and then refuses to run anything
     only while someone else holds the session -- a state it reports.
 

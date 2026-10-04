@@ -318,9 +318,8 @@ def test_api_sessions_kernel_unknown_when_child_unreachable(control):
     assert sessions[0]["session_id"] == "s-unreach"
     assert sessions[0]["kernel"] == "unknown"
     # Every probed field degrades to its least-claiming value: no chat link, and
-    # no stop button that would only 404.
+    # no holder.
     assert sessions[0]["chat"] is False
-    assert sessions[0]["can_stop"] is False
     assert sessions[0]["holder"] is None
 
 
@@ -346,7 +345,6 @@ def test_probe_session_maps_child_health(flag, expected):
                     "ready": True,
                     "busy": False,
                     "chat_enabled": flag,
-                    "can_stop": flag,
                     "lease": {"holder": "agent" if flag else None},
                 }
             ).encode()
@@ -368,7 +366,6 @@ def test_probe_session_maps_child_health(flag, expected):
         assert asyncio.run(go()) == {
             "kernel": "ready",
             "chat": expected,
-            "can_stop": expected,
             "holder": "agent" if expected else None,
         }
     finally:
@@ -409,7 +406,6 @@ def test_probe_session_flags_default_off_on_an_older_child():
         assert asyncio.run(go()) == {
             "kernel": "none",
             "chat": False,
-            "can_stop": False,
             "holder": None,
         }
     finally:
@@ -1964,23 +1960,13 @@ def test_mcp_config_put_rejects_unhashable_enum_value_as_422_not_500(control, mc
 def _env(**kw):
     from biopb_control import _control
 
-    defaults = {"ephemeral": False, "display": None}
-    return _control._launch_env("tok", None, **{**defaults, **kw})
+    return _control._launch_env("tok", None, **{"display": None, **kw})
 
 
-def test_a_launch_for_an_agent_is_marked_ephemeral(monkeypatch):
-    from biopb_control import _control
-
-    monkeypatch.delenv(_control._LIFETIME_ENV, raising=False)
-    assert _env(ephemeral=True)[_control._LIFETIME_ENV] == "ephemeral"
-    assert _control._LIFETIME_ENV not in _env()
-
-
-def test_a_dashboard_launch_is_durable_whatever_the_control_inherited(monkeypatch):
-    from biopb_control import _control
-
-    monkeypatch.setenv(_control._LIFETIME_ENV, "ephemeral")
-    assert _control._LIFETIME_ENV not in _env()
+def test_a_launched_session_carries_no_lifetime_marker():
+    # A session the control launches is the user's until they stop it; nothing
+    # in its environment says otherwise.
+    assert not [k for k in _env() if "LIFETIME" in k]
 
 
 def test_a_dashboard_launch_inherits_the_controls_display(monkeypatch):
@@ -2025,21 +2011,13 @@ def test_the_launch_verb_passes_what_the_agent_asked_for(tmp_path, monkeypatch):
     with TestClient(_launch_app(tmp_path), base_url="http://127.0.0.1:8813") as client:
         resp = client.post(
             "/api/sessions/new",
-            params={
-                "ephemeral": "1",
-                "start_kernel": "0",
-                "display": json.dumps({"DISPLAY": ":1"}),
-            },
+            params={"start_kernel": "0", "display": json.dumps({"DISPLAY": ":1"})},
         )
         assert resp.status_code == 200
-        assert seen == {
-            "ephemeral": True,
-            "start_kernel": False,
-            "display": {"DISPLAY": ":1"},
-        }
+        assert seen == {"start_kernel": False, "display": {"DISPLAY": ":1"}}
         seen.clear()
         client.post("/api/sessions/new")
-        assert seen == {"ephemeral": False, "start_kernel": True, "display": None}
+        assert seen == {"start_kernel": True, "display": None}
         bad = client.post("/api/sessions/new", params={"display": "[1]"})
         assert bad.status_code == 400
 
@@ -2052,170 +2030,3 @@ def test_a_started_launch_names_the_session_to_connect_to(tmp_path, monkeypatch)
     with TestClient(_launch_app(tmp_path), base_url="http://127.0.0.1:8813") as client:
         body = client.post("/api/sessions/new").json()
     assert body["port"] == 1234
-
-
-class _FakeSession:
-    """An httpx client over a table of ``(method, path) -> (status, json)``."""
-
-    def __init__(self, table):
-        self.table, self.calls = table, []
-
-    async def _answer(self, method, url):
-        path = "/" + url.split("/", 3)[3]
-        self.calls.append((method, path))
-        answer = self.table.get((method, path))
-        if answer is None:
-            raise OSError("no route")
-        status, body = answer
-        import httpx
-
-        return httpx.Response(status, json=body)
-
-    async def get(self, url, **kw):
-        return await self._answer("GET", url)
-
-    async def post(self, url, **kw):
-        return await self._answer("POST", url)
-
-
-def _rec(session_id, mode="ephemeral"):
-    return {"session_id": session_id, "port": 4000, "mode": mode}
-
-
-def test_stop_asks_the_session_to_end_itself():
-    import asyncio
-
-    from biopb_control import _control
-
-    client = _FakeSession(
-        {
-            ("GET", "/api/lease"): (200, {"holder": None}),
-            ("POST", "/api/shutdown"): (200, {"stopping": True}),
-        }
-    )
-    status, body = asyncio.run(_control._stop_session(client, _rec("a"), force=False))
-    assert (status, body) == (200, {"stopping": True})
-
-
-def test_stop_refuses_a_held_session_unless_forced():
-    import asyncio
-
-    from biopb_control import _control
-
-    client = _FakeSession(
-        {
-            ("GET", "/api/lease"): (200, {"holder": "agent"}),
-            ("POST", "/api/shutdown"): (200, {"stopping": True}),
-        }
-    )
-    status, body = asyncio.run(_control._stop_session(client, _rec("a"), force=False))
-    assert status == 409 and body["holder"] == "agent"
-    assert ("POST", "/api/shutdown") not in client.calls
-    status, _ = asyncio.run(_control._stop_session(client, _rec("a"), force=True))
-    assert status == 200
-
-
-def test_stop_says_when_a_session_ends_with_its_own_client():
-    import asyncio
-
-    from biopb_control import _control
-
-    client = _FakeSession(
-        {
-            ("GET", "/api/lease"): (200, {"holder": None}),
-            ("POST", "/api/shutdown"): (404, {}),
-        }
-    )
-    status, body = asyncio.run(_control._stop_session(client, _rec("a"), force=False))
-    assert status == 409 and "own client" in body["error"]
-
-
-def test_the_stop_route_resolves_the_session_and_reports(tmp_path, monkeypatch):
-    from starlette.testclient import TestClient
-
-    from biopb_control import _control
-
-    monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path / "state"))
-    _sessions.register("live-1", port=4000, pid=os.getpid(), mode="ephemeral")
-
-    async def fake_stop(client, rec, force):
-        return (409, {"holder": "agent"}) if not force else (200, {"stopping": True})
-
-    monkeypatch.setattr(_control, "_stop_session", fake_stop)
-    with TestClient(_launch_app(tmp_path), base_url="http://127.0.0.1:8813") as client:
-        assert client.post("/api/sessions/nope/stop").status_code == 404
-        assert client.post("/api/sessions/live-1/stop").status_code == 409
-        assert client.post("/api/sessions/live-1/stop?force=1").status_code == 200
-
-
-class TestIdleReaper:
-    """The control ends an ephemeral session once nothing has held it for the
-    grace period -- and only then."""
-
-    def _sweep(self, monkeypatch, recs, table, free_since, now, grace=60.0):
-        import asyncio
-
-        from biopb_control import _control
-
-        monkeypatch.setattr(_control._sessions, "list_sessions", lambda: recs)
-        client = _FakeSession(table)
-        asyncio.run(_control._reap_idle_sessions(client, free_since, grace, now))
-        return client
-
-    FREE = {
-        ("GET", "/api/lease"): (200, {"holder": None}),
-        ("POST", "/api/shutdown"): (200, {"stopping": True}),
-    }
-
-    def test_a_session_is_kept_until_it_has_been_free_for_the_grace(self, monkeypatch):
-        free = {}
-        client = self._sweep(monkeypatch, [_rec("a")], self.FREE, free, now=100.0)
-        assert free == {"a": 100.0}
-        assert ("POST", "/api/shutdown") not in client.calls
-        client = self._sweep(monkeypatch, [_rec("a")], self.FREE, free, now=159.0)
-        assert ("POST", "/api/shutdown") not in client.calls
-        client = self._sweep(monkeypatch, [_rec("a")], self.FREE, free, now=161.0)
-        assert ("POST", "/api/shutdown") in client.calls
-        assert free == {}
-
-    def test_a_held_session_resets_its_clock(self, monkeypatch):
-        free = {"a": 0.0}
-        held = {**self.FREE, ("GET", "/api/lease"): (200, {"holder": "chat"})}
-        client = self._sweep(monkeypatch, [_rec("a")], held, free, now=1000.0)
-        assert free == {}
-        assert ("POST", "/api/shutdown") not in client.calls
-
-    def test_a_durable_session_is_never_ended(self, monkeypatch):
-        free = {}
-        client = self._sweep(
-            monkeypatch, [_rec("a", mode="durable")], self.FREE, free, now=1e6
-        )
-        assert free == {} and client.calls == []
-
-    def test_a_session_that_does_not_answer_is_left_alone(self, monkeypatch):
-        free = {"a": 0.0}
-        client = self._sweep(monkeypatch, [_rec("a")], {}, free, now=1e6)
-        assert ("POST", "/api/shutdown") not in client.calls
-
-    def test_a_session_that_is_gone_drops_its_clock(self, monkeypatch):
-        free = {"gone": 5.0}
-        self._sweep(monkeypatch, [], self.FREE, free, now=10.0)
-        assert free == {}
-
-    def test_a_failed_stop_is_retried_not_forgotten(self, monkeypatch):
-        free = {"a": 0.0}
-        failing = {**self.FREE, ("POST", "/api/shutdown"): (500, {})}
-        self._sweep(monkeypatch, [_rec("a")], failing, free, now=1000.0)
-        assert "a" in free
-
-
-def test_the_grace_comes_from_the_argument_then_the_environment(monkeypatch):
-    from biopb_control import _control
-
-    monkeypatch.delenv(_control._GRACE_ENV, raising=False)
-    assert _control._idle_grace(None) == _control._EPHEMERAL_GRACE
-    monkeypatch.setenv(_control._GRACE_ENV, "7")
-    assert _control._idle_grace(None) == 7.0
-    assert _control._idle_grace(3.0) == 3.0
-    monkeypatch.setenv(_control._GRACE_ENV, "soon")
-    assert _control._idle_grace(None) == _control._EPHEMERAL_GRACE

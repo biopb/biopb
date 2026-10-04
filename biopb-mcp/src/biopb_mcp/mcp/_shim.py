@@ -8,40 +8,31 @@ launcher process. Instead the launcher runs this module, which
    ``attach`` tool, so a client that never attaches costs no session;
 2. on ``attach``, takes the lease of a live session (``/api/lease``) and bridges
    requests to its streamable-http endpoint. For ``new`` (or ``--session new``)
-   it asks the control to launch an ephemeral session, carrying this client's
-   display environment, and leases that -- an error if no control answers, since
-   a session without one has no data plane. A client that pins its data plane by
-   environment is running without the control's, and gets a session this shim
-   spawns on an OS-assigned port, inheriting its live environment
-   (``spawn_session``, driven by ``_Binding``);
-3. releases the lease, or reaps the session it spawned, on the way out
-   (``_Binding.reap``).
+   it first asks the control to launch a session, carrying this client's display
+   environment -- an error if no control answers, since a session without one
+   has no data plane;
+3. releases the lease on the way out.
 
 The process that owns fd 1 as a protocol channel imports nothing that could write
 to stdout (no Qt, dask, uvicorn, or kernel -- only the mcp SDK and the tool
 definitions), so the fd-1 corruption class is structurally impossible here.
 
-Ownership is per session, and only a session this shim spawned is its to end:
+The shim owns no session. Every session is a detached process the control
+launched, or a person did (``biopb mcp view``, the dashboard), and it runs until
+a person stops it from the dashboard; the shim only holds its lease while the
+agent is attached, and the next agent can attach to the same session. A session
+that is stopped, or that another holder takes by force, unbinds the shim, and its
+next request says why. So there is nothing here to reap: no child, no process
+group, no Job Object.
 
-* **Attached.** A session another process started (the dashboard's, a
-  ``biopb mcp view``, or one the control launched for this client, which the
-  control ends once it has been free for a grace period) keeps running when this
-  shim goes. The shim renews its
-  lease every ``RENEW_INTERVAL`` and releases it on exit; a shim killed too hard
-  to release leaves a lease that lapses by itself (``_lease.TTL``). One holder at
-  a time: an attach to a held session is refused unless forced.
-* **Spawned (``new`` with a pinned data plane).** Ephemeral and owned: the child inherits *this* shim's
-  environment, so ``DISPLAY`` / ``XAUTHORITY`` / ``WAYLAND_DISPLAY`` are the
-  user's current session -- never a value frozen into a long-lived daemon (the
-  #98 fix). POSIX: the child stays in this shim's process group (no
-  ``start_new_session``), so the MCP client's process-group teardown takes it --
-  and its kernel, via the kernel's own parent-death pipe -- down with the shim.
-  Windows: this shim holds a kill-on-close Job Object the child is assigned to
-  (see ``_winjob``), and a client-death watchdog
-  (``_install_client_death_watchdog``) reaps the shim itself when its stdio
-  *client* exits without the bridge seeing stdin EOF -- e.g. a multi-process
-  client (Claude Code: a daemon + pty host) keeping a duplicate of the shim's
-  stdin write handle open in a surviving helper (biopb#403, the client side).
+What the shim does own is itself. A shim that outlived its client would go on
+renewing its lease and keep the session locked, so it releases and exits when the
+client goes: on stdin EOF, on SIGTERM/SIGHUP (``_install_release_on_signal``),
+and -- where a multi-process client can keep a duplicate of the stdin write
+handle open after it is gone, as Claude Code does on Windows, biopb#403 --
+through a watchdog on the client's process (``_install_client_death_watchdog``).
+A shim killed too hard to release leaves a lease that lapses by itself
+(``_lease.TTL``).
 
 The bridge itself is vendored rather than delegated to ``mcp-proxy``: mcp-proxy
 drops the initialize ``instructions`` field that carries biopb-mcp's operation
@@ -55,10 +46,7 @@ import json
 import logging
 import os
 import signal
-import sys
-import tempfile
 import threading
-import time
 import urllib.error
 import urllib.request
 import uuid
@@ -67,7 +55,6 @@ from concurrent.futures import ThreadPoolExecutor
 import anyio
 from biopb import _locations, _sessions
 from biopb.lifecycle import winjob as _winjob
-from biopb.lifecycle.owned_child import OwnedChild, open_child_log
 from mcp import types
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
@@ -78,221 +65,24 @@ from .. import _control_client
 
 logger = logging.getLogger(__name__)
 
-# How long spawn_session waits for a spawned child to report its port and start
-# listening. Dominated by the http stack's import time (FastMCP + uvicorn + the
-# tensor client), not the kernel — the kernel starts later, on the first
-# `start_kernel` tool call.
-SESSION_START_TIMEOUT = 60.0
-_PROBE_INTERVAL = 0.25
-# How long a reap waits for the child to exit at each escalation step.
-REAP_TIMEOUT = 10.0
 
-# Env var carrying the path of the file the child publishes its OS-assigned port
-# to; the child also keys "am I shim-owned?" off its presence. Kept in sync with
-# __main__.ENV_PORT_REPORT_FILE (a literal here, like the sentinel paths, to keep
-# this featherweight module from importing the heavy launcher).
-ENV_PORT_REPORT_FILE = "BIOPB_PORT_REPORT_FILE"
-
-# Env var carrying the session id this shim mints for its child, which registers
-# itself under it. Kept in sync with __main__.ENV_SESSION_ID.
-ENV_SESSION_ID = "BIOPB_MCP_SESSION_ID"
-
-# Env var telling the child the path of its own session logfile, so it can report
-# it (server_status) and the agent's execute_code can read it from os.environ.
-# The child inherits it, and so does the kernel it spawns. Bound from the core
-# SDK -- unlike the sentinel paths above, this one is not private to biopb-mcp:
-# the control sets it too, for the viewers it launches. `biopb._locations` is
-# stdlib-only, so this stays as featherweight as a literal.
-ENV_SESSION_LOG = _locations.MCP_SESSION_LOG_ENV
-
-
-def _session_command():
-    """The argv that launches the http session child this shim owns.
-
-    Binds a dynamic port (``--port 0``); the child reports the OS-assigned port
-    back through the file named in ``BIOPB_PORT_REPORT_FILE``.
-    """
-    return [sys.executable, "-m", "biopb_mcp.mcp", "--transport", "http", "--port", "0"]
-
-
-def _session_log_path(config, session_id):
-    """Where this session's child logs. Per-session by default; a single shared
-    file when ``transport.kernel_log`` is set (opt back into the old behavior).
-    """
-    from .._config import get_session_log_dir, get_setting
-
-    override = get_setting(config, "transport.kernel_log")
-    if override:
-        return str(override)
-    return str(get_session_log_dir() / f"{session_id}.log")
-
-
-def _prune_session_logs(keep):
-    """Keep only the newest ``keep`` per-session logs; best-effort.
-
-    Run after the current session's log is created (it is newest, so it always
-    survives). A prune failure never affects the session.
-    """
-    from .._config import get_session_log_dir
-
-    try:
-        logs = sorted(
-            get_session_log_dir().glob("*.log"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-    except OSError:
-        return
-    for old in logs[keep:]:
-        try:
-            old.unlink()
-        except OSError:
-            pass
-
-
-def _read_port_file(path):
-    """The port the child published, or None if not yet written / unparseable.
-
-    The child writes atomically (temp + ``os.replace``), so a read never sees a
-    partial value; an empty/missing file just means "not reported yet".
-    """
-    try:
-        with open(path) as f:
-            text = f.read().strip()
-    except OSError:
-        return None
-    if not text:
-        return None
-    try:
-        port = int(text)
-    except ValueError:
-        return None
-    return port if port > 0 else None
-
-
-def _await_port(proc, port_file, timeout):
-    """Block until the child publishes its port, returning it.
-
-    Raises RuntimeError if the child exits first (its log has the trace) or
-    TimeoutError if nothing is reported within ``timeout`` seconds.
-    """
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        port = _read_port_file(port_file)
-        if port is not None:
-            return port
-        if proc.poll() is not None:
-            raise RuntimeError(
-                f"biopb-mcp session child exited (status {proc.returncode}) "
-                "before reporting its port; check the daemon log"
-            )
-        time.sleep(_PROBE_INTERVAL)
-    raise TimeoutError(
-        f"biopb-mcp session child did not report its port within {timeout:.0f}s; "
-        "check the daemon log"
-    )
-
-
-def spawn_session(config, timeout=SESSION_START_TIMEOUT, on_spawned=None):
-    """Spawn a private http child this shim owns; return (child, url, session_id).
-
-    ``child`` is an :class:`OwnedChild`. See the module docstring for the
-    ownership model. Inherits this shim's live environment (the #98 fix), binds a
-    dynamic port the child reports back, and ties the child's lifetime to this
-    shim (POSIX process group; Windows Job Object). On any startup failure the
-    child is reaped before the error propagates, so a failed bring-up never leaks
-    a process. *on_spawned* gets ``(child, session_id)`` as soon as the child
-    exists, so a reap that
-    fires during the bring-up can find it.
-
-    The child registers itself with the control under ``session_id``, minted
-    here because it also names the child's logfile.
-
-    Raises TimeoutError / RuntimeError if the child never becomes reachable.
-    """
-    from .._config import get_setting
-
-    # Per-session logfile (not the shared mcp-server.log): concurrent sessions no
-    # longer interleave. Prune older ones to the configured cap after opening the
-    # new one (it is newest, so it survives).
-    session_id = _sessions.new_session_id()
-    log_path = _session_log_path(config, session_id)
-    log, logged_to_file = open_child_log(log_path)
-    if logged_to_file and not get_setting(config, "transport.kernel_log"):
-        _prune_session_logs(get_setting(config, "transport.session_log_keep", 5))
-
-    cmd = _session_command()
-    fd, port_file = tempfile.mkstemp(prefix="biopb-mcp-port-", suffix=".txt")
-    os.close(fd)  # the child writes it by path, not fd
-
-    # Inherit THIS shim's live environment (the #98 fix). Explicit copy so the
-    # intent is legible; we add the port-report channel and — so the child can
-    # report its own logfile (server_status) and the agent's execute_code can
-    # read it from os.environ — the session log path.
-    env = os.environ.copy()
-    env[ENV_PORT_REPORT_FILE] = port_file
-    env[ENV_SESSION_ID] = session_id
-    if logged_to_file:
-        env[ENV_SESSION_LOG] = log_path
-
-    # OwnedChild applies the owned-child spawn conventions and the Windows Job
-    # Object bind (CREATE_NO_WINDOW, no new process group; POSIX shares this
-    # shim's group so the client's teardown reaps it — and its kernel, via the
-    # kernel's parent-death pipe). See biopb.lifecycle.owned_child.
-    logger.info("Spawning owned biopb-mcp session: %s", cmd)
-    child = OwnedChild(cmd, log=log, env=env)
-    try:
-        child.spawn()
-    finally:
-        if logged_to_file:
-            log.close()  # the child holds its own duplicate of the fd
-    if on_spawned is not None:
-        on_spawned(child, session_id)
-
-    try:
-        # The child listens before it reports, so a reported port is ready.
-        port = _await_port(child.proc, port_file, timeout)
-    except BaseException:
-        child.stop()
-        raise
-    finally:
-        try:
-            os.unlink(port_file)
-        except OSError:
-            pass
-
-    return child, f"http://127.0.0.1:{port}/mcp", session_id
-
-
-def _reap_session(child, session_id=None):
-    """Tear down the owned child and its kernel grandchild (idempotent).
-
-    Then drop *session_id*'s registry record: the child drops its own on
-    SIGTERM, but Windows kills it outright, and a dead child's record is anyone's
-    to prune.
-    """
-    child.stop(timeout=REAP_TIMEOUT)
-    if session_id is not None:
-        _sessions.unregister(session_id)
-
-
-def _install_shim_reaper(reap):
-    """POSIX: run *reap* (tear down whatever child exists) if this shim is
+def _install_release_on_signal(release):
+    """POSIX: run *release* (give the session's lease back) if this shim is
     signalled to exit.
 
-    A SIGTERM/SIGHUP delivered to the shim *alone* (not its whole group) would
-    otherwise orphan the child, since Python's default handler exits without
-    running ``serve``'s ``finally``. SIGINT is left to its default: it raises
-    KeyboardInterrupt out of ``anyio.run`` and ``serve``'s ``finally`` reaps. On Windows
-    there are no such signals — the Job Object reaps on any shim *death*, and
+    A SIGTERM/SIGHUP would otherwise end the shim through Python's default
+    handler without running ``serve``'s ``finally``, leaving the lease to lapse
+    on its own 30 s later and the session locked until then. SIGINT is left to
+    its default: it raises KeyboardInterrupt out of ``anyio.run`` and ``serve``'s
+    ``finally`` releases. On Windows there are no such signals;
     ``_install_client_death_watchdog`` covers the shim being *orphaned* by its
-    client — so this is a no-op there.
+    client, so this is a no-op there.
     """
     if os.name == "nt":
         return
 
     def _on_signal(signum, frame):
-        reap()
+        release()
         os._exit(0)
 
     for sig in (signal.SIGTERM, getattr(signal, "SIGHUP", None)):
@@ -355,26 +145,25 @@ def _is_windows() -> bool:
     return os.name == "nt"
 
 
-def _install_client_death_watchdog(reap):
-    """Windows: run *reap* if the stdio *client* dies unseen by stdin.
+def _install_client_death_watchdog(release):
+    """Windows: run *release* and exit if the stdio *client* dies unseen by stdin.
 
-    Normal teardown runs when the bridge returns on stdin EOF (client hung
-    up) or, on POSIX, when the client's process-group teardown / a SIGTERM fires
-    ``_install_shim_reaper``. Windows has neither group teardown nor those
+    Normal teardown runs when the bridge returns on stdin EOF (client hung up)
+    or, on POSIX, when the client's process-group teardown / a SIGTERM fires
+    ``_install_release_on_signal``. Windows has neither group teardown nor those
     signals, and a multi-process client can keep a duplicate of the shim's stdin
     write handle open in a surviving helper after the launching process exits, so
-    EOF never arrives — the shim blocks forever in the bridge and the child +
-    kernel leak (they outlive every real client). This watchdog closes that gap:
-    it blocks on the client's process handle and, when the client exits for any
-    reason, reaps the owned tree and exits.
+    EOF never arrives -- the shim blocks forever in the bridge, renewing its
+    lease for a client that is gone, and the session stays locked to it. This
+    watchdog closes that gap: it blocks on the client's process handle and, when
+    the client exits for any reason, releases the lease and exits.
 
     The client is found by :func:`_find_client_process` (walking past our own
-    launcher stubs — see its docstring for why ``os.getppid()`` is not enough).
+    launcher stubs -- see its docstring for why ``os.getppid()`` is not enough).
     We hold a handle to that exact process object, so the wait is immune to pid
-    reuse. If the client cannot be found or opened at arm time, we do not arm: a
-    live session is never reaped off an uncertain baseline; stdin EOF and the Job
-    Object remain the backstops. A no-op off Windows (POSIX is covered by the
-    process group + signal reaper).
+    reuse. If the client cannot be found or opened at arm time, we do not arm:
+    the shim is never ended off an uncertain baseline; stdin EOF remains the
+    backstop. A no-op off Windows.
 
     Returns the watchdog thread (daemon), or ``None`` if not armed.
     """
@@ -392,7 +181,7 @@ def _install_client_death_watchdog(reap):
         return None
     thread = threading.Thread(
         target=_client_deathwatch,
-        args=(handle, client.pid, reap),
+        args=(handle, client.pid, release),
         name="biopb-client-deathwatch",
         daemon=True,
     )
@@ -401,17 +190,18 @@ def _install_client_death_watchdog(reap):
     return thread
 
 
-def _client_deathwatch(handle, client_pid, reap):
-    """Block on the client's ``handle``; on its exit, reap the tree and exit.
+def _client_deathwatch(handle, client_pid, release):
+    """Block on the client's ``handle``; on its exit, release the lease and exit.
 
-    A wait error is treated as *undecided* — we do not reap, since a spurious
-    reap would tear down a live session. On a real exit this ``os._exit``s past
-    ``serve``'s ``finally`` (having already reaped), matching ``_on_signal``.
+    A wait error is treated as *undecided* -- we do not end the shim, since a
+    spurious exit would drop a live attachment. On a real exit this ``os._exit``s
+    past ``serve``'s ``finally`` (having already released), matching the signal
+    handler.
     """
     if not _winjob.wait_for_process(handle):
-        return  # undecided (wait errored) — leave teardown to the other paths
-    logger.info("stdio client (pid %s) exited; reaping the owned session", client_pid)
-    reap()
+        return  # undecided (wait errored) -- leave teardown to the other paths
+    logger.info("stdio client (pid %s) exited; releasing the session", client_pid)
+    release()
     os._exit(0)
 
 
@@ -422,8 +212,8 @@ RENEW_INTERVAL = 10.0
 RENEW_FAILURES = 3
 _CALL_TIMEOUT = 2.0
 
-# How long `attach new` waits for a control to answer before it spawns a session
-# of its own, and for the control to launch one.
+# How long `attach new` waits for a control to answer, and for it to launch a
+# session.
 CONTROL_WAIT = 20.0
 CONTROL_LAUNCH_TIMEOUT = 70.0
 
@@ -436,16 +226,6 @@ _DISPLAY_ENV = (
     "XAUTHORITY",
     "XDG_RUNTIME_DIR",
     "XDG_SESSION_TYPE",
-)
-
-# A client that pins its data plane by environment is running without the
-# control's, and a control-launched session would not see the pin: the one case
-# where the shim spawns a session of its own.
-_PINNED_ENV = (
-    "BIOPB_TENSOR_URL",
-    "BIOPB_TENSOR_TOKEN",
-    "BIOPB_TENSOR_TLS_CA",
-    "BIOPB_TENSOR_TLS_FINGERPRINT",
 )
 
 # No proxy for the loopback calls: an environment ``http_proxy`` would send a
@@ -523,10 +303,9 @@ def session_listing():
 class _Binding:
     """The session this shim is attached to, and the connection to it.
 
-    Starts unbound: the shim owns nothing until the agent attaches. Attaching to
-    an existing session takes its lease and leaves its lifetime alone -- the shim
-    only ever releases it. Attaching to ``new`` spawns a session this shim does
-    own (:func:`spawn_session`) and reaps with it, as the shim always did.
+    Starts unbound, and never owns a session: attaching takes its lease and
+    leaves its lifetime alone, and the shim only ever releases it. ``new`` has
+    the control launch one first.
 
     :meth:`attach` starts the connection in ``task_group`` (set by
     ``_serve_stdio``), where its context lives until the shim exits or the
@@ -538,40 +317,32 @@ class _Binding:
     launcher that already knows which one (``--session``).
     """
 
-    def __init__(self, config, preselect=None):
-        self._config = config
+    def __init__(self, preselect=None):
         self.preselect = preselect
-        self.child = None  # set only for a session this shim spawned
         self.session_id = None
         self.task_group = None
         self.session = None
         self.token = uuid.uuid4().hex
         self.lost = None  # why the last attachment ended
-        self.managed = False  # a session the control launched and will end
+        self.managed = False  # a session the control launched for this client
         self.instructions = ""
         self._base = None
         self._scope = None
         self._lock = anyio.Lock()
-        self._control_started = False
 
-    def reap(self):
-        """Tear down what this shim owns and release what it only holds. Safe
-        from any thread."""
-        child, session_id, base = self.child, self.session_id, self._base
-        if child is not None:
-            _reap_session(child, session_id)
-        elif base is not None:
-            try:
-                _call_session(base, "POST", "/api/lease/release", {"token": self.token})
-            except (OSError, ValueError):
-                pass  # a session that is gone has no lease to release
+    def release(self):
+        """Give back the lease, if one is held. Safe from any thread."""
+        base = self._base
+        if base is None:
+            return
+        try:
+            _call_session(base, "POST", "/api/lease/release", {"token": self.token})
+        except (OSError, ValueError):
+            pass  # a session that is gone has no lease to release
 
     def _forget(self):
-        self.child = self.session_id = self._base = self.session = None
+        self.session_id = self._base = self.session = None
         self.managed = False
-
-    def _own(self, child, session_id):
-        self.child, self.session_id = child, session_id
 
     async def connect(self):
         """The connected ClientSession, attaching to the preselected session
@@ -600,17 +371,17 @@ class _Binding:
             try:
                 self.session = await self.task_group.start(self._serve, selector, force)
             except AttachError:
-                await anyio.to_thread.run_sync(self.reap)
+                await anyio.to_thread.run_sync(self.release)
                 self._forget()
                 raise
             except Exception as e:
                 logger.exception("biopb-mcp session failed to attach")
-                await anyio.to_thread.run_sync(self.reap)
+                await anyio.to_thread.run_sync(self.release)
                 self._forget()
                 raise AttachError(f"could not attach to {selector!r}: {e}") from e
         note = (
-            " The control ends it once you have disconnected and nothing else "
-            "has held it for a while."
+            " It keeps running after you disconnect, so it can be attached to "
+            "again; the user stops it from the dashboard."
             if self.managed
             else ""
         )
@@ -618,18 +389,6 @@ class _Binding:
             f"Attached to session {self.session_id}.{note} The tool list has "
             "changed to this session's.\n\n" + self.instructions
         ).strip()
-
-    def _spawn(self):
-        # The durable control (which owns the data plane the kernel will talk
-        # to) boots in parallel with the child's import-dominated startup, not
-        # waited for: a child that needs it before it is up surfaces the error.
-        if not self._control_started:
-            self._control_started = True
-            try:
-                _control_client.start_control_detached()
-            except Exception:  # noqa: BLE001 - the child surfaces real errors
-                logger.info("control auto-start attempt failed", exc_info=True)
-        return spawn_session(self._config, on_spawned=self._own)
 
     def _take_lease(self, base, label, force=False):
         """Take the lease on the session at *base*, named *label*."""
@@ -660,9 +419,8 @@ class _Binding:
         There is deliberately no session of the shim's own to fall back to: a
         session reaches the data and algorithm planes through the control, so one
         started without it would attach "successfully" and fail on first use,
-        hiding the cause. The control owns the session's end from here: it is
-        detached, and ends once nothing has held it for a grace period, so this
-        shim only ever releases it.
+        hiding the cause. The session is the user's from here: it is detached
+        and runs until they stop it, so this shim only ever releases it.
         """
         log = getattr(_locations, "control_log", None)
         where = f" (its log: {log()})" if log is not None else ""
@@ -700,12 +458,6 @@ class _Binding:
     def _acquire(self, selector, force):
         """Take the lease on *selector*; return its ``/mcp`` url."""
         if selector == "new":
-            if any(os.environ.get(name) for name in _PINNED_ENV):
-                # The client runs without a control's data plane, so a session
-                # the control launched would not see its pin: spawn one here.
-                _, url, _ = self._spawn()
-                self._take_lease(url.rsplit("/mcp", 1)[0], self.session_id)
-                return url
             return self._launch_via_control()
         rec = _sessions.resolve(selector)
         if rec is None or not rec.get("port"):
@@ -739,7 +491,7 @@ class _Binding:
         if self.lost:
             # Not a shim exit (that cancels us past this point): the attachment
             # ended, so give back what it held and go back to unbound.
-            await anyio.to_thread.run_sync(self.reap)
+            await anyio.to_thread.run_sync(self.release)
             self._forget()
 
     async def _heartbeat(self):
@@ -931,31 +683,24 @@ async def _serve_stdio(binding):
         tg.cancel_scope.cancel()
 
 
-def serve(config, port=None, session=None):
+def serve(session=None):
     """Launcher entry point for ``--transport stdio``: bridge, attach on request,
     release.
 
     The shim starts unbound; the agent's ``attach`` tool picks a session, or
     *session* (``--session`` / ``$BIOPB_SESSION``) picks one for it on the first
-    request that needs one -- ``new`` being a session of this shim's own, torn
-    down when the client disconnects.
-
-    ``port`` (the configured ``transport.port``) is vestigial here -- a session
-    this shim spawns binds a dynamic port -- and is accepted only for call-site
-    compatibility with the launcher's dispatch.
+    request that needs one -- ``new`` having the control launch it.
     """
     logger.warning(
-        "stdio is served by bridging to a biopb-mcp session: one the agent "
-        "attaches to, or a private one this shim spawns for `attach new` and "
-        "owns (torn down when this client disconnects). Native http is "
-        "recommended where the client supports it: run a persistent "
-        "`biopb-mcp --transport http` server and attach with `claude mcp add "
-        "--transport http biopb http://127.0.0.1:<port>/mcp`."
+        "stdio is served by bridging to a biopb-mcp session the agent attaches "
+        "to. Native http is recommended where the client supports it: run a "
+        "persistent `biopb-mcp --transport http` server and attach with `claude "
+        "mcp add --transport http biopb http://127.0.0.1:<port>/mcp`."
     )
-    binding = _Binding(config, preselect=session or None)
-    _install_shim_reaper(binding.reap)
-    _install_client_death_watchdog(binding.reap)
+    binding = _Binding(preselect=session or None)
+    _install_release_on_signal(binding.release)
+    _install_client_death_watchdog(binding.release)
     try:
         anyio.run(_serve_stdio, binding)
     finally:
-        binding.reap()
+        binding.release()

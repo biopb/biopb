@@ -117,24 +117,20 @@ class TransportConfig:
     kind: str = _h(
         "stdio",
         'Front-end transport: "http" (loopback streamable-http on `port`) or '
-        '"stdio" (the client spawns biopb-mcp; the shim owns a private http '
-        "session child on a dynamic port and bridges stdin/stdout to it).",
+        '"stdio" (the client spawns biopb-mcp, which bridges stdin/stdout to a '
+        "session the agent attaches to).",
     )
     port: int = _h(
         8765,
         "Fixed loopback port for the http server. Applies only to a directly-"
-        "launched `--transport http` server (the stdio shim and `biopb mcp view` "
-        "use dynamic ports).",
+        "launched `--transport http` server (a session the control launches, or "
+        "`biopb mcp view`, uses a dynamic port).",
     )
     kernel_log: str = _h(
         "",
-        "Force the stdio bridge's session child to log to ONE fixed file instead "
-        "of the default per-session file. Empty -> each session gets its own log.",
-    )
-    session_log_keep: int = _h(
-        5,
-        "How many per-session shim logs to keep (newest by mtime); older ones are "
-        "pruned on each new session. Ignored when kernel_log forces a shared file.",
+        "The log file a directly-launched `--transport http` server whose output "
+        "is redirected to a file reports as its own. Empty -> the canonical "
+        "mcp-server.log.",
     )
     allowed_origins: List[str] = _hlist(
         [],
@@ -461,7 +457,6 @@ _CONSTRAINTS = {
     "TransportConfig": {
         "kind": Enum({"http", "stdio"}),
         "port": Range(min=1, max=65535),
-        "session_log_keep": Range(min=1),  # keep at least the current
     },
     "KernelConfig": {
         "startup_timeout": Range(exclusive_min=0),
@@ -553,19 +548,6 @@ def get_workflow_dir() -> Path:
     newest N, as the per-session logs beside it are pruned.
     """
     d = get_log_dir() / "workflows"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-def get_session_log_dir() -> Path:
-    """Directory for per-session stdio-shim logs (``<log dir>/sessions``).
-
-    Each shim-owned session writes its own logfile here rather than the shared
-    ``mcp-server.log``, so concurrent sessions never interleave; retention
-    (``transport.session_log_keep``) prunes it to the newest N. Composed from the
-    local :func:`get_log_dir` so it tracks any override of that seam.
-    """
-    d = get_log_dir() / "sessions"
     d.mkdir(parents=True, exist_ok=True)
     return d
 

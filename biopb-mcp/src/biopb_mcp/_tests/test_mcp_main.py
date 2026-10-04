@@ -110,23 +110,15 @@ class TestMainDispatch:
 
         calls = []
         monkeypatch.delenv("BIOPB_SESSION", raising=False)
-        monkeypatch.setattr(
-            _shim,
-            "serve",
-            lambda config, port, session=None: calls.append((config, port, session)),
-        )
+        monkeypatch.setattr(_shim, "serve", lambda session=None: calls.append(session))
         assert main(["--transport", "stdio", "--port", "9123"]) == 0
-        assert calls == [({}, 9123, None)]
+        assert calls == [None]
 
     def test_stdio_session_comes_from_the_flag_or_the_environment(self, monkeypatch):
         from biopb_mcp.mcp import _shim
 
         calls = []
-        monkeypatch.setattr(
-            _shim,
-            "serve",
-            lambda config, port, session=None: calls.append(session),
-        )
+        monkeypatch.setattr(_shim, "serve", lambda session=None: calls.append(session))
         monkeypatch.setenv("BIOPB_SESSION", "from-env")
         main(["--transport", "stdio"])
         main(["--transport", "stdio", "--session", "new"])
@@ -135,7 +127,7 @@ class TestMainDispatch:
     def test_stdio_bridge_failure_exits_nonzero(self, monkeypatch):
         from biopb_mcp.mcp import _shim
 
-        def _boom(config, port, session=None):
+        def _boom(session=None):
             raise TimeoutError("daemon never came up")
 
         monkeypatch.setattr(_shim, "serve", _boom)
@@ -347,7 +339,7 @@ class TestSetupChat:
 
     def test_it_mounts_nothing_for_a_harness_session(self, mounted):
         cfg = {"observe": {"enabled": True, "chat_enabled": True}}
-        assert _setup_chat(cfg, mode="shim") is False
+        assert _setup_chat(cfg, mode="direct") is False
         assert mounted == []
 
     def test_it_mounts_nothing_when_the_switch_is_off(self, mounted):
@@ -359,7 +351,7 @@ class TestSetupChat:
         "cfg, mode, expected",
         [
             ({"observe": {"enabled": True, "chat_enabled": True}}, "durable", True),
-            ({"observe": {"enabled": True, "chat_enabled": True}}, "shim", False),
+            ({"observe": {"enabled": True, "chat_enabled": True}}, "direct", False),
             ({"observe": {"enabled": True, "chat_enabled": False}}, "durable", False),
         ],
     )
@@ -388,20 +380,19 @@ class TestSetupChat:
         assert _observe._mode == "durable"
         _observe._shutdown_hook()
         assert calls == [1]
-        _observe.set_session_mode("shim")
+        _observe.set_session_mode("direct")
 
-    def test_setup_observe_gives_a_shim_child_no_teardown(self, monkeypatch):
-        # A shim-owned child is its shim's to reap; handing it a teardown here
-        # would let the web end a session an MCP client is still bridging to.
+    def test_setup_observe_wires_the_teardown_for_every_mode(self, monkeypatch):
+        # Every session can be stopped from the dashboard. A shim whose session
+        # is stopped sees it stop answering and unbinds.
         from biopb_mcp.mcp import _observe
 
-        _setup_observe(
-            {"observe": {"enabled": True}},
-            mode="shim",
-            on_shutdown=lambda: None,
-        )
-        assert _observe._mode == "shim"
-        assert _observe._shutdown_hook is None
+        for mode in ("durable", "direct"):
+            _setup_observe(
+                {"observe": {"enabled": True}}, mode=mode, on_shutdown=lambda: None
+            )
+            assert _observe._mode == mode
+            assert _observe._shutdown_hook is not None
 
     def test_a_failed_mount_reads_as_off(self, monkeypatch):
         from biopb_mcp.mcp import _chat_api, _observe
@@ -419,44 +410,34 @@ class TestSessionMode:
     """How a launch is named, and what hangs off the name.
 
     Pinned as a truth table rather than trusted to inline expressions: whether a
-    session serves the stop route, mounts chat and publishes itself all follow
-    from its mode and must not drift apart.
+    session mounts chat and publishes itself follows from its mode and must not
+    drift apart.
     """
 
     @pytest.mark.parametrize(
-        "view,shim_owned,port,lifetime,expected",
+        "view,port,expected",
         [
             # `biopb mcp view`, on a dynamic or a chosen port.
-            (True, False, 0, None, "durable"),
-            (True, False, 9000, None, "durable"),
-            # The dashboard's new session: a plain http session on port 0.
-            (False, False, 0, None, "durable"),
-            # The control's launch for an agent says so.
-            (False, False, 0, "ephemeral", "ephemeral"),
-            # A shim's child, whatever its port or what the environment says.
-            (False, True, 0, None, "shim"),
-            (True, True, 0, None, "shim"),
-            (False, True, 0, "ephemeral", "shim"),
+            (True, 0, "durable"),
+            (True, 9000, "durable"),
+            # A session the control launched: a plain http session on port 0.
+            (False, 0, "durable"),
             # A direct `--transport http` launch on a fixed port: wired to
             # something by its operator, and publishes no session.
-            (False, False, 8765, None, "direct"),
-            (False, False, 8765, "ephemeral", "direct"),
+            (False, 8765, "direct"),
         ],
     )
-    def test_truth_table(self, view, shim_owned, port, lifetime, expected):
-        assert _session_mode.of(view, shim_owned, port, lifetime) == expected
+    def test_truth_table(self, view, port, expected):
+        assert _session_mode.of(view, port) == expected
 
     @pytest.mark.parametrize(
-        "mode,stop,chat,publishes",
+        "mode,chat,publishes",
         [
-            ("durable", True, True, True),
-            ("ephemeral", True, True, True),
-            ("shim", False, False, True),
-            ("direct", False, False, False),
+            ("durable", True, True),
+            ("direct", False, False),
         ],
     )
-    def test_what_follows_from_the_mode(self, mode, stop, chat, publishes):
-        assert _session_mode.owns_reap(mode) is stop
+    def test_what_follows_from_the_mode(self, mode, chat, publishes):
         assert _session_mode.serves_chat(mode) is chat
         assert _session_mode.publishes(mode) is publishes
 
@@ -487,15 +468,6 @@ class TestSessionRegistration:
         # Nobody launched us, so there is no launch to attribute this to.
         assert "launch_token" not in rec
 
-    def test_a_shim_minted_id_is_used(self):
-        # The shim names the session's logfile with it, so the record must match.
-        from biopb import _sessions
-
-        assert (
-            _register_session(45678, _URL, "20260101-000000-7") == "20260101-000000-7"
-        )
-        assert _sessions.read_session("20260101-000000-7")["port"] == 45678
-
     def test_a_launchers_token_is_echoed_onto_the_record(self, monkeypatch):
         # How the control recognises the viewer it just spawned. It cannot use
         # the pid it holds: behind a Windows trampoline (uv / pip console-script
@@ -507,13 +479,11 @@ class TestSessionRegistration:
         )
         assert rec["launch_token"] == "tok-abc123"
 
-    def test_the_mode_is_recorded_for_the_control_to_read(self):
-        # The control ends an ephemeral session once it has been free for a
-        # while, and finds it by this field.
+    def test_the_mode_is_recorded_on_the_record(self):
         from biopb import _sessions
 
-        rec = _sessions.read_session(_register_session(45678, _URL, mode="ephemeral"))
-        assert rec["mode"] == "ephemeral"
+        rec = _sessions.read_session(_register_session(45678, _URL, mode="durable"))
+        assert rec["mode"] == "durable"
         assert "mode" not in _sessions.read_session(_register_session(45678, _URL))
 
     def test_registered_session_is_listed_as_live(self):

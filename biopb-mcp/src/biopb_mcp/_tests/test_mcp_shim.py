@@ -1,12 +1,12 @@
-"""Tests for the stdio bridge ("shim") to its owned http session child.
+"""Tests for the stdio bridge ("shim"): the attach tool, the lease it holds, and
+the request forwarding of the vendored proxy.
 
-Unit tests cover the session-spawn logic (dynamic-port handoff, env
-inheritance, startup/timeout), the port-report file parsing, the reap, the
-lazy start, the shipped surface snapshot, and the request forwarding of the
-vendored proxy. One end-to-end test runs the real thing: ``biopb-mcp
---transport stdio`` as a subprocess, which must answer the handshake and the
-listings with no child, spawn its own http session child on the first tool
-call, and **reap** that child when the client hangs up.
+Unit tests cover the proxy (what an unattached shim lists and refuses, what an
+attached one forwards), the session listing, the binding's attach / release /
+lost-lease paths, and the guards that end a shim whose client is gone. Two
+end-to-end tests run the real thing: ``biopb-mcp --transport stdio`` as a
+subprocess, against a real control that launches a real session -- which must
+outlive the agent, take the next one, and stop when the user stops it.
 """
 
 import contextlib
@@ -22,7 +22,6 @@ from types import SimpleNamespace
 
 import anyio
 import pytest
-from biopb.lifecycle.owned_child import OwnedChild
 from mcp import types
 
 from biopb_mcp.mcp import (
@@ -36,216 +35,6 @@ def _free_port():
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
-
-
-def _port_listening(port, timeout=0.5):
-    """Whether something accepts TCP connections on 127.0.0.1:<port>."""
-    try:
-        with socket.create_connection(("127.0.0.1", port), timeout=timeout):
-            return True
-    except OSError:
-        return False
-
-
-def _cfg(**transport):
-    return {"transport": transport}
-
-
-# A stand-in session child: reads its port-report file from the env, binds and
-# listens on a dynamic port, publishes it atomically (temp + os.replace), as the
-# real child does, then accepts connections so a test's own probe succeeds.
-_FAKE_CHILD = (
-    "import os, socket, sys, threading, time\n"
-    "pf = os.environ['BIOPB_PORT_REPORT_FILE']\n"
-    "s = socket.socket()\n"
-    "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
-    "s.bind(('127.0.0.1', 0))\n"
-    "s.listen(16)\n"
-    "port = s.getsockname()[1]\n"
-    "tmp = pf + '.tmp'\n"
-    "open(tmp, 'w').write(str(port))\n"
-    "os.replace(tmp, pf)\n"
-    "def _serve():\n"
-    "    while True:\n"
-    "        try:\n"
-    "            conn, _ = s.accept(); conn.close()\n"
-    "        except OSError:\n"
-    "            break\n"
-    "threading.Thread(target=_serve, daemon=True).start()\n"
-    "time.sleep(30)\n"
-)
-
-
-class TestSessionCommand:
-    def test_module_reentry_binds_dynamic_port(self):
-        cmd = _shim._session_command()
-        assert cmd[:3] == [sys.executable, "-m", "biopb_mcp.mcp"]
-        # Dynamic port: the child reports the OS-assigned one back via a file.
-        assert cmd[3:] == ["--transport", "http", "--port", "0"]
-
-
-class TestReadPortFile:
-    def test_valid_port(self, tmp_path):
-        p = tmp_path / "port.txt"
-        p.write_text("8899")
-        assert _shim._read_port_file(str(p)) == 8899
-
-    def test_missing_file(self, tmp_path):
-        assert _shim._read_port_file(str(tmp_path / "nope.txt")) is None
-
-    def test_empty_file_not_yet_reported(self, tmp_path):
-        p = tmp_path / "port.txt"
-        p.write_text("")
-        assert _shim._read_port_file(str(p)) is None
-
-    def test_garbage_is_none(self, tmp_path):
-        p = tmp_path / "port.txt"
-        p.write_text("not-a-port")
-        assert _shim._read_port_file(str(p)) is None
-
-    def test_nonpositive_is_none(self, tmp_path):
-        p = tmp_path / "port.txt"
-        p.write_text("0")
-        assert _shim._read_port_file(str(p)) is None
-
-
-class TestSessionLogPath:
-    def test_default_is_per_session_under_sessions_dir(self, tmp_path, monkeypatch):
-        import biopb_mcp._config as cfg
-
-        monkeypatch.setattr(cfg, "get_log_dir", lambda: tmp_path)
-        p = _shim._session_log_path(_cfg(), "20260101-000000-42")
-        assert p == str(tmp_path / "sessions" / "20260101-000000-42.log")
-
-    def test_kernel_log_override_forces_single_file(self, tmp_path):
-        override = tmp_path / "one.log"
-        p = _shim._session_log_path(_cfg(kernel_log=str(override)), "sid")
-        assert p == str(override)
-
-
-class TestPruneSessionLogs:
-    def test_keeps_newest_n_by_mtime(self, tmp_path, monkeypatch):
-        import biopb_mcp._config as cfg
-
-        monkeypatch.setattr(cfg, "get_log_dir", lambda: tmp_path)
-        sessions = tmp_path / "sessions"
-        sessions.mkdir()
-        for i in range(7):
-            p = sessions / f"s{i}.log"
-            p.write_text("x")
-            os.utime(p, (1000 + i, 1000 + i))  # ascending mtime: s6 newest
-        _shim._prune_session_logs(3)
-        assert sorted(q.name for q in sessions.glob("*.log")) == [
-            "s4.log",
-            "s5.log",
-            "s6.log",
-        ]
-
-    def test_missing_dir_is_noop(self, tmp_path, monkeypatch):
-        import biopb_mcp._config as cfg
-
-        monkeypatch.setattr(cfg, "get_log_dir", lambda: tmp_path / "nope")
-        _shim._prune_session_logs(5)  # must not raise
-
-
-class TestSpawnSession:
-    def test_reports_port_and_waits_until_listening(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(
-            _shim, "_session_command", lambda: [sys.executable, "-c", _FAKE_CHILD]
-        )
-        cfg = _cfg(kernel_log=str(tmp_path / "d.log"))
-        child, url, session_id = _shim.spawn_session(cfg, timeout=15)
-        try:
-            m = re.match(r"http://127\.0\.0\.1:(\d+)/mcp$", url)
-            assert m, url
-            port = int(m.group(1))
-            assert _port_listening(port) is True
-            assert child.poll() is None  # still running while we bridge
-            if os.name == "nt":
-                assert child.job is not None  # Windows: a kill-on-close Job Object
-            else:
-                assert child.job is None  # POSIX: reaped via the group, not a job
-        finally:
-            _shim._reap_session(child)
-        assert child.poll() is not None  # reaped on the way out
-
-    def test_inherits_live_env_and_wires_dynamic_port(self, tmp_path, monkeypatch):
-        # The #98 fix: the child inherits THIS shim's current environment, so a
-        # live DISPLAY flows through instead of a value frozen into a daemon.
-        monkeypatch.setenv("DISPLAY", ":test-99")
-        captured = {}
-
-        class _FakeProc:
-            pid = 4242
-            returncode = None
-
-            def poll(self):
-                return None
-
-        def _fake_popen(cmd, **kwargs):
-            captured["cmd"] = cmd
-            captured["env"] = kwargs["env"]
-            # Stand in for the child publishing its port.
-            with open(kwargs["env"]["BIOPB_PORT_REPORT_FILE"], "w") as f:
-                f.write("54321")
-            return _FakeProc()
-
-        from biopb.lifecycle import owned_child
-
-        monkeypatch.setattr(owned_child.subprocess, "Popen", _fake_popen)
-
-        spawned = []
-        child, url, session_id = _shim.spawn_session(
-            _cfg(kernel_log=str(tmp_path / "d.log")),
-            timeout=5,
-            on_spawned=lambda *a: spawned.append(a),
-        )
-        assert url == "http://127.0.0.1:54321/mcp"
-        assert spawned == [(child, session_id)]
-        # The child registers itself, under the id minted here.
-        assert captured["env"]["BIOPB_MCP_SESSION_ID"] == session_id
-        assert captured["env"]["DISPLAY"] == ":test-99"
-        assert captured["env"]["BIOPB_PORT_REPORT_FILE"]  # port channel wired
-        # session log path handed to the child (here the kernel_log override).
-        assert captured["env"]["BIOPB_MCP_SESSION_LOG"] == str(tmp_path / "d.log")
-        assert captured["cmd"][-2:] == ["--port", "0"]  # dynamic port
-
-    def test_raises_when_child_dies_before_reporting(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(
-            _shim,
-            "_session_command",
-            lambda: [sys.executable, "-c", "raise SystemExit(3)"],
-        )
-        cfg = _cfg(kernel_log=str(tmp_path / "d.log"))
-        with pytest.raises(RuntimeError, match="before reporting its port"):
-            _shim.spawn_session(cfg, timeout=5)
-
-
-class TestReapSession:
-    def test_reaps_running_child(self):
-        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
-        assert proc.poll() is None
-        _shim._reap_session(OwnedChild.adopt(proc))
-        assert proc.poll() is not None
-
-    def test_drops_the_record_a_killed_child_could_not(self, tmp_path, monkeypatch):
-        # Windows kills the child outright, so its _shutdown never runs.
-        from biopb import _sessions
-
-        monkeypatch.setenv("BIOPB_SESSIONS_DIR", str(tmp_path / "sessions"))
-        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
-        _sessions.register("20260101-000000-1", port=1, pid=proc.pid)
-        _shim._reap_session(OwnedChild.adopt(proc), "20260101-000000-1")
-        assert _sessions.read_session("20260101-000000-1") is None
-
-    def test_idempotent_on_dead_child(self):
-        proc = subprocess.Popen([sys.executable, "-c", "pass"])
-        proc.wait()
-        # Both calls must be no-op-safe on an already-dead child.
-        child = OwnedChild.adopt(proc)
-        _shim._reap_session(child)
-        _shim._reap_session(child)
-        assert proc.poll() is not None
 
 
 class _FakeProc:
@@ -351,19 +140,19 @@ class TestClientDeathWatchdog:
         assert isinstance(t, threading.Thread)
         t.join(timeout=5)
 
-    def test_reaps_and_exits_when_client_exits(self, monkeypatch):
+    def test_releases_and_exits_when_client_exits(self, monkeypatch):
         events = []
         monkeypatch.setattr(_shim._winjob, "wait_for_process", lambda h: True)
         monkeypatch.setattr(
             _shim.os, "_exit", lambda code: events.append(("exit", code))
         )
         _shim._client_deathwatch("HANDLE", 4242, lambda: events.append("reap"))
-        # The client's exit must both reap and exit.
+        # The client's exit must both release and exit.
         assert events == ["reap", ("exit", 0)]
 
-    def test_does_not_reap_on_wait_error(self, monkeypatch):
-        # An undecided wait (error / not-signalled) must NOT tear down a session
-        # that may still be live -- the other teardown paths remain the backstop.
+    def test_does_not_release_on_wait_error(self, monkeypatch):
+        # An undecided wait (error / not-signalled) must NOT end a shim whose
+        # client may still be live -- stdin EOF remains the backstop.
         events = []
         monkeypatch.setattr(_shim._winjob, "wait_for_process", lambda h: False)
         monkeypatch.setattr(_shim.os, "_exit", lambda code: events.append("exit"))
@@ -542,19 +331,8 @@ class TestBinding:
     """Drives the real ``attach``/``connect``: the sessions and the connection
     are the fakes."""
 
-    def _binding(self, monkeypatch, preselect=None, fail=0, lease_status=200):
-        env = SimpleNamespace(spawns=[], reaped=[], calls=[], lease_status=lease_status)
-
-        class _Child:
-            pid = 4242
-
-        def _spawn(config, on_spawned=None):
-            child = _Child()
-            env.spawns.append(child)
-            on_spawned(child, "newsid")
-            if len(env.spawns) <= fail:
-                raise RuntimeError(f"spawn {len(env.spawns)} failed")
-            return child, "http://127.0.0.1:1/mcp", "newsid"
+    def _binding(self, monkeypatch, preselect=None, lease_status=200):
+        env = SimpleNamespace(calls=[], lease_status=lease_status)
 
         def _call_session(base, method, path, body=None, timeout=None):
             env.calls.append((base, method, path, body))
@@ -586,13 +364,9 @@ class TestBinding:
             async def initialize(self):
                 return SimpleNamespace(instructions="THE GUIDANCE")
 
-        monkeypatch.setattr(_shim, "spawn_session", _spawn)
         monkeypatch.setattr(_shim, "_call_session", _call_session)
         monkeypatch.setattr(_shim, "streamablehttp_client", _client)
         monkeypatch.setattr(_shim, "ClientSession", _Session)
-        monkeypatch.setattr(
-            _shim, "_reap_session", lambda child, sid: env.reaped.append(child)
-        )
         monkeypatch.setattr(_shim, "session_listing", lambda: "LISTING")
         monkeypatch.setattr(
             _shim._sessions,
@@ -602,9 +376,6 @@ class TestBinding:
                 if sid in ("live", "managed")
                 else None
             ),
-        )
-        monkeypatch.setattr(
-            _shim._control_client, "start_control_detached", lambda: True
         )
         # No control unless a test brings one: the real one would be whatever
         # answers on this machine's control port.
@@ -622,18 +393,12 @@ class TestBinding:
             return env.launch_answer
 
         monkeypatch.setattr(_shim._control_client, "launch_session", _launch)
-        for name in _shim._PINNED_ENV:
-            monkeypatch.delenv(name, raising=False)
-        # A session of the shim's own is for a client that pinned its data plane;
-        # pinned unless a test brings a control with `use_control`.
-        monkeypatch.setenv("BIOPB_TENSOR_URL", "grpc://pinned:1")
 
         def use_control(up=True):
-            monkeypatch.delenv("BIOPB_TENSOR_URL")
             env.control_up = up
 
         env.use_control = use_control
-        return _shim._Binding(config=object(), preselect=preselect), env
+        return _shim._Binding(preselect=preselect), env
 
     def _drive(self, binding, *steps):
         results = []
@@ -654,8 +419,8 @@ class TestBinding:
     def test_nothing_happens_until_asked(self, monkeypatch):
         binding, env = self._binding(monkeypatch)
         self._drive(binding)
-        binding.reap()
-        assert env.spawns == [] and env.reaped == [] and env.calls == []
+        binding.release()
+        assert env.calls == []
 
     def test_a_request_before_attach_says_to_attach_and_lists_sessions(
         self, monkeypatch
@@ -664,11 +429,10 @@ class TestBinding:
         [text] = self._drive(binding, binding.connect)
         assert "`attach`" in text and "LISTING" in text
 
-    def test_attaching_takes_the_lease_and_spawns_nothing(self, monkeypatch):
+    def test_attaching_takes_the_lease(self, monkeypatch):
         binding, env = self._binding(monkeypatch)
         [text] = self._drive(binding, lambda: binding.attach("live"))
         assert "Attached to session live" in text and "THE GUIDANCE" in text
-        assert env.spawns == []
         base, method, path, body = env.calls[0]
         assert (base, path) == ("http://127.0.0.1:7", "/api/lease/acquire")
         assert body == {"token": binding.token, "force": False}
@@ -677,8 +441,7 @@ class TestBinding:
     def test_the_shim_only_releases_a_session_it_attached_to(self, monkeypatch):
         binding, env = self._binding(monkeypatch)
         self._drive(binding, lambda: binding.attach("live"))
-        binding.reap()
-        assert env.reaped == []  # not ours to stop
+        binding.release()
         assert env.calls[-1][2] == "/api/lease/release"
         assert env.calls[-1][3] == {"token": binding.token}
 
@@ -701,15 +464,6 @@ class TestBinding:
         assert "no live session 'gone'" in text and "LISTING" in text
         assert env.calls == []
 
-    def test_new_spawns_a_session_the_shim_owns_and_reaps_it(self, monkeypatch):
-        binding, env = self._binding(monkeypatch)
-        [text] = self._drive(binding, lambda: binding.attach("new"))
-        assert "Attached to session newsid" in text
-        assert len(env.spawns) == 1
-        assert env.calls[0][:3] == ("http://127.0.0.1:1", "POST", "/api/lease/acquire")
-        binding.reap()
-        assert env.reaped == env.spawns
-
     def test_new_asks_the_control_for_a_session_when_one_answers(self, monkeypatch):
         binding, env = self._binding(monkeypatch)
         env.use_control()
@@ -718,8 +472,7 @@ class TestBinding:
         monkeypatch.setenv("LD_PRELOAD", "/tmp/not-sent.so")
         [text] = self._drive(binding, lambda: binding.attach("new"))
         assert "Attached to session managed" in text
-        assert "control ends it" in text
-        assert env.spawns == []
+        assert "keeps running after you disconnect" in text
         # The client's own display goes along, and nothing else of its
         # environment.
         assert env.launches[0]["display"].get("DISPLAY") == ":3"
@@ -731,8 +484,7 @@ class TestBinding:
         env.use_control()
         env.launch_answer = {"state": "started", "session_id": "managed"}
         self._drive(binding, lambda: binding.attach("new"))
-        binding.reap()
-        assert env.reaped == []  # the control ends it, once it has been free a while
+        binding.release()
         assert env.calls[-1][2] == "/api/lease/release"
 
     def test_a_launch_that_failed_says_why_and_does_not_fall_back(self, monkeypatch):
@@ -741,14 +493,13 @@ class TestBinding:
         env.launch_answer = {"state": "failed", "error": "exited 2", "log": "no napari"}
         [text] = self._drive(binding, lambda: binding.attach("new"))
         assert "exited 2" in text and "no napari" in text
-        assert env.spawns == []
 
     def test_a_slow_launch_points_at_the_listing(self, monkeypatch):
         binding, env = self._binding(monkeypatch)
         env.use_control()
         env.launch_answer = {"state": "starting"}
         [text] = self._drive(binding, lambda: binding.attach("new"))
-        assert "still starting" in text and env.spawns == []
+        assert "still starting" in text
 
     def test_a_control_that_will_not_launch_is_an_error_not_a_fallback(
         self, monkeypatch
@@ -760,37 +511,20 @@ class TestBinding:
         env.launch_answer = OSError("refused")
         [text] = self._drive(binding, lambda: binding.attach("new"))
         assert "would not launch a session" in text and "refused" in text
-        assert env.spawns == []
 
     def test_no_control_is_an_error_that_says_how_to_start_one(self, monkeypatch):
         binding, env = self._binding(monkeypatch)
         env.use_control(up=False)
         [text] = self._drive(binding, lambda: binding.attach("new"))
         assert "no control answered" in text and "biopb control start" in text
-        assert env.spawns == [] and env.launches == []
-
-    def test_a_pinned_data_plane_gets_a_session_of_its_own(self, monkeypatch):
-        # Running without the control's plane: its session would not see the pin.
-        binding, env = self._binding(monkeypatch)
-        env.control_up = True
-        env.launch_answer = {"state": "started", "session_id": "managed"}
-        self._drive(binding, lambda: binding.attach("new"))
-        assert env.launches == [] and len(env.spawns) == 1
-
-    def test_a_failed_new_is_reaped_and_can_be_retried(self, monkeypatch):
-        binding, env = self._binding(monkeypatch, fail=1)
-        first, second = self._drive(
-            binding, lambda: binding.attach("new"), lambda: binding.attach("new")
-        )
-        assert "could not attach" in first and "spawn 1 failed" in first
-        assert "Attached to session" in second
-        assert len(env.spawns) == 2
-        assert env.reaped == env.spawns[:1]
+        assert env.launches == []
 
     def test_a_preselected_session_attaches_on_first_use(self, monkeypatch):
         binding, env = self._binding(monkeypatch, preselect="new")
+        env.use_control()
+        env.launch_answer = {"state": "started", "session_id": "managed"}
         self._drive(binding, binding.connect)
-        assert len(env.spawns) == 1
+        assert len(env.launches) == 1 and binding.session_id == "managed"
 
     def test_a_lost_lease_unbinds_and_the_next_request_says_why(self, monkeypatch):
         monkeypatch.setattr(_shim, "RENEW_INTERVAL", 0.01)
@@ -913,179 +647,6 @@ def _extract(pattern, text, what):
     return m.group(1)
 
 
-class TestEndToEnd:
-    """The real thing (all OSes): the shim answers the handshake alone, spawns its
-    OWN session child on the first tool call, bridges it, and reaps that child
-    when the client disconnects."""
-
-    def test_session_is_private_and_reaped_on_disconnect(self, tmp_path):
-        env = _home_env(tmp_path)  # isolate config + log dirs, per platform
-        # A pinned data plane keeps `attach new` off the control: the session it
-        # gets is the shim's own, reaped with it, which is what this test is of.
-        env["BIOPB_TENSOR_URL"] = "grpc://127.0.0.1:1"
-        # The shim still starts a control; keep it off the user's port, and stop
-        # it with the test.
-        env["BIOPB_CONTROL_PORT"] = str(_free_port())
-
-        shim = subprocess.Popen(
-            [sys.executable, "-m", "biopb_mcp.mcp", "--transport", "stdio"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            env=env,
-        )
-        child_pid = None
-        try:
-
-            def send(obj):
-                shim.stdin.write((json.dumps(obj) + "\n").encode())
-                shim.stdin.flush()
-
-            send(
-                {
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "initialize",
-                    "params": {
-                        "protocolVersion": "2025-03-26",
-                        "capabilities": {},
-                        "clientInfo": {"name": "t", "version": "0"},
-                    },
-                }
-            )
-            init = json.loads(shim.stdout.readline())["result"]
-            # Identity and instructions come from the shim itself.
-            assert init["serverInfo"]["name"] == "biopb-mcp"
-            assert "execute_code" in (init.get("instructions") or "")
-
-            send({"jsonrpc": "2.0", "method": "notifications/initialized"})
-            send({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
-            tools = json.loads(shim.stdout.readline())["result"]["tools"]
-            assert {"start_kernel", "execute_code", "attach"} <= {
-                t["name"] for t in tools
-            }
-            assert "attach" in init["instructions"].split("\n")[0]
-
-            # Nothing has needed a session yet, so there is none.
-            sessions_dir = tmp_path / ".local/state/biopb/mcp/sessions"
-            reg_dir = tmp_path / ".local/state/biopb/sessions"
-            assert list(sessions_dir.glob("*.log")) == []
-            assert list(reg_dir.glob("*.json")) == []
-
-            def call(shim, id_, name, arguments=None):
-                shim.stdin.write(
-                    (
-                        json.dumps(
-                            {
-                                "jsonrpc": "2.0",
-                                "id": id_,
-                                "method": "tools/call",
-                                "params": {"name": name, "arguments": arguments or {}},
-                            }
-                        )
-                        + "\n"
-                    ).encode()
-                )
-                shim.stdin.flush()
-                while True:  # skip notifications (tools/list_changed)
-                    msg = json.loads(shim.stdout.readline())
-                    if msg.get("id") == id_:
-                        break
-                result = msg["result"]
-                return result, result["content"][0]["text"]
-
-            # Unattached, a tool is an error that says to attach -- and starts
-            # nothing.
-            result, text = call(shim, 3, "server_status")
-            assert result["isError"] is True and "`attach`" in text
-            assert list(sessions_dir.glob("*.log")) == []
-
-            # `attach new` starts a session this shim owns.
-            result, text = call(shim, 4, "attach", {"session": "new"})
-            assert result.get("isError") is not True, text
-            assert "Attached to session" in text
-            status, _ = call(shim, 5, "server_status")
-            assert status.get("isError") is not True, status
-
-            # A second client sees that session as held, and cannot take it.
-            other = subprocess.Popen(
-                [sys.executable, "-m", "biopb_mcp.mcp", "--transport", "stdio"],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                env=env,
-            )
-            try:
-                other.stdin.write(
-                    (
-                        json.dumps(
-                            {
-                                "jsonrpc": "2.0",
-                                "id": 1,
-                                "method": "initialize",
-                                "params": {
-                                    "protocolVersion": "2025-03-26",
-                                    "capabilities": {},
-                                    "clientInfo": {"name": "t2", "version": "0"},
-                                },
-                            }
-                        )
-                        + "\n"
-                    ).encode()
-                )
-                other.stdin.flush()
-                json.loads(other.stdout.readline())
-                other.stdin.write(
-                    b'{"jsonrpc": "2.0", "method": "notifications/initialized"}\n'
-                )
-                _, listing = call(other, 2, "attach")
-                session_id = next(reg_dir.glob("*.json")).stem
-                assert f"{session_id}: held by agent" in listing, listing
-                result, text = call(other, 3, "attach", {"session": session_id})
-                assert result["isError"] is True and "held by its agent" in text
-            finally:
-                other.stdin.close()
-                other.wait(timeout=30)
-
-            # The owned child logs its PID (uvicorn's "Started server process
-            # [pid]") and its dynamic listen URL (_server.run) to its own
-            # per-session logfile under log/sessions/ (NOT the shared
-            # mcp-server.log — that separation is the session-log feature).
-            session_logs = list(sessions_dir.glob("*.log"))
-            assert len(session_logs) == 1, session_logs
-            log = session_logs[0].read_bytes().decode(errors="replace")
-            child_pid = int(
-                _extract(r"Started server process \[(\d+)\]", log, "child pid")
-            )
-            port = int(_extract(r"http://127\.0\.0\.1:(\d+)/mcp", log, "listen port"))
-            assert _pid_alive(child_pid)  # up now
-            assert _port_listening(port) is True
-
-            # The child registered itself for control discovery (the shared
-            # biopb state tree, isolated here via HOME), under its own pid.
-            records = list(reg_dir.glob("*.json"))
-            assert len(records) == 1, records
-            rec = json.loads(records[0].read_text())
-            assert rec["port"] == port
-            assert rec["pid"] == child_pid
-
-            # Client hangs up: the shim must exit AND reap its private child
-            # (the shared daemon used to survive — that is exactly what changed).
-            shim.stdin.close()
-            assert shim.wait(timeout=40) == 0
-            _await_dead(child_pid, timeout=20)
-            assert _port_listening(port) is False  # server truly gone
-            # No routing ghost, on every OS: the reap drops the record even
-            # where it kills the child outright (Windows).
-            assert list(reg_dir.glob("*.json")) == []
-        finally:
-            if shim.poll() is None:
-                shim.kill()
-            if child_pid is not None:
-                _force_kill(child_pid)
-            _stop_control(env)
-
-
 def _stop_control(env):
     """Stop the control a test's shim started, on the test's own port."""
     biopb = os.path.join(
@@ -1153,76 +714,119 @@ def _rpc_call(shim, id_, name, arguments=None):
 
 
 class TestControlLaunchedSession:
-    """The real control launches the session an agent attaches to, and ends it
-    once nothing has held it for the grace period."""
+    """The real control launches the session an agent attaches to. It outlives
+    the agent, the next agent can attach to it, and the user stops it from the
+    dashboard's verb."""
 
-    def test_the_control_ends_a_session_nothing_holds(self, tmp_path):
+    def test_a_session_outlives_its_agent_until_the_user_stops_it(self, tmp_path):
         env = _home_env(tmp_path)
-        for name in _shim._PINNED_ENV:
-            env.pop(name, None)
+        env.pop("BIOPB_TENSOR_URL", None)
         # A control of this test's own, on a port that is not the user's.
-        env["BIOPB_CONTROL_PORT"] = str(_free_port())
-        env["BIOPB_SESSION_IDLE_GRACE"] = "2"
+        control_port = _free_port()
+        env["BIOPB_CONTROL_PORT"] = str(control_port)
         reg_dir = tmp_path / ".local/state/biopb/sessions"
 
-        shim = subprocess.Popen(
-            [sys.executable, "-m", "biopb_mcp.mcp", "--transport", "stdio"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            env=env,
-        )
+        def start_shim():
+            return subprocess.Popen(
+                [sys.executable, "-m", "biopb_mcp.mcp", "--transport", "stdio"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                env=env,
+            )
+
+        first = start_shim()
+        second = None
         pid = None
         try:
-            _rpc_init(shim)
-            result, text = _rpc_call(shim, 2, "attach", {"session": "new"})
+            _rpc_init(first)
+            result, text = _rpc_call(first, 2, "attach", {"session": "new"})
             assert result.get("isError") is not True, text
-            assert "control ends it" in text, text
+            assert "keeps running after you disconnect" in text, text
 
             records = list(reg_dir.glob("*.json"))
             assert len(records) == 1, records
             rec = json.loads(records[0].read_text())
-            pid = rec["pid"]
-            assert rec["mode"] == "ephemeral"
-            assert _pid_alive(pid)
-            # The control's session is no child of this shim, and nobody else
-            # can take it while it is held.
-            status, _ = _rpc_call(shim, 3, "server_status")
+            pid, session_id = rec["pid"], rec["session_id"]
+            assert rec["mode"] == "durable"
+            status, _ = _rpc_call(first, 3, "server_status")
             assert status.get("isError") is not True, status
 
-            # Disconnect: the shim releases the lease and leaves the session
-            # running; the control ends it after the grace.
-            shim.stdin.close()
-            assert shim.wait(timeout=40) == 0
-            _await_dead(pid, timeout=60)
+            # The agent goes. The session is no child of its shim, so it stays.
+            first.stdin.close()
+            assert first.wait(timeout=40) == 0
+            time.sleep(1.0)
+            assert _pid_alive(pid)
+
+            # The next agent attaches to the same session: its lease was
+            # released, and its kernel is still there.
+            second = start_shim()
+            _rpc_init(second)
+            _, listing = _rpc_call(second, 2, "attach")
+            assert f"{session_id}: free" in listing, listing
+            result, text = _rpc_call(second, 3, "attach", {"session": session_id})
+            assert result.get("isError") is not True, text
+            status, _ = _rpc_call(second, 4, "server_status")
+            assert status.get("isError") is not True, status
+
+            # The user stops it from the dashboard's verb, through the control.
+            import urllib.request
+
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{control_port}/session/{session_id}/api/shutdown",
+                data=b"",
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                assert json.loads(resp.read())["stopping"] is True
+            _await_dead(pid, timeout=30)
             deadline = time.monotonic() + 10
             while list(reg_dir.glob("*.json")) and time.monotonic() < deadline:
                 time.sleep(0.2)
             assert list(reg_dir.glob("*.json")) == []
         finally:
-            if shim.poll() is None:
-                shim.kill()
+            for shim in (first, second):
+                if shim is not None and shim.poll() is None:
+                    shim.kill()
             if pid is not None:
                 _force_kill(pid)
             _stop_control(env)
 
 
 class TestServe:
-    def test_reaps_the_child_on_the_way_out(self, monkeypatch):
-        """The reaper and watchdog are armed before any child exists, over the
-        binding, and serve reaps whatever it holds when the bridge ends."""
-        armed, reaped = [], []
+    def test_releases_the_lease_on_the_way_out(self, monkeypatch):
+        """The signal handler and the watchdog are armed before anything is
+        attached, over the binding, and serve releases whatever it holds when the
+        bridge ends."""
+        armed, released = [], []
 
         async def _fake_serve(binding):
-            binding._own("CHILD", "sid")
+            binding._base = "http://127.0.0.1:9"
 
-        monkeypatch.setattr(_shim, "_install_shim_reaper", armed.append)
+        monkeypatch.setattr(_shim, "_install_release_on_signal", armed.append)
         monkeypatch.setattr(_shim, "_install_client_death_watchdog", armed.append)
         monkeypatch.setattr(_shim, "_serve_stdio", _fake_serve)
         monkeypatch.setattr(
-            _shim, "_reap_session", lambda child, sid: reaped.append((child, sid))
+            _shim,
+            "_call_session",
+            lambda base, method, path, body=None, timeout=None: released.append(
+                (base, path)
+            ),
         )
 
-        _shim.serve(object())
+        _shim.serve()
         assert len(armed) == 2
-        assert reaped == [("CHILD", "sid")]
+        assert released == [("http://127.0.0.1:9", "/api/lease/release")]
+
+    def test_nothing_attached_releases_nothing(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(_shim, "_install_release_on_signal", lambda r: None)
+        monkeypatch.setattr(_shim, "_install_client_death_watchdog", lambda r: None)
+
+        async def _noop(binding):
+            pass
+
+        monkeypatch.setattr(_shim, "_serve_stdio", _noop)
+        monkeypatch.setattr(_shim, "_call_session", lambda *a, **k: calls.append(a))
+        _shim.serve()
+        assert calls == []

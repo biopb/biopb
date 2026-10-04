@@ -3,7 +3,7 @@
 Phases 1 and 2 are implemented; phase 3 is not.
 
 An agent can attach to a session that is already running instead of getting its
-own. The control becomes the authority for session lifecycle; the stdio shim
+own. The control launches the session and the user ends it; the stdio shim
 becomes a stateless attach client. Local attach comes first. Remote attach
 follows once the security model for `/mcp` is settled.
 
@@ -19,14 +19,15 @@ follows once the security model for `/mcp` is settled.
 
 ## Ownership
 
-The control owns lifecycle *policy and API*: launch, stop, idle expiry. It does
-not own process parentage. Sessions stay detached and self-registering, so a
-control restart never ends one, and the registry (`biopb._sessions`) stays the
-source of truth, pruned by pid identity.
+The control launches sessions and does not own them. Sessions stay detached and
+self-registering, so a control restart never ends one, and the registry
+(`biopb._sessions`) stays the source of truth, pruned by pid identity. A session
+runs until a person stops it from the dashboard; nothing ends one on a timer.
 
-The shim owns nothing. Its exit is a detach, never a reap. This replaces the
-process-group, Job Object and client-death-watchdog teardown for attached
-sessions.
+The shim owns no session: it never spawns one and never ends one. Its exit is a
+detach. What it does own is itself: a shim that outlived its client would keep
+renewing its lease and lock the session, so it releases and exits when the client
+goes (stdin EOF, SIGTERM/SIGHUP, and on Windows a watchdog on the client).
 
 ## The lease
 
@@ -72,13 +73,11 @@ session id or `new`:
 
 - No id: the tool error lists live sessions as `id, busy|free, viewer|no viewer`.
 - Id: take the lease, then proxy every other request to it.
-- `new`: asks the control to launch an ephemeral session for this client,
-  leased from birth. If no control answers, that is an error naming the control's
-  log: a session started without one has no data plane, so attaching to it would
-  succeed and then fail on first use. The one exception is a client that pins its
-  data plane in its environment (`BIOPB_TENSOR_*`) and so runs without the
-  control's: a control-launched session would not see the pin, so the shim spawns
-  a session of its own and reaps it, as it always did.
+- `new`: asks the control to launch a session for this client, leased from
+  birth. It keeps running after the agent disconnects, so it can be attached to
+  again; the user stops it from the dashboard. If no control answers, that is an
+  error naming the control's log: a session started without one has no data
+  plane, so attaching to it would succeed and then fail on first use.
 - `--session <id>` (or env) pre-binds for people and scripts.
 
 While unbound the shim answers the handshake and list requests from the imported
@@ -92,15 +91,15 @@ does not forward today.
 
 1. **Local attach.** The lease in the session (agent and chat holders), the
    `attach` tool, direct loopback connection. No ownership change.
-2. **Control-owned lifecycle.** A session has a named mode (`shim`, `durable`,
-   `ephemeral`, `direct`; `mcp/_session_mode.py`) that decides its stop route,
-   chat and registration, in place of the `agentless`/`shim_owned` inference.
-   `attach new` goes through `POST /api/sessions/new?ephemeral=1`, carrying the
-   client's allowlisted display variables in place of the control's own. The
-   control ends an ephemeral session once its lease has been free for the grace
-   period, by asking it to end itself; `POST /api/sessions/<id>/stop` does the same
-   on request, refusing a held session unless forced. Control invariant I1 is
-   rewritten to match.
+2. **Control-launched sessions.** A session has a named mode (`durable`, `direct`;
+   `mcp/_session_mode.py`) in place of the `agentless`/`shim_owned` inference.
+   `attach new` goes through `POST /api/sessions/new`, carrying the client's
+   allowlisted display variables in place of the control's own, and the shim no
+   longer spawns, reaps or owns any session. There is no idle reaper: a session's kernel can be worth keeping after its agent has
+   gone, so a session runs until a person stops it, and every session serves the
+   stop route so every dashboard row can be stopped. A shim whose session is
+   stopped sees it stop answering and unbinds. Control invariant I1 is rewritten
+   to match.
 3. **Remote.** `/mcp` proxied by the control under the token, with the Host and
    Origin guards. `/mcp` runs arbitrary code in a kernel, so it is proxied only
    when a token is enforced. Sessions stay loopback-bound; the control is the only

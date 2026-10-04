@@ -427,16 +427,6 @@ class TestValidation:
         config = _write_and_load(mock_config_dir, {"transport": {"port": 99999}})
         assert get_setting(config, "transport.port") == 8765
 
-    def test_session_log_keep_default_is_five(self):
-        assert get_setting(DEFAULT_CONFIG, "transport.session_log_keep") == 5
-
-    def test_session_log_keep_below_one_reset_to_default(self, mock_config_dir):
-        # Range(min=1): must always keep at least the current session's log.
-        config = _write_and_load(
-            mock_config_dir, {"transport": {"session_log_keep": 0}}
-        )
-        assert get_setting(config, "transport.session_log_keep") == 5
-
     def test_string_number_reset_to_default(self, mock_config_dir):
         """The no-coercion wrinkle: a JSON string where a number is expected fails
         the Range check and is replaced by the numeric default.

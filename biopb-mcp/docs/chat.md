@@ -1,9 +1,10 @@
 # Chat: the built-in loop
 
 `mcp/_chat.py` is the chat pane's agent, and the only one. It exists for a user
-with no MCP harness of their own. A shim's child, which is serving an MCP client,
-gets no pane (`_chat_api.configure`'s *mode* term). Every other session does, and
-the session lease (`mcp/_lease.py`) keeps the pane and an attached agent apart:
+with no MCP harness of their own. A `direct` http server, which an MCP client
+connects to by itself, gets no pane (`_chat_api.configure`'s *mode* term). Every
+other session does, and the session lease (`mcp/_lease.py`) keeps the pane and an
+attached agent apart:
 the first turn takes the lease, an agent holding it refuses the turn, and the
 pane reports who holds the session.
 

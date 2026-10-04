@@ -6,17 +6,14 @@ KeyboardInterrupt into its thread), hard-restart the kernel, save the session as
 a notebook, and — where this session owns its own reap — end it. On by default
 (opt-out via ``observe.enabled``).
 
-**Stopping the session** (``/api/shutdown``) exists only for a session something
-other than a shim ends (``biopb mcp view``, the dashboard's new session, or an
-ephemeral session the control launched for an agent: see ``_session_mode``), and
-runs the launcher's own ``_shutdown``: the same single path Ctrl-C and SIGTERM
-take, injected at wiring time (:func:`set_session_mode`) rather than
-reimplemented. That is what
-keeps the control out of the ownership question — it proxies a session ending
-*itself*, so a viewer someone started in a terminal and one the dashboard
-launched behave identically and neither is anybody's to kill. A shim-owned child
-gets no such route: its shim owns its reap, and ending it here would leave that
-shim bridging to a dead process.
+**Stopping the session** (``/api/shutdown``) exists on every session, and runs
+the launcher's own ``_shutdown``: the same single path Ctrl-C and SIGTERM take,
+injected at wiring time (:func:`set_session_mode`) rather than reimplemented. That
+is what keeps the control out of the ownership question — it proxies a session
+ending *itself*, so a viewer someone started in a terminal, one the dashboard
+launched and one an agent attached to behave identically, and each ends when a
+person stops it. A shim whose session is stopped sees it stop answering and
+unbinds.
 
 The observe **page** itself is served by the control front — it is the React
 ``ObservePage`` in the ``web/`` SPA, served at ``/session/<id>/observe`` — and it
@@ -81,16 +78,14 @@ _poll_interval_ms = 3000
 # set_chat_enabled() rather than configure(), which resets its extras on every
 # call and so cannot be called twice.
 _chat_enabled = False
-# This session's mode (`_session_mode`). Whether it owns its own reap -- a
-# session a person or the control ends, as opposed to a child a stdio shim
-# spawned and will reap -- follows from it. The stop route exists only for the
-# former: ending a shim's child would leave the shim bridging to a dead process
-# and its MCP client reading errors instead of a clean close. Deliberately NOT
-# keyed off _chat_enabled, which is a config switch that is off by default -- a
-# viewer with chat disabled still owns its reap and still needs a way out.
+# This session's mode (`_session_mode`), reported on /api/status. It decides
+# what the session serves (chat), not whether it can be stopped: every session
+# can, whatever started it. Deliberately NOT keyed off _chat_enabled, which is a
+# config switch that is off by default -- a viewer with chat disabled still needs
+# a way out.
 _mode = _session_mode.DIRECT
-# The session's own teardown (the launcher's `_shutdown`), or None where there
-# is nothing this session may end. Injected rather than reimplemented: it is the
+# The session's own teardown (the launcher's `_shutdown`), or None where none was
+# wired (the standalone test app). Injected rather than reimplemented: it is the
 # same single path Ctrl-C and SIGTERM take, so a stop from the web de-registers,
 # reaps the kernel and closes the cluster in exactly the same order.
 _shutdown_hook = None
@@ -120,17 +115,10 @@ def configure(
 
 
 def set_session_mode(mode, on_shutdown=None):
-    """Record this session's mode, and so whether it may be stopped from the
-    web, and how.
-
-    Must run before :func:`register_http_routes`, which reads it to decide
-    whether the stop route exists at all -- an absent route rather than a
-    refusing one, the same shape the chat gate uses, so "can this session be
-    ended from here?" is one answer and not a status code to interpret.
-    """
+    """Record this session's mode, and the teardown its stop route runs."""
     global _mode, _shutdown_hook
     _mode = mode
-    _shutdown_hook = on_shutdown if _session_mode.owns_reap(mode) else None
+    _shutdown_hook = on_shutdown
 
 
 def set_chat_enabled(enabled):
@@ -336,12 +324,7 @@ async def _api_status(request):
             **host.health(),
             "poll_interval_ms": _poll_interval_ms,
             "chat_enabled": _chat_enabled,
-            # Two different questions, both read by the control's dashboard off
-            # this one probe: chat_enabled says what the page leads with,
-            # can_stop says whether the session serves a stop -- and so whether
-            # to offer one.
             "mode": _mode,
-            "can_stop": _session_mode.owns_reap(_mode),
             # Who this session answers to, and whether it has a window: what an
             # agent choosing a session to attach to needs to know about each.
             "lease": _lease.snapshot(),
@@ -447,22 +430,16 @@ _ROUTES = [
     ("/api/lease/release", ["POST"], _http.json_route(_api_lease_release)),
 ]
 
-# Served only where this session owns its own reap. Under ``api`` rather than a
-# root of its own: the control already proxies that root everywhere, and it
-# already carries a comparably destructive verb in /api/kernel/restart. This is
-# not an execute surface, so it needs none of the chat root's local-only gating.
-_SHUTDOWN_ROUTES = [
-    ("/api/shutdown", ["POST"], _route(_api_shutdown)),
-]
-
 
 def _routes():
-    """The routes to serve: the data API, plus the stop route where this
-    session owns its reap."""
-    routes = list(_ROUTES)
-    if _session_mode.owns_reap(_mode):
-        routes += _SHUTDOWN_ROUTES
-    return routes
+    """The routes to serve: the data API, the lease, and the stop route.
+
+    The stop route is under ``api`` rather than a root of its own: the control
+    already proxies that root everywhere, and it already carries a comparably
+    destructive verb in /api/kernel/restart. It is not an execute surface, so it
+    needs none of the chat root's local-only gating.
+    """
+    return [*_ROUTES, ("/api/shutdown", ["POST"], _route(_api_shutdown))]
 
 
 # ---------------------------------------------------------------------------
@@ -482,10 +459,7 @@ def register_http_routes():
     for path, methods, handler in _routes():
         _app.mcp.custom_route(path, methods=methods)(handler)
     _mounted_http = True
-    logger.info(
-        "observe API mounted on the MCP app at /api/* (stop: %s)",
-        "on" if _session_mode.owns_reap(_mode) else "off",
-    )
+    logger.info("observe API mounted on the MCP app at /api/*")
 
 
 def _build_standalone_app():
