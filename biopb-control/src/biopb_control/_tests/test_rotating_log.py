@@ -87,7 +87,8 @@ def test_a_chatty_child_cannot_outgrow_the_limit_and_its_last_words_survive(tmp_
 
     logs = sorted(tmp_path.glob("child.log*"))
     assert len(logs) > 1
-    assert all(p.stat().st_size < 64 * 1024 + 4096 for p in logs)
+    # A file passes the limit by at most the one chunk the pump read.
+    assert all(p.stat().st_size <= 64 * 1024 + 65536 for p in logs)
     assert b"goodbye" in (tmp_path / "child.log").read_bytes()
 
 
