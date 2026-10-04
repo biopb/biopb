@@ -919,6 +919,7 @@ class TestResolveAction:
             discovery_state=DiscoveryState(),
             cloud_roots={Path(zpath).parent},
         )
+        server.set_resolve_handler(mgr.resolve_source)
         claim = SourceClaim("ome-zarr", zpath, source_id=source_id, unresolved=True)
         assert mgr._reconciler._commit_add_claim(claim) is True
         return server, mgr
@@ -1087,14 +1088,20 @@ class TestResolveAction:
             assert mgr._reconciler.is_pending("cloud1")
             assert "cloud1" not in mgr._reconciler._pending_failed
 
+    def test_resolve_action_without_a_handler_is_not_enabled(self):
+        import pyarrow.flight as flight
+
+        server = catalog_server("localhost:0")  # nothing injected a resolver
+        action = flight.Action("resolve", b"cloud1")
+        with pytest.raises(flight.FlightServerError, match="not enabled"):
+            list(server.do_action(None, action))
+
     def test_resolve_action_unknown_source_errors(self):
         import pyarrow.flight as flight
-        from biopb_tensor_server.serving.server import TensorFlightServer
 
-        # Registry only, no catalog row: the sentinel is never described, and
-        # the id under test is a *missing* one.
-        server = TensorFlightServer("localhost:0")
-        server.register_source("cloud1", _SlowSentinel())
+        # A server that resolves, asked for an id it has never heard of.
+        server = catalog_server("localhost:0")
+        server.set_resolve_handler(lambda source_id, on_target: False)
         action = flight.Action("resolve", b"missing")
         with pytest.raises(flight.FlightServerError, match="Source not found"):
             list(server.do_action(None, action))

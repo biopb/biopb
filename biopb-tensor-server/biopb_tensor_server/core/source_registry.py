@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Callable, Dict, Iterator, List, Optional, Protocol, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
 from biopb_tensor_server.core.adapter_base import SourceAdapter
 from biopb_tensor_server.core.normalize import normalize_adapter
@@ -58,16 +58,6 @@ def close_adapter(adapter: Optional[SourceAdapter]) -> None:
         logger.debug("error closing source adapter", exc_info=True)
 
 
-class PendingSources(Protocol):
-    """What the registry asks about a claimed source that is not registered."""
-
-    def materialize(self, source_id: str) -> None: ...
-
-    def check_registered(self, source_id: str) -> None: ...
-
-    def claim_primary_path(self, source_id: str) -> Optional[str]: ...
-
-
 class SourceRegistry:
     """The server's live ``source_id -> SourceAdapter`` map, thread-safe."""
 
@@ -82,13 +72,13 @@ class SourceRegistry:
         self._sources: Dict[str, SourceAdapter] = {}
         self._lock = threading.RLock()
         self._on_register = on_register
-        self._pending_source: Optional[PendingSources] = None
+        self._pending_check: Optional[Callable[[str], None]] = None
 
-    def set_pending_source(self, pending: Optional[PendingSources]) -> None:
-        """Wire what the registry asks about a claimed source that is not
-        registered (``Reconciler`` is the one): :meth:`get_registered` asks why a
-        read cannot be served, :meth:`materialize` has it registered."""
-        self._pending_source = pending
+    def set_pending_check(self, check: Optional[Callable[[str], None]]) -> None:
+        """Wire what :meth:`get_registered` asks when a source is not registered:
+        *check* raises why a read of a claimed source cannot be served (it is
+        unresolved, or its registration failed) and returns for any other id."""
+        self._pending_check = check
 
     def register(self, source_id: str, adapter: SourceAdapter) -> SourceAdapter:
         """Register a data source, in canonical axis order.
@@ -202,33 +192,16 @@ class SourceRegistry:
         """:meth:`get`, raising when the source is claimed but not registered.
 
         What a reader of the source's data or tensors uses: a pending source is
-        not read until a client resolves it (:meth:`materialize`). Raises why it
+        not read until a client resolves it (the ``resolve`` action). Raises why it
         cannot be read -- unresolved while its registration is waiting, a
         registration error once it failed -- and returns None for an unknown
         source. The internal callers that only ask whether it is registered, or
         read its url, use :meth:`get`.
         """
         adapter = self.get(source_id)
-        if adapter is None and self._pending_source is not None:
-            self._pending_source.check_registered(source_id)
+        if adapter is None and self._pending_check is not None:
+            self._pending_check(source_id)
             adapter = self.get(source_id)  # registered while we checked
-        return adapter
-
-    def pending_path(self, source_id: str) -> Optional[str]:
-        """The primary path of a claimed source that is not registered, else None
-        (an unknown source, or one that is registered: ask :meth:`get`)."""
-        if self._pending_source is None or self.get(source_id) is not None:
-            return None
-        return self._pending_source.claim_primary_path(source_id)
-
-    def materialize(self, source_id: str) -> Optional[SourceAdapter]:
-        """Register a claimed source now, if it is waiting to be, and return its
-        adapter (None for an unknown source). The ``resolve`` action's entry;
-        raises the registration's error when it fails."""
-        adapter = self.get(source_id)
-        if adapter is None and self._pending_source is not None:
-            self._pending_source.materialize(source_id)
-            adapter = self.get(source_id)
         return adapter
 
     def snapshot(self) -> List[Tuple[str, SourceAdapter]]:

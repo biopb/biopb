@@ -63,6 +63,13 @@ def _rows(server):
     return {row["source_id"]: row for row in table.to_pylist()}
 
 
+def _resolve(manager, server, source_id):
+    """What the ``resolve`` action does for a source: register it now. Returns
+    its adapter (None for an unknown source)."""
+    manager.resolve_source(source_id, lambda path: None)
+    return server.sources.get(source_id)
+
+
 def _only_ids(server):
     return sorted(_rows(server))
 
@@ -126,7 +133,7 @@ class TestResolveRegistersTheSource:
         _first_scan(manager)
         first, second = _only_ids(server)
 
-        adapter = server.sources.materialize(first)
+        adapter = _resolve(manager, server, first)
 
         assert adapter is not None
         assert server.sources.get(first) is adapter
@@ -179,7 +186,7 @@ class TestResolveRegistersTheSource:
         manager, server = _manager(tmp_path)
         _first_scan(manager)
         (sid,) = _only_ids(server)
-        adapter = server.sources.materialize(sid)
+        adapter = _resolve(manager, server, sid)
         assert server.sources.get_registered(sid) is adapter
 
     def test_an_unknown_source_is_none_not_an_error(self, tmp_path):
@@ -197,7 +204,7 @@ class TestResolveRegistersTheSource:
         pending = reconciler.catalog_url_of(second)
         assert pending.endswith(os.path.basename(reconciler.claim_primary_path(second)))
 
-        server.sources.materialize(first)
+        _resolve(manager, server, first)
         assert reconciler.catalog_url_of(first) == server.sources.get(first).catalog_url
         assert reconciler.catalog_url_of("nope") is None
 
@@ -209,7 +216,7 @@ class TestResolveRegistersTheSource:
         first, second = _only_ids(server)
         assert manager.unregistered_sources() == 2
 
-        server.sources.materialize(first)
+        _resolve(manager, server, first)
         assert manager.unregistered_sources() == 1
         assert len(server.sources) == 1
 
@@ -240,7 +247,7 @@ class TestResolveRegistersTheSource:
         results = []
         threads = [
             threading.Thread(
-                target=lambda: results.append(server.sources.materialize(sid))
+                target=lambda: results.append(_resolve(manager, server, sid))
             )
             for _ in range(4)
         ]
@@ -319,7 +326,7 @@ class TestTheWorker:
         def reader(ids):
             try:
                 for sid in ids:
-                    adapter = server.sources.materialize(sid)
+                    adapter = _resolve(manager, server, sid)
                     assert adapter is not None
             except Exception as exc:  # noqa: BLE001 - surfaced below
                 errors.append(exc)
@@ -465,7 +472,7 @@ class TestFailure:
         self._break(path)
 
         with pytest.raises(SourceRegistrationError, match="could not be registered"):
-            server.sources.materialize(sid)
+            _resolve(manager, server, sid)
 
         row = _rows(server)[sid]
         assert row["is_resolved"] is False
@@ -493,7 +500,7 @@ class TestFailure:
         )[1]
         for _ in range(2):
             with pytest.raises(SourceRegistrationError):
-                server.sources.materialize(sid)
+                _resolve(manager, server, sid)
         assert attempts == []  # inside its backoff window
 
     def test_it_is_retried_once_the_backoff_has_passed_and_the_file_is_fixed(
@@ -598,7 +605,7 @@ class TestPrecacheRouting:
         (sid,) = _only_ids(server)
         assert routed == []
 
-        server.sources.materialize(sid)
+        _resolve(manager, server, sid)
 
         assert [s for s, _ in routed] == [sid]
         assert routed[0][1] > 0
@@ -612,7 +619,7 @@ class TestPrecacheRouting:
         assert not manager.registration_idle()  # first scan not done
         _first_scan(manager)
         assert not manager.registration_idle()
-        server.sources.materialize(_only_ids(server)[0])
+        _resolve(manager, server, _only_ids(server)[0])
         assert manager.registration_idle()
 
     def test_enqueue_backlog_orders_newest_first_and_skips_what_is_queued(self):
@@ -679,6 +686,7 @@ class TestOverFlight:
         manager, server = _manager(tmp_path)
         server.set_registration_pending_provider(manager.pending_registrations)
         server.set_unregistered_provider(manager.unregistered_sources)
+        server.set_resolve_handler(manager.resolve_source)
         _first_scan(manager)
         server.mark_ready()
         threading.Thread(target=server.serve, daemon=True).start()

@@ -820,6 +820,7 @@ def _setup_flight_server(
     # holds no SourceManager reference.
     server.set_add_source_handler(source_manager.add_local_source)
     server.set_remove_source_handler(source_manager.remove_dropped_root)
+    server.set_resolve_handler(source_manager.resolve_source)
 
     precache_worker = None
     if server_config.precache.enabled:

@@ -598,6 +598,9 @@ class TensorFlightServer(flight.FlightServerBase):
         self._allow_runtime_source_add = True
         self._add_source_handler: Optional[Callable[..., Any]] = None
         self._remove_source_handler: Optional[Callable[..., Any]] = None
+        # ``SourceManager.resolve_source``, injected the same way: the ``resolve``
+        # action registers the source (a download, for a cloud one) through it.
+        self._resolve_handler: Optional[Callable[..., bool]] = None
 
     def flight_idle_for(self, seconds: float) -> bool:
         """True if no heavy read is in flight and none finished within *seconds*.
@@ -672,6 +675,18 @@ class TensorFlightServer(flight.FlightServerBase):
         "not enabled".
         """
         self._remove_source_handler = handler
+
+    def set_resolve_handler(self, handler: Optional[Callable[..., bool]]) -> None:
+        """Wire the SourceManager's ``resolve_source`` for the resolve action.
+
+        ``handler(source_id, on_target)`` registers a source that has no adapter
+        yet and writes its catalog row, calling ``on_target(path)`` with what it
+        is about to open; it returns False for an unknown source and raises
+        ``SourceUnresolvedError`` (retriable or not) when it cannot be opened.
+        Injected by the launcher like the add/remove handlers; ``None`` leaves the
+        action reporting "not enabled".
+        """
+        self._resolve_handler = handler
 
     @property
     def metadata_db(self) -> Optional[MetadataDatabase]:
@@ -1333,30 +1348,27 @@ class TensorFlightServer(flight.FlightServerBase):
         adapter, so a retry coalesces onto the finished work
         rather than downloading again.
         """
-        adapter = self.sources.get(source_id)
-        # A cloud source has no adapter until it resolves: its path is its claim's.
-        source_url = (
-            adapter.source_url
-            if adapter is not None
-            else self.sources.pending_path(source_id)
-        )
-        if source_url is None:
-            raise flight.FlightServerError(f"Source not found: {source_id}")
+        handler = self._resolve_handler
+        if handler is None:
+            raise flight.FlightServerError(
+                "Source resolution is not enabled on this server."
+            )
         # The terminal message IS the catalog row, so refuse before the recall
         # rather than after minutes of download with nothing to hand back.
         catalog = self._require_catalog()
 
-        # Name/size of what is being recalled, computed once (stat is recall-free).
-        # Best-effort: an unresolved adapter exposes its URL; a directory or a
+        # Name/size of what is being recalled, filled in by the handler once it
+        # knows the path (stat is recall-free). Best-effort: a directory or a
         # remote URL has no single file size, so target_bytes stays 0 (unknown).
-        source_url = source_url or source_id
-        target_name = os.path.basename(str(source_url).rstrip("/")) or str(source_url)
-        target_bytes = 0
-        try:
-            if os.path.isfile(source_url):
-                target_bytes = os.path.getsize(source_url)
-        except OSError:
-            pass
+        target = {"name": source_id, "bytes": 0}
+
+        def _on_target(path: str) -> None:
+            target["name"] = os.path.basename(str(path).rstrip("/")) or str(path)
+            try:
+                if os.path.isfile(path):
+                    target["bytes"] = os.path.getsize(path)
+            except OSError:
+                pass
 
         started = time.monotonic()
 
@@ -1364,8 +1376,8 @@ class TensorFlightServer(flight.FlightServerBase):
             return ResolveStreamMessage(
                 progress=ResolveProgress(
                     elapsed_seconds=time.monotonic() - started,
-                    target_name=target_name,
-                    target_bytes=target_bytes,
+                    target_name=target["name"],
+                    target_bytes=target["bytes"],
                 )
             ).SerializeToString()
 
@@ -1373,7 +1385,7 @@ class TensorFlightServer(flight.FlightServerBase):
 
         def _run() -> None:
             try:
-                self.sources.materialize(source_id)
+                result["found"] = handler(source_id, _on_target)
             except BaseException as exc:  # surfaced on the stream below
                 result["err"] = exc
 
@@ -1405,6 +1417,9 @@ class TensorFlightServer(flight.FlightServerBase):
             raise flight.FlightServerError(
                 f"resolve failed for {source_id!r}: {exc}"
             ) from exc
+
+        if not result["found"]:
+            raise flight.FlightServerError(f"Source not found: {source_id}")
 
         # The row read back is the one the adapter's ``on_resolved`` callback
         # just backfilled -- resolution fires it, and that is the only thing
