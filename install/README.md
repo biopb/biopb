@@ -94,8 +94,11 @@ are produced.
   (Claude Code/Desktop, Codex CLI, Cursor, opencode) and can install opencode if
   none is found. biopb-mcp speaks MCP over **stdio**, so the agent spawns
   `biopb-mcp --transport stdio` itself — there is no separate server to start by
-  hand. The napari viewer does not open with it: it comes up on the first
-  `start_kernel` call, so prompt the agent (e.g. "start biopb and report
+  hand. The agent first attaches to a session -- one that is already running, or
+  a new one the control launches, which keeps running until you stop it from the
+  dashboard (Codex is given the newest free session, or a new one, without
+  being asked). The napari viewer does not open with it: it comes up on the
+  first `start_kernel` call, so prompt the agent (e.g. "start biopb and report
   status") to bring up the viewer and the data plane.
 
 ## Config & data locations

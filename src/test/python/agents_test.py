@@ -481,12 +481,17 @@ def _codex_on_path(monkeypatch):
     )
 
 
-def _write_codex_config(home, command=_CMD, extra=""):
+# What biopb registers Codex with: it does not refresh its tool list within a
+# turn, so the shim binds a session before the handshake (see CodexCli.mcp_args).
+_CODEX_ARGS = ["--transport", "stdio", "--session", "auto"]
+
+
+def _write_codex_config(home, command=_CMD, extra="", args=_CODEX_ARGS):
     cfg = home / ".codex" / "config.toml"
     cfg.parent.mkdir(parents=True, exist_ok=True)
     cfg.write_text(
         extra + f'[mcp_servers.biopb]\ncommand = "{command}"\n'
-        'args = ["--transport", "stdio"]\n'
+        f"args = {json.dumps(args)}\n"
     )
     return cfg
 
@@ -572,7 +577,38 @@ def test_codex_register_adds_via_cli(home, monkeypatch):
     assert len(calls) == 1
     assert calls[0][1:5] == ["mcp", "add", "biopb", "--"]
     assert _CMD in calls[0]
-    assert "--transport" in calls[0] and "stdio" in calls[0]
+    assert calls[0][calls[0].index(_CMD) + 1 :] == _CODEX_ARGS
+
+
+def test_only_codex_is_registered_with_a_session_to_bind(home):
+    """Codex alone cannot follow tools/list_changed, so only its entry carries
+    `--session auto`; the others attach through the shim's `attach` tool."""
+    by_id = {c.id: c for c in _agents.supported()}
+    assert list(by_id["codex-cli"].mcp_args) == _CODEX_ARGS
+    for name, client in by_id.items():
+        if name != "codex-cli":
+            assert list(client.mcp_args) == ["--transport", "stdio"], name
+
+
+def test_codex_registered_before_it_needed_a_session_is_drift(home, monkeypatch):
+    _codex_on_path(monkeypatch)
+    _write_codex_config(home, args=["--transport", "stdio"])
+    s = _agents.status("codex-cli")
+    assert s["state"] == "registered" and s["drifted"] is True
+
+
+def test_codex_registered_with_its_session_is_not_drift(home, monkeypatch):
+    _codex_on_path(monkeypatch)
+    _write_codex_config(home)
+    assert _agents.status("codex-cli")["drifted"] is False
+
+
+def test_the_scanner_reads_the_args_too(home, monkeypatch, no_tomllib):
+    _codex_on_path(monkeypatch)
+    _write_codex_config(home)
+    assert _agents.status("codex-cli")["drifted"] is False
+    _write_codex_config(home, args=["--transport", "stdio"])
+    assert _agents.status("codex-cli")["drifted"] is True
 
 
 def test_codex_unregister_removes_via_cli(home, monkeypatch):
@@ -664,7 +700,10 @@ def test_scanner_reads_a_literal_string(home, monkeypatch, no_tomllib):
     monkeypatch.setattr(_agents, "_mcp_executable", lambda: r"C:\biopb\biopb-mcp.exe")
     cfg = home / ".codex" / "config.toml"
     cfg.parent.mkdir()
-    cfg.write_text("[mcp_servers.biopb]\ncommand = 'C:\\biopb\\biopb-mcp.exe'\n")
+    cfg.write_text(
+        "[mcp_servers.biopb]\ncommand = 'C:\\biopb\\biopb-mcp.exe'\n"
+        f"args = {json.dumps(_CODEX_ARGS)}\n"
+    )
     s = _agents.status("codex-cli")
     assert s["state"] == "registered" and s["drifted"] is False
 

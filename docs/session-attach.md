@@ -93,7 +93,9 @@ and when an attachment ends.
 
 **Clients that do not follow `list_changed`.** Claude Code and opencode refresh
 their tool list after `attach`; Codex does not, within a turn. For such a client
-the registration passes `--session`: the shim binds *before* it answers
+the registration passes `--session` (`biopb agents register` writes `--session
+auto` into Codex's entry and nothing extra into the others; an entry registered
+before that reads as drifted, so the dashboard offers a Re-register): the shim binds *before* it answers
 `initialize`, so the answer carries the session's own instructions -- in the slot
 a client puts in front of the model from the first turn -- and its tools, and
 nothing needs refreshing. `auto` takes the newest free session, else has the
