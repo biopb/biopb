@@ -1022,7 +1022,8 @@ class CatalogClient:
         One GetFlightInfo on the table's path, the first time it is needed on
         this connection. Empty when the server will not say -- a capability
         token reads a source's pixels, not the catalog -- and a caller then
-        projects the base columns only.
+        projects the base columns only. A refusal is remembered; a dropped or
+        timed-out call is not, so the next call asks again.
         """
         state = self._state
         if state.catalog_columns is None:
@@ -1032,7 +1033,15 @@ class CatalogClient:
                     options=state.call_options,
                 )
                 state.catalog_columns = frozenset(info.schema.names)
-            except Exception:  # noqa: BLE001 - a probe: any failure reads as "unknown"
+            except (
+                flight.FlightUnavailableError,
+                flight.FlightTimedOutError,
+                flight.FlightCancelledError,
+            ):
+                # Transient: this call goes without, the next one asks again.
+                logger.debug("could not read the sources schema", exc_info=True)
+                return frozenset()
+            except Exception:  # noqa: BLE001 - a probe: any other failure is a refusal
                 logger.debug("could not read the sources schema", exc_info=True)
                 state.catalog_columns = frozenset()
         return state.catalog_columns

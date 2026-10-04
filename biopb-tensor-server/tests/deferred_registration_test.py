@@ -703,6 +703,33 @@ class TestOverFlight:
             client.close()
             server.shutdown()
 
+    def test_a_dropped_schema_read_is_asked_again(self, tmp_path):
+        from pyarrow import flight
+
+        manager, server, client = self._serve(tmp_path)
+        try:
+            state = client._catalog._state
+            raw = state.raw_client
+            fail = [True]
+
+            class Flaky:
+                def __getattr__(self, name):
+                    return getattr(raw, name)
+
+                def get_flight_info(self, *a, **k):
+                    if fail[0]:
+                        raise flight.FlightUnavailableError("blip")
+                    return raw.get_flight_info(*a, **k)
+
+            state.raw_client = Flaky()
+            assert client._catalog._catalog_columns() == frozenset()
+            assert state.catalog_columns is None
+            fail[0] = False
+            assert "unresolved_reason" in client._catalog._catalog_columns()
+        finally:
+            client.close()
+            server.shutdown()
+
     def test_a_listing_projection_carries_the_reason(self, tmp_path):
         manager, server, client = self._serve(tmp_path)
         try:
