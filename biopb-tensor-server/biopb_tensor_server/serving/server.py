@@ -1204,7 +1204,7 @@ class TensorFlightServer(flight.FlightServerBase):
                 # Sources claimed but not yet registered: their rows exist with
                 # ``is_resolved`` false and ``unresolved_reason`` "pending", and
                 # fill in as the background registration reaches them (or at
-                # once, when a read asks for one). 0 means the catalog is whole.
+                # once, when a client resolves one). 0 means the catalog is whole.
                 "registration_pending": self._registration_pending(),
                 # Whether drawn ROIs survive a restart. A store that was asked
                 # for and could not be opened is fatal at startup, so this is
@@ -1299,6 +1299,14 @@ class TensorFlightServer(flight.FlightServerBase):
         else:
             self._authorize(context)
             raise flight.FlightServerError(f"Unknown action: {action.type}")
+
+    def _registered(self, source_id: str) -> Optional[SourceAdapter]:
+        """``SourceRegistry.get_registered``, its refusals as Flight errors: an
+        unresolved source is "open to resolve", a failed registration says why."""
+        try:
+            return self.sources.get_registered(source_id)
+        except (SourceUnresolvedError, TensorResolutionError) as exc:
+            raise to_flight_error(exc) from exc
 
     def _handle_resolve(self, source_id: str) -> Iterator[bytes]:
         """Stream the result of resolving a source.
@@ -1441,7 +1449,7 @@ class TensorFlightServer(flight.FlightServerBase):
           filesystem reads, concurrency-safe with real reads, so warming never
           blocks a live viewer read.
         """
-        adapter = self.sources.get_registered(source_id)
+        adapter = self._registered(source_id)
         if adapter is None:
             raise flight.FlightServerError(f"Source not found: {source_id}")
 
@@ -1805,12 +1813,7 @@ class TensorFlightServer(flight.FlightServerBase):
         # crashing on None.split), so honor the documented default in this one
         # chokepoint rather than at every adapter call site.
         if field is None:
-            try:
-                default_adapter = self.sources.get_registered(source_id)
-            except (SourceUnresolvedError, TensorResolutionError) as e:
-                raise _adapter_lookup_error(
-                    e, f"Tensor not found: {source_id}/{field}"
-                ) from e
+            default_adapter = self._registered(source_id)
             if default_adapter is not None:
                 descriptors = default_adapter.list_tensor_descriptors()
                 if descriptors:

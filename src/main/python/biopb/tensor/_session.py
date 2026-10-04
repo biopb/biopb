@@ -976,10 +976,9 @@ class CatalogClient:
         """One source's addressing columns: the resolved flag and the tensor list.
 
         Not ``SOURCE_ROW_COLUMNS`` -- the source's url and type are bytes on the
-        wire nobody here reads. Carries ``unresolved_reason`` when the server has it.
+        wire nobody here reads.
         """
-        columns = with_reason("is_resolved, tensors", self._catalog_columns())
-        return self._addressed_row(columns, source_id)
+        return self._addressed_row("is_resolved, tensors", source_id)
 
     def source_row_columns(self) -> str:
         """``SOURCE_ROW_COLUMNS`` as a SELECT list, plus ``unresolved_reason``

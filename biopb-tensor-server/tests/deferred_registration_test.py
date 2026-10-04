@@ -152,6 +152,28 @@ class TestResolveRegistersTheSource:
         assert server.sources.get(sid) is None
         assert manager.pending_registrations() == 1
 
+    def test_the_server_maps_the_refusal_to_open_to_resolve(self, tmp_path):
+        from pyarrow import flight
+
+        _make_zarr(tmp_path, "a.zarr")
+        manager, server = _manager(tmp_path)
+        _first_scan(manager)
+        (sid,) = _only_ids(server)
+
+        with pytest.raises(flight.FlightUnavailableError, match="resolve"):
+            server._registered(sid)
+        assert server._registered("nope") is None
+
+    def test_an_upload_lookup_under_a_pending_source_is_unknown_not_an_error(
+        self, tmp_path
+    ):
+        _make_zarr(tmp_path, "a.zarr")
+        manager, server = _manager(tmp_path)
+        _first_scan(manager)
+        (sid,) = _only_ids(server)
+
+        assert server.uploads._locate(f"{sid}/labels") == (None, None, None)
+
     def test_a_read_of_a_registered_source_is_served(self, tmp_path):
         _make_zarr(tmp_path, "a.zarr")
         manager, server = _manager(tmp_path)

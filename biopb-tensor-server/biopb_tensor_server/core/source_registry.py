@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Callable, Dict, Iterator, List, Optional, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Protocol, Tuple
 
 from biopb_tensor_server.core.adapter_base import SourceAdapter
 from biopb_tensor_server.core.normalize import normalize_adapter
@@ -58,6 +58,14 @@ def close_adapter(adapter: Optional[SourceAdapter]) -> None:
         logger.debug("error closing source adapter", exc_info=True)
 
 
+class PendingSources(Protocol):
+    """What the registry asks about a claimed source that is not registered."""
+
+    def materialize(self, source_id: str) -> None: ...
+
+    def check_registered(self, source_id: str) -> None: ...
+
+
 class SourceRegistry:
     """The server's live ``source_id -> SourceAdapter`` map, thread-safe."""
 
@@ -72,23 +80,13 @@ class SourceRegistry:
         self._sources: Dict[str, SourceAdapter] = {}
         self._lock = threading.RLock()
         self._on_register = on_register
-        self._materializer: Optional[Callable[[str], None]] = None
-        self._pending_check: Optional[Callable[[str], None]] = None
+        self._pending_source: Optional[PendingSources] = None
 
-    def set_pending_hooks(
-        self,
-        materializer: Optional[Callable[[str], None]],
-        pending_check: Optional[Callable[[str], None]],
-    ) -> None:
-        """Wire what the registry does for a claimed source that is not registered.
-
-        *materializer* registers it (a source whose registration was deferred) and
-        raises why it cannot; :meth:`materialize` calls it. *pending_check* only
-        raises why a read of it cannot be served, never registering;
-        :meth:`get_registered` calls it.
-        """
-        self._materializer = materializer
-        self._pending_check = pending_check
+    def set_pending_source(self, pending: Optional[PendingSources]) -> None:
+        """Wire what the registry asks about a claimed source that is not
+        registered (``Reconciler`` is the one): :meth:`get_registered` asks why a
+        read cannot be served, :meth:`materialize` has it registered."""
+        self._pending_source = pending
 
     def register(self, source_id: str, adapter: SourceAdapter) -> SourceAdapter:
         """Register a data source, in canonical axis order.
@@ -209,8 +207,8 @@ class SourceRegistry:
         read its url, use :meth:`get`.
         """
         adapter = self.get(source_id)
-        if adapter is None and self._pending_check is not None:
-            self._pending_check(source_id)
+        if adapter is None and self._pending_source is not None:
+            self._pending_source.check_registered(source_id)
             adapter = self.get(source_id)  # registered while we checked
         return adapter
 
@@ -219,8 +217,8 @@ class SourceRegistry:
         adapter (None for an unknown source). The ``resolve`` action's entry;
         raises the registration's error when it fails."""
         adapter = self.get(source_id)
-        if adapter is None and self._materializer is not None:
-            self._materializer(source_id)
+        if adapter is None and self._pending_source is not None:
+            self._pending_source.materialize(source_id)
             adapter = self.get(source_id)
         return adapter
 

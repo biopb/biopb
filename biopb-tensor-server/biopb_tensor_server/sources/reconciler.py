@@ -190,7 +190,7 @@ class Reconciler:
         self._pending: Dict[str, Optional[str]] = {}
         self._pending_failed: Dict[str, str] = {}
         # A registration, a refresh and a removal of one source never overlap, so
-        # a read that races the worker coalesces onto one parse and a removed
+        # a resolve that races the worker coalesces onto one parse and a removed
         # source is not registered back. A fixed stripe of locks hashed by
         # source_id: nothing to allocate or clean up, and two sources that share
         # one only wait for each other. Taken before ``self._lock``, never inside

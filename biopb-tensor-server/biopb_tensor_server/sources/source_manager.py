@@ -224,11 +224,9 @@ class SourceManager:
         # whenever that registration happens to finish (see
         # ``_notify_source_committed``).
         self._deferred: Dict[str, float] = {}
-        set_pending_hooks = getattr(server.sources, "set_pending_hooks", None)
-        if set_pending_hooks is not None:
-            set_pending_hooks(
-                self._reconciler.materialize, self._reconciler.check_registered
-            )
+        set_pending_source = getattr(server.sources, "set_pending_source", None)
+        if set_pending_source is not None:
+            set_pending_source(self._reconciler)
 
     @property
     def roots(self) -> Roots:
