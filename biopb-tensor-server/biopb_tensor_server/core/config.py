@@ -232,6 +232,9 @@ _CONSTRAINTS = {
         "max_query_results": _Range(min=1),
         "query_timeout_ms": _Range(min=1),
     },
+    "CatalogConfig": {
+        "checkpoint_threshold_mb": _Range(min=1),
+    },
     "ServerConfig": {
         "log_level": _Enum(
             {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}, case_insensitive=True
@@ -763,6 +766,18 @@ class CatalogConfig:
             "help": "Where the on-disk catalog lives. Empty derives it from the "
             "config file's path, which is what keeps two servers on two configs "
             "off each other's file."
+        },
+    )
+    checkpoint_threshold_mb: int = field(
+        default=1024,
+        metadata={
+            "help": "How much the catalog file's write-ahead log may grow before "
+            "DuckDB rewrites the database file (a checkpoint). Every source's "
+            "row is written through the log, and a checkpoint stalls every "
+            "writer behind it, so a scan of a large site checkpoints constantly "
+            "at DuckDB's own 16 MB default. A larger value trades log size on "
+            "disk, and log to replay after a crash, for a faster build. Has no "
+            "effect with persist off."
         },
     )
 
@@ -1479,6 +1494,7 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
     catalog_kwargs: Dict[str, Any] = {}
     _carry(catalog_kwargs, "persist", catalog_data)
     _carry(catalog_kwargs, "store_path", catalog_data)
+    _carry(catalog_kwargs, "checkpoint_threshold_mb", catalog_data, cast=int)
     catalog_config = CatalogConfig(**catalog_kwargs)
 
     # Parse sources. `url` accepts the legacy `path` alias; every other field is

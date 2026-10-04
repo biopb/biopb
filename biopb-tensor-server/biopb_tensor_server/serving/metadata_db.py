@@ -629,7 +629,9 @@ class MetadataDatabase:
         max_rois_per_tensor: int = 5000,
         store_path: Optional[Path] = None,
         annotations_enabled: bool = True,
+        checkpoint_threshold_mb: int = 1024,
     ):
+        self._checkpoint_threshold_mb = checkpoint_threshold_mb
         self._max_query_results = max_query_results
         self._query_timeout_ms = query_timeout_ms
         self._max_rois_per_tensor = max_rois_per_tensor
@@ -706,7 +708,17 @@ class MetadataDatabase:
         It does not stop DuckDB opening its OWN database file, which is what
         makes a persistent catalog possible without reopening the sandbox.
         """
-        return duckdb.connect(target, config={"enable_external_access": False})
+        return duckdb.connect(
+            target,
+            config={
+                "enable_external_access": False,
+                # A checkpoint rewrites the database file and stalls every writer
+                # behind it. DuckDB's own 16 MB default fires every few dozen
+                # sources of a scan (a row carries up to hundreds of KB of
+                # metadata), roughly doubling its time.
+                "checkpoint_threshold": f"{self._checkpoint_threshold_mb}MiB",
+            },
+        )
 
     def _open_database(self) -> duckdb.DuckDBPyConnection:
         """The connection, from a file when one is configured.

@@ -16,6 +16,7 @@ import pytest
 from biopb_tensor_server.core.config import (
     AnnotationsConfig,
     CacheConfig,
+    CatalogConfig,
     MetadataDbConfig,
     PrecacheConfig,
     PyramidConfig,
@@ -42,6 +43,7 @@ def _default_of(section, field):
         "precache": PrecacheConfig,
         "metadata_db": MetadataDbConfig,
         "annotations": AnnotationsConfig,
+        "catalog": CatalogConfig,
     }
     return getattr(defaults[section](), field)
 
@@ -107,6 +109,12 @@ def _default_of(section, field):
             "annotations",
             "prune_unseen_days",
         ),
+        # A zero threshold would checkpoint after every commit.
+        (
+            {"catalog": {"checkpoint_threshold_mb": 0}},
+            "catalog",
+            "checkpoint_threshold_mb",
+        ),
         ({"server": {"rescan_interval": -1}}, "server", "rescan_interval"),
         ({"server": {"rescan_interval": -1.0}}, "server", "rescan_interval"),
     ],
@@ -120,6 +128,12 @@ def test_bad_value_is_clamped_with_a_warning(raw, section, field, caplog):
     assert f"{section}.{field}" in msgs[0]
     # ...and the value in force is the default, not the rejected one.
     assert getattr(_section_of(config, section), field) == _default_of(section, field)
+
+
+def test_the_checkpoint_threshold_is_read_from_the_catalog_section():
+    assert parse_config({}).catalog.checkpoint_threshold_mb == 1024
+    raw = {"catalog": {"checkpoint_threshold_mb": 256}}
+    assert parse_config(raw).catalog.checkpoint_threshold_mb == 256
 
 
 def test_warning_describes_accepted_range_and_enum_and_the_default_used(caplog):
