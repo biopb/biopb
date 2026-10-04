@@ -878,7 +878,7 @@ class DiscoveryState:
 
     Attributes:
         claims: Forward mapping (source_id → SourceClaim)
-        path_to_source: Reverse mapping (primary_path → source_id)
+        _path_to_source: Reverse mapping (primary_path → source_id)
         consumed_paths: All paths consumed by any source (Set[str] for URLs)
         visited_identities: File identities already visited
         on_source_added: Callback for source addition events
@@ -886,8 +886,8 @@ class DiscoveryState:
     """
 
     claims: Dict[str, SourceClaim]
-    path_to_source: Dict[str, str]  # Changed from Dict[Path, str]
-    source_to_paths: Dict[str, Set[str]]
+    _path_to_source: Dict[str, str]  # Changed from Dict[Path, str]
+    _source_to_paths: Dict[str, Set[str]]
     consumed_paths: Set[str]  # Changed from Set[Path]
     visited_identities: Set[str]
     on_source_added: Optional[Callable[[SourceClaim], None]]
@@ -899,8 +899,8 @@ class DiscoveryState:
         on_source_removed: Optional[Callable[[str], None]] = None,
     ):
         self.claims = {}
-        self.path_to_source = {}
-        self.source_to_paths = {}
+        self._path_to_source = {}
+        self._source_to_paths = {}
         self.consumed_paths = set()
         self.visited_identities = set()
         self.on_source_added = on_source_added
@@ -964,7 +964,7 @@ class DiscoveryState:
 
         existing_owner = None
         for path in member_paths:
-            owner = self.path_to_source.get(path)
+            owner = self._path_to_source.get(path)
             if owner is not None and owner != source_id:
                 existing_owner = owner
                 break
@@ -996,9 +996,9 @@ class DiscoveryState:
         """
         claim.member_paths = member_paths
         self.claims[claim.source_id] = claim
-        self.source_to_paths[claim.source_id] = member_paths
+        self._source_to_paths[claim.source_id] = member_paths
         for path in member_paths - skip:
-            self.path_to_source[path] = claim.source_id
+            self._path_to_source[path] = claim.source_id
             self.consumed_paths.add(path)
 
     def replace_claim(self, claim: SourceClaim) -> Set[str]:
@@ -1027,7 +1027,7 @@ class DiscoveryState:
         conflicting = {
             path
             for path in member_paths
-            if self.path_to_source.get(path) not in (None, source_id)
+            if self._path_to_source.get(path) not in (None, source_id)
         }
 
         self._store_claim(claim, member_paths, skip=conflicting)
@@ -1043,14 +1043,14 @@ class DiscoveryState:
         Returns:
             source_id if removed, None if not found
         """
-        source_id = self.path_to_source.get(path)
+        source_id = self._path_to_source.get(path)
         if source_id is None:
             return None
 
         claim = self.claims.pop(source_id)
-        member_paths = self.source_to_paths.pop(source_id, set(claim.member_paths))
+        member_paths = self._source_to_paths.pop(source_id, set(claim.member_paths))
         for member_path in member_paths:
-            self.path_to_source.pop(member_path, None)
+            self._path_to_source.pop(member_path, None)
             self.consumed_paths.discard(member_path)
 
         # Callback
@@ -1065,7 +1065,7 @@ class DiscoveryState:
 
     def get_source_for_path(self, path: str) -> Optional[str]:
         """Get source_id that owns this path (reverse lookup)."""
-        return self.path_to_source.get(path)
+        return self._path_to_source.get(path)
 
     def get_all_claims(self) -> List[SourceClaim]:
         """Get all claims as a list."""
@@ -1073,7 +1073,7 @@ class DiscoveryState:
 
     def get_paths_for_source(self, source_id: str) -> Set[str]:
         """Get all claimed member paths for a source."""
-        return set(self.source_to_paths.get(source_id, set()))
+        return set(self._source_to_paths.get(source_id, set()))
 
 
 # ``file://`` is a LOCAL url (see ``is_remote_url``): every adapter that meets one

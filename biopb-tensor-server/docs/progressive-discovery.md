@@ -45,7 +45,7 @@ string is used where**, and how the first scan differs from every later one.
 
 | Holder | State | Keyed by |
 |---|---|---|
-| `DiscoveryState` (scratch and confirmed) | `claims`, `path_to_source`, `source_to_paths`, `consumed_paths`, `visited_identities` | `source_id`; claim path strings; file identities |
+| `DiscoveryState` (scratch and confirmed) | `claims`, `_path_to_source`, `_source_to_paths`, `consumed_paths`, `visited_identities` | `source_id`; claim path strings; file identities |
 | `Reconciler` | `_source_signatures`, `_missed_scans`, `_cloud_source_ids`, `_failed_sources` | `source_id` |
 | `Roots` (shared by `SourceManager` and `Reconciler`) | every known root: kind (monitored, scan-once, dropped, upstream), alias, cloud, `dnd://` label | Resolved root `Path`s; a drop's label |
 | `SourceManager` | `_unavailable_roots` | Resolved root `Path`s |
@@ -68,7 +68,7 @@ it. No adapter `claim()` normalizes the path it returns.
    stored root even if that path later becomes a link (a migration that leaves one
    behind). `Roots` holds the same strings the walk uses.
 2. **A claim path is never resolved to key or look it up.** All of
-   `DiscoveryState.claims` / `path_to_source` / `source_to_paths` /
+   `DiscoveryState.claims` / `_path_to_source` / `_source_to_paths` /
    `consumed_paths` and the signature maps use the claim strings exactly as the
    walk spelled them.
 3. **"Under a directory" is lexical.** A claim is under `D` when its string is
@@ -196,7 +196,7 @@ is not claimed again by an adapter on a second look (a drop has no later pass, s
 decline must not cost a working source). A single-file drop skips this scan. Then each claim
 is refreshed if known, else added. A drop whose path lies inside an already-owned directory
 source is rejected (`_find_containing_source` resolves the dropped path and looks each
-ancestor up in `path_to_source`).
+ancestor up in `_path_to_source`).
 
 ## 6. First scan versus re-scan
 

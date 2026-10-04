@@ -52,7 +52,7 @@ class TestDeleteSourceRegression:
     """Regression tests for source deletion Path vs str bug."""
 
     def test_path_to_source_mapping_uses_string_keys(self):
-        """Test that path_to_source uses string keys, not Path objects.
+        """Test that the path-to-source map uses string keys, not Path objects.
 
         This verifies the internal mapping convention that caused the bug.
         get_source_for_path() and remove_claim() expect string keys.
@@ -217,7 +217,7 @@ class TestDiscoveryFailureIsolation:
             assert len(state.claims) == 1
             claim = next(iter(state.claims.values()))
             assert claim.primary_path == str(root / "good.dat")
-            assert str(root / "bad.dat") not in state.path_to_source
+            assert state.get_source_for_path(str(root / "bad.dat")) is None
 
 
 class TestRegistryTypeMap:
