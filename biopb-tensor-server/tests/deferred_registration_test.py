@@ -14,10 +14,8 @@ import time
 import numpy as np
 import pytest
 from biopb_tensor_server.adapters import get_default_registry
-from biopb_tensor_server.adapters.unresolved import PendingSourceAdapter
-from biopb_tensor_server.core.discovery import DiscoveryState, SourceClaim
+from biopb_tensor_server.core.discovery import DiscoveryState
 from biopb_tensor_server.core.errors import SourceRegistrationError
-from biopb_tensor_server.core.source_registry import SourceRegistry
 from biopb_tensor_server.sources.registration_worker import RegistrationWorker
 
 from tests import catalog_server, make_manager
@@ -81,9 +79,9 @@ class TestFirstScan:
             assert row["unresolved_reason"] == "pending"
             assert row["tensors"] == 0
         assert manager.pending_registrations() == 3
-        assert all(
-            isinstance(server.sources.get(sid), PendingSourceAdapter) for sid in rows
-        )
+        # Not registered: the catalog has the row, the registry has no adapter.
+        assert all(server.sources.get(sid) is None for sid in rows)
+        assert all(manager._reconciler.is_pending(sid) for sid in rows)
 
     def test_the_scan_is_over_while_registration_is_not(self, tmp_path):
         _make_zarr(tmp_path, "a.zarr")
@@ -128,22 +126,53 @@ class TestReadRegistersTheSource:
 
         adapter = server.sources.get_registered(first)
 
-        assert not isinstance(adapter, PendingSourceAdapter)
+        assert adapter is not None
         assert server.sources.get(first) is adapter
         row = _rows(server)[first]
         assert row["is_resolved"] is True
         assert row["unresolved_reason"] is None
         assert row["tensors"] == 1
         # The other source is untouched.
-        assert isinstance(server.sources.get(second), PendingSourceAdapter)
+        assert server.sources.get(second) is None
         assert manager.pending_registrations() == 1
+
+    def test_an_unknown_source_is_none_not_an_error(self, tmp_path):
+        manager, server = _manager(tmp_path)
+        assert server.sources.get_registered("nope") is None
+
+    def test_the_catalog_url_covers_pending_and_registered_sources(self, tmp_path):
+        for name in ("a.zarr", "b.zarr"):
+            _make_zarr(tmp_path, name)
+        manager, server = _manager(tmp_path)
+        _first_scan(manager)
+        first, second = _only_ids(server)
+        reconciler = manager._reconciler
+
+        pending = reconciler.catalog_url_of(second)
+        assert pending.endswith(os.path.basename(reconciler.claim_primary_path(second)))
+
+        server.sources.get_registered(first)
+        assert reconciler.catalog_url_of(first) == server.sources.get(first).catalog_url
+        assert reconciler.catalog_url_of("nope") is None
+
+    def test_unregistered_sources_counts_pending_and_failed(self, tmp_path):
+        for name in ("a.zarr", "b.zarr"):
+            _make_zarr(tmp_path, name)
+        manager, server = _manager(tmp_path)
+        _first_scan(manager)
+        first, second = _only_ids(server)
+        assert manager.unregistered_sources() == 2
+
+        server.sources.get_registered(first)
+        assert manager.unregistered_sources() == 1
+        assert len(server.sources) == 1
 
     def test_plain_get_never_registers(self, tmp_path):
         _make_zarr(tmp_path, "a.zarr")
         manager, server = _manager(tmp_path)
         _first_scan(manager)
         (sid,) = _only_ids(server)
-        assert isinstance(server.sources.get(sid), PendingSourceAdapter)
+        assert server.sources.get(sid) is None
         assert manager.pending_registrations() == 1
 
     def test_concurrent_reads_share_one_registration(self, tmp_path):
@@ -176,20 +205,7 @@ class TestReadRegistersTheSource:
 
         assert len(built) == 1
         assert len({id(a) for a in results}) == 1
-        assert not isinstance(results[0], PendingSourceAdapter)
-
-    def test_the_placeholder_does_not_get_uploaded_tensors_attached(self, tmp_path):
-        attached = []
-        registry = SourceRegistry(on_register=lambda sid, a: attached.append(a))
-        stub = PendingSourceAdapter(
-            SourceClaim(
-                source_type="zarr",
-                primary_path=str(tmp_path / "x.zarr"),
-                source_id="x",
-            )
-        )
-        registry.register("x", stub)
-        assert attached == []
+        assert results[0] is not None
 
 
 class TestTheWorker:
@@ -224,7 +240,7 @@ class TestTheWorker:
 
         _first_scan(manager)  # queued, worker not running yet
         by_path = {
-            os.path.basename(server.sources.get(sid).source_url): sid
+            os.path.basename(manager._reconciler.claim_primary_path(sid)): sid
             for sid in _only_ids(server)
         }
         worker.start()
@@ -258,7 +274,7 @@ class TestTheWorker:
             try:
                 for sid in ids:
                     adapter = server.sources.get_registered(sid)
-                    assert not isinstance(adapter, PendingSourceAdapter)
+                    assert adapter is not None
             except Exception as exc:  # noqa: BLE001 - surfaced below
                 errors.append(exc)
 
@@ -402,19 +418,17 @@ class TestFailure:
         (sid,) = _only_ids(server)
         self._break(path)
 
-        adapter = server.sources.get_registered(sid)
+        with pytest.raises(SourceRegistrationError, match="could not be registered"):
+            server.sources.get_registered(sid)
 
-        assert isinstance(adapter, PendingSourceAdapter)
         row = _rows(server)[sid]
         assert row["is_resolved"] is False
         assert row["unresolved_reason"] == "failed"
         assert json.loads(row["metadata_json"])["registration_error"]
-        # Nothing is waiting on it.
+        # Nothing is waiting on it, and nothing serves it.
         assert manager.pending_registrations() == 0
-        with pytest.raises(SourceRegistrationError, match="could not be registered"):
-            adapter.get_tensor_adapter(None)
-        with pytest.raises(SourceRegistrationError):
-            adapter.resolve()
+        assert server.sources.get(sid) is None
+        assert manager._reconciler.is_pending(sid)
 
     def test_a_failed_source_is_not_retried_by_every_read(self, tmp_path):
         path = _make_zarr(tmp_path, "a.zarr")
@@ -422,7 +436,7 @@ class TestFailure:
         _first_scan(manager)
         (sid,) = _only_ids(server)
         self._break(path)
-        server.sources.get_registered(sid)
+        assert not manager._reconciler.ensure_registered(sid)
 
         reconciler = manager._reconciler
         attempts = []
@@ -431,8 +445,9 @@ class TestFailure:
             attempts.append(1),
             real(*a, **k),
         )[1]
-        server.sources.get_registered(sid)
-        server.sources.get_registered(sid)
+        for _ in range(2):
+            with pytest.raises(SourceRegistrationError):
+                server.sources.get_registered(sid)
         assert attempts == []  # inside its backoff window
 
     def test_it_is_retried_once_the_backoff_has_passed_and_the_file_is_fixed(
@@ -445,7 +460,7 @@ class TestFailure:
         meta = self._break(path)
         good = os.path.join(str(tmp_path), "good.zarr")
         _make_zarr(tmp_path, "good.zarr")
-        server.sources.get_registered(sid)
+        assert not manager._reconciler.ensure_registered(sid)
 
         reconciler = manager._reconciler
         assert reconciler.failed_pending_due() == []
@@ -469,7 +484,7 @@ class TestFailure:
         _first_scan(manager)
         (sid,) = _only_ids(server)
         self._break(path)
-        server.sources.get_registered(sid)
+        assert not manager._reconciler.ensure_registered(sid)
         manager._reconciler._failed_sources[sid].next_retry_at = 0.0
 
         manager._requeue_failed_registrations()
@@ -509,7 +524,7 @@ class TestWhilePending:
         row = _rows(server)[sid]
         assert row["is_resolved"] is True and row["tensors"] == 1
         assert manager.pending_registrations() == 0
-        assert not isinstance(server.sources.get(sid), PendingSourceAdapter)
+        assert server.sources.get(sid) is not None
 
 
 class TestPrecacheRouting:
@@ -604,6 +619,7 @@ class TestOverFlight:
             _make_zarr(tmp_path, f"s{i}.zarr")
         manager, server = _manager(tmp_path)
         server.set_registration_pending_provider(manager.pending_registrations)
+        server.set_unregistered_provider(manager.unregistered_sources)
         _first_scan(manager)
         server.mark_ready()
         threading.Thread(target=server.serve, daemon=True).start()
@@ -619,7 +635,10 @@ class TestOverFlight:
             )
             assert [r["unresolved_reason"] for r in rows] == ["pending", "pending"]
             assert not any(r["is_resolved"] for r in rows)
-            assert client.health_check()["registration_pending"] == 2
+            health = client.health_check()
+            assert health["registration_pending"] == 2
+            # No adapter is registered yet; the catalog still has both sources.
+            assert health["source_count"] == 2
         finally:
             client.close()
             server.shutdown()
@@ -758,13 +777,13 @@ class TestStats:
         manager, server = _manager(tmp_path, stats=True)
         _first_scan(manager)
         ids = {
-            os.path.basename(server.sources.get(sid).source_url): sid
+            os.path.basename(manager._reconciler.claim_primary_path(sid)): sid
             for sid in _only_ids(server)
         }
         order = ("a.zarr", "b.zarr") if failing_last else ("b.zarr", "a.zarr")
         with caplog.at_level(logging.INFO):
             for name in order:
-                server.sources.get_registered(ids[name])
+                manager._reconciler.ensure_registered(ids[name])
         assert good and manager.pending_registrations() == 0
         logged = [r for r in caplog.records if "Registration cost" in r.getMessage()]
         assert len(logged) == 1

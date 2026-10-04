@@ -586,6 +586,8 @@ class TensorFlightServer(flight.FlightServerBase):
         # How many claimed sources still await registration (see
         # ``set_registration_pending_provider``); 0 when nothing defers it.
         self._registration_pending: Callable[[], int] = lambda: 0
+        # Catalogued sources that have no adapter in ``self.sources`` yet.
+        self._unregistered: Callable[[], int] = lambda: 0
 
         # Runtime source registration (the "add_source/remove_source" action).
         # The SourceManager injects its ``add_local_source``/``remove_dropped_root``
@@ -636,6 +638,12 @@ class TensorFlightServer(flight.FlightServerBase):
         in their tensors. Surfaced on ``health`` as ``registration_pending``.
         """
         self._registration_pending = provider
+
+    def set_unregistered_provider(self, provider: Callable[[], int]) -> None:
+        """Report how many catalogued sources have no adapter yet (failed ones
+        included), so ``source_count`` counts the catalog and not just the
+        registry."""
+        self._unregistered = provider
 
     def set_last_full_scan(self, timestamp: float) -> None:
         """Record the epoch-seconds time a full catalog rescan last succeeded.
@@ -1178,7 +1186,7 @@ class TensorFlightServer(flight.FlightServerBase):
                 # The Flight protocol shape this server speaks; the SDK checks
                 # it before its first call. A server without the key is v1.
                 "protocol": FLIGHT_PROTOCOL_VERSION,
-                "source_count": len(self.sources),
+                "source_count": len(self.sources) + self._unregistered(),
                 # Whether this server offers a catalog at all. A constant True
                 # since #225 ("every server has a catalog now"), which is the
                 # assumption retiring _owns_catalog removes -- so it is a real

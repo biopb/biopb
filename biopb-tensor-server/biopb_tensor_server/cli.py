@@ -798,6 +798,7 @@ def _setup_flight_server(
         registration_stats=server_config.registration_stats,
     )
     server.set_registration_pending_provider(source_manager.pending_registrations)
+    server.set_unregistered_provider(source_manager.unregistered_sources)
 
     roots = source_manager.roots
     monitored = roots.of_kind(RootKind.MONITORED)

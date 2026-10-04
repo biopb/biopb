@@ -226,22 +226,23 @@ complete_initial_scan      first tick only
 
 Registering a source opens and parses its file, which is most of a large site's start.
 While `registration_workers` is above zero the first scan therefore only *claims*:
-`_commit_pending_claim` commits each deferrable claim with a placeholder
-(`PendingSourceAdapter`). The source is in the registry and the catalog at once
-(`is_resolved` false, `unresolved_reason` `pending`, no tensors), and its claim and
-signatures are in the confirmed state, so the diff, removal and refresh treat it like any
-other source. A `RegistrationWorker` pool then calls `Reconciler.ensure_registered`,
-newest file first, which runs the ordinary registration and swaps the real adapter in.
+`_commit_pending_claim` commits each deferrable claim to the catalog only: a row built
+from the claim (`is_resolved` false, `unresolved_reason` `pending`, no tensors) and no
+adapter in the registry. Its claim and signatures are in the confirmed state, so the diff,
+removal and refresh treat it like any other source. A `RegistrationWorker` pool then calls
+`Reconciler.ensure_registered`, newest file first, which runs the ordinary registration and
+puts the adapter in the registry.
 The pool is held until the first scan is over (`complete_initial_scan` resumes it): walking
 and registering contend, and a held pool lets every claim be committed first, so the whole
 catalog exists, pending, before any file is opened. A rescan does not hold it again; it
 registers what it finds inline.
 
 - **A read registers it at once.** The server's read paths and the upload manager use
-  `SourceRegistry.get_registered`, which calls `ensure_registered` first when the adapter
-  is a placeholder; it is single-flight per source, so a read racing the worker shares one
-  registration. Callers that only ask whether a source exists keep `get`. `resolve` on a
-  pending source registers it and returns the filled row.
+  `SourceRegistry.get_registered`, which on a registry miss calls the reconciler's
+  `materialize`; it is single-flight per source, so a read racing the worker shares one
+  registration, and it raises `SourceRegistrationError` for a failed one. Callers that only
+  ask whether a source is registered keep `get`, which is `None` for a pending source.
+  `resolve` on a pending source registers it and returns the filled row.
 - **Not deferred:** remote proxies (bulk-seeded), cloud sources (already registered
   unresolved), static sources, and everything claimed after the first scan.
 - **`unresolved_reason`** says why a row is not resolved: `needs_recall` (a cloud
@@ -250,7 +251,7 @@ registers what it finds inline.
   reads raise `SourceRegistrationError`, and a tick retries it after its backoff).
 - **While pending** a source can be refreshed (the rebuild is the registration) or removed,
   and a registration never registers a removed source back (a per-source lock orders the
-  three). The upload attacher runs on the real adapter, not the placeholder.
+  three). The upload attacher runs on the adapter once it is registered.
 - **Precache.** One callback after every registration (`_notify_source_committed`) routes
   the source: one the first scan found goes to the backlog (`enqueue_backlog`, with its
   mtime), a later one is prompt-enqueued, a remote one is not enqueued as startup. The

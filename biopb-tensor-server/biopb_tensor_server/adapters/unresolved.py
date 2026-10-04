@@ -33,7 +33,6 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from biopb_tensor_server.core.adapter_base import SourceAdapter, TensorAdapter
 from biopb_tensor_server.core.errors import (
-    SourceRegistrationError,
     SourceResolveRetriableError,
     SourceUnresolvedError,
 )
@@ -43,7 +42,7 @@ if TYPE_CHECKING:
     from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
     from biopb_tensor_server.core.config import SourceConfig
-    from biopb_tensor_server.core.discovery import AdapterRegistry, SourceClaim
+    from biopb_tensor_server.core.discovery import AdapterRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -322,86 +321,3 @@ class UnresolvedSourceAdapter(SourceAdapter):
                 f"source {self.source_id!r} could not be resolved "
                 f"(open/hydrate failed): {e}"
             ) from e
-
-
-class PendingSourceAdapter(SourceAdapter):
-    """Placeholder for a local source whose registration has not run yet.
-
-    The first scan claims every source and registers it in the background, so
-    the catalog has a row for each (``is_resolved`` false, ``unresolved_reason``
-    ``pending``, no tensors) long before its file has been opened. The registry
-    holds this until the real adapter replaces it; a read, or ``resolve``, that
-    finds it there asks the registry's materializer to register the source now
-    (``SourceRegistry.get_registered``), so what a reader sees is never this.
-
-    Unlike :class:`UnresolvedSourceAdapter` it does not resolve in place and
-    stays in the registry for no longer than the registration takes: the real
-    adapter is swapped in, so a registered source is served exactly as it was
-    before registration was deferred.
-
-    ``fail`` records a registration that raised. The row then reads ``failed``
-    with the error in ``metadata_json``, so a client does not wait on a source
-    that will not finish; the next attempt (a rescan, once its retry window has
-    passed) replaces the placeholder as a first one does.
-    """
-
-    #: Read by ``SourceRegistry`` (duck-typed: core does not import adapters).
-    registration_pending = True
-
-    def __init__(self, claim: "SourceClaim", catalog_url: Optional[str] = None):
-        # Identity only. What registration is built from is the claim the
-        # reconciler holds, which a refresh can replace; this keeps no copy.
-        if catalog_url:
-            self._catalog_url = catalog_url
-        self.source_id = claim.source_id
-        self._source_url = str(claim.primary_path)
-        self._source_type = claim.source_type or "unknown"
-        self._tensor_name = None
-        self.error: Optional[str] = None
-
-    def fail(self, error: str) -> None:
-        self.error = error
-
-    # --- catalog surface ------------------------------------------------------
-
-    def is_resolved(self) -> bool:
-        return False
-
-    def unresolved_reason(self) -> Optional[str]:
-        return "failed" if self.error else "pending"
-
-    def list_tensor_descriptors(self) -> List["TensorDescriptor"]:
-        return []
-
-    def get_metadata(self) -> dict:
-        return {"registration_error": self.error} if self.error else {}
-
-    def is_resident(self) -> bool:
-        # Local by construction; a cloud claim is registered unresolved instead.
-        return True
-
-    # --- serve surface --------------------------------------------------------
-
-    def get_tensor_adapter(self, tensor_id: Optional[str]) -> TensorAdapter:
-        raise self._refusal()
-
-    def resolve(self) -> None:
-        raise self._refusal()
-
-    def _refusal(self) -> Exception:
-        """Why this placeholder cannot serve: its registration failed, or has not
-        run (the registry asked for it and it did not complete -- retry)."""
-        if self.error:
-            return SourceRegistrationError(self.source_id, self.error)
-        return SourceUnresolvedError(
-            f"source {self.source_id!r} is unresolved: its registration has not run yet"
-        )
-
-    @classmethod
-    def create_from_config(
-        cls, source: "SourceConfig", credentials_config: Optional[Any] = None
-    ) -> "SourceAdapter":
-        raise NotImplementedError(
-            "PendingSourceAdapter is constructed by the reconciler, "
-            "not via create_from_config"
-        )

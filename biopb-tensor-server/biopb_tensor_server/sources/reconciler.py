@@ -42,10 +42,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
 
-from biopb_tensor_server.adapters.unresolved import (
-    PendingSourceAdapter,
-    UnresolvedSourceAdapter,
-)
+from biopb_tensor_server.adapters.unresolved import UnresolvedSourceAdapter
+from biopb_tensor_server.core.adapter_base import to_catalog_url
 from biopb_tensor_server.core.config import SourceConfig
 from biopb_tensor_server.core.discovery import (
     AdapterRegistry,
@@ -54,7 +52,11 @@ from biopb_tensor_server.core.discovery import (
     _is_offline_placeholder,
     resolve_local_path,
 )
-from biopb_tensor_server.core.errors import UpstreamConfigError
+from biopb_tensor_server.core.errors import (
+    SourceRegistrationError,
+    SourceUnresolvedError,
+    UpstreamConfigError,
+)
 from biopb_tensor_server.core.normalize import normalize_adapter
 from biopb_tensor_server.core.registration_stats import (
     RegistrationStats,
@@ -180,14 +182,15 @@ class Reconciler:
         self._missed_scans: Dict[str, int] = {}
 
         # Deferred registration. While ``_defer_registration`` is set a claim is
-        # committed with a placeholder adapter and registered later, by a worker
-        # or by the first read that needs it. ``_pending`` is the source_ids still
-        # holding a placeholder; ``_pending_failed`` those among them whose
-        # registration raised (they are retried, but are not waited for).
+        # committed to the catalog only (a ``pending`` row) and registered later,
+        # by a worker or by the first read that needs it. ``_pending`` maps each
+        # such source_id to its display url; ``_pending_failed`` maps those among
+        # them whose registration raised to the error (they are retried, but are
+        # not waited for).
         self._defer_registration = False
         self._pending_hook: Optional[Callable[[str], None]] = None
-        self._pending: Set[str] = set()
-        self._pending_failed: Set[str] = set()
+        self._pending: Dict[str, Optional[str]] = {}
+        self._pending_failed: Dict[str, str] = {}
         # Per-source: a registration, a refresh and a removal of one source never
         # overlap, so a read that races the worker coalesces onto one parse and a
         # removed source is not registered back. Taken before ``self._lock``,
@@ -241,7 +244,7 @@ class Reconciler:
     # --- Deferred registration ---------------------------------------------
 
     def set_defer_registration(self, defer: bool) -> None:
-        """Commit new claims with a placeholder from now on (or stop doing so).
+        """Commit new claims as pending, catalog row only, from now on (or stop).
 
         Only claims that register by opening a local file are deferred; see
         :meth:`_deferrable`.
@@ -261,14 +264,35 @@ class Reconciler:
         with self._lock:
             return len(self._pending) - len(self._pending_failed)
 
+    def unregistered_count(self) -> int:
+        """Sources in the catalog whose registration has not completed, failed
+        ones included."""
+        with self._lock:
+            return len(self._pending)
+
     def is_pending(self, source_id: str) -> bool:
         with self._lock:
             return source_id in self._pending
 
+    def catalog_url_of(self, source_id: str) -> Optional[str]:
+        """The catalog ``source_url`` of a source, registered or still pending
+        (None if it is neither)."""
+        adapter = self._server.sources.get(source_id)
+        if adapter is not None:
+            return adapter.catalog_url
+        with self._lock:
+            if source_id not in self._pending:
+                return None
+            claim = self._state.claims.get(source_id)
+            url = self._pending[source_id]
+        if url:
+            return url
+        return to_catalog_url(str(claim.primary_path)) if claim is not None else None
+
     def _clear_pending(self, source_id: str) -> None:
-        """Forget a source's placeholder state. Caller holds ``self._lock``."""
-        self._pending.discard(source_id)
-        self._pending_failed.discard(source_id)
+        """Forget a source's pending state. Caller holds ``self._lock``."""
+        self._pending.pop(source_id, None)
+        self._pending_failed.pop(source_id, None)
 
     def _registration_lock(self, source_id: str) -> threading.RLock:
         with self._lock:
@@ -289,23 +313,22 @@ class Reconciler:
     def _commit_pending_claim(
         self, claim: SourceClaim, catalog_url: Optional[str]
     ) -> bool:
-        """Commit *claim* with a placeholder; its registration runs later.
+        """Commit *claim* to the catalog only; its registration runs later.
 
-        Everything but the parse happens now: the source is in the registry and
-        the catalog (``is_resolved`` false, ``pending``), its claim and signatures
-        are in state, so the rescan diff, removal and refresh treat it as any
-        confirmed source. :meth:`ensure_registered` finishes the job.
+        Everything but the parse happens now: the source has a catalog row
+        (``is_resolved`` false, ``pending``, built from the claim), and its claim
+        and signatures are in state, so the rescan diff, removal and refresh treat
+        it as any confirmed source. It is not in the registry until
+        :meth:`ensure_registered` has built its adapter.
         """
-        adapter = PendingSourceAdapter(claim, catalog_url)
         try:
-            self._server.register_source(claim.source_id, adapter)
             if self._metadata_db is not None:
-                self._metadata_db.sync_source_added(claim.source_id, adapter)
+                self._metadata_db.sync_pending_source(claim, catalog_url)
             self._path_to_source_id[claim.primary_path] = claim.source_id
         except Exception as e:
             self._log_source_failure(
                 claim.source_id,
-                "Failed to register placeholder for source %s (%s): %s",
+                "Failed to catalog pending source %s (%s): %s",
                 claim.source_id,
                 claim.primary_path,
                 e,
@@ -323,7 +346,7 @@ class Reconciler:
                 self._record_failed_source_attempt(claim.source_id)
                 return False
             self._commit_claim_bookkeeping(claim, signatures)
-            self._pending.add(claim.source_id)
+            self._pending[claim.source_id] = catalog_url
         self._on_pending(claim.source_id)
         return True
 
@@ -342,14 +365,12 @@ class Reconciler:
                 claim = self._state.claims.get(source_id)
                 if claim is None or source_id not in self._pending:
                     return source_id not in self._pending
-            stub = self._server.sources.get(source_id)
-            if getattr(stub, "error", None) and not self._should_retry_source(
-                source_id
-            ):
+                failed = source_id in self._pending_failed
+                catalog_url = self._pending[source_id]
+            if failed and not self._should_retry_source(source_id):
                 return False
 
             errors: List[str] = []
-            catalog_url = getattr(stub, "_catalog_url", None)
             if not self._register_source_claim(
                 claim, catalog_url=catalog_url, replace=True, error_sink=errors
             ):
@@ -366,6 +387,25 @@ class Reconciler:
         self._log_summary_if_drained()
         return True
 
+    def materialize(self, source_id: str) -> None:
+        """Register a pending source for a reader that needs it now.
+
+        Returns once the source is registered, or is not pending (unknown,
+        removed). Raises why it cannot be: ``SourceRegistrationError`` when its
+        registration failed, and an unresolved error when it has not completed.
+        """
+        if self.ensure_registered(source_id):
+            return
+        with self._lock:
+            if source_id not in self._pending:
+                return
+            error = self._pending_failed.get(source_id)
+        if error:
+            raise SourceRegistrationError(source_id, error)
+        raise SourceUnresolvedError(
+            f"source {source_id!r} is unresolved: its registration has not run yet"
+        )
+
     def _log_summary_if_drained(self) -> None:
         """Log the registration cost once nothing is left waiting.
 
@@ -376,26 +416,24 @@ class Reconciler:
             self.stats.log_summary()
 
     def _mark_registration_failed(self, source_id: str, errors: List[str]) -> None:
-        """Leave a placeholder that says why it did not register.
+        """Record why a pending source did not register.
 
         The row reads ``failed`` with the error, so a client does not wait on a
-        source that will not finish. Whatever the placeholder is now (a failed
-        replace puts it back) is what carries it.
+        source that will not finish; a read of it raises the error.
         """
         message = errors[-1] if errors else "registration failed (see the server log)"
-        stub = self._server.sources.get(source_id)
-        if not isinstance(stub, PendingSourceAdapter):
-            return
-        stub.fail(message)
         with self._lock:
             # Only while it is still pending: a removal that got here first has
             # forgotten the source, and ``pending_count`` relies on the failed
-            # set being a subset of the pending one.
-            if source_id in self._pending:
-                self._pending_failed.add(source_id)
-        if self._metadata_db is not None:
+            # map being a subset of the pending one.
+            if source_id not in self._pending:
+                return
+            self._pending_failed[source_id] = message
+            claim = self._state.claims.get(source_id)
+            catalog_url = self._pending[source_id]
+        if claim is not None and self._metadata_db is not None:
             try:
-                self._metadata_db.sync_source_added(source_id, stub)
+                self._metadata_db.sync_pending_source(claim, catalog_url, error=message)
             except Exception:
                 logger.exception("could not record the failure of source %s", source_id)
 
@@ -709,7 +747,10 @@ class Reconciler:
         # stamp the marker onto a monitored source, where it would falsely
         # promise that nothing will re-add it.
         live = self._server.sources.get(claim.source_id)
-        catalog_url = getattr(live, "_catalog_url", None) if live is not None else None
+        if live is not None:
+            catalog_url = getattr(live, "_catalog_url", None)
+        else:
+            catalog_url = self._pending.get(claim.source_id)
 
         errors: List[str] = []
         if not self._register_source_claim(
@@ -1319,6 +1360,10 @@ class Reconciler:
                 # A failed REBUILD must not cost the working source: put the
                 # adapter that was serving back, and its catalog row with it.
                 self._restore_displaced_source(claim.source_id, displaced)
+            elif registered and self.is_pending(claim.source_id):
+                # A claimed source still waiting to register keeps its claim and
+                # its pending row: only the adapter this call put in goes.
+                self._server.unregister_source(claim.source_id)
             elif registered:
                 self._rollback_source_registration(claim.source_id)
             if self._server.sources.get(claim.source_id) is not adapter:

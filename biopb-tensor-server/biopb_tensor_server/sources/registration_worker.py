@@ -1,8 +1,8 @@
 """Background registration of the sources the first scan only claimed.
 
 Registration opens and parses each source's file, which is what makes a first
-scan of a large site take hours. The scan therefore commits every claim with a
-placeholder (``Reconciler._commit_pending_claim``) and queues the source here; a
+scan of a large site take hours. The scan therefore commits every claim to the
+catalog alone (``Reconciler._commit_pending_claim``) and queues the source here; a
 small pool of threads registers them, newest file first, so what a user is most
 likely to want is complete soonest. A read that needs a source before its turn
 registers it itself (``Reconciler.ensure_registered``, single-flight), and the

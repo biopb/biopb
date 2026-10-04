@@ -75,7 +75,11 @@ class SourceRegistry:
         self._materializer: Optional[Callable[[str], None]] = None
 
     def set_materializer(self, materializer: Optional[Callable[[str], None]]) -> None:
-        """Register what :meth:`get_registered` calls to register a pending source."""
+        """Set what :meth:`get_registered` calls when a source is not registered.
+
+        It registers the source if it can (a claimed source whose registration was
+        deferred), and raises why if it cannot.
+        """
         self._materializer = materializer
 
     def register(self, source_id: str, adapter: SourceAdapter) -> SourceAdapter:
@@ -118,11 +122,7 @@ class SourceRegistry:
                 f"by splitting on the first '/'."
             )
         adapter = normalize_adapter(adapter)
-        # A pending placeholder is not the source: the hook attaches uploaded
-        # tensors to what will serve them, which is the adapter that replaces it.
-        if self._on_register is not None and not getattr(
-            adapter, "registration_pending", False
-        ):
+        if self._on_register is not None:
             try:
                 self._on_register(source_id, adapter)
             except Exception:
@@ -191,19 +191,18 @@ class SourceRegistry:
             return self._sources.get(source_id)
 
     def get_registered(self, source_id: str) -> Optional[SourceAdapter]:
-        """:meth:`get`, registering the source first if it is still pending.
+        """:meth:`get`, registering the source on a miss if it is claimed but
+        not registered yet.
 
         What a reader of the source's data or tensors uses. The internal callers
-        that only ask whether it exists, or read its url, use :meth:`get`: they
-        must not pay for a registration. Returns the placeholder when the
-        registration failed, which refuses the read with its error.
+        that only ask whether it is registered, or read its url, use :meth:`get`:
+        they must not pay for a registration. Raises what the materializer raises
+        when the registration failed, and returns None for an unknown source.
         """
         adapter = self.get(source_id)
-        if getattr(adapter, "registration_pending", False):
-            materializer = self._materializer
-            if materializer is not None:
-                materializer(source_id)
-                adapter = self.get(source_id)
+        if adapter is None and self._materializer is not None:
+            self._materializer(source_id)
+            adapter = self.get(source_id)
         return adapter
 
     def snapshot(self) -> List[Tuple[str, SourceAdapter]]:

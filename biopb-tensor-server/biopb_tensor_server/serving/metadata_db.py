@@ -53,6 +53,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
+    Any,
     Callable,
     Dict,
     Iterable,
@@ -73,13 +74,14 @@ from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS
 from google.protobuf import json_format
 
 from biopb_tensor_server.adapters.ome_masks import strip_mask_bindata
-from biopb_tensor_server.core.adapter_base import catalog_tensors
+from biopb_tensor_server.core.adapter_base import catalog_tensors, to_catalog_url
 from biopb_tensor_server.core.errors import AnnotationStoreError
 from biopb_tensor_server.core.labels import last_named_segment
 from biopb_tensor_server.core.registration_stats import SyncCost
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.adapter_base import SourceAdapter
+    from biopb_tensor_server.core.discovery import SourceClaim
 
 logger = logging.getLogger(__name__)
 
@@ -1335,37 +1337,24 @@ class MetadataDatabase:
         indexed_at = datetime.now()
         metadata_json = json.dumps(metadata, cls=NumpyEncoder) if metadata else None
 
-        # Insert or replace (upsert) - serialize writes with lock
-        with self._write_lock:
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO sources
-                (source_id, source_url, source_type, indexed_at,
-                 metadata_json, is_resolved, unresolved_reason, tensors)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    source_id,
-                    source_url,
-                    source_type,
-                    indexed_at,
-                    metadata_json,
-                    is_resolved,
-                    unresolved_reason,
-                    tensors,
-                ],
-            )
+        self._upsert_source_row(
+            conn,
+            source_id,
+            source_url,
+            source_type,
+            indexed_at,
+            metadata_json,
+            is_resolved,
+            unresolved_reason,
+            tensors,
+        )
 
         # Deliberately AFTER the source row commits, and deliberately unable to
         # raise. Registration failing here would cost a source its pixels over
         # an annotation, which is the wrong way round: an imported set is
         # disposable (the next registration rebuilds it, and open clears it
         # anyway) where a source that will not register is an outage.
-        # Not for a placeholder: a pending source has no file read yet, so no
-        # set to replace -- and a transaction per source here is a cost the walk
-        # pays for every source it finds.
-        if not getattr(adapter, "registration_pending", False):
-            self._replace_imported(source_id, source_url, imported, indexed_at)
+        self._replace_imported(source_id, source_url, imported, indexed_at)
         upsert_s = time.perf_counter() - started - metadata_s
 
         # The row is committed, so the catalog -- not the adapter -- now owns this
@@ -1388,6 +1377,66 @@ class MetadataDatabase:
             metadata_bytes=len(metadata_json) if metadata_json else 0,
             tensors_bytes=len(json.dumps(tensors)),
             descriptor_bytes=sum(t.ByteSize() for t in catalog),
+        )
+
+    def _upsert_source_row(
+        self,
+        conn: duckdb.DuckDBPyConnection,
+        source_id: str,
+        source_url: str,
+        source_type: str,
+        indexed_at: datetime,
+        metadata_json: Optional[str],
+        is_resolved: bool,
+        unresolved_reason: Optional[str],
+        tensors: List[Dict[str, Any]],
+    ) -> None:
+        """Insert or replace a source's row, serializing writes with the lock."""
+        with self._write_lock:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO sources
+                (source_id, source_url, source_type, indexed_at,
+                 metadata_json, is_resolved, unresolved_reason, tensors)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    source_id,
+                    source_url,
+                    source_type,
+                    indexed_at,
+                    metadata_json,
+                    is_resolved,
+                    unresolved_reason,
+                    tensors,
+                ],
+            )
+
+    def sync_pending_source(
+        self,
+        claim: SourceClaim,
+        catalog_url: Optional[str] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        """Write the row of a claimed source that is not registered yet.
+
+        Built from the claim alone, so no file is opened: ``is_resolved`` false,
+        no tensors, ``unresolved_reason`` ``pending``. With *error* (its
+        registration raised) the reason is ``failed`` and ``metadata_json``
+        carries ``registration_error``, so a client does not wait on it. The
+        registered row replaces this one by the same upsert.
+        """
+        conn = self._get_connection()
+        self._upsert_source_row(
+            conn,
+            claim.source_id,
+            catalog_url or to_catalog_url(str(claim.primary_path)),
+            claim.source_type or "unknown",
+            datetime.now(),
+            json.dumps({"registration_error": error}) if error else None,
+            False,
+            "failed" if error else "pending",
+            [],
         )
 
     def _replace_imported(

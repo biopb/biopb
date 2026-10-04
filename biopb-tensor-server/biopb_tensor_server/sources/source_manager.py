@@ -230,7 +230,7 @@ class SourceManager:
             registry.claim_timer = self._reconciler.stats.record_claim
         set_materializer = getattr(server.sources, "set_materializer", None)
         if set_materializer is not None:
-            set_materializer(self._reconciler.ensure_registered)
+            set_materializer(self._reconciler.materialize)
 
     @property
     def roots(self) -> Roots:
@@ -384,7 +384,7 @@ class SourceManager:
             logger.info(
                 "Initial scan complete: %d sources, %.0f s after start, "
                 "%d awaiting registration",
-                len(self._server.sources),
+                len(self._server.sources) + self._reconciler.unregistered_count(),
                 time.monotonic() - self._started_at,
                 self._reconciler.pending_count(),
             )
@@ -395,6 +395,10 @@ class SourceManager:
     def pending_registrations(self) -> int:
         """How many claimed sources are still waiting to be registered."""
         return self._reconciler.pending_count()
+
+    def unregistered_sources(self) -> int:
+        """How many catalogued sources have no adapter yet, failed ones included."""
+        return self._reconciler.unregistered_count()
 
     def registration_idle(self) -> bool:
         """Whether the first scan is over and every source it claimed is registered.
@@ -1347,9 +1351,9 @@ class SourceManager:
         return self._roots.display_url(claim.primary_path)
 
     def _catalog_url_for(self, source_id: str) -> Optional[str]:
-        """The registered source's catalog ``source_url`` (None if missing)."""
-        adapter = self._server.sources.get(source_id)
-        return adapter.catalog_url if adapter is not None else None
+        """The source's catalog ``source_url``, registered or pending (None if
+        it is neither)."""
+        return self._reconciler.catalog_url_of(source_id)
 
 
 def create_source_manager(
