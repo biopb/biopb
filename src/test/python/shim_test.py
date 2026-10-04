@@ -20,11 +20,11 @@ import sys
 import time
 from types import SimpleNamespace
 
-import anyio
 import pytest
 
-pytest.importorskip("mcp")
+pytest.importorskip("mcp")  # the `shim` extra; anyio comes with it
 
+import anyio  # noqa: E402
 from biopb import _shim  # noqa: E402
 from mcp import types  # noqa: E402
 
