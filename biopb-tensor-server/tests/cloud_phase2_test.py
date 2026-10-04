@@ -994,8 +994,6 @@ class TestResolveAction:
         # Because the worker thread is parked in it until then, the server's
         # heartbeat loop is guaranteed to time out its join at least once and emit
         # a progress message first -- independent of runner load.
-        import threading
-
         import pyarrow.flight as flight
         from biopb_tensor_server.serving import server as server_mod
 
@@ -1105,13 +1103,6 @@ class TestResolveAction:
         action = flight.Action("resolve", b"missing")
         with pytest.raises(flight.FlightServerError, match="Source not found"):
             list(server.do_action(None, action))
-
-
-class _SlowSentinel:
-    """A registered placeholder so the server has a (different) source; the
-    `resolve` test above targets a *missing* id to exercise the not-found path."""
-
-    capability_token = None
 
 
 # --------------------------------------------------------------------------- #

@@ -756,16 +756,7 @@ class Reconciler:
         if self._claim_is_unresolved(claim):
             return self._refresh_recall_claim(claim, previous)
 
-        # The display url is the source's, not the rebuild's. Re-deriving it
-        # would either hand a dnd:// drop its native file:// url back -- losing
-        # its removability, since remove_source authorizes on that scheme -- or
-        # stamp the marker onto a monitored source, where it would falsely
-        # promise that nothing will re-add it.
-        live = self._server.sources.get(claim.source_id)
-        if live is not None:
-            catalog_url = getattr(live, "_catalog_url", None)
-        else:
-            catalog_url = self._pending.get(claim.source_id)
+        catalog_url = self._display_url_of(claim.source_id)
 
         errors: List[str] = []
         if not self._register_source_claim(
@@ -791,24 +782,7 @@ class Reconciler:
         signatures = self._build_claim_signatures(claim)
 
         with self._lock:
-            # Membership moves under a source (a file added to a sequence dir),
-            # so the claim is replaced rather than left at what was discovered
-            # when it was first registered.
-            self._state.remove_claim(previous.primary_path, notify=False)
-            # The rebuilt adapter is already live, so state must track the NEW
-            # membership even where it overlaps another source's claim; the old
-            # membership would describe an adapter that no longer exists. Hence
-            # replace_claim rather than add_claim's reject-on-conflict.
-            conflicting = self._state.replace_claim(claim)
-            if conflicting:
-                logger.error(
-                    "Refreshed source %s now overlaps another source's claim "
-                    "on %s; the rebuilt adapter is serving but those paths "
-                    "remain attributed to the other source",
-                    claim.source_id,
-                    sorted(conflicting),
-                )
-            self._commit_claim_bookkeeping(claim, signatures)
+            self._replace_claim_locked(claim, previous, signatures)
             # A source that was still pending is registered now: this rebuild is
             # the registration the worker would have run.
             self._clear_pending(claim.source_id)
@@ -821,6 +795,46 @@ class Reconciler:
         self._notify_source_committed(claim.source_id)
         return True
 
+    def _display_url_of(self, source_id: str) -> Optional[str]:
+        """The catalog url a source is shown under, registered or still pending.
+
+        The display url is the source's, not a rebuild's. Re-deriving it would
+        either hand a dnd:// drop its native file:// url back -- losing its
+        removability, since remove_source authorizes on that scheme -- or stamp
+        the marker onto a monitored source, where it would falsely promise that
+        nothing will re-add it.
+        """
+        live = self._server.sources.get(source_id)
+        if live is not None:
+            return getattr(live, "_catalog_url", None)
+        return self._pending.get(source_id)
+
+    def _replace_claim_locked(
+        self,
+        claim: SourceClaim,
+        previous: SourceClaim,
+        signatures: Dict[str, Tuple[Any, ...]],
+    ) -> None:
+        """Put a refreshed source's new claim in state. Caller holds ``self._lock``.
+
+        Membership moves under a source (a file added to a sequence dir), so the
+        claim is replaced rather than left at what was discovered when it was
+        first registered. State must track the NEW membership even where it
+        overlaps another source's claim: the old membership would describe an
+        adapter that no longer exists. Hence replace_claim rather than
+        add_claim's reject-on-conflict.
+        """
+        self._state.remove_claim(previous.primary_path, notify=False)
+        conflicting = self._state.replace_claim(claim)
+        if conflicting:
+            logger.error(
+                "Refreshed source %s now overlaps another source's claim "
+                "on %s; those paths remain attributed to the other source",
+                claim.source_id,
+                sorted(conflicting),
+            )
+        self._commit_claim_bookkeeping(claim, signatures)
+
     def _refresh_recall_claim(self, claim: SourceClaim, previous: SourceClaim) -> bool:
         """Refresh a cloud source that is not resident: back to ``needs_recall``.
 
@@ -829,24 +843,18 @@ class Reconciler:
         again, and the next ``resolve`` rebuilds it.
         """
         source_id = claim.source_id
-        live = self._server.sources.get(source_id)
-        if live is not None:
-            catalog_url = getattr(live, "_catalog_url", None)
-        else:
-            catalog_url = self._pending.get(source_id)
+        catalog_url = self._display_url_of(source_id)
         try:
             if self._metadata_db is not None:
                 self._metadata_db.sync_pending_source(claim, catalog_url, recall=True)
-            if live is not None:
+            if self._server.sources.get(source_id) is not None:
                 self._server.unregister_source(source_id)
         except Exception:
             logger.exception("could not refresh cloud source %s", source_id)
             return False
         signatures = self._build_claim_signatures(claim)
         with self._lock:
-            self._state.remove_claim(previous.primary_path, notify=False)
-            self._state.replace_claim(claim)
-            self._commit_claim_bookkeeping(claim, signatures)
+            self._replace_claim_locked(claim, previous, signatures)
             self._pending[source_id] = catalog_url
             self._pending_failed.pop(source_id, None)
             self._recall.add(source_id)
