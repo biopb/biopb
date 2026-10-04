@@ -109,7 +109,6 @@ class SourceManager:
         full_rescan_interval: float = 3600.0,
         prune_unseen_days: int = 0,
         registration_workers: int = 0,
-        registration_stats: bool = False,
         walk_threads: int = 1,
     ):
         # Collaborators. The registry is kept for ``add_local_source``'s own
@@ -207,7 +206,6 @@ class SourceManager:
             notify_source_committed=self._notify_source_committed,
             catalog_url_for=self._display_url_for,
             stability_window=stability_window,
-            registration_stats=registration_stats,
         )
 
         self._walk_threads = walk_threads
@@ -226,8 +224,6 @@ class SourceManager:
         # whenever that registration happens to finish (see
         # ``_notify_source_committed``).
         self._deferred: Dict[str, float] = {}
-        if registration_stats and hasattr(registry, "claim_timer"):
-            registry.claim_timer = self._reconciler.stats.record_claim
         set_materializer = getattr(server.sources, "set_materializer", None)
         if set_materializer is not None:
             set_materializer(self._reconciler.materialize)
@@ -388,7 +384,6 @@ class SourceManager:
                 time.monotonic() - self._started_at,
                 self._reconciler.pending_count(),
             )
-            self._reconciler.log_summary_if_drained()
             self._fire_initial_scan_complete()
 
     def pending_registrations(self) -> int:
@@ -1373,7 +1368,6 @@ def create_source_manager(
     prune_unseen_days: int = 0,
     rescan_interval: float = 120.0,
     registration_workers: int = 0,
-    registration_stats: bool = False,
     walk_threads: int = 1,
 ) -> SourceManager:
     """Create a SourceManager for all configured sources.
@@ -1461,7 +1455,6 @@ def create_source_manager(
         full_rescan_interval=full_rescan_interval,
         prune_unseen_days=prune_unseen_days,
         registration_workers=registration_workers,
-        registration_stats=registration_stats,
         walk_threads=walk_threads,
     )
 
