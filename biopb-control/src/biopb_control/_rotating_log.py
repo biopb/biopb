@@ -17,15 +17,12 @@ from biopb import _locations
 
 logger = logging.getLogger(__name__)
 
-MAX_BYTES = 10 * 1024 * 1024
-BACKUP_COUNT = 5
-
 
 class RotatingLog:
     """An append-only binary log that rotates (``.1`` ... ``.N``) past
     ``max_bytes``. Thread-safe: a child's pump and the supervisor both write.
 
-    Opening rotates a file that is already over the limit, as before. Output is
+    Opening rotates a file that is already over the limit. Output is
     never refused: a failed write or rotation drops data rather than raising,
     because the one thing worse than a lost line is a child blocked on its pipe.
     """
@@ -33,8 +30,8 @@ class RotatingLog:
     def __init__(
         self,
         path: Path,
-        max_bytes: int = MAX_BYTES,
-        backup_count: int = BACKUP_COUNT,
+        max_bytes: int = _locations.LOG_MAX_BYTES,
+        backup_count: int = _locations.LOG_BACKUP_COUNT,
     ) -> None:
         self._path = Path(path)
         self._max_bytes = max_bytes
@@ -42,7 +39,7 @@ class RotatingLog:
         self._lock = threading.Lock()
         self._fh: Optional[BinaryIO] = None
         self._size = 0
-        self._limit = max_bytes
+        self._rotate_at = max_bytes
         self._path.parent.mkdir(parents=True, exist_ok=True)
         _locations.rotate_log(self._path, max_bytes, backup_count)
         self._open()
@@ -56,7 +53,7 @@ class RotatingLog:
             if self._fh is None:
                 return
             try:
-                if self._size >= self._limit:
+                if self._size >= self._rotate_at:
                     self._rotate()
                 self._fh.write(data)
                 self._size += len(data)
@@ -64,18 +61,16 @@ class RotatingLog:
                 pass
 
     def _rotate(self) -> None:
-        assert self._fh is not None
         self._fh.close()
-        self._fh = None
         try:
             _locations.rotate_log(self._path, self._max_bytes, self._backup_count)
-            self._limit = self._max_bytes
+            self._rotate_at = self._max_bytes
         except OSError as e:
             # Could not move it aside (a reader holds it open on Windows, a
             # read-only directory): keep appending and try again a full limit
             # from here, rather than on every write.
             logger.warning("Cannot rotate %s: %s", self._path, e)
-            self._limit = self._size + self._max_bytes
+            self._rotate_at = self._size + self._max_bytes
         self._open()
 
     def close(self) -> None:

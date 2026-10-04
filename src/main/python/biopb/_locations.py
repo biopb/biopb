@@ -499,8 +499,12 @@ def samples_dir() -> Path:
 # --- rotation ------------------------------------------------------------ #
 
 
+LOG_MAX_BYTES = 10 * 1024 * 1024
+LOG_BACKUP_COUNT = 5
+
+
 def rotate_log(
-    log_file: Path, max_bytes: int = 10 * 1024 * 1024, backup_count: int = 5
+    log_file: Path, max_bytes: int = LOG_MAX_BYTES, backup_count: int = LOG_BACKUP_COUNT
 ) -> None:
     """Rotate *log_file* if it exceeds *max_bytes*, keeping up to *backup_count*
     backups (``.1`` … ``.N``).

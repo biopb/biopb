@@ -354,7 +354,7 @@ class ServiceProcess:
     def _drain_log(self, timeout: float = 2.0) -> None:
         """Let the pump copy what the child wrote before it died: the last lines
         are the ones a crash is diagnosed from."""
-        pump_thread = self._pump
+        pump_thread, self._pump = self._pump, None
         if pump_thread is not None:
             pump_thread.join(timeout)
 

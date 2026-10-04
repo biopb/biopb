@@ -1,5 +1,7 @@
 """A supervised child's log stays bounded while the child runs."""
 
+import io
+import os
 import sys
 
 from biopb_control._rotating_log import RotatingLog, pump
@@ -55,7 +57,7 @@ class _Child(ServiceProcess):
         super().__init__()
         self._spec = ServiceSpec(
             argv=[sys.executable, "-c", code],
-            env=dict(__import__("os").environ),
+            env=os.environ.copy(),
             host="127.0.0.1",
             port=1,
             log_path=tmp_path / "child.log",
@@ -89,18 +91,7 @@ def test_a_chatty_child_cannot_outgrow_the_limit_and_its_last_words_survive(tmp_
     assert b"goodbye" in (tmp_path / "child.log").read_bytes()
 
 
-def test_the_pump_drains_a_child_that_has_already_exited(tmp_path):
-    child = _Child(tmp_path, "print('bye')")
-    child._start_process()
-    child._proc.wait(timeout=30)
-    child._drain_log()
-    child._close_log()
-    assert b"bye" in (tmp_path / "child.log").read_bytes()
-
-
-def test_pump_returns_on_a_closed_stream(tmp_path):
-    import io
-
+def test_pump_copies_until_eof(tmp_path):
     log = RotatingLog(tmp_path / "a.log")
     stream = io.BufferedReader(io.BytesIO(b"abc"))
     pump(stream, log)

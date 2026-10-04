@@ -142,7 +142,6 @@ class ScriptEntry(ServiceProcess):
         self._failures = 0
         self._restarts = 0
         self._next_attempt_at = 0.0
-        self._log_rotated = False
 
     # --- ServiceProcess -------------------------------------------------- #
 
@@ -167,10 +166,6 @@ class ScriptEntry(ServiceProcess):
 
     def _probe_target(self) -> tuple[str, int]:
         return "127.0.0.1", self._port
-
-    def _open_log(self):
-        self._log_rotated = True
-        return super()._open_log()
 
     # The server is uv's child, not the process spawned, so a stop takes the
     # whole tree: the process group on POSIX (the child leads its own
@@ -205,12 +200,10 @@ class ScriptEntry(ServiceProcess):
             return None
         return data if isinstance(data, dict) and "hash" in data else None
 
-    def _append_log(self, text: str) -> None:
-        if not self._log_rotated:
-            _locations.rotate_log(self._log)
-            self._log_rotated = True
-        with open(self._log, "a", encoding="utf-8") as fh:
-            fh.write(text)
+    def _append_log(self, data: str | bytes) -> None:
+        sink = self._open_log()
+        if sink is not None:
+            sink.write(data.encode() if isinstance(data, str) else data)
 
     def _fail(self, what: str, file_hash: Optional[str]) -> None:
         lines, _truncated = tail_file(self._log, ERROR_TAIL_LINES, _LOG_TAIL_MAX_BYTES)
@@ -220,18 +213,25 @@ class ScriptEntry(ServiceProcess):
         logger.warning("algorithm %s: %s", self.name, what)
 
     def _run_step(
-        self, argv: list[str], timeout: float, *, stdout=None
+        self, argv: list[str], timeout: float, *, capture: bool = False
     ) -> subprocess.CompletedProcess:
+        """Run one install step, its output going to the log. ``capture`` keeps
+        stdout for the caller and logs only stderr."""
         self._append_log(f"\n--- control: {' '.join(argv)} ---\n")
-        with open(self._log, "ab") as log:
-            return subprocess.run(
+        try:
+            done = subprocess.run(
                 argv,
                 stdin=subprocess.DEVNULL,
-                stdout=stdout if stdout is not None else log,
-                stderr=log,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE if capture else subprocess.STDOUT,
                 timeout=timeout,
                 check=False,
             )
+        except subprocess.TimeoutExpired as exc:
+            self._append_log((exc.stderr if capture else exc.stdout) or b"")
+            raise
+        self._append_log((done.stderr if capture else done.stdout) or b"")
+        return done
 
     def _install(self) -> None:
         """Lock, sync and describe the file as it is now. Runs off the lock."""
@@ -251,7 +251,7 @@ class ScriptEntry(ServiceProcess):
             done = self._run_step(
                 [*self._uv, "run", *script, "--describe"],
                 DESCRIBE_TIMEOUT,
-                stdout=subprocess.PIPE,
+                capture=True,
             )
             if done.returncode != 0:
                 self._fail(f"--describe failed (exit {done.returncode})", file_hash)
