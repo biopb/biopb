@@ -56,6 +56,7 @@ from biopb.tensor._location import normalize_flight_location
 from biopb.tensor._pool import (
     _build_dask_array_from_chunk_map,
     _chunk_map_from_endpoints,
+    _fetch_chunk_distributed,
     _get_shared_call_options,
     _get_thread_client,
 )
@@ -373,6 +374,47 @@ def _dask_from_flight_info(
             )
         ]
     return dask_arr
+
+
+def _array_from_flight_info(
+    info: "flight.FlightInfo",
+    location: str,
+    token: Optional[str],
+    cache_bytes: int,
+    tls_trust: Optional[TlsTrust],
+) -> np.ndarray:
+    """The planned read, materialized now.
+
+    A plan whose one chunk is the whole realized region is fetched directly and
+    cropped, skipping dask: building and running even a one-task graph costs more
+    than the fetch itself. Any other plan goes through ``_dask_from_flight_info``
+    and computes it, so the two forms always agree on the result.
+    """
+    _check_wire_protocol(info.schema)
+    descriptor = TensorDescriptor.FromString(info.descriptor.command)
+    chunk_ids, bounds_list = _parse_flight_endpoints(info)
+    shape = tuple(descriptor.shape)
+    if len(chunk_ids) == 1:
+        bounds = bounds_list[0]
+        start, stop = tuple(bounds.start), tuple(bounds.stop)
+        if not any(start) and stop == shape:
+            arr = _fetch_chunk_distributed(
+                location, token, chunk_ids[0], start, stop, cache_bytes, tls_trust
+            )
+            requested = _requested_slice(info)
+            if requested is not None and descriptor.HasField("slice_hint"):
+                arr = arr[
+                    _request_crop_slices(
+                        len(shape),
+                        requested,
+                        descriptor.slice_hint,
+                        list(descriptor.scale_hint) if descriptor.scale_hint else None,
+                    )
+                ]
+            return arr
+    return _dask_from_flight_info(
+        info, location, token, cache_bytes, tls_trust
+    ).compute()
 
 
 def _explain_handshake_failure(
@@ -1410,4 +1452,22 @@ class ChunkFetcher:
             self._state.token,
             self._state.cache_bytes,
             self._state.trust_for(location),
+        )
+
+    def get_array(
+        self,
+        array_id: str,
+        slice_hint: Optional[Tuple[slice, ...]] = None,
+        scale_hint: Optional[Sequence[int]] = None,
+        reduction_method: Optional[str] = None,
+    ) -> np.ndarray:
+        """Backs TensorFlightClient.get_array; see that method for the full
+        documentation."""
+        info = self._plan_read(array_id, slice_hint, scale_hint, reduction_method)
+        return _array_from_flight_info(
+            info,
+            self._state.location,
+            self._state.token,
+            self._state.cache_bytes,
+            self._state.trust_for(self._state.location),
         )

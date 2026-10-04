@@ -207,7 +207,7 @@ and no `array_id` is a **422**.
 - `X-Scale-Hint: 1,2,2` — the per-axis scale actually read at
 
 `scale_hint` and `reduction_method` are forwarded verbatim to
-`TensorFlightClient.get_tensor(...)`, which resolves the appropriate
+`TensorFlightClient.get_array(...)`, which resolves the appropriate
 precomputed pyramid level (if available) or applies runtime downsampling.
 
 #### `scale_policy` — letting the server choose the scale
