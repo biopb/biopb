@@ -505,10 +505,9 @@ def rotate_log(
     """Rotate *log_file* if it exceeds *max_bytes*, keeping up to *backup_count*
     backups (``.1`` … ``.N``).
 
-    A size-triggered manual rotation applied at process (re)start: the core CLI
-    calls it for ``control.log`` at ``control start`` and the supervisor for
-    ``tensor-server.log`` at each (re)spawn, so their stdout-redirect logs (which
-    have no in-process ``RotatingFileHandler``) don't grow unbounded.
+    A size-triggered manual rotation: the core CLI calls it for ``control.log``
+    at ``control start``, and the control's ``RotatingLog`` calls it for each
+    supervised child's log, at open and whenever the file grows past the limit.
     """
     if not log_file.exists() or log_file.stat().st_size < max_bytes:
         return
