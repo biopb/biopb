@@ -247,6 +247,11 @@ class TensorFlightClient:
         )
         return self._catalog.get_source(source_id)
 
+    def source_row_columns(self) -> str:
+        """The columns a ``sources`` listing needs, as a SELECT list: the base
+        columns, plus ``unresolved_reason`` when the server has it."""
+        return self._catalog.source_row_columns()
+
     def query(self, sql: str, *, format: str = "arrow") -> Any:  # noqa: A002 - public, documented keyword API (mirrors DuckDB/pandas `format`)
         """Execute SQL query against server's source metadata database.
 
