@@ -719,6 +719,9 @@ class TestControlLaunchedSession:
     dashboard's verb."""
 
     def test_a_session_outlives_its_agent_until_the_user_stops_it(self, tmp_path):
+        # biopb-control is not a dependency of biopb-mcp; where it is not
+        # installed there is no control for the shim to start.
+        pytest.importorskip("biopb_control")
         env = _home_env(tmp_path)
         env.pop("BIOPB_TENSOR_URL", None)
         # A control of this test's own, on a port that is not the user's.
