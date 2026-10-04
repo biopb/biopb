@@ -1092,7 +1092,6 @@ class SourceManager:
         # long wait does not sit silent long enough to trip a proxy timeout.
         while not self._catalog_lock.acquire(timeout=_ADD_SOURCE_ACQUIRE_HEARTBEAT):
             yield ("progress", 0, "waiting for catalog scan to finish")
-        committed = False
         new_root: Optional[Root] = None
         try:
             # Where the drop lands is read under the lock: a drop or a removal that
@@ -1112,31 +1111,23 @@ class SourceManager:
                 # gate, the deferred registration, the precache residency check and
                 # the reconcile's cloud scoping all ask the same question of every
                 # path under it. So a consented drop is a cloud root until that drop
-                # is deregistered. Added before registering, so the drop's own
-                # claims see it; taken back below if nothing is committed.
+                # is deregistered. Added by ``_register_root`` at the first
+                # source it commits, so a drop that commits nothing leaves no root.
                 new_root = Root(
                     RootKind.DROPPED,
                     url,
                     cloud=cloud,
                     label=self._roots.unique_label(root_path),
                 )
-                self._roots.add(new_root)
-            for event in self._register_root(
+            yield from self._register_root(
                 url,
                 source_type=source_type,
                 should_cancel=should_cancel,
                 catalog_url_for=self._display_url_for,
-                cloud=self._roots.is_cloud(url),
+                cloud=new_root.cloud if new_root else self._roots.is_cloud(url),
                 new_root=new_root,
-            ):
-                if event[0] == "progress":
-                    committed = committed or event[1] > 0
-                else:
-                    committed = bool(event[1].added)
-                yield event
+            )
         finally:
-            if new_root is not None and not committed:
-                self._roots.remove(new_root)
             self._catalog_lock.release()
 
     def _register_root(
@@ -1159,9 +1150,10 @@ class SourceManager:
 
         ``catalog_url_for`` gives a NEW claim its display ``source_url`` override,
         or None. ``cloud`` scans ``url`` as a cloud root. ``new_root`` is the root
-        a drop has just added for itself: it is refused whole, before anything is
+        a drop is making for itself: it is refused whole, before anything is
         removed or committed, when :meth:`Roots.check_overlap` finds it shares
-        sources with another root.
+        sources with another root, and it joins the roots just before its first
+        new source is committed, so that source sees it.
         """
         is_dir = os.path.isdir(url)
         tally = AddSourceTally()
@@ -1217,7 +1209,6 @@ class SourceManager:
                 Path(url),
                 (path for _, path in self._reconciler.local_claim_paths()),
                 already_registered=bool(already_ids),
-                exclude=new_root,
             )
             if overlap:
                 tally.failed.append((url, overlap))
@@ -1263,8 +1254,21 @@ class SourceManager:
                         )
                     )
             else:
+                if new_root is not None:
+                    self._roots.add(new_root)
                 catalog_url = catalog_url_for(claim)
-                if self._reconciler._commit_add_claim(claim, catalog_url=catalog_url):
+                added = False
+                try:
+                    added = self._reconciler._commit_add_claim(
+                        claim, catalog_url=catalog_url
+                    )
+                finally:
+                    if new_root is not None:
+                        if added:
+                            new_root = None
+                        else:
+                            self._roots.remove(new_root)
+                if added:
                     tally.added.append(claim.source_id)
                     yield ("progress", len(tally.added), str(claim.primary_path))
                 else:

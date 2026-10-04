@@ -285,21 +285,19 @@ class Roots:
         registered_paths: Iterable[str],
         *,
         already_registered: bool = False,
-        exclude: Optional[Root] = None,
     ) -> Optional[str]:
         """Why a root at ``path`` may not be added, or None.
 
         A root that is its own display root must not share sources with another:
         refused when it holds a source that is already registered
         (``already_registered``), when an existing source lies under it
-        (``registered_paths``), or when it contains a root already known
-        (``exclude`` is the root being added, which is not its own overlap).
+        (``registered_paths``), or when it contains a root already known.
         """
         if (
             already_registered
             or any(Path(p).is_relative_to(path) for p in registered_paths)
             or any(
-                r is not exclude and r.path is not None and r.path.is_relative_to(path)
+                r.path is not None and r.path.is_relative_to(path)
                 for r in self._snap.roots
             )
         ):
