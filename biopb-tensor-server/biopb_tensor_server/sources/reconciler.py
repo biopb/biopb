@@ -157,8 +157,6 @@ class Reconciler:
         # deadlock. The coarse whole-pass mutex lives in SourceManager.
         self._lock = threading.RLock()
 
-        # Maps resolved path -> source_id (str keys for URL support).
-        self._path_to_source_id: Dict[str, str] = {}
         # source_id -> member path signature map used to detect in-place changes.
         self._source_signatures: Dict[str, Dict[str, Tuple[Any, ...]]] = {}
         # source_id -> retry/logging state for repeatedly failing datasets.
@@ -172,10 +170,6 @@ class Reconciler:
         # sidecar rewritten in place, a locked header); removing it on the first
         # miss would unregister a working source and rebuild it a tick later.
         self._missed_scans: Dict[str, int] = {}
-
-        # Initialize path tracking from existing claims.
-        for source_id, claim in self._state.claims.items():
-            self._path_to_source_id[claim.primary_path] = source_id
 
         self._state.on_source_added = None
         self._state.on_source_removed = None
@@ -1024,7 +1018,6 @@ class Reconciler:
             if self._metadata_db is not None:
                 self._metadata_db.sync_source_added(claim.source_id, adapter)
 
-            self._path_to_source_id[claim.primary_path] = claim.source_id
             if displaced is not None:
                 # Only now, and this ordering is the reason `swap` hands the
                 # displaced adapter back open rather than closing it: until the
@@ -1072,15 +1065,13 @@ class Reconciler:
             )
 
     def _teardown_source_bookkeeping(self, source_id: str) -> None:
-        """Drop a source's catalog row and path-map entries (best-effort).
+        """Drop a source's catalog row (best-effort).
 
         The teardown shared by the add-failure rollback
         (:meth:`_rollback_source_registration`) and the confirmed remove
         (:meth:`_unregister_source_claim`): the metadata-DB delete is isolated in
         its own try/except -- a catalog-delete failure is logged, never
-        propagated (worst case a leaked row) -- and every ``_path_to_source_id``
-        entry pointing at ``source_id`` is dropped so a later re-add/reconcile of
-        the same path is not misled by a stale mapping.
+        propagated (worst case a leaked row).
 
         Deliberately does NOT touch the server registration (callers own that,
         with differing abort semantics) nor ``_cloud_source_ids``: the remove
@@ -1096,12 +1087,6 @@ class Reconciler:
                     "Failed to remove source %s from metadata DB",
                     source_id,
                 )
-
-        paths_to_remove = [
-            path for path, sid in self._path_to_source_id.items() if sid == source_id
-        ]
-        for path in paths_to_remove:
-            self._path_to_source_id.pop(path, None)
 
     def _rollback_source_registration(self, source_id: str) -> None:
         """Best-effort rollback after a partial add failure."""
@@ -1119,11 +1104,9 @@ class Reconciler:
         state for a later retry). A catalog-delete failure does NOT abort: the
         shared :meth:`_teardown_source_bookkeeping` isolates the
         ``sync_source_removed`` call in its own try/except so the server-side
-        unregister and the ``_path_to_source_id`` cleanup still complete -- a
-        stale path-map entry pointing at an already-unregistered ``source_id``
-        would otherwise mislead a later re-add/reconcile of the same path. The
-        worst case is a leaked catalog row (logged), matching the remove-site
-        log-and-continue policy and the pre-raise behavior.
+        unregister still completes. The worst case is a leaked catalog row
+        (logged), matching the remove-site log-and-continue policy and the
+        pre-raise behavior.
         """
         try:
             self._server.unregister_source(source_id)
