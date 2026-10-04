@@ -672,6 +672,61 @@ class TestOverFlight:
             client.close()
             server.shutdown()
 
+    def test_an_open_ended_read_of_a_pending_source_asks_for_its_reason_once(
+        self, tmp_path
+    ):
+        """The reason rides the row the read already fetches when the server's
+        ``sources`` schema has the column, so no second query asks for it."""
+        manager, server, client = self._serve(tmp_path)
+        try:
+            first, _ = _only_ids(server)
+            asked = []
+            raw = client._state.raw_client
+
+            class Spy:
+                def __getattr__(self, name):
+                    return getattr(raw, name)
+
+                def do_get(self, ticket, *a, **k):
+                    asked.append(ticket.ticket)
+                    return raw.do_get(ticket, *a, **k)
+
+            catalog = client._catalog
+            assert "unresolved_reason" in catalog._catalog_columns()
+            client._state.raw_client = Spy()
+
+            data = client.get_tensor(first, slice_hint=(slice(0, None),) * 3)
+
+            assert data is not None
+            assert not [t for t in asked if b"source_id, unresolved_reason" in t]
+        finally:
+            client.close()
+            server.shutdown()
+
+    def test_a_server_that_will_not_say_its_columns_gets_the_base_projection(
+        self, tmp_path
+    ):
+        from pyarrow import flight
+
+        manager, server, client = self._serve(tmp_path)
+        try:
+            state = client._catalog._state
+            raw = state.raw_client
+
+            class Refuses:
+                def __getattr__(self, name):
+                    return getattr(raw, name)
+
+                def get_flight_info(self, *a, **k):
+                    raise flight.FlightUnauthorizedError("no catalog")
+
+            state.raw_client = Refuses()
+            assert client._catalog._catalog_columns() == frozenset()
+            assert state.catalog_columns == frozenset()
+        finally:
+            client.close()
+            server.shutdown()
+
     def test_resolve_on_a_pending_source_returns_its_filled_row(self, tmp_path):
         manager, server, client = self._serve(tmp_path)
         try:

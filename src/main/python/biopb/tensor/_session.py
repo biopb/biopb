@@ -135,6 +135,10 @@ class _ClientState:
     # if the server didn't advertise one (an old server, a loopback
     # deployment, or the check was bypassed).
     advertised_location: Optional[str] = None
+    # The ``sources`` table's column names, from its flight's schema, read on
+    # first need (see ``CatalogClient._catalog_columns``). Empty when the server
+    # would not say, which a caller reads as "ask for the base columns only".
+    catalog_columns: Optional[frozenset] = None
 
     @property
     def client(self) -> flight.FlightClient:
@@ -916,7 +920,7 @@ class CatalogClient:
         if (
             row is not None
             and not row.get("is_resolved", True)
-            and self._register_if_pending(source_id)
+            and self._register_if_pending(source_id, row)
         ):
             row = self._source_tensors_row(source_id)
 
@@ -968,7 +972,9 @@ class CatalogClient:
         row = self._addressed_row("len(tensors) AS tensor_count", source_id)
         return row["tensor_count"] if row else None
 
-    def _register_if_pending(self, source_id: str) -> bool:
+    def _register_if_pending(
+        self, source_id: str, row: Optional[Mapping[str, Any]] = None
+    ) -> bool:
         """Have the server register a source it has claimed but not yet opened.
 
         A row that is unresolved because its registration is queued (``pending``)
@@ -977,12 +983,15 @@ class CatalogClient:
         A failed one raises here with the server's reason. False for a cloud
         placeholder, or a server too old to say, so the caller's refusal stands.
         """
-        reasons = unresolved_reasons(
-            lambda sql: self._query_table(sql).to_pylist(),
-            f"AND source_id = {sql_literal(source_id)}",
-            errors=flight.FlightError,
-        )
-        if reasons.get(source_id) not in ("pending", "failed"):
+        if row is not None and "unresolved_reason" in row:
+            reason = row["unresolved_reason"]  # the row already said so
+        else:
+            reason = unresolved_reasons(
+                lambda sql: self._query_table(sql).to_pylist(),
+                f"AND source_id = {sql_literal(source_id)}",
+                errors=flight.FlightError,
+            ).get(source_id)
+        if reason not in ("pending", "failed"):
             return False
         self.resolve_source(source_id)
         return True
@@ -993,7 +1002,31 @@ class CatalogClient:
         Not ``SOURCE_ROW_COLUMNS`` -- the source's url and type are bytes on the
         wire nobody here reads.
         """
-        return self._addressed_row("is_resolved, tensors", source_id)
+        columns = "is_resolved, tensors"
+        if "unresolved_reason" in self._catalog_columns():
+            columns += ", unresolved_reason"
+        return self._addressed_row(columns, source_id)
+
+    def _catalog_columns(self) -> frozenset:
+        """The ``sources`` table's columns, so a projection can ask for one only
+        a newer server has instead of a second query for it.
+
+        One GetFlightInfo on the table's path, the first time it is needed on
+        this connection. Empty when the server will not say -- a capability
+        token reads a source's pixels, not the catalog -- and a caller then
+        projects the base columns only.
+        """
+        state = self._state
+        if state.catalog_columns is None:
+            try:
+                info = state.client.get_flight_info(
+                    flight.FlightDescriptor.for_path("sources"),
+                    options=state.call_options,
+                )
+                state.catalog_columns = frozenset(info.schema.names)
+            except flight.FlightError:
+                state.catalog_columns = frozenset()
+        return state.catalog_columns
 
     def _addressed_row(
         self, columns: str, source_id: str
