@@ -9,9 +9,10 @@ launcher process. Instead the launcher runs this module, which
 2. on ``attach``, takes the lease of a live session (``/api/lease``) and bridges
    requests to its streamable-http endpoint. For ``new`` (or ``--session new``)
    it asks the control to launch an ephemeral session, carrying this client's
-   display environment, and leases that; with no control to answer, or a pinned
-   data plane the control's session would not see, it spawns a session of its own
-   on an OS-assigned port, inheriting this shim's live environment
+   display environment, and leases that -- an error if no control answers, since
+   a session without one has no data plane. A client that pins its data plane by
+   environment is running without the control's, and gets a session this shim
+   spawns on an OS-assigned port, inheriting its live environment
    (``spawn_session``, driven by ``_Binding``);
 3. releases the lease, or reaps the session it spawned, on the way out
    (``_Binding.reap``).
@@ -29,7 +30,7 @@ Ownership is per session, and only a session this shim spawned is its to end:
   lease every ``RENEW_INTERVAL`` and releases it on exit; a shim killed too hard
   to release leaves a lease that lapses by itself (``_lease.TTL``). One holder at
   a time: an attach to a held session is refused unless forced.
-* **Spawned (``new``, no control).** Ephemeral and owned: the child inherits *this* shim's
+* **Spawned (``new`` with a pinned data plane).** Ephemeral and owned: the child inherits *this* shim's
   environment, so ``DISPLAY`` / ``XAUTHORITY`` / ``WAYLAND_DISPLAY`` are the
   user's current session -- never a value frozen into a long-lived daemon (the
   #98 fix). POSIX: the child stays in this shim's process group (no
@@ -437,8 +438,9 @@ _DISPLAY_ENV = (
     "XDG_SESSION_TYPE",
 )
 
-# A client that pins its data plane by environment expects its own session to
-# see that pin, and a control-launched one would not: those spawn their own.
+# A client that pins its data plane by environment is running without the
+# control's, and a control-launched session would not see the pin: the one case
+# where the shim spawns a session of its own.
 _PINNED_ENV = (
     "BIOPB_TENSOR_URL",
     "BIOPB_TENSOR_TOKEN",
@@ -652,23 +654,32 @@ class _Binding:
 
     def _launch_via_control(self):
         """A session the control launched for this client, leased; its ``/mcp``
-        url -- or None if there is no control to ask, and the caller spawns one.
+        url. ``AttachError`` when the control cannot be reached or will not
+        launch one.
 
-        The control owns it from here: it is detached, and ends once nothing has
-        held it for a grace period, so this shim only ever releases it.
+        There is deliberately no session of the shim's own to fall back to: a
+        session reaches the data and algorithm planes through the control, so one
+        started without it would attach "successfully" and fail on first use,
+        hiding the cause. The control owns the session's end from here: it is
+        detached, and ends once nothing has held it for a grace period, so this
+        shim only ever releases it.
         """
-        if any(os.environ.get(name) for name in _PINNED_ENV):
-            return None
+        log = getattr(_locations, "control_log", None)
+        where = f" (its log: {log()})" if log is not None else ""
         try:
             if not _control_client.ensure_control(CONTROL_WAIT):
-                return None
+                raise AttachError(
+                    f"no control answered within {CONTROL_WAIT:.0f}s{where}. "
+                    "Retry, or start it with `biopb control start`."
+                )
             answer = _control_client.launch_session(
                 display={k: os.environ[k] for k in _DISPLAY_ENV if k in os.environ},
                 timeout=CONTROL_LAUNCH_TIMEOUT,
             )
         except (OSError, ValueError) as e:
-            logger.info("the control would not launch a session (%s)", e)
-            return None
+            raise AttachError(
+                f"the control would not launch a session: {e}{where}"
+            ) from e
         state = answer.get("state")
         if state == "failed":
             raise AttachError(
@@ -689,12 +700,13 @@ class _Binding:
     def _acquire(self, selector, force):
         """Take the lease on *selector*; return its ``/mcp`` url."""
         if selector == "new":
-            launched = self._launch_via_control()
-            if launched is not None:
-                return launched
-            _, url, _ = self._spawn()
-            self._take_lease(url.rsplit("/mcp", 1)[0], self.session_id)
-            return url
+            if any(os.environ.get(name) for name in _PINNED_ENV):
+                # The client runs without a control's data plane, so a session
+                # the control launched would not see its pin: spawn one here.
+                _, url, _ = self._spawn()
+                self._take_lease(url.rsplit("/mcp", 1)[0], self.session_id)
+                return url
+            return self._launch_via_control()
         rec = _sessions.resolve(selector)
         if rec is None or not rec.get("port"):
             raise AttachError(f"no live session {selector!r}.\n{session_listing()}")

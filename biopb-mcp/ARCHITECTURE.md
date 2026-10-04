@@ -107,11 +107,12 @@ starts **unbound** and owns nothing until the agent calls its local `attach` too
    this client (`POST /api/sessions/new?ephemeral=1`, with the client's display
    variables), starting the control first if need be, and leases it from birth.
    The control owns its end: it stops the session once nothing has held it for a
-   grace period, so the shim only releases it. With no control to answer, or a
-   data plane pinned in the client's environment, the shim **spawns its own
-   session child** on a dynamic OS-assigned port and reaps it as a tree (POSIX
-   process group + parent-death pipe; Windows Job Object, #403) on the way out;
-   that child registers itself under an id the shim mints.
+   grace period, so the shim only releases it. No control is an error, not a
+   fallback: a session without one has no data plane. A client that pins its data
+   plane in its environment is running without the control's, and gets a
+   **session child** its shim spawns on a dynamic OS-assigned port and reaps as a
+   tree (POSIX process group + parent-death pipe; Windows Job Object, #403) on the
+   way out; that child registers itself under an id the shim mints.
    `--session new` (or `$BIOPB_SESSION`) does this on the first request that
    needs a session, with no `attach` call.
 

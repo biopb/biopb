@@ -624,6 +624,15 @@ class TestBinding:
         monkeypatch.setattr(_shim._control_client, "launch_session", _launch)
         for name in _shim._PINNED_ENV:
             monkeypatch.delenv(name, raising=False)
+        # A session of the shim's own is for a client that pinned its data plane;
+        # pinned unless a test brings a control with `use_control`.
+        monkeypatch.setenv("BIOPB_TENSOR_URL", "grpc://pinned:1")
+
+        def use_control(up=True):
+            monkeypatch.delenv("BIOPB_TENSOR_URL")
+            env.control_up = up
+
+        env.use_control = use_control
         return _shim._Binding(config=object(), preselect=preselect), env
 
     def _drive(self, binding, *steps):
@@ -703,7 +712,7 @@ class TestBinding:
 
     def test_new_asks_the_control_for_a_session_when_one_answers(self, monkeypatch):
         binding, env = self._binding(monkeypatch)
-        env.control_up = True
+        env.use_control()
         env.launch_answer = {"state": "started", "session_id": "managed"}
         monkeypatch.setenv("DISPLAY", ":3")
         monkeypatch.setenv("LD_PRELOAD", "/tmp/not-sent.so")
@@ -719,7 +728,7 @@ class TestBinding:
 
     def test_a_control_launched_session_is_released_not_stopped(self, monkeypatch):
         binding, env = self._binding(monkeypatch)
-        env.control_up = True
+        env.use_control()
         env.launch_answer = {"state": "started", "session_id": "managed"}
         self._drive(binding, lambda: binding.attach("new"))
         binding.reap()
@@ -728,7 +737,7 @@ class TestBinding:
 
     def test_a_launch_that_failed_says_why_and_does_not_fall_back(self, monkeypatch):
         binding, env = self._binding(monkeypatch)
-        env.control_up = True
+        env.use_control()
         env.launch_answer = {"state": "failed", "error": "exited 2", "log": "no napari"}
         [text] = self._drive(binding, lambda: binding.attach("new"))
         assert "exited 2" in text and "no napari" in text
@@ -736,29 +745,35 @@ class TestBinding:
 
     def test_a_slow_launch_points_at_the_listing(self, monkeypatch):
         binding, env = self._binding(monkeypatch)
-        env.control_up = True
+        env.use_control()
         env.launch_answer = {"state": "starting"}
         [text] = self._drive(binding, lambda: binding.attach("new"))
         assert "still starting" in text and env.spawns == []
 
-    def test_a_control_that_will_not_launch_falls_back_to_our_own(self, monkeypatch):
+    def test_a_control_that_will_not_launch_is_an_error_not_a_fallback(
+        self, monkeypatch
+    ):
+        # A session without the control has no data plane: attaching to one would
+        # succeed and then fail on first use, hiding the cause.
         binding, env = self._binding(monkeypatch)
-        env.control_up = True
+        env.use_control()
         env.launch_answer = OSError("refused")
-        self._drive(binding, lambda: binding.attach("new"))
-        assert len(env.spawns) == 1
+        [text] = self._drive(binding, lambda: binding.attach("new"))
+        assert "would not launch a session" in text and "refused" in text
+        assert env.spawns == []
 
-    def test_no_control_means_a_session_of_our_own(self, monkeypatch):
+    def test_no_control_is_an_error_that_says_how_to_start_one(self, monkeypatch):
         binding, env = self._binding(monkeypatch)
-        self._drive(binding, lambda: binding.attach("new"))
-        assert env.launches == [] and len(env.spawns) == 1
+        env.use_control(up=False)
+        [text] = self._drive(binding, lambda: binding.attach("new"))
+        assert "no control answered" in text and "biopb control start" in text
+        assert env.spawns == [] and env.launches == []
 
-    def test_a_pinned_data_plane_is_not_handed_to_the_control(self, monkeypatch):
-        # The control's session would not see the pin.
+    def test_a_pinned_data_plane_gets_a_session_of_its_own(self, monkeypatch):
+        # Running without the control's plane: its session would not see the pin.
         binding, env = self._binding(monkeypatch)
         env.control_up = True
         env.launch_answer = {"state": "started", "session_id": "managed"}
-        monkeypatch.setenv("BIOPB_TENSOR_URL", "grpc://elsewhere:1")
         self._drive(binding, lambda: binding.attach("new"))
         assert env.launches == [] and len(env.spawns) == 1
 

@@ -73,9 +73,12 @@ session id or `new`:
 - No id: the tool error lists live sessions as `id, busy|free, viewer|no viewer`.
 - Id: take the lease, then proxy every other request to it.
 - `new`: asks the control to launch an ephemeral session for this client,
-  leased from birth. With no control to answer, or with a data plane pinned in the
-  client's environment (`BIOPB_TENSOR_*`, which a control-launched session would
-  not see), the shim spawns a session of its own and reaps it, as it always did.
+  leased from birth. If no control answers, that is an error naming the control's
+  log: a session started without one has no data plane, so attaching to it would
+  succeed and then fail on first use. The one exception is a client that pins its
+  data plane in its environment (`BIOPB_TENSOR_*`) and so runs without the
+  control's: a control-launched session would not see the pin, so the shim spawns
+  a session of its own and reaps it, as it always did.
 - `--session <id>` (or env) pre-binds for people and scripts.
 
 While unbound the shim answers the handshake and list requests from the imported

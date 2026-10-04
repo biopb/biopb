@@ -31,8 +31,8 @@ Two rules keep that tree correct, and every change here must preserve them.
   own display variables, allowlisted, and the control uses them instead of its
   own, which are frozen at whoever started it. A session's config decides whether
   it gets a napari viewer, and it runs without one where napari or a display is
-  missing. An agent's own shim-spawned session, with no control to ask, is still
-  the shim's to reap.
+  missing. A client that pins its data plane runs without the control's, and its
+  shim-spawned session is still the shim's to reap.
 - **I2 — the control stays lean and subprocess-based.** It supervises components
   as subprocesses, never by importing them, so no Qt/napari/dask/kernel ever enters
   this process. Facts shared with those components — the control endpoint, the
