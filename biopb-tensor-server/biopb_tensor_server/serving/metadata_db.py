@@ -1236,9 +1236,6 @@ class MetadataDatabase:
         source_url = adapter.catalog_url
         source_type = adapter.source_type
         is_resolved = adapter.is_resolved()
-        # getattr: this method only duck-types its argument (see below).
-        reason_of = getattr(adapter, "unresolved_reason", None)
-        unresolved_reason = None if is_resolved or reason_of is None else reason_of()
         catalog = catalog_tensors(adapter)
         metadata = adapter.get_metadata()
 
@@ -1334,7 +1331,7 @@ class MetadataDatabase:
             indexed_at,
             metadata_json,
             is_resolved,
-            unresolved_reason,
+            None,  # a registered adapter has no reason; ``sync_pending_source`` sets one
             tensors,
         )
 

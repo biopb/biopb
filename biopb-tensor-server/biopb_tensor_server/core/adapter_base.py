@@ -923,23 +923,10 @@ class SourceAdapter(ABC):
 
         True by default; only a remote proxy mirroring an unresolved upstream
         source overrides it. A source of this server that is not resolved has no
-        adapter at all, only a catalog row (see ``unresolved_reason``). Unlike
+        adapter at all, only a catalog row (``sources.unresolved_reason`` says why). Unlike
         ``is_resident()``, this never flips back to False once True.
         """
         return True
-
-    def unresolved_reason(self) -> Optional[str]:
-        """Why this source is not resolved, or None when it is.
-
-        ``"needs_recall"``: its bytes are a cloud placeholder and opening it is
-        a consented download. ``"pending"``: a local source whose registration
-        has not run yet; ``resolve`` runs it. ``"failed"``: its registration
-        raised, and ``metadata_json`` carries the error. A client offers a
-        download for the first only. A source of this server that is in one of
-        these states has no adapter, only a catalog row; this answers for a
-        remote proxy that mirrors one.
-        """
-        return None
 
     def is_resident(self) -> bool:
         """Best-effort, recall-free: is this source's content local and cheap to
@@ -2074,7 +2061,6 @@ _SOURCE_SCOPED_API = frozenset(
         "catalog_url",
         "is_resident",
         "is_resolved",
-        "unresolved_reason",
         "get_tensor_adapter",
         "put_chunk",
         "close",
