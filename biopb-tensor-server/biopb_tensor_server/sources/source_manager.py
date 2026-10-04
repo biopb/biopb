@@ -109,6 +109,7 @@ class SourceManager:
         full_rescan_interval: float = 3600.0,
         prune_unseen_days: int = 0,
         registration_workers: int = 0,
+        registration_stats: bool = False,
     ):
         # Collaborators. The registry is kept for ``add_local_source``'s own
         # discovery walk; every confirmed-catalog mutation goes through the
@@ -205,6 +206,7 @@ class SourceManager:
             notify_source_committed=self._notify_source_committed,
             catalog_url_for=self._display_url_for,
             stability_window=stability_window,
+            registration_stats=registration_stats,
         )
 
         # Background registration of what the first scan claims
@@ -222,7 +224,7 @@ class SourceManager:
         # whenever that registration happens to finish (see
         # ``_notify_source_committed``).
         self._deferred: Dict[str, float] = {}
-        if hasattr(registry, "claim_timer"):
+        if registration_stats and hasattr(registry, "claim_timer"):
             registry.claim_timer = self._reconciler.stats.record_claim
         set_materializer = getattr(server.sources, "set_materializer", None)
         if set_materializer is not None:
@@ -1352,6 +1354,7 @@ def create_source_manager(
     prune_unseen_days: int = 0,
     rescan_interval: float = 120.0,
     registration_workers: int = 0,
+    registration_stats: bool = False,
 ) -> SourceManager:
     """Create a SourceManager for all configured sources.
 
@@ -1438,6 +1441,7 @@ def create_source_manager(
         full_rescan_interval=full_rescan_interval,
         prune_unseen_days=prune_unseen_days,
         registration_workers=registration_workers,
+        registration_stats=registration_stats,
     )
 
     # Added first so monitored discovery skips paths already claimed.
