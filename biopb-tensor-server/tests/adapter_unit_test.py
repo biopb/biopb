@@ -1509,6 +1509,37 @@ class TestGetPhysicalScale:
         return plate
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_hcs_plate_is_listed_once_per_adapter(self):
+        """Registration asks for a plate's tensors several times; the field
+        metadata is read once. A rebuilt adapter lists afresh (a refresh)."""
+        from unittest import mock
+
+        from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
+        from biopb_tensor_server.core.config import SourceConfig
+
+        def build(path):
+            return OmeZarrAdapter.create_from_config(
+                SourceConfig(source_id="plate", url=path, type="ome-zarr-hcs")
+            )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._make_hcs_plate(tmpdir)
+            plate = build(path)
+            with mock.patch.object(
+                OmeZarrAdapter,
+                "_enumerate_hcs_fields",
+                autospec=True,
+                side_effect=OmeZarrAdapter._enumerate_hcs_fields,
+            ) as enumerate_fields:
+                first = plate.list_tensor_descriptors()
+                first.clear()  # a caller's edit must not reach the cache
+                assert len(plate.list_tensor_descriptors()) == 1
+                assert enumerate_fields.call_count == 1
+
+                build(path).list_tensor_descriptors()
+                assert enumerate_fields.call_count == 2
+
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
     def test_hcs_field_missing_axes_falls_back_to_source_axes(self):
         """A field whose multiscales omits ``axes`` still resolves units, by
         falling back to the plate source's axes (from the first field)."""

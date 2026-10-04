@@ -255,6 +255,7 @@ class OmeZarrAdapter(ZarrAdapter):
     _hcs_well_paths: dict  # well_name -> zarr path (e.g., 'A01' -> 'A01')
     _hcs_well_metadata: dict  # well_name -> well .zattrs
     _field_adapters: dict  # field_key -> cached adapter
+    _hcs_descriptors: Optional[List[TensorDescriptor]]  # plate listing, once
 
     @classmethod
     def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:
@@ -517,6 +518,10 @@ class OmeZarrAdapter(ZarrAdapter):
         self._hcs_well_paths: dict = {}
         self._hcs_well_metadata: dict = {}
         self._field_adapters: dict = {}
+        # Listing a plate reads every field's .zattrs and opens its level-0 array,
+        # and registration asks for it several times. An adapter is rebuilt, not
+        # mutated, when its source changes, so one listing is good for its life.
+        self._hcs_descriptors = None
         # Cache for level adapters (precomputed pyramid levels)
         self._level_adapters: dict = {}
 
@@ -911,7 +916,9 @@ class OmeZarrAdapter(ZarrAdapter):
             List of TensorDescriptor for all tensors in this source.
         """
         if self._is_hcs_plate:
-            return self._enumerate_hcs_fields()
+            if self._hcs_descriptors is None:
+                self._hcs_descriptors = self._enumerate_hcs_fields()
+            return list(self._hcs_descriptors)
         else:
             # Single multiscale image
             return [catalog_entry(self.get_tensor_descriptor())]
