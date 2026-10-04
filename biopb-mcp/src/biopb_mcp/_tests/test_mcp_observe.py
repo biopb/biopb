@@ -545,3 +545,57 @@ def test_config_defaults():
     assert get_setting({}, "observe.enabled") is True  # opt-out
     assert get_setting({}, "observe.max_output_chars") == 20000
     assert get_setting({}, "observe.poll_interval_ms") == 3000
+
+
+# -- the lease routes -------------------------------------------------------
+
+
+@pytest.fixture
+def lease():
+    from biopb_mcp.mcp import _lease
+
+    _lease._reset()
+    yield _lease
+    _lease._reset()
+
+
+def _post(client, path, **body):
+    return client.post(path, json=body, headers={"content-type": "application/json"})
+
+
+def test_an_agent_takes_the_lease_and_status_shows_it(client, lease):
+    r = _post(client, "/api/lease/acquire", token="t1")
+    assert r.status_code == 200 and r.json()["holder"] == "agent"
+    status = client.get("/api/status").json()
+    assert status["lease"]["holder"] == "agent"
+    assert "viewer" in status
+
+
+def test_a_held_session_is_refused_with_who_holds_it(client, lease):
+    _post(client, "/api/lease/acquire", token="t1")
+    r = _post(client, "/api/lease/acquire", token="t2")
+    assert r.status_code == 409 and r.json()["holder"] == "agent"
+    assert (
+        _post(client, "/api/lease/acquire", token="t2", force=True).status_code == 200
+    )
+    assert _post(client, "/api/lease/renew", token="t1").status_code == 409
+    assert _post(client, "/api/lease/renew", token="t2").status_code == 200
+
+
+def test_release_frees_the_session(client, lease):
+    _post(client, "/api/lease/acquire", token="t1")
+    assert _post(client, "/api/lease/release", token="t1").json() == {"released": True}
+    assert client.get("/api/lease").json() == {"holder": None}
+
+
+def test_a_lease_call_needs_a_token(client, lease):
+    assert _post(client, "/api/lease/acquire").status_code == 400
+
+
+def test_lease_posts_wear_the_json_content_type_guard(client, lease):
+    # A cross-site form cannot set it; this route can take a session from its
+    # holder.
+    r = client.post(
+        "/api/lease/acquire", content=b"{}", headers={"content-type": "text/plain"}
+    )
+    assert r.status_code == 400

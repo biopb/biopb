@@ -147,6 +147,14 @@ def _parse_args(argv, default_transport, default_port):
         help="Port for the http transport (ignored for stdio).",
     )
     parser.add_argument(
+        "--session",
+        default=os.environ.get("BIOPB_SESSION") or None,
+        help="stdio only: attach to this session id on the first request that "
+        "needs one, or 'new' for a session of the shim's own (the behavior "
+        "before attach existed). Default: start unbound and let the agent "
+        "choose with its `attach` tool. Also $BIOPB_SESSION.",
+    )
+    parser.add_argument(
         "--view",
         action="store_true",
         help="Agentless viewer: open the napari viewer directly in the "
@@ -354,7 +362,7 @@ def main(argv=None):
         from . import _shim
 
         try:
-            _shim.serve(config, opts.port)
+            _shim.serve(config, opts.port, session=opts.session)
         except Exception:
             logger.exception("stdio bridge failed")
             return 1

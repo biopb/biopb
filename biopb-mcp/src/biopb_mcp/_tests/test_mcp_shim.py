@@ -18,6 +18,7 @@ import socket
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
 
 import anyio
 import pytest
@@ -386,92 +387,190 @@ class _FakeRemote:
         self.calls.append(("read_resource", str(uri)))
         return types.ReadResourceResult(contents=[])
 
-
-def _connect_to(remote):
-    async def connect():
-        return remote
-
-    return connect
+    async def list_tools(self):
+        return types.ListToolsResult(
+            tools=[types.Tool(name="from_session", inputSchema={"type": "object"})]
+        )
 
 
-async def _no_child():
-    raise AssertionError("a listing must not start the session child")
+class _FakeBinding:
+    """The slice of ``_Binding`` that ``build_proxy`` talks to."""
+
+    def __init__(self, remote=None, attach_text="attached", attach_error=None):
+        self.session = remote
+        self.attached = []
+        self._text, self._error = attach_text, attach_error
+
+    async def connect(self):
+        if self.session is None:
+            raise _shim.NotAttached("No session is attached. Call `attach` first.")
+        return self.session
+
+    async def listing(self):
+        return "Live sessions:\n- s1: free, viewer"
+
+    async def attach(self, selector, force=False):
+        self.attached.append((selector, force))
+        if self._error:
+            raise _shim.AttachError(self._error)
+        return self._text
+
+
+def _call(name, arguments=None):
+    return types.CallToolRequest(
+        method="tools/call",
+        params=types.CallToolRequestParams(name=name, arguments=arguments or {}),
+    )
 
 
 class TestBuildProxy:
     def _call(self, handler, req):
         return anyio.run(lambda: handler(req))
 
-    def test_lists_come_from_the_fastmcp_server_not_the_child(self):
-        app = _shim.build_proxy(_no_child, mcp._mcp_server)
-        tools = self._call(
+    def _list(self, binding):
+        app = _shim.build_proxy(binding, mcp._mcp_server)
+        return self._call(
             app.request_handlers[types.ListToolsRequest],
             types.ListToolsRequest(method="tools/list"),
         )
-        assert {"start_kernel", "execute_code"} <= {t.name for t in tools.root.tools}
+
+    def test_unattached_lists_come_from_the_fastmcp_server_plus_attach(self):
+        tools = self._list(_FakeBinding())
+        names = {t.name for t in tools.root.tools}
+        assert {"start_kernel", "execute_code", "attach"} <= names
+        app = _shim.build_proxy(_FakeBinding(), mcp._mcp_server)
         resources = self._call(
             app.request_handlers[types.ListResourcesRequest],
             types.ListResourcesRequest(method="resources/list"),
         )
         assert [str(r.uri) for r in resources.root.resources] == ["docs://index"]
 
+    def test_an_attached_tool_list_is_the_sessions_own(self):
+        tools = self._list(_FakeBinding(_FakeRemote()))
+        assert [t.name for t in tools.root.tools] == ["from_session"]
+
     def test_call_tool_forwards_name_and_args(self):
         remote = _FakeRemote()
-        app = _shim.build_proxy(_connect_to(remote), mcp._mcp_server)
-        req = types.CallToolRequest(
-            method="tools/call",
-            params=types.CallToolRequestParams(
-                name="server_status", arguments={"a": 1}
-            ),
+        app = _shim.build_proxy(_FakeBinding(remote), mcp._mcp_server)
+        result = self._call(
+            app.request_handlers[types.CallToolRequest],
+            _call("server_status", {"a": 1}),
         )
-        result = self._call(app.request_handlers[types.CallToolRequest], req)
         assert remote.calls == [("call_tool", "server_status", {"a": 1}, None)]
         assert result.root.isError is False
 
     def test_call_tool_failure_becomes_tool_error_not_bridge_death(self):
-        remote = _FakeRemote()
-        app = _shim.build_proxy(_connect_to(remote), mcp._mcp_server)
-        req = types.CallToolRequest(
-            method="tools/call",
-            params=types.CallToolRequestParams(name="explodes", arguments={}),
+        app = _shim.build_proxy(_FakeBinding(_FakeRemote()), mcp._mcp_server)
+        result = self._call(
+            app.request_handlers[types.CallToolRequest], _call("explodes")
         )
-        result = self._call(app.request_handlers[types.CallToolRequest], req)
         assert result.root.isError is True
         assert "kaboom" in result.root.content[0].text
 
-    def test_a_child_that_cannot_start_is_a_tool_error(self):
-        async def connect():
-            raise RuntimeError("the biopb-mcp session did not start: no port")
-
-        app = _shim.build_proxy(connect, mcp._mcp_server)
-        req = types.CallToolRequest(
-            method="tools/call",
-            params=types.CallToolRequestParams(name="start_kernel", arguments={}),
+    def test_a_tool_before_attach_is_a_tool_error_that_says_to_attach(self):
+        app = _shim.build_proxy(_FakeBinding(), mcp._mcp_server)
+        result = self._call(
+            app.request_handlers[types.CallToolRequest], _call("start_kernel")
         )
-        result = self._call(app.request_handlers[types.CallToolRequest], req)
         assert result.root.isError is True
-        assert "did not start: no port" in result.root.content[0].text
+        assert "`attach`" in result.root.content[0].text
+
+    def test_attach_without_a_session_lists_the_sessions(self):
+        binding = _FakeBinding()
+        app = _shim.build_proxy(binding, mcp._mcp_server)
+        result = self._call(
+            app.request_handlers[types.CallToolRequest], _call("attach")
+        )
+        assert result.root.isError is False
+        assert "s1: free" in result.root.content[0].text
+        assert binding.attached == []
+
+    def test_attach_takes_the_named_session(self):
+        binding = _FakeBinding(attach_text="Attached to session s1.")
+        app = _shim.build_proxy(binding, mcp._mcp_server)
+        result = self._call(
+            app.request_handlers[types.CallToolRequest],
+            _call("attach", {"session": " s1 ", "force": True}),
+        )
+        assert binding.attached == [("s1", True)]
+        assert result.root.content[0].text == "Attached to session s1."
+
+    def test_a_refused_attach_is_a_tool_error_with_the_reason(self):
+        binding = _FakeBinding(attach_error="session s1 is held by its chat")
+        app = _shim.build_proxy(binding, mcp._mcp_server)
+        result = self._call(
+            app.request_handlers[types.CallToolRequest],
+            _call("attach", {"session": "s1"}),
+        )
+        assert result.root.isError is True
+        assert "held by its chat" in result.root.content[0].text
 
 
-class TestLazySession:
-    """Drives the real ``get()``: the spawn and the connection are the fakes."""
+class TestSessionListing:
+    def _patch(self, monkeypatch, recs, statuses):
+        monkeypatch.setattr(_shim._sessions, "list_sessions", lambda: recs)
+        monkeypatch.setattr(_shim, "_probe", lambda rec: statuses[rec["session_id"]])
 
-    def _lazy(self, monkeypatch, fail=0):
-        spawns, reaped = [], []
+    def test_no_sessions_points_at_new(self, monkeypatch):
+        self._patch(monkeypatch, [], {})
+        assert "attach(session='new')" in _shim.session_listing()
+
+    def test_each_session_says_whether_it_is_free_and_whether_it_has_a_window(
+        self, monkeypatch
+    ):
+        recs = [
+            {"session_id": "a", "port": 1},
+            {"session_id": "b", "port": 2},
+            {"session_id": "c", "port": 3},
+        ]
+        self._patch(
+            monkeypatch,
+            recs,
+            {
+                "a": {"lease": {"holder": None}, "viewer": True},
+                "b": {"lease": {"holder": "chat"}, "viewer": False},
+                "c": None,
+            },
+        )
+        text = _shim.session_listing()
+        assert "- a: free, viewer" in text
+        assert "- b: held by chat, no viewer" in text
+        assert "- c: unreachable" in text
+
+
+class TestBinding:
+    """Drives the real ``attach``/``connect``: the sessions and the connection
+    are the fakes."""
+
+    def _binding(self, monkeypatch, preselect=None, fail=0, lease_status=200):
+        env = SimpleNamespace(spawns=[], reaped=[], calls=[], lease_status=lease_status)
 
         class _Child:
             pid = 4242
 
         def _spawn(config, on_spawned=None):
             child = _Child()
-            spawns.append(child)
-            on_spawned(child, "sid")
-            if len(spawns) <= fail:
-                raise RuntimeError(f"spawn {len(spawns)} failed")
-            return child, "http://127.0.0.1:1/mcp", "sid"
+            env.spawns.append(child)
+            on_spawned(child, "newsid")
+            if len(env.spawns) <= fail:
+                raise RuntimeError(f"spawn {len(env.spawns)} failed")
+            return child, "http://127.0.0.1:1/mcp", "newsid"
+
+        def _call_session(base, method, path, body=None, timeout=None):
+            env.calls.append((base, method, path, body))
+            if path.endswith("/acquire"):
+                if env.lease_status == 409:
+                    return 409, {"holder": "chat", "age": 12.0}
+                return env.lease_status, {"ok": True}
+            if path.endswith("/renew"):
+                return env.renew_status(), {}
+            return 200, {}
+
+        env.renew_status = lambda: 200
 
         @contextlib.asynccontextmanager
         async def _client(url):
+            env.url = url
             yield "READ", "WRITE", None
 
         class _Session:
@@ -485,66 +584,165 @@ class TestLazySession:
                 return False
 
             async def initialize(self):
-                pass
+                return SimpleNamespace(instructions="THE GUIDANCE")
 
         monkeypatch.setattr(_shim, "spawn_session", _spawn)
+        monkeypatch.setattr(_shim, "_call_session", _call_session)
         monkeypatch.setattr(_shim, "streamablehttp_client", _client)
         monkeypatch.setattr(_shim, "ClientSession", _Session)
         monkeypatch.setattr(
-            _shim, "_reap_session", lambda child, sid: reaped.append(child)
+            _shim, "_reap_session", lambda child, sid: env.reaped.append(child)
+        )
+        monkeypatch.setattr(_shim, "session_listing", lambda: "LISTING")
+        monkeypatch.setattr(
+            _shim._sessions,
+            "resolve",
+            lambda sid: (
+                {"session_id": sid, "port": 7, "mcp_url": "http://127.0.0.1:7/mcp"}
+                if sid == "live"
+                else None
+            ),
         )
         monkeypatch.setattr(
             _shim._control_client, "start_control_detached", lambda: True
         )
-        return _shim._LazySession(config=object()), spawns, reaped
+        return _shim._Binding(config=object(), preselect=preselect), env
 
-    def _drive(self, lazy, *steps):
+    def _drive(self, binding, *steps):
         results = []
 
         async def main():
             async with anyio.create_task_group() as tg:
-                lazy.task_group = tg
+                binding.task_group = tg
                 for step in steps:
                     try:
                         results.append(await step())
-                    except RuntimeError as e:
+                    except (_shim.AttachError, _shim.NotAttached) as e:
                         results.append(str(e))
                 tg.cancel_scope.cancel()
 
         anyio.run(main)
         return results
 
-    def test_nothing_spawns_until_asked(self, monkeypatch):
-        lazy, spawns, reaped = self._lazy(monkeypatch)
-        self._drive(lazy)
-        lazy.reap()  # no child: a no-op
-        assert spawns == [] and reaped == []
+    def test_nothing_happens_until_asked(self, monkeypatch):
+        binding, env = self._binding(monkeypatch)
+        self._drive(binding)
+        binding.reap()
+        assert env.spawns == [] and env.reaped == [] and env.calls == []
 
-    def test_concurrent_requests_share_one_child(self, monkeypatch):
-        lazy, spawns, _ = self._lazy(monkeypatch)
+    def test_a_request_before_attach_says_to_attach_and_lists_sessions(
+        self, monkeypatch
+    ):
+        binding, _ = self._binding(monkeypatch)
+        [text] = self._drive(binding, binding.connect)
+        assert "`attach`" in text and "LISTING" in text
 
-        async def both():
-            out = []
+    def test_attaching_takes_the_lease_and_spawns_nothing(self, monkeypatch):
+        binding, env = self._binding(monkeypatch)
+        [text] = self._drive(binding, lambda: binding.attach("live"))
+        assert "Attached to session live" in text and "THE GUIDANCE" in text
+        assert env.spawns == []
+        base, method, path, body = env.calls[0]
+        assert (base, path) == ("http://127.0.0.1:7", "/api/lease/acquire")
+        assert body == {"token": binding.token, "force": False}
+        assert env.url == "http://127.0.0.1:7/mcp"
 
-            async def one():
-                out.append(await lazy.get())
+    def test_the_shim_only_releases_a_session_it_attached_to(self, monkeypatch):
+        binding, env = self._binding(monkeypatch)
+        self._drive(binding, lambda: binding.attach("live"))
+        binding.reap()
+        assert env.reaped == []  # not ours to stop
+        assert env.calls[-1][2] == "/api/lease/release"
+        assert env.calls[-1][3] == {"token": binding.token}
 
-            async with anyio.create_task_group() as tg:
-                tg.start_soon(one)
-                tg.start_soon(one)
-            return out
+    def test_a_held_session_is_refused_and_force_is_offered(self, monkeypatch):
+        binding, env = self._binding(monkeypatch, lease_status=409)
+        [text] = self._drive(binding, lambda: binding.attach("live"))
+        assert "held by its chat" in text and "force=true" in text
+        assert binding.session is None
+        # Nothing was acquired, so nothing is released.
+        assert not [c for c in env.calls if c[2].endswith("/release")]
 
-        [(first, second)] = self._drive(lazy, both)
-        assert first is second
-        assert len(spawns) == 1
+    def test_force_is_passed_through(self, monkeypatch):
+        binding, env = self._binding(monkeypatch)
+        self._drive(binding, lambda: binding.attach("live", force=True))
+        assert env.calls[0][3]["force"] is True
 
-    def test_a_failed_start_is_reported_then_retried(self, monkeypatch):
-        lazy, spawns, reaped = self._lazy(monkeypatch, fail=1)
-        first, second = self._drive(lazy, lazy.get, lazy.get)
-        assert "did not start: spawn 1 failed" in first
-        assert not isinstance(second, str)
-        assert len(spawns) == 2
-        assert reaped == spawns[:1]  # the failed attempt's child
+    def test_an_unknown_session_is_an_error_with_the_listing(self, monkeypatch):
+        binding, env = self._binding(monkeypatch)
+        [text] = self._drive(binding, lambda: binding.attach("gone"))
+        assert "no live session 'gone'" in text and "LISTING" in text
+        assert env.calls == []
+
+    def test_new_spawns_a_session_the_shim_owns_and_reaps_it(self, monkeypatch):
+        binding, env = self._binding(monkeypatch)
+        [text] = self._drive(binding, lambda: binding.attach("new"))
+        assert "Attached to session newsid" in text
+        assert len(env.spawns) == 1
+        assert env.calls[0][:3] == ("http://127.0.0.1:1", "POST", "/api/lease/acquire")
+        binding.reap()
+        assert env.reaped == env.spawns
+
+    def test_a_failed_new_is_reaped_and_can_be_retried(self, monkeypatch):
+        binding, env = self._binding(monkeypatch, fail=1)
+        first, second = self._drive(
+            binding, lambda: binding.attach("new"), lambda: binding.attach("new")
+        )
+        assert "could not attach" in first and "spawn 1 failed" in first
+        assert "Attached to session" in second
+        assert len(env.spawns) == 2
+        assert env.reaped == env.spawns[:1]
+
+    def test_a_preselected_session_attaches_on_first_use(self, monkeypatch):
+        binding, env = self._binding(monkeypatch, preselect="new")
+        self._drive(binding, binding.connect)
+        assert len(env.spawns) == 1
+
+    def test_a_lost_lease_unbinds_and_the_next_request_says_why(self, monkeypatch):
+        monkeypatch.setattr(_shim, "RENEW_INTERVAL", 0.01)
+        binding, env = self._binding(monkeypatch)
+        env.renew_status = lambda: 409
+
+        async def lose():
+            await binding.attach("live")
+            for _ in range(200):
+                if binding.session is None:
+                    break
+                await anyio.sleep(0.01)
+            return binding.session
+
+        async def later():
+            return await binding.connect()
+
+        gone, msg = self._drive(binding, lose, later)
+        assert gone is None
+        assert "Another holder took the session" in msg and "`attach`" in msg
+        # It handed back what it held on the way out.
+        assert env.calls[-1][2] == "/api/lease/release"
+
+    def test_a_session_that_stops_answering_unbinds_after_three_misses(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(_shim, "RENEW_INTERVAL", 0.01)
+        binding, env = self._binding(monkeypatch)
+        real = _shim._call_session
+
+        def dead(base, method, path, body=None, timeout=None):
+            if path.endswith("/renew"):
+                raise OSError("connection refused")
+            return real(base, method, path, body, timeout)
+
+        async def lose():
+            await binding.attach("live")
+            monkeypatch.setattr(_shim, "_call_session", dead)
+            for _ in range(200):
+                if binding.session is None:
+                    break
+                await anyio.sleep(0.01)
+            return binding.lost
+
+        [lost] = self._drive(binding, lose)
+        assert "stopped answering" in lost
 
 
 # --------------------------------------------------------------------------- #
@@ -663,25 +861,91 @@ class TestEndToEnd:
             send({"jsonrpc": "2.0", "method": "notifications/initialized"})
             send({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
             tools = json.loads(shim.stdout.readline())["result"]["tools"]
-            assert {"start_kernel", "execute_code"} <= {t["name"] for t in tools}
+            assert {"start_kernel", "execute_code", "attach"} <= {
+                t["name"] for t in tools
+            }
+            assert "attach" in init["instructions"].split("\n")[0]
 
-            # Nothing has needed the child yet, so there is none.
+            # Nothing has needed a session yet, so there is none.
             sessions_dir = tmp_path / ".local/state/biopb/mcp/sessions"
             reg_dir = tmp_path / ".local/state/biopb/sessions"
             assert list(sessions_dir.glob("*.log")) == []
             assert list(reg_dir.glob("*.json")) == []
 
-            # The first tool call starts it.
-            send(
-                {
-                    "jsonrpc": "2.0",
-                    "id": 3,
-                    "method": "tools/call",
-                    "params": {"name": "server_status", "arguments": {}},
-                }
-            )
-            status = json.loads(shim.stdout.readline())["result"]
+            def call(shim, id_, name, arguments=None):
+                shim.stdin.write(
+                    (
+                        json.dumps(
+                            {
+                                "jsonrpc": "2.0",
+                                "id": id_,
+                                "method": "tools/call",
+                                "params": {"name": name, "arguments": arguments or {}},
+                            }
+                        )
+                        + "\n"
+                    ).encode()
+                )
+                shim.stdin.flush()
+                while True:  # skip notifications (tools/list_changed)
+                    msg = json.loads(shim.stdout.readline())
+                    if msg.get("id") == id_:
+                        break
+                result = msg["result"]
+                return result, result["content"][0]["text"]
+
+            # Unattached, a tool is an error that says to attach -- and starts
+            # nothing.
+            result, text = call(shim, 3, "server_status")
+            assert result["isError"] is True and "`attach`" in text
+            assert list(sessions_dir.glob("*.log")) == []
+
+            # `attach new` starts a session this shim owns.
+            result, text = call(shim, 4, "attach", {"session": "new"})
+            assert result.get("isError") is not True, text
+            assert "Attached to session" in text
+            status, _ = call(shim, 5, "server_status")
             assert status.get("isError") is not True, status
+
+            # A second client sees that session as held, and cannot take it.
+            other = subprocess.Popen(
+                [sys.executable, "-m", "biopb_mcp.mcp", "--transport", "stdio"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                env=env,
+            )
+            try:
+                other.stdin.write(
+                    (
+                        json.dumps(
+                            {
+                                "jsonrpc": "2.0",
+                                "id": 1,
+                                "method": "initialize",
+                                "params": {
+                                    "protocolVersion": "2025-03-26",
+                                    "capabilities": {},
+                                    "clientInfo": {"name": "t2", "version": "0"},
+                                },
+                            }
+                        )
+                        + "\n"
+                    ).encode()
+                )
+                other.stdin.flush()
+                json.loads(other.stdout.readline())
+                other.stdin.write(
+                    b'{"jsonrpc": "2.0", "method": "notifications/initialized"}\n'
+                )
+                _, listing = call(other, 2, "attach")
+                session_id = next(reg_dir.glob("*.json")).stem
+                assert f"{session_id}: held by agent" in listing, listing
+                result, text = call(other, 3, "attach", {"session": session_id})
+                assert result["isError"] is True and "held by its agent" in text
+            finally:
+                other.stdin.close()
+                other.wait(timeout=30)
 
             # The owned child logs its PID (uvicorn's "Started server process
             # [pid]") and its dynamic listen URL (_server.run) to its own
@@ -724,11 +988,11 @@ class TestEndToEnd:
 class TestServe:
     def test_reaps_the_child_on_the_way_out(self, monkeypatch):
         """The reaper and watchdog are armed before any child exists, over the
-        lazy session, and serve reaps whatever it holds when the bridge ends."""
+        binding, and serve reaps whatever it holds when the bridge ends."""
         armed, reaped = [], []
 
-        async def _fake_serve(lazy):
-            lazy._own("CHILD", "sid")
+        async def _fake_serve(binding):
+            binding._own("CHILD", "sid")
 
         monkeypatch.setattr(_shim, "_install_shim_reaper", armed.append)
         monkeypatch.setattr(_shim, "_install_client_death_watchdog", armed.append)

@@ -60,7 +60,7 @@ from starlette.background import BackgroundTask
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-from . import _app, _http, _notebook, _scratch, _writers
+from . import _app, _http, _lease, _notebook, _scratch, _writers
 
 logger = logging.getLogger(__name__)
 
@@ -337,8 +337,60 @@ async def _api_status(request):
             # this one probe: chat_enabled says what the page leads with,
             # agentless says who owns the reap -- and so whether to offer a stop.
             "agentless": _agentless,
+            # Who this session answers to, and whether it has a window: what an
+            # agent choosing a session to attach to needs to know about each.
+            "lease": _lease.snapshot(),
+            "viewer": bool(host.viewer.has_window),
         }
     )
+
+
+async def _api_lease(_request):
+    return JSONResponse(_lease.snapshot())
+
+
+async def _lease_token(request):
+    """``(token, payload, None)`` from the body, or ``(None, None, 400)``."""
+    payload, err = await _http.json_body(request)
+    if err is not None:
+        return None, None, err
+    token = payload.get("token")
+    if not isinstance(token, str) or not token:
+        return (
+            None,
+            None,
+            JSONResponse({"error": "missing 'token'"}, status_code=400),
+        )
+    return token, payload, None
+
+
+async def _api_lease_acquire(request):
+    """Take the agent lease for ``token``; 409 with the holder if it is held.
+
+    Only the agent kind is takeable here: chat takes its own lease in-process
+    with its first turn.
+    """
+    token, payload, err = await _lease_token(request)
+    if err is not None:
+        return err
+    result = _lease.acquire("agent", token, force=bool(payload.get("force")))
+    return JSONResponse(result, status_code=200 if result["ok"] else 409)
+
+
+async def _api_lease_renew(request):
+    token, _, err = await _lease_token(request)
+    if err is not None:
+        return err
+    if not _lease.renew(token):
+        return JSONResponse({"error": "lease not held", **_lease.snapshot()}, 409)
+    return JSONResponse({"ok": True})
+
+
+async def _api_lease_release(request):
+    token, _, err = await _lease_token(request)
+    if err is not None:
+        return err
+    return JSONResponse({"released": _lease.release(token)})
 
 
 # How long the stop route waits before tearing the process down. The teardown
@@ -384,6 +436,10 @@ _ROUTES = [
     ("/api/kernel/interrupt", ["POST"], _route(_api_interrupt)),
     ("/api/kernel/restart", ["POST"], _route(_api_restart)),
     ("/api/status", ["GET"], _route(_api_status)),
+    ("/api/lease", ["GET"], _route(_api_lease)),
+    ("/api/lease/acquire", ["POST"], _http.json_route(_api_lease_acquire)),
+    ("/api/lease/renew", ["POST"], _http.json_route(_api_lease_renew)),
+    ("/api/lease/release", ["POST"], _http.json_route(_api_lease_release)),
 ]
 
 # Served only where this session owns its own reap. Under ``api`` rather than a

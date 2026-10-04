@@ -321,6 +321,7 @@ def test_api_sessions_kernel_unknown_when_child_unreachable(control):
     # no stop button that would only 404.
     assert sessions[0]["chat"] is False
     assert sessions[0]["can_stop"] is False
+    assert sessions[0]["holder"] is None
 
 
 @pytest.mark.parametrize("flag, expected", [(True, True), (False, False)])
@@ -346,6 +347,7 @@ def test_probe_session_maps_child_health(flag, expected):
                     "busy": False,
                     "chat_enabled": flag,
                     "agentless": flag,
+                    "lease": {"holder": "agent" if flag else None},
                 }
             ).encode()
             self.send_response(200)
@@ -367,6 +369,7 @@ def test_probe_session_maps_child_health(flag, expected):
             "kernel": "ready",
             "chat": expected,
             "agentless": expected,
+            "holder": "agent" if expected else None,
         }
     finally:
         server.shutdown()
@@ -407,6 +410,7 @@ def test_probe_session_flags_default_off_on_an_older_child():
             "kernel": "none",
             "chat": False,
             "agentless": False,
+            "holder": None,
         }
     finally:
         server.shutdown()

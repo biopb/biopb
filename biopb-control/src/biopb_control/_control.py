@@ -634,7 +634,12 @@ def _kernel_state(health: dict) -> str:
 # What a session probe reports when the child cannot be reached or understood.
 # Every field degrades to its least-claiming value: an unknown kernel, no chat,
 # and no stop offered — never a button that would 404.
-_PROBE_UNKNOWN = {"kernel": "unknown", "chat": False, "agentless": False}
+_PROBE_UNKNOWN = {
+    "kernel": "unknown",
+    "chat": False,
+    "agentless": False,
+    "holder": None,
+}
 
 
 async def _probe_session(client: httpx.AsyncClient, rec: dict) -> dict:
@@ -670,6 +675,10 @@ async def _probe_session(client: httpx.AsyncClient, rec: dict) -> dict:
             "kernel": _kernel_state(health),
             "chat": bool(health.get("chat_enabled")),
             "agentless": bool(health.get("agentless")),
+            # Who the session answers to (`agent`, `chat`, or nobody): what an
+            # agent choosing a session to attach to needs, and the dashboard
+            # can show.
+            "holder": (health.get("lease") or {}).get("holder"),
         }
     except Exception:  # noqa: BLE001 - a probe is decorative; never fail the list
         return dict(_PROBE_UNKNOWN)
@@ -1192,6 +1201,7 @@ def build_app(
                 # everywhere, and stopping a session is no more destructive than
                 # the kernel restart already there.
                 "can_stop": probe["agentless"],
+                "holder": probe["holder"],
             }
             for rec, probe in zip(records, probes, strict=True)
         ]

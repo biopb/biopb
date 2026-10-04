@@ -203,6 +203,9 @@ export async function sendTurn(
   }
   if (r.ok || r.status === 202) return null;
   const d = await r.json().catch(() => ({}) as Record<string, unknown>);
+  // A 409 is either this chat's own turn or another holder of the session; only
+  // the second carries `held_by`, and its message says who.
+  if (r.status === 409 && d.held_by) return String(d.error);
   if (r.status === 409) return "A turn is already running. Wait for it, or cancel it.";
   return String(d.error || `send failed (${r.status})`);
 }

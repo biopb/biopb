@@ -110,16 +110,33 @@ class TestMainDispatch:
         from biopb_mcp.mcp import _shim
 
         calls = []
+        monkeypatch.delenv("BIOPB_SESSION", raising=False)
         monkeypatch.setattr(
-            _shim, "serve", lambda config, port: calls.append((config, port))
+            _shim,
+            "serve",
+            lambda config, port, session=None: calls.append((config, port, session)),
         )
         assert main(["--transport", "stdio", "--port", "9123"]) == 0
-        assert calls == [({}, 9123)]
+        assert calls == [({}, 9123, None)]
+
+    def test_stdio_session_comes_from_the_flag_or_the_environment(self, monkeypatch):
+        from biopb_mcp.mcp import _shim
+
+        calls = []
+        monkeypatch.setattr(
+            _shim,
+            "serve",
+            lambda config, port, session=None: calls.append(session),
+        )
+        monkeypatch.setenv("BIOPB_SESSION", "from-env")
+        main(["--transport", "stdio"])
+        main(["--transport", "stdio", "--session", "new"])
+        assert calls == ["from-env", "new"]
 
     def test_stdio_bridge_failure_exits_nonzero(self, monkeypatch):
         from biopb_mcp.mcp import _shim
 
-        def _boom(config, port):
+        def _boom(config, port, session=None):
             raise TimeoutError("daemon never came up")
 
         monkeypatch.setattr(_shim, "serve", _boom)

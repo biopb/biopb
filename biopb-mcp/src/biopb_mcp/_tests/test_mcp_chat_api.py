@@ -14,7 +14,7 @@ from starlette.applications import Starlette
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
-from biopb_mcp.mcp import _chat, _chat_api, _kernel_rpc, _model, _observe
+from biopb_mcp.mcp import _chat, _chat_api, _kernel_rpc, _lease, _model, _observe
 
 # The shape the launcher actually threads: `load_config()` returns a **dict**,
 # and every consumer reads it with `get_setting`, which falls back to
@@ -39,8 +39,10 @@ def configured(tmp_path, monkeypatch):
     cfg["chat"] = {"model": "test-model"}
     _chat_api.configure(cfg, agentless=True)
     _chat.reset()
+    _lease._reset()
     yield cfg
     _chat.reset()
+    _lease._reset()
     remove_credential(_model.KEY_NAME)
 
 
@@ -78,6 +80,7 @@ class TestStatus:
             "ready": True,
             "reason": None,
             "busy": False,
+            "lease": {"holder": None},
             "model": "test-model",
             # Nothing folded yet. Reported because the pane renders every
             # message either way, so compaction would otherwise be invisible to
@@ -748,3 +751,85 @@ class TestProviderModelList:
 
         monkeypatch.setattr(_model.httpx, "AsyncClient", explode)
         assert asyncio.run(_model.list_models({"chat": {}})) == []
+
+
+class TestLease:
+    """Chat holds the session while it is working, and never beside an agent."""
+
+    def test_the_first_turn_takes_the_session(self, client, monkeypatch):
+        async def answer(messages, tools):
+            return {"role": "assistant", "content": "hi"}
+
+        monkeypatch.setattr(_model, "make_model", lambda cfg: answer)
+        assert _lease.snapshot()["holder"] is None
+        assert client.post("/chat/turn", json={"text": "hello"}).status_code == 202
+        assert _lease.snapshot()["holder"] == "chat"
+
+    def test_an_agent_holding_the_session_refuses_the_turn(self, client):
+        _lease.acquire("agent", "a")
+        r = client.post("/chat/turn", json={"text": "hello"})
+        assert r.status_code == 409
+        body = r.json()
+        assert body["held_by"] == "agent" and "busy" not in body
+        assert _chat.history() == []
+
+    def test_history_is_readable_while_an_agent_holds_it(self, client):
+        _lease.acquire("agent", "a")
+        r = client.get("/api/chat/history")
+        assert r.status_code == 200
+        assert r.json()["lease"]["holder"] == "agent"
+
+    def test_reading_history_does_not_take_or_renew_it(self, client):
+        client.get("/api/chat/history")
+        client.get("/api/chat/status")
+        assert _lease.snapshot()["holder"] is None
+
+    def test_reset_lets_go_of_the_session(self, client):
+        _lease.acquire("chat", _lease.CHAT_TOKEN)
+        assert client.post("/chat/reset", json={}).status_code == 200
+        assert _lease.snapshot()["holder"] is None
+
+    def test_release_lets_go_and_says_so(self, client):
+        _lease.acquire("chat", _lease.CHAT_TOKEN)
+        r = client.post("/chat/release", json={})
+        assert r.json() == {"released": True}
+        assert _lease.snapshot()["holder"] is None
+
+    def test_release_is_refused_mid_turn(self, client, monkeypatch):
+        async def pending():
+            task = asyncio.create_task(asyncio.sleep(5))
+            monkeypatch.setattr(_chat_api, "_turn_task", task)
+            return task
+
+        loop = asyncio.new_event_loop()
+        task = loop.run_until_complete(pending())
+        try:
+            r = client.post("/chat/release", json={})
+        finally:
+            task.cancel()
+            loop.run_until_complete(asyncio.sleep(0))
+            loop.close()
+        assert r.status_code == 409 and r.json()["busy"] is True
+
+    def test_losing_the_session_drops_what_chat_had_queued(self, client):
+        _lease.on_change(_chat_api._on_lease_change)
+        _lease.acquire("chat", _lease.CHAT_TOKEN)
+        _chat.queue_user("stale")
+        _lease.acquire("agent", "a", force=True)
+        assert _chat.queued() == []
+
+    def test_taking_the_session_mid_turn_cancels_the_turn(self, monkeypatch):
+        _lease.on_change(_chat_api._on_lease_change)
+
+        async def go():
+            task = asyncio.create_task(asyncio.sleep(5))
+            monkeypatch.setattr(_chat_api, "_turn_task", task)
+            _lease.acquire("chat", _lease.CHAT_TOKEN)
+            _lease.acquire("agent", "a", force=True)
+            try:
+                await task
+            except asyncio.CancelledError:
+                return True
+            return False
+
+        assert asyncio.run(go())

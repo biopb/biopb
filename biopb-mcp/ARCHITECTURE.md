@@ -29,8 +29,9 @@ agreement on what a layer is (label sets, axes, pyramids).
 ## Process structure
 
 Everything the package runs is a chain of four processes, each spawned and reaped
-by the one above it. The whole chain is **client-scoped**: it comes up when an MCP
-client connects and is gone when that client disconnects.
+by the one above it. The chain a shim spawns is **client-scoped**: it comes up when
+an MCP client attaches to `new` and is gone when that client disconnects. A shim
+can instead attach to a session someone else started, which outlives it.
 
 ```
               AI agent / MCP client
@@ -87,21 +88,31 @@ contract; see [`../biopb-control/ARCHITECTURE.md`](../biopb-control/ARCHITECTURE
 
 ## Components
 
-### Shim-owned MCP sessions
+### Attaching a client to a session
 
-Shim (`--transport stdio`) is the interface the mcp clients (claude code) see, which
+Shim (`--transport stdio`) is the interface the mcp clients (claude code) see. It
+starts **unbound** and owns nothing until the agent calls its local `attach` tool:
 
-1. **answers the handshake and the list requests itself**, from the FastMCP
-   server the child runs (imported, never served), so a client that never calls
-   a tool costs no child,
-2. on the **first request that needs one**, start-and-forgets the control plane and
-   **spawns its own ephemeral session child** (FastMCP/uvicorn + the kernel host)
-   on a **dynamic OS-assigned port**; the child **registers itself** with the
-   control, under an id the shim mints,
-3. **bridges** stdio JSON-RPC ↔ that child's `/mcp` until the client closes stdin;
-   a child that fails to start is a tool error, retried by the next call,
-4. **reaps** the child and its kernel grandchild as a tree (POSIX process group +
+1. **Unbound**, it answers the handshake and the list requests itself, from the
+   FastMCP server a session runs (imported, never served), plus `attach`; a
+   client that never attaches costs no session. Every other tool is an error
+   that lists the live sessions and whether each is free.
+2. `attach(session=<id>)` takes the session's **lease** and bridges stdio
+   JSON-RPC ↔ its `/mcp`. The tool list becomes the session's own. The session is
+   not the shim's: the shim renews the lease on a short beat and releases it on
+   the way out, and never stops the session. A lease that is lost (another
+   holder forced it, or the session stopped answering) unbinds the shim.
+3. `attach(session='new')` start-and-forgets the control plane and **spawns its
+   own ephemeral session child** (FastMCP/uvicorn + the kernel host) on a
+   **dynamic OS-assigned port**; the child **registers itself** with the
+   control, under an id the shim mints, and the shim leases it from birth.
+   This one it **owns**: it is reaped as a tree (POSIX process group +
    parent-death pipe; Windows Job Object, #403) on the way out.
+   `--session new` (or `$BIOPB_SESSION`) does this on the first request that
+   needs a session, with no `attach` call.
+
+A session answers to one holder at a time, an `agent` or the built-in `chat`
+(`mcp/_lease.py`); the other kind is refused while the lease lives.
 
 ### The kernel
 
