@@ -998,7 +998,7 @@ class TestRemote:
     def test_a_control_that_serves_no_mcp_is_refused_before_a_lease(self, monkeypatch):
         binding, env = self._remote(monkeypatch, health={"mcp_proxied": False})
         (text,) = self._drive(binding, lambda: binding.attach("s1"))
-        assert "--remote" in text and "does not serve /mcp" in text
+        assert "enforces a token" in text and "does not serve /mcp" in text
         assert not any(path.endswith("/acquire") for _, _, path, _ in env.calls)
 
     def test_a_refused_token_says_so(self, monkeypatch):

@@ -624,11 +624,15 @@ _KERNEL_PROBE_TIMEOUT = 0.6
 # ``None`` (biopb#420): a wedged upstream that accepts the connection but never
 # answers must fail eventually, not hang the request forever. The ``read`` bound
 # is per read-event, not total, and is set generously — every upstream buffers
-# its whole response before sending (no long-poll / SSE / chunked-with-gaps path,
+# its whole response before sending (no long-poll / chunked-with-gaps path, bar
+# the /mcp stream below,
 # so a large slice/render streams without inter-chunk stalls), so 300s only trips
 # on a genuinely stuck upstream, never on legitimately large or slow-computed
 # transfers. ``connect``/``write``/``pool`` are short since every hop is loopback.
 _PROXY_TIMEOUT = httpx.Timeout(connect=10.0, read=300.0, write=60.0, pool=10.0)
+# For a stream that is idle by design (a session's /mcp notification stream); a
+# dead upstream still ends it, by the connection closing.
+_STREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=60.0, pool=10.0)
 
 
 def _kernel_state(health: dict) -> str:
@@ -1036,7 +1040,7 @@ def build_app(
     ``algorithms`` is the algorithm plane the ``/api/algorithms`` verbs drive;
     by default one over the user's registry.
     """
-    session_roots = _session_proxy_roots(loopback_bound, token is not None)
+    session_roots = _session_proxy_roots(loopback_bound, bool(token))
     if algorithms is None:
         algorithms = AlgorithmPlane()
     url_prefix = normalize_url_prefix(url_prefix)
@@ -1603,8 +1607,16 @@ def build_app(
             if k.lower() not in (b"host", b"origin")
         ]
         body = await request.body()
+        # /mcp's GET stream carries server notifications and can sit idle for as
+        # long as the agent does, so it has no read timeout; the others keep the
+        # client's.
+        timeout = (
+            _STREAM_TIMEOUT
+            if segments[0] == _SESSION_MCP_ROOT
+            else httpx.USE_CLIENT_DEFAULT
+        )
         upstream = session_client.build_request(
-            request.method, target, headers=headers, content=body
+            request.method, target, headers=headers, content=body, timeout=timeout
         )
         try:
             resp = await session_client.send(upstream, stream=True)

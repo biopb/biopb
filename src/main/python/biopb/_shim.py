@@ -470,8 +470,8 @@ class _Remote:
         if self._ask("GET", "/health").get("mcp_proxied") is not True:
             raise AttachError(
                 f"the control at {self.url} does not serve /mcp for remote "
-                "agents: it must run on a public bind (`biopb control start "
-                "--remote`)"
+                "agents: it serves it only when it enforces a token "
+                "(`biopb control start --token ...`)"
             )
 
     def states(self):
