@@ -1523,7 +1523,7 @@ function Invoke-BiopbInstall {
 
     # Direct file:// references pin each package to this exact wheel.
     $mcpReq    = "biopb-mcp[napari] @ $(([System.Uri]$mcpWhl).AbsoluteUri)"
-    $biopbReq  = "biopb[tensor]==$($versions.biopb)"
+    $biopbReq  = "biopb[tensor,shim]==$($versions.biopb)"
     $tensorReq = "biopb-tensor-server[$tensorExtras] @ $(([System.Uri]$tensorWhl).AbsoluteUri)"
     $controlReq  = "biopb-control @ $(([System.Uri]$controlWhl).AbsoluteUri)"
 

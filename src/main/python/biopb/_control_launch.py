@@ -1,4 +1,4 @@
-"""Start the biopb control for the stdio shim.
+"""Start the biopb control for the shim.
 
 Asking a running control anything is the core ``biopb`` SDK's job (its
 top-level ``ensure_data_plane``/``algorithms``/etc., backed by the private
@@ -11,34 +11,20 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
-import sys
 import threading
-from pathlib import Path
+
+from . import _agents
 
 logger = logging.getLogger(__name__)
 
 
 def _biopb_executable() -> str | None:
-    """Locate the core ``biopb`` CLI executable, or ``None`` if not found.
+    """The core ``biopb`` CLI executable, or ``None`` if not found.
 
-    Prefer the console script installed alongside this interpreter (the venv /
-    uv-tool ``Scripts``/``bin`` dir, where ``biopb = biopb.cli:app`` lands), so we
-    hit the same environment that installed biopb-mcp even when PATH is not
-    inherited (GUI agents launch us without a shell PATH). Fall back to PATH.
-    ``None`` when neither resolves -- the caller then skips the best-effort control
-    start and the session child surfaces the error on first data-plane use.
+    ``None`` makes the caller skip the best-effort control start; the session
+    then surfaces the error on first data-plane use.
     """
-    import shutil
-
-    name = "biopb.exe" if os.name == "nt" else "biopb"
-    # Do NOT resolve() sys.executable: a venv's `python` is a symlink to the base
-    # interpreter, so resolving would follow it OUT of the venv bin/ (where the
-    # console script actually lives) to the base dir, and the sibling lookup would
-    # miss -- exactly the symlinked-venv + no-PATH case this is meant to cover.
-    sibling = Path(sys.executable).parent / name
-    if sibling.exists():
-        return str(sibling)
-    return shutil.which("biopb")
+    return _agents.console_script("biopb")
 
 
 def start_control_detached() -> bool:

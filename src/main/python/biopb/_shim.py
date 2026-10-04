@@ -811,12 +811,6 @@ def serve(session=None):
     free session, else a new one). That is for a client that cannot follow
     ``list_changed``.
     """
-    logger.warning(
-        "stdio is served by bridging to a biopb-mcp session the agent attaches "
-        "to. Native http is recommended where the client supports it: run a "
-        "persistent `biopb-mcp --transport http` server and attach with `claude "
-        "mcp add --transport http biopb http://127.0.0.1:<port>/mcp`."
-    )
     binding = _Binding(preselect=session or None)
     _install_release_on_signal(binding.release)
     _install_client_death_watchdog(binding.release)

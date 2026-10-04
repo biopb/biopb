@@ -529,7 +529,7 @@ def _prune_spool():
     """Keep only the newest :data:`_SPOOL_KEEP` spooled notebooks; best-effort.
 
     Run after the current one is written, so the newest always survives -- the
-    same shape as the old shim log pruning, for the same reason.
+    the point being that the one just written always survives.
     """
     from .._config import get_workflow_dir
 

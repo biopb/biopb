@@ -93,7 +93,7 @@ contract; see [`../biopb-control/ARCHITECTURE.md`](../biopb-control/ARCHITECTURE
 
 ### Attaching a client to a session
 
-Shim (`--transport stdio`) is the interface the mcp clients (claude code) see. It
+The shim (`biopb-shim`) is the interface the mcp clients (claude code) see. It
 starts **unbound** and owns nothing until the agent calls its local `attach` tool:
 
 1. **Unbound**, it answers the handshake with a paragraph saying to call `attach`,

@@ -92,8 +92,7 @@ are produced.
   removes them.
 - The installer also registers the biopb MCP server with any detected agent
   (Claude Code/Desktop, Codex CLI, Cursor, opencode) and can install opencode if
-  none is found. biopb-mcp speaks MCP over **stdio**, so the agent spawns
-  `biopb-mcp --transport stdio` itself — there is no separate server to start by
+  none is found. the agent spawns `biopb-shim`, which speaks MCP over **stdio**, itself — there is no separate server to start by
   hand. The agent first attaches to a session -- one that is already running, or
   a new one the control launches, which keeps running until you stop it from the
   dashboard (Codex is given the newest free session, or a new one, without

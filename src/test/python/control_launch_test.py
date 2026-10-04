@@ -1,5 +1,6 @@
 """The shim's launch of the biopb control (``start_control_detached``)."""
 
+import sys
 from unittest.mock import MagicMock
 
 import pytest
@@ -68,7 +69,7 @@ class TestBiopbExecutable:
         name = "biopb.exe" if os.name == "nt" else "biopb"
         sibling = bindir / name
         sibling.write_text("")
-        monkeypatch.setattr(_control_client.sys, "executable", str(bindir / "python"))
+        monkeypatch.setattr(sys, "executable", str(bindir / "python"))
         assert _control_client._biopb_executable() == str(sibling)
 
     def test_prefers_sibling_when_interpreter_is_symlinked(self, tmp_path, monkeypatch):
@@ -95,7 +96,7 @@ class TestBiopbExecutable:
         except (OSError, NotImplementedError):
             pytest.skip("symlinks unavailable on this platform/privilege")
 
-        monkeypatch.setattr(_control_client.sys, "executable", str(venv_bin / "python"))
+        monkeypatch.setattr(sys, "executable", str(venv_bin / "python"))
         monkeypatch.setattr(shutil, "which", lambda n: None)
         assert _control_client._biopb_executable() == str(sibling)
 
@@ -105,6 +106,6 @@ class TestBiopbExecutable:
         from biopb import _control_launch as _control_client
 
         # An interpreter dir with no biopb sibling -> resolution falls to PATH.
-        monkeypatch.setattr(_control_client.sys, "executable", str(tmp_path / "python"))
+        monkeypatch.setattr(sys, "executable", str(tmp_path / "python"))
         monkeypatch.setattr(shutil, "which", lambda n: "/usr/bin/biopb")
         assert _control_client._biopb_executable() == "/usr/bin/biopb"

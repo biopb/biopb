@@ -1498,7 +1498,7 @@ install_biopb() {
     # `biopb[tensor]`, the control plane's `biopb`) to the downloaded set; the
     # SDK is pinned exactly to its PyPI release.
     mcp_req="biopb-mcp[napari] @ file://$mcp_whl"
-    biopb_req="biopb[tensor]==$sdk_pin"
+    biopb_req="biopb[tensor,shim]==$sdk_pin"
     tensor_req="biopb-tensor-server[$TENSOR_EXTRAS] @ file://$tensor_whl"
     control_req="biopb-control @ file://$control_whl"
 

@@ -87,21 +87,25 @@ class AgentError(Exception):
 # --------------------------------------------------------------------------- #
 
 
-def _mcp_executable() -> Optional[str]:
-    """Absolute path to the ``biopb-shim`` console script, or ``None`` if not found.
+def console_script(name: str) -> Optional[str]:
+    """Absolute path to the console script *name*, or ``None`` if not found.
 
     Prefer the script installed beside this interpreter (the venv / uv-tool
-    ``Scripts``/``bin`` dir where ``biopb-shim`` lands), so we register the same
-    environment that shipped biopb even when PATH is not inherited; fall back to
-    PATH. Mirrors ``biopb._control_launch._biopb_executable`` — do NOT
-    ``resolve()`` ``sys.executable`` first, or a symlinked venv python would lead
+    ``Scripts``/``bin`` dir), so we hit the same environment that shipped biopb
+    even when PATH is not inherited (GUI clients launch us without a shell PATH);
+    fall back to PATH. Do NOT ``resolve()`` ``sys.executable`` first: a venv's
+    ``python`` is a symlink to the base interpreter, and following it would lead
     the sibling lookup out of the venv bin dir.
     """
-    name = "biopb-shim.exe" if os.name == "nt" else "biopb-shim"
-    sibling = Path(sys.executable).parent / name
+    sibling = Path(sys.executable).parent / (name + (".exe" if os.name == "nt" else ""))
     if sibling.exists():
         return str(sibling)
-    return shutil.which("biopb-shim")
+    return shutil.which(name)
+
+
+def _mcp_executable() -> Optional[str]:
+    """Absolute path to the ``biopb-shim`` console script, or ``None``."""
+    return console_script("biopb-shim")
 
 
 def _mcp_command() -> str:
