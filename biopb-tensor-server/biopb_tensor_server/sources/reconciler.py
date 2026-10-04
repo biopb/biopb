@@ -181,7 +181,7 @@ class Reconciler:
 
         # Deferred registration. While ``_defer_registration`` is set a claim is
         # committed to the catalog only (a ``pending`` row) and registered later,
-        # by a worker or by the first read that needs it. ``_pending`` maps each
+        # by a worker or when a client resolves it. ``_pending`` maps each
         # such source_id to its display url; ``_pending_failed`` maps those among
         # them whose registration raised to the error (they are retried, but are
         # not waited for).
@@ -382,14 +382,22 @@ class Reconciler:
         return True
 
     def materialize(self, source_id: str) -> None:
-        """Register a pending source for a reader that needs it now.
+        """Register a pending source now, for a client that resolved it.
 
         Returns once the source is registered, or is not pending (unknown,
-        removed). Raises why it cannot be: ``SourceRegistrationError`` when its
-        registration failed, and an unresolved error when it has not completed.
+        removed). Raises ``SourceRegistrationError`` when its registration failed.
         """
         if self.ensure_registered(source_id):
             return
+        self.check_registered(source_id)
+
+    def check_registered(self, source_id: str) -> None:
+        """Raise why a read of a pending source cannot be served; never registers.
+
+        ``SourceRegistrationError`` when its registration failed, an unresolved
+        error while it waits -- either way the client resolves it. Returns for a
+        source that is not pending (unknown, registered, removed).
+        """
         with self._lock:
             if source_id not in self._pending:
                 return
@@ -397,7 +405,7 @@ class Reconciler:
         if error:
             raise SourceRegistrationError(source_id, error)
         raise SourceUnresolvedError(
-            f"source {source_id!r} is unresolved: its registration has not run yet"
+            f"source {source_id!r} is unresolved: resolve it to register it"
         )
 
     def _mark_registration_failed(self, source_id: str, errors: List[str]) -> None:

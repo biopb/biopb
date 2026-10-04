@@ -211,7 +211,7 @@ class SourceManager:
         self._walk_threads = walk_threads
         # Background registration of what the first scan claims
         # (``registration_workers`` threads; 0 registers inline, as it always
-        # did). A read that needs a source before its turn registers it itself.
+        # did). A client that resolves a source before its turn registers it itself.
         self._registration_worker: Optional[RegistrationWorker] = None
         if registration_workers > 0:
             self._registration_worker = RegistrationWorker(
@@ -224,9 +224,11 @@ class SourceManager:
         # whenever that registration happens to finish (see
         # ``_notify_source_committed``).
         self._deferred: Dict[str, float] = {}
-        set_materializer = getattr(server.sources, "set_materializer", None)
-        if set_materializer is not None:
-            set_materializer(self._reconciler.materialize)
+        set_pending_hooks = getattr(server.sources, "set_pending_hooks", None)
+        if set_pending_hooks is not None:
+            set_pending_hooks(
+                self._reconciler.materialize, self._reconciler.check_registered
+            )
 
     @property
     def roots(self) -> Roots:

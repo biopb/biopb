@@ -939,7 +939,7 @@ class ServerConfig:
             "which is most of the time a large site takes to start; with this on, "
             "the scan only claims them, every source is in the catalog at once "
             "(unresolved, reason 'pending') and fills in as it is registered, and "
-            "a read that needs one registers it immediately. Raise it on storage "
+            "resolving one registers it immediately. Raise it on storage "
             "that serves many reads at once (network filesystems); 0 registers "
             "each source as it is found, so the catalog is complete when the "
             "first scan is."

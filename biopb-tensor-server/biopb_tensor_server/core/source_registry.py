@@ -73,14 +73,22 @@ class SourceRegistry:
         self._lock = threading.RLock()
         self._on_register = on_register
         self._materializer: Optional[Callable[[str], None]] = None
+        self._pending_check: Optional[Callable[[str], None]] = None
 
-    def set_materializer(self, materializer: Optional[Callable[[str], None]]) -> None:
-        """Set what :meth:`get_registered` calls when a source is not registered.
+    def set_pending_hooks(
+        self,
+        materializer: Optional[Callable[[str], None]],
+        pending_check: Optional[Callable[[str], None]],
+    ) -> None:
+        """Wire what the registry does for a claimed source that is not registered.
 
-        It registers the source if it can (a claimed source whose registration was
-        deferred), and raises why if it cannot.
+        *materializer* registers it (a source whose registration was deferred) and
+        raises why it cannot; :meth:`materialize` calls it. *pending_check* only
+        raises why a read of it cannot be served, never registering;
+        :meth:`get_registered` calls it.
         """
         self._materializer = materializer
+        self._pending_check = pending_check
 
     def register(self, source_id: str, adapter: SourceAdapter) -> SourceAdapter:
         """Register a data source, in canonical axis order.
@@ -191,14 +199,25 @@ class SourceRegistry:
             return self._sources.get(source_id)
 
     def get_registered(self, source_id: str) -> Optional[SourceAdapter]:
-        """:meth:`get`, registering the source on a miss if it is claimed but
-        not registered yet.
+        """:meth:`get`, raising when the source is claimed but not registered.
 
-        What a reader of the source's data or tensors uses. The internal callers
-        that only ask whether it is registered, or read its url, use :meth:`get`:
-        they must not pay for a registration. Raises what the materializer raises
-        when the registration failed, and returns None for an unknown source.
+        What a reader of the source's data or tensors uses: a pending source is
+        not read until a client resolves it (:meth:`materialize`). Raises why it
+        cannot be read -- unresolved while its registration is waiting, a
+        registration error once it failed -- and returns None for an unknown
+        source. The internal callers that only ask whether it is registered, or
+        read its url, use :meth:`get`.
         """
+        adapter = self.get(source_id)
+        if adapter is None and self._pending_check is not None:
+            self._pending_check(source_id)
+            adapter = self.get(source_id)  # registered while we checked
+        return adapter
+
+    def materialize(self, source_id: str) -> Optional[SourceAdapter]:
+        """Register a claimed source now, if it is waiting to be, and return its
+        adapter (None for an unknown source). The ``resolve`` action's entry;
+        raises the registration's error when it fails."""
         adapter = self.get(source_id)
         if adapter is None and self._materializer is not None:
             self._materializer(source_id)

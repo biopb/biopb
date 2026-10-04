@@ -237,16 +237,18 @@ and registering contend, and a held pool lets every claim be committed first, so
 catalog exists, pending, before any file is opened. A rescan does not hold it again; it
 registers what it finds inline.
 
-- **A read registers it at once.** The server's read paths and the upload manager use
-  `SourceRegistry.get_registered`, which on a registry miss calls the reconciler's
-  `materialize`; it is single-flight per source, so a read racing the worker shares one
-  registration, and it raises `SourceRegistrationError` for a failed one. Callers that only
-  ask whether a source is registered keep `get`, which is `None` for a pending source.
-  `resolve` on a pending source registers it and returns the filled row.
+- **`resolve` registers it at once; a read does not.** The server's read paths and the upload
+  manager use `SourceRegistry.get_registered`, which on a registry miss asks the reconciler
+  why: an unresolved error while the source waits ("open to resolve", the same as a cloud
+  source), `SourceRegistrationError` for a failed one. Callers that only ask whether a source
+  is registered keep `get`, which is `None` for a pending source. `resolve` calls the
+  reconciler's `materialize`, single-flight per source, so a resolve racing the worker shares
+  one registration; it registers the source (retrying a failed one) and returns the filled
+  row.
 - **Not deferred:** remote proxies (bulk-seeded), cloud sources (already registered
   unresolved), static sources, and everything claimed after the first scan.
 - **`unresolved_reason`** says why a row is not resolved: `needs_recall` (a cloud
-  placeholder; resolving downloads it), `pending` (queued; a read registers it, no
+  placeholder; resolving downloads it), `pending` (queued; resolving registers it, no
   download), `failed` (registration raised; `metadata_json` holds `registration_error`,
   reads raise `SourceRegistrationError`, and a tick retries it after its backoff).
 - **While pending** a source can be refreshed (the rebuild is the registration) or removed,

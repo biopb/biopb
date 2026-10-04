@@ -783,7 +783,7 @@ class TensorFlightServer(flight.FlightServerBase):
         themselves.
         """
         source_id, _ = split_array_id(array_id)
-        adapter = self.sources.get_registered(source_id)
+        adapter = self.sources.get(source_id)
         if adapter is None:
             return None
         expected = adapter.tensor_capability_token(array_id)
@@ -1317,12 +1317,17 @@ class TensorFlightServer(flight.FlightServerBase):
         projection let the two disagree (the adapter answers ``is_resident()``
         live, the row is a snapshot).
 
-        Resolving an already-resident source is a cheap no-op. If the client
+        Resolving also registers a source whose registration is still pending
+        (or failed, which retries it); that runs here, before the stream. Resolving
+        an already-resident source is a cheap no-op. If the client
         disconnects mid-resolve the daemon thread runs to completion and caches
         the result on the adapter, so a retry coalesces onto the finished work
         rather than downloading again.
         """
-        adapter = self.sources.get_registered(source_id)
+        try:
+            adapter = self.sources.materialize(source_id)
+        except (SourceUnresolvedError, TensorResolutionError) as exc:
+            raise to_flight_error(exc) from exc
         if adapter is None:
             raise flight.FlightServerError(f"Source not found: {source_id}")
         # The terminal message IS the catalog row, so refuse before the recall
@@ -1800,7 +1805,12 @@ class TensorFlightServer(flight.FlightServerBase):
         # crashing on None.split), so honor the documented default in this one
         # chokepoint rather than at every adapter call site.
         if field is None:
-            default_adapter = self.sources.get_registered(source_id)
+            try:
+                default_adapter = self.sources.get_registered(source_id)
+            except (SourceUnresolvedError, TensorResolutionError) as e:
+                raise _adapter_lookup_error(
+                    e, f"Tensor not found: {source_id}/{field}"
+                ) from e
             if default_adapter is not None:
                 descriptors = default_adapter.list_tensor_descriptors()
                 if descriptors:
