@@ -33,7 +33,7 @@ from biopb import (
     LocalTrustError,
     resolve_data_plane,
 )
-from biopb.tensor._catalog_rows import unresolved_reasons
+from biopb.tensor._catalog_rows import reasons_for
 from biopb.tensor.client import TensorFlightClient
 
 app = typer.Typer(
@@ -282,16 +282,9 @@ def query(
         table.add_column("Shape", style="green")
         table.add_column("Dtype", style="blue")
 
-        if any("unresolved_reason" in row for row in sources.values()):
-            reasons = {
-                sid: row.get("unresolved_reason") for sid, row in sources.items()
-            }
-        elif any(not row.get("is_resolved", True) for row in sources.values()):
-            reasons = unresolved_reasons(
-                lambda sql: client.query(sql, format="records")
-            )
-        else:
-            reasons = {}
+        reasons = reasons_for(
+            sources.values(), lambda sql: client.query(sql, format="records")
+        )
         for source_id, row in sources.items():
             tensors = row.get("tensors") or []
             if not tensors:

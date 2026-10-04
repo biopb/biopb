@@ -176,9 +176,7 @@ class TestReadRoundTrips:
         for _ in range(8):
             client.get_tensor("scened", slice_hint=OPEN_ENDED)
 
-        # One plan per read, plus the connection's one read of the ``sources``
-        # schema (what lets the row carry ``unresolved_reason``); the catalog is
-        # asked once per read.
+        # +1 plan: the connection's one read of the ``sources`` schema.
         assert (counter.plans, counter.catalog_queries) == (9, 8)
 
     def test_a_full_read_asks_nothing_extra(self, counted):

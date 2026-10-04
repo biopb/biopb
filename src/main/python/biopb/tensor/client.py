@@ -248,13 +248,8 @@ class TensorFlightClient:
         return self._catalog.get_source(source_id)
 
     def source_row_columns(self) -> str:
-        """The ``sources`` columns a listing needs, as a SELECT list.
-
-        The base structural columns, and ``unresolved_reason`` too when the
-        server has it (read from the table's flight schema, once per connection),
-        so ``SELECT {source_row_columns()} FROM sources`` says why a row is not
-        resolved without a second query. A row carries that key only then.
-        """
+        """The columns a ``sources`` listing needs, as a SELECT list: the base
+        columns, plus ``unresolved_reason`` when the server has it."""
         return self._catalog.source_row_columns()
 
     def query(self, sql: str, *, format: str = "arrow") -> Any:  # noqa: A002 - public, documented keyword API (mirrors DuckDB/pandas `format`)

@@ -672,60 +672,39 @@ class TestOverFlight:
             client.close()
             server.shutdown()
 
+    @staticmethod
+    def _wrap_raw(client, **overrides):
+        """Replace the connection with one that answers ``overrides`` itself and
+        forwards everything else; returns the real connection."""
+        state = client._catalog._state
+        raw = state.raw_client
+
+        class Wrapped:
+            def __getattr__(self, name):
+                return overrides.get(name) or getattr(raw, name)
+
+        state.raw_client = Wrapped()
+        return raw
+
     def test_an_open_ended_read_of_a_pending_source_asks_for_its_reason_once(
         self, tmp_path
     ):
-        """The reason rides the row the read already fetches when the server's
-        ``sources`` schema has the column, so no second query asks for it."""
+        """The reason rides the row the read already fetches, so no second query
+        asks for it."""
         manager, server, client = self._serve(tmp_path)
         try:
             first, _ = _only_ids(server)
             asked = []
             raw = client._state.raw_client
 
-            class Spy:
-                def __getattr__(self, name):
-                    return getattr(raw, name)
+            def do_get(ticket, *a, **k):
+                asked.append(ticket.ticket)
+                return raw.do_get(ticket, *a, **k)
 
-                def do_get(self, ticket, *a, **k):
-                    asked.append(ticket.ticket)
-                    return raw.do_get(ticket, *a, **k)
+            self._wrap_raw(client, do_get=do_get)
+            client.get_tensor(first, slice_hint=(slice(0, None),) * 3)
 
-            catalog = client._catalog
-            assert "unresolved_reason" in catalog._catalog_columns()
-            client._state.raw_client = Spy()
-
-            data = client.get_tensor(first, slice_hint=(slice(0, None),) * 3)
-
-            assert data is not None
             assert not [t for t in asked if b"source_id, unresolved_reason" in t]
-        finally:
-            client.close()
-            server.shutdown()
-
-    def test_a_dropped_schema_read_is_asked_again(self, tmp_path):
-        from pyarrow import flight
-
-        manager, server, client = self._serve(tmp_path)
-        try:
-            state = client._catalog._state
-            raw = state.raw_client
-            fail = [True]
-
-            class Flaky:
-                def __getattr__(self, name):
-                    return getattr(raw, name)
-
-                def get_flight_info(self, *a, **k):
-                    if fail[0]:
-                        raise flight.FlightUnavailableError("blip")
-                    return raw.get_flight_info(*a, **k)
-
-            state.raw_client = Flaky()
-            assert client._catalog._catalog_columns() == frozenset()
-            assert state.catalog_columns is None
-            fail[0] = False
-            assert "unresolved_reason" in client._catalog._catalog_columns()
         finally:
             client.close()
             server.shutdown()
@@ -741,26 +720,28 @@ class TestOverFlight:
             client.close()
             server.shutdown()
 
-    def test_a_server_that_will_not_say_its_columns_gets_the_base_projection(
-        self, tmp_path
+    @pytest.mark.parametrize(
+        "error, remembered",
+        [("FlightUnauthorizedError", True), ("FlightUnavailableError", False)],
+    )
+    def test_a_failed_schema_read_projects_the_base_columns(
+        self, tmp_path, error, remembered
     ):
+        """A refusal is remembered; a dropped call is asked again."""
+        from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS
         from pyarrow import flight
 
         manager, server, client = self._serve(tmp_path)
         try:
+
+            def get_flight_info(*a, **k):
+                raise getattr(flight, error)("no")
+
+            self._wrap_raw(client, get_flight_info=get_flight_info)
+
+            assert client.source_row_columns() == SOURCE_ROW_COLUMNS
             state = client._catalog._state
-            raw = state.raw_client
-
-            class Refuses:
-                def __getattr__(self, name):
-                    return getattr(raw, name)
-
-                def get_flight_info(self, *a, **k):
-                    raise flight.FlightUnauthorizedError("no catalog")
-
-            state.raw_client = Refuses()
-            assert client._catalog._catalog_columns() == frozenset()
-            assert state.catalog_columns == frozenset()
+            assert (state.catalog_columns is not None) is remembered
         finally:
             client.close()
             server.shutdown()
@@ -820,3 +801,40 @@ def _wait_until(predicate, timeout=10.0):
             return
         time.sleep(0.01)
     raise AssertionError("condition not met in time")
+
+
+class TestReasonsFromRows:
+    def test_with_reason_appends_only_when_the_schema_has_it(self):
+        from biopb.tensor._catalog_rows import with_reason
+
+        assert (
+            with_reason("a, b", {"a", "unresolved_reason"}) == "a, b, unresolved_reason"
+        )
+        assert with_reason("a, b", {"a"}) == "a, b"
+
+    def test_a_projected_reason_needs_no_query(self):
+        from biopb.tensor._catalog_rows import reasons_for
+
+        rows = [
+            {"source_id": "x", "is_resolved": False, "unresolved_reason": "pending"},
+            {"source_id": "y", "is_resolved": True, "unresolved_reason": None},
+        ]
+
+        def never(sql):
+            raise AssertionError(sql)
+
+        assert reasons_for(rows, never) == {"x": "pending", "y": None}
+
+    def test_without_the_column_it_asks_once_and_only_for_unresolved_rows(self):
+        from biopb.tensor._catalog_rows import reasons_for
+
+        asked = []
+
+        def ask(sql):
+            asked.append(sql)
+            return [{"source_id": "x", "unresolved_reason": "failed"}]
+
+        resolved = [{"source_id": "y", "is_resolved": True}]
+        pending = [{"source_id": "x", "is_resolved": False}]
+        assert reasons_for(resolved, ask) == {} and not asked
+        assert reasons_for(pending, ask) == {"x": "failed"} and len(asked) == 1

@@ -51,6 +51,7 @@ from biopb.tensor._catalog_rows import (
     sql_literal,
     tensor_descriptors_from_row,
     unresolved_reasons,
+    with_reason,
 )
 from biopb.tensor._labels import LABELS_SEGMENT
 from biopb.tensor._location import normalize_flight_location
@@ -393,6 +394,13 @@ def _explain_handshake_failure(
         return exc
     reason = handshake_failure_reason(location, trust)
     return flight.FlightUnavailableError(f"{exc}\n{reason}") if reason else exc
+
+
+_TRANSIENT_FLIGHT_ERRORS = (
+    flight.FlightUnavailableError,
+    flight.FlightTimedOutError,
+    flight.FlightCancelledError,
+)
 
 
 def _check_flight_protocol(
@@ -1000,20 +1008,16 @@ class CatalogClient:
         """One source's addressing columns: the resolved flag and the tensor list.
 
         Not ``SOURCE_ROW_COLUMNS`` -- the source's url and type are bytes on the
-        wire nobody here reads.
+        wire nobody here reads. Carries ``unresolved_reason`` when the server has it.
         """
-        columns = "is_resolved, tensors"
-        if "unresolved_reason" in self._catalog_columns():
-            columns += ", unresolved_reason"
+        columns = with_reason("is_resolved, tensors", self._catalog_columns())
         return self._addressed_row(columns, source_id)
 
     def source_row_columns(self) -> str:
         """``SOURCE_ROW_COLUMNS`` as a SELECT list, plus ``unresolved_reason``
-        when this server's ``sources`` schema has it -- so one query carries the
-        reason, and an older server is asked for what it has."""
-        if "unresolved_reason" in self._catalog_columns():
-            return SOURCE_ROW_COLUMNS + ", unresolved_reason"
-        return SOURCE_ROW_COLUMNS
+        when this server's ``sources`` schema has it. A row carries that key only
+        then."""
+        return with_reason(SOURCE_ROW_COLUMNS, self._catalog_columns())
 
     def _catalog_columns(self) -> frozenset:
         """The ``sources`` table's columns, so a projection can ask for one only
@@ -1033,17 +1037,11 @@ class CatalogClient:
                     options=state.call_options,
                 )
                 state.catalog_columns = frozenset(info.schema.names)
-            except (
-                flight.FlightUnavailableError,
-                flight.FlightTimedOutError,
-                flight.FlightCancelledError,
-            ):
-                # Transient: this call goes without, the next one asks again.
+            except Exception as exc:  # noqa: BLE001 - a probe: failing reads as "unknown"
                 logger.debug("could not read the sources schema", exc_info=True)
-                return frozenset()
-            except Exception:  # noqa: BLE001 - a probe: any other failure is a refusal
-                logger.debug("could not read the sources schema", exc_info=True)
-                state.catalog_columns = frozenset()
+                if isinstance(exc, _TRANSIENT_FLIGHT_ERRORS):
+                    return frozenset()  # this call goes without; the next asks again
+                state.catalog_columns = frozenset()  # a refusal would repeat
         return state.catalog_columns
 
     def _addressed_row(

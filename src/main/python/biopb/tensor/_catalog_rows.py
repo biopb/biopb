@@ -146,6 +146,33 @@ def unresolved_reasons(
         return {}
 
 
+def with_reason(columns: str, have: Iterable[str]) -> str:
+    """*columns* with ``unresolved_reason`` appended when the server's ``sources``
+    schema (*have*) lists it, so one query carries the reason."""
+    return columns + ", unresolved_reason" if "unresolved_reason" in have else columns
+
+
+def reasons_for(
+    rows: Iterable[Mapping[str, Any]],
+    query: Callable[[str], Iterable[Mapping[str, Any]]],
+    where: str = "",
+    *,
+    errors: Any = Exception,
+) -> Dict[str, Optional[str]]:
+    """``{source_id: unresolved_reason}`` for the unresolved *rows*.
+
+    Read off the rows when they were projected with the column
+    (:func:`with_reason`); otherwise one :func:`unresolved_reasons` query, and only
+    when a row is unresolved. *query*, *where* and *errors* are its own.
+    """
+    rows = list(rows)
+    if any("unresolved_reason" in row for row in rows):
+        return {r["source_id"]: r["unresolved_reason"] for r in rows}
+    if any(not row.get("is_resolved", True) for row in rows):
+        return unresolved_reasons(query, where, errors=errors)
+    return {}
+
+
 def sql_literal(value: str) -> str:
     """Quote a string for the catalog's SQL surface, which takes no parameters."""
     return "'" + value.replace("'", "''") + "'"

@@ -64,7 +64,7 @@ import numpy as np
 import pyarrow.flight as flight
 from biopb import _web_auth
 from biopb.image.annotation_pb2 import RoiAnnotation
-from biopb.tensor._catalog_rows import sql_literal, unresolved_reasons
+from biopb.tensor._catalog_rows import reasons_for, sql_literal
 from biopb.tensor._session import ResolveCancelled
 from biopb.tensor.client import TensorFlightClient
 from biopb.tensor.ticket_pb2 import TensorTicket
@@ -3336,12 +3336,9 @@ def _add_unresolved_reasons(
     """Set ``unresolved_reason`` on the rows that are not resolved. Without an
     answer (a server older than the column) the key stays absent, which a client
     reads as the cloud case it always was."""
-    unresolved = [row for row in rows if not row.get("is_resolved", True)]
-    if not unresolved or any("unresolved_reason" in row for row in rows):
-        return  # none to explain, or the projection already carried the reason
-    reasons = unresolved_reasons(lambda sql: client.query(sql, format="records"), where)
-    for row in unresolved:
-        if row["source_id"] in reasons:
+    reasons = reasons_for(rows, lambda sql: client.query(sql, format="records"), where)
+    for row in rows:
+        if not row.get("is_resolved", True) and row["source_id"] in reasons:
             row["unresolved_reason"] = reasons[row["source_id"]]
 
 
