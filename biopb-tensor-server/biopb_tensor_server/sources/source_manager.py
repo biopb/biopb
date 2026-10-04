@@ -110,6 +110,7 @@ class SourceManager:
         prune_unseen_days: int = 0,
         registration_workers: int = 0,
         registration_stats: bool = False,
+        walk_threads: int = 1,
     ):
         # Collaborators. The registry is kept for ``add_local_source``'s own
         # discovery walk; every confirmed-catalog mutation goes through the
@@ -209,6 +210,7 @@ class SourceManager:
             registration_stats=registration_stats,
         )
 
+        self._walk_threads = walk_threads
         # Background registration of what the first scan claims
         # (``registration_workers`` threads; 0 registers inline, as it always
         # did). A read that needs a source before its turn registers it itself.
@@ -612,6 +614,7 @@ class SourceManager:
                     cloud_root=cloud,
                     report=report,
                     monitored=True,
+                    walk_threads=self._walk_threads,
                 )
 
             # A directory the walk declined (the stability gate, or the skip
@@ -1362,6 +1365,7 @@ def create_source_manager(
     rescan_interval: float = 120.0,
     registration_workers: int = 0,
     registration_stats: bool = False,
+    walk_threads: int = 1,
 ) -> SourceManager:
     """Create a SourceManager for all configured sources.
 
@@ -1449,6 +1453,7 @@ def create_source_manager(
         prune_unseen_days=prune_unseen_days,
         registration_workers=registration_workers,
         registration_stats=registration_stats,
+        walk_threads=walk_threads,
     )
 
     # Added first so monitored discovery skips paths already claimed.

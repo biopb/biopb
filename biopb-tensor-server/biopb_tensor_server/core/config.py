@@ -242,6 +242,7 @@ _CONSTRAINTS = {
         "rescan_interval": _Range(min=0),
         "stability_window": _Range(min=0),
         "registration_workers": _Range(min=0),
+        "walk_threads": _Range(min=1),
         "handle_reaper_ttl": _Range(min=0),
         "upload_ttl": _Range(min=0),
         "scratch_ttl": _Range(min=0),
@@ -927,6 +928,16 @@ class ServerConfig:
             "for removal and rebuild as well as discovery."
         },
     )
+    walk_threads: int = field(
+        default=1,
+        metadata={
+            "help": "Threads that read and probe directories during a scan. One "
+            "reads them in turn, which is fine on a local disk; a network "
+            "filesystem answers one request at a time per thread, so listing a "
+            "large tree there takes as long as its round trips, and more threads "
+            "overlap them."
+        },
+    )
     registration_workers: int = field(
         default=4,
         metadata={
@@ -1379,6 +1390,7 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
     _carry(server_kwargs, "scratch_ttl", server_data, cast=float)
     _carry(server_kwargs, "stability_window", server_data, cast=float)
     _carry(server_kwargs, "registration_workers", server_data, cast=int)
+    _carry(server_kwargs, "walk_threads", server_data, cast=int)
     _carry(server_kwargs, "registration_stats", server_data, cast=bool)
     _carry(server_kwargs, "claim_generic_images", server_data, cast=bool)
     _carry(server_kwargs, "writable", server_data)
