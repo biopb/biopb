@@ -384,10 +384,12 @@ class _Binding:
 
     async def connect(self):
         """The connected ClientSession, attaching to the preselected session
-        if there is one."""
+        if there is one and it has not been lost."""
         if self.session is not None:
             return self.session
-        if self.preselect is not None:
+        if self.preselect is not None and not self.lost:
+            # A bind that failed at start is retried; a session that was lost
+            # (stopped, or taken by force) is reported, not silently replaced.
             await self.attach(self.preselect)
             return self.session
         why = f"{self.lost}. " if self.lost else ""

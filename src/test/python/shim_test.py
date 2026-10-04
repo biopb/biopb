@@ -643,6 +643,17 @@ class TestBinding:
         self._drive(binding, binding.connect)
         assert len(env.launches) == 1 and binding.session_id == "managed"
 
+    def test_a_lost_preselected_session_is_reported_not_replaced(self, monkeypatch):
+        binding, env = self._binding(monkeypatch, preselect="new")
+        env.use_control()
+        env.launch_answer = {"state": "started", "session_id": "managed"}
+        self._drive(binding, binding.connect)
+        binding.session = None
+        binding.lost = "The session was stopped"
+        (text,) = self._drive(binding, binding.connect)
+        assert "was stopped" in text
+        assert len(env.launches) == 1
+
     def _states(self, monkeypatch, *states):
         """Stub the live sessions: ``(id, holder-or-None, answers)``."""
         monkeypatch.setattr(
