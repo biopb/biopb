@@ -24,6 +24,14 @@ S3_TEST_DATA_URL = os.environ.get(
 NFS_TEST_DATA_DIR = os.environ.get("NFS_TEST_DATA_DIR", "/data/microscopy")
 
 
+def percentile(values: List[float], q: float) -> float:
+    """The *q*-quantile (0-1) of *values*, nearest rank; 0.0 when empty."""
+    ordered = sorted(values)
+    if not ordered:
+        return 0.0
+    return ordered[round((len(ordered) - 1) * q)]
+
+
 # =============================================================================
 # Cache utilities
 # =============================================================================

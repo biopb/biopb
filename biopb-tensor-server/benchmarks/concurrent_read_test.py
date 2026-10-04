@@ -23,6 +23,7 @@ from typing import Dict, Iterable, List
 import pytest
 
 from benchmarks.conftest import _generate_and_get_path, _register_source_with_server
+from benchmarks.utils import percentile
 
 CLIENT_COUNTS = [1, 4, 16]
 READ_EDGE = int(os.environ.get("BIOPB_BENCH_READ_EDGE", "2048"))
@@ -37,20 +38,12 @@ _PROCESS_WORKER_CLIENT = None
 _PROCESS_WAVE_BARRIER = None
 
 
-def _percentile(values: List[float], percentile: float) -> float:
-    ordered = sorted(values)
-    if not ordered:
-        return 0.0
-    index = round((len(ordered) - 1) * percentile)
-    return ordered[index]
-
-
 def _latency_summary_ms(latencies_s: Iterable[float]) -> Dict[str, float]:
     latencies_ms = [latency * 1000 for latency in latencies_s]
     return {
         "min_ms": min(latencies_ms),
-        "p50_ms": _percentile(latencies_ms, 0.50),
-        "p95_ms": _percentile(latencies_ms, 0.95),
+        "p50_ms": percentile(latencies_ms, 0.50),
+        "p95_ms": percentile(latencies_ms, 0.95),
         "max_ms": max(latencies_ms),
     }
 

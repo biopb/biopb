@@ -257,11 +257,8 @@ registers what it finds inline.
   mtime), a later one is prompt-enqueued, a remote one is not enqueued as startup. The
   backlog tier waits for `registration_idle` (first scan over, nothing pending); the live
   tier is not held.
-- **Cost.** `benchmarks/registration_cost_test.py` scans a tree (set
-  `BIOPB_REG_COST_ROOT` for a real site) and reports, per source type, the time in
-  `create_from_config`, `normalize_adapter` and the row write, the sizes of `metadata_json` and
-  `tensors`, and each adapter's `claim` time in the walk. The server carries no
-  instrumentation for it.
+- **Cost.** `benchmarks/registration_cost_test.py` reports the per-source-type cost of a scan
+  (`BIOPB_REG_COST_ROOT` points it at a site).
 
 Streaming is safe only because the first scan is add-only. It is idempotent
 against a retry: `_stream_first_scan_add` skips a claim already in the confirmed state,

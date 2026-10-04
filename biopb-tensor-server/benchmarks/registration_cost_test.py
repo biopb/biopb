@@ -16,7 +16,6 @@ By default the tree is a handful of synthetic files. Point it at a real site::
 """
 
 import os
-import threading
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -25,63 +24,30 @@ from typing import Dict, List
 import pytest
 from biopb_tensor_server.adapters import get_default_registry
 from biopb_tensor_server.core.discovery import DiscoveryState
-from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 from biopb_tensor_server.sources import reconciler as reconciler_module
 from tests import catalog_server, make_manager
 
-from benchmarks.utils import generate_synthetic_tiff, generate_synthetic_zarr
+from benchmarks.utils import (
+    generate_synthetic_tiff,
+    generate_synthetic_zarr,
+    percentile,
+)
 
 ROOT_ENV = "BIOPB_REG_COST_ROOT"
 
-
-def _percentile(values: List[float], q: float) -> float:
-    ordered = sorted(values)
-    return ordered[min(len(ordered) - 1, int(q * len(ordered)))]
+# step -> label (an adapter, a source type, or "all") -> samples
+Samples = Dict[str, Dict[str, List[float]]]
 
 
-class _Samples:
-    """Seconds (or bytes) by (group, step), safe to append from any thread."""
+def _timed(samples: Samples, step: str, label: str, fn):
+    """``fn`` that records its wall time under ``samples[step][label]``."""
 
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._values: Dict[str, Dict[str, List[float]]] = defaultdict(
-            lambda: defaultdict(list)
-        )
-
-    def add(self, group: str, step: str, value: float) -> None:
-        with self._lock:
-            self._values[group][step].append(value)
-
-    def groups(self) -> Dict[str, Dict[str, List[float]]]:
-        with self._lock:
-            return {
-                g: {s: list(v) for s, v in d.items()} for g, d in self._values.items()
-            }
-
-
-def _summarize(values: Dict[str, List[float]], *, size: bool) -> str:
-    parts = []
-    for step, samples in values.items():
-        if size:
-            parts.append(
-                f"{step} mean={sum(samples) / len(samples):.0f} max={max(samples):.0f}"
-            )
-        else:
-            parts.append(
-                f"{step} p50={_percentile(samples, 0.5) * 1000:.0f}ms "
-                f"p95={_percentile(samples, 0.95) * 1000:.0f}ms "
-                f"total={sum(samples):.1f}s"
-            )
-    return "; ".join(parts)
-
-
-def _timed(samples: _Samples, group, step, fn):
     def wrapper(*args, **kwargs):
         started = time.perf_counter()
         try:
             return fn(*args, **kwargs)
         finally:
-            samples.add(group, step, time.perf_counter() - started)
+            samples[step][label].append(time.perf_counter() - started)
 
     return wrapper
 
@@ -100,49 +66,46 @@ def tree(tmp_path) -> Path:
     return tmp_path
 
 
-def _instrument(monkeypatch, registry, samples: _Samples) -> None:
-    """Time each adapter's claim and create, and the normalize and row write."""
-    for adapter_cls in registry._adapters:
-        name = adapter_cls.__name__
-        monkeypatch.setattr(
-            adapter_cls,
-            "claim",
-            staticmethod(_timed(samples, f"claim {name}", "claim", adapter_cls.claim)),
+def _report(samples: Samples, sizes: Samples) -> str:
+    lines = []
+    for step, by_label in samples.items():
+        # Slowest first, so a site's cost is at the top of each step.
+        for label, values in sorted(by_label.items(), key=lambda i: -sum(i[1])):
+            lines.append(
+                f"  {step} {label}: n={len(values)} "
+                f"p50={percentile(values, 0.5) * 1000:.0f}ms "
+                f"p95={percentile(values, 0.95) * 1000:.0f}ms "
+                f"total={sum(values):.1f}s"
+            )
+    for source_type, by_column in sorted(sizes.items()):
+        columns = "; ".join(
+            f"{column} mean={sum(v) / len(v):.0f} max={max(v):.0f}"
+            for column, v in by_column.items()
         )
-        monkeypatch.setattr(
-            adapter_cls,
-            "create_from_config",
-            staticmethod(
-                _timed(samples, name, "create", adapter_cls.create_from_config)
-            ),
-        )
-    monkeypatch.setattr(
-        reconciler_module,
-        "normalize_adapter",
-        _timed(samples, "all", "normalize", reconciler_module.normalize_adapter),
-    )
-
-
-def _size_rows(db: MetadataDatabase, samples: _Samples) -> None:
-    rows = db.query(
-        "SELECT source_type, coalesce(length(metadata_json), 0) AS metadata_bytes, "
-        "length(CAST(tensors AS VARCHAR)) AS tensors_bytes FROM sources"
-    ).to_pylist()
-    for row in rows:
-        samples.add(row["source_type"], "metadata_bytes", row["metadata_bytes"])
-        samples.add(row["source_type"], "tensors_bytes", row["tensors_bytes"])
+        lines.append(f"  row {source_type}: {columns}")
+    return "\n".join(lines)
 
 
 def test_registration_cost_by_source_type(tree, monkeypatch):
     registry = get_default_registry()
-    samples = _Samples()
-    _instrument(monkeypatch, registry, samples)
+    samples: Samples = defaultdict(lambda: defaultdict(list))
+    for adapter_cls in registry._adapters:
+        for step, name in (("claim", "claim"), ("create", "create_from_config")):
+            wrapped = _timed(
+                samples, step, adapter_cls.__name__, getattr(adapter_cls, name)
+            )
+            monkeypatch.setattr(adapter_cls, name, staticmethod(wrapped))
+    monkeypatch.setattr(
+        reconciler_module,
+        "normalize_adapter",
+        _timed(samples, "normalize", "all", reconciler_module.normalize_adapter),
+    )
     server = catalog_server("localhost:0")
     db = server.metadata_db
     monkeypatch.setattr(
         db,
         "sync_source_added",
-        _timed(samples, "all", "row_write", db.sync_source_added),
+        _timed(samples, "row_write", "all", db.sync_source_added),
     )
     manager = make_manager(
         server=server,
@@ -158,25 +121,19 @@ def test_registration_cost_by_source_type(tree, monkeypatch):
     manager._handle_rescan()
     elapsed = time.perf_counter() - started
 
-    _size_rows(db, samples)
-    registered = len(server.sources)
-    assert registered > 0, f"nothing was registered under {tree}"
+    sizes: Samples = defaultdict(lambda: defaultdict(list))
+    for row in db.query(
+        "SELECT source_type, coalesce(length(metadata_json), 0) AS metadata_bytes, "
+        "length(CAST(tensors AS VARCHAR)) AS tensors_bytes FROM sources"
+    ).to_pylist():
+        for column in ("metadata_bytes", "tensors_bytes"):
+            sizes[row["source_type"]][column].append(row[column])
 
-    lines = []
-    # Source types and the shared steps first, then the claim probes, slowest first.
-    groups = samples.groups()
-    ordered = sorted(
-        groups.items(),
-        key=lambda item: (
-            item[0].startswith("claim "),
-            -sum(item[1].get("claim", [0])),
-        ),
+    # A step with no samples means a wrapper above no longer sits on the call path.
+    assert len(server.sources) > 0, f"nothing was registered under {tree}"
+    for step in ("claim", "create", "normalize", "row_write"):
+        assert samples[step], f"no {step} was timed"
+    print(
+        f"\nRegistration cost under {tree} ({len(server.sources)} sources, "
+        f"{elapsed:.1f}s):\n{_report(samples, sizes)}"
     )
-    for group, values in ordered:
-        size = "metadata_bytes" in values
-        lines.append(f"  {group}: {_summarize(values, size=size)}")
-    report = (
-        f"Registration cost under {tree} ({registered} sources, {elapsed:.1f}s):\n"
-        + "\n".join(lines)
-    )
-    print("\n" + report)
