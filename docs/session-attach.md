@@ -81,11 +81,15 @@ session id or `new`:
 - `--session <id>` (or env) pre-binds for people and scripts.
 
 While unbound the shim answers the handshake and list requests from the imported
-server, as now, and tool calls other than `attach` return the session list. Once
-bound, the list and `instructions` come from the session, because they are
-composed per session (viewer or not, config) and the session may be a different
-version from the shim. That needs a list-changed notification, which the bridge
-does not forward today.
+server -- if it can import it -- and tool calls other than `attach` return the
+session list. Where it cannot, it advertises `attach` alone and relies on
+`list_changed`. Once bound, the tool, resource and prompt lists come from the
+session, because the session may be a different version from the shim, and so do
+the `instructions`, which are composed per session (viewer or not, config).
+`instructions` cannot be resent after the handshake, so `attach` returns them as
+its result, and attaching again to the same session returns them again, for an
+agent whose context no longer holds them. The handshake declares `listChanged`,
+and the shim sends it on attach and when an attachment ends.
 
 ## Phases
 

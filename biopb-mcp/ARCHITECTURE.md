@@ -96,14 +96,20 @@ Shim (`--transport stdio`) is the interface the mcp clients (claude code) see. I
 starts **unbound** and owns nothing until the agent calls its local `attach` tool:
 
 1. **Unbound**, it answers the handshake and the list requests itself, from the
-   FastMCP server a session runs (imported, never served), plus `attach`; a
-   client that never attaches costs no session. Every other tool is an error
-   that lists the live sessions and whether each is free.
+   FastMCP server a session runs (imported, never served, and only if the import
+   succeeds), plus `attach`; a client that never attaches costs no session. Where
+   the import fails it advertises `attach` alone and relies on `list_changed` for
+   the rest. Every other tool is an error that lists the live sessions and
+   whether each is free.
 2. `attach(session=<id>)` takes the session's **lease** and bridges stdio
-   JSON-RPC ↔ its `/mcp`. The tool list becomes the session's own. The session is
-   not the shim's: the shim renews the lease on a short beat and releases it on
-   the way out, and never stops the session. A lease that is lost (another
-   holder forced it, or the session stopped answering) unbinds the shim.
+   JSON-RPC ↔ its `/mcp`. The tool, resource and prompt lists become the session's
+   own (`list_changed` is declared in the handshake and sent on attach and on
+   detach), and `attach` returns the session's operating rules, which cannot ride
+   the handshake any more; attaching again to the same session returns them
+   again. The session is not the shim's: the shim renews the lease on a short
+   beat and releases it on the way out, and never stops the session. A lease that
+   is lost (another holder forced it, or the session stopped answering) unbinds
+   the shim.
 3. `attach(session='new')` asks the **control** to launch a session for this
    client (`POST /api/sessions/new`, with the client's display variables),
    starting the control first if need be, and leases it from birth. The session

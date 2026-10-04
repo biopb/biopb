@@ -181,6 +181,17 @@ class _FakeRemote:
             tools=[types.Tool(name="from_session", inputSchema={"type": "object"})]
         )
 
+    async def list_resources(self):
+        return types.ListResourcesResult(
+            resources=[types.Resource(name="theirs", uri="docs://theirs")]
+        )
+
+    async def list_resource_templates(self):
+        return types.ListResourceTemplatesResult(resourceTemplates=[])
+
+    async def list_prompts(self):
+        return types.ListPromptsResult(prompts=[])
+
 
 class _FakeBinding:
     """The slice of ``_Binding`` that ``build_proxy`` talks to."""
@@ -197,6 +208,9 @@ class _FakeBinding:
 
     async def listing(self):
         return "Live sessions:\n- s1: free, viewer"
+
+    async def announce_change(self):
+        self.announced = True
 
     async def attach(self, selector, force=False):
         self.attached.append((selector, force))
@@ -233,6 +247,60 @@ class TestBuildProxy:
             types.ListResourcesRequest(method="resources/list"),
         )
         assert [str(r.uri) for r in resources.root.resources] == ["docs://index"]
+
+    def test_without_the_local_surface_only_attach_is_listed(self):
+        # A shim that cannot import the session's tools advertises `attach` alone
+        # and relies on list_changed for the rest.
+        app = _shim.build_proxy(_FakeBinding(), None)
+        tools = self._call(
+            app.request_handlers[types.ListToolsRequest],
+            types.ListToolsRequest(method="tools/list"),
+        )
+        assert [t.name for t in tools.root.tools] == ["attach"]
+        for req_type, req, field in (
+            (
+                types.ListResourcesRequest,
+                types.ListResourcesRequest(method="resources/list"),
+                "resources",
+            ),
+            (
+                types.ListPromptsRequest,
+                types.ListPromptsRequest(method="prompts/list"),
+                "prompts",
+            ),
+            (
+                types.ListResourceTemplatesRequest,
+                types.ListResourceTemplatesRequest(method="resources/templates/list"),
+                "resourceTemplates",
+            ),
+        ):
+            result = self._call(app.request_handlers[req_type], req)
+            assert getattr(result.root, field) == []
+
+    def test_an_attached_shim_lists_the_sessions_resources_too(self):
+        app = _shim.build_proxy(_FakeBinding(_FakeRemote()), mcp._mcp_server)
+        result = self._call(
+            app.request_handlers[types.ListResourcesRequest],
+            types.ListResourcesRequest(method="resources/list"),
+        )
+        assert [str(r.uri) for r in result.root.resources] == ["docs://theirs"]
+
+    @pytest.mark.parametrize("local", [True, False])
+    def test_the_handshake_declares_that_its_lists_change(self, local):
+        server = mcp._mcp_server if local else None
+        app = _shim.build_proxy(_FakeBinding(), server)
+        options = _shim._handshake(app, server, preselect=None)
+        caps = options.capabilities
+        assert caps.tools.listChanged is True
+        assert caps.resources.listChanged is True
+        assert caps.prompts.listChanged is True
+        assert options.instructions.startswith("Before `start_kernel`")
+
+    def test_a_preselected_session_gets_no_attach_paragraph(self):
+        options = _shim._handshake(
+            _shim.build_proxy(_FakeBinding(), None), None, preselect="new"
+        )
+        assert not (options.instructions or "").startswith("Before")
 
     def test_an_attached_tool_list_is_the_sessions_own(self):
         tools = self._list(_FakeBinding(_FakeRemote()))
@@ -282,6 +350,7 @@ class TestBuildProxy:
             _call("attach", {"session": " s1 ", "force": True}),
         )
         assert binding.attached == [("s1", True)]
+        assert binding.announced  # the client is told its lists changed
         assert result.root.content[0].text == "Attached to session s1."
 
     def test_a_refused_attach_is_a_tool_error_with_the_reason(self):
@@ -437,6 +506,50 @@ class TestBinding:
         assert (base, path) == ("http://127.0.0.1:7", "/api/lease/acquire")
         assert body == {"token": binding.token, "force": False}
         assert env.url == "http://127.0.0.1:7/mcp"
+
+    def test_attaching_again_to_the_same_session_hands_back_the_rules(
+        self, monkeypatch
+    ):
+        # An agent whose context no longer holds them can ask again; it is not
+        # an error, and it takes no second lease.
+        binding, env = self._binding(monkeypatch)
+        first, again, other = self._drive(
+            binding,
+            lambda: binding.attach("live"),
+            lambda: binding.attach("live"),
+            lambda: binding.attach("managed"),
+        )
+        assert "THE GUIDANCE" in first and again == first
+        assert "already attached to session live" in other
+        assert [c[2] for c in env.calls].count("/api/lease/acquire") == 1
+
+    def test_the_client_is_told_when_the_attachment_ends(self, monkeypatch):
+        monkeypatch.setattr(_shim, "RENEW_INTERVAL", 0.01)
+        binding, env = self._binding(monkeypatch)
+        env.renew_status = lambda: 409
+        announced = []
+
+        class _Notifier:
+            async def send_tool_list_changed(self):
+                announced.append("tools")
+
+            async def send_resource_list_changed(self):
+                announced.append("resources")
+
+            async def send_prompt_list_changed(self):
+                announced.append("prompts")
+
+        binding.server_session = _Notifier()
+
+        async def lose():
+            await binding.attach("live")
+            for _ in range(200):
+                if binding.session is None:
+                    break
+                await anyio.sleep(0.01)
+
+        self._drive(binding, lose)
+        assert announced == ["tools", "resources", "prompts"]
 
     def test_the_shim_only_releases_a_session_it_attached_to(self, monkeypatch):
         binding, env = self._binding(monkeypatch)
@@ -686,7 +799,8 @@ def _rpc_init(shim):
         )
         shim.stdin.flush()
         if msg is not None:
-            json.loads(shim.stdout.readline())
+            init = json.loads(shim.stdout.readline())["result"]
+    return init
 
 
 def _rpc_call(shim, id_, name, arguments=None):
@@ -742,7 +856,10 @@ class TestControlLaunchedSession:
         second = None
         pid = None
         try:
-            _rpc_init(first)
+            init = _rpc_init(first)
+            # The handshake declares that its lists change, which a client only
+            # follows from a server that says it sends them.
+            assert init["capabilities"]["tools"]["listChanged"] is True
             result, text = _rpc_call(first, 2, "attach", {"session": "new"})
             assert result.get("isError") is not True, text
             assert "keeps running after you disconnect" in text, text
@@ -769,6 +886,9 @@ class TestControlLaunchedSession:
             assert f"{session_id}: free" in listing, listing
             result, text = _rpc_call(second, 3, "attach", {"session": session_id})
             assert result.get("isError") is not True, text
+            # Attaching again hands back the same rules rather than an error.
+            again, text_again = _rpc_call(second, 5, "attach", {"session": session_id})
+            assert again.get("isError") is not True and text_again == text
             status, _ = _rpc_call(second, 4, "server_status")
             assert status.get("isError") is not True, status
 

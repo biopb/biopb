@@ -4,13 +4,16 @@
 launcher process. Instead the launcher runs this module, which
 
 1. starts **unbound**, answering ``initialize`` and the list requests itself,
-   from the FastMCP server a session runs (imported, never served) plus a local
-   ``attach`` tool, so a client that never attaches costs no session;
+   from the FastMCP server a session runs (imported, never served, and only
+   where the import works; otherwise ``attach`` alone is listed and the rest
+   follows ``list_changed``) plus a local ``attach`` tool, so a client that never
+   attaches costs no session;
 2. on ``attach``, takes the lease of a live session (``/api/lease``) and bridges
    requests to its streamable-http endpoint. For ``new`` (or ``--session new``)
    it first asks the control to launch a session, carrying this client's display
    environment -- an error if no control answers, since a session without one
-   has no data plane;
+   has no data plane. Attaching returns the session's own operating rules, and
+   attaching again to the same session returns them again;
 3. releases the lease on the way out.
 
 The process that owns fd 1 as a protocol channel imports nothing that could write
@@ -58,7 +61,7 @@ from biopb.lifecycle import winjob as _winjob
 from mcp import types
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
-from mcp.server.lowlevel.server import Server, request_ctx
+from mcp.server.lowlevel.server import NotificationOptions, Server, request_ctx
 from mcp.server.stdio import stdio_server
 
 from .. import _control_client
@@ -326,6 +329,7 @@ class _Binding:
         self.lost = None  # why the last attachment ended
         self.managed = False  # a session the control launched for this client
         self.instructions = ""
+        self.server_session = None  # the client-facing session, to notify through
         self._base = None
         self._scope = None
         self._lock = anyio.Lock()
@@ -363,9 +367,16 @@ class _Binding:
 
     async def attach(self, selector, force=False):
         """Attach to *selector* (a session id, or ``new``); the text to hand
-        the agent. Raises :class:`AttachError`."""
+        the agent. Raises :class:`AttachError`.
+
+        Attaching to the session already attached is not an error: it hands back
+        the same text, so an agent whose context no longer holds the rules can
+        ask for them again.
+        """
         async with self._lock:
             if self.session is not None:
+                if selector == self.session_id:
+                    return self._attached_text()
                 raise AttachError(f"already attached to session {self.session_id}")
             self.lost = None
             try:
@@ -379,6 +390,9 @@ class _Binding:
                 await anyio.to_thread.run_sync(self.release)
                 self._forget()
                 raise AttachError(f"could not attach to {selector!r}: {e}") from e
+        return self._attached_text()
+
+    def _attached_text(self):
         note = (
             " It keeps running after you disconnect, so it can be attached to "
             "again; the user stops it from the dashboard."
@@ -386,9 +400,30 @@ class _Binding:
             else ""
         )
         return (
-            f"Attached to session {self.session_id}.{note} The tool list has "
-            "changed to this session's.\n\n" + self.instructions
+            f"Attached to session {self.session_id}.{note} Its tools, resources "
+            "and prompts have replaced the ones listed before. The rules below "
+            "apply to every later turn; call `attach` again with this session id "
+            "to read them again.\n\n" + self.instructions
         ).strip()
+
+    async def announce_change(self):
+        """Tell the client its tool, resource and prompt lists changed.
+
+        Best-effort: a client that ignores these still works against the full
+        list the shim advertised unbound, where it has one.
+        """
+        notifier = self.server_session
+        if notifier is None:
+            return
+        for send in (
+            notifier.send_tool_list_changed,
+            notifier.send_resource_list_changed,
+            notifier.send_prompt_list_changed,
+        ):
+            try:
+                await send()
+            except Exception:  # noqa: BLE001 - the client may be gone
+                logger.debug("could not send a list_changed", exc_info=True)
 
     def _take_lease(self, base, label, force=False):
         """Take the lease on the session at *base*, named *label*."""
@@ -493,6 +528,7 @@ class _Binding:
             # ended, so give back what it held and go back to unbound.
             await anyio.to_thread.run_sync(self.release)
             self._forget()
+            await self.announce_change()
 
     async def _heartbeat(self):
         base, token = self._base, self.token
@@ -528,9 +564,10 @@ _ATTACH_TOOL = types.Tool(
         "Attach to a biopb session before using any other tool. With no "
         "arguments, lists the live sessions and whether each is free. "
         "`session` is an id from that list, or 'new' for a session of your "
-        "own. A session you attach to keeps running when you disconnect; a "
-        "'new' one ends with you. `force` takes a session held by something "
-        "else."
+        "own. A session you attach to keeps running when you disconnect. "
+        "`force` takes a session held by something else. The result carries "
+        "the session's operating rules, which apply to every later turn; "
+        "attach to the same session again to read them again."
     ),
     inputSchema={
         "type": "object",
@@ -545,51 +582,98 @@ _ATTACH_PREFACE = (
     "Before `start_kernel` or any other tool: call `attach`. With no arguments "
     "it lists the live biopb sessions and whether each is free; "
     "`attach(session='<id>')` takes one, `attach(session='new')` starts a "
-    "session of your own. Nothing else works until you have attached. The "
-    "guidance below is for the session you attach to, and attaching returns "
-    "its own version of it.\n\n"
+    "session of your own. Nothing else works until you have attached. What "
+    "attaching returns are that session's own operating rules and its tools: "
+    "follow the rules for every later turn, and call `attach` again with the "
+    "same session id if they are no longer in your context.\n\n"
 )
 
 
-def build_proxy(binding, server):
+def _local_server():
+    """The FastMCP low-level server of a session, imported but never served; or
+    None where it cannot be imported.
+
+    It is the shim's copy of the tool, resource and prompt lists and of the
+    handshake instructions, so a client that cannot follow ``list_changed`` still
+    sees every tool. Without it the shim advertises ``attach`` alone and relies on
+    ``list_changed`` for the rest. Importing it costs ~15 ms and starts nothing.
+    """
+    try:
+        from . import _server  # noqa: F401 - registers the tools on _app.mcp
+        from ._app import mcp
+
+        return mcp._mcp_server
+    except Exception:  # noqa: BLE001 - a lighter shim is the fallback
+        logger.info(
+            "the session surface cannot be imported; advertising `attach` only",
+            exc_info=True,
+        )
+        return None
+
+
+def build_proxy(binding, server=None):
     """Build the stdio-facing MCP server.
 
     Until a session is attached, the list requests are answered by *server* --
-    the FastMCP low-level server the child runs, imported here but never served
-    -- with the local ``attach`` tool added, so listing costs no session. Once
-    attached, the tool list is the session's own: it composes its tools and
-    instructions, and it may not be this shim's version.
+    the FastMCP low-level server a session runs, imported here but never served
+    (:func:`_local_server`) -- with the local ``attach`` tool added, so listing
+    costs no session. With no *server* they list ``attach`` alone, and empty
+    resources and prompts. Once attached, every list is the session's own: it
+    composes its tools and instructions, and it may not be this shim's version.
 
     Every other request awaits ``binding.connect()`` and is forwarded; with no
     session attached that is an error the agent reads, and a tool call as a tool
     error.
 
-    Server->client traffic other than tool-call progress and the tool-list
-    change on attach (sampling, elicitation, other list_changed) is not
-    forwarded -- biopb-mcp emits none of it, and a feature that needs it must
-    extend this bridge.
+    Server->client traffic other than tool-call progress and the list changes on
+    attach and detach (sampling, elicitation) is not forwarded -- biopb-mcp emits
+    none of it, and a feature that needs it must extend this bridge.
     """
     app = Server(name="biopb-mcp")
-    for req in (
+
+    def _list(req_type, remote_name, empty, extra=()):
+        local = server.request_handlers[req_type] if server is not None else None
+
+        async def handler(req):
+            if binding.session is not None:
+                try:
+                    return types.ServerResult(
+                        await getattr(binding.session, remote_name)()
+                    )
+                except Exception:  # noqa: BLE001 - the local list is the fallback
+                    logger.info("session %s failed; using the local one", remote_name)
+            result = empty([]) if local is None else (await local(req)).root
+            return types.ServerResult(empty([*_items(result), *extra]))
+
+        app.request_handlers[req_type] = handler
+
+    def _items(result):
+        for name in ("tools", "resources", "resourceTemplates", "prompts"):
+            if hasattr(result, name):
+                return getattr(result, name)
+        return []
+
+    _list(
+        types.ListToolsRequest,
+        "list_tools",
+        lambda items: types.ListToolsResult(tools=items),
+        extra=(_ATTACH_TOOL,),
+    )
+    _list(
         types.ListResourcesRequest,
+        "list_resources",
+        lambda items: types.ListResourcesResult(resources=items),
+    )
+    _list(
         types.ListResourceTemplatesRequest,
+        "list_resource_templates",
+        lambda items: types.ListResourceTemplatesResult(resourceTemplates=items),
+    )
+    _list(
         types.ListPromptsRequest,
-    ):
-        app.request_handlers[req] = server.request_handlers[req]
-
-    local_tools = server.request_handlers[types.ListToolsRequest]
-
-    async def _list_tools(req):
-        if binding.session is not None:
-            try:
-                return types.ServerResult(await binding.session.list_tools())
-            except Exception:  # noqa: BLE001 - the local list is the fallback
-                logger.info("session tool list failed; using the local one")
-        result = await local_tools(req)
-        tools = [*result.root.tools, _ATTACH_TOOL]
-        return types.ServerResult(types.ListToolsResult(tools=tools))
-
-    app.request_handlers[types.ListToolsRequest] = _list_tools
+        "list_prompts",
+        lambda items: types.ListPromptsResult(prompts=items),
+    )
 
     def _text(text, error=False):
         return types.ServerResult(
@@ -607,9 +691,10 @@ def build_proxy(binding, server):
         except AttachError as e:
             return _text(str(e), error=True)
         try:
-            await request_ctx.get().session.send_tool_list_changed()
-        except Exception:  # noqa: BLE001 - a client that ignores it still works
-            logger.debug("could not send tool list_changed", exc_info=True)
+            binding.server_session = request_ctx.get().session
+        except LookupError:  # called outside a request, as the unit tests do
+            pass
+        await binding.announce_change()
         return _text(text)
 
     async def _call_tool(req):
@@ -662,20 +747,29 @@ def build_proxy(binding, server):
     return app
 
 
-async def _serve_stdio(binding):
-    # The tool surface, and the instructions composed per session, are the
-    # child's own because they are its code: importing it costs ~15 ms here and
-    # starts nothing.
-    from . import _server  # noqa: F401 - registers the tools on _app.mcp
-    from ._app import mcp
+def _handshake(app, server, preselect):
+    """The initialize answer: the session surface's own where the shim has it,
+    plus the attach paragraph unless a session is preselected.
 
-    server = mcp._mcp_server
-    app = build_proxy(binding, server)
-    options = server.create_initialization_options()
-    if binding.preselect is None:
+    The lists change on attach and detach, so it declares ``listChanged``: a
+    client only follows those notifications from a server that says it sends
+    them.
+    """
+    changes = NotificationOptions(
+        tools_changed=True, resources_changed=True, prompts_changed=True
+    )
+    options = (server or app).create_initialization_options(changes)
+    if preselect is None:
         options = options.model_copy(
             update={"instructions": _ATTACH_PREFACE + (options.instructions or "")}
         )
+    return options
+
+
+async def _serve_stdio(binding):
+    server = _local_server()
+    app = build_proxy(binding, server)
+    options = _handshake(app, server, binding.preselect)
     async with anyio.create_task_group() as tg:
         binding.task_group = tg
         async with stdio_server() as (read_stream, write_stream):
