@@ -28,7 +28,7 @@ The process that owns fd 1 as a protocol channel imports nothing that could writ
 to stdout (no Qt, dask, uvicorn, kernel, or session code -- only the mcp SDK), so
 the fd-1 corruption class is structurally impossible here. The session reaches the
 shim only over HTTP: ``/api/lease``, ``/api/status``, ``/api/sessions`` and the
-session registry are the contract (biopb-mcp's ARCHITECTURE).
+session registry are the contract between the two packages.
 
 With ``--remote`` the sessions are another machine's, reached through its control
 under the token (``_Remote``): the same lease, status and ``/mcp``, at
@@ -303,8 +303,13 @@ def _session_states():
     ]
     if not recs:
         return []
+    return _probe_all(recs, _probe)
+
+
+def _probe_all(recs, probe):
+    """``[(record, status or None)]``, each session asked in parallel."""
     with ThreadPoolExecutor(max_workers=min(8, len(recs))) as pool:
-        return list(zip(recs, pool.map(_probe, recs), strict=True))
+        return list(zip(recs, pool.map(probe, recs), strict=True))
 
 
 def _holder(status):
@@ -355,10 +360,12 @@ class _Local:
     a control on this machine to launch more."""
 
     headers = {}
-    remote = False
 
     def call(self, base, method, path, body=None):
         return _call_session(base, method, path, body)
+
+    def check(self):
+        """Nothing to check: a session's own port serves its ``/mcp``."""
 
     def states(self):
         return _session_states()
@@ -425,8 +432,6 @@ class _Remote:
     ``<control>/session/<id>/...``; the sessions themselves stay on the host's
     loopback."""
 
-    remote = True
-
     def __init__(self, url, token, headers=None):
         self.url = url.rstrip("/")
         # *headers* are for whatever stands in front of the control (a portal's
@@ -435,6 +440,7 @@ class _Remote:
         # Unlike a session's loopback port, this address is reached the way any
         # other is: through the environment's proxy settings.
         self._opener = urllib.request.build_opener()
+        self._checked = False
 
     def call(self, base, method, path, body=None, timeout=_CALL_TIMEOUT):
         return _call_session(
@@ -466,13 +472,17 @@ class _Remote:
         return data
 
     def check(self):
-        """Refuse early, with the reason, when this control serves no ``/mcp``."""
+        """Refuse early, with the reason, when this control serves no ``/mcp``.
+        Asked once: the answer holds for the life of the control."""
+        if self._checked:
+            return
         if self._ask("GET", "/health").get("mcp_proxied") is not True:
             raise AttachError(
                 f"the control at {self.url} does not serve /mcp for remote "
                 "agents: it serves it only when it enforces a token "
                 "(`biopb control start --token ...`)"
             )
+        self._checked = True
 
     def states(self):
         recs = [
@@ -482,11 +492,7 @@ class _Remote:
         ]
         if not recs:
             return []
-        with ThreadPoolExecutor(max_workers=min(8, len(recs))) as pool:
-            statuses = pool.map(
-                lambda rec: _probe(rec, self.headers, self._opener), recs
-            )
-            return list(zip(recs, statuses, strict=True))
+        return _probe_all(recs, lambda rec: _probe(rec, self.headers, self._opener))
 
     def listing(self):
         try:
@@ -701,8 +707,7 @@ class _Binding:
         *selector* is a session id, ``new``, or ``auto``: the newest free
         session, else a new one.
         """
-        if self.plane.remote:
-            self.plane.check()
+        self.plane.check()
         if selector == "auto":
             free = self.plane.newest_free()
             selector = free["session_id"] if free else "new"
@@ -720,15 +725,10 @@ class _Binding:
         logger.info("Bridging stdio to %s (session %s)", url, self.session_id)
         started = False
         try:
+            headers = self.plane.headers or None
             with anyio.CancelScope() as self._scope:
                 async with (
-                    streamablehttp_client(
-                        url=url, headers=self.plane.headers or None
-                    ) as (
-                        read,
-                        write,
-                        _,
-                    ),
+                    streamablehttp_client(url=url, headers=headers) as (read, write, _),
                     ClientSession(read, write) as session,
                 ):
                     init = await session.initialize()
@@ -1003,6 +1003,19 @@ def serve(session=None, remote=None, token=None, headers=None):
         binding.release()
 
 
+def _parse_headers(lines):
+    """``{name: value}`` from ``'Name: value'`` lines; blanks are skipped."""
+    headers = {}
+    for line in lines:
+        if not line.strip():
+            continue
+        name, sep, value = line.partition(":")
+        if not sep or not name.strip() or any(c in name.strip() for c in " \t"):
+            raise ValueError(f"--header wants 'Name: value', not {line!r}")
+        headers[name.strip()] = value.strip()
+    return headers
+
+
 def main(argv=None):
     """``biopb-shim [--session <id|new|auto>]``: the entry a client spawns."""
     import argparse
@@ -1046,14 +1059,12 @@ def main(argv=None):
     token = None
     headers = {}
     if opts.remote:
-        lines = [*os.environ.get("BIOPB_REMOTE_HEADERS", "").splitlines(), *opts.header]
-        for line in lines:
-            name, sep, value = line.partition(":")
-            if not line.strip():
-                continue
-            if not sep or not name.strip() or any(c in name for c in " \t"):
-                parser.error(f"--header wants 'Name: value', not {line!r}")
-            headers[name.strip()] = value.strip()
+        try:
+            headers = _parse_headers(
+                [*os.environ.get("BIOPB_REMOTE_HEADERS", "").splitlines(), *opts.header]
+            )
+        except ValueError as e:
+            parser.error(str(e))
         token = _control.resolve_data_plane_token(
             opts.token, allow_credential_file=False
         )

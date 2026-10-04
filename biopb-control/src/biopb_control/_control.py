@@ -191,9 +191,8 @@ _SESSION_CHAT_ROOT = "chat"
 # the narrowing by being added here.
 _SESSION_POST_ONLY_ROOTS = frozenset({_SESSION_CHAT_ROOT})
 
-# The session's MCP endpoint, for an agent attaching from another machine
-# (biopb-mcp's ARCHITECTURE, "Attaching from another machine"). It runs arbitrary code in the kernel, so it
-# is the opposite of `chat`: served only where the control **enforces a token**,
+# The session's MCP endpoint, for an agent attaching from another machine. It
+# runs arbitrary code in the kernel, so it is the opposite of `chat`: served only where the control **enforces a token**,
 # whatever its bind, so it is never reachable unauthenticated. A tokenless
 # control does not proxy it (a local agent reaches the session's own port); a
 # loopback control with a token does, which is what an SSH tunnel to it needs. A
@@ -201,6 +200,9 @@ _SESSION_POST_ONLY_ROOTS = frozenset({_SESSION_CHAT_ROOT})
 # CSRF gate has nothing to add and the methods are not narrowed (streamable-http
 # uses POST, GET and DELETE).
 _SESSION_MCP_ROOT = "mcp"
+
+# Roots whose GET stream is idle by design, so the proxy sets no read timeout.
+_SESSION_STREAM_ROOTS = frozenset({_SESSION_MCP_ROOT})
 
 
 def _session_proxy_roots(
@@ -625,8 +627,8 @@ _KERNEL_PROBE_TIMEOUT = 0.6
 # answers must fail eventually, not hang the request forever. The ``read`` bound
 # is per read-event, not total, and is set generously — every upstream buffers
 # its whole response before sending (no long-poll / chunked-with-gaps path, bar
-# the /mcp stream below,
-# so a large slice/render streams without inter-chunk stalls), so 300s only trips
+# the /mcp stream below, so a large slice/render streams without inter-chunk
+# stalls), so 300s only trips
 # on a genuinely stuck upstream, never on legitimately large or slow-computed
 # transfers. ``connect``/``write``/``pool`` are short since every hop is loopback.
 _PROXY_TIMEOUT = httpx.Timeout(connect=10.0, read=300.0, write=60.0, pool=10.0)
@@ -1612,7 +1614,7 @@ def build_app(
         # client's.
         timeout = (
             _STREAM_TIMEOUT
-            if segments[0] == _SESSION_MCP_ROOT
+            if segments[0] in _SESSION_STREAM_ROOTS
             else httpx.USE_CLIENT_DEFAULT
         )
         upstream = session_client.build_request(
