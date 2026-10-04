@@ -1412,9 +1412,9 @@ class TestSourceManagerRegressions:
     def test_unregister_source_claim_completes_when_metadata_remove_fails(
         self, tmp_path
     ):
-        """A catalog-delete failure must not skip the server-unregister or the
-        _path_to_source_id cleanup (issue #223 follow-up). The removal still
-        completes; only the leaked catalog row is logged.
+        """A catalog-delete failure must not skip the server-unregister
+        (issue #223 follow-up). The removal still completes; only the leaked
+        catalog row is logged.
         """
         monitored_dir = tmp_path / "monitored"
         monitored_dir.mkdir()
@@ -1439,13 +1439,10 @@ class TestSourceManagerRegressions:
             member_paths={str(data_path.resolve())},
         )
         assert manager._reconciler._commit_add_claim(claim) is True
-        assert claim.primary_path in manager._reconciler._path_to_source_id
 
         # The catalog DELETE raises, but the removal still completes.
         assert manager._reconciler._commit_remove_source(claim.source_id) is True
         assert server.unregistered == [claim.source_id]
-        # Path map cleaned -- no stale entry to mislead a later re-add/reconcile.
-        assert claim.primary_path not in manager._reconciler._path_to_source_id
         assert claim.source_id not in state.claims
 
     def test_reconcile_changed_source_rebuilds_it_in_place(self, tmp_path):
@@ -1575,11 +1572,9 @@ class TestSourceManagerRegressions:
             monitored_dirs={monitored_dir},
             stability_window=0.0,
         )
-        manager._reconciler._path_to_source_id[str(monitored_dir)] = "source-1"
 
+        # Neither the unregister nor the catalog delete may raise out of a rollback.
         manager._reconciler._rollback_source_registration("source-1")
-
-        assert manager._reconciler._path_to_source_id == {}
 
     def test_failed_dataset_retries_with_backoff(self, tmp_path, monkeypatch):
         monitored_dir = tmp_path / "monitored"

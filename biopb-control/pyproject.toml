@@ -40,6 +40,10 @@ dependencies = [
     # ws="none", so neither a server impl nor a client library is pulled in.
     "uvicorn>=0.34",
     "httpx>=0.27",
+    # httpcore imports sniffio on every request and, when it is missing (anyio 4
+    # no longer pulls it in), pays a failed-import path scan each time: ~45% of
+    # the /data_plane proxy's CPU per request.
+    "sniffio>=1.3",
 ]
 
 # Test/dev deps live in a PEP 735 group (kept out of published metadata), same

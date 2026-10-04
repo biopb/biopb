@@ -46,7 +46,7 @@ string is used where**, and how the first scan differs from every later one.
 | Holder | State | Keyed by |
 |---|---|---|
 | `DiscoveryState` (scratch and confirmed) | `claims`, `_path_to_source`, `_source_to_paths`, `consumed_paths`, `visited_identities` | `source_id`; claim path strings; file identities |
-| `Reconciler` | `_source_signatures`, `_missed_scans`, `_cloud_source_ids`, `_failed_sources`, `_path_to_source_id` | `source_id`; for the last, `claim.primary_path` |
+| `Reconciler` | `_source_signatures`, `_missed_scans`, `_cloud_source_ids`, `_failed_sources` | `source_id` |
 | `Roots` (shared by `SourceManager` and `Reconciler`) | every known root: kind (monitored, scan-once, dropped, upstream), alias, cloud, `dnd://` label | Resolved root `Path`s; a drop's label |
 | `SourceManager` | `_unavailable_roots` | Resolved root `Path`s |
 | Adapter | `_source_url` (the raw claim path, or the library's own filename for hdf5 / nifti / bioio / dicom), `catalog_url` | Opens files with the raw path |
@@ -69,8 +69,8 @@ it. No adapter `claim()` normalizes the path it returns.
    behind). `Roots` holds the same strings the walk uses.
 2. **A claim path is never resolved to key or look it up.** All of
    `DiscoveryState.claims` / `_path_to_source` / `_source_to_paths` /
-   `consumed_paths`, `_path_to_source_id` and the signature maps use the claim
-   strings exactly as the walk spelled them.
+   `consumed_paths` and the signature maps use the claim strings exactly as the
+   walk spelled them.
 3. **"Under a directory" is lexical.** A claim is under `D` when its string is
    `is_relative_to(D)` for a canonical `D`: a monitored root, a drop root, a
    declined directory, a cloud root. A claim is never resolved to answer this. A
