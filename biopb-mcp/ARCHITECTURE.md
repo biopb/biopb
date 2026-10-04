@@ -29,9 +29,10 @@ agreement on what a layer is (label sets, axes, pyramids).
 ## Process structure
 
 Everything the package runs is a chain of four processes, each spawned and reaped
-by the one above it. The chain a shim spawns is **client-scoped**: it comes up when
-an MCP client attaches to `new` and is gone when that client disconnects. A shim
-can instead attach to a session someone else started, which outlives it.
+by the one above it. A session a shim spawns itself is **client-scoped**: it comes
+up when an MCP client attaches to `new` and is gone when that client disconnects.
+A session the control launched for the client is ended by the control once it has
+been free for a grace period, and one someone else started outlives the client.
 
 ```
               AI agent / MCP client
@@ -44,7 +45,7 @@ can instead attach to a session someone else started, which outlives it.
                             │  http → /mcp, dynamic port
                             ▼
    ┌──────────────────────────────────────────────────┐
-   │ session child            ephemeral, shim-owned   │
+   │ session child            shim- or control-owned  │
    │   FastMCP / uvicorn  — tools + resources         │
    │   KernelHost         — owns the kernel           │
    │   observe UI         — job history + cancel      │
@@ -102,12 +103,15 @@ starts **unbound** and owns nothing until the agent calls its local `attach` too
    not the shim's: the shim renews the lease on a short beat and releases it on
    the way out, and never stops the session. A lease that is lost (another
    holder forced it, or the session stopped answering) unbinds the shim.
-3. `attach(session='new')` start-and-forgets the control plane and **spawns its
-   own ephemeral session child** (FastMCP/uvicorn + the kernel host) on a
-   **dynamic OS-assigned port**; the child **registers itself** with the
-   control, under an id the shim mints, and the shim leases it from birth.
-   This one it **owns**: it is reaped as a tree (POSIX process group +
-   parent-death pipe; Windows Job Object, #403) on the way out.
+3. `attach(session='new')` asks the **control** to launch an ephemeral session for
+   this client (`POST /api/sessions/new?ephemeral=1`, with the client's display
+   variables), starting the control first if need be, and leases it from birth.
+   The control owns its end: it stops the session once nothing has held it for a
+   grace period, so the shim only releases it. With no control to answer, or a
+   data plane pinned in the client's environment, the shim **spawns its own
+   session child** on a dynamic OS-assigned port and reaps it as a tree (POSIX
+   process group + parent-death pipe; Windows Job Object, #403) on the way out;
+   that child registers itself under an id the shim mints.
    `--session new` (or `$BIOPB_SESSION`) does this on the first request that
    needs a session, with no `attach` call.
 

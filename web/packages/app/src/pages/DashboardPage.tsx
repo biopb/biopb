@@ -39,7 +39,8 @@ interface SessionRec {
   // error|unknown); decorative, may be absent on an older control.
   kernel?: string;
   // Whether that page leads with the chat client rather than the job list --
-  // true for an agentless `biopb mcp view` session whose chat this control will
+  // true for a session whose mode serves chat (not a shim's child) and whose
+  // chat this control will
   // proxy. Absent on an older control, which reads as an observe link.
   chat?: boolean;
   // Whether the session serves a stop verb -- true only where it owns its own

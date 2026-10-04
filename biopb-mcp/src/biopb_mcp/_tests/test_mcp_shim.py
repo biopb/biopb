@@ -599,13 +599,31 @@ class TestBinding:
             "resolve",
             lambda sid: (
                 {"session_id": sid, "port": 7, "mcp_url": "http://127.0.0.1:7/mcp"}
-                if sid == "live"
+                if sid in ("live", "managed")
                 else None
             ),
         )
         monkeypatch.setattr(
             _shim._control_client, "start_control_detached", lambda: True
         )
+        # No control unless a test brings one: the real one would be whatever
+        # answers on this machine's control port.
+        env.control_up = False
+        env.launch_answer = None
+        env.launches = []
+        monkeypatch.setattr(
+            _shim._control_client, "ensure_control", lambda wait: env.control_up
+        )
+
+        def _launch(**kw):
+            env.launches.append(kw)
+            if isinstance(env.launch_answer, Exception):
+                raise env.launch_answer
+            return env.launch_answer
+
+        monkeypatch.setattr(_shim._control_client, "launch_session", _launch)
+        for name in _shim._PINNED_ENV:
+            monkeypatch.delenv(name, raising=False)
         return _shim._Binding(config=object(), preselect=preselect), env
 
     def _drive(self, binding, *steps):
@@ -682,6 +700,67 @@ class TestBinding:
         assert env.calls[0][:3] == ("http://127.0.0.1:1", "POST", "/api/lease/acquire")
         binding.reap()
         assert env.reaped == env.spawns
+
+    def test_new_asks_the_control_for_a_session_when_one_answers(self, monkeypatch):
+        binding, env = self._binding(monkeypatch)
+        env.control_up = True
+        env.launch_answer = {"state": "started", "session_id": "managed"}
+        monkeypatch.setenv("DISPLAY", ":3")
+        monkeypatch.setenv("LD_PRELOAD", "/tmp/not-sent.so")
+        [text] = self._drive(binding, lambda: binding.attach("new"))
+        assert "Attached to session managed" in text
+        assert "control ends it" in text
+        assert env.spawns == []
+        # The client's own display goes along, and nothing else of its
+        # environment.
+        assert env.launches[0]["display"].get("DISPLAY") == ":3"
+        assert "LD_PRELOAD" not in env.launches[0]["display"]
+        assert env.calls[0][:3] == ("http://127.0.0.1:7", "POST", "/api/lease/acquire")
+
+    def test_a_control_launched_session_is_released_not_stopped(self, monkeypatch):
+        binding, env = self._binding(monkeypatch)
+        env.control_up = True
+        env.launch_answer = {"state": "started", "session_id": "managed"}
+        self._drive(binding, lambda: binding.attach("new"))
+        binding.reap()
+        assert env.reaped == []  # the control ends it, once it has been free a while
+        assert env.calls[-1][2] == "/api/lease/release"
+
+    def test_a_launch_that_failed_says_why_and_does_not_fall_back(self, monkeypatch):
+        binding, env = self._binding(monkeypatch)
+        env.control_up = True
+        env.launch_answer = {"state": "failed", "error": "exited 2", "log": "no napari"}
+        [text] = self._drive(binding, lambda: binding.attach("new"))
+        assert "exited 2" in text and "no napari" in text
+        assert env.spawns == []
+
+    def test_a_slow_launch_points_at_the_listing(self, monkeypatch):
+        binding, env = self._binding(monkeypatch)
+        env.control_up = True
+        env.launch_answer = {"state": "starting"}
+        [text] = self._drive(binding, lambda: binding.attach("new"))
+        assert "still starting" in text and env.spawns == []
+
+    def test_a_control_that_will_not_launch_falls_back_to_our_own(self, monkeypatch):
+        binding, env = self._binding(monkeypatch)
+        env.control_up = True
+        env.launch_answer = OSError("refused")
+        self._drive(binding, lambda: binding.attach("new"))
+        assert len(env.spawns) == 1
+
+    def test_no_control_means_a_session_of_our_own(self, monkeypatch):
+        binding, env = self._binding(monkeypatch)
+        self._drive(binding, lambda: binding.attach("new"))
+        assert env.launches == [] and len(env.spawns) == 1
+
+    def test_a_pinned_data_plane_is_not_handed_to_the_control(self, monkeypatch):
+        # The control's session would not see the pin.
+        binding, env = self._binding(monkeypatch)
+        env.control_up = True
+        env.launch_answer = {"state": "started", "session_id": "managed"}
+        monkeypatch.setenv("BIOPB_TENSOR_URL", "grpc://elsewhere:1")
+        self._drive(binding, lambda: binding.attach("new"))
+        assert env.launches == [] and len(env.spawns) == 1
 
     def test_a_failed_new_is_reaped_and_can_be_retried(self, monkeypatch):
         binding, env = self._binding(monkeypatch, fail=1)
@@ -826,6 +905,12 @@ class TestEndToEnd:
 
     def test_session_is_private_and_reaped_on_disconnect(self, tmp_path):
         env = _home_env(tmp_path)  # isolate config + log dirs, per platform
+        # A pinned data plane keeps `attach new` off the control: the session it
+        # gets is the shim's own, reaped with it, which is what this test is of.
+        env["BIOPB_TENSOR_URL"] = "grpc://127.0.0.1:1"
+        # The shim still starts a control; keep it off the user's port, and stop
+        # it with the test.
+        env["BIOPB_CONTROL_PORT"] = str(_free_port())
 
         shim = subprocess.Popen(
             [sys.executable, "-m", "biopb_mcp.mcp", "--transport", "stdio"],
@@ -983,6 +1068,128 @@ class TestEndToEnd:
                 shim.kill()
             if child_pid is not None:
                 _force_kill(child_pid)
+            _stop_control(env)
+
+
+def _stop_control(env):
+    """Stop the control a test's shim started, on the test's own port."""
+    biopb = os.path.join(
+        os.path.dirname(sys.executable), "biopb.exe" if os.name == "nt" else "biopb"
+    )
+    subprocess.run(
+        [biopb, "control", "stop"],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=60,
+    )
+
+
+def _rpc_init(shim):
+    """Handshake a stdio shim subprocess."""
+    for msg in (
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "t", "version": "0"},
+            },
+        },
+        None,
+    ):
+        shim.stdin.write(
+            (
+                json.dumps(
+                    msg or {"jsonrpc": "2.0", "method": "notifications/initialized"}
+                )
+                + "\n"
+            ).encode()
+        )
+        shim.stdin.flush()
+        if msg is not None:
+            json.loads(shim.stdout.readline())
+
+
+def _rpc_call(shim, id_, name, arguments=None):
+    """A tool call over a shim's stdio: ``(result, text)``, notifications skipped."""
+    shim.stdin.write(
+        (
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": id_,
+                    "method": "tools/call",
+                    "params": {"name": name, "arguments": arguments or {}},
+                }
+            )
+            + "\n"
+        ).encode()
+    )
+    shim.stdin.flush()
+    while True:
+        msg = json.loads(shim.stdout.readline())
+        if msg.get("id") == id_:
+            break
+    result = msg["result"]
+    return result, result["content"][0]["text"]
+
+
+class TestControlLaunchedSession:
+    """The real control launches the session an agent attaches to, and ends it
+    once nothing has held it for the grace period."""
+
+    def test_the_control_ends_a_session_nothing_holds(self, tmp_path):
+        env = _home_env(tmp_path)
+        for name in _shim._PINNED_ENV:
+            env.pop(name, None)
+        # A control of this test's own, on a port that is not the user's.
+        env["BIOPB_CONTROL_PORT"] = str(_free_port())
+        env["BIOPB_SESSION_IDLE_GRACE"] = "2"
+        reg_dir = tmp_path / ".local/state/biopb/sessions"
+
+        shim = subprocess.Popen(
+            [sys.executable, "-m", "biopb_mcp.mcp", "--transport", "stdio"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=env,
+        )
+        pid = None
+        try:
+            _rpc_init(shim)
+            result, text = _rpc_call(shim, 2, "attach", {"session": "new"})
+            assert result.get("isError") is not True, text
+            assert "control ends it" in text, text
+
+            records = list(reg_dir.glob("*.json"))
+            assert len(records) == 1, records
+            rec = json.loads(records[0].read_text())
+            pid = rec["pid"]
+            assert rec["mode"] == "ephemeral"
+            assert _pid_alive(pid)
+            # The control's session is no child of this shim, and nobody else
+            # can take it while it is held.
+            status, _ = _rpc_call(shim, 3, "server_status")
+            assert status.get("isError") is not True, status
+
+            # Disconnect: the shim releases the lease and leaves the session
+            # running; the control ends it after the grace.
+            shim.stdin.close()
+            assert shim.wait(timeout=40) == 0
+            _await_dead(pid, timeout=60)
+            deadline = time.monotonic() + 10
+            while list(reg_dir.glob("*.json")) and time.monotonic() < deadline:
+                time.sleep(0.2)
+            assert list(reg_dir.glob("*.json")) == []
+        finally:
+            if shim.poll() is None:
+                shim.kill()
+            if pid is not None:
+                _force_kill(pid)
+            _stop_control(env)
 
 
 class TestServe:

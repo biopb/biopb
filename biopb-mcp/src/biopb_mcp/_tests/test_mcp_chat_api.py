@@ -37,7 +37,7 @@ def configured(tmp_path, monkeypatch):
     write_credential("sk-x", _model.KEY_NAME)
     cfg = chat_config()
     cfg["chat"] = {"model": "test-model"}
-    _chat_api.configure(cfg, agentless=True)
+    _chat_api.configure(cfg, mode="durable")
     _chat.reset()
     _lease._reset()
     yield cfg
@@ -542,7 +542,7 @@ def test_routes_are_not_mounted_when_chat_is_off():
     # interpret.
     cfg = chat_config()
     cfg["observe"]["chat_enabled"] = False
-    assert _chat_api.configure(cfg, agentless=True) is False
+    assert _chat_api.configure(cfg, mode="durable") is False
 
 
 def test_chat_follows_the_page_it_lives_on():
@@ -550,26 +550,25 @@ def test_chat_follows_the_page_it_lives_on():
     # nothing that can reach them. Enforced rather than documented: the two
     # flags cannot be set to a combination that serves an unreachable surface.
     cfg = chat_config(enabled=False)
-    assert _chat_api.configure(cfg, agentless=True) is False
+    assert _chat_api.configure(cfg, mode="durable") is False
 
 
 def test_a_harness_driven_session_gets_no_chat():
-    # The loop is for users *without* an MCP harness. On a session an agent is
-    # already driving, a second one is not a feature: only one writer can hold
-    # the kernel claim, so the pane would answer questions and then refuse to
-    # run anything -- correct, and not what anyone opening it expects.
-    #
-    # Config alone cannot express this. Both switches are on here, and the
-    # surface is still withheld, because the deciding fact is how the session
-    # was launched rather than how it was configured.
+    # A shim's child is serving an MCP client that cannot share its kernel with
+    # a chat. Config alone cannot express this: both switches are on here, and
+    # the surface is still withheld, because the deciding fact is how the
+    # session was launched. Every other mode serves it, an ephemeral session
+    # included -- the lease, not the mode, keeps it off an attached agent.
     cfg = chat_config()
     cfg["chat"] = {"model": "test-model"}
-    assert _chat_api.configure(cfg, agentless=False) is False
-    assert _chat_api.configure(cfg, agentless=True) is True
+    assert _chat_api.configure(cfg, mode="shim") is False
+    assert _chat_api.configure(cfg, mode="direct") is False
+    assert _chat_api.configure(cfg, mode="durable") is True
+    assert _chat_api.configure(cfg, mode="ephemeral") is True
 
 
 def test_chat_cannot_be_configured_on_by_accident():
-    # `agentless` is required, not defaulted: either default is wrong for one
+    # `mode` is required, not defaulted: either default is wrong for one
     # of the two callers, and the failure would be silent both ways -- chat on
     # every harness-driven session, or missing from the viewer it was built for.
     with pytest.raises(TypeError):

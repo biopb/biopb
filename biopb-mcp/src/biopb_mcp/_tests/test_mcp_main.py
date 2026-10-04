@@ -11,12 +11,11 @@ import sys
 import pytest
 
 from biopb_mcp._config import McpConfig
-from biopb_mcp.mcp import __main__ as launcher
+from biopb_mcp.mcp import __main__ as launcher, _session_mode
 from biopb_mcp.mcp.__main__ import (
     _config_defaults,
     _decide_viewer,
     _has_display,
-    _is_agentless,
     _parse_args,
     _register_session,
     _setup_chat,
@@ -343,37 +342,35 @@ class TestSetupChat:
         ids=["partial", "full"],
     )
     def test_it_mounts_for_a_viewer(self, cfg, mounted):
-        assert _setup_chat(cfg, agentless=True) is True
+        assert _setup_chat(cfg, mode="durable") is True
         assert mounted == [1]
 
     def test_it_mounts_nothing_for_a_harness_session(self, mounted):
         cfg = {"observe": {"enabled": True, "chat_enabled": True}}
-        assert _setup_chat(cfg, agentless=False) is False
+        assert _setup_chat(cfg, mode="shim") is False
         assert mounted == []
 
     def test_it_mounts_nothing_when_the_switch_is_off(self, mounted):
         cfg = {"observe": {"enabled": True, "chat_enabled": False}}
-        assert _setup_chat(cfg, agentless=True) is False
+        assert _setup_chat(cfg, mode="durable") is False
         assert mounted == []
 
     @pytest.mark.parametrize(
-        "cfg, agentless, expected",
+        "cfg, mode, expected",
         [
-            ({"observe": {"enabled": True, "chat_enabled": True}}, True, True),
-            ({"observe": {"enabled": True, "chat_enabled": True}}, False, False),
-            ({"observe": {"enabled": True, "chat_enabled": False}}, True, False),
+            ({"observe": {"enabled": True, "chat_enabled": True}}, "durable", True),
+            ({"observe": {"enabled": True, "chat_enabled": True}}, "shim", False),
+            ({"observe": {"enabled": True, "chat_enabled": False}}, "durable", False),
         ],
     )
-    def test_it_publishes_the_verdict_on_api_status(
-        self, mounted, cfg, agentless, expected
-    ):
+    def test_it_publishes_the_verdict_on_api_status(self, mounted, cfg, mode, expected):
         # The control's dashboard labels a session's link by what it serves, and
         # reads that off /api/status. Set on every path, so a session that never
         # mounted chat -- or failed to -- reads as off rather than stale.
         from biopb_mcp.mcp import _observe
 
         _observe.set_chat_enabled(not expected)  # a value that must be overwritten
-        assert _setup_chat(cfg, agentless=agentless) is expected
+        assert _setup_chat(cfg, mode=mode) is expected
         assert _observe._chat_enabled is expected
 
     def test_setup_observe_hands_over_the_session_teardown(self, monkeypatch):
@@ -385,13 +382,13 @@ class TestSetupChat:
         calls = []
         _setup_observe(
             {"observe": {"enabled": True}},
-            agentless=True,
+            mode="durable",
             on_shutdown=lambda: calls.append(1),
         )
-        assert _observe._agentless is True
+        assert _observe._mode == "durable"
         _observe._shutdown_hook()
         assert calls == [1]
-        _observe.set_session_owns_its_reap(False)
+        _observe.set_session_mode("shim")
 
     def test_setup_observe_gives_a_shim_child_no_teardown(self, monkeypatch):
         # A shim-owned child is its shim's to reap; handing it a teardown here
@@ -400,10 +397,10 @@ class TestSetupChat:
 
         _setup_observe(
             {"observe": {"enabled": True}},
-            agentless=False,
+            mode="shim",
             on_shutdown=lambda: None,
         )
-        assert _observe._agentless is False
+        assert _observe._mode == "shim"
         assert _observe._shutdown_hook is None
 
     def test_a_failed_mount_reads_as_off(self, monkeypatch):
@@ -414,36 +411,54 @@ class TestSetupChat:
         )
         _observe.set_chat_enabled(True)
         cfg = {"observe": {"enabled": True, "chat_enabled": True}}
-        assert _setup_chat(cfg, agentless=True) is False
+        assert _setup_chat(cfg, mode="durable") is False
         assert _observe._chat_enabled is False
 
 
-class TestAgentless:
-    """Which sessions count as one a human opened.
+class TestSessionMode:
+    """How a launch is named, and what hangs off the name.
 
-    Two things hang off this and must not drift apart: such a session owns its
-    reap (the stop route), and it is the only kind served the built-in chat
-    loop. Pinned as a truth table rather than trusted to two inline expressions.
+    Pinned as a truth table rather than trusted to inline expressions: whether a
+    session serves the stop route, mounts chat and publishes itself all follow
+    from its mode and must not drift apart.
     """
 
     @pytest.mark.parametrize(
-        "view,shim_owned,port,expected",
+        "view,shim_owned,port,lifetime,expected",
         [
             # `biopb mcp view`, on a dynamic or a chosen port.
-            (True, False, 0, True),
-            (True, False, 9000, True),
+            (True, False, 0, None, "durable"),
+            (True, False, 9000, None, "durable"),
             # The dashboard's new session: a plain http session on port 0.
-            (False, False, 0, True),
-            # A shim-owned child is serving an MCP client, whatever its port.
-            (False, True, 0, False),
-            (True, True, 0, False),
+            (False, False, 0, None, "durable"),
+            # The control's launch for an agent says so.
+            (False, False, 0, "ephemeral", "ephemeral"),
+            # A shim's child, whatever its port or what the environment says.
+            (False, True, 0, None, "shim"),
+            (True, True, 0, None, "shim"),
+            (False, True, 0, "ephemeral", "shim"),
             # A direct `--transport http` launch on a fixed port: wired to
             # something by its operator, and publishes no session.
-            (False, False, 8765, False),
+            (False, False, 8765, None, "direct"),
+            (False, False, 8765, "ephemeral", "direct"),
         ],
     )
-    def test_truth_table(self, view, shim_owned, port, expected):
-        assert _is_agentless(view, shim_owned, port) is expected
+    def test_truth_table(self, view, shim_owned, port, lifetime, expected):
+        assert _session_mode.of(view, shim_owned, port, lifetime) == expected
+
+    @pytest.mark.parametrize(
+        "mode,stop,chat,publishes",
+        [
+            ("durable", True, True, True),
+            ("ephemeral", True, True, True),
+            ("shim", False, False, True),
+            ("direct", False, False, False),
+        ],
+    )
+    def test_what_follows_from_the_mode(self, mode, stop, chat, publishes):
+        assert _session_mode.owns_reap(mode) is stop
+        assert _session_mode.serves_chat(mode) is chat
+        assert _session_mode.publishes(mode) is publishes
 
 
 _URL = "http://127.0.0.1:45678/mcp"
@@ -491,6 +506,15 @@ class TestSessionRegistration:
             _register_session(45678, _URL, launched_by="tok-abc123")
         )
         assert rec["launch_token"] == "tok-abc123"
+
+    def test_the_mode_is_recorded_for_the_control_to_read(self):
+        # The control ends an ephemeral session once it has been free for a
+        # while, and finds it by this field.
+        from biopb import _sessions
+
+        rec = _sessions.read_session(_register_session(45678, _URL, mode="ephemeral"))
+        assert rec["mode"] == "ephemeral"
+        assert "mode" not in _sessions.read_session(_register_session(45678, _URL))
 
     def test_registered_session_is_listed_as_live(self):
         from biopb import _sessions

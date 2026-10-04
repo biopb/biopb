@@ -1,6 +1,6 @@
 # Attaching an agent to an existing session
 
-Phase 1 is implemented; phases 2 and 3 are not.
+Phases 1 and 2 are implemented; phase 3 is not.
 
 An agent can attach to a session that is already running instead of getting its
 own. The control becomes the authority for session lifecycle; the stdio shim
@@ -72,8 +72,10 @@ session id or `new`:
 
 - No id: the tool error lists live sessions as `id, busy|free, viewer|no viewer`.
 - Id: take the lease, then proxy every other request to it.
-- `new`: phase 1 spawns a shim-owned ephemeral session as today, leased from
-  birth. Phase 2 asks the control to launch one that the control then owns.
+- `new`: asks the control to launch an ephemeral session for this client,
+  leased from birth. With no control to answer, or with a data plane pinned in the
+  client's environment (`BIOPB_TENSOR_*`, which a control-launched session would
+  not see), the shim spawns a session of its own and reaps it, as it always did.
 - `--session <id>` (or env) pre-binds for people and scripts.
 
 While unbound the shim answers the handshake and list requests from the imported
@@ -87,12 +89,15 @@ does not forward today.
 
 1. **Local attach.** The lease in the session (agent and chat holders), the
    `attach` tool, direct loopback connection. No ownership change.
-2. **Control-owned lifecycle.** Launch and stop verbs for agent sessions, idle
-   lease after the last detach, a named session mode replacing the
-   `agentless`/`shim_owned` inference, an allowlisted display environment for
-   sessions the control launches (a control's own environment is frozen at its
-   first start). Rewrite control invariant I1 and the "each client owns one
-   ephemeral session" guide.
+2. **Control-owned lifecycle.** A session has a named mode (`shim`, `durable`,
+   `ephemeral`, `direct`; `mcp/_session_mode.py`) that decides its stop route,
+   chat and registration, in place of the `agentless`/`shim_owned` inference.
+   `attach new` goes through `POST /api/sessions/new?ephemeral=1`, carrying the
+   client's allowlisted display variables in place of the control's own. The
+   control ends an ephemeral session once its lease has been free for the grace
+   period, by asking it to end itself; `POST /api/sessions/<id>/stop` does the same
+   on request, refusing a held session unless forced. Control invariant I1 is
+   rewritten to match.
 3. **Remote.** `/mcp` proxied by the control under the token, with the Host and
    Origin guards. `/mcp` runs arbitrary code in a kernel, so it is proxied only
    when a token is enforced. Sessions stay loopback-bound; the control is the only

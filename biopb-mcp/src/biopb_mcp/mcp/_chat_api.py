@@ -32,7 +32,7 @@ import logging
 from starlette.responses import JSONResponse
 
 from .._config import get_setting
-from . import _app, _chat, _http, _lease, _model, _observe
+from . import _app, _chat, _http, _lease, _model, _observe, _session_mode
 
 logger = logging.getLogger(__name__)
 
@@ -58,33 +58,30 @@ _live_text = ""
 _live_len = 0
 
 
-def configure(config, *, agentless):
+def configure(config, *, mode):
     """Take the resolved config; return whether chat should be served.
 
     The switch is ``observe.chat_enabled``, because what it
     turns on is a pane on the observe page — and it is read together with
     ``observe.enabled`` because that page is how anyone reaches these routes.
 
-    *agentless* is the third term, and the one that is not configuration: this
-    loop exists for users **without** an MCP harness, so a session an agent is
-    already driving does not get one. Offering it there would be technically
-    sound and practically confusing -- two agents on one kernel, of which only
-    one can hold the claim, so the pane would answer questions and then refuse
-    to run anything. A human in an attached notebook has the same shape and is
-    let in anyway, because a person typing a cell is not a second agent; a chat
-    loop is.
+    *mode* is the third term, and the one that is not configuration: a session
+    whose mode serves no chat (a shim's child, which is serving an MCP client)
+    gets no pane. An agent attached to a session that does serve it is kept off
+    by the lease, so the pane answers questions and then refuses to run anything
+    only while someone else holds the session -- a state it reports.
 
     Required rather than defaulted, because both answers are wrong to assume: a
-    default of True serves chat to every harness-driven session, and a default
-    of False silently withholds it from the viewer it was built for. The two
-    call sites both know.
+    default that serves chat gives a pane to every harness-driven session, and
+    one that does not silently withholds it from the viewer it was built for.
+    The call sites all know.
     """
     global _config, _enabled
     _config = config
     _enabled = bool(
         get_setting(config, "observe.enabled")
         and get_setting(config, "observe.chat_enabled")
-        and agentless
+        and _session_mode.serves_chat(mode)
     )
     # The image policy is the loop's session state, not a per-call config read:
     # the model can be switched at runtime, and a refusal it learns belongs to

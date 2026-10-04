@@ -26,11 +26,16 @@ same port**, and routes by namespace so no two upstreams share a path prefix:
   /api/algorithms/logs`` -> the algorithm plane's verbs (``?name=``).
 - ``GET  /api/sessions``          -> the live MCP sessions from the registry, each
                                      with its ``/session/<id>/observe`` link.
-- ``POST /api/sessions/new``      -> launch an agentless session on this
-                                     machine; its config decides whether it
-                                     gets a napari viewer. The child is
+- ``POST /api/sessions/new``      -> launch a session on this machine; its
+                                     config decides whether it gets a napari
+                                     viewer. Durable (a person's, until they stop
+                                     it) unless ``?ephemeral=1``, for an agent:
+                                     then the control ends it once it has been
+                                     free for a grace period. The child is
                                      detached and self-registering, so the
                                      control launches it without owning it.
+- ``POST /api/sessions/<id>/stop`` -> have a session end itself; refused while an
+                                     agent or chat holds it, unless ``?force=1``.
 - ``GET  /`` (and every other non-API, non-proxy GET) -> the built ``web/``
                                      SPA bundle (``static_dir``). The control is
                                      the **single web origin**: it serves the
@@ -637,13 +642,13 @@ def _kernel_state(health: dict) -> str:
 _PROBE_UNKNOWN = {
     "kernel": "unknown",
     "chat": False,
-    "agentless": False,
+    "can_stop": False,
     "holder": None,
 }
 
 
 async def _probe_session(client: httpx.AsyncClient, rec: dict) -> dict:
-    """Best-effort ``{kernel, chat, agentless}`` for one session.
+    """Best-effort ``{kernel, chat, can_stop, holder}`` for one session.
 
     A single cheap loopback GET to the child's ``/api/status`` — which returns
     ``KernelHost.health()`` with no kernel round-trip and whose ``api`` observe
@@ -656,10 +661,10 @@ async def _probe_session(client: httpx.AsyncClient, rec: dict) -> dict:
 
     The two booleans come off the same response rather than extra requests, and
     answer different questions. ``chat_enabled`` says what that session's page
-    leads with, which is how the dashboard labels its link. ``agentless`` says
-    who owns the reap — only an agentless session ends itself, a
-    shim-owned child is its shim's to reap — which is how the dashboard decides
-    whether to offer a stop. Both absent on an older child, which reads as
+    leads with, which is how the dashboard labels its link. ``can_stop`` says
+    whether the session serves a stop — only a session something other than a
+    shim ends does, a shim's child is its shim's to reap — which is how the
+    dashboard decides whether to offer one. Both absent on an older child, which reads as
     False: an observe link and no stop button, the behaviour that predates them.
     """
     port = rec.get("port")
@@ -674,7 +679,7 @@ async def _probe_session(client: httpx.AsyncClient, rec: dict) -> dict:
         return {
             "kernel": _kernel_state(health),
             "chat": bool(health.get("chat_enabled")),
-            "agentless": bool(health.get("agentless")),
+            "can_stop": bool(health.get("can_stop")),
             # Who the session answers to (`agent`, `chat`, or nobody): what an
             # agent choosing a session to attach to needs, and the dashboard
             # can show.
@@ -686,20 +691,26 @@ async def _probe_session(client: httpx.AsyncClient, rec: dict) -> dict:
 
 # --- launching a session ---------------------------------------------------- #
 #
-# Invariant I1 (ARCHITECTURE.md) says the control observes sessions and never
-# spawns them, and its reason is a *display* one: a session spawned from the
-# control's frozen environment would put the agent's napari viewer somewhere the
-# user is not (biopb/biopb-mcp#98). That covers a session serving an MCP client,
-# whose spawner is that client's shim anyway. It does not cover the session the
-# dashboard's "new session" opens: an agentless one, driven by the person at the
-# dashboard through its chat pane or a Jupyter client, and useful with no
-# viewer at all. Whether it gets one is its own config's call, made the way
-# every session makes it -- viewer.enabled, napari installed, a display -- and a
-# session that cannot have one runs without it rather than failing.
+# Invariant I1 (ARCHITECTURE.md): the control sets the policy for sessions and
+# never holds one. It launches two kinds. The dashboard's "new session" is
+# durable: driven by the person at the dashboard through its chat pane or a
+# Jupyter client, useful with no viewer at all, and ended when they stop it. A
+# session launched for an agent is ephemeral: the control ends it once nothing
+# has held it for a grace period. Whether either gets a napari viewer is its own
+# config's call, made the way every session makes it -- viewer.enabled, napari
+# installed, a display -- and a session that cannot have one runs without it
+# rather than failing.
+#
+# The display is why a session spawned from the control's frozen environment can
+# put the agent's viewer somewhere the user is not (biopb/biopb-mcp#98). A launch
+# for an agent therefore says what display the agent's client has (``display``),
+# and the control passes exactly that, never its own. A dashboard launch has no
+# such client, and inherits the control's.
 #
 # What the control does not do is own the result: the child is detached,
-# self-registers, and self-de-registers, so the *registry* still only ever
-# observes, and a control restart does not end the user's session.
+# self-registers, and self-de-registers, so the *registry* still only observes,
+# and a control restart does not end a session -- it only restarts the idle
+# clocks, which are held in memory.
 
 # How long POST /api/sessions/new waits for a launched session to publish
 # itself. Generous because the session starts its kernel -- and a napari window
@@ -726,18 +737,44 @@ _VIEWER_LOG_KEEP = 5
 _VIEWER_LOG_ATTEMPTS = 100
 
 
-def _session_argv() -> list[str]:
-    """The command that starts an agentless session.
+# Marks a session launched for an agent; the session records it as its mode.
+# Kept in sync with ``biopb_mcp.mcp._session_mode.ENV_LIFETIME`` (a literal on
+# each side: the packages cannot import each other, and a core constant would
+# raise biopb-mcp's ``biopb`` floor).
+_LIFETIME_ENV = "BIOPB_SESSION_LIFETIME"
 
-    A plain http session on ``--port 0``, which is what makes it agentless and
-    self-publishing (N of them never collide on the configured MCP port), with
-    its kernel started before it publishes itself so it is ready to use. Run
-    as a module of *this* interpreter -- the supervisor's idiom for the data
+# The only variables a launch's ``display`` may set: where a viewer window can
+# appear. Anything else a client could send is an environment injection into a
+# process that runs arbitrary code (``LD_PRELOAD``, ``PATH``), so it is dropped.
+_DISPLAY_ENV = (
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XAUTHORITY",
+    "XDG_RUNTIME_DIR",
+    "XDG_SESSION_TYPE",
+)
+
+# How long an ephemeral session may go unheld before the control ends it, and
+# how often the control looks. Overridable for tests and for operators.
+_EPHEMERAL_GRACE = 120.0
+_REAP_INTERVAL = 15.0
+_GRACE_ENV = "BIOPB_SESSION_IDLE_GRACE"
+_SESSION_CALL_TIMEOUT = 3.0
+
+
+def _session_argv(start_kernel: bool = True) -> list[str]:
+    """The command that starts a session.
+
+    A plain http session on ``--port 0``, which is what makes it self-publishing
+    (N of them never collide on the configured MCP port), with its kernel
+    started before it publishes itself so it is ready to use -- unless the
+    caller is an agent, which starts the kernel itself with ``start_kernel``.
+    Run as a module of *this* interpreter -- the supervisor's idiom for the data
     plane -- so it resolves through the environment the control was installed
     into and needs no console script on PATH. Importing nothing of it here
     keeps I2.
     """
-    return [
+    argv = [
         sys.executable,
         "-m",
         "biopb_mcp.mcp",
@@ -745,8 +782,40 @@ def _session_argv() -> list[str]:
         "http",
         "--port",
         "0",
-        "--start-kernel",
     ]
+    if start_kernel:
+        argv.append("--start-kernel")
+    return argv
+
+
+def _launch_env(
+    launch_token: str, log_path, *, ephemeral: bool, display: dict | None
+) -> dict:
+    """The environment a launched session starts with.
+
+    Inherited from the control, which carries the DISPLAY/XAUTHORITY/
+    WAYLAND_DISPLAY (or the Aqua session, or the Windows station) that decides
+    whether the session can have a window, and where -- except when the launch
+    names a *display* (an agent's client): then the control's own display
+    variables are dropped and the allowlisted ones it sent are set, so an
+    agent whose client has no display gets no viewer rather than one on the
+    screen the control happened to start under.
+    """
+    env = {**os.environ, _locations.MCP_LAUNCH_TOKEN_ENV: launch_token}
+    if display is not None:
+        for key in _DISPLAY_ENV:
+            env.pop(key, None)
+        for key, value in display.items():
+            if key in _DISPLAY_ENV and isinstance(value, str) and value:
+                env[key] = value
+    if ephemeral:
+        env[_LIFETIME_ENV] = "ephemeral"
+    else:
+        # Whatever the control itself inherited, a dashboard launch is durable.
+        env.pop(_LIFETIME_ENV, None)
+    if log_path is not None:
+        env[_locations.MCP_SESSION_LOG_ENV] = str(log_path)
+    return env
 
 
 def _prune_viewer_logs(log_dir, keep: int) -> None:
@@ -835,8 +904,14 @@ def _is_our_launch(rec: dict, launch_token: str) -> bool:
     return rec.get(_locations.LAUNCH_TOKEN_FIELD) == launch_token
 
 
-def _launch_session(timeout: float) -> dict:
-    """Start an agentless session; wait for it to publish itself.
+def _launch_session(
+    timeout: float,
+    *,
+    ephemeral: bool = False,
+    start_kernel: bool = True,
+    display: dict | None = None,
+) -> dict:
+    """Start a session; wait for it to publish itself.
 
     Registration is the readiness signal: ``--start-kernel`` runs
     ``host.ensure_started()`` *before* ``_register_session`` (biopb-mcp
@@ -856,26 +931,25 @@ def _launch_session(timeout: float) -> dict:
     forwarded exit as "exited before it opened" (biopb#1084).
 
     Detached (:func:`detach_kwargs`) and then forgotten: the ``Popen`` handle is
-    held only long enough to notice an early exit, never to reap or restart. The
-    session is the user's, and a control restart must not end it.
+    held only long enough to notice an early exit, never to reap or restart. A
+    control restart must not end the session.
+
+    *ephemeral* launches it for an agent (see :func:`_launch_env` for
+    *display*): the control will end it once it has been free for a grace
+    period. *start_kernel* is False for an agent, which starts its own.
 
     Returns ``{"state": "started"|"starting"|"failed", ...}``; only ``failed``
     carries ``error`` and ``log``.
     """
     log_fh, log_path = _open_viewer_log()
-    argv = _session_argv()
+    argv = _session_argv(start_kernel)
     logger.info("Launching session: %s (log: %s)", " ".join(argv), log_path)
-    # The environment is inherited: it carries the DISPLAY/XAUTHORITY/
-    # WAYLAND_DISPLAY (or the Aqua session, or the Windows station) that decides
-    # whether the session can have a window, and where. Two additions ride on
-    # top of it: the
-    # per-launch token we recognise the child's registration by, and where its
-    # own output went, so `server_status` can name the file rather than guessing
-    # the canonical one -- the same thing the shim does for its child.
+    # Two additions ride on the environment: the per-launch token we recognise
+    # the child's registration by, and where its own output went, so
+    # `server_status` can name the file rather than guessing the canonical one
+    # -- the same thing the shim does for its child.
     launch_token = secrets.token_hex(8)
-    env = {**os.environ, _locations.MCP_LAUNCH_TOKEN_ENV: launch_token}
-    if log_path is not None:
-        env[_locations.MCP_SESSION_LOG_ENV] = str(log_path)
+    env = _launch_env(launch_token, log_path, ephemeral=ephemeral, display=display)
     try:
         proc = subprocess.Popen(
             argv,
@@ -890,6 +964,11 @@ def _launch_session(timeout: float) -> dict:
     finally:
         if log_fh is not None:
             log_fh.close()  # the child holds its own dup
+    if os.name != "nt":
+        # Reap it when it ends, so a session the control stops does not linger
+        # as a zombie for the control's lifetime. Waiting is not owning: nothing
+        # here restarts it or ends it.
+        threading.Thread(target=proc.wait, daemon=True).start()
 
     deadline = time.monotonic() + timeout
     while True:
@@ -903,6 +982,8 @@ def _launch_session(timeout: float) -> dict:
                     "state": "started",
                     "session_id": session_id,
                     "observe_url": f"/session/{session_id}/observe",
+                    "port": rec.get("port"),
+                    "mcp_url": rec.get("mcp_url"),
                 }
         code = proc.poll()
         if code is not None:
@@ -927,6 +1008,101 @@ def _launch_session(timeout: float) -> dict:
         time.sleep(_SESSION_POLL_INTERVAL)
 
 
+async def _probe_holder(client: httpx.AsyncClient, rec: dict):
+    """``(answered, holder)`` for a session: who holds its lease, or whether it
+    could be asked at all."""
+    url = _loopback_url(rec.get("host", "127.0.0.1"), rec["port"]) + "/api/lease"
+    try:
+        resp = await client.get(url, timeout=_SESSION_CALL_TIMEOUT)
+        if resp.status_code != 200:
+            return False, None
+        return True, resp.json().get("holder")
+    except Exception:  # noqa: BLE001 - an unanswered probe is not an answer
+        return False, None
+
+
+async def _stop_session(
+    client: httpx.AsyncClient, rec: dict, force: bool
+) -> tuple[int, dict]:
+    """Have a session end itself; ``(http status, body)``.
+
+    Asks the session to run its own teardown (``/api/shutdown``) rather than
+    signalling a pid, which is what keeps the control from owning it. A held
+    session is refused unless *force*: the holder is somebody's work. The lease
+    is read again here, not trusted from an earlier look, so a session that
+    was claimed between the reaper's probe and this call is left alone.
+    """
+    base = _loopback_url(rec.get("host", "127.0.0.1"), rec["port"])
+    answered, holder = await _probe_holder(client, rec)
+    if not answered:
+        return 502, {"error": "the session did not answer"}
+    if holder and not force:
+        return 409, {
+            "error": f"the session is held by its {holder}",
+            "holder": holder,
+        }
+    try:
+        resp = await client.post(base + "/api/shutdown", timeout=_SESSION_CALL_TIMEOUT)
+    except Exception as exc:  # noqa: BLE001 - reported, not raised
+        return 502, {"error": f"the session did not answer: {exc}"}
+    if resp.status_code == 404:
+        return 409, {
+            "error": "this session ends with its own client; it cannot be stopped here"
+        }
+    if resp.status_code != 200:
+        return 502, {"error": f"the session refused to stop ({resp.status_code})"}
+    return 200, {"stopping": True}
+
+
+async def _reap_idle_sessions(
+    client: httpx.AsyncClient, free_since: dict, grace: float, now: float
+) -> None:
+    """Stop each ephemeral session that has been free for *grace* seconds.
+
+    *free_since* is the idle clocks, session id -> when it was first seen free,
+    held in memory by the caller: a control restart restarts the clocks, which
+    errs toward keeping a session. A session that does not answer is left alone
+    -- the registry's pid check removes a dead one -- and a held one resets its
+    clock.
+    """
+    seen = set()
+    records = await asyncio.to_thread(_sessions.list_sessions)
+    for rec in records:
+        session_id = rec.get("session_id")
+        if not session_id or rec.get("mode") != "ephemeral" or not rec.get("port"):
+            continue
+        seen.add(session_id)
+        answered, holder = await _probe_holder(client, rec)
+        if not answered:
+            continue
+        if holder:
+            free_since.pop(session_id, None)
+            continue
+        since = free_since.setdefault(session_id, now)
+        if now - since < grace:
+            continue
+        status, body = await _stop_session(client, rec, force=False)
+        logger.info(
+            "Ending idle session %s (free %.0fs): %s", session_id, now - since, body
+        )
+        if status == 200:
+            free_since.pop(session_id, None)
+    for session_id in list(free_since):
+        if session_id not in seen:
+            del free_since[session_id]
+
+
+def _idle_grace(configured: float | None) -> float:
+    """How long an ephemeral session may be free: the argument, else
+    ``$BIOPB_SESSION_IDLE_GRACE``, else the default."""
+    if configured is not None:
+        return configured
+    try:
+        return float(os.environ[_GRACE_ENV])
+    except (KeyError, ValueError):
+        return _EPHEMERAL_GRACE
+
+
 def build_app(
     supervisor: DataPlaneSupervisor,
     ensure_timeout: float,
@@ -936,6 +1112,7 @@ def build_app(
     loopback_bound: bool = False,
     url_prefix: str | None = None,
     algorithms: AlgorithmPlane | None = None,
+    session_idle_grace: float | None = None,
 ) -> Starlette:
     """Build the control-plane ASGI app.
 
@@ -967,6 +1144,10 @@ def build_app(
 
     ``algorithms`` is the algorithm plane the ``/api/algorithms`` verbs drive;
     by default one over the user's registry.
+
+    ``session_idle_grace`` is how long a session launched for an agent may go
+    unheld before the control ends it; by default ``$BIOPB_SESSION_IDLE_GRACE``,
+    else two minutes.
     """
     session_roots = _session_proxy_roots(loopback_bound)
     if algorithms is None:
@@ -1192,7 +1373,7 @@ def build_app(
                 "observe_url": f"/session/{rec['session_id']}/observe",
                 "kernel": probe["kernel"],
                 # Whether that page will lead with the chat client: the child
-                # mounts it (only an agentless session does) AND this
+                # mounts it (only a session whose mode serves it does) AND this
                 # control will proxy /chat/*. Both halves, as ObservePage needs
                 # both — answered here so the dashboard needs no second probe.
                 "chat": probe["chat"] and loopback_bound,
@@ -1200,7 +1381,7 @@ def build_app(
                 # the way chat is: the route lives under `api`, which is proxied
                 # everywhere, and stopping a session is no more destructive than
                 # the kernel restart already there.
-                "can_stop": probe["agentless"],
+                "can_stop": probe["can_stop"],
                 "holder": probe["holder"],
             }
             for rec, probe in zip(records, probes, strict=True)
@@ -1208,7 +1389,7 @@ def build_app(
         return JSONResponse({"sessions": sessions})
 
     def api_session_new(request: Request) -> JSONResponse:
-        # Launch an agentless session on this machine. Sync: it spawns and then
+        # Launch a session on this machine. Sync: it spawns and then
         # blocks polling the registry, so Starlette runs it in the threadpool.
         # The client passes ?client_timeout=<its HTTP timeout>; bound our wait
         # below it so a slow-but-working launch comes back as "starting" rather
@@ -1218,11 +1399,39 @@ def build_app(
         except ValueError:
             client_timeout = 0.0
         wait = _bounded_ensure_wait(_SESSION_START_TIMEOUT, client_timeout)
+        query = request.query_params
+        display = None
+        if "display" in query:
+            try:
+                display = json.loads(query["display"])
+            except ValueError:
+                display = None
+            if not isinstance(display, dict):
+                return JSONResponse(
+                    {"error": "display must be a JSON object"}, status_code=400
+                )
         try:
-            return JSONResponse(_launch_session(wait))
+            return JSONResponse(
+                _launch_session(
+                    wait,
+                    ephemeral=query.get("ephemeral") in ("1", "true"),
+                    start_kernel=query.get("start_kernel", "1") not in ("0", "false"),
+                    display=display,
+                )
+            )
         except Exception as exc:  # noqa: BLE001 - report, never crash the handler
             logger.exception("session launch failed")
             return JSONResponse({"error": str(exc)}, status_code=500)
+
+    async def api_session_stop(request: Request) -> JSONResponse:
+        record = await asyncio.to_thread(
+            _sessions.resolve, request.path_params["session_id"]
+        )
+        if record is None or not record.get("port"):
+            return JSONResponse({"error": "no such session"}, status_code=404)
+        force = request.query_params.get("force") in ("1", "true")
+        status, body = await _stop_session(session_client, record, force)
+        return JSONResponse(body, status_code=status)
 
     def api_agents(_request: Request) -> JSONResponse:
         # The supported MCP clients and whether biopb is registered with each.
@@ -1595,6 +1804,7 @@ def build_app(
         Route("/api/status", api_status, methods=["GET"]),
         Route("/api/sessions", api_sessions, methods=["GET"]),
         Route("/api/sessions/new", api_session_new, methods=["POST"]),
+        Route("/api/sessions/{session_id}/stop", api_session_stop, methods=["POST"]),
         Route("/api/data_plane/ensure", data_plane_ensure, methods=["POST"]),
         Route("/api/data_plane/stop", data_plane_stop, methods=["POST"]),
         Route("/api/data_plane/restart", data_plane_restart, methods=["POST"]),
@@ -1625,11 +1835,29 @@ def build_app(
         ),
     ]
 
+    grace = _idle_grace(session_idle_grace)
+
+    async def reap_idle_sessions() -> None:
+        free_since: dict = {}
+        interval = max(0.2, min(_REAP_INTERVAL, grace / 2))
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await _reap_idle_sessions(
+                    session_client, free_since, grace, time.monotonic()
+                )
+            except Exception:  # noqa: BLE001 - a failed look must not end the loop
+                logger.exception("idle-session sweep failed")
+
     @contextlib.asynccontextmanager
     async def lifespan(_app: Starlette):
+        reaper = asyncio.create_task(reap_idle_sessions())
         try:
             yield
         finally:
+            reaper.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await reaper
             await proxy_client.aclose()
             await session_client.aclose()
 

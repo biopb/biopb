@@ -96,3 +96,77 @@ def start_control_detached() -> bool:
         threading.Thread(target=proc.wait, daemon=True).start()
     logger.info("launched `biopb control start --no-data-plane` (detached)")
     return True
+
+
+def _control_url() -> str:
+    import biopb
+
+    return biopb.base_url()
+
+
+def control_up(timeout: float = 1.0) -> bool:
+    """Whether a control answers ``/health`` on the address clients use."""
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(f"{_control_url()}/health", timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def ensure_control(wait: float) -> bool:
+    """A control that answers, started here if need be; False if none does
+    within *wait* seconds.
+
+    The one place the shim blocks on the control: asking it for a session is
+    only possible once it is up. Callers fall back to a session of their own
+    rather than fail, so a missing control costs a wait and no more.
+    """
+    import time
+
+    if control_up():
+        return True
+    if not start_control_detached():
+        return False
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline:
+        time.sleep(0.5)
+        if control_up():
+            return True
+    return False
+
+
+def launch_session(
+    *, display: dict, timeout: float, ephemeral: bool = True, start_kernel: bool = False
+) -> dict:
+    """Ask the control to launch a session; its answer (``{"state", ...}``).
+
+    *display* is the client's own display environment, which the control uses
+    in place of its own (see ``biopb_control``'s ``_launch_env``). The kernel is
+    left for the agent's ``start_kernel``. ``OSError`` (an ``HTTPError``
+    included) when no control answers or it refuses.
+    """
+    import json
+    import urllib.request
+    from urllib.parse import urlencode
+
+    import biopb
+
+    params = {
+        "ephemeral": int(ephemeral),
+        "start_kernel": int(start_kernel),
+        "display": json.dumps(display),
+        # Bounds the control's own wait under ours, so a slow start comes back
+        # as a verdict and not as a timeout that looks like no control.
+        "client_timeout": timeout,
+    }
+    token = biopb.resolve_data_plane_token()
+    req = urllib.request.Request(
+        f"{_control_url()}/api/sessions/new?{urlencode(params)}",
+        data=b"",
+        method="POST",
+        headers={"X-Biopb-Token": token} if token else {},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode())

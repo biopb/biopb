@@ -19,14 +19,20 @@ are its children, and MCP sessions are independent clients that merely register.
 
 Two rules keep that tree correct, and every change here must preserve them.
 
-- **I1 — the control never *owns* a session.** A session serving an MCP client is
-  spawned by that client's shim and only **registers itself**, so the control routes to
-  and lists it without holding it. The one session the control may *launch* is an
-  agentless one for the dashboard, driven through its chat pane or a Jupyter
-  client; that child is detached and self-registering, so the registry still only
-  observes and a control restart never ends the user's session. Its config decides
-  whether it gets a napari viewer, and it runs without one where napari or a
-  display is missing.
+- **I1 — the control sets policy for sessions and never holds one.** A session is
+  a detached, self-registering process, so the control routes to and lists it
+  without owning it, and a control restart never ends one. It launches two kinds.
+  The dashboard's **durable** session is driven through its chat pane or a Jupyter
+  client and ends when its person stops it. A session launched for an agent is
+  **ephemeral**: the control ends it by asking it to end itself
+  (`/api/shutdown`) once its lease has been free for a grace period
+  (`$BIOPB_SESSION_IDLE_GRACE`, two minutes), with the idle clocks held in memory
+  so a restart errs toward keeping it. A launch for an agent carries the agent's
+  own display variables, allowlisted, and the control uses them instead of its
+  own, which are frozen at whoever started it. A session's config decides whether
+  it gets a napari viewer, and it runs without one where napari or a display is
+  missing. An agent's own shim-spawned session, with no control to ask, is still
+  the shim's to reap.
 - **I2 — the control stays lean and subprocess-based.** It supervises components
   as subprocesses, never by importing them, so no Qt/napari/dask/kernel ever enters
   this process. Facts shared with those components — the control endpoint, the
@@ -130,8 +136,9 @@ contract is a stdlib-only core-SDK module (I2): the session side writes, the
 control reads, and neither imports the other.
 
 Every session on a dynamic port **publishes itself** — a shim-owned child under
-the id its shim minted, an agentless `biopb mcp view` session under its own — and
-drops its record on the way out; a shim also drops its child's once it has reaped
+the id its shim minted, a `biopb mcp view` or control-launched session under its
+own, recording its `mode` (`shim`, `durable`, `ephemeral`) — and drops its record
+on the way out; a shim also drops its child's once it has reaped
 it, since Windows kills the child outright. The control only ever reads.
 
 Lookups **self-heal**, pruning records whose owning pid is dead — or alive on a

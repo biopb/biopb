@@ -7,9 +7,12 @@ launcher process. Instead the launcher runs this module, which
    from the FastMCP server a session runs (imported, never served) plus a local
    ``attach`` tool, so a client that never attaches costs no session;
 2. on ``attach``, takes the lease of a live session (``/api/lease``) and bridges
-   requests to its streamable-http endpoint, or -- for ``new``, or ``--session
-   new`` -- spawns a session of its own on an OS-assigned port, inheriting this
-   shim's live environment (``spawn_session``, driven by ``_Binding``);
+   requests to its streamable-http endpoint. For ``new`` (or ``--session new``)
+   it asks the control to launch an ephemeral session, carrying this client's
+   display environment, and leases that; with no control to answer, or a pinned
+   data plane the control's session would not see, it spawns a session of its own
+   on an OS-assigned port, inheriting this shim's live environment
+   (``spawn_session``, driven by ``_Binding``);
 3. releases the lease, or reaps the session it spawned, on the way out
    (``_Binding.reap``).
 
@@ -20,11 +23,13 @@ definitions), so the fd-1 corruption class is structurally impossible here.
 Ownership is per session, and only a session this shim spawned is its to end:
 
 * **Attached.** A session another process started (the dashboard's, a
-  ``biopb mcp view``) keeps running when this shim goes. The shim renews its
+  ``biopb mcp view``, or one the control launched for this client, which the
+  control ends once it has been free for a grace period) keeps running when this
+  shim goes. The shim renews its
   lease every ``RENEW_INTERVAL`` and releases it on exit; a shim killed too hard
   to release leaves a lease that lapses by itself (``_lease.TTL``). One holder at
   a time: an attach to a held session is refused unless forced.
-* **Spawned (``new``).** Ephemeral and owned: the child inherits *this* shim's
+* **Spawned (``new``, no control).** Ephemeral and owned: the child inherits *this* shim's
   environment, so ``DISPLAY`` / ``XAUTHORITY`` / ``WAYLAND_DISPLAY`` are the
   user's current session -- never a value frozen into a long-lived daemon (the
   #98 fix). POSIX: the child stays in this shim's process group (no
@@ -416,6 +421,31 @@ RENEW_INTERVAL = 10.0
 RENEW_FAILURES = 3
 _CALL_TIMEOUT = 2.0
 
+# How long `attach new` waits for a control to answer before it spawns a session
+# of its own, and for the control to launch one.
+CONTROL_WAIT = 20.0
+CONTROL_LAUNCH_TIMEOUT = 70.0
+
+# Where a viewer window can appear: what the control is told to use for a
+# session it launches for this client, in place of its own frozen environment.
+# Mirrors the control's allowlist (``_DISPLAY_ENV``); it drops anything else.
+_DISPLAY_ENV = (
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XAUTHORITY",
+    "XDG_RUNTIME_DIR",
+    "XDG_SESSION_TYPE",
+)
+
+# A client that pins its data plane by environment expects its own session to
+# see that pin, and a control-launched one would not: those spawn their own.
+_PINNED_ENV = (
+    "BIOPB_TENSOR_URL",
+    "BIOPB_TENSOR_TOKEN",
+    "BIOPB_TENSOR_TLS_CA",
+    "BIOPB_TENSOR_TLS_FINGERPRINT",
+)
+
 # No proxy for the loopback calls: an environment ``http_proxy`` would send a
 # session's own port to somebody else.
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -515,6 +545,7 @@ class _Binding:
         self.session = None
         self.token = uuid.uuid4().hex
         self.lost = None  # why the last attachment ended
+        self.managed = False  # a session the control launched and will end
         self.instructions = ""
         self._base = None
         self._scope = None
@@ -535,6 +566,7 @@ class _Binding:
 
     def _forget(self):
         self.child = self.session_id = self._base = self.session = None
+        self.managed = False
 
     def _own(self, child, session_id):
         self.child, self.session_id = child, session_id
@@ -574,9 +606,15 @@ class _Binding:
                 await anyio.to_thread.run_sync(self.reap)
                 self._forget()
                 raise AttachError(f"could not attach to {selector!r}: {e}") from e
+        note = (
+            " The control ends it once you have disconnected and nothing else "
+            "has held it for a while."
+            if self.managed
+            else ""
+        )
         return (
-            f"Attached to session {self.session_id}. The tool list has changed to "
-            "this session's.\n\n" + self.instructions
+            f"Attached to session {self.session_id}.{note} The tool list has "
+            "changed to this session's.\n\n" + self.instructions
         ).strip()
 
     def _spawn(self):
@@ -591,21 +629,8 @@ class _Binding:
                 logger.info("control auto-start attempt failed", exc_info=True)
         return spawn_session(self._config, on_spawned=self._own)
 
-    def _acquire(self, selector, force):
-        """Take the lease on *selector*; return its ``/mcp`` url."""
-        if selector == "new":
-            _, url, _ = self._spawn()
-            self._base = url.rsplit("/mcp", 1)[0]
-            status, data = _call_session(
-                self._base, "POST", "/api/lease/acquire", {"token": self.token}
-            )
-            if status != 200:
-                raise AttachError(f"the new session refused its lease: {data}")
-            return url
-        rec = _sessions.resolve(selector)
-        if rec is None or not rec.get("port"):
-            raise AttachError(f"no live session {selector!r}.\n{session_listing()}")
-        base = _session_base(rec)
+    def _take_lease(self, base, label, force=False):
+        """Take the lease on the session at *base*, named *label*."""
         try:
             status, data = _call_session(
                 base,
@@ -614,16 +639,67 @@ class _Binding:
                 {"token": self.token, "force": force},
             )
         except (OSError, ValueError) as e:
-            raise AttachError(f"session {selector} is not reachable: {e}") from e
+            raise AttachError(f"session {label} is not reachable: {e}") from e
         if status == 409:
             raise AttachError(
-                f"session {selector} is held by its {data.get('holder')} "
-                f"(for {data.get('age', '?')}s). `attach(session='{selector}', "
+                f"session {label} is held by its {data.get('holder')} "
+                f"(for {data.get('age', '?')}s). `attach(session='{label}', "
                 "force=true)` takes it from them."
             )
         if status != 200:
-            raise AttachError(f"session {selector} refused the attach: {data}")
-        self._base, self.session_id = base, selector
+            raise AttachError(f"session {label} refused the attach: {data}")
+        self._base, self.session_id = base, label
+
+    def _launch_via_control(self):
+        """A session the control launched for this client, leased; its ``/mcp``
+        url -- or None if there is no control to ask, and the caller spawns one.
+
+        The control owns it from here: it is detached, and ends once nothing has
+        held it for a grace period, so this shim only ever releases it.
+        """
+        if any(os.environ.get(name) for name in _PINNED_ENV):
+            return None
+        try:
+            if not _control_client.ensure_control(CONTROL_WAIT):
+                return None
+            answer = _control_client.launch_session(
+                display={k: os.environ[k] for k in _DISPLAY_ENV if k in os.environ},
+                timeout=CONTROL_LAUNCH_TIMEOUT,
+            )
+        except (OSError, ValueError) as e:
+            logger.info("the control would not launch a session (%s)", e)
+            return None
+        state = answer.get("state")
+        if state == "failed":
+            raise AttachError(
+                f"the session did not start: {answer.get('error')}\n"
+                f"{answer.get('log') or ''}".strip()
+            )
+        rec = _sessions.resolve(answer.get("session_id") or "")
+        if state != "started" or rec is None or not rec.get("port"):
+            raise AttachError(
+                "the session is still starting; `attach` with no arguments "
+                "lists it once it is up"
+            )
+        base = _session_base(rec)
+        self._take_lease(base, rec["session_id"])
+        self.managed = True
+        return rec.get("mcp_url") or f"{base}/mcp"
+
+    def _acquire(self, selector, force):
+        """Take the lease on *selector*; return its ``/mcp`` url."""
+        if selector == "new":
+            launched = self._launch_via_control()
+            if launched is not None:
+                return launched
+            _, url, _ = self._spawn()
+            self._take_lease(url.rsplit("/mcp", 1)[0], self.session_id)
+            return url
+        rec = _sessions.resolve(selector)
+        if rec is None or not rec.get("port"):
+            raise AttachError(f"no live session {selector!r}.\n{session_listing()}")
+        base = _session_base(rec)
+        self._take_lease(base, selector, force)
         return rec.get("mcp_url") or f"{base}/mcp"
 
     async def _serve(self, selector, force, *, task_status):
