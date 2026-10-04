@@ -642,6 +642,7 @@ def _open_catalog(
             max_rois_per_tensor=server_config.annotations.max_rois_per_tensor,
             store_path=path,
             annotations_enabled=server_config.annotations.enabled,
+            checkpoint_threshold_mb=server_config.catalog.checkpoint_threshold_mb,
         )
         db.open()
         return db

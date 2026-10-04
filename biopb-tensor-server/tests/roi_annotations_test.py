@@ -1070,6 +1070,22 @@ class TestPersistence:
         assert back[0].roi == written.roi
         assert back[0].rev == written.rev
 
+    @pytest.mark.parametrize(("mb", "expected"), [(None, "1.0 GiB"), (64, "64.0 MiB")])
+    def test_the_checkpoint_threshold_reaches_the_file_backed_catalog(
+        self, tmp_path, mb, expected
+    ):
+        kwargs = {} if mb is None else {"checkpoint_threshold_mb": mb}
+        db = MetadataDatabase(store_path=tmp_path / "catalog.duckdb", **kwargs)
+        try:
+            row = (
+                db._get_connection()
+                .execute("SELECT current_setting('checkpoint_threshold')")
+                .fetchone()
+            )
+            assert row[0] == expected
+        finally:
+            db.close()
+
     def test_without_a_store_path_nothing_persists(self, tmp_path):
         # The default is unchanged: persistence is something a caller asks for.
         db = MetadataDatabase()
