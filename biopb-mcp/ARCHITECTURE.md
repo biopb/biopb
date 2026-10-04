@@ -95,11 +95,10 @@ contract; see [`../biopb-control/ARCHITECTURE.md`](../biopb-control/ARCHITECTURE
 Shim (`--transport stdio`) is the interface the mcp clients (claude code) see. It
 starts **unbound** and owns nothing until the agent calls its local `attach` tool:
 
-1. **Unbound**, it answers the handshake and the list requests itself, from the
-   FastMCP server a session runs (imported, never served, and only if the import
-   succeeds), plus `attach`; a client that never attaches costs no session. Where
-   the import fails it advertises `attach` alone and relies on `list_changed` for
-   the rest. Every other tool is an error that lists the live sessions and
+1. **Unbound**, it answers the handshake with a paragraph saying to call `attach`,
+   and lists `attach` alone; a client that never attaches costs no session. It
+   imports no session code and holds no copy of any session's tools, docs or
+   instructions. Every other tool is an error that lists the live sessions and
    whether each is free.
 2. `attach(session=<id>)` takes the session's **lease** and bridges stdio
    JSON-RPC ↔ its `/mcp`. The tool, resource and prompt lists become the session's
@@ -110,6 +109,12 @@ starts **unbound** and owns nothing until the agent calls its local `attach` too
    beat and releases it on the way out, and never stops the session. A lease that
    is lost (another holder forced it, or the session stopped answering) unbinds
    the shim.
+
+   A client that does not follow `list_changed` (Codex, within a turn) uses
+   `--session <id|new|auto>` instead: the shim binds before it answers
+   `initialize`, so the handshake already carries the session's own instructions
+   and tools. `auto` takes the newest free session, else launches one; the client
+   gives up choosing in exchange.
 3. `attach(session='new')` asks the **control** to launch a session for this
    client (`POST /api/sessions/new`, with the client's display variables),
    starting the control first if need be, and leases it from birth. The session
@@ -117,8 +122,8 @@ starts **unbound** and owns nothing until the agent calls its local `attach` too
    the next agent can attach to it, so the shim only releases it. No control is
    an error, not a fallback: a session without one has no data plane, so one
    started without it would attach and then fail on first use.
-   `--session new` (or `$BIOPB_SESSION`) does this on the first request that
-   needs a session, with no `attach` call.
+   `--session new` (or `$BIOPB_SESSION`) does this before the handshake, with no
+   `attach` call.
 
 What the shim does own is itself: a shim that outlived its client would go on
 renewing its lease and keep the session locked, so it releases and exits on stdin

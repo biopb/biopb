@@ -78,18 +78,30 @@ session id or `new`:
   again; the user stops it from the dashboard. If no control answers, that is an
   error naming the control's log: a session started without one has no data
   plane, so attaching to it would succeed and then fail on first use.
-- `--session <id>` (or env) pre-binds for people and scripts.
+- `--session <id|new|auto>` (or `$BIOPB_SESSION`) binds before the handshake;
+  see below.
 
-While unbound the shim answers the handshake and list requests from the imported
-server -- if it can import it -- and tool calls other than `attach` return the
-session list. Where it cannot, it advertises `attach` alone and relies on
-`list_changed`. Once bound, the tool, resource and prompt lists come from the
-session, because the session may be a different version from the shim, and so do
-the `instructions`, which are composed per session (viewer or not, config).
-`instructions` cannot be resent after the handshake, so `attach` returns them as
-its result, and attaching again to the same session returns them again, for an
-agent whose context no longer holds them. The handshake declares `listChanged`,
-and the shim sends it on attach and when an attachment ends.
+While unbound the shim lists `attach` alone, with empty resources and prompts,
+and tool calls other than `attach` return the session list. It imports no session
+code and holds no copy of any session's surface. Once bound, the tool, resource
+and prompt lists come from the session, and so do the `instructions`, which are
+composed per session (viewer or not, config). `instructions` cannot be resent
+after the handshake, so `attach` returns them as its result, and attaching again
+to the same session returns them again, for an agent whose context no longer
+holds them. The handshake declares `listChanged`, and the shim sends it on attach
+and when an attachment ends.
+
+**Clients that do not follow `list_changed`.** Claude Code and opencode refresh
+their tool list after `attach`; Codex does not, within a turn. For such a client
+the registration passes `--session`: the shim binds *before* it answers
+`initialize`, so the answer carries the session's own instructions -- in the slot
+a client puts in front of the model from the first turn -- and its tools, and
+nothing needs refreshing. `auto` takes the newest free session, else has the
+control launch one. The client cannot choose a session, which is the price. The
+bind happens inside the client's startup window, so a cold control start plus a
+launch can approach its timeout; `auto` prefers an existing session because that
+is nearly instant. A bind that fails is retried on the first request
+that needs a session, and the handshake says why it failed.
 
 ## Phases
 

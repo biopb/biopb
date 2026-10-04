@@ -126,9 +126,10 @@ def _parse_args(argv, default_transport, default_port):
     parser.add_argument(
         "--session",
         default=os.environ.get("BIOPB_SESSION") or None,
-        help="stdio only: attach to this session id on the first request that "
-        "needs one, or 'new' to have the control launch one. Default: start "
-        "unbound and let the agent choose with its `attach` tool. Also "
+        help="stdio only: bind a session before the handshake -- an id, 'new' "
+        "(the control launches one), or 'auto' (the newest free session, else a "
+        "new one) -- for a client that cannot follow list_changed. Default: "
+        "start unbound and let the agent choose with its `attach` tool. Also "
         "$BIOPB_SESSION.",
     )
     parser.add_argument(

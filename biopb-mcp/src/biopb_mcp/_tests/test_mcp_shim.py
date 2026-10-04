@@ -24,11 +24,7 @@ import anyio
 import pytest
 from mcp import types
 
-from biopb_mcp.mcp import (
-    _server,  # noqa: F401 - registers the tools
-    _shim,
-)
-from biopb_mcp.mcp._app import mcp
+from biopb_mcp.mcp import _shim
 
 
 def _free_port():
@@ -198,6 +194,7 @@ class _FakeBinding:
 
     def __init__(self, remote=None, attach_text="attached", attach_error=None):
         self.session = remote
+        self.instructions = ""
         self.attached = []
         self._text, self._error = attach_text, attach_error
 
@@ -231,27 +228,16 @@ class TestBuildProxy:
         return anyio.run(lambda: handler(req))
 
     def _list(self, binding):
-        app = _shim.build_proxy(binding, mcp._mcp_server)
+        app = _shim.build_proxy(binding)
         return self._call(
             app.request_handlers[types.ListToolsRequest],
             types.ListToolsRequest(method="tools/list"),
         )
 
-    def test_unattached_lists_come_from_the_fastmcp_server_plus_attach(self):
-        tools = self._list(_FakeBinding())
-        names = {t.name for t in tools.root.tools}
-        assert {"start_kernel", "execute_code", "attach"} <= names
-        app = _shim.build_proxy(_FakeBinding(), mcp._mcp_server)
-        resources = self._call(
-            app.request_handlers[types.ListResourcesRequest],
-            types.ListResourcesRequest(method="resources/list"),
-        )
-        assert [str(r.uri) for r in resources.root.resources] == ["docs://index"]
-
-    def test_without_the_local_surface_only_attach_is_listed(self):
-        # A shim that cannot import the session's tools advertises `attach` alone
-        # and relies on list_changed for the rest.
-        app = _shim.build_proxy(_FakeBinding(), None)
+    def test_unattached_only_attach_is_listed(self):
+        # The shim holds no copy of any session's surface: a client learns the
+        # rest from list_changed, or from binding first (--session).
+        app = _shim.build_proxy(_FakeBinding())
         tools = self._call(
             app.request_handlers[types.ListToolsRequest],
             types.ListToolsRequest(method="tools/list"),
@@ -278,29 +264,37 @@ class TestBuildProxy:
             assert getattr(result.root, field) == []
 
     def test_an_attached_shim_lists_the_sessions_resources_too(self):
-        app = _shim.build_proxy(_FakeBinding(_FakeRemote()), mcp._mcp_server)
+        app = _shim.build_proxy(_FakeBinding(_FakeRemote()))
         result = self._call(
             app.request_handlers[types.ListResourcesRequest],
             types.ListResourcesRequest(method="resources/list"),
         )
         assert [str(r.uri) for r in result.root.resources] == ["docs://theirs"]
 
-    @pytest.mark.parametrize("local", [True, False])
-    def test_the_handshake_declares_that_its_lists_change(self, local):
-        server = mcp._mcp_server if local else None
-        app = _shim.build_proxy(_FakeBinding(), server)
-        options = _shim._handshake(app, server, preselect=None)
+    def test_the_handshake_declares_that_its_lists_change(self):
+        binding = _FakeBinding()
+        options = _shim._handshake(_shim.build_proxy(binding), binding)
         caps = options.capabilities
         assert caps.tools.listChanged is True
         assert caps.resources.listChanged is True
         assert caps.prompts.listChanged is True
-        assert options.instructions.startswith("Before `start_kernel`")
 
-    def test_a_preselected_session_gets_no_attach_paragraph(self):
+    def test_an_unbound_handshake_is_the_attach_paragraph(self):
+        binding = _FakeBinding()
         options = _shim._handshake(
-            _shim.build_proxy(_FakeBinding(), None), None, preselect="new"
+            _shim.build_proxy(binding), binding, note="Attaching `auto` failed: x\n\n"
         )
-        assert not (options.instructions or "").startswith("Before")
+        assert options.instructions.startswith("Before `start_kernel`")
+        assert options.instructions.endswith("Attaching `auto` failed: x\n\n")
+
+    def test_a_bound_handshake_carries_the_sessions_own_rules(self):
+        # Bound before the handshake, the session's instructions are in the slot a
+        # client puts in front of the model from the first turn -- no attach
+        # paragraph, and no dependence on list_changed.
+        binding = _FakeBinding(_FakeRemote())
+        binding.instructions = "THE SESSION'S RULES"
+        options = _shim._handshake(_shim.build_proxy(binding), binding)
+        assert options.instructions == "THE SESSION'S RULES"
 
     def test_an_attached_tool_list_is_the_sessions_own(self):
         tools = self._list(_FakeBinding(_FakeRemote()))
@@ -308,7 +302,7 @@ class TestBuildProxy:
 
     def test_call_tool_forwards_name_and_args(self):
         remote = _FakeRemote()
-        app = _shim.build_proxy(_FakeBinding(remote), mcp._mcp_server)
+        app = _shim.build_proxy(_FakeBinding(remote))
         result = self._call(
             app.request_handlers[types.CallToolRequest],
             _call("server_status", {"a": 1}),
@@ -317,7 +311,7 @@ class TestBuildProxy:
         assert result.root.isError is False
 
     def test_call_tool_failure_becomes_tool_error_not_bridge_death(self):
-        app = _shim.build_proxy(_FakeBinding(_FakeRemote()), mcp._mcp_server)
+        app = _shim.build_proxy(_FakeBinding(_FakeRemote()))
         result = self._call(
             app.request_handlers[types.CallToolRequest], _call("explodes")
         )
@@ -325,7 +319,7 @@ class TestBuildProxy:
         assert "kaboom" in result.root.content[0].text
 
     def test_a_tool_before_attach_is_a_tool_error_that_says_to_attach(self):
-        app = _shim.build_proxy(_FakeBinding(), mcp._mcp_server)
+        app = _shim.build_proxy(_FakeBinding())
         result = self._call(
             app.request_handlers[types.CallToolRequest], _call("start_kernel")
         )
@@ -334,7 +328,7 @@ class TestBuildProxy:
 
     def test_attach_without_a_session_lists_the_sessions(self):
         binding = _FakeBinding()
-        app = _shim.build_proxy(binding, mcp._mcp_server)
+        app = _shim.build_proxy(binding)
         result = self._call(
             app.request_handlers[types.CallToolRequest], _call("attach")
         )
@@ -344,7 +338,7 @@ class TestBuildProxy:
 
     def test_attach_takes_the_named_session(self):
         binding = _FakeBinding(attach_text="Attached to session s1.")
-        app = _shim.build_proxy(binding, mcp._mcp_server)
+        app = _shim.build_proxy(binding)
         result = self._call(
             app.request_handlers[types.CallToolRequest],
             _call("attach", {"session": " s1 ", "force": True}),
@@ -355,7 +349,7 @@ class TestBuildProxy:
 
     def test_a_refused_attach_is_a_tool_error_with_the_reason(self):
         binding = _FakeBinding(attach_error="session s1 is held by its chat")
-        app = _shim.build_proxy(binding, mcp._mcp_server)
+        app = _shim.build_proxy(binding)
         result = self._call(
             app.request_handlers[types.CallToolRequest],
             _call("attach", {"session": "s1"}),
@@ -639,6 +633,87 @@ class TestBinding:
         self._drive(binding, binding.connect)
         assert len(env.launches) == 1 and binding.session_id == "managed"
 
+    def _states(self, monkeypatch, *states):
+        """Stub the live sessions: ``(id, holder-or-None, answers)``."""
+        monkeypatch.setattr(
+            _shim,
+            "_session_states",
+            lambda: [
+                (
+                    {"session_id": sid, "port": 7},
+                    {"lease": {"holder": holder}} if answers else None,
+                )
+                for sid, holder, answers in states
+            ],
+        )
+
+    def test_auto_takes_the_newest_free_session(self, monkeypatch):
+        binding, env = self._binding(monkeypatch)
+        # Newest first: one nobody answers for, one held, then two free.
+        self._states(
+            monkeypatch,
+            ("gone", None, False),
+            ("held", "chat", True),
+            ("live", None, True),
+            ("managed", None, True),
+        )
+        [text] = self._drive(binding, lambda: binding.attach("auto"))
+        assert "Attached to session live" in text
+        assert env.launches == []
+
+    def test_auto_launches_one_when_none_is_free(self, monkeypatch):
+        binding, env = self._binding(monkeypatch)
+        env.use_control()
+        env.launch_answer = {"state": "started", "session_id": "managed"}
+        self._states(monkeypatch, ("held", "agent", True))
+        [text] = self._drive(binding, lambda: binding.attach("auto"))
+        assert "Attached to session managed" in text and len(env.launches) == 1
+
+    def _handshake_of(self, monkeypatch, preselect):
+        """Run ``_serve_stdio`` against a stub transport; the initialize options
+        it would have answered with."""
+        binding, env = self._binding(monkeypatch, preselect=preselect)
+        seen = []
+        real = _shim.build_proxy
+
+        def wrapped(b):
+            app = real(b)
+
+            async def run(read, write, options):
+                seen.append(options)
+
+            app.run = run
+            return app
+
+        @contextlib.asynccontextmanager
+        async def _stdio():
+            yield None, None
+
+        monkeypatch.setattr(_shim, "build_proxy", wrapped)
+        monkeypatch.setattr(_shim, "stdio_server", _stdio)
+        anyio.run(_shim._serve_stdio, binding)
+        return seen[0], binding, env
+
+    def test_a_preselected_session_is_bound_before_the_handshake(self, monkeypatch):
+        # The point of the mode: a client that never refreshes its tool list gets
+        # the session's own rules and tools in the answer to `initialize`.
+        options, binding, _ = self._handshake_of(monkeypatch, "live")
+        assert options.instructions == "THE GUIDANCE"
+        assert binding.session_id == "live"
+
+    def test_a_preselect_that_fails_says_so_and_is_retried(self, monkeypatch):
+        options, binding, _ = self._handshake_of(monkeypatch, "gone")
+        assert options.instructions.startswith("Before `start_kernel`")
+        assert "Attaching `gone` at start failed" in options.instructions
+        assert binding.session is None and binding.preselect == "gone"
+
+    def test_no_preselect_leaves_the_handshake_to_the_attach_paragraph(
+        self, monkeypatch
+    ):
+        options, binding, env = self._handshake_of(monkeypatch, None)
+        assert options.instructions.startswith("Before `start_kernel`")
+        assert env.calls == []
+
     def test_a_lost_lease_unbinds_and_the_next_request_says_why(self, monkeypatch):
         monkeypatch.setattr(_shim, "RENEW_INTERVAL", 0.01)
         binding, env = self._binding(monkeypatch)
@@ -907,6 +982,84 @@ class TestControlLaunchedSession:
             while list(reg_dir.glob("*.json")) and time.monotonic() < deadline:
                 time.sleep(0.2)
             assert list(reg_dir.glob("*.json")) == []
+        finally:
+            for shim in (first, second):
+                if shim is not None and shim.poll() is None:
+                    shim.kill()
+            if pid is not None:
+                _force_kill(pid)
+            _stop_control(env)
+
+
+class TestImmediateAttach:
+    """``--session auto``: the shim binds before the handshake, for a client that
+    cannot follow list_changed."""
+
+    def test_the_handshake_is_the_sessions_own(self, tmp_path):
+        pytest.importorskip("biopb_control")
+        env = _home_env(tmp_path)
+        env.pop("BIOPB_TENSOR_URL", None)
+        env["BIOPB_CONTROL_PORT"] = str(_free_port())
+        reg_dir = tmp_path / ".local/state/biopb/sessions"
+
+        def start_shim():
+            return subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "biopb_mcp.mcp",
+                    "--transport",
+                    "stdio",
+                    "--session",
+                    "auto",
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                env=env,
+            )
+
+        def tool_names(shim, id_):
+            shim.stdin.write(
+                (
+                    json.dumps({"jsonrpc": "2.0", "id": id_, "method": "tools/list"})
+                    + "\n"
+                ).encode()
+            )
+            shim.stdin.flush()
+            while True:
+                msg = json.loads(shim.stdout.readline())
+                if msg.get("id") == id_:
+                    return {t["name"] for t in msg["result"]["tools"]}
+
+        first = second = None
+        pid = None
+        try:
+            first = start_shim()
+            init = _rpc_init(first)
+            # No `attach` call: the answer to `initialize` already carries the
+            # session's own operating rules, and its tools are listed at once.
+            assert "start_kernel" in init["instructions"]
+            assert not init["instructions"].startswith("Before")
+            names = tool_names(first, 2)
+            assert {"start_kernel", "execute_code"} <= names
+            assert "attach" not in names
+            status, _ = _rpc_call(first, 3, "server_status")
+            assert status.get("isError") is not True, status
+
+            records = list(reg_dir.glob("*.json"))
+            assert len(records) == 1, records
+            rec = json.loads(records[0].read_text())
+            pid = rec["pid"]
+
+            # `auto` takes the newest session nothing holds, so the next client
+            # gets the same session rather than a second one.
+            first.stdin.close()
+            assert first.wait(timeout=40) == 0
+            second = start_shim()
+            _rpc_init(second)
+            assert "execute_code" in tool_names(second, 2)
+            assert [p.stem for p in reg_dir.glob("*.json")] == [rec["session_id"]]
         finally:
             for shim in (first, second):
                 if shim is not None and shim.poll() is None:

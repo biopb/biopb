@@ -3,22 +3,29 @@
 ``biopb-mcp --transport stdio`` does not serve MCP over fd 0/1 from the heavy
 launcher process. Instead the launcher runs this module, which
 
-1. starts **unbound**, answering ``initialize`` and the list requests itself,
-   from the FastMCP server a session runs (imported, never served, and only
-   where the import works; otherwise ``attach`` alone is listed and the rest
-   follows ``list_changed``) plus a local ``attach`` tool, so a client that never
-   attaches costs no session;
+1. starts **unbound**, answering ``initialize`` with a paragraph that says to call
+   the local ``attach`` tool, which is the only tool it lists, so a client that
+   never attaches costs no session. It holds no copy of any session's tools,
+   resources, prompts or instructions;
 2. on ``attach``, takes the lease of a live session (``/api/lease``) and bridges
-   requests to its streamable-http endpoint. For ``new`` (or ``--session new``)
-   it first asks the control to launch a session, carrying this client's display
-   environment -- an error if no control answers, since a session without one
-   has no data plane. Attaching returns the session's own operating rules, and
-   attaching again to the same session returns them again;
+   requests to its streamable-http endpoint, and tells the client its lists
+   changed (``list_changed``). For ``new`` it first asks the control to launch a
+   session, carrying this client's display environment -- an error if no control
+   answers, since a session without one has no data plane. Attaching returns the
+   session's own operating rules, and attaching again to the same session
+   returns them again;
 3. releases the lease on the way out.
 
+A client that cannot follow ``list_changed`` (Codex does not refresh its tool
+list within a turn) is served by ``--session`` instead: the shim binds an id,
+``new``, or ``auto`` (the newest free session, else a new one) *before* it
+answers ``initialize``, so the answer already carries the session's own
+instructions and tools, and the client never needs a refresh. The client gives up
+choosing a session in exchange.
+
 The process that owns fd 1 as a protocol channel imports nothing that could write
-to stdout (no Qt, dask, uvicorn, or kernel -- only the mcp SDK and the tool
-definitions), so the fd-1 corruption class is structurally impossible here.
+to stdout (no Qt, dask, uvicorn, kernel, or session code -- only the mcp SDK), so
+the fd-1 corruption class is structurally impossible here.
 
 The shim owns no session. Every session is a detached process the control
 launched, or a person did (``biopb mcp view``, the dashboard), and it runs until
@@ -274,26 +281,37 @@ def _probe(rec):
     return data if status == 200 else None
 
 
-def session_listing():
-    """The live sessions and whether each can be attached to, as text.
-
-    Read off the registry, each session asked for its own lease, so a record
-    whose process is up but not answering reads ``unreachable`` rather than
-    ``free``.
-    """
+def _session_states():
+    """``[(record, /api/status or None)]`` for the live sessions, newest first,
+    each asked for its own lease and window."""
     recs = [
         r for r in _sessions.list_sessions() if r.get("session_id") and r.get("port")
     ]
     if not recs:
-        return "No live sessions. `attach(session='new')` starts one."
+        return []
     with ThreadPoolExecutor(max_workers=min(8, len(recs))) as pool:
-        statuses = list(pool.map(_probe, recs))
+        return list(zip(recs, pool.map(_probe, recs), strict=True))
+
+
+def _holder(status):
+    return (status.get("lease") or {}).get("holder")
+
+
+def session_listing():
+    """The live sessions and whether each can be attached to, as text.
+
+    A record whose process is up but not answering reads ``unreachable`` rather
+    than ``free``.
+    """
+    states = _session_states()
+    if not states:
+        return "No live sessions. `attach(session='new')` starts one."
     lines = []
-    for rec, status in zip(recs, statuses, strict=True):
+    for rec, status in states:
         if status is None:
             state, window = "unreachable", ""
         else:
-            holder = (status.get("lease") or {}).get("holder")
+            holder = _holder(status)
             state = f"held by {holder}" if holder else "free"
             window = ", viewer" if status.get("viewer") else ", no viewer"
         lines.append(f"- {rec['session_id']}: {state}{window}")
@@ -301,6 +319,18 @@ def session_listing():
         "Live sessions (`attach(session='<id>')` takes a free one; "
         "`attach(session='new')` starts your own):\n" + "\n".join(lines)
     )
+
+
+def _newest_free_session():
+    """The newest session nothing holds, or None.
+
+    What ``--session auto`` takes for a client that cannot choose: it decides
+    before it has said a word to the agent, so it cannot be asked.
+    """
+    for rec, status in _session_states():
+        if status is not None and not _holder(status):
+            return rec
+    return None
 
 
 class _Binding:
@@ -409,8 +439,7 @@ class _Binding:
     async def announce_change(self):
         """Tell the client its tool, resource and prompt lists changed.
 
-        Best-effort: a client that ignores these still works against the full
-        list the shim advertised unbound, where it has one.
+        Best-effort: a client that ignores these is the one ``--session`` is for.
         """
         notifier = self.server_session
         if notifier is None:
@@ -491,7 +520,14 @@ class _Binding:
         return rec.get("mcp_url") or f"{base}/mcp"
 
     def _acquire(self, selector, force):
-        """Take the lease on *selector*; return its ``/mcp`` url."""
+        """Take the lease on *selector*; return its ``/mcp`` url.
+
+        *selector* is a session id, ``new``, or ``auto``: the newest free
+        session, else a new one.
+        """
+        if selector == "auto":
+            free = _newest_free_session()
+            selector = free["session_id"] if free else "new"
         if selector == "new":
             return self._launch_via_control()
         rec = _sessions.resolve(selector)
@@ -589,37 +625,15 @@ _ATTACH_PREFACE = (
 )
 
 
-def _local_server():
-    """The FastMCP low-level server of a session, imported but never served; or
-    None where it cannot be imported.
-
-    It is the shim's copy of the tool, resource and prompt lists and of the
-    handshake instructions, so a client that cannot follow ``list_changed`` still
-    sees every tool. Without it the shim advertises ``attach`` alone and relies on
-    ``list_changed`` for the rest. Importing it costs ~15 ms and starts nothing.
-    """
-    try:
-        from . import _server  # noqa: F401 - registers the tools on _app.mcp
-        from ._app import mcp
-
-        return mcp._mcp_server
-    except Exception:  # noqa: BLE001 - a lighter shim is the fallback
-        logger.info(
-            "the session surface cannot be imported; advertising `attach` only",
-            exc_info=True,
-        )
-        return None
-
-
-def build_proxy(binding, server=None):
+def build_proxy(binding):
     """Build the stdio-facing MCP server.
 
-    Until a session is attached, the list requests are answered by *server* --
-    the FastMCP low-level server a session runs, imported here but never served
-    (:func:`_local_server`) -- with the local ``attach`` tool added, so listing
-    costs no session. With no *server* they list ``attach`` alone, and empty
-    resources and prompts. Once attached, every list is the session's own: it
-    composes its tools and instructions, and it may not be this shim's version.
+    Until a session is attached, ``tools/list`` lists the local ``attach`` tool
+    alone, and resources and prompts are empty: the shim holds no copy of any
+    session's surface. Once attached, every list is the session's own, and the
+    client is told so by ``list_changed``. A client that cannot follow that is
+    served by binding first (``--session``; see :func:`_serve_stdio`), so its
+    first list is already the session's.
 
     Every other request awaits ``binding.connect()`` and is forwarded; with no
     session attached that is an error the agent reads, and a tool call as a tool
@@ -632,26 +646,17 @@ def build_proxy(binding, server=None):
     app = Server(name="biopb-mcp")
 
     def _list(req_type, remote_name, empty, extra=()):
-        local = server.request_handlers[req_type] if server is not None else None
-
         async def handler(req):
             if binding.session is not None:
                 try:
                     return types.ServerResult(
                         await getattr(binding.session, remote_name)()
                     )
-                except Exception:  # noqa: BLE001 - the local list is the fallback
-                    logger.info("session %s failed; using the local one", remote_name)
-            result = empty([]) if local is None else (await local(req)).root
-            return types.ServerResult(empty([*_items(result), *extra]))
+                except Exception:  # noqa: BLE001 - unbound is the fallback
+                    logger.info("session %s failed; listing none", remote_name)
+            return types.ServerResult(empty(list(extra)))
 
         app.request_handlers[req_type] = handler
-
-    def _items(result):
-        for name in ("tools", "resources", "resourceTemplates", "prompts"):
-            if hasattr(result, name):
-                return getattr(result, name)
-        return []
 
     _list(
         types.ListToolsRequest,
@@ -747,31 +752,47 @@ def build_proxy(binding, server=None):
     return app
 
 
-def _handshake(app, server, preselect):
-    """The initialize answer: the session surface's own where the shim has it,
-    plus the attach paragraph unless a session is preselected.
+def _handshake(app, binding, note=""):
+    """The initialize answer.
 
-    The lists change on attach and detach, so it declares ``listChanged``: a
-    client only follows those notifications from a server that says it sends
-    them.
+    Bound before it (``--session``), it is the session's own: its instructions
+    in the privileged slot a client puts in front of the model from the first
+    turn. Unbound, it is the attach paragraph, plus *note* if a requested
+    session could not be attached.
+
+    It declares ``listChanged`` either way: the lists change on attach and on
+    detach, and a client only follows those notifications from a server that
+    says it sends them.
     """
     changes = NotificationOptions(
         tools_changed=True, resources_changed=True, prompts_changed=True
     )
-    options = (server or app).create_initialization_options(changes)
-    if preselect is None:
-        options = options.model_copy(
-            update={"instructions": _ATTACH_PREFACE + (options.instructions or "")}
-        )
-    return options
+    options = app.create_initialization_options(changes)
+    if binding.session is not None:
+        instructions = binding.instructions
+    else:
+        instructions = _ATTACH_PREFACE + note
+    return options.model_copy(update={"instructions": instructions})
 
 
 async def _serve_stdio(binding):
-    server = _local_server()
-    app = build_proxy(binding, server)
-    options = _handshake(app, server, binding.preselect)
+    app = build_proxy(binding)
     async with anyio.create_task_group() as tg:
         binding.task_group = tg
+        note = ""
+        if binding.preselect is not None:
+            # Before the first byte is read: the client's `initialize` waits in
+            # the pipe, and what it gets back is the session's own tools and
+            # rules, so a client that never refreshes its tool list still has
+            # the right one.
+            try:
+                await binding.attach(binding.preselect)
+            except AttachError as e:
+                note = (
+                    f"Attaching `{binding.preselect}` at start failed: {e}\n\n"
+                    "It is retried on the first request that needs a session.\n\n"
+                )
+        options = _handshake(app, binding, note)
         async with stdio_server() as (read_stream, write_stream):
             await app.run(read_stream, write_stream, options)
         tg.cancel_scope.cancel()
@@ -781,9 +802,11 @@ def serve(session=None):
     """Launcher entry point for ``--transport stdio``: bridge, attach on request,
     release.
 
-    The shim starts unbound; the agent's ``attach`` tool picks a session, or
-    *session* (``--session`` / ``$BIOPB_SESSION``) picks one for it on the first
-    request that needs one -- ``new`` having the control launch it.
+    The shim starts unbound; the agent's ``attach`` tool picks a session. Or
+    *session* (``--session`` / ``$BIOPB_SESSION``) binds one before the
+    handshake: an id, ``new`` (the control launches one), or ``auto`` (the newest
+    free session, else a new one). That is for a client that cannot follow
+    ``list_changed``.
     """
     logger.warning(
         "stdio is served by bridging to a biopb-mcp session the agent attaches "
