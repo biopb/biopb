@@ -76,6 +76,7 @@ namespace, which would collide at the root. So the control serves
 | `/session/<id>/observe` | control-served SPA observe shell | in-process |
 | `/session/<id>/api/*` | that session's observe API | loopback proxy |
 | `/session/<id>/chat/*` | that session's chat turns — **loopback-bound control only** | loopback proxy |
+| `/session/<id>/mcp` | that session's MCP endpoint, for an agent on another machine — **only where a token is enforced** | loopback proxy |
 | `/mcp` | agent JSON-RPC — **not routed here**; shim → child, direct | — |
 
 The SPA is built with base `/` so its assets resolve from the root under any shell
@@ -109,7 +110,7 @@ authenticated, for itself and for everything it fronts.
   RCE on the same origin the allowlist above exists to keep RCE off. Folding it
   into `api` would leave that allowlist enforced but no longer true, so it gets
   its own root and is proxied only when the control is loopback-bound — `api`
-  always, `chat` local-mode only, `/mcp` never. The control decides because only it knows its own
+  always, `chat` local-mode only. The control decides because only it knows its own
   bind: the proxy hop strips Host and Origin, so the child cannot tell a browser
   from this trusted hop. Not gated by the token instead: that credential
   authorizes reading pixels, is readable from a local file by design, and rides
@@ -117,6 +118,14 @@ authenticated, for itself and for everything it fronts.
   shell. Known limit: a loopback control published by a reverse proxy reads as
   local; that operator owns the exposure decision, as they already do for the
   data-plane token.
+- **`/mcp` is a third root, gated on the token.** A remote agent attaches through
+  `/session/<id>/mcp` (biopb-mcp's ARCHITECTURE, "Attaching from another
+  machine"). It runs code in the kernel, so it exists only where this control
+  enforces a token, whatever its bind: a tokenless control never serves it, a
+  loopback one with a token does (an SSH tunnel's case). `/health` reports
+  `mcp_proxied`. It is not narrowed to POST (streamable-http also uses GET and
+  DELETE, and a hostile page cannot set the token header) and its GET stream has
+  no read timeout.
 - **Supervised restart is control-routed, not blind-proxied.** The tensor
   sidecar's self-restart spawns a detached process — correct standalone, but under
   supervision it would race the supervisor for the port. So the control marks its

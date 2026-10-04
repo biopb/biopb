@@ -28,7 +28,7 @@ The process that owns fd 1 as a protocol channel imports nothing that could writ
 to stdout (no Qt, dask, uvicorn, kernel, or session code -- only the mcp SDK), so
 the fd-1 corruption class is structurally impossible here. The session reaches the
 shim only over HTTP: ``/api/lease``, ``/api/status``, ``/api/sessions`` and the
-session registry are the contract (docs/session-attach.md).
+session registry are the contract (biopb-mcp's ARCHITECTURE).
 
 With ``--remote`` the sessions are another machine's, reached through its control
 under the token (``_Remote``): the same lease, status and ``/mcp``, at

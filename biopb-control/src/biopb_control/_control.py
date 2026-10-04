@@ -192,7 +192,7 @@ _SESSION_CHAT_ROOT = "chat"
 _SESSION_POST_ONLY_ROOTS = frozenset({_SESSION_CHAT_ROOT})
 
 # The session's MCP endpoint, for an agent attaching from another machine
-# (docs/session-attach.md, phase 3). It runs arbitrary code in the kernel, so it
+# (biopb-mcp's ARCHITECTURE, "Attaching from another machine"). It runs arbitrary code in the kernel, so it
 # is the opposite of `chat`: served only where the control **enforces a token**,
 # whatever its bind, so it is never reachable unauthenticated. A tokenless
 # control does not proxy it (a local agent reaches the session's own port); a

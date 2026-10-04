@@ -132,8 +132,51 @@ EOF, on SIGTERM/SIGHUP, and -- where a multi-process client can keep the stdin
 handle open after it is gone (Windows, #403) -- when a watchdog sees the client
 exit.
 
+### The lease
+
 A session answers to one holder at a time, an `agent` or the built-in `chat`
-(`mcp/_lease.py`); the other kind is refused while the lease lives.
+(`mcp/_lease.py`); the other kind is refused while the lease lives. So one agent
+per session, and chat and an agent never write to one kernel together. The session
+holds the lease, not the control: the shim reaches a session directly on its
+loopback port.
+
+- **Agent**: taken by `attach`, renewed by the shim every 10 s, lapsed after 30 s
+  of silence (three missed beats), so a `kill -9`'d shim frees the session. The
+  holder is identified by a token the shim keeps, not by the connection, so a
+  restarted shim reclaims its own lease.
+- **Chat**: taken by the first turn (not by opening the pane, so a session with an
+  open pane stays attachable), renewed by turns only, never by the history poll,
+  lapsed after 5 min and kept alive while a turn runs. Released on idle, on clear,
+  and by `/chat/release`. Losing it cancels a running turn and drops queued
+  messages, which must not replay against a kernel the agent changed.
+- **Refusals and force**: `attach` on a held session answers with the holder's
+  kind and age; a chat turn on an agent-held session is a 409 with the same
+  facts. `force` takes the lease, and taking it from a mid-turn chat cancels the
+  turn; nothing else ever aborts one.
+- **Busy status** in the session list is the lease: free, agent or chat.
+  A change of holder clears the kernel's one-agent claim (`_writers`).
+
+There is one token for all sessions; there are no per-session grants.
+
+### Attaching from another machine
+
+`biopb-shim --remote <control-url>` (token from `--token` or
+`$BIOPB_TENSOR_TOKEN`; `$BIOPB_REMOTE` for the URL) attaches to another machine's
+sessions through its control, which proxies `/session/<id>/mcp` where it enforces a
+token (biopb-control's ARCHITECTURE). The lease, status and listing take the same
+path, `/session/<id>/...` and `/api/sessions`, so everything above holds. The shim
+sends the token as `X-Biopb-Token` and only to that address; this machine's own
+credential file is never used for a remote. `--header 'Name: value'` (repeatable, or
+`$BIOPB_REMOTE_HEADERS`) adds what a portal in front of the control wants, such as
+its session cookie, and the URL may carry a path prefix. `attach new` launches on
+the host, headless: the client sends no display variables, since the viewer,
+screenshots, paths and data plane all belong to the session's host. The control has
+no TLS of its own, so a published control needs the operator's proxy for it.
+
+The shim and a session meet only over HTTP and the registry: `/api/lease/*`,
+`/api/status`, `/mcp`, the control's `/api/sessions`, `/api/sessions/new`,
+`/health` (`mcp_proxied`) and its `/session/<id>/...` proxy, and `biopb._sessions`.
+A change to any of them is a change to the SDK and biopb-mcp together.
 
 ### The kernel
 
