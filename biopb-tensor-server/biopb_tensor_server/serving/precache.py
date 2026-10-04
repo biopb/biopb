@@ -10,9 +10,10 @@ It serves two tiers, in strict priority order:
 
 - **Live tier (primary).** Sources added to the catalog *after* startup, fed by
   ``SourceManager``'s commit hook (``enqueue``). Always warmed.
-- **Backlog tier (secondary).** Local sources already present at startup, seeded
-  once via ``seed_backlog`` and ordered newest-mtime-first. Drained only when the
-  live queue is empty, and bounded so it never evicts live data (see below).
+- **Backlog tier (secondary).** Local sources the first scan found, added one by
+  one as each is registered (``enqueue_backlog``) and ordered newest-mtime-first.
+  Drained only when the live queue is empty and registration has finished
+  (``backlog_gate``), and bounded so it never evicts live data (see below).
 
 Design constraints (all best-effort, never fatal to the server):
 
@@ -41,7 +42,7 @@ import heapq
 import logging
 import queue
 import threading
-from typing import TYPE_CHECKING, Callable, List, Optional, Sequence, Set, Tuple
+from typing import TYPE_CHECKING, Callable, List, Optional, Set, Tuple
 
 import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
@@ -113,6 +114,12 @@ class PrecacheWorker:
         # there is no manager (e.g. static-only deployments), in which case the
         # gate is a no-op and warming proceeds as before.
         self.should_warm: Optional[Callable[[str], bool]] = None
+        # Holds the backlog tier while it returns False. Wired from
+        # SourceManager.registration_idle: registering the sources a first scan
+        # claimed is the critical path of a start and reads the same files, so
+        # warming them waits for it. The live tier is not gated by this. None
+        # leaves the backlog ungated.
+        self.backlog_gate: Optional[Callable[[], bool]] = None
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -147,30 +154,21 @@ class PrecacheWorker:
             self._seen.add(source_id)
         self._queue.put(source_id)
 
-    def seed_backlog(self, items: Sequence[Tuple[str, float]]) -> None:
-        """Seed the secondary backlog with ``(source_id, mtime)`` pairs.
+    def enqueue_backlog(self, source_id: str, mtime: float) -> None:
+        """Add one source to the backlog, newest mtime first.
 
-        Called once at startup with the existing local sources. Items already
-        queued in the live tier or the backlog are skipped.
+        For a startup source, called when its registration completes (it has
+        nothing to warm before). Skipped if already queued in either tier.
         """
-        if not items:
-            return
         with self._seen_lock:
-            seen_snapshot = set(self._seen)
-        added = 0
+            if source_id in self._seen:
+                return
         with self._backlog_lock:
-            for source_id, mtime in items:
-                if source_id in self._backlog_ids or source_id in seen_snapshot:
-                    continue
-                self._backlog_seq += 1
-                heapq.heappush(self._backlog, (-mtime, self._backlog_seq, source_id))
-                self._backlog_ids.add(source_id)
-                added += 1
-        logger.info(
-            "precache: seeded %d/%d existing sources into backlog",
-            added,
-            len(items),
-        )
+            if source_id in self._backlog_ids:
+                return
+            self._backlog_seq += 1
+            heapq.heappush(self._backlog, (-mtime, self._backlog_seq, source_id))
+            self._backlog_ids.add(source_id)
 
     # -- worker loop -------------------------------------------------------
 
@@ -195,15 +193,23 @@ class PrecacheWorker:
                     # re-check (live eviction may free room later).
                     self._stop.wait(self._cfg.backlog_idle_recheck_seconds)
                     continue
+                if self.backlog_gate is not None and not self.backlog_gate():
+                    # Held; a live addition is still taken as it arrives.
+                    self._wait_live(1.0)
+                    continue
                 self._drain_one_backlog()
                 continue
 
             # 3. Idle: block briefly for the next live addition.
-            try:
-                source_id = self._queue.get(timeout=0.5)
-            except queue.Empty:
-                continue
-            self._process_live(source_id)
+            self._wait_live(0.5)
+
+    def _wait_live(self, timeout: float) -> None:
+        """Block up to *timeout* for a live addition, and warm it if one arrives."""
+        try:
+            source_id = self._queue.get(timeout=timeout)
+        except queue.Empty:
+            return
+        self._process_live(source_id)
 
     def _process_live(self, source_id: str) -> None:
         # Drop the dedup marker before processing: a commit that arrives while

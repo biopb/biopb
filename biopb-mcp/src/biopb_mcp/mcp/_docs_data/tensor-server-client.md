@@ -58,8 +58,8 @@ below rather than building on the details.
 
 Some sources are catalogued by URL only (cloud, or a synced folder like OneDrive
 "Files-On-Demand"): their shape, dtype and field list are unknown until first
-read. They list with `is_resolved == False` and an empty `tensors`, and
-`get_tensor` on one raises.
+read. They list with `is_resolved == False` (`unresolved_reason ==
+'needs_recall'`) and an empty `tensors`, and `get_tensor` on one raises.
 
 ```python
 client.resolve_source("source_id")     # downloads the whole thing; minutes, disk, needs network
@@ -81,6 +81,21 @@ rather than reaching for the whole thing.
 `query("... WHERE tensors[1].dtype = 'uint8'")` silently drops it —
 hidden for being unresolved, not for failing to match. `WHERE NOT is_resolved`
 is how you ask for them on purpose.
+
+## Sources the server has found but not read yet
+
+After a start the server lists every source it finds before it has read any of
+them: each row has `is_resolved == False`, `unresolved_reason == 'pending'` and
+an empty `tensors`, and fills in as the server works through them (newest first;
+`client.health_check()["registration_pending"]` counts what is left, `0` means
+the catalog is whole). This is not a cloud source: nothing is downloaded, and
+reading a pending source (`get_tensor`, `get_descriptor`, `resolve_source`)
+registers it on the spot.
+
+A search by structure (`WHERE tensors[1].dtype = 'uint16'`) cannot see a pending
+source, so an empty result while `registration_pending > 0` means "not known
+yet", not "none". Say so, or wait. A row with `unresolved_reason == 'failed'`
+could not be read (corrupt file, say); `resolve_source` raises with the reason.
 
 ## Loading a tensor
 

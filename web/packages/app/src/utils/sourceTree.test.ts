@@ -5,6 +5,7 @@ import {
   groupTensors,
   isEmptySource,
   isUnresolved,
+  unresolvedKind,
   recentNode,
   sourceLabel,
 } from "./sourceTree";
@@ -117,6 +118,24 @@ describe("recentNode", () => {
 
   it("carries the descriptor through, so a row can be opened", () => {
     expect(recentNode([UPLOAD])?.children[0]?.source).toBe(UPLOAD);
+  });
+});
+
+describe("unresolvedKind", () => {
+  const kind = (reason?: DataSourceDescriptor["unresolved_reason"]) =>
+    unresolvedKind(source({ is_resolved: false, unresolved_reason: reason }));
+
+  it("reads the server's reason", () => {
+    expect(kind("pending")).toBe("pending");
+    expect(kind("failed")).toBe("failed");
+    expect(kind("needs_recall")).toBe("recall");
+  });
+
+  it("is the cloud case when the row has no reason", () => {
+    // Every unresolved row was a cloud placeholder before the field existed, and
+    // a server that predates it still sends none.
+    expect(kind()).toBe("recall");
+    expect(kind(null)).toBe("recall");
   });
 });
 

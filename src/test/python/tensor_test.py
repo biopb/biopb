@@ -364,6 +364,9 @@ class TestResolveDescriptorAddressing:
     def _client(row):
         client = _offline_client(raw_client=Mock())
         client._catalog._source_tensors_row = Mock(return_value=row)
+        # Not a source awaiting registration, whatever it is: that probe is
+        # covered by ``TestPendingRegistration``.
+        client._catalog._register_if_pending = Mock(return_value=False)
         # The row answers every case here; reaching the probe is the failure.
         client._catalog._fetch_tensor_descriptor = Mock(
             side_effect=AssertionError("the row should have answered")
@@ -418,6 +421,97 @@ class TestResolveDescriptorAddressing:
         client = self._client(self._row("solo"))
 
         assert client._catalog._resolve_descriptor("solo").array_id == "solo"
+
+
+class TestPendingRegistration:
+    """A source the server has claimed but not yet registered is read, not refused.
+
+    Its catalog row is unresolved (``unresolved_reason`` ``pending``), and the
+    SDK checks that row before it asks the server; registering a local source
+    costs no download, so it registers it rather than steering the caller to a
+    consented resolve.
+    """
+
+    @staticmethod
+    def _client(rows):
+        client = _offline_client(raw_client=Mock())
+        catalog = client._catalog
+        catalog.resolve_source = Mock()
+        catalog._source_tensors_row = Mock(side_effect=rows)
+        return catalog
+
+    @staticmethod
+    def _reasons(catalog, reason, source_id="solo"):
+        rows = [{"source_id": source_id, "unresolved_reason": reason}]
+        catalog._query_table = Mock(
+            return_value=Mock(to_pylist=Mock(return_value=rows))
+        )
+
+    @staticmethod
+    def _row(is_resolved):
+        tensors = [
+            {
+                "array_id": "solo",
+                "dim_labels": ["y", "x"],
+                "shape": [4, 4],
+                "dtype": "uint8",
+            }
+        ]
+        return {"is_resolved": is_resolved, "tensors": tensors if is_resolved else []}
+
+    def test_a_pending_source_is_registered_then_read_off_its_new_row(self):
+        catalog = self._client([self._row(False), self._row(True)])
+        self._reasons(catalog, "pending")
+
+        desc = catalog._resolve_descriptor("solo")
+
+        assert desc.array_id == "solo"
+        catalog.resolve_source.assert_called_once_with("solo")
+
+    def test_a_failed_one_is_sent_to_resolve_for_the_servers_reason(self):
+        catalog = self._client([self._row(False), self._row(False)])
+        self._reasons(catalog, "failed")
+
+        with pytest.raises(ValueError, match=r"call client\.resolve_source"):
+            catalog._resolve_descriptor("solo")
+        catalog.resolve_source.assert_called_once_with("solo")
+
+    def test_a_cloud_placeholder_is_never_resolved_implicitly(self):
+        catalog = self._client([self._row(False)])
+        self._reasons(catalog, "needs_recall", "cloud_x")
+
+        with pytest.raises(ValueError, match=r"call client\.resolve_source"):
+            catalog._resolve_descriptor("cloud_x")
+        catalog.resolve_source.assert_not_called()
+
+    def test_a_server_without_the_column_keeps_the_old_refusal(self):
+        import pyarrow.flight as flight
+
+        catalog = self._client([self._row(False)])
+        catalog._query_table = Mock(side_effect=flight.FlightServerError("Binder"))
+
+        with pytest.raises(ValueError, match=r"call client\.resolve_source"):
+            catalog._resolve_descriptor("cloud_x")
+        catalog.resolve_source.assert_not_called()
+
+    def test_metadata_is_read_once_the_pending_source_is_registered(self):
+        catalog = self._client([])
+        tables = [
+            [{"is_resolved": False, "metadata_json": None}],
+            [{"is_resolved": True, "metadata_json": '{"a": 1}'}],
+        ]
+
+        def query(sql):
+            if "unresolved_reason" in sql:
+                rows = [{"source_id": "solo", "unresolved_reason": "pending"}]
+            else:
+                rows = tables.pop(0)
+            return Mock(to_pylist=Mock(return_value=rows))
+
+        catalog._query_table = Mock(side_effect=query)
+
+        assert catalog.get_source_metadata("solo") == {"a": 1}
+        catalog.resolve_source.assert_called_once_with("solo")
 
 
 if __name__ == "__main__":

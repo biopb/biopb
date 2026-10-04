@@ -624,10 +624,16 @@ class TestHeadroomProbe:
         assert worker._has_headroom() is False
 
 
+def _seed(worker, items):
+    """Put ``(source_id, mtime)`` pairs on a worker's backlog, as registration does."""
+    for source_id, mtime in items:
+        worker.enqueue_backlog(source_id, mtime)
+
+
 class TestBacklogSeeding:
     def test_orders_newest_mtime_first(self):
         worker = PrecacheWorker(None, PrecacheConfig())
-        worker.seed_backlog([("old", 100.0), ("new", 200.0), ("mid", 150.0)])
+        _seed(worker, [("old", 100.0), ("new", 200.0), ("mid", 150.0)])
         assert worker._pop_backlog()[1] == "new"
         assert worker._pop_backlog()[1] == "mid"
         assert worker._pop_backlog()[1] == "old"
@@ -636,21 +642,21 @@ class TestBacklogSeeding:
     def test_skips_live_queued_sources(self):
         worker = PrecacheWorker(None, PrecacheConfig())
         worker.enqueue("a")  # now in the live tier (_seen)
-        worker.seed_backlog([("a", 100.0), ("b", 50.0)])
+        _seed(worker, [("a", 100.0), ("b", 50.0)])
         # 'a' is already live -> only 'b' lands in the backlog.
         assert worker._pop_backlog()[1] == "b"
         assert worker._pop_backlog() is None
 
     def test_seed_dedups_within_backlog(self):
         worker = PrecacheWorker(None, PrecacheConfig())
-        worker.seed_backlog([("a", 100.0)])
-        worker.seed_backlog([("a", 999.0)])  # already present -> ignored
+        _seed(worker, [("a", 100.0)])
+        _seed(worker, [("a", 999.0)])  # already present -> ignored
         assert worker._pop_backlog()[1] == "a"
         assert worker._pop_backlog() is None
 
     def test_requeue_restores_front_priority(self):
         worker = PrecacheWorker(None, PrecacheConfig())
-        worker.seed_backlog([("a", 100.0), ("b", 200.0)])
+        _seed(worker, [("a", 100.0), ("b", 200.0)])
         neg_mtime, sid = worker._pop_backlog()
         assert sid == "b"  # newest
         worker._requeue_backlog(sid, neg_mtime)
@@ -659,8 +665,12 @@ class TestBacklogSeeding:
         assert worker._pop_backlog()[1] == "a"
 
 
-class TestIterLocalSourceMtimes:
-    def _bare_sm(self):
+class TestStartupRouting:
+    """Where a registered source goes: the backlog if the first scan found it, the
+    live tier if it came later."""
+
+    @staticmethod
+    def _sm():
         from biopb_tensor_server.core.discovery import AdapterRegistry, DiscoveryState
 
         server = TensorFlightServer("localhost:0")
@@ -670,70 +680,70 @@ class TestIterLocalSourceMtimes:
             discovery_state=DiscoveryState(),
             monitored_dirs=set(),
         )
-        return server, sm
+        startup, live = [], []
+        sm.set_startup_source_hook(lambda sid, mtime: startup.append((sid, mtime)))
+        sm.set_source_committed_hook(live.append)
+        return server, sm, startup, live
 
-    def test_skips_remote_and_unstatable(self, tmp_path):
-        server, sm = self._bare_sm()
+    @staticmethod
+    def _claim(sm, source_id, path, remote=False):
+        sm._reconciler._state.claims[source_id] = SimpleNamespace(
+            source_id=source_id, primary_path=path, is_remote=remote
+        )
+
+    def test_a_startup_source_goes_to_the_backlog_with_its_mtime(self, tmp_path):
+        server, sm, startup, live = self._sm()
         try:
-            real = tmp_path / "f.zarr"
-            real.mkdir()
-            sm._reconciler._state.claims["local"] = SimpleNamespace(
-                source_id="local", primary_path=str(real), is_remote=False
-            )
-            sm._reconciler._state.claims["remote"] = SimpleNamespace(
-                source_id="remote", primary_path="s3://bucket/x", is_remote=True
-            )
-            sm._reconciler._state.claims["gone"] = SimpleNamespace(
-                source_id="gone",
-                primary_path=str(tmp_path / "missing"),
-                is_remote=False,
-            )
-            out = dict(sm.iter_local_source_mtimes())
-            assert "local" in out
-            assert isinstance(out["local"], float)
-            assert "remote" not in out  # no os.stat mtime
-            assert "gone" not in out  # OSError -> skipped
+            store = tmp_path / "f.zarr"
+            store.mkdir()
+            self._claim(sm, "local", str(store))
+            sm._notify_source_committed("local")
+            assert [sid for sid, _ in startup] == ["local"]
+            assert startup[0][1] == store.stat().st_mtime
+            assert live == []
         finally:
             server.shutdown()
 
-    def test_snapshot_taken_under_lock(self):
-        # The read must snapshot _state.claims under self._lock (the same lock
-        # _commit_add_claim/_commit_remove_claim hold) so it can't iterate the
-        # dict while the rescan loop mutates it. Prove it by holding the
-        # lock in another thread: the reader must block until it is released.
-        server, sm = self._bare_sm()
-        holder = None
+    def test_a_remote_startup_source_is_not_enqueued(self):
+        server, sm, startup, live = self._sm()
         try:
-            sm._reconciler._state.claims["a"] = SimpleNamespace(
-                source_id="a", primary_path="/x", is_remote=True
-            )
-            held = threading.Event()
-            release = threading.Event()
-            done = threading.Event()
-
-            def hold_lock():
-                with sm._reconciler._lock:
-                    held.set()
-                    release.wait(2.0)
-
-            holder = threading.Thread(target=hold_lock, daemon=True)
-            holder.start()
-            assert held.wait(1.0)
-
-            reader = threading.Thread(
-                target=lambda: (sm.iter_local_source_mtimes(), done.set()),
-                daemon=True,
-            )
-            reader.start()
-            # Lock is held elsewhere -> the snapshot can't proceed yet.
-            assert not done.wait(0.3)
-            release.set()
-            # Released -> the read completes.
-            assert done.wait(2.0)
+            self._claim(sm, "remote", "s3://bucket/x", remote=True)
+            sm._notify_source_committed("remote")
+            assert startup == [] and live == []
         finally:
-            release.set()
-            if holder is not None:
-                holder.join(1.0)
+            server.shutdown()
+
+    def test_a_source_that_is_gone_is_not_enqueued(self):
+        server, sm, startup, live = self._sm()
+        try:
+            sm._notify_source_committed("never-claimed")
+            assert startup == [] and live == []
+        finally:
+            server.shutdown()
+
+    def test_a_source_after_the_first_scan_is_live(self, tmp_path):
+        server, sm, startup, live = self._sm()
+        try:
+            self._claim(sm, "local", str(tmp_path))
+            sm._initial_scan_done = True
+            sm._notify_source_committed("local")
+            assert live == ["local"] and startup == []
+        finally:
+            server.shutdown()
+
+    def test_a_deferred_source_is_startup_whenever_it_registers(self, tmp_path):
+        server, sm, startup, live = self._sm()
+        try:
+            self._claim(sm, "local", str(tmp_path))
+            sm._deferred["local"] = 123.0  # claimed by the first scan, registered later
+            sm._initial_scan_done = True
+            sm._notify_source_committed("local")
+            # With the mtime it was claimed with, not a second stat.
+            assert startup == [("local", 123.0)] and live == []
+            # It is startup once: a refresh of it afterwards is a live addition.
+            sm._notify_source_committed("local")
+            assert live == ["local"]
+        finally:
             server.shutdown()
 
 
@@ -755,7 +765,7 @@ class TestBacklogWarming:
             _register_zarr(server, tmp_path, "s-old")
             _register_zarr(server, tmp_path, "s-new")
             worker = PrecacheWorker(server, PrecacheConfig(idle_debounce_seconds=0.0))
-            worker.seed_backlog([("s-old", 100.0), ("s-new", 200.0)])
+            _seed(worker, [("s-old", 100.0), ("s-new", 200.0)])
             worker.start()
             cm = CacheManager.get_instance()
             deadline = time.time() + 8.0
@@ -779,7 +789,7 @@ class TestBacklogWarming:
             _register_zarr(server, tmp_path, "live")
             _register_zarr(server, tmp_path, "backlog")
             worker = PrecacheWorker(server, PrecacheConfig(idle_debounce_seconds=0.0))
-            worker.seed_backlog([("backlog", 100.0)])
+            _seed(worker, [("backlog", 100.0)])
             worker.enqueue("live")
             worker.start()
             cm = CacheManager.get_instance()
@@ -871,7 +881,7 @@ class TestBacklogWarming:
                 ),
             )
             monkeypatch.setattr(worker, "_has_headroom", lambda: False)
-            worker.seed_backlog([("src", 100.0)])
+            _seed(worker, [("src", 100.0)])
             worker.start()
             time.sleep(0.5)
             worker.stop()

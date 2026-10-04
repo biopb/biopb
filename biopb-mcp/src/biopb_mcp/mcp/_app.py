@@ -78,6 +78,11 @@ _BASE_INSTRUCTIONS = (
     "`WHERE tensors[1].dtype = 'uint8'` silently drops them; filter on "
     "`is_resolved` to opt them in/out on "
     "purpose (`WHERE NOT is_resolved` finds what hasn't been resolved yet). "
+    "Right after a server start many sources are `is_resolved = false` with "
+    "`unresolved_reason = 'pending'`: found, not read yet, filling in "
+    '(`client.health_check()["registration_pending"]` counts them); reading '
+    "one registers it at once, and until they are done an empty structural "
+    'search means "not known yet". '
     "Resolved is not the same as local: assume a cloud or synced-folder source "
     "may not have its bytes on the serving machine, so the first read can be "
     "slow or fail offline. Plan for that -- warn the user before a long read "

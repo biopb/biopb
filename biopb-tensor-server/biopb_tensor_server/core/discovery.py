@@ -22,6 +22,7 @@ import abc
 import hashlib
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import (
@@ -782,6 +783,9 @@ class AdapterRegistry:
     def __init__(self):
         self._adapters: List[Type[SourceAdapter]] = []
         self._type_to_adapter: Dict[str, Type[SourceAdapter]] = {}
+        # Called with (adapter name, seconds, claimed) after every claim probe,
+        # for the registration summary; None times nothing.
+        self.claim_timer: Optional[Callable[[str, float, bool], None]] = None
 
     def register(
         self,
@@ -836,7 +840,15 @@ class AdapterRegistry:
             recorder: List[str] = []
             state._claim_recorder = recorder
             try:
+                timer = self.claim_timer
+                started = time.perf_counter() if timer is not None else 0.0
                 claim = adapter_cls.claim(ctx, state)
+                if timer is not None:
+                    timer(
+                        adapter_cls.__name__,
+                        time.perf_counter() - started,
+                        claim is not None,
+                    )
                 if claim is not None:
                     claim.member_paths.update(recorder)
                     claims.append(claim)

@@ -64,7 +64,7 @@ import numpy as np
 import pyarrow.flight as flight
 from biopb import _web_auth
 from biopb.image.annotation_pb2 import RoiAnnotation
-from biopb.tensor._catalog_rows import sql_literal
+from biopb.tensor._catalog_rows import sql_literal, unresolved_reasons
 from biopb.tensor._session import ResolveCancelled
 from biopb.tensor.client import TensorFlightClient
 from biopb.tensor.ticket_pb2 import TensorTicket
@@ -1904,6 +1904,7 @@ async def list_sources(request: Request) -> JSONResponse:
     try:
         client = ctx.get_client()
         rows = client.query(_SOURCE_LIST_SQL + " ORDER BY source_id", format="records")
+        _add_unresolved_reasons(client, rows)
         result = [_source_row_to_dict(row) for row in rows]
         elapsed = (time.monotonic() - t0) * 1000
         ctx.diag.latency.record(elapsed)
@@ -2340,6 +2341,9 @@ async def get_source(source_id: str, request: Request) -> JSONResponse:
             raise HTTPException(
                 status_code=404, detail=f"Source not found: {source_id}"
             )
+        _add_unresolved_reasons(
+            client, rows, f"AND source_id = {sql_literal(source_id)}"
+        )
         ctx.diag.latency.record((time.monotonic() - t0) * 1000)
         return JSONResponse(_source_row_to_dict(rows[0]))
     except HTTPException:
@@ -3127,6 +3131,7 @@ async def admin_status(request: Request) -> JSONResponse:
             "uptime_seconds": _h("uptime_seconds"),
             "full_scan_in_progress": _h("full_scan_in_progress"),
             "last_full_scan_finished_at": _h("last_full_scan_finished_at"),
+            "registration_pending": _h("registration_pending"),
             "annotations_persisted": _h("annotations_persisted"),
             "catalog_persisted": _h("catalog_persisted"),
         }
@@ -3323,6 +3328,21 @@ _SOURCE_LIST_SQL = (
 )
 
 
+def _add_unresolved_reasons(
+    client: Any, rows: List[Dict[str, Any]], where: str = ""
+) -> None:
+    """Set ``unresolved_reason`` on the rows that are not resolved. Without an
+    answer (a server older than the column) the key stays absent, which a client
+    reads as the cloud case it always was."""
+    unresolved = [row for row in rows if not row.get("is_resolved", True)]
+    if not unresolved:
+        return
+    reasons = unresolved_reasons(lambda sql: client.query(sql, format="records"), where)
+    for row in unresolved:
+        if row["source_id"] in reasons:
+            row["unresolved_reason"] = reasons[row["source_id"]]
+
+
 def _source_row_to_dict(row: Dict[str, Any]) -> Dict[str, Any]:
     """One ``sources`` catalog row as the TS ``DataSourceDescriptor`` JSON."""
     return {
@@ -3339,6 +3359,13 @@ def _source_row_to_dict(row: Dict[str, Any]) -> Dict[str, Any]:
         # server predating the column, the right reading for every pre-existing
         # source.
         "is_resolved": bool(row.get("is_resolved", True)),
+        # Why it is not resolved (cloud recall, queued registration, a failed
+        # one); absent for a resolved row and for a server that predates it.
+        **(
+            {"unresolved_reason": row["unresolved_reason"]}
+            if row.get("unresolved_reason")
+            else {}
+        ),
         "tensors": [_tensor_row_to_dict(t) for t in (row.get("tensors") or [])],
     }
 

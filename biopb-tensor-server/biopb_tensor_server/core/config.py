@@ -238,6 +238,7 @@ _CONSTRAINTS = {
         ),
         "rescan_interval": _Range(min=0),
         "stability_window": _Range(min=0),
+        "registration_workers": _Range(min=0),
         "handle_reaper_ttl": _Range(min=0),
         "upload_ttl": _Range(min=0),
         "scratch_ttl": _Range(min=0),
@@ -911,6 +912,31 @@ class ServerConfig:
             "for removal and rebuild as well as discovery."
         },
     )
+    registration_workers: int = field(
+        default=4,
+        metadata={
+            "help": "Threads that register, in the background, the sources the "
+            "first scan finds. Registration opens and parses each source's file, "
+            "which is most of the time a large site takes to start; with this on, "
+            "the scan only claims them, every source is in the catalog at once "
+            "(unresolved, reason 'pending') and fills in as it is registered, and "
+            "a read that needs one registers it immediately. Raise it on storage "
+            "that serves many reads at once (network filesystems); 0 registers "
+            "each source as it is found, so the catalog is complete when the "
+            "first scan is."
+        },
+    )
+    registration_stats: bool = field(
+        default=False,
+        metadata={
+            "help": "Log, once registration has finished, how long each step of "
+            "registering a source took and how large its catalog row is, per "
+            "source type, and how long each adapter's claim took during the "
+            "scan. For measuring a site or a change, not for a deployment: it "
+            "sizes every row (a second serialization of its tensors) and keeps "
+            "a few numbers per source until the server stops."
+        },
+    )
     claim_generic_images: bool = field(
         default=False,
         metadata={
@@ -1337,6 +1363,8 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
     _carry(server_kwargs, "upload_ttl", server_data, cast=float)
     _carry(server_kwargs, "scratch_ttl", server_data, cast=float)
     _carry(server_kwargs, "stability_window", server_data, cast=float)
+    _carry(server_kwargs, "registration_workers", server_data, cast=int)
+    _carry(server_kwargs, "registration_stats", server_data, cast=bool)
     _carry(server_kwargs, "claim_generic_images", server_data, cast=bool)
     _carry(server_kwargs, "writable", server_data)
     write_dir_str = server_data.get("write_dir")

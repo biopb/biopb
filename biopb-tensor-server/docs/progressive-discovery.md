@@ -214,13 +214,52 @@ complete_initial_scan      first tick only
 |---|---|---|
 | Catalog on entry | Empty | Populated |
 | Pass kind | Full (the interval has never elapsed) | Incremental, full once per `full_rescan_interval` |
-| Registration | **Streamed**: `on_source_added` → `_stream_first_scan_add` commits each claim as the walk finds it, so the catalog grows during the walk | **Batched**: one `_reconcile_discovered_state` after the walk |
+| Registration | **Claimed as the walk finds it** (`on_source_added` → `_stream_first_scan_add`), **registered afterwards** by a worker pool (below); with `registration_workers = 0`, registered as claimed | **Batched**: one `_reconcile_discovered_state` after the walk, each source registered as it is committed |
 | Removal | None possible; every claim is a pure add | Two-miss rule, shielded and scoped as in §5 |
 | Cloud roots | Walked | Skipped unless the pass is full |
 | Scan-once roots | Scanned | Not touched |
 | Upstreams | All due (countdown 0) | Adaptive: every tick while changing or failing, doubling toward `full_rescan_interval` while stable |
-| Precache | Everything registered routes to the slow backlog | New sources prompt-enqueue |
+| Precache | Everything routes to the slow backlog, each source when its registration completes | New sources prompt-enqueue |
 | Freshness signal | Set by `complete_initial_scan` at the end | Advanced only by a completed full pass or upstream-only pass |
+
+### Registration after the walk
+
+Registering a source opens and parses its file, which is most of a large site's start.
+While `registration_workers` is above zero the first scan therefore only *claims*:
+`_commit_pending_claim` commits each deferrable claim with a placeholder
+(`PendingSourceAdapter`). The source is in the registry and the catalog at once
+(`is_resolved` false, `unresolved_reason` `pending`, no tensors), and its claim and
+signatures are in the confirmed state, so the diff, removal and refresh treat it like any
+other source. A `RegistrationWorker` pool then calls `Reconciler.ensure_registered`,
+newest file first, which runs the ordinary registration and swaps the real adapter in.
+The pool is held until the first scan is over (`complete_initial_scan` resumes it): walking
+and registering contend, and a held pool lets every claim be committed first, so the whole
+catalog exists, pending, before any file is opened. A rescan does not hold it again; it
+registers what it finds inline.
+
+- **A read registers it at once.** The server's read paths and the upload manager use
+  `SourceRegistry.get_registered`, which calls `ensure_registered` first when the adapter
+  is a placeholder; it is single-flight per source, so a read racing the worker shares one
+  registration. Callers that only ask whether a source exists keep `get`. `resolve` on a
+  pending source registers it and returns the filled row.
+- **Not deferred:** remote proxies (bulk-seeded), cloud sources (already registered
+  unresolved), static sources, and everything claimed after the first scan.
+- **`unresolved_reason`** says why a row is not resolved: `needs_recall` (a cloud
+  placeholder; resolving downloads it), `pending` (queued; a read registers it, no
+  download), `failed` (registration raised; `metadata_json` holds `registration_error`,
+  reads raise `SourceRegistrationError`, and a tick retries it after its backoff).
+- **While pending** a source can be refreshed (the rebuild is the registration) or removed,
+  and a registration never registers a removed source back (a per-source lock orders the
+  three). The upload attacher runs on the real adapter, not the placeholder.
+- **Precache.** One callback after every registration (`_notify_source_committed`) routes
+  the source: one the first scan found goes to the backlog (`enqueue_backlog`, with its
+  mtime), a later one is prompt-enqueued, a remote one is not enqueued as startup. The
+  backlog tier waits for `registration_idle` (first scan over, nothing pending); the live
+  tier is not held.
+- **Cost** (opt-in: `registration_stats = true`). `RegistrationStats` logs, once registration has drained, per source type the
+  time in `create_from_config`, `normalize_adapter`, the metadata read and the row write,
+  the sizes of `metadata_json`, `tensors` and the lean descriptors, and the member count,
+  plus the time each adapter's `claim` took in the walk.
 
 Streaming is safe only because the first scan is add-only. It is idempotent
 against a retry: `_stream_first_scan_add` skips a claim already in the confirmed state,
@@ -255,7 +294,9 @@ wired and started, before any scan.
 Freshness is a separate, continuous signal on `health`:
 `full_scan_in_progress: bool` (raised by the launcher before the manager starts) and
 `last_full_scan_finished_at: float | null` (epoch seconds, `null` until the first scan
-completes). The same fields serve boot and steady state: a later full pass (a forced full
+completes). A third, `registration_pending: int`, counts the claimed sources still
+waiting to be registered: the scan can be finished while the rows it wrote are still
+filling in, and `0` means the catalog is whole. The same fields serve boot and steady state: a later full pass (a forced full
 rescan, or the pass of an upstream-only config) advances the timestamp exactly as the
 first one did, so a client has no startup case to special-case. Incremental ticks touch
 neither field.
