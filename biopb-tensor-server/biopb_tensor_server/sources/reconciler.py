@@ -42,11 +42,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
 
-from biopb_tensor_server.adapters.unresolved import UnresolvedSourceAdapter
 from biopb_tensor_server.core.adapter_base import to_catalog_url
 from biopb_tensor_server.core.config import SourceConfig
 from biopb_tensor_server.core.discovery import (
     AdapterRegistry,
+    ClaimContext,
     DiscoveryState,
     SourceClaim,
     _is_offline_placeholder,
@@ -54,6 +54,7 @@ from biopb_tensor_server.core.discovery import (
 )
 from biopb_tensor_server.core.errors import (
     SourceRegistrationError,
+    SourceResolveRetriableError,
     SourceUnresolvedError,
     UpstreamConfigError,
 )
@@ -189,6 +190,10 @@ class Reconciler:
         self._pending_hook: Optional[Callable[[str], None]] = None
         self._pending: Dict[str, Optional[str]] = {}
         self._pending_failed: Dict[str, str] = {}
+        # The pending sources that wait for a client, not the pool: a cloud source
+        # is downloaded when it is resolved, never in the background. A subset of
+        # ``_pending``, disjoint from ``_pending_failed``.
+        self._recall: Set[str] = set()
         # A registration, a refresh and a removal of one source never overlap, so
         # a resolve that races the worker coalesces onto one parse and a removed
         # source is not registered back. A fixed stripe of locks hashed by
@@ -257,10 +262,11 @@ class Reconciler:
         """Sources waiting for their registration to run.
 
         A source whose registration failed is not counted: it is retried, but
-        nothing is waiting on it.
+        nothing is waiting on it. Nor is a cloud source, which waits for a
+        client to resolve it.
         """
         with self._lock:
-            return len(self._pending) - len(self._pending_failed)
+            return len(self._pending) - len(self._pending_failed) - len(self._recall)
 
     def unregistered_count(self) -> int:
         """Sources in the catalog whose registration has not completed, failed
@@ -292,6 +298,7 @@ class Reconciler:
         """Forget a source's pending state. Caller holds ``self._lock``."""
         self._pending.pop(source_id, None)
         self._pending_failed.pop(source_id, None)
+        self._recall.discard(source_id)
 
     def _registration_lock(self, source_id: str) -> threading.RLock:
         return self._registration_stripes[hash(source_id) % _REGISTRATION_STRIPES]
@@ -299,19 +306,20 @@ class Reconciler:
     def _deferrable(self, claim: SourceClaim) -> bool:
         """Whether registering *claim* is the slow, local, file-opening kind.
 
-        A remote proxy registers from a bulk seed and an unresolved cloud source
-        opens nothing, so neither gains from waiting.
+        A remote proxy registers from a bulk seed, so it gains nothing from
+        waiting. (A cloud source is not deferred but left for a client: see
+        ``_claim_is_unresolved``.)
         """
-        return (
-            not claim.is_remote
-            and claim.source_type != "tensor-server"
-            and not self._claim_is_unresolved(claim)
-        )
+        return not claim.is_remote and claim.source_type != "tensor-server"
 
     def _commit_pending_claim(
-        self, claim: SourceClaim, catalog_url: Optional[str]
+        self, claim: SourceClaim, catalog_url: Optional[str], recall: bool = False
     ) -> bool:
         """Commit *claim* to the catalog only; its registration runs later.
+
+        *recall* marks a cloud source: its row says ``needs_recall`` and nothing
+        queues it, since registering it downloads it and only a client's
+        ``resolve`` does that.
 
         Everything but the parse happens now: the source has a catalog row
         (``is_resolved`` false, ``pending``, built from the claim), and its claim
@@ -321,7 +329,7 @@ class Reconciler:
         """
         try:
             if self._metadata_db is not None:
-                self._metadata_db.sync_pending_source(claim, catalog_url)
+                self._metadata_db.sync_pending_source(claim, catalog_url, recall=recall)
         except Exception as e:
             self._log_source_failure(
                 claim.source_id,
@@ -344,7 +352,10 @@ class Reconciler:
                 return False
             self._commit_claim_bookkeeping(claim, signatures)
             self._pending[claim.source_id] = catalog_url
-        self._on_pending(claim.source_id)
+            if recall:
+                self._recall.add(claim.source_id)
+        if not recall:
+            self._on_pending(claim.source_id)
         return True
 
     def ensure_registered(self, source_id: str) -> bool:
@@ -363,22 +374,34 @@ class Reconciler:
                 if claim is None or source_id not in self._pending:
                     return source_id not in self._pending
                 failed = source_id in self._pending_failed
+                recall = source_id in self._recall
                 catalog_url = self._pending[source_id]
             if failed and not self._should_retry_source(source_id):
                 return False
 
             errors: List[str] = []
+            # A cloud source raises why it could not be opened (retriable or
+            # not) instead of recording a failure: it stays ``needs_recall`` and
+            # the client that resolved it hears the reason.
             if not self._register_source_claim(
-                claim, catalog_url=catalog_url, replace=True, error_sink=errors
+                claim,
+                catalog_url=catalog_url,
+                replace=True,
+                error_sink=errors,
+                recall=recall,
             ):
-                self._record_failed_source_attempt(source_id)
-                self._mark_registration_failed(source_id, errors)
+                if not recall:
+                    self._record_failed_source_attempt(source_id)
+                    self._mark_registration_failed(source_id, errors)
                 return False
 
             with self._lock:
                 self._clear_pending(source_id)
             self._clear_failed_source_attempt(source_id)
-        self._notify_source_committed(source_id)
+        # A cloud source is not warmed for having been resolved: it is
+        # downloaded because a client asked, and it joins no startup backlog.
+        if not recall:
+            self._notify_source_committed(source_id)
         return True
 
     def materialize(self, source_id: str) -> None:
@@ -402,10 +425,12 @@ class Reconciler:
             if source_id not in self._pending:
                 return
             error = self._pending_failed.get(source_id)
+            recall = source_id in self._recall
         if error:
             raise SourceRegistrationError(source_id, error)
+        what = "download and register" if recall else "register"
         raise SourceUnresolvedError(
-            f"source {source_id!r} is unresolved: resolve it to register it"
+            f"source {source_id!r} is unresolved: resolve it to {what} it"
         )
 
     def _mark_registration_failed(self, source_id: str, errors: List[str]) -> None:
@@ -664,12 +689,11 @@ class Reconciler:
         """
         if catalog_url is None:
             catalog_url = self._catalog_url_for(claim)
-        if (
-            self._defer_registration
-            and catalog_seed is None
-            and self._deferrable(claim)
-        ):
-            return self._commit_pending_claim(claim, catalog_url)
+        if catalog_seed is None:
+            if self._claim_is_unresolved(claim):
+                return self._commit_pending_claim(claim, catalog_url, recall=True)
+            if self._defer_registration and self._deferrable(claim):
+                return self._commit_pending_claim(claim, catalog_url)
         if not self._register_source_claim(
             claim, catalog_seed=catalog_seed, catalog_url=catalog_url
         ):
@@ -729,6 +753,8 @@ class Reconciler:
             previous = self._state.claims.get(claim.source_id)
         if previous is None:
             return False
+        if self._claim_is_unresolved(claim):
+            return self._refresh_recall_claim(claim, previous)
 
         # The display url is the source's, not the rebuild's. Re-deriving it
         # would either hand a dnd:// drop its native file:// url back -- losing
@@ -793,6 +819,38 @@ class Reconciler:
         # Cheap when it has none -- an unmoved token leaves every cache key
         # identical, and resolve_chunk_data calls compute_fn only on a miss.
         self._notify_source_committed(claim.source_id)
+        return True
+
+    def _refresh_recall_claim(self, claim: SourceClaim, previous: SourceClaim) -> bool:
+        """Refresh a cloud source that is not resident: back to ``needs_recall``.
+
+        Nothing is opened. Its adapter, if it had been resolved, is dropped, since
+        the bytes behind it changed or went away; the row says it needs a recall
+        again, and the next ``resolve`` rebuilds it.
+        """
+        source_id = claim.source_id
+        live = self._server.sources.get(source_id)
+        if live is not None:
+            catalog_url = getattr(live, "_catalog_url", None)
+        else:
+            catalog_url = self._pending.get(source_id)
+        try:
+            if self._metadata_db is not None:
+                self._metadata_db.sync_pending_source(claim, catalog_url, recall=True)
+            if live is not None:
+                self._server.unregister_source(source_id)
+        except Exception:
+            logger.exception("could not refresh cloud source %s", source_id)
+            return False
+        signatures = self._build_claim_signatures(claim)
+        with self._lock:
+            self._state.remove_claim(previous.primary_path, notify=False)
+            self._state.replace_claim(claim)
+            self._commit_claim_bookkeeping(claim, signatures)
+            self._pending[source_id] = catalog_url
+            self._pending_failed.pop(source_id, None)
+            self._recall.add(source_id)
+        logger.info(f"Refreshed source: {source_id} (needs recall)")
         return True
 
     def _commit_remove_source(self, source_id: str) -> bool:
@@ -1116,21 +1174,68 @@ class Reconciler:
         except Exception:  # noqa: BLE001 -- a gate that cannot see fails closed
             return False
 
-    def _on_source_resolved(self, source_id: str, adapter: Any) -> None:
-        """Backfill the metadata DB when an unresolved cloud source resolves.
+    def _build_recalled_adapter(
+        self, claim: SourceClaim, source_config: SourceConfig
+    ) -> Any:
+        """Open a cloud source that was left unopened, downloading it if dehydrated.
 
-        ``sync_source_added`` is an INSERT OR REPLACE upsert, so re-syncing the
-        now-resolved adapter overwrites the source's NULL shape/dtype row with the
-        concrete descriptor. Persistence across restart is phase 3 (file-backed
-        DB); here the backfill lives for the process lifetime.
+        Re-runs the claim on the path as it is now: the type recorded at scan
+        time was a recall-free guess (a ``.zarr`` provisionally typed ome-zarr may
+        be ome-zarr-hcs), and the authoritative one comes from the content. A
+        fresh DiscoveryState keeps the scan's consumed paths from suppressing the
+        source's own member claims.
+
+        An I/O failure while the sync engine delivers the bytes raises
+        ``SourceResolveRetriableError``; a format failure, or no adapter for the
+        type, raises ``SourceUnresolvedError`` and will not clear on a retry.
         """
-        if self._metadata_db is not None:
-            try:
-                self._metadata_db.sync_source_added(source_id, adapter)
-            except Exception:
-                logger.exception(
-                    "metadata-DB backfill failed for resolved source %s", source_id
-                )
+        source_id = claim.source_id
+        resolved_type = source_config.type or "unknown"
+        try:
+            ctx = ClaimContext(
+                Path(source_config.url),
+                cloud_root=self._roots.is_cloud(claim.primary_path),
+            )
+            claims = self._registry.get_claims_for_path(ctx, DiscoveryState())
+        except OSError as e:
+            # Not the claim-time guess: that would launder a network blip into a
+            # wrong type.
+            raise SourceResolveRetriableError(
+                f"source {source_id!r} could not be resolved "
+                f"(re-claim recall/IO failed): {e}"
+            ) from e
+        except Exception as e:  # a non-IO claim error: no claim, keep the guess
+            logger.debug("re-claim during resolution failed for %s: %s", source_id, e)
+            claims = []
+        if claims:
+            resolved_type = claims[0].source_type
+
+        adapter_cls = self._registry.get_adapter_for_type(resolved_type)
+        if adapter_cls is None:
+            raise SourceUnresolvedError(
+                f"source {source_id!r} could not be resolved: no adapter "
+                f"for type {resolved_type!r}"
+            )
+        config = SourceConfig(
+            url=source_config.url,
+            type=resolved_type,
+            source_id=source_id,
+            credentials_profile=source_config.credentials_profile,
+            alias=source_config.alias,
+        )
+        try:
+            return adapter_cls.create_from_config(config, self._credentials_config)
+        except SourceUnresolvedError:
+            raise
+        except OSError as e:
+            raise SourceResolveRetriableError(
+                f"source {source_id!r} could not be resolved "
+                f"(open/hydrate recall/IO failed): {e}"
+            ) from e
+        except Exception as e:
+            raise SourceUnresolvedError(
+                f"source {source_id!r} could not be resolved (open/hydrate failed): {e}"
+            ) from e
 
     def _find_containing_source(self, path: str) -> Optional[str]:
         """Return the source_id owning a strict ancestor of ``path``, else None.
@@ -1183,8 +1288,13 @@ class Reconciler:
         catalog_url: Optional[str] = None,
         replace: bool = False,
         error_sink: Optional[List[str]] = None,
+        recall: bool = False,
     ) -> bool:
         """Create and register a source, rolling back on partial failure.
+
+        ``recall`` opens a cloud source that was left unopened (see
+        :meth:`_build_recalled_adapter`); an error that says why it cannot be
+        opened is raised, not recorded.
 
         ``error_sink`` collects the text of the failure, for a caller that records
         it on the source (a deferred registration leaves it in the row).
@@ -1208,17 +1318,8 @@ class Reconciler:
         try:
             source_config = self._source_config_for(claim)
 
-            if self._claim_is_unresolved(claim):
-                # Cloud-storage phase 2: register a placeholder that resolves
-                # lazily on first access (re-claim + create_from_config on the
-                # hydrated path) instead of opening the source now.
-                adapter = UnresolvedSourceAdapter(
-                    source_config,
-                    self._registry,
-                    credentials_config=self._credentials_config,
-                    on_resolved=self._on_source_resolved,
-                    cloud_root=self._roots.is_cloud(claim.primary_path),
-                )
+            if recall:
+                adapter = self._build_recalled_adapter(claim, source_config)
             else:
                 adapter_cls = self._registry.get_adapter_for_type(claim.source_type)
                 if adapter_cls is None:
@@ -1263,6 +1364,8 @@ class Reconciler:
             )
             return False
         except Exception as e:
+            if recall and isinstance(e, SourceUnresolvedError):
+                raise
             if error_sink is not None:
                 error_sink.append(str(e))
             self._log_source_failure(

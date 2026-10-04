@@ -737,8 +737,8 @@ class SourceClaim:
         unresolved: True when the adapter recognized this source by recall-free
             signals only (a non-resident cloud/synced-folder target) and deferred
             its content read. Such a claim carries no shape/dtype yet; the server
-            registers it behind an UnresolvedSourceAdapter and resolves it lazily
-            on first access (cloud-storage phase 2).
+            catalogs it as ``needs_recall`` with no adapter and registers it when
+            a client resolves it (cloud-storage phase 2).
     """
 
     __slots__ = (
@@ -816,8 +816,8 @@ class AdapterRegistry:
                 ``ome-zarr`` and ``ome-zarr-hcs``). Recorded here, at
                 registration, so ``get_adapter_for_type`` resolves a type
                 *before* any path of that type has been claimed -- the
-                lazy-resolve / cloud phase-2 flow (``UnresolvedSourceAdapter``)
-                depends on that. ``None`` registers a claim-only adapter: it
+                lazy-resolve / cloud phase-2 flow (``Reconciler``) depends on
+                that. ``None`` registers a claim-only adapter: it
                 participates in discovery probing but is not resolvable by type
                 (test doubles that only exercise ``claim()``).
         """

@@ -245,8 +245,9 @@ registers what it finds inline.
   reconciler's `materialize`, single-flight per source, so a resolve racing the worker shares
   one registration; it registers the source (retrying a failed one) and returns the filled
   row.
-- **Not deferred:** remote proxies (bulk-seeded), cloud sources (already registered
-  unresolved), static sources, and everything claimed after the first scan.
+- **Not deferred:** remote proxies (bulk-seeded), static sources, and everything claimed
+  after the first scan. A cloud source is left unregistered for good: its row reads
+  `needs_recall`, the pool never queues it, and only `resolve` downloads and registers it.
 - **`unresolved_reason`** says why a row is not resolved: `needs_recall` (a cloud
   placeholder; resolving downloads it), `pending` (queued; resolving registers it, no
   download), `failed` (registration raised; `metadata_json` holds `registration_error`,

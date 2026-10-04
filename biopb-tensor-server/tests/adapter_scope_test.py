@@ -103,22 +103,6 @@ def test_registered_adapters_fill_both_roles():
         assert issubclass(cls, TensorAdapter), cls
 
 
-def test_unresolved_proxy_is_source_only():
-    """The unresolved proxy is a SourceAdapter (catalog surface); it does not
-    implement the tensor role -- tensor-level calls reach the resolved adapter
-    via get_tensor_adapter."""
-    from biopb_tensor_server.adapters.unresolved import UnresolvedSourceAdapter
-
-    assert issubclass(UnresolvedSourceAdapter, SourceAdapter)
-    assert not issubclass(UnresolvedSourceAdapter, TensorAdapter)
-    for name in (
-        "plan_flight_info",
-        "get_native_pyramid_levels",
-        "has_native_pyramid",
-    ):
-        assert not hasattr(UnresolvedSourceAdapter, name)
-
-
 def test_close_is_a_declared_capability_not_a_duck_typed_one():
     """``close()`` is on the interface, with a no-op default (biopb/biopb#71).
 
@@ -131,9 +115,8 @@ def test_close_is_a_declared_capability_not_a_duck_typed_one():
     assert callable(SourceAdapter.close)
 
     from biopb_tensor_server.adapters import get_default_registry
-    from biopb_tensor_server.adapters.unresolved import UnresolvedSourceAdapter
 
-    for cls in set(get_default_registry()._adapters) | {UnresolvedSourceAdapter}:
+    for cls in set(get_default_registry()._adapters):
         assert callable(getattr(cls, "close", None)), cls
 
 

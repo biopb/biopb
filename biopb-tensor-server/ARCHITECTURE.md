@@ -158,8 +158,9 @@ where they are declared — `adapter_base.py` asserts that at import time
 never be written onto `SourceAdapter`.
 
 Every concrete format adapter subclasses `TensorAdapter` and fills both roles in
-one object. The lone source-only adapter is `UnresolvedSourceAdapter`, which has
-no tensors until it resolves.
+one object. A source that is not resolved yet (a cloud source, or one whose
+registration is pending) has no adapter at all: a catalog row and a claim, until
+`resolve` builds its adapter.
 
 A source can also answer for **label sets** it did not produce (biopb/biopb#1059):
 `SourceAdapter.label_sets` merges what the format reads from its own file

@@ -65,6 +65,8 @@ class PendingSources(Protocol):
 
     def check_registered(self, source_id: str) -> None: ...
 
+    def claim_primary_path(self, source_id: str) -> Optional[str]: ...
+
 
 class SourceRegistry:
     """The server's live ``source_id -> SourceAdapter`` map, thread-safe."""
@@ -211,6 +213,13 @@ class SourceRegistry:
             self._pending_source.check_registered(source_id)
             adapter = self.get(source_id)  # registered while we checked
         return adapter
+
+    def pending_path(self, source_id: str) -> Optional[str]:
+        """The primary path of a claimed source that is not registered, else None
+        (an unknown source, or one that is registered: ask :meth:`get`)."""
+        if self._pending_source is None or self.get(source_id) is not None:
+            return None
+        return self._pending_source.claim_primary_path(source_id)
 
     def materialize(self, source_id: str) -> Optional[SourceAdapter]:
         """Register a claimed source now, if it is waiting to be, and return its

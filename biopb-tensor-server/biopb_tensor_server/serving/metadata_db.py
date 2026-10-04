@@ -830,7 +830,7 @@ class MetadataDatabase:
                 is_resolved BOOLEAN NOT NULL DEFAULT TRUE,
                 -- Why is_resolved is FALSE: 'needs_recall' (a cloud placeholder;
                 -- opening it is a consented download), 'pending' (registration
-                -- has not run yet; a read runs it), 'failed' (it raised; the
+                -- has not run yet; resolving it runs it), 'failed' (it raised; the
                 -- error is in metadata_json). NULL when resolved.
                 unresolved_reason VARCHAR,
                 -- Full per-tensor structural info (biopb/biopb#224): one struct
@@ -1396,14 +1396,16 @@ class MetadataDatabase:
         claim: SourceClaim,
         catalog_url: Optional[str] = None,
         error: Optional[str] = None,
+        recall: bool = False,
     ) -> None:
         """Write the row of a claimed source that is not registered yet.
 
         Built from the claim alone, so no file is opened: ``is_resolved`` false,
-        no tensors, ``unresolved_reason`` ``pending``. With *error* (its
-        registration raised) the reason is ``failed`` and ``metadata_json``
-        carries ``registration_error``, so a client does not wait on it. The
-        registered row replaces this one by the same upsert.
+        no tensors, ``unresolved_reason`` ``pending``, or ``needs_recall`` for a
+        cloud source (*recall*), whose registration downloads it and waits for a
+        client. With *error* (its registration raised) the reason is ``failed``
+        and ``metadata_json`` carries ``registration_error``, so a client does not
+        wait on it. The registered row replaces this one by the same upsert.
         """
         conn = self._get_connection()
         self._upsert_source_row(
@@ -1414,7 +1416,7 @@ class MetadataDatabase:
             datetime.now(),
             json.dumps({"registration_error": error}) if error else None,
             False,
-            "failed" if error else "pending",
+            "failed" if error else ("needs_recall" if recall else "pending"),
             [],
         )
 

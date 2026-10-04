@@ -1325,18 +1325,22 @@ class TensorFlightServer(flight.FlightServerBase):
         projection let the two disagree (the adapter answers ``is_resident()``
         live, the row is a snapshot).
 
-        Resolving also registers a source whose registration is still pending
-        (or failed, which retries it); that runs here, before the stream. Resolving
-        an already-resident source is a cheap no-op. If the client
-        disconnects mid-resolve the daemon thread runs to completion and caches
-        the result on the adapter, so a retry coalesces onto the finished work
+        Resolving registers a source that has no adapter yet -- a cloud source
+        (downloading it), a local one whose registration is pending, or one that
+        failed (retrying it) -- and writes its catalog row. Resolving a
+        registered source is a cheap no-op. If the client disconnects
+        mid-resolve the daemon thread runs to completion and registers the
+        adapter, so a retry coalesces onto the finished work
         rather than downloading again.
         """
-        try:
-            adapter = self.sources.materialize(source_id)
-        except (SourceUnresolvedError, TensorResolutionError) as exc:
-            raise to_flight_error(exc) from exc
-        if adapter is None:
+        adapter = self.sources.get(source_id)
+        # A cloud source has no adapter until it resolves: its path is its claim's.
+        source_url = (
+            adapter.source_url
+            if adapter is not None
+            else self.sources.pending_path(source_id)
+        )
+        if source_url is None:
             raise flight.FlightServerError(f"Source not found: {source_id}")
         # The terminal message IS the catalog row, so refuse before the recall
         # rather than after minutes of download with nothing to hand back.
@@ -1345,7 +1349,7 @@ class TensorFlightServer(flight.FlightServerBase):
         # Name/size of what is being recalled, computed once (stat is recall-free).
         # Best-effort: an unresolved adapter exposes its URL; a directory or a
         # remote URL has no single file size, so target_bytes stays 0 (unknown).
-        source_url = adapter.source_url or source_id
+        source_url = source_url or source_id
         target_name = os.path.basename(str(source_url).rstrip("/")) or str(source_url)
         target_bytes = 0
         try:
@@ -1369,7 +1373,7 @@ class TensorFlightServer(flight.FlightServerBase):
 
         def _run() -> None:
             try:
-                adapter.resolve()
+                self.sources.materialize(source_id)
             except BaseException as exc:  # surfaced on the stream below
                 result["err"] = exc
 
@@ -1396,6 +1400,8 @@ class TensorFlightServer(flight.FlightServerBase):
                 raise flight.FlightInternalError(
                     f"Source could not be resolved: {exc}"
                 ) from exc
+            if isinstance(exc, TensorResolutionError):
+                raise to_flight_error(exc) from exc
             raise flight.FlightServerError(
                 f"resolve failed for {source_id!r}: {exc}"
             ) from exc

@@ -909,8 +909,7 @@ class SourceAdapter(ABC):
         source belongs in the interface, where a delegating wrapper's author
         can see it (biopb/biopb#557). On the source role because the chunk
         route is source-scoped: ``source_id/<field>`` is split before the
-        lookup, and every registered source answers it (``UnresolvedSourceAdapter``
-        forwards it). The default ``None`` means "no native levels," so
+        lookup, and every registered source answers it. The default ``None`` means "no native levels," so
         :meth:`resolve_chunk_adapter` falls back to :meth:`get_tensor_adapter`.
         A native-pyramid adapter overrides this to return the level's own
         backend adapter, whose ``array_id`` is ``source_id/{level}`` -- the
@@ -922,10 +921,10 @@ class SourceAdapter(ABC):
     def is_resolved(self) -> bool:
         """Deterministic: is there a hydrated adapter backing this source?
 
-        True by default; only ``UnresolvedSourceAdapter`` overrides it. Unlike
-        ``is_resident()``, this never flips back to False once True in a
-        process (a source isn't un-resolved by re-dehydrating) -- the signal
-        for "should a client offer to resolve this".
+        True by default; only a remote proxy mirroring an unresolved upstream
+        source overrides it. A source of this server that is not resolved has no
+        adapter at all, only a catalog row (see ``unresolved_reason``). Unlike
+        ``is_resident()``, this never flips back to False once True.
         """
         return True
 
@@ -934,31 +933,13 @@ class SourceAdapter(ABC):
 
         ``"needs_recall"``: its bytes are a cloud placeholder and opening it is
         a consented download. ``"pending"``: a local source whose registration
-        has not run yet; any read, or ``resolve``, runs it. ``"failed"``: its
-        registration raised, and ``metadata_json`` carries the error. A client
-        offers a download for the first only.
+        has not run yet; ``resolve`` runs it. ``"failed"``: its registration
+        raised, and ``metadata_json`` carries the error. A client offers a
+        download for the first only. A source of this server that is in one of
+        these states has no adapter, only a catalog row; this answers for a
+        remote proxy that mirrors one.
         """
         return None
-
-    def resolve(self) -> None:
-        """Hydrate this source if needed.
-
-        This is the ONE consented entry point that may perform an extended,
-        blocking recall (e.g. downloading a whole cloud / synced-folder file).
-        It is the sole resolution trigger: the serve paths (get_tensor_adapter ->
-        GetFlightInfo / DoGet) never resolve on their own -- they raise
-        SourceUnresolvedError on an unresolved source so the only thing that
-        downloads is an explicit ``resolve``.
-
-        For an already-resident source this is a cheap no-op (idempotent), so
-        the server's ``resolve`` action works uniformly across all source kinds.
-        ``UnresolvedSourceAdapter`` overrides it to actually hydrate.
-
-        Returns nothing: what the caller wants afterwards is the source's now-
-        concrete catalog row, which resolution writes (``on_resolved`` ->
-        ``sync_source_added``) and the server reads back.
-        """
-        return None  # a resident source is already resolved
 
     def is_resident(self) -> bool:
         """Best-effort, recall-free: is this source's content local and cheap to
@@ -1003,8 +984,8 @@ class SourceAdapter(ABC):
         Single-tensor adapters return self with tensor context set -- sound
         because they are ``TensorAdapter`` subclasses, i.e. sources that also
         fill the tensor role (see :class:`TensorAdapter`). A source that does
-        *not* (``UnresolvedSourceAdapter``) must override this; the default
-        below would otherwise hand back a self that cannot serve pixels.
+        not must override this; the default below would otherwise hand back a
+        self that cannot serve pixels.
         Multi-tensor adapters override this to return a new adapter for the tensor.
 
         Total by contract: a single-tensor source has exactly one tensor, so any
@@ -1065,9 +1046,9 @@ class SourceAdapter(ABC):
         Declared here, rather than sniffed with ``getattr(adapter, "close",
         None)``, for the same reason :meth:`put_chunk` is: an optional capability
         the registry drives on every adapter belongs in the interface, where a
-        delegating wrapper's author can see it. ``UnresolvedSourceAdapter``
-        forwarding everything *except* ``close`` is precisely what a duck-typed
-        hook could not catch (biopb/biopb#71).
+        delegating wrapper's author can see it: a wrapper forwarding
+        everything *except* ``close`` is precisely what a duck-typed hook could
+        not catch (biopb/biopb#71).
 
         Most adapters hold nothing between reads -- see the file-handle policy in
         ARCHITECTURE.md -- so the default is a no-op and only the persistent-handle
@@ -1140,10 +1121,10 @@ class TensorAdapter(SourceAdapter):
     catalog row cannot represent (biopb/biopb#253). Nesting types that reality
     instead of contradicting it (biopb/biopb#380).
 
-    The converse does not hold: ``UnresolvedSourceAdapter`` is a source that has no
-    tensors until it resolves, and stays a plain ``SourceAdapter``. So "source" is
-    the general role and "tensor" the specialization, which is the direction this
-    inheritance encodes.
+    The converse does not hold: a source can have no tensors (a multi-tensor
+    container), and stays a plain ``SourceAdapter``. So "source" is the general
+    role and "tensor" the specialization, which is the direction this inheritance
+    encodes.
 
     The role *scopes* stay disjoint at the point of declaration -- see the
     role-scope guard below -- so a tensor-scoped method still can never be declared
@@ -2091,7 +2072,6 @@ _SOURCE_SCOPED_API = frozenset(
         "get_metadata",
         "get_embedded_rois",
         "catalog_url",
-        "resolve",
         "is_resident",
         "is_resolved",
         "unresolved_reason",

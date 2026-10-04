@@ -1425,7 +1425,8 @@ def create_source_manager(
         logger.info("No sources configured yet; serving an empty catalog")
 
     # EXPERIMENTAL: cloud/synced-folder mode. The walk admits dehydrated entries,
-    # and register placeholder adapters resolved lazily on first access.
+    # and catalog non-resident sources as ``needs_recall``, registered when a
+    # client resolves them.
     for source in (
         *(r.source for r in roots),
         *static_sources,
