@@ -944,6 +944,7 @@ class MicroManagerLegacyAdapter(_PerFileTiffLockMixin, TensorAdapter):
     Handles MicroManager v1 v2 datasets with metadata.txt containing:
     - Summary: IntendedDimensions, AxisOrder, Channels, Slices, Frames, Positions
     - Coords-Default/<filename>: PositionIndex, TimeIndex, ChannelIndex, SliceIndex
+      (or, in older datasets, FrameKey-<frame>-<channel>-<slice>: FileName)
     - Metadata-Default/<filename>: UUID, Width, Height
 
     This adapter supports full 5D/6D datasets: (position, time, channel, z, y, x).
@@ -1027,7 +1028,7 @@ class MicroManagerLegacyAdapter(_PerFileTiffLockMixin, TensorAdapter):
             data = json.loads(content)
 
             # Check for MicroManager v1 format markers
-            has_coords = any(k.startswith("Coords-") for k in data)
+            has_coords = any(k.startswith(("Coords-", "FrameKey-")) for k in data)
             has_summary = "Summary" in data
 
             if not (has_coords or has_summary):
@@ -1068,6 +1069,32 @@ class MicroManagerLegacyAdapter(_PerFileTiffLockMixin, TensorAdapter):
             source_type="micromanager-legacy",
             primary_path=ctx.path_str,
         )
+
+    @staticmethod
+    def _frame_entries(raw: Dict[str, Any]):
+        """``(file path as written, position, time, channel, slice)`` per frame.
+
+        Two metadata generations name the files: ``Coords-<path>`` entries carry
+        the four indices (Micro-Manager 1.4+), and the older
+        ``FrameKey-<frame>-<channel>-<slice>`` entries carry them in the key with
+        the file in ``FileName``, no position axis.
+        """
+        for key, entry in raw.items():
+            if key.startswith("Coords-"):
+                yield (
+                    key[len("Coords-") :],
+                    entry.get("PositionIndex", 0),
+                    entry.get("TimeIndex", 0),
+                    entry.get("ChannelIndex", 0),
+                    entry.get("SliceIndex", 0),
+                )
+            elif key.startswith("FrameKey-"):
+                try:
+                    frame, channel, slice_idx = (int(n) for n in key.split("-")[1:4])
+                except ValueError:
+                    continue
+                if entry.get("FileName"):
+                    yield entry["FileName"], 0, frame, channel, slice_idx
 
     @staticmethod
     def _find_metadata_file(directory: Path) -> Optional[Path]:
@@ -1154,41 +1181,33 @@ class MicroManagerLegacyAdapter(_PerFileTiffLockMixin, TensorAdapter):
         self._coord_map: Dict[Tuple[int, int, int, int], Path] = {}
         self._file_list: List[Path] = []
 
-        for key in self._raw_metadata:
-            if key.startswith("Coords-"):
-                coords = self._raw_metadata[key]
-                # Extract path from key (Coords-Default/<filename> or Coords-<filename>)
-                coords_prefix_len = len("Coords-")
-                filepath_in_key = key[coords_prefix_len:]
-
-                # Get indices
-                pos_idx = coords.get("PositionIndex", 0)
-                time_idx = coords.get("TimeIndex", 0)
-                chan_idx = coords.get("ChannelIndex", 0)
-                slice_idx = coords.get("SliceIndex", 0)
-
-                # The Coords key path is written relative to the acquisition
-                # *parent*, so for a "separate image files" acquisition it carries
-                # a leading position-folder segment (e.g. "Default/img_...").
-                # Which directory this source was claimed at decides how that
-                # resolves: at the acquisition root (a DisplaySettings.json fired
-                # the v2 claim there) the leading segment is real, but with no
-                # DisplaySettings.json the root is invisible and the position
-                # folder's own metadata.txt claims it directly -- so self.directory
-                # *is* that folder and the segment doubles it (biopb/biopb#314).
-                # Try the path as-is, then retry after stripping a leading segment
-                # equal to this directory's own name, so both rootings land on the
-                # same file. (v1 keys carry no prefix and resolve as-is.)
-                file_path = self.directory / filepath_in_key
-                if not file_path.exists():
-                    parts = Path(filepath_in_key).parts
-                    if len(parts) > 1 and parts[0] == self.directory.name:
-                        file_path = self.directory.joinpath(*parts[1:])
-                if file_path.exists():
-                    self._coord_map[(pos_idx, time_idx, chan_idx, slice_idx)] = (
-                        file_path
-                    )
-                    self._file_list.append(file_path)
+        for (
+            filepath_in_key,
+            pos_idx,
+            time_idx,
+            chan_idx,
+            slice_idx,
+        ) in self._frame_entries(self._raw_metadata):
+            # The Coords key path is written relative to the acquisition
+            # *parent*, so for a "separate image files" acquisition it carries
+            # a leading position-folder segment (e.g. "Default/img_...").
+            # Which directory this source was claimed at decides how that
+            # resolves: at the acquisition root (a DisplaySettings.json fired
+            # the v2 claim there) the leading segment is real, but with no
+            # DisplaySettings.json the root is invisible and the position
+            # folder's own metadata.txt claims it directly -- so self.directory
+            # *is* that folder and the segment doubles it (biopb/biopb#314).
+            # Try the path as-is, then retry after stripping a leading segment
+            # equal to this directory's own name, so both rootings land on the
+            # same file. (v1 keys carry no prefix and resolve as-is.)
+            file_path = self.directory / filepath_in_key
+            if not file_path.exists():
+                parts = Path(filepath_in_key).parts
+                if len(parts) > 1 and parts[0] == self.directory.name:
+                    file_path = self.directory.joinpath(*parts[1:])
+            if file_path.exists():
+                self._coord_map[(pos_idx, time_idx, chan_idx, slice_idx)] = file_path
+                self._file_list.append(file_path)
 
         if not self._file_list:
             raise ValueError(f"No MicroManager TIFF files found in {directory}")
@@ -1345,90 +1364,22 @@ class MicroManagerLegacyAdapter(_PerFileTiffLockMixin, TensorAdapter):
         # Slice math (no I/O) needs no lock; all state read below is immutable
         # after __init__. Only the per-file read is synchronized, and per file --
         # so a slow read of one plane no longer blocks reads of other planes.
-        ndim = len(self.full_shape)
-
         # Extract spatial slices (last 2 axes)
         y_slice = slices[-2] if len(slices) >= 2 else slice(None)
         x_slice = slices[-1] if len(slices) >= 1 else slice(None)
 
-        # Determine coordinate ranges based on shape
-        if ndim == 3:
-            # (channels, y, x)
-            chan_slice = slices[0]
-            pos_range = [0]
-            time_range = [0]
-            chan_range = range(
-                chan_slice.start or 0, chan_slice.stop or self._n_channels
-            )
-            z_range = [0]
-        elif ndim == 4:
-            # (channels, z, y, x) or (time, channels, y, x) depending on axis_order
-            if "z" in self.dim_labels[:2]:
-                # (channels, z, y, x) format
-                chan_slice = slices[0]
-                z_slice = slices[1]
-                pos_range = [0]
-                time_range = [0]
-                chan_range = range(
-                    chan_slice.start or 0, chan_slice.stop or self._n_channels
-                )
-                z_range = range(z_slice.start or 0, z_slice.stop or self._n_z)
-            else:
-                # (time, channels, y, x) format
-                time_slice = slices[0]
-                chan_slice = slices[1]
-                pos_range = [0]
-                time_range = range(
-                    time_slice.start or 0, time_slice.stop or self._n_times
-                )
-                chan_range = range(
-                    chan_slice.start or 0, chan_slice.stop or self._n_channels
-                )
-                z_range = [0]
-        elif ndim == 5:
-            # (time, channels, z, y, x) or (position, channels, z, y, x)
-            if "p" in self.dim_labels:
-                pos_slice = slices[0]
-                chan_slice = slices[1]
-                z_slice = slices[2]
-                pos_range = range(
-                    pos_slice.start or 0, pos_slice.stop or self._n_positions
-                )
-                time_range = [0]
-                chan_range = range(
-                    chan_slice.start or 0, chan_slice.stop or self._n_channels
-                )
-                z_range = range(z_slice.start or 0, z_slice.stop or self._n_z)
-            else:
-                time_slice = slices[0]
-                chan_slice = slices[1]
-                z_slice = slices[2]
-                pos_range = [0]
-                time_range = range(
-                    time_slice.start or 0, time_slice.stop or self._n_times
-                )
-                chan_range = range(
-                    chan_slice.start or 0, chan_slice.stop or self._n_channels
-                )
-                z_range = range(z_slice.start or 0, z_slice.stop or self._n_z)
-        elif ndim == 6:
-            # (position, time, channels, z, y, x)
-            pos_slice = slices[0]
-            time_slice = slices[1]
-            chan_slice = slices[2]
-            z_slice = slices[3]
-            pos_range = range(pos_slice.start or 0, pos_slice.stop or self._n_positions)
-            time_range = range(time_slice.start or 0, time_slice.stop or self._n_times)
-            chan_range = range(
-                chan_slice.start or 0, chan_slice.stop or self._n_channels
-            )
-            z_range = range(z_slice.start or 0, z_slice.stop or self._n_z)
-        else:
-            # Fallback - assume all dimensions except last 2 are 1
-            pos_range = [0]
-            time_range = [0]
-            chan_range = [0]
-            z_range = [0]
+        # The requested range on each coordinate axis. An axis dropped from
+        # full_shape for being singleton is the one plane, 0.
+        counts = {
+            "position": self._n_positions,
+            "time": self._n_times,
+            "channel": self._n_channels,
+            "z": self._n_z,
+        }
+        ranges = {axis: range(1) for axis in counts}
+        for axis, axis_slice in zip(self._shape_axes, slices, strict=False):
+            ranges[axis] = range(axis_slice.start or 0, axis_slice.stop or counts[axis])
+        pos_range, time_range, chan_range, z_range = (ranges[a] for a in counts)
 
         # Collect data for each coordinate
         result_pages = []
@@ -1483,41 +1434,18 @@ class MicroManagerLegacyAdapter(_PerFileTiffLockMixin, TensorAdapter):
         if not result_pages:
             return np.array([])
 
-        # Stack pages and reshape to match the expected shape
-        n_pos = len(pos_range)
-        n_time = len(time_range)
-        n_chan = len(chan_range)
-        n_z = len(z_range)
-
-        h = result_pages[0].shape[0] if result_pages else 0
-        w = result_pages[0].shape[1] if result_pages else 0
-
-        # Stack all pages and reshape
-        result = np.stack(result_pages, axis=0)
-
-        # Reshape to (pos, time, chan, z, h, w) based on actual ranges
-        if ndim == 2:
-            # Genuine 2-D [y, x] dataset (all non-spatial axes singleton and
-            # dropped from full_shape). result_pages holds exactly one page,
-            # so drop the leading stack axis to match the descriptor rank.
-            result = result.reshape(h, w)
-        elif ndim == 3:
-            result = result.reshape(n_chan, h, w)
-        elif ndim == 4:
-            result = result.reshape(n_chan * n_z, h, w)
-            if "z" in self.dim_labels[:2]:
-                result = result.reshape(n_chan, n_z, h, w)
-            else:
-                result = result.reshape(n_time, n_chan, h, w)
-        elif ndim == 5:
-            if "p" in self.dim_labels:
-                result = result.reshape(n_pos, n_chan, n_z, h, w)
-            else:
-                result = result.reshape(n_time, n_chan, n_z, h, w)
-        elif ndim == 6:
-            result = result.reshape(n_pos, n_time, n_chan, n_z, h, w)
-
-        return result
+        # Stack the planes (loop order: position, time, channel, z), then lay the
+        # axes out as full_shape orders them: the kept axes in their order, the
+        # dropped singletons folded away.
+        h, w = result_pages[0].shape
+        coord_axes = list(counts)
+        block = np.stack(result_pages, axis=0).reshape(
+            *(len(ranges[a]) for a in coord_axes), h, w
+        )
+        kept = [coord_axes.index(a) for a in self._shape_axes]
+        dropped = [i for i in range(len(coord_axes)) if i not in kept]
+        block = block.transpose(*kept, *dropped, len(coord_axes), len(coord_axes) + 1)
+        return block.reshape(*(len(ranges[a]) for a in self._shape_axes), h, w)
 
     def _physical_scale(self) -> Optional[Tuple[List[float], List[str]]]:
         """Per-dim pixel size (µm) from the MicroManager ``Summary`` metadata.
