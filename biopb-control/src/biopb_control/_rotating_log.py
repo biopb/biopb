@@ -70,11 +70,11 @@ class RotatingLog:
         try:
             _locations.rotate_log(self._path, self._max_bytes, self._backup_count)
             self._limit = self._max_bytes
-        except OSError:
+        except OSError as e:
             # Could not move it aside (a reader holds it open on Windows, a
             # read-only directory): keep appending and try again a full limit
             # from here, rather than on every write.
-            logger.warning("Cannot rotate %s", self._path)
+            logger.warning("Cannot rotate %s: %s", self._path, e)
             self._limit = self._size + self._max_bytes
         self._open()
 

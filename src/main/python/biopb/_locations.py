@@ -515,5 +515,5 @@ def rotate_log(
         src = log_file.parent / f"{log_file.name}.{i}"
         dst = log_file.parent / f"{log_file.name}.{i + 1}"
         if src.exists():
-            src.rename(dst)
-    log_file.rename(log_file.parent / f"{log_file.name}.1")
+            os.replace(src, dst)  # rename() will not replace the oldest on Windows
+    os.replace(log_file, log_file.parent / f"{log_file.name}.1")
