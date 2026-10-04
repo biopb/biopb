@@ -499,16 +499,19 @@ def samples_dir() -> Path:
 # --- rotation ------------------------------------------------------------ #
 
 
+LOG_MAX_BYTES = 10 * 1024 * 1024
+LOG_BACKUP_COUNT = 5
+
+
 def rotate_log(
-    log_file: Path, max_bytes: int = 10 * 1024 * 1024, backup_count: int = 5
+    log_file: Path, max_bytes: int = LOG_MAX_BYTES, backup_count: int = LOG_BACKUP_COUNT
 ) -> None:
     """Rotate *log_file* if it exceeds *max_bytes*, keeping up to *backup_count*
     backups (``.1`` … ``.N``).
 
-    A size-triggered manual rotation applied at process (re)start: the core CLI
-    calls it for ``control.log`` at ``control start`` and the supervisor for
-    ``tensor-server.log`` at each (re)spawn, so their stdout-redirect logs (which
-    have no in-process ``RotatingFileHandler``) don't grow unbounded.
+    A size-triggered manual rotation: the core CLI calls it for ``control.log``
+    at ``control start``, and the control's ``RotatingLog`` calls it for each
+    supervised child's log, at open and whenever the file grows past the limit.
     """
     if not log_file.exists() or log_file.stat().st_size < max_bytes:
         return
@@ -516,5 +519,5 @@ def rotate_log(
         src = log_file.parent / f"{log_file.name}.{i}"
         dst = log_file.parent / f"{log_file.name}.{i + 1}"
         if src.exists():
-            src.rename(dst)
-    log_file.rename(log_file.parent / f"{log_file.name}.1")
+            os.replace(src, dst)  # rename() will not replace the oldest on Windows
+    os.replace(log_file, log_file.parent / f"{log_file.name}.1")
