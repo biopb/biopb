@@ -703,6 +703,17 @@ class TestOverFlight:
             client.close()
             server.shutdown()
 
+    def test_a_listing_projection_carries_the_reason(self, tmp_path):
+        manager, server, client = self._serve(tmp_path)
+        try:
+            columns = client.source_row_columns()
+            assert columns.endswith("unresolved_reason")
+            rows = client.query(f"SELECT {columns} FROM sources", format="records")
+            assert [r["unresolved_reason"] for r in rows] == ["pending", "pending"]
+        finally:
+            client.close()
+            server.shutdown()
+
     def test_a_server_that_will_not_say_its_columns_gets_the_base_projection(
         self, tmp_path
     ):

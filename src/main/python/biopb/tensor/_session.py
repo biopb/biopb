@@ -1007,6 +1007,14 @@ class CatalogClient:
             columns += ", unresolved_reason"
         return self._addressed_row(columns, source_id)
 
+    def source_row_columns(self) -> str:
+        """``SOURCE_ROW_COLUMNS`` as a SELECT list, plus ``unresolved_reason``
+        when this server's ``sources`` schema has it -- so one query carries the
+        reason, and an older server is asked for what it has."""
+        if "unresolved_reason" in self._catalog_columns():
+            return SOURCE_ROW_COLUMNS + ", unresolved_reason"
+        return SOURCE_ROW_COLUMNS
+
     def _catalog_columns(self) -> frozenset:
         """The ``sources`` table's columns, so a projection can ask for one only
         a newer server has instead of a second query for it.
@@ -1024,7 +1032,8 @@ class CatalogClient:
                     options=state.call_options,
                 )
                 state.catalog_columns = frozenset(info.schema.names)
-            except flight.FlightError:
+            except Exception:  # noqa: BLE001 - a probe: any failure reads as "unknown"
+                logger.debug("could not read the sources schema", exc_info=True)
                 state.catalog_columns = frozenset()
         return state.catalog_columns
 

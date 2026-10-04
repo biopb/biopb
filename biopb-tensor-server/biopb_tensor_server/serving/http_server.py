@@ -1903,7 +1903,9 @@ async def list_sources(request: Request) -> JSONResponse:
     t0 = time.monotonic()
     try:
         client = ctx.get_client()
-        rows = client.query(_SOURCE_LIST_SQL + " ORDER BY source_id", format="records")
+        rows = client.query(
+            _source_list_sql(client) + " ORDER BY source_id", format="records"
+        )
         _add_unresolved_reasons(client, rows)
         result = [_source_row_to_dict(row) for row in rows]
         elapsed = (time.monotonic() - t0) * 1000
@@ -2334,7 +2336,7 @@ async def get_source(source_id: str, request: Request) -> JSONResponse:
         # O(catalog) per call and, worse, inherited the listing's safety cap:
         # a source past it answered 404 while being perfectly readable.
         rows = client.query(
-            f"{_SOURCE_LIST_SQL} WHERE source_id = {sql_literal(source_id)}",
+            f"{_source_list_sql(client)} WHERE source_id = {sql_literal(source_id)}",
             format="records",
         )
         if not rows:
@@ -3320,12 +3322,12 @@ def create_app(
 # ---------------------------------------------------------------------------
 
 
-#: The catalog columns the source routes project. Deliberately not
-#: ``metadata_json``: the listing is structural, and the OME tree is its own
-#: route (``/api/sources/{id}/metadata``).
-_SOURCE_LIST_SQL = (
-    "SELECT source_id, source_url, source_type, is_resolved, tensors FROM sources"
-)
+def _source_list_sql(client: Any) -> str:
+    """The query the source routes project. Deliberately not ``metadata_json``:
+    the listing is structural, and the OME tree is its own route
+    (``/api/sources/{id}/metadata``). ``unresolved_reason`` rides along when the
+    server has the column."""
+    return f"SELECT {client.source_row_columns()} FROM sources"
 
 
 def _add_unresolved_reasons(
@@ -3335,8 +3337,8 @@ def _add_unresolved_reasons(
     answer (a server older than the column) the key stays absent, which a client
     reads as the cloud case it always was."""
     unresolved = [row for row in rows if not row.get("is_resolved", True)]
-    if not unresolved:
-        return
+    if not unresolved or any("unresolved_reason" in row for row in rows):
+        return  # none to explain, or the projection already carried the reason
     reasons = unresolved_reasons(lambda sql: client.query(sql, format="records"), where)
     for row in unresolved:
         if row["source_id"] in reasons:
@@ -3349,7 +3351,7 @@ def _source_row_to_dict(row: Dict[str, Any]) -> Dict[str, Any]:
         "source_id": row["source_id"],
         "source_url": row.get("source_url") or "",
         "source_type": row.get("source_type") or "",
-        # Always null on a listing; see _SOURCE_LIST_SQL.
+        # Always null on a listing; see _source_list_sql.
         "metadata_json": None,
         # There is no residency field here, and no column to read one from:
         # "are the bytes local right now" is answered live by the `is_resident`
