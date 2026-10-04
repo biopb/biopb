@@ -146,9 +146,6 @@ dependencies = [
   ndtiff = [
     "ndtiff >= 3.0.0",
   ]
-  hdf5 = [
-    "h5py >= 3.0.0",
-  ]
   # Deprecated, kept for backward compatibility: OmeZarrAdapter reads multiscales
   # via the core `zarr` dependency (no `ome-zarr` package needed). Empty so that
   # pinned installs of `biopb-tensor-server[ome-zarr]` still resolve.
@@ -186,7 +183,7 @@ dependencies = [
   # both Berkeley/NCEM and Velox/ThermoFisher). One reader covers all of them:
   # rosettasciio is HyperSpy's I/O backend, extracted to stand alone (no hyperspy
   # dep). Its EMD lazy path forwards the native HDF5 chunk grid; MRC is parsed
-  # from rosettasciio's header and served from an own np.memmap. The [hdf5] extra
+  # from rosettasciio's header and served from an own np.memmap. rosettasciio[hdf5]
   # pulls h5py for the EMD path.
   em = [
     "rosettasciio[hdf5]",

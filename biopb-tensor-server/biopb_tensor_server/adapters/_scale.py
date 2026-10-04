@@ -6,8 +6,8 @@ already-resident calibration metadata into the compact per-dimension
 carries (see ``TensorAdapter._physical_scale``). Kept here so the
 DICOM / TIFF / MicroManager adapters share one implementation of the
 label-mapping tail and the unit canonicalisation instead of each reinventing
-it. The NIfTI and HDF5 adapters map positionally (their calibration vectors are
-already axis-aligned) and so build their vectors directly rather than through
+it. The NIfTI adapter maps positionally (its calibration vector is
+already axis-aligned) and so builds its vector directly rather than through
 :func:`scale_by_label`.
 """
 

@@ -3,9 +3,7 @@
 Uses synthetic test fixtures from conftest.py - no external data required.
 """
 
-import importlib.util
 import os
-import pathlib
 import tempfile
 
 import numpy as np
@@ -23,10 +21,6 @@ def _zarr_available() -> bool:
         return True
     except ImportError:
         return False
-
-
-def _h5py_available() -> bool:
-    return importlib.util.find_spec("h5py") is not None
 
 
 class TestAicsImageIoAdapterEmbeddedMetadata:
@@ -229,77 +223,3 @@ class TestOmeZarrAdapter:
                 # Check that values match level index (created by fixture)
                 data = arr[0:10, 0:10]
                 assert data.mean() == level_idx
-
-
-class TestHdf5Adapter:
-    """Tests for Hdf5Adapter using synthetic fixtures."""
-
-    @pytest.mark.skipif(not _h5py_available(), reason="h5py not available")
-    def test_adapter_init(self, hdf5_dataset):
-        """Test Hdf5Adapter initialization."""
-        import h5py
-
-        h5_path, shape, chunks = hdf5_dataset
-
-        with h5py.File(h5_path, "r") as f:
-            dataset = f["data"]
-
-            from biopb_tensor_server.adapters.hdf5 import Hdf5Adapter
-
-            adapter = Hdf5Adapter(dataset, "hdf5-test")
-
-            assert adapter.array_id == "hdf5-test"
-
-    @pytest.mark.skipif(not _h5py_available(), reason="h5py not available")
-    def test_get_tensor_descriptor(self, hdf5_dataset):
-        """Test descriptor returns valid shape and dtype."""
-        import h5py
-
-        h5_path, shape, chunks = hdf5_dataset
-
-        with h5py.File(h5_path, "r") as f:
-            dataset = f["data"]
-
-            from biopb_tensor_server.adapters.hdf5 import Hdf5Adapter
-
-            adapter = Hdf5Adapter(dataset, "hdf5-test")
-
-            desc = adapter.get_tensor_descriptor()
-            assert desc.array_id == "hdf5-test"
-            assert tuple(desc.shape) == shape
-            # The HDF5 chunks seed the transfer grid; they are not it. This
-            # dataset is far below the transfer target, so it ships whole
-            # (biopb/biopb#809), still a whole multiple of the native blocks.
-            grid = tuple(desc.chunk_shape)
-            assert all(
-                g % c == 0 and g <= dim
-                for g, c, dim in zip(grid, chunks, shape, strict=True)
-            )
-
-    @pytest.mark.skipif(not _h5py_available(), reason="h5py not available")
-    def test_holds_no_handle_between_reads(self, hdf5_dataset):
-        """A catalogued HDF5 source pins no fd (biopb/biopb#71): the adapter
-        outlives the file it was built from, and reads reopen per call."""
-        import h5py
-        from biopb.tensor.ticket_pb2 import ChunkBounds
-        from biopb_tensor_server.adapters.hdf5 import Hdf5Adapter
-
-        h5_path, shape, chunks = hdf5_dataset
-
-        with h5py.File(h5_path, "r") as f:
-            adapter = Hdf5Adapter(f["data"], "hdf5-test")
-
-        # The constructing handle is gone, yet the read still serves.
-        data = adapter.get_data(ChunkBounds(start=[0] * len(shape), stop=list(shape)))
-        assert data.shape == shape
-
-        fd_dir = pathlib.Path("/proc/self/fd")
-        if not fd_dir.exists():  # non-Linux: no fd table to inspect
-            pytest.skip("/proc/self/fd unavailable")
-        open_files = set()
-        for fd in fd_dir.iterdir():
-            try:
-                open_files.add(os.path.realpath(fd))
-            except OSError:
-                pass
-        assert os.path.realpath(h5_path) not in open_files

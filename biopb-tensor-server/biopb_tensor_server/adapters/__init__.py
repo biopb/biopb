@@ -12,8 +12,6 @@ Usage:
 from biopb_tensor_server.core.adapter_base import SourceAdapter, TensorAdapter
 from biopb_tensor_server.core.discovery import AdapterRegistry
 
-from .hdf5 import Hdf5Adapter
-
 # Not a format: a label set bound as a tensor of its image (biopb/biopb#1059).
 # Imported here so the class is part of the package like every adapter class.
 from .labels import LabelSetAdapter
@@ -138,7 +136,6 @@ __all__ = [
     "ZarrAdapter",
     "LabelSetAdapter",
     "RasterizedMaskAdapter",
-    "Hdf5Adapter",
     "TiffSequenceAdapter",
     "MicroManagerLegacyAdapter",
     "TiffAdapter",
@@ -200,7 +197,6 @@ def get_default_registry() -> AdapterRegistry:
     - DicomSeriesAdapter - Multi-file DICOM series (directories with same SeriesInstanceUID)
     - DicomAdapter - Single DICOM files (.dcm)
     - NiftiAdapter - NIfTI files (.nii, .nii.gz)
-    - Hdf5Adapter - HDF5 files (requires explicit type in config)
 
     Returns:
         AdapterRegistry with all built-in adapters registered
@@ -299,10 +295,8 @@ def get_default_registry() -> AdapterRegistry:
     if NiftiAdapter is not None:
         registry.register(NiftiAdapter, "nifti")
 
-    registry.register(Hdf5Adapter, "hdf5")
-
     # Remote tensor server -- a caching passthrough proxy (biopb/biopb#178).
-    # Config-only (grpc:// url, like hdf5 it never claims a filesystem path), so
+    # Config-only (grpc:// url, so it never claims a filesystem path), so
     # its claim() default returns None and it only registers by explicit type.
     registry.register(RemoteTensorAdapter, "tensor-server")
 

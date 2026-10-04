@@ -40,7 +40,6 @@ NOT_DECIMATING = {
     "ZarrMember": "inherits ZarrAdapter (via OmeZarrAdapter)",
     "CacheMember": "inherits CachedSourceAdapter; chunks served as stored",
     "_QptiffLevelAdapter": "inherits ZarrAdapter",
-    "Hdf5Adapter": "h5py hyperslab still reads whole chunks",
     "OmeTiffAdapter": "a page decodes whole (aszarr chunkmode='page')",
     "_TifffileAdapterBase": "inherits OmeTiffAdapter",
     "TiffAdapter": "inherits OmeTiffAdapter",

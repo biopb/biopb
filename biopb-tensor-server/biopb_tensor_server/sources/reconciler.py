@@ -1184,7 +1184,6 @@ class Reconciler:
             type=claim.source_type,
             url=str(claim.primary_path),
             source_id=claim.source_id,
-            dataset=claim.extra_config.get("dataset"),
             credentials_profile=claim.extra_config.get("credentials_profile"),
             alias=claim.extra_config.get("alias"),
         )

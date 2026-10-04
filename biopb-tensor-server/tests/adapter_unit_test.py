@@ -1184,38 +1184,6 @@ class TestGetPhysicalScale:
         assert scale == [2.0, 0.8, 0.8]
         assert unit == ["mm", "mm", "mm"]
 
-    # ---- HDF5 --------------------------------------------------------------
-
-    @staticmethod
-    def _make_hdf5(dim_labels, attrs):
-        from biopb_tensor_server.adapters.hdf5 import Hdf5Adapter
-
-        a = Hdf5Adapter.__new__(Hdf5Adapter)
-        a.dim_labels = dim_labels
-        a._element_size_um = attrs.get("element_size_um")
-        return a
-
-    def test_hdf5_element_size_um(self):
-        """element_size_um maps positionally onto the dataset axes, in µm."""
-        a = self._make_hdf5(
-            ["z", "y", "x"], {"element_size_um": np.array([2.0, 0.5, 0.5])}
-        )
-        scale, unit = a._physical_scale()
-        assert scale == [2.0, 0.5, 0.5]
-        assert unit == ["µm", "µm", "µm"]
-
-    def test_hdf5_no_attribute(self):
-        """No element_size_um attribute -> None."""
-        a = self._make_hdf5(["z", "y", "x"], {})
-        assert a._physical_scale() is None
-
-    def test_hdf5_length_mismatch_none(self):
-        """A vector whose length != rank cannot be aligned -> None."""
-        a = self._make_hdf5(
-            ["t", "z", "y", "x"], {"element_size_um": np.array([2.0, 0.5, 0.5])}
-        )
-        assert a._physical_scale() is None
-
     # ---- MicroManager (NDTiff + legacy) ------------------------------------
 
     def test_ndtiff_physical_scale_from_summary(self):

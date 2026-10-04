@@ -83,7 +83,6 @@ always the seed:
 | declares | adapters | block |
 | --- | --- | --- |
 | a block | `ZarrAdapter` and its subclasses, `_QptiffLevelAdapter` | store chunk |
-| | `Hdf5Adapter` | dataset chunk; `None` when contiguous |
 | | `OmeTiffAdapter`, `TiffAdapter`, `LsmAdapter` | one page (`aszarr(chunkmode="page")` decodes it whole) |
 | | `TiffSequenceAdapter`, `MicroManagerLegacyAdapter` | one strile |
 | | `DicomAdapter`, `DicomSeriesAdapter` | one frame / slice file |

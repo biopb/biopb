@@ -422,7 +422,7 @@ def _fast_ome_metadata(
 # handle warm across chunk reads. A shared idle reaper closes stores idle longer
 # than the TTL so a long-lived server does not pin file descriptors for sources
 # no one is reading -- OME-TIFF opts into it because its open is linear in IFD
-# count and unbounded, so a reopen-per-read (the hdf5/mrc default) would regress
+# count and unbounded, so a reopen-per-read (the mrc default) would regress
 # large files badly. Only OME-TIFF scene adapters register, so the pool holds only
 # those instances. The TTL is set from ``ServerConfig.handle_reaper_ttl`` at
 # startup; see :mod:`biopb_tensor_server.adapters._handle_reaper`.

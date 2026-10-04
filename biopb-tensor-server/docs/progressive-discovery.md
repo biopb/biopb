@@ -49,7 +49,7 @@ string is used where**, and how the first scan differs from every later one.
 | `Reconciler` | `_source_signatures`, `_missed_scans`, `_cloud_source_ids`, `_failed_sources` | `source_id` |
 | `Roots` (shared by `SourceManager` and `Reconciler`) | every known root: kind (monitored, scan-once, dropped, upstream), alias, cloud, `dnd://` label | Resolved root `Path`s; a drop's label |
 | `SourceManager` | `_unavailable_roots` | Resolved root `Path`s |
-| Adapter | `_source_url` (the raw claim path, or the library's own filename for hdf5 / nifti / bioio / dicom), `catalog_url` | Opens files with the raw path |
+| Adapter | `_source_url` (the raw claim path, or the library's own filename for nifti / bioio / dicom), `catalog_url` | Opens files with the raw path |
 | Catalog (`sources` table) | `source_url` (display only), `tensors`, `metadata_json`, `indexed_at` | `source_id` |
 
 Nothing is persisted by path. The `sources` table is truncated when the database

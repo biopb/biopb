@@ -6,7 +6,7 @@
 - `adapter_unit_test.py` - Adapter unit tests (ZarrAdapter, OmeZarrAdapter, config, compute backend)
 - `adapter_integration_test.py` - Integration tests with server/client
 - `multifield_test.py` - Multifield source tests (multiple tensors per source)
-- `tensor_extended_test.py` - Extended adapter tests (MultiFileOmeTiff, OmeZarr, HDF5)
+- `tensor_extended_test.py` - Extended adapter tests (MultiFileOmeTiff, OmeZarr)
 - `cache_test.py` - Cache module tests
 
 **Client tests** (`src/test/python/`):
@@ -49,7 +49,7 @@ mvn -B test
 
 ### Server-side tests
 - Adapter descriptor generation, chunk endpoints
-- ZarrAdapter, OmeZarrAdapter, Hdf5Adapter, OmeTiffAdapter
+- ZarrAdapter, OmeZarrAdapter, OmeTiffAdapter
 - Multifield sources with varying tensor shapes
 - Compute backend selection (CPU/GPU heuristics)
 - OME-Zarr precomputed pyramid levels

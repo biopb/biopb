@@ -1,7 +1,7 @@
 """Shared idle-handle reaper for adapters that keep a persistent OS handle.
 
-Most file adapters do **not** need this. ``hdf5`` and ``mrc`` reopen their file
-per read (biopb/biopb#71): their open is O(1), so the reopen is unmeasurable
+Most file adapters do **not** need this. ``mrc`` reopens its file
+per read (biopb/biopb#71): its open is O(1), so the reopen is unmeasurable
 against a 64 MB chunk read and it removes the steady-state pin entirely -- no TTL
 to tune, no handle held between reads. That is strictly better whenever it is
 affordable, so it is the default.

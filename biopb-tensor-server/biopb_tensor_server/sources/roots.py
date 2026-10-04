@@ -119,7 +119,7 @@ class Root:
     cloud: bool = False  # offline placeholders admitted, resolved on first access
     label: Optional[str] = None  # DROPPED only: the ``dnd://`` label
     # The config entry a configured root came from: an upstream is re-listed with
-    # its credentials profile, a scan-once directory with its HDF5 ``dataset``.
+    # its credentials profile, a scan-once directory with its ``type``.
     source: Optional[SourceConfig] = None
     # Derived once: queried per claim on every walk.
     path: Optional[Path] = field(init=False, default=None, repr=False)

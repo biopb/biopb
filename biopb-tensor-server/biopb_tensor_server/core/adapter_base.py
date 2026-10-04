@@ -1,7 +1,7 @@
 """Backend adapters for tensor storage formats.
 
 This module provides a consistent interface for reading chunked multi-dimensional
-arrays from various storage backends (Zarr, HDF5, OME-TIFF, TileDB).
+arrays from various storage backends (Zarr, OME-TIFF, TileDB).
 
 Each adapter maps storage-specific chunk layouts to Arrow Flight endpoints:
 - chunk_id: Opaque bytes identifying a chunk in the backend
@@ -253,12 +253,13 @@ def require_resolved(desc: TensorDescriptor) -> None:
 class SourceAdapter(ABC):
     """Abstract base class for source-level adapters.
 
-    Each adapter handles a specific storage format (Zarr, HDF5, OME-TIFF, etc.)
+    Each adapter handles a specific storage format (Zarr, OME-TIFF, etc.)
     and provides methods to discover tensors and read metadata.
 
     Adapters that participate in filesystem auto-discovery override the claim()
     classmethod to detect whether they handle a given path; it is not abstract
-    (the default claims nothing) so a config-only format like HDF5 can opt out.
+    (the default claims nothing) so a config-only format like a remote
+    tensor-server can opt out.
     """
 
     # Required fields
@@ -1310,7 +1311,7 @@ class TensorAdapter(SourceAdapter):
     def read_block_shape(self) -> Optional[Tuple[int, ...]]:
         """What this backend's reads are quantized to, or ``None`` for none.
 
-        A zarr chunk, an HDF5 chunk, a TIFF page: reading any part of one costs
+        A zarr chunk, a TIFF page: reading any part of one costs
         the whole one. The streamed scaled read floors its tile here
         (:func:`~.stream_reduce.streaming_unit`), because the transfer grid is
         derived from this same granularity by *dividing* it whenever it exceeds

@@ -23,7 +23,6 @@ from tests import register_and_catalog
 from benchmarks.utils import (
     generate_multiresolution_zarr,
     generate_synthetic_hcs_plate,
-    generate_synthetic_hdf5,
     generate_synthetic_tiff,
     generate_synthetic_zarr,
     reset_cache,
@@ -128,7 +127,7 @@ def is_nfs_source(source_id: str) -> bool:
 class BaselineClient:
     """Direct library access matching TensorFlightClient API.
 
-    Wraps low-level libraries directly (zarr/tifffile/h5py),
+    Wraps low-level libraries directly (zarr/tifffile),
     returning dask arrays for lazy loading. No Flight protocol overhead,
     no application-level cache (only OS page cache).
     """
@@ -205,14 +204,6 @@ class BaselineClient:
             self._paths[source_id] = tiff_path
             return tiff_path
 
-        elif generator == "generate_synthetic_hdf5":
-            shape = tuple(params.get("shape", [256, 256]))
-            chunks = tuple(params.get("chunks", [128, 128]))
-            dtype = params.get("dtype", "uint16")
-            h5_path = generate_synthetic_hdf5(cache_dir, shape, chunks, dtype)
-            self._paths[source_id] = h5_path
-            return h5_path
-
         raise ValueError(f"Unknown generator: {generator}")
 
     def _open_reader(self, source_id: str) -> Any:
@@ -249,11 +240,6 @@ class BaselineClient:
                 fs = s3fs.S3FileSystem(anon=True)
                 return zarr.open_group(s3fs.S3Map(fs, url), mode="r")
             return zarr.open_group(path, mode="r")
-
-        elif source_type == "hdf5":
-            import h5py
-
-            return h5py.File(path, "r")
 
         # Catch-all: use bioio for any unhandled format
         # Supports: OME-TIFF, TIFF, CZI, ND2, LIF, DV, and many more
@@ -312,11 +298,6 @@ class BaselineClient:
                 for part in parts:
                     zarr_obj = zarr_obj[part]
                 arr = da.from_zarr(zarr_obj)
-
-        elif source_type == "hdf5":
-            dataset_name = tensor_id if tensor_id != source_id else "data"
-            h5_ds = reader[dataset_name]
-            arr = da.from_array(h5_ds, chunks=h5_ds.chunks)
 
         else:
             # Catch-all via bioio: use xarray_dask_data for lazy loading
@@ -488,12 +469,6 @@ def _generate_and_get_path(spec: Dict, cache_dir: str) -> str:
         dtype = params.get("dtype", "uint16")
         return generate_synthetic_tiff(cache_dir, shape, tile, dtype)
 
-    elif generator == "generate_synthetic_hdf5":
-        shape = tuple(params.get("shape", [256, 256]))
-        chunks = tuple(params.get("chunks", [128, 128]))
-        dtype = params.get("dtype", "uint16")
-        return generate_synthetic_hdf5(cache_dir, shape, chunks, dtype)
-
     raise ValueError(f"Unknown generator: {generator}")
 
 
@@ -514,14 +489,13 @@ def _register_source_with_server(
     source_type = spec.get("type")
 
     # Map benchmark config types to registry types
-    # Registry uses: "zarr", "ome-zarr", "ome-tiff", "hdf5", "aics", etc.
+    # Registry uses: "zarr", "ome-zarr", "ome-tiff", "aics", etc.
     registry_type_map = {
         "zarr": "zarr",
         "ome_zarr": "ome-zarr",
         "ome_zarr_hcs": "ome-zarr",
         "ome_tiff": "ome-tiff",
         "tiff": "ome-tiff",
-        "hdf5": "hdf5",
         # AicsImageIO formats (covers many vendor formats)
         "czi": "aics",
         "lif": "aics",
@@ -542,7 +516,6 @@ def _register_source_with_server(
         url=path,
         type=registry_type,
         source_id=source_id,
-        dataset="data" if source_type == "hdf5" else None,
     )
 
     # Get adapter class from registry and create instance

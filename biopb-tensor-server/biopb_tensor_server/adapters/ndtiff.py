@@ -490,7 +490,7 @@ class NdTiffAdapter(TensorAdapter):
         """Release the dataset's per-file readers on teardown (biopb/biopb#71).
 
         The handles stay persistent between reads rather than being reopened per
-        read (unlike hdf5/mrc): the reopen unit here is the *whole* acquisition,
+        read (unlike mrc): the reopen unit here is the *whole* acquisition,
         so a per-read reopen would open thousands of files to serve one plane. The
         idle reaper bounds the steady-state pin; this releases it deterministically
         on unregister/shutdown.
