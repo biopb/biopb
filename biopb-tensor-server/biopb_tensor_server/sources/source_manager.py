@@ -217,7 +217,7 @@ class SourceManager:
         self._registration_worker: Optional[RegistrationWorker] = None
         if registration_workers > 0:
             self._registration_worker = RegistrationWorker(
-                self._reconciler.ensure_registered, registration_workers
+                self._register_pending, registration_workers
             )
         self._reconciler.set_pending_hook(self._enqueue_pending)
         self._on_startup_source: Optional[Callable[[str, float], None]] = None
@@ -388,8 +388,7 @@ class SourceManager:
                 time.monotonic() - self._started_at,
                 self._reconciler.pending_count(),
             )
-            if self._reconciler.pending_count() == 0:
-                self._reconciler.stats.log_summary()
+            self._reconciler.log_summary_if_drained()
             self._fire_initial_scan_complete()
 
     def pending_registrations(self) -> int:
@@ -407,6 +406,18 @@ class SourceManager:
         a start and reads the same files, so warming them is for after it.
         """
         return self._initial_scan_done and self._reconciler.pending_count() == 0
+
+    def _register_pending(self, source_id: str) -> bool:
+        """What a registration worker runs for a queued source.
+
+        A source that was removed while it waited is no longer pending after this,
+        and would otherwise stay in ``_deferred`` for good.
+        """
+        try:
+            return self._reconciler.ensure_registered(source_id)
+        finally:
+            if not self._reconciler.is_pending(source_id):
+                self._deferred.pop(source_id, None)
 
     def _enqueue_pending(self, source_id: str) -> None:
         """Queue a source the reconciler committed pending, newest file first."""

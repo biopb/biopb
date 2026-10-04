@@ -84,6 +84,9 @@ logger = logging.getLogger(__name__)
 # Consecutive rescans a monitored source may go undiscovered before it is removed.
 _MISSES_BEFORE_REMOVAL = 2
 
+# Locks that serialize one source's registration, refresh and removal.
+_REGISTRATION_STRIPES = 256
+
 # Remote/cloud source families are EXPERIMENTAL. Warn once per family per process
 # (registration runs per source) so an operator sees the maturity caveat without
 # per-source log spam. Keyed by family; the set is only ever added to.
@@ -191,11 +194,15 @@ class Reconciler:
         self._pending_hook: Optional[Callable[[str], None]] = None
         self._pending: Dict[str, Optional[str]] = {}
         self._pending_failed: Dict[str, str] = {}
-        # Per-source: a registration, a refresh and a removal of one source never
-        # overlap, so a read that races the worker coalesces onto one parse and a
-        # removed source is not registered back. Taken before ``self._lock``,
-        # never inside it.
-        self._registration_locks: Dict[str, threading.RLock] = {}
+        # A registration, a refresh and a removal of one source never overlap, so
+        # a read that races the worker coalesces onto one parse and a removed
+        # source is not registered back. A fixed stripe of locks hashed by
+        # source_id: nothing to allocate or clean up, and two sources that share
+        # one only wait for each other. Taken before ``self._lock``, never inside
+        # it, and never nested across sources.
+        self._registration_stripes = tuple(
+            threading.RLock() for _ in range(_REGISTRATION_STRIPES)
+        )
 
         # Per-type timings and row sizes of every registration (see its module);
         # collected only when asked for.
@@ -271,8 +278,9 @@ class Reconciler:
             return len(self._pending)
 
     def is_pending(self, source_id: str) -> bool:
-        with self._lock:
-            return source_id in self._pending
+        # A dict membership test is atomic, so this takes no lock: it is asked
+        # on every registry miss, and must not wait on a scan's commits.
+        return source_id in self._pending
 
     def catalog_url_of(self, source_id: str) -> Optional[str]:
         """The catalog ``source_url`` of a source, registered or still pending
@@ -295,8 +303,7 @@ class Reconciler:
         self._pending_failed.pop(source_id, None)
 
     def _registration_lock(self, source_id: str) -> threading.RLock:
-        with self._lock:
-            return self._registration_locks.setdefault(source_id, threading.RLock())
+        return self._registration_stripes[hash(source_id) % _REGISTRATION_STRIPES]
 
     def _deferrable(self, claim: SourceClaim) -> bool:
         """Whether registering *claim* is the slow, local, file-opening kind.
@@ -375,15 +382,14 @@ class Reconciler:
             ):
                 self._record_failed_source_attempt(source_id)
                 self._mark_registration_failed(source_id, errors)
-                self._log_summary_if_drained()
+                self.log_summary_if_drained()
                 return False
 
             with self._lock:
                 self._clear_pending(source_id)
-                self._registration_locks.pop(source_id, None)
             self._clear_failed_source_attempt(source_id)
         self._notify_source_committed(source_id)
-        self._log_summary_if_drained()
+        self.log_summary_if_drained()
         return True
 
     def materialize(self, source_id: str) -> None:
@@ -405,7 +411,7 @@ class Reconciler:
             f"source {source_id!r} is unresolved: its registration has not run yet"
         )
 
-    def _log_summary_if_drained(self) -> None:
+    def log_summary_if_drained(self) -> None:
         """Log the registration cost once nothing is left waiting.
 
         A failed source is not waiting (see :meth:`pending_count`), so a site
@@ -716,11 +722,7 @@ class Reconciler:
         """:meth:`_refresh_claim_locked`, serialized against this source's
         deferred registration and removal."""
         with self._registration_lock(claim.source_id):
-            refreshed = self._refresh_claim_locked(claim)
-        with self._lock:
-            if claim.source_id not in self._pending:
-                self._registration_locks.pop(claim.source_id, None)
-        return refreshed
+            return self._refresh_claim_locked(claim)
 
     def _refresh_claim_locked(self, claim: SourceClaim) -> bool:
         """Re-register an already-confirmed source against its bytes as they are now.
@@ -827,7 +829,6 @@ class Reconciler:
             self._cloud_source_ids.discard(source_id)
             self._missed_scans.pop(source_id, None)
             self._clear_pending(source_id)
-            self._registration_locks.pop(source_id, None)
             self._clear_failed_source_attempt(source_id)
         return True
 

@@ -60,10 +60,11 @@ class RegistrationStats:
     def record_claim(self, adapter: str, seconds: float, claimed: bool) -> None:
         if not self.enabled:
             return
-        entry = self._claims[adapter]
-        entry[0] += 1
-        entry[1] += seconds
-        entry[2] += 1 if claimed else 0
+        with self._lock:
+            entry = self._claims[adapter]
+            entry[0] += 1
+            entry[1] += seconds
+            entry[2] += 1 if claimed else 0
 
     def record_registration(
         self,

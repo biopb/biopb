@@ -510,6 +510,19 @@ class TestWhilePending:
         assert manager._reconciler.ensure_registered(sid)
         assert server.sources.get(sid) is None
 
+    def test_a_source_removed_while_queued_does_not_stay_in_deferred(self, tmp_path):
+        _make_zarr(tmp_path, "a.zarr")
+        manager, server = _manager(tmp_path)
+        _first_scan(manager)
+        (sid,) = _only_ids(server)
+        assert sid in manager._deferred
+
+        assert manager._reconciler._commit_remove_source(sid)
+        # What the registration worker runs for a queued source.
+        assert manager._register_pending(sid)
+
+        assert sid not in manager._deferred
+
     def test_a_changed_source_is_registered_by_its_refresh(self, tmp_path):
         path = _make_zarr(tmp_path, "a.zarr")
         manager, server = _manager(tmp_path)

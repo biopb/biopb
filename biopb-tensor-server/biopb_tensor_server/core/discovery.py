@@ -23,6 +23,7 @@ import hashlib
 import logging
 import os
 import queue
+import stat as stat_module
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -584,6 +585,35 @@ def _leads_back_up(real: str, current: str) -> bool:
     return current == real or current.startswith(real.rstrip(os.sep) + os.sep)
 
 
+def _note_skipped_entry(report: Any, path: Path, is_dir: bool) -> None:
+    """Record, in *report* (a ``WalkReport`` or anything with its two fields), an
+    entry the skip policy passed over. A no-op without a report."""
+    if report is None:
+        return
+    if is_dir:
+        report.declined_dirs.add(str(path))
+    elif not path.name.startswith(".") and _is_offline_placeholder(path):
+        report.offline_files += 1
+
+
+def _descent_refused(
+    path: Path, child_real: str, current_real: str, depth: int, max_depth: int
+) -> bool:
+    """Whether the walk must not enter directory *path*: it leads back to its own
+    ancestry, or it is already ``max_depth`` levels below the root. Logs why."""
+    if _leads_back_up(child_real, current_real):
+        logger.warning("walk: not entering %s: it leads back to %s", path, current_real)
+        return True
+    if depth >= max_depth:
+        logger.warning(
+            "walk: not entering %s: more than %d levels below the root",
+            path,
+            max_depth,
+        )
+        return True
+    return False
+
+
 def walk_with_identity_tracking(
     root: Path,
     visited_identities: Set[str],
@@ -639,13 +669,7 @@ def walk_with_identity_tracking(
                 path, is_dir, admit_nonresident=admit_nonresident
             ):
                 logger.debug("walk: skipping %s", path)
-                if report is not None:
-                    if is_dir:
-                        report.declined_dirs.add(str(path))
-                    elif not path.name.startswith(".") and _is_offline_placeholder(
-                        path
-                    ):
-                        report.offline_files += 1
+                _note_skipped_entry(report, path, is_dir)
                 continue
 
             if path_filter is not None and not path_filter(path):
@@ -675,17 +699,9 @@ def walk_with_identity_tracking(
                 and (should_descend is None or should_descend(path))
             ):
                 child_real = _real_dir(path)
-                if _leads_back_up(child_real, current_real):
-                    logger.warning(
-                        "walk: not entering %s: it leads back to %s", path, current_real
-                    )
-                elif _depth >= max_depth:
-                    logger.warning(
-                        "walk: not entering %s: more than %d levels below the root",
-                        path,
-                        max_depth,
-                    )
-                else:
+                if not _descent_refused(
+                    path, child_real, current_real, _depth, max_depth
+                ):
                     yield from walk_with_identity_tracking(
                         path,
                         visited_identities,
@@ -925,7 +941,6 @@ class DiscoveryState:
         # registry can attribute members without snapshotting consumed_paths.
         # Per thread, so a parallel walk's probes each record their own.
         self._recorders = threading.local()
-        self._claim_recorder = None
 
     @property
     def _claim_recorder(self) -> Optional[List[str]]:
@@ -1248,26 +1263,21 @@ def _visit_directory(
 
     for path in entries:
         try:
-            is_dir = path.is_dir()
+            stat_result = os.stat(path)
         except OSError:
-            continue  # Broken entry or permission issue
+            continue  # Broken entry, broken symlink or permission issue
+        is_dir = stat_module.S_ISDIR(stat_result.st_mode)
 
-        if should_skip_walk_entry(path, is_dir, admit_nonresident=admit_nonresident):
-            if is_dir:
-                visit.declined_dirs.add(str(path))
-            elif not path.name.startswith(".") and _is_offline_placeholder(path):
-                visit.offline_files += 1
+        if should_skip_walk_entry(
+            path, is_dir, stat_result=stat_result, admit_nonresident=admit_nonresident
+        ):
+            _note_skipped_entry(visit, path, is_dir)
             continue
 
         if path_filter is not None and not path_filter(path):
             if is_dir:
                 visit.declined_dirs.add(str(path))
             continue
-
-        try:
-            os.stat(path)
-        except OSError:
-            continue  # Broken symlink or permission issue
 
         path_str = str(path)
         if not state.is_path_claimed(path_str):
@@ -1278,17 +1288,7 @@ def _visit_directory(
 
         if is_dir and not path.is_symlink() and not state.is_path_claimed(path_str):
             child_real = _real_dir(path)
-            if _leads_back_up(child_real, current_real):
-                logger.warning(
-                    "walk: not entering %s: it leads back to %s", path, current_real
-                )
-            elif depth >= max_depth:
-                logger.warning(
-                    "walk: not entering %s: more than %d levels below the root",
-                    path,
-                    max_depth,
-                )
-            else:
+            if not _descent_refused(path, child_real, current_real, depth, max_depth):
                 visit.subdirs.append((path, depth + 1, child_real))
                 continue
             visit.declined_dirs.add(path_str)
@@ -1349,7 +1349,6 @@ def _discover_parallel(
             results.put((None, exc))
 
     visited = 0
-    outstanding = 0
     with ThreadPoolExecutor(
         max_workers=threads, thread_name_prefix="discovery-walk"
     ) as pool:
@@ -1366,14 +1365,16 @@ def _discover_parallel(
             if visit is None or failure is not None:
                 continue
             visited += 1
+            # Subdirectories first: the commit a claim triggers (stats and a catalog
+            # write, on this thread) must not keep idle workers waiting for work.
+            for sub in visit.subdirs:
+                pool.submit(task, *sub)
+                outstanding += 1
             for claim in visit.claims:
                 state.add_claim(claim)
             if report is not None:
                 report.declined_dirs |= visit.declined_dirs
                 report.offline_files += visit.offline_files
-            for sub in visit.subdirs:
-                pool.submit(task, *sub)
-                outstanding += 1
     if failure is not None:
         raise failure
     return visited
