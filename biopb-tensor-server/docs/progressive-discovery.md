@@ -232,6 +232,10 @@ While `registration_workers` is above zero the first scan therefore only *claims
 signatures are in the confirmed state, so the diff, removal and refresh treat it like any
 other source. A `RegistrationWorker` pool then calls `Reconciler.ensure_registered`,
 newest file first, which runs the ordinary registration and swaps the real adapter in.
+The pool is held until the first scan is over (`complete_initial_scan` resumes it): walking
+and registering contend, and a held pool lets every claim be committed first, so the whole
+catalog exists, pending, before any file is opened. A rescan does not hold it again; it
+registers what it finds inline.
 
 - **A read registers it at once.** The server's read paths and the upload manager use
   `SourceRegistry.get_registered`, which calls `ensure_registered` first when the adapter
