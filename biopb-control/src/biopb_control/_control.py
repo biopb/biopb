@@ -78,7 +78,8 @@ never imports — the proxy reaches it over loopback like any other client.
   turns, which run code in that session's kernel, and is proxied **only when
   this control is loopback-bound** (``_session_proxy_roots``). It is a separate
   root precisely so that "can a browser reach an RCE here?" stays one checkable
-  statement: ``api`` always, ``chat`` local-mode only, ``/mcp`` never.
+  statement: ``api`` always, ``chat`` local-mode only, ``mcp`` only where a token
+  is enforced, for an agent attaching from another machine.
 
 This module lands the namespaced origin, the data-plane API proxy, per-session
 observe routing, and the control-served SPA bundle — the full single-origin
@@ -190,8 +191,21 @@ _SESSION_CHAT_ROOT = "chat"
 # the narrowing by being added here.
 _SESSION_POST_ONLY_ROOTS = frozenset({_SESSION_CHAT_ROOT})
 
+# The session's MCP endpoint, for an agent attaching from another machine
+# (docs/session-attach.md, phase 3). It runs arbitrary code in the kernel, so it
+# is the opposite of `chat`: served only where the control **enforces a token**,
+# whatever its bind, so it is never reachable unauthenticated. A tokenless
+# control does not proxy it (a local agent reaches the session's own port); a
+# loopback control with a token does, which is what an SSH tunnel to it needs. A
+# request carries the token in a header, which a hostile page cannot set, so the
+# CSRF gate has nothing to add and the methods are not narrowed (streamable-http
+# uses POST, GET and DELETE).
+_SESSION_MCP_ROOT = "mcp"
 
-def _session_proxy_roots(loopback_bound: bool) -> frozenset[str]:
+
+def _session_proxy_roots(
+    loopback_bound: bool, token_enforced: bool = False
+) -> frozenset[str]:
     """The session-child path roots this control will proxy.
 
     One source for both the proxy's own gate and the auth middleware, so the
@@ -202,9 +216,12 @@ def _session_proxy_roots(loopback_bound: bool) -> frozenset[str]:
     is the child's own decision (``observe.chat_enabled``), which is the half
     this control does not and should not know.
     """
+    roots = _SESSION_ALLOWED_ROOTS
     if loopback_bound:
-        return _SESSION_ALLOWED_ROOTS | {_SESSION_CHAT_ROOT}
-    return _SESSION_ALLOWED_ROOTS
+        roots = roots | {_SESSION_CHAT_ROOT}
+    if token_enforced:
+        roots = roots | {_SESSION_MCP_ROOT}
+    return roots
 
 
 # HTTP methods that change state (so they carry a CSRF risk); safe verbs
@@ -1019,7 +1036,7 @@ def build_app(
     ``algorithms`` is the algorithm plane the ``/api/algorithms`` verbs drive;
     by default one over the user's registry.
     """
-    session_roots = _session_proxy_roots(loopback_bound)
+    session_roots = _session_proxy_roots(loopback_bound, token is not None)
     if algorithms is None:
         algorithms = AlgorithmPlane()
     url_prefix = normalize_url_prefix(url_prefix)
@@ -1080,6 +1097,7 @@ def build_app(
                 "control": "ok",
                 "auth_required": token is not None,
                 "chat_proxied": _SESSION_CHAT_ROOT in session_roots,
+                "mcp_proxied": _SESSION_MCP_ROOT in session_roots,
                 "data_plane": supervisor.snapshot(),
             }
         )
@@ -1541,14 +1559,12 @@ def build_app(
         sub_path = request.path_params["path"]
         # Allowlist the session data API only — the observe page itself is
         # the control-served SPA shell (session_observe below), so only /api/*
-        # proxies here (plus /chat/* when loopback-bound). The
-        # child's /mcp agent transport is deliberately off this origin — agents
-        # reach it directly on the child's own loopback port (stdio shim bridge /
-        # `biopb mcp view`), never via the control — and this hop strips /mcp's
-        # entire auth (Host/Origin), so exposing it would be an RCE hole on the
-        # public origin. Require an allowed first segment AND reject any
-        # parent-traversal, so no path (raw, encoded, or dot-collapsed by httpx)
-        # can escape an allowed root into /mcp.
+        # proxies here, plus /chat/* when loopback-bound and /mcp when
+        # a token is enforced. This hop strips /mcp's own auth
+        # (Host/Origin), so /mcp is proxied only where the middleware demands
+        # the token for it (_session_proxy_roots). Require an allowed first
+        # segment AND reject any parent-traversal, so no path (raw, encoded, or
+        # dot-collapsed by httpx) can escape an allowed root into /mcp.
         segments = sub_path.split("/")
         if segments[0] not in session_roots or ".." in segments:
             return JSONResponse({"error": "not found"}, status_code=404)

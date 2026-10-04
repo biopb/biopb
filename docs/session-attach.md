@@ -1,6 +1,6 @@
 # Attaching an agent to an existing session
 
-Phases 1 and 2 are implemented; phase 3 is not.
+All three phases are implemented.
 
 An agent can attach to a session that is already running instead of getting its
 own. The control launches the session and the user ends it; the stdio shim
@@ -15,7 +15,8 @@ an agent host needs the SDK and not the kernel stack. `biopb-mcp --transport std
 runs the same code. The registration helper (`biopb._agents`) registers
 `biopb-shim`. Shim and session meet only over HTTP and the session registry:
 `/api/lease` (acquire, renew, release), `/api/status`, `/mcp`, the control's
-`/api/sessions` and `/api/sessions/new`, and the records in `biopb._sessions`. A
+`/api/sessions`, `/api/sessions/new` and `/health` (`mcp_proxied`), its
+`/session/<id>/...` proxy of all of those, and the records in `biopb._sessions`. A
 change to any of them is a change to both packages.
 
 ## Rules
@@ -129,11 +130,31 @@ that needs a session, and the handshake says why it failed.
    stop route so every dashboard row can be stopped. A shim whose session is
    stopped sees it stop answering and unbinds. Control invariant I1 is rewritten
    to match.
-3. **Remote.** `/mcp` proxied by the control under the token, with the Host and
-   Origin guards. `/mcp` runs arbitrary code in a kernel, so it is proxied only
-   when a token is enforced. Sessions stay loopback-bound; the control is the only
-   public listener. The viewer, screenshots, filesystem paths and the data-plane
-   endpoint all belong to the session's host, not the client's.
+3. **Remote.** `biopb-shim --remote <control-url> --token <t>` (or `$BIOPB_REMOTE`
+   and `$BIOPB_TENSOR_TOKEN`) attaches to another machine's sessions through its
+   control; nothing else changes for the agent.
+   - The control proxies `/session/<id>/mcp` as a root of its own, **only where it
+     enforces a token**, whatever its bind: `/mcp` runs arbitrary code in a
+     kernel, so a tokenless control never serves it, and a loopback control with a
+     token does, which is what an SSH tunnel to it needs. It is not narrowed to
+     POST: streamable-http also uses GET and DELETE, and the token travels in a
+     header a hostile page cannot set. `/health` reports `mcp_proxied`, so the
+     shim refuses early, with the reason, instead of leasing a session it cannot
+     bridge.
+   - Lease, status and the listing take the same path they do locally:
+     `/session/<id>/api/lease/*`, `/session/<id>/api/status`, `/api/sessions`. A
+     lease on a remote session lapses the same way, so a shim that dies frees it.
+   - Sessions stay loopback-bound; the control is the only listener. The token is
+     sent as `X-Biopb-Token` and only to the `--remote` address: this machine's
+     own credential file is never used for a remote. `--header 'Name: value'`
+     (repeatable, or `$BIOPB_REMOTE_HEADERS`) adds what a portal in front of the
+     control wants, such as its session cookie. The URL may carry a path prefix
+     (`https://portal/node/<host>/<port>`).
+   - `attach new` launches on the host, always headless: the client sends no
+     display variables, because the viewer, screenshots, filesystem paths and the
+     data-plane endpoint all belong to the session's host, not the client's.
+   - The control has no TLS of its own. Over a tunnel that is fine; over a
+     published control the operator's proxy provides it.
 
 ## Open
 

@@ -407,7 +407,9 @@ class TestBinding:
     def _binding(self, monkeypatch, preselect=None, lease_status=200):
         env = SimpleNamespace(calls=[], lease_status=lease_status)
 
-        def _call_session(base, method, path, body=None, timeout=None):
+        def _call_session(
+            base, method, path, body=None, timeout=None, headers=None, opener=None
+        ):
             env.calls.append((base, method, path, body))
             if path.endswith("/acquire"):
                 if env.lease_status == 409:
@@ -420,8 +422,8 @@ class TestBinding:
         env.renew_status = lambda: 200
 
         @contextlib.asynccontextmanager
-        async def _client(url):
-            env.url = url
+        async def _client(url, headers=None):
+            env.url, env.headers = url, headers
             yield "READ", "WRITE", None
 
         class _Session:
@@ -923,6 +925,156 @@ def _rpc_call(shim, id_, name, arguments=None):
     return result, result["content"][0]["text"]
 
 
+class TestRemote:
+    """Sessions of another machine, reached through its control under a token."""
+
+    URL = "https://lab.example:8813"
+
+    def _remote(self, monkeypatch, health=None, sessions=(), new=None, denied=False):
+        env = SimpleNamespace(calls=[], headers=[], mcp=None)
+        health = {"mcp_proxied": True} if health is None else health
+
+        def _call(
+            base, method, path, body=None, timeout=None, headers=None, opener=None
+        ):
+            env.calls.append((base, method, path, body))
+            env.headers.append(headers)
+            if denied and path != "/health":
+                return 401, {"error": "invalid or missing token"}
+            if path == "/health":
+                return 200, health
+            if path == "/api/sessions":
+                return 200, {"sessions": [{"session_id": sid} for sid, _ in sessions]}
+            if path.startswith("/api/sessions/new"):
+                return 200, new
+            if path == "/api/status":
+                holder = dict(sessions).get(base.rsplit("/", 1)[-1])
+                return 200, {"lease": {"holder": holder}, "viewer": False}
+            if path.endswith("/acquire"):
+                return 200, {"ok": True}
+            return 200, {}
+
+        @contextlib.asynccontextmanager
+        async def _client(url, headers=None):
+            env.mcp = (url, headers)
+            yield "READ", "WRITE", None
+
+        class _Session:
+            def __init__(self, read, write):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def initialize(self):
+                return SimpleNamespace(instructions="RULES")
+
+        monkeypatch.setattr(_shim, "_call_session", _call)
+        monkeypatch.setattr(_shim, "streamablehttp_client", _client)
+        monkeypatch.setattr(_shim, "ClientSession", _Session)
+        binding = _shim._Binding(plane=_shim._Remote(self.URL, "tok-123"))
+        return binding, env
+
+    def _drive(self, binding, *steps):
+        return TestBinding()._drive(binding, *steps)
+
+    def test_attach_leases_through_the_control_and_bridges_its_mcp(self, monkeypatch):
+        binding, env = self._remote(monkeypatch)
+        (text,) = self._drive(binding, lambda: binding.attach("s1"))
+        base = f"{self.URL}/session/s1"
+        assert "Attached to session s1" in text
+        assert (
+            base,
+            "POST",
+            "/api/lease/acquire",
+            {"token": binding.token, "force": False},
+        ) in env.calls
+        assert env.mcp == (f"{base}/mcp", {"X-Biopb-Token": "tok-123"})
+        assert all(h == {"X-Biopb-Token": "tok-123"} for h in env.headers)
+
+    def test_a_control_that_serves_no_mcp_is_refused_before_a_lease(self, monkeypatch):
+        binding, env = self._remote(monkeypatch, health={"mcp_proxied": False})
+        (text,) = self._drive(binding, lambda: binding.attach("s1"))
+        assert "--remote" in text and "does not serve /mcp" in text
+        assert not any(path.endswith("/acquire") for _, _, path, _ in env.calls)
+
+    def test_a_refused_token_says_so(self, monkeypatch):
+        binding, env = self._remote(monkeypatch, denied=True)
+        (text,) = self._drive(binding, lambda: binding.attach("auto"))
+        assert "refused the token" in text
+
+    def test_the_listing_asks_the_control_and_each_session(self, monkeypatch):
+        binding, env = self._remote(
+            monkeypatch, sessions=[("s1", None), ("s2", "chat")]
+        )
+        text = binding.plane.listing()
+        assert "- s1: free" in text and "- s2: held by chat" in text
+
+    def test_new_launches_on_the_host_without_a_display(self, monkeypatch):
+        binding, env = self._remote(
+            monkeypatch, new={"state": "started", "session_id": "made"}
+        )
+        monkeypatch.setenv("DISPLAY", ":0")
+        (text,) = self._drive(binding, lambda: binding.attach("new"))
+        (query,) = [p for _, m, p, _ in env.calls if p.startswith("/api/sessions/new")]
+        assert "display=%7B%7D" in query and "start_kernel=0" in query
+        assert "DISPLAY" not in query and binding.session_id == "made"
+        assert env.mcp[0] == f"{self.URL}/session/made/mcp"
+
+    def test_extra_headers_ride_along_with_the_token(self, monkeypatch):
+        binding, env = self._remote(monkeypatch)
+        binding.plane = _shim._Remote(
+            self.URL, "tok-123", {"Cookie": "portal=abc", "X-Biopb-Token": "x"}
+        )
+        self._drive(binding, lambda: binding.attach("s1"))
+        # The token's own header wins, so a stray one cannot displace it.
+        want = {"Cookie": "portal=abc", "X-Biopb-Token": "tok-123"}
+        assert env.mcp == (f"{self.URL}/session/s1/mcp", want)
+        assert all(h == want for h in env.headers)
+
+    def test_headers_come_from_the_flag_and_the_environment(self, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(_shim, "serve", lambda **kw: seen.update(kw))
+        monkeypatch.setenv("BIOPB_REMOTE_HEADERS", "Cookie: a=b\nX-Portal: 1")
+        _shim.main(
+            [
+                "--remote",
+                self.URL,
+                "--token",
+                "tok-0123456789abcdef",
+                "--header",
+                "Authorization: Basic Zm9v",
+            ]
+        )
+        assert seen["headers"] == {
+            "Cookie": "a=b",
+            "X-Portal": "1",
+            "Authorization": "Basic Zm9v",
+        }
+        with pytest.raises(SystemExit):
+            _shim.main(["--remote", self.URL, "--token", "t", "--header", "nonsense"])
+
+    def test_the_local_credential_file_is_never_sent(self, monkeypatch):
+        import biopb
+
+        monkeypatch.delenv("BIOPB_TENSOR_TOKEN", raising=False)
+        monkeypatch.setattr(
+            "biopb._credentials.read_credential", lambda: "the-local-secret"
+        )
+        assert biopb.resolve_data_plane_token(None, allow_credential_file=False) is None
+
+    def test_remote_without_a_token_is_a_usage_error(self, monkeypatch):
+        monkeypatch.delenv("BIOPB_TENSOR_TOKEN", raising=False)
+        monkeypatch.setattr(
+            "biopb._credentials.read_credential", lambda: "the-local-secret"
+        )
+        with pytest.raises(SystemExit):
+            _shim.main(["--remote", self.URL])
+
+
 class TestControlLaunchedSession:
     """The real control launches the session an agent attaches to. It outlives
     the agent, the next agent can attach to it, and the user stops it from the
@@ -1008,6 +1160,84 @@ class TestControlLaunchedSession:
             for shim in (first, second):
                 if shim is not None and shim.poll() is None:
                     shim.kill()
+            if pid is not None:
+                _force_kill(pid)
+            _stop_control(env)
+
+
+class TestRemoteAttach:
+    """A real token-enforcing control (loopback-bound, as behind an SSH tunnel)
+    and a real session, reached by a shim that knows only its URL and token."""
+
+    TOKEN = "remote-attach-test-token-0123456789"
+
+    def test_an_agent_attaches_and_starts_a_session_through_the_control(self, tmp_path):
+        pytest.importorskip("biopb_control")
+        pytest.importorskip("biopb_mcp")
+        env = _home_env(tmp_path)
+        env.pop("BIOPB_TENSOR_URL", None)
+        control_port = _free_port()
+        env["BIOPB_CONTROL_PORT"] = str(control_port)
+        reg_dir = tmp_path / ".local/state/biopb/sessions"
+        url = f"http://127.0.0.1:{control_port}"
+        biopb = os.path.join(
+            os.path.dirname(sys.executable),
+            "biopb.exe" if os.name == "nt" else "biopb",
+        )
+
+        def start_shim(token):
+            return subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "biopb._shim",
+                    "--remote",
+                    url,
+                    "--token",
+                    token,
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                env=env,
+            )
+
+        shim = wrong = None
+        pid = None
+        try:
+            subprocess.run(
+                [biopb, "control", "start", "--token", self.TOKEN, "--no-data-plane"],
+                env=env,
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=120,
+            )
+
+            wrong = start_shim("not-the-token-0123456789")
+            _rpc_init(wrong)
+            result, text = _rpc_call(wrong, 2, "attach")
+            assert "refused the token" in text, text
+            wrong.stdin.close()
+            wrong.wait(timeout=30)
+
+            shim = start_shim(self.TOKEN)
+            _rpc_init(shim)
+            result, text = _rpc_call(shim, 2, "attach", {"session": "new"})
+            assert result.get("isError") is not True, text
+            rec = json.loads(next(iter(reg_dir.glob("*.json"))).read_text())
+            pid = rec["pid"]
+            status, _ = _rpc_call(shim, 3, "server_status")
+            assert status.get("isError") is not True, status
+
+            shim.stdin.close()
+            assert shim.wait(timeout=40) == 0
+            time.sleep(1.0)
+            assert _pid_alive(pid)  # the session is the host's, not the agent's
+        finally:
+            for proc in (shim, wrong):
+                if proc is not None and proc.poll() is None:
+                    proc.kill()
             if pid is not None:
                 _force_kill(pid)
             _stop_control(env)

@@ -30,6 +30,10 @@ the fd-1 corruption class is structurally impossible here. The session reaches t
 shim only over HTTP: ``/api/lease``, ``/api/status``, ``/api/sessions`` and the
 session registry are the contract (docs/session-attach.md).
 
+With ``--remote`` the sessions are another machine's, reached through its control
+under the token (``_Remote``): the same lease, status and ``/mcp``, at
+``<control>/session/<id>/...``. Everything below holds there too.
+
 The shim owns no session. Every session is a detached process the control
 launched, or a person did (``biopb mcp view``, the dashboard), and it runs until
 a person stops it from the dashboard; the shim only holds its lease while the
@@ -65,6 +69,7 @@ import urllib.error
 import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import quote, urlencode
 
 import anyio
 from mcp import types
@@ -73,7 +78,7 @@ from mcp.client.streamable_http import streamablehttp_client
 from mcp.server.lowlevel.server import NotificationOptions, Server, request_ctx
 from mcp.server.stdio import stdio_server
 
-from . import _control_launch, _locations, _sessions
+from . import _control, _control_launch, _locations, _sessions
 from .lifecycle import winjob as _winjob
 
 logger = logging.getLogger(__name__)
@@ -256,30 +261,35 @@ class AttachError(RuntimeError):
 
 
 def _session_base(rec):
-    return f"http://{rec.get('host') or '127.0.0.1'}:{rec['port']}"
+    """Where a session's API is: its own loopback port, or (a record from a
+    remote control) the control's proxy of it."""
+    return rec.get("base") or f"http://{rec.get('host') or '127.0.0.1'}:{rec['port']}"
 
 
-def _call_session(base, method, path, body=None, timeout=_CALL_TIMEOUT):
-    """``(status, json)`` from a session's loopback API; OSError if unreachable."""
-    data = headers = None
+def _call_session(
+    base, method, path, body=None, timeout=_CALL_TIMEOUT, headers=None, opener=_OPENER
+):
+    """``(status, json)`` from a session's API; OSError if unreachable."""
+    data = None
+    headers = dict(headers or {})
     if body is not None:
         data = json.dumps(body).encode()
-        headers = {"Content-Type": "application/json"}
-    req = urllib.request.Request(
-        base + path, data=data, headers=headers or {}, method=method
-    )
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(base + path, data=data, headers=headers, method=method)
     try:
-        with _OPENER.open(req, timeout=timeout) as resp:
+        with opener.open(req, timeout=timeout) as resp:
             status, raw = resp.status, resp.read()
     except urllib.error.HTTPError as e:
         status, raw = e.code, e.read()
     return status, json.loads(raw or b"{}")
 
 
-def _probe(rec):
+def _probe(rec, headers=None, opener=_OPENER):
     """A session's ``/api/status``, or None if it does not answer."""
     try:
-        status, data = _call_session(_session_base(rec), "GET", "/api/status")
+        status, data = _call_session(
+            _session_base(rec), "GET", "/api/status", headers=headers, opener=opener
+        )
     except (OSError, ValueError):
         return None
     return data if status == 200 else None
@@ -307,7 +317,10 @@ def session_listing():
     A record whose process is up but not answering reads ``unreachable`` rather
     than ``free``.
     """
-    states = _session_states()
+    return _format_listing(_session_states())
+
+
+def _format_listing(states):
     if not states:
         return "No live sessions. `attach(session='new')` starts one."
     lines = []
@@ -337,6 +350,195 @@ def _newest_free_session():
     return None
 
 
+class _Local:
+    """Sessions on this machine: the registry, each one's own loopback port, and
+    a control on this machine to launch more."""
+
+    headers = {}
+    remote = False
+
+    def call(self, base, method, path, body=None):
+        return _call_session(base, method, path, body)
+
+    def states(self):
+        return _session_states()
+
+    def listing(self):
+        return session_listing()
+
+    def newest_free(self):
+        return _newest_free_session()
+
+    def find(self, selector):
+        """``(base, mcp_url)`` of the live session *selector*, or None."""
+        rec = _sessions.resolve(selector)
+        if rec is None or not rec.get("port"):
+            return None
+        base = _session_base(rec)
+        return base, rec.get("mcp_url") or f"{base}/mcp"
+
+    def launch(self):
+        """``(session_id, base, mcp_url)`` of a session the control launched for
+        this client. ``AttachError`` when it cannot be reached or will not launch
+        one.
+
+        There is deliberately no session of the shim's own to fall back to: a
+        session reaches the data and algorithm planes through the control, so one
+        started without it would attach "successfully" and fail on first use,
+        hiding the cause.
+        """
+        log = getattr(_locations, "control_log", None)
+        where = f" (its log: {log()})" if log is not None else ""
+        try:
+            if not _control_launch.ensure_control(CONTROL_WAIT):
+                raise AttachError(
+                    f"no control answered within {CONTROL_WAIT:.0f}s{where}. "
+                    "Retry, or start it with `biopb control start`."
+                )
+            answer = _control_launch.launch_session(
+                display={k: os.environ[k] for k in _DISPLAY_ENV if k in os.environ},
+                timeout=CONTROL_LAUNCH_TIMEOUT,
+            )
+        except (OSError, ValueError) as e:
+            raise AttachError(
+                f"the control would not launch a session: {e}{where}"
+            ) from e
+        state = answer.get("state")
+        if state == "failed":
+            raise AttachError(
+                f"the session did not start: {answer.get('error')}\n"
+                f"{answer.get('log') or ''}".strip()
+            )
+        rec = _sessions.resolve(answer.get("session_id") or "")
+        if state != "started" or rec is None or not rec.get("port"):
+            raise AttachError(
+                "the session is still starting; `attach` with no arguments "
+                "lists it once it is up"
+            )
+        base = _session_base(rec)
+        return rec["session_id"], base, rec.get("mcp_url") or f"{base}/mcp"
+
+
+class _Remote:
+    """Sessions on another machine, through its control: the one public
+    listener, under the token. Lease, status and ``/mcp`` of session ``<id>`` are
+    ``<control>/session/<id>/...``; the sessions themselves stay on the host's
+    loopback."""
+
+    remote = True
+
+    def __init__(self, url, token, headers=None):
+        self.url = url.rstrip("/")
+        # *headers* are for whatever stands in front of the control (a portal's
+        # session cookie); the token travels in its own header.
+        self.headers = {**(headers or {}), "X-Biopb-Token": token}
+        # Unlike a session's loopback port, this address is reached the way any
+        # other is: through the environment's proxy settings.
+        self._opener = urllib.request.build_opener()
+
+    def call(self, base, method, path, body=None, timeout=_CALL_TIMEOUT):
+        return _call_session(
+            base,
+            method,
+            path,
+            body,
+            timeout,
+            headers=self.headers,
+            opener=self._opener,
+        )
+
+    def _base(self, session_id):
+        return f"{self.url}/session/{quote(session_id, safe='')}"
+
+    def _ask(self, method, path, timeout=10.0):
+        """The control's JSON answer; ``AttachError`` if it cannot be had."""
+        try:
+            status, data = self.call(self.url, method, path, timeout=timeout)
+        except (OSError, ValueError) as e:
+            raise AttachError(f"the control at {self.url} is not reachable: {e}") from e
+        if status in (401, 403):
+            raise AttachError(
+                f"the control at {self.url} refused the token "
+                "(--token or $BIOPB_TENSOR_TOKEN)"
+            )
+        if status != 200:
+            raise AttachError(f"the control at {self.url} answered {status}: {data}")
+        return data
+
+    def check(self):
+        """Refuse early, with the reason, when this control serves no ``/mcp``."""
+        if self._ask("GET", "/health").get("mcp_proxied") is not True:
+            raise AttachError(
+                f"the control at {self.url} does not serve /mcp for remote "
+                "agents: it must run on a public bind (`biopb control start "
+                "--remote`)"
+            )
+
+    def states(self):
+        recs = [
+            {"session_id": row["session_id"], "base": self._base(row["session_id"])}
+            for row in self._ask("GET", "/api/sessions").get("sessions", [])
+            if row.get("session_id")
+        ]
+        if not recs:
+            return []
+        with ThreadPoolExecutor(max_workers=min(8, len(recs))) as pool:
+            statuses = pool.map(
+                lambda rec: _probe(rec, self.headers, self._opener), recs
+            )
+            return list(zip(recs, statuses, strict=True))
+
+    def listing(self):
+        try:
+            return _format_listing(self.states())
+        except AttachError as e:
+            return f"Could not list the sessions: {e}"
+
+    def newest_free(self):
+        for rec, status in self.states():
+            if status is not None and not _holder(status):
+                return rec
+        return None
+
+    def find(self, selector):
+        base = self._base(selector)
+        return base, f"{base}/mcp"
+
+    def launch(self):
+        """A session on the host, started without a display: the viewer, and the
+        window it would open, belong to the host and not to this client."""
+        query = urlencode(
+            {
+                "start_kernel": 0,
+                "display": "{}",
+                "client_timeout": CONTROL_LAUNCH_TIMEOUT,
+            }
+        )
+        try:
+            status, answer = self.call(
+                self.url,
+                "POST",
+                f"/api/sessions/new?{query}",
+                timeout=CONTROL_LAUNCH_TIMEOUT,
+            )
+        except (OSError, ValueError) as e:
+            raise AttachError(f"the control would not launch a session: {e}") from e
+        if status in (401, 403):
+            raise AttachError(f"the control at {self.url} refused the token")
+        state = answer.get("state")
+        if status != 200 or state == "failed":
+            raise AttachError(
+                f"the session did not start: {answer.get('error') or answer}"
+            )
+        if state != "started" or not answer.get("session_id"):
+            raise AttachError(
+                "the session is still starting; `attach` with no arguments "
+                "lists it once it is up"
+            )
+        base = self._base(answer["session_id"])
+        return answer["session_id"], base, f"{base}/mcp"
+
+
 class _Binding:
     """The session this shim is attached to, and the connection to it.
 
@@ -354,7 +556,8 @@ class _Binding:
     launcher that already knows which one (``--session``).
     """
 
-    def __init__(self, preselect=None):
+    def __init__(self, preselect=None, plane=None):
+        self.plane = plane or _Local()
         self.preselect = preselect
         self.session_id = None
         self.task_group = None
@@ -374,7 +577,7 @@ class _Binding:
         if base is None:
             return
         try:
-            _call_session(base, "POST", "/api/lease/release", {"token": self.token})
+            self.plane.call(base, "POST", "/api/lease/release", {"token": self.token})
         except (OSError, ValueError):
             pass  # a session that is gone has no lease to release
 
@@ -395,11 +598,11 @@ class _Binding:
         why = f"{self.lost}. " if self.lost else ""
         raise NotAttached(
             f"{why}No session is attached. Call `attach` first.\n"
-            + await anyio.to_thread.run_sync(session_listing)
+            + await anyio.to_thread.run_sync(self.plane.listing)
         )
 
     async def listing(self):
-        return await anyio.to_thread.run_sync(session_listing)
+        return await anyio.to_thread.run_sync(self.plane.listing)
 
     async def attach(self, selector, force=False):
         """Attach to *selector* (a session id, or ``new``); the text to hand
@@ -463,7 +666,7 @@ class _Binding:
     def _take_lease(self, base, label, force=False):
         """Take the lease on the session at *base*, named *label*."""
         try:
-            status, data = _call_session(
+            status, data = self.plane.call(
                 base,
                 "POST",
                 "/api/lease/acquire",
@@ -471,6 +674,8 @@ class _Binding:
             )
         except (OSError, ValueError) as e:
             raise AttachError(f"session {label} is not reachable: {e}") from e
+        if status == 404:
+            raise AttachError(f"no live session {label!r}.\n{self.plane.listing()}")
         if status == 409:
             raise AttachError(
                 f"session {label} is held by its {data.get('holder')} "
@@ -483,47 +688,12 @@ class _Binding:
 
     def _launch_via_control(self):
         """A session the control launched for this client, leased; its ``/mcp``
-        url. ``AttachError`` when the control cannot be reached or will not
-        launch one.
-
-        There is deliberately no session of the shim's own to fall back to: a
-        session reaches the data and algorithm planes through the control, so one
-        started without it would attach "successfully" and fail on first use,
-        hiding the cause. The session is the user's from here: it is detached
-        and runs until they stop it, so this shim only ever releases it.
-        """
-        log = getattr(_locations, "control_log", None)
-        where = f" (its log: {log()})" if log is not None else ""
-        try:
-            if not _control_launch.ensure_control(CONTROL_WAIT):
-                raise AttachError(
-                    f"no control answered within {CONTROL_WAIT:.0f}s{where}. "
-                    "Retry, or start it with `biopb control start`."
-                )
-            answer = _control_launch.launch_session(
-                display={k: os.environ[k] for k in _DISPLAY_ENV if k in os.environ},
-                timeout=CONTROL_LAUNCH_TIMEOUT,
-            )
-        except (OSError, ValueError) as e:
-            raise AttachError(
-                f"the control would not launch a session: {e}{where}"
-            ) from e
-        state = answer.get("state")
-        if state == "failed":
-            raise AttachError(
-                f"the session did not start: {answer.get('error')}\n"
-                f"{answer.get('log') or ''}".strip()
-            )
-        rec = _sessions.resolve(answer.get("session_id") or "")
-        if state != "started" or rec is None or not rec.get("port"):
-            raise AttachError(
-                "the session is still starting; `attach` with no arguments "
-                "lists it once it is up"
-            )
-        base = _session_base(rec)
-        self._take_lease(base, rec["session_id"])
+        url. The session is the user's from here: it is detached and runs until
+        they stop it, so this shim only ever releases it."""
+        session_id, base, url = self.plane.launch()
+        self._take_lease(base, session_id)
         self.managed = True
-        return rec.get("mcp_url") or f"{base}/mcp"
+        return url
 
     def _acquire(self, selector, force):
         """Take the lease on *selector*; return its ``/mcp`` url.
@@ -531,17 +701,19 @@ class _Binding:
         *selector* is a session id, ``new``, or ``auto``: the newest free
         session, else a new one.
         """
+        if self.plane.remote:
+            self.plane.check()
         if selector == "auto":
-            free = _newest_free_session()
+            free = self.plane.newest_free()
             selector = free["session_id"] if free else "new"
         if selector == "new":
             return self._launch_via_control()
-        rec = _sessions.resolve(selector)
-        if rec is None or not rec.get("port"):
-            raise AttachError(f"no live session {selector!r}.\n{session_listing()}")
-        base = _session_base(rec)
+        found = self.plane.find(selector)
+        if found is None:
+            raise AttachError(f"no live session {selector!r}.\n{self.plane.listing()}")
+        base, url = found
         self._take_lease(base, selector, force)
-        return rec.get("mcp_url") or f"{base}/mcp"
+        return url
 
     async def _serve(self, selector, force, *, task_status):
         url = await anyio.to_thread.run_sync(self._acquire, selector, force)
@@ -550,7 +722,13 @@ class _Binding:
         try:
             with anyio.CancelScope() as self._scope:
                 async with (
-                    streamablehttp_client(url=url) as (read, write, _),
+                    streamablehttp_client(
+                        url=url, headers=self.plane.headers or None
+                    ) as (
+                        read,
+                        write,
+                        _,
+                    ),
                     ClientSession(read, write) as session,
                 ):
                     init = await session.initialize()
@@ -573,15 +751,13 @@ class _Binding:
             await self.announce_change()
 
     async def _heartbeat(self):
-        base, token = self._base, self.token
+        base, token, call = self._base, self.token, self.plane.call
         failures = 0
         while True:
             await anyio.sleep(RENEW_INTERVAL)
             try:
                 status, _ = await anyio.to_thread.run_sync(
-                    lambda: _call_session(
-                        base, "POST", "/api/lease/renew", {"token": token}
-                    )
+                    lambda: call(base, "POST", "/api/lease/renew", {"token": token})
                 )
             except (OSError, ValueError):
                 failures += 1
@@ -804,7 +980,7 @@ async def _serve_stdio(binding):
         tg.cancel_scope.cancel()
 
 
-def serve(session=None):
+def serve(session=None, remote=None, token=None, headers=None):
     """Bridge stdio to a session: attach on request, release on the way out.
 
     The shim starts unbound; the agent's ``attach`` tool picks a session. Or
@@ -812,8 +988,13 @@ def serve(session=None):
     handshake: an id, ``new`` (the control launches one), or ``auto`` (the newest
     free session, else a new one). That is for a client that cannot follow
     ``list_changed``.
+
+    *remote* is the URL of another machine's control (``--remote``): sessions are
+    then that machine's, reached through it under *token* (and any extra
+    *headers*), and "new" starts one there.
     """
-    binding = _Binding(preselect=session or None)
+    plane = _Remote(remote, token, headers) if remote else None
+    binding = _Binding(preselect=session or None, plane=plane)
     _install_release_on_signal(binding.release)
     _install_client_death_watchdog(binding.release)
     try:
@@ -837,10 +1018,51 @@ def main(argv=None):
         "launches one) or 'auto' (the newest free session, else a new one). For a "
         "client that cannot follow tools/list_changed; default: attach on request.",
     )
+    parser.add_argument(
+        "--remote",
+        default=os.environ.get("BIOPB_REMOTE") or None,
+        metavar="URL",
+        help="Attach to the sessions of another machine's control (a `biopb "
+        "control start --remote`), e.g. https://host:8813. Also $BIOPB_REMOTE. "
+        "Needs the control's token: --token or $BIOPB_TENSOR_TOKEN.",
+    )
+    parser.add_argument(
+        "--token",
+        default=None,
+        help="The remote control's token (default: $BIOPB_TENSOR_TOKEN). This "
+        "machine's own credential file is never sent to a remote.",
+    )
+    parser.add_argument(
+        "--header",
+        action="append",
+        default=[],
+        metavar="'Name: value'",
+        help="An extra header for every request to --remote, e.g. the session "
+        "cookie of a portal in front of the control. Repeatable. Also "
+        "$BIOPB_REMOTE_HEADERS, one per line.",
+    )
     opts = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, stream=sys.stderr)
+    token = None
+    headers = {}
+    if opts.remote:
+        lines = [*os.environ.get("BIOPB_REMOTE_HEADERS", "").splitlines(), *opts.header]
+        for line in lines:
+            name, sep, value = line.partition(":")
+            if not line.strip():
+                continue
+            if not sep or not name.strip() or any(c in name for c in " \t"):
+                parser.error(f"--header wants 'Name: value', not {line!r}")
+            headers[name.strip()] = value.strip()
+        token = _control.resolve_data_plane_token(
+            opts.token, allow_credential_file=False
+        )
+        if not token:
+            parser.error(
+                "--remote needs the control's token (--token or $BIOPB_TENSOR_TOKEN)"
+            )
     try:
-        serve(session=opts.session)
+        serve(session=opts.session, remote=opts.remote, token=token, headers=headers)
     except Exception:
         logger.exception("stdio bridge failed")
         return 1
