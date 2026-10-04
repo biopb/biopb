@@ -67,19 +67,6 @@ def test_a_typed_directory_registers_as_one_source(tmp_path):
     assert type(adapter).__name__ == "ZarrAdapter"
 
 
-def test_an_hdf5_file_takes_the_configured_dataset(tmp_path):
-    h5py = pytest.importorskip("h5py")
-    path = tmp_path / "d.h5"
-    with h5py.File(path, "w") as f:
-        f["images"] = np.zeros((16, 16), dtype=np.uint16)
-        f["other"] = np.zeros((4, 4), dtype=np.uint16)
-
-    server = _serve_config(SourceConfig(url=str(path), type="hdf5", dataset="/images"))
-
-    ((_, adapter),) = _registered(server).items()
-    assert tuple(adapter.get_tensor_descriptor().shape) == (16, 16)
-
-
 def test_a_resident_cloud_file_resolves_on_the_first_tick(tmp_path):
     """Cloud-ness comes from residency: a file that is on disk is read now, a
     placeholder would register unresolved."""

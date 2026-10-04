@@ -318,35 +318,6 @@ def generate_synthetic_tiff(
     return str(tiff_path)
 
 
-def generate_synthetic_hdf5(
-    path: str,
-    shape: Tuple[int, int] = (256, 256),
-    chunks: Tuple[int, int] = (128, 128),
-    dtype: str = "uint16",
-) -> str:
-    """Generate synthetic HDF5 dataset for adapter tests.
-
-    Args:
-        path: Directory to create the HDF5
-        shape: Dataset shape
-        chunks: Chunk size
-        dtype: Data type string
-
-    Returns:
-        HDF5 file path
-    """
-    import h5py
-
-    h5_path = Path(path) / "synthetic.h5"
-    np.random.seed(42)
-    data = np.random.randint(0, 1000, size=shape, dtype=np.dtype(dtype))
-
-    with h5py.File(str(h5_path), "w") as f:
-        f.create_dataset("data", data=data, chunks=chunks)
-
-    return str(h5_path)
-
-
 # =============================================================================
 # Measurement utilities
 # =============================================================================

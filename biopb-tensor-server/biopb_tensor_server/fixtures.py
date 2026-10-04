@@ -642,37 +642,6 @@ def create_companion_ome_dataset(
     return str(companion_path), tiff_files, metadata_info
 
 
-def create_hdf5_dataset(
-    tmpdir: str,
-    shape: Tuple[int, ...] = (100, 100),
-    chunks: Tuple[int, ...] = (50, 50),
-    dtype: np.dtype = np.uint8,
-    dataset_name: str = "data",
-) -> Tuple[str, Tuple[int, ...], Tuple[int, ...]]:
-    """Create HDF5 dataset with chunked array.
-
-    Args:
-        tmpdir: Temporary directory to create file in
-        shape: Shape of dataset
-        chunks: Chunk size
-        dtype: Data type
-        dataset_name: Name of dataset inside HDF5 file
-
-    Returns:
-        Tuple of (h5_path, shape, chunks)
-    """
-    import h5py
-
-    h5_path = Path(tmpdir) / "test.h5"
-
-    with h5py.File(str(h5_path), "w") as f:
-        # Create chunked dataset with distinguishable values
-        data = np.arange(np.prod(shape), dtype=dtype).reshape(shape)
-        f.create_dataset(dataset_name, data=data, chunks=chunks)
-
-    return str(h5_path), shape, chunks
-
-
 def create_zarr_array(
     tmpdir: str,
     shape: Tuple[int, ...] = (128, 128),

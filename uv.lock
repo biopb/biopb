@@ -837,9 +837,6 @@ dicom = [
 em = [
     { name = "rosettasciio", extra = ["hdf5"] },
 ]
-hdf5 = [
-    { name = "h5py" },
-]
 medical = [
     { name = "nibabel" },
     { name = "pydicom" },
@@ -898,7 +895,6 @@ requires-dist = [
     { name = "duckdb", specifier = ">=1.0" },
     { name = "fastapi", marker = "extra == 'web'", specifier = ">=0.111.0" },
     { name = "fsspec" },
-    { name = "h5py", marker = "extra == 'hdf5'", specifier = ">=3.0.0" },
     { name = "httpx", marker = "extra == 'test'", specifier = ">=0.25.0" },
     { name = "imagecodecs", marker = "extra == 'qptiff'", specifier = ">=2023.1.23" },
     { name = "jsonschema", marker = "extra == 'test'", specifier = ">=4.18.0" },
@@ -923,7 +919,7 @@ requires-dist = [
     { name = "uvicorn", extras = ["standard"], marker = "extra == 'web'", specifier = ">=0.30.0" },
     { name = "zarr", specifier = ">=2.0.0,<3" },
 ]
-provides-extras = ["web", "tls", "test", "vendor", "aics", "czi", "ndtiff", "hdf5", "ome-zarr", "bioformats", "dicom", "nifti", "medical", "qptiff", "em"]
+provides-extras = ["web", "tls", "test", "vendor", "aics", "czi", "ndtiff", "ome-zarr", "bioformats", "dicom", "nifti", "medical", "qptiff", "em"]
 
 [[package]]
 name = "black"

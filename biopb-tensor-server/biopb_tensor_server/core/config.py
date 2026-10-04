@@ -21,7 +21,7 @@ Example config (explicit):
       "url": "/data/images.zarr",
       "alias": "my-image",
     },
-    { "type": "hdf5", "url": "/data/sample.h5", "dataset": "/images/channel0" }
+    { "type": "ome-tiff", "url": "/data/scan.ome.tif" }
   ]
 }
 ```
@@ -31,13 +31,11 @@ Example config (relaxed auto-discovery):
 ```json
 {
   "sources": [
-    { "url": "/data/" },
-    { "type": "hdf5", "url": "/data/sample.h5", "dataset": "/images" }
+    { "url": "/data/" }
   ]
 }
 ```
-A bare ``url`` with no ``type`` triggers recursive auto-discovery; HDF5 always
-needs an explicit ``type`` + ``dataset`` (it is not auto-detected).
+A bare ``url`` with no ``type`` triggers recursive auto-discovery.
 
 Example config (remote storage):
 ```json
@@ -365,7 +363,6 @@ class SourceConfig:
     type: Optional[
         Literal[
             "zarr",
-            "hdf5",
             "ome-tiff",
             "ome-tiff-multifile",
             "tiff",
@@ -392,10 +389,6 @@ class SourceConfig:
             "help": "Deprecated and ignored: a source's id is derived from its "
             "resolved URL (biopb/biopb#308). Use `alias` for a display name."
         },
-    )
-    dataset: Optional[str] = field(
-        default=None,
-        metadata={"help": "HDF5 dataset path (required for HDF5 sources)."},
     )
     monitor: bool = field(
         default=False,
@@ -893,7 +886,7 @@ class ServerConfig:
             "kept warm before it is closed; the next read reopens it (0 disables "
             "reaping). A ceiling, not an assignment: each format keeps its own "
             "shorter value where reopening it is cheap, so raising this never "
-            "lengthens a pin. Adapters that reopen per read (hdf5, mrc, ...) are "
+            "lengthens a pin. Adapters that reopen per read (mrc, ...) are "
             "unaffected."
         },
     )
@@ -1582,7 +1575,6 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
                 "always maps to one catalog entry (dropping explicit ids closes "
                 "biopb/biopb#308). Use `alias` to give the source a display name."
             )
-        _carry(src_kwargs, "dataset", src_data)
         _carry(src_kwargs, "monitor", src_data)
         _carry(src_kwargs, "cloud", src_data)
         _carry(src_kwargs, "credentials_profile", src_data)

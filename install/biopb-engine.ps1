@@ -1430,7 +1430,6 @@ function Invoke-BiopbInstall {
     # Windows has wheels for pylibczirw and cryptography, so the CZI reader ([czi])
     # and TLS cert generation ([tls]) are always included here -- only Intel macOS
     # lacks them (handled in install.sh).
-    # HDF5 ([hdf5] -> h5py) is opt-in, not bundled by default (see install.sh).
     # No [aics]: bioio is out of the default install (biopb/biopb#799). [vendor]
     # holds the readers the native vendor adapters import directly.
     $tensorExtras = "web,vendor,qptiff,czi,tls,medical,ndtiff"

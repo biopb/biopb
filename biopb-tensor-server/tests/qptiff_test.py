@@ -395,7 +395,7 @@ class TestQptiffHandleReaper:
     Before this, ``close()`` had no caller anywhere in the package and the adapter
     registered with no reaper, so a QPTIFF held its ``TiffFile`` plus one live
     ``aszarr`` store per level read from registration until the process exited --
-    the pin biopb/biopb#71 removed from hdf5/mrc and OME-TIFF bounded with a
+    the pin biopb/biopb#71 removed from mrc and OME-TIFF bounded with a
     reaper, which this adapter got neither of.
     """
 

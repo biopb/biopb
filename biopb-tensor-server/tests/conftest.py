@@ -32,7 +32,6 @@ from biopb_tensor_server.core.config import CacheConfig
 from biopb_tensor_server.fixtures import (
     create_5d_6d_micromanager_dataset,
     create_companion_ome_dataset,
-    create_hdf5_dataset,
     create_multi_series_ome_tiff,
     create_multifile_micromanager_dataset,
     create_multifile_ome_dataset,
@@ -128,12 +127,6 @@ def multi_series_ome_tiff(temp_dir):
 def companion_ome_dataset(temp_dir):
     """Companion OME dataset with .companion.ome file."""
     return create_companion_ome_dataset(temp_dir)
-
-
-@pytest.fixture
-def hdf5_dataset(temp_dir):
-    """HDF5 dataset with chunked array."""
-    return create_hdf5_dataset(temp_dir)
 
 
 @pytest.fixture

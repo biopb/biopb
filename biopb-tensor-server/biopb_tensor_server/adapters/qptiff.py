@@ -103,7 +103,7 @@ def _default_dim_labels(ndim: int) -> List[str]:
 # Until this pool existed the handle was simply never released: ``close()`` has no
 # caller anywhere in the package, so a QPTIFF held its ``TiffFile`` and stores from
 # registration until the process exited or the adapter was garbage collected --
-# the pin biopb/biopb#71 removed from hdf5/mrc, and that OME-TIFF bounded with a
+# the pin biopb/biopb#71 removed from mrc, and that OME-TIFF bounded with a
 # reaper, which this adapter got neither of.
 _handle_reaper = IdleHandleReaper(
     DEFAULT_HANDLE_REAPER_TTL, "qptiff-handle-reaper", max_handles=16

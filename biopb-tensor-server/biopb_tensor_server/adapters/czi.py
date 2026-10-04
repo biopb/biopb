@@ -26,7 +26,7 @@ single tensor: pixel types that differ across channels.
 shared idle reaper, the same opt-in :mod:`_handle_reaper` describes for
 OME-TIFF.  Opening a CZI parses its subblock directory, so the open costs about
 0.22 us per subblock on top of a 0.03 ms floor -- never negligible against a
-0.1-2 ms ROI read.  Reopening per read (the hdf5/mrc default) measured 1.7x
+0.1-2 ms ROI read.  Reopening per read (the mrc default) measured 1.7x
 slower at 40 subblocks and 3.6x at 1 000, so this format does not meet that
 default's "the reopen is unmeasurable" precondition.
 """

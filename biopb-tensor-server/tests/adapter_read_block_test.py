@@ -21,7 +21,6 @@ QUANTIZED = {
     "LabelSetAdapter": "inherits ZarrAdapter (via OmeZarrAdapter)",
     "ZarrMember": "inherits ZarrAdapter (via OmeZarrAdapter)",
     "_QptiffLevelAdapter": "inherits ZarrAdapter (the level's tile grid)",
-    "Hdf5Adapter": "the dataset's chunk, or None where contiguous",
     "OmeTiffAdapter": "one page: aszarr(chunkmode='page') decodes it whole",
     "_TifffileAdapterBase": "inherits OmeTiffAdapter",
     "TiffAdapter": "inherits OmeTiffAdapter",

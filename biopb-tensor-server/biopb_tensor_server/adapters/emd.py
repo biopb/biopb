@@ -80,9 +80,7 @@ class EmdAdapter(TensorAdapter):
         from rsciio.emd import file_reader
 
         url = str(source.url)
-        # source.dataset (the existing HDF5 "dataset path" field) optionally pins
-        # one signal; None means all signals.
-        signals = file_reader(url, lazy=True, dataset_path=source.dataset)
+        signals = file_reader(url, lazy=True)
         if not signals:
             raise ValueError(f"EMD source {url!r} contained no readable signals")
 

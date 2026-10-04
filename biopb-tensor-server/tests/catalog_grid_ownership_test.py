@@ -22,7 +22,6 @@ from biopb.tensor.descriptor_pb2 import (
     TensorReadOption,
 )
 from biopb_tensor_server.adapters.bioio import ZeissAdapter
-from biopb_tensor_server.adapters.hdf5 import Hdf5Adapter
 from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
 from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
 from biopb_tensor_server.adapters.zarr import ZarrAdapter
@@ -38,7 +37,7 @@ from google.protobuf.field_mask_pb2 import FieldMask
 # --- the invariant, over the real adapters ----------------------------------
 
 
-def _sources(temp_dir, simple_zarr_array, hdf5_dataset, multires_ome_zarr):
+def _sources(temp_dir, simple_zarr_array, multires_ome_zarr):
     """One live adapter per family that has a distinct listing path."""
     from biopb_tensor_server.fixtures import create_multi_series_ome_tiff
 
@@ -46,11 +45,6 @@ def _sources(temp_dir, simple_zarr_array, hdf5_dataset, multires_ome_zarr):
     return {
         "zarr": ZarrAdapter.create_from_config(
             SourceConfig(url=simple_zarr_array[0], type="zarr", source_id="z")
-        ),
-        "hdf5": Hdf5Adapter.create_from_config(
-            SourceConfig(
-                url=hdf5_dataset[0], type="hdf5", source_id="h", dataset="data"
-            )
         ),
         "ome-zarr": OmeZarrAdapter.create_from_config(
             SourceConfig(url=multires_ome_zarr[0], type="ome-zarr", source_id="oz")
@@ -60,15 +54,15 @@ def _sources(temp_dir, simple_zarr_array, hdf5_dataset, multires_ome_zarr):
 
 
 @pytest.fixture
-def live_sources(temp_dir, simple_zarr_array, hdf5_dataset, multires_ome_zarr):
-    return _sources(temp_dir, simple_zarr_array, hdf5_dataset, multires_ome_zarr)
+def live_sources(temp_dir, simple_zarr_array, multires_ome_zarr):
+    return _sources(temp_dir, simple_zarr_array, multires_ome_zarr)
 
 
-@pytest.mark.parametrize("family", ["zarr", "hdf5", "ome-zarr", "ome-tiff"])
+@pytest.mark.parametrize("family", ["zarr", "ome-zarr", "ome-tiff"])
 def test_listing_is_structural_and_binding_answers_the_grid(live_sources, family):
     """Both halves at once, on a real adapter of each listing shape.
 
-    Single-tensor (zarr, hdf5), multi-tensor built from one shared expression
+    Single-tensor (zarr), multi-tensor built from one shared expression
     (ome-zarr), and multi-tensor handing the scene the object it listed
     (ome-tiff) -- the three ways a listing is produced in this registry.
     """

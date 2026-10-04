@@ -307,19 +307,10 @@ def _claim_to_source_config(
         str(claim.primary_path), claim.source_type
     )
 
-    # Handle HDF5 special case - needs dataset path
-    dataset = None
-    if claim.source_type == "hdf5" and claim.extra_config.get("needs_dataset"):
-        # HDF5 claims have needs_dataset flag in extra_config. This will fail at
-        # adapter creation unless dataset is provided; for backward compatibility,
-        # pass through any original dataset.
-        dataset = original_source.dataset
-
     return SourceConfig(
         type=claim.source_type,
         url=str(claim.primary_path),
         source_id=source_id,
-        dataset=dataset,
         credentials_profile=original_source.credentials_profile,  # preserve credentials_profile
         cloud=original_source.cloud,  # propagate cloud gating to expanded sources
     )
@@ -354,7 +345,6 @@ def resolve_all_sources(
         registry = get_default_registry()
 
     all_sources = []
-    hdf5_warnings = []
 
     for source in sources:
         try:
@@ -395,9 +385,6 @@ def resolve_all_sources(
         # is correctly never applied -- see partition_sources's warning.
         reroot = bool(source.alias) and not source.is_remote
         for src in discovered:
-            # Track HDF5 sources that need dataset config
-            if src.type == "hdf5" and src.dataset is None:
-                hdf5_warnings.append(src.url)
             if reroot:
                 src = replace(
                     src,
@@ -414,14 +401,6 @@ def resolve_all_sources(
     # a single bad source must not abort the whole catalog. Non-proxy collisions
     # keep the historical last-wins behavior.
     all_sources = _resolve_tensor_server_id_collisions(all_sources)
-
-    # Print warnings for HDF5 files that need explicit dataset
-    if hdf5_warnings:
-        print("Warning: HDF5 files require explicit 'dataset' path in config:")
-        for h5_url in hdf5_warnings[:5]:
-            print(f"  - {h5_url}")
-        if len(hdf5_warnings) > 5:
-            print(f"  ... and {len(hdf5_warnings) - 5} more")
 
     return all_sources
 

@@ -258,7 +258,6 @@ class UnresolvedSourceAdapter(SourceAdapter):
         from biopb_tensor_server.core.discovery import ClaimContext, DiscoveryState
 
         resolved_type = self._source_type
-        dataset = self._config.dataset
 
         try:
             ctx = ClaimContext(Path(self._source_url), cloud_root=self._cloud_root)
@@ -279,8 +278,6 @@ class UnresolvedSourceAdapter(SourceAdapter):
         if claims:
             claim = claims[0]
             resolved_type = claim.source_type
-            if claim.extra_config.get("dataset"):
-                dataset = claim.extra_config["dataset"]
 
         adapter_cls = self._registry.get_adapter_for_type(resolved_type)
         if adapter_cls is None:
@@ -293,7 +290,6 @@ class UnresolvedSourceAdapter(SourceAdapter):
             url=self._source_url,
             type=resolved_type,
             source_id=self.source_id,
-            dataset=dataset,
             credentials_profile=self._config.credentials_profile,
             alias=self._config.alias,
         )

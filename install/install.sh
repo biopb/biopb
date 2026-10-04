@@ -1390,10 +1390,6 @@ install_biopb() {
     # ===== 3. Install biopb packages =====
     _step "[3/7] Installing biopb packages..."
 
-    # The HDF5 reader ([hdf5] -> h5py) is NOT bundled by default: .h5 is a niche
-    # source format here, and h5py is cleanly gated behind its own opt-in extra
-    # (nothing else in this set pulls it), so a user who needs it installs
-    # biopb-tensor-server[hdf5]. Kept out of the default to slim the install.
     # [aics] (bioio + its plugins) is NOT in the default set: the native
     # adapters own every local vendor format, so what bioio would still add is
     # the Java bridge (its own [bioformats] opt-in) and remote vendor sources,

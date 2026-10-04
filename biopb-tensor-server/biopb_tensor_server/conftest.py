@@ -8,7 +8,6 @@ import tempfile
 import pytest
 
 from biopb_tensor_server.fixtures import (
-    create_hdf5_dataset,
     create_multifile_micromanager_dataset,
     create_multifile_ome_dataset,
     create_multiresolution_ome_zarr,
@@ -62,12 +61,6 @@ def multires_ome_zarr(temp_dir):
 def tiled_ome_tiff(temp_dir):
     """Tiled OME-TIFF file."""
     return create_tiled_ome_tiff(temp_dir)
-
-
-@pytest.fixture
-def hdf5_dataset(temp_dir):
-    """HDF5 dataset with chunked array."""
-    return create_hdf5_dataset(temp_dir)
 
 
 @pytest.fixture

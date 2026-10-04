@@ -556,7 +556,6 @@ class SourceManager:
             source_type=source.type or "",
             catalog_url_for=self._display_url_for,
             cloud=root.cloud,
-            dataset=source.dataset,
         ):
             if event[0] == "result":
                 for path, reason in event[1].failed:
@@ -969,8 +968,6 @@ class SourceManager:
         # claim->SourceConfig drops most configs, so we carry some through to call
         # create_from_config.
         extra_config = {}
-        if source.dataset:
-            extra_config["dataset"] = source.dataset
         if source.credentials_profile:
             extra_config["credentials_profile"] = source.credentials_profile
         if source.alias:  # display-only
@@ -1150,7 +1147,6 @@ class SourceManager:
         should_cancel: Optional[Callable[[], bool]] = None,
         catalog_url_for: Callable[[SourceClaim], Optional[str]],
         cloud: bool = False,
-        dataset: Optional[str] = None,
         new_root: Optional[Root] = None,
     ):
         """Claim everything at or under ``url`` and bring the catalog in line.
@@ -1162,8 +1158,7 @@ class SourceManager:
         readable local path. Yields the events :meth:`add_local_source` documents.
 
         ``catalog_url_for`` gives a NEW claim its display ``source_url`` override,
-        or None. ``cloud`` scans ``url`` as a cloud root; ``dataset`` fills in an
-        HDF5 claim that needs one. ``new_root`` is the root a drop has just added
+        or None. ``cloud`` scans ``url`` as a cloud root. ``new_root`` is the root a drop has just added
         for itself: it is refused whole, before anything is removed or committed,
         when :meth:`Roots.check_overlap` finds it shares sources with another root.
         """
@@ -1205,12 +1200,6 @@ class SourceManager:
         for claim in claims:
             if source_type:
                 claim.source_type = source_type
-            if (
-                dataset
-                and claim.source_type == "hdf5"
-                and claim.extra_config.get("needs_dataset")
-            ):
-                claim.extra_config["dataset"] = dataset
             if not claim.source_id:
                 claim.source_id = generate_source_id(
                     str(claim.primary_path), claim.source_type
