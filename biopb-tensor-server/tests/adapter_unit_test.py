@@ -2249,6 +2249,50 @@ class TestGetData:
             assert data.shape == (32, 48)
             np.testing.assert_array_equal(data, expected)
 
+    def test_micromanager_v1_framekey_metadata(self):
+        """Pre-1.4 Micro-Manager datasets name their files with
+        ``FrameKey-<frame>-<channel>-<slice>`` entries and no ``Coords-`` keys;
+        the frames still resolve to their files, in time order."""
+        import json
+
+        import tifffile
+        from biopb_tensor_server.adapters.tiff import MicroManagerLegacyAdapter
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            meta = {
+                "Summary": {
+                    "Channels": 1,
+                    "Frames": 3,
+                    "Slices": 1,
+                    "ChNames": ["Eos"],
+                    "Width": 8,
+                    "Height": 6,
+                }
+            }
+            for t in range(3):
+                fname = f"img_{t:09d}_Eos_000.tif"
+                tifffile.imwrite(
+                    os.path.join(tmpdir, fname),
+                    np.full((6, 8), 10 * t, dtype=np.uint16),
+                    photometric="minisblack",
+                )
+                meta[f"FrameKey-{t}-0-0"] = {
+                    "FileName": fname,
+                    "Channel": "Eos",
+                    "Frame": t,
+                    "Slice": 0,
+                }
+            with open(os.path.join(tmpdir, "metadata.txt"), "w") as f:
+                json.dump(meta, f)
+
+            adapter = MicroManagerLegacyAdapter(tmpdir, "mm_v1")
+
+            desc = adapter.get_tensor_descriptor()
+            assert list(desc.dim_labels) == ["t", "y", "x"]
+            assert list(desc.shape) == [3, 6, 8]
+            data = adapter.get_data(ChunkBounds(start=[1, 0, 0], stop=[3, 6, 8]))
+            assert data[:, 0, 0].tolist() == [10, 20]
+
 
 class TestOmeZarrStorePathResolution:
     """One store->path resolution, at construction (biopb/biopb#530).
