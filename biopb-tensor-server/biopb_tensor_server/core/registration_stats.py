@@ -42,7 +42,10 @@ class RegistrationStats:
     """Per-source-type samples of registration steps and row sizes, plus the time
     each adapter's ``claim`` spent in the walk."""
 
-    def __init__(self) -> None:
+    def __init__(self, enabled: bool = False) -> None:
+        # Off, every method returns at once and nothing is collected: the numbers
+        # are for measuring a site (a benchmark), not for a deployment to carry.
+        self.enabled = enabled
         self._lock = threading.Lock()
         # 8 bytes a sample, not a boxed float: a site of 100k sources keeps nine
         # per source for the life of the process.
@@ -55,6 +58,8 @@ class RegistrationStats:
         self._reported = 0
 
     def record_claim(self, adapter: str, seconds: float, claimed: bool) -> None:
+        if not self.enabled:
+            return
         entry = self._claims[adapter]
         entry[0] += 1
         entry[1] += seconds
@@ -69,6 +74,8 @@ class RegistrationStats:
         members: int,
         cost: SyncCost | None,
     ) -> None:
+        if not self.enabled:
+            return
         values = {"create_s": create_s, "normalize_s": normalize_s, "members": members}
         if cost is not None:
             values.update(cost._asdict())
@@ -115,7 +122,9 @@ class RegistrationStats:
 
     def log_summary(self) -> None:
         """Log the summary once per new registration (a no-op when nothing was
-        registered since the last call)."""
+        registered since the last call, or when stats are off)."""
+        if not self.enabled:
+            return
         with self._lock:
             total = sum(len(s.get("create_s", ())) for s in self._samples.values())
             if total == self._reported:

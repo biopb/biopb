@@ -34,7 +34,7 @@ def _make_zarr(parent, name, shape=(2, 8, 8)):
     return path
 
 
-def _manager(root, workers=0):
+def _manager(root, workers=0, stats=False):
     server = catalog_server("localhost:0")
     manager = make_manager(
         server=server,
@@ -44,6 +44,7 @@ def _manager(root, workers=0):
         monitored_dirs={root},
         stability_window=0,
         registration_workers=workers,
+        registration_stats=stats,
     )
     return manager, server
 
@@ -640,7 +641,7 @@ class TestOverFlight:
 class TestStats:
     def test_a_registration_is_recorded_by_type_with_its_sizes(self, tmp_path):
         _make_zarr(tmp_path, "a.zarr")
-        manager, server = _manager(tmp_path)
+        manager, server = _manager(tmp_path, stats=True)
         _first_scan(manager)
         server.sources.get_registered(_only_ids(server)[0])
 
@@ -654,7 +655,7 @@ class TestStats:
 
     def test_the_walk_times_each_adapters_claims(self, tmp_path):
         _make_zarr(tmp_path, "a.zarr")
-        manager, _ = _manager(tmp_path)
+        manager, _ = _manager(tmp_path, stats=True)
         _first_scan(manager)
         claim_lines = [
             line
@@ -667,12 +668,12 @@ class TestStats:
         from biopb_tensor_server.core.registration_stats import SyncCost
 
         _make_zarr(tmp_path, "a.zarr")
-        manager, server = _manager(tmp_path)
+        manager, server = _manager(tmp_path, stats=True)
         _first_scan(manager)
         (sid,) = _only_ids(server)
         adapter = server.sources.get_registered(sid)
 
-        cost = server.metadata_db.sync_source_added(sid, adapter)
+        cost = server.metadata_db.sync_source_added(sid, adapter, measure=True)
 
         assert isinstance(cost, SyncCost)
         assert cost.tensors_bytes > 0 and cost.descriptor_bytes > 0
@@ -685,7 +686,7 @@ class TestStats:
 
         for name in ("a.zarr", "b.zarr"):
             _make_zarr(tmp_path, name)
-        manager, server = _manager(tmp_path)
+        manager, server = _manager(tmp_path, stats=True)
         _first_scan(manager)
         with caplog.at_level(logging.INFO):
             for sid in _only_ids(server):
@@ -693,6 +694,41 @@ class TestStats:
         logged = [r for r in caplog.records if "Registration cost" in r.getMessage()]
         assert len(logged) == 1
         assert "(2 sources)" in logged[0].getMessage()
+
+
+class TestStatsAreOptIn:
+    def test_off_by_default_in_the_config(self):
+        from biopb_tensor_server.core.config import ServerConfig
+
+        assert ServerConfig().registration_stats is False
+
+    def test_off_nothing_is_collected_or_measured(self, tmp_path, caplog):
+        import logging
+
+        for name in ("a.zarr", "b.zarr"):
+            _make_zarr(tmp_path, name)
+        manager, server = _manager(tmp_path)
+        _first_scan(manager)
+        with caplog.at_level(logging.INFO):
+            for sid in _only_ids(server):
+                server.sources.get_registered(sid)
+
+        stats = manager._reconciler.stats
+        assert stats.enabled is False
+        assert stats.summary_lines() == []
+        assert not [r for r in caplog.records if "Registration cost" in r.getMessage()]
+        # Neither the claim timer nor the row sizing is paid for.
+        assert manager._registry.claim_timer is None
+
+    def test_sync_source_added_sizes_a_row_only_when_asked(self, tmp_path):
+        _make_zarr(tmp_path, "a.zarr")
+        manager, server = _manager(tmp_path)
+        _first_scan(manager)
+        (sid,) = _only_ids(server)
+        adapter = server.sources.get_registered(sid)
+
+        assert server.metadata_db.sync_source_added(sid, adapter) is None
+        assert server.metadata_db.sync_source_added(sid, adapter, measure=True)
 
 
 def _wait_until(predicate, timeout=10.0):

@@ -941,6 +941,17 @@ class ServerConfig:
             "first scan is."
         },
     )
+    registration_stats: bool = field(
+        default=False,
+        metadata={
+            "help": "Log, once registration has finished, how long each step of "
+            "registering a source took and how large its catalog row is, per "
+            "source type, and how long each adapter's claim took during the "
+            "scan. For measuring a site or a change, not for a deployment: it "
+            "sizes every row (a second serialization of its tensors) and keeps "
+            "a few numbers per source until the server stops."
+        },
+    )
     claim_generic_images: bool = field(
         default=False,
         metadata={
@@ -1368,6 +1379,7 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
     _carry(server_kwargs, "scratch_ttl", server_data, cast=float)
     _carry(server_kwargs, "stability_window", server_data, cast=float)
     _carry(server_kwargs, "registration_workers", server_data, cast=int)
+    _carry(server_kwargs, "registration_stats", server_data, cast=bool)
     _carry(server_kwargs, "claim_generic_images", server_data, cast=bool)
     _carry(server_kwargs, "writable", server_data)
     write_dir_str = server_data.get("write_dir")

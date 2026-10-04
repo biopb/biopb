@@ -1206,7 +1206,9 @@ class MetadataDatabase:
             }
         )
 
-    def sync_source_added(self, source_id: str, adapter: SourceAdapter) -> SyncCost:
+    def sync_source_added(
+        self, source_id: str, adapter: SourceAdapter, measure: bool = False
+    ) -> Optional[SyncCost]:
         """Sync a source to the metadata database (INSERT OR REPLACE upsert).
 
         Called by ``SourceManager`` when a source is registered and, for a
@@ -1225,10 +1227,12 @@ class MetadataDatabase:
         Args:
             source_id: Unique source identifier
             adapter: Backend adapter for the source
+            measure: Also size the row, which serializes the tensors a second
+                time, for the registration summary.
 
         Returns:
-            What the row cost to build and how large it is (:class:`SyncCost`),
-            for the registration summary.
+            With *measure*, what the row cost to build and how large it is
+            (:class:`SyncCost`); otherwise None.
         """
         conn = self._get_connection()
         started = time.perf_counter()
@@ -1376,6 +1380,8 @@ class MetadataDatabase:
                 "release_registration_cache failed for %s", source_id, exc_info=True
             )
         logger.debug(f"Synced source to metadata database: {source_id}")
+        if not measure:
+            return None
         return SyncCost(
             metadata_s=metadata_s,
             upsert_s=upsert_s,

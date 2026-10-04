@@ -794,6 +794,7 @@ def _setup_flight_server(
         prune_unseen_days=server_config.annotations.prune_unseen_days,
         rescan_interval=server_config.rescan_interval,
         registration_workers=server_config.registration_workers,
+        registration_stats=server_config.registration_stats,
     )
     server.set_registration_pending_provider(source_manager.pending_registrations)
 

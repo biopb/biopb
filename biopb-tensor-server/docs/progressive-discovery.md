@@ -252,7 +252,7 @@ newest file first, which runs the ordinary registration and swaps the real adapt
   mtime), a later one is prompt-enqueued, a remote one is not enqueued as startup. The
   backlog tier waits for `registration_idle` (first scan over, nothing pending); the live
   tier is not held.
-- **Cost.** `RegistrationStats` logs, once registration has drained, per source type the
+- **Cost** (opt-in: `registration_stats = true`). `RegistrationStats` logs, once registration has drained, per source type the
   time in `create_from_config`, `normalize_adapter`, the metadata read and the row write,
   the sizes of `metadata_json`, `tensors` and the lean descriptors, and the member count,
   plus the time each adapter's `claim` took in the walk.

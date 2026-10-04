@@ -140,6 +140,7 @@ class Reconciler:
         notify_source_committed: Callable[[str], None],
         catalog_url_for: Callable[[SourceClaim], Optional[str]] = lambda claim: None,
         stability_window: float = 30.0,
+        registration_stats: bool = False,
     ):
         self._server = server
         self._registry = registry
@@ -193,8 +194,9 @@ class Reconciler:
         # never inside it.
         self._registration_locks: Dict[str, threading.RLock] = {}
 
-        # Per-type timings and row sizes of every registration (see its module).
-        self.stats = RegistrationStats()
+        # Per-type timings and row sizes of every registration (see its module);
+        # collected only when asked for.
+        self.stats = RegistrationStats(registration_stats)
 
         self._state.on_source_added = None
         self._state.on_source_removed = None
@@ -1269,7 +1271,12 @@ class Reconciler:
             # so a replace overwrites the row rather than needing it deleted
             # first -- which is what keeps the source continuously catalogued.
             if self._metadata_db is not None:
-                cost = self._metadata_db.sync_source_added(claim.source_id, adapter)
+                sync = self._metadata_db.sync_source_added
+                cost = (
+                    sync(claim.source_id, adapter, measure=True)
+                    if self.stats.enabled
+                    else sync(claim.source_id, adapter)
+                )
 
             if create_s is not None:
                 self.stats.record_registration(
