@@ -301,6 +301,57 @@ class TestTheWorker:
         finally:
             release.set()
 
+    def test_a_paused_pool_registers_nothing_until_resumed(self):
+        seen = []
+        worker = RegistrationWorker(lambda sid: seen.append(sid) or True, workers=2)
+        worker.pause()
+        worker.start()
+        try:
+            worker.enqueue("a", 1.0)
+            worker.enqueue("b", 2.0)
+            time.sleep(0.2)
+            assert seen == []
+            assert worker.queued() == 2
+            worker.resume()
+            _wait_until(lambda: len(seen) == 2)
+        finally:
+            worker.stop()
+
+    def test_a_paused_pool_still_stops(self):
+        worker = RegistrationWorker(lambda sid: True, workers=2)
+        worker.pause()
+        worker.start()
+        worker.enqueue("a")
+        started = time.monotonic()
+        worker.stop(join_timeout=2.0)
+        assert time.monotonic() - started < 1.0
+        assert all(not t.is_alive() for t in worker._threads)
+
+    def test_the_first_scan_walks_before_any_source_registers(self, tmp_path):
+        for i in range(6):
+            _make_zarr(tmp_path, f"s{i}.zarr")
+        manager, server = _manager(tmp_path, workers=2)
+        worker = manager._registration_worker
+        inner = worker._register
+        done_when_registered = []
+        worker._register = lambda sid: (
+            done_when_registered.append(manager._initial_scan_done),
+            inner(sid),
+        )[1]
+
+        manager.start()
+        try:
+            _wait_until(lambda: manager.pending_registrations() == 0)
+            _wait_until(lambda: manager.registration_idle())
+            assert len(done_when_registered) == 6
+            # No registration began before the first scan was over.
+            assert all(done_when_registered)
+            # A later scan does not hold the pool again.
+            manager._handle_rescan()
+            assert worker._paused is False
+        finally:
+            manager.stop()
+
     def test_a_queued_source_is_not_queued_twice(self):
         seen = []
         worker = RegistrationWorker(lambda sid: seen.append(sid) or True, workers=1)

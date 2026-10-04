@@ -257,6 +257,11 @@ class SourceManager:
         if self._registration_worker is not None:
             # After the static sources, which were committed inline before this.
             self._reconciler.set_defer_registration(True)
+            if not self._initial_scan_done:
+                # Held until the walk is over (``complete_initial_scan``): the
+                # two contend, and a held pool lets every claim be committed
+                # first. A later rescan does not hold it again.
+                self._registration_worker.pause()
             self._registration_worker.start()
         self._thread = threading.Thread(
             target=self._event_loop,
@@ -372,6 +377,8 @@ class SourceManager:
             # Sources found from here on are the few a rescan turns up, and are
             # registered when they are claimed, as a drop is.
             self._reconciler.set_defer_registration(False)
+            if self._registration_worker is not None:
+                self._registration_worker.resume()
             logger.info(
                 "Initial scan complete: %d sources, %.0f s after start, "
                 "%d awaiting registration",

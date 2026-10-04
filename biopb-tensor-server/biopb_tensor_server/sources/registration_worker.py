@@ -7,6 +7,10 @@ small pool of threads registers them, newest file first, so what a user is most
 likely to want is complete soonest. A read that needs a source before its turn
 registers it itself (``Reconciler.ensure_registered``, single-flight), and the
 worker finds it done when it gets there.
+
+The pool can be held while the first scan walks (``pause``): registering and
+walking contend, and a held pool lets the walk finish, and so the whole catalog
+exist as pending rows, before any file is opened.
 """
 
 from __future__ import annotations
@@ -36,6 +40,7 @@ class RegistrationWorker:
         self._heap: List[Tuple[float, int, str]] = []
         self._queued: Set[str] = set()
         self._seq = 0
+        self._paused = False
         self._stop = threading.Event()
         self._threads: List[threading.Thread] = []
 
@@ -75,13 +80,23 @@ class RegistrationWorker:
             heapq.heappush(self._heap, (-mtime, self._seq, source_id))
             self._cond.notify()
 
+    def pause(self) -> None:
+        """Hold queued sources back. A registration already under way finishes."""
+        with self._cond:
+            self._paused = True
+
+    def resume(self) -> None:
+        with self._cond:
+            self._paused = False
+            self._cond.notify_all()
+
     def queued(self) -> int:
         with self._cond:
             return len(self._heap)
 
     def _pop(self) -> Optional[str]:
         with self._cond:
-            while not self._heap:
+            while self._paused or not self._heap:
                 if self._stop.is_set():
                     return None
                 self._cond.wait()
