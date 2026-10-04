@@ -3,7 +3,7 @@
 Covers the rule (``core.axes.canonical_permutation``), the seam that applies it
 (``core.normalize``), and the three scope decisions taken on the issue:
 
-1. unlabeled stores (plain zarr / HDF5) are out of scope -- normalization must be
+1. unlabeled stores (plain zarr) are out of scope -- normalization must be
    provably the identity for them, and must not invent semantic labels;
 2. the guarantee is unconditional on the read path, including for the geometry a
    read plan hands a client and for what lands in the chunk cache;
@@ -139,7 +139,7 @@ class TestCanonicalPermutation:
         "labels", [["dim0", "dim1", "dim2"], ["a", "b"], [], ["dim0"]]
     )
     def test_unlabeled_axes_are_identity(self, labels):
-        """Plain zarr / HDF5 emit ``dimN``. There is nothing to reorder, and
+        """Plain zarr emits ``dimN``. There is nothing to reorder, and
         relabeling them z/y/x would turn the consumers' positional *guess*
         into a wire *assertion* -- wrong for e.g. an unlabeled [y, x, c]."""
         assert canonical_permutation(labels, [2] * len(labels)) is None

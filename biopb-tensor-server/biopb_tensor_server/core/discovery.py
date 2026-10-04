@@ -733,7 +733,7 @@ class SourceClaim:
         source_type: Type identifier ("zarr", "ome-tiff", etc.)
         primary_path: Main entry point for the source (str to support URLs)
         source_id: Unique identifier (auto-generated if None)
-        extra_config: Adapter-specific configuration (e.g., an EMD signal path)
+        extra_config: Adapter-specific configuration (e.g., credentials_profile, alias)
         is_remote: Flag indicating if this is a remote source
         unresolved: True when the adapter recognized this source by recall-free
             signals only (a non-resident cloud/synced-folder target) and deferred

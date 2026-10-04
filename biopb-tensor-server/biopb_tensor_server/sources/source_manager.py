@@ -1158,9 +1158,10 @@ class SourceManager:
         readable local path. Yields the events :meth:`add_local_source` documents.
 
         ``catalog_url_for`` gives a NEW claim its display ``source_url`` override,
-        or None. ``cloud`` scans ``url`` as a cloud root. ``new_root`` is the root a drop has just added
-        for itself: it is refused whole, before anything is removed or committed,
-        when :meth:`Roots.check_overlap` finds it shares sources with another root.
+        or None. ``cloud`` scans ``url`` as a cloud root. ``new_root`` is the root
+        a drop has just added for itself: it is refused whole, before anything is
+        removed or committed, when :meth:`Roots.check_overlap` finds it shares
+        sources with another root.
         """
         is_dir = os.path.isdir(url)
         tally = AddSourceTally()

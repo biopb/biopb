@@ -276,8 +276,7 @@ class UnresolvedSourceAdapter(SourceAdapter):
             )
             claims = []
         if claims:
-            claim = claims[0]
-            resolved_type = claim.source_type
+            resolved_type = claims[0].source_type
 
         adapter_cls = self._registry.get_adapter_for_type(resolved_type)
         if adapter_cls is None:
