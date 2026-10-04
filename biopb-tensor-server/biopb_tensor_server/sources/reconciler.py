@@ -877,7 +877,7 @@ class Reconciler:
         p = Path(resolve_local_path(path))
         with self._lock:
             for ancestor in p.parents:
-                owner = self._state.path_to_source.get(str(ancestor))
+                owner = self._state.get_source_for_path(str(ancestor))
                 if owner is not None:
                     return owner
         return None
