@@ -795,7 +795,6 @@ def _setup_flight_server(
         rescan_interval=server_config.rescan_interval,
         registration_workers=server_config.registration_workers,
         walk_threads=server_config.walk_threads,
-        registration_stats=server_config.registration_stats,
     )
     server.set_registration_pending_provider(source_manager.pending_registrations)
     server.set_unregistered_provider(source_manager.unregistered_sources)

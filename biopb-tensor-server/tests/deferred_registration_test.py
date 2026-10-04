@@ -32,7 +32,7 @@ def _make_zarr(parent, name, shape=(2, 8, 8)):
     return path
 
 
-def _manager(root, workers=0, stats=False):
+def _manager(root, workers=0):
     server = catalog_server("localhost:0")
     manager = make_manager(
         server=server,
@@ -42,7 +42,6 @@ def _manager(root, workers=0, stats=False):
         monitored_dirs={root},
         stability_window=0,
         registration_workers=workers,
-        registration_stats=stats,
     )
     return manager, server
 
@@ -719,122 +718,6 @@ class TestOverFlight:
         finally:
             client.close()
             server.shutdown()
-
-
-class TestStats:
-    def test_a_registration_is_recorded_by_type_with_its_sizes(self, tmp_path):
-        _make_zarr(tmp_path, "a.zarr")
-        manager, server = _manager(tmp_path, stats=True)
-        _first_scan(manager)
-        server.sources.get_registered(_only_ids(server)[0])
-
-        lines = manager._reconciler.stats.summary_lines()
-        zarr_line = next(line for line in lines if line.strip().startswith("zarr:"))
-        assert "n=1" in zarr_line
-        for field in ("create", "normalize", "metadata", "upsert"):
-            assert f"{field} p50=" in zarr_line
-        for field in ("metadata_bytes", "tensors_bytes", "descriptor_bytes", "members"):
-            assert f"{field} mean=" in zarr_line
-
-    def test_the_walk_times_each_adapters_claims(self, tmp_path):
-        _make_zarr(tmp_path, "a.zarr")
-        manager, _ = _manager(tmp_path, stats=True)
-        _first_scan(manager)
-        claim_lines = [
-            line
-            for line in manager._reconciler.stats.summary_lines()
-            if line.strip().startswith("claim ")
-        ]
-        assert any("claimed=1" in line for line in claim_lines)
-
-    def test_sync_source_added_reports_what_the_row_cost(self, tmp_path):
-        from biopb_tensor_server.core.registration_stats import SyncCost
-
-        _make_zarr(tmp_path, "a.zarr")
-        manager, server = _manager(tmp_path, stats=True)
-        _first_scan(manager)
-        (sid,) = _only_ids(server)
-        adapter = server.sources.get_registered(sid)
-
-        cost = server.metadata_db.sync_source_added(sid, adapter, measure=True)
-
-        assert isinstance(cost, SyncCost)
-        assert cost.tensors_bytes > 0 and cost.descriptor_bytes > 0
-        assert cost.metadata_s >= 0 and cost.upsert_s >= 0
-
-    def test_the_summary_is_logged_once_when_registration_drains(
-        self, tmp_path, caplog
-    ):
-        import logging
-
-        for name in ("a.zarr", "b.zarr"):
-            _make_zarr(tmp_path, name)
-        manager, server = _manager(tmp_path, stats=True)
-        _first_scan(manager)
-        with caplog.at_level(logging.INFO):
-            for sid in _only_ids(server):
-                server.sources.get_registered(sid)
-        logged = [r for r in caplog.records if "Registration cost" in r.getMessage()]
-        assert len(logged) == 1
-        assert "(2 sources)" in logged[0].getMessage()
-
-    @pytest.mark.parametrize("failing_last", [False, True])
-    def test_the_summary_is_logged_though_a_source_failed(
-        self, tmp_path, caplog, failing_last
-    ):
-        import logging
-
-        good = _make_zarr(tmp_path, "a.zarr")
-        bad = _make_zarr(tmp_path, "b.zarr")
-        TestFailure()._break(bad)
-        manager, server = _manager(tmp_path, stats=True)
-        _first_scan(manager)
-        ids = {
-            os.path.basename(manager._reconciler.claim_primary_path(sid)): sid
-            for sid in _only_ids(server)
-        }
-        order = ("a.zarr", "b.zarr") if failing_last else ("b.zarr", "a.zarr")
-        with caplog.at_level(logging.INFO):
-            for name in order:
-                manager._reconciler.ensure_registered(ids[name])
-        assert good and manager.pending_registrations() == 0
-        logged = [r for r in caplog.records if "Registration cost" in r.getMessage()]
-        assert len(logged) == 1
-
-
-class TestStatsAreOptIn:
-    def test_off_by_default_in_the_config(self):
-        from biopb_tensor_server.core.config import ServerConfig
-
-        assert ServerConfig().registration_stats is False
-
-    def test_off_nothing_is_collected_or_measured(self, tmp_path, caplog):
-        import logging
-
-        for name in ("a.zarr", "b.zarr"):
-            _make_zarr(tmp_path, name)
-        manager, server = _manager(tmp_path)
-        _first_scan(manager)
-        with caplog.at_level(logging.INFO):
-            for sid in _only_ids(server):
-                server.sources.get_registered(sid)
-
-        stats = manager._reconciler.stats
-        assert stats.enabled is False
-        assert stats.summary_lines() == []
-        assert not [r for r in caplog.records if "Registration cost" in r.getMessage()]
-        # Neither the claim timer nor the row sizing is paid for.
-        assert manager._registry.claim_timer is None
-
-    def test_sync_source_added_sizes_a_row_only_when_asked(self, tmp_path):
-        _make_zarr(tmp_path, "a.zarr")
-        manager, server = _manager(tmp_path)
-        _first_scan(manager)
-        (sid,) = _only_ids(server)
-        adapter = server.sources.get_registered(sid)
-
-        assert server.metadata_db.sync_source_added(sid, adapter) is None
-        assert server.metadata_db.sync_source_added(sid, adapter, measure=True)
 
 
 def _wait_until(predicate, timeout=10.0):

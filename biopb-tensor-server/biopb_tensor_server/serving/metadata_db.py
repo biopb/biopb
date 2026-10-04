@@ -77,7 +77,6 @@ from biopb_tensor_server.adapters.ome_masks import strip_mask_bindata
 from biopb_tensor_server.core.adapter_base import catalog_tensors, to_catalog_url
 from biopb_tensor_server.core.errors import AnnotationStoreError
 from biopb_tensor_server.core.labels import last_named_segment
-from biopb_tensor_server.core.registration_stats import SyncCost
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.adapter_base import SourceAdapter
@@ -1208,9 +1207,7 @@ class MetadataDatabase:
             }
         )
 
-    def sync_source_added(
-        self, source_id: str, adapter: SourceAdapter, measure: bool = False
-    ) -> Optional[SyncCost]:
+    def sync_source_added(self, source_id: str, adapter: SourceAdapter) -> None:
         """Sync a source to the metadata database (INSERT OR REPLACE upsert).
 
         Called by ``SourceManager`` when a source is registered and, for a
@@ -1229,15 +1226,8 @@ class MetadataDatabase:
         Args:
             source_id: Unique source identifier
             adapter: Backend adapter for the source
-            measure: Also size the row, which serializes the tensors a second
-                time, for the registration summary.
-
-        Returns:
-            With *measure*, what the row cost to build and how large it is
-            (:class:`SyncCost`); otherwise None.
         """
         conn = self._get_connection()
-        started = time.perf_counter()
 
         # Read the row's fields off the adapter. This is the ONLY place a
         # source's catalog row is built, so `catalog_tensors` is where the
@@ -1251,7 +1241,6 @@ class MetadataDatabase:
         unresolved_reason = None if is_resolved or reason_of is None else reason_of()
         catalog = catalog_tensors(adapter)
         metadata = adapter.get_metadata()
-        metadata_s = time.perf_counter() - started
 
         # Full per-tensor structural info (biopb/biopb#224): one struct per
         # tensor, not just tensors[0]. Expensive/lazy fields (metadata_json,
@@ -1355,7 +1344,6 @@ class MetadataDatabase:
         # disposable (the next registration rebuilds it, and open clears it
         # anyway) where a source that will not register is an outage.
         self._replace_imported(source_id, source_url, imported, indexed_at)
-        upsert_s = time.perf_counter() - started - metadata_s
 
         # The row is committed, so the catalog -- not the adapter -- now owns this
         # source's metadata (biopb/biopb#253). Let the adapter drop whatever it
@@ -1369,15 +1357,6 @@ class MetadataDatabase:
                 "release_registration_cache failed for %s", source_id, exc_info=True
             )
         logger.debug(f"Synced source to metadata database: {source_id}")
-        if not measure:
-            return None
-        return SyncCost(
-            metadata_s=metadata_s,
-            upsert_s=upsert_s,
-            metadata_bytes=len(metadata_json) if metadata_json else 0,
-            tensors_bytes=len(json.dumps(tensors)),
-            descriptor_bytes=sum(t.ByteSize() for t in catalog),
-        )
 
     def _upsert_source_row(
         self,

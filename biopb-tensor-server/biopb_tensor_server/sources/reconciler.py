@@ -58,10 +58,6 @@ from biopb_tensor_server.core.errors import (
     UpstreamConfigError,
 )
 from biopb_tensor_server.core.normalize import normalize_adapter
-from biopb_tensor_server.core.registration_stats import (
-    RegistrationStats,
-    SyncCost,
-)
 from biopb_tensor_server.core.remote import is_remote_url
 from biopb_tensor_server.core.source_registry import close_adapter
 from biopb_tensor_server.sources.entry_stat import (
@@ -145,7 +141,6 @@ class Reconciler:
         notify_source_committed: Callable[[str], None],
         catalog_url_for: Callable[[SourceClaim], Optional[str]] = lambda claim: None,
         stability_window: float = 30.0,
-        registration_stats: bool = False,
     ):
         self._server = server
         self._registry = registry
@@ -203,10 +198,6 @@ class Reconciler:
         self._registration_stripes = tuple(
             threading.RLock() for _ in range(_REGISTRATION_STRIPES)
         )
-
-        # Per-type timings and row sizes of every registration (see its module);
-        # collected only when asked for.
-        self.stats = RegistrationStats(registration_stats)
 
         self._state.on_source_added = None
         self._state.on_source_removed = None
@@ -382,14 +373,12 @@ class Reconciler:
             ):
                 self._record_failed_source_attempt(source_id)
                 self._mark_registration_failed(source_id, errors)
-                self.log_summary_if_drained()
                 return False
 
             with self._lock:
                 self._clear_pending(source_id)
             self._clear_failed_source_attempt(source_id)
         self._notify_source_committed(source_id)
-        self.log_summary_if_drained()
         return True
 
     def materialize(self, source_id: str) -> None:
@@ -410,15 +399,6 @@ class Reconciler:
         raise SourceUnresolvedError(
             f"source {source_id!r} is unresolved: its registration has not run yet"
         )
-
-    def log_summary_if_drained(self) -> None:
-        """Log the registration cost once nothing is left waiting.
-
-        A failed source is not waiting (see :meth:`pending_count`), so a site
-        with sources that cannot register still gets its summary.
-        """
-        if not self._defer_registration and self.pending_count() == 0:
-            self.stats.log_summary()
 
     def _mark_registration_failed(self, source_id: str, errors: List[str]) -> None:
         """Record why a pending source did not register.
@@ -1217,7 +1197,6 @@ class Reconciler:
         and the metadata DB record the re-rooted url.
         """
         self._warn_if_experimental(claim)
-        create_s = None  # set only where a file is actually opened
         try:
             source_config = self._source_config_for(claim)
 
@@ -1246,11 +1225,9 @@ class Reconciler:
                     )
                     return False
 
-                created_at = time.perf_counter()
                 adapter = adapter_cls.create_from_config(
                     source_config, self._credentials_config
                 )
-                create_s = time.perf_counter() - created_at
 
                 # Bulk-seed the catalog surface so sync_source_added below needs
                 # no per-source upstream RPC (biopb/biopb#266). Guarded by the
@@ -1297,16 +1274,13 @@ class Reconciler:
 
         registered = False
         displaced: Optional[Any] = None
-        cost = None
         try:
             # Normalize the axis order here rather than leaning on what
             # register_source hands back (biopb/biopb#596): the catalog row
             # below must describe the same tensors the serve path will hand
             # out, and the wrap is idempotent, so the registry re-applying it
             # is a no-op.
-            normalizing_at = time.perf_counter()
             adapter = normalize_adapter(adapter)
-            normalize_s = time.perf_counter() - normalizing_at
             if replace:
                 adapter, displaced = self._server.swap_source(claim.source_id, adapter)
             else:
@@ -1319,21 +1293,8 @@ class Reconciler:
             # so a replace overwrites the row rather than needing it deleted
             # first -- which is what keeps the source continuously catalogued.
             if self._metadata_db is not None:
-                sync = self._metadata_db.sync_source_added
-                cost = (
-                    sync(claim.source_id, adapter, measure=True)
-                    if self.stats.enabled
-                    else sync(claim.source_id, adapter)
-                )
+                self._metadata_db.sync_source_added(claim.source_id, adapter)
 
-            if create_s is not None:
-                self.stats.record_registration(
-                    claim.source_type,
-                    create_s=create_s,
-                    normalize_s=normalize_s,
-                    members=len(claim.member_paths),
-                    cost=cost if isinstance(cost, SyncCost) else None,
-                )
             if displaced is not None:
                 # Only now, and this ordering is the reason `swap` hands the
                 # displaced adapter back open rather than closing it: until the
