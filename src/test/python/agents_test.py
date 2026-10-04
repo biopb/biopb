@@ -1,10 +1,10 @@
-"""Unit tests for ``biopb._agents`` — registering biopb-mcp with agent clients.
+"""Unit tests for ``biopb._agents`` — registering biopb-shim with agent clients.
 
 Covers the three things the module does per client: a subprocess-free status read
 (not_installed / installed / registered + drift), an atomic JSON merge/delete that
 preserves the user's other config, and the Claude Code path that shells out to the
 ``claude`` CLI. Everything is exercised against a monkeypatched ``$HOME`` (and
-``$APPDATA``), and the ``biopb-mcp`` command is pinned so entries and drift are
+``$APPDATA``), and the ``biopb-shim`` command is pinned so entries and drift are
 deterministic; the ``claude`` CLI is mocked (no real binary needed).
 """
 
@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 from biopb import _agents
 
-_CMD = "/opt/biopb/bin/biopb-mcp"
+_CMD = "/opt/biopb/bin/biopb-shim"
 
 
 @pytest.fixture
@@ -149,8 +149,8 @@ def test_registered_is_drift_when_command_differs(home):
             {
                 "mcpServers": {
                     "biopb": {
-                        "command": "/old/biopb-mcp",
-                        "args": ["--transport", "stdio"],
+                        "command": "/old/biopb-shim",
+                        "args": [],
                     }
                 }
             }
@@ -195,7 +195,7 @@ def test_register_cursor_writes_stdio_entry(home):
     data = json.loads((home / ".cursor" / "mcp.json").read_text())
     assert data["mcpServers"]["biopb"] == {
         "command": _CMD,
-        "args": ["--transport", "stdio"],
+        "args": [],
     }
 
 
@@ -254,7 +254,7 @@ def test_opencode_uses_its_own_entry_shape(home):
     data = json.loads(cfg.read_text())
     assert data["mcp"]["biopb"] == {
         "type": "local",
-        "command": [_CMD, "--transport", "stdio"],
+        "command": [_CMD],
         "enabled": True,
     }
     assert _agents.status("opencode")["state"] == "registered"
@@ -316,7 +316,7 @@ def test_opencode_status_detects_entry_in_commented_jsonc(home):
         '  "mcp": {\n'
         '    "biopb": {"type": "local", "command": ["'
         + _CMD
-        + '", "--transport", "stdio"], "enabled": true},\n'
+        + '"], "enabled": true},\n'
         "  },\n"
         "}\n"
     )
@@ -407,13 +407,7 @@ def test_claude_code_status_reads_claude_json(home, monkeypatch):
     assert _agents.status("claude-code")["state"] == "installed"
     # Entry in ~/.claude.json -> registered.
     (home / ".claude.json").write_text(
-        json.dumps(
-            {
-                "mcpServers": {
-                    "biopb": {"command": _CMD, "args": ["--transport", "stdio"]}
-                }
-            }
-        )
+        json.dumps({"mcpServers": {"biopb": {"command": _CMD, "args": []}}})
     )
     s = _agents.status("claude-code")
     assert s["state"] == "registered" and s["drifted"] is False
@@ -432,9 +426,8 @@ def test_register_claude_removes_then_adds_via_cli(home, monkeypatch):
     # Idempotent: remove first, then add (matches the installer).
     assert calls[0][1:4] == ["mcp", "remove", "biopb"]
     assert calls[1][1:5] == ["mcp", "add", "--scope", "user"]
-    # The resolved command + stdio transport are passed through to `add`.
-    assert _CMD in calls[1]
-    assert "--transport" in calls[1] and "stdio" in calls[1]
+    # The resolved command is passed through to `add`, with no arguments.
+    assert calls[1][-2:] == ["--", _CMD]
 
 
 def test_register_claude_raises_when_add_fails(home, monkeypatch):
@@ -453,7 +446,7 @@ def test_register_claude_raises_when_cli_missing(home, monkeypatch):
 
 def test_register_never_calls_claude_get_or_list(home, monkeypatch):
     # Status must stay subprocess-free and register must never probe with a
-    # connection test (`claude mcp get`/`list` would spawn biopb-mcp).
+    # connection test (`claude mcp get`/`list` would spawn biopb-shim).
     _claude_on_path(monkeypatch)
     seen = []
 
@@ -481,12 +474,17 @@ def _codex_on_path(monkeypatch):
     )
 
 
-def _write_codex_config(home, command=_CMD, extra=""):
+# What biopb registers Codex with: it does not refresh its tool list within a
+# turn, so the shim binds a session before the handshake (see CodexCli.mcp_args).
+_CODEX_ARGS = ["--session", "auto"]
+
+
+def _write_codex_config(home, command=_CMD, extra="", args=_CODEX_ARGS):
     cfg = home / ".codex" / "config.toml"
     cfg.parent.mkdir(parents=True, exist_ok=True)
     cfg.write_text(
         extra + f'[mcp_servers.biopb]\ncommand = "{command}"\n'
-        'args = ["--transport", "stdio"]\n'
+        f"args = {json.dumps(args)}\n"
     )
     return cfg
 
@@ -536,7 +534,7 @@ def test_codex_honors_codex_home_env(home, monkeypatch):
 
 def test_codex_registered_is_drift_when_command_differs(home, monkeypatch):
     _codex_on_path(monkeypatch)
-    _write_codex_config(home, command="/somewhere/else/biopb-mcp")
+    _write_codex_config(home, command="/somewhere/else/biopb-shim")
     s = _agents.status("codex-cli")
     assert s["state"] == "registered" and s["drifted"] is True
 
@@ -572,7 +570,38 @@ def test_codex_register_adds_via_cli(home, monkeypatch):
     assert len(calls) == 1
     assert calls[0][1:5] == ["mcp", "add", "biopb", "--"]
     assert _CMD in calls[0]
-    assert "--transport" in calls[0] and "stdio" in calls[0]
+    assert calls[0][calls[0].index(_CMD) + 1 :] == _CODEX_ARGS
+
+
+def test_only_codex_is_registered_with_a_session_to_bind(home):
+    """Codex alone cannot follow tools/list_changed, so only its entry carries
+    `--session auto`; the others attach through the shim's `attach` tool."""
+    by_id = {c.id: c for c in _agents.supported()}
+    assert list(by_id["codex-cli"].mcp_args) == _CODEX_ARGS
+    for name, client in by_id.items():
+        if name != "codex-cli":
+            assert list(client.mcp_args) == [], name
+
+
+def test_codex_registered_before_it_needed_a_session_is_drift(home, monkeypatch):
+    _codex_on_path(monkeypatch)
+    _write_codex_config(home, args=["--transport", "stdio"])
+    s = _agents.status("codex-cli")
+    assert s["state"] == "registered" and s["drifted"] is True
+
+
+def test_codex_registered_with_its_session_is_not_drift(home, monkeypatch):
+    _codex_on_path(monkeypatch)
+    _write_codex_config(home)
+    assert _agents.status("codex-cli")["drifted"] is False
+
+
+def test_the_scanner_reads_the_args_too(home, monkeypatch, no_tomllib):
+    _codex_on_path(monkeypatch)
+    _write_codex_config(home)
+    assert _agents.status("codex-cli")["drifted"] is False
+    _write_codex_config(home, args=["--transport", "stdio"])
+    assert _agents.status("codex-cli")["drifted"] is True
 
 
 def test_codex_unregister_removes_via_cli(home, monkeypatch):
@@ -604,7 +633,7 @@ def test_codex_register_raises_when_cli_missing(home, monkeypatch):
 
 def test_codex_never_calls_mcp_get_or_list(home, monkeypatch):
     # Same rule as Claude Code: status stays subprocess-free, and neither write
-    # probes with `mcp get`/`list` (a live connection test spawning biopb-mcp).
+    # probes with `mcp get`/`list` (a live connection test spawning biopb-shim).
     _codex_on_path(monkeypatch)
     seen = []
     monkeypatch.setattr(
@@ -661,10 +690,13 @@ def test_scanner_skips_a_preceding_table(home, monkeypatch, no_tomllib):
 def test_scanner_reads_a_literal_string(home, monkeypatch, no_tomllib):
     """Windows paths land in a literal string, where backslashes are verbatim."""
     _codex_on_path(monkeypatch)
-    monkeypatch.setattr(_agents, "_mcp_executable", lambda: r"C:\biopb\biopb-mcp.exe")
+    monkeypatch.setattr(_agents, "_mcp_executable", lambda: r"C:\biopb\biopb-shim.exe")
     cfg = home / ".codex" / "config.toml"
     cfg.parent.mkdir()
-    cfg.write_text("[mcp_servers.biopb]\ncommand = 'C:\\biopb\\biopb-mcp.exe'\n")
+    cfg.write_text(
+        "[mcp_servers.biopb]\ncommand = 'C:\\biopb\\biopb-shim.exe'\n"
+        f"args = {json.dumps(_CODEX_ARGS)}\n"
+    )
     s = _agents.status("codex-cli")
     assert s["state"] == "registered" and s["drifted"] is False
 
@@ -673,5 +705,5 @@ def test_scanner_gives_up_on_an_unquoted_value(home, monkeypatch, no_tomllib):
     _codex_on_path(monkeypatch)
     cfg = home / ".codex" / "config.toml"
     cfg.parent.mkdir()
-    cfg.write_text("[mcp_servers.biopb]\ncommand = biopb-mcp\n")
+    cfg.write_text("[mcp_servers.biopb]\ncommand = biopb-shim\n")
     assert _agents.status("codex-cli")["state"] == "installed"

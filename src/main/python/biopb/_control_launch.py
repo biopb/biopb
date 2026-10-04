@@ -1,4 +1,4 @@
-"""Start the biopb control for the stdio shim.
+"""Start the biopb control for the shim.
 
 Asking a running control anything is the core ``biopb`` SDK's job (its
 top-level ``ensure_data_plane``/``algorithms``/etc., backed by the private
@@ -11,34 +11,20 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
-import sys
 import threading
-from pathlib import Path
+
+from . import _agents
 
 logger = logging.getLogger(__name__)
 
 
 def _biopb_executable() -> str | None:
-    """Locate the core ``biopb`` CLI executable, or ``None`` if not found.
+    """The core ``biopb`` CLI executable, or ``None`` if not found.
 
-    Prefer the console script installed alongside this interpreter (the venv /
-    uv-tool ``Scripts``/``bin`` dir, where ``biopb = biopb.cli:app`` lands), so we
-    hit the same environment that installed biopb-mcp even when PATH is not
-    inherited (GUI agents launch us without a shell PATH). Fall back to PATH.
-    ``None`` when neither resolves -- the caller then skips the best-effort control
-    start and the session child surfaces the error on first data-plane use.
+    ``None`` makes the caller skip the best-effort control start; the session
+    then surfaces the error on first data-plane use.
     """
-    import shutil
-
-    name = "biopb.exe" if os.name == "nt" else "biopb"
-    # Do NOT resolve() sys.executable: a venv's `python` is a symlink to the base
-    # interpreter, so resolving would follow it OUT of the venv bin/ (where the
-    # console script actually lives) to the base dir, and the sibling lookup would
-    # miss -- exactly the symlinked-venv + no-PATH case this is meant to cover.
-    sibling = Path(sys.executable).parent / name
-    if sibling.exists():
-        return str(sibling)
-    return shutil.which("biopb")
+    return _agents.console_script("biopb")
 
 
 def start_control_detached() -> bool:
@@ -96,3 +82,76 @@ def start_control_detached() -> bool:
         threading.Thread(target=proc.wait, daemon=True).start()
     logger.info("launched `biopb control start --no-data-plane` (detached)")
     return True
+
+
+def _control_url() -> str:
+    import biopb
+
+    return biopb.base_url()
+
+
+def control_up(timeout: float = 1.0) -> bool:
+    """Whether a control answers ``/health`` on the address clients use."""
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(f"{_control_url()}/health", timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def ensure_control(wait: float) -> bool:
+    """A control that answers, started here if need be; False if none does
+    within *wait* seconds.
+
+    The one place the shim blocks on the control: asking it for a session is
+    only possible once it is up. Callers fall back to a session of their own
+    rather than fail, so a missing control costs a wait and no more.
+    """
+    import time
+
+    if control_up():
+        return True
+    if not start_control_detached():
+        return False
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline:
+        time.sleep(0.5)
+        if control_up():
+            return True
+    return False
+
+
+def launch_session(
+    *, display: dict, timeout: float, start_kernel: bool = False
+) -> dict:
+    """Ask the control to launch a session; its answer (``{"state", ...}``).
+
+    *display* is the client's own display environment, which the control uses
+    in place of its own (see ``biopb_control``'s ``_launch_env``). The kernel is
+    left for the agent's ``start_kernel``. ``OSError`` (an ``HTTPError``
+    included) when no control answers or it refuses.
+    """
+    import json
+    import urllib.request
+    from urllib.parse import urlencode
+
+    import biopb
+
+    params = {
+        "start_kernel": int(start_kernel),
+        "display": json.dumps(display),
+        # Bounds the control's own wait under ours, so a slow start comes back
+        # as a verdict and not as a timeout that looks like no control.
+        "client_timeout": timeout,
+    }
+    token = biopb.resolve_data_plane_token()
+    req = urllib.request.Request(
+        f"{_control_url()}/api/sessions/new?{urlencode(params)}",
+        data=b"",
+        method="POST",
+        headers={"X-Biopb-Token": token} if token else {},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode())

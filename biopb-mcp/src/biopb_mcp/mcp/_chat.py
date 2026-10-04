@@ -217,6 +217,19 @@ def session_id() -> str:
     return _session_id
 
 
+def drop_unsent():
+    """Forget what is waiting to enter the thread: queued messages and the
+    jobs already noted.
+
+    Called when the chat loses the session (its lease lapsed or was taken):
+    whoever holds it next may change the kernel, so a message queued against the
+    old state, or a note that suppresses a later one, would be replayed into a
+    conversation it no longer describes.
+    """
+    _pending_user.clear()
+    _noted_jobs.clear()
+
+
 def reset():
     """Drop the conversation.
 
@@ -235,8 +248,7 @@ def reset():
     """
     global _running_job_id, _summary, _compacted, _session_id
     _messages.clear()
-    _pending_user.clear()
-    _noted_jobs.clear()
+    drop_unsent()
     _running_job_id = None
     _summary, _compacted = None, 0
     # A new thread is a new conversation to anyone outside this process, so it

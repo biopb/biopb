@@ -122,7 +122,7 @@ $ProgressPreference = 'SilentlyContinue'  # speeds up Invoke-WebRequest
 $script:BiopbPinnedRelease = ''
 
 # Must equal install.sh's INSTALL_SCHEMA (a test enforces it).
-$script:InstallSchema = 1
+$script:InstallSchema = 2
 
 # Install the uv tool environment under %LOCALAPPDATA%, not uv's Roaming default
 # (%APPDATA%\uv\tools). The biopb tool env holds native binaries and a long-lived
@@ -677,14 +677,14 @@ function Set-McpClients {
     # the install; we gate on $LASTEXITCODE explicitly below.
     $ErrorActionPreference = 'SilentlyContinue'
 
-    $mcpCmd = (Get-Command biopb-mcp -ErrorAction SilentlyContinue).Source
-    if (-not $mcpCmd) { $mcpCmd = "biopb-mcp" }
+    $mcpCmd = (Get-Command biopb-shim -ErrorAction SilentlyContinue).Source
+    if (-not $mcpCmd) { $mcpCmd = "biopb-shim" }
 
-    # biopb-mcp speaks MCP over stdio: the AI agent spawns it as a child process
-    # (`biopb-mcp --transport stdio`). We register the resolved absolute path so
+    # biopb-shim speaks MCP over stdio: the AI agent spawns it as a child process
+    # and it attaches to a biopb-mcp session. We register the resolved absolute path so
     # GUI agents (e.g. Claude Desktop), which don't inherit the shell PATH, can
     # still find it.
-    $mcpArgs = @("--transport", "stdio")
+    $mcpArgs = @()
 
     if (-not (Test-Path -LiteralPath $ConfigDir)) { New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null }
 
@@ -1522,7 +1522,7 @@ function Invoke-BiopbInstall {
 
     # Direct file:// references pin each package to this exact wheel.
     $mcpReq    = "biopb-mcp[napari] @ $(([System.Uri]$mcpWhl).AbsoluteUri)"
-    $biopbReq  = "biopb[tensor]==$($versions.biopb)"
+    $biopbReq  = "biopb[tensor,shim]==$($versions.biopb)"
     $tensorReq = "biopb-tensor-server[$tensorExtras] @ $(([System.Uri]$tensorWhl).AbsoluteUri)"
     $controlReq  = "biopb-control @ $(([System.Uri]$controlWhl).AbsoluteUri)"
 

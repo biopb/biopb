@@ -1,7 +1,7 @@
-"""Register biopb-mcp with local AI agent clients — shared, stdlib-only.
+"""Register biopb-shim with local AI agent clients — shared, stdlib-only.
 
 An MCP client (Claude Code, Claude Desktop, Cursor, opencode, …) spawns
-``biopb-mcp`` over stdio; wiring biopb into a client means writing a small MCP
+``biopb-shim`` over stdio; wiring biopb into a client means writing a small MCP
 server entry into that client's config. The installer already does this once at
 install time (``install/install.sh`` + ``install/biopb-engine.ps1``); this module
 is the same knowledge as an importable Python API so the control-plane dashboard
@@ -27,7 +27,7 @@ Three things it does per client:
 - **status** — a subprocess-free read (``not_installed`` / ``installed`` /
   ``registered``, plus ``drifted``). Deliberately never spawns anything: it is
   polled by the dashboard, and (for Claude Code) ``claude mcp get``/``list`` run a
-  *live connection test* that would launch ``biopb-mcp`` on every refresh. So
+  *live connection test* that would launch ``biopb-shim`` on every refresh. So
   status is always a plain config-file read.
 - **register** — write the biopb entry. The calm JSON configs (Claude Desktop,
   Cursor, opencode) get an atomic read-merge-replace that preserves every other
@@ -39,9 +39,9 @@ Three things it does per client:
   have no TOML writer and want none (see :func:`_read_toml_entry`).
 - **unregister** — the inverse; idempotent (removing an absent entry is fine).
 
-The registered command is the **absolute path** to ``biopb-mcp`` (resolved beside
+The registered command is the **absolute path** to ``biopb-shim`` (resolved beside
 this interpreter, then PATH), because GUI clients launch it without inheriting a
-shell PATH (the same reason ``_control_client._biopb_executable`` resolves
+shell PATH (the same reason ``_control_launch._biopb_executable`` resolves
 absolutely). That absolute path is also the drift signal: if biopb is reinstalled
 elsewhere, the stored command no longer matches the freshly resolved one, and the
 client's status comes back ``registered`` with ``drifted=True`` so the UI can
@@ -70,10 +70,11 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# The invocation every client registers: `biopb-mcp --transport stdio`. The
-# command itself is resolved per call (_mcp_command) so a reinstall that moves
-# biopb-mcp is reflected as drift rather than baked in here.
-_MCP_ARGS = ("--transport", "stdio")
+# The invocation a client registers: `biopb-shim`, plus whatever
+# that client needs on top (`ClientBackend.mcp_args`). The command itself is
+# resolved per call (_mcp_command) so a reinstall that moves biopb-shim is
+# reflected as drift rather than baked in here.
+_MCP_ARGS = ()
 
 
 class AgentError(Exception):
@@ -82,34 +83,38 @@ class AgentError(Exception):
 
 
 # --------------------------------------------------------------------------- #
-# Resolving the biopb-mcp command to register
+# Resolving the biopb-shim command to register
 # --------------------------------------------------------------------------- #
 
 
-def _mcp_executable() -> Optional[str]:
-    """Absolute path to the ``biopb-mcp`` console script, or ``None`` if not found.
+def console_script(name: str) -> Optional[str]:
+    """Absolute path to the console script *name*, or ``None`` if not found.
 
     Prefer the script installed beside this interpreter (the venv / uv-tool
-    ``Scripts``/``bin`` dir where ``biopb-mcp`` lands), so we register the same
-    environment that shipped biopb even when PATH is not inherited; fall back to
-    PATH. Mirrors ``biopb_mcp._control_client._biopb_executable`` — do NOT
-    ``resolve()`` ``sys.executable`` first, or a symlinked venv python would lead
+    ``Scripts``/``bin`` dir), so we hit the same environment that shipped biopb
+    even when PATH is not inherited (GUI clients launch us without a shell PATH);
+    fall back to PATH. Do NOT ``resolve()`` ``sys.executable`` first: a venv's
+    ``python`` is a symlink to the base interpreter, and following it would lead
     the sibling lookup out of the venv bin dir.
     """
-    name = "biopb-mcp.exe" if os.name == "nt" else "biopb-mcp"
-    sibling = Path(sys.executable).parent / name
+    sibling = Path(sys.executable).parent / (name + (".exe" if os.name == "nt" else ""))
     if sibling.exists():
         return str(sibling)
-    return shutil.which("biopb-mcp")
+    return shutil.which(name)
+
+
+def _mcp_executable() -> Optional[str]:
+    """Absolute path to the ``biopb-shim`` console script, or ``None``."""
+    return console_script("biopb-shim")
 
 
 def _mcp_command() -> str:
     """The command to register. Falls back to the bare name when the console
     script cannot be located, so a client still gets a working entry if PATH
-    resolves ``biopb-mcp`` at launch — the sibling/PATH resolution above only
+    resolves ``biopb-shim`` at launch — the sibling/PATH resolution above only
     fails when neither is present, which is also when the bare name is the best
     we can offer."""
-    return _mcp_executable() or "biopb-mcp"
+    return _mcp_executable() or "biopb-shim"
 
 
 # --------------------------------------------------------------------------- #
@@ -226,14 +231,16 @@ def _read_toml_entry(path: Path, parent_key: str) -> Optional[dict]:
 def _scan_toml_entry(text: str, parent_key: str) -> Optional[dict]:
     """``_read_toml_entry`` for Python 3.10, which has no ``tomllib``.
 
-    Pulls just ``command`` — the one value status and drift need — out of the
-    ``[<parent_key>.biopb]`` table, stopping at the next table header.
-    Deliberately narrow: it reads the shape ``codex mcp add`` writes (one
-    quoted string per line) and gives up on anything else, which reads as "not
-    registered" like every other config we cannot parse.
+    Pulls just ``command`` and ``args`` — the values status and drift need — out
+    of the ``[<parent_key>.biopb]`` table, stopping at the next table header.
+    Deliberately narrow: it reads the shape ``codex mcp add`` writes (one quoted
+    string, and one array of quoted strings, per line) and gives up on anything
+    else, which reads as "not registered" like every other config we cannot
+    parse.
     """
     header = re.compile(r"^\s*\[\s*" + re.escape(parent_key) + r"\s*\.\s*biopb\s*\]")
     in_table = False
+    found: dict = {}
     for line in text.splitlines():
         if line.lstrip().startswith("["):
             if in_table:
@@ -243,10 +250,20 @@ def _scan_toml_entry(text: str, parent_key: str) -> Optional[dict]:
         if not in_table:
             continue
         key, sep, raw = line.partition("=")
-        if sep and key.strip() == "command":
+        key = key.strip()
+        if sep and key == "command":
             value = _toml_string(raw.strip())
-            return None if value is None else {"command": value}
-    return None
+            if value is None:
+                return None
+            found["command"] = value
+        elif sep and key == "args":
+            try:
+                args = json.loads(raw.strip())  # basic strings are JSON's
+            except ValueError:
+                continue  # unreadable args read as drift, not as "unregistered"
+            if isinstance(args, list):
+                found["args"] = args
+    return found if "command" in found else None
 
 
 def _toml_string(raw: str) -> Optional[str]:
@@ -294,10 +311,10 @@ _READERS = {
 # is why they are defined as a pair rather than in the read and write halves.
 
 
-def _stdio_entry(command: str) -> dict:
+def _stdio_entry(command: str, args) -> dict:
     # Canonical mcpServers stdio form: bare command+args, no "type" (a stray
     # "type" trips stricter validators — matches the installer's choice).
-    return {"command": command, "args": list(_MCP_ARGS)}
+    return {"command": command, "args": list(args)}
 
 
 def _stdio_command(entry: dict) -> Optional[str]:
@@ -305,8 +322,15 @@ def _stdio_command(entry: dict) -> Optional[str]:
     return command if isinstance(command, str) else None
 
 
-def _opencode_entry(command: str) -> dict:
-    return {"type": "local", "command": [command, *_MCP_ARGS], "enabled": True}
+def _stdio_args(entry: dict) -> Optional[list]:
+    args = entry.get("args")
+    if isinstance(args, list) and all(isinstance(a, str) for a in args):
+        return args
+    return None
+
+
+def _opencode_entry(command: str, args) -> dict:
+    return {"type": "local", "command": [command, *args], "enabled": True}
 
 
 def _opencode_command(entry: dict) -> Optional[str]:
@@ -316,11 +340,23 @@ def _opencode_command(entry: dict) -> Optional[str]:
     return None
 
 
-#: entry_style -> (builder, extractor). No default branch, for the same reason
-#: as _READERS: an unknown style must not silently get the stdio shape.
+def _opencode_args(entry: dict) -> Optional[list]:
+    command = entry.get("command")
+    if (
+        isinstance(command, list)
+        and command
+        and all(isinstance(a, str) for a in command)
+    ):
+        return command[1:]
+    return None
+
+
+#: entry_style -> (builder, command extractor, args extractor). No default
+#: branch, for the same reason as _READERS: an unknown style must not silently
+#: get the stdio shape.
 _SHAPES = {
-    "stdio": (_stdio_entry, _stdio_command),
-    "opencode": (_opencode_entry, _opencode_command),
+    "stdio": (_stdio_entry, _stdio_command, _stdio_args),
+    "opencode": (_opencode_entry, _opencode_command, _opencode_args),
 }
 
 
@@ -392,7 +428,7 @@ def _run_client_cli(
     Code runs before an add to stay idempotent (``False`` → tolerate a non-zero
     code, i.e. "wasn't registered"). We never call either client's ``mcp
     get``/``list`` — those run a live connection test that would spawn
-    ``biopb-mcp``.
+    ``biopb-shim``.
     """
     exe = shutil.which(exe_name)
     if exe is None:
@@ -445,6 +481,11 @@ class ClientBackend(ABC):
     config_format: str = "json"
     #: a key of :data:`_SHAPES` -- the entry's shape, written and read back out
     entry_style: str = "stdio"
+    #: what the client launches ``biopb-shim`` with. Per client because a client
+    #: that cannot follow ``tools/list_changed`` needs the shim to bind a session
+    #: before its handshake (Codex: ``--session auto``); drift covers it, so a
+    #: registration made before a client needed it is offered a Re-register.
+    mcp_args: tuple = _MCP_ARGS
 
     @abstractmethod
     def config_path(self) -> Optional[Path]:
@@ -491,14 +532,20 @@ class ClientBackend(ABC):
 
     def entry(self) -> dict:
         """The MCP server entry to write, in this client's shape."""
-        build, _ = _dispatch(_SHAPES, self.entry_style, self, "entry style")
-        return build(_mcp_command())
+        build, _, _ = _dispatch(_SHAPES, self.entry_style, self, "entry style")
+        return build(_mcp_command(), self.mcp_args)
 
     def entry_command(self, entry: dict) -> Optional[str]:
         """The executable a registered entry points at, for drift. ``None`` when
         the entry has no recognizable command (treated as drift, so a malformed
         prior entry prompts a Re-register)."""
-        _, extract = _dispatch(_SHAPES, self.entry_style, self, "entry style")
+        _, extract, _ = _dispatch(_SHAPES, self.entry_style, self, "entry style")
+        return extract(entry)
+
+    def entry_args(self, entry: dict) -> Optional[list]:
+        """The arguments a registered entry launches with, for drift. ``None``
+        when they cannot be read (treated as drift, like an unreadable command)."""
+        _, _, extract = _dispatch(_SHAPES, self.entry_style, self, "entry style")
         return extract(entry)
 
 
@@ -572,7 +619,7 @@ class CliManagedClient(ClientBackend):
     and Codex's config is TOML whose comments and sibling servers only its own
     editor keeps intact. Status is still a plain config read -- never
     ``mcp get``/``list``, which run a live connection test that would spawn
-    ``biopb-mcp`` on every dashboard poll.
+    ``biopb-shim`` on every dashboard poll.
     """
 
     #: the binary to shell out to
@@ -620,7 +667,7 @@ class ClaudeCode(CliManagedClient):
                 "biopb",
                 "--",
                 _mcp_command(),
-                *_MCP_ARGS,
+                *self.mcp_args,
             ],
             required=True,
         )
@@ -661,6 +708,12 @@ class CodexCli(CliManagedClient):
     exe = "codex"
     parent_key = "mcp_servers"
     config_format = "toml"
+    # Codex does not refresh its tool list within a turn, so an unbound shim's
+    # `attach` flow leaves it with `attach` alone. `--session auto` binds the
+    # newest free session (else a new one) before the handshake, which then
+    # carries the session's own tools and instructions. The cost is that Codex
+    # cannot choose its session.
+    mcp_args = (*_MCP_ARGS, "--session", "auto")
 
     def config_path(self) -> Optional[Path]:
         # $CODEX_HOME relocates the whole Codex home (config.toml included);
@@ -673,7 +726,7 @@ class CodexCli(CliManagedClient):
         # exits 0, so unlike Claude Code no remove-then-add dance is needed.
         code, out = _run_client_cli(
             self.exe,
-            ["mcp", "add", "biopb", "--", _mcp_command(), *_MCP_ARGS],
+            ["mcp", "add", "biopb", "--", _mcp_command(), *self.mcp_args],
             required=True,
         )
         if code != 0:
@@ -758,15 +811,19 @@ def status(client_id: str) -> dict:
     ``state`` is ``registered`` if the biopb entry is present (regardless of
     detection -- the entry is ground truth), else ``installed`` if the client is
     detected, else ``not_installed``. ``drifted`` is set only when ``registered``
-    and the stored command no longer matches the freshly resolved ``biopb-mcp``
-    path (a moved/reinstalled biopb), so the UI can offer a Re-register.
+    and the stored command no longer matches the freshly resolved ``biopb-shim``
+    path (a moved/reinstalled biopb), or its arguments no longer match what this
+    client is registered with (a client that has since needed one), so the UI can
+    offer a Re-register.
     """
     client = _client(client_id)
     path = client.config_path()
     entry = client.read_entry()
     if entry is not None:
         state = "registered"
-        drifted = client.entry_command(entry) != _mcp_command()
+        drifted = client.entry_command(entry) != _mcp_command() or client.entry_args(
+            entry
+        ) != list(client.mcp_args)
     elif client.is_installed():
         state, drifted = "installed", False
     else:

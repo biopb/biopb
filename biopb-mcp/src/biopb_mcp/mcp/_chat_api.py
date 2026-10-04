@@ -32,7 +32,7 @@ import logging
 from starlette.responses import JSONResponse
 
 from .._config import get_setting
-from . import _app, _chat, _http, _model, _observe
+from . import _app, _chat, _http, _lease, _model, _observe, _session_mode
 
 logger = logging.getLogger(__name__)
 
@@ -58,33 +58,30 @@ _live_text = ""
 _live_len = 0
 
 
-def configure(config, *, agentless):
+def configure(config, *, mode):
     """Take the resolved config; return whether chat should be served.
 
     The switch is ``observe.chat_enabled``, because what it
     turns on is a pane on the observe page — and it is read together with
     ``observe.enabled`` because that page is how anyone reaches these routes.
 
-    *agentless* is the third term, and the one that is not configuration: this
-    loop exists for users **without** an MCP harness, so a session an agent is
-    already driving does not get one. Offering it there would be technically
-    sound and practically confusing -- two agents on one kernel, of which only
-    one can hold the claim, so the pane would answer questions and then refuse
-    to run anything. A human in an attached notebook has the same shape and is
-    let in anyway, because a person typing a cell is not a second agent; a chat
-    loop is.
+    *mode* is the third term, and the one that is not configuration: a session
+    whose mode serves no chat (a `direct` http server, which an MCP client
+    connects to by itself) gets no pane. An agent attached to a session that does serve it is kept off
+    by the lease, so the pane answers questions and then refuses to run anything
+    only while someone else holds the session -- a state it reports.
 
     Required rather than defaulted, because both answers are wrong to assume: a
-    default of True serves chat to every harness-driven session, and a default
-    of False silently withholds it from the viewer it was built for. The two
-    call sites both know.
+    default that serves chat gives a pane to every harness-driven session, and
+    one that does not silently withholds it from the viewer it was built for.
+    The call sites all know.
     """
     global _config, _enabled
     _config = config
     _enabled = bool(
         get_setting(config, "observe.enabled")
         and get_setting(config, "observe.chat_enabled")
-        and agentless
+        and _session_mode.serves_chat(mode)
     )
     # The image policy is the loop's session state, not a per-call config read:
     # the model can be switched at runtime, and a refusal it learns belongs to
@@ -102,6 +99,39 @@ def _busy_409(message="a turn is running; cancel it first"):
     copies had already drifted into three versions of it.
     """
     return JSONResponse({"error": message, "busy": True}, status_code=409)
+
+
+def _held_409(held):
+    """The "an agent holds this session" refusal.
+
+    Not ``busy``: a turn running is a wait, this is a different holder, and the
+    view should say who rather than offer a retry.
+    """
+    return JSONResponse(
+        {
+            "error": f"this session is held by its {held['holder']} "
+            f"(for {held['age']:.0f}s); chat is available when it lets go",
+            "held_by": held["holder"],
+            "lease": {k: v for k, v in held.items() if k != "ok"},
+        },
+        status_code=409,
+    )
+
+
+def _on_lease_change(previous, new):
+    """Chat lost the session: stop its turn, drop what it had queued.
+
+    Runs on the event loop (every lease call does), so cancelling the task is
+    safe. A turn is cancelled only here, by a holder that took the lease with
+    ``force``; a lapse cannot reach one, because a running turn keeps its lease
+    alive.
+    """
+    if previous != "chat" or new == "chat":
+        return
+    task = _turn_task
+    if task is not None and not task.done():
+        task.cancel()
+    _chat.drop_unsent()
 
 
 def _not_ready_503():
@@ -135,6 +165,7 @@ async def _api_chat_status(request):
             "ready": ready,
             "reason": reason,
             "busy": _chat.busy(),
+            "lease": _lease.snapshot(),
             "model": get_setting(_config, "chat.model") if ready else "",
             # How much of the thread the model no longer sees in full. The pane
             # renders every message either way, so without this the compaction
@@ -237,6 +268,7 @@ async def _api_chat_history(request):
             # nothing said since looks like.
             "full": full,
             "busy": _chat.busy(),
+            "lease": _lease.snapshot(),
             "queued": _chat.queued(),
             "model": get_setting(_config, "chat.model"),
             "partial": _partial(),
@@ -298,6 +330,9 @@ async def _run_turn(text):
     except Exception as exc:  # noqa: BLE001 - a provider/tool failure is content
         logger.warning("chat turn failed: %s", exc)
         _chat.note_error(f"The turn failed: {exc}")
+    finally:
+        # The idle window runs from here, not from when the turn began.
+        _lease.renew(_lease.CHAT_TOKEN)
 
 
 def _in_flight():
@@ -336,6 +371,12 @@ async def _chat_turn(request):
     text = payload.get("text")
     if not isinstance(text, str) or not text.strip():
         return JSONResponse({"error": "missing 'text'"}, status_code=400)
+
+    # The first turn takes the session; every later one renews it. Refused, not
+    # queued, when an agent holds it: it is the other writer of this kernel.
+    held = _lease.acquire("chat", _lease.CHAT_TOKEN)
+    if not held["ok"]:
+        return _held_409(held)
 
     if _in_flight():
         # A running *turn* takes the message at its next round boundary. Anything
@@ -406,11 +447,26 @@ async def _chat_reset(request):
         return _busy_409()
     global _turn_task, _live_job, _live_text, _live_len
     _chat.reset()
+    _lease.release(_lease.CHAT_TOKEN)
     _turn_task = None
     # The partial belongs to the thread that just went away. Left behind, it
     # would be published beside the first message of the new one.
     _live_job, _live_text, _live_len = None, "", 0
     return JSONResponse({"reset": True})
+
+
+async def _chat_release(request):
+    """Let go of the session, so an agent can attach to it.
+
+    Idle expiry does this on its own; this is for the person who wants the
+    session now. Refused while a turn runs, as a reset is, and for the same
+    reason: cancel says what it is doing. Keeps the conversation, which a reset
+    would not.
+    """
+    if _in_flight():
+        return _busy_409()
+    released = _lease.release(_lease.CHAT_TOKEN)
+    return JSONResponse({"released": released})
 
 
 async def _chat_summary(request):
@@ -461,6 +517,7 @@ _ROUTES = [
     ("/chat/turn", ["POST"], _http.json_route(_chat_turn)),
     ("/chat/cancel", ["POST"], _http.json_route(_chat_cancel)),
     ("/chat/reset", ["POST"], _http.json_route(_chat_reset)),
+    ("/chat/release", ["POST"], _http.json_route(_chat_release)),
     ("/chat/summary", ["POST"], _http.json_route(_chat_summary)),
     ("/chat/model", ["POST"], _http.json_route(_chat_model)),
 ]
@@ -472,10 +529,13 @@ def register_http_routes():
     Must run before ``_server.run()``; custom routes are read when the
     streamable-http app is built.
     """
+    _lease.on_change(_on_lease_change)
+    _lease.set_busy_probe("chat", _in_flight)
     for path, methods, handler in _ROUTES:
         _server_custom_route(path, methods)(handler)
     logger.info(
-        "chat API mounted at /api/chat/* and /chat/{turn,cancel,reset,summary,model}"
+        "chat API mounted at /api/chat/* and "
+        "/chat/{turn,cancel,reset,release,summary,model}"
     )
 
 

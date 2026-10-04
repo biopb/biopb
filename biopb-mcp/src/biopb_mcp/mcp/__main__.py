@@ -4,9 +4,8 @@ Under the http transport this process *is* the MCP server: it owns a child
 Jupyter kernel that holds the agent's namespace and, when the session has one,
 a napari viewer on the user's display (or, opted into by config, on a
 launcher-owned Xvfb virtual display; see ``_xvfb``).  Under the (deprecated) stdio transport it is
-instead a thin bridge: it spawns its own http session child on a dynamic port
-and pumps stdio JSON-RPC to it, reaping it on disconnect (see ``_shim``).  Run
-it with::
+instead a thin bridge: it attaches to an http session the control launched, or
+a person did, and pumps stdio JSON-RPC to it (see ``biopb._shim``).  Run it with::
 
     biopb-mcp        # console script
     python -m biopb_mcp.mcp
@@ -28,16 +27,16 @@ from biopb._locations import (
     MCP_SESSION_LOG_ENV,
 )
 
-from ._shim import ENV_PORT_REPORT_FILE, ENV_SESSION_ID
+from . import _session_mode
 
 logger = logging.getLogger(__name__)
 
 
 # Env var naming this process's own logfile, so it can report it (server_status)
 # and the agent's execute_code can read it from os.environ. Set by whoever
-# redirected our output: the stdio shim for the child it spawns, the control for
-# a viewer it launches. Bound from the core SDK rather than repeated, since it is
-# now three processes across two packages that must agree on one string.
+# redirected our output: the control, for a session it launches. Bound from the
+# core SDK rather than repeated, since it is processes across two packages that
+# must agree on one string.
 ENV_SESSION_LOG = MCP_SESSION_LOG_ENV
 
 # Env var naming the launch this viewer belongs to, set by the control when it
@@ -47,40 +46,17 @@ ENV_SESSION_LOG = MCP_SESSION_LOG_ENV
 ENV_LAUNCH_TOKEN = MCP_LAUNCH_TOKEN_ENV
 
 
-def _report_port(path, port):
-    """Publish the OS-assigned ``port`` to the shim's report file.
-
-    The stdio shim (ARCHITECTURE.md, Lifecycle) spawns this
-    child with ``--port 0`` and a unique ``BIOPB_PORT_REPORT_FILE``, then polls
-    that file for the real port to build its bridge URL. Written atomically
-    (temp + ``os.replace``) so the shim never reads a half-written value.
-
-    A cross-platform file rather than the inherited-pipe handshake ``_kernel``
-    uses for its death/window signals: that pipe pattern is POSIX-only there (fd
-    inheritance across a Windows spawn is fragile), whereas a file is uniform.
-    Best-effort: a write
-    failure only costs the shim its port (it times out; the client sees EOF),
-    never the server.
-    """
-    try:
-        tmp = f"{path}.{os.getpid()}.tmp"
-        with open(tmp, "w") as f:
-            f.write(str(port))
-        os.replace(tmp, path)
-    except OSError:
-        logger.warning("Could not write port report file %s", path, exc_info=True)
-
-
-def _register_session(port, mcp_url, session_id=None, launched_by=None):
+def _register_session(port, mcp_url, launched_by=None, mode=None):
     """Publish this session in the session registry; return its id.
 
     The control lists live sessions and proxies ``/session/<id>/*`` from this
     registry, so a session nobody publishes is a session with no observe page
     and no dashboard entry. Every session on a dynamic port publishes itself --
-    a shim-owned child under *session_id*, the id its shim minted, a `biopb mcp
-    view` session under a fresh one -- and drops the record in ``_shutdown``.
+    a `biopb mcp view` or control-launched session -- and drops the record in
+    ``_shutdown``.
     *launched_by* is the control's launch token, echoed so that launcher can
-    recognise *this* session (see MCP_LAUNCH_TOKEN_ENV).
+    recognise *this* session (see MCP_LAUNCH_TOKEN_ENV). *mode* is recorded for
+    whoever lists sessions.
 
     Best-effort, and broadly caught (biopb/biopb#422): a registry write failure
     -- a serialization error, an unwritable state dir -- must cost the session
@@ -90,9 +66,11 @@ def _register_session(port, mcp_url, session_id=None, launched_by=None):
     from biopb import _sessions
 
     extra = {LAUNCH_TOKEN_FIELD: launched_by} if launched_by else {}
+    if mode:
+        extra["mode"] = mode
 
     try:
-        session_id = session_id or _sessions.new_session_id()
+        session_id = _sessions.new_session_id()
         _sessions.register(
             session_id,
             port=port,
@@ -136,15 +114,23 @@ def _parse_args(argv, default_transport, default_port):
         choices=["http", "stdio"],
         default=default_transport,
         help="Front-end transport (default from config; falls back to stdio). "
-        "stdio is deprecated: it is now served by bridging to a private http "
-        "session child the shim spawns on demand; prefer connecting over http "
-        "directly.",
+        "stdio is deprecated: it is served by bridging to an http session the "
+        "agent attaches to; prefer connecting over http directly.",
     )
     parser.add_argument(
         "--port",
         type=int,
         default=default_port,
         help="Port for the http transport (ignored for stdio).",
+    )
+    parser.add_argument(
+        "--session",
+        default=os.environ.get("BIOPB_SESSION") or None,
+        help="stdio only: bind a session before the handshake -- an id, 'new' "
+        "(the control launches one), or 'auto' (the newest free session, else a "
+        "new one) -- for a client that cannot follow list_changed. Default: "
+        "start unbound and let the agent choose with its `attach` tool. Also "
+        "$BIOPB_SESSION.",
     )
     parser.add_argument(
         "--view",
@@ -216,7 +202,7 @@ def _decide_viewer(config, view=False):
     )
 
 
-def _setup_observe(config, agentless=False, on_shutdown=None):
+def _setup_observe(config, mode=_session_mode.DIRECT, on_shutdown=None):
     """Wire up the web observe UI.
 
     On by default (``observe.enabled``, opt-out); it mounts on the existing
@@ -224,8 +210,8 @@ def _setup_observe(config, agentless=False, on_shutdown=None):
     and is swallowed so it can never block the MCP server. Returns True if
     mounted.
 
-    *agentless* / *on_shutdown* decide whether this session serves the stop
-    route, and what it runs. Passed in rather than read here because the
+    *mode* is reported on ``/api/status``; *on_shutdown* is what the stop route
+    runs. Passed in rather than read here because the
     launcher's ``_shutdown`` is the thing being handed over, and it must be
     registered before the routes are, which is inside this call.
     """
@@ -236,7 +222,7 @@ def _setup_observe(config, agentless=False, on_shutdown=None):
     try:
         from . import _observe
 
-        _observe.set_session_owns_its_reap(agentless, on_shutdown=on_shutdown)
+        _observe.set_session_mode(mode, on_shutdown=on_shutdown)
         _observe.configure(
             max_output_chars=get_setting(config, "observe.max_output_chars"),
             poll_interval_ms=get_setting(config, "observe.poll_interval_ms"),
@@ -250,20 +236,7 @@ def _setup_observe(config, agentless=False, on_shutdown=None):
         return False
 
 
-def _is_agentless(view, shim_owned, port):
-    """Whether this session is one a human opened, not a harness's child.
-
-    That is `biopb mcp view`, or a ``--port 0`` http session nobody reaps for
-    it (the dashboard's "new session"). Two things follow from it and must not
-    drift apart: such a session owns its own reap (it serves the stop route),
-    and it is the only kind that gets the built-in chat loop. A shim-owned child
-    is serving an MCP client; a direct ``--transport http`` launch on a fixed
-    port is neither, and publishes no session, so it has no observe page.
-    """
-    return bool(not shim_owned and (view or port == 0))
-
-
-def _setup_chat(config, agentless):
+def _setup_chat(config, mode):
     """Wire up the built-in chat client.
 
     Switched by ``observe.chat_enabled``. On by default,
@@ -273,8 +246,8 @@ def _setup_chat(config, agentless):
     than blocking the MCP server, which is the surface an already-working
     harness depends on. Returns True if mounted.
 
-    *agentless* says whether a human opened this session (:func:`_is_agentless`)
-    rather than some MCP client driving it; chat is served only on the former.
+    *mode* (:mod:`_session_mode`) says whether this session serves chat at all:
+    not a `direct` http server, which an MCP client connects to by itself.
 
     The verdict is also published on ``/api/status``
     (:func:`_observe.set_chat_enabled`), so the control's dashboard can label
@@ -289,7 +262,7 @@ def _setup_chat(config, agentless):
     try:
         from . import _chat_api
 
-        if _chat_api.configure(config, agentless=agentless):
+        if _chat_api.configure(config, mode=mode):
             _chat_api.register_http_routes()
             mounted = True
     except Exception:
@@ -351,10 +324,10 @@ def main(argv=None):
         # (FastMCP/uvicorn/kernel plumbing) is only imported by the owned session
         # child it spawns. Any bridge failure exits nonzero so the client sees EOF
         # rather than a hung server entry.
-        from . import _shim
+        from biopb import _shim
 
         try:
-            _shim.serve(config, opts.port)
+            _shim.serve(session=opts.session)
         except Exception:
             logger.exception("stdio bridge failed")
             return 1
@@ -366,7 +339,7 @@ def main(argv=None):
 def _serve_http(config, port, view=False, start_kernel=False):
     """Run the real MCP server (streamable-http) in the foreground.
 
-    ``view`` selects the agentless-viewer mode (`biopb mcp view`): force a
+    ``view`` selects the foreground-viewer mode (`biopb mcp view`): force a
     visible display, bind a dynamic port and print its URL, and start the
     kernel/viewer eagerly so the window opens immediately instead of on the
     first ``start_kernel`` tool call. ``start_kernel`` does only the last of
@@ -381,8 +354,6 @@ def _serve_http(config, port, view=False, start_kernel=False):
     # What our launcher handed *this* process, taken out of the environment the
     # kernel inherits so a session started from a cell is not mistaken for us.
     # (The session log path stays: the kernel reports it too.)
-    report_file = os.environ.pop(ENV_PORT_REPORT_FILE, None)
-    minted_id = os.environ.pop(ENV_SESSION_ID, None)
     launched_by = os.environ.pop(ENV_LAUNCH_TOKEN, None)
 
     # Windows: serve on the Selector event loop, not the default Proactor one
@@ -445,8 +416,8 @@ def _serve_http(config, port, view=False, start_kernel=False):
 
     # The kernel inherits this process' fds. fd 1 is not a protocol channel
     # under http, so native Qt/GL/dask/gRPC output is harmless: it lands on
-    # the launcher's stdout/stderr — which, for a shim-spawned session child, is
-    # that session's log file (biopb.lifecycle.owned_child.open_child_log).
+    # the launcher's stdout/stderr — which, for a control-launched session, is
+    # that session's log file.
 
     host = KernelHost(
         extra_arguments=extra_arguments,
@@ -491,8 +462,9 @@ def _serve_http(config, port, view=False, start_kernel=False):
     _app.set_promote_after(get_setting(config, "kernel.promote_after"))
 
     # Tell server_status where this process's log lives, so an agent can find it.
-    #   * shim session -> the per-session file (BIOPB_MCP_SESSION_LOG, set by the
-    #     shim); also visible to execute_code via os.environ.
+    #   * a control-launched session -> its per-launch file
+    #     (BIOPB_MCP_SESSION_LOG, set by the control); also visible to
+    #     execute_code via os.environ.
     #   * a non-tty direct `--transport http` launch (output redirected to a
     #     file) -> the canonical mcp-server.log.
     #   * a terminal (foreground `--transport http` / `biopb mcp view`) -> None,
@@ -524,38 +496,30 @@ def _serve_http(config, port, view=False, start_kernel=False):
     # (a no-op safe on an idle, never-started host).
     atexit.register(host.shutdown)
 
-    # Three modes bind their own socket and publish the session:
-    #   * the de-daemonized shim-owned child — the shim set
-    #     BIOPB_PORT_REPORT_FILE and passed --port 0; it reaps us directly (own
-    #     process group / Job Object) and we report the OS-assigned port back;
-    #   * the agentless `biopb mcp view` viewer — a user-owned Ctrl-C session; it
-    #     prints its URL instead;
-    #   * an agentless ``--port 0`` http session (the dashboard's "new
-    #     session"), which prints its URL like the viewer.
-    # A direct `--transport http` binds the configured port. The POSIX signal
-    # handlers below reap our kernel gracefully in every mode.
-    shim_owned = bool(report_file)
-    agentless = _is_agentless(view, shim_owned, port)
-    dynamic_port = shim_owned or agentless
+    # The session's mode (`_session_mode`) is decided once, here. A `durable`
+    # session -- `biopb mcp view`, or one the control launched (the dashboard's
+    # "new session", or `attach new`) -- binds its own socket, publishes itself
+    # and runs until a person stops it; it prints its URL. A `direct`
+    # `--transport http` binds the configured port. The POSIX signal handlers
+    # below reap our kernel gracefully in every mode.
+    mode = _session_mode.of(view, port)
+    dynamic_port = _session_mode.publishes(mode)
     listen_sock = None
     if dynamic_port:
         listen_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         listen_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listen_sock.bind(("127.0.0.1", port))  # port 0 -> OS assigns one
         # Listening from here on, so a connection that arrives before uvicorn
-        # starts accepting (the shim's, the control's) queues instead of being
+        # starts accepting (an agent's, the control's) queues instead of being
         # refused.
         listen_sock.listen()
         port = listen_sock.getsockname()[1]
         mcp_url = f"http://127.0.0.1:{port}/mcp"
-        if shim_owned:
-            _report_port(report_file, port)
-        else:
-            print(
-                f"biopb-mcp session serving on {mcp_url} "
-                "(Ctrl-C to stop; an agent may attach at this URL).",
-                flush=True,
-            )
+        print(
+            f"biopb-mcp session serving on {mcp_url} "
+            "(Ctrl-C to stop; an agent may attach at this URL).",
+            flush=True,
+        )
 
     # Set by the registration below; read by _shutdown. Declared here because the
     # signal handlers are installed before that point, so this name has to exist
@@ -597,12 +561,12 @@ def _serve_http(config, port, view=False, start_kernel=False):
     # goes with it, so a stop from the web takes the same path Ctrl-C does.
     _setup_observe(
         config,
-        agentless=agentless,
+        mode=mode,
         on_shutdown=lambda: _shutdown("stopped from the web"),
     )
-    # A shim-owned child is serving an MCP client, which is the one situation the
-    # built-in loop is not for.
-    _setup_chat(config, agentless=agentless)
+    # A durable session mounts chat, and the lease keeps it off an attached
+    # agent's session.
+    _setup_chat(config, mode=mode)
 
     if start_kernel:
         # Wanted usable now -- the window up, a kernel a Jupyter client can
@@ -622,7 +586,9 @@ def _serve_http(config, port, view=False, start_kernel=False):
     # last, with any eager kernel up and the serve loop the next statement, so
     # a record implies a session that is all but answering.
     if dynamic_port:
-        session_id = _register_session(port, mcp_url, minted_id, launched_by)
+        session_id = _register_session(
+            port, mcp_url, launched_by=launched_by, mode=mode
+        )
 
     _server.run(
         port,

@@ -207,8 +207,9 @@ control.
 
 Because the agent runs arbitrary code against a live session, the session must
 survive the agent doing something wrong — which is why the kernel is a separate,
-interruptible, restartable child process, and why sessions are ephemeral and
-shim-owned while the planes are durable and control-supervised. The session's own
+interruptible, restartable child process, and why a session is a detached process
+a person stops, which an agent attaches to through the shim, while the planes are
+durable and control-supervised. The session's own
 process chain, its security model, and its component map are in
 [`biopb-mcp/ARCHITECTURE.md`](biopb-mcp/ARCHITECTURE.md); the supervision of the
 durable planes and the web origin in

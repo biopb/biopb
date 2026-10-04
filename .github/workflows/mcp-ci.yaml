@@ -16,6 +16,7 @@ on:
       - dev
     paths:
       - 'biopb-mcp/**'
+      - 'biopb-control/**'
       - 'proto/**'
       - 'buf.yaml'
       - 'buf.gen.yaml'
@@ -30,6 +31,7 @@ on:
       - dev
     paths:
       - 'biopb-mcp/**'
+      - 'biopb-control/**'
       - 'proto/**'
       - 'buf.yaml'
       - 'buf.gen.yaml'
@@ -124,8 +126,12 @@ jobs:
       # Resolve the whole workspace so biopb[tensor] and biopb-tensor-server[web]
       # come from the in-tree members (the server is never on PyPI). uv is the
       # workspace-aware installer; this is why CI no longer uses tox+pip.
+      #
+      # biopb-control rides along: it is not a dependency of biopb-mcp, but the
+      # product installs them together and `attach new` asks the control for a
+      # session, so one test here runs the real chain -- shim, control, session.
       - name: Install (workspace, napari extra + testing group)
-        run: uv sync --package biopb-mcp --extra napari --group testing --python ${{ matrix.python-version }}
+        run: uv sync --package biopb-mcp --package biopb-control --extra napari --group testing --python ${{ matrix.python-version }}
 
       - name: Run tests
         env:

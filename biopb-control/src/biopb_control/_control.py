@@ -7,7 +7,7 @@ same port**, and routes by namespace so no two upstreams share a path prefix:
 
 - ``GET  /health``                -> ``{"control": "ok", "data_plane": {...}}`` —
                                      the control's own liveness (what
-                                     ``_control_client`` and the installer poll).
+                                     ``_control_launch`` and the installer poll).
                                      Bare, kept byte-for-byte.
 - ``POST /api/data_plane/{ensure,stop,restart}`` -> supervisor verbs: ensure the
                                      plane is up (bounded wait), stop it, or bounce
@@ -26,11 +26,14 @@ same port**, and routes by namespace so no two upstreams share a path prefix:
   /api/algorithms/logs`` -> the algorithm plane's verbs (``?name=``).
 - ``GET  /api/sessions``          -> the live MCP sessions from the registry, each
                                      with its ``/session/<id>/observe`` link.
-- ``POST /api/sessions/new``      -> launch an agentless session on this
-                                     machine; its config decides whether it
-                                     gets a napari viewer. The child is
+- ``POST /api/sessions/new``      -> launch a session on this machine; its
+                                     config decides whether it gets a napari
+                                     viewer. ``?display=`` is the launching
+                                     client's own display environment, used in
+                                     place of the control's. The child is
                                      detached and self-registering, so the
-                                     control launches it without owning it.
+                                     control launches it without owning it, and
+                                     it runs until a person stops it.
 - ``GET  /`` (and every other non-API, non-proxy GET) -> the built ``web/``
                                      SPA bundle (``static_dir``). The control is
                                      the **single web origin**: it serves the
@@ -209,13 +212,13 @@ def _session_proxy_roots(loopback_bound: bool) -> frozenset[str]:
 _UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
 # Every /api/ route is now gated, `/api/data_plane/ensure` included. It used to be
-# exempted (biopb/biopb#424 item 2) because biopb-mcp's _control_client had no way
+# exempted (biopb/biopb#424 item 2) because biopb._control_launch had no way
 # to obtain the token — the control handed back the plane's endpoint but never a
 # credential — so gating this idempotent route would have locked the mcp client out
 # of a token-gated deployment. That exemption was an unauthenticated state-change,
 # safe only while a local control was necessarily tokenless; #468's optional local
 # token falsified that. The credential handoff (biopb/biopb#470) unblocks the fix:
-# the control writes the token to an owner-only file and _control_client carries it,
+# the control writes the token to an owner-only file and _control_launch carries it,
 # so this route can be gated like the rest and the exemption is gone.
 
 # Data-plane log tail (the dashboard /logs page polls it). Bound BOTH the returned
@@ -375,7 +378,7 @@ class _URLPrefixMiddleware:
       ``/node/h/p/api/data_plane/restart`` would sail past its
       ``startswith("/api/")`` check — an auth bypass, not merely a 404.
     - An unprefixed request must pass through **untouched**, not 404: biopb-mcp's
-      ``_control_client`` and the installer poll ``http://127.0.0.1:8813/health``
+      ``_control_launch`` and the installer poll ``http://127.0.0.1:8813/health``
       over loopback with no prefix, and they keep working while a prefix is
       configured for the portal.
 
@@ -634,11 +637,15 @@ def _kernel_state(health: dict) -> str:
 # What a session probe reports when the child cannot be reached or understood.
 # Every field degrades to its least-claiming value: an unknown kernel, no chat,
 # and no stop offered — never a button that would 404.
-_PROBE_UNKNOWN = {"kernel": "unknown", "chat": False, "agentless": False}
+_PROBE_UNKNOWN = {
+    "kernel": "unknown",
+    "chat": False,
+    "holder": None,
+}
 
 
 async def _probe_session(client: httpx.AsyncClient, rec: dict) -> dict:
-    """Best-effort ``{kernel, chat, agentless}`` for one session.
+    """Best-effort ``{kernel, chat, holder}`` for one session.
 
     A single cheap loopback GET to the child's ``/api/status`` — which returns
     ``KernelHost.health()`` with no kernel round-trip and whose ``api`` observe
@@ -651,10 +658,9 @@ async def _probe_session(client: httpx.AsyncClient, rec: dict) -> dict:
 
     The two booleans come off the same response rather than extra requests, and
     answer different questions. ``chat_enabled`` says what that session's page
-    leads with, which is how the dashboard labels its link. ``agentless`` says
-    who owns the reap — only an agentless session ends itself, a
-    shim-owned child is its shim's to reap — which is how the dashboard decides
-    whether to offer a stop. Both absent on an older child, which reads as
+    leads with, which is how the dashboard labels its link. ``holder`` says who
+    the session answers to, so the dashboard can say what stopping it takes
+    from. Both absent on an older child, which reads as
     False: an observe link and no stop button, the behaviour that predates them.
     """
     port = rec.get("port")
@@ -669,7 +675,10 @@ async def _probe_session(client: httpx.AsyncClient, rec: dict) -> dict:
         return {
             "kernel": _kernel_state(health),
             "chat": bool(health.get("chat_enabled")),
-            "agentless": bool(health.get("agentless")),
+            # Who the session answers to (`agent`, `chat`, or nobody): what an
+            # agent choosing a session to attach to needs, and the dashboard
+            # can show.
+            "holder": (health.get("lease") or {}).get("holder"),
         }
     except Exception:  # noqa: BLE001 - a probe is decorative; never fail the list
         return dict(_PROBE_UNKNOWN)
@@ -677,20 +686,23 @@ async def _probe_session(client: httpx.AsyncClient, rec: dict) -> dict:
 
 # --- launching a session ---------------------------------------------------- #
 #
-# Invariant I1 (ARCHITECTURE.md) says the control observes sessions and never
-# spawns them, and its reason is a *display* one: a session spawned from the
-# control's frozen environment would put the agent's napari viewer somewhere the
-# user is not (biopb/biopb-mcp#98). That covers a session serving an MCP client,
-# whose spawner is that client's shim anyway. It does not cover the session the
-# dashboard's "new session" opens: an agentless one, driven by the person at the
-# dashboard through its chat pane or a Jupyter client, and useful with no
-# viewer at all. Whether it gets one is its own config's call, made the way
-# every session makes it -- viewer.enabled, napari installed, a display -- and a
-# session that cannot have one runs without it rather than failing.
+# Invariant I1 (ARCHITECTURE.md): the control launches sessions and never holds
+# one. Every session it launches is a person's, driven through the dashboard's
+# chat pane, a Jupyter client or an agent that attaches to it, and it runs until
+# they stop it: a session's kernel can be worth keeping after whoever started
+# it has gone. Whether it gets a napari viewer is its own config's call, made
+# the way every session makes it -- viewer.enabled, napari installed, a display
+# -- and a session that cannot have one runs without it rather than failing.
+#
+# The display is why a session spawned from the control's frozen environment can
+# put the agent's viewer somewhere the user is not (biopb/biopb-mcp#98). A launch
+# for an agent therefore says what display the agent's client has (``display``),
+# and the control passes exactly that, never its own. A dashboard launch has no
+# such client, and inherits the control's.
 #
 # What the control does not do is own the result: the child is detached,
-# self-registers, and self-de-registers, so the *registry* still only ever
-# observes, and a control restart does not end the user's session.
+# self-registers, and self-de-registers, so the *registry* still only observes,
+# and a control restart does not end a session.
 
 # How long POST /api/sessions/new waits for a launched session to publish
 # itself. Generous because the session starts its kernel -- and a napari window
@@ -706,9 +718,8 @@ _SESSION_POLL_INTERVAL = 0.25
 # config) and the only one the dashboard can show.
 _VIEWER_LOG_TAIL = 2000
 
-# How many past launches' logs to keep. Matches the shim's session-log retention
-# (``transport.session_log_keep``): enough to look back over a couple of failed
-# attempts, not an unbounded pile of Qt chatter.
+# How many past launches' logs to keep: enough to look back over a couple of
+# failed attempts, not an unbounded pile of Qt chatter.
 _VIEWER_LOG_KEEP = 5
 
 # Cap on same-second name collisions before giving up on a log for this launch.
@@ -717,18 +728,31 @@ _VIEWER_LOG_KEEP = 5
 _VIEWER_LOG_ATTEMPTS = 100
 
 
-def _session_argv() -> list[str]:
-    """The command that starts an agentless session.
+# The only variables a launch's ``display`` may set: where a viewer window can
+# appear. Anything else a client could send is an environment injection into a
+# process that runs arbitrary code (``LD_PRELOAD``, ``PATH``), so it is dropped.
+_DISPLAY_ENV = (
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XAUTHORITY",
+    "XDG_RUNTIME_DIR",
+    "XDG_SESSION_TYPE",
+)
 
-    A plain http session on ``--port 0``, which is what makes it agentless and
-    self-publishing (N of them never collide on the configured MCP port), with
-    its kernel started before it publishes itself so it is ready to use. Run
-    as a module of *this* interpreter -- the supervisor's idiom for the data
+
+def _session_argv(start_kernel: bool = True) -> list[str]:
+    """The command that starts a session.
+
+    A plain http session on ``--port 0``, which is what makes it self-publishing
+    (N of them never collide on the configured MCP port), with its kernel
+    started before it publishes itself so it is ready to use -- unless the
+    caller is an agent, which starts the kernel itself with ``start_kernel``.
+    Run as a module of *this* interpreter -- the supervisor's idiom for the data
     plane -- so it resolves through the environment the control was installed
     into and needs no console script on PATH. Importing nothing of it here
     keeps I2.
     """
-    return [
+    argv = [
         sys.executable,
         "-m",
         "biopb_mcp.mcp",
@@ -736,8 +760,33 @@ def _session_argv() -> list[str]:
         "http",
         "--port",
         "0",
-        "--start-kernel",
     ]
+    if start_kernel:
+        argv.append("--start-kernel")
+    return argv
+
+
+def _launch_env(launch_token: str, log_path, *, display: dict | None) -> dict:
+    """The environment a launched session starts with.
+
+    Inherited from the control, which carries the DISPLAY/XAUTHORITY/
+    WAYLAND_DISPLAY (or the Aqua session, or the Windows station) that decides
+    whether the session can have a window, and where -- except when the launch
+    names a *display* (an agent's client): then the control's own display
+    variables are dropped and the allowlisted ones it sent are set, so an
+    agent whose client has no display gets no viewer rather than one on the
+    screen the control happened to start under.
+    """
+    env = {**os.environ, _locations.MCP_LAUNCH_TOKEN_ENV: launch_token}
+    if display is not None:
+        for key in _DISPLAY_ENV:
+            env.pop(key, None)
+        for key, value in display.items():
+            if key in _DISPLAY_ENV and isinstance(value, str) and value:
+                env[key] = value
+    if log_path is not None:
+        env[_locations.MCP_SESSION_LOG_ENV] = str(log_path)
+    return env
 
 
 def _prune_viewer_logs(log_dir, keep: int) -> None:
@@ -826,8 +875,13 @@ def _is_our_launch(rec: dict, launch_token: str) -> bool:
     return rec.get(_locations.LAUNCH_TOKEN_FIELD) == launch_token
 
 
-def _launch_session(timeout: float) -> dict:
-    """Start an agentless session; wait for it to publish itself.
+def _launch_session(
+    timeout: float,
+    *,
+    start_kernel: bool = True,
+    display: dict | None = None,
+) -> dict:
+    """Start a session; wait for it to publish itself.
 
     Registration is the readiness signal: ``--start-kernel`` runs
     ``host.ensure_started()`` *before* ``_register_session`` (biopb-mcp
@@ -847,26 +901,25 @@ def _launch_session(timeout: float) -> dict:
     forwarded exit as "exited before it opened" (biopb#1084).
 
     Detached (:func:`detach_kwargs`) and then forgotten: the ``Popen`` handle is
-    held only long enough to notice an early exit, never to reap or restart. The
-    session is the user's, and a control restart must not end it.
+    held only long enough to notice an early exit, never to reap or restart. A
+    control restart must not end the session.
+
+    *display* is the launching client's own display environment (see
+    :func:`_launch_env`). *start_kernel* is False for an agent, which starts its
+    own.
 
     Returns ``{"state": "started"|"starting"|"failed", ...}``; only ``failed``
     carries ``error`` and ``log``.
     """
     log_fh, log_path = _open_viewer_log()
-    argv = _session_argv()
+    argv = _session_argv(start_kernel)
     logger.info("Launching session: %s (log: %s)", " ".join(argv), log_path)
-    # The environment is inherited: it carries the DISPLAY/XAUTHORITY/
-    # WAYLAND_DISPLAY (or the Aqua session, or the Windows station) that decides
-    # whether the session can have a window, and where. Two additions ride on
-    # top of it: the
-    # per-launch token we recognise the child's registration by, and where its
-    # own output went, so `server_status` can name the file rather than guessing
-    # the canonical one -- the same thing the shim does for its child.
+    # Two additions ride on the environment: the per-launch token we recognise
+    # the child's registration by, and where its own output went, so
+    # `server_status` can name the file rather than guessing the canonical one
+    # -- the same thing the shim does for its child.
     launch_token = secrets.token_hex(8)
-    env = {**os.environ, _locations.MCP_LAUNCH_TOKEN_ENV: launch_token}
-    if log_path is not None:
-        env[_locations.MCP_SESSION_LOG_ENV] = str(log_path)
+    env = _launch_env(launch_token, log_path, display=display)
     try:
         proc = subprocess.Popen(
             argv,
@@ -881,6 +934,11 @@ def _launch_session(timeout: float) -> dict:
     finally:
         if log_fh is not None:
             log_fh.close()  # the child holds its own dup
+    if os.name != "nt":
+        # Reap it when it ends, so a session the control stops does not linger
+        # as a zombie for the control's lifetime. Waiting is not owning: nothing
+        # here restarts it or ends it.
+        threading.Thread(target=proc.wait, daemon=True).start()
 
     deadline = time.monotonic() + timeout
     while True:
@@ -894,6 +952,8 @@ def _launch_session(timeout: float) -> dict:
                     "state": "started",
                     "session_id": session_id,
                     "observe_url": f"/session/{session_id}/observe",
+                    "port": rec.get("port"),
+                    "mcp_url": rec.get("mcp_url"),
                 }
         code = proc.poll()
         if code is not None:
@@ -1183,22 +1243,18 @@ def build_app(
                 "observe_url": f"/session/{rec['session_id']}/observe",
                 "kernel": probe["kernel"],
                 # Whether that page will lead with the chat client: the child
-                # mounts it (only an agentless session does) AND this
+                # mounts it (only a session whose mode serves it does) AND this
                 # control will proxy /chat/*. Both halves, as ObservePage needs
                 # both — answered here so the dashboard needs no second probe.
                 "chat": probe["chat"] and loopback_bound,
-                # Whether the session serves a stop verb. Not gated on the bind
-                # the way chat is: the route lives under `api`, which is proxied
-                # everywhere, and stopping a session is no more destructive than
-                # the kernel restart already there.
-                "can_stop": probe["agentless"],
+                "holder": probe["holder"],
             }
             for rec, probe in zip(records, probes, strict=True)
         ]
         return JSONResponse({"sessions": sessions})
 
     def api_session_new(request: Request) -> JSONResponse:
-        # Launch an agentless session on this machine. Sync: it spawns and then
+        # Launch a session on this machine. Sync: it spawns and then
         # blocks polling the registry, so Starlette runs it in the threadpool.
         # The client passes ?client_timeout=<its HTTP timeout>; bound our wait
         # below it so a slow-but-working launch comes back as "starting" rather
@@ -1208,8 +1264,25 @@ def build_app(
         except ValueError:
             client_timeout = 0.0
         wait = _bounded_ensure_wait(_SESSION_START_TIMEOUT, client_timeout)
+        query = request.query_params
+        display = None
+        if "display" in query:
+            try:
+                display = json.loads(query["display"])
+            except ValueError:
+                display = None
+            if not isinstance(display, dict):
+                return JSONResponse(
+                    {"error": "display must be a JSON object"}, status_code=400
+                )
         try:
-            return JSONResponse(_launch_session(wait))
+            return JSONResponse(
+                _launch_session(
+                    wait,
+                    start_kernel=query.get("start_kernel", "1") not in ("0", "false"),
+                    display=display,
+                )
+            )
         except Exception as exc:  # noqa: BLE001 - report, never crash the handler
             logger.exception("session launch failed")
             return JSONResponse({"error": str(exc)}, status_code=500)

@@ -19,12 +19,15 @@ are its children, and MCP sessions are independent clients that merely register.
 
 Two rules keep that tree correct, and every change here must preserve them.
 
-- **I1 — the control never *owns* a session.** A session serving an MCP client is
-  spawned by that client's shim and only **registers itself**, so the control routes to
-  and lists it without holding it. The one session the control may *launch* is an
-  agentless one for the dashboard, driven through its chat pane or a Jupyter
-  client; that child is detached and self-registering, so the registry still only
-  observes and a control restart never ends the user's session. Its config decides
+- **I1 — the control launches sessions and never holds one.** A session is a
+  detached, self-registering process, so the control routes to and lists it
+  without owning it, and a control restart never ends one. A session it launches
+  — for the dashboard, or for an agent that then attaches to it — runs until a
+  person stops it, since its kernel can be worth keeping after whoever started it
+  has gone; stopping is the session ending itself (`/api/shutdown`), from the
+  dashboard, and every session serves it. A launch for an agent carries the
+  agent's own display variables, allowlisted, and the control uses them instead
+  of its own, which are frozen at whoever started it. A session's config decides
   whether it gets a napari viewer, and it runs without one where napari or a
   display is missing.
 - **I2 — the control stays lean and subprocess-based.** It supervises components
@@ -129,24 +132,24 @@ once it is reachable, and removes it on reap; the control reads that dir. The
 contract is a stdlib-only core-SDK module (I2): the session side writes, the
 control reads, and neither imports the other.
 
-Every session on a dynamic port **publishes itself** — a shim-owned child under
-the id its shim minted, an agentless `biopb mcp view` session under its own — and
-drops its record on the way out; a shim also drops its child's once it has reaped
-it, since Windows kills the child outright. The control only ever reads.
+Every session on a dynamic port **publishes itself** — a `biopb mcp view` or
+control-launched session, recording its `mode` (`durable`) — and drops its record
+on the way out. The control only ever reads.
 
 Lookups **self-heal**, pruning records whose owning pid is dead — or alive on a
 recycled pid, caught by a create-time token — so a dead session expires to a clean
 "session ended" rather than a hang.
 
-`POST /api/sessions/new` is the third way a session comes to exist: the control
-spawns `biopb-mcp --transport http --port 0 --start-kernel` and waits for it to
-appear in this registry, matched on a per-launch token it hands the child.
+`POST /api/sessions/new` is how a session comes to exist for the dashboard or for
+an agent: the control spawns `biopb-mcp --transport http --port 0` (with
+`--start-kernel` unless an agent will start its own) and waits for it to appear
+in this registry, matched on a per-launch token it hands the child.
 Registration is an exact readiness signal — the kernel (and any window) starts
 *before* it registers — and a child that dies first never registers and comes
 back with its own log tail.
 Each launch writes **its own** file under `state/biopb/mcp/viewers/` (pruned to
-the newest few), beside the shim's per-session logs and for the same reason: a
-shared file interleaves concurrent sessions, and lines that cannot be attributed
+the newest few), for a reason a shared file would defeat: it interleaves
+concurrent sessions, and lines that cannot be attributed
 to a process are no use for diagnosing a session that is still running. The
 child is told the path, so `server_status` names the file its output really
 went to.
@@ -157,5 +160,5 @@ Ctrl-C does. So ownership never enters it: a session started from a terminal and
 one started here are the same process ending itself, and the control keeps no
 record of which it launched. The route rides `api` rather than the local-only
 gate (it is not an execute surface, and `api` already carries the kernel
-restart), and only a session that owns its own reap serves it — a shim-owned
-child does not, since ending it would leave its shim bridging to a dead process.
+restart), and every session serves it, so every dashboard row can be stopped. An
+agent attached to the session through a shim sees it stop answering and unbinds.

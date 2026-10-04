@@ -440,8 +440,8 @@ def _app_client():
 
 def test_status_advertises_whether_chat_is_mounted(host):
     # The control's dashboard reads this to label a session's link: only an
-    # agentless `biopb mcp view` session mounts chat, so this is also its answer
-    # to "viewer, or an MCP client's child?".
+    # session whose mode serves chat mounts it, so this is also its answer to
+    # "viewer, or an MCP client's child?".
     old = _observe._chat_enabled
     try:
         for enabled in (True, False):
@@ -452,44 +452,43 @@ def test_status_advertises_whether_chat_is_mounted(host):
         _observe.set_chat_enabled(old)
 
 
-def test_status_advertises_who_owns_the_reap(host):
-    # The control's dashboard offers a stop only where the session ends itself.
-    # Distinct from chat_enabled: chat is a config switch, and a viewer with
-    # chat off still owns its reap.
-    old = (_observe._agentless, _observe._shutdown_hook)
+def test_status_advertises_its_mode(host):
+    old = _observe._mode
     try:
-        for agentless in (True, False):
-            _observe.set_session_owns_its_reap(agentless, on_shutdown=lambda: None)
-            r = _app_client().get("/api/status")
-            assert r.json()["agentless"] is agentless
+        for mode in ("durable", "direct"):
+            _observe.set_session_mode(mode)
+            assert _app_client().get("/api/status").json()["mode"] == mode
     finally:
-        _observe._agentless, _observe._shutdown_hook = old
+        _observe._mode = old
 
 
-def test_shutdown_route_absent_for_a_shim_owned_child(host):
-    # Not a refusing route -- no route. Ending a shim's child would leave that
-    # shim bridging to a dead process, so the verb must not exist there at all.
-    _observe.set_session_owns_its_reap(False)
-    try:
-        client = _app_client()
-        assert client.post("/api/shutdown").status_code == 404
-        assert client.get("/api/jobs").status_code == 200  # untouched
-    finally:
-        _observe.set_session_owns_its_reap(False)
+def test_shutdown_route_is_on_every_session(host):
+    # Every session can be stopped from the dashboard, whatever started it: a
+    # shim whose session is stopped sees it stop answering and unbinds, so the
+    # shim's own child needs no exemption.
+    paths = {p for p, _, _ in _observe._routes()}
+    assert "/api/shutdown" in paths
 
 
-def test_shutdown_runs_the_session_teardown_after_answering(host):
+def test_shutdown_without_a_wired_teardown_is_a_404(host):
+    # Only the standalone test app has none; the launcher always wires one.
+    _observe.set_session_mode("durable")
+    assert _app_client().post("/api/shutdown").status_code == 404
+
+
+@pytest.mark.parametrize("mode", ["durable", "direct"])
+def test_shutdown_runs_the_session_teardown_after_answering(host, mode):
     # The stop is the session ending itself on the launcher's own `_shutdown`
     # path -- so the hook is what runs, and it runs only once the response is
     # out (it ends in os._exit, which would otherwise cut the reply off).
     calls = []
-    _observe.set_session_owns_its_reap(True, on_shutdown=lambda: calls.append(1))
+    _observe.set_session_mode(mode, on_shutdown=lambda: calls.append(1))
     try:
         r = _app_client().post("/api/shutdown")
         assert r.status_code == 200
         assert r.json()["stopping"] is True
     finally:
-        _observe.set_session_owns_its_reap(False)
+        _observe.set_session_mode("direct")
     # TestClient runs background tasks before returning, so by here it has run.
     assert calls == [1]
 
@@ -545,3 +544,57 @@ def test_config_defaults():
     assert get_setting({}, "observe.enabled") is True  # opt-out
     assert get_setting({}, "observe.max_output_chars") == 20000
     assert get_setting({}, "observe.poll_interval_ms") == 3000
+
+
+# -- the lease routes -------------------------------------------------------
+
+
+@pytest.fixture
+def lease():
+    from biopb_mcp.mcp import _lease
+
+    _lease._reset()
+    yield _lease
+    _lease._reset()
+
+
+def _post(client, path, **body):
+    return client.post(path, json=body, headers={"content-type": "application/json"})
+
+
+def test_an_agent_takes_the_lease_and_status_shows_it(client, lease):
+    r = _post(client, "/api/lease/acquire", token="t1")
+    assert r.status_code == 200 and r.json()["holder"] == "agent"
+    status = client.get("/api/status").json()
+    assert status["lease"]["holder"] == "agent"
+    assert "viewer" in status
+
+
+def test_a_held_session_is_refused_with_who_holds_it(client, lease):
+    _post(client, "/api/lease/acquire", token="t1")
+    r = _post(client, "/api/lease/acquire", token="t2")
+    assert r.status_code == 409 and r.json()["holder"] == "agent"
+    assert (
+        _post(client, "/api/lease/acquire", token="t2", force=True).status_code == 200
+    )
+    assert _post(client, "/api/lease/renew", token="t1").status_code == 409
+    assert _post(client, "/api/lease/renew", token="t2").status_code == 200
+
+
+def test_release_frees_the_session(client, lease):
+    _post(client, "/api/lease/acquire", token="t1")
+    assert _post(client, "/api/lease/release", token="t1").json() == {"released": True}
+    assert client.get("/api/lease").json() == {"holder": None}
+
+
+def test_a_lease_call_needs_a_token(client, lease):
+    assert _post(client, "/api/lease/acquire").status_code == 400
+
+
+def test_lease_posts_wear_the_json_content_type_guard(client, lease):
+    # A cross-site form cannot set it; this route can take a session from its
+    # holder.
+    r = client.post(
+        "/api/lease/acquire", content=b"{}", headers={"content-type": "text/plain"}
+    )
+    assert r.status_code == 400

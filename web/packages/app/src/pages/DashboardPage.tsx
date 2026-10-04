@@ -39,13 +39,13 @@ interface SessionRec {
   // error|unknown); decorative, may be absent on an older control.
   kernel?: string;
   // Whether that page leads with the chat client rather than the job list --
-  // true for an agentless `biopb mcp view` session whose chat this control will
+  // true for a session whose mode serves chat (not a shim's child) and whose
+  // chat this control will
   // proxy. Absent on an older control, which reads as an observe link.
   chat?: boolean;
-  // Whether the session serves a stop verb -- true only where it owns its own
-  // reap (a viewer, not a child some MCP client's shim will reap). Absent on an
-  // older control, which reads as no stop button rather than one that 404s.
-  can_stop?: boolean;
+  // Who the session answers to -- an attached agent, the chat pane, or nobody.
+  // Said in the stop confirmation, since stopping takes the kernel from them.
+  holder?: string | null;
 }
 interface AgentRec {
   id: string;
@@ -271,12 +271,13 @@ export default function DashboardPage() {
   // for a session started here and one started with `biopb mcp view` in a
   // terminal, and the confirm says so: that terminal is about to come back.
   const stopSession = useCallback(
-    async (id: string) => {
+    async (id: string, holder?: string | null) => {
+      const heldBy = holder ? `\n\nIts ${holder} is attached and loses it.` : "";
       if (
         !confirm(
           `Stop session ${id}?\n\nIts kernel (and napari window) closes and any running ` +
             `work is lost. If it was started with \`biopb mcp view\` in a ` +
-            `terminal, that terminal returns.`,
+            `terminal, that terminal returns.${heldBy}`,
         )
       )
         return;
@@ -587,17 +588,15 @@ export default function DashboardPage() {
                     >
                       {s.chat ? "chat →" : "observe →"}
                     </a>
-                    {s.can_stop ? (
-                      <button
-                        className="mini stop"
-                        onClick={() => stopSession(s.session_id)}
-                        disabled={stoppingId === s.session_id}
-                        title="Stop this session"
-                        aria-label={`Stop session ${s.session_id}`}
-                      >
-                        {stoppingId === s.session_id ? "…" : "✕"}
-                      </button>
-                    ) : null}
+                    <button
+                      className="mini stop"
+                      onClick={() => stopSession(s.session_id, s.holder)}
+                      disabled={stoppingId === s.session_id}
+                      title="Stop this session"
+                      aria-label={`Stop session ${s.session_id}`}
+                    >
+                      {stoppingId === s.session_id ? "…" : "✕"}
+                    </button>
                   </li>
                 );
               })
