@@ -65,6 +65,21 @@ class TestOneChunk:
         got = client.get_array(sid, slice_hint=hint)
         np.testing.assert_array_equal(got, data[2:5, 1:7])
 
+    def test_a_small_crop_does_not_keep_its_chunk_alive(
+        self, client, writable_server, tmp_path
+    ):
+        """A view of the whole chunk would pin it (an mmap'd segment or a decoded
+        transfer buffer) for as long as the caller holds the crop. The lazy form
+        copies such a crop (dask's getitem), so this one must too."""
+        sid, data = _zarr_source(
+            writable_server, tmp_path, shape=(64, 64), chunks=(64, 64)
+        )
+        hint = (slice(0, 4), slice(0, 4))
+        got = client.get_array(sid, slice_hint=hint)
+        np.testing.assert_array_equal(got, data[:4, :4])
+        assert got.flags.owndata
+        assert client.get_tensor(sid, slice_hint=hint).compute().flags.owndata
+
     def test_matches_the_lazy_form(self, client, writable_server, tmp_path):
         sid, _ = _zarr_source(writable_server, tmp_path, shape=(8, 8), chunks=(8, 8))
         hint = (slice(1, 6), slice(3, 8))

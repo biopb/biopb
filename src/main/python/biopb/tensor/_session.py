@@ -403,7 +403,7 @@ def _array_from_flight_info(
             )
             requested = _requested_slice(info)
             if requested is not None and descriptor.HasField("slice_hint"):
-                arr = arr[
+                crop = arr[
                     _request_crop_slices(
                         len(shape),
                         requested,
@@ -411,6 +411,12 @@ def _array_from_flight_info(
                         list(descriptor.scale_hint) if descriptor.scale_hint else None,
                     )
                 ]
+                # dask's getitem rule: a small crop must not keep the whole chunk
+                # (a pinned segment mapping or a decoded transfer buffer) alive for
+                # as long as the caller holds it.
+                if not crop.flags.owndata and arr.size >= 2 * crop.size:
+                    crop = crop.copy()
+                arr = crop
             return arr
     return _dask_from_flight_info(
         info, location, token, cache_bytes, tls_trust
