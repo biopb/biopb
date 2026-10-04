@@ -294,9 +294,13 @@ export function AdminPage() {
         if (!mounted.current) return;
         setStatus(st);
         const n = st.source_count ?? 0;
-        if (st.full_scan_in_progress) {
+        if (st.full_scan_in_progress || (st.registration_pending ?? 0) > 0) {
           setRestartScanning(true);
-          setRestartMsg(`Reconnected — scanning… ${n} sources`);
+          setRestartMsg(
+            st.full_scan_in_progress
+              ? `Reconnected — scanning… ${n} sources`
+              : `Reconnected — reading ${st.registration_pending} of ${n} sources…`,
+          );
         } else if (st.health === "SERVING") {
           setRestartScanning(false);
           setRestartMsg(`Ready — ${n} sources`);

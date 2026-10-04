@@ -793,7 +793,12 @@ def _setup_flight_server(
         full_rescan_interval=server_config.full_rescan_interval,
         prune_unseen_days=server_config.annotations.prune_unseen_days,
         rescan_interval=server_config.rescan_interval,
+        registration_workers=server_config.registration_workers,
+        walk_threads=server_config.walk_threads,
+        registration_stats=server_config.registration_stats,
     )
+    server.set_registration_pending_provider(source_manager.pending_registrations)
+    server.set_unregistered_provider(source_manager.unregistered_sources)
 
     roots = source_manager.roots
     monitored = roots.of_kind(RootKind.MONITORED)
@@ -822,18 +827,16 @@ def _setup_flight_server(
         precache_worker = PrecacheWorker(
             server, server_config.precache, server_config.pyramid
         )
-        # need to setup commit hook before source_manager.start()
+        # need to setup the hooks before source_manager.start()
         source_manager.set_source_committed_hook(precache_worker.enqueue)
         # wire should_warm() into precache_worker so it can avoid cloud-root
         # source.
         precache_worker.should_warm = source_manager.should_warm
-        # seed precache backlog after the initial scan completes
+        # Warming waits for the background registration it would compete with.
+        precache_worker.backlog_gate = source_manager.registration_idle
+        # Sources the first scan finds reach the backlog as they are registered.
         if server_config.precache.backlog_enabled:
-            source_manager.set_initial_scan_complete_hook(
-                lambda: precache_worker.seed_backlog(
-                    source_manager.iter_local_source_mtimes()
-                )
-            )
+            source_manager.set_startup_source_hook(precache_worker.enqueue_backlog)
         precache_worker.start()
 
     # Report "a full scan is running" from the first SERVING moment. The scan sets

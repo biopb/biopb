@@ -2,6 +2,7 @@ import type { StateCreator } from "zustand";
 import { TensorFlightClient } from "@biopb/tensor-flight-client";
 import type { DataSourceDescriptor, QuerySourcesResult } from "@biopb/tensor-flight-client";
 import { withBase } from "../base";
+import { catalogIsFilling } from "../utils/catalogHealth";
 import type { AppState } from "./types";
 
 export type ConnectionState = "idle" | "connecting" | "connected" | "error";
@@ -130,7 +131,7 @@ export const createConnectionSlice: StateCreator<AppState, [], [], ConnectionSli
         // leaves the previous value).
         try {
           const readyz = await client.http.readyz();
-          set({ scanning: !!readyz.backend_health?.full_scan_in_progress });
+          set({ scanning: catalogIsFilling(readyz.backend_health) });
         } catch {
           // ignore transient readyz errors
         }

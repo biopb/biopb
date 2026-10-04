@@ -72,6 +72,15 @@ class SourceRegistry:
         self._sources: Dict[str, SourceAdapter] = {}
         self._lock = threading.RLock()
         self._on_register = on_register
+        self._materializer: Optional[Callable[[str], None]] = None
+
+    def set_materializer(self, materializer: Optional[Callable[[str], None]]) -> None:
+        """Set what :meth:`get_registered` calls when a source is not registered.
+
+        It registers the source if it can (a claimed source whose registration was
+        deferred), and raises why if it cannot.
+        """
+        self._materializer = materializer
 
     def register(self, source_id: str, adapter: SourceAdapter) -> SourceAdapter:
         """Register a data source, in canonical axis order.
@@ -180,6 +189,21 @@ class SourceRegistry:
         """Thread-safe source lookup."""
         with self._lock:
             return self._sources.get(source_id)
+
+    def get_registered(self, source_id: str) -> Optional[SourceAdapter]:
+        """:meth:`get`, registering the source on a miss if it is claimed but
+        not registered yet.
+
+        What a reader of the source's data or tensors uses. The internal callers
+        that only ask whether it is registered, or read its url, use :meth:`get`:
+        they must not pay for a registration. Raises what the materializer raises
+        when the registration failed, and returns None for an unknown source.
+        """
+        adapter = self.get(source_id)
+        if adapter is None and self._materializer is not None:
+            self._materializer(source_id)
+            adapter = self.get(source_id)
+        return adapter
 
     def snapshot(self) -> List[Tuple[str, SourceAdapter]]:
         """Return a stable snapshot of registered sources for iteration."""

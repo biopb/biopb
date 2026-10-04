@@ -36,9 +36,10 @@ priority order:
 
 - **Live (primary).** Sources added to the catalog after startup, fed by
   `SourceManager`'s commit hook. Always drained first, and always warmed.
-- **Backlog (secondary).** Local sources already present at startup, seeded
-  once at boot and ordered newest-mtime-first. Drained only when the live
-  queue is empty.
+- **Backlog (secondary).** Local sources the first scan found, added one by one
+  as each is registered and ordered newest-mtime-first. Drained only when the
+  live queue is empty and registration has finished: it reads the same files,
+  and is the critical path of a start.
 
 Before each chunk the worker waits for `idle_debounce_seconds` of Flight
 server quiet (no in-flight `do_get`), re-checking between chunks so a live

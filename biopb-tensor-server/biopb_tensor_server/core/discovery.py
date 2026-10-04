@@ -22,6 +22,11 @@ import abc
 import hashlib
 import logging
 import os
+import queue
+import stat as stat_module
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import (
@@ -580,6 +585,35 @@ def _leads_back_up(real: str, current: str) -> bool:
     return current == real or current.startswith(real.rstrip(os.sep) + os.sep)
 
 
+def _note_skipped_entry(report: Any, path: Path, is_dir: bool) -> None:
+    """Record, in *report* (a ``WalkReport`` or anything with its two fields), an
+    entry the skip policy passed over. A no-op without a report."""
+    if report is None:
+        return
+    if is_dir:
+        report.declined_dirs.add(str(path))
+    elif not path.name.startswith(".") and _is_offline_placeholder(path):
+        report.offline_files += 1
+
+
+def _descent_refused(
+    path: Path, child_real: str, current_real: str, depth: int, max_depth: int
+) -> bool:
+    """Whether the walk must not enter directory *path*: it leads back to its own
+    ancestry, or it is already ``max_depth`` levels below the root. Logs why."""
+    if _leads_back_up(child_real, current_real):
+        logger.warning("walk: not entering %s: it leads back to %s", path, current_real)
+        return True
+    if depth >= max_depth:
+        logger.warning(
+            "walk: not entering %s: more than %d levels below the root",
+            path,
+            max_depth,
+        )
+        return True
+    return False
+
+
 def walk_with_identity_tracking(
     root: Path,
     visited_identities: Set[str],
@@ -635,13 +669,7 @@ def walk_with_identity_tracking(
                 path, is_dir, admit_nonresident=admit_nonresident
             ):
                 logger.debug("walk: skipping %s", path)
-                if report is not None:
-                    if is_dir:
-                        report.declined_dirs.add(str(path))
-                    elif not path.name.startswith(".") and _is_offline_placeholder(
-                        path
-                    ):
-                        report.offline_files += 1
+                _note_skipped_entry(report, path, is_dir)
                 continue
 
             if path_filter is not None and not path_filter(path):
@@ -671,17 +699,9 @@ def walk_with_identity_tracking(
                 and (should_descend is None or should_descend(path))
             ):
                 child_real = _real_dir(path)
-                if _leads_back_up(child_real, current_real):
-                    logger.warning(
-                        "walk: not entering %s: it leads back to %s", path, current_real
-                    )
-                elif _depth >= max_depth:
-                    logger.warning(
-                        "walk: not entering %s: more than %d levels below the root",
-                        path,
-                        max_depth,
-                    )
-                else:
+                if not _descent_refused(
+                    path, child_real, current_real, _depth, max_depth
+                ):
                     yield from walk_with_identity_tracking(
                         path,
                         visited_identities,
@@ -782,6 +802,9 @@ class AdapterRegistry:
     def __init__(self):
         self._adapters: List[Type[SourceAdapter]] = []
         self._type_to_adapter: Dict[str, Type[SourceAdapter]] = {}
+        # Called with (adapter name, seconds, claimed) after every claim probe,
+        # for the registration summary; None times nothing.
+        self.claim_timer: Optional[Callable[[str, float, bool], None]] = None
 
     def register(
         self,
@@ -836,7 +859,15 @@ class AdapterRegistry:
             recorder: List[str] = []
             state._claim_recorder = recorder
             try:
+                timer = self.claim_timer
+                started = time.perf_counter() if timer is not None else 0.0
                 claim = adapter_cls.claim(ctx, state)
+                if timer is not None:
+                    timer(
+                        adapter_cls.__name__,
+                        time.perf_counter() - started,
+                        claim is not None,
+                    )
                 if claim is not None:
                     claim.member_paths.update(recorder)
                     claims.append(claim)
@@ -908,7 +939,16 @@ class DiscoveryState:
         # Set by AdapterRegistry.get_claims_for_path around a single adapter's
         # claim() call: try_claim_path appends each path it consumes so the
         # registry can attribute members without snapshotting consumed_paths.
-        self._claim_recorder: Optional[List[str]] = None
+        # Per thread, so a parallel walk's probes each record their own.
+        self._recorders = threading.local()
+
+    @property
+    def _claim_recorder(self) -> Optional[List[str]]:
+        return getattr(self._recorders, "value", None)
+
+    @_claim_recorder.setter
+    def _claim_recorder(self, value: Optional[List[str]]) -> None:
+        self._recorders.value = value
 
     def try_claim_path(self, path: str | Path, identity: Optional[str] = None) -> bool:
         """Check if path can be claimed and mark it as consumed.
@@ -1186,6 +1226,160 @@ def _record_claim(
     return claim
 
 
+@dataclass
+class _DirVisit:
+    """What one worker found in one directory, for the scheduler to apply."""
+
+    claims: List[SourceClaim] = field(default_factory=list)
+    subdirs: List[tuple] = field(default_factory=list)  # (path, depth, real)
+    declined_dirs: Set[str] = field(default_factory=set)
+    offline_files: int = 0
+
+
+def _visit_directory(
+    directory: Path,
+    depth: int,
+    current_real: str,
+    registry: AdapterRegistry,
+    state: DiscoveryState,
+    path_filter: Optional[Callable[[Path], bool]],
+    admit_nonresident: bool,
+    cloud_root: bool,
+    monitored: bool,
+    max_depth: int,
+) -> _DirVisit:
+    """List one directory and probe its entries, as the serial walk does.
+
+    One worker owns a directory from its listing to the last probe of its
+    entries, so a claim that consumes sibling files (a multi-file source) sees the
+    same entries in the same order as the serial walk. Nothing is applied to the
+    shared claim table here: the claims come back to the scheduler.
+    """
+    visit = _DirVisit()
+    try:
+        entries = list(directory.iterdir())
+    except OSError:
+        return visit  # Permission issue reading directory
+
+    for path in entries:
+        try:
+            stat_result = os.stat(path)
+        except OSError:
+            continue  # Broken entry, broken symlink or permission issue
+        is_dir = stat_module.S_ISDIR(stat_result.st_mode)
+
+        if should_skip_walk_entry(
+            path, is_dir, stat_result=stat_result, admit_nonresident=admit_nonresident
+        ):
+            _note_skipped_entry(visit, path, is_dir)
+            continue
+
+        if path_filter is not None and not path_filter(path):
+            if is_dir:
+                visit.declined_dirs.add(str(path))
+            continue
+
+        path_str = str(path)
+        if not state.is_path_claimed(path_str):
+            ctx = ClaimContext(path, cloud_root=cloud_root, monitored=monitored)
+            claims = registry.get_claims_for_path(ctx, state)
+            if claims:
+                visit.claims.append(claims[0])
+
+        if is_dir and not path.is_symlink() and not state.is_path_claimed(path_str):
+            child_real = _real_dir(path)
+            if not _descent_refused(path, child_real, current_real, depth, max_depth):
+                visit.subdirs.append((path, depth + 1, child_real))
+                continue
+            visit.declined_dirs.add(path_str)
+    return visit
+
+
+def _discover_parallel(
+    root: Path,
+    registry: AdapterRegistry,
+    state: DiscoveryState,
+    path_filter: Optional[Callable[[Path], bool]],
+    admit_nonresident: bool,
+    cloud_root: bool,
+    report: Optional[WalkReport],
+    monitored: bool,
+    threads: int,
+    max_depth: int = MAX_WALK_DEPTH,
+) -> int:
+    """Walk *root* with *threads* workers; the calling thread is the scheduler.
+
+    Workers only read the filesystem and probe; the scheduler alone applies what
+    they return (``add_claim``, so the streamed first-scan commit also runs on
+    one thread) and queues the subdirectories they report. Work is handed out a
+    directory at a time from one queue, so a worker that finishes early takes the
+    next waiting directory. A directory that claim-descent prunes is never queued.
+
+    No identity set, unlike the serial walk: two spellings of one location get one
+    source id, and a hardlinked or bind-mounted copy is a second source.
+
+    Returns the number of directories visited.
+    """
+    results: queue.SimpleQueue = queue.SimpleQueue()
+    cancelled = threading.Event()
+
+    def task(directory: Path, depth: int, real: str) -> None:
+        try:
+            if cancelled.is_set():
+                results.put((None, None))
+                return
+            results.put(
+                (
+                    _visit_directory(
+                        directory,
+                        depth,
+                        real,
+                        registry,
+                        state,
+                        path_filter,
+                        admit_nonresident,
+                        cloud_root,
+                        monitored,
+                        max_depth,
+                    ),
+                    None,
+                )
+            )
+        except BaseException as exc:  # noqa: BLE001 - re-raised by the scheduler
+            results.put((None, exc))
+
+    visited = 0
+    with ThreadPoolExecutor(
+        max_workers=threads, thread_name_prefix="discovery-walk"
+    ) as pool:
+        pool.submit(task, root, 0, _real_dir(root))
+        outstanding = 1
+        failure: Optional[BaseException] = None
+        while outstanding:
+            visit, exc = results.get()
+            outstanding -= 1
+            if exc is not None:
+                failure = failure or exc
+                cancelled.set()
+                continue
+            if visit is None or failure is not None:
+                continue
+            visited += 1
+            # Subdirectories first: the commit a claim triggers (stats and a catalog
+            # write, on this thread) must not keep idle workers waiting for work.
+            for sub in visit.subdirs:
+                pool.submit(task, *sub)
+                outstanding += 1
+            for claim in visit.claims:
+                state.add_claim(claim)
+            if report is not None:
+                report.declined_dirs |= visit.declined_dirs
+                report.offline_files += visit.offline_files
+    if failure is not None:
+        raise failure
+    return visited
+
+
 def discover_sources(
     root: Path,
     registry: AdapterRegistry,
@@ -1195,6 +1389,7 @@ def discover_sources(
     cloud_root: bool = False,
     report: Optional[WalkReport] = None,
     monitored: bool = False,
+    walk_threads: int = 1,
 ) -> DiscoveryState:
     """Recursive filesystem discovery with claim protocol.
 
@@ -1222,6 +1417,9 @@ def discover_sources(
         monitored: The walk is a monitored root's rescan, which visits the same
             files again every tick, so claims memoize their content probes
             (``ClaimContext.monitored``). A one-shot walk does not.
+        walk_threads: Above 1, directories are read and probed by that many
+            worker threads under one scheduler (:func:`_discover_parallel`), which
+            is what a high-latency filesystem (NFS) needs; 1 is the serial walk.
 
     Returns:
         DiscoveryState with all discovered sources
@@ -1245,6 +1443,23 @@ def discover_sources(
     if claim is not None:
         logger.info(f"discover_sources: root {root} claimed as {claim.source_type}")
         return state  # Root claimed, no need to recurse
+
+    if walk_threads > 1:
+        dirs = _discover_parallel(
+            root,
+            registry,
+            state,
+            path_filter,
+            admit_nonresident,
+            cloud_root,
+            report,
+            monitored,
+            walk_threads,
+        )
+        logger.debug(
+            f"discover_sources: {dirs} directories, found {len(state.claims)} sources"
+        )
+        return state
 
     # Walk filesystem
     paths_scanned = 0

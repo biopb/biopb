@@ -3,6 +3,7 @@ import { useNavigate, useSearchParams } from "react-router-dom";
 import { appPath, withBase } from "./base";
 import { useAppStore } from "./store";
 import type { ReadyzSnapshot } from "@biopb/tensor-flight-client";
+import { catalogIsFilling } from "./utils/catalogHealth";
 
 /**
  * Wait for server to be ready, with exponential backoff retry.
@@ -78,7 +79,7 @@ export function ClientBootstrap() {
 
         // Seed the scan-in-progress flag so an empty catalog at startup renders
         // as "Indexing…" rather than "No sources" (progressive discovery).
-        const scanning = !!status.backend_health?.full_scan_in_progress;
+        const scanning = catalogIsFilling(status.backend_health);
 
         if (status.dev_mode) {
           // Dev mode active - bypass token requirement

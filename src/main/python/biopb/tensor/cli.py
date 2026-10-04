@@ -33,7 +33,7 @@ from biopb import (
     LocalTrustError,
     resolve_data_plane,
 )
-from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS
+from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS, unresolved_reasons
 from biopb.tensor.client import TensorFlightClient
 
 app = typer.Typer(
@@ -282,13 +282,21 @@ def query(
         table.add_column("Shape", style="green")
         table.add_column("Dtype", style="blue")
 
+        reasons = (
+            unresolved_reasons(lambda sql: client.query(sql, format="records"))
+            if any(not row.get("is_resolved", True) for row in sources.values())
+            else {}
+        )
         for source_id, row in sources.items():
             tensors = row.get("tensors") or []
             if not tensors:
                 # Two different states, and only one of them is actionable:
                 # an unresolved source has tensors the server has not looked
                 # for yet (biopb/biopb#1032).
-                why = "<no tensors>" if row.get("is_resolved", True) else "<unresolved>"
+                if row.get("is_resolved", True):
+                    why = "<no tensors>"
+                else:
+                    why = f"<{reasons.get(source_id) or 'unresolved'}>"
                 table.add_row(source_id, why, "-", "-")
                 continue
             for tensor in tensors:

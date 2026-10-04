@@ -33,6 +33,7 @@ from biopb_tensor_server.core.errors import UpstreamConfigError
 from biopb_tensor_server.core.remote import is_remote_url
 from biopb_tensor_server.sources.entry_stat import entry_change_time, entry_is_quiet
 from biopb_tensor_server.sources.reconciler import Reconciler
+from biopb_tensor_server.sources.registration_worker import RegistrationWorker
 from biopb_tensor_server.sources.resolve import partition_sources
 from biopb_tensor_server.sources.roots import (
     DND_URL_PREFIX,
@@ -107,6 +108,9 @@ class SourceManager:
         stability_window: float = 30.0,
         full_rescan_interval: float = 3600.0,
         prune_unseen_days: int = 0,
+        registration_workers: int = 0,
+        registration_stats: bool = False,
+        walk_threads: int = 1,
     ):
         # Collaborators. The registry is kept for ``add_local_source``'s own
         # discovery walk; every confirmed-catalog mutation goes through the
@@ -203,7 +207,30 @@ class SourceManager:
             notify_source_committed=self._notify_source_committed,
             catalog_url_for=self._display_url_for,
             stability_window=stability_window,
+            registration_stats=registration_stats,
         )
+
+        self._walk_threads = walk_threads
+        # Background registration of what the first scan claims
+        # (``registration_workers`` threads; 0 registers inline, as it always
+        # did). A read that needs a source before its turn registers it itself.
+        self._registration_worker: Optional[RegistrationWorker] = None
+        if registration_workers > 0:
+            self._registration_worker = RegistrationWorker(
+                self._register_pending, registration_workers
+            )
+        self._reconciler.set_pending_hook(self._enqueue_pending)
+        self._on_startup_source: Optional[Callable[[str, float], None]] = None
+        # Sources committed pending -> their mtime, until their registration
+        # completes. They were found by the first scan, so they are startup set
+        # whenever that registration happens to finish (see
+        # ``_notify_source_committed``).
+        self._deferred: Dict[str, float] = {}
+        if registration_stats and hasattr(registry, "claim_timer"):
+            registry.claim_timer = self._reconciler.stats.record_claim
+        set_materializer = getattr(server.sources, "set_materializer", None)
+        if set_materializer is not None:
+            set_materializer(self._reconciler.materialize)
 
     @property
     def roots(self) -> Roots:
@@ -229,6 +256,15 @@ class SourceManager:
 
         self._next_rescan_at = time.monotonic()
         self._stop.clear()
+        if self._registration_worker is not None:
+            # After the static sources, which were committed inline before this.
+            self._reconciler.set_defer_registration(True)
+            if not self._initial_scan_done:
+                # Held until the walk is over (``complete_initial_scan``): the
+                # two contend, and a held pool lets every claim be committed
+                # first. A later rescan does not hold it again.
+                self._registration_worker.pause()
+            self._registration_worker.start()
         self._thread = threading.Thread(
             target=self._event_loop,
             daemon=True,
@@ -251,18 +287,29 @@ class SourceManager:
         committed *after* the initial scan (a live addition).
 
         The launcher wires this to the precache worker's prompt-enqueue. Startup
-        sources are gated out of it (they route to the slow backlog) until the
-        first full scan flips the startup boundary -- see ``_commit_add_claim``.
+        sources are gated out of it (see :meth:`set_startup_source_hook`) until the
+        first full scan flips the startup boundary.
         """
         self._on_source_committed = callback
+
+    def set_startup_source_hook(
+        self, callback: Optional[Callable[[str, float], None]]
+    ) -> None:
+        """Register the hook called with ``(source_id, mtime)`` when a *local*
+        source from the first scan has been registered.
+
+        The launcher wires this to the precache worker's backlog. It fires when
+        the registration completes, not when the scan claims the source: a source
+        whose registration is deferred has nothing to warm until then.
+        """
+        self._on_startup_source = callback
 
     def set_initial_scan_complete_hook(
         self, callback: Optional[Callable[[], None]]
     ) -> None:
         """Register the hook fired once when the first full scan completes.
 
-        The launcher uses it to seed the precache backlog from the established
-        startup catalog. Fired from the event-loop thread.
+        Fired from the event-loop thread.
         """
         self._on_initial_scan_complete = callback
 
@@ -329,32 +376,67 @@ class SourceManager:
         self._server.set_full_scan_in_progress(False)
         if not self._initial_scan_done:
             self._initial_scan_done = True
+            # Sources found from here on are the few a rescan turns up, and are
+            # registered when they are claimed, as a drop is.
+            self._reconciler.set_defer_registration(False)
+            if self._registration_worker is not None:
+                self._registration_worker.resume()
             logger.info(
-                "Initial scan complete: %d sources, %.0f s after start",
-                len(self._server.sources),
+                "Initial scan complete: %d sources, %.0f s after start, "
+                "%d awaiting registration",
+                len(self._server.sources) + self._reconciler.unregistered_count(),
                 time.monotonic() - self._started_at,
+                self._reconciler.pending_count(),
             )
+            self._reconciler.log_summary_if_drained()
             self._fire_initial_scan_complete()
 
-    def iter_local_source_mtimes(self) -> List[Tuple[str, float]]:
-        """Return ``(source_id, mtime)`` for every currently-registered *local*
-        source, for seeding the precache backlog (newest first).
+    def pending_registrations(self) -> int:
+        """How many claimed sources are still waiting to be registered."""
+        return self._reconciler.pending_count()
 
-        Remote sources are skipped (no ``os.stat`` mtime), as are any whose path
-        can't be stat-ed (e.g. removed between commit and this call).
+    def unregistered_sources(self) -> int:
+        """How many catalogued sources have no adapter yet, failed ones included."""
+        return self._reconciler.unregistered_count()
+
+    def registration_idle(self) -> bool:
+        """Whether the first scan is over and every source it claimed is registered.
+
+        What the precache backlog waits for: registration is the critical path of
+        a start and reads the same files, so warming them is for after it.
         """
-        # The Reconciler snapshots claims under its state lock (the rescan
-        # thread adds/removes claims concurrently); we stat() outside
-        # that lock (I/O).
-        snapshot = self._reconciler.local_claim_paths()
-        out: List[Tuple[str, float]] = []
-        for source_id, primary_path in snapshot:
-            try:
-                mtime = os.stat(primary_path).st_mtime
-            except OSError:
-                continue
-            out.append((source_id, mtime))
-        return out
+        return self._initial_scan_done and self._reconciler.pending_count() == 0
+
+    def _register_pending(self, source_id: str) -> bool:
+        """What a registration worker runs for a queued source.
+
+        A source that was removed while it waited is no longer pending after this,
+        and would otherwise stay in ``_deferred`` for good.
+        """
+        try:
+            return self._reconciler.ensure_registered(source_id)
+        finally:
+            if not self._reconciler.is_pending(source_id):
+                self._deferred.pop(source_id, None)
+
+    def _enqueue_pending(self, source_id: str) -> None:
+        """Queue a source the reconciler committed pending, newest file first."""
+        mtime = self._claim_mtime(source_id) or 0.0
+        self._deferred[source_id] = mtime
+        worker = self._registration_worker
+        if worker is not None:
+            worker.enqueue(source_id, mtime)
+
+    def _claim_mtime(self, source_id: str) -> Optional[float]:
+        """The modification time of a claimed local source's primary path (0.0 if
+        it cannot be stat-ed), or None when it has no claim or is remote."""
+        primary_path = self._reconciler.claim_primary_path(source_id)
+        if primary_path is None or is_remote_url(primary_path):
+            return None
+        try:
+            return os.stat(primary_path).st_mtime
+        except OSError:
+            return 0.0
 
     def stop(self, join_timeout: float = 5) -> None:
         """Stop the event processing loop.
@@ -368,6 +450,8 @@ class SourceManager:
         only burns the shutdown budget. That in-flight RPC is not cancelled.
         """
         self._stop.set()
+        if self._registration_worker is not None:
+            self._registration_worker.stop(join_timeout)
         if self._thread is not None:
             self._thread.join(timeout=join_timeout)
             self._thread = None
@@ -415,6 +499,7 @@ class SourceManager:
                 # backing off toward full_rescan_interval while a source set stays
                 # stable.
                 self._reconcile_due_upstreams()
+                self._requeue_failed_registrations()
             except BaseException:
                 if not self._initial_scan_done:
                     # The next tick retries the first scan; until it completes
@@ -423,6 +508,16 @@ class SourceManager:
                 raise
             if not self._initial_scan_done:
                 self.complete_initial_scan()
+
+    def _requeue_failed_registrations(self) -> None:
+        """Give each source whose registration failed another try once its
+        backoff has passed. A rescan finds nothing to diff for them: their files
+        have not changed, only the attempt failed."""
+        worker = self._registration_worker
+        if worker is None:
+            return
+        for source_id in self._reconciler.failed_pending_due():
+            worker.enqueue(source_id, self._claim_mtime(source_id) or 0.0)
 
     def _scan_pending_roots(self) -> None:
         """Scan the configured ``monitor = false`` directories, each once.
@@ -534,6 +629,7 @@ class SourceManager:
                     cloud_root=cloud,
                     report=report,
                     monitored=True,
+                    walk_threads=self._walk_threads,
                 )
 
             # A directory the walk declined (the stability gate, or the skip
@@ -620,23 +716,29 @@ class SourceManager:
         )
 
     def _notify_source_committed(self, source_id: str) -> None:
-        """Precache routing gate for a freshly committed source (injected into
+        """Route a source that has just been registered to precache (injected into
         the Reconciler as ``notify_source_committed``).
 
-        Only live additions -- those committed after the initial scan completes --
-        are prompt-enqueued; the startup set routes to the slow backlog instead.
-        This manager owns the startup state that decides that, so the gate lives
-        here rather than in the Reconciler. Best-effort: a hook failure must never
-        abort a source commit.
+        A startup source -- one the first scan found, whether it registered as it
+        was claimed or afterwards (``_deferred``) -- goes to the slow backlog, with
+        its mtime; a later addition is prompt-enqueued. This manager owns the
+        startup state that decides that, so the routing lives here rather than in
+        the Reconciler. A remote source is not enqueued as startup: precache does
+        not warm those. Best-effort: a hook failure must never abort a commit.
         """
-        if self._initial_scan_done and self._on_source_committed is not None:
-            try:
+        startup = source_id in self._deferred or not self._initial_scan_done
+        mtime = self._deferred.pop(source_id, None)
+        try:
+            if startup:
+                if self._on_startup_source is not None:
+                    if mtime is None:
+                        mtime = self._claim_mtime(source_id)
+                    if mtime is not None:
+                        self._on_startup_source(source_id, mtime)
+            elif self._on_source_committed is not None:
                 self._on_source_committed(source_id)
-            except Exception:
-                logger.exception(
-                    "precache on_source_committed hook failed for %s",
-                    source_id,
-                )
+        except Exception:
+            logger.exception("precache routing hook failed for %s", source_id)
 
     def should_warm(self, source_id: str) -> bool:
         """Whether the precache worker may warm *source_id* right now.
@@ -1260,9 +1362,9 @@ class SourceManager:
         return self._roots.display_url(claim.primary_path)
 
     def _catalog_url_for(self, source_id: str) -> Optional[str]:
-        """The registered source's catalog ``source_url`` (None if missing)."""
-        adapter = self._server.sources.get(source_id)
-        return adapter.catalog_url if adapter is not None else None
+        """The source's catalog ``source_url``, registered or pending (None if
+        it is neither)."""
+        return self._reconciler.catalog_url_of(source_id)
 
 
 def create_source_manager(
@@ -1276,6 +1378,9 @@ def create_source_manager(
     full_rescan_interval: float = 3600.0,
     prune_unseen_days: int = 0,
     rescan_interval: float = 120.0,
+    registration_workers: int = 0,
+    registration_stats: bool = False,
+    walk_threads: int = 1,
 ) -> SourceManager:
     """Create a SourceManager for all configured sources.
 
@@ -1309,6 +1414,8 @@ def create_source_manager(
         prune_unseen_days: Days of absence after which annotations for a missing
             source are auto-pruned; 0 disables auto-prune.
         rescan_interval: Seconds between rescans (floored at 0.1s).
+        registration_workers: Threads that register, in the background, the
+            sources the first scan claims. 0 registers each as it is claimed.
 
     Returns:
         A SourceManager, empty if no source is usable.
@@ -1359,6 +1466,9 @@ def create_source_manager(
         stability_window=stability_window,
         full_rescan_interval=full_rescan_interval,
         prune_unseen_days=prune_unseen_days,
+        registration_workers=registration_workers,
+        registration_stats=registration_stats,
+        walk_threads=walk_threads,
     )
 
     # Added first so monitored discovery skips paths already claimed.

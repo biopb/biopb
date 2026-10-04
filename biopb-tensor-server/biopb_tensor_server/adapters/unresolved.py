@@ -86,6 +86,9 @@ class UnresolvedSourceAdapter(SourceAdapter):
     def is_resolved(self) -> bool:
         return self._resolved is not None
 
+    def unresolved_reason(self) -> Optional[str]:
+        return None if self._resolved is not None else "needs_recall"
+
     # --- catalog surface (never resolves) -----------------------------------
 
     def list_tensor_descriptors(self) -> List["TensorDescriptor"]:

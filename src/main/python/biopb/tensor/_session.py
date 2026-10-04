@@ -50,6 +50,7 @@ from biopb.tensor._catalog_rows import (
     _descriptor_from_row,
     sql_literal,
     tensor_descriptors_from_row,
+    unresolved_reasons,
 )
 from biopb.tensor._labels import LABELS_SEGMENT
 from biopb.tensor._location import normalize_flight_location
@@ -774,14 +775,16 @@ class CatalogClient:
         # tensor-bound GetFlightInfo instead used to overlay the *first* field's
         # get_tensor_metadata() delta, so a multi-field source reported one
         # arbitrary field's extras as the source's metadata.
-        table = self._query_table(
+        query = (
             "SELECT is_resolved, metadata_json FROM sources "
             f"WHERE source_id = {sql_literal(source_id)}"
         )
-        rows = table.to_pylist()
+        rows = self._query_table(query).to_pylist()
         if not rows:
             raise ValueError(f"Source not found: {source_id}")
         row = rows[0]
+        if not row.get("is_resolved", True) and self._register_if_pending(source_id):
+            row = self._query_table(query).to_pylist()[0]
 
         if not row.get("is_resolved", True):
             # Unresolved (cloud / synced-folder) source: tensors are unknown
@@ -910,6 +913,12 @@ class CatalogClient:
         """
         source_id, tensor_id = split_array_id(array_id)
         row = self._source_tensors_row(source_id)
+        if (
+            row is not None
+            and not row.get("is_resolved", True)
+            and self._register_if_pending(source_id)
+        ):
+            row = self._source_tensors_row(source_id)
 
         if row is not None:
             # The flag, not an empty tensor list: a source can resolve cleanly
@@ -958,6 +967,25 @@ class CatalogClient:
         cannot say -- no row matched, or there is no catalog to ask."""
         row = self._addressed_row("len(tensors) AS tensor_count", source_id)
         return row["tensor_count"] if row else None
+
+    def _register_if_pending(self, source_id: str) -> bool:
+        """Have the server register a source it has claimed but not yet opened.
+
+        A row that is unresolved because its registration is queued (``pending``)
+        or failed is a local source: registering it costs no download and needs no
+        consent, so this does it before the catalog-side check that would refuse.
+        A failed one raises here with the server's reason. False for a cloud
+        placeholder, or a server too old to say, so the caller's refusal stands.
+        """
+        reasons = unresolved_reasons(
+            lambda sql: self._query_table(sql).to_pylist(),
+            f"AND source_id = {sql_literal(source_id)}",
+            errors=flight.FlightError,
+        )
+        if reasons.get(source_id) not in ("pending", "failed"):
+            return False
+        self.resolve_source(source_id)
+        return True
 
     def _source_tensors_row(self, source_id: str) -> Optional[Mapping[str, Any]]:
         """One source's addressing columns: the resolved flag and the tensor list.

@@ -33,7 +33,7 @@ too (``MetadataDatabase.source_row_ipc``) and every reader sees one shape.
 from __future__ import annotations
 
 import warnings
-from typing import Any, Iterable, List, Mapping
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
 
 from biopb.tensor.descriptor_pb2 import DataSourceDescriptor, TensorDescriptor
 
@@ -117,6 +117,33 @@ def descriptors_from_rows(
         stacklevel=2,
     )
     return [_descriptor_from_row(r) for r in rows]
+
+
+def unresolved_reasons(
+    query: Callable[[str], Iterable[Mapping[str, Any]]],
+    where: str = "",
+    *,
+    errors: Any = Exception,
+) -> Dict[str, Optional[str]]:
+    """``{source_id: unresolved_reason}`` for the catalog rows that are not resolved.
+
+    A query of its own, never a column of a row projection: a server older than
+    the column refuses it, and what the caller is doing (a listing, a read) must
+    still work. A refusal (*errors*) reads as no reasons, so the caller treats the
+    row as it always did, a cloud placeholder. *query* takes SQL and returns rows
+    as mappings; *where* narrows it (``"AND source_id = ..."``).
+    """
+    try:
+        rows = query(
+            f"SELECT source_id, unresolved_reason FROM sources WHERE NOT is_resolved {where}"
+        )
+        return {
+            row["source_id"]: row.get("unresolved_reason")
+            for row in rows
+            if "source_id" in row
+        }
+    except errors:
+        return {}
 
 
 def sql_literal(value: str) -> str:

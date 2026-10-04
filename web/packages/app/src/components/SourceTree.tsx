@@ -6,6 +6,8 @@ import { readRecents, subscribeRecents } from "../utils/recentSources";
 import { WarmTray } from "./WarmTray";
 import {
   type TreeNode,
+  FAILED_TOOLTIP,
+  PENDING_TOOLTIP,
   UNRESOLVED_GLYPH,
   UNRESOLVED_TOOLTIP,
   buildTree,
@@ -14,6 +16,7 @@ import {
   isUnresolved,
   matchesQuery,
   recentNode,
+  unresolvedKind,
 } from "../utils/sourceTree";
 
 // Threshold for switching to server-side SQL query
@@ -240,6 +243,21 @@ export function TreeRow({
   // server hydrates it -- so dropping it from the tab order costs nothing and
   // leaves exactly one focusable control, the one that does something.
   if (unresolved) {
+    // Only a cloud placeholder is a download; a pending or failed local source
+    // is read from disk, so its copy and its button say so.
+    const kind = unresolvedKind(src);
+    const tooltip =
+      kind === "pending"
+        ? PENDING_TOOLTIP
+        : kind === "failed"
+          ? FAILED_TOOLTIP
+          : UNRESOLVED_TOOLTIP;
+    const idleLabel = kind === "recall" ? "Resolve" : kind === "pending" ? "Load" : "Retry";
+    const busyLabel = kind === "recall" ? "Resolving\u2026" : "Loading\u2026";
+    const buttonTitle =
+      kind === "recall"
+        ? "Resolve this source \u2014 downloads its content, which can take minutes"
+        : "Read this source's metadata now";
     return (
       <div
         className="tree-item unresolved"
@@ -250,11 +268,11 @@ export function TreeRow({
           paddingLeft: indent,
         }}
         data-source-id={node.id === src.source_id ? src.source_id : undefined}
-        title={`${src.source_url}\n${UNRESOLVED_TOOLTIP}`}
+        title={`${src.source_url}\n${tooltip}`}
       >
         <ChevronSlot />
         <span className="unresolved-glyph" aria-label="Not resolved">
-          {UNRESOLVED_GLYPH}
+          {kind === "recall" ? UNRESOLVED_GLYPH : "\u2026"}
         </span>
         <span style={{ flex: 1, marginLeft: 4 }}>{node.name}</span>
         {startResolve ? (
@@ -262,13 +280,9 @@ export function TreeRow({
             className="resolve-btn"
             disabled={inFlight}
             onClick={() => startResolve(src.source_id)}
-            title={
-              inFlight
-                ? "Already resolving this source"
-                : "Resolve this source \u2014 downloads its content, which can take minutes"
-            }
+            title={inFlight ? "Already resolving this source" : buttonTitle}
           >
-            {inFlight ? "Resolving\u2026" : "Resolve"}
+            {inFlight ? busyLabel : idleLabel}
           </button>
         ) : null}
       </div>

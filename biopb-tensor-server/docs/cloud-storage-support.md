@@ -27,6 +27,10 @@ human actually asks for the pixels.
 
 ## is_resolved vs residency
 
+`is_resolved` is also false for a *local* source whose registration is queued
+(`unresolved_reason = 'pending'`; see `progressive-discovery.md`). That costs no
+download: any read registers it, and only `needs_recall` is a consented recall.
+
 Two descriptor bits a naive API would conflate into one ("is `shape`
 present?"):
 
