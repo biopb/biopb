@@ -44,7 +44,7 @@ A restored row may be stale; the epoch below says so.
   signature, the adapter payload, the epoch of its last write and `last_seen`.
 - **A volatile table**: today's `sources`, renamed, dropped and rebuilt at open. It holds
   what has no restore path: mirrors (catalog rows only, no claim), cloud-root sources,
-  drops, uploads and rows that are not resolved.
+  drops and uploads. Until stage 1.5 it also holds every row that is not yet resolved.
 - **`sources`**: a view over both, exposing the published columns plus `confirmed_epoch`
   and `confirmed` (below). The private columns are not in it. Volatile rows report the
   current epoch, since they were seen this run.
@@ -69,8 +69,9 @@ union.
 A source is restorable when it is resolved, local, comes from a configured scanned root,
 is not a mirror and is not under a cloud root. Nothing is opt-in per adapter: the claim
 is enough to rebuild any of them, and a payload is an optimization that skips the parse
-(OME-TIFF, nd2 and czi have one; others store NULL and are parsed on first read). A
-failed or pending row is not persisted, since a restart retries it anyway.
+(OME-TIFF, nd2 and czi have one; others store NULL and are parsed on first read). From
+stage 1.5 a pending or failed row is persisted too, with its claim and signature, and
+restore re-registers it from the claim (see stage 1.5 for failed rows).
 
 - **Mirrors** are bulk-seeded from `catalog_seed` and need the upstream `indexed_at`.
 - **Drops** (`dnd://`) are not restored: roots live in memory, so a drop is not re-found
@@ -266,14 +267,65 @@ restored yet, and the epoch and `last_seen` sweep are stage 2.
    against a fresh parse (embedded-label descriptors, `has_rois`, attached tensors); a
    persisted-signature test that perturbs `st_dev` and expects no change; a test that
    changes a file between claim and write.
-2. Restore and hydrate every persisted row, behind a setting: the restore rules, the
+2. Unify the scan (stage 1.5, below): the walk writes every claim to `source_catalog`.
+3. Restore and hydrate every persisted row, behind a setting: the restore rules, the
    epoch and per-root confirmation, the post-walk sweep and `last_seen` cap, lazy `@ome`
    ROIs and masks, hydration notifies precache, the observation hooks ignore unconfirmed
    rows, the loud corrupt-catalog log, the rebuild flag.
-3. More payloads for adapters whose parse is slow, as measured; default on after a
+4. More payloads for adapters whose parse is slow, as measured; default on after a
    release cycle with the setting opt-in.
-4. Clients: the SPA dims unconfirmed rows and reads "verifying"; the SDK exposes
+5. Clients: the SPA dims unconfirmed rows and reads "verifying"; the SDK exposes
    `confirmed`.
+
+## Stage 1.5: one scan, claims in `source_catalog`
+
+Today the first scan is a separate mode: with no prior state every claim is new, so the
+walk streams them out as it finds them, batches their rows and skips the end-of-walk diff
+for them. Once the catalog is restored, the first walk has prior state and is an ordinary
+rescan. The special mode goes; what made it fast becomes the "new claim" case of the one
+scan.
+
+**The walk writes claims to `source_catalog`.** A claim that has a catalog record (local,
+under a monitored or scan-once root, not cloud, not a mirror or remote) is written to
+`source_catalog` when the walk finds it, not to the volatile table. Only what has no
+claim stays volatile: mirrors, cloud placeholders, tensor-server and remote sources,
+drops. A row then never changes table; registration fills it in.
+
+| event | write to `source_catalog` |
+|---|---|
+| new claim | batched `INSERT ... ON CONFLICT DO NOTHING`: `is_resolved` false, reason `pending`, claim columns and signature, `payload` NULL |
+| claim changed | `UPDATE` back to pending with the new claim and signature (an overwrite, so not the `DO NOTHING` path; rare, per row) |
+| claim gone | delete the row |
+| unchanged | none |
+| registered | `UPDATE` of `metadata_json`, `tensors`, `payload`, `indexed_at`, `is_resolved` true, reason NULL |
+| registration failed | `UPDATE` to reason `failed` with `unresolved_error` |
+
+The batched writer serves every walk, not only the first. Its `DO NOTHING` is the
+guard against a registration that wrote the real row before the buffered pending row
+landed; it says nothing about whether the claim is current. That decision (unchanged,
+changed, new) is made from the signature before anything is buffered, so a restored row
+whose file changed is overwritten rather than skipped.
+
+**Scan cases.** Each discovered claim is one of: in state and unchanged (no write), in
+state and changed (refresh), new (batched insert). A restored claim the walk did not see
+is dropped by the post-walk sweep, not by a diff of everything.
+
+**Measured** (35k pending rows, 500 per statement, one transaction, local disk, fresh
+store): into `sources_volatile` 1.95 s; into `source_catalog` 3.35 s (0.096 ms a row), the
+same with the `source_url` index dropped, so the index is not the cost; re-inserting the
+same rows, all conflicting, 2.87 s. Registration onto an existing row: `UPDATE` about
+3.0 ms a row, `INSERT OR REPLACE` about 4.5 ms with four times the CPU. Registering by
+`UPDATE` is cheaper than today's write.
+
+**Open:**
+
+- A failed row now persists with its signature. Restore either retries it or leaves it
+  failed until the file changes; leaving it locks the failure in, so retry is the likelier
+  choice.
+- Contention between the batched writer and registration, and the HPC filesystem, are not
+  measured.
+- Rows are cleared at open until stage 2, so stage 1.5 changes what a running server
+  writes and nothing a restart reads.
 
 ## To verify before stage 2
 
@@ -282,6 +334,7 @@ restored yet, and the epoch and `last_seen` sweep are stage 2.
   If the lookups matter, a keyed read can go to `source_catalog` and `sources_volatile`
   directly.
 - The cost of `INSERT OR REPLACE` and one-column updates at 100k rows with large
-  `metadata_json`, on a real catalog.
+  `metadata_json`, on a real catalog (measured at 35k rows with a synthetic 3.3 KB
+  `metadata_json`: see stage 1.5).
 - Whether a root's walk skips nested roots' subtrees; the sweep scope must match.
 - Whether nd2 and czi carry embedded masks or ROIs.
