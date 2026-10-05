@@ -311,3 +311,27 @@ class TestRegistration:
         manager._handle_rescan()
         assert _persisted(server) == []
         assert server.metadata_db.query("SELECT source_id FROM sources").num_rows == 1
+
+
+class TestListFlights:
+    def test_the_sources_flight_has_the_published_schema_and_ticket(self):
+        server = catalog_server("localhost:0")
+        infos = {
+            info.descriptor.path[0].decode(): info
+            for info in server.list_flights(None, b"")
+        }
+        sources = infos["sources"]
+        assert sources.schema.names == [
+            "source_id",
+            "source_url",
+            "source_type",
+            "indexed_at",
+            "metadata_json",
+            "is_resolved",
+            "unresolved_reason",
+            "unresolved_error",
+            "tensors",
+        ]
+        assert sources.endpoints[0].ticket.ticket
+        assert "source_catalog" not in infos
+        assert "sources_volatile" not in infos
