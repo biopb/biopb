@@ -392,16 +392,13 @@ class TestRuntimePhaseGating:
             monkeypatch.setattr(
                 sm._reconciler,
                 "_register_source_claim",
-                lambda claim, catalog_seed=None, catalog_url=None: True,
+                lambda claim, catalog_seed=None, catalog_url=None, **kw: True,
             )
             monkeypatch.setattr(
                 sm._reconciler._state, "add_claim", lambda claim, notify=False: True
             )
             monkeypatch.setattr(
                 sm._reconciler, "_build_claim_signatures", lambda claim: {}
-            )
-            monkeypatch.setattr(
-                sm._reconciler, "_clear_failed_source_attempt", lambda sid: None
             )
 
             fired = []
@@ -429,16 +426,13 @@ class TestRuntimePhaseGating:
             monkeypatch.setattr(
                 sm._reconciler,
                 "_register_source_claim",
-                lambda claim, catalog_seed=None, catalog_url=None: True,
+                lambda claim, catalog_seed=None, catalog_url=None, **kw: True,
             )
             monkeypatch.setattr(
                 sm._reconciler._state, "add_claim", lambda claim, notify=False: True
             )
             monkeypatch.setattr(
                 sm._reconciler, "_build_claim_signatures", lambda claim: {}
-            )
-            monkeypatch.setattr(
-                sm._reconciler, "_clear_failed_source_attempt", lambda sid: None
             )
 
             def boom(_sid):

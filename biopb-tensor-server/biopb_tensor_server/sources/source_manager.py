@@ -91,7 +91,7 @@ class SourceManager:
     """Drives the periodic rescan and owns the filesystem-scan machinery.
 
     The confirmed-catalog write path (registration, the discovered/upstream diff,
-    add/remove lifecycle, failure-retry state) lives in :class:`Reconciler`, which
+    add/remove lifecycle) lives in :class:`Reconciler`, which
     this manager constructs and delegates every catalog mutation to; see that
     class's module docstring for the seam between the two.
     """
@@ -515,7 +515,6 @@ class SourceManager:
                 # backing off toward full_rescan_interval while a source set stays
                 # stable.
                 self._reconcile_due_upstreams()
-                self._requeue_failed_registrations()
             except BaseException:
                 if not self._initial_scan_done:
                     # The next tick retries the first scan; until it completes
@@ -524,16 +523,6 @@ class SourceManager:
                 raise
             if not self._initial_scan_done:
                 self.complete_initial_scan()
-
-    def _requeue_failed_registrations(self) -> None:
-        """Give each source whose registration failed another try once its
-        backoff has passed. A rescan finds nothing to diff for them: their files
-        have not changed, only the attempt failed."""
-        worker = self._registration_worker
-        if worker is None:
-            return
-        for source_id in self._reconciler.failed_pending_due():
-            worker.enqueue(source_id, self._claim_mtime(source_id) or 0.0)
 
     def _scan_pending_roots(self) -> None:
         """Scan the configured ``monitor = false`` directories, each once.
@@ -601,21 +590,16 @@ class SourceManager:
         if force_full_rescan:
             self._server.set_full_scan_in_progress(True)
         try:
-            # Progressive population: on the *first* full scan, register each
-            # source the moment the walk claims it rather than batching every add
-            # into the end-of-walk reconcile, so the catalog grows within the
-            # walk. Safe only for the first scan -- it starts empty and
-            # force-full, so there are no removals to diff and every claim is a
-            # pure add. The stability gate runs inside the walk, so unstable
-            # entries are never claimed and therefore never streamed; the next
-            # rescan picks them up. The end-of-walk reconcile below still runs and
-            # is idempotent for streamed adds.
-            stream_first_scan = force_full_rescan and startup
+            # Progressive population: commit each NEW claim the moment the walk
+            # finds it rather than batching every add into the end-of-walk
+            # reconcile, so the catalog grows within the walk. A claim already
+            # known is left to the reconcile, which compares its signature, and
+            # removals are only ever decided after the walk. The stability gate
+            # runs inside the walk, so unstable entries are never claimed and
+            # therefore never streamed; the next rescan picks them up. The
+            # end-of-walk reconcile below still runs and skips what was streamed.
             discovered_state = DiscoveryState()
-            if stream_first_scan:
-                discovered_state.on_source_added = (
-                    self._reconciler._stream_first_scan_add
-                )
+            discovered_state.on_source_added = self._reconciler._stream_claim_add
 
             # One walk per monitored root, into one state (the identity set it
             # carries stops overlapping roots from claiming a subtree twice). A
@@ -624,8 +608,7 @@ class SourceManager:
             # leave its sources registered (the reconcile scopes them out) rather
             # than re-walking it.
             report = WalkReport()
-            if stream_first_scan:
-                self._reconciler.begin_pending_batch()
+            self._reconciler.begin_pending_batch()
             for monitored_root in sorted(monitored, key=lambda r: r.url):
                 # Walked as stored, not resolved again: the root is canonical
                 # from config, so its claims are spelled under it however the

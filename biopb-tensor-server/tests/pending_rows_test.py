@@ -198,11 +198,30 @@ class TestFirstScan:
         assert len(rows) == 3
         assert {r["unresolved_reason"] for r in rows.values()} == {"pending"}
 
-    def test_a_later_rescan_writes_one_row_per_claim(self, tmp_path, monkeypatch):
+    def test_a_later_rescan_batches_its_pending_rows_too(self, tmp_path, monkeypatch):
         drt._make_zarr(tmp_path, "a.zarr")
         manager, server = drt._manager(tmp_path)
         drt._first_scan(manager)
         manager._reconciler.set_defer_registration(True)
+        db = server.metadata_db
+        bulk = []
+        real = db.sync_pending_sources
+        monkeypatch.setattr(
+            db,
+            "sync_pending_sources",
+            lambda rows: (bulk.append(len(rows)), real(rows)),
+        )
+        drt._make_zarr(tmp_path, "b.zarr")
+        manager._handle_rescan()
+        assert bulk == [1]
+        assert len(drt._rows(server)) == 2
+
+    def test_a_claim_that_registers_where_it_is_found_has_no_batch(
+        self, tmp_path, monkeypatch
+    ):
+        drt._make_zarr(tmp_path, "a.zarr")
+        manager, server = drt._manager(tmp_path)
+        drt._first_scan(manager)  # registration is no longer deferred after this
         db = server.metadata_db
         bulk = []
         monkeypatch.setattr(

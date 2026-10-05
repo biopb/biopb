@@ -484,7 +484,15 @@ class TestFailure:
         assert server.sources.get(sid) is None
         assert manager._reconciler.is_pending(sid)
 
-    def test_a_failed_source_is_not_retried_by_every_read(self, tmp_path):
+    def _fix(self, meta, tmp_path):
+        good = os.path.join(str(tmp_path), "good.zarr")
+        _make_zarr(tmp_path, "good.zarr")
+        with open(os.path.join(good, os.path.basename(meta))) as src:
+            fixed = src.read()
+        with open(meta, "w") as dst:
+            dst.write(fixed)
+
+    def test_neither_a_read_nor_the_walk_retries_a_failed_source(self, tmp_path):
         path = _make_zarr(tmp_path, "a.zarr")
         manager, server = _manager(tmp_path)
         _first_scan(manager)
@@ -501,48 +509,55 @@ class TestFailure:
         )[1]
         for _ in range(2):
             with pytest.raises(SourceRegistrationError):
-                _resolve(manager, server, sid)
-        assert attempts == []  # inside its backoff window
+                reconciler.check_registered(sid)  # what a read does
+            manager._handle_rescan()
+        assert attempts == []
+        assert _rows(server)[sid]["unresolved_reason"] == "failed"
 
-    def test_it_is_retried_once_the_backoff_has_passed_and_the_file_is_fixed(
-        self, tmp_path
-    ):
+    def test_a_resolve_tries_a_failed_source_again(self, tmp_path):
         path = _make_zarr(tmp_path, "a.zarr")
         manager, server = _manager(tmp_path)
         _first_scan(manager)
         (sid,) = _only_ids(server)
         meta = self._break(path)
-        good = os.path.join(str(tmp_path), "good.zarr")
-        _make_zarr(tmp_path, "good.zarr")
         assert not manager._reconciler.ensure_registered(sid)
 
-        reconciler = manager._reconciler
-        assert reconciler.failed_pending_due() == []
-        reconciler._failed_sources[sid].next_retry_at = 0.0
-        assert reconciler.failed_pending_due() == [sid]
-
-        with open(os.path.join(good, os.path.basename(meta))) as src:
-            fixed = src.read()
-        with open(meta, "w") as dst:
-            dst.write(fixed)
-        assert reconciler.ensure_registered(sid)
+        self._fix(meta, tmp_path)
+        assert _resolve(manager, server, sid) is not None
 
         row = _rows(server)[sid]
         assert row["is_resolved"] is True
         assert row["unresolved_reason"] is None
         assert manager.pending_registrations() == 0
 
-    def test_the_tick_requeues_what_failed(self, tmp_path):
+    def test_a_new_signature_registers_a_failed_source(self, tmp_path):
+        path = _make_zarr(tmp_path, "a.zarr")
+        manager, server = _manager(tmp_path)
+        _first_scan(manager)
+        (sid,) = _only_ids(server)
+        meta = self._break(path)
+        assert not manager._reconciler.ensure_registered(sid)
+
+        self._fix(meta, tmp_path)
+        with open(os.path.join(path, "marker"), "w") as f:  # the directory's own stat
+            f.write("x")
+        manager._handle_rescan()
+
+        assert _rows(server)[sid]["is_resolved"] is True
+        assert not manager._reconciler.is_pending(sid)
+
+    def test_the_tick_does_not_queue_what_failed(self, tmp_path):
         path = _make_zarr(tmp_path, "a.zarr")
         manager, server = _manager(tmp_path, workers=1)
         _first_scan(manager)
         (sid,) = _only_ids(server)
         self._break(path)
         assert not manager._reconciler.ensure_registered(sid)
-        manager._reconciler._failed_sources[sid].next_retry_at = 0.0
 
-        manager._requeue_failed_registrations()
-        assert manager._registration_worker.queued() == 1
+        queued = []
+        manager._registration_worker.enqueue = lambda *a, **k: queued.append(a)
+        manager._handle_rescan()
+        assert queued == []
 
 
 class TestWhilePending:

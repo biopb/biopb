@@ -1,6 +1,6 @@
 """Batched catalog rows for claimed sources that are not registered yet.
 
-The first scan claims tens of thousands of sources, and each needs a ``pending``
+A walk that claims tens of thousands of sources gives each a ``pending``
 catalog row. One ``INSERT`` per row costs about 4 ms (mostly DuckDB's per-statement
 work, not the disk), which on a fast filesystem is most of the walk; one
 multi-row ``INSERT`` costs about 0.06 ms a row. The walk therefore hands its rows
@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Sequence
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.discovery import SourceClaim
+    from biopb_tensor_server.serving.metadata_db import CatalogRecord
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,9 @@ class PendingRow:
     catalog_url: Optional[str] = None
     #: A cloud source: ``needs_recall`` instead of ``pending``.
     recall: bool = False
+    #: The claim and signature to persist with the row; None for a source with no
+    #: claim to restore (a drop, a mirror), whose row is volatile.
+    record: Optional[CatalogRecord] = None
 
 
 class PendingRowWriter:

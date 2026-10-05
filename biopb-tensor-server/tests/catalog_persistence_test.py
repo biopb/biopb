@@ -1,8 +1,9 @@
 """The persisted catalog: ``source_catalog``, the volatile table and the view.
 
-Stage 1 only writes; nothing reads the persisted rows back yet. These pin what is
-written (routing, the private columns, the claim-time signature, the payload) and
-what must keep working (queries through the view, an older build opening the file).
+Only written so far; nothing reads the persisted rows back yet. These pin what is
+written (routing by whether the source has a claim, the private columns, the
+claim-time signature, the payload) and what must keep working (queries through the
+view, an older build opening the file).
 """
 
 import json
@@ -35,6 +36,18 @@ def _record(path="/d/s1.zarr", signature=None):
         "zarr", path, "s1", extra_config={"alias": "lab"}, member_paths=[path + "/m"]
     )
     return CatalogRecord(claim, signature or {path: (1, 2, 3, 4)})
+
+
+def _row(db, source_id="s1"):
+    cols = (
+        "is_resolved, unresolved_reason, unresolved_error, payload, signature, "
+        "primary_path, len(tensors)"
+    )
+    return (
+        db._get_connection()
+        .execute(f"SELECT {cols} FROM source_catalog WHERE source_id = ?", [source_id])
+        .fetchone()
+    )
 
 
 def _count(db, table, source_id="s1"):
@@ -78,14 +91,73 @@ class TestRouting:
         ) == (0, 1)
         assert db.query("SELECT source_id FROM sources").num_rows == 1
 
-    def test_an_unresolved_row_is_never_persisted(self):
+    def test_an_unresolved_row_with_a_claim_is_persisted_without_a_payload(self):
+        db = MetadataDatabase()
+        adapter = _Restorable(
+            "s1", "/d/s1.zarr", "zarr", [4, 4], "uint8", is_resolved=False
+        )
+        db.sync_source_added("s1", adapter, _record())
+        assert (_count(db, "source_catalog"), _count(db, "sources_volatile")) == (1, 0)
+        assert _row(db)[3] is None
+
+    def test_a_cloud_claim_is_persisted_without_a_payload(self):
+        db = MetadataDatabase()
+        record = CatalogRecord(_record().claim, {"/d/s1.zarr": (1,)}, cloud=True)
+        db.sync_source_added(
+            "s1", _Restorable("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8"), record
+        )
+        assert _count(db, "source_catalog") == 1
+        assert _row(db)[3] is None
+
+    def test_a_pending_row_with_a_claim_is_persisted_and_one_without_is_not(self):
+        db = MetadataDatabase()
+        db.sync_pending_source(_record().claim, record=_record())
+        other = SourceClaim("zarr", "/drop/s2.zarr", "s2")
+        db.sync_pending_source(other)
+        assert _count(db, "source_catalog") == 1
+        assert _count(db, "sources_volatile", "s2") == 1
+        row = _row(db)
+        assert row[:3] == (False, "pending", None)
+        assert json.loads(row[4]) == {"/d/s1.zarr": [1, 2, 3, 4]}
+        assert row[5] == "/d/s1.zarr"
+
+    def test_registration_fills_in_the_pending_row_it_finds(self):
+        db = MetadataDatabase()
+        db.sync_pending_source(_record().claim, record=_record())
+        db.sync_source_added(
+            "s1", _Restorable("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8"), _record()
+        )
+        assert (_count(db, "source_catalog"), _count(db, "sources_volatile")) == (1, 0)
+        row = _row(db)
+        assert row[:3] == (True, None, None)
+        assert json.loads(row[3]) == {"k": 1}
+        assert row[6] == 1  # its tensors
+
+    def test_a_pending_batch_splits_by_whether_the_row_has_a_record(self):
+        from biopb_tensor_server.sources.pending_rows import PendingRow
+
+        db = MetadataDatabase()
+        kept = _record()
+        db.sync_pending_sources(
+            [
+                PendingRow(kept.claim, record=kept),
+                PendingRow(SourceClaim("zarr", "/drop/s2.zarr", "s2")),
+                PendingRow(SourceClaim("zarr", "/cloud/s3.zarr", "s3"), recall=True),
+            ]
+        )
+        assert _count(db, "source_catalog") == 1
+        assert _count(db, "sources_volatile", "s2") == 1
+        assert db.query("SELECT source_id FROM sources").num_rows == 3
+
+    def test_a_batched_row_does_not_replace_a_registered_one(self):
+        from biopb_tensor_server.sources.pending_rows import PendingRow
+
         db = MetadataDatabase()
         db.sync_source_added(
-            "s1",
-            MockAdapter("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8", is_resolved=False),
-            _record(),
+            "s1", _Restorable("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8"), _record()
         )
-        assert (_count(db, "source_catalog"), _count(db, "sources_volatile")) == (0, 1)
+        db.sync_pending_sources([PendingRow(_record().claim, record=_record())])
+        assert _row(db)[:2] == (True, None)
 
     def test_a_source_changing_kind_moves_and_never_shows_twice(self):
         db = MetadataDatabase()
@@ -104,8 +176,11 @@ class TestRouting:
         db.sync_source_added(
             "s1", _Restorable("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8"), _record()
         )
-        db.sync_pending_source(_record().claim, error="boom")
-        assert (_count(db, "source_catalog"), _count(db, "sources_volatile")) == (0, 1)
+        db.sync_pending_source(_record().claim, error="boom", record=_record())
+        assert (_count(db, "source_catalog"), _count(db, "sources_volatile")) == (1, 0)
+        row = _row(db)
+        assert row[:4] == (False, "failed", "boom", None)
+        assert row[6] == 0
 
     def test_removal_deletes_from_both(self):
         db = MetadataDatabase()

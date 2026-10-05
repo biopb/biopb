@@ -2,8 +2,8 @@
 
 The :class:`Reconciler` owns the *confirmed catalog* -- the live ``SourceClaim``
 set (``DiscoveryState``), the server registration, the metadata-DB rows, and the
-derived indices (path->source_id, per-source signatures, cloud-source ids, and
-failed-source retry state). It is the single writer of that catalog, reached from
+derived indices (path->source_id, per-source signatures and cloud-source ids). It is
+the single writer of that catalog, reached from
 the three desired-state sources, all of which reduce to the same
 add/refresh/remove/register primitives:
 
@@ -38,7 +38,6 @@ import os
 import stat
 import threading
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
 
@@ -113,23 +112,8 @@ def _warn_experimental_source(family: str) -> None:
     logger.warning("%s", _EXPERIMENTAL_SOURCE_MESSAGES[family])
 
 
-@dataclass
-class _FailureTracker:
-    attempts: int = 0
-    next_retry_at: float = 0.0
-    last_log_at: float = float("-inf")
-
-
 class Reconciler:
     """Single-writer of the confirmed source catalog. See the module docstring."""
-
-    _retry_backoff_initial = 1.0
-    _retry_backoff_max = 60.0
-    _failure_log_interval = 30.0
-    # A rebuild failing this many times running is presumed permanent (a member
-    # file deleted), not a transient DB hiccup -- remove the source rather than
-    # serve stale bytes forever on capped backoff.
-    _max_refresh_failures = 5
 
     def __init__(
         self,
@@ -169,8 +153,6 @@ class Reconciler:
 
         # source_id -> member path signature map used to detect in-place changes.
         self._source_signatures: Dict[str, Dict[str, Tuple[Any, ...]]] = {}
-        # source_id -> retry/logging state for repeatedly failing datasets.
-        self._failed_sources: Dict[str, _FailureTracker] = {}
         # source_ids whose primary_path is under a cloud root, maintained at commit
         # time (O(1) per source). Lets the incremental reconcile preserve cloud
         # sources by a hash-set check instead of resolving every cloud member path.
@@ -185,16 +167,17 @@ class Reconciler:
         # committed to the catalog only (a ``pending`` row) and registered later,
         # by a worker or when a client resolves it. ``_pending`` maps each
         # such source_id to its display url; ``_pending_failed`` maps those among
-        # them whose registration raised to the error (they are retried, but are
-        # not waited for).
+        # them whose registration raised to the error (they are not waited for,
+        # and not retried until the walk finds a new signature for them, a drop
+        # refreshes them or a client resolves them).
         self._defer_registration = False
         self._pending_hook: Optional[Callable[[str], None]] = None
-        # While the first scan streams its claims, their pending rows are written
-        # in batches by this (None otherwise: one write per claim).
+        # While a walk streams claims that register later, their pending rows are
+        # written in batches by this (None otherwise: one write per claim).
         self._pending_writer: Optional[PendingRowWriter] = None
-        # Claims the first scan committed as the walk found them. Their signature
-        # was taken a moment before the end-of-walk reconcile, which would stat
-        # every member again to compare it with itself.
+        # Claims a walk committed as it found them. Their signature was taken a
+        # moment before the end-of-walk reconcile, which would stat every member
+        # again to compare it with itself.
         self._streamed_ids: Set[str] = set()
         self._pending: Dict[str, Optional[str]] = {}
         self._pending_failed: Dict[str, str] = {}
@@ -269,9 +252,8 @@ class Reconciler:
     def pending_count(self) -> int:
         """Sources waiting for their registration to run.
 
-        A source whose registration failed is not counted: it is retried, but
-        nothing is waiting on it. Nor is a cloud source, which waits for a
-        client to resolve it.
+        A source whose registration failed is not counted: nothing is waiting on
+        it. Nor is a cloud source, which waits for a client to resolve it.
         """
         with self._lock:
             return len(self._pending) - len(self._pending_failed) - len(self._recall)
@@ -322,10 +304,16 @@ class Reconciler:
 
     def begin_pending_batch(self) -> None:
         """Write the pending rows of the claims that follow in batches, until
-        :meth:`end_pending_batch`. For the first scan, which claims them by the
-        tens of thousands; the walk must not wait on the catalog for each."""
+        :meth:`end_pending_batch`. For a walk that claims them by the tens of
+        thousands; it must not wait on the catalog for each. Only while
+        registration is deferred: otherwise a claim registers where it is found
+        and has no pending row."""
         write = getattr(self._metadata_db, "sync_pending_sources", None)
-        if write is not None and self._pending_writer is None:
+        if (
+            write is not None
+            and self._defer_registration
+            and self._pending_writer is None
+        ):
             self._pending_writer = PendingRowWriter(write)
 
     def end_pending_batch(self) -> None:
@@ -335,7 +323,11 @@ class Reconciler:
             writer.close()
 
     def _commit_pending_claim(
-        self, claim: SourceClaim, catalog_url: Optional[str], recall: bool = False
+        self,
+        claim: SourceClaim,
+        catalog_url: Optional[str],
+        recall: bool = False,
+        queue: bool = True,
     ) -> bool:
         """Commit *claim* to the catalog only; its registration runs later.
 
@@ -348,43 +340,60 @@ class Reconciler:
         and signatures are in state, so the rescan diff, removal and refresh treat
         it as any confirmed source. It is not in the registry until
         :meth:`ensure_registered` has built its adapter.
+
+        The row is written with the claim and its signature when the source has
+        one to persist. The signature is taken once, here, before the row: it is
+        the one the row persists and the one state keeps, and a registration that
+        follows reuses it.
+
+        *queue* False leaves the claim out of the pool: a failed registration,
+        which waits for a new signature, a drop or a resolve.
         """
+        signatures = self._build_claim_signatures(claim)
         try:
+            record = self._catalog_record(claim, signatures=signatures)
             writer = self._pending_writer
             if self._metadata_db is not None:
                 if writer is not None:
-                    writer.add(PendingRow(claim, catalog_url, recall))
+                    writer.add(PendingRow(claim, catalog_url, recall, record))
                 else:
                     self._metadata_db.sync_pending_source(
-                        claim, catalog_url, recall=recall
+                        claim, catalog_url, recall=recall, record=record
                     )
         except Exception as e:
-            self._log_source_failure(
-                claim.source_id,
+            logger.exception(
                 "Failed to catalog pending source %s (%s): %s",
                 claim.source_id,
                 claim.primary_path,
                 e,
-                exc_info=True,
             )
             self._rollback_source_registration(claim.source_id)
-            self._record_failed_source_attempt(claim.source_id)
             return False
 
-        signatures = self._build_claim_signatures(claim)
         with self._lock:
             added = self._state.add_claim(claim, notify=False)
             if not added:
                 self._rollback_source_registration(claim.source_id)
-                self._record_failed_source_attempt(claim.source_id)
                 return False
             self._commit_claim_bookkeeping(claim, signatures)
             self._pending[claim.source_id] = catalog_url
             if recall:
                 self._recall.add(claim.source_id)
-        if not recall:
+        if queue and not recall:
             self._on_pending(claim.source_id)
         return True
+
+    def _commit_failed_claim(
+        self, claim: SourceClaim, catalog_url: Optional[str], errors: List[str]
+    ) -> None:
+        """Keep a claim whose registration failed, as a failed row.
+
+        Without it the claim would not be in state, and the next walk would find
+        it new and try again, for as long as the file stays. As a failed row it is
+        known: the walk leaves it alone until its signature changes.
+        """
+        if self._commit_pending_claim(claim, catalog_url, queue=False):
+            self._mark_registration_failed(claim.source_id, errors)
 
     def ensure_registered(self, source_id: str) -> bool:
         """Register a pending source now. Returns whether it is registered.
@@ -392,7 +401,8 @@ class Reconciler:
         Safe from any thread and single-flight per source: the worker and a read
         that needs the source at the same moment share one registration. A
         source that is not pending (never was, already registered, removed)
-        returns at once. A failed one is not retried inside its backoff window.
+        returns at once. A failed one is tried again: nothing queues it, so this
+        is a client's resolve asking.
         """
         if not self.is_pending(source_id):
             return True
@@ -401,11 +411,8 @@ class Reconciler:
                 claim = self._state.claims.get(source_id)
                 if claim is None or source_id not in self._pending:
                     return source_id not in self._pending
-                failed = source_id in self._pending_failed
                 recall = source_id in self._recall
                 catalog_url = self._pending[source_id]
-            if failed and not self._should_retry_source(source_id):
-                return False
 
             errors: List[str] = []
             # A cloud source raises why it could not be opened (retriable or
@@ -419,13 +426,11 @@ class Reconciler:
                 recall=recall,
             ):
                 if not recall:
-                    self._record_failed_source_attempt(source_id)
                     self._mark_registration_failed(source_id, errors)
                 return False
 
             with self._lock:
                 self._clear_pending(source_id)
-            self._clear_failed_source_attempt(source_id)
         # A cloud source is not warmed for having been resolved: it is
         # downloaded because a client asked, and it joins no startup backlog.
         if not recall:
@@ -479,15 +484,14 @@ class Reconciler:
             catalog_url = self._pending[source_id]
         if claim is not None and self._metadata_db is not None:
             try:
-                self._metadata_db.sync_pending_source(claim, catalog_url, error=message)
+                self._metadata_db.sync_pending_source(
+                    claim,
+                    catalog_url,
+                    error=message,
+                    record=self._catalog_record(claim, reuse_signature=True),
+                )
             except Exception:
                 logger.exception("could not record the failure of source %s", source_id)
-
-    def failed_pending_due(self) -> List[str]:
-        """Pending sources whose registration failed and may be tried again."""
-        with self._lock:
-            failed = list(self._pending_failed)
-        return [sid for sid in failed if self._should_retry_source(sid)]
 
     def _on_pending(self, source_id: str) -> None:
         """Tell whoever registers pending sources that one is waiting."""
@@ -529,6 +533,7 @@ class Reconciler:
         # claim streamed here that changes afterwards is caught by that rescan.
         streamed, self._streamed_ids = self._streamed_ids, set()
         changed_ids: Set[str] = set()
+        unchanged_ids: List[str] = []
         for source_id in (current_ids & discovered_ids) - streamed:
             new_signatures = self._build_claim_signatures(discovered_claims[source_id])
             existing_signatures = self._source_signatures.get(source_id)
@@ -537,6 +542,12 @@ class Reconciler:
                 continue
             if existing_signatures != new_signatures:
                 changed_ids.add(source_id)
+            else:
+                unchanged_ids.append(source_id)
+        # Known and unchanged, but not registered: its row may be waiting on the
+        # wrong thing (a file that became resident, or stopped being).
+        for source_id in unchanged_ids:
+            self._settle_unresolved_claim(discovered_claims[source_id])
 
         # Removal: not rediscovered on _MISSES_BEFORE_REMOVAL consecutive scans, and
         # quiet. A claim found again, or no longer a candidate, forfeits its count.
@@ -562,7 +573,6 @@ class Reconciler:
         added_claims = [
             discovered_claims[source_id]
             for source_id in sorted(discovered_ids - current_ids)
-            if self._should_retry_source(source_id)
         ]
         # A changed source is REBUILT in place rather than removed and re-added:
         # the replacement adapter is registered on top of the live one, so the
@@ -573,15 +583,52 @@ class Reconciler:
             source_id
             for source_id in sorted(changed_ids)
             if self._claim_is_quiet(current_claims[source_id])
-            and self._should_retry_source(source_id)
         ]
 
         for source_id in removed_ids:
             self._commit_remove_source(source_id)
         for claim in added_claims:
-            self._commit_add_claim(claim)
+            self._commit_add_claim(claim, keep_failed=True)
         for source_id in refreshed_ids:
             self._refresh_claim(discovered_claims[source_id])
+
+    def _settle_unresolved_claim(self, claim: SourceClaim) -> None:
+        """Re-decide what a known, unchanged, unregistered claim is waiting for.
+
+        Waiting for the pool (``pending``) when its content is resident, for a
+        client (``needs_recall``) when it is not. A failed row is left alone: it
+        leaves that state only by a new signature, a drop or a resolve.
+        """
+        source_id = claim.source_id
+        # The registration lock, so the row is not written over a registration
+        # that finishes while this decides.
+        with self._registration_lock(source_id):
+            with self._lock:
+                if source_id not in self._pending or source_id in self._pending_failed:
+                    return
+                waiting_on_client = source_id in self._recall
+                catalog_url = self._pending[source_id]
+            if self._claim_is_unresolved(claim) == waiting_on_client:
+                return
+            recall = not waiting_on_client
+            try:
+                if self._metadata_db is not None:
+                    self._metadata_db.sync_pending_source(
+                        claim,
+                        catalog_url,
+                        recall=recall,
+                        record=self._catalog_record(claim, reuse_signature=True),
+                    )
+            except Exception:
+                logger.exception("could not update the row of source %s", source_id)
+                return
+            with self._lock:
+                if recall:
+                    self._recall.add(source_id)
+                else:
+                    self._recall.discard(source_id)
+        if not recall:
+            self._on_pending(source_id)
 
     def _claim_is_quiet(self, claim: SourceClaim) -> bool:
         """Has this claim stopped changing long enough to remove or rebuild it?
@@ -642,14 +689,16 @@ class Reconciler:
         return signatures
 
     def _catalog_record(
-        self, claim: SourceClaim, reuse_signature: bool = False
+        self,
+        claim: SourceClaim,
+        reuse_signature: bool = False,
+        signatures: Optional[Dict[str, Tuple[Any, ...]]] = None,
     ) -> Optional[CatalogRecord]:
-        """The claim and its signature, if its source could be restored later.
+        """The claim and its signature, if its source has a claim to persist.
 
-        Restorable means local, under a monitored or scan-once root that is not
-        a cloud root, and not a mirror: drops live only in memory, cloud claims
-        cannot be validated by an identity-only signature, and a mirror has no
-        claim to rebuild. Whether the adapter can also be rebuilt is its own
+        That is a local source under a monitored or scan-once root, cloud roots
+        included, and not a mirror: a drop's root lives only in memory, and a mirror
+        has no claim to rebuild. Whether the adapter can also be rebuilt is its own
         ``catalog_payload``.
 
         The persisted signature drops ``st_dev`` (first element), which can
@@ -659,26 +708,21 @@ class Reconciler:
         ``stat``: for a claim registering after it was committed pending, that
         is the signature taken at claim time, which is the one that must sit
         beside the parse. A source that is not pending must not (a refresh: state
-        holds the old file's).
+        holds the old file's). *signatures* are ones the caller has just taken.
         """
         if claim.source_type == "tensor-server" or claim.is_remote:
             return None
         root = self._roots.containing(Path(claim.primary_path))
-        if (
-            root is None
-            or root.cloud
-            or root.kind not in (RootKind.MONITORED, RootKind.SCAN_ONCE)
-        ):
+        if root is None or root.kind not in (RootKind.MONITORED, RootKind.SCAN_ONCE):
             return None
-        signatures = (
-            self._source_signatures.get(claim.source_id) if reuse_signature else None
-        )
+        if signatures is None and reuse_signature:
+            signatures = self._source_signatures.get(claim.source_id)
         if signatures is None:
             signatures = self._build_claim_signatures(claim)
         signature = {path: sig[1:] for path, sig in signatures.items()}
         from biopb_tensor_server.serving.metadata_db import CatalogRecord
 
-        return CatalogRecord(claim=claim, signature=signature)
+        return CatalogRecord(claim=claim, signature=signature, cloud=root.cloud)
 
     def _preserve_skipped_claims(
         self,
@@ -724,24 +768,23 @@ class Reconciler:
                     return True
         return False
 
-    def _stream_first_scan_add(self, claim: SourceClaim) -> None:
-        """Commit a first-scan claim live, as the walk discovers it (Option B).
+    def _stream_claim_add(self, claim: SourceClaim) -> None:
+        """Commit a new claim live, as the walk discovers it.
 
-        Wired as the discovery state's ``on_source_added`` only during the first
-        full scan. Routes through ``_commit_add_claim`` so a streamed add gets
-        the same server registration, metadata-DB sync, signature bookkeeping,
-        and precache gating as a reconcile-driven add.
+        Wired as the discovery state's ``on_source_added`` for every walk. A claim
+        already in state is left to the end-of-walk reconcile, which compares its
+        signature; one that is not is new, and routes through ``_commit_add_claim``
+        so a streamed add gets the same server registration, metadata-DB sync,
+        signature bookkeeping and precache gating as a reconcile-driven add.
 
-        Idempotent against a *retried* first scan: a source already committed by
-        a prior partial scan (that later failed before flipping
-        ``_initial_scan_done``) is skipped, so the duplicate-rollback path in
-        ``_commit_add_claim`` -- which would *unregister* it -- is never hit, and
-        the end-of-walk reconcile stays a clean no-op.
+        Idempotent against a *retried* walk: a source already committed by a prior
+        partial one is skipped, so the duplicate-rollback path in
+        ``_commit_add_claim`` -- which would *unregister* it -- is never hit.
         """
         with self._lock:
             if claim.source_id in self._state.claims:
                 return
-        if self._commit_add_claim(claim):
+        if self._commit_add_claim(claim, keep_failed=True):
             self._streamed_ids.add(claim.source_id)
 
     def _commit_add_claim(
@@ -749,8 +792,14 @@ class Reconciler:
         claim: SourceClaim,
         catalog_seed: Optional[tuple] = None,
         catalog_url: Optional[str] = None,
+        keep_failed: bool = False,
     ) -> bool:
         """Register a discovered source, then commit it into confirmed state.
+
+        ``keep_failed`` (the walker's adds): a claim whose registration fails is
+        committed anyway, as a failed row, so the walk does not find it new and
+        try again. A drop reports the failure to its caller instead, and leaves
+        nothing behind.
 
         ``catalog_seed`` is forwarded to ``_register_source_claim`` (biopb/biopb#266,
         remote bulk-seed); ``None`` for local sources. ``catalog_url`` overrides the
@@ -765,10 +814,12 @@ class Reconciler:
                 return self._commit_pending_claim(claim, catalog_url, recall=True)
             if self._defer_registration and self._deferrable(claim):
                 return self._commit_pending_claim(claim, catalog_url)
+        errors: List[str] = []
         if not self._register_source_claim(
-            claim, catalog_seed=catalog_seed, catalog_url=catalog_url
+            claim, catalog_seed=catalog_seed, catalog_url=catalog_url, error_sink=errors
         ):
-            self._record_failed_source_attempt(claim.source_id)
+            if keep_failed and catalog_seed is None:
+                self._commit_failed_claim(claim, catalog_url, errors)
             return False
 
         signatures = self._build_claim_signatures(claim)
@@ -776,7 +827,6 @@ class Reconciler:
             added = self._state.add_claim(claim, notify=False)
             if not added:
                 self._rollback_source_registration(claim.source_id)
-                self._record_failed_source_attempt(claim.source_id)
                 return False
             self._commit_claim_bookkeeping(claim, signatures)
 
@@ -799,7 +849,6 @@ class Reconciler:
         self._source_signatures[claim.source_id] = signatures
         if self._roots.is_cloud(claim.primary_path):
             self._cloud_source_ids.add(claim.source_id)
-        self._clear_failed_source_attempt(claim.source_id)
 
     def _refresh_claim(self, claim: SourceClaim) -> bool:
         """:meth:`_refresh_claim_locked`, serialized against this source's
@@ -833,19 +882,10 @@ class Reconciler:
         if not self._register_source_claim(
             claim, catalog_url=catalog_url, replace=True, error_sink=errors
         ):
-            self._record_failed_source_attempt(claim.source_id)
+            # A source that was serving keeps its adapter and its row; one that
+            # was still pending becomes a failed row. Only the walk removes one.
             if self.is_pending(claim.source_id):
                 self._mark_registration_failed(claim.source_id, errors)
-            tracker = self._failed_sources.get(claim.source_id)
-            if tracker is not None and tracker.attempts >= self._max_refresh_failures:
-                logger.warning(
-                    "Giving up on source %s after %d consecutive failed "
-                    "rebuild attempts; removing it instead of continuing to "
-                    "serve its stale adapter",
-                    claim.source_id,
-                    tracker.attempts,
-                )
-                self._commit_remove_source(claim.source_id)
             return False
 
         # Outside the lock: this stats every member, and the lock it would
@@ -915,15 +955,20 @@ class Reconciler:
         """
         source_id = claim.source_id
         catalog_url = self._display_url_of(source_id)
+        signatures = self._build_claim_signatures(claim)
         try:
             if self._metadata_db is not None:
-                self._metadata_db.sync_pending_source(claim, catalog_url, recall=True)
+                self._metadata_db.sync_pending_source(
+                    claim,
+                    catalog_url,
+                    recall=True,
+                    record=self._catalog_record(claim, signatures=signatures),
+                )
             if self._server.sources.get(source_id) is not None:
                 self._server.unregister_source(source_id)
         except Exception:
             logger.exception("could not refresh cloud source %s", source_id)
             return False
-        signatures = self._build_claim_signatures(claim)
         with self._lock:
             self._replace_claim_locked(claim, previous, signatures)
             self._pending[source_id] = catalog_url
@@ -954,7 +999,6 @@ class Reconciler:
             self._cloud_source_ids.discard(source_id)
             self._missed_scans.pop(source_id, None)
             self._clear_pending(source_id)
-            self._clear_failed_source_attempt(source_id)
         return True
 
     def _reconcile_one_upstream(self, upstream: SourceConfig) -> bool:
@@ -1114,65 +1158,6 @@ class Reconciler:
             client.close()
         except Exception:
             logger.debug("error closing upstream client", exc_info=True)
-
-    def _should_retry_source(self, source_id: str) -> bool:
-        """Return True when a failed source is eligible for another add attempt."""
-        tracker = self._failed_sources.get(source_id)
-        if tracker is None:
-            return True
-        return time.time() >= tracker.next_retry_at
-
-    def _record_failed_source_attempt(self, source_id: Optional[str]) -> None:
-        """Advance retry state for a failing source."""
-        if not source_id:
-            return
-
-        now = time.time()
-        tracker = self._failed_sources.get(source_id)
-        if tracker is None:
-            tracker = _FailureTracker()
-            self._failed_sources[source_id] = tracker
-
-        tracker.attempts += 1
-        delay = min(
-            self._retry_backoff_initial * (2 ** (tracker.attempts - 1)),
-            self._retry_backoff_max,
-        )
-        tracker.next_retry_at = now + delay
-
-    def _clear_failed_source_attempt(self, source_id: Optional[str]) -> None:
-        """Drop retry state after a source reaches a clean steady state."""
-        if not source_id:
-            return
-        self._failed_sources.pop(source_id, None)
-
-    def _log_source_failure(
-        self,
-        source_id: Optional[str],
-        message: str,
-        *args: Any,
-        exc_info: bool = False,
-    ) -> None:
-        """Log a source failure no more than once per rate-limit window."""
-        if not source_id:
-            logger.error(message, *args, exc_info=exc_info)
-            return
-
-        now = time.time()
-        tracker = self._failed_sources.get(source_id)
-        if tracker is None:
-            tracker = _FailureTracker()
-            self._failed_sources[source_id] = tracker
-
-        if now - tracker.last_log_at >= self._failure_log_interval:
-            logger.error(message, *args, exc_info=exc_info)
-            tracker.last_log_at = now
-            return
-
-        logger.debug(
-            "Suppressing repeated failure log for source %s until retry window expires",
-            source_id,
-        )
 
     def _claim_is_unresolved(self, claim: SourceClaim) -> bool:
         """Whether this claim must be registered as an unresolved cloud source.
@@ -1398,7 +1383,7 @@ class Reconciler:
         # parse is recorded with the identity the parse started from.
         record = (
             None
-            if recall or catalog_seed is not None
+            if catalog_seed is not None
             else self._catalog_record(
                 claim, reuse_signature=self.is_pending(claim.source_id)
             )
@@ -1413,8 +1398,7 @@ class Reconciler:
                 if adapter_cls is None:
                     if error_sink is not None:
                         error_sink.append(f"no adapter for type {claim.source_type}")
-                    self._log_source_failure(
-                        claim.source_id,
+                    logger.error(
                         "No adapter for type %s for source %s (%s)",
                         claim.source_type,
                         claim.source_id,
@@ -1442,8 +1426,7 @@ class Reconciler:
             # Same skip, different diagnosis: "failed to create adapter" reads as
             # a transient upstream problem, and this one is an operator edit away
             # from fixed and will fail identically until then (biopb/biopb#608).
-            self._log_source_failure(
-                claim.source_id,
+            logger.error(
                 "Source %s (%s) is MISCONFIGURED and cannot be registered: %s. "
                 "Correct the configuration; retrying will not help.",
                 claim.source_id,
@@ -1456,13 +1439,11 @@ class Reconciler:
                 raise
             if error_sink is not None:
                 error_sink.append(str(e))
-            self._log_source_failure(
-                claim.source_id,
+            logger.exception(
                 "Failed to create adapter for source %s (%s): %s",
                 claim.source_id,
                 claim.primary_path,
                 e,
-                exc_info=True,
             )
             return False
 
@@ -1507,13 +1488,11 @@ class Reconciler:
         except Exception as e:
             if error_sink is not None:
                 error_sink.append(str(e))
-            self._log_source_failure(
-                claim.source_id,
+            logger.exception(
                 "Failed to register/sync source %s (%s): %s",
                 claim.source_id,
                 claim.primary_path,
                 e,
-                exc_info=True,
             )
             if registered and displaced is not None:
                 # A failed REBUILD must not cost the working source: put the
@@ -1538,7 +1517,15 @@ class Reconciler:
         try:
             self._server.swap_source(source_id, displaced)
             if self._metadata_db is not None:
-                self._metadata_db.sync_source_added(source_id, displaced)
+                # State still holds the claim and signature the adapter served under.
+                with self._lock:
+                    previous = self._state.claims.get(source_id)
+                record = (
+                    self._catalog_record(previous, reuse_signature=True)
+                    if previous is not None
+                    else None
+                )
+                self._metadata_db.sync_source_added(source_id, displaced, record)
         except Exception:
             logger.exception(
                 "Failed to restore the previous adapter for source %s; it is "

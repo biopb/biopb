@@ -1,7 +1,7 @@
 # Catalog persistence
 
-**Stage 1 is implemented (writes only); the rest is proposed.** Tracked in
-biopb/biopb#1251. When a stage lands, move what became true into
+**Stages 1 and 1.5 are implemented (writes only, nothing is read back); the rest is
+proposed.** Tracked in biopb/biopb#1251. When a stage lands, move what became true into
 [progressive-discovery.md](progressive-discovery.md) and delete its section here.
 
 Scope: `biopb-tensor-server` only (catalog store, reconciler, source registry). Companion
@@ -45,16 +45,15 @@ A restored row may be stale; the epoch below says so.
   of its last write and `last_seen`. A row is resolved, pending, `needs_recall` or failed.
 - **A volatile table**: today's `sources`, renamed, dropped and rebuilt at open. It holds
   what has no claim to re-derive: mirrors (catalog rows only, no claim), tensor-server and
-  remote sources, uploads, drops. Until stage 1.5 it also holds every row that is not yet
-  resolved, and cloud-root sources.
+  remote sources, uploads, drops.
 - **`sources`**: a view over both, exposing the published columns plus `confirmed_epoch`
   and `confirmed` (below). The private columns are not in it. Volatile rows report the
   current epoch, since they were seen this run.
 
 The writer routes by whether the source has a claim. A source that moves between tables
 (it gained or lost its claim) is deleted from the other table in the same locked write,
-because a union view cannot enforce a unique `source_id`. After stage 1.5 that happens
-rarely, since the row is written when the claim is made.
+because a union view cannot enforce a unique `source_id`. That happens rarely, since the
+row is written when the claim is made.
 
 **The view is persistent, created at open** (dropped first; a physical `sources` table
 from an older build is dropped too). It could be a `TEMP` view, which would let an older
@@ -72,14 +71,17 @@ union.
 A source is restorable when it has a claim under a configured root of kind monitored,
 scan-once or cloud, and is not a mirror. Nothing is opt-in per adapter: the claim is
 enough to rebuild any of them, and a payload is an optimization that skips the parse
-(OME-TIFF, nd2 and czi have one; others store NULL and are parsed on first read). From
-stage 1.5 a pending or failed row is persisted too, with its claim and signature. What
+(OME-TIFF, nd2 and czi have one; others store NULL and are parsed on first read). A
+pending or failed row is persisted too, with its claim and signature
+([progressive-discovery.md](progressive-discovery.md) lists what writes each). What
 restore does with a row:
 
 - **Resolved, local:** hydrated from its payload, or from its claim when it has none.
 - **Pending:** registered from its claim, like any pending claim.
 - **Failed:** restored as failed, and not retried until the walker finds a new signature
-  for the same URL or the user re-drops its path (see stage 1.5).
+  for the same URL, the user re-drops its path or a client resolves it. It has to be put
+  back in the reconciler's `_pending` and `_pending_failed` maps with its persisted
+  `unresolved_error`, or a read of it would find neither an adapter nor the reason.
 - **Cloud:** loaded as unresolved `needs_recall`, never resolved: see Cloud.
 
 - **Mirrors** are bulk-seeded from `catalog_seed` and need the upstream `indexed_at`.
@@ -90,7 +92,7 @@ restore does with a row:
   directory's own, and that mtime does not move when a member is rewritten in place. A
   restart used to heal that; a restored directory source is refreshed by a change in the
   directory's own stat or by a re-drop, which refreshes every known claim under the path
-  unconditionally (stage 1.5). The rebuild flag below is the other escape hatch.
+  unconditionally. The rebuild flag below is the other escape hatch.
 
 ## Config changes between restarts
 
@@ -210,9 +212,9 @@ read lazily from the file.
 
 Cloud-root claims are persisted like any other (the table predicate is "has a claim"), but
 a cloud row is **never restored as resolved**. Restore loads it unresolved with reason
-`needs_recall` and empty `tensors`, with no stat; the walk then settles it (stage 1.5):
-a known claim with the same signature and an unresolved row becomes `pending` if resident,
-else stays `needs_recall`, and registers like any pending claim.
+`needs_recall` and empty `tensors`, with no stat; the walk then settles it: a known
+claim with the same signature and an unresolved row becomes `pending` if resident, else
+stays `needs_recall`, and registers like any pending claim.
 
 Why a resolved cloud row is not trusted:
 
@@ -230,7 +232,7 @@ The cost is one registration per resident cloud source per restart, which is tod
 behaviour. The gain is that cloud sources list at once, as unresolved rows. The walk's
 rule for an unresolved row with an unchanged signature also covers the resident flip
 that `_refresh_recall_claim` does not (it handles only resident to dehydrated). The
-signature gap itself is healed by a re-drop, as for directories (stage 1.5).
+signature gap itself is healed by a re-drop, as for directories.
 
 ## Interactions to handle
 
@@ -253,11 +255,13 @@ signature gap itself is healed by a re-drop, as for directories (stage 1.5).
 
 ## Stages
 
-Stage 1 as implemented: `source_catalog` and `sources_volatile` with the persistent view,
-`SOURCE_CATALOG_FORMAT`, routing by claim record (a resolved source with one is
-persisted; its payload is NULL when the adapter has none), claim-time signature without
-`st_dev`, deletion from both on removal. Payloads exist for OME-TIFF, nd2 and czi, and
-no others:
+Stages 1 and 1.5 as implemented: `source_catalog` and `sources_volatile` with the
+persistent view, `SOURCE_CATALOG_FORMAT`, routing by whether the source has a claim
+record (a pending, failed or resolved row alike; the payload is NULL when the adapter has
+none, and for a cloud claim), claim-time signature without `st_dev`, deletion from both on
+removal, one scan for the first walk and every later one (new claims stream and their
+pending rows are batched), the failure tracker removed. Payloads exist for OME-TIFF, nd2
+and czi, and no others:
 
 - **OME-TIFF**: the scene descriptors (with their transfer grid), `has_rois`, and the
   `@ome` mask label tensors' field, parent and extent, derived from the metadata without
@@ -277,7 +281,8 @@ restored yet, and the epoch and `last_seen` sweep are stage 2.
    against a fresh parse (embedded-label descriptors, `has_rois`, attached tensors); a
    persisted-signature test that perturbs `st_dev` and expects no change; a test that
    changes a file between claim and write.
-2. Unify the scan (stage 1.5, below): the walk writes every claim to `source_catalog`.
+2. Unify the scan: the walk writes every claim to `source_catalog`, registration updates
+   the row, the failure tracker goes. Done.
 3. Restore and hydrate every persisted row, behind a setting: the restore rules, the
    epoch and per-root confirmation, the post-walk sweep and `last_seen` cap, lazy `@ome`
    ROIs and masks, hydration notifies precache, the observation hooks ignore unconfirmed
@@ -287,125 +292,6 @@ restored yet, and the epoch and `last_seen` sweep are stage 2.
 5. Clients: the SPA dims unconfirmed rows and reads "verifying"; the SDK exposes
    `confirmed`.
 
-## Stage 1.5: one scan, claims in `source_catalog`
-
-Today the first scan is a separate mode: with no prior state every claim is new, so the
-walk streams them out as it finds them, batches their rows and skips the end-of-walk diff
-for them. Once the catalog is restored, the first walk has prior state and is an ordinary
-rescan. The special mode goes; what made it fast becomes the "new claim" case of the one
-scan.
-
-**The table predicate is "has a claim".** Any source with a claim under a configured root,
-cloud roots included, is written to `source_catalog` when the walk finds it, never to the
-volatile table. Only what has no claim to re-derive stays volatile: mirrors,
-tensor-server and remote sources, uploads, and drops (their roots live in memory). A row
-never changes table; registration fills it in.
-
-"Resident" below means the claim is not `_claim_is_unresolved`: no adapter-flagged
-`claim.unresolved`, and under a cloud root no dehydrated member. It is a metadata stat,
-so deciding it opens nothing.
-
-| walker finds | write to `source_catalog` |
-|---|---|
-| a new claim | batched `INSERT ... ON CONFLICT DO NOTHING`: unresolved, reason `pending` if resident, else `needs_recall`; claim columns and signature; `payload` NULL |
-| a known claim, same signature, row resolved | none |
-| a known claim, same signature, row unresolved and not `failed` | `UPDATE` of the reason only: `pending` if resident, else `needs_recall` |
-| a known claim, same signature, row `failed` | none |
-| a known claim, new signature (a refresh) | registers inline as a new claim would: one upsert of the resolved row when it succeeds; `needs_recall` if it is no longer resident. A failed refresh leaves the old row and adapter in place |
-| a claim gone | delete the row |
-
-| registration | write |
-|---|---|
-| succeeds | `UPDATE` of `metadata_json`, `tensors`, `payload`, `indexed_at`, `is_resolved` true, reason NULL |
-| fails (a pending claim) | `UPDATE` to reason `failed` with `unresolved_error` |
-
-The batched writer serves every walk, not only the first. Its `DO NOTHING` is the
-guard against a registration that wrote the real row before the buffered pending row
-landed; it says nothing about whether the claim is current. That decision is made from
-the signature before anything is buffered, so a restored row whose file changed is
-refreshed rather than skipped.
-
-**A refresh is a replacement, not a state change of the row.** `_refresh_claim` builds
-the new adapter and swaps it in over the old one, which keeps serving until then. So a
-refresh writes no pending row: the view never says "pending" while the old adapter still
-serves. A failed refresh leaves the old adapter serving and the old row in place.
-
-**Failed rows stay failed.** A failed row persists as unresolved with reason `failed`, its
-error and its signature. Restore does not retry it, and neither does a rescan while the
-signature is unchanged. What clears it: the walker finding a new signature for the same
-URL (a refresh as above), a re-drop of its path (below), or a client resolving it, which
-is an explicit request. The only other way out is deletion.
-
-Today's code does not behave this way: `_requeue_failed_registrations` re-enqueues every
-failed pending source on each rescan tick once its backoff has passed (1 s doubling to a
-60 s cap, no limit on attempts), so a failed source is retried for as long as the server
-runs, and a claim whose inline registration fails is not committed at all and is re-added
-by the next walk after its backoff. Stage 1.5 removes both: every claim is committed with
-its row first, and a failed registration marks that row failed. A restored failed row has
-to be put back in the reconciler's `_pending` and `_pending_failed` maps with its
-persisted `unresolved_error`, or a read of it would find neither an adapter nor the
-reason.
-
-**Only the walker removes a source, and nothing counts failures.** A failed row is not
-removed for failing again. The in-memory failure tracker (`_FailureTracker`,
-`_failed_sources`) goes: its attempt count fed only the rule that removed a source after
-`_max_refresh_failures` (5) failed refreshes, which assumed a stale adapter to protect
-and would delete a failed row that never registered; its retry time gated the requeue
-and the walker's add and refresh, none of which retries on a timer any more, and a new
-signature or a drop should retry at once; and its log stamp rate-limited the repeated
-failure log that retries produced. Registration failures are then logged once, where they
-happen. A source leaves the catalog only when the walk (or a drop's removal half) finds
-its files gone and its claim quiet, as `_commit_remove_source` does today. Code and tests
-that touch the tracker change with it: `_should_retry_source`,
-`_record_failed_source_attempt`, `_clear_failed_source_attempt`, `_log_source_failure`,
-`failed_pending_due`, and the tests that read `_failed_sources`.
-
-**DnD heals what the signature cannot see.** The signature has known gaps: a cloud file's
-is `(dev, ino)` only, and a directory's is its own stat, which does not move when a member
-is rewritten in place. A drop (`add_local_source`) refreshes every already-registered
-claim under the dropped path unconditionally, with no signature compare, including
-directory sources and sources inside a known root, and removes registered sources under
-it whose files are gone. So a re-drop is both the repair for those gaps and the user's
-request to retry a failed row. A rescan never does either; a restart used to, and a
-restored catalog will not (the rebuild flag is the other escape hatch).
-
-Details of the drop, read from `add_local_source`:
-
-- Refused until the first scan has finished.
-- A refresh does not go through the stability window, so a drop always retries (it never
-  went through the backoff, which is removed). A pending source it refreshes is
-  registered by that refresh.
-- Cloudness belongs to the root, not the call. Inside a known root the root's own flag
-  decides; asking for cloud mode inside a non-cloud root is refused. Outside every root
-  the drop becomes a root of its own, cloud if asked. So a re-drop inside a configured
-  cloud root refreshes its claims as cloud: a non-resident one goes back to `needs_recall`
-  without being opened (`_refresh_recall_claim`), a resident one is rebuilt.
-- Sources under a drop's own root are volatile, so only a drop inside a configured root
-  repairs rows that persist.
-
-The walker's own refresh is narrower. A claim is refreshed only when it is quiet (the
-stability window, which cloud sources skip). Cloud-root claims are
-diffed only on a full pass; an incremental tick does not walk them, so the table's rules
-for them run once per full pass.
-
-**Scan cases.** Each discovered claim is one of: known and unchanged, known and changed
-(refresh), new (batched insert). A restored claim the walk did not see is dropped by the
-post-walk sweep, not by a diff of everything.
-
-**Measured** (35k pending rows, 500 per statement, one transaction, local disk, fresh
-store): into `sources_volatile` 1.95 s; into `source_catalog` 3.35 s (0.096 ms a row), the
-same with the `source_url` index dropped, so the index is not the cost; re-inserting the
-same rows, all conflicting, 2.87 s. Registration onto an existing row: `UPDATE` about
-3.0 ms a row, `INSERT OR REPLACE` about 4.5 ms with four times the CPU. Registering by
-`UPDATE` is cheaper than today's write.
-
-**Open:**
-
-- Contention between the batched writer and registration, and the HPC filesystem, are not
-  measured.
-- Rows are cleared at open until stage 2, so stage 1.5 changes what a running server
-  writes and nothing a restart reads.
-
 ## To verify before stage 2
 
 - Done in stage 1: the `ALLOWED_TABLES` check passes the view and keeps both physical
@@ -414,6 +300,6 @@ same rows, all conflicting, 2.87 s. Registration onto an existing row: `UPDATE` 
   directly.
 - The cost of `INSERT OR REPLACE` and one-column updates at 100k rows with large
   `metadata_json`, on a real catalog (measured at 35k rows with a synthetic 3.3 KB
-  `metadata_json`: see stage 1.5).
+  `metadata_json`: an `UPDATE` about 3.1 ms a row against 4.5 ms for `INSERT OR REPLACE`).
 - Whether a root's walk skips nested roots' subtrees; the sweep scope must match.
 - Whether nd2 and czi carry embedded masks or ROIs.
