@@ -1019,6 +1019,18 @@ class SourceAdapter(ABC):
         under ``_io_lock`` (czi / nd2 / ndtiff / bioio).
         """
 
+    def catalog_payload(self) -> Optional[Dict[str, Any]]:
+        """What a restart needs to rebuild this adapter without parsing its file.
+
+        JSON-serializable and written beside the catalog row; ``None`` (the
+        default) means the source is not restorable and is catalogued for this
+        run only. The payload carries the serve path's derived state, such as
+        descriptors with their transfer grid, never what the row already holds.
+        Adding a key needs no version bump; changing the meaning of one bumps
+        ``SOURCE_CATALOG_FORMAT``.
+        """
+        return None
+
     def release_registration_cache(  # noqa: B027 - concrete no-op default
         self,
     ) -> None:
@@ -2033,6 +2045,7 @@ _SOURCE_SCOPED_API = frozenset(
         "put_chunk",
         "close",
         "release_registration_cache",
+        "catalog_payload",
         # attached tensors (biopb/biopb#1059)
         "get_embedded_labels",
         "label_sets",

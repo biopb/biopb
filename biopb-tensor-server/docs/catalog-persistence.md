@@ -1,8 +1,8 @@
 # Catalog persistence
 
-**Proposed, not implemented.** Tracked in biopb/biopb#1251. When a stage lands, move
-what became true into [progressive-discovery.md](progressive-discovery.md) and delete
-its section here.
+**Stage 1 is implemented (writes only); the rest is proposed.** Tracked in
+biopb/biopb#1251. When a stage lands, move what became true into
+[progressive-discovery.md](progressive-discovery.md) and delete its section here.
 
 Scope: `biopb-tensor-server` only (catalog store, reconciler, source registry). Companion
 to [progressive-discovery.md](progressive-discovery.md), which describes how the catalog
@@ -53,8 +53,14 @@ write, because a union view cannot enforce a unique `source_id`.
 
 **The view must not be a persistent object named `sources`.** An older binary runs
 `DROP TABLE IF EXISTS sources`, which fails on a view and would stop it opening the file.
-Make it a `TEMP` view, recreated at each open, so the file holds only the two tables.
-The physical tables use names `sources` never had, so an older binary ignores them.
+Make it a `TEMP` view, so the file holds only the two tables. The physical tables use
+names `sources` never had, so an older binary ignores them.
+
+A temp view belongs to the connection that created it, and the read path takes a fresh
+cursor per call, so each cursor creates the view itself (`_get_cursor`, about 190 µs
+against 4 µs for a bare cursor). Measured at 100k rows: a primary-key lookup through the
+union is a sequential scan of about 0.3 ms and a `source_url` lookup about 1.1 ms; the
+indexes are not used through the union.
 
 ## What is restored
 
@@ -224,6 +230,13 @@ still runs. Worth doing only if a cloud-root walk is slow enough to notice; unme
 
 ## Stages
 
+Stage 1 as implemented: `source_catalog` and `sources_volatile` with the per-cursor view,
+`SOURCE_CATALOG_FORMAT`, routing by `catalog_payload()` and a claim record, claim-time
+signature without `st_dev`, deletion from both on removal. Only OME-TIFF has a payload
+(its scene descriptors); nd2, czi, the `has_rois` flag and the mask descriptors follow.
+Rows are cleared at open, so nothing is restored yet, and the epoch and `last_seen`
+sweep are stage 2.
+
 1. `source_catalog` with `CACHE_FORMAT`, written through at each registration with the
    claim, claim-time signature and payload, deleted on live removal; the volatile table
    and the `TEMP` view. Never read. Golden-payload tests per adapter; row verification
@@ -241,11 +254,10 @@ still runs. Worth doing only if a cloud-root walk is slow enough to notice; unme
 
 ## To verify before stage 2
 
-- A `TEMP` view must be visible through the pooled read cursors (`_get_cursor`); DuckDB
-  temp objects may be connection-scoped. If not, use a persistent view under another name
-  with `sources` created temp over it, or give up free rollback.
-- The check on `ALLOWED_TABLES` must pass the view and keep both physical tables hidden.
-- Whether the indexes (`idx_source_url`, the primary key) are used through the union.
+- Done in stage 1: temp views are connection-scoped (hence one per cursor, above); the
+  `ALLOWED_TABLES` check passes the view and keeps both physical tables hidden (tested);
+  the indexes are not used through the union (measured, above). If the lookups matter,
+  a keyed read can go to `source_catalog` and `sources_volatile` directly.
 - The cost of `INSERT OR REPLACE` and one-column updates at 100k rows with large
   `metadata_json`, on a real catalog.
 - Whether a root's walk skips nested roots' subtrees; the sweep scope must match.

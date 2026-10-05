@@ -866,6 +866,31 @@ class OmeTiffAdapter(TensorAdapter):
                 except Exception:
                     logger.debug("error closing scene adapter", exc_info=True)
 
+    def catalog_payload(self) -> Optional[Dict[str, Any]]:
+        """The scene descriptors, which are what a read needs from the file.
+
+        Source-level only. Each is the serving descriptor (``array_id``, axes,
+        shape, dtype and the transfer grid seeded from the page geometry).
+        ``None`` when tifffile declined the source.
+        """
+        if self.scene_index is not None:
+            return None
+        scenes = self._scene_descriptors()
+        if not scenes:
+            return None
+        return {
+            "scenes": [
+                {
+                    "array_id": d.array_id,
+                    "dim_labels": list(d.dim_labels),
+                    "shape": [int(s) for s in d.shape],
+                    "chunk_shape": [int(c) for c in d.chunk_shape],
+                    "dtype": d.dtype,
+                }
+                for d in scenes
+            ]
+        }
+
     def release_registration_cache(self) -> None:
         """Drop the raw OME-XML now that the catalog holds the metadata (#783).
 

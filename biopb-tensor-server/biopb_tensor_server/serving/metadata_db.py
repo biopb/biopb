@@ -84,6 +84,37 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Bump when a field of the persisted source row or payload changes meaning (an
+# added key needs none). A mismatch drops ``source_catalog`` whole at open.
+SOURCE_CATALOG_FORMAT = 1
+
+# The columns ``sources`` publishes, in table order. Both physical tables carry
+# them first, so the view is a plain UNION ALL.
+_SOURCE_COLUMNS = (
+    "source_id, source_url, source_type, indexed_at, metadata_json, "
+    "is_resolved, unresolved_reason, unresolved_error, tensors"
+)
+_SOURCES_VIEW_DDL = (
+    "CREATE OR REPLACE TEMP VIEW sources AS "
+    f"SELECT {_SOURCE_COLUMNS} FROM source_catalog UNION ALL "
+    f"SELECT {_SOURCE_COLUMNS} FROM sources_volatile"
+)
+
+
+@dataclass(frozen=True)
+class CatalogRecord:
+    """What a restorable source persists beside its public row.
+
+    ``signature`` is the claim's member signature taken when the claim was made,
+    before the parse, in the persisted form (no ``st_dev``): a file that changes
+    during registration must not be stamped with its new identity beside the old
+    metadata.
+    """
+
+    claim: SourceClaim
+    signature: Dict[str, Tuple[Any, ...]]
+
+
 # Opening a persistent catalog is retried this many times: a DuckDB lock held by
 # a server on its way down clears in about a second, and a restart race is the
 # one open failure that fixes itself.
@@ -796,8 +827,9 @@ class MetadataDatabase:
         DuckDB cursors (created via conn.cursor()) are thread-safe and can
         execute concurrently. This allows parallel reads without locking.
         """
-        conn = self._get_connection()
-        return conn.cursor()
+        cursor = self._get_connection().cursor()
+        self.create_sources_view(cursor)
+        return cursor
 
     def _create_schema(self, conn: duckdb.DuckDBPyConnection) -> None:
         """Create the sources and rois tables and their indexes.
@@ -810,9 +842,11 @@ class MetadataDatabase:
         `rois` cannot be rebuilt, so it is versioned instead: see
         :meth:`_reconcile_roi_schema`.
         """
+        # A persisted older build's physical `sources`; the name is a view now.
         conn.execute("DROP TABLE IF EXISTS sources")
+        conn.execute("DROP TABLE IF EXISTS sources_volatile")
         conn.execute("""
-            CREATE TABLE sources (
+            CREATE TABLE sources_volatile (
                 source_id TEXT PRIMARY KEY,
                 source_url TEXT,
                 source_type TEXT,
@@ -866,7 +900,11 @@ class MetadataDatabase:
             )
         """)
         # Index on source_url for path filtering
-        conn.execute("CREATE INDEX idx_source_url ON sources(source_url)")
+        conn.execute(
+            "CREATE INDEX idx_volatile_source_url ON sources_volatile(source_url)"
+        )
+        self._create_source_catalog(conn)
+        self.create_sources_view(conn)
 
         # User-drawn ROI annotations, one row per ROI. A sibling table,
         # deliberately NOT a field inside a source row: sources.metadata_json is
@@ -925,6 +963,76 @@ class MetadataDatabase:
             [str(_DECODE_RATES_SCHEMA_VERSION)],
         )
         logger.debug("Created sources, rois and decode_rates tables and indexes")
+
+    def _create_source_catalog(self, conn: duckdb.DuckDBPyConnection) -> None:
+        """Create ``source_catalog``: the sources that could be restored.
+
+        Public row columns first (see ``_SOURCE_COLUMNS``), then what a restore
+        needs: the claim, its claim-time signature and the adapter payload. The
+        private columns stay out of the ``sources`` view, since the claim can
+        carry credential profile names and paths.
+
+        Dropped whole when ``SOURCE_CATALOG_FORMAT`` differs from the one that
+        wrote it, or is missing: the result is today's behaviour, a rebuild.
+        Rows are cleared at open until a restore reads them; showing last run's
+        rows with no adapter behind them would be a catalog that lies.
+        """
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS catalog_meta (key TEXT PRIMARY KEY, value TEXT)"
+        )
+        stored = conn.execute(
+            "SELECT value FROM catalog_meta WHERE key = 'source_catalog_format'"
+        ).fetchone()
+        if stored is None or stored[0] != str(SOURCE_CATALOG_FORMAT):
+            conn.execute("DROP TABLE IF EXISTS source_catalog")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS source_catalog (
+                source_id TEXT PRIMARY KEY,
+                source_url TEXT,
+                source_type TEXT,
+                indexed_at TIMESTAMP,
+                metadata_json TEXT,
+                is_resolved BOOLEAN NOT NULL DEFAULT TRUE,
+                unresolved_reason VARCHAR,
+                unresolved_error VARCHAR,
+                tensors STRUCT(
+                    array_id VARCHAR,
+                    dim_labels VARCHAR[],
+                    shape BIGINT[],
+                    dtype VARCHAR
+                )[],
+                -- The claim, as `SourceClaim` holds it.
+                primary_path TEXT,
+                member_paths VARCHAR[],
+                extra_config TEXT,
+                -- {member path: [st_ino, size, mtime_ns, ctime_ns]} when the
+                -- claim was made. No st_dev: it renumbers across boots.
+                signature TEXT,
+                -- What the adapter needs to be built without a parse.
+                payload TEXT,
+                last_seen TIMESTAMP
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_catalog_source_url "
+            "ON source_catalog(source_url)"
+        )
+        conn.execute("DELETE FROM source_catalog")
+        conn.execute(
+            "INSERT OR REPLACE INTO catalog_meta VALUES ('source_catalog_format', ?)",
+            [str(SOURCE_CATALOG_FORMAT)],
+        )
+
+    @staticmethod
+    def create_sources_view(conn: duckdb.DuckDBPyConnection) -> None:
+        """Make ``sources`` visible on *conn*.
+
+        A DuckDB temp view belongs to the connection that created it, so every
+        cursor needs its own. It cannot be a persistent view: an older build runs
+        ``DROP TABLE IF EXISTS sources`` at open, which fails on a view and
+        would stop it opening this file.
+        """
+        conn.execute(_SOURCES_VIEW_DDL)
 
     def _reconcile_roi_schema(
         self, conn: duckdb.DuckDBPyConnection, had_rois: bool
@@ -1211,7 +1319,12 @@ class MetadataDatabase:
             }
         )
 
-    def sync_source_added(self, source_id: str, adapter: SourceAdapter) -> None:
+    def sync_source_added(
+        self,
+        source_id: str,
+        adapter: SourceAdapter,
+        record: Optional[CatalogRecord] = None,
+    ) -> None:
         """Sync a source to the metadata database (INSERT OR REPLACE upsert).
 
         Called by ``SourceManager`` when a source is registered and, for a
@@ -1230,6 +1343,10 @@ class MetadataDatabase:
         Args:
             source_id: Unique source identifier
             adapter: Backend adapter for the source
+            record: The claim and its claim-time signature, from a caller that
+                registers restorable sources. With an adapter payload
+                (``catalog_payload``) the row goes to ``source_catalog``;
+                without either it stays in ``sources_volatile``.
         """
         conn = self._get_connection()
 
@@ -1327,6 +1444,12 @@ class MetadataDatabase:
         indexed_at = datetime.now()
         metadata_json = json.dumps(metadata, cls=NumpyEncoder) if metadata else None
 
+        persist = None
+        if record is not None and is_resolved:
+            payload = getattr(adapter, "catalog_payload", lambda: None)()
+            if payload is not None:
+                persist = (record, payload)
+
         self._upsert_source_row(
             conn,
             source_id,
@@ -1337,6 +1460,7 @@ class MetadataDatabase:
             is_resolved,
             None,  # a registered adapter has no reason; ``sync_pending_source`` sets one
             tensors,
+            persist=persist,
         )
 
         # Deliberately AFTER the source row commits, and deliberately unable to
@@ -1371,29 +1495,72 @@ class MetadataDatabase:
         unresolved_reason: Optional[str],
         tensors: List[Dict[str, Any]],
         unresolved_error: Optional[str] = None,
+        persist: Optional[Tuple[CatalogRecord, Dict[str, Any]]] = None,
     ) -> None:
-        """Insert or replace a source's row, serializing writes with the lock."""
+        """Insert or replace a source's row, serializing writes with the lock.
+
+        The row lands in ``source_catalog`` with *persist* (the claim record and
+        adapter payload), else in ``sources_volatile``, and is deleted from the
+        other table in the same transaction: the ``sources`` view is a UNION
+        ALL, so it cannot enforce one row per ``source_id`` itself, and a source
+        that changes kind (resolved to failed, say) must not show twice or
+        vanish between the two statements.
+        """
+        row = [
+            source_id,
+            source_url,
+            source_type,
+            indexed_at,
+            metadata_json,
+            is_resolved,
+            unresolved_reason,
+            tensors,
+            unresolved_error,
+        ]
+        columns = (
+            "source_id, source_url, source_type, indexed_at, metadata_json, "
+            "is_resolved, unresolved_reason, tensors, unresolved_error"
+        )
         with self._write_lock:
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO sources
-                (source_id, source_url, source_type, indexed_at,
-                 metadata_json, is_resolved, unresolved_reason, tensors,
-                 unresolved_error)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    source_id,
-                    source_url,
-                    source_type,
-                    indexed_at,
-                    metadata_json,
-                    is_resolved,
-                    unresolved_reason,
-                    tensors,
-                    unresolved_error,
-                ],
-            )
+            conn.execute("BEGIN TRANSACTION")
+            try:
+                if persist is None:
+                    conn.execute(
+                        "DELETE FROM source_catalog WHERE source_id = ?", [source_id]
+                    )
+                    conn.execute(
+                        f"INSERT OR REPLACE INTO sources_volatile ({columns}) "
+                        f"VALUES ({', '.join('?' * len(row))})",
+                        row,
+                    )
+                else:
+                    record, payload = persist
+                    claim = record.claim
+                    conn.execute(
+                        "DELETE FROM sources_volatile WHERE source_id = ?",
+                        [source_id],
+                    )
+                    conn.execute(
+                        f"INSERT OR REPLACE INTO source_catalog ({columns}, "
+                        "primary_path, member_paths, extra_config, signature, "
+                        "payload, last_seen) "
+                        f"VALUES ({', '.join('?' * (len(row) + 6))})",
+                        row
+                        + [
+                            claim.primary_path,
+                            sorted(claim.member_paths),
+                            json.dumps(claim.extra_config, sort_keys=True),
+                            json.dumps(
+                                {k: list(v) for k, v in record.signature.items()}
+                            ),
+                            json.dumps(payload, sort_keys=True),
+                            indexed_at,
+                        ],
+                    )
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
 
     def sync_pending_source(
         self,
@@ -1595,7 +1762,10 @@ class MetadataDatabase:
         """
         conn = self._get_connection()
         with self._write_lock:
-            conn.execute("DELETE FROM sources WHERE source_id = ?", [source_id])
+            conn.execute("DELETE FROM source_catalog WHERE source_id = ?", [source_id])
+            conn.execute(
+                "DELETE FROM sources_volatile WHERE source_id = ?", [source_id]
+            )
             # Reserved rows go with the source row: they are its scan output,
             # re-derived on the next registration. Hand-drawn annotations are
             # deliberately NOT touched here -- outliving their source is the

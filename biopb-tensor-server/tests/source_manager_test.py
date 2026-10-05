@@ -70,7 +70,7 @@ class _FakeMetadataDb:
         self.pruned.append(before)
         return 0
 
-    def sync_source_added(self, source_id, adapter):
+    def sync_source_added(self, source_id, adapter, record=None):
         self.added.append(source_id)
 
     def sync_source_removed(self, source_id):
@@ -83,7 +83,7 @@ class _FailingMetadataDb(_FakeMetadataDb):
         self._fail_add = fail_add
         self._fail_remove = fail_remove
 
-    def sync_source_added(self, source_id, adapter):
+    def sync_source_added(self, source_id, adapter, record=None):
         if self._fail_add:
             raise RuntimeError("metadata add failed")
         super().sync_source_added(source_id, adapter)

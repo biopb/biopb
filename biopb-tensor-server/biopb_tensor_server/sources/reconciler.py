@@ -66,13 +66,13 @@ from biopb_tensor_server.sources.entry_stat import (
     entry_change_time,
     entry_is_quiet,
 )
-from biopb_tensor_server.sources.roots import Roots
+from biopb_tensor_server.sources.roots import RootKind, Roots
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import (
         SourceConfig as _SourceConfig,  # noqa: F401
     )
-    from biopb_tensor_server.serving.metadata_db import MetadataDatabase
+    from biopb_tensor_server.serving.metadata_db import CatalogRecord, MetadataDatabase
     from biopb_tensor_server.serving.server import TensorFlightServer
 
 logger = logging.getLogger(__name__)
@@ -609,6 +609,34 @@ class Reconciler:
                 cloud=cloud,
             )
         return signatures
+
+    def _catalog_record(self, claim: SourceClaim) -> Optional[CatalogRecord]:
+        """The claim and its signature, if its source could be restored later.
+
+        Restorable means local, under a monitored or scan-once root that is not
+        a cloud root, and not a mirror: drops live only in memory, cloud claims
+        cannot be validated by an identity-only signature, and a mirror has no
+        claim to rebuild. Whether the adapter can also be rebuilt is its own
+        ``catalog_payload``.
+
+        The persisted signature drops ``st_dev`` (first element), which can
+        renumber across boots and would make every row look changed.
+        """
+        if claim.source_type == "tensor-server" or claim.is_remote:
+            return None
+        root = self._roots.containing(Path(claim.primary_path))
+        if (
+            root is None
+            or root.cloud
+            or root.kind not in (RootKind.MONITORED, RootKind.SCAN_ONCE)
+        ):
+            return None
+        signature = {
+            path: sig[1:] for path, sig in self._build_claim_signatures(claim).items()
+        }
+        from biopb_tensor_server.serving.metadata_db import CatalogRecord
+
+        return CatalogRecord(claim=claim, signature=signature)
 
     def _preserve_skipped_claims(
         self,
@@ -1323,6 +1351,11 @@ class Reconciler:
         and the metadata DB record the re-rooted url.
         """
         self._warn_if_experimental(claim)
+        # Taken before the adapter is built, so a file that changes during the
+        # parse is recorded with the identity the parse started from.
+        record = (
+            None if recall or catalog_seed is not None else self._catalog_record(claim)
+        )
         try:
             source_config = self._source_config_for(claim)
 
@@ -1412,7 +1445,7 @@ class Reconciler:
             # so a replace overwrites the row rather than needing it deleted
             # first -- which is what keeps the source continuously catalogued.
             if self._metadata_db is not None:
-                self._metadata_db.sync_source_added(claim.source_id, adapter)
+                self._metadata_db.sync_source_added(claim.source_id, adapter, record)
 
             if displaced is not None:
                 # Only now, and this ordering is the reason `swap` hands the

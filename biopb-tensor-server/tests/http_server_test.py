@@ -1236,7 +1236,7 @@ class TestQuerySourcesEndpoint:
 
         r = tc.post(
             "/api/sources/query",
-            json={"sql": "INSERT INTO sources VALUES ('evil')"},
+            json={"sql": "INSERT INTO sources_volatile VALUES ('evil')"},
             headers=_bearer(_TOKEN),
         )
         assert r.status_code == 400
