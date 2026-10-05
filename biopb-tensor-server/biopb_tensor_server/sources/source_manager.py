@@ -624,6 +624,8 @@ class SourceManager:
             # leave its sources registered (the reconcile scopes them out) rather
             # than re-walking it.
             report = WalkReport()
+            if stream_first_scan:
+                self._reconciler.begin_pending_batch()
             for monitored_root in sorted(monitored, key=lambda r: r.url):
                 # Walked as stored, not resolved again: the root is canonical
                 # from config, so its claims are spelled under it however the
@@ -659,6 +661,9 @@ class SourceManager:
             if completes_here:
                 self._mark_catalog_complete()
         finally:
+            # Before the startup protocol resumes the registration pool, so every
+            # claim has its row by then.
+            self._reconciler.end_pending_batch()
             if completes_here:
                 self._server.set_full_scan_in_progress(False)
 

@@ -400,6 +400,10 @@ class _FakeMetadataDb:
     def sync_pending_source(self, claim, catalog_url=None, error=None, recall=False):
         self.pending.append((claim.source_id, recall))
 
+    def sync_pending_sources(self, rows):
+        for row in rows:
+            self.sync_pending_source(row.claim, row.catalog_url, recall=row.recall)
+
     def sync_source_removed(self, source_id):
         pass
 

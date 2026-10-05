@@ -66,6 +66,7 @@ from biopb_tensor_server.sources.entry_stat import (
     entry_change_time,
     entry_is_quiet,
 )
+from biopb_tensor_server.sources.pending_rows import PendingRow, PendingRowWriter
 from biopb_tensor_server.sources.roots import RootKind, Roots
 
 if TYPE_CHECKING:
@@ -188,6 +189,9 @@ class Reconciler:
         # not waited for).
         self._defer_registration = False
         self._pending_hook: Optional[Callable[[str], None]] = None
+        # While the first scan streams its claims, their pending rows are written
+        # in batches by this (None otherwise: one write per claim).
+        self._pending_writer: Optional[PendingRowWriter] = None
         self._pending: Dict[str, Optional[str]] = {}
         self._pending_failed: Dict[str, str] = {}
         # The pending sources that wait for a client, not the pool: a cloud source
@@ -312,6 +316,20 @@ class Reconciler:
         """
         return not claim.is_remote and claim.source_type != "tensor-server"
 
+    def begin_pending_batch(self) -> None:
+        """Write the pending rows of the claims that follow in batches, until
+        :meth:`end_pending_batch`. For the first scan, which claims them by the
+        tens of thousands; the walk must not wait on the catalog for each."""
+        write = getattr(self._metadata_db, "sync_pending_sources", None)
+        if write is not None and self._pending_writer is None:
+            self._pending_writer = PendingRowWriter(write)
+
+    def end_pending_batch(self) -> None:
+        """Write what is still buffered and go back to one write per claim."""
+        writer, self._pending_writer = self._pending_writer, None
+        if writer is not None:
+            writer.close()
+
     def _commit_pending_claim(
         self, claim: SourceClaim, catalog_url: Optional[str], recall: bool = False
     ) -> bool:
@@ -328,8 +346,14 @@ class Reconciler:
         :meth:`ensure_registered` has built its adapter.
         """
         try:
+            writer = self._pending_writer
             if self._metadata_db is not None:
-                self._metadata_db.sync_pending_source(claim, catalog_url, recall=recall)
+                if writer is not None:
+                    writer.add(PendingRow(claim, catalog_url, recall))
+                else:
+                    self._metadata_db.sync_pending_source(
+                        claim, catalog_url, recall=recall
+                    )
         except Exception as e:
             self._log_source_failure(
                 claim.source_id,
@@ -1514,6 +1538,10 @@ class Reconciler:
         while the rollback path -- which runs outside that lock -- discards it
         itself.
         """
+        writer = self._pending_writer
+        if writer is not None:
+            # Before the delete, so a buffered row cannot be written back after it.
+            writer.discard(source_id)
         if self._metadata_db is not None:
             try:
                 self._metadata_db.sync_source_removed(source_id)

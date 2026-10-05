@@ -81,6 +81,7 @@ from biopb_tensor_server.core.labels import last_named_segment
 if TYPE_CHECKING:
     from biopb_tensor_server.core.adapter_base import SourceAdapter
     from biopb_tensor_server.core.discovery import SourceClaim
+    from biopb_tensor_server.sources.pending_rows import PendingRow
 
 logger = logging.getLogger(__name__)
 
@@ -1588,6 +1589,66 @@ class MetadataDatabase:
             [],
             unresolved_error=error or None,
         )
+
+    # Rows per INSERT: a multi-row statement costs ~0.06 ms a row against ~4 ms for
+    # one statement a row, and stays well under DuckDB's parameter limits.
+    _PENDING_CHUNK = 500
+
+    def sync_pending_sources(self, rows: Sequence[PendingRow]) -> None:
+        """Write the rows of many claimed sources at once (see ``sync_pending_source``).
+
+        Only a source with no row yet gets one. A batch is written some time after
+        its claims were made, and in that time a registration may already have
+        written the real row, which a pending one must not replace.
+
+        One transaction, serialized with every other writer by the lock.
+        """
+        if not rows:
+            return
+        conn = self._get_connection()
+        now = datetime.now()
+        columns = (
+            "source_id, source_url, source_type, indexed_at, metadata_json, "
+            "is_resolved, unresolved_reason, tensors, unresolved_error"
+        )
+        with self._write_lock:
+            conn.execute("BEGIN TRANSACTION")
+            try:
+                persisted = {
+                    r[0]
+                    for r in conn.execute(
+                        "SELECT source_id FROM source_catalog "
+                        "WHERE list_contains(?, source_id)",
+                        [[row.claim.source_id for row in rows]],
+                    ).fetchall()
+                }
+                fresh = [r for r in rows if r.claim.source_id not in persisted]
+                for i in range(0, len(fresh), self._PENDING_CHUNK):
+                    chunk = fresh[i : i + self._PENDING_CHUNK]
+                    params: List[Any] = []
+                    for row in chunk:
+                        claim = row.claim
+                        params += [
+                            claim.source_id,
+                            row.catalog_url or to_catalog_url(str(claim.primary_path)),
+                            claim.source_type or "unknown",
+                            now,
+                            None,
+                            False,
+                            "needs_recall" if row.recall else "pending",
+                            [],
+                            None,
+                        ]
+                    conn.execute(
+                        f"INSERT INTO sources_volatile ({columns}) VALUES "
+                        + ", ".join(["(?, ?, ?, ?, ?, ?, ?, ?, ?)"] * len(chunk))
+                        + " ON CONFLICT DO NOTHING",
+                        params,
+                    )
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
 
     def _replace_imported(
         self,
