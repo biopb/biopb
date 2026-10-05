@@ -39,19 +39,22 @@ A restored row may be stale; the epoch below says so.
 
 ## Tables and the `sources` view
 
-- **`source_catalog`**: persistent, restorable sources only. Public row columns plus the
-  private claim (`member_paths`, `extra_config`, `source_type`), the claim-time
-  signature, the adapter payload, the epoch of its last write and `last_seen`.
+- **`source_catalog`**: every source that has a claim under a configured root, cloud roots
+  included. Public row columns plus the private claim (`primary_path`, `member_paths`,
+  `extra_config`, `source_type`), the claim-time signature, the adapter payload, the epoch
+  of its last write and `last_seen`. A row is resolved, pending, `needs_recall` or failed.
 - **A volatile table**: today's `sources`, renamed, dropped and rebuilt at open. It holds
-  what has no restore path: mirrors (catalog rows only, no claim), cloud-root sources,
-  drops and uploads. Until stage 1.5 it also holds every row that is not yet resolved.
+  what has no claim to re-derive: mirrors (catalog rows only, no claim), tensor-server and
+  remote sources, uploads, drops. Until stage 1.5 it also holds every row that is not yet
+  resolved, and cloud-root sources.
 - **`sources`**: a view over both, exposing the published columns plus `confirmed_epoch`
   and `confirmed` (below). The private columns are not in it. Volatile rows report the
   current epoch, since they were seen this run.
 
-The writer routes by restorability. A source that moves between tables (its root turned
-cloud, its adapter type changed) is deleted from the other table in the same locked
-write, because a union view cannot enforce a unique `source_id`.
+The writer routes by whether the source has a claim. A source that moves between tables
+(it gained or lost its claim) is deleted from the other table in the same locked write,
+because a union view cannot enforce a unique `source_id`. After stage 1.5 that happens
+rarely, since the row is written when the claim is made.
 
 **The view is persistent, created at open** (dropped first; a physical `sources` table
 from an older build is dropped too). It could be a `TEMP` view, which would let an older
@@ -66,25 +69,28 @@ union.
 
 ## What is restored
 
-A source is restorable when it is resolved, local, comes from a configured scanned root,
-is not a mirror and is not under a cloud root. Nothing is opt-in per adapter: the claim
-is enough to rebuild any of them, and a payload is an optimization that skips the parse
+A source is restorable when it has a claim under a configured root of kind monitored,
+scan-once or cloud, and is not a mirror. Nothing is opt-in per adapter: the claim is
+enough to rebuild any of them, and a payload is an optimization that skips the parse
 (OME-TIFF, nd2 and czi have one; others store NULL and are parsed on first read). From
-stage 1.5 a pending or failed row is persisted too, with its claim and signature, and
-restore re-registers a pending row from its claim. A failed row is restored as failed and
-not retried until the walker finds a new signature for it (see stage 1.5).
+stage 1.5 a pending or failed row is persisted too, with its claim and signature. What
+restore does with a row:
+
+- **Resolved, local:** hydrated from its payload, or from its claim when it has none.
+- **Pending:** registered from its claim, like any pending claim.
+- **Failed:** restored as failed, and not retried until the walker finds a new signature
+  for the same URL or the user re-drops its path (see stage 1.5).
+- **Cloud:** loaded as unresolved `needs_recall`, never resolved: see Cloud.
 
 - **Mirrors** are bulk-seeded from `catalog_seed` and need the upstream `indexed_at`.
 - **Drops** (`dnd://`) are not restored: roots live in memory, so a drop is not re-found
   after a restart and its rows could never be confirmed.
-- **Cloud**: see below.
 - **Directory-backed sources** (zarr, ome-zarr, ndtiff, TIFF sequences) are restorable
-  like the rest, with a known limitation. A directory
-  source's signature is the directory's own, and that mtime does not move when a member
-  is rewritten in place. A restart used to heal that; a restored directory source is
-  refreshed only by an explicit re-drop (which rebuilds every known claim
-  unconditionally) or by a change in the directory's own stat. The rebuild flag below is
-  the escape hatch.
+  like the rest, with a known limitation. A directory source's signature is the
+  directory's own, and that mtime does not move when a member is rewritten in place. A
+  restart used to heal that; a restored directory source is refreshed by a change in the
+  directory's own stat or by a re-drop, which refreshes every known claim under the path
+  unconditionally (stage 1.5). The rebuild flag below is the other escape hatch.
 
 ## Config changes between restarts
 
@@ -93,9 +99,11 @@ persisted is each claim's paths, and ownership is re-derived against the current
 
 - A claim not under any current root is deleted, not restored. A removed root's sources
   disappear at once.
-- Only roots of kind monitored or scan-once restore. A root that is now cloud, dropped or
-  upstream makes its rows unrestorable; the persisted signature form depends on cloudness,
-  so it cannot be trusted either.
+- Only roots of kind monitored, scan-once or cloud restore. A root that is now dropped or
+  upstream makes its rows unrestorable. A root whose cloudness changed makes its rows
+  read as changed: the persisted signature form depends on cloudness (one element,
+  `st_ino`, for cloud; three for a directory and four for a file otherwise), so the two
+  never compare equal and the claim is refreshed.
 - A multi-file source needs every member under current roots, else it re-registers.
 - Each claim is attributed to the innermost current root (`Roots.containing`), and the
   display `source_url` is recomputed from the current roots (`Roots.display_url`): an
@@ -200,28 +208,29 @@ read lazily from the file.
 
 ## Cloud
 
-Cloud-root sources are out of the first rollout, and stay in the volatile table.
+Cloud-root claims are persisted like any other (the table predicate is "has a claim"), but
+a cloud row is **never restored as resolved**. Restore loads it unresolved with reason
+`needs_recall` and empty `tensors`, with no stat; the walk then settles it (stage 1.5):
+a known claim with the same signature and an unresolved row becomes `pending` if resident,
+else stays `needs_recall`, and registers like any pending claim.
+
+Why a resolved cloud row is not trusted:
 
 - The cloud signature is identity-only `(dev, ino)` so it survives hydration. It is also
   blind to in-place sync updates (a sync client rewriting a hydrated file usually keeps
   the inode), and some cloud filesystems report a zero inode: a restored row cannot be
-  validated.
-- Cloud content is the least static part of a catalog, and a restart is what heals that
-  staleness today.
+  validated, so a resolved one could serve a stale shape and tensors that nothing
+  refreshes.
 - A source restored as resolved would let a read trigger a download if its members were
   evicted meanwhile, the unintended hydration the resolve guard exists to prevent.
-- There is nothing to save: an unresolved source is built from the claim plus a stat.
+- There is nothing to save: an unresolved source is built from the claim plus a stat, so
+  the payload is NULL.
 
-Restart behaviour is unchanged: the walk lists placeholders; a source whose members are
-all resident registers normally, any dehydrated member gives `needs_recall`.
-
-**Open option, for instant cloud listings:** restore cloud claims as `needs_recall` rows
-only (empty `tensors`, no metadata), whatever they were persisted as. Safe, but a restored
-`needs_recall` claim whose files are resident would stay unresolved after each restart,
-because the identity signature does not change and the reconcile does nothing; it needs
-the refresh to also handle the resident-to-hydrated flip (today's `_refresh_recall_claim`
-handles the other direction, unchecked here). The benefit is latency only, since the walk
-still runs. Worth doing only if a cloud-root walk is slow enough to notice; unmeasured.
+The cost is one registration per resident cloud source per restart, which is today's
+behaviour. The gain is that cloud sources list at once, as unresolved rows. The walk's
+rule for an unresolved row with an unchanged signature also covers the resident flip
+that `_refresh_recall_claim` does not (it handles only resident to dehydrated). The
+signature gap itself is healed by a re-drop, as for directories (stage 1.5).
 
 ## Interactions to handle
 
@@ -286,36 +295,59 @@ for them. Once the catalog is restored, the first walk has prior state and is an
 rescan. The special mode goes; what made it fast becomes the "new claim" case of the one
 scan.
 
-**The walk writes claims to `source_catalog`.** A claim that has a catalog record (local,
-under a monitored or scan-once root, not cloud, not a mirror or remote) is written to
-`source_catalog` when the walk finds it, not to the volatile table. Only what has no
-claim stays volatile: mirrors, cloud placeholders, tensor-server and remote sources,
-drops. A row then never changes table; registration fills it in.
+**The table predicate is "has a claim".** Any source with a claim under a configured root,
+cloud roots included, is written to `source_catalog` when the walk finds it, never to the
+volatile table. Only what has no claim to re-derive stays volatile: mirrors,
+tensor-server and remote sources, uploads, and drops (their roots live in memory). A row
+never changes table; registration fills it in.
 
-| event | write to `source_catalog` |
+"Resident" below means the claim is not `_claim_is_unresolved`: no adapter-flagged
+`claim.unresolved`, and under a cloud root no dehydrated member. It is a metadata stat,
+so deciding it opens nothing.
+
+| walker finds | write to `source_catalog` |
 |---|---|
-| new claim | batched `INSERT ... ON CONFLICT DO NOTHING`: `is_resolved` false, reason `pending`, claim columns and signature, `payload` NULL |
-| claim changed | `UPDATE` back to pending with the new claim and signature (an overwrite, so not the `DO NOTHING` path; rare, per row) |
-| claim gone | delete the row |
-| unchanged | none |
-| registered | `UPDATE` of `metadata_json`, `tensors`, `payload`, `indexed_at`, `is_resolved` true, reason NULL |
-| registration failed | `UPDATE` to reason `failed` with `unresolved_error` |
+| a new claim | batched `INSERT ... ON CONFLICT DO NOTHING`: unresolved, reason `pending` if resident, else `needs_recall`; claim columns and signature; `payload` NULL |
+| a known claim, same signature, row resolved | none |
+| a known claim, same signature, row unresolved and not `failed` | `UPDATE` of the reason only: `pending` if resident, else `needs_recall` |
+| a known claim, same signature, row `failed` | none |
+| a known claim, new signature (a refresh) | registers inline as a new claim would: one upsert of the resolved row when it succeeds; `needs_recall` if it is no longer resident. A failed refresh leaves the old row and adapter in place |
+| a claim gone | delete the row |
+
+| registration | write |
+|---|---|
+| succeeds | `UPDATE` of `metadata_json`, `tensors`, `payload`, `indexed_at`, `is_resolved` true, reason NULL |
+| fails (a pending claim) | `UPDATE` to reason `failed` with `unresolved_error` |
 
 The batched writer serves every walk, not only the first. Its `DO NOTHING` is the
 guard against a registration that wrote the real row before the buffered pending row
-landed; it says nothing about whether the claim is current. That decision (unchanged,
-changed, new) is made from the signature before anything is buffered, so a restored row
-whose file changed is overwritten rather than skipped.
+landed; it says nothing about whether the claim is current. That decision is made from
+the signature before anything is buffered, so a restored row whose file changed is
+refreshed rather than skipped.
+
+**A refresh is a replacement, not a state change of the row.** `_refresh_claim` builds
+the new adapter and swaps it in over the old one, which keeps serving until then. So a
+refresh writes no pending row: the view never says "pending" while the old adapter still
+serves. Sources that fail repeatedly are removed (`_max_refresh_failures`, in memory).
 
 **Failed rows stay failed.** A failed row persists as unresolved with reason `failed`, its
 error and its signature. Restore does not retry it, and neither does a rescan while the
-signature is unchanged. A refresh is the walker finding the same URL with a new
-signature; it is the one thing that clears the failure, by taking the same path as any
-changed claim (update to pending, register again). The only other way out is deletion.
+signature is unchanged. Two things clear it: the walker finding a new signature for the
+same URL, which is a refresh as above, and a re-drop of its path (below). The only other
+way out is deletion.
 
-**Scan cases.** Each discovered claim is one of: in state and unchanged (no write), in
-state and changed (refresh), new (batched insert). A restored claim the walk did not see
-is dropped by the post-walk sweep, not by a diff of everything.
+**DnD heals what the signature cannot see.** The signature has known gaps: a cloud file's
+is `(dev, ino)` only, and a directory's is its own stat, which does not move when a member
+is rewritten in place. A drop (`add_local_source`) refreshes every already-registered
+claim under the dropped path unconditionally, with no signature compare, including
+directory sources and sources inside a known root, and removes registered sources under
+it whose files are gone. So a re-drop is both the repair for those gaps and the user's
+request to retry a failed row. A rescan never does either; a restart used to, and a
+restored catalog will not (the rebuild flag is the other escape hatch).
+
+**Scan cases.** Each discovered claim is one of: known and unchanged, known and changed
+(refresh), new (batched insert). A restored claim the walk did not see is dropped by the
+post-walk sweep, not by a diff of everything.
 
 **Measured** (35k pending rows, 500 per statement, one transaction, local disk, fresh
 store): into `sources_volatile` 1.95 s; into `source_catalog` 3.35 s (0.096 ms a row), the
