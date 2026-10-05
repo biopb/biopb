@@ -211,25 +211,16 @@ async function onJobSettled(get: Get, set: Set, job: SourceJobStatus): Promise<v
   const epochAtStart = _epochAtResolveStart.get(key);
   _epochAtResolveStart.delete(key);
   if (job.state !== "done") return;
-  const row = job.source;
-  const refresh = row ? Promise.resolve(applySourceRow(set, row)) : get().loadSources();
+  if (job.source) applySourceRow(set, job.source);
+  else await get().loadSources();
   // Open it unless something else was opened meanwhile, checked after the row
   // is in place so the open never runs against the stale unresolved one. The
   // bare source id: the server binds the default tensor, so a multi-array
   // source is never guessed.
-  const open = refresh.then(() => {
-    if (epochAtStart !== undefined && get().target.epoch === epochAtStart) {
-      get().openTensor(job.source_id);
-    }
-  });
-  if (!AUTO_WARM_AFTER_RESOLVE) {
-    await open;
-    return;
+  if (epochAtStart !== undefined && get().target.epoch === epochAtStart) {
+    get().openTensor(job.source_id);
   }
-  // Independent: the catalog reload and starting the warm hit different
-  // endpoints and different store slices, so there is nothing for one to wait
-  // on from the other.
-  await Promise.all([open, get().startWarm(job.source_id)]);
+  if (AUTO_WARM_AFTER_RESOLVE) await get().startWarm(job.source_id);
 }
 
 /** Swap one source's row into the catalog copy, keeping its order. */
