@@ -72,7 +72,7 @@ is enough to rebuild any of them, and a payload is an optimization that skips th
 (OME-TIFF, nd2 and czi have one; others store NULL and are parsed on first read). From
 stage 1.5 a pending or failed row is persisted too, with its claim and signature, and
 restore re-registers a pending row from its claim. A failed row is restored as failed and
-not retried unless the user asks (see stage 1.5).
+not retried until the walker finds a new signature for it (see stage 1.5).
 
 - **Mirrors** are bulk-seeded from `catalog_seed` and need the upstream `indexed_at`.
 - **Drops** (`dnd://`) are not restored: roots live in memory, so a drop is not re-found
@@ -309,9 +309,9 @@ whose file changed is overwritten rather than skipped.
 
 **Failed rows stay failed.** A failed row persists as unresolved with reason `failed`, its
 error and its signature. Restore does not retry it, and neither does a rescan while the
-file is unchanged: a retry happens only when the user asks. The user can delete the row,
-or refresh it, which clears the failure and registers it again. A claim whose signature
-changed is refreshed like any changed claim, which also clears it.
+signature is unchanged. A refresh is the walker finding the same URL with a new
+signature; it is the one thing that clears the failure, by taking the same path as any
+changed claim (update to pending, register again). The only other way out is deletion.
 
 **Scan cases.** Each discovered claim is one of: in state and unchanged (no write), in
 state and changed (refresh), new (batched insert). A restored claim the walk did not see
