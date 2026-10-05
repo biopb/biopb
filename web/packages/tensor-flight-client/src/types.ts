@@ -71,6 +71,8 @@ export interface SourceJobStatus {
   cancel_requested: boolean;
   /** Only on the response that started it: false means it joined one running. */
   started?: boolean;
+  /** A finished resolve's now-concrete catalog row; absent otherwise. */
+  source?: DataSourceDescriptor;
 }
 
 /** The union of both job kinds' progress counters; each reports its own subset. */

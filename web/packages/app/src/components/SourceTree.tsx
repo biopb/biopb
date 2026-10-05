@@ -254,13 +254,15 @@ export function TreeRow({
           : UNRESOLVED_TOOLTIP;
     const idleLabel = kind === "recall" ? "Resolve" : kind === "pending" ? "Load" : "Retry";
     const busyLabel = kind === "recall" ? "Resolving\u2026" : "Loading\u2026";
-    const buttonTitle =
-      kind === "recall"
-        ? "Resolve this source \u2014 downloads its content, which can take minutes"
-        : "Read this source's metadata now";
+    // A cloud resolve downloads the content, which can take minutes, so it takes
+    // a deliberate double-click rather than a stray single click on a button.
+    const doubleClickToResolve = kind === "recall" && startResolve && !inFlight;
     return (
       <div
-        className="tree-item unresolved"
+        className={`tree-item unresolved${inFlight ? " resolving" : ""}`}
+        // Focusable so a click (or Tab) highlights the row like a selection
+        // without opening anything: there is no tensor to open yet.
+        tabIndex={0}
         style={{
           width: "100%",
           display: "flex",
@@ -269,22 +271,38 @@ export function TreeRow({
         }}
         data-source-id={node.id === src.source_id ? src.source_id : undefined}
         title={`${src.source_url}\n${tooltip}`}
+        onDoubleClick={
+          doubleClickToResolve ? () => startResolve(src.source_id) : undefined
+        }
       >
         <ChevronSlot />
         <span className="unresolved-glyph" aria-label="Not resolved">
           {kind === "recall" ? UNRESOLVED_GLYPH : "\u2026"}
         </span>
-        <span style={{ flex: 1, marginLeft: 4 }}>{node.name}</span>
-        {startResolve ? (
+        <span className="tree-name" style={{ flex: 1, marginLeft: 4 }}>
+          {node.name}
+        </span>
+        {!startResolve ? null : kind === "recall" ? (
+          <span
+            className="resolve-hint"
+            title="Double-click this row to download and resolve it \u2014 can take minutes"
+          >
+            {inFlight ? busyLabel : "Double-click to resolve"}
+          </span>
+        ) : (
           <button
             className="resolve-btn"
             disabled={inFlight}
             onClick={() => startResolve(src.source_id)}
-            title={inFlight ? "Already resolving this source" : buttonTitle}
+            title={
+              inFlight
+                ? "Already resolving this source"
+                : "Read this source's metadata now"
+            }
           >
             {inFlight ? busyLabel : idleLabel}
           </button>
-        ) : null}
+        )}
       </div>
     );
   }

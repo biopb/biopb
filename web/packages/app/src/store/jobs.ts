@@ -1,5 +1,5 @@
 import type { StateCreator } from "zustand";
-import type { SourceJobStatus } from "@biopb/tensor-flight-client";
+import type { DataSourceDescriptor, SourceJobStatus } from "@biopb/tensor-flight-client";
 import type { AppState, Get, Set } from "./types";
 
 export type SourceJobKind = "resolve" | "warm";
@@ -35,6 +35,14 @@ const JOB_POLL_MS = 1000;
 const AUTO_WARM_AFTER_RESOLVE: boolean = false;
 
 let _jobPollTimerId: ReturnType<typeof setInterval> | undefined;
+
+/**
+ * `target.epoch` when this tab started each resolve, by job key. A resolve opens
+ * its source when it finishes, but only if no open has happened since -- the user
+ * who clicked another source meanwhile keeps that one. Local to this tab on
+ * purpose: a resolve joined from another tab or a reload was not asked for here.
+ */
+const _epochAtResolveStart = new Map<string, number>();
 
 /** A job that has stopped moving, whatever the reason. */
 function isSettled(job: SourceJobStatus): boolean {
@@ -114,13 +122,24 @@ async function startSourceJob(
 ): Promise<void> {
   const { client } = get();
   if (!client) return;
+  // Read before the request, not after: an open that lands while it is in flight
+  // is exactly the one the finished resolve must not override.
+  const epochAtClick = get().target.epoch;
   try {
     const status =
       kind === "resolve"
         ? await client.http.startResolve(sourceId)
         : await client.http.startWarm(sourceId);
     putJob(set, status);
-    ensureJobPolling(get, set);
+    if (kind === "resolve" && status.started !== false) {
+      _epochAtResolveStart.set(jobKey(kind, sourceId), epochAtClick);
+    }
+    if (isSettled(status)) {
+      // Finished before the first poll: nothing would ever settle it.
+      await onJobSettled(get, set, status);
+    } else {
+      ensureJobPolling(get, set);
+    }
   } catch (err) {
     // Synthesised rather than swallowed: a resolve that never started is the
     // one failure the user most needs told about, and the surface that shows
@@ -167,7 +186,7 @@ async function pollSourceJobs(get: Get, set: Set): Promise<void> {
     const after = result.value;
     putJob(set, after);
     if (isSettled(after)) {
-      await onJobSettled(get, after);
+      await onJobSettled(get, set, after);
     }
   }
 }
@@ -176,7 +195,8 @@ async function pollSourceJobs(get: Get, set: Set): Promise<void> {
  * What happens when a job stops.
  *
  * A finished resolve leaves the catalog row stale -- the source is hydrated but
- * the tree still has the listing from before -- so the list is re-read.
+ * the tree still has the listing from before. The job carries the new row, which
+ * replaces the stale one; the list is re-read only if it did not.
  *
  * The warm that used to follow it is gated off; see AUTO_WARM_AFTER_RESOLVE.
  * When on it is unconditional, with no check for whether the source is
@@ -185,14 +205,27 @@ async function pollSourceJobs(get: Get, set: Set): Promise<void> {
  * shows a bar for it. Keeping a list of multi-file source types on this side
  * would be a copy that drifts.
  */
-async function onJobSettled(get: Get, job: SourceJobStatus): Promise<void> {
-  if (job.kind !== "resolve" || job.state !== "done") return;
-  if (!AUTO_WARM_AFTER_RESOLVE) {
-    await get().loadSources();
-    return;
+async function onJobSettled(get: Get, set: Set, job: SourceJobStatus): Promise<void> {
+  if (job.kind !== "resolve") return;
+  const key = jobKey(job.kind, job.source_id);
+  const epochAtStart = _epochAtResolveStart.get(key);
+  _epochAtResolveStart.delete(key);
+  if (job.state !== "done") return;
+  if (job.source) applySourceRow(set, job.source);
+  else await get().loadSources();
+  // Open it unless something else was opened meanwhile, checked after the row
+  // is in place so the open never runs against the stale unresolved one. The
+  // bare source id: the server binds the default tensor, so a multi-array
+  // source is never guessed.
+  if (epochAtStart !== undefined && get().target.epoch === epochAtStart) {
+    get().openTensor(job.source_id);
   }
-  // Independent: the catalog reload and starting the warm hit different
-  // endpoints and different store slices, so there is nothing for one to wait
-  // on from the other.
-  await Promise.all([get().loadSources(), get().startWarm(job.source_id)]);
+  if (AUTO_WARM_AFTER_RESOLVE) await get().startWarm(job.source_id);
+}
+
+/** Swap one source's row into the catalog copy, keeping its order. */
+function applySourceRow(set: Set, row: DataSourceDescriptor): void {
+  set((s) => ({
+    sources: s.sources.map((src) => (src.source_id === row.source_id ? row : src)),
+  }));
 }

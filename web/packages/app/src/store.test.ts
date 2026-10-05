@@ -1997,6 +1997,98 @@ describe("resolve / warm jobs", () => {
     expect(useAppStore.getState().sourceJobs["warm:cloud0"]).toBeUndefined();
   });
 
+  describe("opening the source a resolve finished", () => {
+    const realOpenTensor = useAppStore.getState().openTensor;
+    afterEach(() => useAppStore.setState({ openTensor: realOpenTensor }));
+
+    const resolveClient = (final: SourceJobStatus, first = status()) =>
+      ({
+        listSources: vi.fn().mockResolvedValue([]),
+        http: {
+          startResolve: vi.fn().mockResolvedValue(first),
+          jobStatus: vi.fn().mockResolvedValue(final),
+        },
+      }) as unknown as TensorFlightClient;
+
+    const landed = () =>
+      vi.waitFor(
+        () =>
+          expect(useAppStore.getState().sourceJobs["resolve:cloud0"]?.state).toBe(
+            "done",
+          ),
+        { timeout: 3000 },
+      );
+
+    it("opens the bare source when nothing else was opened meanwhile", async () => {
+      const openTensor = vi.fn();
+      useAppStore.setState({ openTensor, client: resolveClient(status({ state: "done" })) });
+      await useAppStore.getState().startResolve("cloud0");
+      await landed();
+      expect(openTensor).toHaveBeenCalledWith("cloud0");
+    });
+
+    it("leaves the user's newer selection alone", async () => {
+      const openTensor = vi.fn();
+      useAppStore.setState({ openTensor, client: resolveClient(status({ state: "done" })) });
+      await useAppStore.getState().startResolve("cloud0");
+      // Something else is opened while the resolve runs: the epoch moves on.
+      const { target } = useAppStore.getState();
+      useAppStore.setState({ target: { ...target, epoch: target.epoch + 1 } });
+      await landed();
+      expect(openTensor).not.toHaveBeenCalled();
+    });
+
+    it("opens nothing for a resolve that failed", async () => {
+      const openTensor = vi.fn();
+      useAppStore.setState({
+        openTensor,
+        client: resolveClient(status({ state: "error", error: "boom" })),
+      });
+      await useAppStore.getState().startResolve("cloud0");
+      await vi.waitFor(
+        () =>
+          expect(useAppStore.getState().sourceJobs["resolve:cloud0"]?.state).toBe(
+            "error",
+          ),
+        { timeout: 3000 },
+      );
+      expect(openTensor).not.toHaveBeenCalled();
+    });
+
+    it("settles a resolve that was already done when it started", async () => {
+      const openTensor = vi.fn();
+      const done = status({ state: "done", started: true });
+      useAppStore.setState({ openTensor, client: resolveClient(done, done) });
+      await useAppStore.getState().startResolve("cloud0");
+      expect(openTensor).toHaveBeenCalledWith("cloud0");
+    });
+
+    it("counts an open made while the start request was in flight", async () => {
+      const openTensor = vi.fn();
+      const client = resolveClient(status({ state: "done" }));
+      (client.http.startResolve as ReturnType<typeof vi.fn>).mockImplementation(() => {
+        const { target } = useAppStore.getState();
+        useAppStore.setState({ target: { ...target, epoch: target.epoch + 1 } });
+        return Promise.resolve(status());
+      });
+      useAppStore.setState({ openTensor, client });
+      await useAppStore.getState().startResolve("cloud0");
+      await landed();
+      expect(openTensor).not.toHaveBeenCalled();
+    });
+
+    it("does not open for a resolve it only joined", async () => {
+      const openTensor = vi.fn();
+      useAppStore.setState({
+        openTensor,
+        client: resolveClient(status({ state: "done" }), status({ started: false })),
+      });
+      await useAppStore.getState().startResolve("cloud0");
+      await landed();
+      expect(openTensor).not.toHaveBeenCalled();
+    });
+  });
+
   it("does not auto-warm a resolve that failed or was cancelled", async () => {
     const startWarm = vi.fn();
     for (const state of ["error", "cancelled"] as const) {

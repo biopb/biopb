@@ -484,6 +484,7 @@ class _SourceJob:
         self._progress: Dict[str, Any] = {}
         self._error: Optional[str] = None
         self._finished_at: Optional[float] = None
+        self._source: Optional[Dict[str, Any]] = None
 
     def request_cancel(self) -> None:
         self._cancel.set()
@@ -495,6 +496,11 @@ class _SourceJob:
     def set_progress(self, progress: Dict[str, Any]) -> None:
         with self._lock:
             self._progress = progress
+
+    def set_source(self, source: Dict[str, Any]) -> None:
+        """The catalog row a resolve ends with, handed to the client on done."""
+        with self._lock:
+            self._source = source
 
     def finish(self, state: str, error: Optional[str] = None) -> None:
         with self._lock:
@@ -527,6 +533,9 @@ class _SourceJob:
                 # worker has actually unwound. A UI needs the first to stop
                 # offering a button it has already been told about.
                 "cancel_requested": self._cancel.is_set(),
+                # A finished resolve carries the source's now-concrete row, so a
+                # client updates its catalog copy without re-reading the listing.
+                **({"source": self._source} if self._source is not None else {}),
             }
 
 
@@ -2175,11 +2184,26 @@ def _run_recall(
         job.finish(_JOB_DONE)
 
 
+def _attach_resolved_row(job: _SourceJob, row: Any) -> None:
+    """Hand a finished resolve's row to the client, if it can be rendered.
+
+    Best-effort: the source is resolved whatever happens here, so a row that
+    cannot be rendered must not turn the job into an error -- the client falls
+    back to re-reading the listing.
+    """
+    if not isinstance(row, dict):
+        return
+    try:
+        job.set_source(_source_row_to_dict(row))
+    except Exception:  # noqa: BLE001
+        logger.warning(f"resolve row for {job.source_id} not rendered", exc_info=True)
+
+
 def _resolve_worker(ctx: _SidecarContext, job: _SourceJob) -> None:
     """Body of a resolve job. Runs on the registry's daemon thread."""
 
-    def _call() -> None:
-        ctx.get_client().resolve_source(
+    def _call() -> Dict[str, Any]:
+        return ctx.get_client().resolve_source(
             job.source_id,
             on_progress=lambda p: job.set_progress(
                 {
@@ -2191,7 +2215,12 @@ def _resolve_worker(ctx: _SidecarContext, job: _SourceJob) -> None:
             should_cancel=job.cancel_requested,
         )
 
-    _run_recall(ctx, job, _call)
+    _run_recall(
+        ctx,
+        job,
+        _call,
+        on_success=lambda row: _attach_resolved_row(job, row),
+    )
 
 
 def _warm_worker(ctx: _SidecarContext, job: _SourceJob) -> None:

@@ -108,6 +108,10 @@ describe("TreeRow for an unresolved source", () => {
     expect(html).toContain("unresolved");
   });
 
+  it("is focusable, so a click highlights it without opening anything", () => {
+    expect(render(sourceNode(CLOUD))).toContain('tabindex="0"');
+  });
+
   it("is not openable: selecting it would fetch a tile that cannot exist", () => {
     // The row is a div, not a button, so there is nothing to activate. That
     // also keeps the Resolve button below legal -- interactive content cannot
@@ -117,7 +121,7 @@ describe("TreeRow for an unresolved source", () => {
     expect(html).not.toContain("<button");
   });
 
-  it("offers Resolve, the only control on the row", () => {
+  it("asks for a double-click to resolve a cloud source, with no button", () => {
     const html = renderToStaticMarkup(
       <TreeRow
         node={sourceNode(CLOUD)}
@@ -130,7 +134,23 @@ describe("TreeRow for an unresolved source", () => {
         resolving={new Set()}
       />,
     );
-    expect(html).toContain("Resolve");
+    expect(html).toContain("Double-click to resolve");
+    expect(html).not.toContain("resolve-btn");
+  });
+
+  it("keeps the Load button for a local pending source, which costs nothing", () => {
+    const html = renderToStaticMarkup(
+      <TreeRow
+        node={sourceNode({ ...CLOUD, unresolved_reason: "pending" })}
+        activeSourceId={null}
+        activeTensorId={null}
+        expandedFolders={new Set(["onedrive_9c1"])}
+        toggleFolder={() => {}}
+        selectSource={() => {}}
+        startResolve={() => {}}
+        resolving={new Set()}
+      />,
+    );
     expect(html).toContain("resolve-btn");
   });
 
@@ -148,7 +168,24 @@ describe("TreeRow for an unresolved source", () => {
       />,
     );
     expect(html).toContain("Resolving");
-    expect(html).toContain("disabled");
+  });
+
+  it("marks the row as resolving, for the animation, only while one is under way", () => {
+    const row = (resolving: string[]) =>
+      renderToStaticMarkup(
+        <TreeRow
+          node={sourceNode(CLOUD)}
+          activeSourceId={null}
+          activeTensorId={null}
+          expandedFolders={new Set()}
+          toggleFolder={() => {}}
+          selectSource={() => {}}
+          startResolve={() => {}}
+          resolving={new Set(resolving)}
+        />,
+      );
+    expect(row(["onedrive_9c1"])).toContain("unresolved resolving");
+    expect(row([])).not.toContain("resolving\"");
   });
 
   it("explains itself on hover, keeping the url", () => {

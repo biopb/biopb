@@ -110,13 +110,34 @@ html, body {
 .tree-item.active { background: #2a3347; color: #60a5fa; }
 
 /* An unresolved (cloud / synced-folder) source: dimmed and not openable until
-   the server hydrates it. Matches the napari tensor_browser's greyed row. */
+   the server hydrates it. Matches the napari tensor_browser's greyed row. It
+   still answers the pointer: hover highlights it and a click (focus) marks it
+   selected, so the row never looks dead. */
 .tree-item.unresolved {
   color: #64748b;
-  cursor: not-allowed;
+  cursor: default;
   font-style: italic;
 }
-.tree-item.unresolved:hover { background: none; color: #64748b; }
+.tree-item.unresolved:hover { background: #1e2435; color: #94a3b8; }
+.tree-item.unresolved:focus { background: #2a3347; color: #94a3b8; outline: none; }
+/* A resolve under way: the name pulses and trails animated dots, so the row
+   reads as busy for as long as the download takes. */
+.tree-item.unresolved.resolving { color: #93c5fd; animation: resolving-pulse 1.4s ease-in-out infinite; }
+.tree-item.unresolved.resolving .tree-name::after {
+  content: "...";
+  display: inline-block;
+  overflow: hidden;
+  vertical-align: bottom;
+  width: 0;
+  animation: resolving-dots 1.2s steps(4, end) infinite;
+}
+@keyframes resolving-dots { to { width: 1.2em; } }
+@keyframes resolving-pulse { 50% { opacity: 0.55; } }
+@media (prefers-reduced-motion: reduce) {
+  .tree-item.unresolved.resolving { animation: none; }
+  .tree-item.unresolved.resolving .tree-name::after { animation: none; width: 1.2em; }
+}
+.tree-item.unresolved:focus-visible { outline: 1px solid #2d5a8f; outline-offset: -1px; }
 
 .unresolved-glyph {
   font-size: 11px;
@@ -141,6 +162,13 @@ html, body {
   white-space: nowrap;
 }
 .resolve-btn:hover { background: #2d5a8f; color: #dbeafe; }
+.resolve-hint {
+  font-size: 10px;
+  font-style: normal;
+  margin-left: 8px;
+  color: #93c5fd;
+  white-space: nowrap;
+}
 
 /* Hydrate-ahead tray, pinned to the foot of the catalog pane. flex-shrink so
    it keeps its height while the tree above it takes the slack. */
