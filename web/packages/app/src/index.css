@@ -110,13 +110,17 @@ html, body {
 .tree-item.active { background: #2a3347; color: #60a5fa; }
 
 /* An unresolved (cloud / synced-folder) source: dimmed and not openable until
-   the server hydrates it. Matches the napari tensor_browser's greyed row. */
+   the server hydrates it. Matches the napari tensor_browser's greyed row. It
+   still answers the pointer: hover highlights it and a click (focus) marks it
+   selected, so the row never looks dead. */
 .tree-item.unresolved {
   color: #64748b;
-  cursor: not-allowed;
+  cursor: default;
   font-style: italic;
 }
-.tree-item.unresolved:hover { background: none; color: #64748b; }
+.tree-item.unresolved:hover { background: #1e2435; color: #94a3b8; }
+.tree-item.unresolved:focus { background: #2a3347; color: #94a3b8; outline: none; }
+.tree-item.unresolved:focus-visible { outline: 1px solid #2d5a8f; outline-offset: -1px; }
 
 .unresolved-glyph {
   font-size: 11px;

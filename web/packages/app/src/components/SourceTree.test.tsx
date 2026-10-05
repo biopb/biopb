@@ -108,6 +108,10 @@ describe("TreeRow for an unresolved source", () => {
     expect(html).toContain("unresolved");
   });
 
+  it("is focusable, so a click highlights it without opening anything", () => {
+    expect(render(sourceNode(CLOUD))).toContain('tabindex="0"');
+  });
+
   it("is not openable: selecting it would fetch a tile that cannot exist", () => {
     // The row is a div, not a button, so there is nothing to activate. That
     // also keeps the Resolve button below legal -- interactive content cannot

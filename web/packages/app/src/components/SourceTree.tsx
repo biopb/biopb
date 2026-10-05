@@ -261,6 +261,9 @@ export function TreeRow({
     return (
       <div
         className="tree-item unresolved"
+        // Focusable so a click (or Tab) highlights the row like a selection
+        // without opening anything: there is no tensor to open yet.
+        tabIndex={0}
         style={{
           width: "100%",
           display: "flex",
