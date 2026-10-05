@@ -36,7 +36,6 @@ __all__ = [
     "extent_mismatch",
     "join_fields",
     "label_extent",
-    "label_image_axes",
     "label_field",
     "last_named_segment",
     "split_label_field",
@@ -159,27 +158,6 @@ def label_extent(
             for i in kept
         ],
     )
-
-
-def label_image_axes(
-    label_labels: Sequence[str],
-    image_labels: Sequence[str],
-    image_shape: Sequence[int],
-) -> Optional[List[int]]:
-    """For each axis of a set, the wire index of the image axis it indexes.
-
-    ``[0, 1, 2, 3, 4]`` for a ``T C Z Y X`` set of a ``T C Z Y X`` image; an RGB
-    image's samples axis is the one the set leaves out. The server states the
-    mapping rather than leave each client to guess it: reading the wrong one is
-    frame 0 of a timelapse where frame 40 was asked for, and that is a picture
-    rather than an error (biopb/biopb#1059).
-
-    ``None`` when *label_labels* has not the rank of the extent rule, so there is
-    no mapping to state. Callers that have already run :func:`extent_mismatch`
-    never see it.
-    """
-    kept = _kept_axes(image_labels, image_shape)
-    return kept if len(kept) == len(label_labels) else None
 
 
 def extent_mismatch(

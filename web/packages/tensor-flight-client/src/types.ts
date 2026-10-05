@@ -355,20 +355,6 @@ export interface TileInfo {
   sel_axes: TileAxis[];
   levels: TileLevel[];
   /**
-   * A label set only: which of its image's axes each of its own indexes.
-   *
-   * `[0, 1, 2, 3, 4]` for a `T C Z Y X` set of a `T C Z Y X` image (the
-   * channel axis a singleton), and `[0, 2, 3, 4]` for a set written before
-   * that, which has no channel axis. The server states it because a client
-   * matching the two by name gets `t`/`z` right and an unnamed axis wrong on
-   * such a set, which reads frame 0 of a timelapse where frame 40 was asked
-   * for. That is a picture rather than an error, so clients read it and never
-   * derive it.
-   *
-   * Absent on an image; {@link labelSelection} matches by key without it.
-   */
-  image_axes?: number[];
-  /**
    * The ladder the *server* advertises, which is what each rung of `levels` is
    * read from: the coarsest entry whose `scale_hint` divides the rung's scale,
    * with the remainder reduced server-side. Coarsest first, full resolution

@@ -26,7 +26,6 @@ from biopb.tensor._labels import (
     RESERVED_LABEL_PREFIX,
     LabelAddress,
     is_reserved_label_name,
-    label_image_axes,
     split_label_array_id,
 )
 
@@ -92,7 +91,6 @@ __all__ = [
     "RESERVED_LABEL_PREFIX",
     "LabelAddress",
     "is_reserved_label_name",
-    "label_image_axes",
     "split_label_array_id",
     # Client
     "Connection",

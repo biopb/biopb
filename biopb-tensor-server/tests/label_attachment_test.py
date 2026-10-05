@@ -11,7 +11,6 @@ Whatever the origin, a set is listed only if it spans the image it binds to.
 
 import json
 from pathlib import Path
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -33,7 +32,6 @@ from biopb_tensor_server.core.labels import (
     extent_mismatch,
     label_extent,
     label_field,
-    label_image_axes,
     split_label_field,
 )
 from biopb_tensor_server.core.normalize import NormalizingAdapter
@@ -190,33 +188,6 @@ class TestTheFieldShape:
             [64, 64, 5],
         )
 
-    def test_image_axes_states_what_the_extent_rule_implies(self):
-        # The mapping a client would otherwise re-derive. Matching by NAME gets
-        # t/z right and an unnamed axis wrong, which is the whole reason the
-        # server says it out loud (biopb/biopb#1059).
-        five = (["t", "c", "z", "y", "x"], [5, 3, 4, 64, 64])
-        assert label_image_axes(["t", "c", "z", "y", "x"], *five) == [0, 1, 2, 3, 4]
-        # A set without the channel axis has no mapping to state.
-        assert label_image_axes(["t", "z", "y", "x"], *five) is None
-        assert label_image_axes(["y", "x"], ["y", "x"], [64, 64]) == [0, 1]
-        # An RGB samples axis is left out of the set, so it is not mapped.
-        assert label_image_axes(
-            ["t", "y", "x"], ["t", "y", "x", "s"], [2, 64, 64, 3]
-        ) == [0, 1, 2]
-        # An unnamed axis keeps its place.
-        assert label_image_axes(
-            ["", "c", "y", "x"], ["", "c", "y", "x"], [2, 3, 64, 64]
-        ) == [0, 1, 2, 3]
-
-    def test_image_axes_is_none_for_a_set_that_does_not_span(self):
-        # Nothing to state, and the same set `label_sets` drops.
-        assert (
-            label_image_axes(
-                ["z", "y", "x"], ["t", "c", "z", "y", "x"], [5, 3, 4, 64, 64]
-            )
-            is None
-        )
-
 
 class TestANativeSetIsATensorOfItsImage:
     def test_listed_after_the_image_and_readable_by_id(self, registered):
@@ -333,24 +304,8 @@ class TestOverTheWire:
         ]
         meta = json.loads(desc.metadata_json)["metadata"]
         assert meta["image-label"]["source"] == {"image": "oz1"}
-        # Stated, not left to the client: which of the image's axes each of the
-        # set's own indexes. The NGFF block is a spec block and is left alone,
-        # so this rides beside it under `biopb`.
-        assert meta["biopb"]["labels"]["image_axes"] == [0, 1]
-        # ... and the SDK's reader parses that live descriptor. Asserted on the
-        # reader itself, not on the composed answer: the rule re-derives the
-        # same [0, 1] for this pair, so a reader that silently parsed nothing
-        # would pass the composed check. This is the wire shape a napari client
-        # reads (``biopb.tensor._labels``, one describe, no re-derivation).
-        from biopb.tensor._labels import _stated_image_axes
 
-        assert _stated_image_axes(desc) == [0, 1]
-
-    def test_an_image_is_not_given_a_label_axis_block(self, served, client):
-        desc = client.get_descriptor("oz1", with_metadata=True)
-        meta = json.loads(desc.metadata_json)["metadata"]
-        assert "labels" not in (meta.get("biopb") or {})
-
+    def test_a_computed_level_is_read_with_the_precompute_method(self, served, client):
         coarse = client.get_tensor(
             "oz1/@labels/nuclei", scale_hint=[2, 2], reduction_method="precompute"
         )
@@ -464,19 +419,10 @@ class TestTheSdkReadsTheSameRule:
     def _sdk():
         from biopb.tensor._labels import (
             is_reserved_label_name,
-            label_image_axes,
             split_label_array_id,
         )
 
-        return split_label_array_id, label_image_axes, is_reserved_label_name
-
-    @staticmethod
-    def _desc(shape, dim_labels, metadata_json=""):
-        return SimpleNamespace(
-            shape=list(shape),
-            dim_labels=list(dim_labels),
-            metadata_json=metadata_json,
-        )
+        return split_label_array_id, is_reserved_label_name
 
     @pytest.mark.parametrize(
         "array_id,expected",
@@ -492,7 +438,7 @@ class TestTheSdkReadsTheSameRule:
     def test_splits_an_array_id_like_the_server_splits_a_field(
         self, array_id, expected
     ):
-        split, _, _ = self._sdk()
+        split, _ = self._sdk()
         address = split(array_id)
         assert (address.image_array_id, address.name, address.level) == expected
         # ... and the server, handed the same id's field, agrees.
@@ -508,39 +454,11 @@ class TestTheSdkReadsTheSameRule:
         ],
     )
     def test_names_no_set(self, array_id):
-        split, _, _ = self._sdk()
+        split, _ = self._sdk()
         assert split(array_id) is None
 
     def test_reserved_names_match(self):
-        _, _, reserved = self._sdk()
+        _, reserved = self._sdk()
         assert reserved("@ome") is True
         assert reserved("nuclei") is False
         assert RESERVED_PREFIX == "@"
-
-    @staticmethod
-    def _stated(axes):
-        return json.dumps({"metadata": {"biopb": {"labels": {"image_axes": axes}}}})
-
-    def test_reads_the_axes_the_server_states(self):
-        _, sdk_axes, _ = self._sdk()
-        image_labels = ["t", "c", "z", "y", "x"]
-        image = self._desc([5, 3, 4, 64, 64], image_labels)
-        label_labels, label_shape = ["t", "c", "z", "y", "x"], [5, 1, 4, 64, 64]
-        stated = label_image_axes(label_labels, image_labels, image.shape)
-        label = self._desc(label_shape, label_labels, self._stated(stated))
-        assert sdk_axes(label, image) == stated
-
-    def test_a_descriptor_without_the_statement_has_no_mapping(self):
-        # Never derived: a client re-deriving the rule is the third copy of it.
-        _, sdk_axes, _ = self._sdk()
-        image = self._desc([5, 3, 4, 64, 64], ["t", "c", "z", "y", "x"])
-        label = self._desc([5, 1, 4, 64, 64], ["t", "c", "z", "y", "x"])
-        assert sdk_axes(label, image) is None
-        assert sdk_axes(label) is None  # the image is no longer needed
-
-    def test_a_statement_that_does_not_fit_the_rank_is_ignored(self):
-        _, sdk_axes, _ = self._sdk()
-        label = self._desc(
-            [5, 4, 64, 64], ["t", "z", "y", "x"], self._stated([0, 1, 2, 3, 4])
-        )
-        assert sdk_axes(label) is None
