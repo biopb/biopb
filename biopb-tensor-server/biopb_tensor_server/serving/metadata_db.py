@@ -95,7 +95,7 @@ _SOURCE_COLUMNS = (
     "is_resolved, unresolved_reason, unresolved_error, tensors"
 )
 _SOURCES_VIEW_DDL = (
-    "CREATE OR REPLACE TEMP VIEW sources AS "
+    "CREATE VIEW sources AS "
     f"SELECT {_SOURCE_COLUMNS} FROM source_catalog UNION ALL "
     f"SELECT {_SOURCE_COLUMNS} FROM sources_volatile"
 )
@@ -827,9 +827,7 @@ class MetadataDatabase:
         DuckDB cursors (created via conn.cursor()) are thread-safe and can
         execute concurrently. This allows parallel reads without locking.
         """
-        cursor = self._get_connection().cursor()
-        self.create_sources_view(cursor)
-        return cursor
+        return self._get_connection().cursor()
 
     def _create_schema(self, conn: duckdb.DuckDBPyConnection) -> None:
         """Create the sources and rois tables and their indexes.
@@ -842,8 +840,13 @@ class MetadataDatabase:
         `rois` cannot be rebuilt, so it is versioned instead: see
         :meth:`_reconcile_roi_schema`.
         """
-        # A persisted older build's physical `sources`; the name is a view now.
-        conn.execute("DROP TABLE IF EXISTS sources")
+        # `sources` is a view over the two tables below, so it goes first. An
+        # older build left a physical table of that name.
+        if conn.execute(
+            "SELECT 1 FROM duckdb_tables() WHERE table_name = 'sources'"
+        ).fetchone():
+            conn.execute("DROP TABLE sources")
+        conn.execute("DROP VIEW IF EXISTS sources")
         conn.execute("DROP TABLE IF EXISTS sources_volatile")
         conn.execute("""
             CREATE TABLE sources_volatile (
@@ -904,7 +907,7 @@ class MetadataDatabase:
             "CREATE INDEX idx_volatile_source_url ON sources_volatile(source_url)"
         )
         self._create_source_catalog(conn)
-        self.create_sources_view(conn)
+        conn.execute(_SOURCES_VIEW_DDL)
 
         # User-drawn ROI annotations, one row per ROI. A sibling table,
         # deliberately NOT a field inside a source row: sources.metadata_json is
@@ -1022,17 +1025,6 @@ class MetadataDatabase:
             "INSERT OR REPLACE INTO catalog_meta VALUES ('source_catalog_format', ?)",
             [str(SOURCE_CATALOG_FORMAT)],
         )
-
-    @staticmethod
-    def create_sources_view(conn: duckdb.DuckDBPyConnection) -> None:
-        """Make ``sources`` visible on *conn*.
-
-        A DuckDB temp view belongs to the connection that created it, so every
-        cursor needs its own. It cannot be a persistent view: an older build runs
-        ``DROP TABLE IF EXISTS sources`` at open, which fails on a view and
-        would stop it opening this file.
-        """
-        conn.execute(_SOURCES_VIEW_DDL)
 
     def _reconcile_roi_schema(
         self, conn: duckdb.DuckDBPyConnection, had_rois: bool

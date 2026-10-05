@@ -51,16 +51,16 @@ The writer routes by restorability. A source that moves between tables (its root
 cloud, its adapter type changed) is deleted from the other table in the same locked
 write, because a union view cannot enforce a unique `source_id`.
 
-**The view must not be a persistent object named `sources`.** An older binary runs
-`DROP TABLE IF EXISTS sources`, which fails on a view and would stop it opening the file.
-Make it a `TEMP` view, so the file holds only the two tables. The physical tables use
-names `sources` never had, so an older binary ignores them.
+**The view is persistent, created at open** (dropped first; a physical `sources` table
+from an older build is dropped too). It could be a `TEMP` view, which would let an older
+build open the file, but a temp view belongs to the connection that made it and the read
+path takes a fresh cursor per call, so each would pay about 190 µs (against 4 µs for a
+bare cursor) and every reader would have to go through `_get_cursor`. Not worth keeping
+downgrades free: see Versioning and rollback.
 
-A temp view belongs to the connection that created it, and the read path takes a fresh
-cursor per call, so each cursor creates the view itself (`_get_cursor`, about 190 µs
-against 4 µs for a bare cursor). Measured at 100k rows: a primary-key lookup through the
-union is a sequential scan of about 0.3 ms and a `source_url` lookup about 1.1 ms; the
-indexes are not used through the union.
+Measured at 100k rows: a primary-key lookup through the union is a sequential scan of
+about 0.3 ms and a `source_url` lookup about 1.1 ms; the indexes are not used through the
+union.
 
 ## What is restored
 
@@ -156,7 +156,11 @@ Registration threads and the sweep write through the same connection and lock as
 - A committed golden payload per adapter fails the test when the written shape or
   semantics change without a bump (it guards the constant; comparing with a fresh parse
   would not, since both sides come from the current code).
-- **Rollback is free** under the `TEMP` view rule above.
+- **Downgrade needs one manual step.** An older build runs `DROP TABLE IF EXISTS
+  sources` at open, which fails on the view. `DROP VIEW sources` on the file lets it open
+  (the new build recreates the view at its next open). The file also holds user ROI
+  annotations, so deleting it is not the recovery. The two physical tables are ignored by
+  an older build. Document the step in the release notes.
 - **A rebuild flag** (the same drop) covers a bad parser upgrade and the directory limitation.
 - **A corrupt catalog must be loud.** The `_open_catalog` fallback silently serves from
   memory when the store will not open, which would silently turn restore off. Log once at
@@ -180,7 +184,7 @@ read lazily from the file.
   serialized per source. `rois` is not in `ALLOWED_TABLES`, so no SQL surface sees a
   partly filled table.
 - **The open-time `@ome` wipe stays.** Imported rows keep the lifecycle of their source
-  row, so each start re-derives them lazily. Rollback stays free, and no ROI-count guard,
+  row, so each start re-derives them lazily. Downgrade stays one step, and no ROI-count guard,
   orphan GC, non-destructive CLI open, or coupling to `CACHE_FORMAT` is needed.
 - `release_registration_cache` and `_mask_payloads_transferred` assume a registration
   parsed the XML; they must treat the never-parsed state as released.
@@ -230,7 +234,7 @@ still runs. Worth doing only if a cloud-root walk is slow enough to notice; unme
 
 ## Stages
 
-Stage 1 as implemented: `source_catalog` and `sources_volatile` with the per-cursor view,
+Stage 1 as implemented: `source_catalog` and `sources_volatile` with the persistent view,
 `SOURCE_CATALOG_FORMAT`, routing by `catalog_payload()` and a claim record, claim-time
 signature without `st_dev`, deletion from both on removal. Only OME-TIFF has a payload
 (its scene descriptors); nd2, czi, the `has_rois` flag and the mask descriptors follow.
@@ -239,7 +243,7 @@ sweep are stage 2.
 
 1. `source_catalog` with `CACHE_FORMAT`, written through at each registration with the
    claim, claim-time signature and payload, deleted on live removal; the volatile table
-   and the `TEMP` view. Never read. Golden-payload tests per adapter; row verification
+   and the view. Never read. Golden-payload tests per adapter; row verification
    against a fresh parse (embedded-label descriptors, `has_rois`, attached tensors); a
    persisted-signature test that perturbs `st_dev` and expects no change; a test that
    changes a file between claim and write.
@@ -254,10 +258,10 @@ sweep are stage 2.
 
 ## To verify before stage 2
 
-- Done in stage 1: temp views are connection-scoped (hence one per cursor, above); the
-  `ALLOWED_TABLES` check passes the view and keeps both physical tables hidden (tested);
-  the indexes are not used through the union (measured, above). If the lookups matter,
-  a keyed read can go to `source_catalog` and `sources_volatile` directly.
+- Done in stage 1: the `ALLOWED_TABLES` check passes the view and keeps both physical
+  tables hidden (tested); the indexes are not used through the union (measured, above).
+  If the lookups matter, a keyed read can go to `source_catalog` and `sources_volatile`
+  directly.
 - The cost of `INSERT OR REPLACE` and one-column updates at 100k rows with large
   `metadata_json`, on a real catalog.
 - Whether a root's walk skips nested roots' subtrees; the sweep scope must match.

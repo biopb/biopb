@@ -176,15 +176,33 @@ class TestStore:
         ]
         assert "stale_marker" not in cols
 
-    def test_an_older_build_can_still_open_the_file(self, tmp_path):
+    def test_a_file_with_an_older_physical_sources_table_opens(self, tmp_path):
+        path = tmp_path / "c.duckdb"
+        conn = duckdb.connect(str(path))
+        conn.execute("CREATE TABLE sources (source_id TEXT PRIMARY KEY)")
+        conn.close()
+        db = self._db(path)
+        db.sync_source_added(
+            "s1", MockAdapter("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8")
+        )
+        assert db.query("SELECT source_id FROM sources").num_rows == 1
+
+    def test_an_older_build_cannot_open_the_file_until_the_view_is_dropped(
+        self, tmp_path
+    ):
         path = tmp_path / "c.duckdb"
         db = self._db(path)
         db.sync_source_added(
             "s1", _Restorable("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8"), _record()
         )
         db.close()
-        # What the previous build ran at open.
+        # What the previous build runs at open: it fails on the view, and
+        # dropping the view is the whole downgrade step (the file also holds
+        # annotations, so deleting it is not an option).
         conn = duckdb.connect(str(path))
+        with pytest.raises(duckdb.CatalogException):
+            conn.execute("DROP TABLE IF EXISTS sources")
+        conn.execute("DROP VIEW sources")
         conn.execute("DROP TABLE IF EXISTS sources")
         conn.close()
 
