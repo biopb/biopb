@@ -179,6 +179,8 @@ class Reconciler:
         # moment before the end-of-walk reconcile, which would stat every member
         # again to compare it with itself.
         self._streamed_ids: Set[str] = set()
+        # Sources already reported as reachable by two paths (one report each).
+        self._warned_shared: Set[str] = set()
         self._pending: Dict[str, Optional[str]] = {}
         self._pending_failed: Dict[str, str] = {}
         # The pending sources that wait for a client, not the pool: a cloud source
@@ -803,10 +805,32 @@ class Reconciler:
         ``_commit_add_claim`` -- which would *unregister* it -- is never hit.
         """
         with self._lock:
-            if claim.source_id in self._state.claims:
-                return
+            known = self._state.claims.get(claim.source_id)
+        if known is not None:
+            if known.primary_path != claim.primary_path:
+                self._warn_shared_source(known, claim)
+            return
         if self._commit_add_claim(claim, keep_failed=True):
             self._streamed_ids.add(claim.source_id)
+
+    def _warn_shared_source(self, known: SourceClaim, found: SourceClaim) -> None:
+        """Say once that one file was reached by two paths.
+
+        The id hashes the resolved path, so two spellings with one id are one file:
+        a link, or two roots that overlap. The scan assumes neither happens, so
+        this is the one place it is noticed. The source stays under the first path.
+        """
+        if known.source_id in self._warned_shared:
+            return
+        self._warned_shared.add(known.source_id)
+        logger.warning(
+            "Source %s is reachable by two paths, %s and %s; it is catalogued under "
+            "the first. Roots must not nest or share files, and a link must not lead "
+            "into another root.",
+            known.source_id,
+            known.primary_path,
+            found.primary_path,
+        )
 
     def _commit_add_claim(
         self,

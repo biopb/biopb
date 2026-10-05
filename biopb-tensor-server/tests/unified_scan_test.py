@@ -6,6 +6,7 @@ so it gates on the stability window and removes a claim only after two misses; a
 scan-once root is walked once, so it does neither.
 """
 
+import os
 import shutil
 
 from biopb_tensor_server.adapters import get_default_registry
@@ -157,3 +158,35 @@ class TestTheComparisonAddsNothing:
         monkeypatch.setattr(reconciler, "_commit_add_claim", real)
         manager._handle_rescan()
         assert len(reconciler.claim_ids()) == 1
+
+
+class TestSharedFile:
+    def _linked(self, tmp_path):
+        """A scan-once root holding a link to a source in the monitored root."""
+        manager, server, monitored, once = _manager(tmp_path)
+        target = drt._make_zarr(monitored, "a.zarr")
+        os.symlink(target, once / "link.zarr")
+        return manager, server
+
+    def test_a_file_reached_from_two_roots_is_reported_once(self, tmp_path, caplog):
+        manager, server = self._linked(tmp_path)
+        caplog.set_level("WARNING")
+
+        for _ in range(3):
+            manager._handle_rescan()
+
+        records = [r for r in caplog.records if "reachable by two paths" in r.message]
+        assert len(records) == 1
+        assert "link.zarr" in records[0].message and "a.zarr" in records[0].message
+        assert len(_ids(server)) == 1  # one source, under the first path
+
+    def test_an_ordinary_rescan_reports_nothing(self, tmp_path, caplog):
+        manager, server, monitored, once = _manager(tmp_path)
+        drt._make_zarr(monitored, "a.zarr")
+        drt._make_zarr(once, "b.zarr")
+        caplog.set_level("WARNING")
+
+        for _ in range(3):
+            manager._handle_rescan()
+
+        assert not [r for r in caplog.records if "reachable by two paths" in r.message]

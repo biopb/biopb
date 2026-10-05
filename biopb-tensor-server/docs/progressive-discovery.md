@@ -166,7 +166,9 @@ into the comparison (`_preserve_skipped_claims`).
 The scan assumes roots do not nest and that no file is reachable from two roots, which is
 policy and not something the code can fully check (a link defeats a lexical test). Two
 roots that reach the same file produce one `source_id` (it hashes the resolved path) spelled
-two ways, and the claim belongs to the root whose walk committed it first.
+two ways, and the claim belongs to the root whose walk committed it first. The stream hook
+notices the second spelling (the id is already in state under a different path) and logs one
+warning per source naming both paths.
 
 For each root, the comparison decides:
 
