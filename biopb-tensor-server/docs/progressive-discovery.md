@@ -250,7 +250,7 @@ registers what it finds inline.
   `needs_recall`, the pool never queues it, and only `resolve` downloads and registers it.
 - **`unresolved_reason`** says why a row is not resolved: `needs_recall` (a cloud
   placeholder; resolving downloads it), `pending` (queued; resolving registers it, no
-  download), `failed` (registration raised; `metadata_json` holds `registration_error`,
+  download), `failed` (registration raised; `unresolved_error` holds the text,
   reads raise `SourceRegistrationError`, and a tick retries it after its backoff).
 - **While pending** a source can be refreshed (the rebuild is the registration) or removed,
   and a registration never registers a removed source back (a per-source lock orders the
