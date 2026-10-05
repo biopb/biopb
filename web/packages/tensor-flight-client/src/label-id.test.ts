@@ -84,25 +84,14 @@ const IMAGE = grid({
   selectable: { t: 0, z: 2, c: 1 },
   plane: { y: 3, x: 4, s: null },
 });
-const SET = grid({
-  array_id: "src0/@labels/nuclei",
-  dim_labels: ["t", "z", "y", "x"],
-  shape: [50, 20, 64, 64],
-  selectable: { t: 0, z: 1, c: null },
-  plane: { y: 2, x: 3, s: null },
-  dtype: "uint32",
-  image_axes: [0, 2, 3, 4],
-});
-
 /** The set of the same image under the rule: its rank, the channel a singleton. */
-const SET_SAME_RANK = grid({
+const SET = grid({
   array_id: "src0/@labels/nuclei",
   dim_labels: ["t", "c", "z", "y", "x"],
   shape: [50, 1, 20, 64, 64],
   selectable: { t: 0, z: 2, c: 1 },
   plane: { y: 3, x: 4, s: null },
   dtype: "uint32",
-  image_axes: [0, 1, 2, 3, 4],
 });
 
 /** An RGB image `T Y X S` and its set: the samples axis is left out. */
@@ -119,12 +108,11 @@ const RGB_SET = grid({
   selectable: { t: 0, z: null, c: null },
   plane: { y: 1, x: 2, s: null },
   dtype: "uint32",
-  image_axes: [0, 1, 2],
 });
 
 describe("labelSelection", () => {
   it("lines a same-rank set up by position, the channel clamped to its one plane", () => {
-    expect(labelSelection(IMAGE, SET_SAME_RANK, { t: 7, z: 4, c: 2 })).toEqual({
+    expect(labelSelection(IMAGE, SET, { t: 7, z: 4, c: 2 })).toEqual({
       t: 7,
       c: 0,
       z: 4,
@@ -135,27 +123,18 @@ describe("labelSelection", () => {
     expect(labelSelection(RGB_IMAGE, RGB_SET, { t: 7 })).toEqual({ t: 7 });
   });
 
-  it("carries the named axes across, and drops the channel", () => {
-    expect(labelSelection(IMAGE, SET, { t: 7, z: 4, c: 2 })).toEqual({ t: 7, z: 4 });
-  });
-
   it("reads the plane it is given, not a slice position", () => {
     // The caller hands it the selection ON SCREEN, which during play is a frame
     // behind what was asked for. Nothing here may re-derive the plane, or two
     // overlays of one image could disagree about which frame they are drawing.
-    expect(labelSelection(IMAGE, SET, { t: 3, z: 9, c: 1 })).toEqual({ t: 3, z: 9 });
-  });
-
-  it("uses the mapping the server states, not one it re-derives", () => {
-    // Load-bearing: the stated mapping is the whole point of the server
-    // publishing it. A set whose `image_axes` says otherwise is followed.
-    const swapped = grid({ ...SET, image_axes: [2, 0, 3, 4] });
-    expect(labelSelection(IMAGE, swapped, { t: 7, z: 4 })).toEqual({ t: 4, z: 7 });
+    expect(labelSelection(IMAGE, SET, { t: 3, z: 9, c: 1 })).toEqual({
+      t: 3,
+      c: 0,
+      z: 9,
+    });
   });
 
   it("matches an unnamed axis by position, not by key", () => {
-    // The image's unnamed axis is keyed `a1` and the set's `a0`: matching by
-    // key would read frame 0 where frame 40 was asked for.
     const image = grid({
       dim_labels: ["c", "", "y", "x"],
       shape: [3, 155, 64, 64],
@@ -163,48 +142,31 @@ describe("labelSelection", () => {
       plane: { y: 2, x: 3, s: null },
     });
     const set = grid({
-      dim_labels: ["", "y", "x"],
-      shape: [155, 64, 64],
-      selectable: { t: null, z: null, c: null },
-      plane: { y: 1, x: 2, s: null },
-      image_axes: [1, 2, 3],
+      dim_labels: ["c", "", "y", "x"],
+      shape: [1, 155, 64, 64],
+      selectable: { t: null, z: null, c: 0 },
+      plane: { y: 2, x: 3, s: null },
     });
-    expect(labelSelection(image, set, { a1: 40 })).toEqual({ a0: 40 });
+    expect(labelSelection(image, set, { c: 2, a1: 40 })).toEqual({ c: 0, a1: 40 });
   });
 
   it("clamps to the set's own extent", () => {
     const short = grid({
+      dim_labels: ["t", "c", "z", "y", "x"],
+      shape: [50, 1, 1, 64, 64],
+      selectable: { t: 0, z: 2, c: 1 },
+      plane: { y: 3, x: 4, s: null },
+    });
+    expect(labelSelection(IMAGE, short, { t: 7, z: 4 })).toEqual({ t: 7, c: 0, z: 0 });
+  });
+
+  it("handles an image with no channel axis at all", () => {
+    const image = grid({
       dim_labels: ["t", "z", "y", "x"],
-      shape: [50, 1, 64, 64],
+      shape: [50, 20, 64, 64],
       selectable: { t: 0, z: 1, c: null },
       plane: { y: 2, x: 3, s: null },
-      image_axes: [0, 2, 3, 4],
     });
-    expect(labelSelection(IMAGE, short, { t: 7, z: 4 })).toEqual({ t: 7, z: 0 });
-  });
-
-  describe("against a set that states nothing", () => {
-    const unstated = (over: Partial<TileInfo>) => {
-      const info = grid(over);
-      delete info.image_axes;
-      return info;
-    };
-
-    it("matches the axes by key, exact for an ordinary TZYX set", () => {
-      const set = unstated({ ...SET });
-      expect(labelSelection(IMAGE, set, { t: 7, z: 4, c: 2 })).toEqual({ t: 7, z: 4 });
-    });
-
-    it("handles an image with no channel axis at all", () => {
-      const set = unstated({ ...SET });
-      expect(labelSelection(set, set, { t: 7, z: 4 })).toEqual({ t: 7, z: 4 });
-    });
-  });
-
-  it("ignores a stated mapping of the wrong length", () => {
-    // A server and a set that disagree about rank: the statement cannot be
-    // about this set, so the rule answers instead of an index out of range.
-    const bad = grid({ ...SET, image_axes: [0, 2] });
-    expect(labelSelection(IMAGE, bad, { t: 7, z: 4 })).toEqual({ t: 7, z: 4 });
+    expect(labelSelection(image, image, { t: 7, z: 4 })).toEqual({ t: 7, z: 4 });
   });
 });

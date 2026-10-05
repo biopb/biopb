@@ -77,28 +77,23 @@ export function isReservedLabelName(name: string): boolean {
  * a read is outstanding.
  *
  * A set has the image's axes at the image's lengths, with the channel axis a
- * singleton and an RGB samples axis left out (biopb/biopb#1059), so its axes
- * line up with the image's by position. A set written before that rule has no
- * channel axis at all, and there every axis after the image's `c` sits one place
- * to the left in the set. Matching by Viv's selection *key* would be right for
- * named axes and wrong for unnamed ones in that case -- an image's `a3` is the
- * set's `a2`, and reading frame 0 of a timelapse instead of frame 40 is a
- * silently wrong picture rather than a visible failure.
- *
- * So the mapping is **read, never derived**: `TileInfo.image_axes` is the
- * server's own statement of which image axis each of the set's indexes, and
- * every server that serves label sets states it. Without one that fits the
- * set's rank the axes are matched by key, which is exact for an ordinary TZYX
- * set and the best answer left otherwise.
+ * singleton and an RGB samples axis left out (biopb/biopb#1059), so its axis *j*
+ * is the image's axis *j* among those that remain, and the two align by
+ * position. Matching by Viv's selection *key* would be wrong for an unnamed
+ * axis -- an image's `a3` is the set's `a2` once the samples axis is gone --
+ * and reading frame 0 of a timelapse instead of frame 40 is a silently wrong
+ * picture rather than a visible failure.
  */
 export function labelSelection(
   imageInfo: TileInfo,
   labelInfo: TileInfo,
   imageSelection: Record<string, number>,
 ): Record<string, number> {
-  const stated = labelInfo.image_axes;
-  const mapping =
-    stated !== undefined && stated.length === labelInfo.shape.length ? stated : null;
+  // The image's axes a set has: all but the samples axis, in order.
+  const imageAxes: number[] = [];
+  for (let i = 0; i < imageInfo.shape.length; i++) {
+    if (i !== imageInfo.plane.s) imageAxes.push(i);
+  }
 
   const byImageAxis: Record<number, number> = {};
   for (const axis of sliderAxes(imageInfo.dim_labels, imageInfo.shape)) {
@@ -107,11 +102,7 @@ export function labelSelection(
 
   const out: Record<string, number> = {};
   for (const axis of sliderAxes(labelInfo.dim_labels, labelInfo.shape)) {
-    const imageAxis = mapping?.[axis.axis];
-    const want =
-      imageAxis === undefined
-        ? (imageSelection[axis.key] ?? 0)
-        : (byImageAxis[imageAxis] ?? 0);
+    const want = byImageAxis[imageAxes[axis.axis] ?? -1] ?? 0;
     // Clamped against the set's own extent, exactly as `vivSelection` clamps
     // against the image's: the two are equal by the extent rule, and a server
     // that broke it should show the last plane rather than read past the end.
