@@ -57,6 +57,7 @@ from biopb.tensor._location import normalize_flight_location
 from biopb.tensor._pool import (
     _build_dask_array_from_chunk_map,
     _chunk_map_from_endpoints,
+    _fetch_chunk_distributed,
     _get_shared_call_options,
     _get_thread_client,
 )
@@ -335,6 +336,26 @@ def _requested_slice(info: "flight.FlightInfo") -> Optional[SliceHint]:
     return SliceHint.FromString(raw) if raw else None
 
 
+def _crop_slices(
+    descriptor: TensorDescriptor,
+    requested: Optional[SliceHint],
+    ndim: int,
+) -> Optional[Tuple[slice, ...]]:
+    """The slices that crop a plan's realized region back to *requested*, or None
+    when nothing was requested or the plan carries no realized slice.
+
+    The one rule for both forms of a read (lazy and eager), so they cannot drift.
+    """
+    if requested is None or not descriptor.HasField("slice_hint"):
+        return None
+    return _request_crop_slices(
+        ndim,
+        requested,
+        descriptor.slice_hint,
+        list(descriptor.scale_hint) if descriptor.scale_hint else None,
+    )
+
+
 def _dask_from_flight_info(
     info: "flight.FlightInfo",
     location: str,
@@ -366,18 +387,50 @@ def _dask_from_flight_info(
         cache_bytes,
         tls_trust,
     )
-    if requested is None:
-        requested = _requested_slice(info)
-    if requested is not None and descriptor.HasField("slice_hint"):
-        dask_arr = dask_arr[
-            _request_crop_slices(
-                len(shape),
-                requested,
-                descriptor.slice_hint,
-                list(descriptor.scale_hint) if descriptor.scale_hint else None,
-            )
-        ]
-    return dask_arr
+    crop = _crop_slices(
+        descriptor,
+        _requested_slice(info) if requested is None else requested,
+        len(shape),
+    )
+    return dask_arr if crop is None else dask_arr[crop]
+
+
+def _array_from_flight_info(
+    info: "flight.FlightInfo",
+    location: str,
+    token: Optional[str],
+    cache_bytes: int,
+    tls_trust: Optional[TlsTrust],
+) -> np.ndarray:
+    """The planned read, materialized now.
+
+    A plan whose one chunk is the whole realized region is fetched directly and
+    cropped, skipping dask: building and running even a one-task graph costs more
+    than the fetch itself. Any other plan goes through ``_dask_from_flight_info``
+    and computes it, so the two forms always agree on the result.
+    """
+    _check_wire_protocol(info.schema)
+    descriptor = TensorDescriptor.FromString(info.descriptor.command)
+    chunk_ids, bounds_list = _parse_flight_endpoints(info)
+    shape = tuple(descriptor.shape)
+    start, stop = tuple(bounds_list[0].start), tuple(bounds_list[0].stop)
+    if len(chunk_ids) != 1 or any(start) or stop != shape:
+        return _dask_from_flight_info(
+            info, location, token, cache_bytes, tls_trust
+        ).compute()
+    arr = _fetch_chunk_distributed(
+        location, token, chunk_ids[0], start, stop, cache_bytes, tls_trust
+    )
+    crop = _crop_slices(descriptor, _requested_slice(info), len(shape))
+    if crop is None:
+        return arr
+    cropped = arr[crop]
+    # dask's getitem rule: a small crop must not keep the whole chunk (a pinned
+    # segment mapping or a decoded transfer buffer) alive for as long as the
+    # caller holds it.
+    if not cropped.flags.owndata and arr.size >= 2 * cropped.size:
+        cropped = cropped.copy()
+    return cropped
 
 
 def _explain_handshake_failure(
@@ -1454,4 +1507,22 @@ class ChunkFetcher:
             self._state.token,
             self._state.cache_bytes,
             self._state.trust_for(location),
+        )
+
+    def get_array(
+        self,
+        array_id: str,
+        slice_hint: Optional[Tuple[slice, ...]] = None,
+        scale_hint: Optional[Sequence[int]] = None,
+        reduction_method: Optional[str] = None,
+    ) -> np.ndarray:
+        """Backs TensorFlightClient.get_array; see that method for the full
+        documentation."""
+        info = self._plan_read(array_id, slice_hint, scale_hint, reduction_method)
+        return _array_from_flight_info(
+            info,
+            self._state.location,
+            self._state.token,
+            self._state.cache_bytes,
+            self._state.trust_for(self._state.location),
         )

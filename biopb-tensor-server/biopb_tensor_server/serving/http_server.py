@@ -2841,15 +2841,16 @@ async def get_tile(
             read_level=plan.read_level,
             read_scale_hint=plan.scale_hint,
         )
-        arr_lazy = client.get_tensor(
-            # The array_id the geometry above was read from, not a rebuilt one:
-            # the two used to be derived separately and could disagree.
-            td.array_id,
-            slice_hint=_build_slice_hint(start, stop),
-            scale_hint=scale_hint,
-            reduction_method=plan.method,
+        arr = _normalize_array(
+            client.get_array(
+                # The array_id the geometry above was read from, not a rebuilt
+                # one: the two used to be derived separately and could disagree.
+                td.array_id,
+                slice_hint=_build_slice_hint(start, stop),
+                scale_hint=scale_hint,
+                reduction_method=plan.method,
+            )
         )
-        arr = _normalize_array(arr_lazy.compute())
         if plan.residual is None:
             return arr
         return _normalize_array(downsample_block(arr, tuple(plan.residual), "nearest"))
@@ -2959,14 +2960,15 @@ async def slice_tensor(req: SliceRequest, request: Request) -> Response:
 
         def _read() -> np.ndarray:
             # Pass slice_hint to gRPC for optimized slicing (world coordinates)
-            arr_lazy = client.get_tensor(
-                # The array_id the descriptor above was read from, not a rebuilt one.
-                td.array_id,
-                slice_hint=slice_hint,
-                scale_hint=scale_hint,
-                reduction_method=scale_method or req.reduction_method or None,
+            return _normalize_array(
+                client.get_array(
+                    # The array_id the descriptor above was read from, not a rebuilt one.
+                    td.array_id,
+                    slice_hint=slice_hint,
+                    scale_hint=scale_hint,
+                    reduction_method=scale_method or req.reduction_method or None,
+                )
             )
-            return _normalize_array(arr_lazy.compute())
 
         # Off the event loop for the same reason the tile route is: a blocking
         # compute here starves the loop of the turn it needs to notice that

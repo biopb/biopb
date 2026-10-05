@@ -870,6 +870,28 @@ class TensorFlightClient:
             export_location=export_location,
         )
 
+    def get_array(
+        self,
+        array_id: str,
+        slice_hint: Optional[Tuple[slice, ...]] = None,
+        scale_hint: Optional[Sequence[int]] = None,
+        reduction_method: Optional[str] = None,
+    ) -> np.ndarray:
+        """Read a region of a tensor now, as a numpy array.
+
+        The same plan and the same result as
+        ``get_tensor(...).compute()``, without dask's fixed per-call cost
+        (about 1.4 ms) when the region is one chunk -- what a tile or a
+        single-plane read is. A region spanning several chunks is read through
+        dask exactly as ``get_tensor`` would, so prefer ``get_tensor`` there for
+        its parallelism and laziness.
+
+        Args and errors are those of :meth:`get_tensor`.
+        """
+        return self._fetcher.get_array(
+            array_id, slice_hint, scale_hint, reduction_method
+        )
+
     def get_tensor_pb(
         self,
         array_id: str,
