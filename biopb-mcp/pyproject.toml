@@ -97,7 +97,7 @@ napari = [
     "pyqt6",
     "qtpy",
     # The Tensor Browser the kernel docks, and add_tensor's layer pipeline.
-    "biopb-napari-widget >= 0.1.0",
+    "biopb-napari-widget >= 0.1.1rc2",
 ]
 
 # Test/dev dependencies live in a PEP 735 dependency *group* rather than a
