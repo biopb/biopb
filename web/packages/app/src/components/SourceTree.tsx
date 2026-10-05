@@ -254,10 +254,10 @@ export function TreeRow({
           : UNRESOLVED_TOOLTIP;
     const idleLabel = kind === "recall" ? "Resolve" : kind === "pending" ? "Load" : "Retry";
     const busyLabel = kind === "recall" ? "Resolving\u2026" : "Loading\u2026";
-    const buttonTitle =
-      kind === "recall"
-        ? "Resolve this source \u2014 downloads its content, which can take minutes"
-        : "Read this source's metadata now";
+    const buttonTitle = "Read this source's metadata now";
+    // A cloud resolve downloads the content, which can take minutes, so it takes
+    // a deliberate double-click rather than a stray single click on a button.
+    const doubleClickToResolve = kind === "recall" && startResolve && !inFlight;
     return (
       <div
         className="tree-item unresolved"
@@ -269,13 +269,25 @@ export function TreeRow({
         }}
         data-source-id={node.id === src.source_id ? src.source_id : undefined}
         title={`${src.source_url}\n${tooltip}`}
+        onDoubleClick={
+          doubleClickToResolve ? () => startResolve(src.source_id) : undefined
+        }
       >
         <ChevronSlot />
         <span className="unresolved-glyph" aria-label="Not resolved">
           {kind === "recall" ? UNRESOLVED_GLYPH : "\u2026"}
         </span>
         <span style={{ flex: 1, marginLeft: 4 }}>{node.name}</span>
-        {startResolve ? (
+        {kind === "recall" ? (
+          startResolve ? (
+            <span
+              className="resolve-hint"
+              title="Double-click this row to download and resolve it \u2014 can take minutes"
+            >
+              {inFlight ? busyLabel : "Double-click to resolve"}
+            </span>
+          ) : null
+        ) : startResolve ? (
           <button
             className="resolve-btn"
             disabled={inFlight}
