@@ -8,7 +8,7 @@ built ``web/`` SPA bundle at its root, falling back to ``index.html`` for deep
 links (``/``, ``/viewer``, ``/session/<id>/observe``) and serving hashed assets
 as real files, and (4) which session-child roots it will proxy at all — ``api``
 always, ``chat`` (an RCE into that session's kernel) only on a loopback-bound
-control, ``/mcp`` never. A trivial stdlib HTTP
+control, ``mcp`` (an agent attaching remotely) only where a token is enforced. A trivial stdlib HTTP
 server stands in for the tensor sidecar so no real tensor server is needed; a
 tmp bundle stands in for ``web/packages/app/dist``.
 """
@@ -72,6 +72,16 @@ def test_chat_root_is_gated_wherever_it_is_proxied():
     assert _is_proxied_session_path("/session/s1/chat/turn", roots) is True
     assert _is_proxied_session_path("/session/s1/api/jobs", roots) is True
     assert _is_proxied_session_path("/session/s1/mcp", roots) is False
+
+
+def test_mcp_root_exists_only_where_a_token_is_enforced():
+    for loopback in (True, False):
+        assert "mcp" not in _session_proxy_roots(loopback)
+        assert "mcp" in _session_proxy_roots(loopback, token_enforced=True)
+    # Independent of chat, which follows the bind alone.
+    assert "chat" not in _session_proxy_roots(False, token_enforced=True)
+    roots = _session_proxy_roots(True, token_enforced=True)
+    assert _is_proxied_session_path("/session/s1/mcp", roots) is True
 
 
 def test_chat_root_is_off_by_default():
@@ -1049,6 +1059,83 @@ def test_session_proxy_allowlists_api_surface(control, upstream):
         with pytest.raises(urllib.error.HTTPError) as exc:
             _get(f"{control}/session/s1/{path}")
         assert exc.value.code == 404, path
+
+
+@pytest.fixture
+def public_control(upstream, tmp_path, web_bundle):
+    """A control on a public bind (which is never run without a token)."""
+    spec = DataPlaneSpec(
+        config=tmp_path / "config.json",
+        grpc_host="127.0.0.1",
+        grpc_port=_free_port(),
+        server_log=tmp_path / "server.log",
+        token=_TOKEN,
+        static_dir=web_bundle,
+    )
+    sup = DataPlaneSupervisor(spec)
+    api_port = _free_port()
+    server, _thread = serve_control_api(
+        "0.0.0.0", api_port, sup, ensure_timeout=8.0, data_web_url=upstream
+    )
+    try:
+        yield f"http://127.0.0.1:{api_port}"
+    finally:
+        server.shutdown()
+
+
+def test_session_mcp_is_proxied_on_a_public_control_under_the_token(
+    public_control, upstream
+):
+    _register_session("s1", upstream)
+    url = f"{public_control}/session/s1/mcp"
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _get(url)
+    assert exc.value.code == 401
+    bad = urllib.request.Request(
+        url, data=b"{}", method="POST", headers={"Authorization": "Bearer nope"}
+    )
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(bad, timeout=5)
+    assert exc.value.code == 401
+
+    ok = urllib.request.Request(
+        url,
+        data=b"{}",
+        method="POST",
+        headers={"Authorization": f"Bearer {_TOKEN}"},
+    )
+    with urllib.request.urlopen(ok, timeout=5) as resp:
+        echoed = json.loads(resp.read())
+    assert echoed["path"] == "/mcp" and echoed["method"] == "POST"
+    # Sub-paths and traversal stay inside the root's own gate.
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _get(
+            f"{public_control}/session/s1/api/../mcp",
+            headers={"Authorization": f"Bearer {_TOKEN}"},
+        )
+    assert exc.value.code == 404
+
+
+def test_session_mcp_is_proxied_on_a_loopback_control_with_a_token(
+    tokened_control, upstream
+):
+    # What an SSH tunnel to a loopback control needs.
+    _register_session("s1", upstream)
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _get(f"{tokened_control}/session/s1/mcp")
+    assert exc.value.code == 401
+    status, _headers, body = _get(
+        f"{tokened_control}/session/s1/mcp",
+        headers={"X-Biopb-Token": _TOKEN},
+    )
+    assert status == 200 and json.loads(body)["path"] == "/mcp"
+
+
+def test_session_mcp_is_not_proxied_by_a_tokenless_control(control, upstream):
+    _register_session("s1", upstream)
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _get(f"{control}/session/s1/mcp")
+    assert exc.value.code == 404
 
 
 def test_session_chat_is_proxied_on_a_loopback_control(control, upstream):
