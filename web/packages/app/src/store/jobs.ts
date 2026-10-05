@@ -1,5 +1,5 @@
 import type { StateCreator } from "zustand";
-import type { SourceJobStatus } from "@biopb/tensor-flight-client";
+import type { DataSourceDescriptor, SourceJobStatus } from "@biopb/tensor-flight-client";
 import type { AppState, Get, Set } from "./types";
 
 export type SourceJobKind = "resolve" | "warm";
@@ -167,7 +167,7 @@ async function pollSourceJobs(get: Get, set: Set): Promise<void> {
     const after = result.value;
     putJob(set, after);
     if (isSettled(after)) {
-      await onJobSettled(get, after);
+      await onJobSettled(get, set, after);
     }
   }
 }
@@ -176,7 +176,8 @@ async function pollSourceJobs(get: Get, set: Set): Promise<void> {
  * What happens when a job stops.
  *
  * A finished resolve leaves the catalog row stale -- the source is hydrated but
- * the tree still has the listing from before -- so the list is re-read.
+ * the tree still has the listing from before. The job carries the new row, which
+ * replaces the stale one; the list is re-read only if it did not.
  *
  * The warm that used to follow it is gated off; see AUTO_WARM_AFTER_RESOLVE.
  * When on it is unconditional, with no check for whether the source is
@@ -185,14 +186,23 @@ async function pollSourceJobs(get: Get, set: Set): Promise<void> {
  * shows a bar for it. Keeping a list of multi-file source types on this side
  * would be a copy that drifts.
  */
-async function onJobSettled(get: Get, job: SourceJobStatus): Promise<void> {
+async function onJobSettled(get: Get, set: Set, job: SourceJobStatus): Promise<void> {
   if (job.kind !== "resolve" || job.state !== "done") return;
+  const row = job.source;
+  const refresh = row ? Promise.resolve(applySourceRow(set, row)) : get().loadSources();
   if (!AUTO_WARM_AFTER_RESOLVE) {
-    await get().loadSources();
+    await refresh;
     return;
   }
   // Independent: the catalog reload and starting the warm hit different
   // endpoints and different store slices, so there is nothing for one to wait
   // on from the other.
-  await Promise.all([get().loadSources(), get().startWarm(job.source_id)]);
+  await Promise.all([refresh, get().startWarm(job.source_id)]);
+}
+
+/** Swap one source's row into the catalog copy, keeping its order. */
+function applySourceRow(set: Set, row: DataSourceDescriptor): void {
+  set((s) => ({
+    sources: s.sources.map((src) => (src.source_id === row.source_id ? row : src)),
+  }));
 }

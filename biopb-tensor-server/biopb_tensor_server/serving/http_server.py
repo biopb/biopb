@@ -484,6 +484,7 @@ class _SourceJob:
         self._progress: Dict[str, Any] = {}
         self._error: Optional[str] = None
         self._finished_at: Optional[float] = None
+        self._source: Optional[Dict[str, Any]] = None
 
     def request_cancel(self) -> None:
         self._cancel.set()
@@ -495,6 +496,11 @@ class _SourceJob:
     def set_progress(self, progress: Dict[str, Any]) -> None:
         with self._lock:
             self._progress = progress
+
+    def set_source(self, source: Dict[str, Any]) -> None:
+        """The catalog row a resolve ends with, handed to the client on done."""
+        with self._lock:
+            self._source = source
 
     def finish(self, state: str, error: Optional[str] = None) -> None:
         with self._lock:
@@ -527,6 +533,9 @@ class _SourceJob:
                 # worker has actually unwound. A UI needs the first to stop
                 # offering a button it has already been told about.
                 "cancel_requested": self._cancel.is_set(),
+                # A finished resolve carries the source's now-concrete row, so a
+                # client updates its catalog copy without re-reading the listing.
+                **({"source": self._source} if self._source is not None else {}),
             }
 
 
@@ -2178,8 +2187,8 @@ def _run_recall(
 def _resolve_worker(ctx: _SidecarContext, job: _SourceJob) -> None:
     """Body of a resolve job. Runs on the registry's daemon thread."""
 
-    def _call() -> None:
-        ctx.get_client().resolve_source(
+    def _call() -> Dict[str, Any]:
+        return ctx.get_client().resolve_source(
             job.source_id,
             on_progress=lambda p: job.set_progress(
                 {
@@ -2191,7 +2200,12 @@ def _resolve_worker(ctx: _SidecarContext, job: _SourceJob) -> None:
             should_cancel=job.cancel_requested,
         )
 
-    _run_recall(ctx, job, _call)
+    _run_recall(
+        ctx,
+        job,
+        _call,
+        on_success=lambda row: job.set_source(_source_row_to_dict(row)),
+    )
 
 
 def _warm_worker(ctx: _SidecarContext, job: _SourceJob) -> None:

@@ -569,6 +569,39 @@ class TestSourcesEndpoints:
 # ===========================================================================
 
 
+class TestResolveJob:
+    def _wait_done(self, tc, sid):
+        import time
+
+        for _ in range(100):
+            body = tc.get(
+                f"/api/sources/{sid}/resolve/status", headers=_bearer(_TOKEN)
+            ).json()
+            if body["state"] != "running":
+                return body
+            time.sleep(0.02)
+        raise AssertionError("resolve job never finished")
+
+    def test_a_finished_resolve_carries_the_catalog_row(self, auth_client):
+        tc, mock_fc = auth_client
+        mock_fc.resolve_source.return_value = _source_row(_make_source_desc())
+        r = tc.post("/api/sources/src0/resolve", headers=_bearer(_TOKEN))
+        assert r.status_code == 202
+        body = self._wait_done(tc, "src0")
+        assert body["state"] == "done"
+        assert body["source"]["source_id"] == "src0"
+        assert body["source"]["is_resolved"] is True
+        assert body["source"]["tensors"]
+
+    def test_a_running_or_failed_resolve_carries_no_row(self, auth_client):
+        tc, mock_fc = auth_client
+        mock_fc.resolve_source.side_effect = RuntimeError("download failed")
+        tc.post("/api/sources/src0/resolve", headers=_bearer(_TOKEN))
+        body = self._wait_done(tc, "src0")
+        assert body["state"] == "error"
+        assert "source" not in body
+
+
 class TestSliceEndpoint:
     def _post_slice(self, tc, extra_headers=None, **kwargs):
         payload = {"array_id": "src0", **kwargs}
