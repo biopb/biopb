@@ -36,7 +36,6 @@ const AUTO_WARM_AFTER_RESOLVE: boolean = false;
 
 let _jobPollTimerId: ReturnType<typeof setInterval> | undefined;
 
-/** A job that has stopped moving, whatever the reason. */
 /**
  * `target.epoch` when this tab started each resolve, by job key. A resolve opens
  * its source when it finishes, but only if no open has happened since -- the user
@@ -45,6 +44,7 @@ let _jobPollTimerId: ReturnType<typeof setInterval> | undefined;
  */
 const _epochAtResolveStart = new Map<string, number>();
 
+/** A job that has stopped moving, whatever the reason. */
 function isSettled(job: SourceJobStatus): boolean {
   return job.state !== "running";
 }
@@ -122,6 +122,9 @@ async function startSourceJob(
 ): Promise<void> {
   const { client } = get();
   if (!client) return;
+  // Read before the request, not after: an open that lands while it is in flight
+  // is exactly the one the finished resolve must not override.
+  const epochAtClick = get().target.epoch;
   try {
     const status =
       kind === "resolve"
@@ -129,7 +132,7 @@ async function startSourceJob(
         : await client.http.startWarm(sourceId);
     putJob(set, status);
     if (kind === "resolve" && status.started !== false) {
-      _epochAtResolveStart.set(jobKey(kind, sourceId), get().target.epoch);
+      _epochAtResolveStart.set(jobKey(kind, sourceId), epochAtClick);
     }
     if (isSettled(status)) {
       // Finished before the first poll: nothing would ever settle it.
@@ -210,19 +213,23 @@ async function onJobSettled(get: Get, set: Set, job: SourceJobStatus): Promise<v
   if (job.state !== "done") return;
   const row = job.source;
   const refresh = row ? Promise.resolve(applySourceRow(set, row)) : get().loadSources();
-  // Open it unless something else was opened meanwhile. The bare source id: the
-  // server binds the default tensor, so a multi-array source is never guessed.
-  if (epochAtStart !== undefined && get().target.epoch === epochAtStart) {
-    get().openTensor(job.source_id);
-  }
+  // Open it unless something else was opened meanwhile, checked after the row
+  // is in place so the open never runs against the stale unresolved one. The
+  // bare source id: the server binds the default tensor, so a multi-array
+  // source is never guessed.
+  const open = refresh.then(() => {
+    if (epochAtStart !== undefined && get().target.epoch === epochAtStart) {
+      get().openTensor(job.source_id);
+    }
+  });
   if (!AUTO_WARM_AFTER_RESOLVE) {
-    await refresh;
+    await open;
     return;
   }
   // Independent: the catalog reload and starting the warm hit different
   // endpoints and different store slices, so there is nothing for one to wait
   // on from the other.
-  await Promise.all([refresh, get().startWarm(job.source_id)]);
+  await Promise.all([open, get().startWarm(job.source_id)]);
 }
 
 /** Swap one source's row into the catalog copy, keeping its order. */

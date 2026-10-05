@@ -2063,6 +2063,20 @@ describe("resolve / warm jobs", () => {
       expect(openTensor).toHaveBeenCalledWith("cloud0");
     });
 
+    it("counts an open made while the start request was in flight", async () => {
+      const openTensor = vi.fn();
+      const client = resolveClient(status({ state: "done" }));
+      (client.http.startResolve as ReturnType<typeof vi.fn>).mockImplementation(() => {
+        const { target } = useAppStore.getState();
+        useAppStore.setState({ target: { ...target, epoch: target.epoch + 1 } });
+        return Promise.resolve(status());
+      });
+      useAppStore.setState({ openTensor, client });
+      await useAppStore.getState().startResolve("cloud0");
+      await landed();
+      expect(openTensor).not.toHaveBeenCalled();
+    });
+
     it("does not open for a resolve it only joined", async () => {
       const openTensor = vi.fn();
       useAppStore.setState({

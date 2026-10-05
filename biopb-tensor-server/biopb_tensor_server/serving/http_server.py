@@ -2173,6 +2173,7 @@ def _run_recall(
     """
     try:
         result = call()
+        on_success(result)
     except ResolveCancelled:
         job.finish(_JOB_CANCELLED)
     except Exception as exc:  # noqa: BLE001 -- surfaced to the client as `error`
@@ -2180,7 +2181,6 @@ def _run_recall(
         ctx.diag.mark_error(f"{job.kind.upper()}_FAILED", str(exc))
         job.finish(_JOB_ERROR, f"{type(exc).__name__}: {exc}")
     else:
-        on_success(result)
         job.finish(_JOB_DONE)
 
 

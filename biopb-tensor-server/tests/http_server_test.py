@@ -601,6 +601,14 @@ class TestResolveJob:
         assert body["state"] == "error"
         assert "source" not in body
 
+    def test_a_row_that_cannot_be_rendered_fails_the_job(self, auth_client):
+        # Not a job stuck "running" forever: the poll must settle.
+        tc, mock_fc = auth_client
+        mock_fc.resolve_source.return_value = {"no_source_id": 1}
+        tc.post("/api/sources/src0/resolve", headers=_bearer(_TOKEN))
+        body = self._wait_done(tc, "src0")
+        assert body["state"] == "error"
+
 
 class TestSliceEndpoint:
     def _post_slice(self, tc, extra_headers=None, **kwargs):
