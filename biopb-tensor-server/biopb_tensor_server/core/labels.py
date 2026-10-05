@@ -120,17 +120,6 @@ def _axis_key(label: str) -> str:
     return canonical_axis(label) or str(label).lower()
 
 
-def _kept_axes(image_labels: Sequence[str], image_shape: Sequence[int]) -> List[int]:
-    """The image axes a set has: all of them but an interleaved RGB(A) samples axis."""
-    if len(image_labels) != len(image_shape):
-        raise ValueError(
-            f"image_labels {list(image_labels)} and image_shape "
-            f"{list(image_shape)} have different lengths"
-        )
-    samples = samples_axis([str(x) for x in image_labels], tuple(image_shape))
-    return [i for i in range(len(image_labels)) if i != samples]
-
-
 def label_extent(
     image_labels: Sequence[str], image_shape: Sequence[int]
 ) -> Tuple[List[str], List[int]]:
@@ -150,7 +139,13 @@ def label_extent(
     span its image and is not listed. Axes come back as the image spells them,
     which for the normalized descriptors the callers hand in is canonical.
     """
-    kept = _kept_axes(image_labels, image_shape)
+    if len(image_labels) != len(image_shape):
+        raise ValueError(
+            f"image_labels {list(image_labels)} and image_shape "
+            f"{list(image_shape)} have different lengths"
+        )
+    samples = samples_axis([str(x) for x in image_labels], tuple(image_shape))
+    kept = [i for i in range(len(image_labels)) if i != samples]
     return (
         [str(image_labels[i]) for i in kept],
         [
@@ -173,12 +168,13 @@ def extent_mismatch(
     ``"Z"`` and ``"depth"`` agree.
     """
     want_labels, want_shape = label_extent(image_labels, image_shape)
-    if [_axis_key(x) for x in label_labels] != [_axis_key(x) for x in want_labels]:
+    axes = [_axis_key(x) for x in want_labels]
+    if [_axis_key(x) for x in label_labels] != axes:
         return (
-            f"axes {list(label_labels)} do not match the image's "
-            f"{[_axis_key(x) for x in want_labels]} (the channel axis a "
-            "singleton, an RGB samples axis left out)"
+            f"axes {list(label_labels)} do not match the image's {axes} (the "
+            "channel axis a singleton, an RGB samples axis left out)"
         )
-    if [int(s) for s in label_shape] != want_shape:
-        return f"shape {[int(s) for s in label_shape]} does not match the image's {want_shape}"
+    shape = [int(s) for s in label_shape]
+    if shape != want_shape:
+        return f"shape {shape} does not match the image's {want_shape}"
     return None
