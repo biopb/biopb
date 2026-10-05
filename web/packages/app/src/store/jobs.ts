@@ -37,6 +37,14 @@ const AUTO_WARM_AFTER_RESOLVE: boolean = false;
 let _jobPollTimerId: ReturnType<typeof setInterval> | undefined;
 
 /** A job that has stopped moving, whatever the reason. */
+/**
+ * `target.epoch` when this tab started each resolve, by job key. A resolve opens
+ * its source when it finishes, but only if no open has happened since -- the user
+ * who clicked another source meanwhile keeps that one. Local to this tab on
+ * purpose: a resolve joined from another tab or a reload was not asked for here.
+ */
+const _epochAtResolveStart = new Map<string, number>();
+
 function isSettled(job: SourceJobStatus): boolean {
   return job.state !== "running";
 }
@@ -120,7 +128,15 @@ async function startSourceJob(
         ? await client.http.startResolve(sourceId)
         : await client.http.startWarm(sourceId);
     putJob(set, status);
-    ensureJobPolling(get, set);
+    if (kind === "resolve" && status.started !== false) {
+      _epochAtResolveStart.set(jobKey(kind, sourceId), get().target.epoch);
+    }
+    if (isSettled(status)) {
+      // Finished before the first poll: nothing would ever settle it.
+      await onJobSettled(get, set, status);
+    } else {
+      ensureJobPolling(get, set);
+    }
   } catch (err) {
     // Synthesised rather than swallowed: a resolve that never started is the
     // one failure the user most needs told about, and the surface that shows
@@ -187,9 +203,18 @@ async function pollSourceJobs(get: Get, set: Set): Promise<void> {
  * would be a copy that drifts.
  */
 async function onJobSettled(get: Get, set: Set, job: SourceJobStatus): Promise<void> {
-  if (job.kind !== "resolve" || job.state !== "done") return;
+  if (job.kind !== "resolve") return;
+  const key = jobKey(job.kind, job.source_id);
+  const epochAtStart = _epochAtResolveStart.get(key);
+  _epochAtResolveStart.delete(key);
+  if (job.state !== "done") return;
   const row = job.source;
   const refresh = row ? Promise.resolve(applySourceRow(set, row)) : get().loadSources();
+  // Open it unless something else was opened meanwhile. The bare source id: the
+  // server binds the default tensor, so a multi-array source is never guessed.
+  if (epochAtStart !== undefined && get().target.epoch === epochAtStart) {
+    get().openTensor(job.source_id);
+  }
   if (!AUTO_WARM_AFTER_RESOLVE) {
     await refresh;
     return;
