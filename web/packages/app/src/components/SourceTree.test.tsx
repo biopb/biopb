@@ -117,7 +117,7 @@ describe("TreeRow for an unresolved source", () => {
     expect(html).not.toContain("<button");
   });
 
-  it("offers Resolve, the only control on the row", () => {
+  it("asks for a double-click to resolve a cloud source, with no button", () => {
     const html = renderToStaticMarkup(
       <TreeRow
         node={sourceNode(CLOUD)}
@@ -130,7 +130,23 @@ describe("TreeRow for an unresolved source", () => {
         resolving={new Set()}
       />,
     );
-    expect(html).toContain("Resolve");
+    expect(html).toContain("Double-click to resolve");
+    expect(html).not.toContain("resolve-btn");
+  });
+
+  it("keeps the Load button for a local pending source, which costs nothing", () => {
+    const html = renderToStaticMarkup(
+      <TreeRow
+        node={sourceNode({ ...CLOUD, unresolved_reason: "pending" })}
+        activeSourceId={null}
+        activeTensorId={null}
+        expandedFolders={new Set(["onedrive_9c1"])}
+        toggleFolder={() => {}}
+        selectSource={() => {}}
+        startResolve={() => {}}
+        resolving={new Set()}
+      />,
+    );
     expect(html).toContain("resolve-btn");
   });
 
@@ -148,7 +164,6 @@ describe("TreeRow for an unresolved source", () => {
       />,
     );
     expect(html).toContain("Resolving");
-    expect(html).toContain("disabled");
   });
 
   it("explains itself on hover, keeping the url", () => {

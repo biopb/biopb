@@ -141,6 +141,13 @@ html, body {
   white-space: nowrap;
 }
 .resolve-btn:hover { background: #2d5a8f; color: #dbeafe; }
+.resolve-hint {
+  font-size: 10px;
+  font-style: normal;
+  margin-left: 8px;
+  color: #93c5fd;
+  white-space: nowrap;
+}
 
 /* Hydrate-ahead tray, pinned to the foot of the catalog pane. flex-shrink so
    it keeps its height while the tree above it takes the slack. */
