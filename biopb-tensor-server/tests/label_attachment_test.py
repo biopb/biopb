@@ -33,7 +33,6 @@ from biopb_tensor_server.core.labels import (
     extent_mismatch,
     label_extent,
     label_field,
-    label_forms,
     label_image_axes,
     split_label_field,
 )
@@ -144,7 +143,8 @@ class TestTheFieldShape:
 
     def test_extent_mismatch_says_why(self):
         assert (
-            extent_mismatch(["y", "x"], [64, 64], ["c", "y", "x"], [3, 64, 64]) is None
+            extent_mismatch(["c", "y", "x"], [1, 64, 64], ["c", "y", "x"], [3, 64, 64])
+            is None
         )
         assert (
             extent_mismatch(
@@ -161,16 +161,11 @@ class TestTheFieldShape:
             ["c", "y", "x"], [3, 64, 64], ["c", "y", "x"], [3, 64, 64]
         )
 
-    def test_only_a_listing_accepts_the_earlier_shape(self):
-        # A native group or a sidecar from an earlier server may lack the channel
-        # axis; a set being created may not.
+    def test_a_set_without_the_channel_axis_does_not_span(self):
+        # A native group may omit `c` and an older server wrote sidecars without
+        # it; neither is the image's rank.
         image = (["t", "c", "z", "y", "x"], [5, 3, 4, 64, 64])
-        old = (["t", "z", "y", "x"], [5, 4, 64, 64])
-        assert extent_mismatch(*old, *image) is None
-        assert "axes" in extent_mismatch(*old, *image, allow_earlier=False)
-        # A wrong length on an earlier-form set quotes the form it matched.
-        wrong = (["t", "z", "y", "x"], [5, 4, 32, 64])
-        assert "[5, 4, 64, 64]" in extent_mismatch(*wrong, *image)
+        assert "axes" in extent_mismatch(["t", "z", "y", "x"], [5, 4, 64, 64], *image)
 
     def test_a_set_has_the_images_rank_with_a_singleton_channel(self):
         image = (["t", "c", "z", "y", "x"], [5, 3, 4, 64, 64])
@@ -178,15 +173,6 @@ class TestTheFieldShape:
             extent_mismatch(["t", "c", "z", "y", "x"], [5, 1, 4, 64, 64], *image)
             is None
         )
-        # ... and a set written before that rule, without the channel axis, is
-        # still one.
-        assert extent_mismatch(["t", "z", "y", "x"], [5, 4, 64, 64], *image) is None
-        assert [list(f.labels) for f in label_forms(*image)] == [
-            ["t", "c", "z", "y", "x"],
-            ["t", "z", "y", "x"],
-        ]
-        # An image with no channel axis has one form.
-        assert len(label_forms(["z", "y", "x"], [4, 64, 64])) == 1
 
     def test_an_rgb_image_has_a_set_without_the_samples_axis(self):
         # A mask indexes pixels, not a pixel's colour components, and a trailing
@@ -210,8 +196,8 @@ class TestTheFieldShape:
         # server says it out loud (biopb/biopb#1059).
         five = (["t", "c", "z", "y", "x"], [5, 3, 4, 64, 64])
         assert label_image_axes(["t", "c", "z", "y", "x"], *five) == [0, 1, 2, 3, 4]
-        # A set written before the rule is told apart by its rank.
-        assert label_image_axes(["t", "z", "y", "x"], *five) == [0, 2, 3, 4]
+        # A set without the channel axis has no mapping to state.
+        assert label_image_axes(["t", "z", "y", "x"], *five) is None
         assert label_image_axes(["y", "x"], ["y", "x"], [64, 64]) == [0, 1]
         # An RGB samples axis is left out of the set, so it is not mapped.
         assert label_image_axes(
@@ -221,9 +207,6 @@ class TestTheFieldShape:
         assert label_image_axes(
             ["", "c", "y", "x"], ["", "c", "y", "x"], [2, 3, 64, 64]
         ) == [0, 1, 2, 3]
-        assert label_image_axes(
-            ["", "y", "x"], ["", "c", "y", "x"], [2, 3, 64, 64]
-        ) == [0, 2, 3]
 
     def test_image_axes_is_none_for_a_set_that_does_not_span(self):
         # Nothing to state, and the same set `label_sets` drops.
@@ -542,14 +525,10 @@ class TestTheSdkReadsTheSameRule:
         _, sdk_axes, _ = self._sdk()
         image_labels = ["t", "c", "z", "y", "x"]
         image = self._desc([5, 3, 4, 64, 64], image_labels)
-        for label_labels, label_shape in (
-            (["t", "c", "z", "y", "x"], [5, 1, 4, 64, 64]),
-            # from before the channel became a singleton
-            (["t", "z", "y", "x"], [5, 4, 64, 64]),
-        ):
-            stated = label_image_axes(label_labels, image_labels, image.shape)
-            label = self._desc(label_shape, label_labels, self._stated(stated))
-            assert sdk_axes(label, image) == stated
+        label_labels, label_shape = ["t", "c", "z", "y", "x"], [5, 1, 4, 64, 64]
+        stated = label_image_axes(label_labels, image_labels, image.shape)
+        label = self._desc(label_shape, label_labels, self._stated(stated))
+        assert sdk_axes(label, image) == stated
 
     def test_a_descriptor_without_the_statement_has_no_mapping(self):
         # Never derived: a client re-deriving the rule is the third copy of it.

@@ -219,22 +219,17 @@ class TestTheExtentOfASet:
                 chunk_shape=(1, 32, 32),
             )
 
-    def test_a_listing_still_takes_it_and_states_the_old_mapping(
-        self, writable_server, tmp_path
-    ):
-        # A native NGFF group or an earlier server's sidecar, which cannot be
-        # rewritten, keeps being served.
+    def test_a_listing_refuses_it_too(self, writable_server, tmp_path):
+        # A native NGFF group or an older server's sidecar without the channel
+        # axis is not listed.
         from types import SimpleNamespace
 
         store = _image_with_axes(tmp_path, "tcyx", (2, 3, 64, 64))
         adapter = _adapter(store, "img")
         old = SimpleNamespace(dim_labels=["t", "y", "x"], shape=[2, 64, 64])
 
-        assert adapter.label_binding_error("@labels/old", old) is None
-        assert adapter.label_image_axes("@labels/old", old) == [0, 2, 3]
-        assert "does not span" in adapter.label_binding_error(
-            "@labels/old", old, allow_earlier=False
-        )
+        assert "does not span" in adapter.label_binding_error("@labels/old", old)
+        assert adapter.label_image_axes("@labels/old", old) is None
 
     def test_a_channel_axis_at_the_images_length_is_refused(
         self, writable_server, client, tmp_path

@@ -55,7 +55,9 @@ block. `/api/tile_info` surfaces the same list as `image_axes` for a label set.
 The rule is checked twice: the upload refuses a set that would not span its
 image at create, and `SourceAdapter.label_sets` checks every set again where
 the origins meet (`extent_mismatch`, on normalized descriptors). Mismatched labels
-are dropped with a warning.
+are dropped with a warning. That includes a set with no channel axis -- a native
+NGFF group (the spec lets it omit `c`) or a sidecar an older server wrote -- when
+its image has one.
 
 ## Three different origins
 
@@ -160,10 +162,7 @@ other two, the request's `array_id` *is* the final one. The kind:
 - refuses a non-unsigned-integer dtype, a reserved name, a name that would not
   stay inside the sidecar directory (`unsafe_store_name`), or a shape /
   `dim_labels` that is not the parent's extent (above) -- a request naming no
-  `dim_labels` is filled in from the image rather than refused. Only a
-  *listing* accepts the earlier shape without the channel axis (a native NGFF
-  group, or a sidecar an earlier server wrote); a set being created must have
-  the current one;
+  `dim_labels` is filled in from the image rather than refused;
 - refuses a name already attached, finished or pending (biopb/biopb#1054,
   per parent);
 - creates the sidecar array with the pending marker and the minted
