@@ -1022,12 +1022,12 @@ class SourceAdapter(ABC):
     def catalog_payload(self) -> Optional[Dict[str, Any]]:
         """What a restart needs to rebuild this adapter without parsing its file.
 
-        JSON-serializable and written beside the catalog row; ``None`` (the
-        default) means the source is not restorable and is catalogued for this
-        run only. The payload carries the serve path's derived state, such as
-        descriptors with their transfer grid, never what the row already holds.
-        Adding a key needs no version bump; changing the meaning of one bumps
-        ``SOURCE_CATALOG_FORMAT``.
+        An optimization, not a requirement: ``None`` (the default) means a
+        restart rebuilds the adapter from its claim, which parses on first use.
+        JSON-serializable and written beside the catalog row. The payload carries
+        the serve path's derived state, such as descriptors with their transfer
+        grid, never what the row already holds. Adding a key needs no version
+        bump; changing the meaning of one bumps ``SOURCE_CATALOG_FORMAT``.
         """
         return None
 

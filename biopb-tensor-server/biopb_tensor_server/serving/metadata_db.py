@@ -1011,7 +1011,8 @@ class MetadataDatabase:
                 -- {member path: [st_ino, size, mtime_ns, ctime_ns]} when the
                 -- claim was made. No st_dev: it renumbers across boots.
                 signature TEXT,
-                -- What the adapter needs to be built without a parse.
+                -- What the adapter needs to be built without a parse. NULL when
+                -- it has none: a restart rebuilds it from the claim.
                 payload TEXT,
                 last_seen TIMESTAMP
             )
@@ -1336,9 +1337,9 @@ class MetadataDatabase:
             source_id: Unique source identifier
             adapter: Backend adapter for the source
             record: The claim and its claim-time signature, from a caller that
-                registers restorable sources. With an adapter payload
-                (``catalog_payload``) the row goes to ``source_catalog``;
-                without either it stays in ``sources_volatile``.
+                registers restorable sources. A resolved row with one goes to
+                ``source_catalog``, with the adapter's ``catalog_payload`` or
+                none; without one it stays in ``sources_volatile``.
         """
         conn = self._get_connection()
 
@@ -1436,11 +1437,13 @@ class MetadataDatabase:
         indexed_at = datetime.now()
         metadata_json = json.dumps(metadata, cls=NumpyEncoder) if metadata else None
 
+        # Every resolved source with a claim is restorable; the payload only
+        # lets a restart skip the parse, so an adapter without one stores NULL
+        # and is rebuilt from its claim.
         persist = None
         if record is not None and is_resolved:
             payload = getattr(adapter, "catalog_payload", lambda: None)()
-            if payload is not None:
-                persist = (record, payload)
+            persist = (record, payload)
 
         self._upsert_source_row(
             conn,
@@ -1545,7 +1548,9 @@ class MetadataDatabase:
                             json.dumps(
                                 {k: list(v) for k, v in record.signature.items()}
                             ),
-                            json.dumps(payload, sort_keys=True),
+                            None
+                            if payload is None
+                            else json.dumps(payload, sort_keys=True),
                             indexed_at,
                         ],
                     )

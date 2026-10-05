@@ -54,18 +54,38 @@ class TestRouting:
         assert (_count(db, "source_catalog"), _count(db, "sources_volatile")) == (1, 0)
         assert db.query("SELECT source_id FROM sources").num_rows == 1
 
-    def test_without_a_payload_or_a_record_it_stays_volatile(self):
+    def test_a_claim_without_a_payload_is_still_persisted(self):
         db = MetadataDatabase()
         db.sync_source_added(
             "s1", MockAdapter("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8"), _record()
         )
+        assert (_count(db, "source_catalog"), _count(db, "sources_volatile")) == (1, 0)
+        (payload,) = (
+            db._get_connection()
+            .execute("SELECT payload FROM source_catalog")
+            .fetchone()
+        )
+        assert payload is None
+
+    def test_without_a_record_it_stays_volatile(self):
+        db = MetadataDatabase()
         db.sync_source_added(
-            "s2",
-            _Restorable("s2", "/d/s2.zarr", "zarr", [4, 4], "uint8"),
+            "s2", _Restorable("s2", "/d/s2.zarr", "zarr", [4, 4], "uint8")
+        )
+        assert (
+            _count(db, "source_catalog", "s2"),
+            _count(db, "sources_volatile", "s2"),
+        ) == (0, 1)
+        assert db.query("SELECT source_id FROM sources").num_rows == 1
+
+    def test_an_unresolved_row_is_never_persisted(self):
+        db = MetadataDatabase()
+        db.sync_source_added(
+            "s1",
+            MockAdapter("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8", is_resolved=False),
+            _record(),
         )
         assert (_count(db, "source_catalog"), _count(db, "sources_volatile")) == (0, 1)
-        assert _count(db, "sources_volatile", "s2") == 1
-        assert db.query("SELECT source_id FROM sources").num_rows == 2
 
     def test_a_source_changing_kind_moves_and_never_shows_twice(self):
         db = MetadataDatabase()
@@ -335,7 +355,7 @@ class TestRegistration:
         assert label["shape"] == mask["shape"]
         assert label["dim_labels"] == mask["dim_labels"]
 
-    def test_a_source_without_a_payload_is_volatile(self, tmp_path):
+    def test_a_source_without_a_payload_is_persisted_from_its_claim(self, tmp_path):
         import zarr
 
         z = zarr.open_array(
@@ -348,7 +368,10 @@ class TestRegistration:
         z[:] = 1
         manager, server = _manager(tmp_path)
         manager._handle_rescan()
-        assert _persisted(server) == []
+        ((_, primary, signature, payload),) = _persisted(server)
+        assert primary.endswith("a.zarr")
+        assert json.loads(signature)  # a directory is stamped too
+        assert payload is None
         assert server.metadata_db.query("SELECT source_id FROM sources").num_rows == 1
 
 

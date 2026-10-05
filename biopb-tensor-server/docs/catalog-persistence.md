@@ -30,8 +30,10 @@ with restored state:
 2. Each root is then walked as an ordinary rescan. Unchanged signature: nothing. Changed:
    refresh. New: added as found. Gone: removed when the root's walk completes.
 3. A read of a restored source finds no adapter in `SourceRegistry`. `get_registered`
-   asks the reconciler, which builds the adapter from the row (`from_row`: no parse) and
-   runs the upload attacher, then authorizes. This sits beside the pending check.
+   asks the reconciler, which builds the adapter and runs the upload attacher, then
+   authorizes. With a payload the adapter is built from it (`from_payload`: no parse);
+   without one it is built from the claim, the registration path a pending source takes,
+   so the parse happens on this first read. This sits beside the pending check.
 
 A restored row may be stale; the epoch below says so.
 
@@ -42,7 +44,7 @@ A restored row may be stale; the epoch below says so.
   signature, the adapter payload, the epoch of its last write and `last_seen`.
 - **A volatile table**: today's `sources`, renamed, dropped and rebuilt at open. It holds
   what has no restore path: mirrors (catalog rows only, no claim), cloud-root sources,
-  drops, and types without `from_row`.
+  drops, uploads and rows that are not resolved.
 - **`sources`**: a view over both, exposing the published columns plus `confirmed_epoch`
   and `confirmed` (below). The private columns are not in it. Volatile rows report the
   current epoch, since they were seen this run.
@@ -64,17 +66,18 @@ union.
 
 ## What is restored
 
-A source is restorable when it is local, comes from a configured scanned root, is not a
-mirror, is not under a cloud root, and its adapter implements `from_row`. Rollout is per
-adapter type: OME-TIFF, nd2 and czi first, each shipping independently. Everything else
-behaves as today.
+A source is restorable when it is resolved, local, comes from a configured scanned root,
+is not a mirror and is not under a cloud root. Nothing is opt-in per adapter: the claim
+is enough to rebuild any of them, and a payload is an optimization that skips the parse
+(OME-TIFF, nd2 and czi have one; others store NULL and are parsed on first read). A
+failed or pending row is not persisted, since a restart retries it anyway.
 
 - **Mirrors** are bulk-seeded from `catalog_seed` and need the upstream `indexed_at`.
 - **Drops** (`dnd://`) are not restored: roots live in memory, so a drop is not re-found
   after a restart and its rows could never be confirmed.
 - **Cloud**: see below.
 - **Directory-backed sources** (zarr, ome-zarr, ndtiff, TIFF sequences) are restorable
-  once their adapter implements `from_row`, with a known limitation. A directory
+  like the rest, with a known limitation. A directory
   source's signature is the directory's own, and that mtime does not move when a member
   is rewritten in place. A restart used to heal that; a restored directory source is
   refreshed only by an explicit re-drop (which rebuilds every known claim
@@ -153,8 +156,8 @@ Registration threads and the sweep write through the same connection and lock as
 - **One table-level `CACHE_FORMAT` integer in `catalog_meta`.** At open the check drops
   `source_catalog` on a mismatch or a missing key, before the view is created; the table
   and the key are written in one transaction. The result is today's behaviour: a rebuild.
-  No per-row or per-adapter version. Additive payload changes need none (`from_row`
-  treats a missing required key as a miss); bump only when a field changes meaning.
+  No per-row or per-adapter version. Additive payload changes need none (`from_payload`
+  treats a missing required key as a miss, and falls back to the claim); bump only when a field changes meaning.
 - A committed golden payload per adapter fails the test when the written shape or
   semantics change without a bump (it guards the constant; comparing with a fresh parse
   would not, since both sides come from the current code).
@@ -231,15 +234,19 @@ still runs. Worth doing only if a cloud-root walk is slow enough to notice; unme
   id as present must read `confirmed`.
 - **Failure tracker, `_missed_scans`, `_cloud_source_ids`** are in memory; they are
   rebuilt from the restored claims, and empty is fine.
+- **A hydration that fails** (the file was removed or no longer parses) must not leave a
+  resolved row behind: it takes the same path as a failed registration (the row becomes
+  `failed` with the error), so a client does not read a listed source that cannot open.
 - **Single registration point:** the lookup belongs in the shared registration path, not
   only the background worker; a re-drop rebuilds known claims unconditionally.
 
 ## Stages
 
 Stage 1 as implemented: `source_catalog` and `sources_volatile` with the persistent view,
-`SOURCE_CATALOG_FORMAT`, routing by `catalog_payload()` and a claim record, claim-time
-signature without `st_dev`, deletion from both on removal. Payloads exist for OME-TIFF,
-nd2 and czi, and no others:
+`SOURCE_CATALOG_FORMAT`, routing by claim record (a resolved source with one is
+persisted; its payload is NULL when the adapter has none), claim-time signature without
+`st_dev`, deletion from both on removal. Payloads exist for OME-TIFF, nd2 and czi, and
+no others:
 
 - **OME-TIFF**: the scene descriptors (with their transfer grid), `has_rois`, and the
   `@ome` mask label tensors' field, parent and extent, derived from the metadata without
@@ -259,12 +266,12 @@ restored yet, and the epoch and `last_seen` sweep are stage 2.
    against a fresh parse (embedded-label descriptors, `has_rois`, attached tensors); a
    persisted-signature test that perturbs `st_dev` and expects no change; a test that
    changes a file between claim and write.
-2. Restore and hydrate for OME-TIFF, nd2, czi behind a setting: the restore rules, the
+2. Restore and hydrate every persisted row, behind a setting: the restore rules, the
    epoch and per-root confirmation, the post-walk sweep and `last_seen` cap, lazy `@ome`
    ROIs and masks, hydration notifies precache, the observation hooks ignore unconfirmed
    rows, the loud corrupt-catalog log, the rebuild flag.
-3. More adapter types, directory-backed ones included, with the documented limitation;
-   default on after a release cycle with the setting opt-in.
+3. More payloads for adapters whose parse is slow, as measured; default on after a
+   release cycle with the setting opt-in.
 4. Clients: the SPA dims unconfirmed rows and reads "verifying"; the SDK exposes
    `confirmed`.
 
