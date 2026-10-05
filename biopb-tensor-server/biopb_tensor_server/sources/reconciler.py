@@ -153,10 +153,6 @@ class Reconciler:
 
         # source_id -> member path signature map used to detect in-place changes.
         self._source_signatures: Dict[str, Dict[str, Tuple[Any, ...]]] = {}
-        # source_ids whose primary_path is under a cloud root, maintained at commit
-        # time (O(1) per source). Lets the incremental reconcile preserve cloud
-        # sources by a hash-set check instead of resolving every cloud member path.
-        self._cloud_source_ids: Set[str] = set()
         # source_id -> consecutive rescans that did not find it. A source that was
         # claimed can briefly stop being claimable with its files still in place (a
         # sidecar rewritten in place, a locked header); removing it on the first
@@ -175,10 +171,6 @@ class Reconciler:
         # While a walk streams claims that register later, their pending rows are
         # written in batches by this (None otherwise: one write per claim).
         self._pending_writer: Optional[PendingRowWriter] = None
-        # Claims a walk committed as it found them. Their signature was taken a
-        # moment before the end-of-walk reconcile, which would stat every member
-        # again to compare it with itself.
-        self._streamed_ids: Set[str] = set()
         # Sources already reported as reachable by two paths (one report each).
         self._warned_shared: Set[str] = set()
         self._pending: Dict[str, Optional[str]] = {}
@@ -313,20 +305,17 @@ class Reconciler:
         another root.
         """
         with self._lock:
-            return {
-                source_id: claim
-                for source_id, claim in self._state.claims.items()
-                if not is_remote_url(claim.primary_path)
-                and Path(claim.primary_path).is_relative_to(root)
-            }
-
-    def begin_walk(self) -> None:
-        """Start a walk: forget what the last one streamed, batch pending rows."""
-        self._streamed_ids = set()
-        self.begin_pending_batch()
-
-    def end_walk(self) -> None:
-        self.end_pending_batch()
+            claims = list(self._state.claims.items())
+        # Claim paths are already spelled lexically, so a prefix test is the same
+        # answer as ``Path.is_relative_to`` without building a Path per claim; a
+        # remote url never starts with a local root.
+        prefix = str(root)
+        under = prefix if prefix.endswith(os.sep) else prefix + os.sep
+        return {
+            source_id: claim
+            for source_id, claim in claims
+            if claim.primary_path == prefix or claim.primary_path.startswith(under)
+        }
 
     def begin_pending_batch(self) -> None:
         """Write the pending rows of the claims that follow in batches, until
@@ -514,7 +503,9 @@ class Reconciler:
                     claim,
                     catalog_url,
                     error=message,
-                    record=self._catalog_record(claim, reuse_signature=True),
+                    record=self._catalog_record(
+                        claim, self._source_signatures.get(claim.source_id)
+                    ),
                 )
             except Exception:
                 logger.exception("could not record the failure of source %s", source_id)
@@ -536,9 +527,11 @@ class Reconciler:
     ) -> None:
         """Bring one root's claims in line with what its walk found.
 
-        *snapshot* is the root's confirmed claims (:meth:`claims_under`); the walk
-        has already committed every claim that was new, so what is left to decide
-        is what it did not find (removal), and what it found unchanged or changed.
+        *snapshot* is the root's confirmed claims (:meth:`claims_under`) taken
+        BEFORE the walk; the walk has already committed every claim that was new,
+        and those are not in it, so what is left to decide is what the walk did
+        not find (removal), and what it found unchanged or changed. A claim the
+        walk committed is never stat'ed again to be compared with itself.
 
         *recurring* is a monitored root, which is walked again: a claim must be
         missing on ``_MISSES_BEFORE_REMOVAL`` walks running before it is removed,
@@ -551,12 +544,9 @@ class Reconciler:
         current_ids = set(snapshot)
         discovered_ids = set(discovered_claims)
 
-        # Consumed once: a later rescan streams nothing, and diffs every claim. A
-        # claim streamed here that changes afterwards is caught by that rescan.
-        streamed, self._streamed_ids = self._streamed_ids, set()
         changed_ids: Set[str] = set()
         unchanged_ids: List[str] = []
-        for source_id in (current_ids & discovered_ids) - streamed:
+        for source_id in current_ids & discovered_ids:
             new_signatures = self._build_claim_signatures(discovered_claims[source_id])
             existing_signatures = self._source_signatures.get(source_id)
             if existing_signatures is None:
@@ -647,7 +637,9 @@ class Reconciler:
                         claim,
                         catalog_url,
                         recall=recall,
-                        record=self._catalog_record(claim, reuse_signature=True),
+                        record=self._catalog_record(
+                            claim, self._source_signatures.get(claim.source_id)
+                        ),
                     )
             except Exception:
                 logger.exception("could not update the row of source %s", source_id)
@@ -674,9 +666,7 @@ class Reconciler:
         case removal exists to act on. A cloud source bypasses the window, as the
         claim gate does -- a placeholder's mtime is not evidence of a write.
         """
-        if claim.source_id in self._cloud_source_ids or self._roots.is_cloud(
-            claim.primary_path
-        ):
+        if self._roots.is_cloud(claim.primary_path):
             return True
         now = time.time()
         for member_path in {claim.primary_path, *claim.member_paths}:
@@ -721,7 +711,6 @@ class Reconciler:
     def _catalog_record(
         self,
         claim: SourceClaim,
-        reuse_signature: bool = False,
         signatures: Optional[Dict[str, Tuple[Any, ...]]] = None,
     ) -> Optional[CatalogRecord]:
         """The claim and its signature, if its source has a claim to persist.
@@ -734,19 +723,17 @@ class Reconciler:
         The persisted signature drops ``st_dev`` (first element), which can
         renumber across boots and would make every row look changed.
 
-        With *reuse_signature* the one state already holds is used, not a new
-        ``stat``: for a claim registering after it was committed pending, that
-        is the signature taken at claim time, which is the one that must sit
-        beside the parse. A source that is not pending must not (a refresh: state
-        holds the old file's). *signatures* are ones the caller has just taken.
+        *signatures* is the claim-time signature, from a caller that has just taken
+        it (the pending commit) or that wants the one state holds (a registration
+        after the claim was committed pending, which must persist the signature
+        taken then, not a new one; a refresh must not, since state holds the old
+        file's). None means stat now.
         """
         if claim.source_type == "tensor-server" or claim.is_remote:
             return None
         root = self._roots.containing(Path(claim.primary_path))
         if root is None or root.kind not in (RootKind.MONITORED, RootKind.SCAN_ONCE):
             return None
-        if signatures is None and reuse_signature:
-            signatures = self._source_signatures.get(claim.source_id)
         if signatures is None:
             signatures = self._build_claim_signatures(claim)
         signature = {path: sig[1:] for path, sig in signatures.items()}
@@ -810,8 +797,7 @@ class Reconciler:
             if known.primary_path != claim.primary_path:
                 self._warn_shared_source(known, claim)
             return
-        if self._commit_add_claim(claim, keep_failed=True):
-            self._streamed_ids.add(claim.source_id)
+        self._commit_add_claim(claim, keep_failed=True)
 
     def _warn_shared_source(self, known: SourceClaim, found: SourceClaim) -> None:
         """Say once that one file was reached by two paths.
@@ -888,12 +874,8 @@ class Reconciler:
 
         Every index a commit must leave consistent, in one place: the add and
         refresh paths share it so a new one cannot be added to only one of them.
-        ``_cloud_source_ids`` is what lets the incremental reconcile preserve a
-        cloud-root source by a hash-set check (see _reconcile_discovered_state).
         """
         self._source_signatures[claim.source_id] = signatures
-        if self._roots.is_cloud(claim.primary_path):
-            self._cloud_source_ids.add(claim.source_id)
 
     def _refresh_claim(self, claim: SourceClaim) -> bool:
         """:meth:`_refresh_claim_locked`, serialized against this source's
@@ -1041,7 +1023,6 @@ class Reconciler:
         with self._lock:
             self._state.remove_claim(claim.primary_path, notify=False)
             self._source_signatures.pop(source_id, None)
-            self._cloud_source_ids.discard(source_id)
             self._missed_scans.pop(source_id, None)
             self._clear_pending(source_id)
         return True
@@ -1430,7 +1411,10 @@ class Reconciler:
             None
             if catalog_seed is not None
             else self._catalog_record(
-                claim, reuse_signature=self.is_pending(claim.source_id)
+                claim,
+                self._source_signatures.get(claim.source_id)
+                if self.is_pending(claim.source_id)
+                else None,
             )
         )
         try:
@@ -1566,7 +1550,9 @@ class Reconciler:
                 with self._lock:
                     previous = self._state.claims.get(source_id)
                 record = (
-                    self._catalog_record(previous, reuse_signature=True)
+                    self._catalog_record(
+                        previous, self._source_signatures.get(source_id)
+                    )
                     if previous is not None
                     else None
                 )
@@ -1588,10 +1574,7 @@ class Reconciler:
         propagated (worst case a leaked row).
 
         Deliberately does NOT touch the server registration (callers own that,
-        with differing abort semantics) nor ``_cloud_source_ids``: the remove
-        path discards that under ``self._lock`` in :meth:`_commit_remove_source`,
-        while the rollback path -- which runs outside that lock -- discards it
-        itself.
+        with differing abort semantics).
         """
         writer = self._pending_writer
         if writer is not None:
@@ -1613,7 +1596,6 @@ class Reconciler:
         except Exception:
             logger.exception("Rollback failed to unregister source %s", source_id)
         self._teardown_source_bookkeeping(source_id)
-        self._cloud_source_ids.discard(source_id)
 
     def _unregister_source_claim(self, source_id: str) -> bool:
         """Remove a source from the server and metadata DB.

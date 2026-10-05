@@ -576,7 +576,9 @@ class SourceManager:
             source_type=root.source.type if root.source is not None else None,
         )
         report = WalkReport()
-        self._reconciler.begin_walk()
+        # Before the walk, so what the walk streams is not in it.
+        snapshot = self._reconciler.claims_under(root.path)
+        self._reconciler.begin_pending_batch()
         try:
             discover_sources(
                 root.path,
@@ -589,7 +591,6 @@ class SourceManager:
                 monitored=recurring,
                 walk_threads=self._walk_threads,
             )
-            snapshot = self._reconciler.claims_under(root.path)
             self._reconciler._preserve_skipped_claims(
                 snapshot, discovered, report.declined_dirs
             )
@@ -597,7 +598,7 @@ class SourceManager:
         finally:
             # Before the startup protocol resumes the registration pool, so every
             # claim has its row by then.
-            self._reconciler.end_walk()
+            self._reconciler.end_pending_batch()
 
     def _rescan_monitored_dirs(self) -> None:
         """Scan the monitored directories, each against its own claims.
@@ -1118,8 +1119,6 @@ class SourceManager:
                 url,
                 source_type=source_type,
                 should_cancel=should_cancel,
-                catalog_url_for=self._display_url_for,
-                cloud=new_root.cloud if new_root else self._roots.is_cloud(url),
                 new_root=new_root,
             )
         finally:
@@ -1131,24 +1130,23 @@ class SourceManager:
         *,
         source_type: str = "",
         should_cancel: Optional[Callable[[], bool]] = None,
-        catalog_url_for: Callable[[SourceClaim], Optional[str]],
-        cloud: bool = False,
         new_root: Optional[Root] = None,
     ):
         """Claim everything at or under ``url`` and bring the catalog in line.
 
-        A drop's scan: containment guard, ``discover_sources`` into a scratch state, remove what
-        is gone under the root, then per claim refresh-if-known else add. The
-        caller holds ``_catalog_lock`` and has checked that ``url`` is a rooted,
-        readable local path. Yields the events :meth:`add_local_source` documents.
+        A drop's scan: containment guard, ``discover_sources`` into a scratch
+        state, remove what is gone under the path, then per claim refresh-if-known
+        else add. The caller holds ``_catalog_lock`` and has checked that ``url``
+        is a rooted, readable local path. Yields the events
+        :meth:`add_local_source` documents.
 
-        ``catalog_url_for`` gives a NEW claim its display ``source_url`` override,
-        or None. ``cloud`` scans ``url`` as a cloud root. ``new_root`` is the root
-        a drop is making for itself: it is refused whole, before anything is
-        removed or committed, when :meth:`Roots.check_overlap` finds it shares
-        sources with another root, and it joins the roots just before its first
-        new source is committed, so that source sees it.
+        ``new_root`` is the root a drop is making for itself: it is refused whole,
+        before anything is removed or committed, when :meth:`Roots.check_overlap`
+        finds it shares sources with another root, and it joins the roots just
+        before its first new source is committed, so that source sees it. The
+        walk is a cloud one when that root, or the one ``url`` lies in, is.
         """
+        cloud = new_root.cloud if new_root else self._roots.is_cloud(url)
         is_dir = os.path.isdir(url)
         tally = AddSourceTally()
 
@@ -1250,7 +1248,7 @@ class SourceManager:
             else:
                 if new_root is not None:
                     self._roots.add(new_root)
-                catalog_url = catalog_url_for(claim)
+                catalog_url = self._display_url_for(claim)
                 added = False
                 try:
                     added = self._reconciler._commit_add_claim(

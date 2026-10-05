@@ -826,7 +826,7 @@ class TestCloudRescanGating:
 
         mgr._handle_rescan()  # force_full
         sid = next(iter(mgr._reconciler._recall))
-        assert sid in mgr._reconciler._cloud_source_ids
+        assert mgr._roots.is_cloud(mgr._reconciler.claim_primary_path(sid))
 
         walked = self._spy_walks(monkeypatch)
         monkeypatch.setattr(mgr, "_should_force_full_rescan", lambda: False)
@@ -855,7 +855,7 @@ class TestCloudRescanGating:
         orig_sig = mgr._reconciler._build_claim_signatures
 
         def guard(claim):
-            assert claim.source_id not in mgr._reconciler._cloud_source_ids, (
+            assert not mgr._roots.is_cloud(claim.primary_path), (
                 "cloud source must not be signature-diffed on an incremental"
             )
             return orig_sig(claim)
@@ -893,7 +893,8 @@ class TestCloudRescanGating:
         mgr._handle_rescan()  # force_full: re-walk surfaces it, partition rebuilt
         assert len(mgr._reconciler._recall) == 2
         assert all(
-            sid in mgr._reconciler._cloud_source_ids for sid in mgr._reconciler._recall
+            mgr._roots.is_cloud(mgr._reconciler.claim_primary_path(sid))
+            for sid in mgr._reconciler._recall
         )
 
 

@@ -245,7 +245,7 @@ signature gap itself is healed by a re-drop, as for directories.
 - **`scanning` / "Indexing…"** and `full_scan_in_progress` mean "verifying", not
   "empty", once the catalog is restored; the SPA hint and any client that treats a listed
   id as present must read `confirmed`.
-- **`_missed_scans` and `_cloud_source_ids`** are in memory; they are
+- **`_missed_scans`** is in memory; it is
   rebuilt from the restored claims, and empty is fine.
 - **A hydration that fails** (the file was removed or no longer parses) must not leave a
   resolved row behind: it takes the same path as a failed registration (the row becomes

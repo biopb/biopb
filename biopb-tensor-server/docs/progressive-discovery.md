@@ -46,7 +46,7 @@ string is used where**, and how the first scan differs from every later one.
 | Holder | State | Keyed by |
 |---|---|---|
 | `DiscoveryState` (scratch and confirmed) | `claims`, `_path_to_source`, `_source_to_paths`, `consumed_paths`, `visited_identities` | `source_id`; claim path strings; file identities |
-| `Reconciler` | `_source_signatures`, `_missed_scans`, `_cloud_source_ids` | `source_id` |
+| `Reconciler` | `_source_signatures`, `_missed_scans` | `source_id` |
 | `Roots` (shared by `SourceManager` and `Reconciler`) | every known root: kind (monitored, scan-once, dropped, upstream), alias, cloud, `dnd://` label | Resolved root `Path`s; a drop's label |
 | `SourceManager` | `_unavailable_roots` | Resolved root `Path`s |
 | Adapter | `_source_url` (the raw claim path, or the library's own filename for nifti / bioio / dicom), `catalog_url` | Opens files with the raw path |
@@ -139,11 +139,12 @@ claim a subtree twice.
 A monitored root and a scan-once root are scanned the same way (`SourceManager._scan_root`),
 one root at a time, each against its own claims:
 
-1. Walk the root into a scratch state. A claim is committed the moment the walk finds it
-   (`on_source_added` → `_stream_claim_add`), so the catalog grows within the walk.
-2. Take the root's snapshot, `Reconciler.claims_under(root)`: the confirmed claims lying at
+1. Take the root's snapshot, `Reconciler.claims_under(root)`: the confirmed claims lying at
    or under the root, by the path each is spelled under (lexical, so a link belongs to the
-   root it was found in).
+   root it was found in). It is taken before the walk.
+2. Walk the root into a scratch state. A claim is committed the moment the walk finds it
+   (`on_source_added` → `_stream_claim_add`), so the catalog grows within the walk. What
+   the walk commits is new, so it is not in the snapshot and is not stat'ed again.
 3. `_reconcile_root(snapshot, discovered, recurring)` compares the two. A claim is never
    compared with another root's walk, so scanning one root cannot remove the claims of
    another.
@@ -202,8 +203,7 @@ their signatures are identity-only so hydration and eviction do not flap a sourc
 **Full versus incremental.** A full pass runs when `full_rescan_interval` (default
 3600 s) has elapsed since the last one, and on the first tick. Only a full pass walks
 cloud roots and advances `last_full_scan_finished_at`. `full_rescan_interval = 0`
-means no full pass ever runs: cloud roots are never walked, and the first tick is an
-ordinary batched diff, not a streamed scan.
+means no full pass ever runs: cloud roots are never walked.
 
 ### What each event writes to the catalog
 
@@ -348,8 +348,8 @@ end-of-walk reconcile, which compares its signature, and removals are only ever 
 after the walk. It is idempotent against a retry: `_stream_claim_add` skips a claim
 already in the confirmed state, because `_commit_add_claim` unregisters on a duplicate
 add and a retried walk would otherwise delete what it had already streamed. The
-end-of-walk reconcile skips what was streamed (`_streamed_ids`, consumed once, so the
-next rescan compares every claim). The stability gate holds while streaming, so an
+end-of-walk reconcile never sees what was streamed, because the root's snapshot was taken
+before the walk. The stability gate holds while streaming, so an
 unstable entry is never claimed or streamed and is picked up by a later tick.
 
 While registration is deferred the pending rows of the claims a walk streams are written

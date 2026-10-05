@@ -96,9 +96,30 @@ _SOURCE_COLUMNS = (
     "is_resolved, unresolved_reason, unresolved_error, tensors"
 )
 # The columns ``source_catalog`` adds after those, in table order.
-_CLAIM_COLUMNS = (
-    "primary_path, member_paths, extra_config, signature, payload, last_seen"
+_CLAIM_COLUMN_NAMES = (
+    "primary_path",
+    "member_paths",
+    "extra_config",
+    "signature",
+    "payload",
+    "last_seen",
 )
+_CLAIM_COLUMNS = ", ".join(_CLAIM_COLUMN_NAMES)
+# The columns a row is written with, in the order every writer builds its values.
+_ROW_COLUMN_NAMES = (
+    "source_id",
+    "source_url",
+    "source_type",
+    "indexed_at",
+    "metadata_json",
+    "is_resolved",
+    "unresolved_reason",
+    "tensors",
+    "unresolved_error",
+)
+_ROW_COLUMNS = ", ".join(_ROW_COLUMN_NAMES)
+# Everything but the key, for updating a persisted row in place.
+_UPDATE_SET = ", ".join(f"{c} = ?" for c in _ROW_COLUMN_NAMES[1:] + _CLAIM_COLUMN_NAMES)
 _SOURCES_VIEW_DDL = (
     "CREATE VIEW sources AS "
     f"SELECT {_SOURCE_COLUMNS} FROM source_catalog UNION ALL "
@@ -1450,24 +1471,25 @@ class MetadataDatabase:
         # Every source with a claim is persisted; the payload only lets a
         # restart skip the parse, so an adapter without one (or a cloud row, or
         # one that is not resolved) stores NULL and is rebuilt from its claim.
-        persist = None
-        if record is not None:
-            payload = None
-            if is_resolved and not record.cloud:
-                payload = getattr(adapter, "catalog_payload", lambda: None)()
-            persist = (record, payload)
+        payload = None
+        if record is not None and is_resolved and not record.cloud:
+            payload = getattr(adapter, "catalog_payload", lambda: None)()
 
         self._upsert_source_row(
             conn,
-            source_id,
-            source_url,
-            source_type,
-            indexed_at,
-            metadata_json,
-            is_resolved,
-            None,  # a registered adapter has no reason; ``sync_pending_source`` sets one
-            tensors,
-            persist=persist,
+            [
+                source_id,
+                source_url,
+                source_type,
+                indexed_at,
+                metadata_json,
+                is_resolved,
+                None,  # a registered adapter has no reason; ``sync_pending_source`` sets one
+                tensors,
+                None,
+            ],
+            record,
+            payload,
         )
 
         # Deliberately AFTER the source row commits, and deliberately unable to
@@ -1505,80 +1527,80 @@ class MetadataDatabase:
             seen,
         ]
 
+    @staticmethod
+    def _pending_row(
+        claim: SourceClaim,
+        catalog_url: Optional[str],
+        recall: bool,
+        error: Optional[str],
+        now: datetime,
+    ) -> List[Any]:
+        """The row of a claimed source that is not registered yet, built from the
+        claim alone, in ``_ROW_COLUMNS`` order."""
+        return [
+            claim.source_id,
+            catalog_url or to_catalog_url(str(claim.primary_path)),
+            claim.source_type or "unknown",
+            now,
+            None,
+            False,
+            "failed" if error else ("needs_recall" if recall else "pending"),
+            [],
+            error or None,
+        ]
+
     def _upsert_source_row(
         self,
         conn: duckdb.DuckDBPyConnection,
-        source_id: str,
-        source_url: str,
-        source_type: str,
-        indexed_at: datetime,
-        metadata_json: Optional[str],
-        is_resolved: bool,
-        unresolved_reason: Optional[str],
-        tensors: List[Dict[str, Any]],
-        unresolved_error: Optional[str] = None,
-        persist: Optional[Tuple[CatalogRecord, Dict[str, Any]]] = None,
+        row: List[Any],
+        record: Optional[CatalogRecord] = None,
+        payload: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Insert or replace a source's row, serializing writes with the lock.
+        """Insert or replace a source's row (*row*, in ``_ROW_COLUMNS`` order),
+        serializing writes with the lock.
 
-        The row lands in ``source_catalog`` with *persist* (the claim record and
-        adapter payload), else in ``sources_volatile``, and is deleted from the
-        other table in the same transaction: the ``sources`` view is a UNION
-        ALL, so it cannot enforce one row per ``source_id`` itself, and a source
-        that gains or loses its claim must not show twice or vanish between the
-        two statements.
+        The row lands in ``source_catalog`` with a *record* (the claim and its
+        signature, and the adapter *payload*), else in ``sources_volatile``, and
+        is deleted from the other table in the same transaction: the ``sources``
+        view is a UNION ALL, so it cannot enforce one row per ``source_id``
+        itself, and a source that gains or loses its claim must not show twice or
+        vanish between the two statements.
 
         A persisted row that exists is updated, not replaced: a registration
         fills in the pending row its claim made, and an ``UPDATE`` costs about two
         thirds of the wall time and a quarter of the CPU of an ``INSERT OR
         REPLACE`` on the indexed table.
         """
-        row = [
-            source_id,
-            source_url,
-            source_type,
-            indexed_at,
-            metadata_json,
-            is_resolved,
-            unresolved_reason,
-            tensors,
-            unresolved_error,
-        ]
-        columns = (
-            "source_id, source_url, source_type, indexed_at, metadata_json, "
-            "is_resolved, unresolved_reason, tensors, unresolved_error"
+        source_id, indexed_at = row[0], row[3]
+        # Serialized before the lock: a payload can be large, and every other
+        # writer waits while it is held.
+        claim_values = (
+            None if record is None else self._claim_values(record, payload, indexed_at)
         )
         with self._write_lock:
             conn.execute("BEGIN TRANSACTION")
             try:
-                if persist is None:
+                if claim_values is None:
                     conn.execute(
                         "DELETE FROM source_catalog WHERE source_id = ?", [source_id]
                     )
                     conn.execute(
-                        f"INSERT OR REPLACE INTO sources_volatile ({columns}) "
+                        f"INSERT OR REPLACE INTO sources_volatile ({_ROW_COLUMNS}) "
                         f"VALUES ({', '.join('?' * len(row))})",
                         row,
                     )
                 else:
-                    record, payload = persist
-                    claim_values = self._claim_values(record, payload, indexed_at)
                     conn.execute(
                         "DELETE FROM sources_volatile WHERE source_id = ?",
                         [source_id],
                     )
                     updated = conn.execute(
-                        "UPDATE source_catalog SET source_url = ?, source_type = ?, "
-                        "indexed_at = ?, metadata_json = ?, is_resolved = ?, "
-                        "unresolved_reason = ?, tensors = ?, unresolved_error = ?, "
-                        "primary_path = ?, member_paths = ?, extra_config = ?, "
-                        "signature = ?, payload = ?, last_seen = ? "
-                        "WHERE source_id = ?",
+                        f"UPDATE source_catalog SET {_UPDATE_SET} WHERE source_id = ?",
                         row[1:] + claim_values + [source_id],
                     ).fetchone()
                     if not updated or not updated[0]:
                         conn.execute(
-                            f"INSERT INTO source_catalog ({columns}, "
+                            f"INSERT INTO source_catalog ({_ROW_COLUMNS}, "
                             f"{_CLAIM_COLUMNS}) "
                             f"VALUES ({', '.join('?' * (len(row) + len(claim_values)))})",
                             row + claim_values,
@@ -1609,23 +1631,37 @@ class MetadataDatabase:
         claim and signature, and overwrites what the source had there.
         """
         conn = self._get_connection()
-        self._upsert_source_row(
-            conn,
-            claim.source_id,
-            catalog_url or to_catalog_url(str(claim.primary_path)),
-            claim.source_type or "unknown",
-            datetime.now(),
-            None,
-            False,
-            "failed" if error else ("needs_recall" if recall else "pending"),
-            [],
-            unresolved_error=error or None,
-            persist=None if record is None else (record, None),
-        )
+        row = self._pending_row(claim, catalog_url, recall, error, datetime.now())
+        self._upsert_source_row(conn, row, record)
 
     # Rows per INSERT: a multi-row statement costs ~0.06 ms a row against ~4 ms for
     # one statement a row, and stays well under DuckDB's parameter limits.
     _PENDING_CHUNK = 500
+
+    def _pending_inserts(
+        self, table: str, columns: str, rows: Sequence[PendingRow], now: datetime
+    ) -> List[Tuple[str, List[Any]]]:
+        """The multi-row ``INSERT ... DO NOTHING`` statements for *rows*, in chunks."""
+        statements = []
+        for i in range(0, len(rows), self._PENDING_CHUNK):
+            chunk = rows[i : i + self._PENDING_CHUNK]
+            params: List[Any] = []
+            for row in chunk:
+                params += self._pending_row(
+                    row.claim, row.catalog_url, row.recall, None, now
+                )
+                if row.record is not None:
+                    params += self._claim_values(row.record, None, now)
+            width = len(params) // len(chunk)
+            statements.append(
+                (
+                    f"INSERT INTO {table} ({columns}) VALUES "
+                    + ", ".join([f"({', '.join('?' * width)})"] * len(chunk))
+                    + " ON CONFLICT DO NOTHING",
+                    params,
+                )
+            )
+        return statements
 
     def sync_pending_sources(self, rows: Sequence[PendingRow]) -> None:
         """Write the rows of many claimed sources at once (see ``sync_pending_source``).
@@ -1635,63 +1671,41 @@ class MetadataDatabase:
         written the real row, which a pending one must not replace. A row with a
         record goes to ``source_catalog``, one without to ``sources_volatile``.
 
-        One transaction, serialized with every other writer by the lock.
+        One transaction, serialized with every other writer by the lock; the
+        statements for the persisted rows, which are nearly all of them, are built
+        before it is taken.
         """
         if not rows:
             return
         conn = self._get_connection()
         now = datetime.now()
-        columns = (
-            "source_id, source_url, source_type, indexed_at, metadata_json, "
-            "is_resolved, unresolved_reason, tensors, unresolved_error"
+        persisted = [r for r in rows if r.record is not None]
+        volatile = [r for r in rows if r.record is None]
+        statements = self._pending_inserts(
+            "source_catalog", f"{_ROW_COLUMNS}, {_CLAIM_COLUMNS}", persisted, now
         )
         with self._write_lock:
             conn.execute("BEGIN TRANSACTION")
             try:
-                persisted = {
-                    r[0]
-                    for r in conn.execute(
-                        "SELECT source_id FROM source_catalog "
-                        "WHERE list_contains(?, source_id)",
-                        [[row.claim.source_id for row in rows]],
-                    ).fetchall()
-                }
-                with_record = [r for r in rows if r.record is not None]
-                volatile = [
-                    r
-                    for r in rows
-                    if r.record is None and r.claim.source_id not in persisted
-                ]
-                for table, group, extra in (
-                    ("source_catalog", with_record, f", {_CLAIM_COLUMNS}"),
-                    ("sources_volatile", volatile, ""),
-                ):
-                    width = 9 + (6 if extra else 0)
-                    for i in range(0, len(group), self._PENDING_CHUNK):
-                        chunk = group[i : i + self._PENDING_CHUNK]
-                        params: List[Any] = []
-                        for row in chunk:
-                            claim = row.claim
-                            params += [
-                                claim.source_id,
-                                row.catalog_url
-                                or to_catalog_url(str(claim.primary_path)),
-                                claim.source_type or "unknown",
-                                now,
-                                None,
-                                False,
-                                "needs_recall" if row.recall else "pending",
-                                [],
-                                None,
-                            ]
-                            if row.record is not None:
-                                params += self._claim_values(row.record, None, now)
-                        conn.execute(
-                            f"INSERT INTO {table} ({columns}{extra}) VALUES "
-                            + ", ".join([f"({', '.join('?' * width)})"] * len(chunk))
-                            + " ON CONFLICT DO NOTHING",
-                            params,
-                        )
+                if volatile:
+                    # A source that already has a persisted row (it moved) must
+                    # not get a second, volatile one.
+                    held = {
+                        r[0]
+                        for r in conn.execute(
+                            "SELECT source_id FROM source_catalog "
+                            "WHERE source_id IN (SELECT unnest(?))",
+                            [[row.claim.source_id for row in volatile]],
+                        ).fetchall()
+                    }
+                    statements += self._pending_inserts(
+                        "sources_volatile",
+                        _ROW_COLUMNS,
+                        [r for r in volatile if r.claim.source_id not in held],
+                        now,
+                    )
+                for sql, params in statements:
+                    conn.execute(sql, params)
                 conn.execute("COMMIT")
             except BaseException:
                 conn.execute("ROLLBACK")
