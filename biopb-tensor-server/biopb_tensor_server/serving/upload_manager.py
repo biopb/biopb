@@ -80,6 +80,8 @@ from biopb_tensor_server.core.attached import FIELDS_SEGMENT
 from biopb_tensor_server.core.axes import noncanonical_order
 from biopb_tensor_server.core.chunk import get_bounds_from_chunk_id
 from biopb_tensor_server.core.errors import (
+    SourceUnresolvedError,
+    TensorResolutionError,
     UploadClosedError,
     UploadDiscardedError,
     UploadTransitionError,
@@ -264,7 +266,7 @@ class UploadManager:
         source_id, _, field = upload_id.partition("/")
         if not field:
             return self._registry.get(upload_id), None, None
-        parent = self._registry.get_registered(source_id)
+        parent = self._registry.get(source_id)
         if parent is None:
             return None, None, None
         return _attached(parent).get(field), parent, field
@@ -364,7 +366,7 @@ class UploadManager:
         else is a no-op, and answers UNKNOWN like the rest of :meth:`discard`.
         """
         source_id, _, field = array_id.partition("/")
-        parent = self._registry.get_registered(source_id) if field else None
+        parent = self._registry.get(source_id) if field else None
         if parent is None:
             return unknown_upload_status(array_id)
         adapter = parent.detach_tensor(field)
@@ -669,7 +671,10 @@ class UploadManager:
             raise flight.FlightServerError(
                 f"add_tensor: {req_desc.array_id!r} names no tensor. Use {_ID_GRAMMAR}."
             )
-        parent = self._registry.get_registered(source_id)
+        try:
+            parent = self._registry.get_registered(source_id)
+        except (SourceUnresolvedError, TensorResolutionError) as exc:
+            raise flight.FlightServerError(f"add_tensor: {exc}") from exc
         if parent is None:
             raise flight.FlightServerError(
                 f"add_tensor: {req_desc.array_id!r} names no source "

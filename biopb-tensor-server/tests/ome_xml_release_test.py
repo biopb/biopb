@@ -291,22 +291,6 @@ def test_normalizing_wrapper_forwards_the_release(registered):
     assert registered._raw_ome_xml is None
 
 
-def test_unresolved_proxy_forwards_the_release(registered):
-    from biopb_tensor_server.adapters.unresolved import UnresolvedSourceAdapter
-    from biopb_tensor_server.core.config import SourceConfig
-
-    proxy = UnresolvedSourceAdapter(
-        SourceConfig(url=registered._source_url, type="ome-tiff", source_id="perplane"),
-        registry=None,
-    )
-    proxy.release_registration_cache()  # unresolved: a no-op, must not raise
-    proxy._resolved = registered
-
-    proxy.release_registration_cache()
-
-    assert registered._raw_ome_xml is None
-
-
 def test_every_source_adapter_answers_the_release(tmp_path):
     # It is declared on the ABC precisely so a wrapper author sees it; the
     # default is a no-op, and an adapter that holds nothing keeps it.

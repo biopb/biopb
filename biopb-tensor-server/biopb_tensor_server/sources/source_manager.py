@@ -211,7 +211,7 @@ class SourceManager:
         self._walk_threads = walk_threads
         # Background registration of what the first scan claims
         # (``registration_workers`` threads; 0 registers inline, as it always
-        # did). A read that needs a source before its turn registers it itself.
+        # did). A client that resolves a source before its turn registers it itself.
         self._registration_worker: Optional[RegistrationWorker] = None
         if registration_workers > 0:
             self._registration_worker = RegistrationWorker(
@@ -224,9 +224,30 @@ class SourceManager:
         # whenever that registration happens to finish (see
         # ``_notify_source_committed``).
         self._deferred: Dict[str, float] = {}
-        set_materializer = getattr(server.sources, "set_materializer", None)
-        if set_materializer is not None:
-            set_materializer(self._reconciler.materialize)
+        set_pending_check = getattr(server.sources, "set_pending_check", None)
+        if set_pending_check is not None:
+            set_pending_check(self._reconciler.check_registered)
+
+    def resolve_source(self, source_id: str, on_target: Callable[[str], None]) -> bool:
+        """Register a source that has no adapter yet, for the ``resolve`` action.
+
+        A cloud source is downloaded and a pending local one is registered ahead
+        of the pool; a source that is registered already is left alone. Calls
+        ``on_target`` with the path about to be opened. Returns False for an
+        unknown source, and raises why a source cannot be opened (retriable or
+        not): see ``Reconciler.materialize``.
+        """
+        adapter = self._server.sources.get(source_id)
+        path = (
+            adapter.source_url
+            if adapter is not None
+            else self._reconciler.claim_primary_path(source_id)
+        )
+        if path is None:
+            return False
+        on_target(path or source_id)
+        self._reconciler.materialize(source_id)
+        return True
 
     @property
     def roots(self) -> Roots:
@@ -1425,7 +1446,8 @@ def create_source_manager(
         logger.info("No sources configured yet; serving an empty catalog")
 
     # EXPERIMENTAL: cloud/synced-folder mode. The walk admits dehydrated entries,
-    # and register placeholder adapters resolved lazily on first access.
+    # and catalog non-resident sources as ``needs_recall``, registered when a
+    # client resolves them.
     for source in (
         *(r.source for r in roots),
         *static_sources,

@@ -598,6 +598,9 @@ class TensorFlightServer(flight.FlightServerBase):
         self._allow_runtime_source_add = True
         self._add_source_handler: Optional[Callable[..., Any]] = None
         self._remove_source_handler: Optional[Callable[..., Any]] = None
+        # ``SourceManager.resolve_source``, injected the same way: the ``resolve``
+        # action registers the source (a download, for a cloud one) through it.
+        self._resolve_handler: Optional[Callable[..., bool]] = None
 
     def flight_idle_for(self, seconds: float) -> bool:
         """True if no heavy read is in flight and none finished within *seconds*.
@@ -672,6 +675,18 @@ class TensorFlightServer(flight.FlightServerBase):
         "not enabled".
         """
         self._remove_source_handler = handler
+
+    def set_resolve_handler(self, handler: Optional[Callable[..., bool]]) -> None:
+        """Wire the SourceManager's ``resolve_source`` for the resolve action.
+
+        ``handler(source_id, on_target)`` registers a source that has no adapter
+        yet and writes its catalog row, calling ``on_target(path)`` with what it
+        is about to open; it returns False for an unknown source and raises
+        ``SourceUnresolvedError`` (retriable or not) when it cannot be opened.
+        Injected by the launcher like the add/remove handlers; ``None`` leaves the
+        action reporting "not enabled".
+        """
+        self._resolve_handler = handler
 
     @property
     def metadata_db(self) -> Optional[MetadataDatabase]:
@@ -783,7 +798,7 @@ class TensorFlightServer(flight.FlightServerBase):
         themselves.
         """
         source_id, _ = split_array_id(array_id)
-        adapter = self.sources.get_registered(source_id)
+        adapter = self.sources.get(source_id)
         if adapter is None:
             return None
         expected = adapter.tensor_capability_token(array_id)
@@ -1204,7 +1219,7 @@ class TensorFlightServer(flight.FlightServerBase):
                 # Sources claimed but not yet registered: their rows exist with
                 # ``is_resolved`` false and ``unresolved_reason`` "pending", and
                 # fill in as the background registration reaches them (or at
-                # once, when a read asks for one). 0 means the catalog is whole.
+                # once, when a client resolves one). 0 means the catalog is whole.
                 "registration_pending": self._registration_pending(),
                 # Whether drawn ROIs survive a restart. A store that was asked
                 # for and could not be opened is fatal at startup, so this is
@@ -1300,6 +1315,14 @@ class TensorFlightServer(flight.FlightServerBase):
             self._authorize(context)
             raise flight.FlightServerError(f"Unknown action: {action.type}")
 
+    def _registered(self, source_id: str) -> Optional[SourceAdapter]:
+        """``SourceRegistry.get_registered``, its refusals as Flight errors: an
+        unresolved source is "open to resolve", a failed registration says why."""
+        try:
+            return self.sources.get_registered(source_id)
+        except (SourceUnresolvedError, TensorResolutionError) as exc:
+            raise to_flight_error(exc) from exc
+
     def _handle_resolve(self, source_id: str) -> Iterator[bytes]:
         """Stream the result of resolving a source.
 
@@ -1317,29 +1340,35 @@ class TensorFlightServer(flight.FlightServerBase):
         projection let the two disagree (the adapter answers ``is_resident()``
         live, the row is a snapshot).
 
-        Resolving an already-resident source is a cheap no-op. If the client
-        disconnects mid-resolve the daemon thread runs to completion and caches
-        the result on the adapter, so a retry coalesces onto the finished work
+        Resolving registers a source that has no adapter yet -- a cloud source
+        (downloading it), a local one whose registration is pending, or one that
+        failed (retrying it) -- and writes its catalog row. Resolving a
+        registered source is a cheap no-op. If the client disconnects
+        mid-resolve the daemon thread runs to completion and registers the
+        adapter, so a retry coalesces onto the finished work
         rather than downloading again.
         """
-        adapter = self.sources.get_registered(source_id)
-        if adapter is None:
-            raise flight.FlightServerError(f"Source not found: {source_id}")
+        handler = self._resolve_handler
+        if handler is None:
+            raise flight.FlightServerError(
+                "Source resolution is not enabled on this server."
+            )
         # The terminal message IS the catalog row, so refuse before the recall
         # rather than after minutes of download with nothing to hand back.
         catalog = self._require_catalog()
 
-        # Name/size of what is being recalled, computed once (stat is recall-free).
-        # Best-effort: an unresolved adapter exposes its URL; a directory or a
+        # Name/size of what is being recalled, filled in by the handler once it
+        # knows the path (stat is recall-free). Best-effort: a directory or a
         # remote URL has no single file size, so target_bytes stays 0 (unknown).
-        source_url = adapter.source_url or source_id
-        target_name = os.path.basename(str(source_url).rstrip("/")) or str(source_url)
-        target_bytes = 0
-        try:
-            if os.path.isfile(source_url):
-                target_bytes = os.path.getsize(source_url)
-        except OSError:
-            pass
+        target = {"name": source_id, "bytes": 0}
+
+        def _on_target(path: str) -> None:
+            target["name"] = os.path.basename(str(path).rstrip("/")) or str(path)
+            try:
+                if os.path.isfile(path):
+                    target["bytes"] = os.path.getsize(path)
+            except OSError:
+                pass
 
         started = time.monotonic()
 
@@ -1347,8 +1376,8 @@ class TensorFlightServer(flight.FlightServerBase):
             return ResolveStreamMessage(
                 progress=ResolveProgress(
                     elapsed_seconds=time.monotonic() - started,
-                    target_name=target_name,
-                    target_bytes=target_bytes,
+                    target_name=target["name"],
+                    target_bytes=target["bytes"],
                 )
             ).SerializeToString()
 
@@ -1356,7 +1385,7 @@ class TensorFlightServer(flight.FlightServerBase):
 
         def _run() -> None:
             try:
-                adapter.resolve()
+                result["found"] = handler(source_id, _on_target)
             except BaseException as exc:  # surfaced on the stream below
                 result["err"] = exc
 
@@ -1383,9 +1412,14 @@ class TensorFlightServer(flight.FlightServerBase):
                 raise flight.FlightInternalError(
                     f"Source could not be resolved: {exc}"
                 ) from exc
+            if isinstance(exc, TensorResolutionError):
+                raise to_flight_error(exc) from exc
             raise flight.FlightServerError(
                 f"resolve failed for {source_id!r}: {exc}"
             ) from exc
+
+        if not result["found"]:
+            raise flight.FlightServerError(f"Source not found: {source_id}")
 
         # The row read back is the one the adapter's ``on_resolved`` callback
         # just backfilled -- resolution fires it, and that is the only thing
@@ -1436,7 +1470,7 @@ class TensorFlightServer(flight.FlightServerBase):
           filesystem reads, concurrency-safe with real reads, so warming never
           blocks a live viewer read.
         """
-        adapter = self.sources.get_registered(source_id)
+        adapter = self._registered(source_id)
         if adapter is None:
             raise flight.FlightServerError(f"Source not found: {source_id}")
 
@@ -1800,7 +1834,7 @@ class TensorFlightServer(flight.FlightServerBase):
         # crashing on None.split), so honor the documented default in this one
         # chokepoint rather than at every adapter call site.
         if field is None:
-            default_adapter = self.sources.get_registered(source_id)
+            default_adapter = self._registered(source_id)
             if default_adapter is not None:
                 descriptors = default_adapter.list_tensor_descriptors()
                 if descriptors:

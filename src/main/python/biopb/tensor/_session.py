@@ -50,7 +50,6 @@ from biopb.tensor._catalog_rows import (
     _descriptor_from_row,
     sql_literal,
     tensor_descriptors_from_row,
-    unresolved_reasons,
     with_reason,
 )
 from biopb.tensor._labels import LABELS_SEGMENT
@@ -555,7 +554,8 @@ def _raise_read_refusal(exc: flight.FlightError, array_id: str) -> None:
 
 
 def _unresolved_source_error(source_id: str) -> ValueError:
-    """Directive error for reading an *unresolved* (cloud / synced-folder) source.
+    """Directive error for reading an *unresolved* source: a cloud /
+    synced-folder one, or one the server has found but not yet registered.
 
     Shared by every read entry point so the guidance is uniform: name the cure
     (``client.resolve_source``) instead of leaking a bare internal "no tensors",
@@ -565,9 +565,9 @@ def _unresolved_source_error(source_id: str) -> ValueError:
     must not trigger it implicitly."""
     return ValueError(
         f"Source '{source_id}' is unresolved (no tensors listed yet). If this "
-        f"is a cloud / synced-folder source, call "
-        f"client.resolve_source('{source_id}') first to download and resolve "
-        f"it, then read it."
+        f"is a cloud / synced-folder source, or one the server has found but "
+        f"not yet registered, call client.resolve_source('{source_id}') first "
+        f"to resolve it, then read it."
     )
 
 
@@ -795,8 +795,6 @@ class CatalogClient:
         if not rows:
             raise ValueError(f"Source not found: {source_id}")
         row = rows[0]
-        if not row.get("is_resolved", True) and self._register_if_pending(source_id):
-            row = self._query_table(query).to_pylist()[0]
 
         if not row.get("is_resolved", True):
             # Unresolved (cloud / synced-folder) source: tensors are unknown
@@ -925,12 +923,6 @@ class CatalogClient:
         """
         source_id, tensor_id = split_array_id(array_id)
         row = self._source_tensors_row(source_id)
-        if (
-            row is not None
-            and not row.get("is_resolved", True)
-            and self._register_if_pending(source_id, row)
-        ):
-            row = self._source_tensors_row(source_id)
 
         if row is not None:
             # The flag, not an empty tensor list: a source can resolve cleanly
@@ -980,38 +972,13 @@ class CatalogClient:
         row = self._addressed_row("len(tensors) AS tensor_count", source_id)
         return row["tensor_count"] if row else None
 
-    def _register_if_pending(
-        self, source_id: str, row: Optional[Mapping[str, Any]] = None
-    ) -> bool:
-        """Have the server register a source it has claimed but not yet opened.
-
-        A row that is unresolved because its registration is queued (``pending``)
-        or failed is a local source: registering it costs no download and needs no
-        consent, so this does it before the catalog-side check that would refuse.
-        A failed one raises here with the server's reason. False for a cloud
-        placeholder, or a server too old to say, so the caller's refusal stands.
-        """
-        if row is not None and "unresolved_reason" in row:
-            reason = row["unresolved_reason"]  # the row already said so
-        else:
-            reason = unresolved_reasons(
-                lambda sql: self._query_table(sql).to_pylist(),
-                f"AND source_id = {sql_literal(source_id)}",
-                errors=flight.FlightError,
-            ).get(source_id)
-        if reason not in ("pending", "failed"):
-            return False
-        self.resolve_source(source_id)
-        return True
-
     def _source_tensors_row(self, source_id: str) -> Optional[Mapping[str, Any]]:
         """One source's addressing columns: the resolved flag and the tensor list.
 
         Not ``SOURCE_ROW_COLUMNS`` -- the source's url and type are bytes on the
-        wire nobody here reads. Carries ``unresolved_reason`` when the server has it.
+        wire nobody here reads.
         """
-        columns = with_reason("is_resolved, tensors", self._catalog_columns())
-        return self._addressed_row(columns, source_id)
+        return self._addressed_row("is_resolved, tensors", source_id)
 
     def source_row_columns(self) -> str:
         """``SOURCE_ROW_COLUMNS`` as a SELECT list, plus ``unresolved_reason``

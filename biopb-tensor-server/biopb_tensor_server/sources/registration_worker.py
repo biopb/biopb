@@ -4,9 +4,9 @@ Registration opens and parses each source's file, which is what makes a first
 scan of a large site take hours. The scan therefore commits every claim to the
 catalog alone (``Reconciler._commit_pending_claim``) and queues the source here; a
 small pool of threads registers them, newest file first, so what a user is most
-likely to want is complete soonest. A read that needs a source before its turn
-registers it itself (``Reconciler.ensure_registered``, single-flight), and the
-worker finds it done when it gets there.
+likely to want is complete soonest. A client that resolves a source before its
+turn registers it itself (``Reconciler.ensure_registered``, single-flight), and
+the worker finds it done when it gets there.
 
 The pool can be held while the first scan walks (``pause``): registering and
 walking contend, and a held pool lets the walk finish, and so the whole catalog

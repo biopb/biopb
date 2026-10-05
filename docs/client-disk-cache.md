@@ -167,5 +167,5 @@ path.
 - No config surface beyond the four `BIOPB_CHUNK_CACHE*` env vars — nothing
   plumbs this through biopb-mcp's `dask.*` config.
 - A second SDK (e.g. Java) sharing this tree is undecided and not built.
-- `UnresolvedSourceAdapter` (the URL-only cloud model) sets no
-  `_content_version` and therefore cannot be safely served via this path.
+- A cloud source that is not resolved (a catalog row and a claim, no adapter) has
+  no `_content_version` and therefore cannot be safely served via this path.

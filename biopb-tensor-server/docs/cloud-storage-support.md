@@ -63,20 +63,15 @@ sniff) are guarded by `ClaimContext.is_resident()` and, when non-resident,
 emit a provisional `unresolved=True` claim that defers the content read to
 resolve.
 
-**The unresolved adapter (`adapters/unresolved.py`).**
-`Reconciler._claim_is_unresolved` registers a cloud source behind an
-`UnresolvedSourceAdapter` — a catalog row with empty `tensors` and
-`is_resolved=false`. It is split into two surfaces:
-
-- a **catalog surface** (`list_tensor_descriptors` / `get_metadata` /
-  `is_resident`) that never resolves, keeping the metadata-DB sync and the
-  precache worker cheap (precache loops the empty tensor list and skips
-  before any serving call — an unresolved source is never
-  background-warmed);
-- a **serve surface** (`get_tensor_adapter`) that raises
-  `SourceUnresolvedError` rather than hydrating, so `GetFlightInfo`/`DoGet`
-  and the SDK probes stay recall-free and steer callers to the dedicated
-  resolve trigger.
+**An unresolved source has no adapter.**
+`Reconciler._claim_is_unresolved` catalogs a cloud source as a pending row,
+`unresolved_reason` `needs_recall`, `is_resolved=false` and empty `tensors`,
+and keeps its claim; nothing is registered and nothing is opened. It never joins
+the background registration queue, since registering it downloads it, so
+precache has no adapter to warm and an unresolved source is never
+background-warmed. A read of it raises `SourceUnresolvedError` rather than
+hydrating, so `GetFlightInfo`/`DoGet` and the SDK probes stay recall-free and
+steer callers to the dedicated resolve trigger.
 
 **The streaming resolve action (`do_action("resolve")`, `_handle_resolve`).**
 A single dedicated action is the sole resolution trigger — not a side effect
@@ -84,11 +79,11 @@ of `GetFlightInfo`, which would smuggle a minutes-long hydrate into a
 descriptor RPC and trip proxy idle-read timeouts. It streams: empty-body
 heartbeat Results keep the connection warm under proxy timeouts, then one
 terminal Result carries the source's now-concrete catalog row (every tensor,
-one call). Resolution re-runs the real claim + `create_from_config` on the
-now-resident path (the recorded `source_type` was a recall-free guess; the
-authoritative one comes from the hydrated content), caches the real adapter,
-fires `on_resolved` (the metadata-DB backfill — an upsert, so the NULL-shape
-row is overwritten in place), and delegates thereafter. It runs once under a
+one call). Resolution is `Reconciler.materialize`: it re-runs the real claim +
+`create_from_config` on the now-resident path (the recorded `source_type` was a
+recall-free guess; the authoritative one comes from the hydrated content),
+registers the real adapter and upserts its catalog row (the NULL-shape row is
+overwritten in place). It runs once under a
 lock on a daemon thread, so a client disconnect mid-resolve doesn't abort it
 and a retry coalesces. Failure is classified: a transient recall/IO error
 raises `SourceResolveRetriableError` (UNAVAILABLE, "retry"); a permanent one
@@ -128,7 +123,7 @@ time.
   by per-slice `SeriesInstanceUID`) need a content read to know their
   members, and a directory can hold several such datasets, so the dir isn't
   the boundary. They are gated on `ClaimContext.cloud_root` (recorded per
-  entry at scan, carried onto the `UnresolvedSourceAdapter` so it holds at
+  entry at scan, re-derived from the root when it resolves, so it holds at
   both scan *and* resolve — residency can't gate resolve, where the file is
   resident) and under cloud return `None`, so each `.tif`/`.dcm` becomes its
   own single-file source. No later reconstruction.

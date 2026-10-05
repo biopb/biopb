@@ -406,7 +406,7 @@ class TestRuntimePhaseGating:
 
             fired = []
             sm.set_source_committed_hook(fired.append)
-            claim = SimpleNamespace(source_id="s1", primary_path="/x")
+            claim = SimpleNamespace(source_id="s1", primary_path="/x", unresolved=False)
 
             # During the initial scan: startup sources go to the backlog, not the
             # prompt enqueue -- the hook must NOT fire.
@@ -446,7 +446,7 @@ class TestRuntimePhaseGating:
 
             sm.set_source_committed_hook(boom)
             sm._initial_scan_done = True
-            claim = SimpleNamespace(source_id="s2", primary_path="/y")
+            claim = SimpleNamespace(source_id="s2", primary_path="/y", unresolved=False)
             # Commit still succeeds despite the hook raising.
             assert sm._reconciler._commit_add_claim(claim) is True
         finally:

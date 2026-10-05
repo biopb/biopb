@@ -323,11 +323,6 @@ class NormalizingAdapter(TensorAdapter):
         # is what carries the guarantee.
         return self._inner.get_metadata()
 
-    def resolve(self) -> None:
-        # Nothing to normalize: resolution hydrates, and the tensors the caller
-        # reads afterwards come back through list_tensor_descriptors above.
-        self._inner.resolve()
-
     def is_resident(self) -> bool:
         return self._inner.is_resident()
 
@@ -609,8 +604,8 @@ def needs_normalization(adapter: SourceAdapter) -> bool:
     source, and its concrete type is something callers legitimately test and
     switch on.
 
-    The gap that leaves is closed at a closer seam: ``UnresolvedSourceAdapter``
-    normalizes the adapter it builds at resolution time, when the labels finally
+    The gap that leaves is closed at a closer seam: the reconciler normalizes the
+    adapter it builds when a cloud source is resolved, when the labels finally
     exist. Nothing else advertises tensors late -- the remote proxy, which does,
     is not a candidate for wrapping at all (``_normalizable_axes``), so an
     upstream that is down at registration cannot leave a source stranded in a

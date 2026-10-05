@@ -176,8 +176,7 @@ class TestReadRoundTrips:
         for _ in range(8):
             client.get_tensor("scened", slice_hint=OPEN_ENDED)
 
-        # +1 plan: the connection's one read of the ``sources`` schema.
-        assert (counter.plans, counter.catalog_queries) == (9, 8)
+        assert (counter.plans, counter.catalog_queries) == (8, 8)
 
     def test_a_full_read_asks_nothing_extra(self, counted):
         """No slice_hint at all: nothing to fill, and a qualified id to route."""

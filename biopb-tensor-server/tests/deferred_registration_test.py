@@ -15,7 +15,10 @@ import numpy as np
 import pytest
 from biopb_tensor_server.adapters import get_default_registry
 from biopb_tensor_server.core.discovery import DiscoveryState
-from biopb_tensor_server.core.errors import SourceRegistrationError
+from biopb_tensor_server.core.errors import (
+    SourceRegistrationError,
+    SourceUnresolvedError,
+)
 from biopb_tensor_server.sources.registration_worker import RegistrationWorker
 
 from tests import catalog_server, make_manager
@@ -58,6 +61,13 @@ def _rows(server):
         "len(tensors) AS tensors FROM sources ORDER BY source_id"
     )
     return {row["source_id"]: row for row in table.to_pylist()}
+
+
+def _resolve(manager, server, source_id):
+    """What the ``resolve`` action does for a source: register it now. Returns
+    its adapter (None for an unknown source)."""
+    manager.resolve_source(source_id, lambda path: None)
+    return server.sources.get(source_id)
 
 
 def _only_ids(server):
@@ -115,15 +125,15 @@ class TestFirstScan:
         assert manager.pending_registrations() == 1
 
 
-class TestReadRegistersTheSource:
-    def test_get_registered_swaps_in_the_real_adapter_and_fills_the_row(self, tmp_path):
+class TestResolveRegistersTheSource:
+    def test_materialize_swaps_in_the_real_adapter_and_fills_the_row(self, tmp_path):
         for name in ("a.zarr", "b.zarr"):
             _make_zarr(tmp_path, name)
         manager, server = _manager(tmp_path)
         _first_scan(manager)
         first, second = _only_ids(server)
 
-        adapter = server.sources.get_registered(first)
+        adapter = _resolve(manager, server, first)
 
         assert adapter is not None
         assert server.sources.get(first) is adapter
@@ -134,6 +144,50 @@ class TestReadRegistersTheSource:
         # The other source is untouched.
         assert server.sources.get(second) is None
         assert manager.pending_registrations() == 1
+
+    def test_a_read_of_a_pending_source_asks_for_a_resolve_and_registers_nothing(
+        self, tmp_path
+    ):
+        _make_zarr(tmp_path, "a.zarr")
+        manager, server = _manager(tmp_path)
+        _first_scan(manager)
+        (sid,) = _only_ids(server)
+
+        with pytest.raises(SourceUnresolvedError, match="resolve"):
+            server.sources.get_registered(sid)
+
+        assert server.sources.get(sid) is None
+        assert manager.pending_registrations() == 1
+
+    def test_the_server_maps_the_refusal_to_open_to_resolve(self, tmp_path):
+        from pyarrow import flight
+
+        _make_zarr(tmp_path, "a.zarr")
+        manager, server = _manager(tmp_path)
+        _first_scan(manager)
+        (sid,) = _only_ids(server)
+
+        with pytest.raises(flight.FlightUnavailableError, match="resolve"):
+            server._registered(sid)
+        assert server._registered("nope") is None
+
+    def test_an_upload_lookup_under_a_pending_source_is_unknown_not_an_error(
+        self, tmp_path
+    ):
+        _make_zarr(tmp_path, "a.zarr")
+        manager, server = _manager(tmp_path)
+        _first_scan(manager)
+        (sid,) = _only_ids(server)
+
+        assert server.uploads._locate(f"{sid}/labels") == (None, None, None)
+
+    def test_a_read_of_a_registered_source_is_served(self, tmp_path):
+        _make_zarr(tmp_path, "a.zarr")
+        manager, server = _manager(tmp_path)
+        _first_scan(manager)
+        (sid,) = _only_ids(server)
+        adapter = _resolve(manager, server, sid)
+        assert server.sources.get_registered(sid) is adapter
 
     def test_an_unknown_source_is_none_not_an_error(self, tmp_path):
         manager, server = _manager(tmp_path)
@@ -150,7 +204,7 @@ class TestReadRegistersTheSource:
         pending = reconciler.catalog_url_of(second)
         assert pending.endswith(os.path.basename(reconciler.claim_primary_path(second)))
 
-        server.sources.get_registered(first)
+        _resolve(manager, server, first)
         assert reconciler.catalog_url_of(first) == server.sources.get(first).catalog_url
         assert reconciler.catalog_url_of("nope") is None
 
@@ -162,7 +216,7 @@ class TestReadRegistersTheSource:
         first, second = _only_ids(server)
         assert manager.unregistered_sources() == 2
 
-        server.sources.get_registered(first)
+        _resolve(manager, server, first)
         assert manager.unregistered_sources() == 1
         assert len(server.sources) == 1
 
@@ -193,7 +247,7 @@ class TestReadRegistersTheSource:
         results = []
         threads = [
             threading.Thread(
-                target=lambda: results.append(server.sources.get_registered(sid))
+                target=lambda: results.append(_resolve(manager, server, sid))
             )
             for _ in range(4)
         ]
@@ -272,7 +326,7 @@ class TestTheWorker:
         def reader(ids):
             try:
                 for sid in ids:
-                    adapter = server.sources.get_registered(sid)
+                    adapter = _resolve(manager, server, sid)
                     assert adapter is not None
             except Exception as exc:  # noqa: BLE001 - surfaced below
                 errors.append(exc)
@@ -418,7 +472,7 @@ class TestFailure:
         self._break(path)
 
         with pytest.raises(SourceRegistrationError, match="could not be registered"):
-            server.sources.get_registered(sid)
+            _resolve(manager, server, sid)
 
         row = _rows(server)[sid]
         assert row["is_resolved"] is False
@@ -446,7 +500,7 @@ class TestFailure:
         )[1]
         for _ in range(2):
             with pytest.raises(SourceRegistrationError):
-                server.sources.get_registered(sid)
+                _resolve(manager, server, sid)
         assert attempts == []  # inside its backoff window
 
     def test_it_is_retried_once_the_backoff_has_passed_and_the_file_is_fixed(
@@ -551,7 +605,7 @@ class TestPrecacheRouting:
         (sid,) = _only_ids(server)
         assert routed == []
 
-        server.sources.get_registered(sid)
+        _resolve(manager, server, sid)
 
         assert [s for s, _ in routed] == [sid]
         assert routed[0][1] > 0
@@ -565,7 +619,7 @@ class TestPrecacheRouting:
         assert not manager.registration_idle()  # first scan not done
         _first_scan(manager)
         assert not manager.registration_idle()
-        server.sources.get_registered(_only_ids(server)[0])
+        _resolve(manager, server, _only_ids(server)[0])
         assert manager.registration_idle()
 
     def test_enqueue_backlog_orders_newest_first_and_skips_what_is_queued(self):
@@ -632,6 +686,7 @@ class TestOverFlight:
         manager, server = _manager(tmp_path)
         server.set_registration_pending_provider(manager.pending_registrations)
         server.set_unregistered_provider(manager.unregistered_sources)
+        server.set_resolve_handler(manager.resolve_source)
         _first_scan(manager)
         server.mark_ready()
         threading.Thread(target=server.serve, daemon=True).start()
@@ -655,11 +710,16 @@ class TestOverFlight:
             client.close()
             server.shutdown()
 
-    def test_reading_a_pending_source_registers_it(self, tmp_path):
+    def test_reading_a_pending_source_asks_for_a_resolve(self, tmp_path):
         manager, server, client = self._serve(tmp_path)
         try:
             first, second = _only_ids(server)
 
+            with pytest.raises(ValueError, match="resolve_source"):
+                client.get_tensor(first)
+            assert manager._reconciler.is_pending(first)
+
+            client.resolve_source(first)
             data = client.get_tensor(first).compute()
 
             assert data.shape == (2, 8, 8)
@@ -685,29 +745,6 @@ class TestOverFlight:
 
         state.raw_client = Wrapped()
         return raw
-
-    def test_an_open_ended_read_of_a_pending_source_asks_for_its_reason_once(
-        self, tmp_path
-    ):
-        """The reason rides the row the read already fetches, so no second query
-        asks for it."""
-        manager, server, client = self._serve(tmp_path)
-        try:
-            first, _ = _only_ids(server)
-            asked = []
-            raw = client._state.raw_client
-
-            def do_get(ticket, *a, **k):
-                asked.append(ticket.ticket)
-                return raw.do_get(ticket, *a, **k)
-
-            self._wrap_raw(client, do_get=do_get)
-            client.get_tensor(first, slice_hint=(slice(0, None),) * 3)
-
-            assert not [t for t in asked if b"source_id, unresolved_reason" in t]
-        finally:
-            client.close()
-            server.shutdown()
 
     def test_a_listing_projection_carries_the_reason(self, tmp_path):
         manager, server, client = self._serve(tmp_path)
@@ -760,19 +797,23 @@ class TestOverFlight:
             client.close()
             server.shutdown()
 
-    def test_the_sdk_registers_a_pending_source_before_it_would_refuse(self, tmp_path):
-        """``get_source_metadata`` and ``get_descriptor`` check the catalog row
-        first, and refuse an unresolved one without asking the server."""
+    def test_the_sdk_refuses_a_pending_source_until_it_is_resolved(self, tmp_path):
+        """``get_source_metadata`` and ``get_descriptor`` refuse an unresolved row
+        without registering anything: only ``resolve_source`` does."""
         manager, server, client = self._serve(tmp_path, count=3)
         try:
             first, second, third = _only_ids(server)
 
-            assert client.get_source_metadata(first) is not None
-            assert manager._reconciler.is_pending(first) is False
+            for call in (client.get_source_metadata, client.get_descriptor):
+                with pytest.raises(ValueError, match="resolve_source"):
+                    call(first)
+            assert manager._reconciler.is_pending(first)
 
-            desc = client.get_descriptor(second)
+            client.resolve_source(first)
+            assert client.get_source_metadata(first) is not None
+            desc = client.get_descriptor(first)
             assert list(desc.shape) == [2, 8, 8]
-            assert manager._reconciler.is_pending(second) is False
+            assert manager._reconciler.is_pending(second) is True
             assert manager._reconciler.is_pending(third) is True
         finally:
             client.close()
@@ -787,8 +828,10 @@ class TestOverFlight:
                 if os.path.exists(meta):
                     with open(meta, "w") as f:
                         f.write("{ not json")
-            with pytest.raises(Exception, match="could not be registered"):
+            with pytest.raises(ValueError, match="resolve_source"):
                 client.get_descriptor(sid)
+            with pytest.raises(Exception, match="could not be registered"):
+                client.resolve_source(sid)
         finally:
             client.close()
             server.shutdown()
