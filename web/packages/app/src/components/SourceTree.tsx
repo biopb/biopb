@@ -260,7 +260,7 @@ export function TreeRow({
     const doubleClickToResolve = kind === "recall" && startResolve && !inFlight;
     return (
       <div
-        className="tree-item unresolved"
+        className={`tree-item unresolved${inFlight ? " resolving" : ""}`}
         // Focusable so a click (or Tab) highlights the row like a selection
         // without opening anything: there is no tensor to open yet.
         tabIndex={0}
@@ -280,7 +280,9 @@ export function TreeRow({
         <span className="unresolved-glyph" aria-label="Not resolved">
           {kind === "recall" ? UNRESOLVED_GLYPH : "\u2026"}
         </span>
-        <span style={{ flex: 1, marginLeft: 4 }}>{node.name}</span>
+        <span className="tree-name" style={{ flex: 1, marginLeft: 4 }}>
+          {node.name}
+        </span>
         {kind === "recall" ? (
           startResolve ? (
             <span

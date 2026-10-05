@@ -170,6 +170,24 @@ describe("TreeRow for an unresolved source", () => {
     expect(html).toContain("Resolving");
   });
 
+  it("marks the row as resolving, for the animation, only while one is under way", () => {
+    const row = (resolving: string[]) =>
+      renderToStaticMarkup(
+        <TreeRow
+          node={sourceNode(CLOUD)}
+          activeSourceId={null}
+          activeTensorId={null}
+          expandedFolders={new Set()}
+          toggleFolder={() => {}}
+          selectSource={() => {}}
+          startResolve={() => {}}
+          resolving={new Set(resolving)}
+        />,
+      );
+    expect(row(["onedrive_9c1"])).toContain("unresolved resolving");
+    expect(row([])).not.toContain("resolving\"");
+  });
+
   it("explains itself on hover, keeping the url", () => {
     const html = render(sourceNode(CLOUD));
     expect(html).toContain("Not resolved");

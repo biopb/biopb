@@ -120,6 +120,23 @@ html, body {
 }
 .tree-item.unresolved:hover { background: #1e2435; color: #94a3b8; }
 .tree-item.unresolved:focus { background: #2a3347; color: #94a3b8; outline: none; }
+/* A resolve under way: the name pulses and trails animated dots, so the row
+   reads as busy for as long as the download takes. */
+.tree-item.unresolved.resolving { color: #93c5fd; animation: resolving-pulse 1.4s ease-in-out infinite; }
+.tree-item.unresolved.resolving .tree-name::after {
+  content: "...";
+  display: inline-block;
+  overflow: hidden;
+  vertical-align: bottom;
+  width: 0;
+  animation: resolving-dots 1.2s steps(4, end) infinite;
+}
+@keyframes resolving-dots { to { width: 1.2em; } }
+@keyframes resolving-pulse { 50% { opacity: 0.55; } }
+@media (prefers-reduced-motion: reduce) {
+  .tree-item.unresolved.resolving { animation: none; }
+  .tree-item.unresolved.resolving .tree-name::after { animation: none; width: 1.2em; }
+}
 .tree-item.unresolved:focus-visible { outline: 1px solid #2d5a8f; outline-offset: -1px; }
 
 .unresolved-glyph {
