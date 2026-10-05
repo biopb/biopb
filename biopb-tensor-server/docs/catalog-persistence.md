@@ -332,9 +332,30 @@ serves. Sources that fail repeatedly are removed (`_max_refresh_failures`, in me
 
 **Failed rows stay failed.** A failed row persists as unresolved with reason `failed`, its
 error and its signature. Restore does not retry it, and neither does a rescan while the
-signature is unchanged. Two things clear it: the walker finding a new signature for the
-same URL, which is a refresh as above, and a re-drop of its path (below). The only other
-way out is deletion.
+signature is unchanged. What clears it: the walker finding a new signature for the same
+URL (a refresh as above), a re-drop of its path (below), or a client resolving it, which
+is an explicit request. The only other way out is deletion.
+
+Today's code does not behave this way: `_requeue_failed_registrations` re-enqueues every
+failed pending source on each rescan tick once its backoff has passed (1 s doubling to a
+60 s cap, no limit on attempts), so a failed source is retried for as long as the server
+runs. Stage 1.5 removes that requeue (and `failed_pending_due`). The backoff stays as a
+gate on the walker's refresh and on a client resolve, which also call
+`_should_retry_source`. A restored failed row has to be put back in the reconciler's
+`_pending` and `_pending_failed` maps with its persisted `unresolved_error`, or a read of
+it would find neither an adapter nor the reason.
+
+**A refresh that keeps failing removes the source.** The failure tracker is in memory,
+per source, and counts every failed attempt: an add, a pending registration, a resolve
+or a refresh. A refresh that fails with the count at five or more (`_max_refresh_failures`)
+removes the source, logging that it gives up rather than serve a stale adapter, and its
+row is deleted. That rule assumed an adapter to protect. For a source that never
+registered there is none, and five failed registrations followed by one failed refresh
+now removes a failed row, which the next walk re-adds as new (removal clears the
+tracker). A re-drop that fails on the fifth attempt removes it the same way. The tracker
+resets at restart, so a restored failed row starts at zero. Decide whether the removal
+applies only to a source that has a resolved adapter; the plan assumes it does, since
+otherwise a failed row cannot stay failed.
 
 **DnD heals what the signature cannot see.** The signature has known gaps: a cloud file's
 is `(dev, ino)` only, and a directory's is its own stat, which does not move when a member
@@ -344,6 +365,25 @@ directory sources and sources inside a known root, and removes registered source
 it whose files are gone. So a re-drop is both the repair for those gaps and the user's
 request to retry a failed row. A rescan never does either; a restart used to, and a
 restored catalog will not (the rebuild flag is the other escape hatch).
+
+Details of the drop, read from `add_local_source`:
+
+- Refused until the first scan has finished.
+- A refresh does not go through the backoff gate (`_should_retry_source`) or the
+  stability window, so a drop always retries. A pending source it refreshes is registered
+  by that refresh.
+- Cloudness belongs to the root, not the call. Inside a known root the root's own flag
+  decides; asking for cloud mode inside a non-cloud root is refused. Outside every root
+  the drop becomes a root of its own, cloud if asked. So a re-drop inside a configured
+  cloud root refreshes its claims as cloud: a non-resident one goes back to `needs_recall`
+  without being opened (`_refresh_recall_claim`), a resident one is rebuilt.
+- Sources under a drop's own root are volatile, so only a drop inside a configured root
+  repairs rows that persist.
+
+The walker's own refresh is narrower. A claim is refreshed only when it is quiet (the
+stability window, which cloud sources skip) and past its backoff. Cloud-root claims are
+diffed only on a full pass; an incremental tick does not walk them, so the table's rules
+for them run once per full pass.
 
 **Scan cases.** Each discovered claim is one of: known and unchanged, known and changed
 (refresh), new (batched insert). A restored claim the walk did not see is dropped by the
