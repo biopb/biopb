@@ -328,7 +328,7 @@ refreshed rather than skipped.
 **A refresh is a replacement, not a state change of the row.** `_refresh_claim` builds
 the new adapter and swaps it in over the old one, which keeps serving until then. So a
 refresh writes no pending row: the view never says "pending" while the old adapter still
-serves. Sources that fail repeatedly are removed (`_max_refresh_failures`, in memory).
+serves. A failed refresh leaves the old adapter serving and the old row in place.
 
 **Failed rows stay failed.** A failed row persists as unresolved with reason `failed`, its
 error and its signature. Restore does not retry it, and neither does a rescan while the
@@ -339,23 +339,26 @@ is an explicit request. The only other way out is deletion.
 Today's code does not behave this way: `_requeue_failed_registrations` re-enqueues every
 failed pending source on each rescan tick once its backoff has passed (1 s doubling to a
 60 s cap, no limit on attempts), so a failed source is retried for as long as the server
-runs. Stage 1.5 removes that requeue (and `failed_pending_due`). The backoff stays as a
-gate on the walker's refresh and on a client resolve, which also call
-`_should_retry_source`. A restored failed row has to be put back in the reconciler's
-`_pending` and `_pending_failed` maps with its persisted `unresolved_error`, or a read of
-it would find neither an adapter nor the reason.
+runs, and a claim whose inline registration fails is not committed at all and is re-added
+by the next walk after its backoff. Stage 1.5 removes both: every claim is committed with
+its row first, and a failed registration marks that row failed. A restored failed row has
+to be put back in the reconciler's `_pending` and `_pending_failed` maps with its
+persisted `unresolved_error`, or a read of it would find neither an adapter nor the
+reason.
 
-**A refresh that keeps failing removes the source.** The failure tracker is in memory,
-per source, and counts every failed attempt: an add, a pending registration, a resolve
-or a refresh. A refresh that fails with the count at five or more (`_max_refresh_failures`)
-removes the source, logging that it gives up rather than serve a stale adapter, and its
-row is deleted. That rule assumed an adapter to protect. For a source that never
-registered there is none, and five failed registrations followed by one failed refresh
-now removes a failed row, which the next walk re-adds as new (removal clears the
-tracker). A re-drop that fails on the fifth attempt removes it the same way. The tracker
-resets at restart, so a restored failed row starts at zero. Decide whether the removal
-applies only to a source that has a resolved adapter; the plan assumes it does, since
-otherwise a failed row cannot stay failed.
+**Only the walker removes a source, and nothing counts failures.** A failed row is not
+removed for failing again. The in-memory failure tracker (`_FailureTracker`,
+`_failed_sources`) goes: its attempt count fed only the rule that removed a source after
+`_max_refresh_failures` (5) failed refreshes, which assumed a stale adapter to protect
+and would delete a failed row that never registered; its retry time gated the requeue
+and the walker's add and refresh, none of which retries on a timer any more, and a new
+signature or a drop should retry at once; and its log stamp rate-limited the repeated
+failure log that retries produced. Registration failures are then logged once, where they
+happen. A source leaves the catalog only when the walk (or a drop's removal half) finds
+its files gone and its claim quiet, as `_commit_remove_source` does today. Code and tests
+that touch the tracker change with it: `_should_retry_source`,
+`_record_failed_source_attempt`, `_clear_failed_source_attempt`, `_log_source_failure`,
+`failed_pending_due`, and the tests that read `_failed_sources`.
 
 **DnD heals what the signature cannot see.** The signature has known gaps: a cloud file's
 is `(dev, ino)` only, and a directory's is its own stat, which does not move when a member
@@ -369,9 +372,9 @@ restored catalog will not (the rebuild flag is the other escape hatch).
 Details of the drop, read from `add_local_source`:
 
 - Refused until the first scan has finished.
-- A refresh does not go through the backoff gate (`_should_retry_source`) or the
-  stability window, so a drop always retries. A pending source it refreshes is registered
-  by that refresh.
+- A refresh does not go through the stability window, so a drop always retries (it never
+  went through the backoff, which is removed). A pending source it refreshes is
+  registered by that refresh.
 - Cloudness belongs to the root, not the call. Inside a known root the root's own flag
   decides; asking for cloud mode inside a non-cloud root is refused. Outside every root
   the drop becomes a root of its own, cloud if asked. So a re-drop inside a configured
@@ -381,7 +384,7 @@ Details of the drop, read from `add_local_source`:
   repairs rows that persist.
 
 The walker's own refresh is narrower. A claim is refreshed only when it is quiet (the
-stability window, which cloud sources skip) and past its backoff. Cloud-root claims are
+stability window, which cloud sources skip). Cloud-root claims are
 diffed only on a full pass; an incremental tick does not walk them, so the table's rules
 for them run once per full pass.
 
