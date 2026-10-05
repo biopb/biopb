@@ -2806,15 +2806,16 @@ async def get_tile(
             read_level=plan.read_level,
             read_scale_hint=plan.scale_hint,
         )
-        arr = client.get_array(
-            # The array_id the geometry above was read from, not a rebuilt one:
-            # the two used to be derived separately and could disagree.
-            td.array_id,
-            slice_hint=_build_slice_hint(start, stop),
-            scale_hint=scale_hint,
-            reduction_method=plan.method,
+        arr = _normalize_array(
+            client.get_array(
+                # The array_id the geometry above was read from, not a rebuilt
+                # one: the two used to be derived separately and could disagree.
+                td.array_id,
+                slice_hint=_build_slice_hint(start, stop),
+                scale_hint=scale_hint,
+                reduction_method=plan.method,
+            )
         )
-        arr = _normalize_array(arr)
         if plan.residual is None:
             return arr
         return _normalize_array(downsample_block(arr, tuple(plan.residual), "nearest"))
