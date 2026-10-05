@@ -192,6 +192,10 @@ class Reconciler:
         # While the first scan streams its claims, their pending rows are written
         # in batches by this (None otherwise: one write per claim).
         self._pending_writer: Optional[PendingRowWriter] = None
+        # Claims the first scan committed as the walk found them. Their signature
+        # was taken a moment before the end-of-walk reconcile, which would stat
+        # every member again to compare it with itself.
+        self._streamed_ids: Set[str] = set()
         self._pending: Dict[str, Optional[str]] = {}
         self._pending_failed: Dict[str, str] = {}
         # The pending sources that wait for a client, not the pool: a cloud source
@@ -521,8 +525,11 @@ class Reconciler:
         current_ids = set(current_claims)
         discovered_ids = set(discovered_claims)
 
+        # Consumed once: a later rescan streams nothing, and diffs every claim. A
+        # claim streamed here that changes afterwards is caught by that rescan.
+        streamed, self._streamed_ids = self._streamed_ids, set()
         changed_ids: Set[str] = set()
-        for source_id in current_ids & discovered_ids:
+        for source_id in (current_ids & discovered_ids) - streamed:
             new_signatures = self._build_claim_signatures(discovered_claims[source_id])
             existing_signatures = self._source_signatures.get(source_id)
             if existing_signatures is None:
@@ -634,7 +641,9 @@ class Reconciler:
             )
         return signatures
 
-    def _catalog_record(self, claim: SourceClaim) -> Optional[CatalogRecord]:
+    def _catalog_record(
+        self, claim: SourceClaim, reuse_signature: bool = False
+    ) -> Optional[CatalogRecord]:
         """The claim and its signature, if its source could be restored later.
 
         Restorable means local, under a monitored or scan-once root that is not
@@ -645,6 +654,12 @@ class Reconciler:
 
         The persisted signature drops ``st_dev`` (first element), which can
         renumber across boots and would make every row look changed.
+
+        With *reuse_signature* the one state already holds is used, not a new
+        ``stat``: for a claim registering after it was committed pending, that
+        is the signature taken at claim time, which is the one that must sit
+        beside the parse. A source that is not pending must not (a refresh: state
+        holds the old file's).
         """
         if claim.source_type == "tensor-server" or claim.is_remote:
             return None
@@ -655,9 +670,12 @@ class Reconciler:
             or root.kind not in (RootKind.MONITORED, RootKind.SCAN_ONCE)
         ):
             return None
-        signature = {
-            path: sig[1:] for path, sig in self._build_claim_signatures(claim).items()
-        }
+        signatures = (
+            self._source_signatures.get(claim.source_id) if reuse_signature else None
+        )
+        if signatures is None:
+            signatures = self._build_claim_signatures(claim)
+        signature = {path: sig[1:] for path, sig in signatures.items()}
         from biopb_tensor_server.serving.metadata_db import CatalogRecord
 
         return CatalogRecord(claim=claim, signature=signature)
@@ -723,7 +741,8 @@ class Reconciler:
         with self._lock:
             if claim.source_id in self._state.claims:
                 return
-        self._commit_add_claim(claim)
+        if self._commit_add_claim(claim):
+            self._streamed_ids.add(claim.source_id)
 
     def _commit_add_claim(
         self,
@@ -1378,7 +1397,11 @@ class Reconciler:
         # Taken before the adapter is built, so a file that changes during the
         # parse is recorded with the identity the parse started from.
         record = (
-            None if recall or catalog_seed is not None else self._catalog_record(claim)
+            None
+            if recall or catalog_seed is not None
+            else self._catalog_record(
+                claim, reuse_signature=self.is_pending(claim.source_id)
+            )
         )
         try:
             source_config = self._source_config_for(claim)
