@@ -245,7 +245,7 @@ signature gap itself is healed by a re-drop, as for directories.
 - **`scanning` / "Indexing…"** and `full_scan_in_progress` mean "verifying", not
   "empty", once the catalog is restored; the SPA hint and any client that treats a listed
   id as present must read `confirmed`.
-- **Failure tracker, `_missed_scans`, `_cloud_source_ids`** are in memory; they are
+- **`_missed_scans` and `_cloud_source_ids`** are in memory; they are
   rebuilt from the restored claims, and empty is fine.
 - **A hydration that fails** (the file was removed or no longer parses) must not leave a
   resolved row behind: it takes the same path as a failed registration (the row becomes
@@ -301,5 +301,9 @@ restored yet, and the epoch and `last_seen` sweep are stage 2.
 - The cost of `INSERT OR REPLACE` and one-column updates at 100k rows with large
   `metadata_json`, on a real catalog (measured at 35k rows with a synthetic 3.3 KB
   `metadata_json`: an `UPDATE` about 3.1 ms a row against 4.5 ms for `INSERT OR REPLACE`).
-- Whether a root's walk skips nested roots' subtrees; the sweep scope must match.
+- Roots are not to nest, and no file is to be reachable from two roots; that is policy, since a
+  link defeats a lexical check. Each root's scan (and so its sweep) is scoped to the claims
+  spelled under it. A file reached from two roots has one `source_id` and belongs to the
+  root whose walk committed it, so a per-root sweep can drop what the other root still
+  reaches: run it after every root has been walked, or only on ids no root found.
 - Whether nd2 and czi carry embedded masks or ROIs.

@@ -36,8 +36,8 @@ string is used where**, and how the first scan differs from every later one.
 | Source kind | Found by | When | Removed by |
 |---|---|---|---|
 | Static (typed entry, a file, one remote source) | Seeded as a claim, no walk | Once, at construction | Never (config change) |
-| Scan-once directory (`monitor = false`) | Walker, `_register_root` | First tick only, then again on a drop of it | A drop of the same root |
-| Monitored directory | Walker, `_rescan_monitored_dirs` | Every tick | The reconcile diff (§5) |
+| Scan-once directory (`monitor = false`) | Walker, `_scan_root` | First tick only, then again on a drop of it | The same scan's removal (§5), at once |
+| Monitored directory | Walker, `_scan_root` | Every tick | The same scan's removal (§5), after two misses |
 | Dropped path (`add_local_source`) | Walker, `_register_root` | On request, once the first scan is done | A re-drop of the root (what vanished), or `remove_source` for a marked drop |
 | Upstream tensor-server mirror | Upstream catalog query, not the walker | Adaptive cadence per upstream | The upstream re-list |
 
@@ -134,13 +134,46 @@ stability gate is bypassed and placeholders are admitted as unresolved claims.
 One `DiscoveryState` is shared by all roots of a pass, so overlapping roots cannot
 claim a subtree twice.
 
-## 5. The reconcile diff (monitored roots)
+## 5. One scan per root
 
-After walking every monitored root into one scratch state, `_reconcile_discovered_state`
-compares it with the confirmed claims that lie under a monitored root:
+A monitored root and a scan-once root are scanned the same way (`SourceManager._scan_root`),
+one root at a time, each against its own claims:
 
-- **Added** (found, not confirmed): committed. A claim whose registration fails is
-  committed as a failed row, so it is known and the next walk does not try it again.
+1. Walk the root into a scratch state. A claim is committed the moment the walk finds it
+   (`on_source_added` → `_stream_claim_add`), so the catalog grows within the walk.
+2. Take the root's snapshot, `Reconciler.claims_under(root)`: the confirmed claims lying at
+   or under the root, by the path each is spelled under (lexical, so a link belongs to the
+   root it was found in).
+3. `_reconcile_root(snapshot, discovered, recurring)` compares the two. A claim is never
+   compared with another root's walk, so scanning one root cannot remove the claims of
+   another.
+
+Two things differ, both because a monitored root is walked again and a scan-once root is
+not (`recurring`):
+
+| | Monitored (`recurring`) | Scan-once |
+|---|---|---|
+| Stability gate on the walk and on a refresh or removal | Yes: an unstable entry is picked up by a later tick | No: nothing would pick it up |
+| A claim the walk did not find | Removed after `_MISSES_BEFORE_REMOVAL = 2` walks running, once quiet | Removed at once, unless an adapter claims it again on a second look |
+| Claim probes memoized across walks | Yes | No |
+
+A cloud root is scanned only on a full pass; an incremental tick skips it and so leaves its
+sources as they are. A root that cannot be listed is not scanned, so nothing under it is
+removed. A directory the walk declined (the stability gate or the skip policy) is not
+evidence that what is registered under it is gone: the root's claims under it are carried
+into the comparison (`_preserve_skipped_claims`).
+
+The scan assumes roots do not nest and that no file is reachable from two roots, which is
+policy and not something the code can fully check (a link defeats a lexical test). Two
+roots that reach the same file produce one `source_id` (it hashes the resolved path) spelled
+two ways, and the claim belongs to the root whose walk committed it first.
+
+For each root, the comparison decides:
+
+- **Added** (found, not in the snapshot): committed by the walk, as it is found, and not
+  again here. A claim whose registration fails is committed as a failed row, so it is known
+  and the next walk does not try it again. One that did not commit when streamed (the
+  catalog write failed) is found new by the next walk.
 - **Changed** (found and confirmed, signatures differ): rebuilt in place with
   `replace=True` when quiet, so the source is never absent from the catalog and a
   failed rebuild keeps the old adapter. A rebuild that fails is not counted: only the
@@ -229,15 +262,16 @@ its cloud consent.
 Drops are refused until the first scan has finished (a `ValueError`, which the server maps to
 a clean error): both checks above need the whole catalog.
 
-`_register_root` walks the root into a scratch state with **no stability gate**, so a file
-finished a moment before the drop is claimed; the user asked for it now. The gate applies to
-claiming only in the monitored rescan. Then `_remove_unclaimed_under` removes what is gone
-**under that root only** (the periodic diff is whole-catalog, so it cannot be reused on a
-subtree). A source is removed when it is under the root, is not under a monitored root (the
-rescan does that, with its two-miss rule), is not under a declined directory, is quiet, and
-is not claimed again by an adapter on a second look (a drop has no later pass, so a transient
-decline must not cost a working source). A single-file drop skips this scan. Then each claim
-is refreshed if known, else added. A drop whose path lies inside an already-owned directory
+A drop is not a scan of a root: `_register_root` walks the dropped path into a scratch state
+with **no stability gate** (the user asked for it now), then `_remove_unclaimed_under`
+removes what is gone **under that path only**. A source is removed when it is under the path,
+is not under a monitored root (the rescan does that, with its two-miss rule), is not under a
+declined directory, is quiet, and is not claimed again by an adapter on a second look (a drop
+has no later pass, so a transient decline must not cost a working source). A single-file
+drop skips this scan. Then each claim is refreshed if known, whatever its signature, else
+added: the signature never decides, which is what makes a re-drop the repair for the
+signature gaps. (A configured `monitor = false` path is not a drop: it is scanned like a
+monitored root, once.) A drop whose path lies inside an already-owned directory
 source is rejected (`_find_containing_source` resolves the dropped path and looks each
 ancestor up in `_path_to_source`).
 
@@ -257,10 +291,10 @@ complete_initial_scan      first tick only
 |---|---|---|
 | Catalog on entry | Empty | Populated |
 | Pass kind | Full (the interval has never elapsed) | Incremental, full once per `full_rescan_interval` |
-| Registration | A new claim is **committed as the walk finds it** (`on_source_added` → `_stream_claim_add`, every tick), **registered afterwards** by a worker pool (below) while registration is deferred; with `registration_workers = 0` or once the first scan is over, registered as claimed | Same: new claims stream; the known ones are compared by `_reconcile_discovered_state` after the walk |
+| Registration | A new claim is **committed as the walk finds it** (`on_source_added` → `_stream_claim_add`, every tick), **registered afterwards** by a worker pool (below) while registration is deferred; with `registration_workers = 0` or once the first scan is over, registered as claimed | Same: new claims stream; the known ones are compared by `_reconcile_root` after each root's walk |
 | Removal | None possible; every claim is a pure add | Two-miss rule, shielded and scoped as in §5 |
 | Cloud roots | Walked | Skipped unless the pass is full |
-| Scan-once roots | Scanned | Not touched |
+| Scan-once roots | Scanned (the same scan, once) | Not touched |
 | Upstreams | All due (countdown 0) | Adaptive: every tick while changing or failing, doubling toward `full_rescan_interval` while stable |
 | Precache | Everything routes to the slow backlog, each source when its registration completes | New sources prompt-enqueue |
 | Freshness signal | Set by `complete_initial_scan` at the end | Advanced only by a completed full pass or upstream-only pass |

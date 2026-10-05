@@ -302,6 +302,30 @@ class Reconciler:
         """
         return not claim.is_remote and claim.source_type != "tensor-server"
 
+    def claims_under(self, root: Path) -> Dict[str, SourceClaim]:
+        """A snapshot of the confirmed claims that lie at or under *root*.
+
+        Lexical, on the path each claim is spelled under: a claim belongs to the
+        root its walk found it in, whatever a link under it points at. What a
+        root's scan compares its walk with, so that it never diffs the claims of
+        another root.
+        """
+        with self._lock:
+            return {
+                source_id: claim
+                for source_id, claim in self._state.claims.items()
+                if not is_remote_url(claim.primary_path)
+                and Path(claim.primary_path).is_relative_to(root)
+            }
+
+    def begin_walk(self) -> None:
+        """Start a walk: forget what the last one streamed, batch pending rows."""
+        self._streamed_ids = set()
+        self.begin_pending_batch()
+
+    def end_walk(self) -> None:
+        self.end_pending_batch()
+
     def begin_pending_batch(self) -> None:
         """Write the pending rows of the claims that follow in batches, until
         :meth:`end_pending_batch`. For a walk that claims them by the tens of
@@ -502,31 +526,27 @@ class Reconciler:
             except Exception:
                 logger.exception("pending-registration hook failed for %s", source_id)
 
-    def _reconcile_discovered_state(
+    def _reconcile_root(
         self,
+        snapshot: Dict[str, SourceClaim],
         discovered_state: DiscoveryState,
-        force_full: bool = False,
+        recurring: bool,
     ) -> None:
-        """Apply add/remove/update diffs between the current and discovered states.
+        """Bring one root's claims in line with what its walk found.
 
-        On an incremental rescan, cloud-root sources are excluded from the
-        candidate set: their subtree was not walked, so they are absent from
-        ``discovered_state`` and would otherwise be diffed/removed. Excluding them
-        by a hash-set check (``_cloud_source_ids``) preserves them untouched -- no
-        removal, no signature diff, no per-member ``Path.resolve()`` -- without the
-        ``_preserve_skipped_claims`` re-injection loop. On a force_full pass cloud
-        sources ARE walked, so they participate in the full reconcile.
+        *snapshot* is the root's confirmed claims (:meth:`claims_under`); the walk
+        has already committed every claim that was new, so what is left to decide
+        is what it did not find (removal), and what it found unchanged or changed.
+
+        *recurring* is a monitored root, which is walked again: a claim must be
+        missing on ``_MISSES_BEFORE_REMOVAL`` walks running before it is removed,
+        and a claim is removed or rebuilt only once quiet (the stability window).
+        A scan-once root has no later walk to correct a miss, so a claim it did
+        not find is removed at once, after a second look by its adapter, and the
+        stability gate is off.
         """
-        with self._lock:
-            current_claims = {
-                source_id: claim
-                for source_id, claim in self._state.claims.items()
-                if self._roots.is_monitored(claim.primary_path)
-                and (force_full or source_id not in self._cloud_source_ids)
-            }
-
         discovered_claims = discovered_state.claims
-        current_ids = set(current_claims)
+        current_ids = set(snapshot)
         discovered_ids = set(discovered_claims)
 
         # Consumed once: a later rescan streams nothing, and diffs every claim. A
@@ -549,48 +569,56 @@ class Reconciler:
         for source_id in unchanged_ids:
             self._settle_unresolved_claim(discovered_claims[source_id])
 
-        # Removal: not rediscovered on _MISSES_BEFORE_REMOVAL consecutive scans, and
-        # quiet. A claim found again, or no longer a candidate, forfeits its count.
-        # A cloud source on an incremental tick is neither: it was not walked, so
-        # the tick says nothing about it and its count waits for the next full pass
-        # (the only one that can count a miss for it).
+        # Removal. A claim found again forfeits its count.
         absent_ids = current_ids - discovered_ids
-        unwalked_ids = set() if force_full else self._cloud_source_ids
-        for source_id in [
-            sid
-            for sid in self._missed_scans
-            if sid not in absent_ids and sid not in unwalked_ids
-        ]:
-            del self._missed_scans[source_id]
+        for source_id in current_ids - absent_ids:
+            self._missed_scans.pop(source_id, None)
         removed_ids = []
         for source_id in sorted(absent_ids):
-            misses = self._missed_scans.get(source_id, 0) + 1
-            self._missed_scans[source_id] = misses
-            if misses >= _MISSES_BEFORE_REMOVAL and self._claim_is_quiet(
-                current_claims[source_id]
-            ):
-                removed_ids.append(source_id)
-        added_claims = [
-            discovered_claims[source_id]
-            for source_id in sorted(discovered_ids - current_ids)
-        ]
+            claim = snapshot[source_id]
+            if recurring:
+                misses = self._missed_scans.get(source_id, 0) + 1
+                self._missed_scans[source_id] = misses
+                if misses < _MISSES_BEFORE_REMOVAL or not self._claim_is_quiet(claim):
+                    continue
+            elif os.path.exists(claim.primary_path) and self._claimed_again(claim):
+                continue
+            removed_ids.append(source_id)
         # A changed source is REBUILT in place rather than removed and re-added:
         # the replacement adapter is registered on top of the live one, so the
         # source is never absent from ListFlights or the catalog and a failed
-        # rebuild does not cost a working source. Still gated on stability --
-        # rebuilding mid-write reads a half-written file.
+        # rebuild does not cost a working source. A recurring root's claim is
+        # rebuilt only once quiet: rebuilding mid-write reads a half-written file.
         refreshed_ids = [
             source_id
             for source_id in sorted(changed_ids)
-            if self._claim_is_quiet(current_claims[source_id])
+            if not recurring or self._claim_is_quiet(snapshot[source_id])
         ]
 
         for source_id in removed_ids:
-            self._commit_remove_source(source_id)
-        for claim in added_claims:
-            self._commit_add_claim(claim, keep_failed=True)
+            if self._commit_remove_source(source_id):
+                logger.info("Deregistered source %s: no longer found", source_id)
         for source_id in refreshed_ids:
             self._refresh_claim(discovered_claims[source_id])
+
+    def _claimed_again(self, claim: SourceClaim) -> bool:
+        """Whether an adapter claims ``claim``'s primary path right now.
+
+        An adapter can briefly decline a claim it made (a sidecar being rewritten,
+        a locked header); a root with no later walk would lose a working source to
+        that, so a claim is re-probed once before it is removed.
+        """
+        try:
+            again = self._registry.get_claims_for_path(
+                ClaimContext(
+                    Path(claim.primary_path),
+                    cloud_root=self._roots.is_cloud(claim.primary_path),
+                ),
+                DiscoveryState(),
+            )
+        except Exception:
+            return False
+        return any(c.primary_path == claim.primary_path for c in again)
 
     def _settle_unresolved_claim(self, claim: SourceClaim) -> None:
         """Re-decide what a known, unchanged, unregistered claim is waiting for.
@@ -726,28 +754,21 @@ class Reconciler:
 
     def _preserve_skipped_claims(
         self,
+        snapshot: Dict[str, SourceClaim],
         discovered_state: DiscoveryState,
         skipped_dirs: Set[str],
     ) -> None:
-        """Carry forward claims whose subtree was intentionally skipped this cycle."""
+        """Carry forward the root's claims whose subtree was intentionally skipped.
+
+        A directory the walk declined (the stability gate, or the skip policy) is
+        not evidence that what is registered under it is gone.
+        """
         if not skipped_dirs:
             return
 
         skipped_paths = [Path(path_str) for path_str in sorted(skipped_dirs)]
-        with self._lock:
-            current_claims = list(self._state.claims.values())
-
-        for claim in current_claims:
-            if claim.source_id in self._cloud_source_ids:
-                # Cloud sources are preserved by the reconcile scoping (excluded
-                # from the candidate set on incrementals), not re-injected here.
-                # Re-injecting would place them in ``discovered_ids`` while reconcile
-                # drops them from ``current_ids`` -> a spurious re-add every cycle.
-                # Skipping also retires the per-cloud-claim ``Path.resolve()`` loop.
-                continue
-            if not self._roots.is_monitored(claim.primary_path):
-                continue
-            if claim.source_id in discovered_state.claims:
+        for source_id, claim in snapshot.items():
+            if source_id in discovered_state.claims:
                 continue
             if self._claim_overlaps_skipped_subtree(claim, skipped_paths):
                 discovered_state.add_claim(claim, notify=False)

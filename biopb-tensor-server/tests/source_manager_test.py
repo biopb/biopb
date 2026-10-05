@@ -1290,7 +1290,9 @@ class TestSourceManagerRegressions:
         server.unregistered.clear()
         server._metadata_db.removed.clear()
 
-        manager._reconciler._reconcile_discovered_state(DiscoveryState())
+        manager._reconciler._reconcile_root(
+            manager._reconciler.claims_under(monitored_dir), DiscoveryState(), True
+        )
 
         assert claim.source_id in state.claims
         assert server.unregistered == []
@@ -1696,7 +1698,7 @@ class TestProgressiveDiscoveryFreshness:
         def boom(*a, **k):
             raise RuntimeError("reconcile failed")
 
-        monkeypatch.setattr(manager._reconciler, "_reconcile_discovered_state", boom)
+        monkeypatch.setattr(manager._reconciler, "_reconcile_root", boom)
         with pytest.raises(RuntimeError, match="reconcile failed"):
             manager._handle_rescan()
 
@@ -1787,13 +1789,13 @@ class TestProgressiveStreaming:
         # Under Option B every first-scan add is streamed *during* the walk, so
         # the catalog is already full before the end-of-walk reconcile runs.
         seen_at_reconcile = []
-        orig_reconcile = manager._reconciler._reconcile_discovered_state
+        orig_reconcile = manager._reconciler._reconcile_root
 
-        def spy(discovered_state, force_full=False):
+        def spy(snapshot, discovered_state, recurring):
             seen_at_reconcile.append(len(server.registered))
-            return orig_reconcile(discovered_state, force_full=force_full)
+            return orig_reconcile(snapshot, discovered_state, recurring)
 
-        monkeypatch.setattr(manager._reconciler, "_reconcile_discovered_state", spy)
+        monkeypatch.setattr(manager._reconciler, "_reconcile_root", spy)
 
         manager._handle_rescan()
 
@@ -1813,14 +1815,14 @@ class TestProgressiveStreaming:
         (tmp_path / "monitored" / "s2.dat").write_text("data2")
 
         seen_at_reconcile = []
-        orig_reconcile = manager._reconciler._reconcile_discovered_state
+        orig_reconcile = manager._reconciler._reconcile_root
 
-        def spy(discovered_state, force_full=False):
+        def spy(snapshot, discovered_state, recurring):
             # The new source is already registered when reconcile starts.
             seen_at_reconcile.append(len(server.registered))
-            return orig_reconcile(discovered_state, force_full=force_full)
+            return orig_reconcile(snapshot, discovered_state, recurring)
 
-        monkeypatch.setattr(manager._reconciler, "_reconcile_discovered_state", spy)
+        monkeypatch.setattr(manager._reconciler, "_reconcile_root", spy)
         manager._handle_rescan()
 
         assert seen_at_reconcile == [3]
@@ -1835,15 +1837,15 @@ class TestProgressiveStreaming:
         server, manager = self._manager(tmp_path, n_sources=2)
 
         calls = {"n": 0}
-        orig_reconcile = manager._reconciler._reconcile_discovered_state
+        orig_reconcile = manager._reconciler._reconcile_root
 
-        def flaky(discovered_state, force_full=False):
+        def flaky(snapshot, discovered_state, recurring):
             calls["n"] += 1
             if calls["n"] == 1:
                 raise RuntimeError("reconcile failed")
-            return orig_reconcile(discovered_state, force_full=force_full)
+            return orig_reconcile(snapshot, discovered_state, recurring)
 
-        monkeypatch.setattr(manager._reconciler, "_reconcile_discovered_state", flaky)
+        monkeypatch.setattr(manager._reconciler, "_reconcile_root", flaky)
 
         with pytest.raises(RuntimeError, match="reconcile failed"):
             manager._handle_rescan()

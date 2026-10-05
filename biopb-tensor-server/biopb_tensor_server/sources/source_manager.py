@@ -20,7 +20,6 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tupl
 from biopb_tensor_server.core.config import SourceConfig
 from biopb_tensor_server.core.discovery import (
     AdapterRegistry,
-    ClaimContext,
     DiscoveryState,
     SourceClaim,
     WalkReport,
@@ -530,9 +529,9 @@ class SourceManager:
         Runs ahead of the monitored walk on the first tick, so what it registers
         is startup set (precache backlog, not the live enqueue) and the catalog
         grows behind SERVING exactly as a monitored directory's does. A claim
-        registered here sits outside every monitored root, so the rescan's
-        removal diff never sees it; a later drop of the directory picks up
-        changes, as it does for any root.
+        registered here sits outside every monitored root, so the rescan never
+        sees it; a later drop of the directory picks up changes, as it does for
+        any root.
 
         Caller holds ``_catalog_lock``.
         """
@@ -544,30 +543,64 @@ class SourceManager:
                 logger.exception("Could not scan configured directory %s", root.url)
 
     def _scan_configured_root(self, root: Root) -> None:
-        """Register everything at or under one configured path (see
-        :meth:`_register_root`): a directory is walked, a file or typed dataset is
-        claimed in place."""
-        url = root.url
-        if not os.path.exists(url):
-            logger.warning("Configured path does not exist: %s", url)
+        """Scan one configured ``monitor = false`` path: a directory is walked, a
+        file or typed dataset is claimed in place. The same scan as a monitored
+        root's, run once."""
+        if not os.path.exists(root.url):
+            logger.warning("Configured path does not exist: %s", root.url)
             return
-        source = root.source
-        # The config-line analogue of a drag-dropped folder becoming its own root:
-        # an `alias` re-roots everything found under it (``Roots.display_url``).
-        # Persistent here, because nothing rescans the root to re-merge it into the
-        # shared path tree.
-        for event in self._register_root(
-            url,
-            source_type=source.type or "",
-            catalog_url_for=self._display_url_for,
-            cloud=root.cloud,
-        ):
-            if event[0] == "result":
-                for path, reason in event[1].failed:
-                    logger.warning("Configured path %s: %s: %s", url, path, reason)
+        self._scan_root(root, recurring=False)
+
+    def _scan_root(self, root: Root, recurring: bool) -> None:
+        """Walk one root, commit what is new as it is found, then compare the walk
+        with the root's claims: refresh what changed, remove what is gone.
+
+        *recurring* is a monitored root, walked again every tick, so it gates on
+        stability and removes a claim only after two misses; a scan-once root is
+        walked once, so it does neither (see ``Reconciler._reconcile_root``).
+
+        A claim is committed the moment the walk finds it, rather than batched into
+        the comparison after, so the catalog grows within the walk. A claim already
+        known is left to the comparison, which checks its signature, and removal is
+        only decided once the walk is over. The stability gate runs inside the walk,
+        so an unstable entry is never claimed or streamed; the next tick picks it
+        up. The root is walked as stored, not resolved again: it is canonical from
+        config, so its claims are spelled under it however the path has changed
+        since (a migration may have left a link).
+        """
+        # An alias on a configured root re-roots everything found under it
+        # (``Roots.display_url``); persistent for a scan-once root, which nothing
+        # rescans to merge it back into the shared path tree.
+        discovered = DiscoveryState(
+            on_source_added=self._reconciler._stream_claim_add,
+            source_type=root.source.type if root.source is not None else None,
+        )
+        report = WalkReport()
+        self._reconciler.begin_walk()
+        try:
+            discover_sources(
+                root.path,
+                self._registry,
+                discovered,
+                path_filter=self._should_claim if recurring else None,
+                admit_nonresident=root.cloud,
+                cloud_root=root.cloud,
+                report=report,
+                monitored=recurring,
+                walk_threads=self._walk_threads,
+            )
+            snapshot = self._reconciler.claims_under(root.path)
+            self._reconciler._preserve_skipped_claims(
+                snapshot, discovered, report.declined_dirs
+            )
+            self._reconciler._reconcile_root(snapshot, discovered, recurring)
+        finally:
+            # Before the startup protocol resumes the registration pool, so every
+            # claim has its row by then.
+            self._reconciler.end_walk()
 
     def _rescan_monitored_dirs(self) -> None:
-        """Walk the monitored directories and reconcile the discovered catalog.
+        """Scan the monitored directories, each against its own claims.
 
         No-op for an upstream-only config (no monitored dirs). On the first tick
         the progress flag and freshness stamp are left to
@@ -590,63 +623,21 @@ class SourceManager:
         if force_full_rescan:
             self._server.set_full_scan_in_progress(True)
         try:
-            # Progressive population: commit each NEW claim the moment the walk
-            # finds it rather than batching every add into the end-of-walk
-            # reconcile, so the catalog grows within the walk. A claim already
-            # known is left to the reconcile, which compares its signature, and
-            # removals are only ever decided after the walk. The stability gate
-            # runs inside the walk, so unstable entries are never claimed and
-            # therefore never streamed; the next rescan picks them up. The
-            # end-of-walk reconcile below still runs and skips what was streamed.
-            discovered_state = DiscoveryState()
-            discovered_state.on_source_added = self._reconciler._stream_claim_add
-
-            # One walk per monitored root, into one state (the identity set it
-            # carries stops overlapping roots from claiming a subtree twice). A
-            # cloud root is enumerated only on the full pass: listing one is
-            # expensive and its mtimes are unreliable, so the incremental ticks
-            # leave its sources registered (the reconcile scopes them out) rather
-            # than re-walking it.
-            report = WalkReport()
-            self._reconciler.begin_pending_batch()
-            for monitored_root in sorted(monitored, key=lambda r: r.url):
-                # Walked as stored, not resolved again: the root is canonical
-                # from config, so its claims are spelled under it however the
-                # path has changed since (a migration may have left a link).
-                root = monitored_root.path
-                cloud = monitored_root.cloud
-                if cloud and not force_full_rescan:
+            for root in sorted(monitored, key=lambda r: r.url):
+                # A cloud root is enumerated only on the full pass: listing one is
+                # expensive and its mtimes are unreliable, so an incremental tick
+                # leaves its sources as they are.
+                if root.cloud and not force_full_rescan:
                     continue
-                if not self._root_is_listable(root):
-                    report.declined_dirs.add(str(root))
+                # A root that cannot be listed says nothing about what is
+                # registered under it: it is not scanned, so nothing is removed.
+                if not self._root_is_listable(root.path):
                     continue
-                discover_sources(
-                    root,
-                    self._registry,
-                    discovered_state,
-                    path_filter=self._should_claim,
-                    admit_nonresident=cloud,
-                    cloud_root=cloud,
-                    report=report,
-                    monitored=True,
-                    walk_threads=self._walk_threads,
-                )
-
-            # A directory the walk declined (the stability gate, or the skip
-            # policy) is not evidence that what is registered under it is gone.
-            self._reconciler._preserve_skipped_claims(
-                discovered_state, report.declined_dirs
-            )
-            self._reconciler._reconcile_discovered_state(
-                discovered_state, force_full=force_full_rescan
-            )
+                self._scan_root(root, recurring=True)
 
             if completes_here:
                 self._mark_catalog_complete()
         finally:
-            # Before the startup protocol resumes the registration pool, so every
-            # claim has its row by then.
-            self._reconciler.end_pending_batch()
             if completes_here:
                 self._server.set_full_scan_in_progress(False)
 
@@ -1146,8 +1137,7 @@ class SourceManager:
     ):
         """Claim everything at or under ``url`` and bring the catalog in line.
 
-        The one primitive a drop and a one-shot configured directory share:
-        containment guard, ``discover_sources`` into a scratch state, remove what
+        A drop's scan: containment guard, ``discover_sources`` into a scratch state, remove what
         is gone under the root, then per claim refresh-if-known else add. The
         caller holds ``_catalog_lock`` and has checked that ``url`` is a rooted,
         readable local path. Yields the events :meth:`add_local_source` documents.
@@ -1332,7 +1322,9 @@ class SourceManager:
                 continue
             if not self._reconciler._claim_is_quiet(claim):
                 continue
-            if os.path.exists(claim.primary_path) and self._claimed_again(claim):
+            if os.path.exists(claim.primary_path) and self._reconciler._claimed_again(
+                claim
+            ):
                 continue
             if self._reconciler._commit_remove_source(source_id):
                 removed.append(source_id)
@@ -1340,20 +1332,6 @@ class SourceManager:
                     "Deregistered source %s: no longer found under %s", source_id, root
                 )
         return removed
-
-    def _claimed_again(self, claim: SourceClaim) -> bool:
-        """Whether an adapter claims ``claim``'s primary path right now."""
-        try:
-            again = self._registry.get_claims_for_path(
-                ClaimContext(
-                    Path(claim.primary_path),
-                    cloud_root=self._roots.is_cloud(claim.primary_path),
-                ),
-                DiscoveryState(),
-            )
-        except Exception:
-            return False
-        return any(c.primary_path == claim.primary_path for c in again)
 
     def _display_url_for(self, claim: SourceClaim) -> Optional[str]:
         """The display ``source_url`` the roots give a claim (None leaves it plain)."""

@@ -916,7 +916,11 @@ class DiscoveryState:
         self,
         on_source_added: Optional[Callable[[SourceClaim], None]] = None,
         on_source_removed: Optional[Callable[[str], None]] = None,
+        source_type: Optional[str] = None,
     ):
+        # A configured path can name its type; every claim found under it then
+        # has that type, and so the id that type hashes into.
+        self.source_type = source_type or None
         self.claims = {}
         self._path_to_source = {}
         self._source_to_paths = {}
@@ -982,6 +986,8 @@ class DiscoveryState:
         Returns:
             True if added, False if path already claimed
         """
+        if self.source_type:
+            claim.source_type = self.source_type
         # Generate source_id if not provided
         source_id = claim.source_id or generate_source_id(
             str(claim.primary_path), claim.source_type
