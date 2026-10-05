@@ -81,7 +81,6 @@ from biopb_tensor_server.core.errors import (
 from biopb_tensor_server.core.labels import (
     extent_mismatch,
     join_fields,
-    label_image_axes,
     split_label_field,
 )
 from biopb_tensor_server.core.read_mask import ENDPOINTS, PYRAMID, read_mask
@@ -658,8 +657,6 @@ class SourceAdapter(ABC):
         field: str,
         desc: TensorDescriptor,
         images: Optional[Dict[str, TensorDescriptor]] = None,
-        *,
-        allow_earlier: bool = True,
     ) -> Optional[str]:
         """Why a set of *desc* cannot be served at label *field*, or None.
 
@@ -669,8 +666,6 @@ class SourceAdapter(ABC):
         from an earlier server life never passed through the upload. *desc* is
         in canonical order (both callers normalize first), and *images* is
         :meth:`_normalized_tensors` when the caller already holds it.
-        *allow_earlier* is false at create: a new set has the current extent, while
-        a listed one may predate it (``label_forms``).
         """
         if split_label_field(field) is None:
             return f"{field!r} does not name a label set"
@@ -682,35 +677,8 @@ class SourceAdapter(ABC):
             desc.shape,
             image.dim_labels,
             image.shape,
-            allow_earlier=allow_earlier,
         )
         return f"does not span its image: {why}" if why is not None else None
-
-    def label_image_axes(
-        self,
-        field: str,
-        desc: TensorDescriptor,
-        images: Optional[Dict[str, TensorDescriptor]] = None,
-    ) -> Optional[List[int]]:
-        """Which of the image's axes each axis of the set at *field* indexes.
-
-        The mapping the extent rule already implies, stated so a client reads
-        it instead of re-deriving it. Re-deriving is not hypothetical: the two
-        tensors do not number their axes alike, so a client matching them by
-        name gets `t`/`z` right and an unnamed axis wrong -- which is frame 0
-        of a timelapse where frame 40 was asked for, a picture rather than an
-        error.
-
-        Answered here rather than by the set's adapter because the mapping is
-        a fact about the *pair*, and only the source holds both -- in canonical
-        order, which is what makes the answer meaningful when a native set had
-        to be permuted to get there. ``None`` when the set does not span its
-        image, which is the same set :attr:`label_sets` drops.
-        """
-        image = self.label_image_descriptor(field, images=images)
-        if image is None:
-            return None
-        return label_image_axes(desc.dim_labels, image.dim_labels, image.shape)
 
     def label_image_descriptor(
         self,
@@ -2076,7 +2044,6 @@ _SOURCE_SCOPED_API = frozenset(
         "detach_tensor",
         "attachment_changed",
         "label_binding_error",
-        "label_image_axes",
         "label_image_descriptor",
         "resolve_tensor",
         "resolve_chunk_adapter",

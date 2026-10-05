@@ -19,15 +19,13 @@ one, since a scene may plausibly be called ``labels`` and not ``@labels``.
 
 from __future__ import annotations
 
-import json
-from typing import Any, List, NamedTuple, Optional, Sequence
+from typing import NamedTuple, Optional
 
 __all__ = [
     "LABELS_SEGMENT",
     "RESERVED_LABEL_PREFIX",
     "LabelAddress",
     "is_reserved_label_name",
-    "label_image_axes",
     "split_label_array_id",
 ]
 
@@ -72,52 +70,3 @@ def split_label_array_id(array_id: str) -> Optional[LabelAddress]:
 def is_reserved_label_name(name: str) -> bool:
     """Whether *name* is a set the server owns -- read-only to every client."""
     return name.startswith(RESERVED_LABEL_PREFIX)
-
-
-def label_image_axes(label_desc: Any, image_desc: Any = None) -> Optional[List[int]]:
-    """For each axis of a set, the index of the image axis it indexes.
-
-    ``[0, 1, 2, 3, 4]`` for a ``T C Z Y X`` set of a ``T C Z Y X`` image: a set
-    has the image's axes at the image's lengths, with the channel axis a
-    singleton and an RGB samples axis left out. A set from before that rule has no
-    channel axis and maps ``[0, 2, 3, 4]``, every axis after the image's ``c`` one
-    place to the left. A client that instead matched axes by position reads frame
-    0 of a timelapse where frame 40 was asked for, which is a picture rather than
-    an error.
-
-    **Read, never derived**: ``biopb.labels.image_axes`` in the set's
-    ``metadata_json`` is the server's own statement of the mapping, so the
-    descriptor must have been fetched with metadata. ``None`` when it is absent
-    or does not fit the set's rank, which leaves the caller nothing to align. Every
-    server that serves label sets states it. *image_desc* is accepted and unused,
-    for callers written when the SDK derived the mapping from the image.
-    """
-    stated = _stated_image_axes(label_desc)
-    if stated is not None and len(stated) == len(label_desc.shape):
-        return stated
-    return None
-
-
-def _stated_image_axes(label_desc: Any) -> Optional[List[int]]:
-    """``biopb.labels.image_axes`` off a descriptor's metadata, or ``None``.
-
-    The server wraps per-tensor metadata as ``{"type", "dim_label", "metadata"}``
-    (``serving/server.py``), so the block sits one level in. Any shape but a
-    list of ints is treated as absent rather than raised on: this is an
-    advisory field, and a caller that cannot read it still has the rule.
-    """
-    raw = getattr(label_desc, "metadata_json", "") or ""
-    if not raw:
-        return None
-    try:
-        wrapped = json.loads(raw)
-        block = wrapped.get("metadata", wrapped)
-        axes = block["biopb"]["labels"]["image_axes"]
-    except (ValueError, AttributeError, KeyError, TypeError):
-        return None
-    if not isinstance(axes, Sequence) or isinstance(axes, (str, bytes)):
-        return None
-    try:
-        return [int(a) for a in axes]
-    except (TypeError, ValueError):
-        return None

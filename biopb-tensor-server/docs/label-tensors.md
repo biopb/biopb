@@ -48,14 +48,16 @@ index -- the same contract the ROI store runs on ("level-0 pixels, the server
 never rescales geometry") -- which is what lets a viewer overlay a set with no
 transform.
 
-The server states the mapping the rule implies: `biopb.labels.image_axes`, the
-image axis each axis of the set indexes, alongside the NGFF `image-label`
-block. `/api/tile_info` surfaces the same list as `image_axes` for a label set.
+Axis *j* of a set is therefore axis *j* of its image among the axes that remain
+(all but an RGB samples axis), and a client aligns the two by position; the
+server states no mapping.
 
 The rule is checked twice: the upload refuses a set that would not span its
 image at create, and `SourceAdapter.label_sets` checks every set again where
 the origins meet (`extent_mismatch`, on normalized descriptors). Mismatched labels
-are dropped with a warning.
+are dropped with a warning. That includes a set with no channel axis -- a native
+NGFF group (the spec lets it omit `c`) or a sidecar an older server wrote -- when
+its image has one.
 
 ## Three different origins
 
@@ -160,10 +162,7 @@ other two, the request's `array_id` *is* the final one. The kind:
 - refuses a non-unsigned-integer dtype, a reserved name, a name that would not
   stay inside the sidecar directory (`unsafe_store_name`), or a shape /
   `dim_labels` that is not the parent's extent (above) -- a request naming no
-  `dim_labels` is filled in from the image rather than refused. Only a
-  *listing* accepts the earlier shape without the channel axis (a native NGFF
-  group, or a sidecar an earlier server wrote); a set being created must have
-  the current one;
+  `dim_labels` is filled in from the image rather than refused;
 - refuses a name already attached, finished or pending (biopb/biopb#1054,
   per parent);
 - creates the sidecar array with the pending marker and the minted
@@ -252,9 +251,8 @@ consecutive ids land far apart rather than running a gradient; `0` is
 background and fully transparent. `contrastLimits = [0, 1]` is left at
 identity, which is what delivers the stored id to the palette.
 
-`labelSelection` (in `@biopb/tensor-flight-client`) reads the server's
-`image_axes` and never derives it; without one that fits the set's rank it
-matches the axes by key. The set's channel axis is a single
+`labelSelection` (in `@biopb/tensor-flight-client`) aligns the set's axes with
+the image's by position. The set's channel axis is a single
 plane, so the selection's channel clamps to 0 and the mask shows on every
 channel.
 
@@ -289,14 +287,9 @@ because a set's computed levels are advertised `nearest`, and napari only
 *picks* a level, never downsamples the data itself. A multiscale `Labels`
 layer is `editable = False`, matching a write-once set.
 
-**The set is given the image's rank before it is added.** napari aligns
-layers of differing rank from the right, so a `T Z Y X` set added beside a
-`T C Z Y X` image would otherwise land its `T` on the image's `C`. The channel
-axes the set does not have are inserted from `image_axes`, and a singleton
-channel axis it does have is broadcast the same way, to the image's length
-rather than left singleton -- a singleton axis would put the
+**The set has the image's rank, so napari's alignment from the right is the
+right one.** The channel axis is a singleton, and it is broadcast to the
+image's length rather than left singleton -- a singleton axis would put the
 layer outside its own extent at every channel but the first, blanking as the
 channel slider moves; a broadcast axis is a view onto the one underlying chunk,
-so the mask shows on every channel for a single read. Alignment inserts and
-never permutes; a mapping that would need a transpose is refused rather than
-mislaid.
+so the mask shows on every channel for a single read.

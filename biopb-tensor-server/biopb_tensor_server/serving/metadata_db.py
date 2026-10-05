@@ -831,8 +831,12 @@ class MetadataDatabase:
                 -- Why is_resolved is FALSE: 'needs_recall' (a cloud placeholder;
                 -- opening it is a consented download), 'pending' (registration
                 -- has not run yet; resolving it runs it), 'failed' (it raised; the
-                -- error is in metadata_json). NULL when resolved.
+                -- error is in unresolved_error). NULL when resolved.
                 unresolved_reason VARCHAR,
+                -- Why a 'failed' registration raised, as plain text. NULL for
+                -- every other row; metadata_json stays the source's own
+                -- metadata, never an error.
+                unresolved_error VARCHAR,
                 -- Full per-tensor structural info (biopb/biopb#224): one struct
                 -- per tensor, so multi-field / HCS sources are queryable per
                 -- tensor. This is the sole home of shape/dtype -- there is no
@@ -1366,6 +1370,7 @@ class MetadataDatabase:
         is_resolved: bool,
         unresolved_reason: Optional[str],
         tensors: List[Dict[str, Any]],
+        unresolved_error: Optional[str] = None,
     ) -> None:
         """Insert or replace a source's row, serializing writes with the lock."""
         with self._write_lock:
@@ -1373,8 +1378,9 @@ class MetadataDatabase:
                 """
                 INSERT OR REPLACE INTO sources
                 (source_id, source_url, source_type, indexed_at,
-                 metadata_json, is_resolved, unresolved_reason, tensors)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 metadata_json, is_resolved, unresolved_reason, tensors,
+                 unresolved_error)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     source_id,
@@ -1385,6 +1391,7 @@ class MetadataDatabase:
                     is_resolved,
                     unresolved_reason,
                     tensors,
+                    unresolved_error,
                 ],
             )
 
@@ -1401,8 +1408,8 @@ class MetadataDatabase:
         no tensors, ``unresolved_reason`` ``pending``, or ``needs_recall`` for a
         cloud source (*recall*), whose registration downloads it and waits for a
         client. With *error* (its registration raised) the reason is ``failed``
-        and ``metadata_json`` carries ``registration_error``, so a client does not
-        wait on it. The registered row replaces this one by the same upsert.
+        and ``unresolved_error`` carries the text, so a client does not wait on
+        it. The registered row replaces this one by the same upsert.
         """
         conn = self._get_connection()
         self._upsert_source_row(
@@ -1411,10 +1418,11 @@ class MetadataDatabase:
             catalog_url or to_catalog_url(str(claim.primary_path)),
             claim.source_type or "unknown",
             datetime.now(),
-            json.dumps({"registration_error": error}) if error else None,
+            None,
             False,
             "failed" if error else ("needs_recall" if recall else "pending"),
             [],
+            unresolved_error=error or None,
         )
 
     def _replace_imported(

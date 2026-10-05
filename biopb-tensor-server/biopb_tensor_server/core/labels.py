@@ -33,12 +33,9 @@ __all__ = [
     "LABELS_SEGMENT",
     "RESERVED_PREFIX",
     "LabelField",
-    "LabelForm",
     "extent_mismatch",
     "join_fields",
     "label_extent",
-    "label_forms",
-    "label_image_axes",
     "label_field",
     "last_named_segment",
     "split_label_field",
@@ -123,19 +120,10 @@ def _axis_key(label: str) -> str:
     return canonical_axis(label) or str(label).lower()
 
 
-class LabelForm(NamedTuple):
-    """One legal extent for a set of an image: its axes, lengths and the image
-    axis each one indexes."""
-
-    labels: List[str]
-    shape: List[int]
-    image_axes: List[int]
-
-
-def label_forms(
+def label_extent(
     image_labels: Sequence[str], image_shape: Sequence[int]
-) -> List[LabelForm]:
-    """The extents a set of this image may have, preferred first.
+) -> Tuple[List[str], List[int]]:
+    """The axes and lengths a set of this image has.
 
     **The extent rule**: the image's own axes at the image's lengths, except that
     a channel axis is a singleton and an interleaved RGB(A) samples axis is
@@ -146,12 +134,9 @@ def label_forms(
     because it is a pixel's colour components, which a mask has none of, and a
     trailing singleton would shift the spatial axes of a right-aligned viewer.
 
-    **The earlier rule** -- the channel axis dropped altogether -- is listed
-    second, and only a read accepts it: a native NGFF group (a file we cannot
-    rewrite, and one the spec allows to omit ``c``) and a sidecar an earlier server
-    wrote keep being served. A new set must have the preferred form
-    (``extent_mismatch(..., allow_earlier=False)``). It is the same list when the
-    image has no channel axis. Axes come back as the image spells them,
+    The rule has one form. A set without a channel axis (a native NGFF group,
+    which the spec lets omit ``c``, or a sidecar an older server wrote) does not
+    span its image and is not listed. Axes come back as the image spells them,
     which for the normalized descriptors the callers hand in is canonical.
     """
     if len(image_labels) != len(image_shape):
@@ -161,59 +146,13 @@ def label_forms(
         )
     samples = samples_axis([str(x) for x in image_labels], tuple(image_shape))
     kept = [i for i in range(len(image_labels)) if i != samples]
-
-    is_channel = [canonical_axis(label) == "c" for label in image_labels]
-    preferred = LabelForm(
+    return (
         [str(image_labels[i]) for i in kept],
-        [1 if is_channel[i] else int(image_shape[i]) for i in kept],
-        kept,
+        [
+            1 if canonical_axis(image_labels[i]) == "c" else int(image_shape[i])
+            for i in kept
+        ],
     )
-    without_channel = [i for i in kept if not is_channel[i]]
-    earlier = LabelForm(
-        [str(image_labels[i]) for i in without_channel],
-        [int(image_shape[i]) for i in without_channel],
-        without_channel,
-    )
-    # The forms differ in rank exactly when the image has a channel axis, which is
-    # what lets `label_image_axes` tell them apart by rank.
-    return [preferred] if earlier == preferred else [preferred, earlier]
-
-
-def label_extent(
-    image_labels: Sequence[str], image_shape: Sequence[int]
-) -> Tuple[List[str], List[int]]:
-    """The axes and lengths a new set of this image has (design, "Extent").
-
-    The preferred :func:`label_forms` entry: what :func:`extent_mismatch`
-    compares against first and what the upload fills in for a request that
-    named no axes.
-    """
-    preferred = label_forms(image_labels, image_shape)[0]
-    return preferred.labels, preferred.shape
-
-
-def label_image_axes(
-    label_labels: Sequence[str],
-    image_labels: Sequence[str],
-    image_shape: Sequence[int],
-) -> Optional[List[int]]:
-    """For each axis of a set, the wire index of the image axis it indexes.
-
-    ``[0, 1, 2, 3, 4]`` for a ``T C Z Y X`` set of a ``T C Z Y X`` image, and
-    ``[0, 2, 3, 4]`` for a set written under the earlier rule (no channel axis).
-    The form is told apart by rank, which is why the server states the mapping
-    rather than leave each client to guess it: reading the wrong one is frame 0 of
-    a timelapse where frame 40 was asked for, and that is a picture rather than
-    an error (biopb/biopb#1059).
-
-    ``None`` when *label_labels* matches no form of *image_labels*, so there is
-    no mapping to state. Callers that have already run :func:`extent_mismatch`
-    never see it.
-    """
-    for form in label_forms(image_labels, image_shape):
-        if len(form.labels) == len(label_labels):
-            return list(form.image_axes)
-    return None
 
 
 def extent_mismatch(
@@ -221,29 +160,21 @@ def extent_mismatch(
     label_shape: Sequence[int],
     image_labels: Sequence[str],
     image_shape: Sequence[int],
-    *,
-    allow_earlier: bool = True,
 ) -> Optional[str]:
     """Why a set of *label_shape* over *label_labels* does not span the image,
     or None when it does.
 
-    The rule is :func:`label_forms`; this is the comparison, against each form
-    in turn, or against the preferred one alone when *allow_earlier* is false (a
-    set being created). Axes are matched by canonical name, so ``"Z"`` and
-    ``"depth"`` agree.
+    The rule is :func:`label_extent`. Axes are matched by canonical name, so
+    ``"Z"`` and ``"depth"`` agree.
     """
-    forms = label_forms(image_labels, image_shape)
-    if not allow_earlier:
-        forms = forms[:1]
-    axes = [_axis_key(label) for label in label_labels]
-    shape = [int(s) for s in label_shape]
-    same_axes = [f for f in forms if axes == [_axis_key(label) for label in f.labels]]
-    if not same_axes:
+    want_labels, want_shape = label_extent(image_labels, image_shape)
+    axes = [_axis_key(x) for x in want_labels]
+    if [_axis_key(x) for x in label_labels] != axes:
         return (
-            f"axes {list(label_labels)} do not match the image's "
-            f"{[_axis_key(label) for label in forms[0].labels]} (the channel "
-            "axis a singleton, an RGB samples axis left out)"
+            f"axes {list(label_labels)} do not match the image's {axes} (the "
+            "channel axis a singleton, an RGB samples axis left out)"
         )
-    if any(shape == f.shape for f in same_axes):
-        return None
-    return f"shape {shape} does not match the image's {same_axes[0].shape}"
+    shape = [int(s) for s in label_shape]
+    if shape != want_shape:
+        return f"shape {shape} does not match the image's {want_shape}"
+    return None

@@ -732,7 +732,7 @@ testing = [
 [package.metadata]
 requires-dist = [
     { name = "biopb", extras = ["shim", "tensor"], editable = "." },
-    { name = "biopb-napari-widget", marker = "extra == 'napari'", specifier = ">=0.1.0" },
+    { name = "biopb-napari-widget", marker = "extra == 'napari'", specifier = ">=0.1.1rc2" },
     { name = "distributed", specifier = ">=2023.9.0" },
     { name = "ipykernel" },
     { name = "jupyter-client" },
@@ -773,7 +773,7 @@ testing = [
 
 [[package]]
 name = "biopb-napari-widget"
-version = "0.1.0"
+version = "0.1.1rc2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "biopb", extra = ["tensor"] },
@@ -791,9 +791,9 @@ dependencies = [
     { name = "zarr", version = "2.18.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "zarr", version = "2.18.7", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/fc/75/b2d84b2eaec821b1e95c2ed0fddc969d7bf18c0be71eb5586de917a9e60c/biopb_napari_widget-0.1.0.tar.gz", hash = "sha256:f99ab968737e062d31073f4f140a83ebb1ff0079085eec719c6af0bbff6de8fd", size = 116330, upload-time = "2026-09-28T20:59:15.565Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/27/5a/2b2f80cc7ce43d1b5170eb1a80e839ef9b529d7bf4e11d9a0864d4e584bb/biopb_napari_widget-0.1.1rc2.tar.gz", hash = "sha256:c12a55d615a7ca3335979b28272d91b190bebfd7a74716b37808642fe9d02239", size = 119855, upload-time = "2026-10-05T03:08:01.787Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/1d/5e/6653db8d24a4987843eab77523b20661e1578dc5e4f15b90df3cf1f815ef/biopb_napari_widget-0.1.0-py3-none-any.whl", hash = "sha256:0cf69672cd616f6b97984afccbf421c0f75898ac61dcf99792d20978dc1e2b90", size = 78993, upload-time = "2026-09-28T20:59:14.175Z" },
+    { url = "https://files.pythonhosted.org/packages/7b/a0/c0f9f23a50d667f69face200aa2a90ce624a5b75e1e1dab38178e4f2dd22/biopb_napari_widget-0.1.1rc2-py3-none-any.whl", hash = "sha256:fa2e52df2a09ea4ecd190f8eb00bfe769dfed674ccd035525636416201b3319b", size = 81147, upload-time = "2026-10-05T02:59:58.974Z" },
 ]
 
 [[package]]

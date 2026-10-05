@@ -6,7 +6,6 @@ registers them, newest first, and a read that needs one registers it at once.
 Real zarr sources against a real catalog, driven one tick at a time.
 """
 
-import json
 import os
 import threading
 import time
@@ -57,8 +56,8 @@ def _first_scan(manager):
 
 def _rows(server):
     table = server.metadata_db.query(
-        "SELECT source_id, is_resolved, unresolved_reason, metadata_json, "
-        "len(tensors) AS tensors FROM sources ORDER BY source_id"
+        "SELECT source_id, is_resolved, unresolved_reason, unresolved_error, "
+        "metadata_json, len(tensors) AS tensors FROM sources ORDER BY source_id"
     )
     return {row["source_id"]: row for row in table.to_pylist()}
 
@@ -477,7 +476,9 @@ class TestFailure:
         row = _rows(server)[sid]
         assert row["is_resolved"] is False
         assert row["unresolved_reason"] == "failed"
-        assert json.loads(row["metadata_json"])["registration_error"]
+        assert row["unresolved_error"]
+        # The error is not metadata: that column stays the source's own.
+        assert row["metadata_json"] is None
         # Nothing is waiting on it, and nothing serves it.
         assert manager.pending_registrations() == 0
         assert server.sources.get(sid) is None
