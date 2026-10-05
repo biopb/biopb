@@ -314,6 +314,27 @@ class TestRegistration:
             os.stat(path).st_ctime_ns,
         ]
 
+    def test_a_masked_file_is_persisted_with_its_label_tensor(self, tmp_path):
+        from tests import ome_mask_test
+
+        raw = np.packbits(np.eye(4, dtype=np.uint8).flatten()).tobytes()
+        ome_mask_test.TestFastMetadataRealBitmap()._write(tmp_path, raw)
+        manager, server = _manager(tmp_path)
+        manager._handle_rescan()
+
+        ((source_id, _, _, payload),) = _persisted(server)
+        payload = json.loads(payload)
+        assert payload["has_rois"] is True
+        (mask,) = payload["masks"]
+        assert mask["field"] == "Image:0/@labels/@ome"
+        assert mask["parent_array_id"] == f"{source_id}/Image:0"
+        # The catalog lists the label tensor the payload describes.
+        (row,) = server.metadata_db.query("SELECT tensors FROM sources").to_pylist()
+        listed = {t["array_id"]: t for t in row["tensors"]}
+        label = listed[f"{source_id}/{mask['field']}"]
+        assert label["shape"] == mask["shape"]
+        assert label["dim_labels"] == mask["dim_labels"]
+
     def test_a_source_without_a_payload_is_volatile(self, tmp_path):
         import zarr
 

@@ -139,6 +139,32 @@ class _CziLayout:
     #: settings that can run to megabytes and nothing here reads them.
     information: Dict[str, Any]
 
+    def to_payload(self) -> dict:
+        """The layout as JSON, without ``information``: the catalog row already
+        holds it as ``metadata_json``."""
+        return {
+            "scenes": [[s.index, s.x, s.y, s.width, s.height] for s in self.scenes],
+            "plane_axes": list(self.plane_axes),
+            "plane_sizes": {k: int(v) for k, v in self.plane_sizes.items()},
+            "dtype": self.dtype,
+            "samples": int(self.samples),
+            "scale_um": dict(self.scale_um),
+        }
+
+    @classmethod
+    def from_payload(cls, payload: dict, information: Optional[dict] = None):
+        """Rebuild a layout from :meth:`to_payload`; *information* is the row's
+        metadata, which a hydrated adapter reports as its own."""
+        return cls(
+            scenes=tuple(_CziScene(*(int(v) for v in s)) for s in payload["scenes"]),
+            plane_axes=tuple(payload["plane_axes"]),
+            plane_sizes={k: int(v) for k, v in payload["plane_sizes"].items()},
+            dtype=payload["dtype"],
+            samples=int(payload["samples"]),
+            scale_um=dict(payload["scale_um"]),
+            information=dict(information or {}),
+        )
+
 
 def _plane_axes(
     bounding_box: Dict[str, Tuple[int, int]],
@@ -353,6 +379,13 @@ class CziAdapter(TensorAdapter):
         self._active_reads = 0
 
     # ---- descriptors --------------------------------------------------------
+
+    def catalog_payload(self) -> Optional[Dict[str, Any]]:
+        """The probed layout: everything a read needs from the file. Source-level
+        only."""
+        if self.scene_position is not None:
+            return None
+        return {"layout": self._layout.to_payload()}
 
     def _scene(self) -> _CziScene:
         """The scene this adapter is bound to (the first, at source level)."""

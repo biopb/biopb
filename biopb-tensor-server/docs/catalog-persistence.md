@@ -128,10 +128,12 @@ Registration threads and the sweep write through the same connection and lock as
 ## The row and its payload
 
 - **Payload** (JSON): what a read needs: base `chunk_shape`s, the pyramid, scene layout,
-  the axis permutation from `normalize_adapter`, the claim, a `has_rois` flag and the
+  a `has_rois` flag and the
   descriptor (`array_id`, `dim_labels`, `shape`) of each embedded `@ome` mask label
   tensor. Base descriptors only, not the public `tensors` list: that includes attached
   fields and label sets, which the attacher re-derives at registration or hydration.
+  The claim is its own columns; the axis permutation is recomputed by
+  `normalize_adapter` from the native axes.
 - **`metadata_json` is stored once**, in the row (about 90% of the file: ~2 GB at 100k
   sources). There is no second copy and no join.
 - **A failed registration's error** is text in `unresolved_error`, never `metadata_json`.
@@ -236,10 +238,20 @@ still runs. Worth doing only if a cloud-root walk is slow enough to notice; unme
 
 Stage 1 as implemented: `source_catalog` and `sources_volatile` with the persistent view,
 `SOURCE_CATALOG_FORMAT`, routing by `catalog_payload()` and a claim record, claim-time
-signature without `st_dev`, deletion from both on removal. Only OME-TIFF has a payload
-(its scene descriptors); nd2, czi, the `has_rois` flag and the mask descriptors follow.
-Rows are cleared at open, so nothing is restored yet, and the epoch and `last_seen`
-sweep are stage 2.
+signature without `st_dev`, deletion from both on removal. Payloads exist for OME-TIFF,
+nd2 and czi, and no others:
+
+- **OME-TIFF**: the scene descriptors (with their transfer grid), `has_rois`, and the
+  `@ome` mask label tensors' field, parent and extent, derived from the metadata without
+  decoding a bitmap. Built before `release_registration_cache`, which drops the bitmaps.
+- **nd2, czi**: the probed layout (`to_payload` / `from_payload` on the layout, so the
+  round trip is tested now), without the metadata the row already holds. An nd2 payload
+  carries one entry per frame (`frame_indices`), so a long timelapse is the large case;
+  measure it before stage 2 and pack it if it matters.
+
+Each payload is tested by rebuilding an adapter from the JSON and requiring the same
+tensors, grid and scale as the parsed one. Rows are cleared at open, so nothing is
+restored yet, and the epoch and `last_seen` sweep are stage 2.
 
 1. `source_catalog` with `CACHE_FORMAT`, written through at each registration with the
    claim, claim-time signature and payload, deleted on live removal; the volatile table

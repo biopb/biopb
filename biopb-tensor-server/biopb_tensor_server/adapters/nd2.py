@@ -176,6 +176,36 @@ class _Nd2Layout:
             if label != _POSITION_AXIS
         ]
 
+    def to_payload(self) -> dict:
+        """The layout as JSON, without ``ome_summary``: the catalog row already
+        holds it as ``metadata_json``."""
+        return {
+            "labels": list(self.labels),
+            "shape": [int(s) for s in self.shape],
+            "dtype": self.dtype.str,
+            "voxel_um": dict(self.voxel_um),
+            # One [loop coordinate..., frame index] row per frame.
+            "frame_indices": [
+                [*key, frame] for key, frame in sorted(self.frame_indices.items())
+            ],
+        }
+
+    @classmethod
+    def from_payload(cls, payload: dict, ome_summary: Optional[dict] = None):
+        """Rebuild a layout from :meth:`to_payload`; *ome_summary* is the row's
+        metadata, which a hydrated adapter reports as its own."""
+        return cls(
+            labels=tuple(payload["labels"]),
+            shape=tuple(int(s) for s in payload["shape"]),
+            dtype=np.dtype(payload["dtype"]),
+            voxel_um=dict(payload["voxel_um"]),
+            ome_summary=dict(ome_summary or {}),
+            frame_indices={
+                tuple(int(c) for c in row[:-1]): int(row[-1])
+                for row in payload["frame_indices"]
+            },
+        )
+
 
 def _loop_key(coordinates: Dict[str, int], present: Tuple[str, ...]) -> Tuple[int, ...]:
     return tuple(coordinates.get(axis, 0) for axis in present)
@@ -326,6 +356,13 @@ class Nd2Adapter(TensorAdapter):
         self._io_lock = io_lock if io_lock is not None else threading.Lock()
         self._shared_handle: Optional[_Nd2Reader] = shared_handle
         self._tensor_adapters: Dict[str, Nd2Adapter] = {}
+
+    def catalog_payload(self) -> Optional[Dict[str, Any]]:
+        """The probed layout: everything a read needs from the file. Source-level
+        only."""
+        if self.position is not None:
+            return None
+        return {"layout": self._layout.to_payload()}
 
     def _position_frame_plan(
         self, layout: "_Nd2Layout", position: int

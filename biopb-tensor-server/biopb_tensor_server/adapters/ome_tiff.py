@@ -788,23 +788,12 @@ class OmeTiffAdapter(TensorAdapter):
         the field half of a scene's ``array_id`` IS the OME image id for this
         format, so the match is string equality, not inference.
         """
-        descriptors = self._scene_descriptors()
-        by_image = masks_by_image(
-            self.get_metadata(),
-            tensors_by_field([(d.array_id, list(d.dim_labels)) for d in descriptors]),
-        )
-        if not by_image:
+        plan = self._mask_label_plan()
+        if not plan:
             self._mask_payloads_transferred = True
             return {}
         sets: Dict[str, TensorAdapter] = {}
-        for desc in descriptors:
-            masks = by_image.get(desc.array_id)
-            if not masks:
-                continue
-            dim_labels, shape = label_extent(list(desc.dim_labels), list(desc.shape))
-            field = label_field(
-                self._within_source_field(desc.array_id) or "", OME_SET_NAME
-            )
+        for desc, field, dim_labels, shape, masks in plan:
             sets[field] = RasterizedMaskAdapter(
                 self.source_id,
                 field,
@@ -816,6 +805,27 @@ class OmeTiffAdapter(TensorAdapter):
             )
         self._mask_payloads_transferred = True
         return sets
+
+    def _mask_label_plan(self) -> list:
+        """``(scene descriptor, label field, dim_labels, shape, masks)`` for every
+        scene that carries a ``<Mask>``, from the metadata alone: no bitmap is
+        decoded here, so the catalog can list the label tensors without it."""
+        descriptors = self._scene_descriptors()
+        by_image = masks_by_image(
+            self.get_metadata(),
+            tensors_by_field([(d.array_id, list(d.dim_labels)) for d in descriptors]),
+        )
+        plan = []
+        for desc in descriptors:
+            masks = by_image.get(desc.array_id)
+            if not masks:
+                continue
+            dim_labels, shape = label_extent(list(desc.dim_labels), list(desc.shape))
+            field = label_field(
+                self._within_source_field(desc.array_id) or "", OME_SET_NAME
+            )
+            plan.append((desc, field, dim_labels, shape, masks))
+        return plan
 
     def _reduced_ome_xml_cached(self) -> Optional[str]:
         """The plane-stripped OME-XML, computed once and kept for the adapter's life.
@@ -870,8 +880,10 @@ class OmeTiffAdapter(TensorAdapter):
         """The scene descriptors, which are what a read needs from the file.
 
         Source-level only. Each is the serving descriptor (``array_id``, axes,
-        shape, dtype and the transfer grid seeded from the page geometry).
-        ``None`` when tifffile declined the source.
+        shape, dtype and the transfer grid seeded from the page geometry), plus
+        ``has_rois`` and the embedded mask label tensors. Call it before
+        :meth:`release_registration_cache`, which drops the mask bitmaps the
+        label plan reads. ``None`` when tifffile declined the source.
         """
         if self.scene_index is not None:
             return None
@@ -888,7 +900,21 @@ class OmeTiffAdapter(TensorAdapter):
                     "dtype": d.dtype,
                 }
                 for d in scenes
-            ]
+            ],
+            # Whether the file carries ``<ROI>`` elements, so a read can import
+            # them on first request instead of at registration.
+            "has_rois": bool(self.get_metadata().get("rois")),
+            # The ``@ome`` label tensors, so the catalog lists them without
+            # parsing the masks; the bitmaps are read when the tensor is.
+            "masks": [
+                {
+                    "field": field,
+                    "parent_array_id": desc.array_id,
+                    "dim_labels": list(dim_labels),
+                    "shape": [int(s) for s in shape],
+                }
+                for desc, field, dim_labels, shape, _ in self._mask_label_plan()
+            ],
         }
 
     def release_registration_cache(self) -> None:
