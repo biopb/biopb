@@ -190,3 +190,57 @@ class TestSharedFile:
             manager._handle_rescan()
 
         assert not [r for r in caplog.records if "reachable by two paths" in r.message]
+
+
+class TestDropRemoval:
+    """A drop's removal half is the shared rule, scoped to the dropped path."""
+
+    def test_it_removes_what_is_gone_under_its_path_and_nothing_else(self, tmp_path):
+        manager, server, monitored, once = _manager(tmp_path)
+        drt._make_zarr(monitored, "m.zarr")
+        keep = drt._make_zarr(once, "keep.zarr")
+        gone = drt._make_zarr(once, "gone.zarr")
+        manager._handle_rescan()
+        reconciler = manager._reconciler
+        ids = {
+            reconciler.claim_primary_path(sid): sid for sid in reconciler.claim_ids()
+        }
+        shutil.rmtree(gone)
+
+        removed = manager._remove_unclaimed_under(str(once), {ids[keep]}, set())
+
+        assert removed == [ids[gone]]
+        assert len(_ids(server)) == 2
+
+    def test_it_leaves_a_monitored_root_to_the_rescan(self, tmp_path):
+        manager, server, monitored, once = _manager(tmp_path)
+        gone = drt._make_zarr(monitored, "m.zarr")
+        manager._handle_rescan()
+        shutil.rmtree(gone)
+
+        assert manager._remove_unclaimed_under(str(monitored), set(), set()) == []
+        assert len(_ids(server)) == 1
+
+    def test_it_waits_for_a_source_that_is_still_changing(self, tmp_path, monkeypatch):
+        manager, server, monitored, once = _manager(tmp_path)
+        gone = drt._make_zarr(once, "gone.zarr")
+        manager._handle_rescan()
+        reconciler = manager._reconciler
+        shutil.rmtree(gone)
+
+        monkeypatch.setattr(reconciler, "_claim_is_quiet", lambda claim: False)
+        assert manager._remove_unclaimed_under(str(once), set(), set()) == []
+
+        monkeypatch.setattr(reconciler, "_claim_is_quiet", lambda claim: True)
+        assert len(manager._remove_unclaimed_under(str(once), set(), set())) == 1
+
+    def test_it_skips_a_directory_the_walk_declined(self, tmp_path):
+        manager, server, monitored, once = _manager(tmp_path)
+        sub = once / "declined"
+        sub.mkdir()
+        gone = drt._make_zarr(sub, "gone.zarr")
+        manager._handle_rescan()
+        shutil.rmtree(gone)
+
+        assert manager._remove_unclaimed_under(str(once), set(), {str(sub)}) == []
+        assert len(manager._remove_unclaimed_under(str(once), set(), set())) == 1

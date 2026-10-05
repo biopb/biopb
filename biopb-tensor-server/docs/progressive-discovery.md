@@ -158,6 +158,16 @@ not (`recurring`):
 | A claim the walk did not find | Removed after `_MISSES_BEFORE_REMOVAL = 2` walks running, once quiet | Removed at once, unless an adapter claims it again on a second look |
 | Claim probes memoized across walks | Yes | No |
 
+Removal is one rule for every scan, `Reconciler._remove_absent`, with three switches: how
+many walks running a claim must be missing (`strikes`), whether it must be quiet (`gated`),
+and whether an adapter must decline it on a second look (`reprobe`). A monitored root is
+(2, gated, no re-probe), a scan-once root (1, not gated, re-probe) and a drop (1, gated,
+re-probe). A drop differs only in which claims it may remove, below.
+
+A claim that registers as it is found (a non-deferred add, or a refresh) is stat'ed once,
+before the parse; that signature is the one persisted beside the row and the one state
+keeps, so a file that changes during the parse reads as changed on the next scan.
+
 A cloud root is scanned only on a full pass; an incremental tick skips it and so leaves its
 sources as they are. A root that cannot be listed is not scanned, so nothing under it is
 removed. A directory the walk declined (the stability gate or the skip policy) is not
@@ -266,11 +276,10 @@ a clean error): both checks above need the whole catalog.
 
 A drop is not a scan of a root: `_register_root` walks the dropped path into a scratch state
 with **no stability gate** (the user asked for it now), then `_remove_unclaimed_under`
-removes what is gone **under that path only**. A source is removed when it is under the path,
-is not under a monitored root (the rescan does that, with its two-miss rule), is not under a
-declined directory, is quiet, and is not claimed again by an adapter on a second look (a drop
-has no later pass, so a transient decline must not cost a working source). A single-file
-drop skips this scan. Then each claim is refreshed if known, whatever its signature, else
+removes what is gone **under that path only**, by the shared rule above. The claims it may
+remove are those under the path that are not under a monitored root (the rescan does that,
+with its two-miss rule) and not under a declined directory. A single-file drop skips this
+scan. Then each claim is refreshed if known, whatever its signature, else
 added: the signature never decides, which is what makes a re-drop the repair for the
 signature gaps. (A configured `monitor = false` path is not a drop: it is scanned like a
 monitored root, once.) A drop whose path lies inside an already-owned directory

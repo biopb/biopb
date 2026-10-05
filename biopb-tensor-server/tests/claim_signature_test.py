@@ -101,3 +101,78 @@ class TestRegistration:
         st = os.stat(path)
         assert after != before
         assert after == [st.st_ino, st.st_mtime_ns, st.st_ctime_ns]
+
+
+def _count_by_id(monkeypatch):
+    calls = []
+    real = Reconciler._build_claim_signatures
+
+    def counting(self, claim):
+        calls.append(claim.source_id)
+        return real(self, claim)
+
+    monkeypatch.setattr(Reconciler, "_build_claim_signatures", counting)
+    return calls
+
+
+class TestRegisteredWhereFound:
+    """A claim that registers as it is found is stat'ed once, before the parse."""
+
+    def test_an_add_stats_each_claim_once(self, tmp_path, monkeypatch):
+        for name in ("a.zarr", "b.zarr", "c.zarr"):
+            drt._make_zarr(tmp_path, name)
+        manager, _ = drt._manager(tmp_path)
+        calls = _count_by_id(monkeypatch)
+
+        manager._handle_rescan()  # no deferral: each registers as the walk finds it
+
+        assert sorted(calls) == sorted(set(calls)) and len(calls) == 3
+
+    def test_a_refresh_stats_the_claim_once_to_compare_and_once_to_rebuild(
+        self, tmp_path, monkeypatch
+    ):
+        paths = [drt._make_zarr(tmp_path, f"{n}.zarr") for n in ("a", "b", "c")]
+        manager, server = drt._manager(tmp_path)
+        manager._handle_rescan()
+        by_path = {
+            manager._reconciler.claim_primary_path(sid): sid
+            for sid in manager._reconciler.claim_ids()
+        }
+        calls = _count_by_id(monkeypatch)
+
+        _touch(paths[1])
+        manager._handle_rescan()
+
+        assert calls.count(by_path[paths[1]]) == 2
+        assert calls.count(by_path[paths[0]]) == calls.count(by_path[paths[2]]) == 1
+
+    def test_a_file_that_changes_during_the_parse_is_refreshed_next_scan(
+        self, tmp_path, monkeypatch
+    ):
+        path = drt._make_zarr(tmp_path, "a.zarr")
+        manager, server = drt._manager(tmp_path)
+        real = Reconciler._register_source_claim
+        touched = []
+
+        def touching(self, claim, *a, **k):
+            if not touched:
+                touched.append(1)
+                _touch(path)  # after the signature was taken, before the parse ends
+            return real(self, claim, *a, **k)
+
+        monkeypatch.setattr(Reconciler, "_register_source_claim", touching)
+        manager._handle_rescan()
+        monkeypatch.setattr(Reconciler, "_register_source_claim", real)
+
+        refreshed = []
+        real_refresh = Reconciler._refresh_claim
+        monkeypatch.setattr(
+            Reconciler,
+            "_refresh_claim",
+            lambda self, claim: (
+                refreshed.append(claim.primary_path),
+                real_refresh(self, claim),
+            )[1],
+        )
+        manager._handle_rescan()
+        assert refreshed == [path]

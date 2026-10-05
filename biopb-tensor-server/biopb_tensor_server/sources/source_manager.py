@@ -1281,55 +1281,28 @@ class SourceManager:
     ) -> List[str]:
         """Remove the sources under ``root`` that this walk did not find again.
 
-        Scoped to the root, deliberately: the periodic reconcile's diff is
-        whole-catalog (``current_ids - discovered_ids``), so running it against a
-        subtree walk would deregister every source outside the drop.
+        Scoped to the root, deliberately: a subtree walk says nothing about the
+        sources outside it. The claims it may remove are those under ``root`` that
 
-        A source is removed when it is under ``root`` and
+        * are not under a monitored root -- the rescan does that, whose two-miss
+          rule suits a source that is only briefly unclaimable; a drop outside
+          every monitored root has no later pass, so waiting would mean never; and
+        * do not live in a directory the walk declined (the skip policy never
+          entered it, so absence says nothing).
 
-        * the rescan will not do it for us -- a source under a monitored root is
-          left to the rescan, whose two-scan rule suits a source that is only
-          briefly unclaimable; a drop outside every monitored root has no later
-          pass, so waiting would mean never;
-        * the walk did not decline the directory it lives in (the skip policy
-          never entered it, so absence says nothing);
-        * its own paths are quiet, the same test the rescan's removal applies; and
-        * an adapter does not claim it on a second look. An adapter can briefly
-          decline a claim it made (a sidecar being rewritten, a locked header),
-          and with no later pass a transient miss would cost a working source.
-          The re-probe is one claim per missing source.
-
-        A source whose primary path is gone skips the re-probe: nothing to claim.
+        Those are removed by the same rule every scan uses (``_remove_absent``): at
+        once, once quiet, and only if no adapter claims them on a second look.
         """
-        root_path = Path(root)
         declined = [Path(d) for d in declined_dirs]
-
-        removed: List[str] = []
-        for source_id, claim in self._reconciler.claim_items():
-            if source_id in discovered_ids or is_remote_url(claim.primary_path):
-                continue
-            # Lexical, so nearly every source in the catalog is rejected
-            # without touching the filesystem, and a link is under the root it was
-            # found in wherever it points.
-            primary = Path(claim.primary_path)
-            if not primary.is_relative_to(root_path):
-                continue
-            if self._roots.is_monitored(claim.primary_path):
-                continue
-            if any(primary.is_relative_to(d) for d in declined):
-                continue
-            if not self._reconciler._claim_is_quiet(claim):
-                continue
-            if os.path.exists(claim.primary_path) and self._reconciler._claimed_again(
-                claim
-            ):
-                continue
-            if self._reconciler._commit_remove_source(source_id):
-                removed.append(source_id)
-                logger.info(
-                    "Deregistered source %s: no longer found under %s", source_id, root
-                )
-        return removed
+        snapshot = {
+            source_id: claim
+            for source_id, claim in self._reconciler.claims_under(Path(root)).items()
+            if not self._roots.is_monitored(claim.primary_path)
+            and not self._reconciler._claim_overlaps_skipped_subtree(claim, declined)
+        }
+        return self._reconciler._remove_absent(
+            snapshot, discovered_ids, strikes=1, gated=True, reprobe=True
+        )
 
     def _display_url_for(self, claim: SourceClaim) -> Optional[str]:
         """The display ``source_url`` the roots give a claim (None leaves it plain)."""

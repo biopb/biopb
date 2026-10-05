@@ -561,21 +561,16 @@ class Reconciler:
         for source_id in unchanged_ids:
             self._settle_unresolved_claim(discovered_claims[source_id])
 
-        # Removal. A claim found again forfeits its count.
-        absent_ids = current_ids - discovered_ids
-        for source_id in current_ids - absent_ids:
+        # A claim found again forfeits its count.
+        for source_id in current_ids & discovered_ids:
             self._missed_scans.pop(source_id, None)
-        removed_ids = []
-        for source_id in sorted(absent_ids):
-            claim = snapshot[source_id]
-            if recurring:
-                misses = self._missed_scans.get(source_id, 0) + 1
-                self._missed_scans[source_id] = misses
-                if misses < _MISSES_BEFORE_REMOVAL or not self._claim_is_quiet(claim):
-                    continue
-            elif os.path.exists(claim.primary_path) and self._claimed_again(claim):
-                continue
-            removed_ids.append(source_id)
+        self._remove_absent(
+            snapshot,
+            discovered_ids,
+            strikes=_MISSES_BEFORE_REMOVAL if recurring else 1,
+            gated=recurring,
+            reprobe=not recurring,
+        )
         # A changed source is REBUILT in place rather than removed and re-added:
         # the replacement adapter is registered on top of the live one, so the
         # source is never absent from ListFlights or the catalog and a failed
@@ -587,11 +582,55 @@ class Reconciler:
             if not recurring or self._claim_is_quiet(snapshot[source_id])
         ]
 
-        for source_id in removed_ids:
-            if self._commit_remove_source(source_id):
-                logger.info("Deregistered source %s: no longer found", source_id)
         for source_id in refreshed_ids:
             self._refresh_claim(discovered_claims[source_id])
+
+    def _remove_absent(
+        self,
+        snapshot: Dict[str, SourceClaim],
+        found_ids: Set[str],
+        *,
+        strikes: int,
+        gated: bool,
+        reprobe: bool,
+    ) -> List[str]:
+        """Remove the claims in *snapshot* that a walk did not find again.
+
+        The one removal rule of every scan; what differs is how sure it must be:
+
+        * *strikes*: a claim must be missing on this many walks running. A root
+          that is walked again can wait for a second look; one that is walked once
+          (a scan-once root, a drop) cannot, so it removes at once (1).
+        * *gated*: only once the claim is quiet, the stability window the claim
+          gate applies on the way in, so a source being rewritten is not removed
+          for an adapter that declines its half-written file.
+        * *reprobe*: only if no adapter claims the path again on a second look. With
+          no later walk to correct a transient decline (a sidecar being rewritten, a
+          locked header), a miss would cost a working source. A claim whose primary
+          path is gone skips the re-probe: nothing to claim.
+
+        Returns the ids removed.
+        """
+        removed: List[str] = []
+        for source_id in sorted(set(snapshot) - found_ids):
+            claim = snapshot[source_id]
+            if strikes > 1:
+                misses = self._missed_scans.get(source_id, 0) + 1
+                self._missed_scans[source_id] = misses
+                if misses < strikes:
+                    continue
+            if gated and not self._claim_is_quiet(claim):
+                continue
+            if (
+                reprobe
+                and os.path.exists(claim.primary_path)
+                and self._claimed_again(claim)
+            ):
+                continue
+            if self._commit_remove_source(source_id):
+                removed.append(source_id)
+                logger.info("Deregistered source %s: no longer found", source_id)
+        return removed
 
     def _claimed_again(self, claim: SourceClaim) -> bool:
         """Whether an adapter claims ``claim``'s primary path right now.
@@ -845,15 +884,20 @@ class Reconciler:
                 return self._commit_pending_claim(claim, catalog_url, recall=True)
             if self._defer_registration and self._deferrable(claim):
                 return self._commit_pending_claim(claim, catalog_url)
+        # Before the parse, and the one the registration persists and state keeps.
+        signatures = self._build_claim_signatures(claim)
         errors: List[str] = []
         if not self._register_source_claim(
-            claim, catalog_seed=catalog_seed, catalog_url=catalog_url, error_sink=errors
+            claim,
+            catalog_seed=catalog_seed,
+            catalog_url=catalog_url,
+            error_sink=errors,
+            signatures=signatures,
         ):
             if keep_failed and catalog_seed is None:
                 self._commit_failed_claim(claim, catalog_url, errors)
             return False
 
-        signatures = self._build_claim_signatures(claim)
         with self._lock:
             added = self._state.add_claim(claim, notify=False)
             if not added:
@@ -905,19 +949,22 @@ class Reconciler:
 
         catalog_url = self._display_url_of(claim.source_id)
 
+        # Before the parse: the new file's identity, not the one state holds, is
+        # what the rebuilt row persists and what state keeps afterwards.
+        signatures = self._build_claim_signatures(claim)
         errors: List[str] = []
         if not self._register_source_claim(
-            claim, catalog_url=catalog_url, replace=True, error_sink=errors
+            claim,
+            catalog_url=catalog_url,
+            replace=True,
+            error_sink=errors,
+            signatures=signatures,
         ):
             # A source that was serving keeps its adapter and its row; one that
             # was still pending becomes a failed row. Only the walk removes one.
             if self.is_pending(claim.source_id):
                 self._mark_registration_failed(claim.source_id, errors)
             return False
-
-        # Outside the lock: this stats every member, and the lock it would
-        # otherwise hold also serializes the rescan's reconcile.
-        signatures = self._build_claim_signatures(claim)
 
         with self._lock:
             self._replace_claim_locked(claim, previous, signatures)
@@ -1379,8 +1426,16 @@ class Reconciler:
         replace: bool = False,
         error_sink: Optional[List[str]] = None,
         recall: bool = False,
+        signatures: Optional[Dict[str, Tuple[Any, ...]]] = None,
     ) -> bool:
         """Create and register a source, rolling back on partial failure.
+
+        ``signatures`` is the claim's member signature, taken by a caller that
+        will keep it in state: it is persisted beside the parse and the caller
+        commits the same one, so the members are stat'ed once. Taken before the
+        adapter is built, a file that changes during the parse then reads as
+        changed on the next scan. Without it a pending source's claim-time
+        signature is used (state holds it), else the members are stat'ed now.
 
         ``recall`` opens a cloud source that was left unopened (see
         :meth:`_build_recalled_adapter`); an error that says why it cannot be
@@ -1407,15 +1462,12 @@ class Reconciler:
         self._warn_if_experimental(claim)
         # Taken before the adapter is built, so a file that changes during the
         # parse is recorded with the identity the parse started from.
+        if signatures is None and self.is_pending(claim.source_id):
+            signatures = self._source_signatures.get(claim.source_id)
         record = (
             None
             if catalog_seed is not None
-            else self._catalog_record(
-                claim,
-                self._source_signatures.get(claim.source_id)
-                if self.is_pending(claim.source_id)
-                else None,
-            )
+            else self._catalog_record(claim, signatures)
         )
         try:
             source_config = self._source_config_for(claim)
