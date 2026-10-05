@@ -2173,7 +2173,6 @@ def _run_recall(
     """
     try:
         result = call()
-        on_success(result)
     except ResolveCancelled:
         job.finish(_JOB_CANCELLED)
     except Exception as exc:  # noqa: BLE001 -- surfaced to the client as `error`
@@ -2181,7 +2180,23 @@ def _run_recall(
         ctx.diag.mark_error(f"{job.kind.upper()}_FAILED", str(exc))
         job.finish(_JOB_ERROR, f"{type(exc).__name__}: {exc}")
     else:
+        on_success(result)
         job.finish(_JOB_DONE)
+
+
+def _attach_resolved_row(job: _SourceJob, row: Any) -> None:
+    """Hand a finished resolve's row to the client, if it can be rendered.
+
+    Best-effort: the source is resolved whatever happens here, so a row that
+    cannot be rendered must not turn the job into an error -- the client falls
+    back to re-reading the listing.
+    """
+    if not isinstance(row, dict):
+        return
+    try:
+        job.set_source(_source_row_to_dict(row))
+    except Exception:  # noqa: BLE001
+        logger.warning(f"resolve row for {job.source_id} not rendered", exc_info=True)
 
 
 def _resolve_worker(ctx: _SidecarContext, job: _SourceJob) -> None:
@@ -2204,7 +2219,7 @@ def _resolve_worker(ctx: _SidecarContext, job: _SourceJob) -> None:
         ctx,
         job,
         _call,
-        on_success=lambda row: job.set_source(_source_row_to_dict(row)),
+        on_success=lambda row: _attach_resolved_row(job, row),
     )
 
 
