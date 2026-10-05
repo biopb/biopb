@@ -71,7 +71,8 @@ is not a mirror and is not under a cloud root. Nothing is opt-in per adapter: th
 is enough to rebuild any of them, and a payload is an optimization that skips the parse
 (OME-TIFF, nd2 and czi have one; others store NULL and are parsed on first read). From
 stage 1.5 a pending or failed row is persisted too, with its claim and signature, and
-restore re-registers it from the claim (see stage 1.5 for failed rows).
+restore re-registers a pending row from its claim. A failed row is restored as failed and
+not retried unless the user asks (see stage 1.5).
 
 - **Mirrors** are bulk-seeded from `catalog_seed` and need the upstream `indexed_at`.
 - **Drops** (`dnd://`) are not restored: roots live in memory, so a drop is not re-found
@@ -306,6 +307,12 @@ landed; it says nothing about whether the claim is current. That decision (uncha
 changed, new) is made from the signature before anything is buffered, so a restored row
 whose file changed is overwritten rather than skipped.
 
+**Failed rows stay failed.** A failed row persists as unresolved with reason `failed`, its
+error and its signature. Restore does not retry it, and neither does a rescan while the
+file is unchanged: a retry happens only when the user asks. The user can delete the row,
+or refresh it, which clears the failure and registers it again. A claim whose signature
+changed is refreshed like any changed claim, which also clears it.
+
 **Scan cases.** Each discovered claim is one of: in state and unchanged (no write), in
 state and changed (refresh), new (batched insert). A restored claim the walk did not see
 is dropped by the post-walk sweep, not by a diff of everything.
@@ -319,9 +326,6 @@ same rows, all conflicting, 2.87 s. Registration onto an existing row: `UPDATE` 
 
 **Open:**
 
-- A failed row now persists with its signature. Restore either retries it or leaves it
-  failed until the file changes; leaving it locks the failure in, so retry is the likelier
-  choice.
 - Contention between the batched writer and registration, and the HPC filesystem, are not
   measured.
 - Rows are cleared at open until stage 2, so stage 1.5 changes what a running server
