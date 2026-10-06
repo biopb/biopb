@@ -1,7 +1,7 @@
 # Catalog persistence
 
-**Stages 1 and 1.5 are implemented (writes only, nothing is read back); the rest is
-proposed.** Tracked in biopb/biopb#1251. When a stage lands, move what became true into
+**Stages 1 and 1.5 are implemented, and so are steps 4a-4c of the restore (behind
+`catalog.restore`, off by default); the rest is proposed.** Tracked in biopb/biopb#1251. When a stage lands, move what became true into
 [progressive-discovery.md](progressive-discovery.md) and delete its section here.
 
 Scope: `biopb-tensor-server` only (catalog store, reconciler, source registry). Companion
@@ -299,8 +299,8 @@ and czi, and no others:
   measure it before stage 2 and pack it if it matters.
 
 Each payload is tested by rebuilding an adapter from the JSON and requiring the same
-tensors, grid and scale as the parsed one. Rows are cleared at open, so nothing is
-restored yet, and the epoch and `last_seen` sweep are stage 2.
+tensors, grid and scale as the parsed one. Rows are cleared at open unless
+`catalog.restore` is on (step 4).
 
 1. `source_catalog` with `CACHE_FORMAT`, written through at each registration with the
    claim, claim-time signature and payload, deleted on live removal; the volatile table
@@ -364,7 +364,7 @@ A restored row is held in the reconciler's existing maps, so nothing new waits o
 6. Clients: the SPA dims unconfirmed rows and reads "verifying"; the SDK exposes
    `confirmed`.
 
-## To verify before stage 2
+## To verify
 
 - Done in stage 1: the `ALLOWED_TABLES` check passes the view and keeps both physical
   tables hidden (tested); the indexes are not used through the union (measured, above).
@@ -379,3 +379,8 @@ A restored row is held in the reconciler's existing maps, so nothing new waits o
   root whose walk committed it, so a per-root sweep can drop what the other root still
   reaches: run it after every root has been walked, or only on ids no root found.
 - Whether nd2 and czi carry embedded masks or ROIs.
+- **OME-TIFF hydration from its payload** is the remaining slow case: measured on
+  `~/data`, a restored nd2, tiff or ome-zarr hydrates in about 25 ms, an OME-TIFF in about
+  500 ms because it still parses. It needs the reduced OME-XML (for the physical scale) and
+  the cached descriptors seeded, and the embedded ROIs and masks imported lazily on
+  first request, not at registration.

@@ -11,7 +11,10 @@ import pytest
 from biopb_tensor_server.adapters import get_default_registry
 from biopb_tensor_server.core.config import SourceConfig
 from biopb_tensor_server.core.discovery import DiscoveryState
-from biopb_tensor_server.core.errors import SourceRegistrationError
+from biopb_tensor_server.core.errors import (
+    SourceRegistrationError,
+    SourceUnresolvedError,
+)
 from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 
 from tests import catalog_server, deferred_registration_test as drt, make_manager
@@ -20,7 +23,7 @@ from tests import catalog_server, deferred_registration_test as drt, make_manage
 class _Run:
     """One server run over a catalog file, driven without the loop thread."""
 
-    def __init__(self, tmp_path, *, restore=True, aliases=None, once=()):
+    def __init__(self, tmp_path, *, restore=True, aliases=None, once=(), cloud=False):
         self.db = MetadataDatabase(
             store_path=tmp_path / "catalog.duckdb", restore_sources=restore
         )
@@ -34,6 +37,7 @@ class _Run:
             discovery_state=DiscoveryState(),
             metadata_db=self.db,
             monitored_dirs={self.monitored},
+            cloud_roots={self.monitored} if cloud else (),
             monitored_aliases={self.monitored: aliases} if aliases else None,
             scan_once_sources=[SourceConfig(url=str(p)) for p in once],
             stability_window=0,
@@ -385,4 +389,32 @@ class TestConfirmation:
         run.restore()
 
         assert list(run.rows()) == [ids[1]]
+        run.stop()
+
+
+class TestCloudFlagFlip:
+    def test_a_root_that_became_cloud_lists_its_sources_unresolved(self, tmp_path):
+        ids = _first_run(tmp_path)
+        run = _Run(tmp_path, cloud=True)
+        run.restore()
+
+        rows = run.rows()
+        assert sorted(rows) == ids
+        for row in rows.values():
+            assert row["unresolved_reason"] == "needs_recall"
+            assert not row["is_resolved"] and not row["tensors"]
+        with pytest.raises(SourceUnresolvedError):
+            run.server.sources.get_registered(ids[0])
+        run.stop()
+
+    def test_a_root_that_stopped_being_cloud_registers_its_sources(self, tmp_path):
+        ids = _first_run(tmp_path, cloud=True)
+        run = _Run(tmp_path)
+        run.restore()
+        run.first_scan()
+
+        assert sorted(run.rows()) == ids
+        for source_id in ids:
+            run.server.sources.get_registered(source_id)
+        assert all(r["is_resolved"] for r in run.rows().values())
         run.stop()
