@@ -17,7 +17,7 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
 from biopb_tensor_server.adapters._scale import MICRON, scale_by_label, unit_to_um
-from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
+from biopb_tensor_server.adapters.ome_tiff import _UNSET, OmeTiffAdapter
 from biopb_tensor_server.adapters.tiff import _tiff_pixel_size_um
 from biopb_tensor_server.core.chunk import default_transfer_chunk_shape
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
@@ -106,9 +106,11 @@ class _TifffileAdapterBase(OmeTiffAdapter):
 
     _LSM = False
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, hydrated_descriptors=None, **kwargs):
         super().__init__(*args, **kwargs)
-        if self.scene_index is None and self._tifffile_descriptor is None:
+        if hydrated_descriptors is not None:
+            self._cached_descriptors = hydrated_descriptors
+        elif self.scene_index is None and self._tifffile_descriptor is None:
             message = (
                 f"{self.__class__.__name__} cannot read TIFF source "
                 f"{self._source_url!r}"
@@ -122,6 +124,16 @@ class _TifffileAdapterBase(OmeTiffAdapter):
             if not descriptors:
                 raise ValueError(message)
             self._cached_descriptors = descriptors
+
+    @classmethod
+    def _parsed_form(cls, row_metadata):
+        """The row's metadata is what the native reader returns."""
+        return dict(row_metadata or {})
+
+    @classmethod
+    def _new_hydrated(cls, url, source_id, descriptors):
+        """A source-level adapter holding *descriptors*, built without reading."""
+        return cls(url, source_id, hydrated_descriptors=descriptors)
 
     @classmethod
     def create_from_config(cls, source, credentials_config=None):
@@ -253,6 +265,7 @@ class _TifffileAdapterBase(OmeTiffAdapter):
             io_lock=self._io_lock,
         )
         adapter._tensor_name = field
+        self._seed_scene(adapter, descriptors[scene_index].array_id)
         self._tensor_adapters[field] = adapter
         return adapter
 
@@ -322,6 +335,8 @@ class _TifffileAdapterBase(OmeTiffAdapter):
 
     def _physical_scale(self):
         """Return TIFF resolution or LSM voxel calibration in micrometres."""
+        if self._seeded_scale is not _UNSET:
+            return self._seeded_scale
         url = self._source_url or ""
         if "://" in url and not url.startswith("file://"):
             return None
@@ -367,8 +382,11 @@ class _TifffileAdapterBase(OmeTiffAdapter):
 
         ImageJ and LSM metadata take precedence. Plain TIFFs commonly carry
         tifffile's JSON-shaped metadata (for example, the stored shape) in
-        the image description; use that when ImageJ metadata is absent.
+        the image description; use that when ImageJ metadata is absent. A source
+        rebuilt from its row returns the row's metadata, which is this dict.
         """
+        if self._hydrated_metadata is not None:
+            return dict(self._hydrated_metadata)
         url = self._source_url or ""
         if "://" in url and not url.startswith("file://"):
             return {}

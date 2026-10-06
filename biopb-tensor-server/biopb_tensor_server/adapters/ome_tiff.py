@@ -455,6 +455,9 @@ def _parallel_read_enabled() -> bool:
 # =============================================================================
 
 
+_UNSET: Any = object()
+
+
 class OmeTiffAdapter(TensorAdapter):
     """Pure-tifffile adapter for OME-TIFF (embedded OME-XML), single or multi-file.
 
@@ -471,6 +474,15 @@ class OmeTiffAdapter(TensorAdapter):
     """
 
     SOURCE_TYPE = "ome-tiff"
+
+    # Set on an adapter rebuilt from a stored payload (``create_from_payload``): what
+    # it was rebuilt from, the physical scale each scene had (``_UNSET`` until
+    # then, since ``None`` is a legitimate "no calibration"), and the row's
+    # metadata where that is the whole of it (a file with no ROIs).
+    _hydrated_payload: Optional[dict] = None
+    _seeded_scale: Any = _UNSET
+    _hydrated_metadata: Optional[dict] = None
+    _seeded_scales: dict = {}
 
     def __init__(
         self,
@@ -567,6 +579,79 @@ class OmeTiffAdapter(TensorAdapter):
     ) -> "OmeTiffAdapter":
         """Create a source-level adapter from a SourceConfig."""
         return cls(str(source.url), source.source_id)
+
+    @classmethod
+    def create_from_payload(
+        cls,
+        source: "SourceConfig",
+        payload: dict,
+        metadata: dict,
+        credentials_config: Optional[object] = None,
+    ) -> Optional["OmeTiffAdapter"]:
+        """Rebuild a source-level adapter from its stored payload: no file is opened.
+
+        The scene descriptors (with their transfer grid) and each scene's physical
+        scale come from the payload. The metadata is the row's, which is the whole
+        of it for a file with no ROIs; a file that has them keeps ``get_metadata``,
+        ``get_embedded_rois`` and the ``@ome`` labels lazy, parsing the file when
+        asked, since the row holds neither the ROIs nor the mask bitmaps.
+
+        ``None`` for a payload that predates the scale (the source is parsed).
+        """
+        if source.is_remote or payload.get("physical_scale") is None:
+            return None
+        scenes = payload.get("scenes")
+        if not scenes:
+            return None
+        descriptors = [
+            TensorDescriptor(
+                array_id=s["array_id"],
+                dim_labels=s["dim_labels"],
+                shape=s["shape"],
+                chunk_shape=s["chunk_shape"],
+                dtype=s["dtype"],
+            )
+            for s in scenes
+        ]
+        adapter = cls._new_hydrated(str(source.url), source.source_id, descriptors)
+        adapter._hydrated_payload = payload
+        adapter._seeded_scales = {
+            array_id: None if scale is None else (list(scale[0]), list(scale[1]))
+            for array_id, scale in payload["physical_scale"].items()
+        }
+        if not payload.get("has_rois"):
+            full = cls._parsed_form(metadata)
+            adapter._parsed_metadata = full or None
+            adapter._parsed_metadata_probed = True
+            adapter._hydrated_metadata = full
+        return adapter
+
+    @classmethod
+    def _parsed_form(cls, row_metadata: dict) -> dict:
+        """The metadata a parse would give, from the row's: the row drops the empty
+        ``rois`` an OME parse reports."""
+        return {**row_metadata, "rois": []} if row_metadata else {}
+
+    @classmethod
+    def _new_hydrated(cls, url: str, source_id: str, descriptors) -> "OmeTiffAdapter":
+        """A source-level adapter holding *descriptors*, built without reading."""
+        adapter = cls(url, source_id)
+        adapter._cached_descriptors = descriptors
+        return adapter
+
+    def _seed_scene(self, scene: "OmeTiffAdapter", array_id: str) -> None:
+        """Hand a scene adapter what this rebuilt source knows, so the scene does not
+        open the file for it either."""
+        if self._hydrated_payload is None:
+            return
+        scene._hydrated_payload = self._hydrated_payload
+        scales = self._seeded_scales
+        if array_id in scales:
+            scene._seeded_scale = scales[array_id]
+        scene._hydrated_metadata = self._hydrated_metadata
+        if self._hydrated_metadata is not None:
+            scene._parsed_metadata = self._parsed_metadata
+            scene._parsed_metadata_probed = True
 
     # ---- reads --------------------------------------------------------------
 
@@ -711,6 +796,7 @@ class OmeTiffAdapter(TensorAdapter):
             io_lock=self._io_lock,
         )
         adapter._tensor_name = field
+        self._seed_scene(adapter, descriptors[scene_idx].array_id)
         # Hand the scene the source's already-parsed OME-XML (_scene_descriptors
         # above populated it) so the scene's metadata / physical-scale paths read
         # the cached string instead of re-opening the master file once per scene --
@@ -850,6 +936,8 @@ class OmeTiffAdapter(TensorAdapter):
 
     def _physical_scale(self):
         """Per-dim physical pixel size + unit from the local OME-XML (or None)."""
+        if self._seeded_scale is not _UNSET:
+            return self._seeded_scale
         return self._physical_scale_from_ome_xml()
 
     # ---- lifecycle ----------------------------------------------------------
@@ -890,6 +978,13 @@ class OmeTiffAdapter(TensorAdapter):
         scenes = self._scene_descriptors()
         if not scenes:
             return None
+        has_rois = bool(self.get_metadata().get("rois"))
+        scales = {}
+        for d in scenes:
+            scale = self.get_tensor_adapter(d.array_id)._physical_scale()
+            scales[d.array_id] = (
+                None if scale is None else [list(scale[0]), list(scale[1])]
+            )
         return {
             "scenes": [
                 {
@@ -903,7 +998,9 @@ class OmeTiffAdapter(TensorAdapter):
             ],
             # Whether the file carries ``<ROI>`` elements, so a read can import
             # them on first request instead of at registration.
-            "has_rois": bool(self.get_metadata().get("rois")),
+            "has_rois": has_rois,
+            # Each scene's calibration, so a restart serves it without the XML.
+            "physical_scale": scales,
             # The ``@ome`` label tensors, so the catalog lists them without
             # parsing the masks; the bitmaps are read when the tensor is.
             "masks": [
@@ -949,6 +1046,17 @@ class OmeTiffAdapter(TensorAdapter):
         its next physical-scale call would reopen the file AND re-cache the raw
         string for good: the leak back, on a scene nothing releases again.
         """
+        if (
+            self._hydrated_payload is not None
+            and not self._raw_ome_xml_probed
+            and not self._reduced_ome_xml_probed
+        ):
+            # Rebuilt from a payload and never asked for the XML: there is nothing
+            # to settle, and settling would open the file.
+            for adapter in list(self._tensor_adapters.values()):
+                if adapter is not self:
+                    adapter.release_registration_cache()
+            return
         # Settle first, drop second: a get_tensor_adapter racing this then
         # inherits either (raw, unsettled) and gets cascaded below, or (no raw,
         # settled) and needs nothing.
