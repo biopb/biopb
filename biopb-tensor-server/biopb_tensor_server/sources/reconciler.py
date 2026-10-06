@@ -1671,6 +1671,8 @@ class Reconciler:
         and the metadata DB record the re-rooted url.
         """
         self._warn_if_experimental(claim)
+        # Whether the adapter was rebuilt from the row it is already catalogued by.
+        from_payload = False
         # Taken before the adapter is built, so a file that changes during the
         # parse is recorded with the identity the parse started from.
         if signatures is None and self.is_pending(claim.source_id):
@@ -1704,6 +1706,7 @@ class Reconciler:
                         adapter = adapter_cls.create_from_payload(
                             source_config, *hydrate, self._credentials_config
                         )
+                        from_payload = adapter is not None
                     except Exception:
                         logger.warning(
                             "could not rebuild source %s from its stored payload; "
@@ -1778,7 +1781,13 @@ class Reconciler:
             # ListFlights but absent from DuckDB. sync_source_added is an upsert,
             # so a replace overwrites the row rather than needing it deleted
             # first -- which is what keeps the source continuously catalogued.
-            if self._metadata_db is not None:
+            # A source rebuilt from its own row is already described by it (the files
+            # are as they were persisted): rewriting a row that can hold megabytes of
+            # metadata to say the same thing is most of what a hydration would cost,
+            # so it is only marked as seen.
+            if self._metadata_db is not None and not (
+                from_payload and self._metadata_db.confirm_source(claim.source_id)
+            ):
                 self._metadata_db.sync_source_added(claim.source_id, adapter, record)
 
             if displaced is not None:

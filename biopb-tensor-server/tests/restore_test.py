@@ -322,6 +322,51 @@ class TestHydrateFromPayload:
         assert [t.array_id for t in adapter.list_tensor_descriptors()] == array_ids
         run.stop()
 
+    def test_a_hydrated_source_marks_its_row_seen_instead_of_rewriting_it(
+        self, tmp_path, probes, monkeypatch
+    ):
+        sid, _ = self._first_run(tmp_path)
+        run = _Run(tmp_path)
+        run.restore()
+        rewrites = []
+        real = run.db.sync_source_added
+        monkeypatch.setattr(
+            run.db,
+            "sync_source_added",
+            lambda source_id, adapter, record=None: (
+                rewrites.append(source_id) or real(source_id, adapter, record)
+            ),
+        )
+
+        run.server.sources.get_registered(sid)
+
+        assert rewrites == []
+        assert _confirmed(run)[sid]  # written this run, as far as the view is concerned
+        assert run.rows()[sid]["is_resolved"]
+        run.stop()
+
+    def test_a_source_that_had_to_be_parsed_is_rewritten(
+        self, tmp_path, probes, monkeypatch
+    ):
+        sid, _ = self._first_run(tmp_path)
+        (tmp_path / "monitored" / "img.nd2").write_bytes(b"\x00\x00\x00")
+        run = _Run(tmp_path)
+        run.restore()
+        rewrites = []
+        real = run.db.sync_source_added
+        monkeypatch.setattr(
+            run.db,
+            "sync_source_added",
+            lambda source_id, adapter, record=None: (
+                rewrites.append(source_id) or real(source_id, adapter, record)
+            ),
+        )
+
+        run.server.sources.get_registered(sid)
+
+        assert rewrites == [sid]
+        run.stop()
+
     def test_a_file_changed_while_down_is_probed_not_rebuilt(self, tmp_path, probes):
         sid, array_ids = self._first_run(tmp_path)
         (tmp_path / "monitored" / "img.nd2").write_bytes(b"\x00\x00\x00")

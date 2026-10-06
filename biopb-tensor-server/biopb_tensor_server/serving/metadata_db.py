@@ -1847,6 +1847,21 @@ class MetadataDatabase:
                 conn.execute("ROLLBACK")
                 raise
 
+    def confirm_source(self, source_id: str) -> bool:
+        """Mark a persisted, resolved row as seen this run without rewriting it.
+
+        For a source rebuilt from the row itself. False when there is no such row,
+        and the caller writes one.
+        """
+        conn = self._get_connection()
+        with self._write_lock:
+            updated = conn.execute(
+                "UPDATE source_catalog SET epoch = ?, last_seen = ? "
+                "WHERE source_id = ? AND is_resolved",
+                [self.run_epoch, datetime.now(), source_id],
+            ).fetchone()
+        return bool(updated and updated[0])
+
     def confirm_root(self, root_id: str) -> None:
         """Record that this run's walk of a root finished: every row under it that a
         restore brought back is now verified against the disk."""
