@@ -1391,11 +1391,8 @@ class TensorFlightServer(flight.FlightServerBase):
         if not result["found"]:
             raise flight.FlightServerError(f"Source not found: {source_id}")
 
-        # The row read back is the one the adapter's ``on_resolved`` callback
-        # just backfilled -- resolution fires it, and that is the only thing
-        # that overwrites the NULL-shape placeholder registration wrote. An
-        # unresolved source built without the callback has no way to correct its
-        # row, which is why this reads the catalog rather than re-syncing here.
+        # The catalog's row, not one built from the adapter: the registration just
+        # wrote it, or it is the row a restored source was rebuilt from.
         row = catalog.source_row_ipc(source_id)
         if row is None:
             raise flight.FlightServerError(

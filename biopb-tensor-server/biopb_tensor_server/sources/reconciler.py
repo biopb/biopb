@@ -1683,6 +1683,8 @@ class Reconciler:
                             source_config, *hydrate, self._credentials_config
                         )
                         from_payload = adapter is not None
+                        if from_payload:
+                            self._stamp_persisted_version(adapter, claim)
                     except Exception:
                         logger.warning(
                             "could not rebuild source %s from its stored payload; "
@@ -1757,13 +1759,11 @@ class Reconciler:
             # ListFlights but absent from DuckDB. sync_source_added is an upsert,
             # so a replace overwrites the row rather than needing it deleted
             # first -- which is what keeps the source continuously catalogued.
-            # A source rebuilt from its own row is already described by it (the files
-            # are as they were persisted): rewriting a row that can hold megabytes of
-            # metadata to say the same thing is most of what a hydration would cost,
-            # so it is only marked as seen.
-            if self._metadata_db is not None and not (
-                from_payload and self._metadata_db.confirm_source(claim.source_id)
-            ):
+            # A source rebuilt from its own row is already described by it:
+            # rewriting a row that can hold megabytes of metadata to say the same
+            # thing is most of what a hydration would cost. It is not confirmed
+            # either: only its root's walk says the files are as persisted.
+            if self._metadata_db is not None and not from_payload:
                 self._metadata_db.sync_source_added(claim.source_id, adapter, record)
 
             if displaced is not None:
@@ -1802,6 +1802,23 @@ class Reconciler:
                 # rollback already closed it: close() must be safe twice.
                 close_adapter(adapter)
             return False
+
+    def _stamp_persisted_version(self, adapter: Any, claim: SourceClaim) -> None:
+        """Version a source rebuilt from its row by the file state it was parsed at.
+
+        An adapter stamps ``content_version`` from the file's stat when it is built,
+        which for a rebuilt one is after the file may have changed. Chunks read
+        through the old layout would then be cached under the new version and
+        outlive the walk's refresh. The persisted ``mtime_ns:size`` is what a
+        registered source holds, so the same read lands under a version the refresh
+        replaces. Only a file with a versioned adapter: a directory's persisted
+        signature has no size.
+        """
+        held = (self._source_signatures.get(claim.source_id) or {}).get(
+            str(claim.primary_path)
+        )
+        if held is not None and len(held) == 5 and adapter.content_version is not None:
+            adapter._content_version = f"{held[3]}:{held[2]}".encode()
 
     def _restore_displaced_source(self, source_id: str, displaced: Any) -> None:
         """Put a swapped-out adapter back after a failed replace (best-effort)."""

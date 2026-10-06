@@ -218,7 +218,7 @@ it in.
 | Gone | Delete |
 | Registration succeeds | `UPDATE` of `metadata_json`, `tensors`, `payload`, `indexed_at`, resolved |
 | Registration fails (a pending claim) | `UPDATE` to `failed` with `unresolved_error` |
-| A restored source rebuilt from its own row (§8) | `UPDATE` of `epoch` and `last_seen` only |
+| A restored source rebuilt from its own row (§8) | None; its root's walk confirms it |
 
 "Resident" is `_claim_is_unresolved` being false: the adapter did not flag the claim, and
 under a cloud root no member is a dehydrated placeholder (a metadata `stat`, nothing is
@@ -462,10 +462,13 @@ with no check of the files: the walk is what compares them with the persisted si
 refreshes a claim that changed, as it does for any registered source. A restored source is
 therefore as stale as a registered one between rescans, from restart until the first walk
 reaches its root (a file deleted meanwhile raises when read; one rewritten meanwhile is read
-through the old layout). The chunk cache is not served stale: an adapter stamps its
-`content_version` from the file's stat when it is built. A source with no payload is parsed.
-A source rebuilt from its own row is marked seen (`confirm_source`: `epoch` and
-`last_seen`) and its row is not rewritten, since a row can hold megabytes of metadata.
+through the old layout). The chunk cache is kept honest by the version: a rebuilt file
+source takes its `content_version` from the persisted signature (`mtime_ns:size` it was
+parsed at), as a registered one holds, so chunks read through a stale layout are cached
+under a version the walk's refresh replaces, and an unchanged file keeps its cache across
+the restart. A directory source takes the stat at build. A source with no payload is
+parsed. A source rebuilt from its own row is neither rewritten (a row can hold megabytes of
+metadata) nor confirmed: only its root's walk confirms it.
 
 **The contract of a payload.** Every file adapter has one: the OME-TIFF family (OME-TIFF,
 TIFF, LSM), nd2, czi, the BioIO family (Zeiss, Leica, Nikon, Olympus, Bioformats, aics),

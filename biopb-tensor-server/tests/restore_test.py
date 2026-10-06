@@ -317,7 +317,7 @@ class TestHydrateFromPayload:
         assert [t.array_id for t in adapter.list_tensor_descriptors()] == array_ids
         run.stop()
 
-    def test_a_hydrated_source_marks_its_row_seen_instead_of_rewriting_it(
+    def test_a_hydrated_source_leaves_its_row_alone_and_unconfirmed_until_the_walk(
         self, tmp_path, probes, monkeypatch
     ):
         sid, _ = self._first_run(tmp_path)
@@ -336,9 +336,73 @@ class TestHydrateFromPayload:
         run.server.sources.get_registered(sid)
 
         assert rewrites == []
-        assert _confirmed(run)[sid]  # written this run, as far as the view is concerned
+        assert not _confirmed(run)[sid]  # nothing has checked the files yet
         assert run.rows()[sid]["is_resolved"]
+
+        run.first_scan()  # the walk does, for its root
+        assert _confirmed(run)[sid]
         run.stop()
+
+    def test_resolving_a_restored_source_registers_it_from_its_row(
+        self, tmp_path, probes
+    ):
+        sid, array_ids = self._first_run(tmp_path)
+        run = _Run(tmp_path)
+        run.restore()
+        targets = []
+
+        assert run.manager.resolve_source(sid, targets.append)
+
+        assert targets == [str(tmp_path / "monitored" / "img.nd2")]
+        assert len(probes) == 1  # no parse
+        adapter = run.server.sources.get(sid)
+        assert [t.array_id for t in adapter.list_tensor_descriptors()] == array_ids
+        assert run.rows()[sid]["is_resolved"]
+        assert not run.reconciler.is_pending(sid)
+        assert run.db.source_row_ipc(sid) is not None
+        run.manager.resolve_source(sid, targets.append)  # a registered one: no-op
+        assert len(probes) == 1 and run.server.sources.get(sid) is adapter
+        run.stop()
+
+    def test_resolving_a_source_that_vanished_while_down_registers_it_from_its_row(
+        self, tmp_path, probes
+    ):
+        sid, _ = self._first_run(tmp_path)
+        (tmp_path / "monitored" / "img.nd2").unlink()
+        run = _Run(tmp_path)
+        run.restore()
+
+        assert run.manager.resolve_source(sid, lambda path: None)
+
+        assert run.server.sources.get(sid) is not None
+        assert run.rows()[sid]["is_resolved"]  # the walk is what removes it
+        run.stop()
+
+    def test_a_rebuilt_source_is_versioned_by_the_file_state_it_was_parsed_at(
+        self, tmp_path, probes
+    ):
+        from biopb_tensor_server.core.chunk import content_version_from_path
+
+        sid, _ = self._first_run(tmp_path)
+        path = tmp_path / "monitored" / "img.nd2"
+        parsed_at = content_version_from_path(str(path))
+
+        unchanged = _Run(tmp_path)
+        unchanged.restore()
+        unchanged.manager.resolve_source(sid, lambda p: None)
+        assert unchanged.server.sources.get(sid).content_version == parsed_at
+        unchanged.stop()
+
+        path.write_bytes(b"\x00\x00\x00")
+        changed = _Run(tmp_path)
+        changed.restore()
+        changed.manager.resolve_source(sid, lambda p: None)
+        # Chunks read through the old layout before the walk land under this
+        # version, not under the changed file's, which the refresh will stamp.
+        assert changed.server.sources.get(sid).content_version == parsed_at
+        changed.first_scan()
+        assert changed.server.sources.get(sid).content_version != parsed_at
+        changed.stop()
 
     def test_a_file_changed_while_down_is_rebuilt_from_its_row_then_parsed_by_the_walk(
         self, tmp_path, probes, monkeypatch
