@@ -653,7 +653,8 @@ class TestDropRemoval:
 
         assert len(result.removed) == 1
 
-    def test_a_source_that_is_still_churning_is_kept(self, tmp_path):
+    def test_a_source_that_is_still_churning_is_removed(self, tmp_path):
+        # A drop has no next tick to wait for, so the stability window is not applied.
         (tmp_path / "a.dat").write_text("a")
         registry = _ScriptedRegistry()
         server, manager = self._manager(registry, stability_window=10**9)
@@ -662,7 +663,7 @@ class TestDropRemoval:
         registry.decline = True
         result = _drain_drop(manager, tmp_path)
 
-        assert result.removed == []
+        assert len(result.removed) == 1
 
     def test_a_source_under_a_monitored_root_is_left_to_the_rescan(self, tmp_path):
         (tmp_path / "a.dat").write_text("a")
