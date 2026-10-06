@@ -246,12 +246,19 @@ class EmdAdapter(TensorAdapter):
         any of them closes them all.
         """
         import h5py
+        from dask.highlevelgraph import MaterializedLayer
 
         with self._io_lock:
             for sig in self._signals:
-                for node in sig["data"].__dask_graph__().values():
-                    if isinstance(node, h5py.Dataset) and node:
-                        node.file.close()
+                # The dataset sits in a layer of its own; the per-chunk layers are
+                # lazy, and walking the whole graph would build them (~140 ms for
+                # 4k chunks).
+                for layer in sig["data"].dask.layers.values():
+                    if not isinstance(layer, MaterializedLayer):
+                        continue
+                    for node in layer.values():
+                        if isinstance(node, h5py.Dataset) and node:
+                            node.file.close()
 
     @property
     def read_block_shape(self) -> Optional[Tuple[int, ...]]:
