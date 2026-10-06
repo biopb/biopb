@@ -820,10 +820,23 @@ class Reconciler:
         with self._lock:
             known = self._state.claims.get(claim.source_id)
         if known is not None:
-            if known.primary_path != claim.primary_path:
-                self._warn_shared_source(known, claim)
+            self.is_held_under_another_path(claim)
             return
         self._commit_add_claim(claim, keep_failed=True)
+
+    def is_held_under_another_path(self, claim: SourceClaim) -> bool:
+        """Whether *claim*'s source is already held, spelled by a different path.
+
+        The same file reached by a link or an overlapping root. It stays where it
+        is: re-spelling it would move it to another root, and so possibly between
+        the persisted table and the volatile one. Warns once.
+        """
+        with self._lock:
+            known = self._state.claims.get(claim.source_id)
+        if known is None or known.primary_path == claim.primary_path:
+            return False
+        self._warn_shared_source(known, claim)
+        return True
 
     def _warn_shared_source(self, known: SourceClaim, found: SourceClaim) -> None:
         """Say once that one file was reached by two paths.

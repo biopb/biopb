@@ -1234,6 +1234,8 @@ class SourceManager:
         for claim in claims:
             if claim.source_id in already_ids:
                 tally.already_present.append(claim.source_id)
+                if self._reconciler.is_held_under_another_path(claim):
+                    continue
                 if self._reconciler._refresh_claim(claim):
                     tally.refreshed.append(claim.source_id)
                     yield ("progress", len(tally.added), str(claim.primary_path))

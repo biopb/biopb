@@ -180,6 +180,20 @@ class TestSharedFile:
         assert "link.zarr" in records[0].message and "a.zarr" in records[0].message
         assert len(_ids(server)) == 1  # one source, under the first path
 
+    def test_a_drop_does_not_move_a_claim_to_another_root(self, tmp_path):
+        manager, server = self._linked(tmp_path)
+        manager._handle_rescan()
+        reconciler = manager._reconciler
+        (sid,) = reconciler.claim_ids()
+        held = reconciler.claim_primary_path(sid)
+        # Drop whichever root does not hold it: the walk reaches the same file there.
+        other = tmp_path / ("monitored" if "once" in held else "once")
+
+        for _ in manager.add_local_source(str(other)):
+            pass
+
+        assert reconciler.claim_primary_path(sid) == held
+
     def test_an_ordinary_rescan_reports_nothing(self, tmp_path, caplog):
         manager, server, monitored, once = _manager(tmp_path)
         drt._make_zarr(monitored, "a.zarr")
