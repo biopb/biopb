@@ -293,8 +293,9 @@ export function TreeRow({
           doubleClickToResolve ? () => startResolve(src.source_id) : undefined
         }
       >
-        <ChevronSlot />
-        <span className="unresolved-glyph" aria-label="Not resolved">
+        {/* The glyph is this row's chevron slot, not a second element after it,
+            so the name stays in the label column of its resolved siblings. */}
+        <span className="unresolved-glyph" role="img" aria-label="Not resolved">
           {kind === "recall" ? UNRESOLVED_GLYPH : "\u2026"}
         </span>
         <span className="tree-name" style={{ flex: 1, marginLeft: 4 }}>
