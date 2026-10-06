@@ -3391,6 +3391,25 @@ def shutdown_sentinel_path() -> os.PathLike:
     return _locations.tensor_stop_sentinel()
 
 
+_PROBE_PATHS = ("/livez", "/readyz", "/healthz")
+
+
+class _ProbeAccessFilter(logging.Filter):
+    """Drop the access-log line of a probe that succeeded.
+
+    Supervisors and proxies poll the probes every few seconds, which buries every
+    other request. A failing probe still logs.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        # uvicorn's access record: (client, method, path, http_version, status).
+        try:
+            _client, _method, path, _version, status = record.args
+        except (TypeError, ValueError):
+            return True
+        return not (str(path).split("?", 1)[0] in _PROBE_PATHS and status == 200)
+
+
 def _install_windows_shutdown_listener(server) -> None:
     """Windows-only: let the control supervisor shut the daemon down gracefully.
 
@@ -3464,6 +3483,7 @@ def run(
         config_path=config_path,
         tls_fingerprint=tls_fingerprint,
     )
+    logging.getLogger("uvicorn.access").addFilter(_ProbeAccessFilter())
     server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level="info"))
     # Windows: enable graceful `biopb server stop` via a sentinel-file watcher
     # that flips server.should_exit (no-op on other platforms, which use SIGTERM).
