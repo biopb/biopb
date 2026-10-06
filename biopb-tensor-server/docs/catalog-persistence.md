@@ -306,10 +306,46 @@ restored yet, and the epoch and `last_seen` sweep are stage 2.
    Tests: an alias edited between two opens shows in the view with no source row
    written; each id appears once; `rel` and `root_url` equal `Roots.display_url` for
    plain, aliased and scan-once roots, and for a file that is the root itself.
-4. Restore and hydrate every persisted row, behind a setting: the restore rules, the
-   epoch and per-root confirmation, the post-walk sweep and `last_seen` cap, lazy `@ome`
-   ROIs and masks, hydration notifies precache, the observation hooks ignore unconfirmed
-   rows, the loud corrupt-catalog log, the rebuild flag.
+4. Restore and hydrate every persisted row, behind `catalog.restore` (off by default),
+   in steps:
+   - **4a. Restore from the claim.** At `start()`, before the first tick, each row
+     becomes a claim and a pending source: the catalog is complete at once, the pool (or
+     a client's read) registers it by parsing, and the first walk is an ordinary rescan
+     against the restored claims. The config-change rules, failed and cloud rows, and the
+     `check_registered` hook that hydrates a restored source on a read.
+   - **4b. Hydrate from the payload:** OME-TIFF, nd2 and czi build their adapter from the
+     row's payload, skipping the parse.
+   - **4c. Confirmation:** the run counter, `catalog_roots.epoch`, `confirmed` in the
+     view, the post-walk sweep and the `last_seen` cap, the observation hooks ignoring
+     unconfirmed rows.
+   - **4d. The rest of Interactions:** lazy `@ome` ROIs and masks, precache on hydration,
+     the loud corrupt-catalog log.
+
+### 4a: how a restore works
+
+A restored row is held in the reconciler's existing maps, so nothing new waits on it:
+
+| Row | In memory | Hydrated by |
+|---|---|---|
+| resolved, local | `_pending`, and `_restored` | the pool, or a read (`check_registered`) |
+| `pending` | `_pending` | the pool |
+| `needs_recall` (cloud) | `_pending`, `_recall` | a client's resolve |
+| `failed` | `_pending`, `_pending_failed` (the row's error) | a resolve, a drop, or a new signature |
+
+- **The row stays as it is** until its registration rewrites it, so the listing is
+  complete from the start. `_restored` marks a resolved row with no adapter: `check_registered`
+  registers it on a read (where a fresh pending source raises "resolve it"), and a failed
+  hydration makes the row `failed` like any registration.
+- **Signatures:** the persisted form has no `st_dev`, so a restored signature is held with
+  `None` there and compared on the other fields only (`_same_signature`); the first walk then
+  keeps an unchanged claim and refreshes a changed one.
+- **Ownership** is re-derived at restore (see Config changes): a claim under no persisted
+  root, or with a member outside the roots, is deleted; a row whose `root_id` or `rel` differs
+  is rewritten. The display url is recomputed from the roots, never read from the row.
+- **A row that cannot be read** (a payload or claim that does not decode) is deleted and
+  logged, and its file is found again by the walk as a new claim.
+- **Off:** the tables are cleared at open, as before.
+
 5. More payloads for adapters whose parse is slow, as measured; default on after a
    release cycle with the setting opt-in.
 6. Clients: the SPA dims unconfirmed rows and reads "verifying"; the SDK exposes

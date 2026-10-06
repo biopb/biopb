@@ -713,8 +713,12 @@ class MetadataDatabase:
         store_path: Optional[Path] = None,
         annotations_enabled: bool = True,
         checkpoint_threshold_mb: int = 1024,
+        restore_sources: bool = False,
     ):
         self._checkpoint_threshold_mb = checkpoint_threshold_mb
+        #: Keep ``source_catalog`` across a restart (``catalog.restore``): its rows
+        #: are read back by :meth:`restorable_rows`, not cleared at open.
+        self.restore_sources = restore_sources and store_path is not None
         self._max_query_results = max_query_results
         self._query_timeout_ms = query_timeout_ms
         self._max_rois_per_tensor = max_rois_per_tensor
@@ -1027,8 +1031,9 @@ class MetadataDatabase:
 
         Dropped whole when ``SOURCE_CATALOG_FORMAT`` differs from the one that
         wrote it, or is missing: the result is today's behaviour, a rebuild.
-        Rows are cleared at open until a restore reads them; showing last run's
-        rows with no adapter behind them would be a catalog that lies.
+        Rows are cleared at open unless ``restore_sources``: showing last run's
+        rows with no adapter behind them would be a catalog that lies, so a
+        restore registers (or marks pending) every row it keeps.
         """
         conn.execute(
             "CREATE TABLE IF NOT EXISTS catalog_meta (key TEXT PRIMARY KEY, value TEXT)"
@@ -1074,7 +1079,8 @@ class MetadataDatabase:
             "CREATE TABLE IF NOT EXISTS catalog_roots "
             "(root_id TEXT PRIMARY KEY, root_url TEXT NOT NULL)"
         )
-        conn.execute("DELETE FROM source_catalog")
+        if not self.restore_sources:
+            conn.execute("DELETE FROM source_catalog")
         conn.execute("DELETE FROM catalog_roots")
         conn.execute(
             "INSERT OR REPLACE INTO catalog_meta VALUES ('source_catalog_format', ?)",
@@ -1708,6 +1714,67 @@ class MetadataDatabase:
                     )
                 for sql, params in statements:
                     conn.execute(sql, params)
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+
+    def restorable_rows(self) -> List[Dict[str, Any]]:
+        """The persisted rows a restore rebuilds claims from, without the payload and
+        the metadata (large, and read per source when it is hydrated).
+
+        Empty unless ``restore_sources``: the table was cleared at open.
+        """
+        if not self.restore_sources:
+            return []
+        conn = self._get_connection()
+        cursor = conn.execute(
+            "SELECT source_id, source_type, is_resolved, unresolved_reason, "
+            "unresolved_error, root_id, rel, primary_path, member_paths, "
+            "extra_config, signature FROM source_catalog"
+        )
+        names = [d[0] for d in cursor.description]
+        return [dict(zip(names, row, strict=True)) for row in cursor.fetchall()]
+
+    def drop_catalog_rows(self, source_ids: Sequence[str]) -> None:
+        """Delete persisted rows a restore did not keep, with the reserved ROI rows
+        each one's registration derived (see :meth:`sync_source_removed`)."""
+        if not source_ids:
+            return
+        conn = self._get_connection()
+        ids = list(source_ids)
+        with self._write_lock:
+            conn.execute("BEGIN TRANSACTION")
+            try:
+                conn.execute(
+                    "DELETE FROM source_catalog WHERE source_id IN (SELECT unnest(?))",
+                    [ids],
+                )
+                conn.execute(
+                    "DELETE FROM rois WHERE source_id IN (SELECT unnest(?)) "
+                    "AND starts_with(set_name, ?)",
+                    [ids, RESERVED_SET_PREFIX],
+                )
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+
+    def rewrite_row_roots(self, rows: Sequence[Tuple[str, str, str]]) -> None:
+        """Re-attribute persisted rows to the roots a restore found them under:
+        ``(source_id, root_id, rel)`` each."""
+        if not rows:
+            return
+        conn = self._get_connection()
+        with self._write_lock:
+            conn.execute("BEGIN TRANSACTION")
+            try:
+                for source_id, root_id, rel in rows:
+                    conn.execute(
+                        "UPDATE source_catalog SET root_id = ?, rel = ? "
+                        "WHERE source_id = ?",
+                        [root_id, rel, source_id],
+                    )
                 conn.execute("COMMIT")
             except BaseException:
                 conn.execute("ROLLBACK")

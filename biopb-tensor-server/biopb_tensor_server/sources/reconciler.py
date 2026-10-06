@@ -39,7 +39,17 @@ import stat
 import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+)
 
 from biopb_tensor_server.core.adapter_base import to_catalog_url
 from biopb_tensor_server.core.config import SourceConfig
@@ -102,6 +112,23 @@ _EXPERIMENTAL_SOURCE_MESSAGES = {
         "Remote URL sources (s3://, http(s)://, ...) are EXPERIMENTAL and may change."
     ),
 }
+
+
+def _same_signature(
+    held: Dict[str, Tuple[Any, ...]], found: Dict[str, Tuple[Any, ...]]
+) -> bool:
+    """Whether two member signatures are the same file state.
+
+    A restored signature has no ``st_dev`` (the persisted form drops it, since it
+    renumbers across boots), held as ``None``, which matches whatever the device is.
+    """
+    if held.keys() != found.keys():
+        return False
+    return all(
+        held[path] == found[path]
+        or (held[path][0] is None and held[path][1:] == found[path][1:])
+        for path in held
+    )
 
 
 def _warn_experimental_source(family: str) -> None:
@@ -179,6 +206,11 @@ class Reconciler:
         # is downloaded when it is resolved, never in the background. A subset of
         # ``_pending``, disjoint from ``_pending_failed``.
         self._recall: Set[str] = set()
+        # The pending sources a restore found resolved: their rows are complete
+        # and list at once, and a read registers them (``check_registered``)
+        # rather than raising "resolve it", which a client would never ask for.
+        # A subset of ``_pending``, disjoint from the other two.
+        self._restored: Set[str] = set()
         # A registration, a refresh and a removal of one source never overlap, so
         # a resolve that races the worker coalesces onto one parse and a removed
         # source is not registered back. A fixed stripe of locks hashed by
@@ -283,6 +315,7 @@ class Reconciler:
         self._pending.pop(source_id, None)
         self._pending_failed.pop(source_id, None)
         self._recall.discard(source_id)
+        self._restored.discard(source_id)
 
     def _registration_lock(self, source_id: str) -> threading.RLock:
         return self._registration_stripes[hash(source_id) % _REGISTRATION_STRIPES]
@@ -316,6 +349,116 @@ class Reconciler:
             for source_id, claim in claims
             if claim.primary_path == prefix or claim.primary_path.startswith(under)
         }
+
+    def restore(self, rows: Sequence[Dict[str, Any]]) -> Dict[str, int]:
+        """Put the claims of the persisted *rows* back, every one waiting to register.
+
+        What a restart keeps of the last run: the claim, its claim-time signature
+        and what its row said it was waiting for (see ``_pending``, ``_recall``,
+        ``_pending_failed`` and ``_restored``). No file is opened. The first walk
+        then verifies each claim like any rescan: an unchanged one is left, a
+        changed one refreshed, one that is gone removed.
+
+        Ownership is re-derived against the current roots, never read from the
+        row: a claim under no persisted root, or with a member outside them, or
+        that cannot be read, is deleted and left for the walk to find again; a row
+        whose root or path under it differs is rewritten. A claim that conflicts
+        with one already restored is dropped, the first holding it.
+
+        Returns the counts ``restored``, ``dropped`` and ``rewritten``.
+        """
+        plan = []
+        dropped: List[str] = []
+        for row in rows:
+            source_id = row["source_id"]
+            restored = self._restored_claim(row)
+            if restored is None:
+                dropped.append(source_id)
+            else:
+                plan.append((row, *restored))
+
+        kept = 0
+        rewrites: List[Tuple[str, str, str]] = []
+        recall_rows: List[SourceClaim] = []
+        queue: List[str] = []
+        with self._lock:
+            for row, claim, signatures, root in plan:
+                source_id = claim.source_id
+                if not self._state.add_claim(claim, notify=False):
+                    dropped.append(source_id)
+                    continue
+                kept += 1
+                self._source_signatures[source_id] = signatures
+                self._pending[source_id] = self._catalog_url_for(claim)
+                reason = row["unresolved_reason"]
+                if root.cloud or reason == "needs_recall":
+                    # Never resolved from a row: see the Cloud section of the design.
+                    self._recall.add(source_id)
+                    if row["is_resolved"]:
+                        recall_rows.append(claim)
+                elif reason == "failed":
+                    self._pending_failed[source_id] = (
+                        row["unresolved_error"]
+                        or "registration failed (see the server log)"
+                    )
+                else:
+                    if row["is_resolved"]:
+                        self._restored.add(source_id)
+                    queue.append(source_id)
+                rel = path_under_root(root.url, claim.primary_path)
+                if (row["root_id"], row["rel"]) != (root.root_id, rel):
+                    rewrites.append((source_id, root.root_id, rel))
+
+        if self._metadata_db is not None:
+            self._metadata_db.drop_catalog_rows(dropped)
+            self._metadata_db.rewrite_row_roots(rewrites)
+            for claim in recall_rows:
+                # Listed as the unresolved source it will be, not as a resolved one.
+                self._metadata_db.sync_pending_source(
+                    claim,
+                    self._pending.get(claim.source_id),
+                    recall=True,
+                    record=self._state_record(claim),
+                )
+        for source_id in queue:
+            self._on_pending(source_id)
+        return {
+            "restored": kept,
+            "dropped": len(dropped),
+            "rewritten": len(rewrites),
+        }
+
+    def _restored_claim(self, row: Dict[str, Any]):
+        """``(claim, signatures, root)`` of a persisted row, or None if it cannot be
+        kept: unreadable, or no longer under the roots."""
+        try:
+            primary = row["primary_path"]
+            members = list(row["member_paths"] or [primary])
+            claim = SourceClaim(
+                row["source_type"],
+                primary,
+                row["source_id"],
+                extra_config=json.loads(row["extra_config"] or "{}"),
+                member_paths=members,
+                unresolved=row["unresolved_reason"] == "needs_recall",
+            )
+            signatures = {
+                path: (None, *values)
+                for path, values in json.loads(row["signature"]).items()
+            }
+        except Exception:
+            logger.warning(
+                "dropping unreadable catalog row for source %s",
+                row.get("source_id"),
+                exc_info=True,
+            )
+            return None
+        root = self._roots.containing(Path(primary))
+        if root is None or root.kind not in (RootKind.MONITORED, RootKind.SCAN_ONCE):
+            return None
+        if any(self._roots.containing(Path(m)) is None for m in members):
+            return None
+        return claim, signatures, root
 
     def begin_pending_batch(self) -> None:
         """Write the pending rows of the claims that follow in batches, until
@@ -468,7 +611,15 @@ class Reconciler:
         ``SourceRegistrationError`` when its registration failed, an unresolved
         error while it waits -- either way the client resolves it. Returns for a
         source that is not pending (unknown, registered, removed).
+
+        A restored source is the exception to "never registers": its row is
+        complete and lists as resolved, so a read hydrates it here, once (the
+        registration is single-flight), instead of asking a client to resolve it.
         """
+        with self._lock:
+            restored = source_id in self._restored
+        if restored and self.ensure_registered(source_id):
+            return
         with self._lock:
             if source_id not in self._pending:
                 return
@@ -550,7 +701,7 @@ class Reconciler:
             if existing_signatures is None:
                 self._source_signatures[source_id] = new_signatures
                 continue
-            if existing_signatures != new_signatures:
+            if not _same_signature(existing_signatures, new_signatures):
                 changed_ids.add(source_id)
             else:
                 unchanged_ids.append(source_id)

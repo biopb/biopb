@@ -278,6 +278,7 @@ class SourceManager:
 
         self._next_rescan_at = time.monotonic()
         self._stop.clear()
+        self._restore_catalog()
         if self._registration_worker is not None:
             # After the static sources, which were committed inline before this.
             self._reconciler.set_defer_registration(True)
@@ -295,6 +296,31 @@ class SourceManager:
         self._thread.start()
         logger.info(
             "SourceManager started; rescanning every %.1fs", self._rescan_interval
+        )
+
+    def _restore_catalog(self) -> None:
+        """Put the last run's sources back as claims, before the first scan.
+
+        Only with ``catalog.restore``. A failure leaves the catalog as a fresh one:
+        a restore that cannot be trusted is a rebuild, never a half-restored state.
+        """
+        db = self._metadata_db
+        if db is None or not getattr(db, "restore_sources", False):
+            return
+        started = time.monotonic()
+        try:
+            summary = self._reconciler.restore(db.restorable_rows())
+        except Exception:
+            logger.exception("Catalog restore failed; rebuilding the catalog")
+            db.drop_catalog_rows([r["source_id"] for r in db.restorable_rows()])
+            return
+        logger.info(
+            "Restored %d sources from the catalog in %.1f s (%d dropped, %d "
+            "re-attributed)",
+            summary["restored"],
+            time.monotonic() - started,
+            summary["dropped"],
+            summary["rewritten"],
         )
 
     # --- Startup-protocol seam ------------------------------------------------
