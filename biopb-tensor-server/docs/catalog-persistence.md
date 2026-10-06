@@ -49,7 +49,7 @@ it comes back.
 | Holder | State | Keyed by |
 |---|---|---|
 | `DiscoveryState` (scratch and confirmed) | `claims`, `_path_to_source`, `_source_to_paths`, `consumed_paths`, `visited_identities` | `source_id`; claim path strings; file identities |
-| `Reconciler` | `_source_signatures`, `_missed_scans`, `_pending`, `_pending_failed`, `_recall`, `_restored`, `_verified` | `source_id` |
+| `Reconciler` | `_source_signatures`, `_missed_scans`, `_pending`, `_pending_failed`, `_recall`, `_restored` | `source_id` |
 | `Roots` (shared by `SourceManager` and `Reconciler`) | every known root: kind (monitored, scan-once, dropped, upstream), alias, cloud, `dnd://` label, `root_id`, `root_url` | Resolved root `Path`s; a drop's label |
 | `SourceManager` | `_unavailable_roots` | Resolved root `Path`s |
 | Adapter | `_source_url` (the raw claim path, or the library's own filename for nifti / bioio / dicom), `catalog_url` | Opens files with the raw path |
@@ -457,12 +457,15 @@ tables:
   (`_RESTORE_MAX_AGE`) is dropped, so an unreachable root does not leave its sources listed
   forever.
 
-**Hydration from the payload.** Registering a restored source skips the parse when the
-files' signature is still the one persisted: the walk's verdict once it has found the claim
-unchanged (`_verified`, so the members are not stat'ed again), else a stat of the members.
-Otherwise the claim is parsed. A source rebuilt from its own row is marked seen
-(`confirm_source`: `epoch` and `last_seen`) and its row is not rewritten, since a row can
-hold megabytes of metadata.
+**Hydration from the payload.** Registering a restored source rebuilds it from its row
+with no check of the files: the walk is what compares them with the persisted signature and
+refreshes a claim that changed, as it does for any registered source. A restored source is
+therefore as stale as a registered one between rescans, from restart until the first walk
+reaches its root (a file deleted meanwhile raises when read; one rewritten meanwhile is read
+through the old layout). The chunk cache is not served stale: an adapter stamps its
+`content_version` from the file's stat when it is built. A source with no payload is parsed.
+A source rebuilt from its own row is marked seen (`confirm_source`: `epoch` and
+`last_seen`) and its row is not rewritten, since a row can hold megabytes of metadata.
 
 **The contract of a payload.** Every file adapter has one: the OME-TIFF family (OME-TIFF,
 TIFF, LSM), nd2, czi, the BioIO family (Zeiss, Leica, Nikon, Olympus, Bioformats, aics),

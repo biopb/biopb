@@ -217,9 +217,6 @@ class Reconciler:
         # rather than raising "resolve it", which a client would never ask for.
         # A subset of ``_pending``, disjoint from the other two.
         self._restored: Set[str] = set()
-        # The restored sources whose files this run's walk found as they were
-        # persisted: their hydration need not stat every member again.
-        self._verified: Set[str] = set()
         # A registration, a refresh and a removal of one source never overlap, so
         # a resolve that races the worker coalesces onto one parse and a removed
         # source is not registered back. A fixed stripe of locks hashed by
@@ -325,7 +322,6 @@ class Reconciler:
         self._pending_failed.pop(source_id, None)
         self._recall.discard(source_id)
         self._restored.discard(source_id)
-        self._verified.discard(source_id)
 
     def _registration_lock(self, source_id: str) -> threading.RLock:
         return self._registration_stripes[hash(source_id) % _REGISTRATION_STRIPES]
@@ -594,7 +590,14 @@ class Reconciler:
                 catalog_url = self._pending[source_id]
 
             errors: List[str] = []
-            hydrate = self._hydration_for(claim) if restored else None
+            # A restored row is taken as it was written: the walk compares the
+            # files with its signature and refreshes what changed, as it does for
+            # any registered source.
+            hydrate = (
+                self._metadata_db.read_hydration(source_id)
+                if restored and self._metadata_db is not None
+                else None
+            )
             # A cloud source raises why it could not be opened (retriable or
             # not) instead of recording a failure: it stays ``needs_recall`` and
             # the client that resolved it hears the reason.
@@ -617,28 +620,6 @@ class Reconciler:
         if not recall:
             self._notify_source_committed(source_id)
         return True
-
-    def _hydration_for(
-        self, claim: SourceClaim
-    ) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
-        """The stored payload and metadata of a restored source, if its files are as
-        they were when the row was written; None parses the claim instead.
-
-        The check is a stat of the members, the walk's own: a file rewritten while
-        the server was down must not be served from the old layout in the moment
-        before the walk reaches it. Once the walk has found the claim unchanged
-        (``_verified``) it is not repeated, which for a directory of thousands of
-        members is most of the cost of a hydration on a network share.
-        """
-        if self._metadata_db is None:
-            return None
-        if claim.source_id not in self._verified:
-            held = self._source_signatures.get(claim.source_id)
-            if held is None or not _same_signature(
-                held, self._build_claim_signatures(claim)
-            ):
-                return None
-        return self._metadata_db.read_hydration(claim.source_id)
 
     def materialize(self, source_id: str) -> None:
         """Register a pending source now, for a client that resolved it.
@@ -752,11 +733,6 @@ class Reconciler:
                 unchanged_ids.append(source_id)
         # Known and unchanged, but not registered: its row may be waiting on the
         # wrong thing (a file that became resident, or stopped being).
-        with self._lock:
-            self._verified.update(
-                source_id for source_id in unchanged_ids if source_id in self._restored
-            )
-            self._verified.difference_update(changed_ids)
         for source_id in unchanged_ids:
             self._settle_unresolved_claim(discovered_claims[source_id])
 

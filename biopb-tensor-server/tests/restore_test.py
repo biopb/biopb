@@ -195,7 +195,7 @@ class TestRestore:
             run.server.sources.get_registered(sid)
         run.stop()
 
-    def test_a_read_of_a_source_that_vanished_fails_it_instead_of_listing_it(
+    def test_a_source_that_vanished_is_served_from_its_row_until_the_walk_removes_it(
         self, tmp_path
     ):
         ids = _first_run(tmp_path)
@@ -206,11 +206,14 @@ class TestRestore:
             i for i in ids if run.reconciler.claim_primary_path(i).endswith("a.zarr")
         ]
 
-        with pytest.raises(SourceRegistrationError):
-            run.server.sources.get_registered(gone)
+        # Built from its row without opening the file, as a stale registered
+        # source is: the row stays resolved, and the walk is what removes it.
+        assert run.server.sources.get_registered(gone) is not None
+        assert run.rows()[gone]["is_resolved"]
 
-        assert run.rows()[gone]["unresolved_reason"] == "failed"
-        assert not run.rows()[gone]["is_resolved"]
+        run.first_scan()
+        run.manager._handle_rescan()
+        assert gone not in run.rows()
         run.stop()
 
     def test_restored_sources_are_queued_for_the_pool_without_a_stat(
@@ -227,29 +230,18 @@ class TestRestore:
         assert sorted(run.manager._deferred) == ids
         run.stop()
 
-    def test_a_walk_that_verified_a_source_spares_its_hydration_the_stat(
-        self, tmp_path, monkeypatch
-    ):
+    def test_hydrating_a_restored_source_stats_no_member(self, tmp_path, monkeypatch):
         ids = _first_run(tmp_path)
         run = _Run(tmp_path)
         run.restore()
-        stats = []
-        real = run.reconciler._build_claim_signatures
         monkeypatch.setattr(
             run.reconciler,
             "_build_claim_signatures",
-            lambda claim: stats.append(claim.source_id) or real(claim),
+            lambda claim: pytest.fail("a hydration stat'ed the members"),
         )
 
-        run.server.sources.get_registered(ids[0])  # a read before the walk checks
-        assert stats.count(ids[0]) >= 1
-        before = len(stats)
-
-        run.first_scan()  # the walk verifies the rest
-        walked = len(stats) - before
-        run.server.sources.get_registered(ids[1])
-
-        assert len(stats) - before == walked  # hydrating it stat'ed nothing more
+        for source_id in ids:  # reads before the walk: it is the walk's to check
+            run.server.sources.get_registered(source_id)
         run.stop()
 
     def test_nothing_is_restored_when_the_setting_is_off(self, tmp_path):
@@ -348,7 +340,7 @@ class TestHydrateFromPayload:
         assert run.rows()[sid]["is_resolved"]
         run.stop()
 
-    def test_a_source_that_had_to_be_parsed_is_rewritten(
+    def test_a_file_changed_while_down_is_rebuilt_from_its_row_then_parsed_by_the_walk(
         self, tmp_path, probes, monkeypatch
     ):
         sid, _ = self._first_run(tmp_path)
@@ -365,20 +357,11 @@ class TestHydrateFromPayload:
             ),
         )
 
-        run.server.sources.get_registered(sid)
+        run.server.sources.get_registered(sid)  # before the walk: the row, as it was
+        assert len(probes) == 1 and rewrites == []
 
-        assert rewrites == [sid]
-        run.stop()
-
-    def test_a_file_changed_while_down_is_probed_not_rebuilt(self, tmp_path, probes):
-        sid, array_ids = self._first_run(tmp_path)
-        (tmp_path / "monitored" / "img.nd2").write_bytes(b"\x00\x00\x00")
-
-        run = _Run(tmp_path)
-        run.restore()
-        run.server.sources.get_registered(sid)
-
-        assert len(probes) == 2
+        run.first_scan()  # the walk finds the signature changed and parses it
+        assert len(probes) == 2 and rewrites == [sid]
         run.stop()
 
 
