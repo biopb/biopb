@@ -145,6 +145,38 @@ class TestRouting:
         assert json.loads(row[3]) == {"k": 1}
         assert row[6] == 1  # its tensors
 
+    def test_a_registration_whose_update_missed_the_row_overwrites_it(self):
+        """The row is there but the UPDATE reports none (a CI runner on Windows saw
+        the INSERT after it fail on a duplicate key): the row is overwritten, the
+        registration does not fail."""
+        db = _db()
+        db.sync_pending_source(_record().claim, record=_record())
+
+        class _Missed:
+            """The shared connection, whose first UPDATE of a source row matches
+            nothing."""
+
+            def __init__(self, conn):
+                self._conn = conn
+
+            def execute(self, sql, *args):
+                if sql.startswith("UPDATE source_catalog SET source_type"):
+                    return self._conn.execute("SELECT 0")
+                return self._conn.execute(sql, *args)
+
+            def __getattr__(self, name):
+                return getattr(self._conn, name)
+
+        db._conn = _Missed(db._get_connection())
+        db.sync_source_added(
+            "s1", _Restorable("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8"), _record()
+        )
+
+        assert _count(db, "source_catalog") == 1
+        row = _row(db)
+        assert row[:3] == (True, None, None)
+        assert row[6] == 1
+
     def test_a_pending_batch_splits_by_whether_the_row_has_a_record(self):
         from biopb_tensor_server.sources.pending_rows import PendingRow
 

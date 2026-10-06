@@ -129,6 +129,10 @@ _PERSISTED_COLUMNS = ", ".join(_PERSISTED_ROW_COLUMN_NAMES + _CLAIM_COLUMN_NAMES
 _UPDATE_SET = ", ".join(
     f"{c} = ?" for c in _PERSISTED_ROW_COLUMN_NAMES[1:] + _CLAIM_COLUMN_NAMES
 )
+# The same, for an ``INSERT ... ON CONFLICT DO UPDATE`` that finds the row there.
+_UPSERT_SET = ", ".join(
+    f"{c} = excluded.{c}" for c in _PERSISTED_ROW_COLUMN_NAMES[1:] + _CLAIM_COLUMN_NAMES
+)
 # ``_SOURCE_COLUMNS`` for a ``source_catalog`` row (alias ``c``) joined to its root
 # (alias ``r``): the url is the root's, then the row's path beneath it.
 _PERSISTED_SOURCE_COLUMNS = _SOURCE_COLUMNS.replace(
@@ -1668,9 +1672,13 @@ class MetadataDatabase:
                 persisted[1:] + claim_values + [source_id],
             ).fetchone()
             if not updated or not updated[0]:
+                # A row that is there by now (the UPDATE did not see it) is
+                # overwritten, which is what was asked: a registration must not
+                # fail on the pending row its claim made.
                 conn.execute(
                     f"INSERT INTO source_catalog ({_PERSISTED_COLUMNS}) "
-                    f"VALUES ({', '.join('?' * (len(persisted) + len(claim_values)))})",
+                    f"VALUES ({', '.join('?' * (len(persisted) + len(claim_values)))}) "
+                    f"ON CONFLICT (source_id) DO UPDATE SET {_UPSERT_SET}",
                     persisted + claim_values,
                 )
 
