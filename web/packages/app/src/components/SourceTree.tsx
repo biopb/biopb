@@ -40,6 +40,14 @@ function formatShape(shape: number[]): string {
   return shape.join("×");
 }
 
+// The badge's shape without its leading singleton axes (1×1×343×278×300 reads
+// as 343×278×300): they carry nothing a glance needs and crowd the row. The
+// tooltip keeps the full shape. An all-ones shape stays "1".
+function compactShape(shape: number[]): string {
+  const first = shape.findIndex((n) => n !== 1);
+  return formatShape(first < 0 ? shape.slice(-1) : shape.slice(first));
+}
+
 // Deepest folder level a search opens by itself. A match deep in a big tree
 // would otherwise open every folder on the way down, and a result list of
 // thousands of rows is no longer a list anyone reads: the top level shows where
@@ -104,12 +112,19 @@ function folderPathTo(node: TreeNode, sourceId: string): string[] | null {
   return null;
 }
 
+/** Indent per tree level, px: half the Chevron slot. */
+const INDENT_STEP = 8;
+
 function Chevron({ expanded }: { expanded: boolean }) {
   return (
     <span
       style={{
         display: "inline-block",
         width: 16,
+        flexShrink: 0,
+        // Centred so the rotation (about the box centre) turns the glyph in
+        // place; left-aligned, the expanded triangle lands right of the collapsed one.
+        textAlign: "center",
         fontSize: 10,
         transition: "transform 0.15s",
         transform: expanded ? "rotate(90deg)" : "rotate(0deg)",
@@ -170,7 +185,8 @@ export function TreeRow({
   labelOverlay,
   setLabelOverlay,
 }: TreeRowProps) {
-  const indent = node.depth * 12 + 12;
+  // Half a Chevron's width per level, so a deep tree keeps room for its labels.
+  const indent = node.depth * INDENT_STEP + 12;
   // Label sets filed under the image they annotate, rather than listed beside
   // it: a set is a tensor of the source, but it is *about* one of the others.
   //
@@ -199,7 +215,9 @@ export function TreeRow({
           onClick={() => toggleFolder(node.id)}
         >
           <Chevron expanded={expanded} />
-          <span style={{ marginLeft: 4 }}>{node.name}</span>
+          <span className="tree-name" style={{ marginLeft: 4 }} title={node.name}>
+            {node.name}
+          </span>
         </button>
         {expanded &&
           node.children.map((child) => (
@@ -256,7 +274,9 @@ export function TreeRow({
     const busyLabel = kind === "recall" ? "Resolving\u2026" : "Loading\u2026";
     // A cloud resolve downloads the content, which can take minutes, so it takes
     // a deliberate double-click rather than a stray single click on a button.
-    const doubleClickToResolve = kind === "recall" && startResolve && !inFlight;
+    // A pending or failed row takes the same gesture in addition to its button,
+    // which a narrow pane can push off the edge.
+    const doubleClickToResolve = startResolve && !inFlight;
     return (
       <div
         className={`tree-item unresolved${inFlight ? " resolving" : ""}`}
@@ -275,8 +295,9 @@ export function TreeRow({
           doubleClickToResolve ? () => startResolve(src.source_id) : undefined
         }
       >
-        <ChevronSlot />
-        <span className="unresolved-glyph" aria-label="Not resolved">
+        {/* The glyph is this row's chevron slot, not a second element after it,
+            so the name stays in the label column of its resolved siblings. */}
+        <span className="unresolved-glyph" role="img" aria-label="Not resolved">
           {kind === "recall" ? UNRESOLVED_GLYPH : "\u2026"}
         </span>
         <span className="tree-name" style={{ flex: 1, marginLeft: 4 }}>
@@ -335,7 +356,9 @@ export function TreeRow({
         title={src.source_url}
       >
         <ChevronSlot />
-        <span style={{ flex: 1, marginLeft: 4 }}>{node.name}</span>
+        <span className="tree-name" style={{ flex: 1, marginLeft: 4 }}>
+          {node.name}
+        </span>
         {groups.length > 1 ? (
           <span className="tensor-pill" style={{ marginLeft: 8 }}>
             {groups.length}
@@ -346,7 +369,7 @@ export function TreeRow({
             style={{ marginLeft: 8 }}
             title={formatShape(firstTensor.shape)}
           >
-            {formatShape(firstTensor.shape)}
+            {compactShape(firstTensor.shape)}
           </span>
         ) : null}
       </button>
@@ -365,7 +388,7 @@ export function TreeRow({
                   style={{
                     width: "100%",
                     textAlign: "left",
-                    paddingLeft: indent + 12,
+                    paddingLeft: indent + INDENT_STEP,
                     display: "flex",
                     alignItems: "center",
                     fontSize: 12,
@@ -374,7 +397,7 @@ export function TreeRow({
                   title={`${image.array_id}\nShape: ${formatShape(image.shape)}\nDtype: ${image.dtype}`}
                 >
                   <ChevronSlot />
-                  <span style={{ flex: 1, marginLeft: 4 }}>
+                  <span className="tree-name" style={{ flex: 1, marginLeft: 4 }}>
                     {tensorShortName(image.array_id)}
                   </span>
                 </button>
@@ -388,7 +411,7 @@ export function TreeRow({
                     style={{
                       width: "100%",
                       textAlign: "left",
-                      paddingLeft: indent + (showImageRows ? 24 : 12),
+                      paddingLeft: indent + (showImageRows ? 2 : 1) * INDENT_STEP,
                       display: "flex",
                       alignItems: "center",
                       fontSize: 12,
@@ -410,7 +433,7 @@ export function TreeRow({
                   >
                     <ChevronSlot />
                     <span aria-hidden="true">{on ? LABEL_ON_GLYPH : LABEL_OFF_GLYPH}</span>
-                    <span style={{ flex: 1, marginLeft: 4 }}>
+                    <span className="tree-name" style={{ flex: 1, marginLeft: 4 }}>
                       {tensorShortName(set.array_id)}
                     </span>
                   </button>
