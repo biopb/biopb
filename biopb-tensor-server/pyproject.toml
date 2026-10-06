@@ -184,10 +184,10 @@ dependencies = [
   # rosettasciio is HyperSpy's I/O backend, extracted to stand alone (no hyperspy
   # dep). Its EMD lazy path forwards the native HDF5 chunk grid; MRC is parsed
   # from rosettasciio's header and served from an own np.memmap. rosettasciio[hdf5]
-  # pulls h5py for the EMD path. Capped below 0.15, whose lazy EMD reader keeps the
-  # HDF5 file open until EmdAdapter.close() (#822).
+  # pulls h5py for the EMD path. From 0.15, whose lazy EMD reader keeps the HDF5
+  # file open until EmdAdapter.close() (#822); earlier versions read eagerly.
   em = [
-    "rosettasciio[hdf5] < 0.15",
+    "rosettasciio[hdf5] >= 0.15",
   ]
 
 [project.scripts]
