@@ -185,7 +185,7 @@ dependencies = [
   # dep). Its EMD lazy path forwards the native HDF5 chunk grid; MRC is parsed
   # from rosettasciio's header and served from an own np.memmap. rosettasciio[hdf5]
   # pulls h5py for the EMD path. 0.15's lazy EMD reader keeps the HDF5 file open
-  # until EmdAdapter.close() (#822); earlier versions read eagerly. 0.15 ships no
+  # until the idle reaper or EmdAdapter.close() releases it (#822); earlier versions read eagerly. 0.15 ships no
   # cp310 wheel, so 3.10 stays on 0.14 rather than building it from source.
   em = [
     "rosettasciio[hdf5] >= 0.15; python_version >= '3.11'",

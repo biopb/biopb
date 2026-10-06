@@ -158,22 +158,76 @@ class TestEmdAdapter:
                     adapter.get_tensor_adapter("99")
 
 
-class TestEmdAdapterClose:
-    def test_close_releases_the_file_and_is_idempotent(self):
-        import h5py
+def _file_is_held(path) -> bool:
+    """Whether this process still has the HDF5 file open (h5py refuses a second
+    open in another mode, and opening for append does not truncate)."""
+    import h5py
 
+    try:
+        with h5py.File(path, "a"):
+            return False
+    except OSError:
+        return True
+
+
+class TestEmdAdapterHandle:
+    """The file is held between reads, released on close or when idle, reopened by
+    the next read. rosettasciio 0.15+ keeps the file open under ``lazy=True``."""
+
+    _FIRST = ChunkBounds(start=[0, 0, 0, 0], stop=[4, 4, 1, 1])
+
+    @pytest.fixture(autouse=True)
+    def _needs_a_lazy_reader_that_holds_the_file(self):
+        # Older rosettasciio reads eagerly, so there is no file to hold.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = Path(tmpdir) / "probe.emd"
+            create_synthetic_emd(p)
+            with _emd_adapter(p):
+                if not _file_is_held(p):
+                    pytest.skip("rosettasciio reads EMD eagerly here")
+
+    def _read(self, adapter):
+        return adapter.get_tensor_adapter("0").get_data(self._FIRST)
+
+    def test_close_releases_the_file_and_is_idempotent(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             p = Path(tmpdir) / "test.emd"
             create_synthetic_emd(p)
             adapter = EmdAdapter.create_from_config(SourceConfig(url=str(p)))
-            adapter.get_tensor_adapter("0").get_data(
-                ChunkBounds(start=[0, 0, 0, 0], stop=[1, 1, 1, 1])
-            )
+            self._read(adapter)
             adapter.close()
             adapter.close()
-            # h5py refuses to reopen a file for writing while it is open here.
-            with h5py.File(p, "w"):
-                pass
+            assert not _file_is_held(p)
+
+    def test_a_read_after_close_reopens_the_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = Path(tmpdir) / "test.emd"
+            create_synthetic_emd(p)
+            with _emd_adapter(p) as adapter:
+                before = self._read(adapter)
+                adapter.close()
+                assert not _file_is_held(p)
+                np.testing.assert_array_equal(self._read(adapter), before)
+                assert _file_is_held(p)
+
+    def test_an_idle_file_is_released_by_the_reaper_and_reopened_on_read(
+        self, monkeypatch
+    ):
+        from biopb_tensor_server.adapters import _handle_reaper, emd
+
+        reaper = _handle_reaper.IdleHandleReaper(0.01, "emd-test", max_handles=8)
+        monkeypatch.setattr(emd, "_handle_reaper", reaper)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = Path(tmpdir) / "test.emd"
+            create_synthetic_emd(p)
+            with _emd_adapter(p) as adapter:
+                before = self._read(adapter)
+                assert _file_is_held(p)
+                time.sleep(0.05)
+                reaper._sweep()
+                assert not _file_is_held(p)
+                np.testing.assert_array_equal(self._read(adapter), before)
+                assert _file_is_held(p)
 
 
 # NOTE: Velox/ThermoFisher eager-fallback (rsciio's Velox 4D-STEM lazy is a TODO)
