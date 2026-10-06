@@ -206,6 +206,20 @@ class TestRestore:
         assert not run.rows()[gone]["is_resolved"]
         run.stop()
 
+    def test_restored_sources_are_queued_for_the_pool_without_a_stat(
+        self, tmp_path, monkeypatch
+    ):
+        ids = _first_run(tmp_path)
+        run = _Run(tmp_path)
+        monkeypatch.setattr(
+            run.manager, "_claim_mtime", lambda sid: pytest.fail("stat on restore")
+        )
+
+        run.restore()
+
+        assert sorted(run.manager._deferred) == ids
+        run.stop()
+
     def test_nothing_is_restored_when_the_setting_is_off(self, tmp_path):
         _first_run(tmp_path)
         run = _Run(tmp_path, restore=False)

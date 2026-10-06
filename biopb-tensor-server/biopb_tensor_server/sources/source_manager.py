@@ -314,6 +314,13 @@ class SourceManager:
             logger.exception("Catalog restore failed; rebuilding the catalog")
             db.drop_catalog_rows([r["source_id"] for r in db.restorable_rows()])
             return
+        worker = self._registration_worker
+        for source_id in summary["queue"]:
+            # Newest-first needs a stat each, which is the walk's to pay: restored
+            # sources are queued as they were found.
+            self._deferred[source_id] = 0.0
+            if worker is not None:
+                worker.enqueue(source_id, 0.0)
         logger.info(
             "Restored %d sources from the catalog in %.1f s (%d dropped, %d "
             "re-attributed)",

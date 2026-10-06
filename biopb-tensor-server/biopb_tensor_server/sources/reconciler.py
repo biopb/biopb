@@ -356,7 +356,7 @@ class Reconciler:
             if claim.primary_path == prefix or claim.primary_path.startswith(under)
         }
 
-    def restore(self, rows: Sequence[Dict[str, Any]]) -> Dict[str, int]:
+    def restore(self, rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         """Put the claims of the persisted *rows* back, every one waiting to register.
 
         What a restart keeps of the last run: the claim, its claim-time signature
@@ -375,7 +375,8 @@ class Reconciler:
         ``_RESTORE_MAX_AGE`` ago is dropped too: a root that is never reachable
         (a drive that is gone) must not leave its sources listed for ever.
 
-        Returns the counts ``restored``, ``dropped`` and ``rewritten``.
+        Returns the counts ``restored``, ``dropped`` and ``rewritten``, and the
+        ``queue`` of sources to register in the background.
         """
         plan = []
         dropped: List[str] = []
@@ -434,9 +435,10 @@ class Reconciler:
                     recall=True,
                     record=self._state_record(claim),
                 )
-        for source_id in queue:
-            self._on_pending(source_id)
         return {
+            # For the caller to queue: a stat of every restored file for its
+            # priority would stall a start over a slow share.
+            "queue": queue,
             "restored": kept,
             "dropped": len(dropped),
             "rewritten": len(rewrites),
