@@ -23,10 +23,11 @@ Chunk ID format:
 - array_id (= source_id/field) + bounds
 """
 
+import json
 import logging
 import threading
 import time
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import dask.array as da
 import numpy as np
@@ -48,6 +49,61 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import SourceConfig
     from biopb_tensor_server.core.discovery import DiscoveryState
+
+
+def _read_signals(url: str) -> List[dict]:
+    """Every signal of an EMD file as rsciio reads it lazily, each ``data`` a dask
+    array. rsciio auto-detects NCEM vs Velox."""
+    from rsciio.emd import file_reader
+
+    signals = file_reader(url, lazy=True)
+    if not signals:
+        raise ValueError(f"EMD source {url!r} contained no readable signals")
+
+    # Velox eager-fallback: normalize any non-dask signal to a dask array so
+    # the read path is uniform.
+    for i, sig in enumerate(signals):
+        d = sig["data"]
+        if not isinstance(d, da.Array):
+            logger.warning(
+                "EMD %s signal %d returned eager (non-lazy) data; wrapping. "
+                "A large spectrum-image may load whole into RAM.",
+                url,
+                i,
+            )
+            sig["data"] = da.from_array(np.asarray(d))
+    return signals
+
+
+def _json_default(value: Any) -> Any:
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, bytes):
+        return value.hex()
+    return str(value)
+
+
+def _json_safe(value: Any) -> Any:
+    """*value* as plain JSON types, which is what a payload is made of."""
+    return json.loads(json.dumps(value, default=_json_default))
+
+
+class _NotOpened:
+    """One signal's array before the file is opened: what the descriptors and the
+    grid are made of (``shape``, ``dtype``, ``chunksize``), none of the data.
+
+    A source rebuilt from its row holds these, with its handle released, so the
+    HDF5 container is opened by the first read and not before.
+    """
+
+    def __init__(
+        self, shape: Tuple[int, ...], dtype: np.dtype, chunksize: Tuple[int, ...]
+    ):
+        self.shape = shape
+        self.dtype = dtype
+        self.chunksize = chunksize
 
 
 # Seconds an idle EMD file is kept open. Short, like MRC: a reopen is ~3.5 ms
@@ -80,9 +136,11 @@ class _EmdHandle:
         self._io_lock = io_lock
         self._active_reads = 0  # a read holds _io_lock throughout
         self._persistent_last_access = time.monotonic()
-        self._released = not self._datasets()
-        self._holds_file = not self._released
-        if self._holds_file:
+        # Signals still ``_NotOpened`` (a source rebuilt from its row) start
+        # released: the first read opens the file.
+        self._released = any(not isinstance(sig["data"], da.Array) for sig in signals)
+        self._holds_file = self._released or bool(self._datasets())
+        if self._holds_file and not self._released:
             _handle_reaper.register(self)
 
     def _datasets(self) -> list:
@@ -114,9 +172,7 @@ class _EmdHandle:
         return self.signals[index]["data"]
 
     def _reopen(self) -> None:
-        from rsciio.emd import file_reader
-
-        fresh = file_reader(self._url, lazy=True)
+        fresh = _read_signals(self._url)
         if len(fresh) != len(self.signals):
             raise RuntimeError(
                 f"EMD {self._url!r} changed on disk: it had {len(self.signals)} "
@@ -125,8 +181,10 @@ class _EmdHandle:
         for sig, new in zip(self.signals, fresh, strict=True):
             sig["data"] = new["data"]
         self._released = False
+        self._holds_file = bool(self._datasets())
         self._persistent_last_access = time.monotonic()
-        _handle_reaper.register(self)
+        if self._holds_file:
+            _handle_reaper.register(self)
 
     def _release_persistent_handle(self) -> None:
         """Close the file and permit a later reopen; safe to call twice.
@@ -173,32 +231,63 @@ class EmdAdapter(TensorAdapter):
         credentials_config: Optional[Any] = None,
     ) -> "EmdAdapter":
         """Create source-level adapter. rsciio auto-detects NCEM vs Velox."""
-        from rsciio.emd import file_reader
-
         url = str(source.url)
-        signals = file_reader(url, lazy=True)
-        if not signals:
-            raise ValueError(f"EMD source {url!r} contained no readable signals")
-
-        # Velox eager-fallback: normalize any non-dask signal to a dask array so
-        # the read path is uniform.
-        for i, sig in enumerate(signals):
-            d = sig["data"]
-            if not isinstance(d, da.Array):
-                logger.warning(
-                    "EMD %s signal %d returned eager (non-lazy) data; wrapping. "
-                    "A large spectrum-image may load whole into RAM.",
-                    url,
-                    i,
-                )
-                sig["data"] = da.from_array(np.asarray(d))
-
         return cls(
             source_id=source.source_id,
             url=url,
-            signals=signals,
+            signals=_read_signals(url),
             source_url=url,
         )
+
+    @classmethod
+    def create_from_payload(
+        cls,
+        source: "SourceConfig",
+        payload: Dict[str, Any],
+        metadata: Dict[str, Any],
+        credentials_config: Optional[Any] = None,
+    ) -> "EmdAdapter":
+        """Rebuild from the row's per-signal structure; the HDF5 container is
+        opened by the first read of a signal."""
+        url = str(source.url)
+        signals = [
+            {
+                "data": _NotOpened(
+                    tuple(int(s) for s in entry["shape"]),
+                    np.dtype(entry["dtype"]),
+                    tuple(int(c) for c in entry["chunksize"]),
+                ),
+                "axes": entry["axes"],
+                "original_metadata": entry["original_metadata"],
+            }
+            for entry in payload["signals"]
+        ]
+        return cls(source_id=source.source_id, url=url, signals=signals, source_url=url)
+
+    def catalog_payload(self) -> Optional[Dict[str, Any]]:
+        """Each signal's structure, calibration and metadata: what its descriptor,
+        grid, scale and per-tensor metadata are made of. Source level only."""
+        if self.signal_index is not None:
+            return None
+        return {
+            "signals": [
+                {
+                    "shape": [int(s) for s in sig["data"].shape],
+                    "dtype": np.dtype(sig["data"].dtype).str,
+                    "chunksize": [int(c) for c in sig["data"].chunksize],
+                    "axes": [
+                        {
+                            "name": ax.get("name"),
+                            "scale": _json_safe(ax.get("scale")),
+                            "units": ax.get("units"),
+                        }
+                        for ax in sig["axes"]
+                    ],
+                    "original_metadata": _json_safe(sig.get("original_metadata", {})),
+                }
+                for sig in self._signals
+            ]
+        }
 
     def __init__(
         self,

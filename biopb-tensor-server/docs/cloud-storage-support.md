@@ -5,7 +5,7 @@
 Scope: `biopb-tensor-server` (server + Python SDK), the Java SDK, and the web
 SPA. Related: the discovery placeholder guard in `discovery.py`, the metadata
 DB (`metadata_db.py`), the pre-cache worker (`precache.py`),
-[progressive-discovery.md](progressive-discovery.md), [remote-tensor-cache.md](remote-tensor-cache.md).
+[catalog-persistence.md](catalog-persistence.md), [remote-tensor-cache.md](remote-tensor-cache.md).
 
 ## Why
 
@@ -28,7 +28,7 @@ human actually asks for the pixels.
 ## is_resolved vs residency
 
 `is_resolved` is also false for a *local* source whose registration is queued
-(`unresolved_reason = 'pending'`; see `progressive-discovery.md`). That costs no
+(`unresolved_reason = 'pending'`; see `catalog-persistence.md`). That costs no
 download: any read registers it, and only `needs_recall` is a consented recall.
 
 Two descriptor bits a naive API would conflate into one ("is `shape`

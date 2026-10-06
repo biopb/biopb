@@ -3,6 +3,7 @@
 Imports fixture factory functions from fixtures module and wraps them as pytest fixtures.
 """
 
+import functools
 import os
 import tempfile
 import threading
@@ -45,6 +46,45 @@ from tests import catalog_server
 # =============================================================================
 # pytest fixtures using the factory functions
 # =============================================================================
+
+
+@pytest.fixture(autouse=True)
+def _shut_down_what_a_test_started(monkeypatch):
+    """Shut down every server and catalog a test made, when it ends.
+
+    A ``TensorFlightServer`` keeps its gRPC threads, an upload reaper and the
+    DuckDB catalog behind it (one worker thread per core) alive until it is shut
+    down, and a test that does not leaks all of them for the rest of the run: the
+    suite ended with some 7,000 native threads, and a macOS runner, which caps a
+    process at a couple of thousand, aborted inside a gRPC call late in the run.
+
+    Only what the test itself made is shut down: anything a module- or
+    session-scoped fixture built was made before this fixture ran. Shutdown is
+    safe to repeat, so a test that shuts its own server down is unaffected.
+    """
+    from biopb_tensor_server.serving.metadata_db import MetadataDatabase
+    from biopb_tensor_server.serving.server import TensorFlightServer
+
+    made = []
+
+    def track(cls, closer):
+        original = cls.__init__
+
+        @functools.wraps(original)
+        def tracking(self, *args, **kwargs):
+            original(self, *args, **kwargs)
+            made.append(getattr(self, closer))
+
+        monkeypatch.setattr(cls, "__init__", tracking)
+
+    track(TensorFlightServer, "shutdown")
+    track(MetadataDatabase, "close")
+    yield
+    for close in reversed(made):
+        try:
+            close()
+        except Exception:  # a test may have torn it down in its own way
+            pass
 
 
 @pytest.fixture(autouse=True)

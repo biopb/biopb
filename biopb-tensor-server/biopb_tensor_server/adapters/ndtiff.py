@@ -19,7 +19,7 @@ from __future__ import annotations
 import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
@@ -39,6 +39,7 @@ from biopb_tensor_server.core.chunk import (
     default_transfer_chunk_shape,
 )
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
+from biopb_tensor_server.core.remote import is_remote_url
 
 if TYPE_CHECKING:
     from ndtiff import NDTiffDataset
@@ -304,6 +305,9 @@ class NdTiffAdapter(TensorAdapter):
         source_url: str,
         io_lock: Optional[threading.Lock] = None,
         reopen: Optional[Callable[[], NDTiffDataset]] = None,
+        *,
+        structure: Optional[Dict[str, Any]] = None,
+        summary: Optional[dict] = None,
     ):
         """Initialize NDTiff adapter.
 
@@ -317,6 +321,10 @@ class NdTiffAdapter(TensorAdapter):
                 between reads and the read path reopens on demand. When None (a
                 caller that handed in a bare dataset, e.g. a test), the handle is
                 never reaped and a read after ``close()`` fails loudly.
+            structure / summary: a restored source's axes, shape and dtype and its
+                summary metadata (``catalog_payload`` and the row), given with no
+                *dataset* (``None``) and a *reopen*: nothing is opened until a read
+                needs the acquisition, as after the reaper closes an idle one.
         """
         self._dataset = dataset
         self._reopen = reopen
@@ -335,16 +343,26 @@ class NdTiffAdapter(TensorAdapter):
         self._persistent_last_access = time.monotonic()
         self._active_reads = 0
 
-        # Get dask array from dataset
-        self._dask_arr = dataset.as_array()
+        if dataset is not None:
+            # Get dask array from dataset
+            self._dask_arr = dataset.as_array()
 
-        # Summary metadata snapshot -- so get_metadata/_physical_scale never reach
-        # through self._dataset, which the reaper may have closed (see the helper).
-        self._summary_metadata = _extract_summary(dataset)
+            # Summary metadata snapshot -- so get_metadata/_physical_scale never
+            # reach through self._dataset, which the reaper may have closed (see
+            # the helper).
+            self._summary_metadata = _extract_summary(dataset)
 
-        # Get axes from dataset
-        # ndtiff uses axis names: position, time, channel, z, row, column
-        self._axes = list(dataset.axes.keys()) if hasattr(dataset, "axes") else []
+            # Get axes from dataset
+            # ndtiff uses axis names: position, time, channel, z, row, column
+            self._axes = list(dataset.axes.keys()) if hasattr(dataset, "axes") else []
+            self._shape = list(self._dask_arr.shape)
+            self._dtype = str(self._dask_arr.dtype)
+        else:
+            self._dask_arr = None
+            self._summary_metadata = summary or {}
+            self._axes = list(structure["axes"])
+            self._shape = [int(s) for s in structure["shape"]]
+            self._dtype = structure["dtype"]
 
         # Map axis names to short labels
         axis_alias = {
@@ -363,10 +381,6 @@ class NdTiffAdapter(TensorAdapter):
             self.dim_labels.append(label)
         self.dim_labels.extend(["y", "x"])
 
-        # Get shape and dtype from dask array
-        self._shape = list(self._dask_arr.shape)
-        self._dtype = str(self._dask_arr.dtype)
-
         # One 2D plane matches ndtiff's tile-based storage; it seeds the
         # transfer grid rather than being it (biopb/biopb#809), so a small plane
         # ships several planes per chunk instead of one endpoint each.
@@ -382,9 +396,47 @@ class NdTiffAdapter(TensorAdapter):
 
         # Only a reopen-capable adapter is worth reaping -- one handed a bare
         # dataset it cannot rebuild must keep it. Registering also lazily starts
-        # the reaper thread, so a bare-dataset caller (a test) spawns nothing.
-        if self._reopen is not None:
+        # the reaper thread, so a bare-dataset caller (a test) spawns nothing. A
+        # restored source holds no handle yet: its first read registers it.
+        if self._reopen is not None and dataset is not None:
             _dataset_reaper.register(self)
+
+    def catalog_payload(self) -> Optional[Dict[str, Any]]:
+        """The acquisition's axes, shape and dtype: what opening it (every stack
+        file, and a dask graph over them) is done for before a descriptor can be
+        made. The summary metadata is the row's. ``None`` for a remote store."""
+        if is_remote_url(self._source_url):
+            return None
+        return {
+            "axes": list(self._axes),
+            "shape": [int(s) for s in self._shape],
+            "dtype": self._dtype,
+        }
+
+    @classmethod
+    def create_from_payload(
+        cls,
+        source: SourceConfig,
+        payload: Dict[str, Any],
+        metadata: Dict[str, Any],
+        credentials_config: Optional[Any] = None,
+    ) -> NdTiffAdapter:
+        """Rebuild with no dataset open: the acquisition is opened by the first read
+        (``_ensure_dask_arr``), as it is after the reaper has closed an idle one."""
+        reopen = cls._dataset_opener(
+            url=source.url,
+            is_remote=source.is_remote,
+            credentials_config=credentials_config,
+            credentials_profile=source.credentials_profile,
+        )
+        return cls(
+            dataset=None,
+            source_id=source.source_id or "",
+            source_url=str(source.url),
+            reopen=reopen,
+            structure=payload,
+            summary=metadata,
+        )
 
     def get_tensor_descriptor(self) -> TensorDescriptor:
         """Return TensorDescriptor for this adapter."""

@@ -116,7 +116,7 @@ model are in `README.md`; the architectural notes that aren't there:
 - **Store (Zustand, `store/`, one slice file per lifetime).** Holds the `TensorHttpClient` + connection state,
   the source list (plus a `scanning` flag seeded from `/readyz` `backend_health` so
   the UI can distinguish "indexing" from "empty" during progressive discovery — see
-  `../biopb-tensor-server/docs/progressive-discovery.md`), the active source/tensor,
+  `../biopb-tensor-server/docs/catalog-persistence.md`), the active source/tensor,
   and the slice selection (`t`/`z`/`c`, `scaleFactors`, `reductionMethod`). Actions:
   `initClient` / `loadSources` / `openTensor` / `setSlice` / `clearSession`.
 - **Label overlays** (`labelLayers.ts`, `labelPalette.ts`, `useLabelOverlay.ts`).

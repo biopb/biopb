@@ -278,6 +278,7 @@ class SourceManager:
 
         self._next_rescan_at = time.monotonic()
         self._stop.clear()
+        self._restore_catalog()
         if self._registration_worker is not None:
             # After the static sources, which were committed inline before this.
             self._reconciler.set_defer_registration(True)
@@ -295,6 +296,39 @@ class SourceManager:
         self._thread.start()
         logger.info(
             "SourceManager started; rescanning every %.1fs", self._rescan_interval
+        )
+
+    def _restore_catalog(self) -> None:
+        """Put the last run's sources back as claims, before the first scan.
+
+        Only with ``catalog.restore``. A failure leaves the catalog as a fresh one:
+        a restore that cannot be trusted is a rebuild, never a half-restored state.
+        """
+        db = self._metadata_db
+        if db is None or not getattr(db, "restore_sources", False):
+            return
+        started = time.monotonic()
+        rows = db.restorable_rows()
+        try:
+            summary = self._reconciler.restore(rows)
+        except Exception:
+            logger.exception("Catalog restore failed; rebuilding the catalog")
+            db.drop_catalog_rows([r["source_id"] for r in rows])
+            return
+        worker = self._registration_worker
+        for source_id in summary["queue"]:
+            # Newest-first needs a stat each, which is the walk's to pay: restored
+            # sources are queued as they were found.
+            self._deferred[source_id] = 0.0
+            if worker is not None:
+                worker.enqueue(source_id, 0.0)
+        logger.info(
+            "Restored %d sources from the catalog in %.1f s (%d dropped, %d "
+            "re-attributed)",
+            summary["restored"],
+            time.monotonic() - started,
+            summary["dropped"],
+            summary["rewritten"],
         )
 
     # --- Startup-protocol seam ------------------------------------------------
@@ -605,6 +639,20 @@ class SourceManager:
             # Before the startup protocol resumes the registration pool, so every
             # claim has its row by then.
             self._reconciler.end_pending_batch()
+        if self._metadata_db is not None:
+            self._confirm_root(root)
+
+    def _confirm_root(self, root: Root) -> None:
+        """Record that a root's walk finished, and sweep the rows no claim holds.
+
+        Only a walk that ran to the end: a root that could not be listed, or whose
+        walk raised, leaves its restored rows unconfirmed.
+        """
+        try:
+            self._metadata_db.sweep_root(root.root_id, self._reconciler.has_claim)
+            self._metadata_db.confirm_root(root.root_id)
+        except Exception:
+            logger.exception("could not confirm root %s", root.url)
 
     def _rescan_monitored_dirs(self) -> None:
         """Scan the monitored directories, each against its own claims.

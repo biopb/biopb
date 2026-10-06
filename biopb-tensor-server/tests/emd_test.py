@@ -210,6 +210,29 @@ class TestEmdAdapterHandle:
                 np.testing.assert_array_equal(self._read(adapter), before)
                 assert _file_is_held(p)
 
+    def test_a_source_rebuilt_from_its_row_holds_no_file_until_its_first_read(self):
+        from tests.payload_equivalence import hydrate
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = Path(tmpdir) / "test.emd"
+            create_synthetic_emd(p)
+            source = SourceConfig(url=str(p), type="emd", source_id="src")
+            parsed = EmdAdapter.create_from_config(source)
+            before = self._read(parsed)
+            rebuilt = hydrate(parsed, source)
+            parsed.close()
+            try:
+                assert rebuilt.list_tensor_descriptors()
+                assert not _file_is_held(p)  # built from the row, nothing opened
+                np.testing.assert_array_equal(self._read(rebuilt), before)
+                assert _file_is_held(p)
+                rebuilt.close()
+                assert not _file_is_held(p)
+                np.testing.assert_array_equal(self._read(rebuilt), before)
+                assert _file_is_held(p)  # released and reopened like any other
+            finally:
+                rebuilt.close()
+
     def test_an_idle_file_is_released_by_the_reaper_and_reopened_on_read(
         self, monkeypatch
     ):

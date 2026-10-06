@@ -66,6 +66,12 @@ class _FakeMetadataDb:
     def sync_roots(self, roots):
         self.roots = list(roots)
 
+    def sweep_root(self, root_id, is_claimed):
+        return 0
+
+    def confirm_root(self, root_id):
+        pass
+
     def mark_sources_seen(self):
         self.seen_calls += 1
         return 0

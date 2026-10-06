@@ -37,6 +37,7 @@ adapter-package namestore (``from .dv import DeltaVisionAdapter``).
 import logging
 import threading
 import time
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import numpy as np
@@ -117,27 +118,67 @@ class DeltaVisionAdapter(TensorAdapter):
 
         return cls(path, source.source_id)
 
+    @classmethod
+    def create_from_payload(
+        cls,
+        source: "SourceConfig",
+        payload: dict,
+        metadata: dict,
+        credentials_config: Optional[Any] = None,
+    ) -> "DeltaVisionAdapter":
+        """Rebuild from the row's header facts and header summary: no file is opened."""
+        url = str(source.url)
+        path = url[len("file://") :] if url.startswith("file://") else url
+        adapter = cls(path, source.source_id, probed=payload)
+        adapter._stored_metadata = metadata
+        return adapter
+
+    def catalog_payload(self) -> dict:
+        """The probed header facts a read needs: axes, shape, dtype, voxel size."""
+        return {
+            "axes": self._axes,
+            "shape": [int(s) for s in self._shape],
+            "dtype": self._dtype.str,
+            "voxel": {
+                axis: (None if v is None else float(v))
+                for axis, v in (
+                    ("x", self._voxel.x),
+                    ("y", self._voxel.y),
+                    ("z", self._voxel.z),
+                )
+            },
+        }
+
     def __init__(
         self,
         url: str,
         source_id: str,
+        probed: Optional[dict] = None,
     ):
         self.source_id = source_id
         self._url = url
         self._source_url = url
         self._source_type = self.SOURCE_TYPE
         self._content_version = content_version_from_path(url)
+        # The header summary a row holds, when the adapter was rebuilt from one.
+        self._stored_metadata: Optional[dict] = None
 
-        # Probe the header once now so a malformed file fails at registration
-        # rather than on the first read; the mapping is released immediately
-        # (a source that is catalogued but never read should pin nothing).
-        import mrc
+        if probed is not None:
+            self._axes = str(probed["axes"])
+            self._shape = tuple(int(s) for s in probed["shape"])
+            self._dtype = np.dtype(probed["dtype"])
+            self._voxel = SimpleNamespace(**probed["voxel"])
+        else:
+            # Probe the header once now so a malformed file fails at registration
+            # rather than on the first read; the mapping is released immediately
+            # (a source that is catalogued but never read should pin nothing).
+            import mrc
 
-        with mrc.DVFile(url) as probe:
-            self._axes = str(probe.axes)  # e.g. "CTZYX" -- native loop order + YX
-            self._shape = tuple(int(probe.sizes[axis]) for axis in self._axes)
-            self._dtype = probe.dtype
-            self._voxel = probe.voxel_size
+            with mrc.DVFile(url) as probe:
+                self._axes = str(probe.axes)  # e.g. "CTZYX" -- native loop order + YX
+                self._shape = tuple(int(probe.sizes[axis]) for axis in self._axes)
+                self._dtype = probe.dtype
+                self._voxel = probe.voxel_size
 
         self.dim_labels = list(self._axes)
 
@@ -253,7 +294,12 @@ class DeltaVisionAdapter(TensorAdapter):
     def get_metadata(self) -> dict:
         """The DV header as a JSON-safe dict; skips the per-frame extended
         header (biopb/biopb#799 -- O(sections), not worth paying for a catalog
-        listing nobody asked to see frame-by-frame acquisition metadata in)."""
+        listing nobody asked to see frame-by-frame acquisition metadata in).
+
+        An adapter rebuilt from a row answers with the summary the row holds.
+        """
+        if self._stored_metadata is not None:
+            return self._stored_metadata
         try:
             import mrc
 

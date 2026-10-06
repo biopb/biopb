@@ -145,6 +145,38 @@ class TestRouting:
         assert json.loads(row[3]) == {"k": 1}
         assert row[6] == 1  # its tensors
 
+    def test_a_registration_whose_update_missed_the_row_overwrites_it(self):
+        """The row is there but the UPDATE reports none (a CI runner on Windows saw
+        the INSERT after it fail on a duplicate key): the row is overwritten, the
+        registration does not fail."""
+        db = _db()
+        db.sync_pending_source(_record().claim, record=_record())
+
+        class _Missed:
+            """The shared connection, whose first UPDATE of a source row matches
+            nothing."""
+
+            def __init__(self, conn):
+                self._conn = conn
+
+            def execute(self, sql, *args):
+                if sql.startswith("UPDATE source_catalog SET source_type"):
+                    return self._conn.execute("SELECT 0")
+                return self._conn.execute(sql, *args)
+
+            def __getattr__(self, name):
+                return getattr(self._conn, name)
+
+        db._conn = _Missed(db._get_connection())
+        db.sync_source_added(
+            "s1", _Restorable("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8"), _record()
+        )
+
+        assert _count(db, "source_catalog") == 1
+        row = _row(db)
+        assert row[:3] == (True, None, None)
+        assert row[6] == 1
+
     def test_a_pending_batch_splits_by_whether_the_row_has_a_record(self):
         from biopb_tensor_server.sources.pending_rows import PendingRow
 
@@ -270,6 +302,22 @@ class TestRootsInTheTable:
         db.sync_roots([("r1", "lab")])
 
         assert db.query(url).to_pylist() == [{"source_url": "lab/s1.zarr"}]
+
+    def test_a_sweep_drops_only_the_rows_nothing_claims(self):
+        db = _db()
+        for source_id in ("s1", "s2", "s3"):
+            path = f"/d/{source_id}.zarr"
+            claim = SourceClaim("zarr", path, source_id, member_paths=[path])
+            db.sync_pending_source(
+                claim,
+                record=CatalogRecord(claim, {path: (1,)}, "r1", f"{source_id}.zarr"),
+            )
+
+        swept = db.sweep_root("r1", lambda source_id: source_id != "s2")
+
+        assert swept == 1
+        left = db.query("SELECT source_id FROM sources ORDER BY source_id")
+        assert [r["source_id"] for r in left.to_pylist()] == ["s1", "s3"]
 
     def test_a_row_whose_root_is_gone_is_not_shown(self):
         db = _db()
@@ -532,8 +580,13 @@ class TestRegistration:
         assert label["shape"] == mask["shape"]
         assert label["dim_labels"] == mask["dim_labels"]
 
-    def test_a_source_without_a_payload_is_persisted_from_its_claim(self, tmp_path):
+    def test_a_source_without_a_payload_is_persisted_from_its_claim(
+        self, tmp_path, monkeypatch
+    ):
         import zarr
+        from biopb_tensor_server.adapters.zarr import ZarrAdapter
+
+        monkeypatch.setattr(ZarrAdapter, "catalog_payload", lambda self: None)
 
         z = zarr.open_array(
             os.path.join(tmp_path, "a.zarr"),

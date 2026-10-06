@@ -9,7 +9,7 @@ import os
 import shutil
 import threading
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
@@ -25,6 +25,7 @@ from biopb_tensor_server.core.chunk import (
     default_transfer_chunk_shape,
 )
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
+from biopb_tensor_server.core.remote import is_remote_url
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import SourceConfig
@@ -152,6 +153,64 @@ def _biopb_block(ctx: ClaimContext) -> dict:
     return block if isinstance(block, dict) else {}
 
 
+class _LazyStore:
+    """The one thing of a store the adapters read before a read: where it is."""
+
+    def __init__(self, path: str):
+        self.path = path
+
+    def __str__(self) -> str:
+        return self.path
+
+
+class _LazyZarrArray:
+    """A zarr array's structure, standing in for it until something reads or writes.
+
+    A restored source knows its shape, chunks and dtype from its row, which is all
+    a descriptor is made of, so the store is not opened to list or describe it. The
+    first ``__getitem__`` (or any other attribute) opens the array, once, exactly as
+    ``create_from_config`` would have: read-only, at the same path.
+    """
+
+    def __init__(self, path: str, shape, chunks, dtype, key: str = ""):
+        self._path = path
+        #: Where the array sits in the store at ``path`` ("" for the store root).
+        self.path = key
+        self.shape = tuple(int(s) for s in shape)
+        self.chunks = tuple(int(c) for c in chunks)
+        self.dtype = np.dtype(dtype)
+        self.ndim = len(self.shape)
+        self.store = _LazyStore(path)
+        self._opened = None
+        self._open_lock = threading.Lock()
+
+    def _array(self):
+        arr = self._opened
+        if arr is None:
+            with self._open_lock:
+                if self._opened is None:
+                    import zarr
+
+                    self._opened = zarr.open_array(
+                        self._path, path=self.path or None, mode="r"
+                    )
+                arr = self._opened
+        return arr
+
+    def __getitem__(self, key):
+        return self._array()[key]
+
+    def __setitem__(self, key, value):
+        self._array()[key] = value
+
+    def __getattr__(self, name):
+        # Only reached for what is not set above; a private name must not open
+        # the store (copy / pickle probe for them before __init__ has run).
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self._array(), name)
+
+
 class ZarrAdapter(WritableSource, TensorAdapter):
     """Adapter for Zarr/N5 chunked arrays.
 
@@ -250,6 +309,46 @@ class ZarrAdapter(WritableSource, TensorAdapter):
 
     def get_metadata(self):
         return {}
+
+    def catalog_payload(self) -> Optional[Dict[str, Any]]:
+        """The array's structure: everything a descriptor is made of.
+
+        ``None`` for a remote store, which no restart restores. The transfer grid
+        is not stored: it is a function of these and the server's transfer target,
+        and is derived where it is asked for.
+        """
+        if self._tensor_name is not None or is_remote_url(self._source_url):
+            return None
+        return self._array_payload()
+
+    def _array_payload(self) -> Dict[str, Any]:
+        arr = self.zarr_array
+        return {
+            "shape": [int(s) for s in arr.shape],
+            "chunks": [int(c) for c in arr.chunks],
+            "dtype": arr.dtype.str,
+            "dim_labels": list(self.dim_labels),
+            "source_url": self._source_url,
+            "key": getattr(arr, "path", "") or "",
+        }
+
+    @classmethod
+    def create_from_payload(
+        cls,
+        source: "SourceConfig",
+        payload: Dict[str, Any],
+        metadata: Dict[str, Any],
+        credentials_config: Optional[Any] = None,
+    ) -> "ZarrAdapter":
+        """Rebuild from the stored structure; the store opens on the first read."""
+        arr = _LazyZarrArray(
+            payload["source_url"],
+            payload["shape"],
+            payload["chunks"],
+            payload["dtype"],
+            payload.get("key", ""),
+        )
+        return cls(arr, source.source_id, payload["dim_labels"])
 
     # get_tensor_adapter: inherit the total single-tensor base -- it returns self
     # for the source's sole tensor and raises TensorNotFound for an unknown

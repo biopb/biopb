@@ -397,6 +397,12 @@ class _FakeMetadataDb:
     def sync_roots(self, roots):
         pass
 
+    def sweep_root(self, root_id, is_claimed):
+        return 0
+
+    def confirm_root(self, root_id):
+        pass
+
     def sync_source_added(self, source_id, adapter, record=None):
         self.added.append((source_id, adapter))
 
