@@ -283,6 +283,35 @@ class TestHealthEndpoints:
         assert r.json()["dev_mode"] is True
 
 
+class TestProbeAccessFilter:
+    @staticmethod
+    def _keeps(path, status):
+        import logging
+
+        from biopb_tensor_server.serving.http_server import _ProbeAccessFilter
+
+        record = logging.LogRecord(
+            "uvicorn.access",
+            logging.INFO,
+            "",
+            0,
+            '%s - "%s %s HTTP/%s" %d',
+            ("127.0.0.1:1", "GET", path, "1.1", status),
+            None,
+        )
+        return _ProbeAccessFilter().filter(record)
+
+    @pytest.mark.parametrize("path", ["/livez", "/readyz", "/healthz", "/healthz?x=1"])
+    def test_a_successful_probe_is_not_logged(self, path):
+        assert not self._keeps(path, 200)
+
+    def test_a_failing_probe_is_logged(self):
+        assert self._keeps("/readyz", 503)
+
+    def test_other_requests_are_logged(self):
+        assert self._keeps("/api/tile_info", 200)
+
+
 class TestReadyzTracksBackend:
     """Readiness must follow the backend, not the traffic (biopb/biopb#755).
 
