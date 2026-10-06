@@ -300,16 +300,16 @@ persistent view, `SOURCE_CATALOG_FORMAT`, routing by whether the source has a cl
 record (a pending, failed or resolved row alike; the payload is NULL when the adapter has
 none, and for a cloud claim), claim-time signature without `st_dev`, deletion from both on
 removal, one scan for the first walk and every later one (new claims stream and their
-pending rows are batched), the failure tracker removed. Payloads exist for OME-TIFF, nd2
-and czi, and no others:
-
-- **OME-TIFF**: the scene descriptors (with their transfer grid), `has_rois`, and the
-  `@ome` mask label tensors' field, parent and extent, derived from the metadata without
-  decoding a bitmap. Built before `release_registration_cache`, which drops the bitmaps.
-- **nd2, czi**: the probed layout (`to_payload` / `from_payload` on the layout, so the
-  round trip is tested now), without the metadata the row already holds. An nd2 payload
-  carries one entry per frame (`frame_indices`), so a long timelapse is the large case;
-  measure it before stage 2 and pack it if it matters.
+pending rows are batched), the failure tracker removed. Every file adapter has a payload
+(`catalog_payload`) and rebuilds from it (`create_from_payload`): the OME-TIFF family
+(OME-TIFF, TIFF, LSM), nd2, czi, the BioIO family (Zeiss, Leica, Nikon, Olympus,
+Bioformats, aics), LIF, DeltaVision, MRC, EMD, QPTIFF, DICOM (file and series), NIfTI,
+zarr, OME-Zarr, NDTiff, TIFF sequence and the legacy micromanager layout. Only the remote
+proxy has none, as a mirror is not persisted. What a payload holds is each adapter's own
+probe of the file (scene descriptors with their transfer grid, a layout, the native
+pyramid, the physical scale, `has_rois` and the `@ome` mask descriptors for OME-TIFF),
+never the metadata the row holds. A payload is O(members) for a directory source: a
+micromanager dataset or a tiff sequence stores its plane or file map.
 
 Each payload is tested by rebuilding an adapter from the JSON and requiring the same
 tensors, grid and scale as the parsed one. Rows are cleared at open unless
@@ -336,11 +336,14 @@ tensors, grid and scale as the parsed one. Rows are cleared at open unless
      a client's read) registers it by parsing, and the first walk is an ordinary rescan
      against the restored claims. The config-change rules, failed and cloud rows, and the
      `check_registered` hook that hydrates a restored source on a read.
-   - **4b. Hydrate from the payload:** nd2 and czi build their adapter from the row's
-     payload (`create_from_payload`), skipping the parse, when the files' signature is
-     still the one persisted; otherwise, and for every other type, the claim is parsed.
-     OME-TIFF still parses: its serve path needs the reduced OME-XML for the physical
-     scale and the cached descriptors seeded, which is an adapter change of its own.
+   - **4b. Hydrate from the payload:** every adapter above builds from the row's payload,
+     skipping the parse, when the files' signature is still the one persisted (the walk's
+     verdict once it has found the claim unchanged, else a stat of the members); otherwise
+     the claim is parsed. A source rebuilt from its own row is marked seen
+     (`confirm_source`: its `epoch` and `last_seen`) and its row is not rewritten, since
+     the files are as they were persisted and a row can hold megabytes of metadata.
+     Embedded ROIs and masks are answered from the payload flags and parsed only when
+     requested.
    - **4c. Confirmation:** the run counter, `catalog_roots.epoch`, the
      `source_confirmation` view, the post-walk sweep and the age cap, the observation hooks
      ignoring unconfirmed rows.
@@ -392,8 +395,16 @@ A restored row is held in the reconciler's existing maps, so nothing new waits o
   root whose walk committed it, so a per-root sweep can drop what the other root still
   reaches: run it after every root has been walked, or only on ids no root found.
 - Whether nd2 and czi carry embedded masks or ROIs.
-- **OME-TIFF hydration from its payload** is the remaining slow case: measured on
-  `~/data`, a restored nd2, tiff or ome-zarr hydrates in about 25 ms, an OME-TIFF in about
-  500 ms because it still parses. It needs the reduced OME-XML (for the physical scale) and
-  the cached descriptors seeded, and the embedded ROIs and masks imported lazily on
-  first request, not at registration.
+- **What a hydration still reads.** `read_hydration` decodes the row's payload and its
+  `metadata_json`, which for a micromanager dataset is several MB; that decode is most of
+  what is left of its hydration (about 2 s at the 95th percentile on `/labs`). Passing the
+  metadata as a lazy mapping that parses on first access would skip it for the adapters
+  that never ask. Not done: it changes what every `create_from_payload` receives.
+- **Measured on `/labs/Yu/Ji` (NFS, one run, the page cache of the sample dropped between
+  the two), registration from the claim against from the row**, median (95th percentile),
+  ms: tiff 11 (60) / 1.7 (2.1), OME-TIFF 72 (3300) / 1.8 (2.3), LSM 138 (193) / 4.3 (5.2),
+  czi 76 (180) / 2.2 (3.5), nifti 34 (88) / 2.0 (2.7), mrc 8.6 (33) / 1.8 (2.7),
+  micromanager 236 (21600) / 8 (2300), tiff sequence 470 (20500) / 2.2 (24). Restoring 1016
+  sources took 79 ms and the verifying walk 0.46 s, with no refresh. Hydrating from the
+  payload changed no row in 956 sources. `.zvi` (Bioformats) fails to open in
+  that environment either way.
