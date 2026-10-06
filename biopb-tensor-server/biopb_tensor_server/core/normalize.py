@@ -411,6 +411,12 @@ class NormalizingAdapter(TensorAdapter):
     def close(self) -> None:
         self._inner.close()
 
+    def catalog_payload(self) -> Optional[Dict[str, Any]]:
+        # Declared on SourceAdapter, so it never reaches __getattr__. The inner
+        # payload is the native one: the permutation is a pure function of the
+        # native axes and is recomputed by ``normalize_adapter`` on a rebuild.
+        return self._inner.catalog_payload()
+
     def release_registration_cache(self) -> None:
         # Declared on SourceAdapter, so it resolves on the wrapper and never
         # reaches __getattr__ -- delegate explicitly or the inner adapter would

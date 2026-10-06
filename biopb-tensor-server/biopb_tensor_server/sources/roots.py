@@ -15,6 +15,7 @@ How the configured ``[[sources]]`` become roots is :mod:`~biopb_tensor_server.so
 
 from __future__ import annotations
 
+import hashlib
 import os
 import threading
 from dataclasses import dataclass, field
@@ -22,6 +23,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Iterable, List, NamedTuple, Optional, Tuple
 
+from biopb_tensor_server.core.adapter_base import to_catalog_url
 from biopb_tensor_server.core.config import SourceConfig
 from biopb_tensor_server.core.remote import is_remote_url
 
@@ -56,15 +58,18 @@ def reroot_catalog_url(label: str, root_path: str, primary_path: str) -> str:
     ``source_id`` (which hashes the raw path), so a bare virtual path with no
     scheme is fine.
     """
+    rel = path_under_root(root_path, primary_path)
+    return label if rel == "." else f"{label}/{rel}"
+
+
+def path_under_root(root_path: str, primary_path: str) -> str:
+    """``primary_path`` beneath ``root_path``, forward-slashed; ``.`` when it is the
+    root itself or (defensively) not under it, so a url never carries ``../``."""
     try:
         rel = os.path.relpath(str(primary_path), str(root_path)).replace("\\", "/")
     except ValueError:  # different drive on Windows, etc. -- can't relativize
-        rel = "."
-    if rel in (".", "") or rel.startswith("../"):
-        # primary IS the root (single file / dataset dir), or (defensively) not
-        # under it -- keep the whole thing as one root, never emit a "../" url.
-        return label
-    return f"{label}/{rel}"
+        return "."
+    return "." if rel in (".", "") or rel.startswith("../") else rel
 
 
 def _drop_catalog_url(
@@ -130,6 +135,17 @@ class Root:
             path = Path(self.url)
             object.__setattr__(self, "path", path)
             object.__setattr__(self, "depth", len(path.parts))
+
+    @property
+    def root_id(self) -> str:
+        """Names the root in the catalog table: a hash of its resolved path."""
+        return hashlib.sha256(self.url.encode()).hexdigest()[:12]
+
+    @property
+    def root_url(self) -> str:
+        """What a source's catalog url starts with: the alias, else the file url of
+        the root. A drop's ``dnd://`` label is its own and is never persisted."""
+        return self.alias or to_catalog_url(self.url)
 
     @classmethod
     def from_config(cls, source: SourceConfig, kind: RootKind) -> Root:
@@ -257,27 +273,22 @@ class Roots:
         """The display ``source_url`` for a source found at ``claim_path``, or None.
 
         What the root it is under makes of it: a drop's ``dnd://`` label (so the
-        source goes with the drop), the innermost aliased monitored root's alias,
-        or a ``monitor = false`` root's alias. None leaves the plain file url.
-        Display-only: the source id still hashes the native path.
+        source goes with the drop), else the root's alias. None leaves the plain
+        file url. The catalog's view builds the same from a row's root and path
+        (``Root.root_url``). Display-only: the source id still hashes the native path.
         """
-        path = Path(claim_path)
-        inside = [r for r in self._snap.local if path.is_relative_to(r.path)]
-        root = _innermost(inside)
+        root = self.containing(Path(claim_path))
         if root is None:
             return None
         if root.kind is RootKind.DROPPED:
             return _drop_catalog_url(root.url, claim_path, label=root.label)
-        if root.kind is RootKind.SCAN_ONCE:
-            # Persistent: nothing rescans the root to re-merge it into the tree.
-            alias_root = root if root.alias else None
-        else:
-            alias_root = _innermost(
-                r for r in inside if r.kind is RootKind.MONITORED and r.alias
-            )
-        if alias_root is None:
+        if root.alias is None:
             return None
-        return reroot_catalog_url(alias_root.alias, alias_root.url, claim_path)
+        return reroot_catalog_url(root.alias, root.url, claim_path)
+
+    def persisted(self) -> List[Root]:
+        """The roots whose sources the catalog table holds."""
+        return self.of_kind(RootKind.MONITORED, RootKind.SCAN_ONCE)
 
     def check_overlap(
         self,

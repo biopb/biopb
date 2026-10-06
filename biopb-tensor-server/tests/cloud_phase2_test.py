@@ -394,11 +394,20 @@ class _FakeMetadataDb:
         self.added = []
         self.pending = []  # (source_id, recall) of each pending row written
 
-    def sync_source_added(self, source_id, adapter):
+    def sync_roots(self, roots):
+        pass
+
+    def sync_source_added(self, source_id, adapter, record=None):
         self.added.append((source_id, adapter))
 
-    def sync_pending_source(self, claim, catalog_url=None, error=None, recall=False):
+    def sync_pending_source(
+        self, claim, catalog_url=None, error=None, recall=False, record=None
+    ):
         self.pending.append((claim.source_id, recall))
+
+    def sync_pending_sources(self, rows):
+        for row in rows:
+            self.sync_pending_source(row.claim, row.catalog_url, recall=row.recall)
 
     def sync_source_removed(self, source_id):
         pass
@@ -820,7 +829,7 @@ class TestCloudRescanGating:
 
         mgr._handle_rescan()  # force_full
         sid = next(iter(mgr._reconciler._recall))
-        assert sid in mgr._reconciler._cloud_source_ids
+        assert mgr._roots.is_cloud(mgr._reconciler.claim_primary_path(sid))
 
         walked = self._spy_walks(monkeypatch)
         monkeypatch.setattr(mgr, "_should_force_full_rescan", lambda: False)
@@ -849,7 +858,7 @@ class TestCloudRescanGating:
         orig_sig = mgr._reconciler._build_claim_signatures
 
         def guard(claim):
-            assert claim.source_id not in mgr._reconciler._cloud_source_ids, (
+            assert not mgr._roots.is_cloud(claim.primary_path), (
                 "cloud source must not be signature-diffed on an incremental"
             )
             return orig_sig(claim)
@@ -887,7 +896,8 @@ class TestCloudRescanGating:
         mgr._handle_rescan()  # force_full: re-walk surfaces it, partition rebuilt
         assert len(mgr._reconciler._recall) == 2
         assert all(
-            sid in mgr._reconciler._cloud_source_ids for sid in mgr._reconciler._recall
+            mgr._roots.is_cloud(mgr._reconciler.claim_primary_path(sid))
+            for sid in mgr._reconciler._recall
         )
 
 

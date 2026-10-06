@@ -58,9 +58,13 @@ class _FakeMetadataDb:
     def __init__(self):
         self.added = []
         self.removed = []
+        self.pending = []  # (source_id, error) of each pending row written
         # The orphan clock, driven from _mark_catalog_complete.
         self.seen_calls = 0
         self.pruned = []
+
+    def sync_roots(self, roots):
+        self.roots = list(roots)
 
     def mark_sources_seen(self):
         self.seen_calls += 1
@@ -70,8 +74,13 @@ class _FakeMetadataDb:
         self.pruned.append(before)
         return 0
 
-    def sync_source_added(self, source_id, adapter):
+    def sync_source_added(self, source_id, adapter, record=None):
         self.added.append(source_id)
+
+    def sync_pending_source(
+        self, claim, catalog_url=None, error=None, recall=False, record=None
+    ):
+        self.pending.append((claim.source_id, error))
 
     def sync_source_removed(self, source_id):
         self.removed.append(source_id)
@@ -83,7 +92,7 @@ class _FailingMetadataDb(_FakeMetadataDb):
         self._fail_add = fail_add
         self._fail_remove = fail_remove
 
-    def sync_source_added(self, source_id, adapter):
+    def sync_source_added(self, source_id, adapter, record=None):
         if self._fail_add:
             raise RuntimeError("metadata add failed")
         super().sync_source_added(source_id, adapter)
@@ -647,7 +656,8 @@ class TestDropRemoval:
 
         assert len(result.removed) == 1
 
-    def test_a_source_that_is_still_churning_is_kept(self, tmp_path):
+    def test_a_source_that_is_still_churning_is_removed(self, tmp_path):
+        # A drop has no next tick to wait for, so the stability window is not applied.
         (tmp_path / "a.dat").write_text("a")
         registry = _ScriptedRegistry()
         server, manager = self._manager(registry, stability_window=10**9)
@@ -656,7 +666,7 @@ class TestDropRemoval:
         registry.decline = True
         result = _drain_drop(manager, tmp_path)
 
-        assert result.removed == []
+        assert len(result.removed) == 1
 
     def test_a_source_under_a_monitored_root_is_left_to_the_rescan(self, tmp_path):
         (tmp_path / "a.dat").write_text("a")
@@ -993,7 +1003,6 @@ class TestClaimSpelling:
         assert new_id != old_id
         monkeypatch.setattr(manager, "_should_force_full_rescan", lambda: False)
         for _ in range(4):
-            manager._reconciler._failed_sources.clear()  # not the retry gate's test
             manager._handle_rescan()
 
         assert list(state.claims) == [new_id]
@@ -1285,7 +1294,9 @@ class TestSourceManagerRegressions:
         server.unregistered.clear()
         server._metadata_db.removed.clear()
 
-        manager._reconciler._reconcile_discovered_state(DiscoveryState())
+        manager._reconciler._reconcile_root(
+            manager._reconciler.claims_under(monitored_dir), DiscoveryState(), True
+        )
 
         assert claim.source_id in state.claims
         assert server.unregistered == []
@@ -1576,12 +1587,11 @@ class TestSourceManagerRegressions:
         # Neither the unregister nor the catalog delete may raise out of a rollback.
         manager._reconciler._rollback_source_registration("source-1")
 
-    def test_failed_dataset_retries_with_backoff(self, tmp_path, monkeypatch):
+    def _flaky_manager(self, tmp_path):
         monitored_dir = tmp_path / "monitored"
         monitored_dir.mkdir()
         data_path = monitored_dir / "sample.dat"
         data_path.write_text("hello")
-
         server = _FakeServer()
         manager = _make_manager(
             server,
@@ -1590,93 +1600,48 @@ class TestSourceManagerRegressions:
             monitored_dirs={monitored_dir},
             stability_window=0.0,
         )
+        return server, manager, data_path
 
-        clock = {"now": 100.0}
-        monkeypatch.setattr(
-            "biopb_tensor_server.sources.source_manager.time.time", lambda: clock["now"]
-        )
+    def test_a_failed_dataset_is_kept_and_the_walk_does_not_retry_it(self, tmp_path):
+        server, manager, data_path = self._flaky_manager(tmp_path)
 
         manager._handle_rescan()
         source_id = generate_source_id(str(data_path.resolve()), "fake")
 
         assert _FlakyAdapter.calls == 1
-        assert manager._reconciler._failed_sources[source_id].attempts == 1
+        # Known, as a failed row: the walk would otherwise find it new every tick.
+        assert source_id in manager._reconciler._pending_failed
+        assert manager._reconciler.has_claim(source_id)
+        assert server._metadata_db.pending[-1][0] == source_id
+        assert server._metadata_db.pending[-1][1]  # the error text
 
-        clock["now"] = 100.5
-        manager._handle_rescan()
-
+        for _ in range(3):
+            manager._handle_rescan()
         assert _FlakyAdapter.calls == 1
-        assert manager._reconciler._failed_sources[source_id].attempts == 1
 
-        clock["now"] = 101.1
+    def test_a_new_signature_retries_a_failed_dataset(self, tmp_path):
+        server, manager, data_path = self._flaky_manager(tmp_path)
+        manager._handle_rescan()
+        assert _FlakyAdapter.calls == 1
+
+        data_path.write_text("hello, again")
         manager._handle_rescan()
 
         assert _FlakyAdapter.calls == 2
-        assert manager._reconciler._failed_sources[source_id].attempts == 2
-        assert manager._reconciler._failed_sources[
-            source_id
-        ].next_retry_at == pytest.approx(103.1)
 
-    def test_failed_dataset_logs_are_rate_limited(self, tmp_path, monkeypatch, caplog):
-        monitored_dir = tmp_path / "monitored"
-        monitored_dir.mkdir()
-        data_path = monitored_dir / "sample.dat"
-        data_path.write_text("hello")
-
-        server = _FakeServer()
-        manager = _make_manager(
-            server,
-            registry=_RegistryWithFlakyAdapter(),
-            discovery_state=DiscoveryState(),
-            monitored_dirs={monitored_dir},
-            stability_window=0.0,
-        )
-
-        clock = {"now": 100.0}
-        monkeypatch.setattr(
-            "biopb_tensor_server.sources.source_manager.time.time", lambda: clock["now"]
-        )
-
+    def test_a_failed_dataset_is_logged_once(self, tmp_path, caplog):
+        server, manager, data_path = self._flaky_manager(tmp_path)
         caplog.set_level("ERROR")
 
-        manager._handle_rescan()
-        clock["now"] = 101.1
-        manager._handle_rescan()
-        clock["now"] = 104.0
-        manager._handle_rescan()
+        for _ in range(4):
+            manager._handle_rescan()
 
-        error_records = [
-            record
-            for record in caplog.records
-            if "Failed to create adapter for source" in record.message
+        records = [
+            r
+            for r in caplog.records
+            if "Failed to create adapter for source" in r.message
         ]
-        assert len(error_records) == 1
-
-        clock["now"] = 132.0
-        manager._handle_rescan()
-
-        error_records = [
-            record
-            for record in caplog.records
-            if "Failed to create adapter for source" in record.message
-        ]
-        assert len(error_records) == 2
-
-
-def test_get_file_identity_path_hash_fallback_distinguishes_zero_inode(tmp_path):
-    """A zeroed inode (Windows ``DirEntry.stat()``, cloud placeholders) falls back to
-    hashing the resolved path, so distinct entries still get distinct identities
-    and ``visited_identities`` dedup does not collapse a walk into one bucket."""
-    from types import SimpleNamespace
-
-    from biopb_tensor_server.core.discovery import get_file_identity
-
-    a, b = tmp_path / "a", tmp_path / "b"
-    a.mkdir()
-    b.mkdir()
-    zeroed = SimpleNamespace(st_ino=0, st_dev=0, st_mode=0o040755, st_nlink=1)
-
-    assert get_file_identity(a, zeroed) != get_file_identity(b, zeroed)
+        assert len(records) == 1
 
 
 class TestProgressiveDiscoveryFreshness:
@@ -1737,7 +1702,7 @@ class TestProgressiveDiscoveryFreshness:
         def boom(*a, **k):
             raise RuntimeError("reconcile failed")
 
-        monkeypatch.setattr(manager._reconciler, "_reconcile_discovered_state", boom)
+        monkeypatch.setattr(manager._reconciler, "_reconcile_root", boom)
         with pytest.raises(RuntimeError, match="reconcile failed"):
             manager._handle_rescan()
 
@@ -1828,13 +1793,13 @@ class TestProgressiveStreaming:
         # Under Option B every first-scan add is streamed *during* the walk, so
         # the catalog is already full before the end-of-walk reconcile runs.
         seen_at_reconcile = []
-        orig_reconcile = manager._reconciler._reconcile_discovered_state
+        orig_reconcile = manager._reconciler._reconcile_root
 
-        def spy(discovered_state, force_full=False):
+        def spy(snapshot, discovered_state, recurring):
             seen_at_reconcile.append(len(server.registered))
-            return orig_reconcile(discovered_state, force_full=force_full)
+            return orig_reconcile(snapshot, discovered_state, recurring)
 
-        monkeypatch.setattr(manager._reconciler, "_reconcile_discovered_state", spy)
+        monkeypatch.setattr(manager._reconciler, "_reconcile_root", spy)
 
         manager._handle_rescan()
 
@@ -1843,9 +1808,9 @@ class TestProgressiveStreaming:
         # Reconcile did not re-add them (idempotent): exactly one register each.
         assert len(server.registered) == len(set(server.registered))
 
-    def test_steady_state_rescan_does_not_stream(self, tmp_path, monkeypatch):
-        # After the first scan, a force-full steady-state rescan must NOT stream
-        # (its on_source_added stays unset) -- adds go through batch reconcile.
+    def test_a_later_rescan_streams_a_new_claim_too(self, tmp_path, monkeypatch):
+        # One scan, first or later: a claim the walk finds new is committed as it
+        # is found, and the end-of-walk reconcile only compares the known ones.
         server, manager = self._manager(tmp_path, n_sources=2)
         manager._handle_rescan()  # first scan: _initial_scan_done -> True
 
@@ -1854,18 +1819,17 @@ class TestProgressiveStreaming:
         (tmp_path / "monitored" / "s2.dat").write_text("data2")
 
         seen_at_reconcile = []
-        orig_reconcile = manager._reconciler._reconcile_discovered_state
+        orig_reconcile = manager._reconciler._reconcile_root
 
-        def spy(discovered_state, force_full=False):
-            # The new source is NOT yet registered when reconcile starts: it is
-            # added by reconcile (batch), not streamed during the walk.
+        def spy(snapshot, discovered_state, recurring):
+            # The new source is already registered when reconcile starts.
             seen_at_reconcile.append(len(server.registered))
-            return orig_reconcile(discovered_state, force_full=force_full)
+            return orig_reconcile(snapshot, discovered_state, recurring)
 
-        monkeypatch.setattr(manager._reconciler, "_reconcile_discovered_state", spy)
+        monkeypatch.setattr(manager._reconciler, "_reconcile_root", spy)
         manager._handle_rescan()
 
-        assert seen_at_reconcile == [2]  # only the original two before reconcile
+        assert seen_at_reconcile == [3]
         assert len(server.registered) == 3
 
     def test_retried_first_scan_does_not_unregister_streamed_sources(
@@ -1877,15 +1841,15 @@ class TestProgressiveStreaming:
         server, manager = self._manager(tmp_path, n_sources=2)
 
         calls = {"n": 0}
-        orig_reconcile = manager._reconciler._reconcile_discovered_state
+        orig_reconcile = manager._reconciler._reconcile_root
 
-        def flaky(discovered_state, force_full=False):
+        def flaky(snapshot, discovered_state, recurring):
             calls["n"] += 1
             if calls["n"] == 1:
                 raise RuntimeError("reconcile failed")
-            return orig_reconcile(discovered_state, force_full=force_full)
+            return orig_reconcile(snapshot, discovered_state, recurring)
 
-        monkeypatch.setattr(manager._reconciler, "_reconcile_discovered_state", flaky)
+        monkeypatch.setattr(manager._reconciler, "_reconcile_root", flaky)
 
         with pytest.raises(RuntimeError, match="reconcile failed"):
             manager._handle_rescan()

@@ -81,8 +81,89 @@ from biopb_tensor_server.core.labels import last_named_segment
 if TYPE_CHECKING:
     from biopb_tensor_server.core.adapter_base import SourceAdapter
     from biopb_tensor_server.core.discovery import SourceClaim
+    from biopb_tensor_server.sources.pending_rows import PendingRow
 
 logger = logging.getLogger(__name__)
+
+# Bump when a field of the persisted source row or payload changes meaning (an
+# added key needs none). A mismatch drops ``source_catalog`` whole at open.
+SOURCE_CATALOG_FORMAT = 2
+
+# The columns ``sources`` publishes, in table order. Both physical tables carry
+# them first, so the view is a plain UNION ALL.
+_SOURCE_COLUMNS = (
+    "source_id, source_url, source_type, indexed_at, metadata_json, "
+    "is_resolved, unresolved_reason, unresolved_error, tensors"
+)
+# The columns ``source_catalog`` adds after those, in table order. It has no
+# ``source_url``: the view builds it from the row's root and ``rel``.
+_CLAIM_COLUMN_NAMES = (
+    "root_id",
+    "rel",
+    "primary_path",
+    "member_paths",
+    "extra_config",
+    "signature",
+    "payload",
+    "last_seen",
+)
+_CLAIM_COLUMNS = ", ".join(_CLAIM_COLUMN_NAMES)
+# The columns a row is written with, in the order every writer builds its values.
+_ROW_COLUMN_NAMES = (
+    "source_id",
+    "source_url",
+    "source_type",
+    "indexed_at",
+    "metadata_json",
+    "is_resolved",
+    "unresolved_reason",
+    "tensors",
+    "unresolved_error",
+)
+_ROW_COLUMNS = ", ".join(_ROW_COLUMN_NAMES)
+# The row columns a persisted row has: all but ``source_url``, which is the view's.
+_PERSISTED_ROW_COLUMN_NAMES = _ROW_COLUMN_NAMES[:1] + _ROW_COLUMN_NAMES[2:]
+_PERSISTED_COLUMNS = ", ".join(_PERSISTED_ROW_COLUMN_NAMES + _CLAIM_COLUMN_NAMES)
+# Everything but the key, for updating a persisted row in place.
+_UPDATE_SET = ", ".join(
+    f"{c} = ?" for c in _PERSISTED_ROW_COLUMN_NAMES[1:] + _CLAIM_COLUMN_NAMES
+)
+# ``_SOURCE_COLUMNS`` for a ``source_catalog`` row (alias ``c``) joined to its root
+# (alias ``r``): the url is the root's, then the row's path beneath it.
+_PERSISTED_SOURCE_COLUMNS = _SOURCE_COLUMNS.replace(
+    "source_url",
+    "CASE WHEN c.rel = '.' THEN r.root_url ELSE r.root_url || '/' || c.rel END AS source_url",
+).replace("source_id", "c.source_id", 1)
+_SOURCES_VIEW_DDL = (
+    "CREATE VIEW sources AS "
+    f"SELECT {_PERSISTED_SOURCE_COLUMNS} FROM source_catalog c "
+    "JOIN catalog_roots r USING (root_id) UNION ALL "
+    f"SELECT {_SOURCE_COLUMNS} FROM sources_volatile"
+)
+
+
+@dataclass(frozen=True)
+class CatalogRecord:
+    """What a source with a claim persists beside its public row.
+
+    ``signature`` is the claim's member signature taken when the claim was made,
+    before the parse, in the persisted form (no ``st_dev``): a file that changes
+    during registration must not be stamped with its new identity beside the old
+    metadata.
+
+    ``root_id`` and ``rel``: the root it sits under and its path beneath it, which
+    the view turns into ``source_url`` against that root's ``catalog_roots`` row.
+
+    ``cloud``: the claim sits under a cloud root, whose rows keep no payload (a
+    restart never trusts one resolved, so there is nothing to skip).
+    """
+
+    claim: SourceClaim
+    signature: Dict[str, Tuple[Any, ...]]
+    root_id: str
+    rel: str
+    cloud: bool = False
+
 
 # Opening a persistent catalog is retried this many times: a DuckDB lock held by
 # a server on its way down clears in about a second, and a restart race is the
@@ -796,8 +877,7 @@ class MetadataDatabase:
         DuckDB cursors (created via conn.cursor()) are thread-safe and can
         execute concurrently. This allows parallel reads without locking.
         """
-        conn = self._get_connection()
-        return conn.cursor()
+        return self._get_connection().cursor()
 
     def _create_schema(self, conn: duckdb.DuckDBPyConnection) -> None:
         """Create the sources and rois tables and their indexes.
@@ -810,9 +890,16 @@ class MetadataDatabase:
         `rois` cannot be rebuilt, so it is versioned instead: see
         :meth:`_reconcile_roi_schema`.
         """
-        conn.execute("DROP TABLE IF EXISTS sources")
+        # `sources` is a view over the two tables below, so it goes first. An
+        # older build left a physical table of that name.
+        if conn.execute(
+            "SELECT 1 FROM duckdb_tables() WHERE table_name = 'sources'"
+        ).fetchone():
+            conn.execute("DROP TABLE sources")
+        conn.execute("DROP VIEW IF EXISTS sources")
+        conn.execute("DROP TABLE IF EXISTS sources_volatile")
         conn.execute("""
-            CREATE TABLE sources (
+            CREATE TABLE sources_volatile (
                 source_id TEXT PRIMARY KEY,
                 source_url TEXT,
                 source_type TEXT,
@@ -866,7 +953,11 @@ class MetadataDatabase:
             )
         """)
         # Index on source_url for path filtering
-        conn.execute("CREATE INDEX idx_source_url ON sources(source_url)")
+        conn.execute(
+            "CREATE INDEX idx_volatile_source_url ON sources_volatile(source_url)"
+        )
+        self._create_source_catalog(conn)
+        conn.execute(_SOURCES_VIEW_DDL)
 
         # User-drawn ROI annotations, one row per ROI. A sibling table,
         # deliberately NOT a field inside a source row: sources.metadata_json is
@@ -925,6 +1016,70 @@ class MetadataDatabase:
             [str(_DECODE_RATES_SCHEMA_VERSION)],
         )
         logger.debug("Created sources, rois and decode_rates tables and indexes")
+
+    def _create_source_catalog(self, conn: duckdb.DuckDBPyConnection) -> None:
+        """Create ``source_catalog``: the sources that could be restored.
+
+        Public row columns first (see ``_SOURCE_COLUMNS``), then what a restore
+        needs: the claim, its claim-time signature and the adapter payload. The
+        private columns stay out of the ``sources`` view, since the claim can
+        carry credential profile names and paths.
+
+        Dropped whole when ``SOURCE_CATALOG_FORMAT`` differs from the one that
+        wrote it, or is missing: the result is today's behaviour, a rebuild.
+        Rows are cleared at open until a restore reads them; showing last run's
+        rows with no adapter behind them would be a catalog that lies.
+        """
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS catalog_meta (key TEXT PRIMARY KEY, value TEXT)"
+        )
+        stored = conn.execute(
+            "SELECT value FROM catalog_meta WHERE key = 'source_catalog_format'"
+        ).fetchone()
+        if stored is None or stored[0] != str(SOURCE_CATALOG_FORMAT):
+            conn.execute("DROP TABLE IF EXISTS source_catalog")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS source_catalog (
+                source_id TEXT PRIMARY KEY,
+                source_type TEXT,
+                indexed_at TIMESTAMP,
+                metadata_json TEXT,
+                is_resolved BOOLEAN NOT NULL DEFAULT TRUE,
+                unresolved_reason VARCHAR,
+                unresolved_error VARCHAR,
+                tensors STRUCT(
+                    array_id VARCHAR,
+                    dim_labels VARCHAR[],
+                    shape BIGINT[],
+                    dtype VARCHAR
+                )[],
+                -- The root it sits under (`catalog_roots`) and its path beneath
+                -- it; the view makes `source_url` of the two.
+                root_id TEXT NOT NULL,
+                rel TEXT NOT NULL,
+                -- The claim, as `SourceClaim` holds it.
+                primary_path TEXT,
+                member_paths VARCHAR[],
+                extra_config TEXT,
+                -- {member path: [st_ino, size, mtime_ns, ctime_ns]} when the
+                -- claim was made. No st_dev: it renumbers across boots.
+                signature TEXT,
+                -- What the adapter needs to be built without a parse. NULL when
+                -- it has none: a restart rebuilds it from the claim.
+                payload TEXT,
+                last_seen TIMESTAMP
+            )
+        """)
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS catalog_roots "
+            "(root_id TEXT PRIMARY KEY, root_url TEXT NOT NULL)"
+        )
+        conn.execute("DELETE FROM source_catalog")
+        conn.execute("DELETE FROM catalog_roots")
+        conn.execute(
+            "INSERT OR REPLACE INTO catalog_meta VALUES ('source_catalog_format', ?)",
+            [str(SOURCE_CATALOG_FORMAT)],
+        )
 
     def _reconcile_roi_schema(
         self, conn: duckdb.DuckDBPyConnection, had_rois: bool
@@ -1211,7 +1366,12 @@ class MetadataDatabase:
             }
         )
 
-    def sync_source_added(self, source_id: str, adapter: SourceAdapter) -> None:
+    def sync_source_added(
+        self,
+        source_id: str,
+        adapter: SourceAdapter,
+        record: Optional[CatalogRecord] = None,
+    ) -> None:
         """Sync a source to the metadata database (INSERT OR REPLACE upsert).
 
         Called by ``SourceManager`` when a source is registered and, for a
@@ -1230,6 +1390,11 @@ class MetadataDatabase:
         Args:
             source_id: Unique source identifier
             adapter: Backend adapter for the source
+            record: The claim and its claim-time signature, from a caller that
+                registers a source with a claim. A row with one goes to
+                ``source_catalog``, with the adapter's ``catalog_payload`` when it
+                is resolved and has one; without one it goes to
+                ``sources_volatile``.
         """
         conn = self._get_connection()
 
@@ -1327,16 +1492,28 @@ class MetadataDatabase:
         indexed_at = datetime.now()
         metadata_json = json.dumps(metadata, cls=NumpyEncoder) if metadata else None
 
+        # Every source with a claim is persisted; the payload only lets a
+        # restart skip the parse, so an adapter without one (or a cloud row, or
+        # one that is not resolved) stores NULL and is rebuilt from its claim.
+        payload = None
+        if record is not None and is_resolved and not record.cloud:
+            payload = adapter.catalog_payload()
+
         self._upsert_source_row(
             conn,
-            source_id,
-            source_url,
-            source_type,
-            indexed_at,
-            metadata_json,
-            is_resolved,
-            None,  # a registered adapter has no reason; ``sync_pending_source`` sets one
-            tensors,
+            [
+                source_id,
+                source_url,
+                source_type,
+                indexed_at,
+                metadata_json,
+                is_resolved,
+                None,  # a registered adapter has no reason; ``sync_pending_source`` sets one
+                tensors,
+                None,
+            ],
+            record,
+            payload,
         )
 
         # Deliberately AFTER the source row commits, and deliberately unable to
@@ -1359,41 +1536,91 @@ class MetadataDatabase:
             )
         logger.debug(f"Synced source to metadata database: {source_id}")
 
+    @staticmethod
+    def _claim_values(
+        record: CatalogRecord, payload: Optional[Dict[str, Any]], seen: datetime
+    ) -> List[Any]:
+        """The ``source_catalog`` columns after the public ones, in table order."""
+        claim = record.claim
+        return [
+            record.root_id,
+            record.rel,
+            claim.primary_path,
+            sorted(claim.member_paths),
+            json.dumps(claim.extra_config, sort_keys=True),
+            json.dumps({k: list(v) for k, v in record.signature.items()}),
+            None if payload is None else json.dumps(payload, sort_keys=True),
+            seen,
+        ]
+
+    @staticmethod
+    def _pending_row(
+        claim: SourceClaim,
+        catalog_url: Optional[str],
+        recall: bool,
+        error: Optional[str],
+        now: datetime,
+    ) -> List[Any]:
+        """The row of a claimed source that is not registered yet, built from the
+        claim alone, in ``_ROW_COLUMNS`` order."""
+        return [
+            claim.source_id,
+            catalog_url or to_catalog_url(str(claim.primary_path)),
+            claim.source_type or "unknown",
+            now,
+            None,
+            False,
+            "failed" if error else ("needs_recall" if recall else "pending"),
+            [],
+            error or None,
+        ]
+
     def _upsert_source_row(
         self,
         conn: duckdb.DuckDBPyConnection,
-        source_id: str,
-        source_url: str,
-        source_type: str,
-        indexed_at: datetime,
-        metadata_json: Optional[str],
-        is_resolved: bool,
-        unresolved_reason: Optional[str],
-        tensors: List[Dict[str, Any]],
-        unresolved_error: Optional[str] = None,
+        row: List[Any],
+        record: Optional[CatalogRecord] = None,
+        payload: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Insert or replace a source's row, serializing writes with the lock."""
+        """Insert or replace a source's row (*row*, in ``_ROW_COLUMNS`` order),
+        serializing writes with the lock.
+
+        The row lands in ``source_catalog`` with a *record* (the claim and its
+        signature, and the adapter *payload*), else in ``sources_volatile``. A
+        source keeps its table for life (it belongs to one root, and a root that
+        would share a source is refused), so the ``sources`` view, a UNION ALL,
+        shows each ``source_id`` once without a write checking the sibling table.
+
+        A persisted row that exists is updated, not replaced: a registration
+        fills in the pending row its claim made, and an ``UPDATE`` costs about two
+        thirds of the wall time and a quarter of the CPU of an ``INSERT OR
+        REPLACE`` on the indexed table.
+        """
+        source_id, indexed_at = row[0], row[3]
+        # Serialized before the lock: a payload can be large, and every other
+        # writer waits while it is held.
+        claim_values = (
+            None if record is None else self._claim_values(record, payload, indexed_at)
+        )
         with self._write_lock:
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO sources
-                (source_id, source_url, source_type, indexed_at,
-                 metadata_json, is_resolved, unresolved_reason, tensors,
-                 unresolved_error)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    source_id,
-                    source_url,
-                    source_type,
-                    indexed_at,
-                    metadata_json,
-                    is_resolved,
-                    unresolved_reason,
-                    tensors,
-                    unresolved_error,
-                ],
-            )
+            if claim_values is None:
+                conn.execute(
+                    f"INSERT OR REPLACE INTO sources_volatile ({_ROW_COLUMNS}) "
+                    f"VALUES ({', '.join('?' * len(row))})",
+                    row,
+                )
+                return
+            persisted = row[:1] + row[2:]
+            updated = conn.execute(
+                f"UPDATE source_catalog SET {_UPDATE_SET} WHERE source_id = ?",
+                persisted[1:] + claim_values + [source_id],
+            ).fetchone()
+            if not updated or not updated[0]:
+                conn.execute(
+                    f"INSERT INTO source_catalog ({_PERSISTED_COLUMNS}) "
+                    f"VALUES ({', '.join('?' * (len(persisted) + len(claim_values)))})",
+                    persisted + claim_values,
+                )
 
     def sync_pending_source(
         self,
@@ -1401,6 +1628,7 @@ class MetadataDatabase:
         catalog_url: Optional[str] = None,
         error: Optional[str] = None,
         recall: bool = False,
+        record: Optional[CatalogRecord] = None,
     ) -> None:
         """Write the row of a claimed source that is not registered yet.
 
@@ -1410,20 +1638,98 @@ class MetadataDatabase:
         client. With *error* (its registration raised) the reason is ``failed``
         and ``unresolved_error`` carries the text, so a client does not wait on
         it. The registered row replaces this one by the same upsert.
+
+        With a *record* the row is persisted in ``source_catalog``, with the
+        claim and signature, and overwrites what the source had there.
         """
         conn = self._get_connection()
-        self._upsert_source_row(
-            conn,
-            claim.source_id,
-            catalog_url or to_catalog_url(str(claim.primary_path)),
-            claim.source_type or "unknown",
-            datetime.now(),
-            None,
-            False,
-            "failed" if error else ("needs_recall" if recall else "pending"),
-            [],
-            unresolved_error=error or None,
+        row = self._pending_row(claim, catalog_url, recall, error, datetime.now())
+        self._upsert_source_row(conn, row, record)
+
+    # Rows per INSERT: a multi-row statement costs ~0.06 ms a row against ~4 ms for
+    # one statement a row, and stays well under DuckDB's parameter limits.
+    _PENDING_CHUNK = 500
+
+    def _pending_inserts(
+        self, table: str, columns: str, rows: Sequence[PendingRow], now: datetime
+    ) -> List[Tuple[str, List[Any]]]:
+        """The multi-row ``INSERT ... DO NOTHING`` statements for *rows*, in chunks."""
+        statements = []
+        for i in range(0, len(rows), self._PENDING_CHUNK):
+            chunk = rows[i : i + self._PENDING_CHUNK]
+            params: List[Any] = []
+            for row in chunk:
+                values = self._pending_row(
+                    row.claim, row.catalog_url, row.recall, None, now
+                )
+                if row.record is None:
+                    params += values
+                else:
+                    params += values[:1] + values[2:]
+                    params += self._claim_values(row.record, None, now)
+            width = len(params) // len(chunk)
+            statements.append(
+                (
+                    f"INSERT INTO {table} ({columns}) VALUES "
+                    + ", ".join([f"({', '.join('?' * width)})"] * len(chunk))
+                    + " ON CONFLICT DO NOTHING",
+                    params,
+                )
+            )
+        return statements
+
+    def sync_pending_sources(self, rows: Sequence[PendingRow]) -> None:
+        """Write the rows of many claimed sources at once (see ``sync_pending_source``).
+
+        Only a source with no row yet gets one. A batch is written some time after
+        its claims were made, and in that time a registration may already have
+        written the real row, which a pending one must not replace. A row with a
+        record goes to ``source_catalog``, one without to ``sources_volatile``.
+
+        One transaction, serialized with every other writer by the lock; the
+        statements for the persisted rows, which are nearly all of them, are built
+        before it is taken.
+        """
+        if not rows:
+            return
+        conn = self._get_connection()
+        now = datetime.now()
+        persisted = [r for r in rows if r.record is not None]
+        volatile = [r for r in rows if r.record is None]
+        statements = self._pending_inserts(
+            "source_catalog", _PERSISTED_COLUMNS, persisted, now
         )
+        with self._write_lock:
+            conn.execute("BEGIN TRANSACTION")
+            try:
+                if volatile:
+                    statements += self._pending_inserts(
+                        "sources_volatile", _ROW_COLUMNS, volatile, now
+                    )
+                for sql, params in statements:
+                    conn.execute(sql, params)
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+
+    def sync_roots(self, roots: Sequence[Tuple[str, str]]) -> None:
+        """Replace ``catalog_roots`` with *roots*, ``(root_id, root_url)`` each.
+
+        Config is the truth and this table a cache of it, so it is rewritten whole
+        before any source row is: the view shows a row only against its root.
+        """
+        conn = self._get_connection()
+        with self._write_lock:
+            conn.execute("BEGIN TRANSACTION")
+            try:
+                conn.execute("DELETE FROM catalog_roots")
+                for root in roots:
+                    conn.execute("INSERT INTO catalog_roots VALUES (?, ?)", list(root))
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
 
     def _replace_imported(
         self,
@@ -1595,7 +1901,10 @@ class MetadataDatabase:
         """
         conn = self._get_connection()
         with self._write_lock:
-            conn.execute("DELETE FROM sources WHERE source_id = ?", [source_id])
+            conn.execute("DELETE FROM source_catalog WHERE source_id = ?", [source_id])
+            conn.execute(
+                "DELETE FROM sources_volatile WHERE source_id = ?", [source_id]
+            )
             # Reserved rows go with the source row: they are its scan output,
             # re-derived on the next registration. Hand-drawn annotations are
             # deliberately NOT touched here -- outliving their source is the
