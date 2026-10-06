@@ -29,13 +29,16 @@ from google.protobuf.json_format import MessageToDict
 def stored(adapter, source_id: str = "src") -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """``(payload, metadata)`` as a registration stores them and a restore reads them."""
     db = MetadataDatabase()
-    db.sync_roots([("r", "file:///")])
-    path = str(adapter.source_url)
-    claim = SourceClaim(adapter.source_type, path, source_id, member_paths=[path])
-    db.sync_source_added(
-        source_id, adapter, CatalogRecord(claim, {path: (1, 2, 3, 4)}, "r", "x")
-    )
-    hydration = db.read_hydration(source_id)
+    try:
+        db.sync_roots([("r", "file:///")])
+        path = str(adapter.source_url)
+        claim = SourceClaim(adapter.source_type, path, source_id, member_paths=[path])
+        db.sync_source_added(
+            source_id, adapter, CatalogRecord(claim, {path: (1, 2, 3, 4)}, "r", "x")
+        )
+        hydration = db.read_hydration(source_id)
+    finally:
+        db.close()
     assert hydration is not None, "the adapter stored no payload"
     return hydration
 

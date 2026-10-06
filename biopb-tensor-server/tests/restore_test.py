@@ -60,6 +60,9 @@ class _Run:
         return {r["source_id"]: r["source_url"] for r in table.to_pylist()}
 
     def stop(self):
+        # The server too: each one holds sockets and threads until it is shut down,
+        # and a suite that leaks dozens runs out of descriptors on a small runner.
+        self.server.shutdown()
         self.db.close()
 
 
