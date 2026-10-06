@@ -1291,7 +1291,9 @@ class SourceManager:
           entered it, so absence says nothing).
 
         Those are removed by the same rule every scan uses (``_remove_absent``): at
-        once, once quiet, and only if no adapter claims them on a second look.
+        once, quiet or not (a recently written file is read, and only a monitored
+        root has a next tick to wait for), and only if no adapter claims them on a
+        second look.
         """
         declined = [Path(d) for d in declined_dirs]
         snapshot = {
@@ -1301,7 +1303,7 @@ class SourceManager:
             and not self._reconciler._claim_overlaps_skipped_subtree(claim, declined)
         }
         return self._reconciler._remove_absent(
-            snapshot, discovered_ids, strikes=1, gated=True, reprobe=True
+            snapshot, discovered_ids, strikes=1, gated=False, reprobe=True
         )
 
     def _display_url_for(self, claim: SourceClaim) -> Optional[str]:

@@ -161,8 +161,8 @@ not (`recurring`):
 Removal is one rule for every scan, `Reconciler._remove_absent`, with three switches: how
 many walks running a claim must be missing (`strikes`), whether it must be quiet (`gated`),
 and whether an adapter must decline it on a second look (`reprobe`). A monitored root is
-(2, gated, no re-probe), a scan-once root (1, not gated, re-probe) and a drop (1, gated,
-re-probe). A drop differs only in which claims it may remove, below.
+(2, gated, no re-probe), a scan-once root (1, not gated, re-probe) and a drop (the same as scan-once). Only a monitored root can wait for quiet, since only it is walked again. A drop differs only
+in which claims it may remove, below.
 
 A claim that registers as it is found (a non-deferred add, or a refresh) is stat'ed once,
 before the parse; that signature is the one persisted beside the row and the one state

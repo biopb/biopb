@@ -221,7 +221,9 @@ class TestDropRemoval:
         assert manager._remove_unclaimed_under(str(monitored), set(), set()) == []
         assert len(_ids(server)) == 1
 
-    def test_it_waits_for_a_source_that_is_still_changing(self, tmp_path, monkeypatch):
+    def test_it_does_not_wait_for_a_source_that_is_still_changing(
+        self, tmp_path, monkeypatch
+    ):
         manager, server, monitored, once = _manager(tmp_path)
         gone = drt._make_zarr(once, "gone.zarr")
         manager._handle_rescan()
@@ -229,9 +231,6 @@ class TestDropRemoval:
         shutil.rmtree(gone)
 
         monkeypatch.setattr(reconciler, "_claim_is_quiet", lambda claim: False)
-        assert manager._remove_unclaimed_under(str(once), set(), set()) == []
-
-        monkeypatch.setattr(reconciler, "_claim_is_quiet", lambda claim: True)
         assert len(manager._remove_unclaimed_under(str(once), set(), set())) == 1
 
     def test_it_skips_a_directory_the_walk_declined(self, tmp_path):

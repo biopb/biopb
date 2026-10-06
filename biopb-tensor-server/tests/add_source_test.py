@@ -962,10 +962,9 @@ class TestReDropRemovesVanished:
         assert removed == [added[0]]
         assert added_outside[0] in server.sources
 
-    def test_a_still_present_but_unclaimed_path_is_kept(self, tmp_path):
-        """Absence from the walk is not evidence of deletion -- a drop has none
-        of the stability gating the periodic path removes under -- so only a
-        vanished path deregisters."""
+    def test_a_still_present_path_no_adapter_claims_is_removed(self, tmp_path):
+        """A drop has no later pass, so it removes at once, recently written or
+        not; the re-probe is what spares a path an adapter still claims."""
         manager, server = _make_manager()
         root = tmp_path / "exp"
         root.mkdir()
@@ -979,5 +978,5 @@ class TestReDropRemovesVanished:
                 os.remove(os.path.join(zpath, meta))
         _, _, _, removed, _ = _drain_all(manager.add_local_source(str(root)))
 
-        assert not removed
-        assert sid in server.sources
+        assert removed == [sid]
+        assert sid not in server.sources
