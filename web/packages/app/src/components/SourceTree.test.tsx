@@ -211,6 +211,38 @@ describe("TreeRow for an unresolved source", () => {
   });
 });
 
+describe("shape badge", () => {
+  const withShape = (shape: number[]): DataSourceDescriptor => ({
+    ...UPLOAD,
+    tensors: [{ ...UPLOAD.tensors[0]!, shape }],
+  });
+  const badge = (shape: number[]) =>
+    /dim-badge[^>]*>([^<]*)</.exec(
+      renderToStaticMarkup(
+        <TreeRow
+          node={{ id: "u", name: "u", type: "source", children: [], source: withShape(shape), depth: 1 }}
+          activeSourceId={null}
+          activeTensorId={null}
+          expandedFolders={new Set()}
+          toggleFolder={() => {}}
+          selectSource={() => {}}
+        />,
+      ),
+    )?.[1];
+
+  it("drops leading singleton axes", () => {
+    expect(badge([1, 1, 343, 278, 300])).toBe("343×278×300");
+  });
+
+  it("keeps singletons that follow a real axis", () => {
+    expect(badge([1, 3, 1, 512, 512])).toBe("3×1×512×512");
+  });
+
+  it("keeps a lone 1 for an all-ones shape", () => {
+    expect(badge([1, 1])).toBe("1");
+  });
+});
+
 describe("TreeRow with label sets", () => {
   const WITH_LABELS: DataSourceDescriptor = {
     source_id: "zarr_b1",

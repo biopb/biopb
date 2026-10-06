@@ -40,6 +40,14 @@ function formatShape(shape: number[]): string {
   return shape.join("×");
 }
 
+// The badge's shape without its leading singleton axes (1×1×343×278×300 reads
+// as 343×278×300): they carry nothing a glance needs and crowd the row. The
+// tooltip keeps the full shape. An all-ones shape stays "1".
+function compactShape(shape: number[]): string {
+  const first = shape.findIndex((n) => n !== 1);
+  return formatShape(first < 0 ? shape.slice(-1) : shape.slice(first));
+}
+
 // Deepest folder level a search opens by itself. A match deep in a big tree
 // would otherwise open every folder on the way down, and a result list of
 // thousands of rows is no longer a list anyone reads: the top level shows where
@@ -352,7 +360,7 @@ export function TreeRow({
             style={{ marginLeft: 8 }}
             title={formatShape(firstTensor.shape)}
           >
-            {formatShape(firstTensor.shape)}
+            {compactShape(firstTensor.shape)}
           </span>
         ) : null}
       </button>
