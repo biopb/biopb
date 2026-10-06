@@ -224,6 +224,31 @@ class TestRestore:
         assert sorted(run.manager._deferred) == ids
         run.stop()
 
+    def test_a_walk_that_verified_a_source_spares_its_hydration_the_stat(
+        self, tmp_path, monkeypatch
+    ):
+        ids = _first_run(tmp_path)
+        run = _Run(tmp_path)
+        run.restore()
+        stats = []
+        real = run.reconciler._build_claim_signatures
+        monkeypatch.setattr(
+            run.reconciler,
+            "_build_claim_signatures",
+            lambda claim: stats.append(claim.source_id) or real(claim),
+        )
+
+        run.server.sources.get_registered(ids[0])  # a read before the walk checks
+        assert stats.count(ids[0]) >= 1
+        before = len(stats)
+
+        run.first_scan()  # the walk verifies the rest
+        walked = len(stats) - before
+        run.server.sources.get_registered(ids[1])
+
+        assert len(stats) - before == walked  # hydrating it stat'ed nothing more
+        run.stop()
+
     def test_nothing_is_restored_when_the_setting_is_off(self, tmp_path):
         _first_run(tmp_path)
         run = _Run(tmp_path, restore=False)
