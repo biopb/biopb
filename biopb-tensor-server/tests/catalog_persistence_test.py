@@ -532,8 +532,13 @@ class TestRegistration:
         assert label["shape"] == mask["shape"]
         assert label["dim_labels"] == mask["dim_labels"]
 
-    def test_a_source_without_a_payload_is_persisted_from_its_claim(self, tmp_path):
+    def test_a_source_without_a_payload_is_persisted_from_its_claim(
+        self, tmp_path, monkeypatch
+    ):
         import zarr
+        from biopb_tensor_server.adapters.zarr import ZarrAdapter
+
+        monkeypatch.setattr(ZarrAdapter, "catalog_payload", lambda self: None)
 
         z = zarr.open_array(
             os.path.join(tmp_path, "a.zarr"),

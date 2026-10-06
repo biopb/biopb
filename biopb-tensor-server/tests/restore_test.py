@@ -259,7 +259,9 @@ class TestHydrateFromPayload:
         """An nd2 file that cannot be told from a real one, and a count of how many
         times it was probed."""
         pytest.importorskip("nd2")
-        from biopb_tensor_server.adapters import nd2 as nd2_module
+        import importlib
+
+        nd2_module = importlib.import_module("biopb_tensor_server.adapters.nd2")
 
         from tests.nd2_adapter_test import _install_fake
 

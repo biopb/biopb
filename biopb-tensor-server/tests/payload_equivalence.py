@@ -12,12 +12,17 @@ the metadata is the row's, not the adapter's.
 
 from __future__ import annotations
 
+import json
 from typing import Any, Callable, Dict, Iterable, Optional, Tuple
 
 import numpy as np
 from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server.core.discovery import SourceClaim
-from biopb_tensor_server.serving.metadata_db import CatalogRecord, MetadataDatabase
+from biopb_tensor_server.serving.metadata_db import (
+    CatalogRecord,
+    MetadataDatabase,
+    NumpyEncoder,
+)
 from google.protobuf.json_format import MessageToDict
 
 
@@ -41,6 +46,14 @@ def hydrate(adapter, source, source_id: str = "src"):
     rebuilt = type(adapter).create_from_payload(source, payload, metadata, None)
     assert rebuilt is not None, f"{type(adapter).__name__} has no create_from_payload"
     return rebuilt
+
+
+def stored_form(metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Metadata as the row holds it: through the row's JSON encoder, without ``rois``
+    (``sync_source_added`` files those in the annotation store, not the row)."""
+    form = json.loads(json.dumps(metadata or {}, cls=NumpyEncoder))
+    form.pop("rois", None)
+    return form
 
 
 def _read_all(tensor) -> np.ndarray:
@@ -124,7 +137,14 @@ def assert_hydrates_equivalently(
     with _patched(monkeypatch, opens):
         rebuilt = cls.create_from_payload(source, payload, metadata, None)
     assert rebuilt is not None, f"{cls.__name__} has no create_from_payload"
-    _same(snapshot(rebuilt, read=read), snapshot(parsed, read=read), cls.__name__)
+    # What a rebuilt adapter reports as metadata is the row's, so that is what the
+    # parsed one is held to; a parse's own second answer can differ (BioIO ids come
+    # from a counter) and is not the contract.
+    expected = snapshot(parsed, read=read)
+    actual = snapshot(rebuilt, read=read)
+    expected["metadata"] = stored_form(metadata)
+    actual["metadata"] = stored_form(actual["metadata"])
+    _same(actual, expected, cls.__name__)
     if close is not None:
         close(rebuilt)
     return rebuilt
