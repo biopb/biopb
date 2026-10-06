@@ -110,6 +110,10 @@ function Chevron({ expanded }: { expanded: boolean }) {
       style={{
         display: "inline-block",
         width: 16,
+        flexShrink: 0,
+        // Centred so the rotation (about the box centre) turns the glyph in
+        // place; left-aligned, the expanded triangle lands right of the collapsed one.
+        textAlign: "center",
         fontSize: 10,
         transition: "transform 0.15s",
         transform: expanded ? "rotate(90deg)" : "rotate(0deg)",
