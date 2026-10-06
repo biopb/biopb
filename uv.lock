@@ -841,7 +841,8 @@ dicom = [
     { name = "pydicom" },
 ]
 em = [
-    { name = "rosettasciio", extra = ["hdf5"] },
+    { name = "rosettasciio", version = "0.14.0", source = { registry = "https://pypi.org/simple" }, extra = ["hdf5"], marker = "python_full_version < '3.11'" },
+    { name = "rosettasciio", version = "0.15.0", source = { registry = "https://pypi.org/simple" }, extra = ["hdf5"], marker = "python_full_version >= '3.11'" },
 ]
 medical = [
     { name = "nibabel" },
@@ -917,7 +918,8 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'test'", specifier = ">=7.0.0" },
     { name = "pytest-timeout", marker = "extra == 'test'", specifier = ">=2.1.0" },
     { name = "readlif", marker = "extra == 'vendor'", specifier = ">=0.6.4" },
-    { name = "rosettasciio", extras = ["hdf5"], marker = "extra == 'em'" },
+    { name = "rosettasciio", extras = ["hdf5"], marker = "python_full_version >= '3.11' and extra == 'em'", specifier = ">=0.15" },
+    { name = "rosettasciio", extras = ["hdf5"], marker = "python_full_version < '3.11' and extra == 'em'", specifier = "<0.15" },
     { name = "scipy" },
     { name = "scyjava", marker = "extra == 'bioformats'", specifier = ">=1.9.0" },
     { name = "tifffile", specifier = ">=2024.8.10,<2025.5.21" },
@@ -4951,15 +4953,23 @@ wheels = [
 name = "rosettasciio"
 version = "0.14.0"
 source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version > '3.10' and python_full_version < '3.11' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version > '3.10' and python_full_version < '3.11' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version <= '3.10' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version <= '3.10' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version > '3.10' and python_full_version < '3.11' and platform_machine == 'aarch64' and sys_platform == 'linux'",
+    "python_full_version <= '3.10' and platform_machine == 'aarch64' and sys_platform == 'linux'",
+    "(python_full_version > '3.10' and python_full_version < '3.11' and platform_machine != 'aarch64' and sys_platform == 'linux') or (python_full_version > '3.10' and python_full_version < '3.11' and sys_platform != 'darwin' and sys_platform != 'linux')",
+    "(python_full_version <= '3.10' and platform_machine != 'aarch64' and sys_platform == 'linux') or (python_full_version <= '3.10' and sys_platform != 'darwin' and sys_platform != 'linux')",
+]
 dependencies = [
-    { name = "dask", extra = ["array"] },
+    { name = "dask", extra = ["array"], marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "pint", version = "0.24.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "pint", version = "0.25.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-    { name = "python-box" },
-    { name = "python-dateutil" },
-    { name = "pyyaml" },
+    { name = "python-box", marker = "python_full_version < '3.11'" },
+    { name = "python-dateutil", marker = "python_full_version < '3.11'" },
+    { name = "pyyaml", marker = "python_full_version < '3.11'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/57/ca/dc7c3871b47e1bd89b7a11a34b7b68219504a03047788e52cff1ce823755/rosettasciio-0.14.0.tar.gz", hash = "sha256:4b21582f0d832f086e10236b1798b1c17e327dc6d610e845a8eddd4df817504f", size = 1245393, upload-time = "2026-05-27T15:29:54.331Z" }
 wheels = [
@@ -4986,7 +4996,55 @@ wheels = [
 
 [package.optional-dependencies]
 hdf5 = [
-    { name = "h5py" },
+    { name = "h5py", marker = "python_full_version < '3.11'" },
+]
+
+[[package]]
+name = "rosettasciio"
+version = "0.15.0"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version >= '3.12' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version >= '3.12' and platform_machine == 'aarch64' and sys_platform == 'linux'",
+    "python_full_version >= '3.12' and sys_platform == 'win32'",
+    "python_full_version >= '3.12' and sys_platform == 'emscripten'",
+    "(python_full_version >= '3.12' and platform_machine != 'aarch64' and sys_platform == 'linux') or (python_full_version >= '3.12' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32')",
+    "python_full_version == '3.11.*' and platform_machine == 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version == '3.11.*' and platform_machine != 'x86_64' and sys_platform == 'darwin'",
+    "python_full_version == '3.11.*' and platform_machine == 'aarch64' and sys_platform == 'linux'",
+    "python_full_version == '3.11.*' and sys_platform == 'win32'",
+    "python_full_version == '3.11.*' and sys_platform == 'emscripten'",
+    "(python_full_version == '3.11.*' and platform_machine != 'aarch64' and sys_platform == 'linux') or (python_full_version == '3.11.*' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32')",
+]
+dependencies = [
+    { name = "dask", extra = ["array"], marker = "python_full_version >= '3.11'" },
+    { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "pint", version = "0.25.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "python-box", marker = "python_full_version >= '3.11'" },
+    { name = "python-dateutil", marker = "python_full_version >= '3.11'" },
+    { name = "pyyaml", marker = "python_full_version >= '3.11'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c6/7a/2433c23ce616759c25442aa5a3bd33d8da4ceaca8a8abae2b6f91f95429f/rosettasciio-0.15.0.tar.gz", hash = "sha256:fcf6e6e3675d766231e6eae59b951d2850e3363fd1c9a23957d8408f2833132f", size = 1273205, upload-time = "2026-10-06T08:38:57.503Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3e/7e/a544786dfd65dc7620b3f22414bf80b1d466be7be9563c5c703d159dceaf/rosettasciio-0.15.0-cp311-cp311-macosx_10_9_x86_64.whl", hash = "sha256:a32492f3992b3121b604f51b31cb8aaaa8b4f4e7734415533044efe29f471190", size = 900949, upload-time = "2026-10-06T08:37:50.453Z" },
+    { url = "https://files.pythonhosted.org/packages/c1/2b/65f2e5be37f126f58562f46563f2dea581d51e6c4780b8bbdefbf26d6cdd/rosettasciio-0.15.0-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:c4faffbccc457cb8952713c4b3a01bda7eb1bc7893f05640544479bd1534fedf", size = 902947, upload-time = "2026-10-06T08:37:52.16Z" },
+    { url = "https://files.pythonhosted.org/packages/c4/6b/10d7cbd89c9c01b31d69b0681a18c69ee02c129f62a965a26fb0ef97a591/rosettasciio-0.15.0-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:36e76d636180d880c43ed0f524b0336202d35594425c0722478f639df5b5b487", size = 1398712, upload-time = "2026-10-06T08:37:53.79Z" },
+    { url = "https://files.pythonhosted.org/packages/4b/cf/6c316c0385f7877de93467d09c2b5592b416b792c2d6a915484428b39bde/rosettasciio-0.15.0-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:dbad78e01865dc3f988eeeb1e0990fc985b0cc69058be38f5ed125b2303525cf", size = 1402498, upload-time = "2026-10-06T08:37:55.505Z" },
+    { url = "https://files.pythonhosted.org/packages/da/e9/43618fd8e46c944a11e0e1369a089deef4c3110efee8847aa8f0e677eb16/rosettasciio-0.15.0-cp311-cp311-win_amd64.whl", hash = "sha256:b07a66451c2c430c14e209642dff673e5d4d1f1fa92af0acf5e1eec503d663d2", size = 887405, upload-time = "2026-10-06T08:37:57.33Z" },
+    { url = "https://files.pythonhosted.org/packages/3e/77/9f4bcff1198e13abfddd2df230f2b889b09341086e9c846f695fefe41fd6/rosettasciio-0.15.0-cp311-cp311-win_arm64.whl", hash = "sha256:7a4a9c1ee928ecf9bfde78b83d78935748340448e5b01e9580e3125c3f4bd67d", size = 881060, upload-time = "2026-10-06T08:37:58.8Z" },
+    { url = "https://files.pythonhosted.org/packages/ec/3b/d1c03e14425c7387b5ef6aa1d6d55511c43201fea6f4914521b45787dc46/rosettasciio-0.15.0-cp312-cp312-macosx_10_13_x86_64.whl", hash = "sha256:6e500189686eb163708c4317df817e83319f447715a8faf19beecb05997d3bf6", size = 900709, upload-time = "2026-10-06T08:38:00.325Z" },
+    { url = "https://files.pythonhosted.org/packages/68/03/97432a6dace3cc5016b59d9c7e5720549315cc4c232c840721c222fb997e/rosettasciio-0.15.0-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:5655705c38931dd5942b35296145eb10ac55a2515f734866083daeb616db21f9", size = 901887, upload-time = "2026-10-06T08:38:01.7Z" },
+    { url = "https://files.pythonhosted.org/packages/d1/c9/8f545f2e0f24ba59ec73b5685114428d64a2b6c093890ac2132d5171f759/rosettasciio-0.15.0-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:ffcd27854de60f64e31561394336937279dfc1d6916cb14f7e45a7df24c13393", size = 1393360, upload-time = "2026-10-06T08:38:03.481Z" },
+    { url = "https://files.pythonhosted.org/packages/0a/b8/a8dd2405dc7c7cacf2de05ab21bc53026c061735406c6c6644a9e10c60ba/rosettasciio-0.15.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:ed239779478bae697c412e53c5e30afe3904816dfee9a7c344711dd799229c17", size = 1399692, upload-time = "2026-10-06T08:38:05.201Z" },
+    { url = "https://files.pythonhosted.org/packages/66/92/b7d3f03e8f4216483bf8bc9bd2d6d0fce25dbc5d78c1c40227db97c077ea/rosettasciio-0.15.0-cp312-cp312-win_amd64.whl", hash = "sha256:b9e35870c24b6292f42b09b2b8cf03b8e3c4a4d528fcc27c37e23a2eaef02205", size = 888101, upload-time = "2026-10-06T08:38:06.816Z" },
+    { url = "https://files.pythonhosted.org/packages/d9/8e/db1c34df4fd7dc7cb6c6df181400243119ea0d5b5fd6e28bc01d61ddbbe6/rosettasciio-0.15.0-cp312-cp312-win_arm64.whl", hash = "sha256:7ca92fd5f8c2f225b5580f7086e4259116c1bdced0ac3944142b9cf8e2fa037d", size = 880649, upload-time = "2026-10-06T08:38:08.304Z" },
+    { url = "https://files.pythonhosted.org/packages/f1/67/52d063b4113f0a62e7cea491d532801cd11434b555a6ed3d3f28591d1f0f/rosettasciio-0.15.0-py3-none-any.whl", hash = "sha256:3a60a60cd11827f3bea2045ede68861e552a9c50db687e3e2e62da96598e4db8", size = 633860, upload-time = "2026-10-06T08:38:55.899Z" },
+]
+
+[package.optional-dependencies]
+hdf5 = [
+    { name = "h5py", marker = "python_full_version >= '3.11'" },
 ]
 
 [[package]]
