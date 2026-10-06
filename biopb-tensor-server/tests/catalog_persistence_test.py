@@ -101,6 +101,23 @@ class TestRouting:
         ) == (0, 1)
         assert db.query("SELECT source_id FROM sources").num_rows == 1
 
+    def test_a_relisting_without_a_record_updates_the_persisted_row(self):
+        """biopb/biopb#1290: the upload path re-lists a discovered source with no
+        claim to hand. It must land on the persisted row, keeping the claim, and
+        never add a volatile one beside it."""
+        db = _db()
+        db.sync_source_added(
+            "s1", _Restorable("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8"), _record()
+        )
+        before = _row(db)
+        db.sync_source_added(
+            "s1", _Restorable("s1", "/d/s1.zarr", "zarr", [8, 8], "uint8")
+        )
+        assert (_count(db, "source_catalog"), _count(db, "sources_volatile")) == (1, 0)
+        assert _row(db)[3:6] == before[3:6]  # payload, signature, primary_path
+        (shape,) = db.query("SELECT tensors[1].shape AS s FROM sources")[0].to_pylist()
+        assert shape == [8, 8]
+
     def test_an_unresolved_row_with_a_claim_is_persisted_without_a_payload(self):
         db = _db()
         adapter = _Restorable(

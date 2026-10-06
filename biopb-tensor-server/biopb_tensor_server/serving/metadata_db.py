@@ -129,6 +129,8 @@ _PERSISTED_COLUMNS = ", ".join(_PERSISTED_ROW_COLUMN_NAMES + _CLAIM_COLUMN_NAMES
 _UPDATE_SET = ", ".join(
     f"{c} = ?" for c in _PERSISTED_ROW_COLUMN_NAMES[1:] + _CLAIM_COLUMN_NAMES
 )
+# The row columns alone, for re-listing a persisted row without touching its claim.
+_ROW_UPDATE_SET = ", ".join(f"{c} = ?" for c in _PERSISTED_ROW_COLUMN_NAMES[1:])
 # The same, for an ``INSERT ... ON CONFLICT DO UPDATE`` that finds the row there.
 _UPSERT_SET = ", ".join(
     f"{c} = excluded.{c}" for c in _PERSISTED_ROW_COLUMN_NAMES[1:] + _CLAIM_COLUMN_NAMES
@@ -1645,7 +1647,14 @@ class MetadataDatabase:
         signature, and the adapter *payload*), else in ``sources_volatile``. A
         source keeps its table for life (it belongs to one root, and a root that
         would share a source is refused), so the ``sources`` view, a UNION ALL,
-        shows each ``source_id`` once without a write checking the sibling table.
+        shows each ``source_id`` once.
+
+        A write without a *record* is not always a source without a claim: the
+        upload path re-lists a discovered source when a field or label set is
+        published or deleted, and has only the adapter to hand. So such a write
+        first updates the persisted row's listing columns, leaving its claim
+        alone, and goes to ``sources_volatile`` only when there is none --
+        otherwise the view would list the source twice (biopb/biopb#1290).
 
         A persisted row that exists is updated, not replaced: a registration
         fills in the pending row its claim made, and an ``UPDATE`` costs about two
@@ -1660,6 +1669,12 @@ class MetadataDatabase:
         )
         with self._write_lock:
             if claim_values is None:
+                relisted = conn.execute(
+                    f"UPDATE source_catalog SET {_ROW_UPDATE_SET} WHERE source_id = ?",
+                    row[2:] + [source_id],
+                ).fetchone()
+                if relisted and relisted[0]:
+                    return
                 conn.execute(
                     f"INSERT OR REPLACE INTO sources_volatile ({_ROW_COLUMNS}) "
                     f"VALUES ({', '.join('?' * len(row))})",

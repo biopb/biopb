@@ -22,6 +22,8 @@ from biopb_tensor_server.adapters.fields import fields_root, scan_source_fields
 from biopb_tensor_server.adapters.zarr import ZarrAdapter
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.core.config import CacheConfig
+from biopb_tensor_server.core.discovery import SourceClaim
+from biopb_tensor_server.serving.metadata_db import CatalogRecord
 
 from tests import catalog_server, register_and_catalog
 
@@ -283,6 +285,55 @@ class TestAcrossARestart:
             "SELECT tensors FROM sources WHERE source_id = 'theirs'"
         )
         assert "theirs/@fields/raw" in [str(t["array_id"]) for t in rows[0][0]]
+
+
+class TestAPersistedSourceKeepsOneRow:
+    """biopb/biopb#1290: a discovered source's row is persisted (``source_catalog``),
+    and the upload path re-lists it with no claim to hand. That re-listing must
+    update the persisted row, not add a second one beside it in the view."""
+
+    @pytest.fixture
+    def persisted(self, writable_server, tmp_path):
+        """A discovered source catalogued the way the reconciler does: with its
+        claim, so its row is in ``source_catalog``."""
+        db = writable_server.metadata_db
+        db.sync_roots([("r1", "file:///d")])
+        claim = SourceClaim("zarr", "/d/theirs.zarr", "theirs")
+        record = CatalogRecord(
+            claim, {"/d/theirs.zarr": (1, 2, 3, 4)}, "r1", "theirs.zarr"
+        )
+        registered = writable_server.register_source("theirs", _their_file(tmp_path))
+        db.sync_source_added("theirs", registered, record)
+        return "theirs"
+
+    def _rows(self, server):
+        return server.metadata_db.query(
+            "SELECT tensors FROM sources WHERE source_id = 'theirs'"
+        ).to_pylist()
+
+    def test_a_published_field_is_listed_on_the_one_row(
+        self, writable_server, client, persisted
+    ):
+        desc = _add(client, persisted, "raw")
+        client.upload_array(desc, _arr())
+
+        rows = self._rows(writable_server)
+        assert len(rows) == 1
+        assert [t["array_id"] for t in rows[0]["tensors"]] == [
+            "theirs",
+            "theirs/@fields/raw",
+        ]
+
+    def test_a_discarded_field_leaves_the_one_row(
+        self, writable_server, client, persisted
+    ):
+        desc = _add(client, persisted, "raw")
+        client.upload_array(desc, _arr())
+        client.set_upload_status(desc.array_id, "DISCARDED")
+
+        rows = self._rows(writable_server)
+        assert len(rows) == 1
+        assert [t["array_id"] for t in rows[0]["tensors"]] == ["theirs"]
 
 
 class TestDiscardAndDelete:
