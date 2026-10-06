@@ -611,6 +611,7 @@ class SourceManager:
         # Before the walk, so what the walk streams is not in it.
         snapshot = self._reconciler.claims_under(root.path)
         self._reconciler.begin_pending_batch()
+        walked = False
         try:
             discover_sources(
                 root.path,
@@ -627,10 +628,27 @@ class SourceManager:
                 snapshot, discovered, report.declined_dirs
             )
             self._reconciler._reconcile_root(snapshot, discovered, recurring)
+            walked = True
         finally:
             # Before the startup protocol resumes the registration pool, so every
             # claim has its row by then.
             self._reconciler.end_pending_batch()
+        if walked and self._metadata_db is not None:
+            self._confirm_root(root)
+
+    def _confirm_root(self, root: Root) -> None:
+        """Record that a root's walk finished, and sweep the rows no claim holds.
+
+        Only a walk that ran to the end: a root that could not be listed, or whose
+        walk raised, leaves its restored rows unconfirmed.
+        """
+        try:
+            self._metadata_db.sweep_root(
+                root.root_id, self._reconciler.claims_under(root.path)
+            )
+            self._metadata_db.confirm_root(root.root_id)
+        except Exception:
+            logger.exception("could not confirm root %s", root.url)
 
     def _rescan_monitored_dirs(self) -> None:
         """Scan the monitored directories, each against its own claims.

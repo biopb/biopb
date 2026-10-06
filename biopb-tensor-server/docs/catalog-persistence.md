@@ -52,9 +52,12 @@ A restored row may be stale; the epoch below says so.
 - **A volatile table**: today's `sources`, renamed, dropped and rebuilt at open. It holds
   what has no claim to re-derive: mirrors (catalog rows only, no claim), tensor-server and
   remote sources, uploads, drops.
-- **`sources`**: a view over both, exposing the published columns plus `confirmed_epoch`
-  and `confirmed` (below). The private columns are not in it. Volatile rows report the
-  current epoch, since they were seen this run. For a persisted row the view computes
+- **`sources`**: a view over both, exposing the published columns only; the private
+  columns are not in it.
+- **`source_confirmation(source_id, confirmed_epoch, confirmed)`**: whether each source was
+  verified this run (below). A separate view, hidden from queries like the tables, because
+  `sources` is a published schema; adding `confirmed` to it is a protocol change, made
+  with the clients that read it. Volatile rows are confirmed, being seen this run. For a persisted row the view computes
   `source_url` from its root: `root_url`, or `root_url || '/' || rel`. That equals what
   `Roots.display_url` gives the claim today, so an alias edit is one `catalog_roots` row
   and no source row can carry a stale url. A volatile row keeps a literal `source_url`:
@@ -134,12 +137,19 @@ persisted is each claim's paths, and ownership is re-derived against the current
 
 ## The epoch: restored is not confirmed
 
-`catalog_meta` holds a run counter incremented once at open; no row is rewritten at
-start. Each root's `catalog_roots.epoch` is set when its walk completes successfully
-(rows for roots no longer in config are deleted at open, with their sources). A row's
-`confirmed_epoch` is the greater of its own write epoch and its root's epoch, and
-`confirmed` is that equal to the run counter. A restored row whose root has not finished
-reads unconfirmed. One write per root, not one per source; a batched per-source confirm
+`catalog_meta` holds a run counter incremented at every open (`run_epoch`); no row is
+rewritten at start. Each root's `catalog_roots.epoch` and `last_scanned` are set when its
+walk completes (`SourceManager._confirm_root`); a root that cannot be listed, or whose walk
+raised, is not confirmed. `sync_roots` keeps them across restarts and deletes the rows of
+a root no longer in config. A row's `epoch` is the run that wrote it, and its
+`confirmed_epoch` is the greater of that and its root's; `confirmed` is that equal to the
+run counter. A restored row whose root has not finished reads unconfirmed.
+
+Two things use it today: `mark_sources_seen` and `put_rois` observe only confirmed
+sources, so a listed-but-unverified source does not stop `roi_prune` from firing; and a
+restore drops a row whose `last_seen` and root's `last_scanned` are both more than 30
+days old (`_RESTORE_MAX_AGE`), so a root that is never reachable does not leave its
+sources listed for ever. One write per root, not one per source; a batched per-source confirm
 would write every row once per start, so add it only if per-root progress is not enough.
 
 ## Removal and growth
@@ -318,9 +328,9 @@ restored yet, and the epoch and `last_seen` sweep are stage 2.
      still the one persisted; otherwise, and for every other type, the claim is parsed.
      OME-TIFF still parses: its serve path needs the reduced OME-XML for the physical
      scale and the cached descriptors seeded, which is an adapter change of its own.
-   - **4c. Confirmation:** the run counter, `catalog_roots.epoch`, `confirmed` in the
-     view, the post-walk sweep and the `last_seen` cap, the observation hooks ignoring
-     unconfirmed rows.
+   - **4c. Confirmation:** the run counter, `catalog_roots.epoch`, the
+     `source_confirmation` view, the post-walk sweep and the age cap, the observation hooks
+     ignoring unconfirmed rows.
    - **4d. The rest of Interactions:** lazy `@ome` ROIs and masks, precache on hydration,
      the loud corrupt-catalog log.
 

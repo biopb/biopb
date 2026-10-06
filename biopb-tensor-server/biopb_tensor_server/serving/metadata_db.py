@@ -87,7 +87,7 @@ logger = logging.getLogger(__name__)
 
 # Bump when a field of the persisted source row or payload changes meaning (an
 # added key needs none). A mismatch drops ``source_catalog`` whole at open.
-SOURCE_CATALOG_FORMAT = 2
+SOURCE_CATALOG_FORMAT = 3
 
 # The columns ``sources`` publishes, in table order. Both physical tables carry
 # them first, so the view is a plain UNION ALL.
@@ -106,6 +106,7 @@ _CLAIM_COLUMN_NAMES = (
     "signature",
     "payload",
     "last_seen",
+    "epoch",
 )
 _CLAIM_COLUMNS = ", ".join(_CLAIM_COLUMN_NAMES)
 # The columns a row is written with, in the order every writer builds its values.
@@ -134,12 +135,33 @@ _PERSISTED_SOURCE_COLUMNS = _SOURCE_COLUMNS.replace(
     "source_url",
     "CASE WHEN c.rel = '.' THEN r.root_url ELSE r.root_url || '/' || c.rel END AS source_url",
 ).replace("source_id", "c.source_id", 1)
-_SOURCES_VIEW_DDL = (
-    "CREATE VIEW sources AS "
-    f"SELECT {_PERSISTED_SOURCE_COLUMNS} FROM source_catalog c "
-    "JOIN catalog_roots r USING (root_id) UNION ALL "
-    f"SELECT {_SOURCE_COLUMNS} FROM sources_volatile"
-)
+
+
+def _sources_view_ddl() -> str:
+    """The published ``sources`` view: both tables, the public columns only."""
+    return (
+        "CREATE VIEW sources AS "
+        f"SELECT {_PERSISTED_SOURCE_COLUMNS} FROM source_catalog c "
+        "JOIN catalog_roots r USING (root_id) UNION ALL "
+        f"SELECT {_SOURCE_COLUMNS} FROM sources_volatile"
+    )
+
+
+def _confirmation_view_ddl(run_epoch: int) -> str:
+    """Whether each source was verified this run, apart from the published view.
+
+    A persisted row is *confirmed* when it was written this run or its root's walk
+    finished this run; a volatile row was seen this run by construction. Kept out
+    of ``sources`` because that is a published schema, and out of the allowed
+    tables because only the server's own bookkeeping asks.
+    """
+    return (
+        "CREATE VIEW source_confirmation AS "
+        "SELECT c.source_id, greatest(c.epoch, r.epoch) AS confirmed_epoch, "
+        f"greatest(c.epoch, r.epoch) = {int(run_epoch)} AS confirmed "
+        "FROM source_catalog c JOIN catalog_roots r USING (root_id) UNION ALL "
+        f"SELECT source_id, {int(run_epoch)}, TRUE FROM sources_volatile"
+    )
 
 
 @dataclass(frozen=True)
@@ -719,6 +741,9 @@ class MetadataDatabase:
         #: Keep ``source_catalog`` across a restart (``catalog.restore``): its rows
         #: are read back by :meth:`restorable_rows`, not cleared at open.
         self.restore_sources = restore_sources and store_path is not None
+        #: How many times the file has been opened: what a row's ``epoch`` and its
+        #: root's are compared with to say a row was confirmed this run.
+        self.run_epoch = 0
         self._max_query_results = max_query_results
         self._query_timeout_ms = query_timeout_ms
         self._max_rois_per_tensor = max_rois_per_tensor
@@ -901,6 +926,7 @@ class MetadataDatabase:
         ).fetchone():
             conn.execute("DROP TABLE sources")
         conn.execute("DROP VIEW IF EXISTS sources")
+        conn.execute("DROP VIEW IF EXISTS source_confirmation")
         conn.execute("DROP TABLE IF EXISTS sources_volatile")
         conn.execute("""
             CREATE TABLE sources_volatile (
@@ -961,7 +987,8 @@ class MetadataDatabase:
             "CREATE INDEX idx_volatile_source_url ON sources_volatile(source_url)"
         )
         self._create_source_catalog(conn)
-        conn.execute(_SOURCES_VIEW_DDL)
+        conn.execute(_sources_view_ddl())
+        conn.execute(_confirmation_view_ddl(self.run_epoch))
 
         # User-drawn ROI annotations, one row per ROI. A sibling table,
         # deliberately NOT a field inside a source row: sources.metadata_json is
@@ -1043,6 +1070,7 @@ class MetadataDatabase:
         ).fetchone()
         if stored is None or stored[0] != str(SOURCE_CATALOG_FORMAT):
             conn.execute("DROP TABLE IF EXISTS source_catalog")
+            conn.execute("DROP TABLE IF EXISTS catalog_roots")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS source_catalog (
                 source_id TEXT PRIMARY KEY,
@@ -1072,16 +1100,31 @@ class MetadataDatabase:
                 -- What the adapter needs to be built without a parse. NULL when
                 -- it has none: a restart rebuilds it from the claim.
                 payload TEXT,
-                last_seen TIMESTAMP
+                last_seen TIMESTAMP,
+                -- The run that wrote it (``run_epoch``).
+                epoch BIGINT NOT NULL DEFAULT 0
             )
         """)
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS catalog_roots "
-            "(root_id TEXT PRIMARY KEY, root_url TEXT NOT NULL)"
-        )
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS catalog_roots (
+                root_id TEXT PRIMARY KEY,
+                root_url TEXT NOT NULL,
+                -- The last run whose walk of this root finished, and when.
+                epoch BIGINT NOT NULL DEFAULT 0,
+                last_scanned TIMESTAMP
+            )
+        """)
         if not self.restore_sources:
             conn.execute("DELETE FROM source_catalog")
-        conn.execute("DELETE FROM catalog_roots")
+            conn.execute("DELETE FROM catalog_roots")
+        row = conn.execute(
+            "SELECT value FROM catalog_meta WHERE key = 'run_epoch'"
+        ).fetchone()
+        self.run_epoch = (int(row[0]) if row else 0) + 1
+        conn.execute(
+            "INSERT OR REPLACE INTO catalog_meta VALUES ('run_epoch', ?)",
+            [str(self.run_epoch)],
+        )
         conn.execute(
             "INSERT OR REPLACE INTO catalog_meta VALUES ('source_catalog_format', ?)",
             [str(SOURCE_CATALOG_FORMAT)],
@@ -1542,9 +1585,11 @@ class MetadataDatabase:
             )
         logger.debug(f"Synced source to metadata database: {source_id}")
 
-    @staticmethod
     def _claim_values(
-        record: CatalogRecord, payload: Optional[Dict[str, Any]], seen: datetime
+        self,
+        record: CatalogRecord,
+        payload: Optional[Dict[str, Any]],
+        seen: datetime,
     ) -> List[Any]:
         """The ``source_catalog`` columns after the public ones, in table order."""
         claim = record.claim
@@ -1557,6 +1602,7 @@ class MetadataDatabase:
             json.dumps({k: list(v) for k, v in record.signature.items()}),
             None if payload is None else json.dumps(payload, sort_keys=True),
             seen,
+            self.run_epoch,
         ]
 
     @staticmethod
@@ -1729,9 +1775,11 @@ class MetadataDatabase:
             return []
         conn = self._get_connection()
         cursor = conn.execute(
-            "SELECT source_id, source_type, is_resolved, unresolved_reason, "
-            "unresolved_error, root_id, rel, primary_path, member_paths, "
-            "extra_config, signature FROM source_catalog"
+            "SELECT c.source_id, c.source_type, c.is_resolved, "
+            "c.unresolved_reason, c.unresolved_error, c.root_id, c.rel, "
+            "c.primary_path, c.member_paths, c.extra_config, c.signature, "
+            "c.last_seen, r.last_scanned "
+            "FROM source_catalog c LEFT JOIN catalog_roots r USING (root_id)"
         )
         names = [d[0] for d in cursor.description]
         return [dict(zip(names, row, strict=True)) for row in cursor.fetchall()]
@@ -1799,19 +1847,58 @@ class MetadataDatabase:
                 conn.execute("ROLLBACK")
                 raise
 
+    def confirm_root(self, root_id: str) -> None:
+        """Record that this run's walk of a root finished: every row under it that a
+        restore brought back is now verified against the disk."""
+        conn = self._get_connection()
+        with self._write_lock:
+            conn.execute(
+                "UPDATE catalog_roots SET epoch = ?, last_scanned = ? "
+                "WHERE root_id = ?",
+                [self.run_epoch, datetime.now(), root_id],
+            )
+
+    def sweep_root(self, root_id: str, keep_ids: Iterable[str]) -> int:
+        """Delete a root's rows that no claim holds, after a walk of it finished.
+
+        The walk removes a claim that is gone, with its row; this is for the row
+        that outlived its claim (a crash between the two writes). Returns the
+        number deleted.
+        """
+        conn = self._get_connection()
+        keep = set(keep_ids)
+        held = [
+            r[0]
+            for r in conn.execute(
+                "SELECT source_id FROM source_catalog WHERE root_id = ?", [root_id]
+            ).fetchall()
+        ]
+        orphans = [source_id for source_id in held if source_id not in keep]
+        self.drop_catalog_rows(orphans)
+        return len(orphans)
+
     def sync_roots(self, roots: Sequence[Tuple[str, str]]) -> None:
         """Replace ``catalog_roots`` with *roots*, ``(root_id, root_url)`` each.
 
-        Config is the truth and this table a cache of it, so it is rewritten whole
-        before any source row is: the view shows a row only against its root.
+        Config is the truth, so a root that is gone is deleted and the rest keep
+        their ``epoch``: it says when a restored row's root was last walked. Written
+        before any source row is, since the view shows a row only against its root.
         """
         conn = self._get_connection()
+        ids = [root_id for root_id, _ in roots]
         with self._write_lock:
             conn.execute("BEGIN TRANSACTION")
             try:
-                conn.execute("DELETE FROM catalog_roots")
-                for root in roots:
-                    conn.execute("INSERT INTO catalog_roots VALUES (?, ?)", list(root))
+                conn.execute(
+                    "DELETE FROM catalog_roots WHERE root_id NOT IN (SELECT unnest(?))",
+                    [ids],
+                )
+                for root_id, root_url in roots:
+                    conn.execute(
+                        "INSERT INTO catalog_roots (root_id, root_url) VALUES (?, ?) "
+                        "ON CONFLICT (root_id) DO UPDATE SET root_url = excluded.root_url",
+                        [root_id, root_url],
+                    )
                 conn.execute("COMMIT")
             except BaseException:
                 conn.execute("ROLLBACK")
@@ -2251,7 +2338,9 @@ class MetadataDatabase:
           does.
         """
         row = conn.execute(
-            "SELECT source_url FROM sources WHERE source_id = ?", [source_id]
+            "SELECT source_url FROM sources WHERE source_id = ? AND source_id IN "
+            "(SELECT source_id FROM source_confirmation WHERE confirmed)",
+            [source_id],
         ).fetchone()
         if row is None:
             logger.debug(
@@ -2296,6 +2385,8 @@ class MetadataDatabase:
                 "UPDATE rois SET "
                 "source_url = COALESCE(NULLIF(s.source_url, ''), rois.source_url), "
                 "last_seen_at = ? FROM sources s WHERE rois.source_id = s.source_id "
+                "AND s.source_id IN "
+                "(SELECT source_id FROM source_confirmation WHERE confirmed) "
                 "RETURNING rois.roi_id",
                 [datetime.now()],
             ).fetchall()

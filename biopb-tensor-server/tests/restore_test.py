@@ -287,3 +287,88 @@ class TestHydrateFromPayload:
 
         assert len(probes) == 2
         run.stop()
+
+
+def _confirmed(run):
+    rows = (
+        run.db._get_connection()
+        .execute("SELECT source_id, confirmed FROM source_confirmation")
+        .fetchall()
+    )
+    return dict(rows)
+
+
+class TestConfirmation:
+    def test_a_restored_row_is_confirmed_when_its_root_has_been_walked(self, tmp_path):
+        ids = _first_run(tmp_path)
+        run = _Run(tmp_path)
+        run.restore()
+        assert _confirmed(run) == dict.fromkeys(ids, False)
+
+        run.first_scan()
+
+        assert _confirmed(run) == dict.fromkeys(ids, True)
+        run.stop()
+
+    def test_the_published_columns_do_not_carry_it(self, tmp_path):
+        _first_run(tmp_path)
+        run = _Run(tmp_path)
+        run.restore()
+        cols = run.db.query("SELECT * FROM sources LIMIT 1").schema.names
+        assert "confirmed" not in cols
+        run.stop()
+
+    def test_an_unconfirmed_source_is_not_a_sighting_of_its_annotations(self, tmp_path):
+        from tests.roi_annotations_test import _annotation
+
+        ids = _first_run(tmp_path)
+        run = _Run(tmp_path)
+        run.restore()
+        run.db.put_rois(f"{ids[0]}/Image:0", [_annotation()])
+
+        assert run.db.mark_sources_seen() == 0  # listed, not yet verified
+
+        run.first_scan()
+        assert run.db.mark_sources_seen() == 1
+        run.stop()
+
+    def test_a_row_no_claim_holds_is_swept_when_its_root_is_walked(self, tmp_path):
+        from biopb_tensor_server.core.discovery import SourceClaim
+
+        _first_run(tmp_path)
+        run = _Run(tmp_path)
+        run.restore()
+        path = str(run.monitored / "stray.zarr")
+        stray = SourceClaim("zarr", path, "zarr_stray", member_paths=[path])
+        run.db.sync_pending_source(stray, record=run.reconciler._catalog_record(stray))
+        assert "zarr_stray" in run.rows()
+
+        run.first_scan()
+
+        assert "zarr_stray" not in run.rows()
+        assert len(run.rows()) == 2
+        run.stop()
+
+    def test_a_source_nobody_has_seen_for_a_month_is_not_restored(self, tmp_path):
+        ids = _first_run(tmp_path)
+        db = MetadataDatabase(
+            store_path=tmp_path / "catalog.duckdb", restore_sources=True
+        )
+        db.open()
+        conn = db._get_connection()
+        conn.execute("UPDATE catalog_roots SET last_scanned = now() - INTERVAL 60 DAY")
+        conn.execute(
+            "UPDATE source_catalog SET last_seen = now() - INTERVAL 60 DAY "
+            "WHERE source_id = ?",
+            [ids[0]],
+        )
+        conn.execute(
+            "UPDATE source_catalog SET last_seen = now() WHERE source_id = ?", [ids[1]]
+        )
+        db.close()
+
+        run = _Run(tmp_path)
+        run.restore()
+
+        assert list(run.rows()) == [ids[1]]
+        run.stop()
