@@ -23,6 +23,7 @@ BioIO and has no fallback path of its own.
 """
 
 import logging
+from collections import namedtuple
 from dataclasses import dataclass
 from itertools import product
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
@@ -73,6 +74,63 @@ class _LifLayout:
     filename: str
     image_list: Tuple[Dict[str, Any], ...]
     offsets: Tuple[Tuple[int, int], ...]
+
+    def to_payload(self) -> Dict[str, Any]:
+        """The layout as JSON: every image's ``image_list`` entry and byte offsets.
+
+        Raises ``TypeError`` for a value JSON cannot carry faithfully (the caller
+        then stores no payload and the file is parsed on a restart).
+        """
+        return {
+            "image_list": [_encode(info) for info in self.image_list],
+            "offsets": [[int(a), int(b)] for a, b in self.offsets],
+        }
+
+    @classmethod
+    def from_payload(cls, payload: Dict[str, Any], filename: str) -> "_LifLayout":
+        """Rebuild a layout from :meth:`to_payload`; *filename* is where the file is now."""
+        return cls(
+            filename=filename,
+            image_list=tuple(_decode(info) for info in payload["image_list"]),
+            offsets=tuple((int(a), int(b)) for a, b in payload["offsets"]),
+        )
+
+
+def _encode(value: Any) -> Any:
+    """*value* as JSON-safe data that :func:`_decode` turns back into the same value.
+
+    ``readlif`` fills an ``image_list`` entry with namedtuples (``dims``), tuples,
+    and dicts keyed by int, none of which survive ``json`` as themselves.
+    """
+    if isinstance(value, tuple) and hasattr(value, "_fields"):
+        return {
+            "__namedtuple__": [type(value).__name__, list(value._fields)],
+            "values": [_encode(v) for v in value],
+        }
+    if isinstance(value, tuple):
+        return {"__tuple__": [_encode(v) for v in value]}
+    if isinstance(value, list):
+        return [_encode(v) for v in value]
+    if isinstance(value, dict):
+        return {"__dict__": [[_encode(k), _encode(v)] for k, v in value.items()]}
+    if isinstance(value, np.generic):
+        return value.item()
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    raise TypeError(f"cannot store a {type(value).__name__} in a payload")
+
+
+def _decode(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_decode(v) for v in value]
+    if isinstance(value, dict):
+        if "__namedtuple__" in value:
+            name, fields = value["__namedtuple__"]
+            return namedtuple(name, fields)(*[_decode(v) for v in value["values"]])
+        if "__tuple__" in value:
+            return tuple(_decode(v) for v in value["__tuple__"])
+        return {_decode(k): _decode(v) for k, v in value["__dict__"]}
+    return value
 
 
 def read_layout(path: str) -> _LifLayout:
@@ -167,6 +225,34 @@ class LifAdapter(TensorAdapter):
             source.source_id,
             layout=read_layout(path),
         )
+
+    @classmethod
+    def create_from_payload(
+        cls,
+        source: "SourceConfig",
+        payload: Dict[str, Any],
+        metadata: Dict[str, Any],
+        credentials_config: Optional[Any] = None,
+    ) -> "LifAdapter":
+        """Rebuild from the row's parsed image list: no file is opened."""
+        url = str(source.url)
+        path = url[len("file://") :] if url.startswith("file://") else url
+        return cls(
+            path,
+            source.source_id,
+            layout=_LifLayout.from_payload(payload["layout"], path),
+        )
+
+    def catalog_payload(self) -> Optional[Dict[str, Any]]:
+        """The parsed image list and offsets. Source-level only; ``None`` when the
+        list holds something JSON cannot carry back faithfully."""
+        if self.image_position is not None:
+            return None
+        try:
+            return {"layout": self._layout.to_payload()}
+        except TypeError:
+            logger.debug("LIF layout is not storable as a payload", exc_info=True)
+            return None
 
     def __init__(
         self,
