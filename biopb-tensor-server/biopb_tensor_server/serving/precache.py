@@ -324,10 +324,8 @@ class PrecacheWorker:
         # remote-tensor proxy source would speculatively pull chunks across the
         # network from the upstream at startup -- costly I/O of questionable
         # value (the real read path caches on demand, and the upstream caches
-        # too). It is also unsound today: the proxy does not implement
-        # has_native_pyramid() (#1120), so a pyramidal upstream would be warmed
-        # at a computed coarse level the upstream already serves natively --
-        # caching chunks the native-pyramid skip below is meant to avoid.
+        # too). The warm path also plans locally, which a proxy cannot serve:
+        # its chunk_ids must be upstream-minted envelopes.
         from biopb_tensor_server.core.remote import is_remote_url
 
         if is_remote_url(source_adapter.source_url or ""):
