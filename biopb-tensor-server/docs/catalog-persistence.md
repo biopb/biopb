@@ -39,16 +39,33 @@ A restored row may be stale; the epoch below says so.
 
 ## Tables and the `sources` view
 
+- **`catalog_roots(root_id, root_url, epoch)`**: one row per configured root, rewritten
+  from config at every open. `root_id` is a hash of the resolved root path; `root_url` is
+  the root's alias, or `to_catalog_url` of its path when it has none. A cache of config,
+  not state: config stays the one source of truth.
 - **`source_catalog`**: every source that has a claim under a configured root, cloud roots
-  included. Public row columns plus the private claim (`primary_path`, `member_paths`,
-  `extra_config`, `source_type`), the claim-time signature, the adapter payload, the epoch
-  of its last write and `last_seen`. A row is resolved, pending, `needs_recall` or failed.
+  included. Public row columns, with `root_id` and `rel` (the forward-slashed path under
+  the root, `.` for the root itself) in place of `source_url`, plus the private claim
+  (`primary_path`, `member_paths`, `extra_config`, `source_type`), the claim-time
+  signature, the adapter payload, the epoch of its last write and `last_seen`. A row is
+  resolved, pending, `needs_recall` or failed.
 - **A volatile table**: today's `sources`, renamed, dropped and rebuilt at open. It holds
   what has no claim to re-derive: mirrors (catalog rows only, no claim), tensor-server and
   remote sources, uploads, drops.
 - **`sources`**: a view over both, exposing the published columns plus `confirmed_epoch`
   and `confirmed` (below). The private columns are not in it. Volatile rows report the
-  current epoch, since they were seen this run.
+  current epoch, since they were seen this run. For a persisted row the view computes
+  `source_url` from its root: `root_url`, or `root_url || '/' || rel`. That equals what
+  `Roots.display_url` gives the claim today, so an alias edit is one `catalog_roots` row
+  and no source row can carry a stale url. A volatile row keeps a literal `source_url`:
+  a drop's `dnd://` label, a mirror or a remote url has no persisted root.
+
+A source belongs to one root, held as `root_id`: the one-root-per-source rule is a column,
+a root's claim snapshot is `WHERE root_id = ?`, and a claim found again under another root
+(a link, an overlap) keeps the first, as the scan does. `rel` is computed where the row is
+written, so path normalization stays out of SQL. The adapter's in-memory `_catalog_url`
+comes from the same `display_url` function at construction; it is the one copy the table
+does not own.
 
 The writer routes by whether the source has a claim. A source that moves between tables
 (it gained or lost its claim) is deleted from the other table in the same locked write,
@@ -107,10 +124,10 @@ persisted is each claim's paths, and ownership is re-derived against the current
   `st_ino`, for cloud; three for a directory and four for a file otherwise), so the two
   never compare equal and the claim is refreshed.
 - A multi-file source needs every member under current roots, else it re-registers.
-- Each claim is attributed to the innermost current root (`Roots.containing`), and the
-  display `source_url` is recomputed from the current roots (`Roots.display_url`): an
-  alias change must show. This is an in-memory pass; a row is rewritten only when its
-  attribution or URL differs.
+- Each claim is attributed to the innermost current root (`Roots.containing`); a row is
+  rewritten only when its `root_id` or `rel` differs. The display url needs no pass: an
+  alias change is in `catalog_roots`, rewritten at open, and the view follows. A row whose
+  `root_id` is in no current root is the removed-root case above.
 - The restart never merges overlapping roots. It restores a claim set that was already
   consistent, attributes each claim to one root and walks each root as a rescan, so the
   runtime refusal of a partly overlapping root does not arise.
@@ -118,8 +135,8 @@ persisted is each claim's paths, and ownership is re-derived against the current
 ## The epoch: restored is not confirmed
 
 `catalog_meta` holds a run counter incremented once at open; no row is rewritten at
-start. Each root has a `root_epoch(root_url, epoch)` entry set when its walk completes
-successfully (entries for roots no longer in config are deleted at open). A row's
+start. Each root's `catalog_roots.epoch` is set when its walk completes successfully
+(rows for roots no longer in config are deleted at open, with their sources). A row's
 `confirmed_epoch` is the greater of its own write epoch and its root's epoch, and
 `confirmed` is that equal to the run counter. A restored row whose root has not finished
 reads unconfirmed. One write per root, not one per source; a batched per-source confirm
@@ -132,8 +149,8 @@ The key is `source_id`, so a changed file overwrites its row. Growth is orphans.
 1. A claim removed during uptime deletes its row (the existing removal path).
 2. After a root's successful walk, delete that root's rows the walk did not see. Take the
    claim set under the reconciler lock in one pass; protect anything written this run.
-   The sweep must follow the same ownership rule as the walk: delete only rows whose
-   innermost root is the one walked.
+   The sweep follows the same ownership rule as the walk: delete only rows whose
+   `root_id` is the one walked.
 3. A root that was not scanned successfully (offline, unmounted, aborted) is not swept.
    Its rows age out by `last_seen` (say 30 days), or they stay as ghosts forever.
 
@@ -283,13 +300,18 @@ restored yet, and the epoch and `last_seen` sweep are stage 2.
    changes a file between claim and write.
 2. Unify the scan: the walk writes every claim to `source_catalog`, registration updates
    the row, the failure tracker goes. Done.
-3. Restore and hydrate every persisted row, behind a setting: the restore rules, the
+3. Roots in the table: `catalog_roots`, `root_id` and `rel` in place of `source_url`, the
+   view computing it, `SOURCE_CATALOG_FORMAT` bumped, the root snapshot a keyed query.
+   Tests: an alias edited between two opens shows in the view with no source row
+   written; each id appears once; `rel` and `root_url` equal `Roots.display_url` for
+   plain, aliased and scan-once roots, and for a file that is the root itself.
+4. Restore and hydrate every persisted row, behind a setting: the restore rules, the
    epoch and per-root confirmation, the post-walk sweep and `last_seen` cap, lazy `@ome`
    ROIs and masks, hydration notifies precache, the observation hooks ignore unconfirmed
    rows, the loud corrupt-catalog log, the rebuild flag.
-4. More payloads for adapters whose parse is slow, as measured; default on after a
+5. More payloads for adapters whose parse is slow, as measured; default on after a
    release cycle with the setting opt-in.
-5. Clients: the SPA dims unconfirmed rows and reads "verifying"; the SDK exposes
+6. Clients: the SPA dims unconfirmed rows and reads "verifying"; the SDK exposes
    `confirmed`.
 
 ## To verify before stage 2
