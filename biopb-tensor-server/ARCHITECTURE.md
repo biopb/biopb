@@ -284,7 +284,7 @@ holds the `source_id <-> path` maps and the `on_source_added` /
 **Progressive discovery (biopb/biopb#212).** The CLI launcher reaches `SERVING`
 ASAP and runs the monitored bootstrap scan in the background; the catalog grows
 *within* that scan as each source is claimed (see Directory Monitoring below).
-See **[docs/progressive-discovery.md](docs/progressive-discovery.md)**.
+See **[docs/catalog-persistence.md](docs/catalog-persistence.md)**.
 
 ### Directory scanning (`core.discovery`, `sources.source_manager`)
 

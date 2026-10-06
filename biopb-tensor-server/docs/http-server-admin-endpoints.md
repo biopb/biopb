@@ -1,6 +1,6 @@
 # Tensor-Server Admin Endpoint — Config / Status / Restart over HTTP
 
-Config/status HTTP routes on the FastAPI sidecar (`http_server.py`) plus a schema-driven admin page in the top-level `web/` SPA (served by the **control plane**, not this sidecar); restart is owned by the control plane (`POST /api/data_plane/restart`), and `save_config` lives in the tensor-server config model. **Related:** [progressive-discovery.md](progressive-discovery.md) (the scan-freshness `health` fields this page consumes), [remote-tensor-cache.md](remote-tensor-cache.md) (the config-GUI design this realizes).
+Config/status HTTP routes on the FastAPI sidecar (`http_server.py`) plus a schema-driven admin page in the top-level `web/` SPA (served by the **control plane**, not this sidecar); restart is owned by the control plane (`POST /api/data_plane/restart`), and `save_config` lives in the tensor-server config model. **Related:** [catalog-persistence.md](catalog-persistence.md) (the scan-freshness `health` fields this page consumes), [remote-tensor-cache.md](remote-tensor-cache.md) (the config-GUI design this realizes).
 
 ## Why
 
@@ -16,7 +16,7 @@ All mount on `http_server.create_app`. `GET /api/config` and the `/api/admin/*` 
 |---|---|---|
 | `/api/config` | `GET` | Return the raw `biopb.json` dict, its on-disk path, and the JSON Schema (`build_config_schema()`). Secrets are redacted (see below). |
 | `/api/config` | `PUT` | Validate the body against the schema → restore redacted secrets → `save_config()` atomically → `{saved, restart_required: true}`. Does **not** restart. |
-| `/api/admin/status` | `GET` | `running / health / pid / version / config path / uptime` + the progressive-discovery freshness fields (`source_count`, `full_scan_in_progress`, `last_full_scan_finished_at`) + the `supervised` / `local` flags. |
+| `/api/admin/status` | `GET` | `running / health / pid / version / config path / uptime` + the discovery freshness fields (`source_count`, `full_scan_in_progress`, `last_full_scan_finished_at`) + the `supervised` / `local` flags. |
 | `/api/admin/browse` | `GET` | Filesystem directory listing for the Sources file chooser. **Local-mode only** — 404s when a token is enforced, since a browsable FS listing is an info-disclosure surface. Returns `{path, parent, entries:[{name,is_dir}], truncated}`. |
 
 There is **no** restart route on this sidecar — restart is control-owned (see **Restart** below).
@@ -56,7 +56,7 @@ A React route `/admin` in the control-served `web/` SPA, reusing the app shell, 
 
 ## Post-restart UX — show the scan, don't blind-wait
 
-On a large/cloud root the startup discovery scan can run for **minutes**. The daemon reaches `SERVING` immediately (backgrounded scan, [progressive-discovery.md](progressive-discovery.md)), so the page polls `/api/admin/status` and narrates the freshness fields rather than blind-waiting: `/livez` dead → "Restarting…"; answering with `full_scan_in_progress` true → "Reconnected — scanning… N sources" (climbing `source_count`); `last_full_scan_finished_at` set and `health == "SERVING"` → "Ready — N sources". A timeout (~60 s) surfaces a "server did not come back" toast pointing at the control's status / the log — never an infinite spinner.
+On a large/cloud root the startup discovery scan can run for **minutes**. The daemon reaches `SERVING` immediately (backgrounded scan, [catalog-persistence.md](catalog-persistence.md)), so the page polls `/api/admin/status` and narrates the freshness fields rather than blind-waiting: `/livez` dead → "Restarting…"; answering with `full_scan_in_progress` true → "Reconnected — scanning… N sources" (climbing `source_count`); `last_full_scan_finished_at` set and `health == "SERVING"` → "Ready — N sources". A timeout (~60 s) surfaces a "server did not come back" toast pointing at the control's status / the log — never an infinite spinner.
 
 ## Gotchas
 

@@ -27,7 +27,7 @@ below (SIGTERM / the Windows sentinel), which still runs the plane's orderly
 shutdown when the control is alive to ask for it; the bind is only the backstop
 for when it is not.
 
-Readiness beyond "port bound" (the progressive-discovery ``SERVING`` scan) is
+Readiness beyond "port bound" (the discovery ``SERVING`` scan) is
 left to the *client*: ``biopb.tensor.Connection`` connects and waits the
 server through its data-folder scan itself. The supervisor's job ends at "the
 process is up and listening".
