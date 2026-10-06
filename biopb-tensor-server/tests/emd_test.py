@@ -3,6 +3,7 @@
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -54,6 +55,17 @@ def _emd_expected(path):
     return file_reader(str(path), lazy=False)[0]["data"]
 
 
+@contextmanager
+def _emd_adapter(path):
+    """An adapter over *path*, closed on exit: Windows cannot delete the file of
+    a test's temp directory while the adapter holds it open."""
+    adapter = EmdAdapter.create_from_config(SourceConfig(url=str(path)))
+    try:
+        yield adapter
+    finally:
+        adapter.close()
+
+
 class TestEmdAdapterClaim:
     """Tests for EmdAdapter.claim()."""
 
@@ -86,65 +98,82 @@ class TestEmdAdapter:
         with tempfile.TemporaryDirectory() as tmpdir:
             p = Path(tmpdir) / "test.emd"
             create_synthetic_emd(p, shape=(2, 3, 8, 8), chunks=(1, 1, 8, 8))
-            adapter = EmdAdapter.create_from_config(SourceConfig(url=str(p)))
+            with _emd_adapter(p) as adapter:
+                descs = adapter.list_tensor_descriptors()
+                assert len(descs) == 1
+                d = descs[0]
+                # array_id is source_id/field
+                assert d.array_id == f"{adapter.source_id}/0"
+                assert list(d.shape) == [8, 8, 3, 2]
+                assert d.chunk_shape == []  # structural listing (biopb/biopb#812)
 
-            descs = adapter.list_tensor_descriptors()
-            assert len(descs) == 1
-            d = descs[0]
-            # array_id is source_id/field
-            assert d.array_id == f"{adapter.source_id}/0"
-            assert list(d.shape) == [8, 8, 3, 2]
-            assert d.chunk_shape == []  # structural listing (biopb/biopb#812)
-
-            # chunk_shape is the transfer grid (biopb/biopb#809), answered by the
-            # signal-bound adapter: seeded by the native HDF5 blocks and reversed
-            # with the axes like everything else rsciio reports: native
-            # (1,1,8,8) -> (8,8,1,1), then grown in whole blocks because one
-            # 128-byte block is far below the transfer target.
-            signal = adapter.get_tensor_adapter(d.array_id)
-            grid = list(signal.get_tensor_descriptor().chunk_shape)
-            assert [grid[0], grid[1]] == [8, 8]
-            assert all(
-                g % n == 0 and g <= s
-                for g, n, s in zip(grid, [8, 8, 1, 1], [8, 8, 3, 2], strict=True)
-            )
-            assert d.dtype == np.dtype("uint16").str
+                # chunk_shape is the transfer grid (biopb/biopb#809), answered by the
+                # signal-bound adapter: seeded by the native HDF5 blocks and reversed
+                # with the axes like everything else rsciio reports: native
+                # (1,1,8,8) -> (8,8,1,1), then grown in whole blocks because one
+                # 128-byte block is far below the transfer target.
+                signal = adapter.get_tensor_adapter(d.array_id)
+                grid = list(signal.get_tensor_descriptor().chunk_shape)
+                assert [grid[0], grid[1]] == [8, 8]
+                assert all(
+                    g % n == 0 and g <= s
+                    for g, n, s in zip(grid, [8, 8, 1, 1], [8, 8, 3, 2], strict=True)
+                )
+                assert d.dtype == np.dtype("uint16").str
 
     def test_get_tensor_adapter_and_read(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             p = Path(tmpdir) / "test.emd"
             create_synthetic_emd(p)
-            adapter = EmdAdapter.create_from_config(SourceConfig(url=str(p)))
-            expected = _emd_expected(p)
+            with _emd_adapter(p) as adapter:
+                expected = _emd_expected(p)
 
-            field = adapter._within_source_field(
-                adapter.list_tensor_descriptors()[0].array_id
-            )
-            ta = adapter.get_tensor_adapter(field)
-            assert ta.get_tensor_descriptor().array_id == f"{adapter.source_id}/0"
+                field = adapter._within_source_field(
+                    adapter.list_tensor_descriptors()[0].array_id
+                )
+                ta = adapter.get_tensor_adapter(field)
+                assert ta.get_tensor_descriptor().array_id == f"{adapter.source_id}/0"
 
-            stop = list(expected.shape)
-            sub = ta.get_data(
-                ChunkBounds(start=[0, 0, 0, 0], stop=[s // 2 or 1 for s in stop])
-            )
-            exp = np.asarray(expected)[tuple(slice(0, s // 2 or 1) for s in stop)]
-            np.testing.assert_array_equal(sub, exp)
+                stop = list(expected.shape)
+                sub = ta.get_data(
+                    ChunkBounds(start=[0, 0, 0, 0], stop=[s // 2 or 1 for s in stop])
+                )
+                exp = np.asarray(expected)[tuple(slice(0, s // 2 or 1) for s in stop)]
+                np.testing.assert_array_equal(sub, exp)
 
     def test_source_level_get_data_rejected(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             p = Path(tmpdir) / "test.emd"
             create_synthetic_emd(p)
-            adapter = EmdAdapter.create_from_config(SourceConfig(url=str(p)))
-            with pytest.raises(ValueError):
-                adapter.get_data(ChunkBounds(start=[0, 0, 0, 0], stop=[1, 1, 1, 1]))
+            with _emd_adapter(p) as adapter:
+                with pytest.raises(ValueError):
+                    adapter.get_data(ChunkBounds(start=[0, 0, 0, 0], stop=[1, 1, 1, 1]))
 
     def test_unknown_signal_rejected(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             p = Path(tmpdir) / "test.emd"
             create_synthetic_emd(p)
+            with _emd_adapter(p) as adapter:
+                with pytest.raises(ValueError):
+                    adapter.get_tensor_adapter("99")
+
+
+class TestEmdAdapterClose:
+    def test_close_releases_the_file_and_is_idempotent(self):
+        import h5py
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = Path(tmpdir) / "test.emd"
+            create_synthetic_emd(p)
             adapter = EmdAdapter.create_from_config(SourceConfig(url=str(p)))
-            with pytest.raises(ValueError):
-                adapter.get_tensor_adapter("99")
+            adapter.get_tensor_adapter("0").get_data(
+                ChunkBounds(start=[0, 0, 0, 0], stop=[1, 1, 1, 1])
+            )
+            adapter.close()
+            adapter.close()
+            # h5py refuses to reopen a file for writing while it is open here.
+            with h5py.File(p, "w"):
+                pass
 
 
 # NOTE: Velox/ThermoFisher eager-fallback (rsciio's Velox 4D-STEM lazy is a TODO)
@@ -162,25 +191,25 @@ class TestEmdAdapterIntegration:
         with tempfile.TemporaryDirectory() as tmpdir:
             p = Path(tmpdir) / "test.emd"
             create_synthetic_emd(p, shape=(2, 3, 16, 16), chunks=(1, 1, 16, 16))
-            adapter = EmdAdapter.create_from_config(SourceConfig(url=str(p)))
-            source_id = adapter.source_id
-            expected = np.asarray(_emd_expected(p))
-            array_id = adapter.list_tensor_descriptors()[0].array_id
+            with _emd_adapter(p) as adapter:
+                source_id = adapter.source_id
+                expected = np.asarray(_emd_expected(p))
+                array_id = adapter.list_tensor_descriptors()[0].array_id
 
-            server = catalog_server("localhost:0")
-            register_and_catalog(server, source_id, adapter)
-            server.mark_ready()
-            t = threading.Thread(target=server.serve, daemon=True)
-            t.start()
-            time.sleep(1)
-            try:
-                client = TensorFlightClient(
-                    f"grpc://localhost:{server.port}", cache_bytes=10_000_000
-                )
-                assert source_id in client.list_sources()
-                darr = client.get_tensor(array_id)  # source_id/field
-                assert tuple(darr.shape) == tuple(expected.shape)
-                np.testing.assert_array_equal(darr.compute(), expected)
-                client.close()
-            finally:
-                server.shutdown()
+                server = catalog_server("localhost:0")
+                register_and_catalog(server, source_id, adapter)
+                server.mark_ready()
+                t = threading.Thread(target=server.serve, daemon=True)
+                t.start()
+                time.sleep(1)
+                try:
+                    client = TensorFlightClient(
+                        f"grpc://localhost:{server.port}", cache_bytes=10_000_000
+                    )
+                    assert source_id in client.list_sources()
+                    darr = client.get_tensor(array_id)  # source_id/field
+                    assert tuple(darr.shape) == tuple(expected.shape)
+                    np.testing.assert_array_equal(darr.compute(), expected)
+                    client.close()
+                finally:
+                    server.shutdown()

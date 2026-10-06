@@ -236,6 +236,23 @@ class EmdAdapter(TensorAdapter):
         self._tensor_adapters[field] = adapter
         return adapter
 
+    def close(self) -> None:
+        """Close the HDF5 files the lazy signals read from; safe to call twice.
+
+        rosettasciio's lazy reader hands back dask arrays over live h5py
+        datasets, so the file stays open for as long as the signals do, and
+        Windows will not delete or replace it meanwhile. The signals are shared
+        by the source-level adapter and its tensor adapters, so closing through
+        any of them closes them all.
+        """
+        import h5py
+
+        with self._io_lock:
+            for sig in self._signals:
+                for node in sig["data"].__dask_graph__().values():
+                    if isinstance(node, h5py.Dataset) and node:
+                        node.file.close()
+
     @property
     def read_block_shape(self) -> Optional[Tuple[int, ...]]:
         """The dask block -- the ``native=`` seed of this field's grid."""
