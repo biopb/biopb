@@ -14,7 +14,11 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.adapters._scale import scale_by_label
+from biopb_tensor_server.adapters._scale import (
+    scale_by_label,
+    scale_from_payload,
+    scale_to_payload,
+)
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
     catalog_entry,
@@ -179,15 +183,6 @@ def _dicom_physical_scale(ds, dim_labels) -> Optional[Tuple[List[float], List[st
         {"y": row_sp, "x": col_sp, "z": z_sp, "frame": z_sp},
         "mm",
     )
-
-
-def _scale_payload(scale):
-    """A physical scale as JSON: ``[[sizes], [units]]``, or None."""
-    return None if scale is None else [list(scale[0]), list(scale[1])]
-
-
-def _scale_from_payload(scale):
-    return None if scale is None else (list(scale[0]), list(scale[1]))
 
 
 def _dicom_header_only(ds):
@@ -515,7 +510,7 @@ class DicomAdapter(TensorAdapter):
             stored={
                 "shape": tuple(int(s) for s in payload["shape"]),
                 "dtype": payload["dtype"],
-                "scale": _scale_from_payload(payload["scale"]),
+                "scale": scale_from_payload(payload["scale"]),
                 "metadata": metadata,
             },
         )
@@ -526,7 +521,7 @@ class DicomAdapter(TensorAdapter):
         return {
             "shape": [int(s) for s in self._shape],
             "dtype": self._dtype,
-            "scale": _scale_payload(self._physical_scale()),
+            "scale": scale_to_payload(self._physical_scale()),
         }
 
     def __init__(
@@ -835,7 +830,7 @@ class DicomSeriesAdapter(TensorAdapter):
                 "rows": int(payload["rows"]),
                 "cols": int(payload["cols"]),
                 "dtype": payload["dtype"],
-                "scale": _scale_from_payload(payload["scale"]),
+                "scale": scale_from_payload(payload["scale"]),
                 "metadata": metadata,
             },
         )
@@ -848,7 +843,7 @@ class DicomSeriesAdapter(TensorAdapter):
             "rows": int(self._rows),
             "cols": int(self._cols),
             "dtype": self._dtype,
-            "scale": _scale_payload(self._physical_scale()),
+            "scale": scale_to_payload(self._physical_scale()),
         }
 
     def __init__(

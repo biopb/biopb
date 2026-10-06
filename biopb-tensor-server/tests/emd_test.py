@@ -21,6 +21,12 @@ from biopb.tensor.ticket_pb2 import ChunkBounds  # noqa: E402
 from tests import catalog_server, register_and_catalog
 
 
+def _tmpdir():
+    """A temp directory that tolerates the adapter's open HDF5 handle: a live
+    adapter holds its file, which Windows will not delete from under it."""
+    return tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+
+
 def create_synthetic_emd(
     path: Path,
     shape: tuple = (2, 3, 8, 8),
@@ -58,7 +64,7 @@ class TestEmdAdapterClaim:
     """Tests for EmdAdapter.claim()."""
 
     def test_claim_emd(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with _tmpdir() as tmpdir:
             p = Path(tmpdir) / "test.emd"
             create_synthetic_emd(p)
             claim = EmdAdapter.claim(ClaimContext(p), DiscoveryState())
@@ -67,13 +73,13 @@ class TestEmdAdapterClaim:
             assert claim.primary_path == str(p)
 
     def test_claim_non_emd(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with _tmpdir() as tmpdir:
             p = Path(tmpdir) / "test.h5"
             p.write_bytes(b"\x89HDF\r\n\x1a\n")
             assert EmdAdapter.claim(ClaimContext(p), DiscoveryState()) is None
 
     def test_claim_directory(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with _tmpdir() as tmpdir:
             assert (
                 EmdAdapter.claim(ClaimContext(Path(tmpdir)), DiscoveryState()) is None
             )
@@ -83,7 +89,7 @@ class TestEmdAdapter:
     """Tests for EmdAdapter functionality (multi-tensor source)."""
 
     def test_list_tensors_and_native_chunks(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with _tmpdir() as tmpdir:
             p = Path(tmpdir) / "test.emd"
             create_synthetic_emd(p, shape=(2, 3, 8, 8), chunks=(1, 1, 8, 8))
             adapter = EmdAdapter.create_from_config(SourceConfig(url=str(p)))
@@ -111,7 +117,7 @@ class TestEmdAdapter:
             assert d.dtype == np.dtype("uint16").str
 
     def test_get_tensor_adapter_and_read(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with _tmpdir() as tmpdir:
             p = Path(tmpdir) / "test.emd"
             create_synthetic_emd(p)
             adapter = EmdAdapter.create_from_config(SourceConfig(url=str(p)))
@@ -131,7 +137,7 @@ class TestEmdAdapter:
             np.testing.assert_array_equal(sub, exp)
 
     def test_source_level_get_data_rejected(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with _tmpdir() as tmpdir:
             p = Path(tmpdir) / "test.emd"
             create_synthetic_emd(p)
             adapter = EmdAdapter.create_from_config(SourceConfig(url=str(p)))
@@ -139,7 +145,7 @@ class TestEmdAdapter:
                 adapter.get_data(ChunkBounds(start=[0, 0, 0, 0], stop=[1, 1, 1, 1]))
 
     def test_unknown_signal_rejected(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with _tmpdir() as tmpdir:
             p = Path(tmpdir) / "test.emd"
             create_synthetic_emd(p)
             adapter = EmdAdapter.create_from_config(SourceConfig(url=str(p)))
@@ -159,7 +165,7 @@ class TestEmdAdapterIntegration:
     def test_server_client_roundtrip(self):
         from biopb.tensor import TensorFlightClient
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with _tmpdir() as tmpdir:
             p = Path(tmpdir) / "test.emd"
             create_synthetic_emd(p, shape=(2, 3, 16, 16), chunks=(1, 1, 16, 16))
             adapter = EmdAdapter.create_from_config(SourceConfig(url=str(p)))

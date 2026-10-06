@@ -157,10 +157,10 @@ def _confirmation_view_ddl(run_epoch: int) -> str:
     """
     return (
         "CREATE VIEW source_confirmation AS "
-        "SELECT c.source_id, greatest(c.epoch, r.epoch) AS confirmed_epoch, "
+        "SELECT c.source_id, "
         f"greatest(c.epoch, r.epoch) = {int(run_epoch)} AS confirmed "
         "FROM source_catalog c JOIN catalog_roots r USING (root_id) UNION ALL "
-        f"SELECT source_id, {int(run_epoch)}, TRUE FROM sources_volatile"
+        "SELECT source_id, TRUE FROM sources_volatile"
     )
 
 

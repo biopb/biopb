@@ -12,6 +12,7 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
+from biopb_tensor_server.adapters._scale import scale_from_payload, scale_to_payload
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
     catalog_entry,
@@ -31,10 +32,6 @@ if TYPE_CHECKING:
 # 0 (unknown) is intentionally absent: an uncalibrated pixdim still carries a
 # meaningful relative voxel size, reported with an empty unit.
 _NIFTI_SPATIAL_UNIT = {1: "m", 2: "mm", 3: "µm"}
-
-
-def _scale_from_payload(scale):
-    return None if scale is None else (list(scale[0]), list(scale[1]))
 
 
 class NiftiAdapter(TensorAdapter):
@@ -166,7 +163,7 @@ class NiftiAdapter(TensorAdapter):
             stored={
                 "shape": tuple(int(s) for s in payload["shape"]),
                 "dim_labels": list(payload["dim_labels"]),
-                "scale": _scale_from_payload(payload["scale"]),
+                "scale": scale_from_payload(payload["scale"]),
                 "metadata": metadata,
             },
         )
@@ -178,7 +175,7 @@ class NiftiAdapter(TensorAdapter):
         return {
             "shape": [int(s) for s in self._shape],
             "dim_labels": list(self.dim_labels),
-            "scale": None if scale is None else [list(scale[0]), list(scale[1])],
+            "scale": scale_to_payload(scale),
         }
 
     def __init__(

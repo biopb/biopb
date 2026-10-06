@@ -308,11 +308,12 @@ class SourceManager:
         if db is None or not getattr(db, "restore_sources", False):
             return
         started = time.monotonic()
+        rows = db.restorable_rows()
         try:
-            summary = self._reconciler.restore(db.restorable_rows())
+            summary = self._reconciler.restore(rows)
         except Exception:
             logger.exception("Catalog restore failed; rebuilding the catalog")
-            db.drop_catalog_rows([r["source_id"] for r in db.restorable_rows()])
+            db.drop_catalog_rows([r["source_id"] for r in rows])
             return
         worker = self._registration_worker
         for source_id in summary["queue"]:
@@ -618,7 +619,6 @@ class SourceManager:
         # Before the walk, so what the walk streams is not in it.
         snapshot = self._reconciler.claims_under(root.path)
         self._reconciler.begin_pending_batch()
-        walked = False
         try:
             discover_sources(
                 root.path,
@@ -635,12 +635,11 @@ class SourceManager:
                 snapshot, discovered, report.declined_dirs
             )
             self._reconciler._reconcile_root(snapshot, discovered, recurring)
-            walked = True
         finally:
             # Before the startup protocol resumes the registration pool, so every
             # claim has its row by then.
             self._reconciler.end_pending_batch()
-        if walked and self._metadata_db is not None:
+        if self._metadata_db is not None:
             self._confirm_root(root)
 
     def _confirm_root(self, root: Root) -> None:

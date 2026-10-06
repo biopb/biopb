@@ -62,6 +62,16 @@ _UNIT_TO_UM: Dict[str, Optional[float]] = {
 }
 
 
+def scale_to_payload(scale):
+    """A physical scale as JSON: ``[[sizes], [units]]``, or None."""
+    return None if scale is None else [list(scale[0]), list(scale[1])]
+
+
+def scale_from_payload(scale):
+    """The inverse of :func:`scale_to_payload`."""
+    return None if scale is None else (list(scale[0]), list(scale[1]))
+
+
 def unit_to_um(unit) -> Optional[float]:
     """Micrometres per ``unit`` for a length-unit string, or ``None``.
 
