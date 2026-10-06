@@ -1473,7 +1473,7 @@ class MetadataDatabase:
         # one that is not resolved) stores NULL and is rebuilt from its claim.
         payload = None
         if record is not None and is_resolved and not record.cloud:
-            payload = getattr(adapter, "catalog_payload", lambda: None)()
+            payload = adapter.catalog_payload()
 
         self._upsert_source_row(
             conn,
@@ -1560,11 +1560,10 @@ class MetadataDatabase:
         serializing writes with the lock.
 
         The row lands in ``source_catalog`` with a *record* (the claim and its
-        signature, and the adapter *payload*), else in ``sources_volatile``, and
-        is deleted from the other table in the same transaction: the ``sources``
-        view is a UNION ALL, so it cannot enforce one row per ``source_id``
-        itself, and a source that gains or loses its claim must not show twice or
-        vanish between the two statements.
+        signature, and the adapter *payload*), else in ``sources_volatile``. A
+        source keeps its table for life (it belongs to one root, and a root that
+        would share a source is refused), so the ``sources`` view, a UNION ALL,
+        shows each ``source_id`` once without a write checking the sibling table.
 
         A persisted row that exists is updated, not replaced: a registration
         fills in the pending row its claim made, and an ``UPDATE`` costs about two
@@ -1578,37 +1577,23 @@ class MetadataDatabase:
             None if record is None else self._claim_values(record, payload, indexed_at)
         )
         with self._write_lock:
-            conn.execute("BEGIN TRANSACTION")
-            try:
-                if claim_values is None:
-                    conn.execute(
-                        "DELETE FROM source_catalog WHERE source_id = ?", [source_id]
-                    )
-                    conn.execute(
-                        f"INSERT OR REPLACE INTO sources_volatile ({_ROW_COLUMNS}) "
-                        f"VALUES ({', '.join('?' * len(row))})",
-                        row,
-                    )
-                else:
-                    conn.execute(
-                        "DELETE FROM sources_volatile WHERE source_id = ?",
-                        [source_id],
-                    )
-                    updated = conn.execute(
-                        f"UPDATE source_catalog SET {_UPDATE_SET} WHERE source_id = ?",
-                        row[1:] + claim_values + [source_id],
-                    ).fetchone()
-                    if not updated or not updated[0]:
-                        conn.execute(
-                            f"INSERT INTO source_catalog ({_ROW_COLUMNS}, "
-                            f"{_CLAIM_COLUMNS}) "
-                            f"VALUES ({', '.join('?' * (len(row) + len(claim_values)))})",
-                            row + claim_values,
-                        )
-                conn.execute("COMMIT")
-            except BaseException:
-                conn.execute("ROLLBACK")
-                raise
+            if claim_values is None:
+                conn.execute(
+                    f"INSERT OR REPLACE INTO sources_volatile ({_ROW_COLUMNS}) "
+                    f"VALUES ({', '.join('?' * len(row))})",
+                    row,
+                )
+                return
+            updated = conn.execute(
+                f"UPDATE source_catalog SET {_UPDATE_SET} WHERE source_id = ?",
+                row[1:] + claim_values + [source_id],
+            ).fetchone()
+            if not updated or not updated[0]:
+                conn.execute(
+                    f"INSERT INTO source_catalog ({_ROW_COLUMNS}, {_CLAIM_COLUMNS}) "
+                    f"VALUES ({', '.join('?' * (len(row) + len(claim_values)))})",
+                    row + claim_values,
+                )
 
     def sync_pending_source(
         self,
@@ -1688,21 +1673,8 @@ class MetadataDatabase:
             conn.execute("BEGIN TRANSACTION")
             try:
                 if volatile:
-                    # A source that already has a persisted row (it moved) must
-                    # not get a second, volatile one.
-                    held = {
-                        r[0]
-                        for r in conn.execute(
-                            "SELECT source_id FROM source_catalog "
-                            "WHERE source_id IN (SELECT unnest(?))",
-                            [[row.claim.source_id for row in volatile]],
-                        ).fetchall()
-                    }
                     statements += self._pending_inserts(
-                        "sources_volatile",
-                        _ROW_COLUMNS,
-                        [r for r in volatile if r.claim.source_id not in held],
-                        now,
+                        "sources_volatile", _ROW_COLUMNS, volatile, now
                     )
                 for sql, params in statements:
                     conn.execute(sql, params)

@@ -503,9 +503,7 @@ class Reconciler:
                     claim,
                     catalog_url,
                     error=message,
-                    record=self._catalog_record(
-                        claim, self._source_signatures.get(claim.source_id)
-                    ),
+                    record=self._state_record(claim),
                 )
             except Exception:
                 logger.exception("could not record the failure of source %s", source_id)
@@ -564,13 +562,7 @@ class Reconciler:
         # A claim found again forfeits its count.
         for source_id in current_ids & discovered_ids:
             self._missed_scans.pop(source_id, None)
-        self._remove_absent(
-            snapshot,
-            discovered_ids,
-            strikes=_MISSES_BEFORE_REMOVAL if recurring else 1,
-            gated=recurring,
-            reprobe=not recurring,
-        )
+        self._remove_absent(snapshot, discovered_ids, recurring=recurring)
         # A changed source is REBUILT in place rather than removed and re-added:
         # the replacement adapter is registered on top of the live one, so the
         # source is never absent from ListFlights or the catalog and a failed
@@ -590,42 +582,35 @@ class Reconciler:
         snapshot: Dict[str, SourceClaim],
         found_ids: Set[str],
         *,
-        strikes: int,
-        gated: bool,
-        reprobe: bool,
+        recurring: bool,
     ) -> List[str]:
         """Remove the claims in *snapshot* that a walk did not find again.
 
-        The one removal rule of every scan; what differs is how sure it must be:
+        The one removal rule of every scan; what differs is how sure it must be.
+        A *recurring* root is walked again, so it waits:
 
-        * *strikes*: a claim must be missing on this many walks running. A root
-          that is walked again can wait for a second look; one that is walked once
-          (a scan-once root, a drop) cannot, so it removes at once (1).
-        * *gated*: only once the claim is quiet, the stability window the claim
-          gate applies on the way in, so a source being rewritten is not removed
-          for an adapter that declines its half-written file.
-        * *reprobe*: only if no adapter claims the path again on a second look. With
-          no later walk to correct a transient decline (a sidecar being rewritten, a
-          locked header), a miss would cost a working source. A claim whose primary
-          path is gone skips the re-probe: nothing to claim.
+        * a claim must be missing on ``_MISSES_BEFORE_REMOVAL`` walks running;
+        * and quiet, the stability window the claim gate applies on the way in, so
+          a source being rewritten is not removed for an adapter that declines its
+          half-written file.
+
+        A root walked once (a scan-once root, a drop) has no later walk to correct
+        a transient decline (a sidecar being rewritten, a locked header), so it
+        removes at once, but only if no adapter claims the path again on a second
+        look. A claim whose primary path is gone skips the re-probe: nothing to
+        claim.
 
         Returns the ids removed.
         """
         removed: List[str] = []
         for source_id in sorted(set(snapshot) - found_ids):
             claim = snapshot[source_id]
-            if strikes > 1:
+            if recurring:
                 misses = self._missed_scans.get(source_id, 0) + 1
                 self._missed_scans[source_id] = misses
-                if misses < strikes:
+                if misses < _MISSES_BEFORE_REMOVAL or not self._claim_is_quiet(claim):
                     continue
-            if gated and not self._claim_is_quiet(claim):
-                continue
-            if (
-                reprobe
-                and os.path.exists(claim.primary_path)
-                and self._claimed_again(claim)
-            ):
+            elif os.path.exists(claim.primary_path) and self._claimed_again(claim):
                 continue
             if self._commit_remove_source(source_id):
                 removed.append(source_id)
@@ -676,9 +661,7 @@ class Reconciler:
                         claim,
                         catalog_url,
                         recall=recall,
-                        record=self._catalog_record(
-                            claim, self._source_signatures.get(claim.source_id)
-                        ),
+                        record=self._state_record(claim),
                     )
             except Exception:
                 logger.exception("could not update the row of source %s", source_id)
@@ -779,6 +762,10 @@ class Reconciler:
         from biopb_tensor_server.serving.metadata_db import CatalogRecord
 
         return CatalogRecord(claim=claim, signature=signature, cloud=root.cloud)
+
+    def _state_record(self, claim: SourceClaim) -> Optional[CatalogRecord]:
+        """The record of a claim already committed, with the signature state holds."""
+        return self._catalog_record(claim, self._source_signatures.get(claim.source_id))
 
     def _preserve_skipped_claims(
         self,
@@ -1601,13 +1588,7 @@ class Reconciler:
                 # State still holds the claim and signature the adapter served under.
                 with self._lock:
                     previous = self._state.claims.get(source_id)
-                record = (
-                    self._catalog_record(
-                        previous, self._source_signatures.get(source_id)
-                    )
-                    if previous is not None
-                    else None
-                )
+                record = self._state_record(previous) if previous is not None else None
                 self._metadata_db.sync_source_added(source_id, displaced, record)
         except Exception:
             logger.exception(

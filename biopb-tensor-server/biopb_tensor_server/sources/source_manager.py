@@ -1303,7 +1303,7 @@ class SourceManager:
             and not self._reconciler._claim_overlaps_skipped_subtree(claim, declined)
         }
         return self._reconciler._remove_absent(
-            snapshot, discovered_ids, strikes=1, gated=False, reprobe=True
+            snapshot, discovered_ids, recurring=False
         )
 
     def _display_url_for(self, claim: SourceClaim) -> Optional[str]:

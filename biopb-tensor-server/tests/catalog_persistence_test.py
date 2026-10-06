@@ -159,17 +159,26 @@ class TestRouting:
         db.sync_pending_sources([PendingRow(_record().claim, record=_record())])
         assert _row(db)[:2] == (True, None)
 
-    def test_a_source_changing_kind_moves_and_never_shows_twice(self):
+    def test_every_source_shows_once_across_both_tables(self):
+        from biopb_tensor_server.sources.pending_rows import PendingRow
+
         db = MetadataDatabase()
         restorable = _Restorable("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8")
+        plain = MockAdapter("s2", "/d/s2.zarr", "zarr", [4, 4], "uint8")
         db.sync_source_added("s1", restorable, _record())
-        db.sync_source_added(
-            "s1", MockAdapter("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8")
-        )
-        assert (_count(db, "source_catalog"), _count(db, "sources_volatile")) == (0, 1)
+        db.sync_source_added("s2", plain)
+        # Registered again and pended again: each stays in its own table.
         db.sync_source_added("s1", restorable, _record())
-        assert (_count(db, "source_catalog"), _count(db, "sources_volatile")) == (1, 0)
-        assert db.query("SELECT source_id FROM sources").num_rows == 1
+        db.sync_source_added("s2", plain)
+        db.sync_pending_sources([PendingRow(_record().claim, record=_record())])
+        assert (
+            _count(db, "source_catalog", "s1"),
+            _count(db, "sources_volatile", "s1"),
+            _count(db, "source_catalog", "s2"),
+            _count(db, "sources_volatile", "s2"),
+        ) == (1, 0, 0, 1)
+        rows = db.query("SELECT source_id FROM sources").to_pylist()
+        assert sorted(r["source_id"] for r in rows) == ["s1", "s2"]
 
     def test_a_failed_registration_row_replaces_a_persisted_one(self):
         db = MetadataDatabase()

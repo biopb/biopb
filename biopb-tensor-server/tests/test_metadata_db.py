@@ -40,6 +40,9 @@ class MockAdapter:
     def catalog_url(self):
         return self._source_url
 
+    def catalog_payload(self):
+        return None
+
     @property
     def source_type(self):
         return self._source_type

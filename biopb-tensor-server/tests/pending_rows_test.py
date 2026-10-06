@@ -155,18 +155,6 @@ class TestBulkInsert:
         }
         assert rows == {"s0": True, "s1": False}
 
-    def test_a_persisted_row_is_not_shadowed(self):
-        from tests.catalog_persistence_test import _record, _Restorable
-
-        db = MetadataDatabase()
-        db.sync_source_added(
-            "s1", _Restorable("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8"), _record()
-        )
-        db.sync_pending_sources([_row(1)])
-        assert self._count(db, "source_catalog") == 1
-        assert self._count(db, "sources_volatile") == 0
-        assert db.query("SELECT source_id FROM sources").num_rows == 1
-
     def test_nothing_to_write(self):
         MetadataDatabase().sync_pending_sources([])
 
