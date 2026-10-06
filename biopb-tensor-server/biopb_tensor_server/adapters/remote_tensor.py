@@ -514,7 +514,7 @@ class RemoteTensorAdapter(TensorAdapter):
         # Whether the upstream *source* has resolved (carried from the bulk row),
         # None until seeded. is_resolved() is its only reader (biopb/biopb#266).
         self._upstream_resolved: Optional[bool] = None
-        # (array_id, content_version, native) for has_native_pyramid().
+        # ((array_id, content_version), native) for has_native_pyramid().
         self._native_pyramid_memo: Optional[tuple] = None
 
     # ------------------------------------------------------------------ upstream
@@ -878,9 +878,8 @@ class RemoteTensorAdapter(TensorAdapter):
         """Plan a read, refusing a non-canonical upstream first (#596).
 
         The other read boundary besides ``plan_flight_info``: the precache warms
-        through it. Checking
-        the request descriptor is free -- it is derived from the mirrored one the
-        caller already holds.
+        through it. Checking the request descriptor is free -- it is derived from
+        the mirrored one the caller already holds.
         """
         self._require_canonical_upstream(request_desc)
         return super().get_read_plan(request_desc)
@@ -1035,8 +1034,8 @@ class RemoteTensorAdapter(TensorAdapter):
         """
         key = (self.array_id, self.content_version)
         memo = self._native_pyramid_memo
-        if memo is not None and memo[:2] == key:
-            return memo[2]
+        if memo is not None and memo[0] == key:
+            return memo[1]
         try:
             info = self._upstream_flight_info(
                 TensorReadOption(
@@ -1050,7 +1049,7 @@ class RemoteTensorAdapter(TensorAdapter):
             return False
         desc = TensorDescriptor.FromString(info.descriptor.command)
         native = any(level.native for level in desc.pyramid)
-        self._native_pyramid_memo = (*key, native)
+        self._native_pyramid_memo = (key, native)
         return native
 
     def _upstream_flight_info(self, read_opt: TensorReadOption):
