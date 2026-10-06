@@ -63,6 +63,9 @@ class _FakeMetadataDb:
         self.seen_calls = 0
         self.pruned = []
 
+    def sync_roots(self, roots):
+        self.roots = list(roots)
+
     def mark_sources_seen(self):
         self.seen_calls += 1
         return 0

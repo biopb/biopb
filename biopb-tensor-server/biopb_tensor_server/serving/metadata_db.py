@@ -87,7 +87,7 @@ logger = logging.getLogger(__name__)
 
 # Bump when a field of the persisted source row or payload changes meaning (an
 # added key needs none). A mismatch drops ``source_catalog`` whole at open.
-SOURCE_CATALOG_FORMAT = 1
+SOURCE_CATALOG_FORMAT = 2
 
 # The columns ``sources`` publishes, in table order. Both physical tables carry
 # them first, so the view is a plain UNION ALL.
@@ -95,8 +95,11 @@ _SOURCE_COLUMNS = (
     "source_id, source_url, source_type, indexed_at, metadata_json, "
     "is_resolved, unresolved_reason, unresolved_error, tensors"
 )
-# The columns ``source_catalog`` adds after those, in table order.
+# The columns ``source_catalog`` adds after those, in table order. It has no
+# ``source_url``: the view builds it from the row's root and ``rel``.
 _CLAIM_COLUMN_NAMES = (
+    "root_id",
+    "rel",
     "primary_path",
     "member_paths",
     "extra_config",
@@ -118,11 +121,23 @@ _ROW_COLUMN_NAMES = (
     "unresolved_error",
 )
 _ROW_COLUMNS = ", ".join(_ROW_COLUMN_NAMES)
+# The row columns a persisted row has: all but ``source_url``, which is the view's.
+_PERSISTED_ROW_COLUMN_NAMES = _ROW_COLUMN_NAMES[:1] + _ROW_COLUMN_NAMES[2:]
+_PERSISTED_COLUMNS = ", ".join(_PERSISTED_ROW_COLUMN_NAMES + _CLAIM_COLUMN_NAMES)
 # Everything but the key, for updating a persisted row in place.
-_UPDATE_SET = ", ".join(f"{c} = ?" for c in _ROW_COLUMN_NAMES[1:] + _CLAIM_COLUMN_NAMES)
+_UPDATE_SET = ", ".join(
+    f"{c} = ?" for c in _PERSISTED_ROW_COLUMN_NAMES[1:] + _CLAIM_COLUMN_NAMES
+)
+# ``_SOURCE_COLUMNS`` for a ``source_catalog`` row (alias ``c``) joined to its root
+# (alias ``r``): the url is the root's, then the row's path beneath it.
+_PERSISTED_SOURCE_COLUMNS = _SOURCE_COLUMNS.replace(
+    "source_url",
+    "CASE WHEN c.rel = '.' THEN r.root_url ELSE r.root_url || '/' || c.rel END AS source_url",
+).replace("source_id", "c.source_id", 1)
 _SOURCES_VIEW_DDL = (
     "CREATE VIEW sources AS "
-    f"SELECT {_SOURCE_COLUMNS} FROM source_catalog UNION ALL "
+    f"SELECT {_PERSISTED_SOURCE_COLUMNS} FROM source_catalog c "
+    "JOIN catalog_roots r USING (root_id) UNION ALL "
     f"SELECT {_SOURCE_COLUMNS} FROM sources_volatile"
 )
 
@@ -136,12 +151,17 @@ class CatalogRecord:
     during registration must not be stamped with its new identity beside the old
     metadata.
 
+    ``root_id`` and ``rel``: the root it sits under and its path beneath it, which
+    the view turns into ``source_url`` against that root's ``catalog_roots`` row.
+
     ``cloud``: the claim sits under a cloud root, whose rows keep no payload (a
     restart never trusts one resolved, so there is nothing to skip).
     """
 
     claim: SourceClaim
     signature: Dict[str, Tuple[Any, ...]]
+    root_id: str
+    rel: str
     cloud: bool = False
 
 
@@ -1021,7 +1041,6 @@ class MetadataDatabase:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS source_catalog (
                 source_id TEXT PRIMARY KEY,
-                source_url TEXT,
                 source_type TEXT,
                 indexed_at TIMESTAMP,
                 metadata_json TEXT,
@@ -1034,6 +1053,10 @@ class MetadataDatabase:
                     shape BIGINT[],
                     dtype VARCHAR
                 )[],
+                -- The root it sits under (`catalog_roots`) and its path beneath
+                -- it; the view makes `source_url` of the two.
+                root_id TEXT NOT NULL,
+                rel TEXT NOT NULL,
                 -- The claim, as `SourceClaim` holds it.
                 primary_path TEXT,
                 member_paths VARCHAR[],
@@ -1048,10 +1071,11 @@ class MetadataDatabase:
             )
         """)
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_catalog_source_url "
-            "ON source_catalog(source_url)"
+            "CREATE TABLE IF NOT EXISTS catalog_roots "
+            "(root_id TEXT PRIMARY KEY, root_url TEXT NOT NULL)"
         )
         conn.execute("DELETE FROM source_catalog")
+        conn.execute("DELETE FROM catalog_roots")
         conn.execute(
             "INSERT OR REPLACE INTO catalog_meta VALUES ('source_catalog_format', ?)",
             [str(SOURCE_CATALOG_FORMAT)],
@@ -1519,6 +1543,8 @@ class MetadataDatabase:
         """The ``source_catalog`` columns after the public ones, in table order."""
         claim = record.claim
         return [
+            record.root_id,
+            record.rel,
             claim.primary_path,
             sorted(claim.member_paths),
             json.dumps(claim.extra_config, sort_keys=True),
@@ -1584,15 +1610,16 @@ class MetadataDatabase:
                     row,
                 )
                 return
+            persisted = row[:1] + row[2:]
             updated = conn.execute(
                 f"UPDATE source_catalog SET {_UPDATE_SET} WHERE source_id = ?",
-                row[1:] + claim_values + [source_id],
+                persisted[1:] + claim_values + [source_id],
             ).fetchone()
             if not updated or not updated[0]:
                 conn.execute(
-                    f"INSERT INTO source_catalog ({_ROW_COLUMNS}, {_CLAIM_COLUMNS}) "
-                    f"VALUES ({', '.join('?' * (len(row) + len(claim_values)))})",
-                    row + claim_values,
+                    f"INSERT INTO source_catalog ({_PERSISTED_COLUMNS}) "
+                    f"VALUES ({', '.join('?' * (len(persisted) + len(claim_values)))})",
+                    persisted + claim_values,
                 )
 
     def sync_pending_source(
@@ -1632,10 +1659,13 @@ class MetadataDatabase:
             chunk = rows[i : i + self._PENDING_CHUNK]
             params: List[Any] = []
             for row in chunk:
-                params += self._pending_row(
+                values = self._pending_row(
                     row.claim, row.catalog_url, row.recall, None, now
                 )
-                if row.record is not None:
+                if row.record is None:
+                    params += values
+                else:
+                    params += values[:1] + values[2:]
                     params += self._claim_values(row.record, None, now)
             width = len(params) // len(chunk)
             statements.append(
@@ -1667,7 +1697,7 @@ class MetadataDatabase:
         persisted = [r for r in rows if r.record is not None]
         volatile = [r for r in rows if r.record is None]
         statements = self._pending_inserts(
-            "source_catalog", f"{_ROW_COLUMNS}, {_CLAIM_COLUMNS}", persisted, now
+            "source_catalog", _PERSISTED_COLUMNS, persisted, now
         )
         with self._write_lock:
             conn.execute("BEGIN TRANSACTION")
@@ -1678,6 +1708,24 @@ class MetadataDatabase:
                     )
                 for sql, params in statements:
                     conn.execute(sql, params)
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+
+    def sync_roots(self, roots: Sequence[Tuple[str, str]]) -> None:
+        """Replace ``catalog_roots`` with *roots*, ``(root_id, root_url)`` each.
+
+        Config is the truth and this table a cache of it, so it is rewritten whole
+        before any source row is: the view shows a row only against its root.
+        """
+        conn = self._get_connection()
+        with self._write_lock:
+            conn.execute("BEGIN TRANSACTION")
+            try:
+                conn.execute("DELETE FROM catalog_roots")
+                for root in roots:
+                    conn.execute("INSERT INTO catalog_roots VALUES (?, ?)", list(root))
                 conn.execute("COMMIT")
             except BaseException:
                 conn.execute("ROLLBACK")

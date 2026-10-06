@@ -394,6 +394,9 @@ class _FakeMetadataDb:
         self.added = []
         self.pending = []  # (source_id, recall) of each pending row written
 
+    def sync_roots(self, roots):
+        pass
+
     def sync_source_added(self, source_id, adapter, record=None):
         self.added.append((source_id, adapter))
 

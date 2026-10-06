@@ -125,6 +125,12 @@ class SourceManager:
         # entry is not a root, having nothing to re-list. Shared with the
         # Reconciler.
         self._roots = roots if roots is not None else Roots()
+        # The catalog shows a persisted row only against its root, so the roots go
+        # in before the first source does.
+        if metadata_db is not None:
+            metadata_db.sync_roots(
+                [(root.root_id, root.root_url) for root in self._roots.persisted()]
+            )
         # Monitored roots that could not be listed on the last walk, so a change
         # of state is logged once, not every tick.
         self._unavailable_roots: Set[Path] = set()

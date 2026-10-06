@@ -66,7 +66,7 @@ from biopb_tensor_server.sources.entry_stat import (
     entry_is_quiet,
 )
 from biopb_tensor_server.sources.pending_rows import PendingRow, PendingRowWriter
-from biopb_tensor_server.sources.roots import RootKind, Roots
+from biopb_tensor_server.sources.roots import RootKind, Roots, path_under_root
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import (
@@ -761,7 +761,13 @@ class Reconciler:
         signature = {path: sig[1:] for path, sig in signatures.items()}
         from biopb_tensor_server.serving.metadata_db import CatalogRecord
 
-        return CatalogRecord(claim=claim, signature=signature, cloud=root.cloud)
+        return CatalogRecord(
+            claim=claim,
+            signature=signature,
+            root_id=root.root_id,
+            rel=path_under_root(root.url, claim.primary_path),
+            cloud=root.cloud,
+        )
 
     def _state_record(self, claim: SourceClaim) -> Optional[CatalogRecord]:
         """The record of a claim already committed, with the signature state holds."""

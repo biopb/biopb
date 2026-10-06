@@ -19,6 +19,7 @@ from biopb_tensor_server.serving.metadata_db import (
     CatalogRecord,
     MetadataDatabase,
 )
+from biopb_tensor_server.sources.roots import path_under_root
 
 from tests import catalog_server, make_manager
 from tests.test_metadata_db import MockAdapter
@@ -31,11 +32,20 @@ class _Restorable(MockAdapter):
         return {"k": 1}
 
 
+def _db():
+    """A catalog with the one root, ``/d``, that ``_record`` sits under."""
+    db = MetadataDatabase()
+    db.sync_roots([("r1", "file:///d")])
+    return db
+
+
 def _record(path="/d/s1.zarr", signature=None):
     claim = SourceClaim(
         "zarr", path, "s1", extra_config={"alias": "lab"}, member_paths=[path + "/m"]
     )
-    return CatalogRecord(claim, signature or {path: (1, 2, 3, 4)})
+    return CatalogRecord(
+        claim, signature or {path: (1, 2, 3, 4)}, "r1", path_under_root("/d", path)
+    )
 
 
 def _row(db, source_id="s1"):
@@ -60,7 +70,7 @@ def _count(db, table, source_id="s1"):
 
 class TestRouting:
     def test_a_restorable_source_lands_in_the_persistent_table_only(self):
-        db = MetadataDatabase()
+        db = _db()
         db.sync_source_added(
             "s1", _Restorable("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8"), _record()
         )
@@ -68,7 +78,7 @@ class TestRouting:
         assert db.query("SELECT source_id FROM sources").num_rows == 1
 
     def test_a_claim_without_a_payload_is_still_persisted(self):
-        db = MetadataDatabase()
+        db = _db()
         db.sync_source_added(
             "s1", MockAdapter("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8"), _record()
         )
@@ -81,7 +91,7 @@ class TestRouting:
         assert payload is None
 
     def test_without_a_record_it_stays_volatile(self):
-        db = MetadataDatabase()
+        db = _db()
         db.sync_source_added(
             "s2", _Restorable("s2", "/d/s2.zarr", "zarr", [4, 4], "uint8")
         )
@@ -92,7 +102,7 @@ class TestRouting:
         assert db.query("SELECT source_id FROM sources").num_rows == 1
 
     def test_an_unresolved_row_with_a_claim_is_persisted_without_a_payload(self):
-        db = MetadataDatabase()
+        db = _db()
         adapter = _Restorable(
             "s1", "/d/s1.zarr", "zarr", [4, 4], "uint8", is_resolved=False
         )
@@ -101,8 +111,10 @@ class TestRouting:
         assert _row(db)[3] is None
 
     def test_a_cloud_claim_is_persisted_without_a_payload(self):
-        db = MetadataDatabase()
-        record = CatalogRecord(_record().claim, {"/d/s1.zarr": (1,)}, cloud=True)
+        db = _db()
+        record = CatalogRecord(
+            _record().claim, {"/d/s1.zarr": (1,)}, "r1", "s1.zarr", cloud=True
+        )
         db.sync_source_added(
             "s1", _Restorable("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8"), record
         )
@@ -110,7 +122,7 @@ class TestRouting:
         assert _row(db)[3] is None
 
     def test_a_pending_row_with_a_claim_is_persisted_and_one_without_is_not(self):
-        db = MetadataDatabase()
+        db = _db()
         db.sync_pending_source(_record().claim, record=_record())
         other = SourceClaim("zarr", "/drop/s2.zarr", "s2")
         db.sync_pending_source(other)
@@ -122,7 +134,7 @@ class TestRouting:
         assert row[5] == "/d/s1.zarr"
 
     def test_registration_fills_in_the_pending_row_it_finds(self):
-        db = MetadataDatabase()
+        db = _db()
         db.sync_pending_source(_record().claim, record=_record())
         db.sync_source_added(
             "s1", _Restorable("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8"), _record()
@@ -136,7 +148,7 @@ class TestRouting:
     def test_a_pending_batch_splits_by_whether_the_row_has_a_record(self):
         from biopb_tensor_server.sources.pending_rows import PendingRow
 
-        db = MetadataDatabase()
+        db = _db()
         kept = _record()
         db.sync_pending_sources(
             [
@@ -152,7 +164,7 @@ class TestRouting:
     def test_a_batched_row_does_not_replace_a_registered_one(self):
         from biopb_tensor_server.sources.pending_rows import PendingRow
 
-        db = MetadataDatabase()
+        db = _db()
         db.sync_source_added(
             "s1", _Restorable("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8"), _record()
         )
@@ -162,7 +174,7 @@ class TestRouting:
     def test_every_source_shows_once_across_both_tables(self):
         from biopb_tensor_server.sources.pending_rows import PendingRow
 
-        db = MetadataDatabase()
+        db = _db()
         restorable = _Restorable("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8")
         plain = MockAdapter("s2", "/d/s2.zarr", "zarr", [4, 4], "uint8")
         db.sync_source_added("s1", restorable, _record())
@@ -181,7 +193,7 @@ class TestRouting:
         assert sorted(r["source_id"] for r in rows) == ["s1", "s2"]
 
     def test_a_failed_registration_row_replaces_a_persisted_one(self):
-        db = MetadataDatabase()
+        db = _db()
         db.sync_source_added(
             "s1", _Restorable("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8"), _record()
         )
@@ -192,7 +204,7 @@ class TestRouting:
         assert row[6] == 0
 
     def test_removal_deletes_from_both(self):
-        db = MetadataDatabase()
+        db = _db()
         db.sync_source_added(
             "s1", _Restorable("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8"), _record()
         )
@@ -207,23 +219,25 @@ class TestRouting:
 
 class TestPrivacy:
     def test_the_claim_columns_are_not_in_the_view(self):
-        db = MetadataDatabase()
+        db = _db()
         db.sync_source_added(
             "s1", _Restorable("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8"), _record()
         )
         cols = db.query("SELECT * FROM sources").column_names
         assert not {"extra_config", "member_paths", "payload", "signature"} & set(cols)
 
-    @pytest.mark.parametrize("table", ["source_catalog", "sources_volatile"])
+    @pytest.mark.parametrize(
+        "table", ["source_catalog", "sources_volatile", "catalog_roots"]
+    )
     def test_the_physical_tables_are_not_queryable(self, table):
-        db = MetadataDatabase()
+        db = _db()
         with pytest.raises(ValueError):
             db.query(f"SELECT * FROM {table}")
 
 
 class TestRow:
     def test_the_persisted_row_holds_the_claim_and_the_payload(self):
-        db = MetadataDatabase()
+        db = _db()
         db.sync_source_added(
             "s1", _Restorable("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8"), _record()
         )
@@ -240,6 +254,85 @@ class TestRow:
         assert json.loads(row[2]) == {"alias": "lab"}
         assert json.loads(row[3]) == {"/d/s1.zarr": [1, 2, 3, 4]}
         assert json.loads(row[4]) == {"k": 1}
+
+
+class TestRootsInTheTable:
+    """``source_url`` is the view's: the root's url, then the row's path beneath it."""
+
+    def test_an_alias_edit_shows_with_no_source_row_written(self):
+        db = _db()
+        db.sync_source_added(
+            "s1", _Restorable("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8"), _record()
+        )
+        url = "SELECT source_url FROM sources WHERE source_id = 's1'"
+        assert db.query(url).to_pylist() == [{"source_url": "file:///d/s1.zarr"}]
+
+        db.sync_roots([("r1", "lab")])
+
+        assert db.query(url).to_pylist() == [{"source_url": "lab/s1.zarr"}]
+
+    def test_a_row_whose_root_is_gone_is_not_shown(self):
+        db = _db()
+        db.sync_source_added(
+            "s1", _Restorable("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8"), _record()
+        )
+        db.sync_roots([])
+        assert db.query("SELECT source_id FROM sources").num_rows == 0
+
+    def test_the_view_agrees_with_the_roots_for_every_kind_of_root(self, tmp_path):
+        import biopb_tensor_server.adapters  # noqa: F401
+        from biopb_tensor_server.core.adapter_base import to_catalog_url
+        from biopb_tensor_server.core.config import SourceConfig
+
+        from tests import deferred_registration_test as drt
+
+        plain, aliased, once = (tmp_path / n for n in ("plain", "aliased", "once"))
+        for d in (plain, aliased, once):
+            d.mkdir()
+        drt._make_zarr(plain, "a.zarr")
+        drt._make_zarr(aliased, "b.zarr")
+        sub = aliased / "sub"
+        sub.mkdir()
+        drt._make_zarr(sub, "c.zarr")
+        drt._make_zarr(once, "d.zarr")
+        solo = drt._make_zarr(tmp_path, "solo.zarr")
+        server = catalog_server("localhost:0")
+        manager = make_manager(
+            server=server,
+            registry=get_default_registry(),
+            discovery_state=DiscoveryState(),
+            metadata_db=server.metadata_db,
+            monitored_dirs={plain, aliased},
+            monitored_aliases={aliased: "lab"},
+            scan_once_sources=[
+                SourceConfig(url=str(once), alias="once-lab"),
+                SourceConfig(url=str(solo), alias="solo-lab"),
+            ],
+            stability_window=0,
+        )
+        manager._handle_rescan()
+
+        rows = [
+            {"source_url": url, "primary_path": path}
+            for url, path in server.metadata_db._get_connection()
+            .execute(
+                "SELECT s.source_url, c.primary_path "
+                "FROM sources s JOIN source_catalog c USING (source_id)"
+            )
+            .fetchall()
+        ]
+        assert len(rows) == 5
+        for row in rows:
+            expected = manager._roots.display_url(
+                row["primary_path"]
+            ) or to_catalog_url(row["primary_path"])
+            assert row["source_url"] == expected, row
+        assert {r["source_url"] for r in rows} >= {
+            "lab/b.zarr",
+            "lab/sub/c.zarr",
+            "once-lab/d.zarr",
+            "solo-lab",
+        }
 
 
 class TestStore:
@@ -311,7 +404,7 @@ class TestStore:
         conn.close()
 
     def test_a_cursor_sees_the_view(self):
-        db = MetadataDatabase()
+        db = _db()
         db.sync_source_added(
             "s1", MockAdapter("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8")
         )

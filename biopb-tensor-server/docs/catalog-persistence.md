@@ -39,8 +39,8 @@ A restored row may be stale; the epoch below says so.
 
 ## Tables and the `sources` view
 
-- **`catalog_roots(root_id, root_url, epoch)`**: one row per configured root, rewritten
-  from config at every open. `root_id` is a hash of the resolved root path; `root_url` is
+- **`catalog_roots(root_id, root_url)`**: one row per configured monitored or scan-once
+  root, rewritten from config when the manager is built (the restore stage adds `epoch`). `root_id` is a hash of the resolved root path; `root_url` is
   the root's alias, or `to_catalog_url` of its path when it has none. A cache of config,
   not state: config stays the one source of truth.
 - **`source_catalog`**: every source that has a claim under a configured root, cloud roots
@@ -272,7 +272,7 @@ signature gap itself is healed by a re-drop, as for directories.
 
 ## Stages
 
-Stages 1 and 1.5 as implemented: `source_catalog` and `sources_volatile` with the
+Stages 1, 1.5 and the roots table (item 3 below) as implemented: `source_catalog` and `sources_volatile` with the
 persistent view, `SOURCE_CATALOG_FORMAT`, routing by whether the source has a claim
 record (a pending, failed or resolved row alike; the payload is NULL when the adapter has
 none, and for a cloud claim), claim-time signature without `st_dev`, deletion from both on
@@ -301,7 +301,8 @@ restored yet, and the epoch and `last_seen` sweep are stage 2.
 2. Unify the scan: the walk writes every claim to `source_catalog`, registration updates
    the row, the failure tracker goes. Done.
 3. Roots in the table: `catalog_roots`, `root_id` and `rel` in place of `source_url`, the
-   view computing it, `SOURCE_CATALOG_FORMAT` bumped, the root snapshot a keyed query.
+   view computing it, `SOURCE_CATALOG_FORMAT` bumped. Done; the root snapshot as a keyed
+   query waits for the restore, which reads the rows.
    Tests: an alias edited between two opens shows in the view with no source row
    written; each id appears once; `rel` and `root_url` equal `Roots.display_url` for
    plain, aliased and scan-once roots, and for a file that is the root itself.
