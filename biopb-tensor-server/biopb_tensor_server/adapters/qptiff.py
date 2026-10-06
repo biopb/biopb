@@ -38,7 +38,7 @@ import logging
 import threading
 import time
 import xml.etree.ElementTree as ET
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from biopb.tensor.descriptor_pb2 import PyramidLevel, TensorDescriptor
@@ -187,6 +187,58 @@ class QptiffAdapter(TensorAdapter):
         """Create a source-level adapter (the tifffile handle opens lazily)."""
         return cls(str(source.url), source.source_id)
 
+    @classmethod
+    def create_from_payload(
+        cls,
+        source: "SourceConfig",
+        payload: Dict[str, Any],
+        metadata: Dict[str, Any],
+        credentials_config: Optional[Any] = None,
+    ) -> "QptiffAdapter":
+        """Rebuild from the row: descriptor, pyramid shapes, scale and metadata are
+        answered from it, and the TIFF handle opens on the first read."""
+        adapter = cls(str(source.url), source.source_id)
+        shape = tuple(int(s) for s in payload["shape"])
+        labels = _default_dim_labels(len(shape))
+        adapter.dim_labels = labels
+        adapter._stored = {
+            "payload": payload,
+            "level_shapes": [tuple(int(s) for s in lv) for lv in payload["levels"]],
+            "scale": payload["scale"],
+            "metadata": metadata,
+            "descriptor": TensorDescriptor(
+                array_id=adapter.array_id,
+                dim_labels=labels,
+                shape=list(shape),
+                chunk_shape=default_transfer_chunk_shape(
+                    shape,
+                    payload["dtype"],
+                    labels,
+                    native=tuple(int(c) for c in payload["chunks"]),
+                ),
+                dtype=payload["dtype"],
+            ),
+        }
+        return adapter
+
+    def catalog_payload(self) -> Optional[Dict[str, Any]]:
+        """The baseline image's shape, dtype and tile grid, every pyramid level's
+        shape and the physical scale: what the descriptor, the native pyramid and
+        the scale hint are made of."""
+        if self._stored is not None:
+            return self._stored["payload"]
+        za, _ = self._level_store(0)
+        scale = self._physical_scale()
+        return {
+            "shape": [int(s) for s in self._level_shape(0)],
+            "dtype": za.dtype.str,
+            "chunks": [int(c) for c in za.chunks],
+            "levels": [
+                [int(s) for s in self._level_shape(i)] for i in range(self._n_levels())
+            ],
+            "scale": None if scale is None else [list(scale[0]), list(scale[1])],
+        }
+
     def __init__(
         self,
         url: str,
@@ -213,6 +265,9 @@ class QptiffAdapter(TensorAdapter):
         self._level_stores: dict = {}  # level -> (zarr_array, store)
         self._level_adapters: dict = {}  # level -> ZarrAdapter (native-level backend)
         self._cached_descriptor: Optional[TensorDescriptor] = None
+        # What a source rebuilt from its row answers without the file (descriptor,
+        # level shapes, scale, metadata); None for one parsed from the file.
+        self._stored: Optional[Dict[str, Any]] = None
 
         # ReapableHandle state. Reads decode WITHOUT ``_io_lock`` (see
         # _read_level), so ``_active_reads`` -- not the lock -- is what stops a
@@ -258,10 +313,14 @@ class QptiffAdapter(TensorAdapter):
             return za, store
 
     def _n_levels(self) -> int:
+        if self._stored is not None:
+            return len(self._stored["level_shapes"])
         with self._io_lock:
             return len(self._open().levels)
 
     def _level_shape(self, level: int) -> Tuple[int, ...]:
+        if self._stored is not None:
+            return self._stored["level_shapes"][level]
         with self._io_lock:
             return tuple(int(x) for x in self._open().levels[level].shape)
 
@@ -365,6 +424,8 @@ class QptiffAdapter(TensorAdapter):
     # ---- descriptors --------------------------------------------------------
 
     def get_tensor_descriptor(self) -> TensorDescriptor:
+        if self._stored is not None:
+            return self._stored["descriptor"]
         if self._cached_descriptor is not None:
             return self._cached_descriptor
         za, _ = self._level_store(0)
@@ -498,6 +559,9 @@ class QptiffAdapter(TensorAdapter):
         pixel size = unit / density, converted to micrometres. Returns ``None``
         when no usable resolution is present (e.g. ResolutionUnit "none").
         """
+        if self._stored is not None:
+            scale = self._stored["scale"]
+            return None if scale is None else (list(scale[0]), list(scale[1]))
         try:
             with self._io_lock:
                 self._open()
@@ -541,6 +605,8 @@ class QptiffAdapter(TensorAdapter):
         Auxiliary series (thumbnail/overview/label) are listed by name only -- v1
         does not expose them as tensors (biopb/biopb#135).
         """
+        if self._stored is not None:
+            return dict(self._stored["metadata"])
         meta: dict = {"format": "qptiff"}
         try:
             with self._io_lock:

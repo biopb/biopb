@@ -3,8 +3,10 @@
 Handles .nii and .nii.gz files using nibabel.
 """
 
+import copy
+import threading
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
@@ -31,6 +33,10 @@ if TYPE_CHECKING:
 _NIFTI_SPATIAL_UNIT = {1: "m", 2: "mm", 3: "µm"}
 
 
+def _scale_from_payload(scale):
+    return None if scale is None else (list(scale[0]), list(scale[1]))
+
+
 class NiftiAdapter(TensorAdapter):
     """Adapter for NIfTI files (.nii and .nii.gz).
 
@@ -43,6 +49,12 @@ class NiftiAdapter(TensorAdapter):
 
     Single chunk strategy - base class handles splitting for oversized arrays.
     """
+
+    # What a source rebuilt from its row answers without the file (see
+    # ``create_from_payload``); None for one parsed from it.
+    _stored: Optional[Dict[str, Any]] = None
+    _closed = False
+    _nifti_img = None
 
     @classmethod
     def claim(cls, ctx: ClaimContext, state: "DiscoveryState") -> Optional[SourceClaim]:
@@ -134,12 +146,49 @@ class NiftiAdapter(TensorAdapter):
                 source_url=str(source.url),
             )
 
+    @classmethod
+    def create_from_payload(
+        cls,
+        source: "SourceConfig",
+        payload: Dict[str, Any],
+        metadata: Dict[str, Any],
+        credentials_config: Optional[Any] = None,
+    ) -> Optional["NiftiAdapter"]:
+        """Rebuild a local file from the row: shape, labels, scale and metadata are
+        the row's, and nibabel loads the image on the first read. A remote file is
+        parsed (it is downloaded to a temp file first)."""
+        if source.is_remote:
+            return None
+        return cls(
+            None,
+            source.source_id,
+            source_url=str(source.url),
+            stored={
+                "shape": tuple(int(s) for s in payload["shape"]),
+                "dim_labels": list(payload["dim_labels"]),
+                "scale": _scale_from_payload(payload["scale"]),
+                "metadata": metadata,
+            },
+        )
+
+    def catalog_payload(self) -> Optional[Dict[str, Any]]:
+        """The shape, the axis labels derived from the header and the voxel scale:
+        what the descriptor and the scale hint are made of."""
+        scale = self._physical_scale()
+        return {
+            "shape": [int(s) for s in self._shape],
+            "dim_labels": list(self.dim_labels),
+            "scale": None if scale is None else [list(scale[0]), list(scale[1])],
+        }
+
     def __init__(
         self,
         nifti_img,
         source_id: str,
         source_url: Optional[str] = None,
         temp_file: Optional[Path] = None,
+        *,
+        stored: Optional[Dict[str, Any]] = None,
     ):
         """Initialize NIfTI adapter.
 
@@ -149,15 +198,20 @@ class NiftiAdapter(TensorAdapter):
             source_url: Optional source URL (overrides file_map-derived path)
             temp_file: Optional path to temp file for remote sources (for cleanup tracking)
         """
-        self.nifti_img = nifti_img
+        self._stored = stored
+        self._closed = False
+        self._image_lock = threading.Lock()
+        # A source rebuilt from its row has no image until a read loads it, and no
+        # header: what the header gave is in ``stored``.
+        self._nifti_img = None if stored is not None else nifti_img
         self.source_id = source_id
-        self.header = nifti_img.header
+        self.header = None if stored is not None else nifti_img.header
         self._temp_file = temp_file  # Track temp file for potential cleanup
 
         # Source-level metadata for DataSourceDescriptor
         if source_url:
             self._source_url = source_url
-        elif hasattr(nifti_img, "file_map"):
+        elif nifti_img is not None and hasattr(nifti_img, "file_map"):
             # Try to get file path from nibabel
             files = list(nifti_img.file_map.keys())
             self._source_url = files[0] if files else ""
@@ -169,6 +223,16 @@ class NiftiAdapter(TensorAdapter):
         self._content_version = content_version_from_path(self._source_url)
         self._source_type = "nifti"
 
+        # NIfTI uses slope/intercept scaling to represent physical values.
+        # Scaled data is always float64, so we report float64 as the dtype
+        # and return scaled float64 values via nibabel's lazy slicing.
+        self._dtype = "float64"
+
+        if stored is not None:
+            self._shape = stored["shape"]
+            self.dim_labels = list(stored["dim_labels"])
+            return
+
         # Get shape and dtype from header
         # NIfTI dim array: dim[0] = ndim, dim[1-7] = dimensions
         dim_info = self.header.get("dim", None)
@@ -178,12 +242,25 @@ class NiftiAdapter(TensorAdapter):
         else:
             self._shape = tuple(nifti_img.shape)
 
-        # NIfTI uses slope/intercept scaling to represent physical values.
-        # Scaled data is always float64, so we report float64 as the dtype
-        # and return scaled float64 values via nibabel's lazy slicing.
-        self._dtype = "float64"
-
         self.dim_labels = self._derive_dim_labels()
+
+    @property
+    def nifti_img(self):
+        """The nibabel image: held from parsing, or loaded on first use for a source
+        rebuilt from its row. ``None`` once the source is closed."""
+        img = self._nifti_img
+        if img is not None or self._stored is None:
+            return img
+        with self._image_lock:
+            if self._nifti_img is None and not self._closed:
+                import nibabel as nib
+
+                self._nifti_img = nib.load(str(self._source_url))
+            return self._nifti_img
+
+    @nifti_img.setter
+    def nifti_img(self, value) -> None:
+        self._nifti_img = value
 
     def _derive_dim_labels(self) -> List[str]:
         """Derive dimension labels from NIfTI header."""
@@ -316,6 +393,8 @@ class NiftiAdapter(TensorAdapter):
         get ``0.0`` / ``""``. Returns ``None`` when no spatial axis carries a
         positive size.
         """
+        if self._stored is not None:
+            return self._stored["scale"]
         try:
             pixdim = self.header.get("pixdim", None)
             if pixdim is None:
@@ -360,6 +439,8 @@ class NiftiAdapter(TensorAdapter):
         Returns:
             Dictionary with format identifier, header fields, and affine matrix
         """
+        if self._stored is not None:
+            return copy.deepcopy(self._stored["metadata"])
         metadata = {
             "format": "nifti",
             "header": {},
@@ -484,7 +565,8 @@ class NiftiAdapter(TensorAdapter):
         """
         temp_file = getattr(self, "_temp_file", None)
         self._temp_file = None
-        self.nifti_img = None
+        self._closed = True
+        self._nifti_img = None
         if temp_file is not None:
             try:
                 Path(temp_file).unlink(missing_ok=True)

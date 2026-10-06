@@ -21,9 +21,10 @@ Chunk ID format:
 - array_id (= source_id/field) + bounds
 """
 
+import json
 import logging
 import threading
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import dask.array as da
 import numpy as np
@@ -44,6 +45,86 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import SourceConfig
     from biopb_tensor_server.core.discovery import DiscoveryState
+
+
+def _read_signals(url: str) -> List[dict]:
+    """Every signal of an EMD file as rsciio reads it lazily, each ``data`` a dask
+    array. rsciio auto-detects NCEM vs Velox."""
+    from rsciio.emd import file_reader
+
+    signals = file_reader(url, lazy=True)
+    if not signals:
+        raise ValueError(f"EMD source {url!r} contained no readable signals")
+
+    # Velox eager-fallback: normalize any non-dask signal to a dask array so
+    # the read path is uniform.
+    for i, sig in enumerate(signals):
+        d = sig["data"]
+        if not isinstance(d, da.Array):
+            logger.warning(
+                "EMD %s signal %d returned eager (non-lazy) data; wrapping. "
+                "A large spectrum-image may load whole into RAM.",
+                url,
+                i,
+            )
+            sig["data"] = da.from_array(np.asarray(d))
+    return signals
+
+
+def _json_default(value: Any) -> Any:
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, bytes):
+        return value.hex()
+    return str(value)
+
+
+def _json_safe(value: Any) -> Any:
+    """*value* as plain JSON types, which is what a payload is made of."""
+    return json.loads(json.dumps(value, default=_json_default))
+
+
+class _SignalLoader:
+    """Reads an EMD file's signals once, when the first read needs them."""
+
+    def __init__(self, url: str):
+        self._url = url
+        self._lock = threading.Lock()
+        self._signals: Optional[List[dict]] = None
+
+    def signals(self) -> List[dict]:
+        with self._lock:
+            if self._signals is None:
+                self._signals = _read_signals(self._url)
+            return self._signals
+
+
+class _DeferredData:
+    """One signal's dask array, standing in for it until a read opens the file.
+
+    Carries what the descriptors and the grid are made of (``shape``, ``dtype``,
+    ``chunksize``); slicing it reads the real array, so a source rebuilt from its
+    row opens the HDF5 container on its first read and not before.
+    """
+
+    def __init__(
+        self,
+        loader: _SignalLoader,
+        index: int,
+        shape: Tuple[int, ...],
+        dtype: np.dtype,
+        chunksize: Tuple[int, ...],
+    ):
+        self._loader = loader
+        self._index = index
+        self.shape = shape
+        self.dtype = dtype
+        self.chunksize = chunksize
+
+    def __getitem__(self, slices: Any) -> da.Array:
+        return self._loader.signals()[self._index]["data"][slices]
 
 
 class EmdAdapter(TensorAdapter):
@@ -77,32 +158,66 @@ class EmdAdapter(TensorAdapter):
         credentials_config: Optional[Any] = None,
     ) -> "EmdAdapter":
         """Create source-level adapter. rsciio auto-detects NCEM vs Velox."""
-        from rsciio.emd import file_reader
-
         url = str(source.url)
-        signals = file_reader(url, lazy=True)
-        if not signals:
-            raise ValueError(f"EMD source {url!r} contained no readable signals")
-
-        # Velox eager-fallback: normalize any non-dask signal to a dask array so
-        # the read path is uniform.
-        for i, sig in enumerate(signals):
-            d = sig["data"]
-            if not isinstance(d, da.Array):
-                logger.warning(
-                    "EMD %s signal %d returned eager (non-lazy) data; wrapping. "
-                    "A large spectrum-image may load whole into RAM.",
-                    url,
-                    i,
-                )
-                sig["data"] = da.from_array(np.asarray(d))
-
         return cls(
             source_id=source.source_id,
             url=url,
-            signals=signals,
+            signals=_read_signals(url),
             source_url=url,
         )
+
+    @classmethod
+    def create_from_payload(
+        cls,
+        source: "SourceConfig",
+        payload: Dict[str, Any],
+        metadata: Dict[str, Any],
+        credentials_config: Optional[Any] = None,
+    ) -> "EmdAdapter":
+        """Rebuild from the row's per-signal structure; the HDF5 container is
+        opened by the first read of a signal."""
+        url = str(source.url)
+        loader = _SignalLoader(url)
+        signals = [
+            {
+                "data": _DeferredData(
+                    loader,
+                    i,
+                    tuple(int(s) for s in entry["shape"]),
+                    np.dtype(entry["dtype"]),
+                    tuple(int(c) for c in entry["chunksize"]),
+                ),
+                "axes": entry["axes"],
+                "original_metadata": entry["original_metadata"],
+            }
+            for i, entry in enumerate(payload["signals"])
+        ]
+        return cls(source_id=source.source_id, url=url, signals=signals, source_url=url)
+
+    def catalog_payload(self) -> Optional[Dict[str, Any]]:
+        """Each signal's structure, calibration and metadata: what its descriptor,
+        grid, scale and per-tensor metadata are made of. Source level only."""
+        if self.signal_index is not None:
+            return None
+        return {
+            "signals": [
+                {
+                    "shape": [int(s) for s in sig["data"].shape],
+                    "dtype": np.dtype(sig["data"].dtype).str,
+                    "chunksize": [int(c) for c in sig["data"].chunksize],
+                    "axes": [
+                        {
+                            "name": ax.get("name"),
+                            "scale": _json_safe(ax.get("scale")),
+                            "units": ax.get("units"),
+                        }
+                        for ax in sig["axes"]
+                    ],
+                    "original_metadata": _json_safe(sig.get("original_metadata", {})),
+                }
+                for sig in self._signals
+            ]
+        }
 
     def __init__(
         self,

@@ -47,7 +47,7 @@ Single chunk strategy - base class handles splitting for oversized arrays.
 
 import threading
 import time
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
@@ -76,6 +76,20 @@ MRC_EXTENSIONS = (".mrc", ".mrcs", ".rec", ".st", ".map")
 # Standard MRC-2014 header is 1024 bytes; the extended header (NEXT bytes)
 # follows, then the raw data.
 _MRC_HEADER_BYTES = 1024
+
+# The header blocks ``get_metadata`` reports, and so the part of rsciio's
+# ``original_metadata`` the row keeps.
+_HEADER_KEYS = ("std_header", "fei_header")
+
+
+def _positive_float(value: Any) -> float:
+    """``value`` as a float, 0.0 when it is not a number: the reading of an axis
+    scale ``axes_scale`` makes, kept in the payload so it is JSON."""
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
 
 # Seconds an idle mapping is kept warm. Short on purpose, and for a different
 # reason than the parse-a-directory formats: what a held MRC mapping saves is a
@@ -154,6 +168,48 @@ class MrcAdapter(TensorAdapter):
             source_url=url,
         )
 
+    @classmethod
+    def create_from_payload(
+        cls,
+        source: "SourceConfig",
+        payload: Dict[str, Any],
+        metadata: Dict[str, Any],
+        credentials_config: Optional[Any] = None,
+    ) -> "MrcAdapter":
+        """Rebuild from the row's header facts: neither rsciio nor the mapping is
+        touched until a read. The layout was probed when the row was written."""
+        url = str(source.url)
+        return cls(
+            source_id=source.source_id,
+            url=url,
+            shape=tuple(int(s) for s in payload["shape"]),
+            dtype=np.dtype(payload["dtype"]),
+            axes=payload["axes"],
+            std_header={"NEXT": int(payload["offset"]) - _MRC_HEADER_BYTES},
+            original_metadata={
+                key: metadata[key] for key in _HEADER_KEYS if key in metadata
+            },
+            source_url=url,
+            probe=False,
+        )
+
+    def catalog_payload(self) -> Optional[Dict[str, Any]]:
+        """What the header said that a read needs: shape, dtype, the axes' names
+        and calibration, and where the data region starts."""
+        return {
+            "shape": [int(s) for s in self._shape],
+            "dtype": self._dtype.str,
+            "axes": [
+                {
+                    "name": ax.get("name"),
+                    "scale": _positive_float(ax.get("scale")),
+                    "units": ax.get("units"),
+                }
+                for ax in self._axes
+            ],
+            "offset": int(self._offset),
+        }
+
     def __init__(
         self,
         source_id: str,
@@ -164,6 +220,7 @@ class MrcAdapter(TensorAdapter):
         std_header: dict,
         original_metadata: dict,
         source_url: Optional[str] = None,
+        probe: bool = True,
     ):
         self.source_id = source_id
         self._url = url
@@ -199,8 +256,11 @@ class MrcAdapter(TensorAdapter):
 
         # Probe the mapping once now so an unmappable layout fails at
         # registration rather than on the first read. Released immediately: a
-        # source that is catalogued but never read should pin nothing.
-        self._release(self._map())
+        # source that is catalogued but never read should pin nothing. A source
+        # rebuilt from its row passed this probe when the row was written, and its
+        # files are unchanged, so it is not repeated.
+        if probe:
+            self._release(self._map())
 
     def _map(self) -> np.memmap:
         """Map the data region read-only. Caller must ``_release`` the result."""
@@ -335,7 +395,7 @@ class MrcAdapter(TensorAdapter):
     def get_metadata(self) -> dict:
         """MRC header as a JSON-safe dict (rsciio hex-encodes byte/void fields)."""
         meta = {"format": "mrc"}
-        for key in ("std_header", "fei_header"):
+        for key in _HEADER_KEYS:
             if key in self._original_metadata:
                 meta[key] = self._original_metadata[key]
         return meta
