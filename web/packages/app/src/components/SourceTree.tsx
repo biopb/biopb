@@ -215,7 +215,9 @@ export function TreeRow({
           onClick={() => toggleFolder(node.id)}
         >
           <Chevron expanded={expanded} />
-          <span style={{ marginLeft: 4 }}>{node.name}</span>
+          <span className="tree-name" style={{ marginLeft: 4 }} title={node.name}>
+            {node.name}
+          </span>
         </button>
         {expanded &&
           node.children.map((child) => (
@@ -354,7 +356,9 @@ export function TreeRow({
         title={src.source_url}
       >
         <ChevronSlot />
-        <span style={{ flex: 1, marginLeft: 4 }}>{node.name}</span>
+        <span className="tree-name" style={{ flex: 1, marginLeft: 4 }}>
+          {node.name}
+        </span>
         {groups.length > 1 ? (
           <span className="tensor-pill" style={{ marginLeft: 8 }}>
             {groups.length}
@@ -393,7 +397,7 @@ export function TreeRow({
                   title={`${image.array_id}\nShape: ${formatShape(image.shape)}\nDtype: ${image.dtype}`}
                 >
                   <ChevronSlot />
-                  <span style={{ flex: 1, marginLeft: 4 }}>
+                  <span className="tree-name" style={{ flex: 1, marginLeft: 4 }}>
                     {tensorShortName(image.array_id)}
                   </span>
                 </button>
@@ -429,7 +433,7 @@ export function TreeRow({
                   >
                     <ChevronSlot />
                     <span aria-hidden="true">{on ? LABEL_ON_GLYPH : LABEL_OFF_GLYPH}</span>
-                    <span style={{ flex: 1, marginLeft: 4 }}>
+                    <span className="tree-name" style={{ flex: 1, marginLeft: 4 }}>
                       {tensorShortName(set.array_id)}
                     </span>
                   </button>
