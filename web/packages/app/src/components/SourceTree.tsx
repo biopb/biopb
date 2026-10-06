@@ -112,6 +112,9 @@ function folderPathTo(node: TreeNode, sourceId: string): string[] | null {
   return null;
 }
 
+/** Indent per tree level, px: half the Chevron slot. */
+const INDENT_STEP = 8;
+
 function Chevron({ expanded }: { expanded: boolean }) {
   return (
     <span
@@ -182,7 +185,8 @@ export function TreeRow({
   labelOverlay,
   setLabelOverlay,
 }: TreeRowProps) {
-  const indent = node.depth * 12 + 12;
+  // Half a Chevron's width per level, so a deep tree keeps room for its labels.
+  const indent = node.depth * INDENT_STEP + 12;
   // Label sets filed under the image they annotate, rather than listed beside
   // it: a set is a tensor of the source, but it is *about* one of the others.
   //
@@ -379,7 +383,7 @@ export function TreeRow({
                   style={{
                     width: "100%",
                     textAlign: "left",
-                    paddingLeft: indent + 12,
+                    paddingLeft: indent + INDENT_STEP,
                     display: "flex",
                     alignItems: "center",
                     fontSize: 12,
@@ -402,7 +406,7 @@ export function TreeRow({
                     style={{
                       width: "100%",
                       textAlign: "left",
-                      paddingLeft: indent + (showImageRows ? 24 : 12),
+                      paddingLeft: indent + (showImageRows ? 2 : 1) * INDENT_STEP,
                       display: "flex",
                       alignItems: "center",
                       fontSize: 12,
