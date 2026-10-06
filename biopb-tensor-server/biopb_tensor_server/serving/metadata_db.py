@@ -1814,11 +1814,11 @@ class MetadataDatabase:
             conn.execute("BEGIN TRANSACTION")
             try:
                 conn.execute(
-                    "DELETE FROM source_catalog WHERE source_id IN (SELECT unnest(?))",
+                    "DELETE FROM source_catalog WHERE source_id IN (SELECT unnest(?::VARCHAR[]))",
                     [ids],
                 )
                 conn.execute(
-                    "DELETE FROM rois WHERE source_id IN (SELECT unnest(?)) "
+                    "DELETE FROM rois WHERE source_id IN (SELECT unnest(?::VARCHAR[])) "
                     "AND starts_with(set_name, ?)",
                     [ids, RESERVED_SET_PREFIX],
                 )
@@ -1873,22 +1873,23 @@ class MetadataDatabase:
                 [self.run_epoch, datetime.now(), root_id],
             )
 
-    def sweep_root(self, root_id: str, keep_ids: Iterable[str]) -> int:
+    def sweep_root(self, root_id: str, is_claimed: Callable[[str], bool]) -> int:
         """Delete a root's rows that no claim holds, after a walk of it finished.
 
         The walk removes a claim that is gone, with its row; this is for the row
-        that outlived its claim (a crash between the two writes). Returns the
-        number deleted.
+        that outlived its claim (a crash between the two writes). Whether a claim
+        holds a row is asked of the caller one id at a time, an exact answer, so a
+        source being registered as this runs is never taken for an orphan. Returns
+        the number deleted.
         """
         conn = self._get_connection()
-        keep = set(keep_ids)
         held = [
             r[0]
             for r in conn.execute(
                 "SELECT source_id FROM source_catalog WHERE root_id = ?", [root_id]
             ).fetchall()
         ]
-        orphans = [source_id for source_id in held if source_id not in keep]
+        orphans = [source_id for source_id in held if not is_claimed(source_id)]
         self.drop_catalog_rows(orphans)
         return len(orphans)
 
@@ -1905,7 +1906,7 @@ class MetadataDatabase:
             conn.execute("BEGIN TRANSACTION")
             try:
                 conn.execute(
-                    "DELETE FROM catalog_roots WHERE root_id NOT IN (SELECT unnest(?))",
+                    "DELETE FROM catalog_roots WHERE root_id NOT IN (SELECT unnest(?::VARCHAR[]))",
                     [ids],
                 )
                 for root_id, root_url in roots:

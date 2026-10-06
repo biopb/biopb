@@ -66,7 +66,7 @@ class _FakeMetadataDb:
     def sync_roots(self, roots):
         self.roots = list(roots)
 
-    def sweep_root(self, root_id, keep_ids):
+    def sweep_root(self, root_id, is_claimed):
         return 0
 
     def confirm_root(self, root_id):

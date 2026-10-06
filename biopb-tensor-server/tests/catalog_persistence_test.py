@@ -271,6 +271,22 @@ class TestRootsInTheTable:
 
         assert db.query(url).to_pylist() == [{"source_url": "lab/s1.zarr"}]
 
+    def test_a_sweep_drops_only_the_rows_nothing_claims(self):
+        db = _db()
+        for source_id in ("s1", "s2", "s3"):
+            path = f"/d/{source_id}.zarr"
+            claim = SourceClaim("zarr", path, source_id, member_paths=[path])
+            db.sync_pending_source(
+                claim,
+                record=CatalogRecord(claim, {path: (1,)}, "r1", f"{source_id}.zarr"),
+            )
+
+        swept = db.sweep_root("r1", lambda source_id: source_id != "s2")
+
+        assert swept == 1
+        left = db.query("SELECT source_id FROM sources ORDER BY source_id")
+        assert [r["source_id"] for r in left.to_pylist()] == ["s1", "s3"]
+
     def test_a_row_whose_root_is_gone_is_not_shown(self):
         db = _db()
         db.sync_source_added(

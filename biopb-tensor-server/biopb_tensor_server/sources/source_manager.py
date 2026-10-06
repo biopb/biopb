@@ -650,9 +650,7 @@ class SourceManager:
         walk raised, leaves its restored rows unconfirmed.
         """
         try:
-            self._metadata_db.sweep_root(
-                root.root_id, self._reconciler.claims_under(root.path)
-            )
+            self._metadata_db.sweep_root(root.root_id, self._reconciler.has_claim)
             self._metadata_db.confirm_root(root.root_id)
         except Exception:
             logger.exception("could not confirm root %s", root.url)
