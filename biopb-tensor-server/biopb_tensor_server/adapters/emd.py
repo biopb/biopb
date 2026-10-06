@@ -10,7 +10,9 @@ Reads go through rsciio's lazy dask array, which for HDF5 forwards the
 **native chunk grid** (``da.from_array(dataset, chunks=dataset.chunks)``) -- the
 physical/compression layout, so ``chunk_shape`` advertised to clients is the
 storage-efficient one, and ``get_data(bounds)`` is a native h5py partial read
-(no per-block memmap reopen, unlike the flat-blob MRC case).
+(no per-block memmap reopen, unlike the flat-blob MRC case). The HDF5 file stays
+open between reads and the shared idle reaper (:mod:`_handle_reaper`) closes it
+once idle; the next read reopens it.
 
 Velox lazy support is complete for image data but a TODO for 4D-STEM
 spectrum-images (FrameLocationTable); when rsciio returns an eager (non-dask)
@@ -23,6 +25,7 @@ Chunk ID format:
 
 import logging
 import threading
+import time
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import dask.array as da
@@ -30,6 +33,7 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
+from biopb_tensor_server.adapters._handle_reaper import IdleHandleReaper
 from biopb_tensor_server.adapters._scale import axes_scale
 from biopb_tensor_server.core.adapter_base import TensorAdapter
 from biopb_tensor_server.core.chunk import (
@@ -44,6 +48,98 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import SourceConfig
     from biopb_tensor_server.core.discovery import DiscoveryState
+
+
+# Seconds an idle EMD file is kept open. Short, like MRC: a reopen is ~3.5 ms
+# (rsciio re-reads the metadata and rebuilds the dask graph), so what a held file
+# saves is that one open across a burst of reads, worth only as long as the burst.
+_HANDLE_TTL = 5.0
+
+# One open HDF5 file per source; bounded like every pool so a catalogued EM
+# collection cannot hold every file it has ever served.
+_handle_reaper = IdleHandleReaper(_HANDLE_TTL, "emd-handle-reaper", max_handles=8)
+
+
+class _EmdHandle:
+    """A source's open HDF5 file, shared by its source and tensor adapters.
+
+    rosettasciio's lazy reader returns dask arrays over live h5py datasets, so the
+    file stays open as long as the signals are used. This is the
+    :class:`~biopb_tensor_server.adapters._handle_reaper.ReapableHandle`: the
+    reaper closes the file once idle, and the next read reopens it and swaps the
+    signals' arrays. Everything else a signal carries (axes, shape, chunks,
+    metadata) is kept from the first open.
+
+    A source whose signals are not backed by h5py (Velox's eager fallback) holds
+    no file, so there is nothing to release.
+    """
+
+    def __init__(self, url: str, signals: List[dict], io_lock: threading.Lock):
+        self._url = url
+        self.signals = signals
+        self._io_lock = io_lock
+        self._active_reads = 0  # a read holds _io_lock throughout
+        self._persistent_last_access = time.monotonic()
+        self._released = not self._datasets()
+        self._holds_file = not self._released
+        if self._holds_file:
+            _handle_reaper.register(self)
+
+    def _datasets(self) -> list:
+        """The h5py datasets under the signals' arrays.
+
+        Each sits in a layer of its own; the per-chunk layers are lazy, and walking
+        the whole graph would build them (~140 ms for 4k chunks).
+        """
+        import h5py
+        from dask.highlevelgraph import MaterializedLayer
+
+        return [
+            node
+            for sig in self.signals
+            for layer in sig["data"].dask.layers.values()
+            if isinstance(layer, MaterializedLayer)
+            for node in layer.values()
+            if isinstance(node, h5py.Dataset)
+        ]
+
+    def array(self, index: int) -> da.Array:
+        """Signal *index*'s dask array, reopening the file if it was released.
+
+        Caller holds ``_io_lock``.
+        """
+        if self._released:
+            self._reopen()
+        self._persistent_last_access = time.monotonic()
+        return self.signals[index]["data"]
+
+    def _reopen(self) -> None:
+        from rsciio.emd import file_reader
+
+        fresh = file_reader(self._url, lazy=True)
+        if len(fresh) != len(self.signals):
+            raise RuntimeError(
+                f"EMD {self._url!r} changed on disk: it had {len(self.signals)} "
+                f"signals and now has {len(fresh)}"
+            )
+        for sig, new in zip(self.signals, fresh, strict=True):
+            sig["data"] = new["data"]
+        self._released = False
+        self._persistent_last_access = time.monotonic()
+        _handle_reaper.register(self)
+
+    def _release_persistent_handle(self) -> None:
+        """Close the file and permit a later reopen; safe to call twice.
+
+        The reaper hook. Caller holds ``_io_lock``.
+        """
+        _handle_reaper.discard(self)
+        if self._released or not self._holds_file:
+            return
+        for dataset in self._datasets():
+            if dataset:
+                dataset.file.close()
+        self._released = True
 
 
 class EmdAdapter(TensorAdapter):
@@ -112,12 +208,14 @@ class EmdAdapter(TensorAdapter):
         signal_index: Optional[int] = None,
         source_url: Optional[str] = None,
         io_lock: Optional[threading.Lock] = None,
+        handle: Optional[_EmdHandle] = None,
     ):
         self.source_id = source_id
         self._url = url
         self._signals = signals
         self.signal_index = signal_index
         self._io_lock = io_lock if io_lock is not None else threading.Lock()
+        self._handle = handle or _EmdHandle(url, signals, self._io_lock)
         self._tensor_adapters: dict = {}
 
         self._source_url = source_url if source_url else url
@@ -231,10 +329,21 @@ class EmdAdapter(TensorAdapter):
             signal_index=index,
             source_url=self._source_url,
             io_lock=self._io_lock,
+            handle=self._handle,
         )
         adapter._tensor_name = field
         self._tensor_adapters[field] = adapter
         return adapter
+
+    def close(self) -> None:
+        """Close the HDF5 file now rather than waiting for the reaper.
+
+        The signals are shared by the source-level adapter and its tensor
+        adapters, so closing through any of them closes them all. A later read
+        reopens the file.
+        """
+        with self._io_lock:
+            self._handle._release_persistent_handle()
 
     @property
     def read_block_shape(self) -> Optional[Tuple[int, ...]]:
@@ -249,7 +358,7 @@ class EmdAdapter(TensorAdapter):
         super().get_data(bounds)
         slices = self._bounds_to_slices(bounds)
         with self._io_lock:
-            return self._data[slices].compute()
+            return self._handle.array(self.signal_index)[slices].compute()
 
     def _physical_scale(self) -> Optional[tuple]:
         """Voxel size + unit per dimension, from this signal's axis scales."""
