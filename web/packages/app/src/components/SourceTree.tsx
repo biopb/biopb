@@ -256,7 +256,9 @@ export function TreeRow({
     const busyLabel = kind === "recall" ? "Resolving\u2026" : "Loading\u2026";
     // A cloud resolve downloads the content, which can take minutes, so it takes
     // a deliberate double-click rather than a stray single click on a button.
-    const doubleClickToResolve = kind === "recall" && startResolve && !inFlight;
+    // A pending or failed row takes the same gesture in addition to its button,
+    // which a narrow pane can push off the edge.
+    const doubleClickToResolve = startResolve && !inFlight;
     return (
       <div
         className={`tree-item unresolved${inFlight ? " resolving" : ""}`}
