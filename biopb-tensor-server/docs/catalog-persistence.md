@@ -176,6 +176,19 @@ Registration threads and the sweep write through the same connection and lock as
   fields and label sets, which the attacher re-derives at registration or hydration.
   The claim is its own columns; the axis permutation is recomputed by
   `normalize_adapter` from the native axes.
+- **The contract of a payload.** `catalog_payload()` (source level only) returns JSON of
+  everything the adapter takes from the file before it reads pixels that the row does not
+  hold: tensor structure, the transfer grid, native pyramid, physical scale, anything a
+  descriptor or plan is made of. `create_from_payload(source, payload, metadata, creds)`
+  rebuilds an adapter that serves the same listing, descriptors, grid, pyramid, scale,
+  metadata (the row's), content version and pixels as `create_from_config`, **without
+  opening the file**: it may stat it, and opens it lazily on the first read, as a parsed
+  adapter does. What needs the file (embedded ROIs or masks) is answered lazily, from a
+  payload flag when it can be (`has_rois`). It returns `None`, or raises, when it cannot,
+  and the source is parsed. `tests/payload_equivalence.py::assert_hydrates_equivalently`
+  is the check every adapter passes: it stores through `sync_source_added`, rebuilds from
+  `read_hydration`, forbids the file readers during the rebuild, and compares the
+  snapshots including a full read.
 - **`metadata_json` is stored once**, in the row (about 90% of the file: ~2 GB at 100k
   sources). There is no second copy and no join.
 - **A failed registration's error** is text in `unresolved_error`, never `metadata_json`.
