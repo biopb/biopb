@@ -1019,6 +1019,23 @@ class SourceAdapter(ABC):
         under ``_io_lock`` (czi / nd2 / ndtiff / bioio).
         """
 
+    @classmethod
+    def create_from_payload(
+        cls,
+        source: SourceConfig,
+        payload: Dict[str, Any],
+        metadata: Dict[str, Any],
+        credentials_config: Optional[Any] = None,
+    ) -> Optional[SourceAdapter]:
+        """Rebuild the adapter a restart finds a row for, without parsing its file.
+
+        The inverse of :meth:`catalog_payload`: *payload* is what that returned,
+        *metadata* the row's ``metadata_json``. The caller has checked that the
+        file is as it was when the row was written. ``None`` (the default) means
+        this adapter has no such path, and the source is built from its claim.
+        """
+        return None
+
     def catalog_payload(self) -> Optional[Dict[str, Any]]:
         """What a restart needs to rebuild this adapter without parsing its file.
 
@@ -2035,6 +2052,7 @@ _SOURCE_SCOPED_API = frozenset(
         "check_readable",
         "claim",
         "create_from_config",
+        "create_from_payload",
         "list_tensor_descriptors",
         "get_metadata",
         "get_embedded_rois",

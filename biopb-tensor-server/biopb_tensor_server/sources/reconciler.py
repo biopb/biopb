@@ -570,9 +570,11 @@ class Reconciler:
                 if claim is None or source_id not in self._pending:
                     return source_id not in self._pending
                 recall = source_id in self._recall
+                restored = source_id in self._restored
                 catalog_url = self._pending[source_id]
 
             errors: List[str] = []
+            hydrate = self._hydration_for(claim) if restored else None
             # A cloud source raises why it could not be opened (retriable or
             # not) instead of recording a failure: it stays ``needs_recall`` and
             # the client that resolved it hears the reason.
@@ -582,6 +584,7 @@ class Reconciler:
                 replace=True,
                 error_sink=errors,
                 recall=recall,
+                hydrate=hydrate,
             ):
                 if not recall:
                     self._mark_registration_failed(source_id, errors)
@@ -594,6 +597,25 @@ class Reconciler:
         if not recall:
             self._notify_source_committed(source_id)
         return True
+
+    def _hydration_for(
+        self, claim: SourceClaim
+    ) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
+        """The stored payload and metadata of a restored source, if its files are as
+        they were when the row was written; None parses the claim instead.
+
+        The check is a stat of the members, the walk's own: a file rewritten while
+        the server was down must not be served from the old layout in the moment
+        before the walk reaches it.
+        """
+        if self._metadata_db is None:
+            return None
+        held = self._source_signatures.get(claim.source_id)
+        if held is None or not _same_signature(
+            held, self._build_claim_signatures(claim)
+        ):
+            return None
+        return self._metadata_db.read_hydration(claim.source_id)
 
     def materialize(self, source_id: str) -> None:
         """Register a pending source now, for a client that resolved it.
@@ -1584,8 +1606,12 @@ class Reconciler:
         error_sink: Optional[List[str]] = None,
         recall: bool = False,
         signatures: Optional[Dict[str, Tuple[Any, ...]]] = None,
+        hydrate: Optional[Tuple[Dict[str, Any], Dict[str, Any]]] = None,
     ) -> bool:
         """Create and register a source, rolling back on partial failure.
+
+        ``hydrate`` is a restored row's ``(payload, metadata)``: the adapter is
+        rebuilt from it when its type can be, and parsed from the claim when not.
 
         ``signatures`` is the claim's member signature, taken by a caller that
         will keep it in state: it is persisted beside the parse and the caller
@@ -1644,9 +1670,23 @@ class Reconciler:
                     )
                     return False
 
-                adapter = adapter_cls.create_from_config(
-                    source_config, self._credentials_config
-                )
+                adapter = None
+                if hydrate is not None:
+                    try:
+                        adapter = adapter_cls.create_from_payload(
+                            source_config, *hydrate, self._credentials_config
+                        )
+                    except Exception:
+                        logger.warning(
+                            "could not rebuild source %s from its stored payload; "
+                            "parsing it",
+                            claim.source_id,
+                            exc_info=True,
+                        )
+                if adapter is None:
+                    adapter = adapter_cls.create_from_config(
+                        source_config, self._credentials_config
+                    )
 
                 # Bulk-seed the catalog surface so sync_source_added below needs
                 # no per-source upstream RPC (biopb/biopb#266). Guarded by the

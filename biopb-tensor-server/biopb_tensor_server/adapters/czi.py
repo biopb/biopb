@@ -344,6 +344,20 @@ class CziAdapter(TensorAdapter):
             layout=read_layout(path),
         )
 
+    @classmethod
+    def create_from_payload(
+        cls,
+        source: "SourceConfig",
+        payload: Dict[str, Any],
+        metadata: Dict[str, Any],
+        credentials_config: Optional[Any] = None,
+    ) -> "CziAdapter":
+        """Rebuild from the row's probed layout: no file is opened."""
+        url = str(source.url)
+        path = url[len("file://") :] if url.startswith("file://") else url
+        layout = _CziLayout.from_payload(payload["layout"], metadata)
+        return cls(path, source.source_id, layout=layout)
+
     def __init__(
         self,
         url: str,

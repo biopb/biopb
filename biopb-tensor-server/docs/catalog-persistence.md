@@ -313,8 +313,11 @@ restored yet, and the epoch and `last_seen` sweep are stage 2.
      a client's read) registers it by parsing, and the first walk is an ordinary rescan
      against the restored claims. The config-change rules, failed and cloud rows, and the
      `check_registered` hook that hydrates a restored source on a read.
-   - **4b. Hydrate from the payload:** OME-TIFF, nd2 and czi build their adapter from the
-     row's payload, skipping the parse.
+   - **4b. Hydrate from the payload:** nd2 and czi build their adapter from the row's
+     payload (`create_from_payload`), skipping the parse, when the files' signature is
+     still the one persisted; otherwise, and for every other type, the claim is parsed.
+     OME-TIFF still parses: its serve path needs the reduced OME-XML for the physical
+     scale and the cached descriptors seeded, which is an adapter change of its own.
    - **4c. Confirmation:** the run counter, `catalog_roots.epoch`, `confirmed` in the
      view, the post-walk sweep and the `last_seen` cap, the observation hooks ignoring
      unconfirmed rows.

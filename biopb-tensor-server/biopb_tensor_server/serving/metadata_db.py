@@ -1736,6 +1736,25 @@ class MetadataDatabase:
         names = [d[0] for d in cursor.description]
         return [dict(zip(names, row, strict=True)) for row in cursor.fetchall()]
 
+    def read_hydration(
+        self, source_id: str
+    ) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
+        """``(payload, metadata)`` of a persisted source, or None when it has no
+        payload (or it does not decode): what an adapter is rebuilt from without a
+        parse. One keyed read, made when the source is hydrated and not before."""
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT payload, metadata_json FROM source_catalog WHERE source_id = ?",
+            [source_id],
+        ).fetchone()
+        if row is None or row[0] is None:
+            return None
+        try:
+            return json.loads(row[0]), json.loads(row[1]) if row[1] else {}
+        except (TypeError, ValueError):
+            logger.warning("unreadable payload for source %s", source_id)
+            return None
+
     def drop_catalog_rows(self, source_ids: Sequence[str]) -> None:
         """Delete persisted rows a restore did not keep, with the reserved ROI rows
         each one's registration derived (see :meth:`sync_source_removed`)."""

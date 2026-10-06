@@ -233,3 +233,57 @@ class TestRestore:
         run.first_scan()
         assert sorted(run.rows()) == ids
         run.stop()
+
+
+class TestHydrateFromPayload:
+    @pytest.fixture
+    def probes(self, monkeypatch):
+        """An nd2 file that cannot be told from a real one, and a count of how many
+        times it was probed."""
+        pytest.importorskip("nd2")
+        from biopb_tensor_server.adapters import nd2 as nd2_module
+
+        from tests.nd2_adapter_test import _install_fake
+
+        _install_fake(monkeypatch)
+        calls = []
+        real = nd2_module.read_layout
+
+        def counting(path):
+            calls.append(path)
+            return real(path)
+
+        monkeypatch.setattr(nd2_module, "read_layout", counting)
+        return calls
+
+    def _first_run(self, tmp_path):
+        run = _Run(tmp_path)
+        (run.monitored / "img.nd2").write_bytes(b"\x00")
+        run.manager._handle_rescan()
+        (sid,) = run.rows()
+        tensors = run.server.sources.get(sid).list_tensor_descriptors()
+        run.stop()
+        return sid, [t.array_id for t in tensors]
+
+    def test_a_restored_nd2_is_rebuilt_without_probing_the_file(self, tmp_path, probes):
+        sid, array_ids = self._first_run(tmp_path)
+        assert len(probes) == 1
+
+        run = _Run(tmp_path)
+        run.restore()
+        adapter = run.server.sources.get_registered(sid)
+
+        assert len(probes) == 1  # the layout came from the row
+        assert [t.array_id for t in adapter.list_tensor_descriptors()] == array_ids
+        run.stop()
+
+    def test_a_file_changed_while_down_is_probed_not_rebuilt(self, tmp_path, probes):
+        sid, array_ids = self._first_run(tmp_path)
+        (tmp_path / "monitored" / "img.nd2").write_bytes(b"\x00\x00\x00")
+
+        run = _Run(tmp_path)
+        run.restore()
+        run.server.sources.get_registered(sid)
+
+        assert len(probes) == 2
+        run.stop()
