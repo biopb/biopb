@@ -1532,6 +1532,10 @@ public class TensorFlightClient implements AutoCloseable {
      * the store's fill value already reads as background, so one labelled frame
      * of a thousand costs one frame (biopb/biopb#1059).
      *
+     * <p>Chunks are put {@value TensorUploads#DEFAULT_CONCURRENCY} at a time; see
+     * {@link #uploadArray(TensorDescriptor, RandomAccessibleInterval, int)} to
+     * say otherwise.
+     *
      * @param descriptor the descriptor {@link #setupArrayUpload} returned
      * @param array the array to upload
      * @param <T> the pixel type
@@ -1544,6 +1548,30 @@ public class TensorFlightClient implements AutoCloseable {
     public <T extends NativeType<T> & RealType<T>> Map<String, Object> uploadArray(
             TensorDescriptor descriptor, RandomAccessibleInterval<T> array) {
         return uploads.uploadArray(descriptor, array);
+    }
+
+    /**
+     * {@link #uploadArray(TensorDescriptor, RandomAccessibleInterval)} with the
+     * number of chunk puts in flight set by the caller.
+     *
+     * <p>Each in-flight chunk holds one encoded block in memory, so the width is
+     * also the memory bound. The chunks are read out of {@code array} from
+     * several threads at once, each through its own {@code RandomAccess}; an
+     * array whose reads are not safe to share (a view over a stateful source)
+     * wants {@code concurrency} of 1, which puts every chunk on the calling
+     * thread in plan order.
+     *
+     * <p>A refusal on any one stream fails the whole upload -- still an
+     * {@link UploadRefusedException} -- and stops chunks not yet started; the
+     * source is not sealed. Any other failure of a chunk put does the same.
+     *
+     * @param concurrency chunk puts in flight at once, at least 1
+     * @throws IllegalArgumentException if {@code concurrency} is below 1, or
+     *         as the two-argument form
+     */
+    public <T extends NativeType<T> & RealType<T>> Map<String, Object> uploadArray(
+            TensorDescriptor descriptor, RandomAccessibleInterval<T> array, int concurrency) {
+        return uploads.uploadArray(descriptor, array, concurrency);
     }
 
     /**
