@@ -27,32 +27,28 @@ import re
 import threading
 import time
 from collections.abc import Callable
-from typing import Any, Dict, List, Optional
-from urllib.parse import urlparse
+from typing import Dict, List, Optional
 
 import biopb.image as proto
 import dask.array as da
 import grpc
 import numpy as np
 from biopb.image import (
+    NDIM_LABELS,
     deserialize_image_data,
+    json_arg,
+    json_value,
+    make_channel,
+    op_error,
     serialize_from_numpy_to_image_data,
 )
 from biopb.tensor._location import same_location
-from google.protobuf import struct_pb2
 
 from .._config import get_setting
 
 logger = logging.getLogger(__name__)
 
 # biopb's ndim -> axis-label convention (see biopb.image._utils).
-_NDIM_LABELS = {
-    2: ["Y", "X"],
-    3: ["Y", "X", "C"],
-    4: ["Z", "Y", "X", "C"],
-    5: ["T", "Z", "Y", "X", "C"],
-}
-
 #: The tensor server's scratch source, which every writable server serves at
 #: this fixed id. An upload adds a tensor to a source that already exists, and
 #: an op result belongs to no source of the user's, so this is where it goes.
@@ -77,100 +73,8 @@ _REREAD_INTERVAL_S = 2.0
 _REREAD_TIMEOUT_S = 3.0
 
 
-def _make_channel(url: str, options=None) -> grpc.Channel:
-    """Build a gRPC channel from a ``grpc://`` or ``grpcs://`` URL."""
-    parsed = urlparse(url)
-    scheme = parsed.scheme.lower()
-    target = parsed.netloc or parsed.path
-    if not target:
-        raise ValueError(f"algorithm server URL has no host: {url!r}")
-    if scheme == "grpcs":
-        return grpc.secure_channel(
-            target, grpc.ssl_channel_credentials(), options=options
-        )
-    if scheme == "grpc":
-        return grpc.insecure_channel(target, options=options)
-    raise ValueError(f"algorithm server URL must be grpc:// or grpcs://, got {url!r}")
-
-
 def _sanitize_name(name: str) -> str:
     return re.sub(r"\W", "_", name) or "op"
-
-
-def _jsonable(value: Any) -> Any:
-    if isinstance(value, np.generic):
-        return _jsonable(value.item())
-    if isinstance(value, np.ndarray):
-        # Only complex needs the element walk: a bare complex isn't JSON.
-        items = value.tolist()
-        return _jsonable(items) if value.dtype.kind == "c" else items
-    if isinstance(value, dict):
-        return {str(k): _jsonable(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_jsonable(v) for v in value]
-    return value
-
-
-def _fill_value(target: struct_pb2.Value, value: Any) -> None:
-    """Set *target* from plain JSON types, field by field.
-
-    Not ``json_format.ParseDict``/``MessageToDict``: those are JSON *text*
-    guards, and a ``Value`` on the wire is protobuf binary, where
-    ``number_value`` is a double that carries nan and inf unchanged -- an
-    argument or a result may legitimately be either.
-    """
-    if value is None:
-        target.null_value = struct_pb2.NULL_VALUE
-    elif isinstance(value, bool):
-        target.bool_value = value
-    elif isinstance(value, (int, float)):
-        target.number_value = value
-    elif isinstance(value, str):
-        target.string_value = value
-    elif isinstance(value, dict):
-        target.struct_value.Clear()
-        for key, item in value.items():
-            _fill_value(target.struct_value.fields[key], item)
-    else:
-        target.list_value.Clear()
-        for item in value:
-            _fill_value(target.list_value.values.add(), item)
-
-
-def _json_arg(value: Any) -> proto.Arg:
-    arg = proto.Arg()
-    _fill_value(arg.json, _jsonable(value))
-    return arg
-
-
-def _read_value(value: struct_pb2.Value) -> Any:
-    """A ``Value`` as Python, its integral numbers as ints: a protobuf number is
-    always a double, so a count the server sent as 6 arrives as 6.0."""
-    kind = value.WhichOneof("kind")
-    if kind == "number_value":
-        number = value.number_value
-        return int(number) if number.is_integer() else number
-    if kind == "string_value":
-        return value.string_value
-    if kind == "bool_value":
-        return value.bool_value
-    if kind == "struct_value":
-        return {k: _read_value(v) for k, v in value.struct_value.fields.items()}
-    if kind == "list_value":
-        return [_read_value(v) for v in value.list_value.values]
-    return None
-
-
-def _refusal(name: str, exc: grpc.RpcError) -> Exception:
-    """The exception an op's failure raises in the kernel: the server's
-    message, typed by what went wrong rather than wrapped in gRPC's repr."""
-    detail = (exc.details() or "").strip() or exc.code().name
-    code = exc.code()
-    if code == grpc.StatusCode.INVALID_ARGUMENT:
-        return ValueError(f"{name}: {detail}")
-    if code == grpc.StatusCode.NOT_FOUND:
-        return LookupError(f"{name}: {detail}")
-    return RuntimeError(f"{name}: {code.name}: {detail}")
 
 
 _same_plane = same_location
@@ -206,7 +110,7 @@ class _Server:
                     )
                 self._url, self._token, self._stub = row["url"], row["token"], None
             if self._stub is None:
-                self._stub = proto.OpsStub(_make_channel(self._url, self._options))
+                self._stub = proto.OpsStub(make_channel(self._url, self._options))
             metadata = (
                 [("authorization", f"Bearer {self._token}")] if self._token else None
             )
@@ -257,7 +161,7 @@ class _OpCall:
         arr = np.asarray(value)
         if isinstance(labels, dict):
             labels = labels.get(name)
-        labels = list(labels) if labels is not None else _NDIM_LABELS.get(arr.ndim)
+        labels = list(labels) if labels is not None else NDIM_LABELS.get(arr.ndim)
         image_data = serialize_from_numpy_to_image_data(arr, dim_labels=labels)
         return proto.Arg(eager=image_data.eager_data)
 
@@ -294,7 +198,7 @@ class _OpCall:
                 by_id = by_id or isinstance(value, str)
                 encoded[name] = self._tensor(name, value, dim_labels, client)
             else:
-                encoded[name] = _json_arg(value)
+                encoded[name] = json_arg(value)
         return encoded, by_id
 
     # --- the stream ------------------------------------------------------ #
@@ -376,7 +280,7 @@ class _OpCall:
     def value(self, arg: proto.Arg, by_id: bool):
         kind = arg.WhichOneof("kind")
         if kind == "json":
-            return _read_value(arg.json)
+            return json_value(arg.json, ints=True)
         client = self.client_getter()
         if kind == "eager":
             array = deserialize_image_data(proto.ImageData(eager_data=arg.eager))
@@ -410,7 +314,7 @@ def _build_op(call: _OpCall) -> Callable:
         try:
             events = call.stream(arguments)
         except grpc.RpcError as exc:
-            raise _refusal(call.name, exc) from None
+            raise op_error(call.name, exc) from None
         values = [call.result(event, by_id) for event in events]
         if not values:
             return None

@@ -12,15 +12,18 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.flight as flight
 import pytest
-from biopb.image import deserialize_image_data, serialize_from_numpy_to_image_data
+from biopb.image import (
+    deserialize_image_data,
+    json_arg as _json_arg,
+    json_value,
+    make_channel as _make_channel,
+    serialize_from_numpy_to_image_data,
+)
 from biopb.tensor import SerializedTensor, TensorDescriptor
 
 from biopb_mcp.mcp import _process_ops
 from biopb_mcp.mcp._process_ops import (
     Ops,
-    _json_arg,
-    _make_channel,
-    _read_value,
     _same_plane,
 )
 
@@ -81,7 +84,7 @@ class _Servicer(proto.OpsServicer):
             )
         elif op == "stats":
             kwargs = {
-                k: _read_value(v.json)
+                k: json_value(v.json, ints=True)
                 for k, v in args.items()
                 if v.WhichOneof("kind") == "json"
             }
@@ -110,7 +113,7 @@ class _Servicer(proto.OpsServicer):
             yield proto.Event(outputs={"result": _json({"x": float("nan"), "ok": 1.5})})
         elif op == "echo_kwarg":
             kwargs = {
-                k: _read_value(v.json)
+                k: json_value(v.json, ints=True)
                 for k, v in args.items()
                 if v.WhichOneof("kind") == "json"
             }

@@ -1,8 +1,11 @@
 """CLI client for algorithm servers (the ``biopb.image`` Ops protocol).
 
+A server is a ``grpc://`` / ``grpcs://`` URL, or the name of a registry entry
+the control manages (see ``biopb algorithm list``).
+
 Commands:
     ops         List the operations an algorithm server offers
-    process     Run one operation on an image
+    call        Run one operation on an image
 """
 
 import json
@@ -13,14 +16,18 @@ from typing import Literal, Optional
 import grpc
 import imageio
 import typer
-from google.protobuf import empty_pb2, json_format, struct_pb2
 from rich.console import Console
 from rich.table import Table
 
-from biopb.image import Arg, Call, ImageData, OpInfo, OpList, OpsStub
-from biopb.image._utils import (
-    deserialize_image_data,
-    serialize_from_numpy_to_image_data,
+from biopb.image import (
+    Arg,
+    OpInfo,
+    connect,
+    decode_arg,
+    encode_arg,
+    json_arg,
+    json_value,
+    op_error,
 )
 from biopb.tensor.serialized_pb2 import SerializedTensor
 
@@ -36,33 +43,6 @@ def _log_timing(start_time: float) -> None:
     """Print elapsed time since start_time to stderr."""
     elapsed = time.time() - start_time
     stderr_console.print(f"[dim]Completed in {elapsed:.2f}s[/dim]")
-
-
-def _parse_server_address(server: str) -> tuple[str, bool]:
-    """Parse server address, strip grpc:// or grpcs:// prefix.
-
-    Returns:
-        Tuple of (address, use_tls)
-    """
-    if server.startswith("grpcs://"):
-        return server[8:], True
-    if server.startswith("grpc://"):
-        return server[7:], False
-    return server, False
-
-
-def _create_grpc_channel(server: str) -> grpc.Channel:
-    """Create gRPC channel with user-friendly error handling."""
-    addr, use_tls = _parse_server_address(server)
-    try:
-        if use_tls:
-            credentials = grpc.ssl_channel_credentials()
-            return grpc.secure_channel(addr, credentials)
-        else:
-            return grpc.insecure_channel(addr)
-    except Exception as exc:
-        stderr_console.print(f"[red]Cannot connect to server at {server}:[/red] {exc}")
-        raise typer.Exit(1)
 
 
 def _infer_format(output: str, format: Optional[str]) -> Literal["pb", "pickle"]:
@@ -118,7 +98,7 @@ def _build_arg(is_file: bool, data_or_path) -> Arg:
             stderr_console.print(
                 f"[green]Loaded image:[/green] shape={np_arr.shape}, dtype={np_arr.dtype}"
             )
-            return Arg(eager=serialize_from_numpy_to_image_data(np_arr).eager_data)
+            return encode_arg(np_arr)
         except Exception as img_exc:
             stderr_console.print(
                 f"[yellow]imageio failed, trying protobuf parse:[/yellow] {img_exc}"
@@ -145,7 +125,7 @@ def _parse_bytes_to_arg(raw_bytes: bytes) -> Arg:
         stderr_console.print(
             f"[green]Parsed as image:[/green] shape={np_arr.shape}, dtype={np_arr.dtype}"
         )
-        return Arg(eager=serialize_from_numpy_to_image_data(np_arr).eager_data)
+        return encode_arg(np_arr)
     except Exception as img_exc:
         stderr_console.print(f"[red]Cannot parse input:[/red] {img_exc}")
         raise typer.Exit(1)
@@ -170,7 +150,7 @@ def _write_tensor(arg: Arg, output: str, format: Literal["pb", "pickle"]) -> Non
                 "Provide output filename."
             )
             raise typer.Exit(1)
-        np_arr = deserialize_image_data(ImageData(eager_data=arg.eager))
+        np_arr = decode_arg(arg)
         stderr_console.print(
             f"[green]Output shape:[/green] {np_arr.shape}, dtype={np_arr.dtype}"
         )
@@ -208,17 +188,6 @@ def _write_tensor(arg: Arg, output: str, format: Literal["pb", "pickle"]) -> Non
         stderr_console.print(f"[green]Pickled saved to:[/green] {output}")
 
 
-def _plain(value) -> object:
-    """A ``google.protobuf.Value`` as Python. Not ``MessageToDict``, which raises
-    on nan/inf, and a measurement may legitimately be either."""
-    kind = value.WhichOneof("kind")
-    if kind == "struct_value":
-        return {k: _plain(v) for k, v in value.struct_value.fields.items()}
-    if kind == "list_value":
-        return [_plain(v) for v in value.list_value.values]
-    return getattr(value, kind) if kind and kind != "null_value" else None
-
-
 def _write_outputs(outputs, output: str, format: Literal["pb", "pickle"]) -> None:  # noqa: A002 - mirrors the --format option
     """Tensor outputs to *output*; JSON outputs printed plain, one per line,
     to stdout, or to stderr when a tensor goes to stdout. With more than one
@@ -228,45 +197,44 @@ def _write_outputs(outputs, output: str, format: Literal["pb", "pickle"]) -> Non
     for key in sorted(outputs):
         arg = outputs[key]
         if arg.WhichOneof("kind") == "json":
-            text = json.dumps(_plain(arg.json))
+            text = json.dumps(json_value(arg.json))
             print(text if len(outputs) == 1 else f"{key}: {text}", file=stream)
         else:
             _write_tensor(arg, _output_path(output, key, len(tensors)), format)
 
 
-_SERVER_OPTION = typer.Option(
-    "grpc://localhost:50051",
-    "--server",
-    "-s",
-    envvar="BIOPB_IMAGE_SERVER",
-    help="Algorithm server URI (grpc:// or grpcs://)",
+_SERVER_ARG = typer.Argument(
+    ..., help="grpc:// or grpcs:// URL, or a registry entry name"
 )
 _TOKEN_OPTION = typer.Option(
     None,
     "--token",
     "-t",
     envvar="BIOPB_IMAGE_TOKEN",
-    help="Bearer token for server authentication",
+    help="Bearer token for server authentication (a registry name brings its own)",
 )
 
 
-def _describe(stub: OpsStub, metadata) -> OpList:
-    return stub.Describe(empty_pb2.Empty(), metadata=metadata, timeout=10)
+def _connect(server: str, token: Optional[str]):
+    try:
+        return connect(server, token=token)
+    except (LookupError, RuntimeError, ValueError) as exc:
+        stderr_console.print(f"[red]Cannot connect to {server}:[/red] {exc}")
+        raise typer.Exit(1) from exc
 
 
 @app.command(help="List the operations an algorithm server offers.")
-def ops(server: str = _SERVER_OPTION, token: Optional[str] = _TOKEN_OPTION) -> None:
+def ops(server: str = _SERVER_ARG, token: Optional[str] = _TOKEN_OPTION) -> None:
     """List the operations an algorithm server offers.
 
     Example:
-        biopb image ops --server grpc://localhost:50051
-        biopb image ops -s grpc://myhost:9000 --token mytoken123
+        biopb image ops grpc://localhost:50051
+        biopb image ops cellpose
     """
     start_time = time.time()
-    channel = _create_grpc_channel(server)
-    metadata = [("authorization", f"Bearer {token}")] if token else None
+    client = _connect(server, token)
     try:
-        listing = _describe(OpsStub(channel), metadata)
+        listing = client.describe()
         if not listing.ops:
             stderr_console.print(f"[yellow]No operations found on {server}[/yellow]")
             _log_timing(start_time)
@@ -303,24 +271,21 @@ def ops(server: str = _SERVER_OPTION, token: Optional[str] = _TOKEN_OPTION) -> N
     except grpc.RpcError as exc:
         stderr_console.print(f"[red]gRPC error:[/red] {exc.code()} - {exc.details()}")
         raise typer.Exit(1)
-    except Exception as exc:
-        stderr_console.print(f"[red]Error querying server:[/red] {exc}")
-        raise typer.Exit(1)
     finally:
-        channel.close()
+        client.close()
 
 
 @app.command(help="Run an operation on an algorithm server.")
-def process(
-    input: Optional[str] = typer.Argument(  # noqa: A002 - the CLI's positional name
-        None,
-        help="Input file path or '-' for stdin. If omitted, reads from stdin.",
+def call(
+    server: str = _SERVER_ARG,
+    op: Optional[str] = typer.Argument(
+        None, help="Operation name (optional if the server has a single op)"
     ),
-    op: Optional[str] = typer.Option(
+    input: Optional[str] = typer.Option(  # noqa: A002 - the CLI's option name
         None,
-        "--op",
-        "-o",
-        help="Operation name (optional if the server has a single op)",
+        "--input",
+        "-i",
+        help="Input file path or '-' for stdin. If omitted, reads from stdin.",
     ),
     tensor: Optional[str] = typer.Option(
         None,
@@ -345,7 +310,6 @@ def process(
         "-f",
         help="Output format for lazy data: pb (default) or pickle.",
     ),
-    server: str = _SERVER_OPTION,
     token: Optional[str] = _TOKEN_OPTION,
 ) -> None:
     """Run one operation on an image.
@@ -361,23 +325,20 @@ def process(
     printed.
 
     Examples:
-        biopb image process input.png --op gaussian --kwargs '{"sigma": 2}' -O out.png
-        biopb image process input.pb --op segment -O out.pb
-        biopb tensor get my-source -o - | biopb image process --op segment -O -
+        biopb image call cellpose gaussian -i input.png -k '{"sigma": 2}' -O out.png
+        biopb image call grpc://host:50051 segment -i input.pb -O out.pb
+        biopb tensor get my-source -o - | biopb image call cellpose segment -O -
     """
     start_time = time.time()
-    channel = _create_grpc_channel(server)
     fmt = _infer_format(output, format)
-    metadata = [("authorization", f"Bearer {token}")] if token else None
+    client = _connect(server, token)
 
     try:
-        stub = OpsStub(channel)
-        listing = _describe(stub, metadata)
-        by_name = {info.name: info for info in listing.ops}
+        by_name = {info.name: info for info in client.describe().ops}
         if op is None:
             if len(by_name) != 1:
                 stderr_console.print(
-                    f"[red]Error:[/red] --op is required; the server has {sorted(by_name)}"
+                    f"[red]Error:[/red] OP is required; the server has {sorted(by_name)}"
                 )
                 raise typer.Exit(1)
             op = next(iter(by_name))
@@ -398,11 +359,11 @@ def process(
         is_file, data_or_path = _parse_input(input)
         args = {tensor: _build_arg(is_file, data_or_path)}
         for name, value in json.loads(kwargs or "{}").items():
-            args[name] = Arg(json=json_format.ParseDict(value, struct_pb2.Value()))
+            args[name] = json_arg(value)
 
         stderr_console.print(f"[green]Sending request to[/green] {server} (op: {op})")
         outputs = None
-        for event in stub.Call(Call(op=op, args=args), metadata=metadata):
+        for event in client.events(op, args):
             if event.progress and not event.outputs:
                 stderr_console.print(f"[dim]{event.progress}[/dim]")
             if event.outputs:
@@ -416,13 +377,13 @@ def process(
     except typer.Exit:
         raise
     except grpc.RpcError as exc:
-        stderr_console.print(f"[red]gRPC error:[/red] {exc.code()} - {exc.details()}")
+        stderr_console.print(f"[red]Error:[/red] {op_error(op or '', exc)}")
         raise typer.Exit(1)
     except Exception as exc:
         stderr_console.print(f"[red]Error processing image:[/red] {exc}")
         raise typer.Exit(1)
     finally:
-        channel.close()
+        client.close()
 
 
 if __name__ == "__main__":
