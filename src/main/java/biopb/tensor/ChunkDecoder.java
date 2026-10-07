@@ -27,7 +27,7 @@ final class ChunkDecoder {
      */
     static double[] decodeChunkBytes(byte[] raw, String dtypeStr) {
         String s = dtypeStr == null ? "" : dtypeStr.trim().toLowerCase();
-        ByteOrder order = s.startsWith(">") ? ByteOrder.BIG_ENDIAN : ByteOrder.LITTLE_ENDIAN;
+        ByteOrder order = orderOf(s);
         // The byte-order mark and the spelled-out aliases are folded away by
         // the same normalizer createType and bytesPerElement use, so this
         // decode and the imglib2 type it lands in cannot disagree about a
@@ -74,6 +74,53 @@ final class ChunkDecoder {
             }
         }
         return out;
+    }
+
+    /** The byte order a trimmed, lowercased numpy dtype string names: {@code >} is big, anything else little. */
+    private static ByteOrder orderOf(String dtype) {
+        return dtype.startsWith(">") ? ByteOrder.BIG_ENDIAN : ByteOrder.LITTLE_ENDIAN;
+    }
+
+    /** Whether a dtype string is an integer kind ({@code u}/{@code i}), decoded exactly. */
+    static boolean isInteger(String dtypeStr) {
+        String body = TensorChunkCodec.normalizeDtype(dtypeStr);
+        return !body.isEmpty() && (body.charAt(0) == 'u' || body.charAt(0) == 'i');
+    }
+
+    /** How many elements {@code raw} holds at this dtype's size. */
+    static int elementCount(byte[] raw, String dtypeStr) {
+        return raw.length / TensorChunkCodec.bytesPerElement(dtypeStr);
+    }
+
+    /**
+     * Decode an integer chunk's bytes into {@code out} from {@code offset}, exactly.
+     *
+     * <p>Unlike {@link #decodeChunkBytes}, nothing passes through a
+     * {@code double}, so an {@code i8}/{@code u8} id above 2^53 survives. An
+     * unsigned value is zero-extended; a {@code u8} above 2^63 is its raw 64-bit
+     * pattern, which is what {@code UnsignedLongType.setInteger} takes.
+     *
+     * @return the number of elements written
+     */
+    static int decodeChunkIntegers(byte[] raw, String dtypeStr, long[] out, int offset) {
+        String s = dtypeStr == null ? "" : dtypeStr.trim().toLowerCase();
+        ByteOrder order = orderOf(s);
+        String body = TensorChunkCodec.normalizeDtype(s);
+        boolean unsigned = body.charAt(0) == 'u';
+        int size = TensorChunkCodec.bytesPerElement(body);
+        ByteBuffer buf = ByteBuffer.wrap(raw).order(order);
+        int n = raw.length / size;
+        for (int i = 0; i < n; i++) {
+            long v;
+            switch (size) {
+                case 1: v = unsigned ? buf.get() & 0xFFL : buf.get(); break;
+                case 2: v = unsigned ? buf.getShort() & 0xFFFFL : buf.getShort(); break;
+                case 4: v = unsigned ? buf.getInt() & 0xFFFFFFFFL : buf.getInt(); break;
+                default: v = buf.getLong(); break;
+            }
+            out[offset + i] = v;
+        }
+        return n;
     }
 
     /**

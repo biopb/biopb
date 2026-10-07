@@ -644,6 +644,168 @@ public class TensorFlightClientTest {
         }
     }
 
+    // ---- unresolved_reason: register a pending source instead of refusing it -----
+
+    @Test
+    public void testGetSourceMetadataRegistersAPendingSourceThenReadsIt() throws Exception {
+        try (TestFlightServer server = new TestFlightServer()) {
+            server.setSourceResolved(false);
+            server.setUnresolvedReason("pending");
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                Map<String, Object> metadata = client.getSourceMetadata("test-source");
+                Assert.assertEquals("test_value", metadata.get("test_key"));
+                Assert.assertEquals(1, server.getResolveCount());
+            }
+        }
+    }
+
+    @Test
+    public void testGetSourceMetadataRaisesTheReasonARegistrationFailed() throws Exception {
+        try (TestFlightServer server = new TestFlightServer()) {
+            server.setSourceResolved(false);
+            server.setUnresolvedReason("failed");
+            server.setResolveFails(true);
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                Exception error = Assert.assertThrows(Exception.class,
+                        () -> client.getSourceMetadata("test-source"));
+                Assert.assertTrue(String.valueOf(error.getMessage()), error.getMessage().contains("bad header"));
+            }
+        }
+    }
+
+    @Test
+    public void testGetSourceMetadataNeverRecallsACloudPlaceholder() throws Exception {
+        try (TestFlightServer server = new TestFlightServer()) {
+            server.setSourceResolved(false);
+            server.setUnresolvedReason("needs_recall");
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                IllegalStateException error = Assert.assertThrows(IllegalStateException.class,
+                        () -> client.getSourceMetadata("test-source"));
+                Assert.assertTrue(error.getMessage().contains("resolveSource"));
+                Assert.assertEquals(0, server.getResolveCount());
+            }
+        }
+    }
+
+    @Test
+    public void testAServerThatWillNotSayWhyKeepsTheOldRefusal() throws Exception {
+        // No `unresolved_reason` in the schema (an older server, or a token that
+        // cannot browse): the row is read as it always was, a cloud placeholder.
+        try (TestFlightServer server = new TestFlightServer()) {
+            server.setSourceResolved(false);
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                Assert.assertThrows(IllegalStateException.class,
+                        () -> client.getSourceMetadata("test-source"));
+                Assert.assertEquals(0, server.getResolveCount());
+                for (String sql : server.getCatalogQueries()) {
+                    Assert.assertFalse(sql, sql.contains("unresolved_reason"));
+                }
+            }
+        }
+    }
+
+    @Test
+    public void testTheRowProjectionCarriesTheReasonOnlyWhenTheServerHasIt() throws Exception {
+        try (TestFlightServer server = new TestFlightServer()) {
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                Assert.assertEquals(TensorFlightClient.SOURCE_ROW_COLUMNS, client.sourceRowColumns());
+            }
+        }
+        try (TestFlightServer server = new TestFlightServer()) {
+            server.setUnresolvedReason("pending");
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                String columns = client.sourceRowColumns();
+                Assert.assertEquals(TensorFlightClient.SOURCE_ROW_COLUMNS + ", unresolved_reason", columns);
+                try (VectorSchemaRoot root = client.query("SELECT " + columns + " FROM sources")) {
+                    Assert.assertNotNull(root.getVector("unresolved_reason"));
+                }
+            }
+        }
+    }
+
+    @Test
+    public void testTheSourcesSchemaIsReadOncePerConnection() throws Exception {
+        try (TestFlightServer server = new TestFlightServer()) {
+            server.setUnresolvedReason("pending");
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                client.sourceRowColumns();
+                client.sourceRowColumns();
+                client.getSourceMetadata("test-source");
+                Assert.assertEquals(1, server.getSchemaProbeCount());
+            }
+        }
+        // A refusal is remembered too: it would repeat.
+        try (TestFlightServer server = new TestFlightServer()) {
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                client.sourceRowColumns();
+                client.sourceRowColumns();
+                Assert.assertEquals(1, server.getSchemaProbeCount());
+            }
+        }
+    }
+
+    // ---- describe options, advertised location ----------------------------------
+
+    @Test
+    public void testGetDescriptorAsksForThePyramidAndNothingElseByDefault() throws Exception {
+        try (TestFlightServer server = new TestFlightServer()) {
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                client.getDescriptor("test-tensor");
+                Assert.assertEquals(Arrays.asList("pyramid"), server.getLastFields());
+            }
+        }
+    }
+
+    @Test
+    public void testGetDescriptorOptionsChooseTheOptionalParts() throws Exception {
+        try (TestFlightServer server = new TestFlightServer()) {
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                client.getDescriptor("test-tensor", DescribeOptions.defaults()
+                        .withPyramid(false)
+                        .withMetadata(true)
+                        .withReadPlan(true)
+                        .withResidency(true)
+                        .withUploadStatus(true));
+                Assert.assertEquals(
+                        Arrays.asList("endpoints", "metadata_json", "upload_status", "is_resident"),
+                        server.getLastFields());
+
+                client.getDescriptor("test-tensor", DescribeOptions.defaults().withPyramid(false));
+                Assert.assertEquals(Collections.emptyList(), server.getLastFields());
+            }
+        }
+    }
+
+    @Test
+    public void testAdvertisedLocationIsTheServersOwnAnswerNormalized() throws Exception {
+        try (TestFlightServer server = new TestFlightServer()) {
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                Assert.assertNull("a server that publishes none", client.getAdvertisedLocation());
+            }
+            server.setExternalLocation("grpcs://real-host:8815");
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                Assert.assertEquals("grpc+tls://real-host:8815", client.getAdvertisedLocation());
+                int before = server.getHealthRequestCount();
+                client.getAdvertisedLocation();
+                client.getDescriptor("test-tensor");
+                Assert.assertEquals("read off the one health check", before, server.getHealthRequestCount());
+            }
+        }
+    }
+
+    @Test
+    public void testGetTensorAsPbExportsTheLocationItIsGiven() throws Exception {
+        try (TestFlightServer server = new TestFlightServer()) {
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                Assert.assertTrue(client.getTensorAsPb("test-tensor", null, null, null)
+                        .getLocation().contains("localhost:" + server.getPort()));
+                SerializedTensor exported = client.getTensorAsPb(
+                        "test-tensor", null, null, null, "grpc://plane.example:8815");
+                Assert.assertEquals("grpc://plane.example:8815", exported.getLocation());
+            }
+        }
+    }
+
     @Test
     public void testResolveSourceWithoutTerminalRowFails() throws Exception {
         // Heartbeats and nothing else: the server closed without a row. That is an
@@ -870,6 +1032,36 @@ public class TensorFlightClientTest {
             producer.sourceHasTensors = has;
         }
 
+        /** The server has the {@code unresolved_reason} column and reports this. */
+        void setUnresolvedReason(String reason) {
+            producer.catalogHasReason = true;
+            producer.unresolvedReason = reason;
+        }
+
+        void setResolveFails(boolean fails) {
+            producer.resolveFails = fails;
+        }
+
+        int getResolveCount() {
+            return producer.resolveCalls.get();
+        }
+
+        int getSchemaProbeCount() {
+            return producer.schemaProbes.get();
+        }
+
+        List<String> getCatalogQueries() {
+            return producer.catalogQueries;
+        }
+
+        void setExternalLocation(String location) {
+            producer.externalLocation = location;
+        }
+
+        List<String> getLastFields() {
+            return producer.getLastFields();
+        }
+
         void setProtocolVersion(int version) {
             producer.protocolVersion = version;
         }
@@ -929,8 +1121,18 @@ public class TensorFlightClientTest {
         // resolved and held nothing readable, which is the pair #1032 exists
         // to stop conflating.
         private volatile boolean sourceHasTensors = true;
+        // Why an unresolved row is unresolved, as a server that has the column
+        // says it; `catalogHasReason` is whether the `sources` schema lists it.
+        private volatile String unresolvedReason = null;
+        private volatile boolean catalogHasReason = false;
+        private volatile boolean resolveFails = false;
+        final AtomicInteger resolveCalls = new AtomicInteger();
+        final AtomicInteger schemaProbes = new AtomicInteger();
+        final List<String> catalogQueries = new java.util.concurrent.CopyOnWriteArrayList<>();
         // The Flight protocol shape this fake claims to speak.
         volatile int protocolVersion = 2;
+        // What `health` says clients outside the server's network should dial.
+        volatile String externalLocation = null;
         final AtomicInteger healthRequests = new AtomicInteger();
         /** Producer calls currently running, so teardown can wait them out. */
         final AtomicInteger inFlight = new AtomicInteger();
@@ -1006,6 +1208,12 @@ public class TensorFlightClientTest {
             return flightInfoRequests.get();
         }
 
+        List<String> getLastFields() {
+            return lastCmd == null || !lastCmd.hasTensorRead()
+                    ? null
+                    : lastCmd.getTensorRead().getFields().getPathsList();
+        }
+
         String getLastReductionMethod() {
             if (lastCmd == null || !lastCmd.hasTensorRead()) {
                 return null;
@@ -1015,6 +1223,22 @@ public class TensorFlightClientTest {
 
         @Override
         public FlightInfo getFlightInfo(FlightProducer.CallContext context, FlightDescriptor descriptor) {
+            if (descriptor.isCommand() == false) {
+                // The `sources` table's schema. A server that will not say (or
+                // predates the column) refuses it, which is the default here.
+                schemaProbes.incrementAndGet();
+                if (!descriptor.getPath().equals(Collections.singletonList("sources"))) {
+                    throw typedError(FlightStatusCode.NOT_FOUND, "no such flight", "NOT_FOUND", null);
+                }
+                if (!catalogHasReason) {
+                    throw typedError(FlightStatusCode.UNAUTHORIZED, "catalog is not browsable",
+                            "UNAUTHORIZED", null);
+                }
+                try (VectorSchemaRoot root = catalogRoot(
+                        "SELECT " + TensorFlightClient.SOURCE_ROW_COLUMNS + ", unresolved_reason FROM sources", 0)) {
+                    return new FlightInfo(root.getSchema(), descriptor, new ArrayList<>(), -1, -1);
+                }
+            }
             flightInfoRequests.incrementAndGet();
             FlightRequest cmd = parseCmd(descriptor.getCommand());
             lastCmd = cmd;
@@ -1178,8 +1402,11 @@ public class TensorFlightClientTest {
                 }
                 // Every v2 server answers this, and the SDK probes it once per
                 // connection before its first real call.
+                String external = externalLocation == null
+                        ? ""
+                        : ",\"external_location\":\"" + externalLocation + "\"";
                 listener.onNext(new Result(("{\"status\":\"SERVING\",\"protocol\":"
-                        + protocolVersion + "}").getBytes(StandardCharsets.UTF_8)));
+                        + protocolVersion + external + "}").getBytes(StandardCharsets.UTF_8)));
                 listener.onCompleted();
                 return;
             }
@@ -1236,6 +1463,12 @@ public class TensorFlightClientTest {
          * an Arrow IPC stream.
          */
         private void doResolve(String sourceId, FlightProducer.StreamListener<Result> listener) {
+            resolveCalls.incrementAndGet();
+            if (resolveFails) {
+                listener.onError(CallStatus.INTERNAL
+                        .withDescription("registration failed: bad header").toRuntimeException());
+                return;
+            }
             for (int i = 0; i < resolveHeartbeats; i++) {
                 ResolveStreamMessage beat = ResolveStreamMessage.newBuilder()
                         .setProgress(ResolveProgress.newBuilder()
@@ -1327,6 +1560,7 @@ public class TensorFlightClientTest {
                 // single rows with one -- a fake that answered every id with its
                 // one row would report a missing source as present.
                 String sql = tensorTicket.getCatalogQuery().getSql();
+                catalogQueries.add(sql);
                 boolean matches = !sql.contains("WHERE source_id = ")
                         || sql.contains("'test-source'");
                 try (VectorSchemaRoot root = catalogRoot(sql, matches ? 1 : 0)) {
@@ -1399,6 +1633,8 @@ public class TensorFlightClientTest {
             columns.put("metadata_json", new Field("metadata_json", FieldType.nullable(ArrowType.Utf8.INSTANCE), null));
             columns.put("data_resident", new Field("data_resident", FieldType.nullable(ArrowType.Bool.INSTANCE), null));
             columns.put("is_resolved", new Field("is_resolved", FieldType.nullable(ArrowType.Bool.INSTANCE), null));
+            columns.put("unresolved_reason",
+                    new Field("unresolved_reason", FieldType.nullable(ArrowType.Utf8.INSTANCE), null));
             columns.put("tensors", new Field("tensors", FieldType.nullable(ArrowType.List.INSTANCE),
                     Collections.singletonList(tensorStruct)));
 
@@ -1424,6 +1660,9 @@ public class TensorFlightClientTest {
             }
             setBool(root, "data_resident", true);
             setBool(root, "is_resolved", sourceResolved);
+            if (!sourceResolved && unresolvedReason != null) {
+                setText(root, "unresolved_reason", unresolvedReason);
+            }
             ListVector tensors = (ListVector) root.getVector("tensors");
             if (tensors != null && !sourceHasTensors) {
                 UnionListWriter empty = tensors.getWriter();

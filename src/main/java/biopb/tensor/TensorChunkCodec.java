@@ -8,6 +8,7 @@ import com.google.protobuf.InvalidProtocolBufferException;
 
 import net.imglib2.RandomAccess;
 import net.imglib2.type.NativeType;
+import net.imglib2.type.numeric.IntegerType;
 import net.imglib2.type.numeric.RealType;
 import net.imglib2.type.numeric.integer.ByteType;
 import net.imglib2.type.numeric.integer.IntType;
@@ -131,10 +132,9 @@ final class TensorChunkCodec {
      * read back as a {@link FloatType} loses every id above 2^24, silently --
      * which is exactly the case a label set is (biopb/biopb#1059).
      *
-     * <p>The type is right; the values reaching it are not yet. {@link
-     * ChunkDecoder} still decodes to {@code double[]} and {@link #writeChunk}
-     * still scatters with {@code setReal}, so {@code i8}/{@code u8} lose the
-     * same way above 2^53 -- biopb/biopb#1071.
+     * <p>Integer values reach it exactly: {@link ChunkDecoder} decodes the
+     * integer kinds to {@code long[]} and {@link #writeChunk} sets them with
+     * {@code setInteger}, so an {@code i8}/{@code u8} id above 2^53 survives.
      */
     static NativeType<?> createType(String dtype) {
         switch (normalizeDtype(dtype)) {
@@ -206,29 +206,72 @@ final class TensorChunkCodec {
             RandomAccess<T> access,
             ChunkBounds bounds,
             double[] values) {
-
-        long[] start = toLongArray(bounds.getStartList());
-        long[] stop = toLongArray(bounds.getStopList());
-        long[] chunkShape = new long[start.length];
-        long expectedSize = 1L;
-        for (int axis = 0; axis < start.length; axis++) {
-            chunkShape[axis] = stop[axis] - start[axis];
-            expectedSize *= chunkShape[axis];
+        ChunkWalk walk = new ChunkWalk(bounds, values.length);
+        for (double value : values) {
+            walk.moveTo(access);
+            access.get().setReal(value);
         }
-        if (expectedSize != values.length) {
-            throw new IllegalStateException(
-                    "Chunk size mismatch: expected " + expectedSize + " values but received " + values.length);
-        }
+    }
 
-        long[] localPosition = new long[chunkShape.length];
-        long[] globalPosition = new long[chunkShape.length];
-        for (int index = 0; index < values.length; index++) {
-            for (int axis = 0; axis < chunkShape.length; axis++) {
-                globalPosition[axis] = start[axis] + localPosition[axis];
+    /**
+     * {@link #writeChunk(RandomAccess, ChunkBounds, double[])} for integer
+     * chunks, exact for every 64-bit value.
+     *
+     * <p>A target that is not an {@link IntegerType} takes the value as a
+     * {@code double}, as it would have before.
+     */
+    static <T extends NativeType<T> & RealType<T>> void writeChunk(
+            RandomAccess<T> access,
+            ChunkBounds bounds,
+            long[] values) {
+        ChunkWalk walk = new ChunkWalk(bounds, values.length);
+        if (access.get() instanceof IntegerType) {
+            for (long value : values) {
+                walk.moveTo(access);
+                ((IntegerType<?>) access.get()).setInteger(value);
             }
-            access.setPosition(globalPosition);
-            access.get().setReal(values[index]);
-            advanceRowMajor(localPosition, chunkShape);
+        } else {
+            for (long value : values) {
+                walk.moveTo(access);
+                access.get().setReal(value);
+            }
+        }
+    }
+
+    /**
+     * A chunk's elements in row-major order, as the global positions they go to:
+     * checks the count against the bounds once, then {@link #moveTo} steps a
+     * {@code RandomAccess} onto the next element.
+     */
+    private static final class ChunkWalk {
+        private final long[] start;
+        private final long[] shape;
+        private final long[] local;
+        private final long[] global;
+
+        ChunkWalk(ChunkBounds bounds, int count) {
+            start = toLongArray(bounds.getStartList());
+            long[] stop = toLongArray(bounds.getStopList());
+            shape = new long[start.length];
+            long expectedSize = 1L;
+            for (int axis = 0; axis < start.length; axis++) {
+                shape[axis] = stop[axis] - start[axis];
+                expectedSize *= shape[axis];
+            }
+            if (expectedSize != count) {
+                throw new IllegalStateException(
+                        "Chunk size mismatch: expected " + expectedSize + " values but received " + count);
+            }
+            local = new long[shape.length];
+            global = new long[shape.length];
+        }
+
+        void moveTo(RandomAccess<?> access) {
+            for (int axis = 0; axis < shape.length; axis++) {
+                global[axis] = start[axis] + local[axis];
+            }
+            access.setPosition(global);
+            advanceRowMajor(local, shape);
         }
     }
 
