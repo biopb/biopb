@@ -11,7 +11,7 @@ A field is a label sidecar without the label half: it binds to no image, is
 read from no format, and maps to no axes. So the shared machinery serves it
 unchanged -- ``SourceAdapter.attach_tensor``, ``resolve_tensor``,
 ``catalog_tensors``, attach-on-READY -- and what is here is the layout and the
-``on_register`` attacher over it.
+scan that finds a source's finished fields.
 
 **An orphaned field outlives its source.** A discovery root that goes away
 leaves ``<write_dir>/fields/<source_id>/`` behind with nothing to attach it to.
@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Dict, Optional
 
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
@@ -40,11 +40,9 @@ from biopb_tensor_server.core.attached import attached_field, split_attached_fie
 
 __all__ = [
     "create_field_upload",
-    "fields_attacher",
     "fields_root",
     "scan_source_fields",
     "source_fields_dir",
-    "upload_attacher",
 ]
 
 logger = logging.getLogger(__name__)
@@ -143,43 +141,3 @@ def scan_source_fields(source_id: str, fields_dir: Path) -> Dict[str, TensorAdap
         if adapter is not None:
             fields[field] = adapter
     return fields
-
-
-def fields_attacher(fields_dir: Path) -> Callable[[str, Any], None]:
-    """The registry's ``on_register`` hook: attach a source's uploaded fields.
-
-    Runs at the one registration chokepoint, because a field is keyed by
-    ``source_id`` and no format knows about it -- the shape
-    ``labels.sidecar_attacher`` already has. This is also how the scratch
-    source gets its tensors back at boot: it has no format to enumerate them,
-    so adoption is this pass and nothing else. A field that will not open costs
-    the field, never the source.
-    """
-
-    def attach(source_id: str, adapter: Any) -> None:
-        for field, tensor in scan_source_fields(source_id, fields_dir).items():
-            adapter.attach_tensor(field, tensor)
-
-    return attach
-
-
-def upload_attacher(
-    *attachers: Callable[[str, Any], None],
-) -> Callable[[str, Any], None]:
-    """Several attachers as the one hook the registry takes.
-
-    Each is caught on its own: a throw that escaped here would cost the *other*
-    attacher's tensors, and a failed attach costs its tensors rather than the
-    registration (``SourceRegistry.register``).
-    """
-
-    def attach(source_id: str, adapter: Any) -> None:
-        for attacher in attachers:
-            try:
-                attacher(source_id, adapter)
-            except Exception:
-                logger.warning(
-                    f"attaching uploaded tensors of {source_id} failed", exc_info=True
-                )
-
-    return attach

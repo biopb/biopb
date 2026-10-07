@@ -357,6 +357,9 @@ class NormalizingAdapter(TensorAdapter):
     def get_embedded_labels(self) -> Dict[str, TensorAdapter]:
         return self._inner.get_embedded_labels()
 
+    def bind_attachments(self, index: Dict[str, TensorAdapter]) -> None:
+        self._inner.bind_attachments(index)
+
     def attach_tensor(self, field: str, adapter: TensorAdapter) -> None:
         self._inner.attach_tensor(field, adapter)
 

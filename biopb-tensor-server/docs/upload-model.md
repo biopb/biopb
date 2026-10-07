@@ -53,8 +53,7 @@ unless it names one.
 - **The id is fixed, which is the point.** A producer writes
   `zarr://scratch/@fields/<name>` without a round trip first -- nothing to
   mint, nothing for a client to remember, and nothing to adopt at boot. Its
-  tensors come back through the `on_register` hook that gives every source
-  its uploaded fields (`fields_attacher`).
+  tensors come back with the registry's boot scan like any source's.
 - **It keeps no directory of its own**, so there is nothing under
   `write_dir` naming it and nothing to sweep. `content_version` is None,
   the base's word for content this adapter does not serve; every member
@@ -110,13 +109,15 @@ segment and writes its sidecar -- no segment is open on a READY member.
 `<write_dir>/fields/<source_id>/<name>/` -- a member directory in either
 store format -- whatever kind the source is. One layout, because neither
 kind has anywhere of its own to put it: a discovered source's bytes are the
-user's, and the scratch source holds none. It is attached by the same
-`on_register` hook that attaches label sidecars, and listed after the
+user's, and the scratch source holds none. It is adopted by the registry's boot scan with the label sidecars, and listed after the
 format's own tensors (of which the scratch source has none).
 
-A field and a label set are both **attached tensors**: `SourceAdapter`
-holds one `field -> adapter` index (`_attached_tensors`), and `label_sets`,
-`label_uploads` and `attached_fields` are checked views over it --
+A field and a label set are both **attached tensors**. `SourceRegistry` owns
+one `field -> adapter` index per source id, scanned from disk once at boot and
+handed to every adapter registered under the id (`bind_attachments`), so an
+adapter rebuilt by a refresh serves the same tensors and an upload in flight
+keeps routing. `label_sets`, `label_uploads` and `attached_fields` are checked
+views over the adapter's reference to it --
 `label_sets` is the attached tensors whose field parses as a set, each
 checked against `label_binding_error`. A field differs from a label set in
 binding to nothing, decoding nothing, and mapping to no axes.

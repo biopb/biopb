@@ -28,8 +28,7 @@ What a set adds over a plain OME-Zarr image:
 Three ways a set reaches a parent: :func:`native_label_sets` for an image
 group's ``labels/`` (called from ``OmeZarrAdapter.get_embedded_labels``),
 :func:`sidecar_label_sets` for the finished stores under
-``<write_dir>/labels/<source_id>/``, which :func:`sidecar_attacher` runs at
-registration, and :func:`create_label_upload` for a set arriving over the wire.
+``<write_dir>/labels/<source_id>/``, which the server scans at boot, and :func:`create_label_upload` for a set arriving over the wire.
 The readers skip only what they cannot *open* -- a float dtype, an unreadable
 ``.zattrs`` -- with a warning; whether a set spans its image is checked once
 for every origin where the sets meet (``SourceAdapter.label_binding_error``,
@@ -43,7 +42,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 from biopb.tensor.descriptor_pb2 import PyramidLevel, TensorDescriptor
@@ -84,7 +83,6 @@ __all__ = [
     "labels_root",
     "native_label_sets",
     "open_label_set",
-    "sidecar_attacher",
     "sidecar_attrs",
     "sidecar_dir",
     "sidecar_label_sets",
@@ -277,7 +275,7 @@ def native_label_sets(
 def labels_root(write_dir: Path) -> Path:
     """Where every source's uploaded sets live: ``<write_dir>/labels/``.
 
-    The one definition of the sidecar layout: the attacher reads it, the
+    The one definition of the sidecar layout: the boot scan reads it, the
     upload kind writes under it, and the boot sweep globs it.
     """
     return write_dir / "labels"
@@ -503,19 +501,3 @@ def create_label_upload(
     adapter._upload_store_path = store
     adapter.begin_upload(desc.shape, grid, expires_at)
     return adapter
-
-
-def sidecar_attacher(labels_dir: Path) -> Callable[[str, Any], None]:
-    """The registry's ``on_register`` hook: attach a source's finished sidecars.
-
-    Runs at the one registration chokepoint, because a sidecar is keyed by
-    ``source_id`` and no format knows about it. The registry stays ignorant of
-    the layout; this module owns it. A sidecar that will not open costs the
-    set, never the source.
-    """
-
-    def attach(source_id: str, adapter: Any) -> None:
-        for field, label_set in sidecar_label_sets(source_id, labels_dir).items():
-            adapter.attach_tensor(field, label_set)
-
-    return attach

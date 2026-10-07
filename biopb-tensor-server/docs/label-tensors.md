@@ -89,7 +89,7 @@ discovery root, otherwise the label is listed twice under two ids.
 Sets are tensors *of the parent source*, not sources. `SourceAdapter` owns the
 concept via a hook: `get_embedded_labels()` that an adapter class overrides
 (`OmeZarrAdapter` reads its NGFF `labels/` group there); `attach_label_set`
-/ `detach_label_set` are what the registry's `on_register` hook (`sidecar_attacher`)
+/ `detach_label_set` are what the registry's boot scan (`SourceRegistry.adopt`)
 and the upload kind (at READY; discard) use.
 
 `label_uploads` is the second, smaller index: sets the upload path is still

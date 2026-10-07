@@ -715,13 +715,24 @@ class SourceAdapter(ABC):
         """The tensor attached at *field*, whatever its state, or None."""
         return (self._attached_tensors or {}).get(field)
 
+    def bind_attachments(self, index: Dict[str, TensorAdapter]) -> None:
+        """Serve the attachments in *index*, the registry's dict for this source.
+
+        The registry owns the dict and hands the same one to every adapter it
+        registers under the id, so attachments survive a rebuild. Tensors
+        attached before registration are carried into it.
+        """
+        for field, tensor in (self._attached_tensors or {}).items():
+            index.setdefault(field, tensor)
+        self._attached_tensors = index
+        self.attachment_changed()
+
     def attach_tensor(self, field: str, adapter: TensorAdapter) -> None:
         """Make *adapter* answer for *field* on this source.
 
-        Every kind arrives here: ``add_tensor`` attaches an upload the moment
-        it mints one -- that is what routes the tensor's own writes -- and the
-        registration hooks attach what an earlier life left on disk.
-        Handed over in its own axis order and checked when the source's tensors
+        For an adapter not on a registry; a registered source's tensors are
+        attached through :meth:`SourceRegistry.attach`, which lands in the same
+        dict. Handed over in its own axis order and checked when the source's tensors
         are next listed, not here: an unresolved source has no tensors to check
         a set against yet, and the upload kinds validate at create anyway.
 
@@ -2074,6 +2085,7 @@ _SOURCE_SCOPED_API = frozenset(
         "attach_tensor",
         "detach_tensor",
         "attachment_changed",
+        "bind_attachments",
         "label_binding_error",
         "label_image_descriptor",
         "resolve_tensor",

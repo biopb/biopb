@@ -78,12 +78,8 @@ from biopb_tensor_server.adapters._writable import (
     unsettable_state_message,
     upload_of,
 )
-from biopb_tensor_server.adapters.fields import (
-    fields_attacher,
-    fields_root,
-    upload_attacher,
-)
-from biopb_tensor_server.adapters.labels import labels_root, sidecar_attacher
+from biopb_tensor_server.adapters.fields import fields_root, scan_source_fields
+from biopb_tensor_server.adapters.labels import labels_root, sidecar_label_sets
 from biopb_tensor_server.adapters.scratch import DEFAULT_SCRATCH_TTL
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.core.adapter_base import (
@@ -232,15 +228,35 @@ def _adapter_lookup_error(exc: Exception, miss_context: str) -> flight.FlightErr
 _RESOLVE_HEARTBEAT_SECONDS = 15.0
 
 
-def _upload_attacher(write_dir: Path):
-    """The registry's ``on_register`` hook over every layout the upload path owns.
+def _uploaded_tensors(write_dir: Path) -> Dict[str, Dict[str, TensorAdapter]]:
+    """The finished tensors the upload path left on disk, by source id.
 
-    Fields before sets, the order ``catalog_tensors`` lists them in.
+    Fields before sets, the order ``catalog_tensors`` lists them in. A source
+    whose tensors will not open costs those tensors, never the boot.
     """
-    return upload_attacher(
-        fields_attacher(fields_root(write_dir)),
-        sidecar_attacher(labels_root(write_dir)),
+    fields, labels = fields_root(write_dir), labels_root(write_dir)
+    source_ids = sorted(
+        {
+            d.name
+            for root in (fields, labels)
+            if root.is_dir()
+            for d in root.iterdir()
+            if d.is_dir()
+        }
     )
+    index: Dict[str, Dict[str, TensorAdapter]] = {}
+    for source_id in source_ids:
+        try:
+            found = {
+                **scan_source_fields(source_id, fields),
+                **sidecar_label_sets(source_id, labels),
+            }
+        except Exception:
+            logger.warning(f"scanning uploads of {source_id} failed", exc_info=True)
+            continue
+        if found:
+            index[source_id] = found
+    return index
 
 
 class _AuthMiddleware(flight.ServerMiddleware):
@@ -494,14 +510,9 @@ class TensorFlightServer(flight.FlightServerBase):
         # that dialed us (biopb/biopb#1158). None means advertise nothing.
         self._external_location: Optional[str] = external_location or None
 
-        # The source registry is the single chokepoint for adapter lifecycle.
-        # Sever with a write_dir set gets an on_register hook for attaching
-        # sidecar data.
-        self.sources = SourceRegistry(
-            on_register=_upload_attacher(Path(write_dir))
-            if write_dir is not None
-            else None
-        )
+        # The source registry is the single chokepoint for adapter lifecycle
+        # and owns the tensors attached to sources (adopted at boot, below).
+        self.sources = SourceRegistry()
 
         # The catalog, or None for a catalog-less server.
         self._metadata_db: Optional[MetadataDatabase] = metadata_db
@@ -521,6 +532,8 @@ class TensorFlightServer(flight.FlightServerBase):
             self.sources, write_dir, self._metadata_db, ttl=upload_ttl
         )
         self.uploads.discard_unfinished_stores()
+        if write_dir is not None:
+            self.sources.adopt(_uploaded_tensors(Path(write_dir)))
         self.uploads.install_scratch(scratch_ttl if scratch_ttl > 0 else None)
         self.uploads.start_sweep()
 

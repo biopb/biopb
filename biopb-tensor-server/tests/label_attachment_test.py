@@ -18,9 +18,9 @@ import zarr
 from biopb_tensor_server.adapters.labels import (
     LabelSetAdapter,
     open_label_set,
-    sidecar_attacher,
     sidecar_attrs,
     sidecar_dir,
+    sidecar_label_sets,
 )
 from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
 from biopb_tensor_server.adapters.zarr import UPLOAD_PENDING, with_upload_state
@@ -37,7 +37,7 @@ from biopb_tensor_server.core.normalize import NormalizingAdapter
 from biopb_tensor_server.core.source_registry import SourceRegistry
 from biopb_tensor_server.fixtures import create_multiresolution_ome_zarr
 
-from tests import register_and_catalog
+from tests import catalog_server, register_and_catalog
 
 SHAPE = (64, 64)
 CHUNK = (32, 32)
@@ -332,6 +332,13 @@ def _sidecar(
     )
 
 
+def _adopting(labels_dir):
+    """A registry that took the finished sidecars of ``oz1`` at boot."""
+    registry = SourceRegistry()
+    registry.adopt({"oz1": sidecar_label_sets("oz1", labels_dir)})
+    return registry
+
+
 class TestASidecarIsAttachedAtRegistration:
     def test_a_ready_sidecar_is_a_set_a_pending_one_is_not(self, image, tmp_path):
         labels_dir = tmp_path / "labels"
@@ -339,9 +346,7 @@ class TestASidecarIsAttachedAtRegistration:
         _sidecar(labels_dir, "oz1", "half", state=UPLOAD_PENDING)
         _sidecar(labels_dir, "other", "theirs")
 
-        adapter = SourceRegistry(on_register=sidecar_attacher(labels_dir)).register(
-            "oz1", _adapter(image)
-        )
+        adapter = _adopting(labels_dir).register("oz1", _adapter(image))
 
         assert set(adapter.label_sets) == NATIVE | {"@labels/mine"}
         mine = adapter.resolve_tensor("oz1/@labels/mine")
@@ -356,9 +361,7 @@ class TestASidecarIsAttachedAtRegistration:
         _sidecar(labels_dir, "oz1", "orphan", image_field="Image:9")
         _sidecar(labels_dir, "oz1", "fits")
 
-        adapter = SourceRegistry(on_register=sidecar_attacher(labels_dir)).register(
-            "oz1", _adapter(image)
-        )
+        adapter = _adopting(labels_dir).register("oz1", _adapter(image))
 
         assert set(adapter.label_sets) == NATIVE | {"@labels/fits"}
 
@@ -369,12 +372,10 @@ class TestASidecarIsAttachedAtRegistration:
         del attrs["biopb"]["labels"]["content_version"]
         (group / ".zattrs").write_text(json.dumps(attrs))
 
-        adapter = SourceRegistry(on_register=sidecar_attacher(labels_dir)).register(
-            "oz1", _adapter(image)
-        )
+        adapter = _adopting(labels_dir).register("oz1", _adapter(image))
         assert "@labels/untokened" not in adapter.label_sets
 
-    def test_no_hook_means_no_sidecars(self, image, tmp_path):
+    def test_nothing_adopted_means_no_sidecars(self, image, tmp_path):
         _sidecar(tmp_path / "labels", "oz1", "mine")
         adapter = SourceRegistry().register("oz1", _adapter(image))
         assert "@labels/mine" not in adapter.label_sets
@@ -391,11 +392,12 @@ class TestASidecarIsAttachedAtRegistration:
         with pytest.raises(TensorNotFound):
             registered.resolve_tensor("@labels/late")
 
-    def test_the_server_wires_its_write_dir(self, writable_server, image, tmp_path):
+    def test_the_server_adopts_its_write_dir_at_boot(self, image, tmp_path):
         _sidecar(tmp_path / "labels", "oz1", "mine")
-        register_and_catalog(writable_server, "oz1", _adapter(image))
+        server = catalog_server("localhost:0", writable=True, write_dir=tmp_path)
+        register_and_catalog(server, "oz1", _adapter(image))
         ids = (
-            writable_server.metadata_db.query(
+            server.metadata_db.query(
                 "SELECT t.array_id FROM sources, UNNEST(tensors) AS u(t)"
             )
             .column(0)

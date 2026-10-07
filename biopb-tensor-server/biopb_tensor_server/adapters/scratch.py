@@ -5,8 +5,8 @@ The id is fixed (:data:`SCRATCH_SOURCE_ID`), so there is no container to mint
 and nothing to remember between runs.
 
 It owns no directory. Its tensors are uploaded fields under
-``<write_dir>/fields/scratch/``, re-attached at boot by
-``fields.fields_attacher`` like any other source's, and an empty scratch source
+``<write_dir>/fields/scratch/``, adopted at boot by the
+registry's scan like any other source's, and an empty scratch source
 is simply one between uploads -- never reclaimed. What it does own is
 :attr:`~ScratchSource.max_upload_ttl`, the cap that keeps a temp store from
 accumulating forever.
