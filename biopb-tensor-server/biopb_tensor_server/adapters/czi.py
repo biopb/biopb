@@ -503,7 +503,14 @@ class CziAdapter(TensorAdapter):
         sidesteps the reduction rather than swapping which one runs. This must
         not become the reason that route never lands (#799).
         """
-        factor = self._zoom_factor(bounds, scale_hint, reduction_method)
+        # The zoom read is positional in this adapter's own plane order; a
+        # document whose order is not canonical takes the default path, which
+        # reads through the permuting seam.
+        factor = (
+            None
+            if self._axis_perm() is not None
+            else self._zoom_factor(bounds, scale_hint, reduction_method)
+        )
         if factor is not None:
             try:
                 return self._read_planes(bounds, factor=factor)
