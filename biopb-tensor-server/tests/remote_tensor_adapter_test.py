@@ -549,12 +549,78 @@ class TestRemoteTensorProxy:
                 upstream.shutdown()
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-    def test_forward_flight_info_returns_none_when_upstream_unreachable(self, caplog):
-        """A **transport** failure (upstream unreachable) returns None so the
-        *server* falls back to its local planner. Categorized as an expected
-        operational condition: logged at DEBUG, never escalated to WARNING."""
-        import logging
+    def test_has_native_pyramid_follows_the_upstream(self, simple_zarr_array):
+        """True only when the upstream stores its levels: a computed upstream
+        pyramid is advertised too, and must not count."""
+        import tempfile
 
+        import zarr
+        from biopb_tensor_server import OmeZarrAdapter
+        from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+        from biopb_tensor_server.fixtures import create_multiresolution_ome_zarr
+
+        def proxy_of(upstream, sid):
+            return RemoteTensorAdapter(
+                source_id=f"hpc__{sid}",
+                upstream_location=f"grpc://localhost:{upstream.port}",
+                upstream_source_id=sid,
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            zpath, _, _ = create_multiresolution_ome_zarr(
+                tmp, n_levels=4, base_shape=(256, 256), chunk_size=(64, 64)
+            )
+            upstream = catalog_server("localhost:0")
+            register_and_catalog(
+                upstream,
+                "ome",
+                OmeZarrAdapter(zarr.open_group(zpath, mode="r")["0"], "ome"),
+            )
+            flat = self._upstream(simple_zarr_array[0])
+            _serve(upstream)
+            try:
+                assert proxy_of(upstream, "ome").has_native_pyramid() is True
+                assert proxy_of(flat, "img").has_native_pyramid() is False
+            finally:
+                upstream.shutdown()
+                flat.shutdown()
+
+    def test_has_native_pyramid_is_memoized_and_unreachable_is_false(self):
+        from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+
+        adapter = RemoteTensorAdapter(
+            source_id="hpc__aics",
+            upstream_location="grpc://localhost:1",  # nothing listening
+            upstream_source_id="aics",
+        )
+        assert adapter.has_native_pyramid() is False
+        assert adapter._native_pyramid_memo is None  # a failed probe is retried
+
+        calls = []
+
+        def probe(read_opt):
+            from types import SimpleNamespace
+
+            from biopb.tensor.descriptor_pb2 import PyramidLevel, TensorDescriptor
+
+            calls.append(read_opt)
+            desc = TensorDescriptor(array_id="aics")
+            desc.pyramid.append(PyramidLevel(native=True))
+            return SimpleNamespace(
+                descriptor=SimpleNamespace(command=desc.SerializeToString())
+            )
+
+        adapter._upstream_flight_info = probe
+        assert adapter.has_native_pyramid() is True
+        assert adapter.has_native_pyramid() is True
+        assert len(calls) == 1
+        assert list(calls[0].fields.paths) == ["pyramid"]
+
+    @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
+    def test_unreachable_upstream_fails_flight_info(self):
+        """An unreachable upstream fails the open, like every other upstream
+        call: a locally planned answer would carry chunk_ids the proxy refuses."""
+        import pyarrow.flight as flight
         from biopb.tensor.descriptor_pb2 import TensorReadOption
         from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
 
@@ -576,27 +642,16 @@ class TestRemoteTensorProxy:
             metadata={},
             is_resolved=True,
         )
-        with caplog.at_level(
-            logging.DEBUG, logger="biopb_tensor_server.adapters.remote_tensor"
-        ):
-            plan = adapter.forward_flight_info(TensorReadOption(array_id="hpc__aics"))
-        assert plan is None
-        recs = [r for r in caplog.records if r.name.endswith("remote_tensor")]
-        assert any("RPC failed" in r.getMessage() for r in recs)
-        # a transport error is expected -- it must NOT be raised to WARNING
-        assert not any(r.levelno >= logging.WARNING for r in recs)
+        with pytest.raises(flight.FlightError):
+            adapter.plan_flight_info(TensorReadOption(array_id="hpc__aics"), None)
 
     @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-    def test_forward_flight_info_returns_none_on_unparseable_upstream_endpoint(
-        self, caplog
-    ):
-        """A **logic** failure (a response received but not localizable) returns
-        None so the server falls back -- but, unlike a transport error, it is
-        unexpected and logged at WARNING so the fallback never silently masks a
-        protocol mismatch or a proxy bug."""
-        import logging
+    def test_forward_flight_info_raises_on_unparseable_upstream_endpoint(self):
+        """A response that arrives but cannot be localized is an internal error,
+        not a silent fallback."""
         from types import SimpleNamespace
 
+        import pyarrow.flight as flight
         from biopb.tensor.descriptor_pb2 import TensorReadOption
         from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
 
@@ -627,16 +682,8 @@ class TestRemoteTensorProxy:
         )
         adapter._upstream_flight_info = lambda read_opt: fake_info
 
-        with caplog.at_level(
-            logging.DEBUG, logger="biopb_tensor_server.adapters.remote_tensor"
-        ):
-            plan = adapter.forward_flight_info(TensorReadOption(array_id="hpc__aics"))
-        assert plan is None
-        recs = [r for r in caplog.records if r.name.endswith("remote_tensor")]
-        assert any(
-            r.levelno == logging.WARNING and "could not be localized" in r.getMessage()
-            for r in recs
-        )
+        with pytest.raises(flight.FlightInternalError, match="could not be localized"):
+            adapter.forward_flight_info(TensorReadOption(array_id="hpc__aics"))
 
     def test_scaled_read_downsamples_via_upstream(self, simple_zarr_array):
         from biopb.tensor import TensorFlightClient
@@ -1273,10 +1320,9 @@ def test_server_get_flight_info_uses_proxy_forward():
 
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-def test_server_get_flight_info_falls_back_when_proxy_forward_none(simple_zarr_array):
-    """When a proxy's forward_flight_info returns None (upstream unreachable /
-    unparseable), server.get_flight_info falls through to the local planner and
-    still returns a best-effort plan -- the branch degrades, it does not raise."""
+def test_server_get_flight_info_fails_when_upstream_is_gone(simple_zarr_array):
+    """With the upstream gone, the proxy's open fails instead of answering with
+    a local plan whose chunk_ids it would refuse to serve."""
     import zarr
     from biopb.tensor.descriptor_pb2 import FlightRequest, TensorReadOption
     from biopb_tensor_server import ZarrAdapter
@@ -1307,9 +1353,6 @@ def test_server_get_flight_info_falls_back_when_proxy_forward_none(simple_zarr_a
             metadata={},
             is_resolved=True,
         )
-        # Force the forward to yield nothing -> the server must use the local planner.
-        adapter.forward_flight_info = lambda read_opt: None
-
         proxy = catalog_server("localhost:0")
         register_and_catalog(proxy, "lab__img", adapter)
         _serve(proxy)
@@ -1320,8 +1363,9 @@ def test_server_get_flight_info_falls_back_when_proxy_forward_none(simple_zarr_a
                 ),
             )
             fd = flight.FlightDescriptor.for_command(cmd.SerializeToString())
-            info = proxy.get_flight_info(None, fd)  # must not raise
-            assert len(info.endpoints) >= 1  # local planner produced a plan
+            upstream.shutdown()
+            with pytest.raises(flight.FlightError):
+                proxy.get_flight_info(None, fd)
         finally:
             proxy.shutdown()
     finally:

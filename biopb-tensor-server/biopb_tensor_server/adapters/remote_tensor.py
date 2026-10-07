@@ -63,6 +63,7 @@ from biopb.tensor.descriptor_pb2 import (
     TensorReadOption,
 )
 from biopb.tensor.ticket_pb2 import ChunkBounds, TensorTicket
+from google.protobuf.field_mask_pb2 import FieldMask
 
 from biopb_tensor_server.adapters.scratch import SCRATCH_SOURCE_ID
 from biopb_tensor_server.core.adapter_base import (
@@ -83,7 +84,7 @@ from biopb_tensor_server.core.chunk import (
 )
 from biopb_tensor_server.core.chunk_batch import unpack_chunk_array
 from biopb_tensor_server.core.errors import StaleChunkError, UpstreamConfigError
-from biopb_tensor_server.core.read_mask import LOCAL_ONLY, read_mask
+from biopb_tensor_server.core.read_mask import LOCAL_ONLY, PYRAMID, read_mask
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import SourceConfig
@@ -513,6 +514,8 @@ class RemoteTensorAdapter(TensorAdapter):
         # Whether the upstream *source* has resolved (carried from the bulk row),
         # None until seeded. is_resolved() is its only reader (biopb/biopb#266).
         self._upstream_resolved: Optional[bool] = None
+        # ((array_id, content_version), native) for has_native_pyramid().
+        self._native_pyramid_memo: Optional[tuple] = None
 
     # ------------------------------------------------------------------ upstream
 
@@ -851,7 +854,7 @@ class RemoteTensorAdapter(TensorAdapter):
         return view
 
     def plan_flight_info(self, read_opt, pyramid_config):
-        """Forward the upstream's authoritative GetFlightInfo, else plan locally.
+        """Forward the upstream's authoritative GetFlightInfo.
 
         A caching proxy mirrors its upstream 1:1 and re-derives no chunk grid,
         pyramid, or physical scale of its own, so consult the upstream once
@@ -860,16 +863,11 @@ class RemoteTensorAdapter(TensorAdapter):
         server-advertised pyramid *when the request opted in* (``with_pyramid``,
         relayed to the upstream, biopb/biopb#563), and its physical scale (kept by
         ``_localize_forwarded_descriptor``; only ``metadata_json`` is stripped and
-        refilled locally from the mirror catalog). On an upstream failure the
-        forward returns ``None`` and we fall back to the base local planner --
-        never worse than a non-proxy adapter (biopb/biopb#295). On that fallback
-        the proxy advertises no physical scale of its own (inherited
-        ``_physical_scale`` default ``None``, exactly as before; tracked by
-        #266/#274).
+        refilled locally from the mirror catalog). An unreachable upstream fails
+        the call, as it does every other upstream read: a locally planned
+        answer would carry bare chunk_ids this proxy refuses to serve.
         """
         plan = self.forward_flight_info(read_opt)
-        if plan is None:
-            plan = super().plan_flight_info(read_opt, pyramid_config)
         self._require_canonical_upstream(plan.descriptor)
         return plan
 
@@ -880,9 +878,8 @@ class RemoteTensorAdapter(TensorAdapter):
         """Plan a read, refusing a non-canonical upstream first (#596).
 
         The other read boundary besides ``plan_flight_info``: the precache warms
-        through it, and the local-planner fallback routes through it. Checking
-        the request descriptor is free -- it is derived from the mirrored one the
-        caller already holds.
+        through it. Checking the request descriptor is free -- it is derived from
+        the mirrored one the caller already holds.
         """
         self._require_canonical_upstream(request_desc)
         return super().get_read_plan(request_desc)
@@ -939,12 +936,8 @@ class RemoteTensorAdapter(TensorAdapter):
         need to. ``plan_flight_info`` forwards the whole upstream
         ``GetFlightInfo`` (``forward_flight_info``), whose descriptor carries the
         upstream's authoritative grid, and that path never routes through here.
-        What is left is the local-planner fallback, which runs only when the
-        upstream is unreachable -- so a probe for the grid at that moment would
-        fail too. A seeded descriptor therefore reports the structure it has and
-        an empty grid, and the planner falls back to the whole tensor split under
-        the Arrow ceiling, exactly as the catalog surface falls back to an empty
-        tensor list.
+        A seeded descriptor therefore reports the structure it has and an empty
+        grid.
 
         Falls back to a live fetch when this tensor was not seeded (a
         single-source static remote, or a field absent from the seed); that IS an
@@ -967,9 +960,7 @@ class RemoteTensorAdapter(TensorAdapter):
         )
         return self._localize_descriptor(desc)
 
-    def forward_flight_info(
-        self, read_opt: TensorReadOption
-    ) -> Optional[TensorReadPlan]:
+    def forward_flight_info(self, read_opt: TensorReadOption) -> TensorReadPlan:
         """Forward a whole ``GetFlightInfo`` to the upstream and localize it.
 
         The server's ``get_flight_info`` calls this for a proxy tensor *instead*
@@ -991,32 +982,11 @@ class RemoteTensorAdapter(TensorAdapter):
         ``do_get`` on one forwards straight back upstream via
         ``resolve_chunk_data`` (the same array_id swap).
 
-        Returns ``None`` in either failure mode, so the caller falls back to the
-        local planner -- never worse than a non-proxy adapter. The two modes are
-        caught separately: a **transport** failure of the upstream RPC (unreachable
-        / UNAVAILABLE / timeout / auth / upstream-side error) is an expected
-        operational condition, logged at DEBUG; a **logic** failure localizing a
-        response we *did* receive (a too-old / unexpected upstream, a corrupt
-        payload, or a proxy bug) is unexpected and logged at WARNING, so the
-        fallback never silently masks it.
+        An unreachable upstream raises the transport ``FlightError``; a response
+        that cannot be localized (a too-old upstream, a corrupt payload, a proxy
+        bug) raises ``FlightInternalError``.
         """
-        # Transport step -- the upstream GetFlightInfo RPC. flight.FlightError
-        # covers every upstream/gRPC failure (unavailable, timeout, auth, and an
-        # upstream-side internal error); OSError covers a socket-level fault.
-        try:
-            info = self._upstream_flight_info(read_opt)
-        except (flight.FlightError, OSError) as exc:
-            logger.debug(
-                "upstream flight-info RPC failed for %s (%r); falling back to the "
-                "local read planner",
-                self.array_id,
-                exc,
-            )
-            return None
-
-        # Logic step -- localize the response. A failure here is not a transport
-        # problem, so surface it (WARNING) rather than letting the fallback hide a
-        # protocol mismatch or a proxy bug.
+        info = self._upstream_flight_info(read_opt)
         try:
             up_desc = TensorDescriptor.FromString(info.descriptor.command)
             endpoints = []
@@ -1031,8 +1001,8 @@ class RemoteTensorAdapter(TensorAdapter):
                 # array_id (not self.array_id -- a sibling-field chunk keeps its own)
                 # only to build the LOCAL route, so the server dispatches a later
                 # do_get back to the right local tensor view. The upstream's
-                # The upstream's content_version rides the envelope, so the
-                # proxy cache namespaces by upstream content.
+                # content_version rides the envelope, so the proxy cache
+                # namespaces by upstream content.
                 upstream_aid = array_id_from_chunk_id(ticket.chunk_id)
                 local_chunk_id = encode_proxy_envelope(
                     ticket.chunk_id,
@@ -1045,14 +1015,42 @@ class RemoteTensorAdapter(TensorAdapter):
                 chunk_endpoints=endpoints,
             )
         except Exception as exc:
-            logger.warning(
-                "upstream flight-info response for %s could not be localized (%r); "
-                "falling back to the local read planner",
-                self.array_id,
-                exc,
-                exc_info=True,
+            raise flight.FlightInternalError(
+                f"upstream flight-info response for {self.array_id} could not be "
+                f"localized: {exc!r}"
+            ) from exc
+
+    def has_native_pyramid(self) -> bool:
+        """Whether the upstream serves this tensor from stored pyramid levels.
+
+        Asked of the upstream (one ``GetFlightInfo`` carrying only the pyramid
+        path, no read plan) and memoized until the mirror re-syncs. An upstream
+        advertises a pyramid even when computed, so only a ``native`` level
+        counts. An unreachable upstream answers False, unmemoized.
+
+        ``get_native_pyramid_levels`` stays ``None``: the proxy stores no
+        levels, and the levels it advertises come from the forwarded upstream
+        plan.
+        """
+        key = (self.array_id, self.content_version)
+        memo = self._native_pyramid_memo
+        if memo is not None and memo[0] == key:
+            return memo[1]
+        try:
+            info = self._upstream_flight_info(
+                TensorReadOption(
+                    array_id=self.array_id, fields=FieldMask(paths=[PYRAMID])
+                )
             )
-            return None
+        except (flight.FlightError, OSError) as exc:
+            logger.debug(
+                "upstream pyramid probe failed for %s (%r)", self.array_id, exc
+            )
+            return False
+        desc = TensorDescriptor.FromString(info.descriptor.command)
+        native = any(level.native for level in desc.pyramid)
+        self._native_pyramid_memo = (key, native)
+        return native
 
     def _upstream_flight_info(self, read_opt: TensorReadOption):
         """One ``GetFlightInfo`` to the upstream for this tensor, hints forwarded.
