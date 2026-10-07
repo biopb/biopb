@@ -45,10 +45,10 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
-from biopb import _algorithms
 from biopb._config import locations as _locations
 from biopb._lifecycle import winjob as _winjob
 
+from . import _registry
 from ._supervisor import (
     _BACKOFF_SCHEDULE,
     _HEALTHY_RESET_SECONDS,
@@ -435,7 +435,7 @@ class ScriptEntry(ServiceProcess):
             )
             oplist = cached["oplist"] if current else {}
             running = state in ("up", "starting") and self._proc is not None
-            return _algorithms.row(
+            return _registry.row(
                 {"name": self.name, "kind": "script", "url": None},
                 url=f"grpc://127.0.0.1:{self._port}" if running else None,
                 state=state,
@@ -477,7 +477,7 @@ class AlgorithmPlane:
     def _entries(self) -> list[dict]:
         """The registry now, with the script entries' supervisors kept in step:
         a new file gets one, and a removed file's server is stopped."""
-        listed = _algorithms.entries(self._directory)
+        listed = _registry.entries(self._directory)
         state_dir = self._state_dir or _locations.algorithms_state_dir()
         gone = []
         with self._lock:
@@ -508,18 +508,16 @@ class AlgorithmPlane:
 
     def _row(self, entry: dict, *, probe: bool, timeout: float) -> dict:
         if entry["error"]:
-            return _algorithms.row(entry, state="invalid")
+            return _registry.row(entry, state="invalid")
         if entry["kind"] == "script":
             with self._lock:
                 script = self._scripts.get(entry["name"])
             if script is not None:
                 return script.row()
-            return _algorithms.row(entry, state="new")
+            return _registry.row(entry, state="new")
         if not probe:
-            return _algorithms.row(entry)
-        return _algorithms.row(
-            entry, **_algorithms.probe(entry["url"], timeout=timeout)
-        )
+            return _registry.row(entry)
+        return _registry.row(entry, **_registry.probe(entry["url"], timeout=timeout))
 
     def rows(
         self,
@@ -535,7 +533,7 @@ class AlgorithmPlane:
         """
         if entries is None:
             entries = self._entries()
-        return _algorithms.sweep(
+        return _registry.sweep(
             entries, lambda e: self._row(e, probe=probe, timeout=timeout)
         )
 

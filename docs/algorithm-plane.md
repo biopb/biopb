@@ -8,7 +8,7 @@ control or by someone else.
 |---|---|
 | the protocol | `proto/biopb/image/rpc_ops.proto` |
 | `op` / `serve`, the server side | `biopb-image-runtime` (`biopb_image_base.ops`), a wheel on PyPI and a Docker base image |
-| the registry and the probe | `biopb._algorithms` (core SDK) |
+| the registry and the probe | `biopb_control._registry` (biopb-control) |
 | supervision and `/api/algorithms` | `biopb-control` (`_algorithm_plane.py`, `_control.py`) |
 | clients | `biopb.algorithms()`, the kernel's `ops` (biopb-mcp `_process_ops.py`), `biopb image`, the dashboard's algorithm card |
 

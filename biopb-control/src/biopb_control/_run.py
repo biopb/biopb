@@ -21,10 +21,10 @@ import threading
 from pathlib import Path
 from typing import Optional
 
-from biopb import _algorithms
 from biopb._control import _endpoints
 from biopb._security import credentials as _credentials
 
+from . import _registry
 from ._algorithm_plane import AlgorithmPlane
 from ._control import serve_control_api
 from ._supervisor import DataPlaneSpec, DataPlaneSupervisor
@@ -160,7 +160,7 @@ def run_control(
 
     # The algorithm servers the mcp config listed become url entries, once.
     try:
-        _algorithms.migrate_from_mcp_config()
+        _registry.migrate_from_mcp_config()
     except OSError as exc:
         logger.warning("could not migrate the algorithm servers: %s", exc)
 

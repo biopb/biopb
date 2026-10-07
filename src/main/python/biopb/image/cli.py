@@ -1,7 +1,6 @@
 """CLI client for algorithm servers (the ``biopb.image`` Ops protocol).
 
 Commands:
-    servers     List the algorithm servers the control knows, with their state
     ops         List the operations an algorithm server offers
     process     Run one operation on an image
 """
@@ -18,7 +17,6 @@ from google.protobuf import empty_pb2, json_format, struct_pb2
 from rich.console import Console
 from rich.table import Table
 
-from biopb import _algorithms
 from biopb.image import Arg, Call, ImageData, OpInfo, OpList, OpsStub
 from biopb.image._utils import (
     deserialize_image_data,
@@ -234,78 +232,6 @@ def _write_outputs(outputs, output: str, format: Literal["pb", "pickle"]) -> Non
             print(text if len(outputs) == 1 else f"{key}: {text}", file=stream)
         else:
             _write_tensor(arg, _output_path(output, key, len(tensors)), format)
-
-
-def _state_style(state: str) -> str:
-    """Rich colour for a probe state, so the table reads at a glance."""
-    return {
-        "up": "green",
-        "unreachable": "red",
-        "error": "red",
-        "invalid": "yellow",
-        "unknown": "yellow",
-    }.get(state, "white")
-
-
-@app.command(help="List the configured algorithm servers with a health probe.")
-def servers(
-    json_output: bool = typer.Option(
-        False, "--json", help="Emit machine-readable JSON instead of a table"
-    ),
-    timeout: float = typer.Option(
-        4.0, "--timeout", help="Per-server probe deadline in seconds"
-    ),
-) -> None:
-    """List the algorithm servers, as the control reports them.
-
-    The entries of ~/.config/biopb/algorithms/: a server file the control runs,
-    with its state, and a url entry, probed. With no control, the url entries
-    are probed from here. Read-only.
-
-    Examples:
-        biopb image servers
-        biopb image servers --json --timeout 2
-    """
-    from biopb import algorithms
-
-    rows = algorithms(timeout=timeout + 6)
-    if rows is None:
-        stderr_console.print(
-            "[yellow]No control answered:[/yellow] probing url entries only."
-        )
-        rows = _algorithms.statuses(timeout=timeout)
-
-    if json_output:
-        print(json.dumps({"servers": rows}))
-        raise typer.Exit(0)
-
-    if not rows:
-        stderr_console.print(
-            "[yellow]No algorithm servers configured.[/yellow] Add a server file "
-            'or a {"url": ...} file to [bold]~/.config/biopb/algorithms/[/bold].'
-        )
-        raise typer.Exit(0)
-
-    table = Table(title="Algorithm plane servers")
-    table.add_column("Name", style="cyan")
-    table.add_column("Server", style="cyan")
-    table.add_column("Scheme", style="blue")
-    table.add_column("State", style="green")
-    table.add_column("Ops", style="magenta")
-
-    for r in rows:
-        if r["state"] == "up":
-            ops_cell = ", ".join(o.get("name", "") for o in r["ops"]) or "-"
-        else:
-            ops_cell = r.get("error") or "-"
-        state = f"[{_state_style(r['state'])}]{r['state']}[/]"
-        table.add_row(r["name"], r["target"], r["scheme"], state, ops_cell)
-
-    console.print(table)
-    n_up = sum(1 for r in rows if r["state"] == "up")
-    stderr_console.print(
-        f"\n[green]Servers:[/green] {len(rows)}  [green]up:[/green] {n_up}"
-    )
 
 
 _SERVER_OPTION = typer.Option(

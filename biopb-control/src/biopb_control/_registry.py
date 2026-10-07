@@ -1,5 +1,8 @@
 """The algorithm registry, and a probe of a server of the ``Ops`` protocol.
 
+Owned by the control: it is the only process that reads the registry and
+probes servers. Clients ask it over HTTP (``biopb.algorithms``).
+
 The registry is a directory, ``~/.config/biopb/algorithms/``. Each file is one
 entry, named by its stem; a stem starting with ``_`` is skipped:
 
@@ -219,10 +222,9 @@ def probe(
     Never raises.
     """
     try:
+        import biopb.image as proto
         import grpc
         from google.protobuf import empty_pb2, json_format
-
-        import biopb.image as proto
     except ImportError as exc:  # pragma: no cover - grpc is a base dependency
         return _result("error", error=f"gRPC support unavailable: {exc}")
 
@@ -273,7 +275,7 @@ def probe(
 
 
 def row(entry: dict, **state) -> dict:
-    """One entry's row, as the control and ``biopb image servers`` list it:
+    """One entry's row, as the control and ``biopb algorithm list`` show it:
     ``{name, kind, url, target, scheme, state, ops, op_count, fingerprint,
     error}``. *state* supplies or overrides the live fields."""
     url = state.pop("url", None) or entry.get("url") or ""

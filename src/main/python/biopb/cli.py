@@ -1656,6 +1656,152 @@ def agents_unregister(
 app.add_typer(agents_app, name="agents")
 
 
+algorithm_app = typer.Typer(
+    name="algorithm",
+    help="List and manage the algorithm servers the control knows.",
+)
+
+_ALGORITHM_STATE_STYLE = {
+    "up": "green",
+    "installing": "yellow",
+    "starting": "yellow",
+    "new": "yellow",
+    "invalid": "yellow",
+    "unknown": "yellow",
+    "unreachable": "red",
+    "error": "red",
+}
+
+
+def _no_control() -> "typer.Exit":
+    console.print(
+        "[red]No control answered.[/red] Start it with [bold]biopb control start[/bold]."
+    )
+    return typer.Exit(1)
+
+
+def _algorithm_verb(call, *args, **kwargs):
+    """Run a control client verb, turning its errors into a message and exit 1."""
+    try:
+        return call(*args, **kwargs)
+    except (LookupError, ValueError, RuntimeError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+
+
+def _print_algorithm_rows(rows: list, json_output: bool) -> None:
+    if json_output:
+        print(json.dumps({"servers": rows}))
+        return
+    if not rows:
+        console.print(
+            "[yellow]No algorithm servers configured.[/yellow] Add a server file "
+            'or a {"url": ...} file to [bold]~/.config/biopb/algorithms/[/bold].'
+        )
+        return
+    table = Table(title="Algorithm servers")
+    table.add_column("Name", style="cyan")
+    table.add_column("Server", style="cyan")
+    table.add_column("Scheme", style="blue")
+    table.add_column("State")
+    table.add_column("Ops", style="magenta")
+    for r in rows:
+        if r["state"] == "up":
+            ops_cell = ", ".join(o.get("name", "") for o in r["ops"]) or "-"
+        else:
+            ops_cell = r.get("error") or "-"
+        style = _ALGORITHM_STATE_STYLE.get(r["state"], "white")
+        table.add_row(
+            r["name"],
+            r.get("target") or "-",
+            r.get("scheme") or "-",
+            f"[{style}]{r['state']}[/{style}]",
+            ops_cell,
+        )
+    console.print(table)
+
+
+@algorithm_app.command("list", help="List the algorithm servers with their state.")
+def algorithm_list(
+    json_output: bool = typer.Option(
+        False, "--json", help="Emit machine-readable JSON instead of a table"
+    ),
+    timeout: float = typer.Option(
+        4.0, "--timeout", help="Per-server probe deadline in seconds"
+    ),
+):
+    """List the entries of ~/.config/biopb/algorithms/ as the control reports
+    them: a server file the control runs, and a url entry it probes. Needs a
+    running control."""
+    from . import algorithms
+
+    # The control probes url entries under the same deadline before it answers.
+    rows = algorithms(timeout=timeout + 6)
+    if rows is None:
+        raise _no_control()
+    _print_algorithm_rows(rows, json_output)
+
+
+@algorithm_app.command("refresh", help="Re-read the registry and install new entries.")
+def algorithm_refresh(
+    json_output: bool = typer.Option(False, "--json", help="Emit JSON"),
+):
+    from . import refresh_algorithms
+
+    rows = refresh_algorithms()
+    if rows is None:
+        raise _no_control()
+    _print_algorithm_rows(rows, json_output)
+
+
+@algorithm_app.command(
+    "start", help="Bring a server file's server up, installing it first."
+)
+def algorithm_start(
+    name: str = typer.Argument(..., help="Registry entry name"),
+    timeout: float = typer.Option(600.0, "--timeout", help="Seconds to wait"),
+):
+    from . import ensure_algorithm
+
+    row = _algorithm_verb(ensure_algorithm, name, timeout=timeout)
+    _print_algorithm_rows([row], False)
+
+
+@algorithm_app.command("stop", help="Stop a server file's server.")
+def algorithm_stop(name: str = typer.Argument(..., help="Registry entry name")):
+    from . import stop_algorithm
+
+    row = _algorithm_verb(stop_algorithm, name)
+    _print_algorithm_rows([row], False)
+
+
+@algorithm_app.command(
+    "restart", help="Stop a server file's server and start it again."
+)
+def algorithm_restart(
+    name: str = typer.Argument(..., help="Registry entry name"),
+    timeout: float = typer.Option(600.0, "--timeout", help="Seconds to wait"),
+):
+    from . import restart_algorithm
+
+    row = _algorithm_verb(restart_algorithm, name, timeout=timeout)
+    _print_algorithm_rows([row], False)
+
+
+@algorithm_app.command("logs", help="Show the tail of a server file's log.")
+def algorithm_logs_cmd(
+    name: str = typer.Argument(..., help="Registry entry name"),
+    lines: int = typer.Option(200, "--lines", "-n", help="Lines to show"),
+):
+    from . import algorithm_logs
+
+    for line in _algorithm_verb(algorithm_logs, name, lines=lines):
+        print(line)
+
+
+app.add_typer(algorithm_app, name="algorithm")
+
+
 # ---------------------------------------------------------------------------
 # skip-windows-defender: Defender exclusion for the biopb install
 # ---------------------------------------------------------------------------
