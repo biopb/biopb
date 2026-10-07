@@ -179,7 +179,7 @@ def test_expiry_warning_is_advisory_not_fatal():
 
 def test_cert_init_reports_an_expired_cert_it_reuses(monkeypatch):
     """The one command an operator runs to inspect the cert has to say it is dead."""
-    from biopb._locations import tls_server_cert, tls_server_key
+    from biopb._config.locations import tls_server_cert, tls_server_key
     from biopb_tensor_server.cli import app
     from biopb_tensor_server.serving.tls import generate_self_signed_cert
 
@@ -276,7 +276,7 @@ def test_cert_init_san_requires_force_to_widen():
 
 
 def test_ensure_server_cert_generates_then_reuses():
-    from biopb._locations import tls_server_cert, tls_server_key
+    from biopb._config.locations import tls_server_cert, tls_server_key
     from biopb_tensor_server.serving.tls import ensure_server_cert
 
     assert not tls_server_cert().exists()
@@ -389,7 +389,7 @@ def test_byo_material_is_validated_by_opening_it(tmp_path):
 
 def test_cert_init_generates_and_prints_fingerprint():
     """The full digest is printed, colon-grouped and unwrapped (copy-pasteable)."""
-    from biopb._locations import tls_server_cert
+    from biopb._config.locations import tls_server_cert
     from biopb_tensor_server.cli import app
     from biopb_tensor_server.serving.tls import cert_fingerprint, format_fingerprint
 
@@ -401,7 +401,7 @@ def test_cert_init_generates_and_prints_fingerprint():
 
 
 def test_cert_init_idempotent_without_force():
-    from biopb._locations import tls_server_cert
+    from biopb._config.locations import tls_server_cert
     from biopb_tensor_server.cli import app
 
     runner = CliRunner()
@@ -414,7 +414,7 @@ def test_cert_init_idempotent_without_force():
 
 
 def test_cert_init_force_rotates():
-    from biopb._locations import tls_server_cert
+    from biopb._config.locations import tls_server_cert
     from biopb_tensor_server.cli import app
 
     runner = CliRunner()
@@ -436,7 +436,7 @@ def test_cert_init_paths_survive_a_narrow_terminal(monkeypatch):
     A path split mid-component is unusable in the mount/scp/trust-config it gets
     pasted into, and the reader cannot tell a wrap from a real path.
     """
-    from biopb._locations import tls_server_cert, tls_server_key
+    from biopb._config.locations import tls_server_cert, tls_server_key
     from biopb_tensor_server.cli import app
 
     monkeypatch.setenv("COLUMNS", "60")
@@ -455,7 +455,7 @@ def test_cert_init_prints_a_bracketed_path_intact(tmp_path, monkeypatch):
     dir named `st[ate]dir` prints as `stdir` -- a *wrong* path, rendered as
     confidently as a right one.
     """
-    from biopb._locations import tls_server_cert
+    from biopb._config.locations import tls_server_cert
     from biopb_tensor_server.cli import app
 
     monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path / "st[ate]dir"))

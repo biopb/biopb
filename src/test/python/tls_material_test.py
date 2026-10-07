@@ -3,7 +3,7 @@
 Three entry points resolve the same ``--tls-cert`` / ``--tls-key`` pair and only
 the tensor server actually serves it, so a fault the two control entry points
 miss surfaces in a supervised child that crash-loops on backoff. The rule they
-share lives in :mod:`biopb._tls_material`; these are its cases.
+share lives in :mod:`biopb._security.tls_material`; these are its cases.
 
 ``is_file()`` is what this replaces, and the case that motivated it is the
 *normal* state of a private key: mode 0600, often owned by another user. It
@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from biopb._tls_material import (
+from biopb._security.tls_material import (
     TlsAnchor,
     TlsMaterialError,
     choose_anchor,

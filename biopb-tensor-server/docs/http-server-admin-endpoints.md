@@ -41,7 +41,7 @@ The server reads config **once at startup**, so applying a config change means a
 
 ## Same-origin guard
 
-`PUT /api/config` is the sidecar's first **mutating** surface (restart lives on the control, not here). Under local mode (no token) a page the user merely visits could fire a cross-origin `PUT` at the loopback sidecar — it can't read the response (CORS) but a state change doesn't need to. `_require_same_origin` delegates to the shared `biopb._web_auth.is_forgeable_cross_site(headers.get)` policy: a request carrying a token header is not forgeable; a browser that stamped `Sec-Fetch-Site` cross-site is the vector and is refused (`403`); a non-browser client (curl) sends neither and is allowed (a token-gated server still enforces `check_token` independently). This blocks drive-by browser CSRF even with no token, at zero storage cost.
+`PUT /api/config` is the sidecar's first **mutating** surface (restart lives on the control, not here). Under local mode (no token) a page the user merely visits could fire a cross-origin `PUT` at the loopback sidecar — it can't read the response (CORS) but a state change doesn't need to. `_require_same_origin` delegates to the shared `biopb._security.web_auth.is_forgeable_cross_site(headers.get)` policy: a request carrying a token header is not forgeable; a browser that stamped `Sec-Fetch-Site` cross-site is the vector and is refused (`403`); a non-browser client (curl) sends neither and is allowed (a token-gated server still enforces `check_token` independently). This blocks drive-by browser CSRF even with no token, at zero storage cost.
 
 ## The admin page
 

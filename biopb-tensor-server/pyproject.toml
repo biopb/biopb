@@ -25,13 +25,13 @@ classifiers = [
 ]
 dependencies = [
   # Floor: the server imports several stdlib-only primitives out of the SDK's
-  # private core -- _lifecycle.file_lock, _locations, the _config_* validators,
-  # and (since v0.10.0) _fs_detect. All are plain module imports at startup, so
+  # private core -- _lifecycle.file_lock, _config.locations, the _config validators,
+  # and (since v0.10.0) tensor._fs_detect. All are plain module imports at startup, so
   # an SDK below the floor is an ImportError, not a degraded path. This floor is
   # documentation for any non-workspace install path; a workspace install
   # resolves biopb from the tree.
   #
-  # v0.10.0 is the release that first ships _fs_detect; it is cut from the same
+  # v0.10.0 is the release that first ships tensor._fs_detect; it is cut from the same
   # commit that raises this floor, so the tag and the constraint cannot disagree.
   # Keep it that way: the SDK `v*` tag and the product `release-v*` tag must sit
   # on one commit, or the biopb wheel release.yaml bundles (and install.sh

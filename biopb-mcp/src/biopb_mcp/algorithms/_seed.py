@@ -33,7 +33,7 @@ def seed_algorithms(dest: Path | str | None = None) -> list[tuple[str, str]]:
     ``"exists"`` (left as the user has it). Creates the directory if needed.
     """
     if dest is None:
-        from biopb._locations import algorithms_dir
+        from biopb._config.locations import algorithms_dir
 
         dest = algorithms_dir()
     dest = Path(dest)

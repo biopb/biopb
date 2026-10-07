@@ -23,8 +23,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from . import _locations
-from ._lifecycle.proc import is_process_running, process_create_time
+from .._config import locations as _locations
+from .proc import is_process_running, process_create_time
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +34,7 @@ _SUFFIX = ".json"
 
 def sessions_dir() -> Path:
     """The registry directory (``BIOPB_SESSIONS_DIR`` override, else the biopb
-    state tree), created on access by :func:`biopb._locations.sessions_dir`."""
+    state tree), created on access by :func:`biopb._config.locations.sessions_dir`."""
     return _locations.sessions_dir()
 
 

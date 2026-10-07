@@ -140,8 +140,8 @@ def main(argv: list[str] | None = None) -> int:
     # possible, but only as the deliberate, named act of passing a public
     # `--control-host` (or BIOPB_CONTROL_HOST) -- e.g. behind an operator's own
     # TLS proxy.
-    from biopb import _web_auth
     from biopb._control._endpoints import control_host, control_port
+    from biopb._security import web_auth as _web_auth
 
     resolved_control_host = args.control_host or control_host()
 
@@ -179,7 +179,7 @@ def main(argv: list[str] | None = None) -> int:
     # supervised child on every spawn, crash-looping with the reason in
     # tensor-server.log (biopb/biopb#913). The shared rule opens each file rather
     # than stat'ing it -- a key readable only by root passes `is_file()`.
-    from biopb import _tls_material
+    from biopb._security import tls_material as _tls_material
 
     if (args.tls_cert is None) != (args.tls_key is None):
         print(

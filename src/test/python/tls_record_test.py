@@ -9,8 +9,8 @@ import json
 import os
 
 import pytest
-from biopb import _tls_record
-from biopb._locations import tls_served_certs
+from biopb._config.locations import tls_served_certs
+from biopb._security import tls_record as _tls_record
 
 
 @pytest.fixture(autouse=True)

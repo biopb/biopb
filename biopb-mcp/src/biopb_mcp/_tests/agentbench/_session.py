@@ -246,7 +246,8 @@ def _spawn_session(scratch: Path, timeout: float):
     environment, which is the point: the staged wheel, the tripwire and the
     redirected config all reach the session and its kernel through it.
     """
-    from biopb import _locations, _sessions
+    from biopb._config import locations as _locations
+    from biopb._lifecycle import sessions as _sessions
 
     token = secrets.token_hex(8)
     env = {**os.environ, _locations.MCP_LAUNCH_TOKEN_ENV: token}
@@ -285,7 +286,7 @@ def _spawn_session(scratch: Path, timeout: float):
 
 def _stop_session(proc, session_id: str) -> None:
     """End the session child and its kernel, and drop its record."""
-    from biopb import _sessions
+    from biopb._lifecycle import sessions as _sessions
 
     proc.terminate()  # the session's own SIGTERM handler reaps its kernel
     try:

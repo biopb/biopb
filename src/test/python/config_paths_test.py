@@ -1,4 +1,4 @@
-"""Unit tests for the XDG-aware path resolution in :mod:`biopb._locations`.
+"""Unit tests for the XDG-aware path resolution in :mod:`biopb._config.locations`.
 
 Pins the on-disk contract every biopb component (and both installers) must agree
 on: the three XDG base trees, the derived log/session/pid/sentinel paths, the
@@ -13,7 +13,7 @@ import pathlib
 import sys
 
 import pytest
-from biopb import _locations as L
+from biopb._config import locations as L
 
 
 @pytest.fixture(autouse=True)

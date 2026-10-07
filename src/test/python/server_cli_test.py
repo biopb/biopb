@@ -18,7 +18,7 @@ from unittest.mock import MagicMock, patch
 import biopb.cli as cli
 import pytest
 import typer
-from biopb import _locations
+from biopb._config import locations as _locations
 from biopb._lifecycle import daemon as _daemon
 from typer.testing import CliRunner
 

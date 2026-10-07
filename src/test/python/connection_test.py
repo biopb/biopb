@@ -19,7 +19,9 @@ def _isolated(monkeypatch):
     monkeypatch.delenv("BIOPB_TENSOR_TOKEN", raising=False)
     # A credential is ON DISK throughout, so the rule that it goes only to the
     # control's own address is tested against a file that exists.
-    monkeypatch.setattr("biopb._credentials.read_credential", lambda: "cred-tok")
+    monkeypatch.setattr(
+        "biopb._security.credentials.read_credential", lambda: "cred-tok"
+    )
     monkeypatch.setattr(_connection, "ensure_data_plane", lambda **_: None)
     monkeypatch.setattr(_connection.time, "sleep", lambda _s: None)
 
@@ -208,7 +210,7 @@ _FAKE_CERT = b"-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END CERTIFICATE-----\
 
 def _seed_cert(monkeypatch, tmp_path):
     monkeypatch.setenv("BIOPB_STATE_HOME", str(tmp_path / "state"))
-    from biopb._locations import tls_server_cert
+    from biopb._config.locations import tls_server_cert
 
     path = tls_server_cert()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -217,7 +219,7 @@ def _seed_cert(monkeypatch, tmp_path):
 
 
 def test_a_local_tls_plane_is_dialed_with_its_own_anchor(monkeypatch, tmp_path):
-    from biopb import _tls_material
+    from biopb._security import tls_material as _tls_material
 
     _seed_cert(monkeypatch, tmp_path)
     seen = {}

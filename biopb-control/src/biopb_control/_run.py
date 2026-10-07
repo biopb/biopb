@@ -21,8 +21,9 @@ import threading
 from pathlib import Path
 from typing import Optional
 
-from biopb import _algorithms, _credentials
+from biopb import _algorithms
 from biopb._control import _endpoints
+from biopb._security import credentials as _credentials
 
 from ._algorithm_plane import AlgorithmPlane
 from ._control import serve_control_api

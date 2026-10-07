@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
-from biopb import _locations
+from biopb._config import locations as _locations
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +37,7 @@ _UNSAFE_IN_A_NAME = re.compile(r"[^A-Za-z0-9_-]+")
 
 
 def registry_dir() -> Path:
-    """The registry directory; see :func:`biopb._locations.algorithms_dir`."""
+    """The registry directory; see :func:`biopb._config.locations.algorithms_dir`."""
     return _locations.algorithms_dir()
 
 

@@ -1,8 +1,8 @@
 """The one config-validation scheme every biopb package uses, in core ``biopb``.
 
 Both config-bearing packages describe their config as dataclasses plus a
-class-keyed ``_CONSTRAINTS`` table (see :mod:`biopb._config_constraints` for the
-``Range``/``Enum`` primitives and :mod:`biopb._config_schema` for the JSON-Schema
+class-keyed ``_CONSTRAINTS`` table (see :mod:`biopb._config.constraints` for the
+``Range``/``Enum`` primitives and :mod:`biopb._config.schema` for the JSON-Schema
 projection). This module is the third piece: **checking values against that
 table**, once, for everyone -- biopb-tensor-server's load path, biopb-mcp's load
 path, and the control plane's two admin config endpoints, which previously each

@@ -2,13 +2,13 @@
 
 Mirrors the tensor server's ``config_schema`` but for biopb-mcp's own (separate)
 config -- nothing merges; the two share only the *machinery*
-(:mod:`biopb._config_schema`). The flat section dataclasses in
+(:mod:`biopb._config.schema`). The flat section dataclasses in
 :mod:`biopb_mcp._config` and their ``_CONSTRAINTS`` table are the single source
 of truth; this re-projects them as a JSON Schema (Draft 2020-12) describing
 ``mcp-config.json``, so a config generator, editor autocomplete, and a
 schema-driven admin editor share one definition without drift.
 
-Scalar fields come from :func:`biopb._config_schema.dataclass_section`; the few
+Scalar fields come from :func:`biopb._config.schema.dataclass_section`; the few
 list-valued fields (grid tile vectors, the server/origin lists) are added here as
 the package-specific array parts, exactly as the tensor composer adds its
 ``sources`` / ``credentials`` arrays.
@@ -22,7 +22,7 @@ from __future__ import annotations
 import dataclasses
 from typing import Any, Dict, List, Optional
 
-from biopb._config_schema import dataclass_section, json_type
+from biopb._config.schema import dataclass_section, json_type
 
 from biopb_mcp._config import _CONSTRAINTS, McpConfig
 

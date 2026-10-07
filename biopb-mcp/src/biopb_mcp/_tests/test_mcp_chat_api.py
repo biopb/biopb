@@ -9,7 +9,7 @@ import asyncio
 import json
 
 import pytest
-from biopb._credentials import remove_credential, write_credential
+from biopb._security.credentials import remove_credential, write_credential
 from starlette.applications import Starlette
 from starlette.routing import Route
 from starlette.testclient import TestClient

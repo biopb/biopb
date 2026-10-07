@@ -38,8 +38,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from biopb import _tls_material
-from biopb._locations import tls_server_cert, tls_server_key
+from biopb._config.locations import tls_server_cert, tls_server_key
+from biopb._security import tls_material as _tls_material
 
 logger = logging.getLogger(__name__)
 

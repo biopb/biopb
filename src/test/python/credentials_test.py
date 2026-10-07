@@ -1,4 +1,4 @@
-"""Unit tests for the local data-plane credential handoff (:mod:`biopb._credentials`).
+"""Unit tests for the local data-plane credential handoff (:mod:`biopb._security.credentials`).
 
 Pins the contract the control (writer) and biopb-mcp (reader) share: where the
 credential lives, that a write is atomic and owner-restricted, and that the
@@ -15,7 +15,7 @@ import subprocess
 import sys
 
 import pytest
-from biopb import _credentials as C
+from biopb._security import credentials as C
 
 
 @pytest.fixture(autouse=True)

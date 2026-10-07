@@ -76,7 +76,7 @@ under `%LOCALAPPDATA%` is already owner-only by inherited ACL, and the mode
 check itself is POSIX-only.
 
 A root detected as `tmpfs`, a network mount, or a cloud-synced folder is
-refused outright (`biopb._fs_detect`, shared with the server's own `cache_dir`
+refused outright (`biopb.tensor._fs_detect`, shared with the server's own `cache_dir`
 demotion logic) — the read path degrades to the in-memory fallback like any
 other disk-cache failure. `/tmp` is excluded for the same reason: it is often
 `tmpfs`, which would turn "unbounded disk" into unevictable RAM.

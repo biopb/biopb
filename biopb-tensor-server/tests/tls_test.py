@@ -200,7 +200,7 @@ def test_sdk_client_tofu_roundtrip(simple_zarr_array, tmp_path, monkeypatch):
         got = client.get_tensor("img").compute()
         np.testing.assert_array_equal(got, arr[:])
         # The cert was actually pinned for this host:port.
-        from biopb._locations import tls_known_hosts
+        from biopb._config.locations import tls_known_hosts
 
         assert f"localhost:{server.port}" in tls_known_hosts().read_text()
         client.close()
@@ -341,7 +341,7 @@ def test_sidecar_reads_over_tls_without_pinning(
     would then break the sidecar whenever the cert is rotated.
     """
     import zarr
-    from biopb._locations import tls_known_hosts
+    from biopb._config.locations import tls_known_hosts
     from biopb_tensor_server import ZarrAdapter
     from biopb_tensor_server.serving.http_server import create_app
     from biopb_tensor_server.serving.tls import cert_fingerprint
@@ -391,7 +391,7 @@ def test_sidecar_reads_over_a_cert_that_does_not_name_loopback(
     instead of the PEM is what earns the hostname override that fixes it.
     """
     import zarr
-    from biopb._locations import tls_known_hosts
+    from biopb._config.locations import tls_known_hosts
     from biopb_tensor_server import ZarrAdapter
     from biopb_tensor_server.serving.http_server import create_app
     from biopb_tensor_server.serving.tls import cert_fingerprint
@@ -489,12 +489,8 @@ def test_a_local_sdk_client_reads_a_plane_serving_a_byo_cert(
     """
     import numpy as np
     import zarr
-    from biopb import (
-        LocalTrustError,
-        _tls_material,
-        _tls_record,
-        local_data_plane_fingerprint,
-    )
+    from biopb import LocalTrustError, local_data_plane_fingerprint
+    from biopb._security import tls_material as _tls_material, tls_record as _tls_record
     from biopb.tensor import TensorFlightClient
     from biopb_tensor_server import ZarrAdapter
 
@@ -530,7 +526,7 @@ def test_a_local_sdk_client_reads_a_plane_serving_a_byo_cert(
         np.testing.assert_array_equal(client.get_tensor("img").compute(), arr[:])
         client.close()
 
-        from biopb._locations import tls_known_hosts
+        from biopb._config.locations import tls_known_hosts
 
         assert not tls_known_hosts().exists(), "verified, not pinned"
     finally:

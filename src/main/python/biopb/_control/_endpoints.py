@@ -61,7 +61,7 @@ def _runtime_record() -> dict:
     ``os.environ``). Nowhere to look is just another way of having no record.
     """
     try:
-        from .._locations import control_runtime_file
+        from .._config.locations import control_runtime_file
 
         with open(control_runtime_file(), encoding="utf-8") as fh:
             rec = json.load(fh)
@@ -91,8 +91,8 @@ def write_runtime_record(
     platform has no cheap create-time -- readers degrade to liveness there, as
     they do for a legacy bare-pid file.
     """
+    from .._config.locations import control_runtime_file
     from .._lifecycle.proc import process_create_time
-    from .._locations import control_runtime_file
 
     path = control_runtime_file()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -123,7 +123,7 @@ def write_runtime_record(
 def remove_runtime_record() -> None:
     """Retract the published endpoint on a clean stop. Best-effort."""
     try:
-        from .._locations import control_runtime_file
+        from .._config.locations import control_runtime_file
 
         control_runtime_file().unlink()
     except (OSError, ImportError, RuntimeError):

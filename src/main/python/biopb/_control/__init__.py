@@ -7,8 +7,8 @@ monorepo. It implements a language-neutral contract, so a client in another
 language can do the same over plain HTTP. The algorithm plane is asked the
 same way: which servers there are, and to start or stop the ones it runs.
 
-It never starts a process and imports nothing beyond the standard library, so
-it can be imported where ``biopb.tensor`` (pyarrow) cannot.
+The client imports nothing beyond the standard library, so it can be imported
+where ``biopb.tensor`` (pyarrow) cannot.
 
 Private (leading underscore): its names are not meant to be reached at
 ``biopb._control.x``. The root package re-exports every name below directly
@@ -17,6 +17,9 @@ so that dotted path is never mistaken for ``biopb-control``, the separate
 control-plane server distribution this package is a client *of*.
 """
 
+# Not re-exported, and so not public: ``_launch`` (start the control for the
+# shim, the one place this package starts a process) and ``_agents`` (register
+# the shim with agent clients). The ``biopb`` CLI is their supported interface.
 from ._algorithms import (
     algorithm_logs,
     algorithms,

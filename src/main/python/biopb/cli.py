@@ -15,8 +15,9 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from . import _agents, _locations, _tls_material, _web_auth
-from ._control import _endpoints
+from ._config import locations as _locations
+from ._config.locations import find_config
+from ._control import _agents, _endpoints
 from ._control._endpoints import (
     flight_port_for as _flight_port,
     sidecar_port_for as _sidecar_port,
@@ -34,7 +35,7 @@ from ._lifecycle.proc import (
     is_process_running as _is_process_running,
     process_create_time as _process_create_time,
 )
-from ._locations import find_config
+from ._security import tls_material as _tls_material, web_auth as _web_auth
 
 console = Console()
 
@@ -341,7 +342,7 @@ def _plane_bind(grpc_bind: str, base_port: int) -> Tuple[str, int]:
     """The flight plane's bind: the address from ``--grpc-bind``, port from the base.
 
     Everything downstream (token required? TLS by default?) derives from this
-    address through :func:`biopb._web_auth.host_is_public_bind`.
+    address through :func:`biopb._security.web_auth.host_is_public_bind`.
     """
     return (grpc_bind, _flight_port(base_port))
 
@@ -635,7 +636,7 @@ def _control_endpoint() -> Tuple[str, int]:
     """Where to *find* a control: env override -> published record -> 8813.
 
     For commands that talk to a control someone else started; a non-default
-    ``--base-port`` is followed via ``biopb._locations.control_runtime_file``.
+    ``--base-port`` is followed via ``biopb._config.locations.control_runtime_file``.
     Never used to decide a *bind* (see :func:`_control_bind_endpoint`): a crashed
     control's stale record must not dictate where the next one listens.
     """
@@ -756,7 +757,7 @@ def _resolve_tls_material(
     Validated here for the same reason as :func:`_require_tls_extra` (otherwise
     the supervised child crash-loops under a clean-looking start). Each file is
     opened rather than stat'd, since an unreadable key passes ``is_file()``. The
-    rule is shared via :mod:`biopb._tls_material`.
+    rule is shared via :mod:`biopb._security.tls_material`.
     """
     if (tls_cert is None) != (tls_key is None):
         console.print("[red]--tls-cert and --tls-key must be given together.[/red]")
@@ -792,7 +793,7 @@ def _resolve_mode(grpc_bind: str, token: Optional[str]) -> Optional[str]:
     - **Public**: required -- supplied, else generated and printed.
 
     The control (browser UI) stays on loopback with either bind (plaintext HTTP).
-    Exposure is decided by :func:`biopb._web_auth.host_is_public_bind`, shared with
+    Exposure is decided by :func:`biopb._security.web_auth.host_is_public_bind`, shared with
     the tensor ``launch`` and the control's bind guard, so they cannot drift.
 
     Returns the token to enforce (``None`` only when none is supplied on a
@@ -1509,7 +1510,7 @@ def dashboard(
 # ---------------------------------------------------------------------------
 # biopb agents: register biopb-mcp with local AI agent clients
 # ---------------------------------------------------------------------------
-# Uses the stdlib-only catalog in biopb._agents, shared with the dashboard.
+# Uses the stdlib-only catalog in biopb._control._agents, shared with the dashboard.
 agents_app = typer.Typer(
     name="agents",
     help="Register biopb-mcp with local AI agent clients.",

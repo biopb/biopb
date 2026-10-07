@@ -32,7 +32,7 @@ X-Biopb-Token: <token>
 ```
 
 The check is timing-safe (`secrets.compare_digest`, via the shared
-`biopb._web_auth` policy the control plane also uses) and compares against
+`biopb._security.web_auth` policy the control plane also uses) and compares against
 the token the sidecar was launched with. A `None` token means no enforcement;
 a token present is enforced on every protected endpoint. There is no separate
 dev flag.

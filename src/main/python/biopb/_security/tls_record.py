@@ -19,7 +19,7 @@ import tempfile
 import time
 from typing import Dict, Optional
 
-from biopb._locations import tls_served_certs
+from biopb._config.locations import tls_served_certs
 
 logger = logging.getLogger(__name__)
 

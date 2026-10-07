@@ -46,7 +46,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
 
-from biopb import _locations
+from biopb._config import locations as _locations
 from biopb._lifecycle import deathwatch as _deathwatch, winjob as _winjob
 
 from biopb_control._rotating_log import RotatingLog, pump
@@ -711,7 +711,7 @@ class DataPlaneSupervisor(ServiceProcess):
     @staticmethod
     def _win_stop_sentinel() -> Path:
         # The one definition the tensor server's shutdown listener also binds to
-        # (biopb._locations.tensor_stop_sentinel), so writer and watcher
+        # (biopb._config.locations.tensor_stop_sentinel), so writer and watcher
         # cannot disagree — a single fixed name under the biopb state dir, not
         # keyed by PID.
         return _locations.tensor_stop_sentinel()

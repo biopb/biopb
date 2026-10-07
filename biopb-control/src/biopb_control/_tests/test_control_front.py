@@ -25,7 +25,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import pytest
-from biopb import _sessions
+from biopb._lifecycle import sessions as _sessions
 
 from biopb_control._control import (
     _SESSION_ALLOWED_ROOTS,
@@ -154,11 +154,11 @@ def _isolated_sessions(tmp_path, monkeypatch):
     monkeypatch.setenv("BIOPB_SESSIONS_DIR", str(tmp_path / "sessions"))
     # And the algorithm registry, so no test reads (or probes) the user's.
     monkeypatch.setattr(
-        "biopb._locations.algorithms_dir", lambda: tmp_path / "algorithms"
+        "biopb._config.locations.algorithms_dir", lambda: tmp_path / "algorithms"
     )
     state = tmp_path / "algorithm-state"
     state.mkdir(exist_ok=True)
-    monkeypatch.setattr("biopb._locations.algorithms_state_dir", lambda: state)
+    monkeypatch.setattr("biopb._config.locations.algorithms_state_dir", lambda: state)
 
 
 @pytest.fixture
@@ -799,7 +799,7 @@ def test_upstream_dies_mid_response_returns_502(tmp_path):
 # --------------------------------------------------------------------------- #
 # Agent-client registration API (/api/agents)
 # --------------------------------------------------------------------------- #
-# The endpoints are a thin front over biopb._agents; we stub that core so the
+# The endpoints are a thin front over biopb._control._agents; we stub that core so the
 # tests never touch the machine's real client configs, and assert the wiring:
 # GET lists, POST register/unregister pass the path id through and return the
 # fresh status, an AgentError is a 400, and the whole surface is token-gated.
@@ -821,7 +821,7 @@ def test_api_agents_lists_client_status(control, monkeypatch):
             "config_path": "/x/mcp.json",
         },
     ]
-    monkeypatch.setattr("biopb._agents.statuses", lambda: fake)
+    monkeypatch.setattr("biopb._control._agents.statuses", lambda: fake)
     status, _h, body = _get(f"{control}/api/agents")
     assert status == 200
     assert json.loads(body)["agents"] == fake
@@ -840,7 +840,7 @@ def test_agent_register_passes_id_and_returns_status(control, monkeypatch):
             "config_path": "/x/mcp.json",
         }
 
-    monkeypatch.setattr("biopb._agents.register", fake_register)
+    monkeypatch.setattr("biopb._control._agents.register", fake_register)
     status, _h, body = _post(f"{control}/api/agents/cursor/register")
     assert status == 200
     assert seen["id"] == "cursor"
@@ -849,7 +849,7 @@ def test_agent_register_passes_id_and_returns_status(control, monkeypatch):
 
 def test_agent_unregister_passes_id_and_returns_status(control, monkeypatch):
     monkeypatch.setattr(
-        "biopb._agents.unregister",
+        "biopb._control._agents.unregister",
         lambda agent_id: {
             "id": agent_id,
             "name": "Cursor",
@@ -864,19 +864,19 @@ def test_agent_unregister_passes_id_and_returns_status(control, monkeypatch):
 
 
 def test_agent_action_error_is_400(control, monkeypatch):
-    from biopb._agents import AgentError
+    from biopb._control._agents import AgentError
 
     def boom(agent_id):
         raise AgentError("unknown agent client 'nope'")
 
-    monkeypatch.setattr("biopb._agents.register", boom)
+    monkeypatch.setattr("biopb._control._agents.register", boom)
     with pytest.raises(urllib.error.HTTPError) as exc:
         _post(f"{control}/api/agents/nope/register")
     assert exc.value.code == 400
 
 
 def test_api_agents_is_token_gated(tokened_control, monkeypatch):
-    monkeypatch.setattr("biopb._agents.statuses", list)
+    monkeypatch.setattr("biopb._control._agents.statuses", list)
     # No token -> 401 (every /api/* route is gated).
     with pytest.raises(urllib.error.HTTPError) as exc:
         _get(f"{tokened_control}/api/agents")
@@ -1239,7 +1239,8 @@ def _registering_child_script(session_id: str) -> str:
     session would."""
     return (
         "import os, time;"
-        "from biopb import _locations, _sessions;"
+        "from biopb._config import locations as _locations;"
+        "from biopb._lifecycle import sessions as _sessions;"
         f"_sessions.register({session_id!r}, port=1234, pid=os.getpid(),"
         " launch_token=os.environ[_locations.MCP_LAUNCH_TOKEN_ENV]);"
         "time.sleep(30)"
@@ -1461,7 +1462,7 @@ def test_the_child_is_told_where_its_log_went(tmp_path, monkeypatch):
     # a viewer the control launched has no other way to know it -- its own
     # fallback would name the canonical mcp-server.log, which is not where its
     # output actually went.
-    from biopb import _locations
+    from biopb._config import locations as _locations
 
     from biopb_control import _control
 
@@ -1855,7 +1856,7 @@ def test_bare_prefix_with_no_trailing_slash_serves_the_shell(prefixed_control):
 
 
 def test_unprefixed_requests_still_work(prefixed_control):
-    # biopb._control_launch and the installer poll /health over loopback
+    # biopb._control._launch and the installer poll /health over loopback
     # with no prefix; configuring one for the portal must not break them.
     status, _headers, body = _get(f"{prefixed_control}/health")
     assert status == 200

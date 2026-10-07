@@ -55,8 +55,8 @@ from pathlib import Path
 from typing import Dict, NamedTuple, Optional, Sequence, Tuple
 from urllib.parse import urlsplit
 
-from biopb import _tls_material
-from biopb._locations import tls_known_hosts
+from biopb._config.locations import tls_known_hosts
+from biopb._security import tls_material as _tls_material
 
 logger = logging.getLogger(__name__)
 

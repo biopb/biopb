@@ -45,7 +45,8 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
-from biopb import _algorithms, _locations
+from biopb import _algorithms
+from biopb._config import locations as _locations
 from biopb._lifecycle import winjob as _winjob
 
 from ._supervisor import (

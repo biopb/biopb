@@ -63,7 +63,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import biopb.image as proto
 import grpc
 import numpy as np
-from biopb._web_auth import host_is_public_bind
+from biopb._security.web_auth import host_is_public_bind
 from biopb.image import (
     deserialize_image_data,
     normalize_array_dims,

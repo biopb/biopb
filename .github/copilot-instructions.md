@@ -75,7 +75,7 @@ tokenless by default, a public address *requires* a token and defaults TLS **on*
 `--grpc-bind 0.0.0.0`.
 
 The bind address *is* the mode, read once through
-`biopb._web_auth.host_is_public_bind` — shared by the core CLI, the control's
+`biopb._security.web_auth.host_is_public_bind` — shared by the core CLI, the control's
 bind guard, and the tensor `launch` — so "public + unauthenticated" is
 unrepresentable and the three cannot drift. There is no dev-mode token bypass.
 Only the flight plane is ever published: the control (browser UI) and the sidecar

@@ -156,7 +156,7 @@ so `--cache-dir` works in the Docker base image only.
 
 ## The registry
 
-`~/.config/biopb/algorithms/` (`biopb._locations.algorithms_dir()`), one file
+`~/.config/biopb/algorithms/` (`biopb._config.locations.algorithms_dir()`), one file
 per server, named by its stem; a stem starting with `_` is skipped.
 
 - **`<name>.py`, a script entry**: a server file. The control runs it with uv,

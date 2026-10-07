@@ -13,7 +13,7 @@ import threading
 from pathlib import Path
 from typing import BinaryIO, Optional
 
-from biopb import _locations
+from biopb._config import locations as _locations
 
 logger = logging.getLogger(__name__)
 

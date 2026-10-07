@@ -69,12 +69,12 @@ _cmd()  { printf "  ${CYAN}%s${RESET}\n" "$*"; }
 # BIOPB_DATA_HOME) and no longer reads XDG_* (biopb/biopb#790): an unrelated app
 # setting XDG_STATE_HOME used to relocate biopb's state tree along with its own.
 # A deployment that relocated via XDG would otherwise silently move back to the
-# default, so name the rename. Must stay in step with biopb._locations._tree and
+# default, so name the rename. Must stay in step with biopb._config.locations._tree and
 # biopb-engine.ps1's Get-BiopbTree, or installer and runtime disagree on paths.
 # A relative value resolves against each process's cwd, so the installer, the
 # control and the biopb-mcp shim would each place the tree somewhere different
 # (biopb/biopb#790). Refuse it here rather than install into one tree and have
-# the runtime read another. Mirrors biopb._locations._require_absolute.
+# the runtime read another. Mirrors biopb._config.locations._require_absolute.
 _require_absolute_trees() {
     local var val
     for var in BIOPB_CONFIG_HOME BIOPB_STATE_HOME BIOPB_DATA_HOME BIOPB_SESSIONS_DIR; do
@@ -470,7 +470,7 @@ EOF
     _ok "MCP definition written: $CONFIG_DIR/mcp.json"
 
     # Register with every detected client through the single source of truth:
-    # `biopb agents` (core biopb._agents), the same catalog + write logic the
+    # `biopb agents` (core biopb._control._agents), the same catalog + write logic the
     # control-plane dashboard uses. It resolves the absolute biopb-shim path and
     # writes each client's own config (Claude Code via its CLI, the rest via an
     # atomic JSON merge that preserves the user's other servers), so this installer
@@ -1173,7 +1173,7 @@ install_biopb() {
     # wants is the `release-v*` one, so the release fetch filters by this prefix
     # instead of using /releases/latest (which is repo-wide).
     RELEASE_TAG_PREFIX="release-v"
-    # On-disk trees follow XDG (matching biopb._locations): config in the
+    # On-disk trees follow XDG (matching biopb._config.locations): config in the
     # config tree, portable assets (webapp/samples) in the data tree, and logs /
     # pid / sentinels in the STATE tree. Honor the XDG env vars, defaulting to the
     # conventional dirs, so writer (installer) and reader (code) never disagree.

@@ -1,4 +1,4 @@
-"""Unit tests for ``biopb._agents`` — registering biopb-shim with agent clients.
+"""Unit tests for ``biopb._control._agents`` — registering biopb-shim with agent clients.
 
 Covers the three things the module does per client: a subprocess-free status read
 (not_installed / installed / registered + drift), an atomic JSON merge/delete that
@@ -12,7 +12,7 @@ import json
 from pathlib import Path
 
 import pytest
-from biopb import _agents
+from biopb._control import _agents
 
 _CMD = "/opt/biopb/bin/biopb-shim"
 

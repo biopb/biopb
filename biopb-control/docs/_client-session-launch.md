@@ -3,7 +3,7 @@
 Status: **proposed** — nothing implemented.
 
 The dashboard already knows which MCP clients are installed and whether biopb is
-registered with each (`/api/agents`, backed by `biopb._agents`). It stops there:
+registered with each (`/api/agents`, backed by `biopb._control._agents`). It stops there:
 the user still opens a terminal to actually talk to an agent. Three of the five
 clients can be driven from a browser, so the dashboard can start that session
 itself — one button, next to the registration state it already shows.

@@ -36,7 +36,7 @@ MCP_SESSION_LOG_ENV = "BIOPB_MCP_SESSION_LOG"
 # from the real interpreter's.
 MCP_LAUNCH_TOKEN_ENV = "BIOPB_MCP_LAUNCH_TOKEN"
 
-# The registry-record field the token is echoed into (biopb._sessions.register).
+# The registry-record field the token is echoed into (biopb._lifecycle.sessions.register).
 LAUNCH_TOKEN_FIELD = "launch_token"
 
 

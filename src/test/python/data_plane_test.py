@@ -233,7 +233,7 @@ class TestResolutionOrder:
         # launched plane's scheme, so it is asked of the socket instead. (A local
         # grpcs:// dial then has to identify what that plane serves, so seed the
         # minted cert it falls back to.)
-        from biopb._locations import tls_server_cert
+        from biopb._config.locations import tls_server_cert
 
         cert = tls_server_cert()
         cert.parent.mkdir(parents=True, exist_ok=True)
@@ -313,7 +313,7 @@ class TestTokenResolution:
     """
 
     def _write_credential(self, token):
-        from biopb._credentials import write_credential
+        from biopb._security.credentials import write_credential
 
         write_credential(token)
 
@@ -374,7 +374,7 @@ class TestTheCredentialFollowsTheAddress:
     """
 
     def _write_credential(self, token="file-token"):
-        from biopb._credentials import write_credential
+        from biopb._security.credentials import write_credential
 
         write_credential(token)
 
@@ -461,7 +461,7 @@ class TestLocalTrustAnchor:
     CERT = b"-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END CERTIFICATE-----\n"
 
     def _seed_cert(self, body=None):
-        from biopb._locations import tls_server_cert
+        from biopb._config.locations import tls_server_cert
 
         path = tls_server_cert()
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -470,7 +470,7 @@ class TestLocalTrustAnchor:
 
     @staticmethod
     def _digest(pem):
-        from biopb import _tls_material
+        from biopb._security import tls_material as _tls_material
 
         return _tls_material.fingerprint(_tls_material.leaf_pem(pem))
 
@@ -485,7 +485,7 @@ class TestLocalTrustAnchor:
 
     def test_a_published_record_names_the_certificate_actually_served(self):
         """The only source that knows about a --tls-cert: the plane says so."""
-        from biopb import _tls_record
+        from biopb._security import tls_record as _tls_record
 
         self._seed_cert()  # a minted cert that is NOT what the plane serves
         _tls_record.publish(8815, "deadbeef")
@@ -497,7 +497,7 @@ class TestLocalTrustAnchor:
     def test_the_record_is_keyed_by_port(self):
         """Nothing guarantees one plane per state tree: the cache lock that would
         is uid-scoped, optional, and absent for the memory backend."""
-        from biopb import _tls_record
+        from biopb._security import tls_record as _tls_record
 
         _tls_record.publish(8815, "aaaa")
         _tls_record.publish(9815, "bbbb")
@@ -509,7 +509,7 @@ class TestLocalTrustAnchor:
         )
 
     def test_a_retracted_record_falls_back_rather_than_lying(self):
-        from biopb import _tls_record
+        from biopb._security import tls_record as _tls_record
 
         self._seed_cert()
         _tls_record.publish(8815, "deadbeef")

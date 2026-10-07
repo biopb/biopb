@@ -1,9 +1,9 @@
 """Process-lifecycle primitives shared across biopb's subprocesses.
 
-Public: biopb-control, biopb-mcp, biopb-tensor-server, and biopb-image-base
-all depend on this directly, and biopb-control/biopb-mcp can't import each
-other -- so this stays in the dependency-light core SDK where all four can
-reach it, without hiding that dependency behind an underscore.
+Private (not a supported API): biopb-control, biopb-mcp, biopb-tensor-server,
+and biopb-image-base all import it directly, and biopb-control/biopb-mcp can't
+import each other -- so it stays in the dependency-light core SDK where all four
+can reach it.
 
 Two lifecycle patterns live here, plus the OS-level mechanics they share.
 
@@ -38,6 +38,9 @@ Shared by both patterns:
   a process lifetime (the tensor server's cache directory). Both put exclusion
   on an open descriptor, so a holder's death releases it with nothing left to
   reap -- which is why neither needs the pid-identity logic below.
+
+* :mod:`biopb._lifecycle.sessions` -- the filesystem registry of live MCP
+  sessions (``session id -> port + pid``), keyed on the same create-time token.
 
 The *keepalive* (restart-on-crash) loop is deliberately **not** here -- it is the
 supervisor's concern, layered on top of an owned child, and only the tensor

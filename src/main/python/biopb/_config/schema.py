@@ -11,12 +11,12 @@ description(help), constraint?, bounds…}`` by the exact same rules.
 
 That identical core lives here so neither package re-implements it (and
 biopb-mcp, which cannot import biopb-tensor-server -- not on PyPI -- reuses it
-the same way it already shares :mod:`biopb._config_constraints`). Each package
+the same way it already shares :mod:`biopb._config.constraints`). Each package
 keeps its own *composer* that calls :func:`dataclass_section` for its scalar
 sections and adds whatever bespoke array/alias parts it has.
 
-Deliberately stdlib-only, like the sibling :mod:`biopb._config_constraints` and
-:mod:`biopb._locations`: it duck-types the constraint objects
+Deliberately stdlib-only, like the sibling :mod:`biopb._config.constraints` and
+:mod:`biopb._config.locations`: it duck-types the constraint objects
 (``to_json_schema`` / ``describe``) and never imports the constraint classes, so
 it pulls in none of the heavy adapter/discovery machinery.
 """

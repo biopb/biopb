@@ -75,7 +75,7 @@ from dataclasses import MISSING as _DC_MISSING, dataclass, field, fields
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
-from biopb._config_constraints import (
+from biopb._config.constraints import (
     PYRAMID_CONSTRAINTS,
     Enum as _Enum,
     Range as _Range,
@@ -84,23 +84,23 @@ from biopb._config_constraints import (
 # The one validation scheme, shared with biopb-mcp and the control's admin
 # endpoints: check at the read step, warn and fall back to the default, stay
 # strict only where a human submitted the value (biopb/biopb#34).
-from biopb._config_io import atomic_write_json
-from biopb._config_validate import (
-    MISSING,
-    Problem,
-    check_sections,
-    warn_and_clamp,
-)
+from biopb._config.io import atomic_write_json
 
 # Config file location & format preference live in the core `biopb` package so
 # the umbrella CLI shares one definition (both depend on `biopb`). Re-exported
 # for back-compat (`biopb_tensor_server.core.config.find_config` and the name
-# constants). See biopb._locations for the JSON-canonical rationale
+# constants). See biopb._config.locations for the JSON-canonical rationale
 # (biopb/biopb#34).
-from biopb._locations import (
+from biopb._config.locations import (
     CANONICAL_CONFIG_NAME as CANONICAL_CONFIG_NAME,
     DEFAULT_CONFIG_DIR as DEFAULT_CONFIG_DIR,
     find_config as find_config,
+)
+from biopb._config.validate import (
+    MISSING,
+    Problem,
+    check_sections,
+    warn_and_clamp,
 )
 
 # The constraint primitives and the shared pyramid-knob bounds live in the core
@@ -154,12 +154,12 @@ DEFAULT_FILE_CACHE_DIR = _default_file_cache_dir()
 # <= 0 -> infinite loop in the precache worker; reduction_method="bogus" -> a
 # read-time ValueError; downscale_factor=1 -> a silently single-level pyramid.
 # The declarative fix is this table, checked at the read step (parse_config) by
-# the shared biopb._config_validate walker -- the same walker and the same policy
+# the shared biopb._config.validate walker -- the same walker and the same policy
 # biopb-mcp and the control's admin endpoints use, so a knob is judged identically
 # wherever it is met. The same table also feeds the JSON Schema emitter
 # (config_schema.py), so the constraints are declared exactly once.
 #
-# Policy: warn and use the default (never raise). See _config_validate's module
+# Policy: warn and use the default (never raise). See biopb._config.validate's module
 # docstring for why -- in short, this server is a control-plane child that is
 # restarted on crash with capped backoff, so refusing to load would turn one bad
 # number into a permanent restart loop whose real cause is buried in a log. The
@@ -188,7 +188,7 @@ _REDUCTION_METHODS = {
 # above the class definitions). full_rescan_interval is intentionally absent:
 # a value <= 0 *disables* the periodic full-scan backstop (documented sentinel).
 # `_Range`/`_Enum` and the pyramid rows (PYRAMID_CONSTRAINTS) come from
-# biopb._config_constraints so biopb-mcp validates the same knobs identically.
+# biopb._config.constraints so biopb-mcp validates the same knobs identically.
 _CONSTRAINTS = {
     "CacheConfig": {
         "file_max_segment_bytes": _Range(min=1),
@@ -308,7 +308,7 @@ def _dataclass_default(cls, key: str) -> Any:
 def _clamp_invalid(config: ServerConfig) -> None:
     """Warn about each violation and reset that field to its dataclass default.
 
-    The load-path policy (see :mod:`biopb._config_validate`): a bad knob must not
+    The load-path policy (see :mod:`biopb._config.validate`): a bad knob must not
     reach the request path, but must also not stop the server from coming up --
     it is supervised, and refusing would just be restarted into the same failure.
     Falling back to the *dataclass* default means "the default" is exactly what

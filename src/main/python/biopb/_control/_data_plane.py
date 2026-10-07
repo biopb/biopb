@@ -32,7 +32,7 @@ from dataclasses import dataclass
 from typing import Optional
 from urllib.parse import urlparse
 
-from .._tls_material import (
+from .._security.tls_material import (
     TlsAnchor,
     TlsMaterialError,
     choose_anchor,
@@ -140,7 +140,7 @@ def local_data_plane_fingerprint(url: str) -> Optional[str]:
 
     Two sources, in order:
 
-    - what the plane **published** for this port (:mod:`biopb._tls_record`),
+    - what the plane **published** for this port (:mod:`biopb._security.tls_record`),
       which is the only thing that knows about a ``--tls-cert`` the plane was
       handed;
     - failing that, the certificate the plane would have **minted**
@@ -161,8 +161,8 @@ def local_data_plane_fingerprint(url: str) -> Optional[str]:
     if not url.lower().startswith("grpcs://") or not is_local_url(url):
         return None
 
-    from .. import _tls_material, _tls_record
-    from .._locations import tls_served_certs, tls_server_cert
+    from .._config.locations import tls_served_certs, tls_server_cert
+    from .._security import tls_material as _tls_material, tls_record as _tls_record
 
     port = urlparse(url).port
     if port is not None:
@@ -381,6 +381,6 @@ def resolve_data_plane_token(
     if not allow_credential_file:
         return None
 
-    from .._credentials import read_credential
+    from .._security.credentials import read_credential
 
     return read_credential()

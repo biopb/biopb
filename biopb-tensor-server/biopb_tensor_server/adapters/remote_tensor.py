@@ -50,7 +50,7 @@ from urllib.parse import urlsplit
 import numpy as np
 import pyarrow as pa
 import pyarrow.flight as flight
-from biopb._tls_material import (
+from biopb._security.tls_material import (
     TlsMaterialError,
     choose_anchor,
     expand_user_path,

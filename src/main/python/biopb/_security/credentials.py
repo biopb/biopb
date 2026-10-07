@@ -16,7 +16,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from ._locations import state_dir
+from .._config.locations import state_dir
 
 logger = logging.getLogger(__name__)
 

@@ -60,8 +60,10 @@ from mcp.client.streamable_http import streamablehttp_client
 from mcp.server.lowlevel.server import NotificationOptions, Server, request_ctx
 from mcp.server.stdio import stdio_server
 
-from . import _control, _control_launch, _locations, _sessions
-from ._lifecycle import winjob as _winjob
+from . import _control
+from ._config import locations as _locations
+from ._control import _launch as _control_launch
+from ._lifecycle import sessions as _sessions, winjob as _winjob
 
 logger = logging.getLogger(__name__)
 

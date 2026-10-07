@@ -15,7 +15,7 @@ from biopb._control import _client
 def _isolated(monkeypatch):
     monkeypatch.delenv("BIOPB_TENSOR_URL", raising=False)
     monkeypatch.delenv("BIOPB_TENSOR_TOKEN", raising=False)
-    monkeypatch.setattr("biopb._credentials.read_credential", lambda: None)
+    monkeypatch.setattr("biopb._security.credentials.read_credential", lambda: None)
 
 
 def _serve(monkeypatch, payload, status=200):
@@ -47,12 +47,16 @@ def _refuse(monkeypatch):
 
 class TestFindDataPlane:
     def test_names_the_plane_and_its_credential(self, monkeypatch):
-        monkeypatch.setattr("biopb._credentials.read_credential", lambda: "cred")
+        monkeypatch.setattr(
+            "biopb._security.credentials.read_credential", lambda: "cred"
+        )
         _serve(monkeypatch, {"data_plane": {"grpc_url": "grpc://x:5"}})
         assert biopb.find_data_plane() == {"url": "grpc://x:5", "token": "cred"}
 
     def test_the_env_token_wins_over_the_file(self, monkeypatch):
-        monkeypatch.setattr("biopb._credentials.read_credential", lambda: "cred")
+        monkeypatch.setattr(
+            "biopb._security.credentials.read_credential", lambda: "cred"
+        )
         monkeypatch.setenv("BIOPB_TENSOR_TOKEN", "env")
         _serve(monkeypatch, {"data_plane": {"grpc_url": "grpc://x:5"}})
         assert biopb.find_data_plane()["token"] == "env"
@@ -68,7 +72,9 @@ class TestFindDataPlane:
 
 class TestEnsureDataPlane:
     def test_posts_with_the_token_header(self, monkeypatch):
-        monkeypatch.setattr("biopb._credentials.read_credential", lambda: "tok")
+        monkeypatch.setattr(
+            "biopb._security.credentials.read_credential", lambda: "tok"
+        )
         seen = _serve(monkeypatch, {"data_plane": {"grpc_url": "grpc://x:5"}})
 
         assert biopb.ensure_data_plane(timeout=5.0) == {

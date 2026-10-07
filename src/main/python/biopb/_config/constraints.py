@@ -14,7 +14,7 @@ silently breaks pyramid construction (``downscale_factor=1`` -> a single
 full-res level; ``pixel_budget_cubic_root<=0`` -> an infinite loop)
 (biopb/biopb#34, #182).
 
-Deliberately stdlib-only, like the sibling :mod:`biopb._locations`, so
+Deliberately stdlib-only, like the sibling :mod:`biopb._config.locations`, so
 importing it stays cheap and pulls in none of the heavy adapter/discovery
 machinery.
 """

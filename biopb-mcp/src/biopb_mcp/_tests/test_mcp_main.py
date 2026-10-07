@@ -447,7 +447,7 @@ _URL = "http://127.0.0.1:45678/mcp"
 
 class TestSessionRegistration:
     """Every session on a dynamic port publishes itself into the shared registry
-    the control reads (`biopb._sessions`). Without this a session is invisible:
+    the control reads (`biopb._lifecycle.sessions`). Without this a session is invisible:
     no dashboard entry, no observe page, no `/session/<id>/*` proxying."""
 
     @pytest.fixture(autouse=True)
@@ -455,7 +455,7 @@ class TestSessionRegistration:
         monkeypatch.setenv("BIOPB_SESSIONS_DIR", str(tmp_path / "sessions"))
 
     def test_registers_a_routable_record(self):
-        from biopb import _sessions
+        from biopb._lifecycle import sessions as _sessions
 
         session_id = _register_session(45678, _URL)
         assert session_id is not None
@@ -472,7 +472,7 @@ class TestSessionRegistration:
         # How the control recognises the viewer it just spawned. It cannot use
         # the pid it holds: behind a Windows trampoline (uv / pip console-script
         # launchers) that is the stub's, not ours (biopb#1084).
-        from biopb import _sessions
+        from biopb._lifecycle import sessions as _sessions
 
         rec = _sessions.read_session(
             _register_session(45678, _URL, launched_by="tok-abc123")
@@ -480,14 +480,14 @@ class TestSessionRegistration:
         assert rec["launch_token"] == "tok-abc123"
 
     def test_the_mode_is_recorded_on_the_record(self):
-        from biopb import _sessions
+        from biopb._lifecycle import sessions as _sessions
 
         rec = _sessions.read_session(_register_session(45678, _URL, mode="durable"))
         assert rec["mode"] == "durable"
         assert "mode" not in _sessions.read_session(_register_session(45678, _URL))
 
     def test_registered_session_is_listed_as_live(self):
-        from biopb import _sessions
+        from biopb._lifecycle import sessions as _sessions
 
         session_id = _register_session(45678, _URL)
         # Our own pid owns the record, so the liveness prune must keep it --
@@ -495,7 +495,7 @@ class TestSessionRegistration:
         assert session_id in [r["session_id"] for r in _sessions.list_sessions()]
 
     def test_unregister_removes_the_record(self):
-        from biopb import _sessions
+        from biopb._lifecycle import sessions as _sessions
 
         session_id = _register_session(45678, _URL)
         _unregister_session(session_id)
@@ -507,7 +507,7 @@ class TestSessionRegistration:
         _unregister_session(None)
 
     def test_publish_failure_costs_only_discoverability(self, monkeypatch):
-        from biopb import _sessions
+        from biopb._lifecycle import sessions as _sessions
 
         def _boom(*a, **k):
             raise OSError("read-only state dir")
@@ -517,7 +517,7 @@ class TestSessionRegistration:
         assert _register_session(45678, _URL) is None
 
     def test_unregister_failure_does_not_break_teardown(self, monkeypatch):
-        from biopb import _sessions
+        from biopb._lifecycle import sessions as _sessions
 
         def _boom(*a, **k):
             raise OSError("gone")

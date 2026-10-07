@@ -62,7 +62,7 @@ from typing import (
 
 import numpy as np
 import pyarrow.flight as flight
-from biopb import _web_auth
+from biopb._security import web_auth as _web_auth
 from biopb.image.annotation_pb2 import RoiAnnotation
 from biopb.tensor._catalog_rows import reasons_for, sql_literal
 from biopb.tensor._session import ResolveCancelled
@@ -427,7 +427,7 @@ class _SidecarContext:
     def check_token(self, request: Request) -> None:
         """Raise 401 if the request does not carry a valid token.
 
-        Delegates the token decision to the shared ``biopb._web_auth`` policy
+        Delegates the token decision to the shared ``biopb._security.web_auth`` policy
         (the single source the control uses too). A ``None`` token — local mode,
         where every listener is loopback-bound — is the "no token enforced" case,
         expressed as a falsy ``expected``.
@@ -601,7 +601,7 @@ def _require_same_origin(request: Request) -> None:
     user merely visits can fire a cross-origin ``POST``/``PUT`` at the
     loopback sidecar; it cannot read the response (CORS) but a state change
     does not need to. The CSRF decision lives in the shared
-    ``biopb._web_auth.is_forgeable_cross_site`` policy: a request carrying a
+    ``biopb._security.web_auth.is_forgeable_cross_site`` policy: a request carrying a
     token header is not forgeable, and a browser that stamped
     ``Sec-Fetch-Site`` cross-site is the vector; a non-browser client (curl)
     sends none and is allowed -- a token-gated server still enforces
@@ -3379,14 +3379,14 @@ def shutdown_sentinel_path() -> os.PathLike:
     """Path of the shutdown sentinel file the control supervisor writes (Windows).
 
     The one definition ``DataPlaneSupervisor._win_stop_sentinel`` also binds to
-    (both call ``biopb._locations.tensor_stop_sentinel``), so the writer and
+    (both call ``biopb._config.locations.tensor_stop_sentinel``), so the writer and
     this watcher cannot drift. A single fixed name in the user's biopb state dir -
     NOT keyed by PID: on Windows the process the supervisor records can differ from
     the one running launch()/uvicorn (Store-Python/uv shims), so a PID in the name
     would make writer and watcher disagree. The control is the sole owner of the
     plane, so a fixed name is unambiguous.
     """
-    from biopb import _locations
+    from biopb._config import locations as _locations
 
     return _locations.tensor_stop_sentinel()
 

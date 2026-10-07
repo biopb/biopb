@@ -66,7 +66,7 @@ never imports — the proxy reaches it over loopback like any other client.
 - ``/session/<id>/observe`` serves the control's own SPA shell (the React
   ObservePage), while ``/session/<id>/api/*`` is reverse-proxied to the shim-owned
   MCP session child on its dynamic loopback port, resolved per-request from the
-  filesystem registry (``biopb._sessions``); an unknown or dead session
+  filesystem registry (``biopb._lifecycle.sessions``); an unknown or dead session
   yields a clean 404 (and the dead record is pruned). Unlike the data-plane proxy,
   the ``/api/*`` hop drops both ``Host`` and ``Origin``: httpx then sets ``Host``
   to the loopback target (satisfying the child's own loopback Host guard) and the
@@ -106,14 +106,11 @@ from urllib.parse import urlsplit
 
 import httpx
 import uvicorn
-from biopb import (
-    _agents,
-    _locations,
-    _sessions,
-    _web_auth,
-)
-from biopb._control import _endpoints
+from biopb._config import locations as _locations
+from biopb._control import _agents, _endpoints
+from biopb._lifecycle import sessions as _sessions
 from biopb._lifecycle.daemon import detach_kwargs
+from biopb._security import web_auth as _web_auth
 from starlette.applications import Starlette
 from starlette.background import BackgroundTask
 from starlette.datastructures import Headers
@@ -231,7 +228,7 @@ def _session_proxy_roots(
 _UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
 # Every /api/ route is now gated, `/api/data_plane/ensure` included. It used to be
-# exempted (biopb/biopb#424 item 2) because biopb._control_launch had no way
+# exempted (biopb/biopb#424 item 2) because biopb._control._launch had no way
 # to obtain the token — the control handed back the plane's endpoint but never a
 # credential — so gating this idempotent route would have locked the mcp client out
 # of a token-gated deployment. That exemption was an unauthenticated state-change,
@@ -911,7 +908,7 @@ def _launch_session(
     ``mcp/__main__.py``), so a record appearing means the kernel -- and any
     napari window -- came up, and a child that dies first never registers. The record is
     matched on a per-launch token we hand the child in its environment
-    (:data:`biopb._locations.MCP_LAUNCH_TOKEN_ENV`), so a session someone else
+    (:data:`biopb._config.locations.MCP_LAUNCH_TOKEN_ENV`), so a session someone else
     starts concurrently is never mistaken for this one.
 
     The token replaced a pid match, which looked exact and was not: on Windows a
@@ -1313,7 +1310,7 @@ def build_app(
 
     def api_agents(_request: Request) -> JSONResponse:
         # The supported MCP clients and whether biopb is registered with each.
-        # Reads are subprocess-free (biopb._agents), so the dashboard can poll
+        # Reads are subprocess-free (biopb._control._agents), so the dashboard can poll
         # this without spawning anything; still sync (filesystem), so Starlette
         # runs it in the threadpool.
         try:
@@ -1412,7 +1409,7 @@ def build_app(
         # them owns the file. biopb_mcp is soft-imported (only for the schema): the
         # lean control does not hard-depend on it (invariant I2), but a real biopb
         # deployment always co-installs it. mcp_config_path lives in core biopb.
-        from biopb._locations import mcp_config_path
+        from biopb._config.locations import mcp_config_path
 
         try:
             from biopb_mcp._config_schema import build_mcp_config_schema
@@ -1455,7 +1452,7 @@ def build_app(
             return JSONResponse(
                 {"error": f"biopb-mcp is not installed: {exc}"}, status_code=501
             )
-        from biopb._locations import mcp_config_path
+        from biopb._config.locations import mcp_config_path
 
         try:
             body = await request.json()
