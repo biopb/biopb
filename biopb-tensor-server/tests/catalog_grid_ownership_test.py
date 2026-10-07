@@ -30,8 +30,8 @@ from biopb_tensor_server.core.adapter_base import (
     catalog_entry,
 )
 from biopb_tensor_server.core.config import PyramidConfig, SourceConfig
-from biopb_tensor_server.core.source_registry import SourceRegistry
 from biopb_tensor_server.serving.metadata_db import MetadataDatabase
+from biopb_tensor_server.sources.source_registry import SourceRegistry
 from google.protobuf.field_mask_pb2 import FieldMask
 
 # --- the invariant, over the real adapters ----------------------------------

@@ -1,7 +1,7 @@
 """SignatureMemo: a content probe reused while the file's identity is unchanged."""
 
 import pytest
-from biopb_tensor_server.core.signature_memo import SignatureMemo, file_signature
+from biopb_tensor_server.adapters._signature_memo import SignatureMemo, file_signature
 
 SIG_A = (1, 100, 2048, 111, 111)
 SIG_B = (1, 100, 4096, 222, 222)

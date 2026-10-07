@@ -37,8 +37,8 @@ from biopb_tensor_server.core.labels import (
     split_label_field,
 )
 from biopb_tensor_server.core.normalize import NormalizingAdapter
-from biopb_tensor_server.core.source_registry import SourceRegistry
 from biopb_tensor_server.fixtures import create_multiresolution_ome_zarr
+from biopb_tensor_server.sources.source_registry import SourceRegistry
 
 from tests import catalog_server, register_and_catalog
 

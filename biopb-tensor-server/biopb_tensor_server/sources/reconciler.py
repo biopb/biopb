@@ -70,7 +70,6 @@ from biopb_tensor_server.core.errors import (
 )
 from biopb_tensor_server.core.normalize import normalize_adapter
 from biopb_tensor_server.core.remote import is_remote_url
-from biopb_tensor_server.core.source_registry import close_adapter
 from biopb_tensor_server.sources.entry_stat import (
     build_entry_signature,
     entry_change_time,
@@ -78,6 +77,7 @@ from biopb_tensor_server.sources.entry_stat import (
 )
 from biopb_tensor_server.sources.pending_rows import PendingRow, PendingRowWriter
 from biopb_tensor_server.sources.roots import Root, RootKind, Roots, path_under_root
+from biopb_tensor_server.sources.source_registry import close_adapter
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import (

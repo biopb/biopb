@@ -88,8 +88,8 @@ from biopb_tensor_server.core.errors import (
     WriteNotSupportedError,
 )
 from biopb_tensor_server.core.labels import LABELS_SEGMENT, split_label_field
-from biopb_tensor_server.core.source_registry import SourceRegistry
 from biopb_tensor_server.serving.metadata_db import MetadataDatabase
+from biopb_tensor_server.sources.source_registry import SourceRegistry
 
 __all__ = [
     "DEFAULT_UPLOAD_TTL",

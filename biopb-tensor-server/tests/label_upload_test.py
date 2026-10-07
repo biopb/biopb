@@ -22,8 +22,8 @@ from biopb_tensor_server.adapters.zarr import UPLOAD_PENDING, UPLOAD_READY, uplo
 from biopb_tensor_server.core.chunk import content_version_of
 from biopb_tensor_server.core.config import SourceConfig
 from biopb_tensor_server.core.errors import WriteNotSupportedError
-from biopb_tensor_server.core.source_registry import SourceRegistry
 from biopb_tensor_server.fixtures import create_multiresolution_ome_zarr
+from biopb_tensor_server.sources.source_registry import SourceRegistry
 
 from tests import label_sets, register_and_catalog
 from tests.label_attachment_test import _write_label_group
