@@ -164,6 +164,11 @@ def _sources_view_ddl() -> str:
     return f"CREATE VIEW sources AS SELECT {_VIEW_SOURCE_COLUMNS} {_VIEW_FROM}"
 
 
+def _array_id(tensor: Dict[str, Any]) -> str:
+    """Sort key for a ``tensors`` entry."""
+    return tensor["array_id"]
+
+
 def _confirmation_view_ddl(run_epoch: int) -> str:
     """Whether each source was verified this run, apart from the published view.
 
@@ -1466,15 +1471,7 @@ class MetadataDatabase:
         # pyramid, physical_scale) are omitted -- they belong to the
         # tensor-bound adapter GetFlightInfo binds. Unresolved cloud sources
         # have no tensors -> empty list.
-        tensors = [
-            {
-                "array_id": t.array_id,
-                "dim_labels": list(t.dim_labels),
-                "shape": [int(s) for s in t.shape],
-                "dtype": t.dtype,
-            }
-            for t in catalog
-        ]
+        tensors = self._tensor_rows(catalog)
 
         # ROIs the file carries, filed in the reserved @ome set (#951). Derived
         # HERE because this method is already the replace-on-rescan mechanism --
@@ -1588,6 +1585,46 @@ class MetadataDatabase:
                 "release_registration_cache failed for %s", source_id, exc_info=True
             )
         logger.debug(f"Synced source to metadata database: {source_id}")
+
+    @staticmethod
+    def _tensor_rows(catalog: Sequence[Any]) -> List[Dict[str, Any]]:
+        """The ``tensors`` column for *catalog* (``catalog_tensors`` of an adapter)."""
+        return [
+            {
+                "array_id": t.array_id,
+                "dim_labels": list(t.dim_labels),
+                "shape": [int(s) for s in t.shape],
+                "dtype": t.dtype,
+            }
+            for t in catalog
+        ]
+
+    def relist_tensors(self, source_id: str, adapter: SourceAdapter) -> bool:
+        """Make a row list the tensors *adapter* serves now, and only that.
+
+        For a source rebuilt from its row, whose row was written before the
+        uploaded fields and label sets on disk were attached (or before some of
+        them went): the row says what was true at its last write. Writes the
+        ``tensors`` column and nothing else when it differs -- the metadata the row
+        holds is not re-read -- and reports whether it did. The order is not
+        compared: a row lists fields in the order they were uploaded and the attach
+        scan finds them by name, and neither is a change.
+        """
+        tensors = self._tensor_rows(catalog_tensors(adapter))
+        conn = self._get_connection()
+        row = conn.execute(
+            "SELECT tensors FROM source_catalog WHERE source_id = ?", [source_id]
+        ).fetchone()
+        if row is None or sorted(row[0], key=_array_id) == sorted(
+            tensors, key=_array_id
+        ):
+            return False
+        with self._write_lock:
+            conn.execute(
+                "UPDATE source_catalog SET tensors = ? WHERE source_id = ?",
+                [tensors, source_id],
+            )
+        return True
 
     def _claim_values(
         self,

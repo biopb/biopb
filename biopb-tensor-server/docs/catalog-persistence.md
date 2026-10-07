@@ -219,7 +219,7 @@ re-listing its source) updates the public columns and leaves the claim as it was
 | Gone | Delete |
 | Registration succeeds | `UPDATE` of `metadata_json`, `tensors`, `payload`, `indexed_at`, resolved |
 | Registration fails (a pending claim) | `UPDATE` to `failed` with `unresolved_error` |
-| A restored source rebuilt from its own row (§8) | None; its root's walk confirms it |
+| A restored source rebuilt from its own row (§8) | `UPDATE` of `tensors` if the uploaded fields and label sets now attached differ from the row's; its root's walk confirms it |
 
 "Resident" is `_claim_is_unresolved` being false: the adapter did not flag the claim, and
 under a cloud root no member is a dehydrated placeholder (a metadata `stat`, nothing is
@@ -470,7 +470,11 @@ parsed at), as a registered one holds, so chunks read through a stale layout are
 under a version the walk's refresh replaces, and an unchanged file keeps its cache across
 the restart. A directory source takes the stat at build. A source with no payload is
 parsed. A source rebuilt from its own row is neither rewritten (a row can hold megabytes of
-metadata) nor confirmed: only its root's walk confirms it.
+metadata) nor confirmed: only its root's walk confirms it. Its registration does attach the
+uploaded fields and label sets on disk, which the row, written before they changed, cannot
+know, so it compares the row's tensor ids (as a set) with what the adapter lists and writes
+the `tensors` column alone when they differ. A failed write is logged and costs only the
+listing.
 
 **The contract of a payload.** Every file adapter has one: the OME-TIFF family (OME-TIFF,
 TIFF, LSM), nd2, czi, the BioIO family (Zeiss, Leica, Nikon, Olympus, Bioformats, aics),

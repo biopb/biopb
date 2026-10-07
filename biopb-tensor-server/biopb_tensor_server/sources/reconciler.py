@@ -1762,9 +1762,17 @@ class Reconciler:
             # A source rebuilt from its own row is already described by it:
             # rewriting a row that can hold megabytes of metadata to say the same
             # thing is most of what a hydration would cost. It is not confirmed
-            # either: only its root's walk says the files are as persisted.
-            if self._metadata_db is not None and not from_payload:
-                self._metadata_db.sync_source_added(claim.source_id, adapter, record)
+            # either: only its root's walk says the files are as persisted. What
+            # the row cannot know is which uploaded fields and label sets are on
+            # disk now, which the registration has just attached, so it relists
+            # the tensors.
+            if self._metadata_db is not None:
+                if not from_payload:
+                    self._metadata_db.sync_source_added(
+                        claim.source_id, adapter, record
+                    )
+                else:
+                    self._relist_tensors(claim.source_id, adapter)
 
             if displaced is not None:
                 # Only now, and this ordering is the reason `swap` hands the
@@ -1802,6 +1810,20 @@ class Reconciler:
                 # rollback already closed it: close() must be safe twice.
                 close_adapter(adapter)
             return False
+
+    def _relist_tensors(self, source_id: str, adapter: Any) -> None:
+        """Bring a hydrated source's listed tensors up to what it serves.
+
+        Best-effort: a stale listing is what the row already was, so a failure
+        here must not cost the registration the source's pixels.
+        """
+        try:
+            if self._metadata_db.relist_tensors(source_id, adapter):
+                logger.info(f"Relisted the tensors of restored source {source_id}")
+        except Exception:
+            logger.warning(
+                "could not relist the tensors of %s", source_id, exc_info=True
+            )
 
     def _stamp_persisted_version(self, adapter: Any, claim: SourceClaim) -> None:
         """Version a source rebuilt from its row by the file state it was parsed at.
