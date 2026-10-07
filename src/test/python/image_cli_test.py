@@ -15,7 +15,15 @@ runner = CliRunner()
 
 
 class _Ops(proto.OpsServicer):
+    def __init__(self, token=None):
+        self._token = token
+
     def Describe(self, request, context):  # noqa: N802 - gRPC method name
+        if self._token and (
+            ("authorization", f"Bearer {self._token}")
+            not in context.invocation_metadata()
+        ):
+            context.abort(grpc.StatusCode.UNAUTHENTICATED, "token")
         return proto.OpList(
             ops=[
                 proto.OpInfo(
@@ -40,13 +48,25 @@ class _Ops(proto.OpsServicer):
             yield proto.Event(outputs={"result": proto.json_arg({"n": 3})})
 
 
-@pytest.fixture
-def url():
+def _serve(servicer):
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
-    proto.add_OpsServicer_to_server(_Ops(), server)
+    proto.add_OpsServicer_to_server(servicer, server)
     port = server.add_insecure_port("127.0.0.1:0")
     server.start()
-    yield f"grpc://127.0.0.1:{port}"
+    return server, f"grpc://127.0.0.1:{port}"
+
+
+@pytest.fixture
+def url():
+    server, address = _serve(_Ops())
+    yield address
+    server.stop(None)
+
+
+@pytest.fixture
+def secured_url():
+    server, address = _serve(_Ops(token="secret"))
+    yield address
     server.stop(None)
 
 
@@ -124,3 +144,24 @@ def test_an_unreachable_registry_name_is_a_clean_error(monkeypatch):
     result = runner.invoke(app, ["ops", "ghost"])
     assert result.exit_code == 1
     assert "no algorithm 'ghost'" in result.stderr
+
+
+@pytest.mark.parametrize("command", [["ops"], ["call", "--tensor", "image"]])
+def test_the_token_option_is_sent(secured_url, command):
+    refused = runner.invoke(app, [command[0], secured_url, *command[1:]])
+    assert refused.exit_code == 1
+    assert "UNAUTHENTICATED" in refused.stderr
+
+    accepted = runner.invoke(
+        app, [command[0], secured_url, *command[1:], "--token", "secret"]
+    )
+    assert "UNAUTHENTICATED" not in accepted.stderr
+    if command[0] == "ops":
+        assert accepted.exit_code == 0
+        assert "invert" in accepted.stdout
+
+
+def test_the_token_is_read_from_the_environment(secured_url, monkeypatch):
+    monkeypatch.setenv("BIOPB_IMAGE_TOKEN", "secret")
+    result = runner.invoke(app, ["ops", secured_url])
+    assert result.exit_code == 0

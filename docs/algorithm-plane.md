@@ -10,7 +10,7 @@ control or by someone else.
 | `op` / `serve`, the server side | `biopb-image-runtime` (`biopb_image_base.ops`), a wheel on PyPI and a Docker base image |
 | the registry and the probe | `biopb_control._registry` (biopb-control) |
 | supervision and `/api/algorithms` | `biopb-control` (`_algorithm_plane.py`, `_control.py`) |
-| clients | `biopb.algorithms()`, the kernel's `ops` (biopb-mcp `_process_ops.py`), `biopb image`, the dashboard's algorithm card |
+| clients | `biopb.image.connect()` (calls a server), `biopb.algorithms()` (asks the control), the kernel's `ops` (biopb-mcp `_process_ops.py`), `biopb algorithm` and `biopb image`, the dashboard's algorithm card |
 
 Most algorithms cannot run in the kernel: they pin a torch that conflicts with
 the session, want another Python, or are not Python at all. So each runs in its
@@ -226,7 +226,9 @@ waits at most `?client_timeout` less five seconds (at most the install bound,
 60 s without the hint), so a slow install answers before the caller gives up.
 `biopb` wraps them stdlib-only (backed by the private `biopb._control`):
 `algorithms()`, `refresh_algorithms()`, `ensure_algorithm()`,
-`stop_algorithm()`, `restart_algorithm()`, `algorithm_logs()`.
+`stop_algorithm()`, `restart_algorithm()`, `algorithm_logs()`. The `biopb
+algorithm` commands (`list`, `refresh`, `start`, `stop`, `restart`, `logs`) are
+thin faces over them; none starts a control, so each says so when none answers.
 
 ## Clients
 
@@ -238,7 +240,17 @@ waits at most `?client_timeout` less five seconds (at most the install bound,
   returns its value; other outputs return as a tuple. `ops.refresh()`,
   `ops.status()`, `ops.logs(name)` and `ops.restart(name)` manage the entries;
   `server_status` includes `ops.status()`.
-- **`biopb image`**: `servers`, `ops` and `process`.
+- **`biopb.image.connect(target)`** is the SDK client of one server. `target`
+  is a `grpc://` or `grpcs://` URL, or a registry name, which the control
+  brings up first and whose token it takes. `OpsClient.describe()` lists the
+  ops; `call(op, **values)` sends arrays as pixels and everything else as JSON
+  and returns the decoded result (`encode_arg` / `decode_arg` are the codec);
+  `events()` is the raw stream, with `inactivity_timeout` bounding the silence
+  and a cancel when the caller leaves. A failed call raises `ValueError` (the op
+  refused its arguments), `LookupError` (no such op) or `RuntimeError`.
+- **`biopb image`**: `ops <server>` and `call <server> [op]`, where `<server>`
+  is a URL or a registry name. `--token` (or `BIOPB_IMAGE_TOKEN`) sets the
+  bearer token for a URL; a registry name brings its own.
 - **The dashboard**'s algorithm card lists `/api/algorithms`.
 - **The docs store** page `algorithm-servers.md` is the agent's reference for
   writing a server file.
