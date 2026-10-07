@@ -35,7 +35,7 @@ def _polygon(*pts):
 
 def _register_source(db, source_id, source_url):
     db._get_connection().execute(
-        "INSERT INTO sources_volatile (source_id, source_url, source_type, tensors) "
+        "INSERT INTO source_catalog (source_id, source_url, source_type, tensors) "
         "VALUES (?, ?, ?, ?)",
         [source_id, source_url, "zarr", []],
     )
@@ -521,7 +521,7 @@ class TestStore:
         )
 
         db._get_connection().execute(
-            "DELETE FROM sources_volatile WHERE source_id = ?", ["zarr_a1b2c3"]
+            "DELETE FROM source_catalog WHERE source_id = ?", ["zarr_a1b2c3"]
         )
         db.put_rois(ARRAY_ID, [_annotation(roi_id="a", label="v2")])
 
@@ -583,7 +583,7 @@ class TestStore:
         _register_source(db, "zarr_a1b2c3", "/data/exp.zarr")
         db.put_rois(ARRAY_ID, [_annotation(roi_id="a")])
         db._get_connection().execute(
-            "UPDATE sources_volatile SET source_url = ? WHERE source_id = ?",
+            "UPDATE source_catalog SET source_url = ? WHERE source_id = ?",
             ["dnd://exp.zarr", "zarr_a1b2c3"],
         )
         db.put_rois(ARRAY_ID, [_annotation(roi_id="b")])
@@ -607,7 +607,7 @@ class TestStore:
         _register_source(db, "zarr_a1b2c3", "/data/exp.zarr")
         db.put_rois(ARRAY_ID, [_annotation(roi_id="a")])
         db._get_connection().execute(
-            "UPDATE sources_volatile SET source_url = ? WHERE source_id = ?",
+            "UPDATE source_catalog SET source_url = ? WHERE source_id = ?",
             [unnamed, "zarr_a1b2c3"],
         )
         db.put_rois(ARRAY_ID, [_annotation(roi_id="b")])
@@ -1375,7 +1375,7 @@ class TestOrphanClock:
         _register_source(db, "zarr_a1b2c3", "file:///data/a.zarr")
         db.put_rois(ARRAY_ID, [_annotation()])
         db._get_connection().execute(
-            "UPDATE sources_volatile SET source_url = ? WHERE source_id = ?",
+            "UPDATE source_catalog SET source_url = ? WHERE source_id = ?",
             ["lab/a.zarr", "zarr_a1b2c3"],
         )
 
@@ -1397,13 +1397,13 @@ class TestOrphanClock:
         _register_source(db, "zarr_a1b2c3", "/data/exp.zarr")
         db.put_rois(ARRAY_ID, [_annotation()])
         db._get_connection().execute(
-            "UPDATE sources_volatile SET source_url = ? WHERE source_id = ?",
+            "UPDATE source_catalog SET source_url = ? WHERE source_id = ?",
             ["lab/exp.zarr", "zarr_a1b2c3"],
         )
         db.mark_sources_seen()
 
         # The source goes away; absence writes nothing, so the label stands.
-        db._get_connection().execute("DELETE FROM sources_volatile")
+        db._get_connection().execute("DELETE FROM source_catalog")
         self._age(db, ARRAY_ID, days=40)
         db.mark_sources_seen()
 

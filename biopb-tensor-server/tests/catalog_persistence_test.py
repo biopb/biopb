@@ -1,9 +1,8 @@
-"""The persisted catalog: ``source_catalog``, the volatile table and the view.
+"""The catalog table, ``source_catalog``, and the ``sources`` view over it.
 
-Only written so far; nothing reads the persisted rows back yet. These pin what is
-written (routing by whether the source has a claim, the private columns, the
-claim-time signature, the payload) and what must keep working (queries through the
-view, an older build opening the file).
+These pin what is written (one row per source, whether or not it has a claim; the
+private columns, the claim-time signature, the payload) and what must keep working
+(queries through the view, an older build opening the file).
 """
 
 import json
@@ -68,13 +67,28 @@ def _count(db, table, source_id="s1"):
     )
 
 
+def _kinds(db, source_id="s1"):
+    """How many rows *source_id* has with a claim and without one."""
+    claimed, unclaimed = (
+        db._get_connection()
+        .execute(
+            "SELECT count(*) FILTER (WHERE root_id IS NOT NULL), "
+            "count(*) FILTER (WHERE root_id IS NULL) "
+            "FROM source_catalog WHERE source_id = ?",
+            [source_id],
+        )
+        .fetchone()
+    )
+    return claimed, unclaimed
+
+
 class TestRouting:
-    def test_a_restorable_source_lands_in_the_persistent_table_only(self):
+    def test_a_restorable_source_has_one_row_with_its_claim(self):
         db = _db()
         db.sync_source_added(
             "s1", _Restorable("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8"), _record()
         )
-        assert (_count(db, "source_catalog"), _count(db, "sources_volatile")) == (1, 0)
+        assert _kinds(db) == (1, 0)
         assert db.query("SELECT source_id FROM sources").num_rows == 1
 
     def test_a_claim_without_a_payload_is_still_persisted(self):
@@ -82,7 +96,7 @@ class TestRouting:
         db.sync_source_added(
             "s1", MockAdapter("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8"), _record()
         )
-        assert (_count(db, "source_catalog"), _count(db, "sources_volatile")) == (1, 0)
+        assert _kinds(db) == (1, 0)
         (payload,) = (
             db._get_connection()
             .execute("SELECT payload FROM source_catalog")
@@ -90,15 +104,12 @@ class TestRouting:
         )
         assert payload is None
 
-    def test_without_a_record_it_stays_volatile(self):
+    def test_without_a_record_the_row_has_no_claim(self):
         db = _db()
         db.sync_source_added(
             "s2", _Restorable("s2", "/d/s2.zarr", "zarr", [4, 4], "uint8")
         )
-        assert (
-            _count(db, "source_catalog", "s2"),
-            _count(db, "sources_volatile", "s2"),
-        ) == (0, 1)
+        assert _kinds(db, "s2") == (0, 1)
         assert db.query("SELECT source_id FROM sources").num_rows == 1
 
     def test_an_unresolved_row_with_a_claim_is_persisted_without_a_payload(self):
@@ -107,7 +118,7 @@ class TestRouting:
             "s1", "/d/s1.zarr", "zarr", [4, 4], "uint8", is_resolved=False
         )
         db.sync_source_added("s1", adapter, _record())
-        assert (_count(db, "source_catalog"), _count(db, "sources_volatile")) == (1, 0)
+        assert _kinds(db) == (1, 0)
         assert _row(db)[3] is None
 
     def test_a_cloud_claim_is_persisted_without_a_payload(self):
@@ -127,7 +138,7 @@ class TestRouting:
         other = SourceClaim("zarr", "/drop/s2.zarr", "s2")
         db.sync_pending_source(other)
         assert _count(db, "source_catalog") == 1
-        assert _count(db, "sources_volatile", "s2") == 1
+        assert _kinds(db, "s2") == (0, 1)
         row = _row(db)
         assert row[:3] == (False, "pending", None)
         assert json.loads(row[4]) == {"/d/s1.zarr": [1, 2, 3, 4]}
@@ -139,7 +150,7 @@ class TestRouting:
         db.sync_source_added(
             "s1", _Restorable("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8"), _record()
         )
-        assert (_count(db, "source_catalog"), _count(db, "sources_volatile")) == (1, 0)
+        assert _kinds(db) == (1, 0)
         row = _row(db)
         assert row[:3] == (True, None, None)
         assert json.loads(row[3]) == {"k": 1}
@@ -190,7 +201,7 @@ class TestRouting:
             ]
         )
         assert _count(db, "source_catalog") == 1
-        assert _count(db, "sources_volatile", "s2") == 1
+        assert _kinds(db, "s2") == (0, 1)
         assert db.query("SELECT source_id FROM sources").num_rows == 3
 
     def test_a_batched_row_does_not_replace_a_registered_one(self):
@@ -203,7 +214,7 @@ class TestRouting:
         db.sync_pending_sources([PendingRow(_record().claim, record=_record())])
         assert _row(db)[:2] == (True, None)
 
-    def test_every_source_shows_once_across_both_tables(self):
+    def test_every_source_shows_once_however_it_is_written(self):
         from biopb_tensor_server.sources.pending_rows import PendingRow
 
         db = _db()
@@ -211,18 +222,52 @@ class TestRouting:
         plain = MockAdapter("s2", "/d/s2.zarr", "zarr", [4, 4], "uint8")
         db.sync_source_added("s1", restorable, _record())
         db.sync_source_added("s2", plain)
-        # Registered again and pended again: each stays in its own table.
+        # Registered again, re-listed without a record, and pended again.
         db.sync_source_added("s1", restorable, _record())
+        db.sync_source_added("s1", restorable)
         db.sync_source_added("s2", plain)
         db.sync_pending_sources([PendingRow(_record().claim, record=_record())])
-        assert (
-            _count(db, "source_catalog", "s1"),
-            _count(db, "sources_volatile", "s1"),
-            _count(db, "source_catalog", "s2"),
-            _count(db, "sources_volatile", "s2"),
-        ) == (1, 0, 0, 1)
+        assert (_kinds(db, "s1"), _kinds(db, "s2")) == ((1, 0), (0, 1))
         rows = db.query("SELECT source_id FROM sources").to_pylist()
         assert sorted(r["source_id"] for r in rows) == ["s1", "s2"]
+
+    def test_a_relisting_without_a_record_updates_the_claimed_row(self):
+        """A field uploaded to a discovered source re-lists it with no record: its
+        tensors change, its claim, payload and url stay."""
+        db = _db()
+        adapter = _Restorable("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8")
+        db.sync_source_added("s1", adapter, _record())
+        before = _row(db)
+
+        class _WithAField(_Restorable):
+            def list_tensor_descriptors(self):
+                (own,) = super().list_tensor_descriptors()
+                field = type(own)(array_id="s1/@fields/f", shape=[4, 4], dtype="uint8")
+                return [own, field]
+
+        two = _WithAField("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8")
+        db.sync_source_added("s1", two)
+
+        assert _kinds(db) == (1, 0)
+        after = _row(db)
+        assert after[6] == 2 * before[6]  # the listing moved
+        assert after[3:6] == before[3:6]  # payload, signature, primary path did not
+        (url,) = db.query("SELECT source_url FROM sources").to_pylist()
+        assert url["source_url"] == "file:///d/s1.zarr"
+
+    def test_a_row_that_gains_a_claim_loses_its_literal_url(self):
+        db = _db()
+        adapter = _Restorable("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8")
+        db.sync_source_added("s1", adapter)
+        assert _kinds(db) == (0, 1)
+        db.sync_source_added("s1", adapter, _record())
+        assert _kinds(db) == (1, 0)
+        stored = (
+            db._get_connection()
+            .execute("SELECT source_url FROM source_catalog WHERE source_id = 's1'")
+            .fetchone()
+        )
+        assert stored == (None,)
 
     def test_a_failed_registration_row_replaces_a_persisted_one(self):
         db = _db()
@@ -230,7 +275,7 @@ class TestRouting:
             "s1", _Restorable("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8"), _record()
         )
         db.sync_pending_source(_record().claim, error="boom", record=_record())
-        assert (_count(db, "source_catalog"), _count(db, "sources_volatile")) == (1, 0)
+        assert _kinds(db) == (1, 0)
         row = _row(db)
         assert row[:4] == (False, "failed", "boom", None)
         assert row[6] == 0
@@ -249,6 +294,30 @@ class TestRouting:
         assert _count(db, "source_catalog", "s1") == 0
 
 
+class TestAcrossAnOpen:
+    def test_only_the_rows_with_a_claim_survive_a_restoring_open(self, tmp_path):
+        store = tmp_path / "catalog.duckdb"
+        db = MetadataDatabase(store_path=store, restore_sources=True)
+        db.open()
+        db.sync_roots([("r1", "file:///d")])
+        db.sync_source_added(
+            "s1", _Restorable("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8"), _record()
+        )
+        db.sync_source_added(
+            "s2", MockAdapter("s2", "/x/s2.zarr", "zarr", [4, 4], "uint8")
+        )
+        db.close()
+
+        db = MetadataDatabase(store_path=store, restore_sources=True)
+        db.open()
+        try:
+            assert [r["source_id"] for r in db.restorable_rows()] == ["s1"]
+            rows = db.query("SELECT source_id FROM sources").to_pylist()
+            assert [r["source_id"] for r in rows] == ["s1"]
+        finally:
+            db.close()
+
+
 class TestPrivacy:
     def test_the_claim_columns_are_not_in_the_view(self):
         db = _db()
@@ -258,9 +327,7 @@ class TestPrivacy:
         cols = db.query("SELECT * FROM sources").column_names
         assert not {"extra_config", "member_paths", "payload", "signature"} & set(cols)
 
-    @pytest.mark.parametrize(
-        "table", ["source_catalog", "sources_volatile", "catalog_roots"]
-    )
+    @pytest.mark.parametrize("table", ["source_catalog", "catalog_roots"])
     def test_the_physical_tables_are_not_queryable(self, table):
         db = _db()
         with pytest.raises(ValueError):
@@ -626,4 +693,3 @@ class TestListFlights:
         ]
         assert sources.endpoints[0].ticket.ticket
         assert "source_catalog" not in infos
-        assert "sources_volatile" not in infos

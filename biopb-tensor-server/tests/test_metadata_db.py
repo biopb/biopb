@@ -624,7 +624,7 @@ class TestGetMetadataJson:
         )
         with db._write_lock:
             db._get_connection().execute(
-                "UPDATE sources_volatile SET metadata_json = ? WHERE source_id = ?",
+                "UPDATE source_catalog SET metadata_json = ? WHERE source_id = ?",
                 ["{not valid json", "s1"],
             )
         assert db.get_metadata_json("s1") is None
@@ -752,7 +752,7 @@ class TestSQLValidation:
         db = MetadataDatabase()
 
         with pytest.raises(ValueError, match="forbidden keyword"):
-            db._validate_query("INSERT INTO sources_volatile VALUES ('test', 'test')")
+            db._validate_query("INSERT INTO source_catalog VALUES ('test', 'test')")
 
     def test_validate_forbidden_update(self):
         """Test that UPDATE is blocked."""
@@ -760,7 +760,7 @@ class TestSQLValidation:
 
         with pytest.raises(ValueError, match="forbidden keyword"):
             db._validate_query(
-                "UPDATE sources_volatile SET source_id='new' WHERE source_id='old'"
+                "UPDATE source_catalog SET source_id='new' WHERE source_id='old'"
             )
 
     def test_validate_forbidden_delete(self):
@@ -1074,7 +1074,7 @@ class TestIsResolvedColumn:
         conn = db._get_connection()
 
         conn.execute(
-            "INSERT INTO sources_volatile (source_id, source_url) VALUES ('partial', '/p')"
+            "INSERT INTO source_catalog (source_id, source_url) VALUES ('partial', '/p')"
         )
         row = conn.execute(
             "SELECT is_resolved FROM sources WHERE source_id='partial'"
@@ -1083,5 +1083,5 @@ class TestIsResolvedColumn:
 
         with pytest.raises(duckdb.ConstraintException):
             conn.execute(
-                "INSERT INTO sources_volatile (source_id, is_resolved) VALUES ('bad', NULL)"
+                "INSERT INTO source_catalog (source_id, is_resolved) VALUES ('bad', NULL)"
             )

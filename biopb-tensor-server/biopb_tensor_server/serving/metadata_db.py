@@ -87,7 +87,7 @@ logger = logging.getLogger(__name__)
 
 # Bump when a field of the persisted source row or payload changes meaning (an
 # added key needs none). A mismatch drops ``source_catalog`` whole at open.
-SOURCE_CATALOG_FORMAT = 3
+SOURCE_CATALOG_FORMAT = 4
 
 # The columns ``sources`` publishes, in table order. Both physical tables carry
 # them first, so the view is a plain UNION ALL.
@@ -122,49 +122,62 @@ _ROW_COLUMN_NAMES = (
     "unresolved_error",
 )
 _ROW_COLUMNS = ", ".join(_ROW_COLUMN_NAMES)
-# The row columns a persisted row has: all but ``source_url``, which is the view's.
+# The row columns a claimed row stores: all but ``source_url``, which is NULL
+# there and the view's (a row with no claim stores it literally).
 _PERSISTED_ROW_COLUMN_NAMES = _ROW_COLUMN_NAMES[:1] + _ROW_COLUMN_NAMES[2:]
 _PERSISTED_COLUMNS = ", ".join(_PERSISTED_ROW_COLUMN_NAMES + _CLAIM_COLUMN_NAMES)
-# Everything but the key, for updating a persisted row in place.
-_UPDATE_SET = ", ".join(
+# Everything but the key, for updating a row that gains a claim in place.
+_UPDATE_SET = "source_url = NULL, " + ", ".join(
     f"{c} = ?" for c in _PERSISTED_ROW_COLUMN_NAMES[1:] + _CLAIM_COLUMN_NAMES
 )
 # The same, for an ``INSERT ... ON CONFLICT DO UPDATE`` that finds the row there.
-_UPSERT_SET = ", ".join(
+_UPSERT_SET = "source_url = NULL, " + ", ".join(
     f"{c} = excluded.{c}" for c in _PERSISTED_ROW_COLUMN_NAMES[1:] + _CLAIM_COLUMN_NAMES
 )
+# A write without a claim sets the public columns and leaves the claim alone. The
+# url is stored only on a row with no root: a claimed row's is the root's.
+_LISTING_COLUMN_NAMES = _ROW_COLUMN_NAMES[2:]
+_LISTING_SET = "source_url = CASE WHEN root_id IS NULL THEN ? END, " + ", ".join(
+    f"{c} = ?" for c in _LISTING_COLUMN_NAMES
+)
+_LISTING_UPSERT_SET = (
+    "source_url = CASE WHEN source_catalog.root_id IS NULL "
+    "THEN excluded.source_url END, "
+    + ", ".join(f"{c} = excluded.{c}" for c in _LISTING_COLUMN_NAMES)
+)
 # ``_SOURCE_COLUMNS`` for a ``source_catalog`` row (alias ``c``) joined to its root
-# (alias ``r``): the url is the root's, then the row's path beneath it.
-_PERSISTED_SOURCE_COLUMNS = _SOURCE_COLUMNS.replace(
+# (alias ``r``): a claimed row's url is the root's, then the row's path beneath it.
+_VIEW_SOURCE_COLUMNS = _SOURCE_COLUMNS.replace(
     "source_url",
-    "CASE WHEN c.rel = '.' THEN r.root_url ELSE r.root_url || '/' || c.rel END AS source_url",
+    "COALESCE(c.source_url, CASE WHEN c.rel = '.' THEN r.root_url "
+    "ELSE r.root_url || '/' || c.rel END) AS source_url",
 ).replace("source_id", "c.source_id", 1)
+# A claimed row shows against its root only: one whose root is gone is not listed.
+_VIEW_FROM = (
+    "FROM source_catalog c LEFT JOIN catalog_roots r ON c.root_id = r.root_id "
+    "WHERE c.root_id IS NULL OR r.root_id IS NOT NULL"
+)
 
 
 def _sources_view_ddl() -> str:
-    """The published ``sources`` view: both tables, the public columns only."""
-    return (
-        "CREATE VIEW sources AS "
-        f"SELECT {_PERSISTED_SOURCE_COLUMNS} FROM source_catalog c "
-        "JOIN catalog_roots r USING (root_id) UNION ALL "
-        f"SELECT {_SOURCE_COLUMNS} FROM sources_volatile"
-    )
+    """The published ``sources`` view: the public columns only."""
+    return f"CREATE VIEW sources AS SELECT {_VIEW_SOURCE_COLUMNS} {_VIEW_FROM}"
 
 
 def _confirmation_view_ddl(run_epoch: int) -> str:
     """Whether each source was verified this run, apart from the published view.
 
-    A persisted row is *confirmed* when it was written this run or its root's walk
-    finished this run; a volatile row was seen this run by construction. Kept out
-    of ``sources`` because that is a published schema, and out of the allowed
+    A claimed row is *confirmed* when it was written this run or its root's walk
+    finished this run; a row with no claim was seen this run by construction. Kept
+    out of ``sources`` because that is a published schema, and out of the allowed
     tables because only the server's own bookkeeping asks.
     """
     return (
         "CREATE VIEW source_confirmation AS "
         "SELECT c.source_id, "
-        f"greatest(c.epoch, r.epoch) = {int(run_epoch)} AS confirmed "
-        "FROM source_catalog c JOIN catalog_roots r USING (root_id) UNION ALL "
-        "SELECT source_id, TRUE FROM sources_volatile"
+        f"(c.root_id IS NULL OR greatest(c.epoch, r.epoch) = {int(run_epoch)}) "
+        "AS confirmed "
+        "FROM source_catalog c LEFT JOIN catalog_roots r ON c.root_id = r.root_id"
     )
 
 
@@ -923,73 +936,17 @@ class MetadataDatabase:
         `rois` cannot be rebuilt, so it is versioned instead: see
         :meth:`_reconcile_roi_schema`.
         """
-        # `sources` is a view over the two tables below, so it goes first. An
-        # older build left a physical table of that name.
+        # `sources` is a view over `source_catalog`, so it goes first. An older
+        # build left a physical table of that name.
         if conn.execute(
             "SELECT 1 FROM duckdb_tables() WHERE table_name = 'sources'"
         ).fetchone():
             conn.execute("DROP TABLE sources")
         conn.execute("DROP VIEW IF EXISTS sources")
         conn.execute("DROP VIEW IF EXISTS source_confirmation")
+        # A build with a separate table for the sources that have no claim left it
+        # behind.
         conn.execute("DROP TABLE IF EXISTS sources_volatile")
-        conn.execute("""
-            CREATE TABLE sources_volatile (
-                source_id TEXT PRIMARY KEY,
-                source_url TEXT,
-                source_type TEXT,
-                indexed_at TIMESTAMP,
-                metadata_json TEXT,
-                -- Does a real, hydrated adapter back this row? Monotonic --
-                -- never flips back to FALSE once TRUE -- which is what makes it
-                -- storable: a stale copy can only lag harmlessly. TRUE default:
-                -- every adapter but the unresolved-cloud proxy is resolved by
-                -- construction.
-                --
-                -- Residency deliberately has no column beside it. It swings both
-                -- ways with no event to refresh a row from, so the `is_resident`
-                -- action answers it live (biopb/biopb#1035).
-                is_resolved BOOLEAN NOT NULL DEFAULT TRUE,
-                -- Why is_resolved is FALSE: 'needs_recall' (a cloud placeholder;
-                -- opening it is a consented download), 'pending' (registration
-                -- has not run yet; resolving it runs it), 'failed' (it raised; the
-                -- error is in unresolved_error). NULL when resolved.
-                unresolved_reason VARCHAR,
-                -- Why a 'failed' registration raised, as plain text. NULL for
-                -- every other row; metadata_json stays the source's own
-                -- metadata, never an error.
-                unresolved_error VARCHAR,
-                -- Full per-tensor structural info (biopb/biopb#224): one struct
-                -- per tensor, so multi-field / HCS sources are queryable per
-                -- tensor. This is the sole home of shape/dtype -- there is no
-                -- scalar projection column -- so a source-wide answer means
-                -- `tensors[1].dtype` (DuckDB is 1-indexed), empty on an
-                -- unresolved source. Only cheap/structural fields
-                -- (already in the lean ListFlights descriptor) are stored
-                -- here -- the expensive/lazy fields (metadata_json, pyramid,
-                -- physical_scale) are deliberately left out, filled only by
-                -- GetFlightInfo. A single nested column (not a
-                -- child table) keeps the whole row a single-statement upsert, so
-                -- shrinking a source's tensor set can't leave ghost rows and a
-                -- read never straddles a torn sources-tensors join. Unresolved
-                -- cloud sources carry an empty list. Query per tensor with
-                -- UNNEST(tensors) or list_filter(tensors, t -> ...).
-                -- The transfer chunk_shape is deliberately NOT here: it is the
-                -- read plan of the adapter bound to a specific tensor, not a
-                -- catalog fact, and a source-level listing that names one is
-                -- guessing for a scene it never selected (biopb/biopb#812).
-                -- GetFlightInfo answers it, per resolved tensor.
-                tensors STRUCT(
-                    array_id VARCHAR,
-                    dim_labels VARCHAR[],
-                    shape BIGINT[],
-                    dtype VARCHAR
-                )[]
-            )
-        """)
-        # Index on source_url for path filtering
-        conn.execute(
-            "CREATE INDEX idx_volatile_source_url ON sources_volatile(source_url)"
-        )
         self._create_source_catalog(conn)
         conn.execute(_sources_view_ddl())
         conn.execute(_confirmation_view_ddl(self.run_epoch))
@@ -1053,18 +1010,21 @@ class MetadataDatabase:
         logger.debug("Created sources, rois and decode_rates tables and indexes")
 
     def _create_source_catalog(self, conn: duckdb.DuckDBPyConnection) -> None:
-        """Create ``source_catalog``: the sources that could be restored.
+        """Create ``source_catalog``: one row per source, whatever kind it is.
 
-        Public row columns first (see ``_SOURCE_COLUMNS``), then what a restore
-        needs: the claim, its claim-time signature and the adapter payload. The
-        private columns stay out of the ``sources`` view, since the claim can
-        carry credential profile names and paths.
+        Public row columns first (see ``_SOURCE_COLUMNS``), then the claim, its
+        claim-time signature and the adapter payload. A source with a claim under a
+        configured root has them and could be restored; one without (a mirror, a
+        remote proxy, an upload, a drop) has ``root_id`` NULL and its url stored
+        literally. The private columns stay out of the ``sources`` view, since the
+        claim can carry credential profile names and paths.
 
         Dropped whole when ``SOURCE_CATALOG_FORMAT`` differs from the one that
         wrote it, or is missing: the result is today's behaviour, a rebuild.
-        Rows are cleared at open unless ``restore_sources``: showing last run's
+        Rows are cleared at open unless ``restore_sources`` (showing last run's
         rows with no adapter behind them would be a catalog that lies, so a
-        restore registers (or marks pending) every row it keeps.
+        restore registers or marks pending every row it keeps), and the rows with
+        no claim are cleared either way: nothing could rebuild them.
         """
         conn.execute(
             "CREATE TABLE IF NOT EXISTS catalog_meta (key TEXT PRIMARY KEY, value TEXT)"
@@ -1078,12 +1038,51 @@ class MetadataDatabase:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS source_catalog (
                 source_id TEXT PRIMARY KEY,
+                -- Set only on a row with no root; a claimed row's is the root's,
+                -- then its `rel`, which the view puts together.
+                source_url TEXT,
                 source_type TEXT,
                 indexed_at TIMESTAMP,
                 metadata_json TEXT,
+                -- Does a real, hydrated adapter back this row? Monotonic --
+                -- never flips back to FALSE once TRUE -- which is what makes it
+                -- storable: a stale copy can only lag harmlessly. TRUE default:
+                -- every adapter but the unresolved-cloud proxy is resolved by
+                -- construction.
+                --
+                -- Residency deliberately has no column beside it. It swings both
+                -- ways with no event to refresh a row from, so the `is_resident`
+                -- action answers it live (biopb/biopb#1035).
                 is_resolved BOOLEAN NOT NULL DEFAULT TRUE,
+                -- Why is_resolved is FALSE: 'needs_recall' (a cloud placeholder;
+                -- opening it is a consented download), 'pending' (registration
+                -- has not run yet; resolving it runs it), 'failed' (it raised; the
+                -- error is in unresolved_error). NULL when resolved.
                 unresolved_reason VARCHAR,
+                -- Why a 'failed' registration raised, as plain text. NULL for
+                -- every other row; metadata_json stays the source's own
+                -- metadata, never an error.
                 unresolved_error VARCHAR,
+                -- Full per-tensor structural info (biopb/biopb#224): one struct
+                -- per tensor, so multi-field / HCS sources are queryable per
+                -- tensor. This is the sole home of shape/dtype -- there is no
+                -- scalar projection column -- so a source-wide answer means
+                -- `tensors[1].dtype` (DuckDB is 1-indexed), empty on an
+                -- unresolved source. Only cheap/structural fields
+                -- (already in the lean ListFlights descriptor) are stored
+                -- here -- the expensive/lazy fields (metadata_json, pyramid,
+                -- physical_scale) are deliberately left out, filled only by
+                -- GetFlightInfo. A single nested column (not a
+                -- child table) keeps the whole row a single-statement upsert, so
+                -- shrinking a source's tensor set can't leave ghost rows and a
+                -- read never straddles a torn sources-tensors join. Unresolved
+                -- cloud sources carry an empty list. Query per tensor with
+                -- UNNEST(tensors) or list_filter(tensors, t -> ...).
+                -- The transfer chunk_shape is deliberately NOT here: it is the
+                -- read plan of the adapter bound to a specific tensor, not a
+                -- catalog fact, and a source-level listing that names one is
+                -- guessing for a scene it never selected (biopb/biopb#812).
+                -- GetFlightInfo answers it, per resolved tensor.
                 tensors STRUCT(
                     array_id VARCHAR,
                     dim_labels VARCHAR[],
@@ -1091,9 +1090,9 @@ class MetadataDatabase:
                     dtype VARCHAR
                 )[],
                 -- The root it sits under (`catalog_roots`) and its path beneath
-                -- it; the view makes `source_url` of the two.
-                root_id TEXT NOT NULL,
-                rel TEXT NOT NULL,
+                -- it. NULL for a source with no claim.
+                root_id TEXT,
+                rel TEXT,
                 -- The claim, as `SourceClaim` holds it.
                 primary_path TEXT,
                 member_paths VARCHAR[],
@@ -1121,6 +1120,8 @@ class MetadataDatabase:
         if not self.restore_sources:
             conn.execute("DELETE FROM source_catalog")
             conn.execute("DELETE FROM catalog_roots")
+        else:
+            conn.execute("DELETE FROM source_catalog WHERE root_id IS NULL")
         row = conn.execute(
             "SELECT value FROM catalog_meta WHERE key = 'run_epoch'"
         ).fetchone()
@@ -1444,10 +1445,9 @@ class MetadataDatabase:
             source_id: Unique source identifier
             adapter: Backend adapter for the source
             record: The claim and its claim-time signature, from a caller that
-                registers a source with a claim. A row with one goes to
-                ``source_catalog``, with the adapter's ``catalog_payload`` when it
-                is resolved and has one; without one it goes to
-                ``sources_volatile``.
+                registers a source with a claim. The row keeps them, with the
+                adapter's ``catalog_payload`` when it is resolved and has one;
+                without one the row's claim, if it has one, is left as it was.
         """
         conn = self._get_connection()
 
@@ -1638,19 +1638,20 @@ class MetadataDatabase:
         record: Optional[CatalogRecord] = None,
         payload: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Insert or replace a source's row (*row*, in ``_ROW_COLUMNS`` order),
+        """Insert or update a source's row (*row*, in ``_ROW_COLUMNS`` order),
         serializing writes with the lock.
 
-        The row lands in ``source_catalog`` with a *record* (the claim and its
-        signature, and the adapter *payload*), else in ``sources_volatile``. A
-        source keeps its table for life (it belongs to one root, and a root that
-        would share a source is refused), so the ``sources`` view, a UNION ALL,
-        shows each ``source_id`` once without a write checking the sibling table.
+        A ``source_id`` has one row, so a write cannot list a source twice. With a
+        *record* (the claim and its signature, and the adapter *payload*) the row
+        takes the claim and loses any literal url, which its root supplies. Without
+        one only the public columns are written and a claim the row already has is
+        left alone, which is what a re-listing wants: a field uploaded to a
+        discovered source changes its tensors, not its claim.
 
-        A persisted row that exists is updated, not replaced: a registration
-        fills in the pending row its claim made, and an ``UPDATE`` costs about two
-        thirds of the wall time and a quarter of the CPU of an ``INSERT OR
-        REPLACE`` on the indexed table.
+        A row that exists is updated, not replaced: a registration fills in the
+        pending row its claim made, and an ``UPDATE`` costs about two thirds of
+        the wall time and a quarter of the CPU of an ``INSERT OR REPLACE`` on the
+        indexed table.
         """
         source_id, indexed_at = row[0], row[3]
         # Serialized before the lock: a payload can be large, and every other
@@ -1660,11 +1661,17 @@ class MetadataDatabase:
         )
         with self._write_lock:
             if claim_values is None:
-                conn.execute(
-                    f"INSERT OR REPLACE INTO sources_volatile ({_ROW_COLUMNS}) "
-                    f"VALUES ({', '.join('?' * len(row))})",
-                    row,
-                )
+                updated = conn.execute(
+                    f"UPDATE source_catalog SET {_LISTING_SET} WHERE source_id = ?",
+                    row[1:] + [source_id],
+                ).fetchone()
+                if not updated or not updated[0]:
+                    conn.execute(
+                        f"INSERT INTO source_catalog ({_ROW_COLUMNS}) "
+                        f"VALUES ({', '.join('?' * len(row))}) "
+                        f"ON CONFLICT (source_id) DO UPDATE SET {_LISTING_UPSERT_SET}",
+                        row,
+                    )
                 return
             persisted = row[:1] + row[2:]
             updated = conn.execute(
@@ -1699,8 +1706,8 @@ class MetadataDatabase:
         and ``unresolved_error`` carries the text, so a client does not wait on
         it. The registered row replaces this one by the same upsert.
 
-        With a *record* the row is persisted in ``source_catalog``, with the
-        claim and signature, and overwrites what the source had there.
+        With a *record* the row carries the claim and signature, and overwrites
+        what the source had.
         """
         conn = self._get_connection()
         row = self._pending_row(claim, catalog_url, recall, error, datetime.now())
@@ -1711,9 +1718,10 @@ class MetadataDatabase:
     _PENDING_CHUNK = 500
 
     def _pending_inserts(
-        self, table: str, columns: str, rows: Sequence[PendingRow], now: datetime
+        self, columns: str, rows: Sequence[PendingRow], now: datetime
     ) -> List[Tuple[str, List[Any]]]:
-        """The multi-row ``INSERT ... DO NOTHING`` statements for *rows*, in chunks."""
+        """The multi-row ``INSERT ... DO NOTHING`` statements for *rows*, in chunks.
+        All of *rows* have a record, or none does."""
         statements = []
         for i in range(0, len(rows), self._PENDING_CHUNK):
             chunk = rows[i : i + self._PENDING_CHUNK]
@@ -1730,7 +1738,7 @@ class MetadataDatabase:
             width = len(params) // len(chunk)
             statements.append(
                 (
-                    f"INSERT INTO {table} ({columns}) VALUES "
+                    f"INSERT INTO source_catalog ({columns}) VALUES "
                     + ", ".join([f"({', '.join('?' * width)})"] * len(chunk))
                     + " ON CONFLICT DO NOTHING",
                     params,
@@ -1744,28 +1752,24 @@ class MetadataDatabase:
         Only a source with no row yet gets one. A batch is written some time after
         its claims were made, and in that time a registration may already have
         written the real row, which a pending one must not replace. A row with a
-        record goes to ``source_catalog``, one without to ``sources_volatile``.
+        record has its claim columns, one without has none and a literal url.
 
         One transaction, serialized with every other writer by the lock; the
-        statements for the persisted rows, which are nearly all of them, are built
-        before it is taken.
+        statements for the rows with a claim, which are nearly all of them, are
+        built before it is taken.
         """
         if not rows:
             return
         conn = self._get_connection()
         now = datetime.now()
-        persisted = [r for r in rows if r.record is not None]
-        volatile = [r for r in rows if r.record is None]
-        statements = self._pending_inserts(
-            "source_catalog", _PERSISTED_COLUMNS, persisted, now
-        )
+        claimed = [r for r in rows if r.record is not None]
+        unclaimed = [r for r in rows if r.record is None]
+        statements = self._pending_inserts(_PERSISTED_COLUMNS, claimed, now)
         with self._write_lock:
             conn.execute("BEGIN TRANSACTION")
             try:
-                if volatile:
-                    statements += self._pending_inserts(
-                        "sources_volatile", _ROW_COLUMNS, volatile, now
-                    )
+                if unclaimed:
+                    statements += self._pending_inserts(_ROW_COLUMNS, unclaimed, now)
                 for sql, params in statements:
                     conn.execute(sql, params)
                 conn.execute("COMMIT")
@@ -1774,8 +1778,8 @@ class MetadataDatabase:
                 raise
 
     def restorable_rows(self) -> List[Dict[str, Any]]:
-        """The persisted rows a restore rebuilds claims from, without the payload and
-        the metadata (large, and read per source when it is hydrated).
+        """The rows with a claim, which a restore rebuilds claims from, without the
+        payload and the metadata (large, and read per source when it is hydrated).
 
         Empty unless ``restore_sources``: the table was cleared at open.
         """
@@ -1787,7 +1791,8 @@ class MetadataDatabase:
             "c.unresolved_reason, c.unresolved_error, c.root_id, c.rel, "
             "c.primary_path, c.member_paths, c.extra_config, c.signature, "
             "c.last_seen, r.last_scanned "
-            "FROM source_catalog c LEFT JOIN catalog_roots r USING (root_id)"
+            "FROM source_catalog c LEFT JOIN catalog_roots r USING (root_id) "
+            "WHERE c.root_id IS NOT NULL"
         )
         names = [d[0] for d in cursor.description]
         return [dict(zip(names, row, strict=True)) for row in cursor.fetchall()]
@@ -2084,9 +2089,6 @@ class MetadataDatabase:
         conn = self._get_connection()
         with self._write_lock:
             conn.execute("DELETE FROM source_catalog WHERE source_id = ?", [source_id])
-            conn.execute(
-                "DELETE FROM sources_volatile WHERE source_id = ?", [source_id]
-            )
             # Reserved rows go with the source row: they are its scan output,
             # re-derived on the next registration. Hand-drawn annotations are
             # deliberately NOT touched here -- outliving their source is the

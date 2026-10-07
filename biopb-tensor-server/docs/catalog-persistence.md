@@ -22,7 +22,7 @@ it comes back.
         Reconciler: diff against the confirmed DiscoveryState
                       │  add / refresh / remove
                       ▼
-   register_source (server) + catalog row (source_catalog / sources_volatile)
+   register_source (server) + catalog row (source_catalog)
 ```
 
 - **One walker.** A drop, a one-shot directory and the periodic rescan of a monitored root
@@ -53,7 +53,7 @@ it comes back.
 | `Roots` (shared by `SourceManager` and `Reconciler`) | every known root: kind (monitored, scan-once, dropped, upstream), alias, cloud, `dnd://` label, `root_id`, `root_url` | Resolved root `Path`s; a drop's label |
 | `SourceManager` | `_unavailable_roots` | Resolved root `Path`s |
 | Adapter | `_source_url` (the raw claim path, or the library's own filename for nifti / bioio / dicom), `catalog_url` | Opens files with the raw path |
-| Catalog | `catalog_roots`, `source_catalog`, `sources_volatile`, the `sources` view (§7) | `root_id`; `source_id` |
+| Catalog | `catalog_roots`, `source_catalog`, the `sources` view (§7) | `root_id`; `source_id` |
 
 ## 3. Path invariants
 
@@ -88,8 +88,8 @@ adapter `claim()` normalizes the path it returns.
 6. **I/O follows the claim path.** `open` and `stat` of a claim path follow links, so a
    link claim reads and signs its target. Quietness and change signatures stat the spelled
    path (`entry_is_quiet`, `build_entry_signature`).
-7. **The catalog `source_url` is display, never an input.** For a persisted row it is
-   computed from its root (§7); for a volatile row it is `dnd://<label>` for a drop from
+7. **The catalog `source_url` is display, never an input.** For a row with a claim it is
+   computed from its root (§7); for a row with none it is `dnd://<label>` for a drop from
    outside every known root, `cache://`, `scratch://`, or `grpc://<alias>/…` for a mirror.
    It is not fed to the filesystem or to `generate_source_id`, and rows are found and
    removed by `source_id`. The one lookup by url is `remove_source`, which matches a
@@ -203,10 +203,11 @@ ever runs: cloud roots are never walked.
 
 ### What each event writes to the catalog
 
-A source with a claim under a monitored or scan-once root (cloud roots included) has its row
-in `source_catalog` from the moment the walk finds it; a source with none (a mirror, a drop,
-an upload) has it in `sources_volatile`. The row never changes table, and registration fills
-it in.
+Every source has one row in `source_catalog`, keyed by `source_id`. A source with a claim
+under a monitored or scan-once root (cloud roots included) has it, with its claim columns,
+from the moment the walk finds it; a source with none (a mirror, a drop, an upload) has a row
+without them. Registration fills the row in, and a write that carries no claim (an upload
+re-listing its source) updates the public columns and leaves the claim as it was.
 
 | Event | Write |
 |---|---|
@@ -264,7 +265,7 @@ path only**: the claims under it that are not under a monitored root (the rescan
 and not under a declined directory. A single-file drop skips this. Then each claim is
 refreshed if known, whatever its signature, else added. A drop whose path lies inside an
 already-owned directory source is rejected (`_find_containing_source`). A drop's sources
-are volatile and **session-only**: they are not persisted and not restored, and the marks
+have no claim and are **session-only**: they are not persisted and not restored, and the marks
 are remembered in memory only.
 
 ## 6. First scan versus re-scan
@@ -368,34 +369,35 @@ from the rest, and one view publishes both:
   `root_id` is a hash of the resolved root path; `root_url` is the root's alias, or
   `to_catalog_url` of its path. A cache of config, not state: config stays the one source of
   truth.
-- **`source_catalog`**: every source that has a claim under a configured root, cloud roots
-  included. The public row columns, with `root_id` and `rel` (the forward-slashed path under
-  the root, `.` for the root itself) in place of `source_url`; the private claim
-  (`primary_path`, `member_paths`, `extra_config`, `source_type`); the claim-time signature;
-  the adapter `payload`; the `epoch` of its last write and `last_seen`. A row is resolved,
-  pending, `needs_recall` or failed.
-- **`sources_volatile`**: what has no claim to re-derive: mirrors (catalog rows only),
-  remote proxies, uploads, drops. Rebuilt empty at every open.
-- **`sources`**: a view over both exposing the published columns only. A persisted row's
+- **`source_catalog`**: one row per source. The public row columns; for a source with a
+  claim under a configured root (cloud roots included), `root_id` and `rel` (the
+  forward-slashed path under the root, `.` for the root itself) in place of `source_url`, the
+  private claim (`primary_path`, `member_paths`, `extra_config`, `source_type`), the
+  claim-time signature, the adapter `payload`, and the `epoch` of its last write and
+  `last_seen`. A row is resolved, pending, `needs_recall` or failed. A source with no claim to
+  re-derive (a mirror, a remote proxy, an upload, a drop) has `root_id` NULL, a literal
+  `source_url` and no claim columns; those rows are deleted at every open, and a restore reads
+  only the rows with a root.
+- **`sources`**: a view over it exposing the published columns only. A claimed row's
   `source_url` is `root_url`, or `root_url || '/' || rel`, which is what `Roots.display_url`
   gives the claim, so an alias edit is one `catalog_roots` row and no source row can carry a
-  stale url. A volatile row keeps a literal `source_url`.
+  stale url. A row of a root that is no longer configured is not listed.
 - **`source_confirmation(source_id, confirmed)`**: a second view, hidden from queries like the
   tables, saying whether each source was verified this run (§8). It is not part of `sources`
   because that is a published schema.
 
 The private columns are hidden because `sources` is queryable by everyone with read access
-and a claim can carry credential profile names, aliases and paths. The writer routes by
-whether the source has a claim; a source that moves between tables is deleted from the other
-in the same locked write, because a union view cannot enforce a unique `source_id`.
+and a claim can carry credential profile names, aliases and paths. `source_id` is the primary
+key, so a source cannot be listed twice whichever way it is written: a write with a claim
+fills the claim columns and clears a literal url, one without leaves them alone.
 
 A source's one root is the column `root_id`: a root's claim snapshot is `WHERE root_id = ?`,
 and `rel` is computed where the row is written, so path normalization stays out of SQL.
 
 The view is persistent, created at open (a `TEMP` view belongs to the connection that made
-it, and the read path takes a fresh cursor per call). At 100k rows a primary-key lookup
-through the union is a sequential scan of about 0.3 ms and a `source_url` lookup about
-1.1 ms; the indexes are not used through the union.
+it, and the read path takes a fresh cursor per call). At 100k rows a `source_id` lookup
+through the view takes about 1 ms and a `source_url` lookup about 10 ms, since the url is
+computed from the root.
 
 **The row.**
 
