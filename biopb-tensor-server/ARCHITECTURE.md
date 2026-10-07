@@ -48,16 +48,15 @@ The `biopb_tensor_server` package is organized into layered subpackages:
 
 - **`core/`** — foundational primitives and contracts: adapter ABCs, the
   `claim()` discovery protocol, `config` (the schema and its file I/O, nothing
-  that reads a disk or a network), the `axes` vocabulary + its `normalize` seam,
-  and the live `source_registry`.
+  that reads a disk or a network), the `axes` vocabulary + its `normalize` seam.
 - **`serving/`** — the runtime: `server` (Arrow Flight), `http_server` (FastAPI
   sidecar), `upload_manager`, `precache`, `renderer`, plus what those servers
   own directly: `metadata_db` (the DuckDB store whose `sources` / `rois` /
   `decode_rates` tables back the surfaces they expose), `tls` (the listener's
   self-signed leaf) and `activity` (in-flight read tracking). Builds on `core`.
 - **`sources/`** — source lifecycle: `resolve` (config entries -> concrete
-  sources), `source_manager` (scan orchestration)
-  and `reconciler` (the confirmed-catalog single writer). Builds on `core` and
+  sources), `source_manager` (scan orchestration),
+  `source_registry` (the live id -> adapter map) and `reconciler` (the confirmed-catalog single writer). Builds on `core` and
   `adapters`; it names `serving`'s server and `metadata_db` only in type
   annotations, never importing them at runtime.
 - **`adapters/`**, **`cache/`** — storage-format adapters and the virtual-chunk

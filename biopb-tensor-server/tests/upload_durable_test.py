@@ -393,8 +393,8 @@ class TestTheBootSweepDropsTheLegacyRow:
 
     @staticmethod
     def _manager(write_dir, db):
-        from biopb_tensor_server.core.source_registry import SourceRegistry
         from biopb_tensor_server.serving.upload_manager import UploadManager
+        from biopb_tensor_server.sources.source_registry import SourceRegistry
 
         return UploadManager(SourceRegistry(), write_dir, db)
 
@@ -466,8 +466,8 @@ class TestTheBootSweepRemovesAPendingMember:
             CacheManager.reset()
 
     def test_no_write_dir_means_nothing_to_sweep(self):
-        from biopb_tensor_server.core.source_registry import SourceRegistry
         from biopb_tensor_server.serving.upload_manager import UploadManager
+        from biopb_tensor_server.sources.source_registry import SourceRegistry
 
         manager = UploadManager(SourceRegistry(), None, None)
         assert manager.discard_unfinished_stores() == 0
@@ -480,8 +480,8 @@ class TestTheBootSweepCollectsEmptySourceDirs:
 
     @staticmethod
     def _manager(write_dir):
-        from biopb_tensor_server.core.source_registry import SourceRegistry
         from biopb_tensor_server.serving.upload_manager import UploadManager
+        from biopb_tensor_server.sources.source_registry import SourceRegistry
 
         return UploadManager(SourceRegistry(), write_dir, None)
 

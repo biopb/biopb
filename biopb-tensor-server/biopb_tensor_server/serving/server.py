@@ -109,7 +109,6 @@ from biopb_tensor_server.core.read_mask import (
     read_mask,
 )
 from biopb_tensor_server.core.retention import set_active_pyramid_config
-from biopb_tensor_server.core.source_registry import SourceRegistry
 from biopb_tensor_server.serving.activity import ActivityTracker
 from biopb_tensor_server.serving.metadata_db import (
     MetadataDatabase,
@@ -120,6 +119,7 @@ from biopb_tensor_server.serving.upload_manager import (
     DEFAULT_UPLOAD_TTL,
     UploadManager,
 )
+from biopb_tensor_server.sources.source_registry import SourceRegistry
 
 logger = logging.getLogger(__name__)
 

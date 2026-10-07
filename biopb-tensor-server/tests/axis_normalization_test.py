@@ -30,8 +30,8 @@ from biopb_tensor_server.core.normalize import (
     NormalizingAdapter,
     normalize_adapter,
 )
-from biopb_tensor_server.core.source_registry import SourceRegistry
 from biopb_tensor_server.serving.server import TensorFlightServer
+from biopb_tensor_server.sources.source_registry import SourceRegistry
 from google.protobuf.field_mask_pb2 import FieldMask
 
 from tests import catalog_server, register_and_catalog, source_ids
@@ -314,7 +314,7 @@ class TestNormalizedDescriptorAndData:
             assert list(desc.chunk_shape) == native[::-1]
 
     def test_catalog_row_tensors_are_canonical(self):
-        from biopb_tensor_server.core.source_registry import SourceRegistry
+        from biopb_tensor_server.sources.source_registry import SourceRegistry
 
         with tempfile.TemporaryDirectory() as tmp:
             adapter, _ = self._wrapped(tmp)

@@ -1,7 +1,7 @@
 """Attached tensors belong to the registry: they outlive the adapter that serves them."""
 
 from biopb_tensor_server.adapters.scratch import ScratchSource
-from biopb_tensor_server.core.source_registry import SourceRegistry, close_adapter
+from biopb_tensor_server.sources.source_registry import SourceRegistry, close_adapter
 
 
 class _Tensor:

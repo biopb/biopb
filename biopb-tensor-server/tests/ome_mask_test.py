@@ -351,7 +351,7 @@ class TestFastMetadataRealBitmap:
 
     def test_get_embedded_labels_end_to_end(self, tmp_path):
         from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
-        from biopb_tensor_server.core.source_registry import SourceRegistry
+        from biopb_tensor_server.sources.source_registry import SourceRegistry
 
         raw_bitmap = np.zeros((4, 4), dtype=np.uint8)
         raw_bitmap[1:3, 1:3] = 1

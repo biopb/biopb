@@ -184,7 +184,7 @@ class TestMultifieldSourceLevel:
     def test_catalog_row_fields_cover_all_tensors(self):
         """What the source contributes to its catalog row: its own id/url/type,
         and a structural entry per tensor (not just tensors[0])."""
-        from biopb_tensor_server.core.source_registry import SourceRegistry
+        from biopb_tensor_server.sources.source_registry import SourceRegistry
 
         tensor_specs = [
             ("tensor_0", (64, 64), "uint8"),
