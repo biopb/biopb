@@ -29,8 +29,8 @@ import com.google.gson.reflect.TypeToken;
  *
  * <p>Every foreground Flight call enters here, so typed server errors are
  * translated consistently both when an RPC starts and when a streaming action
- * reports an error while its iterator is consumed. TLS construction joins this
- * class in the next migration slice; its ownership boundary is established now.
+ * reports an error while its iterator is consumed. It also builds the TLS
+ * client from a resolved {@link TlsTrust}.
  */
 public final class FlightSession implements AutoCloseable {
     private final BufferAllocator allocator;
@@ -38,6 +38,7 @@ public final class FlightSession implements AutoCloseable {
     private final CredentialCallOption authOption;
     private final Location location;
     private final String token;
+    private final TlsTrust trust;
 
     private static final Gson GSON = new Gson();
 
@@ -50,10 +51,34 @@ public final class FlightSession implements AutoCloseable {
     private volatile boolean protocolChecked;
 
     public FlightSession(Location location, String token) {
+        this(location, token, TlsTrust.NONE);
+    }
+
+    /**
+     * Open a session whose TLS trust is {@code trust}: its anchor is the only
+     * certificate the connection accepts, and its hostname override (when set)
+     * is the name matched against the certificate instead of the dialed one.
+     * {@link TlsTrust#NONE} leaves the JDK's default trust store in charge.
+     * Meaningful only for a {@code grpc+tls://} location.
+     */
+    public FlightSession(Location location, String token, TlsTrust trust) {
+        TlsTrust effective = trust == null ? TlsTrust.NONE : trust;
+        if (effective.reresolve()) {
+            throw new IllegalArgumentException("an anchored TlsTrust must be made concrete for this "
+                    + "location first: TlsTrusts.concrete(location, trust)");
+        }
         this.location = location;
         this.token = token;
+        this.trust = effective;
         this.allocator = new RootAllocator(Long.MAX_VALUE);
-        this.client = FlightClient.builder(allocator, location).build();
+        FlightClient.Builder builder = FlightClient.builder(allocator, location);
+        if (effective.rootCerts() != null) {
+            builder.trustedCertificates(new java.io.ByteArrayInputStream(effective.rootCerts()));
+        }
+        if (effective.overrideHostname() != null) {
+            builder.overrideHostname(effective.overrideHostname());
+        }
+        this.client = builder.build();
         this.authOption = token == null || token.isEmpty()
                 ? null
                 : new CredentialCallOption(headers -> headers.insert("authorization", "Bearer " + token));
@@ -61,6 +86,7 @@ public final class FlightSession implements AutoCloseable {
 
     public Location location() { return location; }
     public String token() { return token; }
+    public TlsTrust trust() { return trust; }
     public BufferAllocator allocator() { return allocator; }
     public FlightClient client() { return client; }
     public CredentialCallOption authOption() { return authOption; }

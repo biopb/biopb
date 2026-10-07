@@ -178,9 +178,28 @@ public class TensorFlightClient implements AutoCloseable {
      * @param token      Bearer token for authentication (null disables auth)
      */
     public TensorFlightClient(Location location, long cacheBytes, String token) {
+        this(location, cacheBytes, token, TlsTrust.NONE);
+    }
+
+    /**
+     * Create a new TensorFlightClient for a {@code grpc+tls://} location whose
+     * certificate the JDK's default trust store does not know.
+     *
+     * <p>{@code trust} is what {@link TlsTrusts#resolve} returned for this
+     * location: a private CA, the server's own pinned leaf, or a verified
+     * fingerprint, with a hostname override when the certificate does not list
+     * the name dialed. Resolve once and pass it here; this constructor does no
+     * network I/O of its own for trust.
+     *
+     * @param location   Flight server location
+     * @param cacheBytes Maximum cache size in bytes
+     * @param token      Bearer token for authentication (null disables auth)
+     * @param trust      TLS trust for {@code location}, or {@link TlsTrust#NONE}
+     */
+    public TensorFlightClient(Location location, long cacheBytes, String token, TlsTrust trust) {
         LOGGER.info(
                 "Connecting to Flight server at " + location + ", cache=" + cacheBytes + "B, auth=" + (token != null));
-        this.session = new FlightSession(location, token);
+        this.session = new FlightSession(location, token, trust);
         // Every RPC goes through the session; what is read back out of it here
         // is what this class answers to callers (location / token) and the
         // allocator its Arrow results are owned by.
@@ -1280,6 +1299,12 @@ public class TensorFlightClient implements AutoCloseable {
                 .setFlightInfo(ByteString.copyFrom(info.serialize()));
         if (token != null && !token.isEmpty()) {
             builder.setAuthToken(token);
+        }
+        // The anchor the plan was read under, so the consumer trusts the same
+        // certificate instead of the first one it sees.
+        byte[] anchor = session.trust().rootCerts();
+        if (anchor != null) {
+            builder.setTlsAnchor(ByteString.copyFrom(anchor));
         }
         return builder.build();
     }

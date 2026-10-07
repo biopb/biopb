@@ -26,16 +26,11 @@ import org.apache.arrow.flight.Location;
  * belongs in the key in every one of them: two callers on one server with
  * different capabilities must not share a channel's authorization.
  *
- * <p>The one to carry over is the third component Python's connection key has
- * and this one does not: {@code TlsTrust.key_id}. One process can front two
- * upstreams naming the same {@code host:port} under different configured trust
- * anchors, each with its own hostname override, and keying without it hands one
- * upstream a connection built with the other's trust (biopb/biopb#604 item 4).
- * It is not a gap yet only because {@link FlightSession} does not construct TLS
- * at all -- {@link LocationUris} parses a {@code grpc+tls://} location but
- * nothing configures trust for it. <b>Whoever adds TLS must add it to this key
- * in the same change</b>, or the bug arrives silently with the feature.
- * biopb/biopb#1072 tracks that work and names this as part of it.
+ * <p>The third component of the key is the one Python's connection key has too:
+ * {@link TlsTrust#keyId()}. One process can front two upstreams naming the same
+ * {@code host:port} under different configured trust anchors, each with its own
+ * hostname override, and keying without it hands one upstream a connection built
+ * with the other's trust (biopb/biopb#604 item 4).
  *
  * <p>Sessions live until the JVM exits. That is the point -- there is no
  * reference count to hang a close on, because an image hands its session to an
@@ -61,18 +56,26 @@ final class FlightSessions {
      * use. The cache owns it; do <b>not</b> close the result.
      */
     static FlightSession shared(Location location, String token) {
-        String key = key(location, token);
-        return CACHE.computeIfAbsent(key, ignored -> new FlightSession(location, token));
+        return shared(location, token, TlsTrust.NONE);
+    }
+
+    /** As {@link #shared(Location, String)}, trusting the server as {@code trust} says. */
+    static FlightSession shared(Location location, String token, TlsTrust trust) {
+        TlsTrust effective = trust == null ? TlsTrust.NONE : trust;
+        return CACHE.computeIfAbsent(key(location, token, effective),
+                ignored -> new FlightSession(location, token, effective));
     }
 
     /**
      * The token is part of the key, not just the location: two callers on one
      * server with different capabilities must not share a channel's
-     * authorization. A resolved TLS trust id belongs here too, once there is
-     * one -- see the class javadoc.
+     * authorization. So is the trust id: two upstreams naming one
+     * {@code host:port} under different anchors must not be handed each other's
+     * connection.
      */
-    private static String key(Location location, String token) {
-        return location.getUri().toString() + "\u0000" + (token == null ? "" : token);
+    private static String key(Location location, String token, TlsTrust trust) {
+        return location.getUri().toString() + "\u0000" + (token == null ? "" : token)
+                + "\u0000" + (trust.keyId() == null ? "" : trust.keyId());
     }
 
     /** Close every cached session. Package-private for tests and the shutdown hook. */

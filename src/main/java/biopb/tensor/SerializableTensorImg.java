@@ -128,9 +128,13 @@ public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
         // Shared per (location, token): an image hands its session to an imglib2
         // cell cache that outlives every call here, so there is no point at
         // which this class could close one. See FlightSessions.
+        org.apache.arrow.flight.Location location = LocationUris.parse(handle.getLocation());
+        // The sender's anchor says which certificate; the name check is this
+        // process's, because it depends on the name dialed here.
         session = FlightSessions.shared(
-                LocationUris.parse(handle.getLocation()),
-                handle.getAuthToken().isEmpty() ? null : handle.getAuthToken());
+                location,
+                handle.getAuthToken().isEmpty() ? null : handle.getAuthToken(),
+                TlsTrusts.concrete(location, TlsTrusts.anchored(handle.getTlsAnchor().toByteArray())));
         if (plan.getEndpoints().isEmpty()) {
             plan = refreshEndpointlessPlan(plan);
         }
