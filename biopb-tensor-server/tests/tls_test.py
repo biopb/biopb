@@ -489,7 +489,7 @@ def test_a_local_sdk_client_reads_a_plane_serving_a_byo_cert(
     """
     import numpy as np
     import zarr
-    from biopb import LocalTrustError, local_data_plane_fingerprint
+    from biopb._control import LocalTrustError, local_data_plane_fingerprint
     from biopb._security import tls_material as _tls_material, tls_record as _tls_record
     from biopb.tensor import TensorFlightClient
     from biopb_tensor_server import ZarrAdapter

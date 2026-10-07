@@ -1,7 +1,7 @@
 """The algorithm registry, and a probe of a server of the ``Ops`` protocol.
 
 Owned by the control: it is the only process that reads the registry and
-probes servers. Clients ask it over HTTP (``biopb.algorithms``).
+probes servers. Clients ask it over HTTP (``biopb._control.algorithms``).
 
 The registry is a directory, ``~/.config/biopb/algorithms/``. Each file is one
 entry, named by its stem; a stem starting with ``_`` is skipped:

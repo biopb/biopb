@@ -1,7 +1,7 @@
 """Tests for the ``biopb algorithm`` CLI group.
 
 ``list`` is a thin, read-only face over the control client's
-``biopb.algorithms``. We stub that so the test never dials a control, and assert
+``biopb._control.algorithms``. We stub that so the test never dials a control, and assert
 the rendering: the human table, the ``--json`` shape, the empty-registry message,
 that ``--timeout`` is threaded through, and that a missing control is an error
 (the CLI never starts one).
@@ -59,7 +59,7 @@ def stub_control(monkeypatch):
             seen["timeout"] = timeout
             return rows
 
-        monkeypatch.setattr("biopb.algorithms", control)
+        monkeypatch.setattr("biopb._control.algorithms", control)
         return seen
 
     return _factory

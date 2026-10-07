@@ -758,7 +758,7 @@ class _FakeControlAlgorithms:
         return server
 
     def publish(self) -> None:
-        """Write the control runtime record so ``biopb.algorithms()``
+        """Write the control runtime record so ``biopb._control.algorithms()``
         finds this fake control the same way it would a real one."""
         from biopb._control._endpoints import write_runtime_record
 

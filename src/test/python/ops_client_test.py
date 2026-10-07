@@ -187,7 +187,7 @@ def test_a_name_is_brought_up_through_the_control(monkeypatch, serve):
         asked.append(name)
         return {"state": "up", "url": url, "token": "t"}
 
-    monkeypatch.setattr("biopb.ensure_algorithm", ensure)
+    monkeypatch.setattr("biopb._control.ensure_algorithm", ensure)
     with proto.connect("cellpose") as client:
         assert client.describe().ops
     assert asked == ["cellpose"]
@@ -195,7 +195,7 @@ def test_a_name_is_brought_up_through_the_control(monkeypatch, serve):
 
 def test_a_name_that_is_not_up_is_a_runtime_error(monkeypatch):
     monkeypatch.setattr(
-        "biopb.ensure_algorithm",
+        "biopb._control.ensure_algorithm",
         lambda name, timeout: {"state": "error", "error": "no gpu"},
     )
     with pytest.raises(RuntimeError, match="error:\nno gpu"):

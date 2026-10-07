@@ -297,10 +297,10 @@ def test_build_ops_from_config_reads_the_control(monkeypatch):
             "ops": [_info("seg")],
         }
     ]
-    monkeypatch.setattr("biopb.algorithms", lambda timeout: rows)
+    monkeypatch.setattr("biopb._control.algorithms", lambda timeout: rows)
     ops = _process_ops.build_ops_from_config({}, lambda: None)
     assert list(ops) == ["seg"]
-    monkeypatch.setattr("biopb.algorithms", lambda timeout: None)
+    monkeypatch.setattr("biopb._control.algorithms", lambda timeout: None)
     assert len(_process_ops.build_ops_from_config({}, lambda: None)) == 0
 
 
@@ -444,7 +444,7 @@ def test_a_script_entry_is_ensured_and_found_again(serve, monkeypatch):
         ensured.append(name)
         return next(answers)
 
-    monkeypatch.setattr("biopb.ensure_algorithm", ensure)
+    monkeypatch.setattr("biopb._control.ensure_algorithm", ensure)
     ops = _ops([{"name": "seg", "kind": "script", "state": "stopped", "ops": OPS}])
     assert ops.track() == "done"
     assert ensured == ["seg"]
@@ -456,7 +456,7 @@ def test_a_script_entry_is_ensured_and_found_again(serve, monkeypatch):
 
 def test_a_script_entry_that_fails_says_where_to_look(monkeypatch):
     monkeypatch.setattr(
-        "biopb.ensure_algorithm",
+        "biopb._control.ensure_algorithm",
         lambda name, timeout: {"state": "failed", "error": "ImportError: torch"},
     )
     ops = _ops([{"name": "seg", "kind": "script", "state": "stopped", "ops": OPS}])
@@ -476,7 +476,7 @@ def test_refresh_rebinds_and_reports(monkeypatch):
         {"name": "b", "kind": "script", "state": "installing", "ops": []},
         {"name": "c", "kind": "script", "state": "failed", "ops": [], "error": "x"},
     ]
-    monkeypatch.setattr("biopb.refresh_algorithms", lambda: rows)
+    monkeypatch.setattr("biopb._control.refresh_algorithms", lambda: rows)
     ops = _ops(None)
     report = ops.refresh()
     assert list(ops) == ["seg"]
@@ -495,10 +495,12 @@ def test_status_logs_restart(monkeypatch):
             "error": "exited before serving\nTraceback...",
         }
     ]
-    monkeypatch.setattr("biopb.algorithms", lambda: rows)
-    monkeypatch.setattr("biopb.algorithm_logs", lambda name, lines: ["l1", "l2"])
+    monkeypatch.setattr("biopb._control.algorithms", lambda: rows)
     monkeypatch.setattr(
-        "biopb.restart_algorithm",
+        "biopb._control.algorithm_logs", lambda name, lines: ["l1", "l2"]
+    )
+    monkeypatch.setattr(
+        "biopb._control.restart_algorithm",
         lambda name, timeout: {"state": "up", "error": None},
     )
     ops = _ops(rows)
@@ -521,7 +523,7 @@ _BUILT = {"name": "a", "kind": "script", "state": "stopped", "ops": [_info("seg"
 def test_a_miss_rereads_the_registry_once_the_server_is_built(monkeypatch):
     ops = _ops([_NEW])
     assert repr(ops) == "<ops: none; not built yet: a>"
-    monkeypatch.setattr("biopb.algorithms", lambda timeout: [_BUILT])
+    monkeypatch.setattr("biopb._control.algorithms", lambda timeout: [_BUILT])
     assert ops.seg.op_name == "seg"
     assert ops["seg"] is ops.seg
     assert repr(ops) == "<ops: seg>"
@@ -529,7 +531,7 @@ def test_a_miss_rereads_the_registry_once_the_server_is_built(monkeypatch):
 
 def test_a_miss_names_the_servers_not_built_yet(monkeypatch):
     ops = _ops([_NEW])
-    monkeypatch.setattr("biopb.algorithms", lambda timeout: [_NEW])
+    monkeypatch.setattr("biopb._control.algorithms", lambda timeout: [_NEW])
     with pytest.raises(AttributeError, match="Not built yet: a"):
         _ = ops.seg
 
@@ -537,7 +539,7 @@ def test_a_miss_names_the_servers_not_built_yet(monkeypatch):
 def test_misses_reread_at_most_once_per_interval(monkeypatch):
     calls = []
     monkeypatch.setattr(
-        "biopb.algorithms", lambda timeout: calls.append(timeout) or [_NEW]
+        "biopb._control.algorithms", lambda timeout: calls.append(timeout) or [_NEW]
     )
     ops = _ops([_NEW])
     for _ in range(3):
@@ -547,7 +549,8 @@ def test_misses_reread_at_most_once_per_interval(monkeypatch):
 
 def test_an_underscore_probe_does_not_reread(monkeypatch):
     monkeypatch.setattr(
-        "biopb.algorithms", lambda timeout: pytest.fail("a probe must not read")
+        "biopb._control.algorithms",
+        lambda timeout: pytest.fail("a probe must not read"),
     )
     assert not hasattr(_ops([_NEW]), "_repr_html_")
 
@@ -556,7 +559,7 @@ def test_a_failed_reread_still_raises_the_miss(monkeypatch):
     def boom(timeout):
         raise OSError("no control")
 
-    monkeypatch.setattr("biopb.algorithms", boom)
+    monkeypatch.setattr("biopb._control.algorithms", boom)
     with pytest.raises(AttributeError, match="no op 'seg'"):
         _ = _ops([_NEW]).seg
     with pytest.raises(KeyError):
@@ -565,7 +568,7 @@ def test_a_failed_reread_still_raises_the_miss(monkeypatch):
 
 def test_status_says_when_the_control_has_ops_this_kernel_lacks(monkeypatch):
     ops = _ops([_NEW])
-    monkeypatch.setattr("biopb.algorithms", lambda: [_BUILT])
+    monkeypatch.setattr("biopb._control.algorithms", lambda: [_BUILT])
     assert "(not bound in this kernel: call ops.refresh())" in ops.status()
     ops.bind([_BUILT])
     assert "not bound" not in ops.status()

@@ -8,7 +8,7 @@ Commands:
     cache-stats  Show the server's cache hit/miss diagnostics
 
 Every command dials the *same* plane through the one resolver,
-:func:`biopb.resolve_data_plane` (biopb/biopb#615): ``--server`` -> ``BIOPB_TENSOR_URL`` ->
+:func:`biopb._control.resolve_data_plane` (biopb/biopb#615): ``--server`` -> ``BIOPB_TENSOR_URL`` ->
 the control plane's published endpoint -> the default. ``--server`` stays because
 a plane launched directly on a custom port is recorded nowhere and so cannot be
 discovered; everything else is asked for rather than reconstructed.
@@ -27,7 +27,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from biopb import (
+from biopb._control import (
     ENV_TENSOR_TOKEN,
     DataPlaneEndpoint,
     LocalTrustError,

@@ -20,6 +20,10 @@ The CLI module provides the `biopb tensor` command with four subcommands:
 Note: Server components have been moved to the biopb-tensor-server package.
 """
 
+# Raised by Connection when the local plane's TLS certificate cannot be trusted.
+# Stdlib only, so it needs no lazy import.
+from biopb._control import LocalTrustError
+
 # Import proto-generated classes with explicit paths
 from biopb.tensor.descriptor_pb2 import (
     CatalogQuery,
@@ -74,6 +78,7 @@ __all__ = [
     "SerializedTensor",
     # Client
     "Connection",
+    "LocalTrustError",
     "TensorFlightClient",
     "ResolveCancelled",
     "UploadRefused",

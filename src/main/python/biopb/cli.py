@@ -473,7 +473,7 @@ def _require_control_for_view() -> None:
     Its 2s budget is deliberate: ``/health`` takes the supervisor lock, so a busy
     control answers late, and a false negative here is a hard exit.
     """
-    from . import ENV_TENSOR_URL
+    from ._control import ENV_TENSOR_URL
 
     if os.environ.get(ENV_TENSOR_URL, "").strip():
         return
@@ -1733,7 +1733,7 @@ def algorithm_list(
     """List the entries of ~/.config/biopb/algorithms/ as the control reports
     them: a server file the control runs, and a url entry it probes. Needs a
     running control."""
-    from . import algorithms
+    from ._control import algorithms
 
     # The control probes url entries under the same deadline before it answers.
     rows = algorithms(timeout=timeout + 6)
@@ -1746,7 +1746,7 @@ def algorithm_list(
 def algorithm_refresh(
     json_output: bool = typer.Option(False, "--json", help="Emit JSON"),
 ):
-    from . import refresh_algorithms
+    from ._control import refresh_algorithms
 
     rows = refresh_algorithms()
     if rows is None:
@@ -1761,7 +1761,7 @@ def algorithm_start(
     name: str = typer.Argument(..., help="Registry entry name"),
     timeout: float = typer.Option(600.0, "--timeout", help="Seconds to wait"),
 ):
-    from . import ensure_algorithm
+    from ._control import ensure_algorithm
 
     row = _algorithm_verb(ensure_algorithm, name, timeout=timeout)
     _print_algorithm_rows([row], False)
@@ -1769,7 +1769,7 @@ def algorithm_start(
 
 @algorithm_app.command("stop", help="Stop a server file's server.")
 def algorithm_stop(name: str = typer.Argument(..., help="Registry entry name")):
-    from . import stop_algorithm
+    from ._control import stop_algorithm
 
     row = _algorithm_verb(stop_algorithm, name)
     _print_algorithm_rows([row], False)
@@ -1782,7 +1782,7 @@ def algorithm_restart(
     name: str = typer.Argument(..., help="Registry entry name"),
     timeout: float = typer.Option(600.0, "--timeout", help="Seconds to wait"),
 ):
-    from . import restart_algorithm
+    from ._control import restart_algorithm
 
     row = _algorithm_verb(restart_algorithm, name, timeout=timeout)
     _print_algorithm_rows([row], False)
@@ -1793,7 +1793,7 @@ def algorithm_logs_cmd(
     name: str = typer.Argument(..., help="Registry entry name"),
     lines: int = typer.Option(200, "--lines", "-n", help="Lines to show"),
 ):
-    from . import algorithm_logs
+    from ._control import algorithm_logs
 
     for line in _algorithm_verb(algorithm_logs, name, lines=lines):
         print(line)

@@ -2,9 +2,8 @@
 
 How a client on this machine finds the tensor (data) plane and the token for
 it. It is files, environment variables and two HTTP calls, so any language can
-implement it; `biopb`'s top-level control-client functions (backed by the
-private `biopb._control`) are the Python one, and `biopb.tensor.Connection`
-dials what it returns.
+implement it; the private `biopb._control` is the Python one, and
+`biopb.tensor.Connection` is its public face: it finds the plane and dials it.
 
 ## State directory
 
@@ -23,7 +22,7 @@ A control behind a reverse proxy also publishes how the *user's browser* reaches
 it, which is not the address above, as `user_url`: the origin (`--public-origin` /
 `BIOPB_PUBLIC_ORIGIN`, e.g. `https://portal.example.edu`) followed by the path
 prefix (`--url-prefix` / `BIOPB_URL_PREFIX`, e.g. `/node/<host>/<port>`), or the
-bare prefix when no origin was given. `biopb.user_base_url()` returns it, else
+bare prefix when no origin was given. `user_base_url()` (in `biopb._control`) returns it, else
 the connect URL: a link to hand a person, where `base_url()` is for this
 machine's own requests. Nothing routes or authorizes on it.
 

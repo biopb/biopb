@@ -5,7 +5,7 @@ dials and, when it has none, why. It caches nothing else: the catalog, health
 and sources are the plane's to answer, asked on the client.
 
 Where the plane is comes from, in order: ``$BIOPB_TENSOR_URL``, then the
-control (:func:`biopb.ensure_data_plane`), which also brings the plane
+control (:func:`biopb._control.ensure_data_plane`), which also brings the plane
 up. An address from anywhere but the control is dialed with an explicit token
 or ``$BIOPB_TENSOR_TOKEN``, never with the control's credential file.
 
@@ -21,14 +21,14 @@ import os
 import time
 from typing import Optional
 
-from biopb import (
+from biopb._control import (
     ENV_TENSOR_TOKEN,
     ENV_TENSOR_URL,
     LocalTrustError,
+    data_plane_trust,
     ensure_data_plane,
     resolve_data_plane_token,
 )
-from biopb._control import data_plane_trust
 
 from .client import TensorFlightClient
 

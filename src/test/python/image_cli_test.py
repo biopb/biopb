@@ -128,7 +128,7 @@ def test_call_refuses_an_unknown_op(url):
 
 def test_a_registry_name_is_resolved_through_the_control(url, monkeypatch):
     monkeypatch.setattr(
-        "biopb.ensure_algorithm",
+        "biopb._control.ensure_algorithm",
         lambda name, timeout: {"state": "up", "url": url, "token": None},
     )
     result = runner.invoke(app, ["ops", "cellpose"])
@@ -140,7 +140,7 @@ def test_an_unreachable_registry_name_is_a_clean_error(monkeypatch):
     def refuse(name, timeout):
         raise LookupError(f"no algorithm {name!r}")
 
-    monkeypatch.setattr("biopb.ensure_algorithm", refuse)
+    monkeypatch.setattr("biopb._control.ensure_algorithm", refuse)
     result = runner.invoke(app, ["ops", "ghost"])
     assert result.exit_code == 1
     assert "no algorithm 'ghost'" in result.stderr

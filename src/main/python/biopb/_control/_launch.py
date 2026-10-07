@@ -14,6 +14,8 @@ import subprocess
 import threading
 
 from . import _agents
+from ._client import base_url
+from ._data_plane import resolve_data_plane_token
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +36,7 @@ def start_control_detached() -> bool:
 
     Fire-and-forget because the shim must answer the MCP initialize within its
     timeout. If the control is still down when the child first needs the data
-    plane, :func:`biopb.ensure_data_plane` returns ``None`` and the connection
+    plane, :func:`biopb._control.ensure_data_plane` returns ``None`` and the connection
     reports it.
 
     The process is detached, so it survives a client that disconnects early.
@@ -74,9 +76,7 @@ def start_control_detached() -> bool:
 
 
 def _control_url() -> str:
-    import biopb
-
-    return biopb.base_url()
+    return base_url()
 
 
 def control_up(timeout: float = 1.0) -> bool:
@@ -122,15 +122,13 @@ def launch_session(
     import urllib.request
     from urllib.parse import urlencode
 
-    import biopb
-
     params = {
         "start_kernel": int(start_kernel),
         "display": json.dumps(display),
         # Keeps the control's own wait under ours, so a slow start returns a verdict.
         "client_timeout": timeout,
     }
-    token = biopb.resolve_data_plane_token()
+    token = resolve_data_plane_token()
     req = urllib.request.Request(
         f"{_control_url()}/api/sessions/new?{urlencode(params)}",
         data=b"",

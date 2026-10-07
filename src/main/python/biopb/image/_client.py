@@ -178,7 +178,7 @@ def connect(
     and takes the server's own token; an explicit *token* overrides it.
     """
     if "://" not in target:
-        from biopb import ensure_algorithm
+        from biopb._control import ensure_algorithm
 
         row = ensure_algorithm(target, timeout=_ENSURE_TIMEOUT)
         if row["state"] != "up":

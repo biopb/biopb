@@ -344,7 +344,7 @@ def control(plane, tmp_path, monkeypatch):
 
 
 def test_client_verbs_over_http(control, registry):
-    import biopb as client
+    from biopb import _control as client
 
     (registry / "seg.py").write_text(_server())
     (registry / "remote.json").write_text(json.dumps({"url": "grpc://127.0.0.1:1"}))
@@ -366,7 +366,7 @@ def test_client_verbs_over_http(control, registry):
 
 
 def test_no_control_is_none(monkeypatch):
-    import biopb as client
+    from biopb import _control as client
 
     monkeypatch.setattr(
         "biopb._control._client.control_base_url", lambda: "http://127.0.0.1:1"
