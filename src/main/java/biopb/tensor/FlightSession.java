@@ -160,9 +160,7 @@ public final class FlightSession implements AutoCloseable {
         if (advertised == null) {
             return null;
         }
-        return advertised.regionMatches(true, 0, "grpcs://", 0, 8)
-                ? "grpc+tls://" + advertised.substring(8)
-                : advertised;
+        return LocationUris.normalizeScheme(advertised);
     }
 
     /**

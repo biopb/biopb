@@ -191,7 +191,13 @@ public class TensorChunkCodecTest {
     public void a_chunk_split_across_rows_decodes_in_order() {
         ChunkValues values = ChunkValues.decode(
                 Arrays.asList(leLongs(1, 2), leLongs(3)), Arrays.asList("<i8", "<i8"));
-        Assert.assertEquals(3, values.length());
+        ArrayImg<LongType, ?> img = new ArrayImgFactory<>(new LongType()).create(3);
+        values.writeTo(img.randomAccess(), line(3));
+        RandomAccess<LongType> access = img.randomAccess();
+        for (int i = 0; i < 3; i++) {
+            access.setPosition(i, 0);
+            Assert.assertEquals(i + 1L, access.get().get());
+        }
     }
 
     @Test(expected = IllegalStateException.class)

@@ -78,6 +78,9 @@ public final class TlsTrusts {
     /** An anchor this close to its notAfter is warned about, once per resolve. */
     private static final long EXPIRY_WARN_MS = 30L * 86_400_000L;
 
+    private static final java.util.concurrent.ConcurrentHashMap<String, TlsTrust> ANCHORED =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
     private TlsTrusts() {}
 
     /**
@@ -169,8 +172,13 @@ public final class TlsTrusts {
             return TlsTrust.NONE;
         }
         byte[] anchor = trust.rootCerts();
-        String override = resolveHostnameOverride(target, anchor, Mode.ANCHORED);
-        return new TlsTrust(anchor, override, keyId(target.key(), anchor, null) + "|anchored", false);
+        String key = keyId(target.key(), anchor, null) + "|anchored";
+        // Deserializing a tensor lands here once per tensor, ahead of the session
+        // cache, and the answer is a pair of TLS handshakes: ask once per endpoint
+        // and anchor. Not invalidated, like Python's memo -- a rotated certificate
+        // is a restart.
+        return ANCHORED.computeIfAbsent(key, ignored -> new TlsTrust(
+                anchor, resolveHostnameOverride(target, anchor, Mode.ANCHORED), key, false));
     }
 
     /** Whether {@code location} is a {@code grpc+tls://} address, so trust applies. */

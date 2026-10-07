@@ -57,7 +57,8 @@ public final class ControlClient {
         params.put("client_timeout", String.valueOf(timeout.toMillis() / 1000.0));
         JsonObject answer;
         try {
-            answer = discovery.controlRequest("POST", "/api/algorithms/ensure", params, timeout);
+            answer = discovery.controlRequest("POST", "/api/algorithms/ensure", params,
+                    discovery.resolveToken(null, true), timeout);
         } catch (DataPlaneDiscovery.ControlRefused refused) {
             if (refused.status == 404) {
                 throw new NoSuchElementException(refused.getMessage());

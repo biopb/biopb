@@ -42,6 +42,9 @@ public final class OpsClient implements AutoCloseable {
      */
     private static final Duration ENSURE_TIMEOUT = Duration.ofSeconds(900);
 
+    /** Ends the event queue: the server closed the stream. */
+    private static final Object END = new Object();
+
     private final String url;
     private final ManagedChannel channel;
     private final Duration inactivityTimeout;
@@ -163,7 +166,8 @@ public final class OpsClient implements AutoCloseable {
      */
     public void events(String op, Map<String, Arg> args, Consumer<Event> sink) {
         biopb.image.Call request = biopb.image.Call.newBuilder().setOp(op).putAllArgs(args).build();
-        BlockingQueue<Object[]> items = new LinkedBlockingQueue<>();
+        // An Event, the Throwable that ended the call, or END.
+        BlockingQueue<Object> items = new LinkedBlockingQueue<>();
         AtomicReference<ClientCallStreamObserver<biopb.image.Call>> handle = new AtomicReference<>();
         OpsGrpc.newStub(channel)
                 .withInterceptors(MetadataUtils.newAttachHeadersInterceptor(headers))
@@ -175,40 +179,38 @@ public final class OpsClient implements AutoCloseable {
 
                     @Override
                     public void onNext(Event event) {
-                        items.add(new Object[] { "event", event });
+                        items.add(event);
                     }
 
                     @Override
                     public void onError(Throwable error) {
-                        items.add(new Object[] { "error", error });
+                        items.add(error);
                     }
 
                     @Override
                     public void onCompleted() {
-                        items.add(new Object[] { "end", null });
+                        items.add(END);
                     }
                 });
         try {
             while (true) {
-                Object[] item = inactivityTimeout == null
+                Object item = inactivityTimeout == null
                         ? items.take()
                         : items.poll(inactivityTimeout.toNanos(), TimeUnit.NANOSECONDS);
                 if (item == null) {
                     throw new OpTimeoutException(op + ": no word from the server in "
                             + inactivityTimeout.toMillis() / 1000.0 + " s");
                 }
-                switch ((String) item[0]) {
-                    case "end":
-                        return;
-                    case "error": {
-                        Throwable error = (Throwable) item[1];
-                        throw error instanceof StatusRuntimeException
-                                ? opError(op, (StatusRuntimeException) error)
-                                : new IllegalStateException(op + ": " + error, error);
-                    }
-                    default:
-                        sink.accept((Event) item[1]);
+                if (item == END) {
+                    return;
                 }
+                if (item instanceof Throwable) {
+                    Throwable error = (Throwable) item;
+                    throw error instanceof StatusRuntimeException
+                            ? opError(op, (StatusRuntimeException) error)
+                            : new IllegalStateException(op + ": " + error, error);
+                }
+                sink.accept((Event) item);
             }
         } catch (InterruptedException error) {
             Thread.currentThread().interrupt();
@@ -299,7 +301,7 @@ public final class OpsClient implements AutoCloseable {
      */
     public static ManagedChannel makeChannel(String url) {
         int separator = url.indexOf("://");
-        String scheme = separator < 0 ? "" : url.substring(0, separator).toLowerCase();
+        String scheme = separator < 0 ? "" : url.substring(0, separator).toLowerCase(java.util.Locale.ROOT);
         String rest = separator < 0 ? url : url.substring(separator + 3);
         int slash = rest.indexOf('/');
         String target = slash < 0 ? rest : rest.substring(0, slash);

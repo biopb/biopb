@@ -1,6 +1,7 @@
 package biopb.tensor;
 
 import java.util.Arrays;
+import java.util.Objects;
 
 /**
  * Everything a {@code FlightClient} needs to trust one TLS endpoint -- plain
@@ -63,10 +64,6 @@ public final class TlsTrust {
         return reresolve;
     }
 
-    boolean isNone() {
-        return rootCerts == null && overrideHostname == null;
-    }
-
     @Override
     public boolean equals(Object other) {
         if (!(other instanceof TlsTrust)) {
@@ -74,13 +71,13 @@ public final class TlsTrust {
         }
         TlsTrust that = (TlsTrust) other;
         return Arrays.equals(rootCerts, that.rootCerts)
-                && java.util.Objects.equals(overrideHostname, that.overrideHostname)
-                && java.util.Objects.equals(keyId, that.keyId)
+                && Objects.equals(overrideHostname, that.overrideHostname)
+                && Objects.equals(keyId, that.keyId)
                 && reresolve == that.reresolve;
     }
 
     @Override
     public int hashCode() {
-        return java.util.Objects.hash(Arrays.hashCode(rootCerts), overrideHostname, keyId, reresolve);
+        return Objects.hash(Arrays.hashCode(rootCerts), overrideHostname, keyId, reresolve);
     }
 }

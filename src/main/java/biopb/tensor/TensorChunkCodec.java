@@ -206,7 +206,11 @@ final class TensorChunkCodec {
             RandomAccess<T> access,
             ChunkBounds bounds,
             double[] values) {
-        scatter(access, bounds, values.length, (type, index) -> type.setReal(values[index]));
+        ChunkWalk walk = new ChunkWalk(bounds, values.length);
+        for (double value : values) {
+            walk.moveTo(access);
+            access.get().setReal(value);
+        }
     }
 
     /**
@@ -220,43 +224,54 @@ final class TensorChunkCodec {
             RandomAccess<T> access,
             ChunkBounds bounds,
             long[] values) {
+        ChunkWalk walk = new ChunkWalk(bounds, values.length);
         if (access.get() instanceof IntegerType) {
-            scatter(access, bounds, values.length,
-                    (type, index) -> ((IntegerType<?>) type).setInteger(values[index]));
-        } else {
-            scatter(access, bounds, values.length, (type, index) -> type.setReal(values[index]));
-        }
-    }
-
-    /** Sets one element of the target type from the chunk's {@code index}th value. */
-    private interface Setter<T> {
-        void set(T type, int index);
-    }
-
-    private static <T extends NativeType<T> & RealType<T>> void scatter(
-            RandomAccess<T> access, ChunkBounds bounds, int count, Setter<T> setter) {
-        long[] start = toLongArray(bounds.getStartList());
-        long[] stop = toLongArray(bounds.getStopList());
-        long[] chunkShape = new long[start.length];
-        long expectedSize = 1L;
-        for (int axis = 0; axis < start.length; axis++) {
-            chunkShape[axis] = stop[axis] - start[axis];
-            expectedSize *= chunkShape[axis];
-        }
-        if (expectedSize != count) {
-            throw new IllegalStateException(
-                    "Chunk size mismatch: expected " + expectedSize + " values but received " + count);
-        }
-
-        long[] localPosition = new long[chunkShape.length];
-        long[] globalPosition = new long[chunkShape.length];
-        for (int index = 0; index < count; index++) {
-            for (int axis = 0; axis < chunkShape.length; axis++) {
-                globalPosition[axis] = start[axis] + localPosition[axis];
+            for (long value : values) {
+                walk.moveTo(access);
+                ((IntegerType<?>) access.get()).setInteger(value);
             }
-            access.setPosition(globalPosition);
-            setter.set(access.get(), index);
-            advanceRowMajor(localPosition, chunkShape);
+        } else {
+            for (long value : values) {
+                walk.moveTo(access);
+                access.get().setReal(value);
+            }
+        }
+    }
+
+    /**
+     * A chunk's elements in row-major order, as the global positions they go to:
+     * checks the count against the bounds once, then {@link #moveTo} steps a
+     * {@code RandomAccess} onto the next element.
+     */
+    private static final class ChunkWalk {
+        private final long[] start;
+        private final long[] shape;
+        private final long[] local;
+        private final long[] global;
+
+        ChunkWalk(ChunkBounds bounds, int count) {
+            start = toLongArray(bounds.getStartList());
+            long[] stop = toLongArray(bounds.getStopList());
+            shape = new long[start.length];
+            long expectedSize = 1L;
+            for (int axis = 0; axis < start.length; axis++) {
+                shape[axis] = stop[axis] - start[axis];
+                expectedSize *= shape[axis];
+            }
+            if (expectedSize != count) {
+                throw new IllegalStateException(
+                        "Chunk size mismatch: expected " + expectedSize + " values but received " + count);
+            }
+            local = new long[shape.length];
+            global = new long[shape.length];
+        }
+
+        void moveTo(RandomAccess<?> access) {
+            for (int axis = 0; axis < shape.length; axis++) {
+                global[axis] = start[axis] + local[axis];
+            }
+            access.setPosition(global);
+            advanceRowMajor(local, shape);
         }
     }
 

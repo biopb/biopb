@@ -27,7 +27,7 @@ final class ChunkDecoder {
      */
     static double[] decodeChunkBytes(byte[] raw, String dtypeStr) {
         String s = dtypeStr == null ? "" : dtypeStr.trim().toLowerCase();
-        ByteOrder order = s.startsWith(">") ? ByteOrder.BIG_ENDIAN : ByteOrder.LITTLE_ENDIAN;
+        ByteOrder order = orderOf(s);
         // The byte-order mark and the spelled-out aliases are folded away by
         // the same normalizer createType and bytesPerElement use, so this
         // decode and the imglib2 type it lands in cannot disagree about a
@@ -76,6 +76,11 @@ final class ChunkDecoder {
         return out;
     }
 
+    /** The byte order a trimmed, lowercased numpy dtype string names: {@code >} is big, anything else little. */
+    private static ByteOrder orderOf(String dtype) {
+        return dtype.startsWith(">") ? ByteOrder.BIG_ENDIAN : ByteOrder.LITTLE_ENDIAN;
+    }
+
     /** Whether a dtype string is an integer kind ({@code u}/{@code i}), decoded exactly. */
     static boolean isInteger(String dtypeStr) {
         String body = TensorChunkCodec.normalizeDtype(dtypeStr);
@@ -99,7 +104,7 @@ final class ChunkDecoder {
      */
     static int decodeChunkIntegers(byte[] raw, String dtypeStr, long[] out, int offset) {
         String s = dtypeStr == null ? "" : dtypeStr.trim().toLowerCase();
-        ByteOrder order = s.startsWith(">") ? ByteOrder.BIG_ENDIAN : ByteOrder.LITTLE_ENDIAN;
+        ByteOrder order = orderOf(s);
         String body = TensorChunkCodec.normalizeDtype(s);
         boolean unsigned = body.charAt(0) == 'u';
         int size = TensorChunkCodec.bytesPerElement(body);

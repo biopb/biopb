@@ -12,6 +12,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.Duration;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.logging.Logger;
 
 import com.google.gson.JsonElement;
@@ -73,7 +74,8 @@ final class DataPlaneDiscovery {
     }
 
     private final DiscoveryEnvironment env;
-    private final HttpClient http = HttpClient.newHttpClient();
+    /** Shared: each client owns a selector thread and an executor, and none is ever closed. */
+    private static final HttpClient HTTP = HttpClient.newHttpClient();
 
     DataPlaneDiscovery(DiscoveryEnvironment env) {
         this.env = env;
@@ -87,19 +89,20 @@ final class DataPlaneDiscovery {
 
     /** Where the control listens, e.g. {@code http://127.0.0.1:8813}. */
     String controlBaseUrl() {
-        return connectUrl(controlHost(), controlPort());
+        JsonObject record = runtimeRecord();
+        return connectUrl(controlHost(record), controlPort(record));
     }
 
     /**
      * {@code BIOPB_CONTROL_HOST}, then the serving control's published record,
      * then 127.0.0.1.
      */
-    String controlHost() {
+    private String controlHost(JsonObject record) {
         String fromEnv = env.get("BIOPB_CONTROL_HOST");
         if (fromEnv != null && !fromEnv.isEmpty()) {
             return fromEnv;
         }
-        JsonElement host = runtimeRecord().get("host");
+        JsonElement host = record.get("host");
         return host != null && host.isJsonPrimitive() && !host.getAsString().isEmpty()
                 ? host.getAsString()
                 : CONTROL_DEFAULT_HOST;
@@ -111,6 +114,10 @@ final class DataPlaneDiscovery {
      * value can never wedge a client that only wants to probe the control.
      */
     int controlPort() {
+        return controlPort(runtimeRecord());
+    }
+
+    private int controlPort(JsonObject record) {
         String raw = env.get("BIOPB_CONTROL_PORT");
         if (raw != null && !raw.isEmpty()) {
             try {
@@ -119,7 +126,7 @@ final class DataPlaneDiscovery {
                 return CONTROL_DEFAULT_PORT;
             }
         }
-        JsonElement port = runtimeRecord().get("port");
+        JsonElement port = record.get("port");
         if (port != null && port.isJsonPrimitive() && port.getAsJsonPrimitive().isNumber()) {
             double value = port.getAsDouble();
             if (value == Math.rint(value)) {
@@ -176,18 +183,8 @@ final class DataPlaneDiscovery {
      */
     String controlGrpcUrl(Duration timeout) {
         try {
-            HttpRequest request = HttpRequest.newBuilder(URI.create(controlBaseUrl() + "/health"))
-                    .timeout(timeout)
-                    .GET()
-                    .build();
-            HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
-            if (response.statusCode() != 200) {
-                return null;
-            }
-            return grpcUrlOf(JsonParser.parseString(response.body()));
-        } catch (InterruptedException error) {
-            Thread.currentThread().interrupt();
-            return null;
+            // Bare: this one is unauthenticated, so the credential is not sent.
+            return grpcUrlOf(controlRequest("GET", "/health", Collections.emptyMap(), null, timeout));
         } catch (IOException | RuntimeException error) {
             return null;
         }
@@ -202,33 +199,18 @@ final class DataPlaneDiscovery {
      * back as a verdict rather than as a timeout that looks like no control at all.
      */
     DataPlane ensureDataPlane(Duration timeout) {
-        double seconds = timeout.toMillis() / 1000.0;
         String token = resolveToken(null, true);
         try {
-            HttpRequest.Builder request = HttpRequest.newBuilder(URI.create(
-                            controlBaseUrl() + "/api/data_plane/ensure?client_timeout=" + seconds))
-                    .timeout(timeout)
-                    .POST(HttpRequest.BodyPublishers.noBody());
-            // The token also clears the control's CSRF gate on a POST. Without
-            // one (a tokenless local control) the gate falls back to a loopback Host.
-            if (token != null) {
-                request.header("X-Biopb-Token", token);
-            }
-            HttpResponse<String> response = http.send(request.build(), HttpResponse.BodyHandlers.ofString());
-            if (response.statusCode() / 100 != 2) {
-                LOGGER.info("control ensure_data_plane answered " + response.statusCode());
-                return null;
-            }
-            JsonElement parsed = JsonParser.parseString(response.body());
-            String url = grpcUrlOf(parsed);
+            JsonObject answer = controlRequest("POST", "/api/data_plane/ensure",
+                    Collections.singletonMap("client_timeout", String.valueOf(timeout.toMillis() / 1000.0)),
+                    token, timeout);
+            String url = grpcUrlOf(answer);
             if (url == null) {
                 LOGGER.warning("control answered ensure without a data-plane url");
                 return null;
             }
-            return answer(url);
-        } catch (InterruptedException error) {
-            Thread.currentThread().interrupt();
-            return null;
+            // The credential file is the control's handoff for the plane it named.
+            return new DataPlane(url, token);
         } catch (IOException | RuntimeException error) {
             LOGGER.info("control ensure_data_plane failed: " + error);
             return null;
@@ -248,12 +230,15 @@ final class DataPlaneDiscovery {
 
     /**
      * The control's JSON answer to {@code method path} with {@code params} as its
-     * query string, carrying the control's token when there is one.
+     * query string, carrying {@code token} when there is one. The token also
+     * clears the control's CSRF gate on a POST; without one (a tokenless local
+     * control) the gate falls back to a loopback Host.
      *
      * @throws ControlRefused the control answered with an error status
      * @throws IOException no control answers
      */
-    JsonObject controlRequest(String method, String path, java.util.Map<String, String> params, Duration timeout)
+    JsonObject controlRequest(
+            String method, String path, java.util.Map<String, String> params, String token, Duration timeout)
             throws IOException {
         StringBuilder query = new StringBuilder();
         for (java.util.Map.Entry<String, String> param : params.entrySet()) {
@@ -262,7 +247,6 @@ final class DataPlaneDiscovery {
                     .append('=')
                     .append(java.net.URLEncoder.encode(param.getValue(), StandardCharsets.UTF_8));
         }
-        String token = resolveToken(null, true);
         HttpRequest.Builder request = HttpRequest.newBuilder(URI.create(controlBaseUrl() + path + query))
                 .timeout(timeout);
         if ("POST".equals(method)) {
@@ -270,14 +254,12 @@ final class DataPlaneDiscovery {
         } else {
             request.GET();
         }
-        // The token also clears the control's CSRF gate on a POST. Without one
-        // (a tokenless local control) the gate falls back to a loopback Host.
         if (token != null) {
             request.header("X-Biopb-Token", token);
         }
         HttpResponse<String> response;
         try {
-            response = http.send(request.build(), HttpResponse.BodyHandlers.ofString());
+            response = HTTP.send(request.build(), HttpResponse.BodyHandlers.ofString());
         } catch (InterruptedException error) {
             Thread.currentThread().interrupt();
             throw new IOException("interrupted", error);
@@ -310,15 +292,6 @@ final class DataPlaneDiscovery {
         }
         JsonElement url = plane.getAsJsonObject().get("grpc_url");
         return url != null && url.isJsonPrimitive() && !url.getAsString().isEmpty() ? url.getAsString() : null;
-    }
-
-    /**
-     * The plane the control named. The credential file is read here and only
-     * here: it is the control's credential for its own plane, so it goes only to
-     * an address the control gave.
-     */
-    DataPlane answer(String url) {
-        return new DataPlane(url, resolveToken(null, true));
     }
 
     // ---- the token ------------------------------------------------------------
@@ -409,8 +382,7 @@ final class DataPlaneDiscovery {
      *         identity for an unverified one where the strong option was meant to apply
      */
     String localDataPlaneFingerprint(String url) {
-        String lower = url.toLowerCase();
-        if (!(lower.startsWith("grpcs://") || lower.startsWith("grpc+tls://")) || !isLocalUrl(url)) {
+        if (!LocationUris.isTls(url) || !isLocalUrl(url)) {
             return null;
         }
         Path state = env.stateDir();

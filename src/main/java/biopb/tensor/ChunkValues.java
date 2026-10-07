@@ -32,10 +32,6 @@ final class ChunkValues {
         return new ChunkValues(null, values);
     }
 
-    int length() {
-        return reals != null ? reals.length : integers.length;
-    }
-
     /**
      * Decode a chunk delivered as several rows (one per record batch row, all
      * of one dtype) into one value array, copying each row once.
