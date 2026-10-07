@@ -36,6 +36,7 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
+from biopb_tensor_server.adapters._handle_pool import HandlePool, PooledHandle
 from biopb_tensor_server.adapters._handle_reaper import (
     DEFAULT_HANDLE_REAPER_TTL,
     IdleHandleReaper,
@@ -435,6 +436,15 @@ _store_reaper = IdleHandleReaper(
 )
 
 
+# Prototype (#1284 item 2): handles pooled by file identity rather than owned by
+# the adapter, so an evicted and rebuilt adapter reuses its predecessor's handle.
+_store_pool = HandlePool(DEFAULT_HANDLE_REAPER_TTL, 32, "tiff-store-pool")
+
+
+def _handle_pool_enabled() -> bool:
+    return os.environ.get("BIOPB_OMETIFF_HANDLE_POOL", "0") == "1"
+
+
 def _parallel_read_enabled() -> bool:
     """Whether OME-TIFF chunk reads decode lock-free (biopb/biopb#473).
 
@@ -704,6 +714,9 @@ class OmeTiffAdapter(TensorAdapter):
         super().get_data(bounds)  # validate bounds against the descriptor
         slices = self._bounds_to_slices(bounds)
 
+        if _handle_pool_enabled():
+            return self._get_data_pooled(slices)
+
         if not _parallel_read_enabled():
             # Default: read+decode under _io_lock (concurrent reads serialized).
             with self._io_lock:
@@ -726,6 +739,39 @@ class OmeTiffAdapter(TensorAdapter):
                 self._active_reads -= 1
                 self._persistent_last_access = time.monotonic()
                 self._release_ephemeral_store()
+
+    def _pool_key(self):
+        return (self._source_url, self.scene_index, self._content_version)
+
+    def _open_pooled(self) -> Optional[PooledHandle]:
+        """Open this scene's store and hand its ownership to the pool."""
+        opened = self._open_store()
+        if opened is None:
+            return None
+        za, axes = opened
+        store, tiff = self._persistent_store, self._persistent_tiff
+        self._persistent_store = self._persistent_tiff = None
+
+        def close():
+            for obj in (store, tiff):
+                obj.close()
+
+        return PooledHandle(self._pool_key(), (za, axes), close)
+
+    def _get_data_pooled(self, slices) -> np.ndarray:
+        """Read under a lease on the pooled handle. The lease keeps it open;
+        the handle's own lock serializes readers unless reads are lock-free."""
+        with _store_pool.checkout(self._pool_key(), self._open_pooled) as handle:
+            if handle is None:
+                raise ValueError(
+                    f"OME-TIFF aszarr store unavailable for {self._source_url!r} "
+                    f"(scene {self.scene_index})"
+                )
+            za, axes = handle.value
+            if _parallel_read_enabled():
+                return self._read_region(za, axes, slices)
+            with handle.lock:
+                return self._read_region(za, axes, slices)
 
     def _acquire_store_or_raise(self):
         """Open (or reuse) the persistent aszarr store; stamp last-access.
@@ -950,6 +996,8 @@ class OmeTiffAdapter(TensorAdapter):
         their duration, so drain any in-flight lock-free read first (bounded, so
         teardown never hangs) -- a read must never decode from a closed handle.
         """
+        if self.scene_index is not None:
+            _store_pool.drop(self._pool_key())
         deadline = time.monotonic() + 5.0
         while True:
             with self._io_lock:
