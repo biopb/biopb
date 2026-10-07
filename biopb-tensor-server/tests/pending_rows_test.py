@@ -141,7 +141,7 @@ class TestBulkInsert:
         db = MetadataDatabase()
         n = MetadataDatabase._PENDING_CHUNK * 2 + 37
         db.sync_pending_sources([_row(i) for i in range(n)])
-        assert self._count(db, "sources_volatile") == n
+        assert self._count(db, "source_catalog") == n
 
     def test_a_registered_row_is_not_replaced(self):
         db = MetadataDatabase()

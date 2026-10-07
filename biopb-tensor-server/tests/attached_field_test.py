@@ -361,6 +361,47 @@ class TestDiscardAndDelete:
             second.shutdown()
 
 
+class TestADiscoveredSourceKeepsOneRow:
+    """A discovered source has a claim, so its row is the reconciler's; a field
+    uploaded to it re-lists that row rather than adding a second."""
+
+    @pytest.fixture
+    def claimed(self, writable_server, tmp_path):
+        from biopb_tensor_server.core.discovery import SourceClaim
+        from biopb_tensor_server.serving.metadata_db import CatalogRecord
+
+        db = writable_server.metadata_db
+        db.sync_roots([("r", "file:///data")])
+        adapter = writable_server.register_source("theirs", _their_file(tmp_path))
+        claim = SourceClaim("zarr", str(tmp_path / "data" / "theirs.zarr"), "theirs")
+        db.sync_source_added(
+            "theirs", adapter, CatalogRecord(claim, {}, "r", "theirs.zarr")
+        )
+        return db
+
+    @staticmethod
+    def _listed(db):
+        rows = db.query(
+            "SELECT [t.array_id for t in tensors] AS ids FROM sources "
+            "WHERE source_id = 'theirs'"
+        ).to_pylist()
+        return [r["ids"] for r in rows]
+
+    def test_a_published_field_is_listed_on_the_one_row(self, client, claimed):
+        desc = _add(client, "theirs", "raw")
+        client.upload_array(desc, _arr())
+
+        assert self._listed(claimed) == [["theirs", "theirs/@fields/raw"]]
+
+    def test_a_discarded_field_leaves_the_one_row(self, client, claimed):
+        desc = _add(client, "theirs", "raw")
+        client.upload_array(desc, _arr())
+        assert self._listed(claimed) == [["theirs", "theirs/@fields/raw"]]
+        client.set_upload_status(desc.array_id, "DISCARDED")
+
+        assert self._listed(claimed) == [["theirs"]]
+
+
 class TestScanSourceFields:
     def test_it_skips_a_pending_store(self, tmp_path):
         root = tmp_path / "fields" / "src"

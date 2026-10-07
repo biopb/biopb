@@ -32,7 +32,7 @@ def _catalog_row(server, source_id):
 def _volatile_count(server):
     return (
         server.metadata_db._get_connection()
-        .execute("SELECT count(*) FROM sources_volatile")
+        .execute("SELECT count(*) FROM source_catalog WHERE root_id IS NULL")
         .fetchone()[0]
     )
 
