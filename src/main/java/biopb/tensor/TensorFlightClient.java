@@ -8,9 +8,12 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ExecutionException;
+import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
@@ -220,6 +223,67 @@ public class TensorFlightClient implements AutoCloseable {
             "source_id, source_url, source_type, is_resolved, tensors";
 
     /**
+     * Why a source is not resolved: {@code pending} (registration queued; a read
+     * or {@link #resolveSource} registers it with no download), {@code failed}
+     * (registration raised; the error is in {@code metadata_json}) or
+     * {@code needs_recall} (a cloud placeholder). Null on a resolved source.
+     */
+    static final String UNRESOLVED_REASON = "unresolved_reason";
+
+    /** The {@code sources} table's columns, once known; null until asked. */
+    private volatile Set<String> catalogColumns;
+
+    /**
+     * The {@code sources} table's columns, so a projection can ask for one only a
+     * newer server has instead of a second query for it.
+     *
+     * <p>One {@code GetFlightInfo} on the table's path, the first time it is
+     * needed on this connection. Empty when the server will not say -- a
+     * capability token reads a source's pixels, not the catalog -- and a caller
+     * then projects the base columns only. A refusal is remembered; a dropped or
+     * timed-out call is not, so the next call asks again.
+     */
+    Set<String> catalogColumns() {
+        Set<String> known = catalogColumns;
+        if (known != null) {
+            return known;
+        }
+        try {
+            FlightInfo info = session.client().getInfo(
+                    FlightDescriptor.path("sources"), session.authOption());
+            known = new HashSet<>();
+            for (org.apache.arrow.vector.types.pojo.Field field : info.getSchema().getFields()) {
+                known.add(field.getName());
+            }
+        } catch (FlightRuntimeException error) {
+            LOGGER.log(Level.FINE, "could not read the sources schema", error);
+            switch (error.status().code()) {
+                case UNAVAILABLE:
+                case TIMED_OUT:
+                case CANCELLED:
+                    return Collections.emptySet();   // this call goes without; the next asks again
+                default:
+                    known = Collections.emptySet();  // a refusal would repeat
+            }
+        }
+        catalogColumns = known;
+        return known;
+    }
+
+    /**
+     * {@link #SOURCE_ROW_COLUMNS} as a SELECT list, plus {@code unresolved_reason}
+     * when this server's {@code sources} table has it. A row carries that column
+     * only then.
+     */
+    public String sourceRowColumns() {
+        return withReason(SOURCE_ROW_COLUMNS);
+    }
+
+    private String withReason(String columns) {
+        return catalogColumns().contains(UNRESOLVED_REASON) ? columns + ", " + UNRESOLVED_REASON : columns;
+    }
+
+    /**
      * One source's catalog row by id, or {@code null} when nothing answers to it.
      *
      * <p>One addressed catalog row, so a source past the browse cap still
@@ -228,7 +292,7 @@ public class TensorFlightClient implements AutoCloseable {
      */
     private VectorSchemaRoot fetchSourceRow(String sourceId) throws IOException {
         VectorSchemaRoot root = query(
-                "SELECT " + SOURCE_ROW_COLUMNS + " FROM sources WHERE source_id = "
+                "SELECT " + sourceRowColumns() + " FROM sources WHERE source_id = "
                         + sqlLiteral(sourceId));
         if (root.getRowCount() == 0) {
             root.close();
@@ -410,34 +474,29 @@ public class TensorFlightClient implements AutoCloseable {
      * extras (an OME-Zarr HCS field's OME block, an EMD signal's
      * {@code original_metadata}) are per-tensor and are not merged in here.
      *
+     * <p>A source the server has found but not yet registered ({@code pending},
+     * or one whose registration {@code failed}) is registered first -- nothing is
+     * downloaded -- and then read; a failed one raises with the server's reason.
+     *
      * @param sourceId Source identifier
      * @return The source's metadata map, or an empty map if it carries none
      * @throws IllegalArgumentException if the source is unknown
-     * @throws IllegalStateException    if the source is unresolved (cloud /
-     *                                  synced-folder) -- call {@link #resolveSource}
-     *                                  first
+     * @throws IllegalStateException    if the source is a cloud placeholder or
+     *                                  the server cannot say why it is unresolved
+     *                                  -- call {@link #resolveSource} first
      */
     public Map<String, Object> getSourceMetadata(String sourceId) throws IOException {
         // The column IS the answer: the server calls the adapter's get_metadata()
         // once at registration to fill it and reads it back from the catalog on
         // the serve path rather than recomputing (biopb/biopb#253).
-        String metadataJson = null;
-        boolean found = false;
-        boolean resolved = false;
-        try (VectorSchemaRoot root = query(
-                "SELECT is_resolved, metadata_json FROM sources WHERE source_id = " + sqlLiteral(sourceId))) {
-            if (root.getRowCount() > 0) {
-                found = true;
-                Boolean isRes = nullableBool(root.getVector("is_resolved"), 0);
-                resolved = isRes == null || isRes;
-                FieldVector meta = root.getVector("metadata_json");
-                metadataJson = meta == null || meta.isNull(0) ? null : String.valueOf(meta.getObject(0));
-            }
+        MetadataRow row = readMetadataRow(sourceId);
+        if (!row.resolved && registersOnRead(row.reason)) {
+            // Nothing to download: the server registers it on the call. A failed
+            // registration raises here with its own reason.
+            closeQuietly(resolveSource(sourceId));
+            row = readMetadataRow(sourceId);
         }
-        if (!found) {
-            throw new IllegalArgumentException("Source not found: " + sourceId);
-        }
-        if (!resolved) {
+        if (!row.resolved) {
             // Unresolved (cloud / synced-folder) source: tensors are unknown until
             // resolve. Don't return {} -- that conflates "unresolved" with
             // "resolved, no metadata". Steer to the explicit, consented resolveSource().
@@ -445,7 +504,43 @@ public class TensorFlightClient implements AutoCloseable {
             // and hold nothing readable (biopb/biopb#1032).
             throw unresolvedSourceError(sourceId);
         }
-        return parseMetadataJson(metadataJson);
+        return parseMetadataJson(row.metadataJson);
+    }
+
+    /** What {@link #getSourceMetadata} reads off one catalog row. */
+    private static final class MetadataRow {
+        boolean resolved;
+        String reason;
+        String metadataJson;
+    }
+
+    private MetadataRow readMetadataRow(String sourceId) throws IOException {
+        MetadataRow row = new MetadataRow();
+        try (VectorSchemaRoot root = query(
+                "SELECT " + withReason("is_resolved, metadata_json")
+                        + " FROM sources WHERE source_id = " + sqlLiteral(sourceId))) {
+            if (root.getRowCount() == 0) {
+                throw new IllegalArgumentException("Source not found: " + sourceId);
+            }
+            Boolean isRes = nullableBool(root.getVector("is_resolved"), 0);
+            row.resolved = isRes == null || isRes;
+            row.metadataJson = nullableText(root.getVector("metadata_json"), 0);
+            row.reason = nullableText(root.getVector(UNRESOLVED_REASON), 0);
+        }
+        return row;
+    }
+
+    /**
+     * Whether a source unresolved for this reason registers without a download.
+     * A server that does not say why (no reason column, or a capability token)
+     * gets the old refusal: the safe reading is a cloud placeholder.
+     */
+    private static boolean registersOnRead(String reason) {
+        return "pending".equals(reason) || "failed".equals(reason);
+    }
+
+    private static String nullableText(FieldVector vector, int index) {
+        return vector == null || vector.isNull(index) ? null : String.valueOf(vector.getObject(index));
     }
 
     /** Quote a string for the catalog's SQL surface, which takes no parameters. */
@@ -696,16 +791,42 @@ public class TensorFlightClient implements AutoCloseable {
      *         registered path REBUILDS it against the file as it is now -- that
      *         is what {@code refreshed} reports, and it is how a source picks up
      *         an in-place edit. Registration wrote each source's catalog row, so
-     *         anything beyond the ids is one {@link #query} away.
+     *         anything beyond the ids is one {@link #query} away. A non-zero
+     *         {@code skippedOffline} means the import is incomplete: offline
+     *         placeholders were skipped because this was not a cloud folder, and
+     *         resending with {@code cloud} set registers them.
      */
     public AddSourceResult registerLocalPath(
             String url,
             String sourceType,
             Consumer<AddSourceProgress> onProgress,
             BooleanSupplier shouldCancel) throws IOException {
+        return registerLocalPath(url, sourceType, false, onProgress, shouldCancel);
+    }
+
+    /**
+     * Register a path on the server, saying whether it is a cloud / synced folder.
+     *
+     * <p>{@code cloud} registers the folder's offline placeholders (OneDrive,
+     * Dropbox, iCloud "Files On-Demand") as unresolved sources instead of
+     * skipping them; the result's {@code skippedOffline} counts what was skipped
+     * when it was not set. Set it only with the user's consent: a wrong guess
+     * turns off multi-file grouping (OME-TIFF and the like). A path already under
+     * a configured cloud root is cloud whatever this says.
+     *
+     * @param cloud treat {@code url} as a cloud / synced folder
+     * @see #registerLocalPath(String, String, Consumer, BooleanSupplier)
+     */
+    public AddSourceResult registerLocalPath(
+            String url,
+            String sourceType,
+            boolean cloud,
+            Consumer<AddSourceProgress> onProgress,
+            BooleanSupplier shouldCancel) throws IOException {
         AddSourceRequest request = AddSourceRequest.newBuilder()
                 .setUrl(url)
                 .setSourceType(sourceType == null ? "" : sourceType)
+                .setCloud(cloud)
                 .build();
         AddSourceResult[] result = { null };
         streamAction("add_source", request.toByteArray(), AddSourceStreamMessage.parser(),

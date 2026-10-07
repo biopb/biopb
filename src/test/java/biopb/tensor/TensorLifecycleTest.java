@@ -83,6 +83,22 @@ public class TensorLifecycleTest {
     }
 
     @Test
+    public void testRegisterLocalPathCarriesCloudOnlyWhenSet() throws Exception {
+        try (TestServer server = new TestServer()) {
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                AddSourceResult plain = client.registerLocalPath("/data/plate", "", null, null);
+                Assert.assertFalse(server.producer.lastAddSource.getCloud());
+                // The only sign a plain add left placeholders behind.
+                Assert.assertEquals(3, plain.getSkippedOffline());
+
+                AddSourceResult cloud = client.registerLocalPath("/data/plate", "", true, null, null);
+                Assert.assertTrue(server.producer.lastAddSource.getCloud());
+                Assert.assertEquals(0, cloud.getSkippedOffline());
+            }
+        }
+    }
+
+    @Test
     public void testRegisterLocalPathCancelKeepsWhatRegistered() throws Exception {
         // A cancel is intentional, so it reports an empty tally rather than an
         // error -- and the sources already registered stay registered.
@@ -831,7 +847,10 @@ public class TensorLifecycleTest {
                     .setResult(AddSourceResult.newBuilder()
                             .addAllAdded(Arrays.asList("plate_a", "plate_b"))
                             .addAlreadyPresent("plate_c")
-                            .addRefreshed("plate_c"))
+                            .addRefreshed("plate_c")
+                            // Offline placeholders are skipped unless the request
+                            // said the folder is a cloud one.
+                            .setSkippedOffline(lastAddSource.getCloud() ? 0 : 3))
                     .build().toByteArray()));
         }
 
