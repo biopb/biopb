@@ -45,6 +45,7 @@ from biopb_tensor_server.adapters._ome_rois import (
     imported_annotations,
     tensors_by_field,
 )
+from biopb_tensor_server.adapters._signature_memo import Signature, SignatureMemo
 from biopb_tensor_server.adapters.ome_masks import RasterizedMaskAdapter, masks_by_image
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
@@ -57,7 +58,6 @@ from biopb_tensor_server.core.chunk import (
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import TensorNotFound
 from biopb_tensor_server.core.labels import label_extent, label_field
-from biopb_tensor_server.core.signature_memo import Signature, SignatureMemo
 
 logger = logging.getLogger(__name__)
 

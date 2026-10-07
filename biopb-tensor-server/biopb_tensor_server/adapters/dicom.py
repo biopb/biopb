@@ -19,6 +19,7 @@ from biopb_tensor_server.adapters._scale import (
     scale_from_payload,
     scale_to_payload,
 )
+from biopb_tensor_server.adapters._signature_memo import SignatureMemo
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
     catalog_entry,
@@ -31,7 +32,6 @@ from biopb_tensor_server.core.discovery import (
     ClaimContext,
     SourceClaim,
 )
-from biopb_tensor_server.core.signature_memo import SignatureMemo
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import SourceConfig
