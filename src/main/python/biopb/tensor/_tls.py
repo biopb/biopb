@@ -1,61 +1,41 @@
-"""Trust-on-first-use (TOFU) certificate pinning for the tensor Flight client.
+"""TLS trust resolution for the tensor Flight client.
 
-A ``grpcs://`` server on a private/firewalled LAN typically presents a
-self-signed or private-CA certificate with no publicly-trusted anchor. Rather
-than make the operator distribute a root CA into every client's trust store, the
-client pins the server's certificate on **first** connect — the SSH host-key
-model (biopb/biopb#604):
+A ``grpc+tls://`` server on a private LAN usually presents a self-signed or
+private-CA certificate with no public anchor. :func:`resolve_tls_trust` turns a
+location into a :class:`TlsTrust` -- the trusted root PEM, an optional hostname
+override, and a key id -- by one of three paths, chosen by what the caller
+already knows:
 
-- first connect to a ``host:port``: fetch the presented leaf cert, record its PEM
-  in the pin store, and use that exact cert as the trusted root;
-- later connects: use the pinned cert as the trusted root. If the server now
-  presents a *different* cert (a rotation, or a MITM), the fingerprints diverge
-  and we raise :class:`TlsPinMismatchError` with the fix — exactly like SSH's
-  "REMOTE HOST IDENTIFICATION HAS CHANGED" warning.
+- **Configured CA** (``ca_pem``): trust exactly these PEM bytes -- a private CA
+  or the server's own leaf. No network, no pin store, no hostname override: the
+  configured anchor is the source of truth, and the SAN check against a real CA
+  is load-bearing.
+- **Expected fingerprint** (``expected_fingerprint``): fetch the presented leaf
+  and require its SHA-256 to match on *every* connect, so an attacker in the path
+  at first connect is refused rather than pinned. No pin store.
+- **Trust on first use** (neither; the default): pin the presented leaf on first
+  connect to a ``host:port`` and trust that exact cert afterwards, like SSH host
+  keys. A different cert later raises :class:`TlsPinMismatchError`. The first
+  handshake is trusted implicitly, so this protects only against an attacker who
+  arrives after pinning.
 
-The security boundary is the same as SSH: the *first* handshake is trusted
-implicitly, so TOFU protects against an attacker who arrives *after* pinning, not
-one already in the path at first connect — an accepted trade on a trusted LAN.
+Checks common to all three:
 
-Pinning supplies the anchor; it does **not** exempt the certificate from validity
-checking. gRPC verifies notAfter on the anchor even when the anchor is the
-presented leaf, so an expired pinned cert fails every handshake — reported by the
-transport as a bare "failed to connect to all addresses", with the reason only in
-gRPC's own stderr log. :class:`TlsCertExpiredError` is raised here instead, on
-the resolution path that already has the answer (biopb/biopb#913).
+- **Expiry.** An anchor supplies trust but not validity: gRPC still checks
+  ``notAfter``, and an expired anchor fails every handshake with an opaque
+  "failed to connect to all addresses". :class:`TlsCertExpiredError` reports it
+  instead. Within 30 days of expiry, a warning is logged once per connection.
+  A ``ca_pem`` stays offline, so only a single-certificate one is checked.
+- **Hostname.** gRPC matches the *dialed* name against the cert's SANs
+  independently of the anchor. In the two modes that reach the network the
+  anchor is the presented leaf itself, so that check is redundant, and an
+  ``override_hostname`` naming a SAN the cert does list replaces a dialed name it
+  lacks (see :func:`_resolve_hostname_override`).
 
-Resolution yields a :class:`TlsTrust` — plain data (PEM bytes, an optional
-hostname override, and a key id). That is what the connection pool passes to
-every worker's ``FlightClient``, so a worker executing a chunk-fetch task
-receives the resolved trust as ordinary graph data and never touches the pin
-store. A worker that opens its *own* client (the ``tensor_from_pb`` path)
-resolves once per process and then reads the memo below.
-
-Trust and hostname verification are separate checks, and pinning only answers the
-first: it supplies the trust *anchor*, but gRPC still matches the **dialed** name
-against the certificate's SANs. A cert that pins fine therefore still fails every
-handshake if the client dials a name the server did not put in its SANs — the
-normal shape for a container that minted its cert before anyone knew what name
-clients would use (biopb/biopb#606). Where the anchor is the presented leaf
-itself, that second check is redundant — the presented cert must *be* the pinned
-one, so there is no "different but validly-issued cert" for a name check to
-exclude — and :func:`resolve_tls_trust` substitutes a name the cert does list via
-``override_hostname``. See :func:`_resolve_hostname_override` for the exact
-predicate and the two things this deliberately does not do.
-
-TOFU is the *default*, not the only mode. A caller that already knows what the
-server should present can say so, which removes the trust-on-*first*-use hole
-(biopb/biopb#604 item 4 — a downstream server mounting a remote plane configures
-this per upstream):
-
-- ``ca_pem`` — trust this PEM (a private CA, or the server's own leaf) and skip
-  TOFU entirely. The pin store is not consulted or written: the configured anchor
-  is the source of truth, and a second one that can go stale independently would
-  only produce mismatch errors naming a file the operator never edited.
-- ``expected_fingerprint`` — verified-first-use. The presented leaf must match
-  this SHA-256 digest on *every* connect, so an attacker in the path at first
-  connect is refused rather than pinned. Also bypasses the pin store, for the
-  same reason.
+A :class:`TlsTrust` is plain data, so the connection pool can hand it to dask
+workers as ordinary graph data without them touching the pin store. Results are
+memoized per process by ``host:port`` and trust material; a worker that opens
+its own client resolves once and then reads the memo.
 """
 
 from __future__ import annotations
