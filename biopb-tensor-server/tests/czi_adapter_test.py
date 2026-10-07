@@ -233,7 +233,7 @@ def test_idle_reader_is_reaped(tmp_path):
 
     ttl = pool._pool_ttl
     pool.set_ttl(0.001)
-    time.sleep(0.01)
+    time.sleep(0.05)
     try:
         pool.sweep()
     finally:

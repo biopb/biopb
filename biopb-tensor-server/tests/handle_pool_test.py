@@ -43,7 +43,7 @@ def test_a_leased_handle_survives_sweep_cap_and_drop_until_released(pool):
     open_fn = _Opener("a")
     pool.set_ttl(0.001)
     with pool.checkout("a", open_fn):
-        time.sleep(0.01)
+        time.sleep(0.05)
         pool.sweep()
         pool.drop("a")
         assert open_fn.closed == 0
@@ -56,7 +56,7 @@ def test_sweep_closes_idle_handles(pool):
     with pool.checkout("a", open_fn):
         pass
     pool.set_ttl(0.001)
-    time.sleep(0.01)
+    time.sleep(0.05)
     pool.sweep()
     assert open_fn.closed == 1
 
