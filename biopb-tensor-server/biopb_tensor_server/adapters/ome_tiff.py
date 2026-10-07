@@ -26,8 +26,6 @@ import os
 import re
 import struct
 import sys
-import threading
-import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
@@ -36,10 +34,8 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.adapters._handle_reaper import (
-    DEFAULT_HANDLE_REAPER_TTL,
-    IdleHandleReaper,
-)
+from biopb_tensor_server.adapters._handle_pool import HandlePool, PooledHandle
+from biopb_tensor_server.adapters._handle_reaper import DEFAULT_HANDLE_REAPER_TTL
 from biopb_tensor_server.adapters._ome_rois import (
     OME_SET_NAME,
     imported_annotations,
@@ -418,32 +414,24 @@ def _fast_ome_metadata(
 # Persistent aszarr-store pool (tifffile read path)
 # =============================================================================
 #
-# The read path opens a source's tifffile ``aszarr`` store once and keeps the
-# handle warm across chunk reads. A shared idle reaper closes stores idle longer
-# than the TTL so a long-lived server does not pin file descriptors for sources
-# no one is reading -- OME-TIFF opts into it because its open is linear in IFD
-# count and unbounded, so a reopen-per-read (the mrc default) would regress
-# large files badly. Only OME-TIFF scene adapters register, so the pool holds only
-# those instances. The TTL is set from ``ServerConfig.handle_reaper_ttl`` at
-# startup; see :mod:`biopb_tensor_server.adapters._handle_reaper`.
-# One handle here is a parsed IFD table, and reopening it is the expensive case
-# _handle_reaper is written for (~615 ms extrapolated at 50k pages), so the TTL
-# is the long default. The cap is generous for the same reason: evicting one
-# costs the most of any pool.
-_store_reaper = IdleHandleReaper(
-    DEFAULT_HANDLE_REAPER_TTL, "tiff-store-reaper", max_handles=32
-)
+# A scene's tifffile ``aszarr`` store is opened once and kept warm across chunk
+# reads in a pool keyed by file identity, not by adapter, so an adapter that is
+# dropped and rebuilt finds the store its predecessor opened. The pool closes a
+# store idle longer than the TTL (``ServerConfig.handle_reaper_ttl`` is its
+# ceiling) and the least recently used beyond the cap. Reopening is the expensive
+# case the pool is written for: open is linear in IFD count (~615 ms extrapolated
+# at 50k pages), so the TTL is the long default and the cap generous.
+_store_pool = HandlePool(DEFAULT_HANDLE_REAPER_TTL, 32, "tiff-store-pool")
 
 
 def _parallel_read_enabled() -> bool:
     """Whether OME-TIFF chunk reads decode lock-free (biopb/biopb#473).
 
-    Default **off**: ``get_data`` holds ``_io_lock`` across the whole read+decode,
-    exactly as before this flag existed, so nothing changes unless opted in. Set
+    Default **off**: readers of one store serialize on its handle lock. Set
     ``BIOPB_OMETIFF_PARALLEL_READ=1`` to serve reads lock-free -- tifffile
     serializes the raw seek+read on the store's own shared handle lock and the tile
     decode is per-tile into a fresh buffer, so concurrent decodes run in parallel
-    (the ``_active_reads`` counter then guards the reaper). Read at call time so a
+    (the lease keeps the store open for each). Read at call time so a
     process (or a test) can toggle it without reimport; the cost is one dict lookup
     per chunk, negligible against a tile read.
     """
@@ -490,7 +478,6 @@ class OmeTiffAdapter(TensorAdapter):
         source_id: str,
         scene_index: Optional[int] = None,
         tensor_descriptor: Optional[TensorDescriptor] = None,
-        io_lock: Optional[threading.Lock] = None,
     ):
         """Initialize an OME-TIFF adapter.
 
@@ -500,8 +487,6 @@ class OmeTiffAdapter(TensorAdapter):
             scene_index: None for source-level, int for a bound scene.
             tensor_descriptor: The scene's authoritative tifffile descriptor
                 (scene-level only); its dim_labels become this adapter's.
-            io_lock: Shared IO lock. Source-level creates one if None; scene-level
-                receives the source's lock.
         """
         self.source_id = source_id
         self._source_url = url or ""
@@ -511,7 +496,6 @@ class OmeTiffAdapter(TensorAdapter):
         self._content_version = content_version_from_path(self._source_url)
         self._source_type = self.SOURCE_TYPE
         self.scene_index = scene_index
-        self._io_lock = io_lock if io_lock is not None else threading.Lock()
         self._cached_descriptors = None
 
         self._tifffile_descriptor = tensor_descriptor
@@ -519,21 +503,6 @@ class OmeTiffAdapter(TensorAdapter):
             self.dim_labels = list(tensor_descriptor.dim_labels)
         else:
             self.dim_labels = None
-
-        # Persistent aszarr-store state (opened lazily on first get_data). The
-        # read serves regions straight from the zarr array -- no dask.
-        self._persistent_zarr = None
-        self._persistent_axes = None
-        self._persistent_store = None
-        self._persistent_tiff = None
-        self._persistent_attempted = False
-        self._ephemeral_store_open = False
-        self._persistent_last_access = 0.0
-        # In-flight lock-free reads on this scene's store. get_data holds _io_lock
-        # only to acquire the store + bookkeep, then reads without it (tifffile
-        # serializes the raw read on its own handle lock); this counter is what
-        # keeps the reaper from closing the store mid-read.
-        self._active_reads = 0
 
         # Cache of the embedded OME-XML string (biopb/biopb#168), shared by the
         # descriptor, metadata, and physical-scale paths so registration opens the
@@ -681,19 +650,11 @@ class OmeTiffAdapter(TensorAdapter):
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read data within bounds from this scene's tifffile aszarr store.
 
-        Two read modes, selected by ``BIOPB_OMETIFF_PARALLEL_READ``
-        (:func:`_parallel_read_enabled`, default **off**):
-
-        - **Default** -- acquire the store and serve the slice entirely under
-          ``_io_lock``, so concurrent chunk reads of one scene are serialized. This
-          is the long-standing behavior; a store held under the lock is never closed
-          mid-read, so the ``_active_reads`` guard is not needed.
-        - **Opt-in lock-free** -- hold ``_io_lock`` only to acquire the store and
-          register the read as in-flight, then decode **without** it. tifffile
-          serializes the raw seek+read on the store's own shared handle lock and the
-          tile decode is per-tile into a fresh buffer, so concurrent reads are
-          thread-safe and their decodes run in parallel; ``_active_reads`` stops the
-          reaper from closing the store mid-read (biopb/biopb#473).
+        The read holds a lease on the pooled store, so it is never closed
+        mid-read. By default readers of one store serialize on the handle's lock;
+        ``BIOPB_OMETIFF_PARALLEL_READ=1`` (:func:`_parallel_read_enabled`) reads
+        without it, since tifffile serializes the raw seek+read on its own handle
+        lock and decodes per tile into a fresh buffer (biopb/biopb#473).
 
         Raises:
             ValueError: bad bounds, source-level adapter, or store unavailable.
@@ -704,45 +665,56 @@ class OmeTiffAdapter(TensorAdapter):
         super().get_data(bounds)  # validate bounds against the descriptor
         slices = self._bounds_to_slices(bounds)
 
-        if not _parallel_read_enabled():
-            # Default: read+decode under _io_lock (concurrent reads serialized).
-            with self._io_lock:
-                za, axes = self._acquire_store_or_raise()
-                try:
-                    result = self._read_region(za, axes, slices)
-                    self._persistent_last_access = time.monotonic()
-                    return result
-                finally:
-                    self._release_ephemeral_store()
+        with self._leased_store() as handle:
+            if handle is None:
+                raise ValueError(
+                    f"OME-TIFF aszarr store unavailable for {self._source_url!r} "
+                    f"(scene {self.scene_index})"
+                )
+            za, axes = handle.value
+            if _parallel_read_enabled():
+                return self._read_region(za, axes, slices)
+            with handle.lock:
+                return self._read_region(za, axes, slices)
 
-        # Opt-in lock-free: register the read as in-flight, decode without the lock.
-        with self._io_lock:
-            za, axes = self._acquire_store_or_raise()
-            self._active_reads += 1
-        try:
-            return self._read_region(za, axes, slices)
-        finally:
-            with self._io_lock:
-                self._active_reads -= 1
-                self._persistent_last_access = time.monotonic()
-                self._release_ephemeral_store()
+    def _pool_key(self):
+        return (
+            type(self).__name__,
+            self._source_url,
+            self.scene_index,
+            self._content_version,
+        )
 
-    def _acquire_store_or_raise(self):
-        """Open (or reuse) the persistent aszarr store; stamp last-access.
+    def _leased_store(self):
+        """Lease this scene's store: pooled, or opened for this read alone when
+        :meth:`_should_persist_store` says the file is too small to keep open."""
+        return _store_pool.checkout(
+            self._pool_key(), self._open_pooled, persist=self._should_persist_store()
+        )
 
-        Caller must hold ``_io_lock``. Returns ``(zarr_array, axes)``.
+    def _open_pooled(self) -> Optional[PooledHandle]:
+        """Open this scene's store as a handle the pool (or the caller) closes.
 
-        Raises:
-            ValueError: the store is unavailable for this scene.
+        None when the store is unavailable for this scene: a non-tifffile
+        reader, a remote URL, a descriptor mismatch, or an open error.
         """
-        opened = self._ensure_store()
+        try:
+            opened = self._open_store()
+        except Exception as exc:
+            logger.debug("aszarr store unavailable for %s: %r", self._source_url, exc)
+            return None
         if opened is None:
-            raise ValueError(
-                f"OME-TIFF aszarr store unavailable for {self._source_url!r} "
-                f"(scene {self.scene_index})"
-            )
-        self._persistent_last_access = time.monotonic()
-        return opened
+            return None
+        za, axes, store, tiff = opened
+
+        def close():
+            for obj in (store, tiff):
+                try:
+                    obj.close()
+                except Exception:
+                    logger.debug("error closing aszarr store", exc_info=True)
+
+        return PooledHandle(self._pool_key(), (za, axes), close)
 
     # ---- descriptors --------------------------------------------------------
 
@@ -793,7 +765,6 @@ class OmeTiffAdapter(TensorAdapter):
             self.source_id,
             scene_index=scene_idx,
             tensor_descriptor=descriptors[scene_idx],
-            io_lock=self._io_lock,
         )
         adapter._tensor_name = field
         self._seed_scene(adapter, descriptors[scene_idx].array_id)
@@ -943,20 +914,10 @@ class OmeTiffAdapter(TensorAdapter):
     # ---- lifecycle ----------------------------------------------------------
 
     def close(self) -> None:
-        """Release the persistent file handle and cascade to scene adapters.
-
-        Scene adapters share this adapter's ``_io_lock`` (non-reentrant), so the
-        cascade runs WITHOUT holding it. Reads no longer hold ``_io_lock`` for
-        their duration, so drain any in-flight lock-free read first (bounded, so
-        teardown never hangs) -- a read must never decode from a closed handle.
-        """
-        deadline = time.monotonic() + 5.0
-        while True:
-            with self._io_lock:
-                if self._active_reads == 0 or time.monotonic() >= deadline:
-                    self._release_persistent_handle()
-                    break
-            time.sleep(0.005)
+        """Release this scene's pooled store (at its last lease) and cascade to
+        the scene adapters."""
+        if self.scene_index is not None:
+            _store_pool.drop(self._pool_key())
         for adapter in list(self._tensor_adapters.values()):
             if adapter is not self:
                 try:
@@ -1093,13 +1054,6 @@ class OmeTiffAdapter(TensorAdapter):
                 adapter._parsed_metadata_probed = False
                 adapter._mask_payloads_transferred = True
             adapter.release_registration_cache()
-
-    def __del__(self):
-        # GC backstop: release the handle even without an explicit close().
-        try:
-            self._release_persistent_handle()
-        except Exception:
-            pass
 
     # ---- OME-XML internals --------------------------------------------------
 
@@ -1298,46 +1252,11 @@ class OmeTiffAdapter(TensorAdapter):
         """Whether an opened aszarr store should remain open between reads."""
         return True
 
-    def _release_ephemeral_store(self) -> None:
-        """Close a per-read store once no lock-free reads still use it."""
-        if self._ephemeral_store_open and self._active_reads == 0:
-            self._release_persistent_handle()
-
-    def _ensure_store(self):
-        """Open the aszarr store as a zarr array once (caller holds ``_io_lock``).
-
-        Returns ``(zarr_array, axes_str)`` or None. A pure-tifffile read needs no
-        dask -- ``zarr`` slices the store's pages directly for the requested region
-        (see ``_read_region``).
-        """
-        if self._persistent_zarr is not None:
-            return self._persistent_zarr, self._persistent_axes
-        if self._persistent_attempted:
-            return None
-        self._persistent_attempted = True
-        try:
-            opened = self._open_store()
-        except Exception as exc:
-            # Non-tifffile reader, remote URL, dim mismatch, or FD exhaustion
-            # (EMFILE/OSError): leave the store unavailable for this scene.
-            logger.debug("aszarr store unavailable for %s: %r", self._source_url, exc)
-            self._release_persistent_handle()
-            opened = None
-        if opened is not None:
-            self._persistent_zarr, self._persistent_axes = opened
-            self._persistent_last_access = time.monotonic()
-            self._ephemeral_store_open = not self._should_persist_store()
-            if not self._ephemeral_store_open:
-                _store_reaper.register(self)
-            return opened
-        return None
-
     def _open_store(self):
         """Open ``series[scene].aszarr`` as a zarr array; validate vs the descriptor.
 
-        Returns ``(zarr_array, axes_str)`` or None. Raises on open/read errors so
-        the caller records the store as absent. Stashes the tifffile handle + store
-        on the instance for ``_release_persistent_handle``.
+        Returns ``(zarr_array, axes_str, store, tiff)`` or None; the caller owns
+        closing ``store`` and ``tiff``. Raises on open/read errors.
         """
         import tifffile
         import zarr
@@ -1381,9 +1300,7 @@ class OmeTiffAdapter(TensorAdapter):
             tiff.close()
             raise
 
-        self._persistent_tiff = tiff
-        self._persistent_store = store
-        return za, axes
+        return za, axes, store, tiff
 
     def _read_region(self, za, axes, slices):
         """Read the requested canonical region straight from the zarr store.
@@ -1403,30 +1320,6 @@ class OmeTiffAdapter(TensorAdapter):
             if ax not in axes:
                 sub = np.expand_dims(sub, axis=i)
         return sub
-
-    def _release_persistent_handle(self):
-        """Close the persistent store/handle and allow a later reopen.
-
-        Caller holds ``self._io_lock`` (reaper/get_data) or is the GC finalizer
-        (no concurrent reads possible). Safe to call repeatedly. This is the
-        :class:`~biopb_tensor_server.adapters._handle_reaper.ReapableHandle`
-        release hook the shared reaper calls when the store has gone idle.
-        """
-        store = getattr(self, "_persistent_store", None)
-        tiff = getattr(self, "_persistent_tiff", None)
-        self._persistent_zarr = None
-        self._persistent_axes = None
-        self._persistent_store = None
-        self._persistent_tiff = None
-        self._persistent_attempted = False  # permit reopen on the next read
-        _store_reaper.discard(self)
-        for obj in (store, tiff):
-            if obj is not None:
-                try:
-                    obj.close()
-                except Exception:
-                    logger.debug("error closing persistent tiff store", exc_info=True)
-        self._ephemeral_store_open = False
 
     # ---- claim --------------------------------------------------------------
 

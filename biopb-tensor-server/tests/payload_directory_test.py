@@ -222,9 +222,10 @@ class TestNdTiff:
             parsed, source, monkeypatch=monkeypatch, opens=[(ndtiff, "NDTiffDataset")]
         )
 
-        # The parse opened one; the rebuilt adapter opened none until its read.
-        assert len(opens) == 2
-        assert rebuilt._dataset is not None
+        # The parse opened one and pooled it; the rebuilt adapter opens none, and
+        # its first read goes through the one the parse left.
+        assert len(opens) == 1
+        assert rebuilt._reopen is not None
 
 
 class TestTiffSequence:

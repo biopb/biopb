@@ -7,19 +7,17 @@ to tune, no handle held between reads. That is strictly better whenever it is
 affordable, so it is the default.
 
 This reaper is the **opt-in** alternative for the adapters where it is *not*
-affordable -- those whose open cost scales with something:
+affordable, and whose handle is cheap to keep per adapter (``nd2``, ``emd``,
+``mrc``'s mapping, ``dv``): the handle stays warm between reads and a background
+reaper closes it once it has been idle longer than a TTL -- bounding the
+steady-state pin (the Windows-undeletable / disk-not-reclaimed effects) rather
+than eliminating it, at the cost of one reopen on the next read after a lull.
 
-- ``ome-tiff`` -- open is linear in IFD count and unbounded (~615 ms extrapolated
-  for a 50k-page whole-slide file), so a reopen-per-read would be a >150%
-  regression on exactly the large files the format exists for.
-- ``ndtiff`` -- the reopen *unit* is the whole acquisition: ``NDTiffDataset``
-  eagerly opens every ``NDTiffStack_*.tif``, so a reopen-per-read would open
-  thousands of files to serve one plane.
-
-For those, the handle stays warm between reads and a background reaper closes it
-once it has been idle longer than a TTL -- bounding the steady-state pin (the
-Windows-undeletable / disk-not-reclaimed effects) rather than eliminating it, at
-the cost of one reopen on the next read after a lull.
+The formats whose reopen is expensive -- ``ome-tiff`` and the TIFF family
+(open is linear in IFD count), ``qptiff``, ``czi`` (the subblock directory) and
+``ndtiff`` (the whole acquisition) -- use :mod:`_handle_pool` instead, which
+keeps the handle by file identity so a rebuilt adapter finds it. Its TTL and cap
+are bounded the same way and share :func:`set_handle_reaper_ttl`.
 
 A pool is bounded on **two** axes, and both are properties of the pool rather
 than of the process:
@@ -70,7 +68,7 @@ _NO_CEILING = float("inf")
 
 # Every constructed reaper, so one config knob can retune them all at startup.
 # Weak, so a reaper built in a test is not pinned for the process lifetime.
-_configured_reapers: "weakref.WeakSet[IdleHandleReaper]" = weakref.WeakSet()
+_configured_reapers: "weakref.WeakSet[TtlCeiling]" = weakref.WeakSet()
 
 
 def set_handle_reaper_ttl(seconds: float) -> None:
@@ -91,6 +89,33 @@ def set_handle_reaper_ttl(seconds: float) -> None:
         reaper.set_ceiling(seconds)
 
 
+class TtlCeiling:
+    """An idle TTL of the pool's own, capped by the process-wide ceiling.
+
+    Shared by :class:`IdleHandleReaper` and ``_handle_pool.HandlePool`` so one
+    :func:`set_handle_reaper_ttl` retunes both kinds.
+    """
+
+    def __init__(self, ttl_seconds: float) -> None:
+        self._pool_ttl = float(ttl_seconds)
+        self._ceiling = _NO_CEILING
+        _configured_reapers.add(self)
+
+    @property
+    def ttl(self) -> float:
+        """Effective TTL: this pool's own, capped by the process-wide ceiling."""
+        return min(self._pool_ttl, self._ceiling)
+
+    def set_ttl(self, seconds: float) -> None:
+        """Retune this pool's own TTL; ``<= 0`` disables the pool."""
+        self._pool_ttl = float(seconds)
+
+    def set_ceiling(self, seconds: float) -> None:
+        """Cap this pool's TTL from process-wide config. See
+        :func:`set_handle_reaper_ttl`."""
+        self._ceiling = float(seconds)
+
+
 @runtime_checkable
 class ReapableHandle(Protocol):
     """What the reaper needs from an adapter holding a persistent handle."""
@@ -108,7 +133,7 @@ class ReapableHandle(Protocol):
         ...
 
 
-class IdleHandleReaper:
+class IdleHandleReaper(TtlCeiling):
     """Closes persistent handles idle longer than a TTL, on one daemon thread.
 
     One instance per handle pool (e.g. one for OME-TIFF stores, one for NDTiff
@@ -140,8 +165,7 @@ class IdleHandleReaper:
                 OME-TIFF store holds a parsed IFD table, so there is no
                 defensible shared default to inherit by accident.
         """
-        self._pool_ttl = float(ttl_seconds)
-        self._ceiling = _NO_CEILING
+        super().__init__(ttl_seconds)
         self._max_handles = int(max_handles)
         self._thread_name = thread_name
         self._adapters: weakref.WeakSet = weakref.WeakSet()
@@ -151,28 +175,11 @@ class IdleHandleReaper:
         # itself.
         self._lock = threading.RLock()
         self._started = False
-        _configured_reapers.add(self)
-
-    @property
-    def ttl(self) -> float:
-        """Effective TTL: this pool's own, capped by the process-wide ceiling."""
-        return min(self._pool_ttl, self._ceiling)
 
     @property
     def enabled(self) -> bool:
         """Whether reaping is active (effective TTL > 0)."""
         return self.ttl > 0
-
-    def set_ttl(self, seconds: float) -> None:
-        """Retune this pool's own TTL. Read live by ``register``/``_sweep``, so a
-        value applied at startup (before the thread lazily starts) fully takes
-        effect; ``<= 0`` disables the pool."""
-        self._pool_ttl = float(seconds)
-
-    def set_ceiling(self, seconds: float) -> None:
-        """Cap this pool's TTL from process-wide config. See
-        :func:`set_handle_reaper_ttl`."""
-        self._ceiling = float(seconds)
 
     def register(self, adapter: ReapableHandle) -> None:
         """Track an adapter that just opened its handle; start the thread if needed.

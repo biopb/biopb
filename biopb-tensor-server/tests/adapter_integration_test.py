@@ -645,6 +645,7 @@ class TestMultiSeriesOmeTiffIntegration:
 
         assert data.shape == (1, 1, 1, 32, 32)
         assert data[0, 0, 0].mean() == 1  # First plane has value 1
+        adapter.close()  # the pooled store would pin the file past the fixture
 
 
 class TestCompanionOmeIntegration:

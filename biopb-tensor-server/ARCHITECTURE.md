@@ -62,7 +62,7 @@ The `biopb_tensor_server` package is organized into layered subpackages:
 - **`adapters/`**, **`cache/`** — storage-format adapters and the virtual-chunk
   cache. A bare module name here is an adapter; an underscored one is shared
   machinery: `_scale` and `_ome_rois` (format metadata in, common representation
-  out), `_handle_reaper`, and `_writable` — the mixin two of the adapters
+  out), `_handle_reaper`, `_handle_pool`, and `_writable` — the mixin two of the adapters
   inherit for progress, completion and disposal. `cache/segment_index` and
   `cache/segment_store` are the Arrow segment format itself, so an uploaded
   `cache://` member writes what the chunk cache writes: the codec and the boot
@@ -247,7 +247,7 @@ justified by open cost.
 | Open cost | Policy | Adapters |
 |---|---|---|
 | O(1) and/or fast (< 1 ms) | **reopen per read**, no handle, no `close()` needed | `mrc`, TIFF sequences, `bioio`, `dicom`, local `zarr` |
-| O(N) and/or unbounded | persistent handle + `close()`, and TTL reaper (`handle_reaper_ttl`) | `ome-tiff`, native plain TIFF/LSM, `qptiff`, `ndtiff` |
+| O(N) and/or unbounded | pooled handle keyed by file identity (`_handle_pool`; TTL `handle_reaper_ttl`) | `ome-tiff`, native plain TIFF/LSM, `qptiff`, `czi`, `ndtiff` |
 
 ---
 
@@ -447,7 +447,7 @@ supervisor: see
 | `BIOPB_UPSTREAM_TENSOR_TOKEN` | Bearer token for **one** upstream tensor server (`tensor-server` sources) — a single-upstream convenience. A source's credentials profile overrides it, and is the only way to give several upstreams different tokens or any TLS trust. |
 | `BIOPB_LOG_LEVEL` | `DEBUG`/`INFO`/`WARNING`/`ERROR`/`CRITICAL`; anything else is ignored and the CLI/default level wins. |
 | `BIOPB_DATA_PLANE_SUPERVISED` | Set **by the control** on the child it spawns. The sidecar reports it and refuses self-restart, so a supervised restart is control-routed instead of racing the supervisor. |
-| `BIOPB_OMETIFF_PARALLEL_READ` | Opt in (`=1`) to lock-free OME-TIFF chunk reads — concurrent tile decodes run in parallel instead of serializing under `_io_lock` (biopb/biopb#473). **Default off**. |
+| `BIOPB_OMETIFF_PARALLEL_READ` | Opt in (`=1`) to lock-free OME-TIFF chunk reads — concurrent tile decodes run in parallel instead of serializing on the pooled handle's lock (biopb/biopb#473). **Default off**. |
 | `BIOPB_CLAIM_GENERIC_IMAGES` | Seeds the initial default for claiming generic raster/video during discovery (**off**, biopb/biopb#40). Only matters on discovery paths that never load a `ServerConfig`; a loaded config's `claim_generic_images` overrides it at startup. |
 | `BIOPB_DISCOVERY_SKIP_OFFLINE` | `0` disables skipping suspected cloud placeholders during discovery (**on** by default) — an escape hatch for a filesystem that reports zero allocated blocks spuriously. |
 

@@ -22,9 +22,9 @@ registry -- this module imports nothing from BioIO and has no fallback path of
 its own.  The one document it refuses is one no reader can represent as a
 single tensor: pixel types that differ across channels.
 
-**Handle policy.**  The reader is kept warm between reads and closed by the
-shared idle reaper, the same opt-in :mod:`_handle_reaper` describes for
-OME-TIFF.  Opening a CZI parses its subblock directory, so the open costs about
+**Handle policy.**  The reader is kept warm between reads in a pool keyed by
+file identity (:mod:`_handle_pool`), so a rebuilt adapter finds it, and closed
+once idle.  Opening a CZI parses its subblock directory, so the open costs about
 0.22 us per subblock on top of a 0.03 ms floor -- never negligible against a
 0.1-2 ms ROI read.  Reopening per read (the mrc default) measured 1.7x
 slower at 40 subblocks and 3.6x at 1 000, so this format does not meet that
@@ -32,8 +32,6 @@ default's "the reopen is unmeasurable" precondition.
 """
 
 import logging
-import threading
-import time
 from dataclasses import dataclass
 from itertools import product
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
@@ -42,10 +40,8 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.adapters._handle_reaper import (
-    DEFAULT_HANDLE_REAPER_TTL,
-    IdleHandleReaper,
-)
+from biopb_tensor_server.adapters._handle_pool import HandlePool, PooledHandle
+from biopb_tensor_server.adapters._handle_reaper import DEFAULT_HANDLE_REAPER_TTL
 from biopb_tensor_server.adapters._scale import MICRON, scale_by_label
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
@@ -98,13 +94,11 @@ _PIXEL_TYPES = {
 }
 
 # One pool for CZI readers, separate from the OME-TIFF store pool so each is
-# retuned and reported on its own.  See :mod:`_handle_reaper`.
-# Opening parses the subblock directory (~0.22 us per subblock over a 0.03 ms
-# floor), so reopening is measurably worse than holding -- 1.7x at 40 subblocks,
-# 3.6x at 1000 -- and the TTL is the long default. One handle pins one reader.
-_reader_reaper = IdleHandleReaper(
-    DEFAULT_HANDLE_REAPER_TTL, "czi-reader-reaper", max_handles=32
-)
+# retuned and reported on its own.  Opening parses the subblock directory (~0.22
+# us per subblock over a 0.03 ms floor), so reopening is measurably worse than
+# holding -- 1.7x at 40 subblocks, 3.6x at 1000 -- and the TTL is the long
+# default. One handle pins one reader, shared by every scene of the file.
+_reader_pool = HandlePool(DEFAULT_HANDLE_REAPER_TTL, 32, "czi-reader-pool")
 
 
 @dataclass(frozen=True)
@@ -364,7 +358,6 @@ class CziAdapter(TensorAdapter):
         source_id: str,
         layout: _CziLayout,
         scene_position: Optional[int] = None,
-        io_lock: Optional[threading.Lock] = None,
     ):
         self.source_id = source_id
         self._url = url
@@ -380,17 +373,7 @@ class CziAdapter(TensorAdapter):
             native_labels.append(_SAMPLES_DIM)
         self.dim_labels = native_labels
 
-        # One lock per source, shared with its scene adapters: libCZI's reader
-        # is not documented as thread-safe, and it also fences a reaper close
-        # against an in-flight read.
-        self._io_lock = io_lock if io_lock is not None else threading.Lock()
         self._tensor_adapters: Dict[str, CziAdapter] = {}
-        self._persistent_reader = None
-        self._persistent_context = None
-        self._persistent_last_access = 0.0
-        # Reads hold ``_io_lock`` end to end, so no read is ever in flight when
-        # the reaper can take the lock; the counter exists for the protocol.
-        self._active_reads = 0
 
     # ---- descriptors --------------------------------------------------------
 
@@ -456,7 +439,6 @@ class CziAdapter(TensorAdapter):
             self.source_id,
             self._layout,
             scene_position=position,
-            io_lock=self._io_lock,
         )
         adapter._tensor_name = field
         self._tensor_adapters[field] = adapter
@@ -621,8 +603,13 @@ class CziAdapter(TensorAdapter):
             range(starts[axis], stops[axis]) for axis in range(n_plane)
         ]
         zoom = None if factor is None else 1.0 / factor
-        with self._io_lock:
-            reader = self._acquire_reader()
+        # libCZI's reader is not documented as thread-safe: readers of one file
+        # serialize on the handle's lock, and the lease keeps it open.
+        with (
+            _reader_pool.checkout(self._pool_key(), self._open_reader) as handle,
+            handle.lock,
+        ):
+            reader = handle.value
             try:
                 for coordinates in product(*coordinate_ranges):
                     plane = reader.read(
@@ -642,58 +629,32 @@ class CziAdapter(TensorAdapter):
                             f"expected {output[destination].shape}"
                         )
                     output[destination] = pixels
-                self._persistent_last_access = time.monotonic()
+            except _ZoomShapeMismatch:
+                raise
             except Exception:
                 # A half-open reader is not reusable; drop it so the next read
                 # reopens rather than failing on the same handle.
-                self._release_persistent_handle()
+                _reader_pool.drop(self._pool_key())
                 raise
         return output
 
-    def _acquire_reader(self):
-        """Open (or reuse) a libCZI reader.  Caller holds ``_io_lock``."""
-        if self._persistent_reader is not None:
-            return self._persistent_reader
+    def _pool_key(self):
+        return (self._url, self._content_version)
 
+    def _open_reader(self) -> PooledHandle:
+        """Open a libCZI reader as a handle the pool closes."""
         from pylibCZIrw import czi as pyczi
 
         context = pyczi.open_czi(self._url)
         reader = context.__enter__()
-        self._persistent_context = context
-        self._persistent_reader = reader
-        self._persistent_last_access = time.monotonic()
-        _reader_reaper.register(self)
-        return reader
-
-    def _release_persistent_handle(self) -> None:
-        """Close the reader and permit a later reopen.
-
-        The :class:`~biopb_tensor_server.adapters._handle_reaper.ReapableHandle`
-        hook.  Caller holds ``_io_lock`` (read path / reaper) or is the GC
-        finalizer.  Safe to call repeatedly.
-        """
-        context = self._persistent_context
-        self._persistent_reader = None
-        self._persistent_context = None
-        _reader_reaper.discard(self)
-        if context is not None:
-            try:
-                context.__exit__(None, None, None)
-            except Exception:
-                logger.debug("error closing persistent CZI reader", exc_info=True)
+        return PooledHandle(
+            self._pool_key(), reader, lambda: context.__exit__(None, None, None)
+        )
 
     def close(self) -> None:
-        """Release this source's readers, including its scene adapters'."""
-        for adapter in list(self._tensor_adapters.values()):
-            adapter.close()
-        with self._io_lock:
-            self._release_persistent_handle()
-
-    def __del__(self):
-        try:
-            self._release_persistent_handle()
-        except Exception:
-            pass
+        """Release this file's reader (shared by every scene; closed at its last
+        lease) rather than waiting for the pool's TTL."""
+        _reader_pool.drop(self._pool_key())
 
     # ---- metadata -----------------------------------------------------------
 
