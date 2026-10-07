@@ -181,7 +181,7 @@ def epoch_of(chunk_id: bytes) -> int:
 # NOT for a segment-file layout change -- that is CACHE_FILE_FORMAT_VERSION.
 # A bump cold-starts every cache everywhere, which is the correct outcome for a
 # change in what the bytes mean.
-CHUNK_SEMANTICS_EPOCH = 0
+CHUNK_SEMANTICS_EPOCH = 1
 
 
 def current_epoch() -> int:
