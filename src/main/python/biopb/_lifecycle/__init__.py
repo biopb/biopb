@@ -13,10 +13,10 @@ must reap. Two owners share it: the tensor server (held by the control
 supervisor) and the biopb-mcp session child (held by the stdio shim, which in
 turn holds the kernel).
 
-* :mod:`biopb.lifecycle._owned_child` -- the ``OwnedChild`` handle itself.
-* :mod:`biopb.lifecycle.winjob` -- Windows Job Object: kill-on-close bind (the
+* :mod:`biopb._lifecycle._owned_child` -- the ``OwnedChild`` handle itself.
+* :mod:`biopb._lifecycle.winjob` -- Windows Job Object: kill-on-close bind (the
   child dies with its parent for any reason) plus a from-outside tree-kill.
-* :mod:`biopb.lifecycle.deathwatch` -- the child-side parent-death pipe watcher:
+* :mod:`biopb._lifecycle.deathwatch` -- the child-side parent-death pipe watcher:
   self-terminate if the parent dies uncatchably (the POSIX counterpart to the
   Job Object).
 
@@ -24,15 +24,15 @@ turn holds the kernel).
 spawned it, is found again by a pidfile rather than a handle, and is signalled to
 stop. The one such daemon is the control plane (``biopb control start``).
 
-* :mod:`biopb.lifecycle.daemon` -- pidfile identity across a reused pid,
+* :mod:`biopb._lifecycle.daemon` -- pidfile identity across a reused pid,
   graceful stop, and console-detach ``Popen`` kwargs.
 
 Shared by both patterns:
 
-* :mod:`biopb.lifecycle.proc` -- process liveness + create-time identity, the
+* :mod:`biopb._lifecycle.proc` -- process liveness + create-time identity, the
   primitive that lets a pidfile owner tell its own child from an unrelated
   process that later inherited a reused PID.
-* :mod:`biopb.lifecycle.file_lock` -- a cross-process advisory lock, in two
+* :mod:`biopb._lifecycle.file_lock` -- a cross-process advisory lock, in two
   scopes: ``file_lock`` for a block that must not race another owner (e.g.
   ``control start``), and ``ExclusiveFileLock`` for single-ownership held across
   a process lifetime (the tensor server's cache directory). Both put exclusion

@@ -364,7 +364,7 @@ def test_unlinked_entry_stays_readable_through_a_live_mapping(settings):
 def test_only_one_holder_sweeps_at_a_time(settings):
     """N processes must not all scan-and-evict at once, or they over-eviction by
     a factor of N -- each seeing the same pre-sweep total."""
-    from biopb.lifecycle.file_lock import ExclusiveFileLock
+    from biopb._lifecycle.file_lock import ExclusiveFileLock
 
     settings.root.mkdir(parents=True, exist_ok=True)
     other = ExclusiveFileLock(settings.root / dc._LOCK_NAME)

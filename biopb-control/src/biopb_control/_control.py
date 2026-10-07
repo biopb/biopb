@@ -113,7 +113,7 @@ from biopb import (
     _web_auth,
 )
 from biopb._control import _endpoints
-from biopb.lifecycle.daemon import detach_kwargs
+from biopb._lifecycle.daemon import detach_kwargs
 from starlette.applications import Starlette
 from starlette.background import BackgroundTask
 from starlette.datastructures import Headers

@@ -3,7 +3,7 @@
 Covers the daemon liveness/health probe, the `control status` / `control run`
 argv wiring, mode resolution, and the bind/TLS/token derivations. The lower-level
 detached-daemon lifecycle helpers those commands call live in
-:mod:`biopb.lifecycle.daemon` (``daemon_test.py``); the data-plane commands that
+:mod:`biopb._lifecycle.daemon` (``daemon_test.py``); the data-plane commands that
 used to live under `biopb server` moved with biopb/biopb#615 -- cache-stats to
 ``cli_test.py`` (it is a `biopb tensor` command now). OS calls are mocked so the tests are
 deterministic and fast on any platform; time.sleep is neutralized.
@@ -19,7 +19,7 @@ import biopb.cli as cli
 import pytest
 import typer
 from biopb import _locations
-from biopb.lifecycle import daemon as _daemon
+from biopb._lifecycle import daemon as _daemon
 from typer.testing import CliRunner
 
 

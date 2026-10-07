@@ -21,8 +21,7 @@ from ._control._endpoints import (
     flight_port_for as _flight_port,
     sidecar_port_for as _sidecar_port,
 )
-from ._locations import find_config
-from .lifecycle.daemon import (
+from ._lifecycle.daemon import (
     detach_kwargs as _detach_kwargs,
     is_our_daemon as _is_our_daemon,
     read_pid_record as _read_pid_record,
@@ -30,11 +29,12 @@ from .lifecycle.daemon import (
     stop_daemon as _stop_daemon,
     write_pid_file as _write_pid_file,
 )
-from .lifecycle.file_lock import LockTimeout, file_lock
-from .lifecycle.proc import (
+from ._lifecycle.file_lock import LockTimeout, file_lock
+from ._lifecycle.proc import (
     is_process_running as _is_process_running,
     process_create_time as _process_create_time,
 )
+from ._locations import find_config
 
 console = Console()
 
@@ -707,7 +707,7 @@ def _control_start_lock() -> Path:
 
     Concurrent starters (launcher, installer, agent sessions) would otherwise
     both see "no pidfile" and the bind-loser could clobber the winner's pidfile,
-    orphaning a control `control stop` cannot reach. See biopb.lifecycle.file_lock.
+    orphaning a control `control stop` cannot reach. See biopb._lifecycle.file_lock.
     """
     return CONTROL_PID_FILE.parent / "control.start.lock"
 

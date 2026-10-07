@@ -92,7 +92,7 @@ class TestRuntimeRecord:
         """
         import os
 
-        from biopb.lifecycle.proc import process_create_time
+        from biopb._lifecycle.proc import process_create_time
 
         _endpoints.write_runtime_record("127.0.0.1", 9003, os.getpid())
         record = _endpoints.read_runtime_record()

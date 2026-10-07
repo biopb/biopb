@@ -6,7 +6,7 @@ It lives in the core SDK because neither side can import the other.
 
 Readers prune records whose process is gone, so a hard-killed session leaves no
 routing ghost. Liveness is an identity check: the record stores the process
-create-time token (``biopb.lifecycle.proc.process_create_time``), so a recycled
+create-time token (``biopb._lifecycle.proc.process_create_time``), so a recycled
 PID is not mistaken for the session.
 
 Writes are atomic (temp file + ``os.replace``); a record unlinked between listing
@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Optional
 
 from . import _locations
-from .lifecycle.proc import is_process_running, process_create_time
+from ._lifecycle.proc import is_process_running, process_create_time
 
 logger = logging.getLogger(__name__)
 

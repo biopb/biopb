@@ -1,4 +1,4 @@
-"""Tests for biopb.lifecycle._owned_child (the Pattern O primitive).
+"""Tests for biopb._lifecycle._owned_child (the Pattern O primitive).
 
 Spawn a real Python child, assert liveness/identity, and the graceful-then-hard
 stop escalation. Runs on every OS: the stop escalation differs by platform
@@ -11,7 +11,7 @@ import subprocess
 import sys
 import time
 
-from biopb.lifecycle._owned_child import OwnedChild, open_child_log
+from biopb._lifecycle._owned_child import OwnedChild, open_child_log
 
 
 class TestOpenChildLog:

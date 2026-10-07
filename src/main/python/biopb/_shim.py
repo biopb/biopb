@@ -61,7 +61,7 @@ from mcp.server.lowlevel.server import NotificationOptions, Server, request_ctx
 from mcp.server.stdio import stdio_server
 
 from . import _control, _control_launch, _locations, _sessions
-from .lifecycle import winjob as _winjob
+from ._lifecycle import winjob as _winjob
 
 logger = logging.getLogger(__name__)
 

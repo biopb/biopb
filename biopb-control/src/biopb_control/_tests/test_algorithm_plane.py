@@ -108,7 +108,7 @@ def plane(tmp_path, registry, monkeypatch):
 def _crash(entry) -> None:
     """Kill an entry's uv and server at once, as an OOM kill would."""
     if os.name == "nt":
-        from biopb.lifecycle import winjob
+        from biopb._lifecycle import winjob
 
         winjob.terminate_job(entry._winjob)
     else:

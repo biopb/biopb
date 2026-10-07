@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
-from biopb.lifecycle.file_lock import ExclusiveFileLock
+from biopb._lifecycle.file_lock import ExclusiveFileLock
 
 # Sieve-K counter saturation cap (levels: 0, 1, ..., K).
 K = 2
@@ -179,7 +179,7 @@ class ProcessLock:
     Two jobs, and they are now carried by two different files:
 
     * **Exclusion** is an OS advisory lock on ``<path>`` held for the life of the
-      process (``biopb.lifecycle.file_lock.ExclusiveFileLock``). It lives on an
+      process (``biopb._lifecycle.file_lock.ExclusiveFileLock``). It lives on an
       open descriptor, so the OS releases it when the owner exits *however* it
       exits.
     * **Crash detection** is a sibling ``<path>.owner`` record, written after the
