@@ -25,9 +25,11 @@ from typing import Any, Dict, List, Optional, Tuple
 from biopb_tensor_server.adapters import get_default_registry
 from biopb_tensor_server.adapters.remote_tensor import (
     _split_grpc_url,
+    close_upstream_client,
     is_bare_host_upstream_url,
     list_upstream_source_ids,
     mirrorable_upstream_id,
+    open_upstream_client,
     resolve_upstream_credentials,
 )
 from biopb_tensor_server.core.config import (
@@ -44,12 +46,12 @@ from biopb_tensor_server.core.discovery import (
     get_file_identity,
 )
 from biopb_tensor_server.core.errors import UpstreamConfigError
-from biopb_tensor_server.serving.upload_manager import write_dir_under_root
 from biopb_tensor_server.sources.roots import (
     Root,
     RootKind,
     Roots,
     reroot_catalog_url,
+    write_dir_under_root,
 )
 
 logger = logging.getLogger(__name__)
@@ -118,25 +120,12 @@ def _discover_tensor_server(
 
     # Bare-host form: mirror every source on the upstream. Enumerate via the
     # complete server-side catalog (see list_upstream_source_ids).
-    from biopb.tensor import TensorFlightClient
-
     credentials = resolve_upstream_credentials(source, credentials_config)
-    client = TensorFlightClient(
-        endpoint,
-        cache_bytes=0,
-        token=credentials.token,
-        tls_ca_pem=credentials.tls_ca_pem,
-        tls_fingerprint=credentials.tls_fingerprint,
-    )
+    client = open_upstream_client(endpoint, credentials)
     try:
         upstream_ids = sorted(list_upstream_source_ids(client, endpoint))
     finally:
-        # Never let a failing close() replace the upstream error propagating out
-        # of the try: body (biopb/biopb#529).
-        try:
-            client.close()
-        except Exception:
-            logger.debug("error closing upstream client", exc_info=True)
+        close_upstream_client(client)
 
     expanded = []
     for upstream_id in upstream_ids:
