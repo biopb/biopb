@@ -32,8 +32,6 @@ class SegmentEntryInfo:
     segment_id: int
     offset: int  # Entry index within segment (used by the sequential reader)
     size_bytes: int
-    created_at: float = 0.0
-    last_access_time: float = 0.0  # Updated on each read
     # Byte location of the entry's encapsulated Arrow IPC message within the
     # segment file. Lets a localhost client mmap the segment and read just this
     # message (issue #9). Defaults of 0 mean "unknown" (e.g. legacy index);
@@ -49,7 +47,6 @@ class SieveKSegmentInfo:
     Attributes:
         segment_id: Unique segment identifier
         size_bytes: Total size of segment file
-        created_at: Creation timestamp
         last_access_time: Last access timestamp
         entry_count: Number of entries in this segment
         frequency: Saturating counter (0 to K=2) for Sieve-K algorithm
@@ -58,7 +55,6 @@ class SieveKSegmentInfo:
 
     segment_id: int
     size_bytes: int
-    created_at: float
     last_access_time: float
     entry_count: int
     frequency: int = 0  # Saturating counter (0 to K=2)
@@ -240,15 +236,6 @@ class ProcessLock:
             pass  # A record we can't remove costs a spurious recovery, no more.
         self._lock.release()
 
-    def is_held(self) -> bool:
-        """Whether this instance currently owns the cache directory.
-
-        Exists so a caller can tell "we released" from "we deliberately did
-        not": a shutdown that leaves a writer running must keep the lock, and
-        that is otherwise only observable by reaching inside the file lock.
-        """
-        return self._lock.is_held()
-
     def is_stale(self) -> bool:
         """Whether the previous owner exited without releasing (i.e. crashed).
 
@@ -263,7 +250,12 @@ class ProcessLock:
         return self._prior_owner
 
     def is_acquired(self) -> bool:
-        """Check if this instance holds the lock."""
+        """Whether this instance currently owns the cache directory.
+
+        Lets a caller tell "we released" from "we deliberately did not": a
+        shutdown that leaves a writer running must keep the lock, and that is
+        otherwise only observable by reaching inside the file lock.
+        """
         return self._lock.is_held()
 
     def _read_owner_record(self) -> Optional[dict]:
