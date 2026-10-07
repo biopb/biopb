@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "biopb"
 dynamic = ["version"]
-requires-python = ">=3.10,<3.13"
+requires-python = ">=3.10,<3.14"
 authors = [ {name = "Ji Yu", email = "jyu@uchc.edu" } ]
 description = "Python bindings of BioPB: open protobuf/gRPC protocols for biomedical image processing"
 readme = "README.md"
@@ -21,6 +21,7 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Image Processing",
 ]
 dependencies = [

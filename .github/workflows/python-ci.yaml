@@ -34,7 +34,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        python-version: ["3.10", "3.11", "3.12"]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
     defaults:
       run:
         shell: bash
@@ -56,7 +56,15 @@ jobs:
       - name: Setup build environment
         run: |
           python -m pip install --upgrade pip setuptools
-          pip install -e ".[test,tensor,shim]"
+          if [[ "${{ matrix.python-version }}" == "3.13" ]]; then
+            # 3.14 is not tested: zarr<3 pins numcodecs<0.16, which has no macOS
+            # cp314 wheel (source build fails to link).
+            # The `test` extra pulls biopb-mcp, which is still capped below 3.13;
+            # install the rest of it by hand. The tests that need biopb-mcp skip.
+            pip install -e ".[tensor,shim]" pytest pytest-timeout "opencv-python-headless==4.10.0.84"
+          else
+            pip install -e ".[test,tensor,shim]"
+          fi
       - name: Test
         run: |
           pytest --timeout=300 --timeout-method=thread src/test/python/
