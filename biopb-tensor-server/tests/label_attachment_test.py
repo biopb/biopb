@@ -25,7 +25,11 @@ from biopb_tensor_server.adapters.labels import (
 from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
 from biopb_tensor_server.adapters.zarr import UPLOAD_PENDING, with_upload_state
 from biopb_tensor_server.core.config import PyramidConfig, SourceConfig
-from biopb_tensor_server.core.errors import TensorNotFound, WriteNotSupportedError
+from biopb_tensor_server.core.errors import (
+    AttachedTensorMismatch,
+    TensorNotFound,
+    WriteNotSupportedError,
+)
 from biopb_tensor_server.core.labels import (
     extent_mismatch,
     label_extent,
@@ -129,6 +133,8 @@ def registered(reg):
 
 
 NATIVE = {"@labels/nuclei", "@labels/flat", "@labels/xy"}
+# Also in the fixture, listed but 32x32 on a 64x64 image: it refuses to be read.
+STALE_NATIVE = {"@labels/small"}
 
 
 class TestTheFieldShape:
@@ -198,7 +204,7 @@ class TestANativeSetIsATensorOfItsImage:
     def test_listed_after_the_image_and_readable_by_id(self, registered, reg):
         ids = [t.array_id for t in reg.catalog_tensors("oz1", registered)]
         assert ids[0] == "oz1"
-        assert set(ids[1:]) == {f"oz1/{f}" for f in NATIVE}
+        assert set(ids[1:]) == {f"oz1/{f}" for f in NATIVE | STALE_NATIVE}
 
         nuclei = reg.resolve_tensor("oz1", "oz1/@labels/nuclei")
         assert isinstance(nuclei, LabelSetAdapter)
@@ -207,10 +213,16 @@ class TestANativeSetIsATensorOfItsImage:
         desc = nuclei.get_tensor_descriptor()
         assert (list(desc.shape), desc.dtype) == ([64, 64], "<u4")
 
-    def test_a_set_that_cannot_open_or_does_not_span_is_dropped(self, registered, reg):
+    def test_a_set_that_does_not_span_is_listed_and_refuses_to_be_read(
+        self, registered, reg
+    ):
         """``bad`` is a float (the reader skips it); ``small`` is 32x32 on a
-        64x64 image (the merge drops it). The image registers either way."""
-        assert set(reg.attached_to("oz1").label_sets(registered)) == NATIVE
+        64x64 image: listed, but a read says why instead of serving it
+        misaligned. The image registers either way."""
+        sets = reg.attached_to("oz1").label_sets(registered)
+        assert set(sets) == NATIVE | STALE_NATIVE
+        with pytest.raises(AttachedTensorMismatch, match="does not span"):
+            reg.resolve_tensor("oz1", "@labels/small")
         assert reg.resolve_tensor("oz1", "oz1").array_id == "oz1"
 
     def test_an_unknown_set_is_the_formats_miss(self, registered, reg):
@@ -358,15 +370,17 @@ class TestASidecarIsAttachedAtRegistration:
         reg = _adopting(labels_dir)
         adapter = reg.register("oz1", _adapter(image))
 
-        assert set(reg.attached_to("oz1").label_sets(adapter)) == NATIVE | {
-            "@labels/mine"
-        }
+        assert set(
+            reg.attached_to("oz1").label_sets(adapter)
+        ) == NATIVE | STALE_NATIVE | {"@labels/mine"}
         mine = reg.resolve_tensor("oz1", "oz1/@labels/mine")
         assert mine.content_version == b"\x01\x02"
         assert mine.get_tensor_metadata()["image-label"]["source"] == {"image": "oz1"}
         assert "biopb" not in mine.get_tensor_metadata()
 
-    def test_one_that_does_not_span_or_bind_is_dropped(self, image, tmp_path):
+    def test_one_that_does_not_span_or_bind_is_listed_and_refuses_to_be_read(
+        self, image, tmp_path
+    ):
         labels_dir = tmp_path / "labels"
         _sidecar(labels_dir, "oz1", "small", shape=(32, 32))
         _sidecar(labels_dir, "oz1", "extra", shape=(2, 64, 64), axes=("z", "y", "x"))
@@ -376,9 +390,14 @@ class TestASidecarIsAttachedAtRegistration:
         reg = _adopting(labels_dir)
         adapter = reg.register("oz1", _adapter(image))
 
-        assert set(reg.attached_to("oz1").label_sets(adapter)) == NATIVE | {
-            "@labels/fits"
-        }
+        stale = {"@labels/small", "@labels/extra", "Image:9/@labels/orphan"}
+        assert set(reg.attached_to("oz1").label_sets(adapter)) == (
+            NATIVE | {"@labels/fits"} | stale
+        )
+        for name in sorted(stale):
+            with pytest.raises(AttachedTensorMismatch):
+                reg.resolve_tensor("oz1", name)
+        assert reg.resolve_tensor("oz1", "@labels/fits") is not None
 
     def test_a_store_without_a_token_is_corrupt_and_skipped(self, image, tmp_path):
         labels_dir = tmp_path / "labels"

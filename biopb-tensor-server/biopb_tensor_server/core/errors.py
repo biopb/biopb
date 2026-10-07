@@ -124,6 +124,21 @@ class InvalidReadRequest(TensorResolutionError):
     grpc_code = "INVALID_ARGUMENT"
 
 
+class AttachedTensorMismatch(TensorResolutionError):
+    """An attached tensor no longer fits the source it is attached to.
+
+    Canonical gRPC ``FAILED_PRECONDITION``: the tensor is listed, but reading it
+    would hand back data misaligned with its image -- a label set whose source
+    file was replaced by one of another shape. The message says how it differs;
+    deleting the tensor clears it.
+    """
+
+    grpc_code = "FAILED_PRECONDITION"
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, reason="attached_mismatch")
+
+
 class UnknownResolutionError(TensorResolutionError):
     """A resolution-path exception that could not be classified.
 

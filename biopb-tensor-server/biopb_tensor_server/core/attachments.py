@@ -28,6 +28,7 @@ from biopb_tensor_server.core.adapter_base import (
     strip_source_prefix,
 )
 from biopb_tensor_server.core.attached import is_published, split_attached_field
+from biopb_tensor_server.core.errors import AttachedTensorMismatch
 from biopb_tensor_server.core.labels import (
     extent_mismatch,
     join_fields,
@@ -47,9 +48,11 @@ class Attachments:
         self.source_id = source_id
         #: The routable index: published, still filling, or a tombstone.
         self.tensors: Dict[str, TensorAdapter] = {}
-        # The validated published sets, for the parent they were built against;
-        # a rebuilt parent is a different object and misses.
+        # The published sets, for the parent they were built against; a rebuilt
+        # parent is a different object and misses.
         self._view: Optional[Tuple[Any, Dict[str, TensorAdapter]]] = None
+        # Why a listed set cannot be read, by field; rebuilt with the view.
+        self._mismatch: Dict[str, str] = {}
         # The sets the parent's own file carries, read once per parent.
         self._embedded: Optional[Tuple[Any, Dict[str, TensorAdapter]]] = None
 
@@ -103,8 +106,10 @@ class Attachments:
         each checked -- whatever its origin -- against the image it binds to:
         that image must be a tensor of the source, and the set must span it
         (:func:`~biopb_tensor_server.core.labels.extent_mismatch`). A set that
-        fails is dropped with a warning rather than served misaligned. Empty
-        until the source is resolved, since its tensors are unknown before that.
+        fails stays listed, is logged as an error, and raises
+        :class:`AttachedTensorMismatch` when read, rather than being served
+        misaligned or vanishing. Empty until the source is resolved, since its
+        tensors are unknown before that.
 
         This is the *published* view -- what the catalog lists and what a read
         resolves first. A set still being uploaded is in :meth:`label_uploads`
@@ -122,14 +127,15 @@ class Attachments:
         images = self.normalized_tensors(parent)
         candidates = {**self._embedded[1], **self._labels(published=True)}
         view: Dict[str, TensorAdapter] = {}
+        self._mismatch = {}
         for field, tensor in candidates.items():
             normalized = normalize_adapter(tensor)
             why = self.label_binding_error(
                 parent, field, normalized.get_tensor_descriptor(), images=images
             )
             if why is not None:
-                logger.warning(f"labels: {self.source_id}/{field} dropped: {why}")
-                continue
+                logger.error(f"labels: {self.source_id}/{field} cannot be read: {why}")
+                self._mismatch[field] = why
             view[field] = normalized
         self._view = (parent, view)
         return view
@@ -249,6 +255,9 @@ class Attachments:
         """
         label_set = self.label_sets(parent).get(set_field)
         if label_set is not None:
+            why = self._mismatch.get(set_field)
+            if why is not None:
+                raise AttachedTensorMismatch(f"{self.source_id}/{set_field} {why}")
             return label_set
         return self.label_uploads().get(set_field)
 

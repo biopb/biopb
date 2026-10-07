@@ -53,8 +53,10 @@ server states no mapping.
 
 The rule is checked twice: the upload refuses a set that would not span its
 image at create, and `Attachments.label_sets` checks every set again where
-the origins meet (`extent_mismatch`, on normalized descriptors). Mismatched labels
-are dropped with a warning. That includes a set with no channel axis -- a native
+the origins meet (`extent_mismatch`, on normalized descriptors). A mismatched set
+stays listed, is logged as an error, and fails a read with `attached_mismatch`
+(deleting it clears that), rather than being served misaligned or vanishing.
+That includes a set with no channel axis -- a native
 NGFF group (the spec lets it omit `c`) or a sidecar an older server wrote -- when
 its image has one.
 
