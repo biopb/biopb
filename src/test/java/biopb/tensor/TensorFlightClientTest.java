@@ -744,6 +744,68 @@ public class TensorFlightClientTest {
         }
     }
 
+    // ---- describe options, advertised location ----------------------------------
+
+    @Test
+    public void testGetDescriptorAsksForThePyramidAndNothingElseByDefault() throws Exception {
+        try (TestFlightServer server = new TestFlightServer()) {
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                client.getDescriptor("test-tensor");
+                Assert.assertEquals(Arrays.asList("pyramid"), server.getLastFields());
+            }
+        }
+    }
+
+    @Test
+    public void testGetDescriptorOptionsChooseTheOptionalParts() throws Exception {
+        try (TestFlightServer server = new TestFlightServer()) {
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                client.getDescriptor("test-tensor", DescribeOptions.defaults()
+                        .withPyramid(false)
+                        .withMetadata(true)
+                        .withReadPlan(true)
+                        .withResidency(true)
+                        .withUploadStatus(true));
+                Assert.assertEquals(
+                        Arrays.asList("endpoints", "metadata_json", "upload_status", "is_resident"),
+                        server.getLastFields());
+
+                client.getDescriptor("test-tensor", DescribeOptions.defaults().withPyramid(false));
+                Assert.assertEquals(Collections.emptyList(), server.getLastFields());
+            }
+        }
+    }
+
+    @Test
+    public void testAdvertisedLocationIsTheServersOwnAnswerNormalized() throws Exception {
+        try (TestFlightServer server = new TestFlightServer()) {
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                Assert.assertNull("a server that publishes none", client.getAdvertisedLocation());
+            }
+            server.setExternalLocation("grpcs://real-host:8815");
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                Assert.assertEquals("grpc+tls://real-host:8815", client.getAdvertisedLocation());
+                int before = server.getHealthRequestCount();
+                client.getAdvertisedLocation();
+                client.getDescriptor("test-tensor");
+                Assert.assertEquals("read off the one health check", before, server.getHealthRequestCount());
+            }
+        }
+    }
+
+    @Test
+    public void testGetTensorAsPbExportsTheLocationItIsGiven() throws Exception {
+        try (TestFlightServer server = new TestFlightServer()) {
+            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
+                Assert.assertTrue(client.getTensorAsPb("test-tensor", null, null, null)
+                        .getLocation().contains("localhost:" + server.getPort()));
+                SerializedTensor exported = client.getTensorAsPb(
+                        "test-tensor", null, null, null, "grpc://plane.example:8815");
+                Assert.assertEquals("grpc://plane.example:8815", exported.getLocation());
+            }
+        }
+    }
+
     @Test
     public void testResolveSourceWithoutTerminalRowFails() throws Exception {
         // Heartbeats and nothing else: the server closed without a row. That is an
@@ -992,6 +1054,14 @@ public class TensorFlightClientTest {
             return producer.catalogQueries;
         }
 
+        void setExternalLocation(String location) {
+            producer.externalLocation = location;
+        }
+
+        List<String> getLastFields() {
+            return producer.getLastFields();
+        }
+
         void setProtocolVersion(int version) {
             producer.protocolVersion = version;
         }
@@ -1061,6 +1131,8 @@ public class TensorFlightClientTest {
         final List<String> catalogQueries = new java.util.concurrent.CopyOnWriteArrayList<>();
         // The Flight protocol shape this fake claims to speak.
         volatile int protocolVersion = 2;
+        // What `health` says clients outside the server's network should dial.
+        volatile String externalLocation = null;
         final AtomicInteger healthRequests = new AtomicInteger();
         /** Producer calls currently running, so teardown can wait them out. */
         final AtomicInteger inFlight = new AtomicInteger();
@@ -1134,6 +1206,12 @@ public class TensorFlightClientTest {
 
         int getFlightInfoRequestCount() {
             return flightInfoRequests.get();
+        }
+
+        List<String> getLastFields() {
+            return lastCmd == null || !lastCmd.hasTensorRead()
+                    ? null
+                    : lastCmd.getTensorRead().getFields().getPathsList();
         }
 
         String getLastReductionMethod() {
@@ -1324,8 +1402,11 @@ public class TensorFlightClientTest {
                 }
                 // Every v2 server answers this, and the SDK probes it once per
                 // connection before its first real call.
+                String external = externalLocation == null
+                        ? ""
+                        : ",\"external_location\":\"" + externalLocation + "\"";
                 listener.onNext(new Result(("{\"status\":\"SERVING\",\"protocol\":"
-                        + protocolVersion + "}").getBytes(StandardCharsets.UTF_8)));
+                        + protocolVersion + external + "}").getBytes(StandardCharsets.UTF_8)));
                 listener.onCompleted();
                 return;
             }

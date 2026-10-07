@@ -1139,7 +1139,36 @@ public class TensorFlightClient implements AutoCloseable {
      * @return The TensorDescriptor for that tensor
      */
     public TensorDescriptor getDescriptor(String arrayId) {
-        return describe(arrayId, readMask("pyramid"));
+        return getDescriptor(arrayId, DescribeOptions.defaults());
+    }
+
+    /**
+     * {@link #getDescriptor(String)} with the optional parts of the response
+     * chosen by the caller: the full OME metadata, the read plan, residency, the
+     * upload status, or no pyramid. Each costs what {@link DescribeOptions}
+     * says it does.
+     *
+     * @param arrayId Globally-unique tensor id
+     * @param options which optional parts to fill
+     * @return The TensorDescriptor for that tensor
+     */
+    public TensorDescriptor getDescriptor(String arrayId, DescribeOptions options) {
+        return describe(arrayId, readMask((options == null ? DescribeOptions.defaults() : options)
+                .paths().toArray(new String[0])));
+    }
+
+    /**
+     * The address the server says it is reachable at ({@code
+     * health.external_location}), or null if it published none.
+     *
+     * <p>Nothing in the SDK dials it for you. Pass it as the {@code
+     * exportLocation} of {@link #getTensorAsPb(String, SliceHint, long[], String,
+     * String)} when the result goes to a process that cannot reach this
+     * connection's own address. Reading it runs the one {@code health} check if
+     * no call has yet.
+     */
+    public String getAdvertisedLocation() {
+        return session.advertisedLocation();
     }
 
     /**
@@ -1284,18 +1313,45 @@ public class TensorFlightClient implements AutoCloseable {
             SliceHint sliceHint,
             long[] scaleHint,
             String reductionMethod) {
+        return getTensorAsPb(arrayId, sliceHint, scaleHint, reductionMethod, null);
+    }
+
+    /**
+     * {@link #getTensorAsPb(String, SliceHint, long[], String)} naming the
+     * address to bake into the result's {@code location} instead of this
+     * connection's own dial address.
+     *
+     * <p>Set it when the result leaves this process and the dial address is not
+     * reachable from there; {@link #getAdvertisedLocation} is the server's own
+     * answer for that. The result carries the trust anchor this connection
+     * verified the server with, not a resolved trust: whoever dials the new
+     * address applies it to that name, so a leaf-pinned certificate that omits
+     * the name still connects (a CA keeps its SAN check).
+     *
+     * @param exportLocation the address to export, or null for this connection's own
+     */
+    public SerializedTensor getTensorAsPb(
+            String arrayId,
+            SliceHint sliceHint,
+            long[] scaleHint,
+            String reductionMethod,
+            String exportLocation) {
 
         LOGGER.fine("getTensorAsPb: arrayId=" + arrayId);
         RequestContext context = planRead(arrayId, sliceHint, scaleHint, reductionMethod);
 
         // The plan is Arrow's own FlightInfo, carried whole; only where and as
         // whom to read it is ours to add.
-        return serializedTensorOf(context.info);
+        return serializedTensorOf(context.info, exportLocation);
     }
 
     private SerializedTensor serializedTensorOf(FlightInfo info) {
+        return serializedTensorOf(info, null);
+    }
+
+    private SerializedTensor serializedTensorOf(FlightInfo info, String exportLocation) {
         SerializedTensor.Builder builder = SerializedTensor.newBuilder()
-                .setLocation(location.getUri().toString())
+                .setLocation(exportLocation == null ? location.getUri().toString() : exportLocation)
                 .setFlightInfo(ByteString.copyFrom(info.serialize()));
         if (token != null && !token.isEmpty()) {
             builder.setAuthToken(token);

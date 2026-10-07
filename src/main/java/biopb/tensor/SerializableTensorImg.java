@@ -22,18 +22,19 @@ import net.imglib2.type.numeric.RealType;
  * Compatibility adapter for Java serialization of a lazy tensor image.
  *
  * <p>The sole cross-process handle is {@link SerializedTensor}. This class is
- * only an imglib2 adapter: its externalized state is exactly a
- * {@code SerializedTensor} protobuf and a local cache budget. It never
+ * only an imglib2 adapter, and not part of the public API -- callers see a
+ * {@code RandomAccessibleInterval}, and pass {@link SerializedTensor} to hand a
+ * read to another process. Its externalized state is exactly a
+ * {@code SerializedTensor} protobuf and a local cache budget; it never
  * serializes source IDs, read options, descriptors, or a second bespoke ticket
- * format. New cross-process APIs should pass {@link SerializedTensor} directly.
+ * format.
  *
  * <p>Its Flight connection comes from {@link FlightSessions}, shared per
  * {@code (location, token)} across every image in the process, so
  * reconstructing many tensors from one server costs one channel rather than
  * one each.
  */
-@Deprecated
-public class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
+class SerializableTensorImg<T extends NativeType<T> & RealType<T>>
         implements RandomAccessibleInterval<T>, Externalizable, AutoCloseable {
 
     private byte[] serializedTensorBytes;

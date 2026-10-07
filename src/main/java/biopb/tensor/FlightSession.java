@@ -50,6 +50,9 @@ public final class FlightSession implements AutoCloseable {
      */
     private volatile boolean protocolChecked;
 
+    /** The server's own {@code health.external_location}, once {@link #ensureProtocol} has read it. */
+    private volatile String advertisedLocation;
+
     public FlightSession(Location location, String token) {
         this(location, token, TlsTrust.NONE);
     }
@@ -125,6 +128,10 @@ public final class FlightSession implements AutoCloseable {
             }
             throw TensorErrorMapper.map(error);
         }
+        Object external = health.orElse(Collections.emptyMap()).get("external_location");
+        if (external instanceof String && !((String) external).isEmpty()) {
+            advertisedLocation = (String) external;
+        }
         // Anything but a stated v2 is a v1 server. The key postdates that
         // version, so its absence names the version rather than leaving it
         // unknown -- and a server that is not biopb at all is refused here
@@ -138,6 +145,24 @@ public final class FlightSession implements AutoCloseable {
                     "The server at " + location + " routes requests in another shape."));
         }
         protocolChecked = true;
+    }
+
+    /**
+     * The address the server says it is reachable at ({@code
+     * health.external_location}, biopb/biopb#1158), as Arrow names it
+     * ({@code grpc+tls://} for a TLS location), or null if it published none or
+     * will not say (a capability token cannot reach {@code health}). Runs the one
+     * protocol check if no call has yet.
+     */
+    String advertisedLocation() {
+        ensureProtocol();
+        String advertised = advertisedLocation;
+        if (advertised == null) {
+            return null;
+        }
+        return advertised.regionMatches(true, 0, "grpcs://", 0, 8)
+                ? "grpc+tls://" + advertised.substring(8)
+                : advertised;
     }
 
     /**
