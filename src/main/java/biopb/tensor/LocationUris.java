@@ -28,9 +28,13 @@ public final class LocationUris {
      * <p>A scheme-less authority (e.g. {@code "host:port"}) defaults to an
      * insecure gRPC location; any explicit scheme Arrow understands
      * ({@code grpc}, {@code grpc+tcp}, {@code grpc+tls}, {@code grpc+unix}) is
-     * passed through as-is.
+     * passed through as-is, and {@code grpcs://} is read as {@code grpc+tls://}.
      */
     public static Location parse(String uri) {
+        // `grpcs://` is the public spelling of Arrow's `grpc+tls://`.
+        if (uri.regionMatches(true, 0, "grpcs://", 0, 8)) {
+            uri = "grpc+tls://" + uri.substring(8);
+        }
         try {
             return new Location(URI.create(uri));
         } catch (Exception e) {

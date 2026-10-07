@@ -4,6 +4,9 @@ How a client on this machine finds the tensor (data) plane and the token for
 it. It is files, environment variables and two HTTP calls, so any language can
 implement it; the private `biopb._control` is the Python one, and
 `biopb.tensor.Connection` is its public face: it finds the plane and dials it.
+The Java SDK's `biopb.tensor.Connection` is the other implementation, with the
+same reads in the same order; its trust-on-first-use pins live in memory, not in
+the pin store Python keeps.
 
 ## State directory
 
