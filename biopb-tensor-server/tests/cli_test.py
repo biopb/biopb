@@ -626,7 +626,8 @@ def test_setup_empty_sources_serves_empty_catalog(tmp_path):
     config_path.write_text(
         json.dumps(
             {
-                "server": {"host": "127.0.0.1", "port": 0},
+                # not writable: the scratch source would count as a source
+                "server": {"host": "127.0.0.1", "port": 0, "writable": False},
                 "cache": {"file_cache_dir": str(tmp_path / "cache")},
                 "sources": [],
             }
@@ -854,7 +855,8 @@ def test_setup_a_configured_path_serves_then_registers_with_freshness(tmp_path):
     config_path.write_text(
         json.dumps(
             {
-                "server": {"host": "127.0.0.1", "port": 0},
+                # not writable: the scratch source would count as a source
+                "server": {"host": "127.0.0.1", "port": 0, "writable": False},
                 "cache": {"file_cache_dir": str(tmp_path / "cache")},
                 "sources": [
                     {

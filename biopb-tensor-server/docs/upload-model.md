@@ -42,11 +42,13 @@ catalog. It holds no bytes **and no tensors** of its own: what is added to it
 is an uploaded field like any other, under `<write_dir>/fields/scratch/`
 (Uploaded fields).
 
-`write_dir`, not `writable`, is the switch: `writable` serves the Flight write
-verbs, and an in-process producer wants the scratch source without them. That
-is `biopb-image-base`'s embedded result cache, which calls `add_tensor`
-directly and leaves `add_tensor`, `set_upload_status` and DoPut refused on the
-wire.
+`write_dir`, not `writable`, is the switch: `writable` (on by default) serves
+the Flight write verbs, and an in-process producer wants the scratch source
+without them. That is `biopb-image-base`'s embedded result cache, which calls
+`add_tensor` directly and leaves `add_tensor`, `set_upload_status` and DoPut
+refused on the wire. A writable server that names no `write_dir` uses
+`~/.local/share/biopb/tensor-server/uploads`; a non-writable one has none
+unless it names one.
 
 - **The id is fixed, which is the point.** A producer writes
   `zarr://scratch/@fields/<name>` without a round trip first -- nothing to

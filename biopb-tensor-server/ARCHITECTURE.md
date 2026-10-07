@@ -338,10 +338,10 @@ See **[docs/roi-annotations.md](docs/roi-annotations.md)**.
 **Command:** `biopb-tensor-server launch`
 
 ```
-biopb-tensor-server launch --config biopb.json [--host 127.0.0.1] [--port 8815] [--writable] [--web-port 8816] [--web-host 127.0.0.1] [--cors ORIGIN]
+biopb-tensor-server launch --config biopb.json [--host 127.0.0.1] [--port 8815] [--no-writable] [--web-port 8816] [--web-host 127.0.0.1] [--cors ORIGIN]
 
 # for grpc only (no web server) — same flight options + token handling as launch
-biopb-tensor-server serve --config biopb.json [--host 127.0.0.1] [--port 8815] [--writable] [--tls] [--san NAME]
+biopb-tensor-server serve --config biopb.json [--host 127.0.0.1] [--port 8815] [--no-writable] [--tls] [--san NAME]
 
 # generate / rotate the self-signed TLS cert and print its fingerprint
 biopb-tensor-server cert init [--force] [--san NAME]

@@ -38,6 +38,7 @@ from biopb_tensor_server.core.config import (
     ServerConfig,
     SourceConfig,
     _read_config_file,
+    default_write_dir,
     load_config,
     validate_config_dict,
 )
@@ -698,7 +699,11 @@ def _setup_flight_server(
         Tuple of (flight_server, source_manager, precache_worker)
     """
     effective_writable = writable if writable is not None else server_config.writable
-    write_dir = server_config.write_dir
+    # Writable is the single switch the admin page can flip, so it also decides
+    # whether an unset write_dir has a default. A named one is always honored.
+    write_dir = server_config.write_dir or (
+        default_write_dir() if effective_writable else None
+    )
 
     # Apply the discovery-claim policy for generic raster/video (biopb/biopb#40).
     # Off by default so recursive scans don't register screenshots/icons/movies.
@@ -791,7 +796,7 @@ def _setup_flight_server(
         server=server,
         registry=registry,
         sources=server_config.sources,
-        write_dir=server_config.write_dir,
+        write_dir=write_dir,
         metadata_db=metadata_db,
         credentials_config=server_config.credentials,
         stability_window=server_config.stability_window,
@@ -950,7 +955,7 @@ def serve(
     writable: Optional[bool] = typer.Option(
         None,
         "--writable/--no-writable",
-        help="Enable write mode for source creation and data upload. Omitted, "
+        help="Serve the write path (data upload); on by default. Omitted, "
         "the config file's `server.writable` decides; the flag overrides it "
         "either way.",
     ),
@@ -1469,7 +1474,7 @@ def launch(
     writable: Optional[bool] = typer.Option(
         None,
         "--writable/--no-writable",
-        help="Enable write mode for source creation and data upload. Omitted, "
+        help="Serve the write path (data upload); on by default. Omitted, "
         "the config file's `server.writable` decides; the flag overrides it "
         "either way.",
     ),

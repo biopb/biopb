@@ -94,6 +94,7 @@ from biopb._config.io import atomic_write_json
 from biopb._config.locations import (
     CANONICAL_CONFIG_NAME as CANONICAL_CONFIG_NAME,
     DEFAULT_CONFIG_DIR as DEFAULT_CONFIG_DIR,
+    data_dir,
     find_config as find_config,
 )
 from biopb._config.validate import (
@@ -145,6 +146,15 @@ def _default_file_cache_dir() -> Path:
 
 
 DEFAULT_FILE_CACHE_DIR = _default_file_cache_dir()
+
+
+def default_write_dir() -> Path:
+    """Where a writable server puts uploads unless the config names a directory.
+
+    The data tree (``~/.local/share/biopb``), not the cache: uploaded tensors
+    are the user's results, and a cache janitor may empty a cache at any time.
+    """
+    return data_dir() / "tensor-server" / "uploads"
 
 
 # --- Declarative config validation (biopb/biopb#34) ---------------------------
@@ -964,16 +974,17 @@ class ServerConfig:
         },
     )
     writable: bool = field(
-        default=False,
-        metadata={"help": "Enable write mode: allow source creation and data upload."},
+        default=True,
+        metadata={"help": "Serve the write path: allow data upload."},
     )
     write_dir: Optional[Path] = field(
         default=None,
         metadata={
-            "help": "Directory for zarr-backed uploaded sources (unset = no zarr "
-            "uploads). Keep it outside every source directory: an uploaded "
-            "store is registered by the upload path, and discovery walking it "
-            "too would catalog it a second time."
+            "help": "Directory for uploaded tensors. Unset, a writable server "
+            "uses ~/.local/share/biopb/tensor-server/uploads, and a "
+            "non-writable one has none. Keep it outside every source "
+            "directory: an uploaded store is registered by the upload path, "
+            "and discovery walking it too would catalog it a second time."
         },
     )
     cache: CacheConfig = field(default_factory=CacheConfig)
