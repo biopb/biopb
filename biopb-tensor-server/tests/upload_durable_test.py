@@ -30,7 +30,7 @@ from biopb_tensor_server.core.chunk import encode_chunk_id
 from biopb_tensor_server.core.config import CacheConfig
 from biopb_tensor_server.core.discovery import ClaimContext, DiscoveryState
 from biopb_tensor_server.core.errors import UploadDiscardedReadError
-from biopb_tensor_server.serving.upload_manager import write_dir_under_root
+from biopb_tensor_server.sources.roots import write_dir_under_root
 
 from tests import catalog_server
 

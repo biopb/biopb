@@ -351,3 +351,27 @@ class Roots:
         ):
             return OVERLAP_MESSAGE
         return None
+
+
+def write_dir_under_root(
+    write_dir: Optional[Path], roots: Iterable[Path]
+) -> Optional[Path]:
+    """The discovery root that contains *write_dir*, if any.
+
+    A store minted under ``write_dir`` is registered by the upload path under
+    its own id. The zarr and ome-zarr claims decline anything carrying the
+    upload subsystem's ``biopb`` block (``is_upload_subsystem_store``), so a
+    discovery walk does not catalogue it a second time -- but it still descends
+    into the store and stats its chunk files, and one being written keeps its
+    directory busy. So ``write_dir`` belongs outside every discovered directory;
+    ``partition_sources`` warns when it is not (biopb/biopb#1059). Compared
+    resolved, so a symlinked root still matches.
+    """
+    if write_dir is None:
+        return None
+    target = write_dir.resolve()
+    for root in roots:
+        resolved = root.resolve()
+        if target == resolved or resolved in target.parents:
+            return root
+    return None

@@ -146,6 +146,37 @@ _CLIENT_POOL: Dict[Tuple[str, UpstreamCredentials], Any] = {}
 _CLIENT_POOL_LOCK = threading.Lock()
 
 
+def open_upstream_client(location: str, credentials: UpstreamCredentials):
+    """A new ``TensorFlightClient`` for *location* under *credentials*.
+
+    The one place the credential fields reach the client, so the pooled adapter
+    connections and the direct catalog fetches dial with the same token and
+    trust anchor.
+    """
+    from biopb.tensor import TensorFlightClient
+
+    return TensorFlightClient(
+        location,
+        cache_bytes=0,
+        token=credentials.token,
+        tls_ca_pem=credentials.tls_ca_pem,
+        tls_fingerprint=credentials.tls_fingerprint,
+    )
+
+
+def close_upstream_client(client) -> None:
+    """Close *client*, never raising.
+
+    An exception here would replace whatever is propagating out of the caller's
+    ``try`` body -- and a broken channel is exactly when both an upstream failure
+    and a failing ``close()`` happen together (biopb/biopb#529).
+    """
+    try:
+        client.close()
+    except Exception:
+        logger.debug("error closing upstream client", exc_info=True)
+
+
 def _pooled_upstream_client(location: str, credentials: UpstreamCredentials):
     """Return the shared ``TensorFlightClient`` for ``(location, credentials)``.
 
@@ -158,15 +189,7 @@ def _pooled_upstream_client(location: str, credentials: UpstreamCredentials):
     with _CLIENT_POOL_LOCK:
         client = _CLIENT_POOL.get(key)
         if client is None:
-            from biopb.tensor import TensorFlightClient
-
-            client = TensorFlightClient(
-                location,
-                cache_bytes=0,
-                token=credentials.token,
-                tls_ca_pem=credentials.tls_ca_pem,
-                tls_fingerprint=credentials.tls_fingerprint,
-            )
+            client = open_upstream_client(location, credentials)
             _CLIENT_POOL[key] = client
         return client
 
@@ -185,10 +208,7 @@ def _evict_pooled_upstream_client(
     with _CLIENT_POOL_LOCK:
         client = _CLIENT_POOL.pop(key, None)
     if client is not None:
-        try:
-            client.close()
-        except Exception:
-            pass
+        close_upstream_client(client)
 
 
 def _clear_client_pool() -> None:
@@ -197,10 +217,7 @@ def _clear_client_pool() -> None:
         clients = list(_CLIENT_POOL.values())
         _CLIENT_POOL.clear()
     for client in clients:
-        try:
-            client.close()
-        except Exception:
-            pass
+        close_upstream_client(client)
 
 
 def _split_grpc_url(url: str) -> tuple[str, Optional[str]]:

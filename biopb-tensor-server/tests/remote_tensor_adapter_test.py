@@ -1555,7 +1555,7 @@ def test_failed_upstream_retried_on_fast_incremental_cadence(simple_zarr_array):
         # first rescan is force-full (last-full = -inf) -> tries the dead upstream
         assert manager._should_force_full_rescan() is True
         manager._handle_rescan()
-        assert url in manager._failed_upstreams  # recorded as failed
+        assert url in manager._upstream_failures  # recorded as failed
         # the force-full was consumed, so the next rescan is NOT force-full
         assert manager._should_force_full_rescan() is False
         assert source_ids(client) == set()  # nothing mirrored yet
@@ -1572,7 +1572,7 @@ def test_failed_upstream_retried_on_fast_incremental_cadence(simple_zarr_array):
             assert manager._should_force_full_rescan() is False
             manager._handle_rescan()
             assert source_ids(client) == {"lab__img"}
-            assert manager._failed_upstreams == set()  # cleared on recovery
+            assert manager._upstream_failures == {}  # cleared on recovery
             client.close()
         finally:
             up.shutdown()
@@ -1675,7 +1675,7 @@ class TestMisconfiguredUpstreamIsNotUnreachable:
         state = manager._upstream_relist[upstream.url]
         assert state["period"] == manager._upstream_max_period
         assert state["countdown"] == manager._upstream_max_period
-        assert upstream.url in manager._failed_upstreams
+        assert upstream.url in manager._upstream_config_errors
         # ...and the operator is told it is config, not connectivity, *and* how
         # long the back-off means they will wait after fixing it.
         assert "MISCONFIGURED" in caplog.text
@@ -1715,7 +1715,7 @@ class TestMisconfiguredUpstreamIsNotUnreachable:
 
         assert "configured correctly again" in caplog.text
         assert manager._upstream_relist[upstream.url]["period"] == 1
-        assert upstream.url not in manager._failed_upstreams
+        assert upstream.url not in manager._upstream_config_errors
 
     def test_a_healthy_upstream_does_not_announce_a_recovery(self, caplog):
         """Nothing was broken, so there is nothing to report -- and the ordinary
@@ -1748,7 +1748,7 @@ class TestMisconfiguredUpstreamIsNotUnreachable:
             proxy.shutdown()
 
         assert manager._upstream_relist[upstream.url]["period"] == 1
-        assert upstream.url in manager._failed_upstreams
+        assert upstream.url in manager._upstream_failures
 
     def test_the_same_error_is_reported_once_but_a_new_one_is_not_swallowed(
         self, tmp_path, caplog
@@ -1860,7 +1860,7 @@ class TestUnreachableUpstreamIsReportedOnAWindow:
         assert caplog.text.count("Upstream re-list failed") == 1
         # The retry cadence is untouched -- only the log was throttled.
         assert manager._upstream_relist[upstream.url]["period"] == 1
-        assert upstream.url in manager._failed_upstreams
+        assert upstream.url in manager._upstream_failures
 
     def test_a_different_failure_is_not_held_back_by_the_window(self, caplog):
         """A changed error is the operator's cue that something moved -- sitting on

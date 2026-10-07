@@ -153,7 +153,6 @@ class SourceManager:
         # window instead of on every tick.
         self._upstream_relist: Dict[str, Dict[str, int]] = {}
         self._upstream_max_period: int = _UPSTREAM_RELIST_MAX_TICKS
-        self._failed_upstreams: Set[str] = set()
         self._upstream_config_errors: Dict[str, str] = {}
         self._upstream_failures: Dict[str, Tuple[float, str]] = {}
 
@@ -577,19 +576,13 @@ class SourceManager:
         """
         for root in self._roots.take_unscanned():
             try:
-                self._scan_configured_root(root)
+                if os.path.exists(root.url):
+                    self._scan_root(root, recurring=False)
+                else:
+                    logger.warning("Configured path does not exist: %s", root.url)
             except Exception:
                 # One bad root must not cost the others.
                 logger.exception("Could not scan configured directory %s", root.url)
-
-    def _scan_configured_root(self, root: Root) -> None:
-        """Scan one configured ``monitor = false`` path: a directory is walked, a
-        file or typed dataset is claimed in place. The same scan as a monitored
-        root's, run once."""
-        if not os.path.exists(root.url):
-            logger.warning("Configured path does not exist: %s", root.url)
-            return
-        self._scan_root(root, recurring=False)
 
     def _scan_root(self, root: Root, recurring: bool) -> None:
         """Walk one root, commit what is new as it is found, then compare the walk
@@ -981,7 +974,6 @@ class SourceManager:
             # trust anchor recovers on its own. Back all the way off instead of
             # re-reading the same broken file every tick (biopb/biopb#608); a
             # fixed config is still picked up, one slow tick later.
-            self._failed_upstreams.add(upstream.url)
             state["period"] = self._upstream_max_period
             state["countdown"] = state["period"]
             # We never dialed, so any pending unreachable report is stale -- drop
@@ -992,12 +984,10 @@ class SourceManager:
             return
         except Exception as exc:
             # Failure (unreachable): retry on the fast cadence next tick.
-            self._failed_upstreams.add(upstream.url)
             state["period"] = 1
             state["countdown"] = state["period"]
             self._log_upstream_unreachable(upstream.url, exc)
             return
-        self._failed_upstreams.discard(upstream.url)
         self._clear_upstream_failure(upstream.url)
         recovered = self._clear_upstream_config_error(upstream.url)
         if changed or recovered:

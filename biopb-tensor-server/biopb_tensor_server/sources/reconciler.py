@@ -18,9 +18,8 @@ the stability gate, the startup protocol) and delegates every catalog mutation
 here. The seam is deliberately narrow:
 
   * SourceManager -> Reconciler: the reconcile/commit calls above, plus four
-    claim-snapshot accessors (:meth:`claim_items` / :meth:`claim_ids` /
-    :meth:`has_claim` / :meth:`local_claim_paths`) for its cleanup and precache
-    reads.
+    claim-snapshot accessors (:meth:`claim_ids` / :meth:`has_claim` /
+    :meth:`local_claim_paths`) for its cleanup and precache reads.
   * Reconciler -> SourceManager: one injected callable,
     ``notify_source_committed`` (the precache routing gate, owned by the startup
     state), plus the shared :class:`~biopb_tensor_server.sources.roots.Roots`.
@@ -235,11 +234,6 @@ class Reconciler:
     # --- Claim-snapshot accessors (SourceManager cleanup / precache reads) -----
     # Each snapshots under the fine-grained lock so a caller can iterate without
     # racing a concurrent commit ("dict changed size during iteration").
-
-    def claim_items(self) -> List[Tuple[str, SourceClaim]]:
-        """A ``(source_id, claim)`` snapshot of the confirmed catalog."""
-        with self._lock:
-            return list(self._state.claims.items())
 
     def claim_ids(self) -> List[str]:
         """A snapshot of the confirmed source_ids."""
@@ -551,7 +545,7 @@ class Reconciler:
             if not added:
                 self._rollback_source_registration(claim.source_id)
                 return False
-            self._commit_claim_bookkeeping(claim, signatures)
+            self._source_signatures[claim.source_id] = signatures
             self._pending[claim.source_id] = catalog_url
             if recall:
                 self._recall.add(claim.source_id)
@@ -1118,23 +1112,13 @@ class Reconciler:
             if not added:
                 self._rollback_source_registration(claim.source_id)
                 return False
-            self._commit_claim_bookkeeping(claim, signatures)
+            self._source_signatures[claim.source_id] = signatures
 
         # Route the freshly committed source to the precache worker. The
         # live-vs-startup gate (and the best-effort hook invocation) lives in the
         # injected SourceManager callback, which owns the startup/suppress state.
         self._notify_source_committed(claim.source_id)
         return True
-
-    def _commit_claim_bookkeeping(
-        self, claim: SourceClaim, signatures: Dict[str, Tuple[Any, ...]]
-    ) -> None:
-        """Index a claim that has just been committed. Caller holds ``self._lock``.
-
-        Every index a commit must leave consistent, in one place: the add and
-        refresh paths share it so a new one cannot be added to only one of them.
-        """
-        self._source_signatures[claim.source_id] = signatures
 
     def _refresh_claim(self, claim: SourceClaim) -> bool:
         """:meth:`_refresh_claim_locked`, serialized against this source's
@@ -1233,7 +1217,7 @@ class Reconciler:
                 claim.source_id,
                 sorted(conflicting),
             )
-        self._commit_claim_bookkeeping(claim, signatures)
+        self._source_signatures[claim.source_id] = signatures
 
     def _refresh_recall_claim(self, claim: SourceClaim, previous: SourceClaim) -> bool:
         """Refresh a cloud source that is not resident: back to ``needs_recall``.
@@ -1299,12 +1283,12 @@ class Reconciler:
         path signature): desired = the alias-namespaced ids the upstream lists now;
         current = the tensor-server claims already mirrored from this endpoint.
         """
-        from biopb.tensor import TensorFlightClient
-
         from biopb_tensor_server.adapters.remote_tensor import (
             _split_grpc_url,
+            close_upstream_client,
             fetch_upstream_rows,
             list_upstream_versions,
+            open_upstream_client,
             resolve_upstream_credentials,
         )
         from biopb_tensor_server.sources.resolve import namespaced_source_id
@@ -1317,13 +1301,7 @@ class Reconciler:
         # grpcs:// upstream with a configured CA would still be TOFU-pinned here.
         credentials = resolve_upstream_credentials(upstream, self._credentials_config)
 
-        client = TensorFlightClient(
-            endpoint,
-            cache_bytes=0,
-            token=credentials.token,
-            tls_ca_pem=credentials.tls_ca_pem,
-            tls_fingerprint=credentials.tls_fingerprint,
-        )
+        client = open_upstream_client(endpoint, credentials)
         try:
             # A narrow id + indexed_at pass decides everything that follows, so a
             # steady re-list of a six-figure catalog moves two columns, not every
@@ -1391,7 +1369,7 @@ class Reconciler:
                     elif source_id in stale:
                         self._refresh_mirrored_source(source_id, stale[source_id], seed)
         finally:
-            self._close_upstream_client(client)
+            close_upstream_client(client)
 
         if added or removed:
             logger.info(
@@ -1443,16 +1421,6 @@ class Reconciler:
                     exc_info=True,
                 )
 
-    @staticmethod
-    def _close_upstream_client(client) -> None:
-        # An exception here would replace whatever is propagating out of the
-        # caller's try: body -- and a broken channel is exactly when both an
-        # upstream failure and a failing close() happen together (biopb/biopb#529).
-        try:
-            client.close()
-        except Exception:
-            logger.debug("error closing upstream client", exc_info=True)
-
     def _claim_is_unresolved(self, claim: SourceClaim) -> bool:
         """Whether this claim must be registered as an unresolved cloud source.
 
@@ -1484,7 +1452,7 @@ class Reconciler:
 
         A directory source (zarr store, ...) is born resolved from its resident
         sidecars; only a non-resident *content file* forces deferral. Guard on
-        ``is_file`` so a directory's ``st_blocks == 0`` (macOS APFS) is never a
+        ``S_ISREG`` so a directory's ``st_blocks == 0`` (macOS APFS) is never a
         false hit.
         """
         for member in claim.member_paths:
@@ -1492,7 +1460,10 @@ class Reconciler:
                 continue
             member_path = Path(member)
             try:
-                if member_path.is_file() and _is_offline_placeholder(member_path):
+                st = member_path.stat()
+                if stat.S_ISREG(st.st_mode) and _is_offline_placeholder(
+                    member_path, st
+                ):
                     return True
             except OSError:
                 continue
