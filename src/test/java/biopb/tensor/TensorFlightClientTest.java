@@ -546,7 +546,7 @@ public class TensorFlightClientTest {
         }
     }
 
-    // ---- cloud path: resolve / warm / getSourceMetadata -------------------
+    // ---- cloud path: resolve / getSourceMetadata -------------------
     // These run against a `doAction` fake, which is what the suite lacked: the
     // three calls that drive an unresolved (cloud / synced-folder) source were
     // compiled but never executed here.
@@ -857,52 +857,6 @@ public class TensorFlightClientTest {
     }
 
     @Test
-    public void testWarmSourceReturnsTheTerminalCounts() throws Exception {
-        // warm returns a status, not a row: residency is not a durable catalog
-        // fact, so these counts exist nowhere else (biopb/biopb#1035).
-        try (TestFlightServer server = new TestFlightServer()) {
-            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
-                WarmProgress done = client.warmSource("test-source");
-                Assert.assertEquals(2, done.getFilesTotal());
-                Assert.assertEquals(2, done.getFilesDone());
-                Assert.assertEquals(2048L, done.getBytesDone());
-            }
-        }
-    }
-
-    @Test
-    public void testWarmSourceWithoutTerminalStatusFails() throws Exception {
-        try (TestFlightServer server = new TestFlightServer()) {
-            server.setWarmSendsDone(false);
-            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
-                IOException error = Assert.assertThrows(
-                        IOException.class,
-                        () -> client.warmSource("test-source"));
-                Assert.assertTrue(error.getMessage().contains("no terminal status"));
-            }
-        }
-    }
-
-    @Test
-    public void testWarmSourceReportsProgressAndHonorsCancellation() throws Exception {
-        try (TestFlightServer server = new TestFlightServer()) {
-            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
-                List<WarmProgress> progress = new ArrayList<>();
-                WarmProgress done = client.warmSource("test-source", progress::add, () -> false);
-                Assert.assertEquals(1, progress.size());
-                Assert.assertEquals(1, progress.get(0).getFilesDone());
-                Assert.assertEquals(2, done.getFilesDone());
-
-                TensorOperationCancelledException error = Assert.assertThrows(
-                        TensorOperationCancelledException.class,
-                        () -> client.warmSource("test-source", ignored -> Assert.fail("must not report after cancellation"),
-                                () -> true));
-                Assert.assertEquals("warmSource", error.getOperation());
-            }
-        }
-    }
-
-    @Test
     public void testGetSourceMetadataReadsTheColumn() throws Exception {
         // The column IS the answer -- filled once at registration, read back from
         // the catalog rather than recomputed (biopb/biopb#253).
@@ -1024,10 +978,6 @@ public class TensorFlightClientTest {
             producer.resolveSendsRow = sends;
         }
 
-        void setWarmSendsDone(boolean sends) {
-            producer.warmSendsDone = sends;
-        }
-
         void setSourceHasTensors(boolean has) {
             producer.sourceHasTensors = has;
         }
@@ -1116,7 +1066,6 @@ public class TensorFlightClientTest {
         private volatile String sourceMetadataJson = "{\"test_key\": \"test_value\"}";
         private volatile int resolveHeartbeats = 0;
         private volatile boolean resolveSendsRow = true;
-        private volatile boolean warmSendsDone = true;
         // An unresolved source lists with no tensors -- but so does one that
         // resolved and held nothing readable, which is the pair #1032 exists
         // to stop conflating.
@@ -1414,10 +1363,6 @@ public class TensorFlightClientTest {
                 doResolve(new String(action.getBody(), StandardCharsets.UTF_8), listener);
                 return;
             }
-            if ("warm".equals(action.getType())) {
-                doWarm(listener);
-                return;
-            }
             // `upload_status` is not an action any more: it rides the descriptor
             // GetFlightInfo returns (biopb/biopb#1048 step 2). See
             // `nextUploadStatus`, which serves the registered sequence there.
@@ -1509,32 +1454,6 @@ public class TensorFlightClientTest {
                     .setSourceRow(ByteString.copyFrom(ipc))
                     .build();
             listener.onNext(new Result(done.toByteArray()));
-            listener.onCompleted();
-        }
-
-        /** The `warm` action: one progress update, then the terminal counts. */
-        private void doWarm(FlightProducer.StreamListener<Result> listener) {
-            WarmStreamMessage beat = WarmStreamMessage.newBuilder()
-                    .setProgress(WarmProgress.newBuilder()
-                            .setFilesTotal(2)
-                            .setFilesDone(1)
-                            .setBytesTotal(2048)
-                            .setBytesDone(1024)
-                            .setCurrentName("0.0.0")
-                            .build())
-                    .build();
-            listener.onNext(new Result(beat.toByteArray()));
-            if (warmSendsDone) {
-                WarmStreamMessage done = WarmStreamMessage.newBuilder()
-                        .setDone(WarmProgress.newBuilder()
-                                .setFilesTotal(2)
-                                .setFilesDone(2)
-                                .setBytesTotal(2048)
-                                .setBytesDone(2048)
-                                .build())
-                        .build();
-                listener.onNext(new Result(done.toByteArray()));
-            }
             listener.onCompleted();
         }
 

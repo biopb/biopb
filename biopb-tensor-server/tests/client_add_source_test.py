@@ -34,7 +34,7 @@ def _result_body(added=(), already=(), failed=()):
 def _bare_client():
     from biopb.tensor._session import CatalogClient, ChunkFetcher, _ClientState
 
-    # register_local_path / resolve_source / warm_source now live on CatalogClient (#278 item C); build
+    # register_local_path / resolve_source now live on CatalogClient (#278 item C); build
     # the shared state + collaborators (no connection) and inject the fake flight
     # at ``client._state.client`` where the catalog reads it.
     client = object.__new__(TensorFlightClient)

@@ -1885,7 +1885,7 @@ describe("catalogFingerprint", () => {
   });
 });
 
-describe("resolve / warm jobs", () => {
+describe("resolve jobs", () => {
   const status = (over: Partial<SourceJobStatus> = {}): SourceJobStatus => ({
     kind: "resolve",
     source_id: "cloud0",
@@ -1929,30 +1929,15 @@ describe("resolve / warm jobs", () => {
     expect(job?.error).toContain("host unreachable");
   });
 
-  it("keeps resolve and warm on one source apart", async () => {
-    useAppStore.setState({
-      client: stubClient({
-        startResolve: vi.fn().mockResolvedValue(status()),
-        startWarm: vi.fn().mockResolvedValue(status({ kind: "warm" })),
-      }),
-    });
-    await useAppStore.getState().startResolve("cloud0");
-    await useAppStore.getState().startWarm("cloud0");
-    expect(Object.keys(useAppStore.getState().sourceJobs).sort()).toEqual([
-      "resolve:cloud0",
-      "warm:cloud0",
-    ]);
-  });
-
   it("dismisses only the job named", async () => {
     useAppStore.setState({
       sourceJobs: {
         "resolve:cloud0": status({ state: "error" }),
-        "warm:cloud0": status({ kind: "warm", state: "done" }),
+        "resolve:cloud1": status({ source_id: "cloud1", state: "done" }),
       },
     });
     useAppStore.getState().dismissSourceJob("resolve", "cloud0");
-    expect(Object.keys(useAppStore.getState().sourceJobs)).toEqual(["warm:cloud0"]);
+    expect(Object.keys(useAppStore.getState().sourceJobs)).toEqual(["resolve:cloud1"]);
   });
 
   it("a failed cancel leaves the job alone", async () => {
@@ -1961,25 +1946,20 @@ describe("resolve / warm jobs", () => {
     // not something to tell the user about.
     useAppStore.setState({
       client: stubClient({ cancelJob: vi.fn().mockRejectedValue(new Error("nope")) }),
-      sourceJobs: { "warm:cloud0": status({ kind: "warm" }) },
+      sourceJobs: { "resolve:cloud0": status() },
     });
-    await useAppStore.getState().cancelSourceJob("warm", "cloud0");
-    expect(useAppStore.getState().sourceJobs["warm:cloud0"]?.state).toBe("running");
+    await useAppStore.getState().cancelSourceJob("resolve", "cloud0");
+    expect(useAppStore.getState().sourceJobs["resolve:cloud0"]?.state).toBe("running");
   });
 
-  it("re-reads the catalog when a resolve lands, and warms nothing", async () => {
-    // Hydrate-ahead is gated off (biopb/biopb#1043): the server's chunk cache is
-    // mmap-served, so an unattended warm of a >RAM source evicts the segments
-    // serving every other source. The stale-row reload still runs -- the row
-    // still lists the pre-resolve tensors the moment a resolve lands.
+  it("re-reads the catalog when a resolve lands", async () => {
+    // The row still lists the pre-resolve tensors the moment a resolve lands.
     const listSources = vi.fn().mockResolvedValue([]);
-    const startWarm = vi.fn().mockResolvedValue(status({ kind: "warm" }));
     const client = {
       listSources,
       http: {
         startResolve: vi.fn().mockResolvedValue(status()),
         jobStatus: vi.fn().mockResolvedValue(status({ state: "done" })),
-        startWarm,
       },
     } as unknown as TensorFlightClient;
     useAppStore.setState({ client });
@@ -1993,8 +1973,6 @@ describe("resolve / warm jobs", () => {
       { timeout: 3000 },
     );
     expect(listSources).toHaveBeenCalled();
-    expect(startWarm).not.toHaveBeenCalled();
-    expect(useAppStore.getState().sourceJobs["warm:cloud0"]).toBeUndefined();
   });
 
   describe("opening the source a resolve finished", () => {
@@ -2087,32 +2065,6 @@ describe("resolve / warm jobs", () => {
       await landed();
       expect(openTensor).not.toHaveBeenCalled();
     });
-  });
-
-  it("does not auto-warm a resolve that failed or was cancelled", async () => {
-    const startWarm = vi.fn();
-    for (const state of ["error", "cancelled"] as const) {
-      useAppStore.setState({
-        sourceJobs: {},
-        client: {
-          listSources: vi.fn().mockResolvedValue([]),
-          http: {
-            startResolve: vi.fn().mockResolvedValue(status()),
-            jobStatus: vi.fn().mockResolvedValue(status({ state })),
-            startWarm,
-          },
-        } as unknown as TensorFlightClient,
-      });
-      await useAppStore.getState().startResolve("cloud0");
-      await vi.waitFor(
-        () =>
-          expect(useAppStore.getState().sourceJobs["resolve:cloud0"]?.state).toBe(
-            state,
-          ),
-        { timeout: 3000 },
-      );
-    }
-    expect(startWarm).not.toHaveBeenCalled();
   });
 });
 

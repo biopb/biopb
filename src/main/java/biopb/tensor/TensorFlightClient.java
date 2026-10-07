@@ -588,10 +588,8 @@ public class TensorFlightClient implements AutoCloseable {
      *         returns, which the <b>caller must close</b>. A row, not a type
      *         this SDK picked: every client can already decode one, and what
      *         you decode it into stays yours (biopb/biopb#1032).
-     *         <p>Unlike {@link #warmSource}, which returns a status because residency
-     *         is not a durable catalog fact and its file counts exist nowhere
-     *         else, this returns the result: resolving is defined by what it
-     *         writes to the row.
+     *         <p>Resolving is defined by what it writes to the row, so this
+     *         returns that row.
      * @throws IOException If the action fails or the server returns no row
      */
     public VectorSchemaRoot resolveSource(String sourceId) throws IOException {
@@ -700,69 +698,6 @@ public class TensorFlightClient implements AutoCloseable {
         } finally {
             batch.close();
         }
-    }
-
-    /**
-     * Hydrate-ahead: ask the server to recall all of a resolved multi-file
-     * source's member files, so later reads are warm and never stall.
-     *
-     * <p>{@link #resolveSource} populates a source's metadata but, for a multi-file
-     * cloud source (zarr / ome-zarr / ndtiff / tiff-sequence / micromanager),
-     * leaves the bulk pixel data dehydrated -- each member file then recalls
-     * one-at-a-time, slowly, the first time a read touches it. This walks the
-     * source directory server-side and reads every file to force the sync
-     * engine's recall; no pixels cross the wire, only progress. It is idempotent
-     * (already-resident files are cheap local reads) and a no-op for a
-     * single-file source (resolveSource already recalled it). A remote-url source --
-     * an object store, or a {@code grpc://} mirror -- fails instead: nothing on
-     * the serving machine can be made resident (biopb/biopb#1035).
-     *
-     * @param sourceId The (already-resolved) source to warm.
-     * @return The terminal {@link WarmProgress} snapshot (files/bytes made
-     *         resident). {@code filesTotal == 0} means the source was local and
-     *         had nothing to warm, i.e. single-file; "not applicable" raises.
-     * @throws IOException If the action fails or it returns no terminal status
-     * @throws UnsupportedOperationException If the server predates the
-     *         {@code warm} action
-     */
-    public WarmProgress warmSource(String sourceId) throws IOException {
-        return warmSource(sourceId, null, null);
-    }
-
-    /**
-     * Warm a source with optional progress and cancellation hooks.
-     *
-     * @param sourceId source to warm
-     * @param onProgress receives non-terminal warm progress, or null
-     * @param shouldCancel polled once per action message, or null
-     * @return the terminal progress snapshot
-     */
-    public WarmProgress warmSource(
-            String sourceId,
-            Consumer<WarmProgress> onProgress,
-            BooleanSupplier shouldCancel) throws IOException {
-        WarmProgress[] done = { null };
-        streamAction("warm", sourceId.getBytes(StandardCharsets.UTF_8),
-                WarmStreamMessage.parser(),
-                message -> {
-                    if (shouldCancel != null && shouldCancel.getAsBoolean()) {
-                        throw new TensorOperationCancelledException("warmSource", sourceId);
-                    }
-                    if (message.getPayloadCase() == WarmStreamMessage.PayloadCase.PROGRESS) {
-                        if (onProgress != null) {
-                            onProgress.accept(message.getProgress());
-                        }
-                    } else if (message.getPayloadCase() == WarmStreamMessage.PayloadCase.DONE) {
-                        done[0] = message.getDone();
-                    }
-                    return true;
-                },
-                "Hydrate-ahead is unavailable");
-        if (done[0] == null) {
-            throw new IOException("warmSource('" + sourceId
-                    + "') returned no terminal status (server closed the stream without a 'done')");
-        }
-        return done[0];
     }
 
     // ---- source lifecycle -------------------------------------------------
@@ -1729,7 +1664,7 @@ public class TensorFlightClient implements AutoCloseable {
      * Consume a streaming action, handing each non-empty message to
      * {@code onMessage}; returning false from it stops consuming.
      *
-     * <p>The loop shared by {@link #resolveSource} / {@link #warmSource} /
+     * <p>The loop shared by {@link #resolveSource} /
      * {@link #registerLocalPath}: the {@code doAction} call, the empty-body heartbeat
      * skip, the envelope parse, and the old-server {@code "Unknown action"}
      * remap, applied only when {@code unavailableHint} is given.
@@ -1740,7 +1675,7 @@ public class TensorFlightClient implements AutoCloseable {
      * Python gets by closing its generator, and what lets a server stop a walk
      * it is halfway through rather than finish it for nobody. It happens on
      * every exit, so a caller that throws out of {@code onMessage}
-     * (resolveSource/warmSource raise on cancel) also releases the server.
+     * (resolveSource raises on cancel) also releases the server.
      *
      * <p>A message that does not parse as {@code M} is skipped. Python can call
      * that harmless because its SDK refuses a pre-v2 server at connect; this
@@ -1750,7 +1685,7 @@ public class TensorFlightClient implements AutoCloseable {
      * {@code protocol} check is ported.
      *
      * <p>Cancellation policy is deliberately NOT decided here: its semantics
-     * differ per caller (resolveSource/warmSource raise, registerLocalPath returns what it has),
+     * differ per caller (resolveSource raises, registerLocalPath returns what it has),
      * and the poll must run relative to a consumed message, which only the
      * caller knows the right side of.
      */

@@ -16,8 +16,8 @@ let _pollingTimerId: ReturnType<typeof setInterval> | undefined;
  * The poll used to diff the `source_url` set alone, which is blind to every
  * in-place change: a cloud source that resolves was already listed under that
  * url, it just gained its tensors and flipped its flags, so the tree kept
- * showing it as unresolved until a manual reload (biopb/biopb#1030). Warming
- * and eviction are invisible the same way. `JSON.stringify` covers every
+ * showing it as unresolved until a manual reload (biopb/biopb#1030). Eviction
+ * is invisible the same way. `JSON.stringify` covers every
  * field of `DataSourceDescriptor` by construction, so a field added later
  * can't go silently blind to the poll the way the url-only check did.
  *

@@ -17,7 +17,7 @@ or a byte-prefix sniff):
   takes a ``RoiPut`` / ``RoiDelete``. Private: gated per source.
 
 Custom actions (``list_actions``) cover health, uploads, cache locate, cloud
-resolve / warm, runtime source add / remove, and annotation pruning.
+resolve, runtime source add / remove, and annotation pruning.
 """
 
 import hmac
@@ -27,7 +27,6 @@ import logging
 import os
 import threading
 import time
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
@@ -64,8 +63,6 @@ from biopb.tensor.descriptor_pb2 import (
     ResolveStreamMessage,
     TensorDescriptor,
     UploadStatus as UploadStatusPb,
-    WarmProgress,
-    WarmStreamMessage,
 )
 from biopb.tensor.ticket_pb2 import (
     ChunkBounds,
@@ -115,7 +112,6 @@ from biopb_tensor_server.core.read_mask import (
     UPLOAD_STATUS,
     read_mask,
 )
-from biopb_tensor_server.core.remote import is_remote_url
 from biopb_tensor_server.core.retention import set_active_pyramid_config
 from biopb_tensor_server.core.source_registry import SourceRegistry
 from biopb_tensor_server.serving.activity import ActivityTracker
@@ -234,17 +230,6 @@ def _adapter_lookup_error(exc: Exception, miss_context: str) -> flight.FlightErr
 # (nginx ``grpc_read_timeout`` defaults to 60s) so a minutes-long recall doesn't
 # get its stream reset.
 _RESOLVE_HEARTBEAT_SECONDS = 15.0
-
-# Block size for the ``warm`` action's recall reads, and the minimum interval
-# between its progress messages. The min interval throttles the stream to a
-# smooth UI cadence (rather than one message per file) while staying well under
-# the proxy idle timeout, so it doubles as the heartbeat during a single large
-# file's read. Enumeration (a long recall-free stat walk) falls back to the
-# resolve heartbeat cadence.
-_WARM_READ_BLOCK_BYTES = 8 * 1024 * 1024
-_WARM_PROGRESS_MIN_INTERVAL = 0.5
-_WARM_MAX_WORKERS = 4
-_WARM_POLL_SECONDS = 0.1
 
 
 def _upload_attacher(write_dir: Path):
@@ -376,7 +361,7 @@ class TensorFlightServer(flight.FlightServerBase):
     - ``self.sources`` (:class:`SourceRegistry`) -- the ``source_id`` -> adapter
       map, registration chokepoint, and adapter-lifecycle cleanup.
     - ``self.activity`` (:class:`ActivityTracker`) -- in-flight-read counters
-      (the precache idle signal) and the warm-in-progress guard.
+      (the precache idle signal).
     - ``self.uploads`` (:class:`UploadManager`) -- the writable-server DoPut path
       (source creation, chunk writing, upload-progress state).
 
@@ -543,8 +528,7 @@ class TensorFlightServer(flight.FlightServerBase):
         # an Event.
         self._ready = threading.Event()
 
-        # Flight activity + warm-guard tracking for the background precache
-        # worker.
+        # Flight activity tracking for the background precache worker.
         self.activity = ActivityTracker()
 
         # Catalog-freshness signals for the ``health`` action. Written by the
@@ -787,9 +771,7 @@ class TensorFlightServer(flight.FlightServerBase):
 
         **A capability never reaches this.** Actions are the control surface,
         and a grant meaning "read this one tensor" must not authorize, say,
-        ``warm`` -- whose cost is not scoped to that tensor at all, since it
-        walks the page-cache LRU and evicts the segments serving every other
-        source (biopb/biopb#1043).
+        ``remove_source``.
         """
         if self._server_token is None:
             return
@@ -1104,10 +1086,6 @@ class TensorFlightServer(flight.FlightServerBase):
                 "cache_stats", "Cache statistics - returns backend CacheStats JSON"
             ),
             flight.ActionType(
-                "warm",
-                "Hydrate-ahead: recall a resolved cloud source's member files server-side",
-            ),
-            flight.ActionType(
                 "add_source",
                 "Register a local path/dir as a served source at runtime (streams progress)",
             ),
@@ -1130,10 +1108,8 @@ class TensorFlightServer(flight.FlightServerBase):
 
         Every arm takes full access (:meth:`_authorize`) but two. Actions are
         the control surface: a capability means "read this one tensor", and
-        what is reachable here is not scoped to one -- ``warm`` walks the
-        page-cache LRU and evicts the segments serving every other source
-        (biopb/biopb#1043), and a mutation on a source is never covered by a
-        read grant on it.
+        what is reachable here is not scoped to one, and a mutation on a source
+        is never covered by a read grant on it.
 
         ``health`` is **ungated**, the way an HTTP server answers ``/healthz``
         to anyone: it is the liveness probe, so a caller that cannot yet
@@ -1265,10 +1241,6 @@ class TensorFlightServer(flight.FlightServerBase):
             self._authorize(context)
             source_id = action.body.to_pybytes().decode("utf-8")
             yield from self._handle_resolve(source_id)
-        elif action.type == "warm":
-            self._authorize(context)
-            source_id = action.body.to_pybytes().decode("utf-8")
-            yield from self._handle_warm(source_id, context)
         elif action.type == "add_source":
             self._authorize(context)
             req = AddSourceRequest.FromString(action.body.to_pybytes())
@@ -1364,7 +1336,7 @@ class TensorFlightServer(flight.FlightServerBase):
         while worker.is_alive():
             worker.join(timeout=_RESOLVE_HEARTBEAT_SECONDS)
             if worker.is_alive():
-                yield _progress()  # heartbeat: warm + progress, carries no pixels
+                yield _progress()  # heartbeat: carries no pixels
 
         if "err" in result:
             exc = result["err"]
@@ -1399,270 +1371,6 @@ class TensorFlightServer(flight.FlightServerBase):
                 f"resolve succeeded for {source_id!r} but the catalog has no row for it"
             )
         yield ResolveStreamMessage(source_row=row).SerializeToString()
-
-    def _handle_warm(
-        self, source_id: str, context: flight.ServerCallContext
-    ) -> Iterator[bytes]:
-        """Stream the progress of *warming* (hydrate-ahead) a resolved source.
-
-        After ``resolve`` populates a multi-file cloud source's metadata, its
-        member data files are still dehydrated and recall one-at-a-time onto the
-        lazy ``do_get`` read path (the canonical case is zarr/ome-zarr: resolve
-        reads only ``.zattrs``/``.zarray``, so every chunk file recalls the first
-        time the viewer scrubs to it). ``warm`` opts into pulling them all
-        resident up front: it walks the source directory and reads every file to
-        force the sync engine's recall -- entirely server-side, so no pixels
-        cross the wire, only the ``WarmStreamMessage`` progress.
-
-        Unlike ``resolve`` (one opaque blocking call wrapped on a daemon thread),
-        warming is our own loop, so it runs inline in this generator: a bounded
-        worker pool recalls files concurrently while the generator polls for
-        cancellation and emits progress (throttled to
-        ``_WARM_PROGRESS_MIN_INTERVAL``). Warming is a pure side-effect
-        (residency), so a cancel genuinely stops -- there is no result to
-        preserve.
-
-        Properties:
-        - **No-op for single-file sources** -- their one file was already
-          recalled by resolve, so this emits one terminal ``done`` with
-          ``files_total == 0`` and returns. A *remote* source raises instead;
-          nothing here can be made resident.
-        - **Read every file unconditionally** -- residency is volatile (eviction /
-          re-dehydration can flip it underneath us), so a "skip already-resident"
-          check would be a TOCTOU trap; an unconditional read is idempotent
-          (already-warm files are cheap local reads, cold files recall).
-        - **Counts as Flight activity** (wrapped in ``activity.serving_request``) so the
-          background precache worker yields to it for the duration.
-        - Does **not** hold the adapter's per-source IO lock -- these are plain
-          filesystem reads, concurrency-safe with real reads, so warming never
-          blocks a live viewer read.
-        """
-        adapter = self._registered(source_id)
-        if adapter is None:
-            raise flight.FlightServerError(f"Source not found: {source_id}")
-
-        root = adapter.source_url
-        # A remote source has no local tree to walk, so refuse rather than fall
-        # into the no-op below: `files_total == 0` is how a client learns a
-        # source is single-file, and must not also mean "not applicable"
-        # (biopb/biopb#1035). Scheme only, so a mirror's aliased `source_url`
-        # (display authority, never the dial address) is still sound to ask.
-        if root and is_remote_url(root):
-            scheme = root.split("://", 1)[0]
-            raise flight.FlightServerError(
-                f"Cannot warm {source_id!r}: it is a remote ({scheme}) source, "
-                "and warm recalls member files onto the serving machine's own "
-                "filesystem. Nothing here can be made resident. Warm it on the "
-                "server that holds the data."
-            )
-        # Single-file / non-directory source: nothing to warm beyond what
-        # resolve already recalled. One terminal `done`, files_total == 0.
-        if not root or not os.path.isdir(root):
-            yield WarmStreamMessage(done=WarmProgress()).SerializeToString()
-            return
-
-        # Reject a second concurrent warm of the same source (avoid doubling the
-        # disk/recall pressure); the browser also disables re-trigger while running.
-        if not self.activity.begin_warm(source_id):
-            raise flight.FlightServerError(
-                f"warm already in progress for {source_id!r}"
-            )
-
-        started = time.monotonic()
-        last_yield = 0.0
-        progress_lock = threading.Lock()
-        cancel_event = threading.Event()
-        progress_state = {
-            "files_done": 0,
-            "bytes_done": 0,
-            "current_name": "",
-        }
-        worker_local = threading.local()
-
-        def _progress(
-            files_total: int,
-            files_done: int,
-            bytes_total: int,
-            bytes_done: int,
-            current_name: str,
-        ) -> bytes:
-            return WarmStreamMessage(
-                progress=WarmProgress(
-                    files_total=files_total,
-                    files_done=files_done,
-                    bytes_total=bytes_total,
-                    bytes_done=bytes_done,
-                    current_name=current_name,
-                    elapsed_seconds=time.monotonic() - started,
-                )
-            ).SerializeToString()
-
-        def _snapshot() -> Tuple[int, int, str]:
-            with progress_lock:
-                return (
-                    progress_state["files_done"],
-                    progress_state["bytes_done"],
-                    progress_state["current_name"],
-                )
-
-        def _read_file(fpath: str) -> None:
-            """Read one file, updating the shared warm progress snapshot."""
-            if cancel_event.is_set():
-                return
-
-            name = os.path.basename(fpath)
-            with progress_lock:
-                # A cancellation can race with a worker being scheduled. Do not
-                # open a new file once the main loop has observed cancellation.
-                if cancel_event.is_set():
-                    return
-                progress_state["current_name"] = name
-
-            try:
-                # Each executor worker owns and reuses its buffer: sharing the
-                # old single buffer would race readinto() calls and corrupt the
-                # byte tally.
-                buf = getattr(worker_local, "buf", None)
-                if buf is None:
-                    buf = bytearray(_WARM_READ_BLOCK_BYTES)
-                    worker_local.buf = buf
-                with open(fpath, "rb", buffering=0) as fh:
-                    while not cancel_event.is_set():
-                        n = fh.readinto(buf)
-                        if not n:
-                            break
-                        # current_name was already set above; re-stamping it on
-                        # every block would retake the lock for no new value and
-                        # serialize the fast path -- already-resident files that
-                        # read fast enough for 4 workers to contend on this lock.
-                        with progress_lock:
-                            progress_state["bytes_done"] += n
-            except OSError as exc:
-                logger.warning("warm: skipping %s: %s", fpath, exc)
-            finally:
-                with progress_lock:
-                    progress_state["files_done"] += 1
-
-        try:
-            # Warming registers as in-flight activity so the precache worker parks.
-            with self.activity.serving_request():
-                # 1. Enumerate + stat (recursive, recall-free). os.walk separates
-                #    directories from `names`, so `names` are the data files we
-                #    want; stat does not recall a placeholder.
-                entries: List[Tuple[int, str]] = []
-                bytes_total = 0
-                for dirpath, _dirs, names in os.walk(root):
-                    if context.is_cancelled():
-                        yield WarmStreamMessage(
-                            done=WarmProgress(
-                                elapsed_seconds=time.monotonic() - started
-                            )
-                        ).SerializeToString()
-                        return
-                    for name in names:
-                        fpath = os.path.join(dirpath, name)
-                        try:
-                            size = os.stat(fpath).st_size
-                        except OSError:
-                            continue  # vanished/unreadable between walk and stat
-                        entries.append((size, fpath))
-                        bytes_total += size
-                    now = time.monotonic()
-                    if now - last_yield >= _RESOLVE_HEARTBEAT_SECONDS:
-                        last_yield = now
-                        yield _progress(0, 0, 0, 0, "")  # still enumerating
-
-                # 2. Ascending size: for pyramidal data this approximates
-                #    coarsest-level-first (coarse levels are the small files) so the
-                #    viewer becomes responsive earliest; otherwise a harmless tie.
-                entries.sort(key=lambda e: e[0])
-                files_total = len(entries)
-                files_done = 0
-                bytes_done = 0
-
-                # Immediately surface the total before the first (possibly long) read.
-                last_yield = time.monotonic()
-                yield _progress(files_total, files_done, bytes_total, bytes_done, "")
-
-                # 3. Recall loop: read every file to completion (forces residency).
-                # Keep only one batch of work per worker in flight. Besides
-                # bounding threads, fds, and per-worker buffers, this preserves
-                # the existing smallest-files-first launch order without queuing
-                # tens of thousands of futures in the executor.
-                pending = set()
-                next_entry = 0
-
-                def _check_cancel() -> None:
-                    if context.is_cancelled():
-                        cancel_event.set()
-
-                with ThreadPoolExecutor(max_workers=_WARM_MAX_WORKERS) as pool:
-
-                    def _refill() -> None:
-                        nonlocal next_entry
-                        while (
-                            not cancel_event.is_set()
-                            and len(pending) < _WARM_MAX_WORKERS
-                            and next_entry < files_total
-                        ):
-                            fpath = entries[next_entry][1]
-                            next_entry += 1
-                            pending.add(pool.submit(_read_file, fpath))
-
-                    try:
-                        _check_cancel()
-                        _refill()
-
-                        while pending:
-                            _check_cancel()
-
-                            completed, pending = wait(
-                                pending,
-                                timeout=_WARM_POLL_SECONDS,
-                                return_when=FIRST_COMPLETED,
-                            )
-                            for future in completed:
-                                future.result()
-
-                            _check_cancel()
-                            _refill()
-
-                            now = time.monotonic()
-                            if now - last_yield >= _WARM_PROGRESS_MIN_INTERVAL:
-                                last_yield = now
-                                done_files, done_bytes, current_name = _snapshot()
-                                yield _progress(
-                                    files_total,
-                                    done_files,
-                                    bytes_total,
-                                    done_bytes,
-                                    current_name,
-                                )
-
-                        # The executor has no queued work here. Shutdown still
-                        # joins any read that was in progress before cancellation.
-                        done_files, done_bytes, current_name = _snapshot()
-                        files_done = done_files
-                        bytes_done = done_bytes
-                    finally:
-                        # A client may close the generator at a progress yield.
-                        # Set the flag before the `with` block joins the
-                        # executor's in-flight workers so they stop before
-                        # opening another file.
-                        cancel_event.set()
-
-                # 4. Terminal done (partial counts if cancelled mid-loop).
-                yield WarmStreamMessage(
-                    done=WarmProgress(
-                        files_total=files_total,
-                        files_done=files_done,
-                        bytes_total=bytes_total,
-                        bytes_done=bytes_done,
-                        elapsed_seconds=time.monotonic() - started,
-                    )
-                ).SerializeToString()
-        finally:
-            self.activity.end_warm(source_id)
 
     def _handle_add_source(
         self, req: AddSourceRequest, context: flight.ServerCallContext

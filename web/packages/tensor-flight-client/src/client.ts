@@ -414,7 +414,7 @@ export class TensorHttpClient {
     );
   }
 
-  // -- Resolve / warm jobs --------------------------------------------------
+  // -- Resolve jobs ---------------------------------------------------
   //
   // Start -> poll -> optionally cancel. Starting is idempotent per source: the
   // server keys jobs by (kind, source_id), so a double-click joins the recall
@@ -428,14 +428,9 @@ export class TensorHttpClient {
     return this.startJob("resolve", sourceId, opts);
   }
 
-  /** Begin (or join) a hydrate-ahead warm of a resolved source. */
-  async startWarm(sourceId: string, opts?: RequestOptions): Promise<SourceJobStatus> {
-    return this.startJob("warm", sourceId, opts);
-  }
-
   /** Poll a job. Rejects with a 404 `TensorApiError` if none was started. */
   async jobStatus(
-    kind: "resolve" | "warm",
+    kind: "resolve",
     sourceId: string,
     opts?: RequestOptions,
   ): Promise<SourceJobStatus> {
@@ -449,7 +444,7 @@ export class TensorHttpClient {
 
   /** Ask a job to stop. A no-op on one that already finished, not an error. */
   async cancelJob(
-    kind: "resolve" | "warm",
+    kind: "resolve",
     sourceId: string,
     opts?: RequestOptions,
   ): Promise<SourceJobStatus> {
@@ -462,7 +457,7 @@ export class TensorHttpClient {
   }
 
   private async startJob(
-    kind: "resolve" | "warm",
+    kind: "resolve",
     sourceId: string,
     opts?: RequestOptions,
   ): Promise<SourceJobStatus> {

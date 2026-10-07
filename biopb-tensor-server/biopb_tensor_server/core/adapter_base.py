@@ -310,8 +310,8 @@ class SourceAdapter(ABC):
     def source_url(self) -> Optional[str]:
         """The source's real, addressable URL/path: a filesystem path this
         adapter reads bytes from, or the dial address of an upstream it
-        proxies. Every filesystem op (warm's recall walk, residency checks)
-        and the remote check (``is_remote_url``) trust this to be genuine.
+        proxies. Every filesystem op (residency checks) and the remote check
+        (``is_remote_url``) trust this to be genuine.
 
         Wraps the backing ``_source_url``; None when the adapter never set one.
         An adapter that wants a different, cosmetic identity in the catalog
@@ -1131,8 +1131,8 @@ class TensorAdapter(SourceAdapter):
         A *narrow grant*, never a replacement: it opens this tensor's pixels
         and annotations to a holder with no server-wide token, and the
         server-wide token still opens them (``_authorize_read``). Reads only --
-        writes, ``resolve`` and ``warm`` take full access, because their cost
-        is not scoped to one tensor. The catalog row stays public either way.
+        writes and ``resolve`` take full access, because their cost is not
+        scoped to one tensor. The catalog row stays public either way.
 
         Per tensor rather than per source, because a source is shared: an
         uploaded result has one producer and lands beside everyone else's on

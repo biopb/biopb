@@ -32,7 +32,6 @@ from biopb.tensor.descriptor_pb2 import (
     SliceHint,
     TensorDescriptor,
     TensorReadOption,
-    WarmProgress,
 )
 from biopb.tensor.serialized_pb2 import SerializedTensor
 from biopb.tensor.ticket_pb2 import ChunkBounds, TensorTicket
@@ -74,7 +73,6 @@ __all__ = [
     "TensorReadOption",
     "CatalogQuery",
     "ResolveProgress",
-    "WarmProgress",
     "SerializedTensor",
     # Client
     "Connection",

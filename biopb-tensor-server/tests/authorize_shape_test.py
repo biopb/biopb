@@ -9,7 +9,7 @@ did before:
 
 - the server token is checked **first** and opens everything, so a capability
   *adds* access rather than replacing it;
-- a capability covers reads only, so writes, ``resolve`` and ``warm`` take full
+- a capability covers reads only, so writes, ``resolve`` and ``remove_source`` take full
   access whatever grant the tensor carries.
 
 A grant sits on a *tensor*, never on the source it hangs off: one source is
@@ -125,9 +125,8 @@ class TestFullAccess:
     def test_a_capability_does_not_reach_it(self, guarded):
         """Actions are the control surface, and a capability is not a key to it.
 
-        The concrete case is ``warm``: a grant meaning "read this one tensor"
-        must not authorize an operation whose cost lands on every other source
-        (biopb/biopb#1043).
+        The concrete case is ``remove_source``: a grant meaning "read this one
+        tensor" must not authorize an operation on another source.
         """
         with pytest.raises(flight.FlightUnauthenticatedError):
             guarded._authorize(_Context(CAPABILITY))
@@ -360,6 +359,6 @@ class TestGrantsSeam:
 
     def test_an_action_outside_the_grant_is_false(self, guarded):
         """The right token for the right tensor, asked about something it does
-        not cover. This is what keeps `warm` out even if a call site ever asked
-        `_authorize_read` about it."""
-        assert guarded._grants(CAPABILITY, "warm", GATED) is False
+        not cover. This is what keeps `remove_source` out even if a call site
+        ever asked `_authorize_read` about it."""
+        assert guarded._grants(CAPABILITY, "remove_source", GATED) is False

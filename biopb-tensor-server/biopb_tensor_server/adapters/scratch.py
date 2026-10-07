@@ -58,7 +58,7 @@ class ScratchSource(SourceAdapter):
     ) -> None:
         self.source_id = SCRATCH_SOURCE_ID
         #: The real backing tree (``<write_dir>/fields/scratch``) -- the
-        #: adapter contract's addressable url, which warm/recall/residency all
+        #: adapter contract's addressable url, which recall and residency checks
         #: trust to be genuine (``SourceAdapter.source_url``). None on a server
         #: with no ``write_dir``, where nothing can be uploaded here anyway
         #: (see ``UploadManager.install_scratch``).

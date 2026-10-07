@@ -10,8 +10,7 @@ import { shortId, unresolvedKind } from "../utils/sourceTree";
  *
  * Modal because resolving is the blocking, consenting step: it downloads the
  * whole source and nothing can be opened until it lands, so there is no useful
- * work to do behind it. Warming is the opposite -- background, concurrent,
- * several at once -- and lives in the tray at the foot of the catalog.
+ * work to do behind it.
  *
  * Only a cloud recall is that blocking step. A pending or failed local source
  * is read from disk in moments, so while it runs its tree row pulses instead
@@ -54,14 +53,14 @@ export function ResolveModalView({
         </p>
         {!failed && (
           <div
-            className="warm-bar indeterminate"
+            className="resolve-bar indeterminate"
             role="progressbar"
             // No aria-valuenow at all: the server reports elapsed time and the
             // target's size, never how much of it has landed, so any percentage
             // here would be invented.
             aria-label={`Resolving ${name}`}
           >
-            <div className="warm-bar-fill" style={{ width: "100%" }} />
+            <div className="resolve-bar-fill" style={{ width: "100%" }} />
           </div>
         )}
         <div className="admin-modal-actions">
