@@ -1016,7 +1016,8 @@ class TestIsResolvedColumn:
         conn = db._get_connection()
 
         conn.execute(
-            "INSERT INTO source_catalog (source_id, source_url) VALUES ('partial', '/p')"
+            "INSERT INTO source_catalog (source_id, root_id, rel) "
+            "VALUES ('partial', 'internal', '/p')"
         )
         row = conn.execute(
             "SELECT is_resolved FROM sources WHERE source_id='partial'"
@@ -1025,5 +1026,6 @@ class TestIsResolvedColumn:
 
         with pytest.raises(duckdb.ConstraintException):
             conn.execute(
-                "INSERT INTO source_catalog (source_id, is_resolved) VALUES ('bad', NULL)"
+                "INSERT INTO source_catalog (source_id, root_id, rel, is_resolved) "
+                "VALUES ('bad', 'internal', '/b', NULL)"
             )

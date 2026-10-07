@@ -150,3 +150,67 @@ class TestOverlap:
         assert roots.check_overlap(Path("/d"), []) == OVERLAP_MESSAGE
         roots.remove(known)
         assert roots.check_overlap(Path("/d"), []) is None
+
+
+class TestCatalogIdentity:
+    """What names a root in the catalog, and the url its sources start with."""
+
+    def test_a_local_roots_alias_is_display_only(self):
+        plain = _root(RootKind.MONITORED, "/data")
+        aliased = _root(RootKind.MONITORED, "/data", alias="lab")
+
+        assert plain.root_id == aliased.root_id
+        assert (plain.root_url, aliased.root_url) == ("file:///data", "lab")
+        assert plain.persisted and aliased.persisted
+
+    def test_an_upstreams_alias_is_part_of_its_identity(self):
+        """Its sources' ids carry it (``namespaced_source_id``), so renaming it is a
+        new root, not an edit of the old one."""
+        one = _root(RootKind.UPSTREAM, "grpc://lab:8815", alias="a")
+        other = _root(RootKind.UPSTREAM, "grpc://lab:8815", alias="b")
+
+        assert one.root_id != other.root_id
+        assert not one.persisted
+
+    def test_an_upstreams_url_is_its_scheme_and_authority(self):
+        aliased = _root(RootKind.UPSTREAM, "grpcs://lab:8815", alias="hpc")
+        bare = _root(RootKind.UPSTREAM, "grpc://lab:8815")
+
+        assert aliased.root_url == "grpcs://hpc"
+        assert bare.root_url == "grpc://lab:8815"
+
+    def test_a_drops_url_is_its_label(self):
+        drop = _root(RootKind.DROPPED, "/data/exp.zarr", label="exp")
+        unlabelled = _root(RootKind.DROPPED, "/data/exp.zarr")
+
+        assert drop.root_url == DND_URL_PREFIX + "exp"
+        assert unlabelled.root_url == DND_URL_PREFIX + "exp.zarr"
+        assert not drop.persisted
+
+    def test_a_drop_does_not_share_an_id_with_a_root_of_its_path(self):
+        assert (
+            _root(RootKind.DROPPED, "/data").root_id
+            != _root(RootKind.MONITORED, "/data").root_id
+        )
+
+    def test_the_upstream_of_a_mirrored_claim_is_found_by_endpoint_and_alias(self):
+        a = _root(RootKind.UPSTREAM, "grpc://lab:8815", alias="a")
+        b = _root(RootKind.UPSTREAM, "grpc://lab:8815", alias="b")
+        roots = Roots([a, b])
+
+        assert roots.upstream_of("grpc://lab:8815/img", "a") is a
+        assert roots.upstream_of("grpc://lab:8815/img", "b") is b
+        assert roots.upstream_of("grpc://lab:8815/img", None) is None
+        assert roots.upstream_of("grpc://other:8815/img", "a") is None
+
+    def test_only_the_configured_kinds_are_persisted(self):
+        roots = Roots(
+            [
+                _root(RootKind.MONITORED, "/a"),
+                _root(RootKind.SCAN_ONCE, "/b"),
+                _root(RootKind.DROPPED, "/c"),
+                _root(RootKind.UPSTREAM, "grpc://lab:8815"),
+            ]
+        )
+
+        assert [r.url for r in roots.persisted()] == ["/a", "/b"]

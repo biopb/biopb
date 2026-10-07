@@ -95,11 +95,15 @@ _SOURCE_COLUMNS = (
     "source_id, source_url, source_type, indexed_at, metadata_json, "
     "is_resolved, unresolved_reason, unresolved_error, tensors"
 )
-# The columns ``source_catalog`` adds after those, in table order. It has no
-# ``source_url``: the view builds it from the row's root and ``rel``.
+# The root a source sits under, and its path beneath it, which the view turns into
+# ``source_url`` against that root's ``catalog_roots`` row. A source that sits under
+# none of the roots the server knows (the scratch source, one registered through the
+# API) is under the built-in root with no url of its own, whose rows' ``rel`` is the
+# whole url.
+INTERNAL_ROOT_ID = "internal"
+_LOCATION_COLUMN_NAMES = ("root_id", "rel")
+# The claim, the columns a source with no claim leaves NULL (bar the last two).
 _CLAIM_COLUMN_NAMES = (
-    "root_id",
-    "rel",
     "primary_path",
     "member_paths",
     "extra_config",
@@ -109,6 +113,8 @@ _CLAIM_COLUMN_NAMES = (
     "epoch",
 )
 # The columns a row is written with, in the order every writer builds its values.
+# ``source_url`` is the url the adapter shows: it is only the ``rel`` of a row under
+# the built-in root, since every other row's url is its root's.
 _ROW_COLUMN_NAMES = (
     "source_id",
     "source_url",
@@ -120,42 +126,37 @@ _ROW_COLUMN_NAMES = (
     "tensors",
     "unresolved_error",
 )
-_ROW_COLUMNS = ", ".join(_ROW_COLUMN_NAMES)
-# The row columns a claimed row stores: all but ``source_url``, which is NULL
-# there and the view's (a row with no claim stores it literally).
-_PERSISTED_ROW_COLUMN_NAMES = _ROW_COLUMN_NAMES[:1] + _ROW_COLUMN_NAMES[2:]
-_PERSISTED_COLUMNS = ", ".join(_PERSISTED_ROW_COLUMN_NAMES + _CLAIM_COLUMN_NAMES)
-# Everything but the key, for updating a row that gains a claim in place.
-_UPDATE_SET = "source_url = NULL, " + ", ".join(
-    f"{c} = ?" for c in _PERSISTED_ROW_COLUMN_NAMES[1:] + _CLAIM_COLUMN_NAMES
+# What the table stores of those: all but ``source_url``.
+_STORED_ROW_COLUMN_NAMES = _ROW_COLUMN_NAMES[:1] + _ROW_COLUMN_NAMES[2:]
+_ALL_COLUMN_NAMES = (
+    _STORED_ROW_COLUMN_NAMES + _LOCATION_COLUMN_NAMES + _CLAIM_COLUMN_NAMES
 )
+_ALL_COLUMNS = ", ".join(_ALL_COLUMN_NAMES)
+# Everything but the key, for updating a row in place.
+_UPDATE_SET = ", ".join(f"{c} = ?" for c in _ALL_COLUMN_NAMES[1:])
 # The same, for an ``INSERT ... ON CONFLICT DO UPDATE`` that finds the row there.
-_UPSERT_SET = "source_url = NULL, " + ", ".join(
-    f"{c} = excluded.{c}" for c in _PERSISTED_ROW_COLUMN_NAMES[1:] + _CLAIM_COLUMN_NAMES
-)
-# A write without a claim sets the public columns and leaves the claim alone. The
-# url is stored only on a row with no root: a claimed row's is the root's.
+_UPSERT_SET = ", ".join(f"{c} = excluded.{c}" for c in _ALL_COLUMN_NAMES[1:])
+# A write without a record sets the public columns and leaves the location and the
+# claim alone, bar the ``rel`` of a row under the built-in root, which is its url.
 _LISTING_COLUMN_NAMES = _ROW_COLUMN_NAMES[2:]
-_LISTING_SET = "source_url = CASE WHEN root_id IS NULL THEN ? END, " + ", ".join(
-    f"{c} = ?" for c in _LISTING_COLUMN_NAMES
+_LISTING_SET = (
+    ", ".join(f"{c} = ?" for c in _LISTING_COLUMN_NAMES)
+    + f", rel = CASE WHEN root_id = '{INTERNAL_ROOT_ID}' THEN ? ELSE rel END"
 )
 _LISTING_UPSERT_SET = (
-    "source_url = CASE WHEN source_catalog.root_id IS NULL "
-    "THEN excluded.source_url END, "
-    + ", ".join(f"{c} = excluded.{c}" for c in _LISTING_COLUMN_NAMES)
+    ", ".join(f"{c} = excluded.{c}" for c in _LISTING_COLUMN_NAMES)
+    + f", rel = CASE WHEN source_catalog.root_id = '{INTERNAL_ROOT_ID}' "
+    "THEN excluded.rel ELSE source_catalog.rel END"
 )
 # ``_SOURCE_COLUMNS`` for a ``source_catalog`` row (alias ``c``) joined to its root
-# (alias ``r``): a claimed row's url is the root's, then the row's path beneath it.
+# (alias ``r``): the url is the root's, then the row's path beneath it.
 _VIEW_SOURCE_COLUMNS = _SOURCE_COLUMNS.replace(
     "source_url",
-    "COALESCE(c.source_url, CASE WHEN c.rel = '.' THEN r.root_url "
-    "ELSE r.root_url || '/' || c.rel END) AS source_url",
+    "CASE WHEN r.root_url = '' THEN c.rel WHEN c.rel = '.' THEN r.root_url "
+    "ELSE r.root_url || '/' || c.rel END AS source_url",
 ).replace("source_id", "c.source_id", 1)
-# A claimed row shows against its root only: one whose root is gone is not listed.
-_VIEW_FROM = (
-    "FROM source_catalog c LEFT JOIN catalog_roots r ON c.root_id = r.root_id "
-    "WHERE c.root_id IS NULL OR r.root_id IS NOT NULL"
-)
+# A row shows against its root only: one whose root is gone is not listed.
+_VIEW_FROM = "FROM source_catalog c JOIN catalog_roots r ON c.root_id = r.root_id"
 
 
 def _sources_view_ddl() -> str:
@@ -171,37 +172,36 @@ def _array_id(tensor: Dict[str, Any]) -> str:
 def _confirmation_view_ddl(run_epoch: int) -> str:
     """Whether each source was verified this run, apart from the published view.
 
-    A claimed row is *confirmed* when it was written this run or its root's walk
-    finished this run; a row with no claim was seen this run by construction. Kept
-    out of ``sources`` because that is a published schema, and out of the allowed
-    tables because only the server's own bookkeeping asks.
+    A row under a persisted root is *confirmed* when it was written this run or its
+    root's walk finished this run; any other row was seen this run by construction.
+    Kept out of ``sources`` because that is a published schema, and out of the
+    allowed tables because only the server's own bookkeeping asks.
     """
     return (
         "CREATE VIEW source_confirmation AS "
         "SELECT c.source_id, "
-        f"(c.root_id IS NULL OR greatest(c.epoch, r.epoch) = {int(run_epoch)}) "
+        f"(NOT r.persisted OR greatest(c.epoch, r.epoch) = {int(run_epoch)}) "
         "AS confirmed "
-        "FROM source_catalog c LEFT JOIN catalog_roots r ON c.root_id = r.root_id"
+        "FROM source_catalog c JOIN catalog_roots r ON c.root_id = r.root_id"
     )
 
 
 @dataclass(frozen=True)
 class CatalogRecord:
-    """What a source with a claim persists beside its public row.
+    """Where a source sits in the catalog, and what it persists beside its row.
 
-    ``signature`` is the claim's member signature taken when the claim was made,
-    before the parse, in the persisted form (no ``st_dev``): a file that changes
-    during registration must not be stamped with its new identity beside the old
-    metadata.
+    ``root_id`` and ``rel``: the root it sits under and its path beneath it.
 
-    ``root_id`` and ``rel``: the root it sits under and its path beneath it, which
-    the view turns into ``source_url`` against that root's ``catalog_roots`` row.
+    ``claim`` and ``signature``: only a source under a persisted root has them. The
+    signature is the claim's member signature taken when the claim was made, before
+    the parse, in the persisted form (no ``st_dev``): a file that changes during
+    registration must not be stamped with its new identity beside the old metadata.
 
     ``cloud``: the claim sits under a cloud root, whose rows keep no payload (a
     restart never trusts one resolved, so there is nothing to skip).
     """
 
-    claim: SourceClaim
+    claim: Optional[SourceClaim]
     signature: Dict[str, Tuple[Any, ...]]
     root_id: str
     rel: str
@@ -1016,19 +1016,21 @@ class MetadataDatabase:
     def _create_source_catalog(self, conn: duckdb.DuckDBPyConnection) -> None:
         """Create ``source_catalog``: one row per source, whatever kind it is.
 
-        Public row columns first (see ``_SOURCE_COLUMNS``), then the claim, its
-        claim-time signature and the adapter payload. A source with a claim under a
-        configured root has them and could be restored; one without (a mirror, a
-        remote proxy, an upload, a drop) has ``root_id`` NULL and its url stored
-        literally. The private columns stay out of the ``sources`` view, since the
-        claim can carry credential profile names and paths.
+        Public row columns first (see ``_SOURCE_COLUMNS``), then where the source
+        sits (a root and a path beneath it), then the claim, its claim-time signature
+        and the adapter payload. Only a source under a persisted root has a claim
+        and could be restored; a mirror, a drop or an API registration sits under a
+        root that is not persisted and has none. The private columns stay out of the
+        ``sources`` view, since the claim can carry credential profile names and
+        paths.
 
         Dropped whole when ``SOURCE_CATALOG_FORMAT`` differs from the one that
         wrote it, or is missing: the result is today's behaviour, a rebuild.
         Rows are cleared at open unless ``restore_sources`` (showing last run's
         rows with no adapter behind them would be a catalog that lies, so a
-        restore registers or marks pending every row it keeps), and the rows with
-        no claim are cleared either way: nothing could rebuild them.
+        restore registers or marks pending every row it keeps), and the rows under
+        roots that are not persisted are cleared either way: nothing could rebuild
+        them.
         """
         conn.execute(
             "CREATE TABLE IF NOT EXISTS catalog_meta (key TEXT PRIMARY KEY, value TEXT)"
@@ -1042,9 +1044,6 @@ class MetadataDatabase:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS source_catalog (
                 source_id TEXT PRIMARY KEY,
-                -- Set only on a row with no root; a claimed row's is the root's,
-                -- then its `rel`, which the view puts together.
-                source_url TEXT,
                 source_type TEXT,
                 indexed_at TIMESTAMP,
                 metadata_json TEXT,
@@ -1094,10 +1093,11 @@ class MetadataDatabase:
                     dtype VARCHAR
                 )[],
                 -- The root it sits under (`catalog_roots`) and its path beneath
-                -- it. NULL for a source with no claim.
-                root_id TEXT,
-                rel TEXT,
-                -- The claim, as `SourceClaim` holds it.
+                -- it; the view makes `source_url` of the two.
+                root_id TEXT NOT NULL,
+                rel TEXT NOT NULL,
+                -- The claim, as `SourceClaim` holds it. NULL under a root that is
+                -- not persisted.
                 primary_path TEXT,
                 member_paths VARCHAR[],
                 extra_config TEXT,
@@ -1116,6 +1116,10 @@ class MetadataDatabase:
             CREATE TABLE IF NOT EXISTS catalog_roots (
                 root_id TEXT PRIMARY KEY,
                 root_url TEXT NOT NULL,
+                -- Whether its sources are kept across a restart. Only a root the
+                -- config names is; a drop, an upstream and the built-in root are
+                -- gone at open.
+                persisted BOOLEAN NOT NULL DEFAULT TRUE,
                 -- The last run whose walk of this root finished, and when.
                 epoch BIGINT NOT NULL DEFAULT 0,
                 last_scanned TIMESTAMP
@@ -1125,7 +1129,16 @@ class MetadataDatabase:
             conn.execute("DELETE FROM source_catalog")
             conn.execute("DELETE FROM catalog_roots")
         else:
-            conn.execute("DELETE FROM source_catalog WHERE root_id IS NULL")
+            conn.execute(
+                "DELETE FROM source_catalog WHERE root_id IN "
+                "(SELECT root_id FROM catalog_roots WHERE NOT persisted)"
+            )
+            conn.execute("DELETE FROM catalog_roots WHERE NOT persisted")
+        conn.execute(
+            "INSERT INTO catalog_roots (root_id, root_url, persisted) "
+            "VALUES (?, '', FALSE)",
+            [INTERNAL_ROOT_ID],
+        )
         row = conn.execute(
             "SELECT value FROM catalog_meta WHERE key = 'run_epoch'"
         ).fetchone()
@@ -1545,7 +1558,12 @@ class MetadataDatabase:
         # restart skip the parse, so an adapter without one (or a cloud row, or
         # one that is not resolved) stores NULL and is rebuilt from its claim.
         payload = None
-        if record is not None and is_resolved and not record.cloud:
+        if (
+            record is not None
+            and record.claim is not None
+            and is_resolved
+            and not record.cloud
+        ):
             payload = adapter.catalog_payload()
 
         self._upsert_source_row(
@@ -1625,25 +1643,36 @@ class MetadataDatabase:
             )
         return True
 
-    def _claim_values(
+    def _placement(
         self,
-        record: CatalogRecord,
+        record: Optional[CatalogRecord],
+        url: str,
         payload: Optional[Dict[str, Any]],
         seen: datetime,
     ) -> List[Any]:
-        """The ``source_catalog`` columns after the public ones, in table order."""
-        claim = record.claim
-        return [
-            record.root_id,
-            record.rel,
-            claim.primary_path,
-            sorted(claim.member_paths),
-            json.dumps(claim.extra_config, sort_keys=True),
-            json.dumps({k: list(v) for k, v in record.signature.items()}),
-            None if payload is None else json.dumps(payload, sort_keys=True),
-            seen,
-            self.run_epoch,
-        ]
+        """The ``source_catalog`` columns after the public ones, in table order.
+
+        Without a *record* the source sits under the built-in root and *url* is its
+        ``rel``. Without a claim in it the claim columns are NULL.
+        """
+        if record is None:
+            location = [INTERNAL_ROOT_ID, url]
+            claim_values = [None] * 5
+        else:
+            location = [record.root_id, record.rel]
+            claim = record.claim
+            claim_values = (
+                [None] * 5
+                if claim is None
+                else [
+                    claim.primary_path,
+                    sorted(claim.member_paths),
+                    json.dumps(claim.extra_config, sort_keys=True),
+                    json.dumps({k: list(v) for k, v in record.signature.items()}),
+                    None if payload is None else json.dumps(payload, sort_keys=True),
+                ]
+            )
+        return location + claim_values + [seen, self.run_epoch]
 
     @staticmethod
     def _pending_row(
@@ -1654,7 +1683,7 @@ class MetadataDatabase:
         now: datetime,
     ) -> List[Any]:
         """The row of a claimed source that is not registered yet, built from the
-        claim alone, in ``_ROW_COLUMNS`` order."""
+        claim alone, in ``_ROW_COLUMN_NAMES`` order."""
         return [
             claim.source_id,
             catalog_url or to_catalog_url(str(claim.primary_path)),
@@ -1674,38 +1703,31 @@ class MetadataDatabase:
         record: Optional[CatalogRecord] = None,
         payload: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Insert or update a source's row (*row*, in ``_ROW_COLUMNS`` order),
+        """Insert or update a source's row (*row*, in ``_ROW_COLUMN_NAMES`` order),
         serializing writes with the lock.
 
         A ``source_id`` has one row, so a write cannot list a source twice. With a
-        *record* (the claim and its signature, and the adapter *payload*) the row
-        takes the claim and loses any literal url, which its root supplies. Without
-        one only the public columns are written and a claim the row already has is
-        left alone, which is what a re-listing wants: a field uploaded to a
-        discovered source changes its tensors, not its claim.
+        *record* (where the source sits, its claim and signature, and the adapter
+        *payload*) the row takes all of it. Without one only the public columns are
+        written and the location and claim the row already has are left alone, which
+        is what a re-listing wants: a field uploaded to a discovered source changes
+        its tensors, not where it sits. A source new to the catalog with no record
+        sits under the built-in root, its url the ``rel``.
 
         A row that exists is updated, not replaced: a registration fills in the
         pending row its claim made, and an ``UPDATE`` costs about two thirds of
         the wall time and a quarter of the CPU of an ``INSERT OR REPLACE`` on the
         indexed table.
         """
-        source_id, indexed_at = row[0], row[3]
+        source_id, url, indexed_at = row[0], row[1], row[3]
         # Serialized before the lock: a payload can be large, and every other
         # writer waits while it is held.
-        claim_values = (
-            None if record is None else self._claim_values(record, payload, indexed_at)
-        )
-        if claim_values is None:
-            columns, values = _ROW_COLUMNS, row
+        values = row[:1] + row[2:] + self._placement(record, url, payload, indexed_at)
+        if record is None:
             update_set, upsert_set = _LISTING_SET, _LISTING_UPSERT_SET
-            set_values = row[1:]
+            set_values = row[2:] + [url]
         else:
-            values = row[:1] + row[2:] + claim_values
-            columns, update_set, upsert_set = (
-                _PERSISTED_COLUMNS,
-                _UPDATE_SET,
-                _UPSERT_SET,
-            )
+            update_set, upsert_set = _UPDATE_SET, _UPSERT_SET
             set_values = values[1:]
         with self._write_lock:
             updated = conn.execute(
@@ -1717,7 +1739,7 @@ class MetadataDatabase:
                 # overwritten, which is what was asked: a registration must not
                 # fail on the pending row its claim made.
                 conn.execute(
-                    f"INSERT INTO source_catalog ({columns}) "
+                    f"INSERT INTO source_catalog ({_ALL_COLUMNS}) "
                     f"VALUES ({', '.join('?' * len(values))}) "
                     f"ON CONFLICT (source_id) DO UPDATE SET {upsert_set}",
                     values,
@@ -1740,8 +1762,8 @@ class MetadataDatabase:
         and ``unresolved_error`` carries the text, so a client does not wait on
         it. The registered row replaces this one by the same upsert.
 
-        With a *record* the row carries the claim and signature, and overwrites
-        what the source had.
+        With a *record* the row carries where the source sits and its claim, and
+        overwrites what the source had.
         """
         conn = self._get_connection()
         row = self._pending_row(claim, catalog_url, recall, error, datetime.now())
@@ -1754,11 +1776,7 @@ class MetadataDatabase:
     def _pending_inserts(
         self, rows: Sequence[PendingRow], now: datetime
     ) -> List[Tuple[str, List[Any]]]:
-        """The multi-row ``INSERT ... DO NOTHING`` statements for *rows*, in chunks.
-        All of *rows* have a record, or none does."""
-        columns = (
-            _ROW_COLUMNS if rows and rows[0].record is None else _PERSISTED_COLUMNS
-        )
+        """The multi-row ``INSERT ... DO NOTHING`` statements for *rows*, in chunks."""
         statements = []
         for i in range(0, len(rows), self._PENDING_CHUNK):
             chunk = rows[i : i + self._PENDING_CHUNK]
@@ -1767,15 +1785,12 @@ class MetadataDatabase:
                 values = self._pending_row(
                     row.claim, row.catalog_url, row.recall, None, now
                 )
-                if row.record is None:
-                    params += values
-                else:
-                    params += values[:1] + values[2:]
-                    params += self._claim_values(row.record, None, now)
+                params += values[:1] + values[2:]
+                params += self._placement(row.record, values[1], None, now)
             width = len(params) // len(chunk)
             statements.append(
                 (
-                    f"INSERT INTO source_catalog ({columns}) VALUES "
+                    f"INSERT INTO source_catalog ({_ALL_COLUMNS}) VALUES "
                     + ", ".join([f"({', '.join('?' * width)})"] * len(chunk))
                     + " ON CONFLICT DO NOTHING",
                     params,
@@ -1788,22 +1803,15 @@ class MetadataDatabase:
 
         Only a source with no row yet gets one. A batch is written some time after
         its claims were made, and in that time a registration may already have
-        written the real row, which a pending one must not replace. A row with a
-        record has its claim columns, one without has none and a literal url.
+        written the real row, which a pending one must not replace.
 
         One transaction, serialized with every other writer by the lock; the
-        statements for the rows with a claim, which are nearly all of them, are
-        built before it is taken.
+        statements are built before it is taken.
         """
         if not rows:
             return
         conn = self._get_connection()
-        now = datetime.now()
-        claimed = [r for r in rows if r.record is not None]
-        unclaimed = [r for r in rows if r.record is None]
-        statements = self._pending_inserts(claimed, now) + self._pending_inserts(
-            unclaimed, now
-        )
+        statements = self._pending_inserts(rows, datetime.now())
         with self._write_lock:
             conn.execute("BEGIN TRANSACTION")
             try:
@@ -1828,8 +1836,8 @@ class MetadataDatabase:
             "c.unresolved_reason, c.unresolved_error, c.root_id, c.rel, "
             "c.primary_path, c.member_paths, c.extra_config, c.signature, "
             "c.last_seen, r.last_scanned "
-            "FROM source_catalog c LEFT JOIN catalog_roots r USING (root_id) "
-            "WHERE c.root_id IS NOT NULL"
+            "FROM source_catalog c JOIN catalog_roots r ON c.root_id = r.root_id "
+            "WHERE c.primary_path IS NOT NULL"
         )
         names = [d[0] for d in cursor.description]
         return [dict(zip(names, row, strict=True)) for row in cursor.fetchall()]
@@ -1929,11 +1937,13 @@ class MetadataDatabase:
         return len(orphans)
 
     def sync_roots(self, roots: Sequence[Tuple[str, str]]) -> None:
-        """Replace ``catalog_roots`` with *roots*, ``(root_id, root_url)`` each.
+        """Replace the persisted roots in ``catalog_roots`` with *roots*,
+        ``(root_id, root_url)`` each.
 
-        Config is the truth, so a root that is gone is deleted and the rest keep
-        their ``epoch``: it says when a restored row's root was last walked. Written
-        before any source row is, since the view shows a row only against its root.
+        Config is the truth, so a persisted root that is gone is deleted and the
+        rest keep their ``epoch``: it says when a restored row's root was last
+        walked. Written before any source row is, since the view shows a row only
+        against its root. The roots that are not persisted are :meth:`ensure_root`'s.
         """
         conn = self._get_connection()
         ids = [root_id for root_id, _ in roots]
@@ -1941,12 +1951,14 @@ class MetadataDatabase:
             conn.execute("BEGIN TRANSACTION")
             try:
                 conn.execute(
-                    "DELETE FROM catalog_roots WHERE root_id NOT IN (SELECT unnest(?::VARCHAR[]))",
+                    "DELETE FROM catalog_roots WHERE persisted AND root_id NOT IN "
+                    "(SELECT unnest(?::VARCHAR[]))",
                     [ids],
                 )
                 for root_id, root_url in roots:
                     conn.execute(
-                        "INSERT INTO catalog_roots (root_id, root_url) VALUES (?, ?) "
+                        "INSERT INTO catalog_roots (root_id, root_url, persisted) "
+                        "VALUES (?, ?, TRUE) "
                         "ON CONFLICT (root_id) DO UPDATE SET root_url = excluded.root_url",
                         [root_id, root_url],
                     )
@@ -1954,6 +1966,19 @@ class MetadataDatabase:
             except BaseException:
                 conn.execute("ROLLBACK")
                 raise
+
+    def ensure_root(self, root_id: str, root_url: str) -> None:
+        """Record a root that is not persisted (a drop, an upstream) before a source
+        under it is written, since the view shows a row only against its root. It
+        goes at the next open with the rows under it."""
+        conn = self._get_connection()
+        with self._write_lock:
+            conn.execute(
+                "INSERT INTO catalog_roots (root_id, root_url, persisted) "
+                "VALUES (?, ?, FALSE) "
+                "ON CONFLICT (root_id) DO UPDATE SET root_url = excluded.root_url",
+                [root_id, root_url],
+            )
 
     def _replace_imported(
         self,

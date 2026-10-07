@@ -88,9 +88,10 @@ adapter `claim()` normalizes the path it returns.
 6. **I/O follows the claim path.** `open` and `stat` of a claim path follow links, so a
    link claim reads and signs its target. Quietness and change signatures stat the spelled
    path (`entry_is_quiet`, `build_entry_signature`).
-7. **The catalog `source_url` is display, never an input.** For a row with a claim it is
-   computed from its root (§7); for a row with none it is `dnd://<label>` for a drop from
-   outside every known root, `cache://`, `scratch://`, or `grpc://<alias>/…` for a mirror.
+7. **The catalog `source_url` is display, never an input.** It is computed from the
+   row's root (§7): `dnd://<label>/…` for a drop from outside every known root,
+   `grpc://<alias>/…` for a mirror, the alias or file url of a configured root, and the
+   source's own url (`cache://`, `scratch://`) under the built-in root.
    It is not fed to the filesystem or to `generate_source_id`, and rows are found and
    removed by `source_id`. The one lookup by url is `remove_source`, which matches a
    `dnd://<label>/` prefix.
@@ -203,11 +204,12 @@ ever runs: cloud roots are never walked.
 
 ### What each event writes to the catalog
 
-Every source has one row in `source_catalog`, keyed by `source_id`. A source with a claim
-under a monitored or scan-once root (cloud roots included) has it, with its claim columns,
-from the moment the walk finds it; a source with none (a mirror, a drop, an upload) has a row
-without them. Registration fills the row in, and a write that carries no claim (an upload
-re-listing its source) updates the public columns and leaves the claim as it was.
+Every source has one row in `source_catalog`, keyed by `source_id`, and sits under a root.
+A source under a monitored or scan-once root (cloud roots included) has its claim columns,
+from the moment the walk finds it; one under a drop or an upstream has the row without them.
+Registration fills the row in, and a write that carries no record (an upload re-listing its
+source) updates the public columns and leaves where the source sits, and its claim, as they
+were.
 
 | Event | Write |
 |---|---|
@@ -363,33 +365,41 @@ caller) and runs as a live addition; where it lands is decided after the lock is
 The catalog is a DuckDB database (`serving/metadata_db.py`). Persisted state is kept apart
 from the rest, and one view publishes both:
 
-- **`catalog_roots(root_id, root_url, epoch, last_scanned)`**: one row per configured
-  monitored or scan-once root, merged from config when the manager is built (`sync_roots`
-  keeps `epoch` and `last_scanned` and deletes the rows of a root no longer in config).
-  `root_id` is a hash of the resolved root path; `root_url` is the root's alias, or
-  `to_catalog_url` of its path. A cache of config, not state: config stays the one source of
-  truth.
-- **`source_catalog`**: one row per source. The public row columns; for a source with a
-  claim under a configured root (cloud roots included), `root_id` and `rel` (the
-  forward-slashed path under the root, `.` for the root itself) in place of `source_url`, the
-  private claim (`primary_path`, `member_paths`, `extra_config`, `source_type`), the
+- **`catalog_roots(root_id, root_url, persisted, epoch, last_scanned)`**: one row per root a
+  source sits under. The configured monitored and scan-once roots are `persisted`, merged
+  from config when the manager is built (`sync_roots` keeps `epoch` and `last_scanned` and
+  deletes the persisted roots no longer in config). A drop and an upstream are not persisted;
+  the reconciler records each (`ensure_root`) when it first files a source under it, and the
+  catalog has one built-in root (`internal`, no url) for a source under none of them (the
+  scratch source, one registered through the API). `root_id` is a hash of the resolved root
+  path for a persisted root, whose alias is display only. An upstream's is a hash of its
+  endpoint and alias together, because the alias namespaces its sources' ids
+  (`<alias>__<id>`): renaming it makes a new root. `root_url` is the root's alias, or
+  `to_catalog_url` of its path; for a drop its `dnd://` label; for an upstream its scheme and
+  authority (the alias when it has one). A cache of config, not state: config stays the one
+  source of truth.
+- **`source_catalog`**: one row per source. The public row columns; `root_id` and `rel` (the
+  forward-slashed path under the root, `.` for the root itself; for a row under the built-in
+  root, its whole url) in place of `source_url`; and, for a source under a persisted root,
+  the private claim (`primary_path`, `member_paths`, `extra_config`, `source_type`), the
   claim-time signature, the adapter `payload`, and the `epoch` of its last write and
-  `last_seen`. A row is resolved, pending, `needs_recall` or failed. A source with no claim to
-  re-derive (a mirror, a remote proxy, an upload, a drop) has `root_id` NULL, a literal
-  `source_url` and no claim columns; those rows are deleted at every open, and a restore reads
-  only the rows with a root.
-- **`sources`**: a view over it exposing the published columns only. A claimed row's
-  `source_url` is `root_url`, or `root_url || '/' || rel`, which is what `Roots.display_url`
-  gives the claim, so an alias edit is one `catalog_roots` row and no source row can carry a
-  stale url. A row of a root that is no longer configured is not listed.
+  `last_seen`. A row is resolved, pending, `needs_recall` or failed. A source has a claim when
+  `primary_path` is not NULL. The rows under roots that are not persisted are deleted at every
+  open with those roots, and a restore reads only the rows with a claim.
+- **`sources`**: a view over it exposing the published columns only. `source_url` is the
+  root's `root_url`, or `root_url || '/' || rel` (the built-in root has none, so it is the
+  `rel`), which is what `Roots.display_url` gives a local claim and what a mirror's adapter
+  shows, so an alias edit of a local root is one `catalog_roots` row and no source row can
+  carry a stale url. A row whose root is gone is not listed.
 - **`source_confirmation(source_id, confirmed)`**: a second view, hidden from queries like the
-  tables, saying whether each source was verified this run (§8). It is not part of `sources`
+  tables, saying whether each source was verified this run (§8): a row under a persisted root
+  by its root's walk or its own write, any other row by being written this run. It is not part of `sources`
   because that is a published schema.
 
 The private columns are hidden because `sources` is queryable by everyone with read access
 and a claim can carry credential profile names, aliases and paths. `source_id` is the primary
-key, so a source cannot be listed twice whichever way it is written: a write with a claim
-fills the claim columns and clears a literal url, one without leaves them alone.
+key, so a source cannot be listed twice whichever way it is written: a write with a record
+takes its place and claim, one without leaves them alone.
 
 A source's one root is the column `root_id`: a root's claim snapshot is `WHERE root_id = ?`,
 and `rel` is computed where the row is written, so path normalization stays out of SQL.

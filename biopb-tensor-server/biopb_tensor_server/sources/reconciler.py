@@ -77,7 +77,7 @@ from biopb_tensor_server.sources.entry_stat import (
     entry_is_quiet,
 )
 from biopb_tensor_server.sources.pending_rows import PendingRow, PendingRowWriter
-from biopb_tensor_server.sources.roots import RootKind, Roots, path_under_root
+from biopb_tensor_server.sources.roots import Root, RootKind, Roots, path_under_root
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import (
@@ -169,6 +169,8 @@ class Reconciler:
         # Shared with SourceManager; read-only here (monitored-claim scoping, cloud
         # policy).
         self._roots = roots
+        # The roots that are not persisted the catalog has been told of.
+        self._catalog_roots: Set[str] = set()
         # Injected SourceManager seam (see module docstring).
         self._notify_source_committed = notify_source_committed
         # Display root for a newly discovered claim (a monitored root's alias);
@@ -911,13 +913,19 @@ class Reconciler:
         self,
         claim: SourceClaim,
         signatures: Optional[Dict[str, Tuple[Any, ...]]] = None,
+        adapter: Optional[Any] = None,
     ) -> Optional[CatalogRecord]:
-        """The claim and its signature, if its source has a claim to persist.
+        """Where *claim*'s source sits in the catalog, and what it persists.
 
-        That is a local source under a monitored or scan-once root, cloud roots
-        included, and not a mirror: a drop's root lives only in memory, and a mirror
-        has no claim to rebuild. Whether the adapter can also be rebuilt is its own
-        ``catalog_payload``.
+        A source under a root the server knows sits under it: a local source under a
+        monitored or scan-once root (cloud roots included) with its claim and
+        signature, which a restart rebuilds it from; a drop, or a mirror of an
+        upstream, under that root without them, since nothing would rebuild it. Any
+        other has none, and the catalog files it under its built-in root. Whether the
+        adapter can also be rebuilt is its own ``catalog_payload``.
+
+        A mirror's path beneath its root is the url its adapter shows, once the
+        adapter has been seeded (*adapter*); before that, its upstream id.
 
         The persisted signature drops ``st_dev`` (first element), which can
         renumber across boots and would make every row look changed.
@@ -928,23 +936,47 @@ class Reconciler:
         taken then, not a new one; a refresh must not, since state holds the old
         file's). None means stat now.
         """
-        if claim.source_type == "tensor-server" or claim.is_remote:
+        from biopb_tensor_server.serving.metadata_db import CatalogRecord
+
+        if claim.source_type == "tensor-server":
+            root = self._roots.upstream_of(
+                claim.primary_path, claim.extra_config.get("alias")
+            )
+            if root is None:
+                return None
+            upstream_id = str(claim.primary_path).rsplit("/", 1)[-1]
+            url = adapter.catalog_url if adapter is not None else None
+            prefix = root.root_url + "/"
+            rel = url[len(prefix) :] if url and url.startswith(prefix) else upstream_id
+            self._ensure_root(root)
+            return CatalogRecord(None, {}, root.root_id, rel)
+        if claim.is_remote:
             return None
         root = self._roots.containing(Path(claim.primary_path))
-        if root is None or root.kind not in (RootKind.MONITORED, RootKind.SCAN_ONCE):
+        if root is None:
             return None
+        rel = path_under_root(root.url, claim.primary_path)
+        if not root.persisted:
+            self._ensure_root(root)
+            return CatalogRecord(None, {}, root.root_id, rel)
         if signatures is None:
             signatures = self._build_claim_signatures(claim)
         signature = {path: sig[1:] for path, sig in signatures.items()}
-        from biopb_tensor_server.serving.metadata_db import CatalogRecord
-
         return CatalogRecord(
             claim=claim,
             signature=signature,
             root_id=root.root_id,
-            rel=path_under_root(root.url, claim.primary_path),
+            rel=rel,
             cloud=root.cloud,
         )
+
+    def _ensure_root(self, root: Root) -> None:
+        """Have the catalog know a root that is not persisted before a row sits under
+        it. Once per root: its id names its url and the alias that namespaces it."""
+        if self._metadata_db is None or root.root_id in self._catalog_roots:
+            return
+        self._metadata_db.ensure_root(root.root_id, root.root_url)
+        self._catalog_roots.add(root.root_id)
 
     def _state_record(self, claim: SourceClaim) -> Optional[CatalogRecord]:
         """The record of a claim already committed, with the signature state holds."""
@@ -1397,7 +1429,13 @@ class Reconciler:
         seed changed (so a steady re-list does not churn ``indexed_at``)."""
         if adapter.seed_catalog(*seed) and self._metadata_db is not None:
             try:
-                self._metadata_db.sync_source_added(source_id, adapter)
+                claim = self._state.claims.get(source_id)
+                record = (
+                    self._catalog_record(claim, adapter=adapter)
+                    if claim is not None
+                    else None
+                )
+                self._metadata_db.sync_source_added(source_id, adapter, record)
             except Exception:
                 logger.warning(
                     "failed to refresh mirrored catalog row for %s",
@@ -1653,11 +1691,7 @@ class Reconciler:
         # parse is recorded with the identity the parse started from.
         if signatures is None and self.is_pending(claim.source_id):
             signatures = self._source_signatures.get(claim.source_id)
-        record = (
-            None
-            if catalog_seed is not None
-            else self._catalog_record(claim, signatures)
-        )
+        record = self._catalog_record(claim, signatures)
         try:
             source_config = self._source_config_for(claim)
 
@@ -1738,6 +1772,9 @@ class Reconciler:
         # register/sync so ListFlights and the metadata-DB row both carry it.
         if catalog_url:
             adapter._catalog_url = catalog_url
+        if claim.source_type == "tensor-server":
+            # A mirror's place under its upstream is the url the seed gave its adapter.
+            record = self._catalog_record(claim, adapter=adapter)
 
         registered = False
         displaced: Optional[Any] = None

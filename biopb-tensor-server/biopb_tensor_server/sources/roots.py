@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Iterable, List, NamedTuple, Optional, Tuple
+from urllib.parse import urlsplit
 
 from biopb_tensor_server.core.adapter_base import to_catalog_url
 from biopb_tensor_server.core.config import SourceConfig
@@ -137,14 +138,39 @@ class Root:
             object.__setattr__(self, "depth", len(path.parts))
 
     @property
+    def persisted(self) -> bool:
+        """Whether the catalog keeps this root's sources across a restart."""
+        return self.kind in (RootKind.MONITORED, RootKind.SCAN_ONCE)
+
+    @property
     def root_id(self) -> str:
-        """Names the root in the catalog table: a hash of its resolved path."""
-        return hashlib.sha256(self.url.encode()).hexdigest()[:12]
+        """Names the root in the catalog table.
+
+        A hash of the resolved path for a persisted root, whose alias is display
+        only. An upstream's alias is part of its sources' ids (``namespaced_source_id``),
+        so it is part of the root's identity: renaming it is a new root, not an
+        edit of this one. The kind keeps a drop from sharing an id with a root
+        of the same path.
+        """
+        if self.persisted:
+            return hashlib.sha256(self.url.encode()).hexdigest()[:12]
+        key = f"{self.kind.value}\0{self.url}\0{self.alias or ''}"
+        return hashlib.sha256(key.encode()).hexdigest()[:12]
 
     @property
     def root_url(self) -> str:
-        """What a source's catalog url starts with: the alias, else the file url of
-        the root. A drop's ``dnd://`` label is its own and is never persisted."""
+        """What a source's catalog url starts with.
+
+        A local root: the alias, else the file url of the root. A drop: its
+        ``dnd://`` label. An upstream: its scheme and authority, the authority being
+        the alias when there is one (the form the mirrored source's url takes).
+        """
+        if self.kind is RootKind.DROPPED:
+            label = self.label or os.path.basename(self.url.rstrip("/\\")) or self.url
+            return DND_URL_PREFIX + label
+        if self.kind is RootKind.UPSTREAM:
+            parts = urlsplit(self.url)
+            return f"{parts.scheme or 'grpc'}://{self.alias or parts.netloc}"
         return self.alias or to_catalog_url(self.url)
 
     @classmethod
@@ -288,7 +314,18 @@ class Roots:
 
     def persisted(self) -> List[Root]:
         """The roots whose sources the catalog table holds."""
-        return self.of_kind(RootKind.MONITORED, RootKind.SCAN_ONCE)
+        return [r for r in self._snap.roots if r.persisted]
+
+    def upstream_of(self, primary_path: str, alias: Optional[str]) -> Optional[Root]:
+        """The upstream a mirrored source comes from: the one whose endpoint is the
+        claim's ``<endpoint>/<upstream id>`` and whose alias namespaced its id."""
+        for root in self.of_kind(RootKind.UPSTREAM):
+            parts = urlsplit(root.url)
+            if root.alias == alias and str(primary_path).startswith(
+                f"{parts.scheme}://{parts.netloc}/"
+            ):
+                return root
+        return None
 
     def check_overlap(
         self,

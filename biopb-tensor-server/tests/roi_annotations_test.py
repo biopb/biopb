@@ -35,8 +35,8 @@ def _polygon(*pts):
 
 def _register_source(db, source_id, source_url):
     db._get_connection().execute(
-        "INSERT INTO source_catalog (source_id, source_url, source_type, tensors) "
-        "VALUES (?, ?, ?, ?)",
+        "INSERT INTO source_catalog (source_id, root_id, rel, source_type, tensors) "
+        "VALUES (?, 'internal', ?, ?, ?)",
         [source_id, source_url, "zarr", []],
     )
 
@@ -583,7 +583,7 @@ class TestStore:
         _register_source(db, "zarr_a1b2c3", "/data/exp.zarr")
         db.put_rois(ARRAY_ID, [_annotation(roi_id="a")])
         db._get_connection().execute(
-            "UPDATE source_catalog SET source_url = ? WHERE source_id = ?",
+            "UPDATE source_catalog SET rel = ? WHERE source_id = ?",
             ["dnd://exp.zarr", "zarr_a1b2c3"],
         )
         db.put_rois(ARRAY_ID, [_annotation(roi_id="b")])
@@ -595,19 +595,19 @@ class TestStore:
         )
         assert urls == [("a", "dnd://exp.zarr"), ("b", "dnd://exp.zarr")]
 
-    @pytest.mark.parametrize("unnamed", [None, ""])
+    @pytest.mark.parametrize("unnamed", [""])
     def test_a_catalog_row_that_names_nothing_leaves_the_label_alone(self, unnamed):
         """An unnamed source is not a rename.
 
         Refreshing from it would wipe the only human-readable thing an orphan
-        report has -- and `sources.source_url` is nullable, with the descriptor
-        path writing "" when a source carries no url of its own.
+        report has -- and the descriptor path writes "" when a source carries no
+        url of its own.
         """
         db = MetadataDatabase()
         _register_source(db, "zarr_a1b2c3", "/data/exp.zarr")
         db.put_rois(ARRAY_ID, [_annotation(roi_id="a")])
         db._get_connection().execute(
-            "UPDATE source_catalog SET source_url = ? WHERE source_id = ?",
+            "UPDATE source_catalog SET rel = ? WHERE source_id = ?",
             [unnamed, "zarr_a1b2c3"],
         )
         db.put_rois(ARRAY_ID, [_annotation(roi_id="b")])
@@ -1375,7 +1375,7 @@ class TestOrphanClock:
         _register_source(db, "zarr_a1b2c3", "file:///data/a.zarr")
         db.put_rois(ARRAY_ID, [_annotation()])
         db._get_connection().execute(
-            "UPDATE source_catalog SET source_url = ? WHERE source_id = ?",
+            "UPDATE source_catalog SET rel = ? WHERE source_id = ?",
             ["lab/a.zarr", "zarr_a1b2c3"],
         )
 
@@ -1397,7 +1397,7 @@ class TestOrphanClock:
         _register_source(db, "zarr_a1b2c3", "/data/exp.zarr")
         db.put_rois(ARRAY_ID, [_annotation()])
         db._get_connection().execute(
-            "UPDATE source_catalog SET source_url = ? WHERE source_id = ?",
+            "UPDATE source_catalog SET rel = ? WHERE source_id = ?",
             ["lab/exp.zarr", "zarr_a1b2c3"],
         )
         db.mark_sources_seen()
@@ -1414,7 +1414,7 @@ class TestOrphanClock:
         # in_catalog and source_url are separate answers: presence is what
         # turns a fresh row's clock on, not whether a URL came with it.
         db = MetadataDatabase()
-        _register_source(db, "zarr_a1b2c3", None)
+        _register_source(db, "zarr_a1b2c3", "")
         db.put_rois(ARRAY_ID, [_annotation()])
         (seen,) = db._get_cursor().execute("SELECT last_seen_at FROM rois").fetchone()
         assert seen is not None

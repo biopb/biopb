@@ -422,8 +422,8 @@ class TestTheBootSweepDropsTheLegacyRow:
         done = self._legacy_store(write_dir, "done", "ready")
         for source_id, store in ((crashed, "crashed"), (done, "done")):
             db._get_cursor().execute(
-                "INSERT INTO source_catalog (source_id, source_url, source_type) "
-                "VALUES (?, ?, 'ome_zarr')",
+                "INSERT INTO source_catalog (source_id, root_id, rel, source_type) "
+                "VALUES (?, 'internal', ?, 'ome_zarr')",
                 [source_id, str(write_dir / f"{store}.zarr")],
             )
         assert _catalog_ids(db) == {crashed, done}

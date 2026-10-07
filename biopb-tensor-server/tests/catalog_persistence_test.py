@@ -14,6 +14,7 @@ import pytest
 from biopb_tensor_server.adapters import get_default_registry
 from biopb_tensor_server.core.discovery import DiscoveryState, SourceClaim
 from biopb_tensor_server.serving.metadata_db import (
+    INTERNAL_ROOT_ID,
     SOURCE_CATALOG_FORMAT,
     CatalogRecord,
     MetadataDatabase,
@@ -72,8 +73,8 @@ def _kinds(db, source_id="s1"):
     claimed, unclaimed = (
         db._get_connection()
         .execute(
-            "SELECT count(*) FILTER (WHERE root_id IS NOT NULL), "
-            "count(*) FILTER (WHERE root_id IS NULL) "
+            "SELECT count(*) FILTER (WHERE primary_path IS NOT NULL), "
+            "count(*) FILTER (WHERE primary_path IS NULL) "
             "FROM source_catalog WHERE source_id = ?",
             [source_id],
         )
@@ -238,19 +239,36 @@ class TestRows:
         (url,) = db.query("SELECT source_url FROM sources").to_pylist()
         assert url["source_url"] == "file:///d/s1.zarr"
 
-    def test_a_row_that_gains_a_claim_loses_its_literal_url(self):
+    def test_a_row_with_no_record_sits_under_the_builtin_root_by_its_url(self):
+        db = _db()
+        adapter = _Restorable("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8")
+        db.sync_source_added("s1", adapter)
+        placed = (
+            db._get_connection()
+            .execute("SELECT root_id, rel FROM source_catalog WHERE source_id = 's1'")
+            .fetchone()
+        )
+        assert placed == (INTERNAL_ROOT_ID, "/d/s1.zarr")
+        assert db.query("SELECT source_url FROM sources").to_pylist() == [
+            {"source_url": "/d/s1.zarr"}
+        ]
+
+    def test_a_row_that_gains_a_claim_moves_to_its_root(self):
         db = _db()
         adapter = _Restorable("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8")
         db.sync_source_added("s1", adapter)
         assert _kinds(db) == (0, 1)
         db.sync_source_added("s1", adapter, _record())
         assert _kinds(db) == (1, 0)
-        stored = (
+        placed = (
             db._get_connection()
-            .execute("SELECT source_url FROM source_catalog WHERE source_id = 's1'")
+            .execute("SELECT root_id, rel FROM source_catalog WHERE source_id = 's1'")
             .fetchone()
         )
-        assert stored == (None,)
+        assert placed == ("r1", "s1.zarr")
+        assert db.query("SELECT source_url FROM sources").to_pylist() == [
+            {"source_url": "file:///d/s1.zarr"}
+        ]
 
     def test_a_failed_registration_row_replaces_a_persisted_one(self):
         db = _db()

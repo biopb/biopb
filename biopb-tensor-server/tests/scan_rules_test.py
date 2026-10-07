@@ -236,14 +236,19 @@ class TestRecord:
         record = manager._reconciler._catalog_record(claim)
         assert record is not None and not record.cloud
 
-    def test_a_drop_has_none(self, tmp_path):
+    def test_a_drop_sits_under_its_root_with_no_claim(self, tmp_path):
         manager = self._manager(tmp_path / "root")
         elsewhere = Path(tmp_path) / "dropped"
-        manager._roots.add(Root(RootKind.DROPPED, str(elsewhere), label="dnd://x"))
-        claim = SourceClaim("zarr", str(elsewhere / "a.zarr"), "x")
-        assert manager._reconciler._catalog_record(claim) is None
+        root = Root(RootKind.DROPPED, str(elsewhere), label="x")
+        manager._roots.add(root)
+        claim = SourceClaim("zarr", str(elsewhere / "sub" / "a.zarr"), "x")
 
-    def test_a_mirror_has_none(self, tmp_path):
+        record = manager._reconciler._catalog_record(claim)
+
+        assert record is not None and record.claim is None
+        assert (record.root_id, record.rel) == (root.root_id, "sub/a.zarr")
+
+    def test_a_mirror_of_no_known_upstream_has_none(self, tmp_path):
         manager = self._manager(tmp_path)
         claim = SourceClaim("tensor-server", str(tmp_path / "a.zarr"), "x")
         assert manager._reconciler._catalog_record(claim) is None
