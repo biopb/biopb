@@ -235,6 +235,71 @@ final class DataPlaneDiscovery {
         }
     }
 
+    /** The control refused a request: its HTTP status and the message it gave. */
+    static final class ControlRefused extends IOException {
+        private static final long serialVersionUID = 1L;
+        final int status;
+
+        ControlRefused(int status, String message) {
+            super(message);
+            this.status = status;
+        }
+    }
+
+    /**
+     * The control's JSON answer to {@code method path} with {@code params} as its
+     * query string, carrying the control's token when there is one.
+     *
+     * @throws ControlRefused the control answered with an error status
+     * @throws IOException no control answers
+     */
+    JsonObject controlRequest(String method, String path, java.util.Map<String, String> params, Duration timeout)
+            throws IOException {
+        StringBuilder query = new StringBuilder();
+        for (java.util.Map.Entry<String, String> param : params.entrySet()) {
+            query.append(query.length() == 0 ? '?' : '&')
+                    .append(java.net.URLEncoder.encode(param.getKey(), StandardCharsets.UTF_8))
+                    .append('=')
+                    .append(java.net.URLEncoder.encode(param.getValue(), StandardCharsets.UTF_8));
+        }
+        String token = resolveToken(null, true);
+        HttpRequest.Builder request = HttpRequest.newBuilder(URI.create(controlBaseUrl() + path + query))
+                .timeout(timeout);
+        if ("POST".equals(method)) {
+            request.POST(HttpRequest.BodyPublishers.noBody());
+        } else {
+            request.GET();
+        }
+        // The token also clears the control's CSRF gate on a POST. Without one
+        // (a tokenless local control) the gate falls back to a loopback Host.
+        if (token != null) {
+            request.header("X-Biopb-Token", token);
+        }
+        HttpResponse<String> response;
+        try {
+            response = http.send(request.build(), HttpResponse.BodyHandlers.ofString());
+        } catch (InterruptedException error) {
+            Thread.currentThread().interrupt();
+            throw new IOException("interrupted", error);
+        }
+        JsonObject body = new JsonObject();
+        try {
+            JsonElement parsed = JsonParser.parseString(response.body());
+            if (parsed.isJsonObject()) {
+                body = parsed.getAsJsonObject();
+            }
+        } catch (RuntimeException ignored) {
+            // an error page that is not JSON: the status says enough
+        }
+        if (response.statusCode() / 100 != 2) {
+            JsonElement message = body.get("error");
+            throw new ControlRefused(response.statusCode(), message != null && message.isJsonPrimitive()
+                    ? message.getAsString()
+                    : "the control answered HTTP " + response.statusCode());
+        }
+        return body;
+    }
+
     private static String grpcUrlOf(JsonElement payload) {
         if (!payload.isJsonObject()) {
             return null;
