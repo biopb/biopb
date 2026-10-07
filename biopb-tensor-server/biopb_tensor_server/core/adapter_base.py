@@ -19,6 +19,7 @@ Caching behavior depends on the configured CacheManager backend:
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time
@@ -77,6 +78,7 @@ from biopb_tensor_server.core.errors import (
     TensorNotFound,
     WriteNotSupportedError,
 )
+from biopb_tensor_server.core.json_encoding import NumpyEncoder
 from biopb_tensor_server.core.read_mask import ENDPOINTS, PYRAMID, read_mask
 from biopb_tensor_server.core.retention import (
     computed_ladder,
@@ -1697,6 +1699,42 @@ class TensorAdapter(SourceAdapter):
             if ndim and len(scale_vec) == ndim and len(unit_vec) == ndim:
                 descriptor.physical_scale[:] = scale_vec
                 descriptor.physical_unit[:] = unit_vec
+
+
+def build_adapter(
+    adapter_cls: Any, source: SourceConfig, credentials_config: Optional[Any] = None
+) -> Any:
+    """Build the adapter for a source being registered for the first time.
+
+    The file is parsed once, by ``create_from_config``, and the adapter that
+    serves is rebuilt by ``create_from_payload`` from the record the catalog row
+    is made of (its payload and metadata, JSON-normalized as the row stores
+    them). The parsed adapter is dropped, so the parse state a live adapter would
+    hold is transient, and one construction path serves a fresh registration, a
+    restart and an eviction rebuild: a payload that is incomplete fails the first
+    registration, not only a restart.
+
+    An adapter with no payload path, an unresolved source, or a payload the
+    adapter declines (``None``) is served as parsed.
+    """
+    parsed = adapter_cls.create_from_config(source, credentials_config)
+    rebuild = getattr(adapter_cls, "create_from_payload", None)
+    if (
+        rebuild is None
+        or rebuild.__func__ is SourceAdapter.create_from_payload.__func__
+        or not parsed.is_resolved()
+    ):
+        return parsed
+    payload = parsed.catalog_payload()
+    if payload is None:
+        return parsed
+    rebuilt = rebuild(
+        source,
+        json.loads(json.dumps(payload)),
+        json.loads(json.dumps(parsed.get_metadata() or {}, cls=NumpyEncoder)),
+        credentials_config,
+    )
+    return parsed if rebuilt is None else rebuilt
 
 
 # --- role-scope enforcement -------------------------------------------------

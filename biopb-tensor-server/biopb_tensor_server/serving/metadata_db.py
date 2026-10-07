@@ -66,7 +66,6 @@ from typing import (
 )
 
 import duckdb
-import numpy as np
 import pyarrow as pa
 from biopb.image.annotation_pb2 import RoiAnnotation, RoiConflict
 from biopb.image.roi_pb2 import ROI
@@ -77,6 +76,7 @@ from biopb_tensor_server.adapters.ome_masks import strip_mask_bindata
 from biopb_tensor_server.core.adapter_base import to_catalog_url
 from biopb_tensor_server.core.attachments import Attachments
 from biopb_tensor_server.core.errors import AnnotationStoreError
+from biopb_tensor_server.core.json_encoding import NumpyEncoder  # noqa: F401
 from biopb_tensor_server.core.labels import last_named_segment
 
 if TYPE_CHECKING:
@@ -377,28 +377,6 @@ CREATE TABLE IF NOT EXISTS rois (
     PRIMARY KEY (array_id, roi_id)
 )
 """
-
-
-class NumpyEncoder(json.JSONEncoder):
-    """JSON encoder that handles numpy scalar and array types, and bytes."""
-
-    def default(self, obj):
-        if isinstance(obj, np.integer):
-            return int(obj)
-        elif isinstance(obj, np.floating):
-            return float(obj)
-        elif isinstance(obj, np.ndarray):
-            return obj.tolist()
-        elif isinstance(obj, bytes):
-            # Try to decode as UTF-8, otherwise use base64
-            try:
-                return obj.decode("utf-8")
-            except UnicodeDecodeError:
-                import base64
-
-                return base64.b64encode(obj).decode("ascii")
-        # Catch-all: indicate unserializable type
-        return f"Unserializable {type(obj).__qualname__}"
 
 
 # ---------------------------------------------------------------------------

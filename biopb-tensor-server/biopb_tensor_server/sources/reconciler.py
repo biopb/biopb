@@ -51,7 +51,7 @@ from typing import (
     Tuple,
 )
 
-from biopb_tensor_server.core.adapter_base import to_catalog_url
+from biopb_tensor_server.core.adapter_base import build_adapter, to_catalog_url
 from biopb_tensor_server.core.config import SourceConfig
 from biopb_tensor_server.core.discovery import (
     AdapterRegistry,
@@ -1698,8 +1698,8 @@ class Reconciler:
                             exc_info=True,
                         )
                 if adapter is None:
-                    adapter = adapter_cls.create_from_config(
-                        source_config, self._credentials_config
+                    adapter = build_adapter(
+                        adapter_cls, source_config, self._credentials_config
                     )
 
                 # Bulk-seed the catalog surface so sync_source_added below needs
