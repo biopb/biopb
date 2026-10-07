@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
@@ -37,6 +37,9 @@ from biopb_tensor_server.adapters.members import member_marker
 from biopb_tensor_server.adapters.zarr import UPLOAD_PENDING, upload_state
 from biopb_tensor_server.core.adapter_base import TensorAdapter
 from biopb_tensor_server.core.attached import attached_field, split_attached_field
+
+if TYPE_CHECKING:
+    from biopb_tensor_server.core.attachments import Attachments
 
 __all__ = [
     "create_field_upload",
@@ -70,7 +73,7 @@ def create_field_upload(
     desc: TensorDescriptor,
     *,
     fields_dir: Path,
-    attached: Any,
+    attached: Attachments,
     expires_at: Optional[float] = None,
 ) -> TensorAdapter:
     """Mint the store for a new uploaded field on *parent* and track its upload.

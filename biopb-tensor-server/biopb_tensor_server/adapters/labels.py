@@ -28,7 +28,8 @@ What a set adds over a plain OME-Zarr image:
 Three ways a set reaches a parent: :func:`native_label_sets` for an image
 group's ``labels/`` (called from ``OmeZarrAdapter.get_embedded_labels``),
 :func:`sidecar_label_sets` for the finished stores under
-``<write_dir>/labels/<source_id>/``, which the server scans at boot, and :func:`create_label_upload` for a set arriving over the wire.
+``<write_dir>/labels/<source_id>/``, which the server scans at boot, and
+:func:`create_label_upload` for a set arriving over the wire.
 The readers skip only what they cannot *open* -- a float dtype, an unreadable
 ``.zattrs`` -- with a warning; whether a set spans its image is checked once
 for every origin where the sets meet (``Attachments.label_binding_error``,
@@ -42,7 +43,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import numpy as np
 from biopb.tensor.descriptor_pb2 import PyramidLevel, TensorDescriptor
@@ -75,6 +76,9 @@ from biopb_tensor_server.core.labels import (
     label_field,
     split_label_field,
 )
+
+if TYPE_CHECKING:
+    from biopb_tensor_server.core.attachments import Attachments
 
 __all__ = [
     "LabelSetAdapter",
@@ -367,7 +371,7 @@ def create_label_upload(
     desc: TensorDescriptor,
     *,
     labels_dir: Path,
-    attached: Any,
+    attached: Attachments,
     metadata: Optional[dict] = None,
     expires_at: Optional[float] = None,
 ) -> LabelSetAdapter:

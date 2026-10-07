@@ -767,8 +767,6 @@ class TensorFlightServer(flight.FlightServerBase):
         themselves.
         """
         source_id, _ = split_array_id(array_id)
-        if source_id not in self.sources:
-            return None
         expected = self.sources.tensor_capability_token(source_id, array_id)
         if not expected:
             return None

@@ -56,6 +56,18 @@ class Attachments:
         # The sets the parent's own file carries, read once per parent.
         self._embedded: Optional[Tuple[Any, Dict[str, TensorAdapter]]] = None
 
+    def attach(self, field: str, tensor: TensorAdapter) -> None:
+        """Make *tensor* answer for *field*."""
+        self.tensors[field] = tensor
+        self.changed()
+
+    def detach(self, field: str) -> Optional[TensorAdapter]:
+        """Stop answering for *field*; returns what was attached, or None."""
+        removed = self.tensors.pop(field, None)
+        if removed is not None:
+            self.changed()
+        return removed
+
     def changed(self) -> None:
         """An attached tensor's state moved: rebuild the checked views.
 
@@ -124,10 +136,10 @@ class Attachments:
             # package, and one that knows nothing of labels has none.
             embedded = getattr(parent, "get_embedded_labels", None)
             self._embedded = (parent, dict(embedded()) if embedded else {})
-        images = self.normalized_tensors(parent)
         candidates = {**self._embedded[1], **self._labels(published=True)}
         view: Dict[str, TensorAdapter] = {}
         self._mismatch = {}
+        images = self.normalized_tensors(parent) if candidates else {}
         for field, tensor in candidates.items():
             normalized = normalize_adapter(tensor)
             why = self.label_binding_error(
@@ -235,14 +247,27 @@ class Attachments:
         ``@fields/<name>``. Everything else is the format's own routing, which
         is the whole of the rule -- the upload path mints no bare field.
         """
+        key, is_set = self._key(field)
+        if key is None:
+            return None
+        return self._label_set_for(parent, key) if is_set else self.tensors.get(key)
+
+    @staticmethod
+    def _key(field: Optional[str]) -> Tuple[Optional[str], bool]:
+        """The index key that answers for within-source *field*, and whether it
+        is a label set; ``(None, False)`` for a field no attachment answers.
+
+        The one parse of the marked-segment grammar, shared by routing and by
+        the capability gate so the two cannot disagree.
+        """
         parsed = split_label_field(field)
         if parsed is not None:
-            if parsed.level is not None:
-                return None
-            return self._label_set_for(parent, parsed.set_field)
-        if field is None or split_attached_field(field) is None:
-            return None
-        return self.tensors.get(field)
+            return (
+                (None, False) if parsed.level is not None else (parsed.set_field, True)
+            )
+        return (
+            (field, False) if split_attached_field(field) is not None else (None, False)
+        )
 
     def _label_set_for(
         self, parent: SourceAdapter, set_field: str
@@ -323,13 +348,6 @@ class Attachments:
         """
         if not self.tensors:
             return None
-        field = strip_source_prefix(self.source_id, array_id)
-        # A label set's capability lives on the routable index, not the view.
-        parsed = split_label_field(field)
-        if parsed is not None:
-            tensor = (
-                None if parsed.level is not None else self.tensors.get(parsed.set_field)
-            )
-        else:
-            tensor = self.tensors.get(field) if field else None
+        key, _ = self._key(strip_source_prefix(self.source_id, array_id))
+        tensor = self.tensors.get(key) if key is not None else None
         return tensor.capability_token if tensor is not None else None

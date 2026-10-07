@@ -233,17 +233,11 @@ class SourceRegistry:
 
     def attach(self, source_id: str, field: str, tensor: TensorAdapter) -> None:
         """Make *tensor* answer for *field* on *source_id*."""
-        attachments = self.attached_to(source_id)
-        attachments.tensors[field] = tensor
-        attachments.changed()
+        self.attached_to(source_id).attach(field, tensor)
 
     def detach(self, source_id: str, field: str) -> Optional[TensorAdapter]:
         """Stop answering for *field*; returns what was attached, or None."""
-        attachments = self.attached_to(source_id)
-        removed = attachments.tensors.pop(field, None)
-        if removed is not None:
-            attachments.changed()
-        return removed
+        return self.attached_to(source_id).detach(field)
 
     def attachment_changed(self, source_id: str) -> None:
         """Rebuild the source's checked views: an attached tensor's state moved."""
