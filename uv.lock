@@ -732,7 +732,7 @@ testing = [
 [package.metadata]
 requires-dist = [
     { name = "biopb", extras = ["shim", "tensor"], editable = "." },
-    { name = "biopb-napari-widget", marker = "extra == 'napari'", specifier = ">=0.1.1rc2" },
+    { name = "biopb-napari-widget", marker = "extra == 'napari'", specifier = ">=0.1.1rc4" },
     { name = "distributed", specifier = ">=2023.9.0" },
     { name = "ipykernel" },
     { name = "jupyter-client" },
@@ -773,7 +773,7 @@ testing = [
 
 [[package]]
 name = "biopb-napari-widget"
-version = "0.1.1rc2"
+version = "0.1.1rc4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "biopb", extra = ["tensor"] },
@@ -791,9 +791,9 @@ dependencies = [
     { name = "zarr", version = "2.18.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "zarr", version = "2.18.7", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/27/5a/2b2f80cc7ce43d1b5170eb1a80e839ef9b529d7bf4e11d9a0864d4e584bb/biopb_napari_widget-0.1.1rc2.tar.gz", hash = "sha256:c12a55d615a7ca3335979b28272d91b190bebfd7a74716b37808642fe9d02239", size = 119855, upload-time = "2026-10-05T03:08:01.787Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/5d/ea/0d7a6840138b9644573c715e63c22ebf7a365120d161f33ffd73c15f4479/biopb_napari_widget-0.1.1rc4.tar.gz", hash = "sha256:8363aba7a6abb12830b3ee2c8622edd5826a76dd648905573a08659cd55014c4", size = 121753, upload-time = "2026-10-07T16:44:05.573Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/7b/a0/c0f9f23a50d667f69face200aa2a90ce624a5b75e1e1dab38178e4f2dd22/biopb_napari_widget-0.1.1rc2-py3-none-any.whl", hash = "sha256:fa2e52df2a09ea4ecd190f8eb00bfe769dfed674ccd035525636416201b3319b", size = 81147, upload-time = "2026-10-05T02:59:58.974Z" },
+    { url = "https://files.pythonhosted.org/packages/2a/95/15e1738e59f65570066417004030d75efab4956304d9ccc0970068ca531c/biopb_napari_widget-0.1.1rc4-py3-none-any.whl", hash = "sha256:a5e2a3d88e3d3199dd7e9b239b4d3a3881112d67f931e0d7df0ab3bf9a7f3c95", size = 82907, upload-time = "2026-10-07T16:44:04.433Z" },
 ]
 
 [[package]]
