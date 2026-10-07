@@ -732,7 +732,7 @@ class OmeZarrAdapter(ZarrAdapter):
                     "shape": [int(s) for s in d.shape],
                     "dtype": d.dtype,
                 }
-                for d in self.list_tensor_descriptors()
+                for d in self._list_native_descriptors()
             ],
         }
 
@@ -767,9 +767,7 @@ class OmeZarrAdapter(ZarrAdapter):
                 try:
                     levels[path] = [
                         int(s)
-                        for s in self.get_level_adapter(path)
-                        .get_tensor_descriptor()
-                        .shape
+                        for s in self.get_level_adapter(path)._native_descriptor().shape
                     ]
                 except Exception:
                     logger.debug(
@@ -983,7 +981,7 @@ class OmeZarrAdapter(ZarrAdapter):
         datasets = multiscales[0].get("datasets", [])
         return len(datasets) >= 2
 
-    def get_native_pyramid_levels(self) -> Optional[List[PyramidLevel]]:
+    def _native_pyramid_levels(self) -> Optional[List[PyramidLevel]]:
         """Advertise the OME-Zarr multiscales datasets as native pyramid levels.
 
         One ``PyramidLevel`` per native dataset, ``native=True`` and
@@ -1018,7 +1016,7 @@ class OmeZarrAdapter(ZarrAdapter):
                 continue
             try:
                 level_shape = self._level_shapes.get(path) or list(
-                    self.get_level_adapter(path).get_tensor_descriptor().shape
+                    self.get_level_adapter(path)._native_descriptor().shape
                 )
             except Exception:
                 logger.exception(
@@ -1037,7 +1035,7 @@ class OmeZarrAdapter(ZarrAdapter):
             )
         return levels or None
 
-    def list_tensor_descriptors(self) -> List[TensorDescriptor]:
+    def _list_native_descriptors(self) -> List[TensorDescriptor]:
         """List all tensors available in this source.
 
         For HCS plates: Returns flattened list of field tensors.
@@ -1052,7 +1050,7 @@ class OmeZarrAdapter(ZarrAdapter):
             return list(self._hcs_descriptors)
         else:
             # Single multiscale image
-            return [catalog_entry(self.get_tensor_descriptor())]
+            return [catalog_entry(self._native_descriptor())]
 
     def get_tensor_adapter(self, tensor_id: str) -> "TensorAdapter":
         """Get adapter for a specific tensor.

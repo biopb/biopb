@@ -298,10 +298,10 @@ class RasterizedMaskAdapter(NearestPyramidMixin, TensorAdapter):
             "OmeTiffAdapter.get_embedded_labels(), not from config"
         )
 
-    def list_tensor_descriptors(self) -> List[TensorDescriptor]:
-        return [catalog_entry(self.get_tensor_descriptor())]
+    def _list_native_descriptors(self) -> List[TensorDescriptor]:
+        return [catalog_entry(self._native_descriptor())]
 
-    def get_tensor_descriptor(self) -> TensorDescriptor:
+    def _native_descriptor(self) -> TensorDescriptor:
         return TensorDescriptor(
             array_id=self.array_id,
             dim_labels=self._dim_labels,
@@ -354,8 +354,8 @@ class RasterizedMaskAdapter(NearestPyramidMixin, TensorAdapter):
         self._bitmaps[key] = cached
         return cached
 
-    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
-        super().get_data(bounds)
+    def _read_native(self, bounds: ChunkBounds) -> np.ndarray:
+        super()._read_native(bounds)
         starts = [int(s) for s in bounds.start]
         stops = [int(e) for e in bounds.stop]
         out = np.zeros(

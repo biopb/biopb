@@ -412,7 +412,7 @@ class CziAdapter(TensorAdapter):
             dtype=layout.dtype,
         )
 
-    def list_tensor_descriptors(self) -> List[TensorDescriptor]:
+    def _list_native_descriptors(self) -> List[TensorDescriptor]:
         # Structural entries only: every scene shares one layout here, so the
         # grid would be right -- but the catalog is not where a grid is
         # published, whoever could compute it (biopb/biopb#812).
@@ -421,7 +421,7 @@ class CziAdapter(TensorAdapter):
             for position in range(len(self._layout.scenes))
         ]
 
-    def get_tensor_descriptor(self) -> TensorDescriptor:
+    def _native_descriptor(self) -> TensorDescriptor:
         return self._descriptor_for(
             0 if self.scene_position is None else self.scene_position
         )
@@ -460,7 +460,7 @@ class CziAdapter(TensorAdapter):
     # ---- reads --------------------------------------------------------------
 
     @property
-    def read_block_shape(self) -> Optional[Tuple[int, ...]]:
+    def _native_read_block_shape(self) -> Optional[Tuple[int, ...]]:
         """None: a libCZI ROI read composes only the subblocks it touches.
 
         Deliberately *not* the ``native=`` plane that seeds the transfer grid.
@@ -472,7 +472,7 @@ class CziAdapter(TensorAdapter):
         """
         return None
 
-    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
+    def _read_native(self, bounds: ChunkBounds) -> np.ndarray:
         """Read the requested region, one libCZI read per plane coordinate."""
         return self._read_planes(bounds, factor=None)
 
@@ -574,7 +574,7 @@ class CziAdapter(TensorAdapter):
         if self.scene_position is None:
             raise ValueError("Cannot get data from source-level adapter")
 
-        super().get_data(bounds)  # validate bounds against the descriptor
+        super()._read_native(bounds)  # validate bounds against the descriptor
         scene = self._scene()
         layout = self._layout
         starts = [int(value) for value in bounds.start]

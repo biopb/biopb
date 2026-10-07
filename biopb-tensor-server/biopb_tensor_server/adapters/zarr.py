@@ -433,7 +433,7 @@ class ZarrAdapter(WritableSource, TensorAdapter):
         self._write_lock = threading.Lock()
 
     @property
-    def read_block_shape(self) -> Optional[Tuple[int, ...]]:
+    def _native_read_block_shape(self) -> Optional[Tuple[int, ...]]:
         """The store's chunk -- the ``native=`` seed of the grid below.
 
         Inherited by ``OmeZarrAdapter``, ``_HcsFieldAdapter`` and
@@ -452,7 +452,7 @@ class ZarrAdapter(WritableSource, TensorAdapter):
             return None
         return tuple(int(size) for size in chunks)
 
-    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
+    def _read_native(self, bounds: ChunkBounds) -> np.ndarray:
         """Read data within bounds from zarr array.
 
         Args:
@@ -464,7 +464,7 @@ class ZarrAdapter(WritableSource, TensorAdapter):
         Raises:
             ValueError: If bounds exceed array shape
         """
-        super().get_data(bounds)
+        super()._read_native(bounds)
         slices = self._bounds_to_slices(bounds)
         return self.zarr_array[slices]
 
@@ -539,7 +539,7 @@ class ZarrAdapter(WritableSource, TensorAdapter):
             )
         ] = arr
 
-    def get_tensor_descriptor(self) -> TensorDescriptor:
+    def _native_descriptor(self) -> TensorDescriptor:
         return TensorDescriptor(
             array_id=self.array_id,
             dim_labels=self.dim_labels,
@@ -558,5 +558,5 @@ class ZarrAdapter(WritableSource, TensorAdapter):
             dtype=self.zarr_array.dtype.str,
         )
 
-    def list_tensor_descriptors(self):
-        return [catalog_entry(self.get_tensor_descriptor())]
+    def _list_native_descriptors(self):
+        return [catalog_entry(self._native_descriptor())]

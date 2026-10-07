@@ -278,19 +278,6 @@ def test_registering_on_a_bare_server_releases_into_its_own_catalog(per_plane_ti
         server.shutdown()
 
 
-# --- the delegating wrappers -------------------------------------------------
-
-
-def test_normalizing_wrapper_forwards_the_release(registered):
-    # SourceAdapter declares the method, so it resolves on the wrapper and never
-    # reaches its __getattr__ passthrough -- it has to delegate explicitly.
-    from biopb_tensor_server.core.normalize import NormalizingAdapter
-
-    NormalizingAdapter(registered).release_registration_cache()
-
-    assert registered._raw_ome_xml is None
-
-
 def test_every_source_adapter_answers_the_release(tmp_path):
     # It is declared on the ABC precisely so a wrapper author sees it; the
     # default is a no-op, and an adapter that holds nothing keeps it.

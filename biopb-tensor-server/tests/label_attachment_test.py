@@ -36,7 +36,6 @@ from biopb_tensor_server.core.labels import (
     label_field,
     split_label_field,
 )
-from biopb_tensor_server.core.normalize import NormalizingAdapter
 from biopb_tensor_server.fixtures import create_multiresolution_ome_zarr
 from biopb_tensor_server.sources.source_registry import SourceRegistry
 
@@ -283,7 +282,7 @@ class TestANativeSetIsATensorOfItsImage:
 
     def test_a_non_canonical_set_is_normalized_like_any_tensor(self, registered, reg):
         xy = reg.resolve_tensor("oz1", "@labels/xy")
-        assert isinstance(xy, NormalizingAdapter)
+        assert xy._axis_perm() is not None
         assert list(xy.get_tensor_descriptor().dim_labels) == ["y", "x"]
         assert [
             t.dim_labels[0]

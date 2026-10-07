@@ -22,7 +22,7 @@ from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
 from biopb_tensor_server.core.adapter_base import SourceAdapter, TensorAdapter
 from biopb_tensor_server.core.attachments import Attachments
-from biopb_tensor_server.core.normalize import normalize_adapter
+from biopb_tensor_server.core.normalize import log_reordering
 
 logger = logging.getLogger(__name__)
 
@@ -72,16 +72,11 @@ class SourceRegistry:
         self._pending_check = check
 
     def register(self, source_id: str, adapter: SourceAdapter) -> SourceAdapter:
-        """Register a data source, in canonical axis order.
+        """Register a data source.
 
-        Being the single registration chokepoint, this is also where the
-        canonical-axis-order guarantee is applied (biopb/biopb#596): the adapter
-        is passed through :func:`normalize_adapter`, which wraps it only if its
-        axes are not already canonical. **Returns the registered adapter** --
-        the same object in the overwhelmingly common compliant case, the wrapper
-        otherwise. Callers that keep using the adapter after registering it (to
-        sync the catalog row, say) must use the return value, or the catalog
-        would describe a different axis order than the serve path.
+        Canonical axis order (biopb/biopb#596) is the adapter's own business
+        (``TensorAdapter``); registering only reports a source that is served
+        reordered.
 
         Args:
             source_id: Unique identifier for the data source. Must be non-empty
@@ -89,7 +84,7 @@ class SourceRegistry:
             adapter: Source adapter for the data source
 
         Returns:
-            The adapter as registered -- normalized if it needed it.
+            The adapter, as passed.
 
         Raises:
             ValueError: If *source_id* is empty or contains ``"/"``. The tensor
@@ -110,7 +105,7 @@ class SourceRegistry:
                 f"{source_id!r}); the chunk-route id source_id/array_id decodes "
                 f"by splitting on the first '/'."
             )
-        adapter = normalize_adapter(adapter)
+        _log_reordering(source_id, adapter)
         with self._lock:
             self._sources[source_id] = adapter
         logger.debug(f"Registered source: {source_id}")
@@ -332,3 +327,19 @@ class SourceRegistry:
     def values(self) -> List[SourceAdapter]:
         with self._lock:
             return list(self._sources.values())
+
+
+def _log_reordering(source_id: str, adapter: SourceAdapter) -> None:
+    """INFO-log the tensors ``adapter`` will serve reordered, if any.
+
+    Never fails a registration: a duck-typed double, or an adapter that cannot
+    list yet (an unresolved cloud source), just reports nothing.
+    """
+    if not getattr(adapter, "_normalizable_axes", False):
+        return
+    try:
+        log_reordering(source_id, adapter._list_native_descriptors())
+    except Exception:
+        logger.debug(
+            "axis normalization: could not inspect %r", source_id, exc_info=True
+        )

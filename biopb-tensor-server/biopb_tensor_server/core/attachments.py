@@ -34,7 +34,7 @@ from biopb_tensor_server.core.labels import (
     join_fields,
     split_label_field,
 )
-from biopb_tensor_server.core.normalize import _normalize_descriptor, normalize_adapter
+from biopb_tensor_server.core.normalize import normalize_descriptor
 
 __all__ = ["Attachments"]
 
@@ -141,14 +141,13 @@ class Attachments:
         self._mismatch = {}
         images = self.normalized_tensors(parent) if candidates else {}
         for field, tensor in candidates.items():
-            normalized = normalize_adapter(tensor)
             why = self.label_binding_error(
-                parent, field, normalized.get_tensor_descriptor(), images=images
+                parent, field, tensor.get_tensor_descriptor(), images=images
             )
             if why is not None:
                 logger.error(f"labels: {self.source_id}/{field} cannot be read: {why}")
                 self._mismatch[field] = why
-            view[field] = normalized
+            view[field] = tensor
         self._view = (parent, view)
         return view
 
@@ -163,7 +162,7 @@ class Attachments:
         """
         descs = list(parent.list_tensor_descriptors())
         descs += [t.get_tensor_descriptor() for t in self.attached_fields().values()]
-        return {d.array_id: _normalize_descriptor(d) for d in descs}
+        return {d.array_id: normalize_descriptor(d) for d in descs}
 
     def label_binding_error(
         self,

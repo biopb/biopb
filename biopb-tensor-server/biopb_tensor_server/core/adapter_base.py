@@ -77,6 +77,14 @@ from biopb_tensor_server.core.errors import (
     TensorNotFound,
     WriteNotSupportedError,
 )
+from biopb_tensor_server.core.normalize import (
+    descriptor_permutation,
+    invert,
+    normalize_descriptor,
+    permute,
+    permute_bounds,
+    permute_repeated,
+)
 from biopb_tensor_server.core.read_mask import ENDPOINTS, PYRAMID, read_mask
 from biopb_tensor_server.core.retention import (
     computed_ladder,
@@ -257,9 +265,9 @@ class SourceAdapter(ABC):
     _catalog_url: Optional[str] = None
 
     # Whether the server may bring this source into canonical axis order by
-    # *permuting* it -- wrapping the adapter in a ``NormalizingAdapter``
-    # (biopb/biopb#596). True for every adapter that reads its own bytes: the
-    # server owns the whole read path for those, so it can transpose them.
+    # *permuting* it (biopb/biopb#596). True for every adapter that reads its own
+    # bytes: the server owns the whole read path for those, so it can transpose
+    # them.
     #
     # False when the axis order is owned by ANOTHER party who has aligned the
     # rest of their state to it -- today only the remote proxy, whose upstream
@@ -410,9 +418,24 @@ class SourceAdapter(ABC):
             An instance of a SourceAdapter subclass initialized with the provided config
         """
 
-    @abstractmethod
     def list_tensor_descriptors(self) -> List[TensorDescriptor]:
-        """List this source's tensors as **structural catalog entries**.
+        """This source's tensors as structural catalog entries, in canonical
+        axis order (biopb/biopb#596).
+
+        Each entry is normalized by its **own** labels rather than the source's:
+        a multi-tensor source (HCS fields, a multi-scene file) may hold tensors
+        of differing rank and labelling. Subclasses implement
+        :meth:`_list_native_descriptors`.
+        """
+        descs = self._list_native_descriptors()
+        if not self._normalizable_axes:
+            return descs
+        return [normalize_descriptor(d) for d in descs]
+
+    @abstractmethod
+    def _list_native_descriptors(self) -> List[TensorDescriptor]:
+        """List this source's tensors as **structural catalog entries**, in the
+        order its reader emits them.
 
         The source-listing/discovery surface: what the DuckDB catalog stores and
         what ``ListFlights`` publishes. It returns lightweight entries without
@@ -839,9 +862,42 @@ class TensorAdapter(SourceAdapter):
     # it already holds) would otherwise enrol it silently.
     _decode_time_is_rebuild_cost: bool = True
 
-    @abstractmethod
+    # --- canonical axis order (biopb/biopb#596) ---------------------------------
+    # A leaf adapter implements the ``_native_*`` hooks in whatever order its
+    # reader emits; the public methods below present them in canonical order, so
+    # the planner, the scaled and streamed reads and the pyramid -- all built on
+    # the public surface -- never see a native axis. Inside a leaf, ``self`` speaks
+    # native: a leaf reads its own ``_native_descriptor()``, never the public one.
+
+    def _axis_perm(self) -> Optional[Tuple[int, ...]]:
+        """This tensor's native -> canonical permutation, or None for identity.
+
+        Derived from the native descriptor on every call, deliberately **not**
+        memoized: an adapter's advertised labels are not immutable -- a source can
+        be undescribable now and describable later, or differently later -- and a
+        cached permutation cannot notice. Cheap: ``canonical_permutation`` is
+        O(ndim) over a descriptor most callers build anyway.
+        """
+        if not self._normalizable_axes:
+            return None
+        try:
+            desc = self._native_descriptor()
+        except Exception:
+            return None
+        return descriptor_permutation(desc)
+
     def get_tensor_descriptor(self) -> TensorDescriptor:
-        """Return the full **serving** descriptor for this bound tensor.
+        """The full **serving** descriptor for this bound tensor, in canonical
+        axis order. Subclasses implement :meth:`_native_descriptor`."""
+        desc = self._native_descriptor()
+        if not self._normalizable_axes:
+            return desc
+        return normalize_descriptor(desc)
+
+    @abstractmethod
+    def _native_descriptor(self) -> TensorDescriptor:
+        """Return the full **serving** descriptor for this bound tensor, in the
+        order the reader emits.
 
         The counterpart to :meth:`SourceAdapter.list_tensor_descriptors`, which
         answers the structural half for every tensor without binding any of them.
@@ -916,17 +972,29 @@ class TensorAdapter(SourceAdapter):
             list(desc.dim_labels),
         )
 
-    @abstractmethod
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
-        """Read data within bounds from the backend.
-        Subclasses should call super().get_data(bounds) to validate bounds,
+        """Read ``bounds`` -- given in canonical order -- as a canonical array.
+
+        A non-canonical tensor is read natively and transposed without a copy,
+        so the planner's chunk grid, a cached segment and the served bytes all
+        agree. Subclasses implement :meth:`_read_native`.
+        """
+        perm = self._axis_perm()
+        if perm is None:
+            return self._read_native(bounds)
+        return self._read_native(permute_bounds(bounds, invert(perm))).transpose(perm)
+
+    @abstractmethod
+    def _read_native(self, bounds: ChunkBounds) -> np.ndarray:
+        """Read data within bounds from the backend, in the reader's own order.
+        Subclasses should call super()._read_native(bounds) to validate bounds,
         then read data from their backend.
 
         The returned array's memory MUST NOT have its lifetime tied to a
         closable handle. A transpose or slice view over an array this adapter
         owns is fine; a view onto a reader-owned mmap that ``_handle_reaper``
         can close is not -- the caller may hold it well past the adapter's lock,
-        and ``core/normalize.py`` transposes it without copying. An adapter
+        and :meth:`get_data` transposes it without copying. An adapter
         reading through a mapping copies before returning.
 
         Args:
@@ -936,12 +1004,21 @@ class TensorAdapter(SourceAdapter):
         Raises:
             ValueError: If bounds exceed array shape
         """
-        desc = self.get_tensor_descriptor()
+        desc = self._native_descriptor()
         shape = tuple(int(dim) for dim in desc.shape)
         self._validate_bounds(bounds, shape)
 
     @property
     def read_block_shape(self) -> Optional[Tuple[int, ...]]:
+        """:meth:`_native_read_block_shape`, in canonical axis order."""
+        block = self._native_read_block_shape
+        perm = self._axis_perm() if block is not None else None
+        if perm is None or len(block) != len(perm):
+            return block
+        return tuple(permute(block, perm))
+
+    @property
+    def _native_read_block_shape(self) -> Optional[Tuple[int, ...]]:
         """What this backend's reads are quantized to, or ``None`` for none.
 
         A zarr chunk, a TIFF page: reading any part of one costs
@@ -976,6 +1053,19 @@ class TensorAdapter(SourceAdapter):
         return None
 
     def get_decimated_data(
+        self, bounds: ChunkBounds, step: Tuple[int, ...]
+    ) -> Optional[np.ndarray]:
+        """:meth:`_decimated_native` over canonical ``bounds`` and ``step``."""
+        perm = self._axis_perm()
+        if perm is None:
+            return self._decimated_native(bounds, step)
+        inverse = invert(perm)
+        out = self._decimated_native(
+            permute_bounds(bounds, inverse), tuple(permute(step, inverse))
+        )
+        return None if out is None else out.transpose(perm)
+
+    def _decimated_native(
         self, bounds: ChunkBounds, step: Tuple[int, ...]
     ) -> Optional[np.ndarray]:
         """Every ``step``-th element of ``bounds``, or ``None`` to decline.
@@ -1430,7 +1520,14 @@ class TensorAdapter(SourceAdapter):
         translate the request's slice into that level's coordinates, and plan the
         read against the level's own store.
         """
-        level = self._find_level_for_scale(scale_hint)
+        # The hint arrives canonical; the level lookup matches native factors.
+        perm = self._axis_perm()
+        native_hint = (
+            tuple(permute(scale_hint, invert(perm)))
+            if perm is not None and len(scale_hint) == len(perm)
+            else tuple(scale_hint)
+        )
+        level = self._find_level_for_scale(native_hint)
         if level is None:
             raise ValueError(
                 f"No precomputed level matching scale_hint {tuple(scale_hint)}."
@@ -1438,9 +1535,10 @@ class TensorAdapter(SourceAdapter):
         slice_hint = (
             request_desc.slice_hint if request_desc.HasField("slice_hint") else None
         )
-        level_slice = _convert_slice_to_level(
-            slice_hint, self._level_downsample_factors(level)
-        )
+        factors = self._level_downsample_factors(level)
+        if perm is not None and len(factors) == len(perm):
+            factors = permute(factors, perm)
+        level_slice = _convert_slice_to_level(slice_hint, factors)
         return self._plan_from_precomputed(level, level_slice)
 
     def _find_level_for_scale(self, scale_hint: Tuple[int, ...]) -> Optional[Any]:
@@ -1574,6 +1672,21 @@ class TensorAdapter(SourceAdapter):
         return read_plan
 
     def get_native_pyramid_levels(self) -> Optional[List[PyramidLevel]]:
+        """:meth:`_native_pyramid_levels`, in canonical axis order."""
+        levels = self._native_pyramid_levels()
+        perm = self._axis_perm() if levels is not None else None
+        if perm is None:
+            return levels
+        out = []
+        for level in levels:
+            copy = type(level)()
+            copy.CopyFrom(level)
+            permute_repeated(copy.shape, perm)
+            permute_repeated(copy.scale_hint, perm)
+            out.append(copy)
+        return out
+
+    def _native_pyramid_levels(self) -> Optional[List[PyramidLevel]]:
         """Native (precomputed on-disk) pyramid levels for this tensor, or None.
 
         Returns ``None`` for formats without a real on-disk pyramid (the default),
@@ -1693,6 +1806,9 @@ class TensorAdapter(SourceAdapter):
             self._physical_scale_cache = phys
         if phys is not None:
             scale_vec, unit_vec = phys
+            perm = self._axis_perm()
+            if perm is not None and len(scale_vec) == len(perm) == len(unit_vec):
+                scale_vec, unit_vec = permute(scale_vec, perm), permute(unit_vec, perm)
             ndim = len(descriptor.dim_labels)
             if ndim and len(scale_vec) == ndim and len(unit_vec) == ndim:
                 descriptor.physical_scale[:] = scale_vec

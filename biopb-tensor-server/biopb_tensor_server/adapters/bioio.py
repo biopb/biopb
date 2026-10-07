@@ -344,7 +344,7 @@ class _BioioAdapterBase(TensorAdapter):
         """
         if self.scene_index is not None:
             return None
-        entries = self.list_tensor_descriptors()
+        entries = self._list_native_descriptors()
         if not entries or len(entries) > _PAYLOAD_MAX_SCENES:
             return None
         listing, scenes = [], []
@@ -359,8 +359,8 @@ class _BioioAdapterBase(TensorAdapter):
                 }
             )
             scene = self.get_tensor_adapter(field)
-            descriptor = scene.get_tensor_descriptor()
-            block = scene.read_block_shape
+            descriptor = scene._native_descriptor()
+            block = scene._native_read_block_shape
             scale = scene._physical_scale()
             scenes.append(
                 {
@@ -480,7 +480,7 @@ class _BioioAdapterBase(TensorAdapter):
             self.dim_labels = None
 
     @property
-    def read_block_shape(self) -> Optional[Tuple[int, ...]]:
+    def _native_read_block_shape(self) -> Optional[Tuple[int, ...]]:
         """The dask block -- the ``native=`` seed, and what a slice materialises.
 
         ``get_data`` slices the scene's dask array, which computes whole blocks
@@ -502,7 +502,7 @@ class _BioioAdapterBase(TensorAdapter):
             self._dask_data = self._bio_image.dask_data
         return self._dask_data
 
-    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
+    def _read_native(self, bounds: ChunkBounds) -> np.ndarray:
         """Read data within bounds from this scene's bioio dask array.
 
         Args:
@@ -517,12 +517,12 @@ class _BioioAdapterBase(TensorAdapter):
         if self.scene_index is None:
             raise ValueError("Cannot get data from source-level adapter")
 
-        super().get_data(bounds)
+        super()._read_native(bounds)
         slices = self._bounds_to_slices(bounds)
         with self._io_lock:
             return self._scene_dask()[slices].compute()
 
-    def get_tensor_descriptor(self) -> TensorDescriptor:
+    def _native_descriptor(self) -> TensorDescriptor:
         """Return TensorDescriptor for this adapter (bioio).
 
         Scene-level (scene_index set): computed from the bioio dask array.
@@ -543,13 +543,13 @@ class _BioioAdapterBase(TensorAdapter):
         # Source-level: the default (first) scene -- answered by the adapter
         # bound to it, not read back off the catalog listing, which carries no
         # transfer grid (biopb/biopb#812).
-        entries = self.list_tensor_descriptors()
+        entries = self._list_native_descriptors()
         if not entries:
             raise TensorNotFound(
                 f"source {self.source_id!r} exposes no scenes",
                 reason="unknown_source",
             )
-        return self.get_tensor_adapter(entries[0].array_id).get_tensor_descriptor()
+        return self.get_tensor_adapter(entries[0].array_id)._native_descriptor()
 
     def _native_block(self, dask_data: Any) -> Optional[List[int]]:
         """The backend's own block, used to align the transfer grid.
@@ -599,7 +599,7 @@ class _BioioAdapterBase(TensorAdapter):
         with self._io_lock:
             return self._bio_image.ome_metadata
 
-    def list_tensor_descriptors(self) -> List[TensorDescriptor]:
+    def _list_native_descriptors(self) -> List[TensorDescriptor]:
         """List every scene as a structural catalog entry.
 
         Uses OME metadata for shapes without scene switching when possible, else
@@ -739,7 +739,7 @@ class _BioioAdapterBase(TensorAdapter):
         # Populate _cached_descriptors before resolving the scene index. Idempotent
         # (cached), and it closes the latent list(self._bio_image.scenes) parse in
         # _scene_index_for_field for a read that skipped registration.
-        self.list_tensor_descriptors()
+        self._list_native_descriptors()
 
         # Accept either the within-source field (scene id) or the full
         # source-qualified array_id (identity policy: array_id = source_id/field).
@@ -1047,7 +1047,7 @@ class NikonAdapter(_BioioAdapterBase):
     RETAIN_SCENE_DASK = False
 
     @property
-    def read_block_shape(self) -> Optional[Tuple[int, ...]]:
+    def _native_read_block_shape(self) -> Optional[Tuple[int, ...]]:
         """None: ``nd2.read_frame`` returns a view onto the reader's mmap.
 
         The crop that follows copies only the rows asked for, so no part of a
@@ -1201,7 +1201,7 @@ class NikonAdapter(_BioioAdapterBase):
             compute_transfer_chunk_size(tuple(unit), tuple(shape), dtype, labels)
         )
 
-    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
+    def _read_native(self, bounds: ChunkBounds) -> np.ndarray:
         """Read requested pixels directly from ND2 sequence frames.
 
         BioIO remains authoritative for scenes and metadata. Pixel reads skip
@@ -1211,7 +1211,7 @@ class NikonAdapter(_BioioAdapterBase):
         """
         return self._read(bounds, (1,) * len(bounds.start))
 
-    def get_decimated_data(
+    def _decimated_native(
         self, bounds: ChunkBounds, step: Tuple[int, ...]
     ) -> Optional[np.ndarray]:
         """The same read, strided -- the one place a scaled read skips bytes.
@@ -1232,11 +1232,11 @@ class NikonAdapter(_BioioAdapterBase):
         if self.scene_index is None:
             raise ValueError("Cannot get data from source-level adapter")
 
-        TensorAdapter.get_data(self, bounds)
+        TensorAdapter._read_native(self, bounds)
         if not self._source_url or not os.path.isfile(self._source_url):
             return self._get_data_via_bioio(bounds, step)
 
-        desc = self.get_tensor_descriptor()
+        desc = self._native_descriptor()
         labels = [label.upper() for label in desc.dim_labels]
         if len(labels) != len(desc.shape) or not {"Y", "X"}.issubset(labels):
             return self._get_data_via_bioio(bounds, step)

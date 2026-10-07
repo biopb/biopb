@@ -24,12 +24,9 @@ import pytest
 from biopb.tensor.descriptor_pb2 import TensorDescriptor, TensorReadOption
 from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server.cache import CacheManager
+from biopb_tensor_server.core import normalize as _normalize
 from biopb_tensor_server.core.axes import canonical_axis, canonical_permutation
 from biopb_tensor_server.core.config import CacheConfig, PyramidConfig
-from biopb_tensor_server.core.normalize import (
-    NormalizingAdapter,
-    normalize_adapter,
-)
 from biopb_tensor_server.serving.server import TensorFlightServer
 from biopb_tensor_server.sources.source_registry import SourceRegistry
 from google.protobuf.field_mask_pb2 import FieldMask
@@ -174,15 +171,13 @@ class TestCanonicalPermutation:
 
 
 @requires_zarr
-class TestNormalizeAdapter:
-    def test_compliant_adapter_is_returned_unchanged(self):
-        """The common case keeps its object identity: no wrapper, no delegation
-        on the hot path, no behavior change at all."""
+class TestTheAdapterOwnsTheOrder:
+    def test_compliant_adapter_has_no_permutation(self):
         with tempfile.TemporaryDirectory() as tmp:
             adapter = _zarr_adapter(tmp, np.zeros((4, 5, 6), np.uint8), ["z", "y", "x"])
-            assert normalize_adapter(adapter) is adapter
+            assert adapter._axis_perm() is None
 
-    def test_unlabeled_adapter_is_returned_unchanged(self):
+    def test_unlabeled_adapter_has_no_permutation(self):
         """Decision 1, asserted at the seam and not just in the rule."""
         with tempfile.TemporaryDirectory() as tmp:
             adapter = _zarr_adapter(tmp, np.zeros((4, 5, 6), np.uint8), None)
@@ -191,100 +186,36 @@ class TestNormalizeAdapter:
                 "dim1",
                 "dim2",
             ]
-            assert normalize_adapter(adapter) is adapter
+            assert adapter._axis_perm() is None
 
-    def test_divergent_adapter_is_wrapped(self):
+    def test_divergent_adapter_is_permuted(self):
         with tempfile.TemporaryDirectory() as tmp:
             adapter = _zarr_adapter(tmp, np.zeros((4, 5, 6), np.uint8), ["x", "y", "z"])
-            assert isinstance(normalize_adapter(adapter), NormalizingAdapter)
+            assert adapter._axis_perm() == (2, 1, 0)
+            assert list(adapter.get_tensor_descriptor().dim_labels) == ["z", "y", "x"]
+            assert list(adapter._native_descriptor().dim_labels) == ["x", "y", "z"]
 
-    def test_wrapping_is_idempotent(self):
-        """What makes normalization composable: applying it twice is applying it
-        once, so a caller may normalize defensively without stacking wrappers."""
-        with tempfile.TemporaryDirectory() as tmp:
-            adapter = _zarr_adapter(tmp, np.zeros((4, 5, 6), np.uint8), ["x", "y", "z"])
-            once = normalize_adapter(adapter)
-            assert normalize_adapter(once) is once
-
-    def test_a_duck_typed_double_is_left_alone(self):
-        class NotAnAdapter:
-            source_id = "x"
-
-        double = NotAnAdapter()
-        assert normalize_adapter(double) is double
-
-    def test_registry_applies_the_guarantee(self):
+    def test_registry_keeps_the_adapter_and_it_serves_canonical(self):
         with tempfile.TemporaryDirectory() as tmp:
             registry = SourceRegistry()
             adapter = _zarr_adapter(tmp, np.zeros((4, 5, 6), np.uint8), ["x", "y", "z"])
-            returned = registry.register("src", adapter)
-            assert isinstance(returned, NormalizingAdapter)
-            assert registry.get("src") is returned
+            assert registry.register("src", adapter) is adapter
+            assert registry.get("src") is adapter
+            assert list(adapter.get_tensor_descriptor().shape) == [6, 5, 4]
 
-    def test_wrapping_is_announced_once(self, caplog):
+    def test_registering_a_reordered_source_is_announced(self, caplog):
         """Reordering a source is a visible behavior change; without a log line
-        the only evidence of it is the transposed data. Once, not once per chunk
-        read -- normalize_adapter is re-entered per get_tensor_adapter."""
+        the only evidence of it is the transposed data."""
         import logging as _logging
 
-        from biopb_tensor_server.core import normalize as _normalize
-
         with tempfile.TemporaryDirectory() as tmp:
-            _normalize._reported.clear()
             adapter = _zarr_adapter(tmp, np.zeros((4, 5, 6), np.uint8), ["x", "y", "z"])
             with caplog.at_level(_logging.INFO, logger=_normalize.__name__):
-                for _ in range(3):
-                    normalize_adapter(adapter)
+                SourceRegistry().register("src", adapter)
             lines = [r for r in caplog.records if "axis normalization" in r.message]
             assert len(lines) == 1
             said = lines[0].getMessage()
             assert "['z', 'y', 'x']" in said and "['x', 'y', 'z']" in said
-
-    def test_the_chunk_lookup_path_does_not_reclassify(
-        self, monkeypatch, transfer_target
-    ):
-        """``get_tensor_adapter`` / ``get_level_adapter`` sit on the do_get path
-        -- the server resolves a chunk's adapter through them on *every* read --
-        so running the source-level classifier there cost a full
-        ``list_tensor_descriptors`` per chunk. A view needs no decision: whether
-        it permutes is ``perm``'s business, made per access.
-        """
-        from biopb_tensor_server import ZarrAdapter
-
-        # The subject is the per-chunk lookup, so the plan needs several chunks;
-        # at the default target this 96-byte array is one (biopb/biopb#809).
-        transfer_target(32)
-
-        calls = {"n": 0}
-        real = ZarrAdapter.list_tensor_descriptors
-        monkeypatch.setattr(
-            ZarrAdapter,
-            "list_tensor_descriptors",
-            lambda self: (calls.__setitem__("n", calls["n"] + 1), real(self))[1],
-        )
-
-        with tempfile.TemporaryDirectory() as tmp:
-            src = np.arange(2 * 3 * 8, dtype=np.uint16).reshape(2, 3, 8)
-            registry = SourceRegistry()
-            adapter = registry.register("src", _zarr_adapter(tmp, src, ["x", "y", "z"]))
-            assert isinstance(adapter, NormalizingAdapter)
-            plan = adapter.get_tensor_adapter(None).plan_flight_info(
-                TensorReadOption(array_id="src", fields=FieldMask(paths=["endpoints"])),
-                PyramidConfig(),
-            )
-            assert len(plan.chunk_endpoints) > 1
-
-            calls["n"] = 0
-            for ce in plan.chunk_endpoints:  # the do_get inner loop
-                adapter.get_tensor_adapter(None).resolve_chunk_data(ce.chunk_id)
-            assert calls["n"] == 0
-
-    def test_registry_leaves_a_compliant_source_alone(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            registry = SourceRegistry()
-            adapter = _zarr_adapter(tmp, np.zeros((4, 5, 6), np.uint8), ["z", "y", "x"])
-            assert registry.register("src", adapter) is adapter
-            assert registry.get("src") is adapter
 
 
 @requires_zarr
@@ -293,7 +224,7 @@ class TestNormalizedDescriptorAndData:
 
     def _wrapped(self, tmp):
         src = np.arange(2 * 3 * 4, dtype=np.uint16).reshape(2, 3, 4)  # x, y, z
-        adapter = normalize_adapter(_zarr_adapter(tmp, src, ["x", "y", "z"]))
+        adapter = _zarr_adapter(tmp, src, ["x", "y", "z"])
         return adapter, src
 
     def test_descriptor_is_canonical(self):
@@ -308,7 +239,7 @@ class TestNormalizedDescriptorAndData:
             # grid rather than a literal -- x,y,z -> z,y,x is a full reversal.
             native = list(
                 _zarr_adapter(tmp, src, ["x", "y", "z"], name="raw")
-                .get_tensor_descriptor()
+                ._native_descriptor()
                 .chunk_shape
             )
             assert list(desc.chunk_shape) == native[::-1]
@@ -331,7 +262,7 @@ class TestNormalizedDescriptorAndData:
             adapter, src = self._wrapped(tmp)
             native = list(
                 _zarr_adapter(tmp, src, ["x", "y", "z"], name="raw")
-                .get_tensor_descriptor()
+                ._native_descriptor()
                 .chunk_shape
             )
             assert adapter.get_transfer_chunk_size() == tuple(native[::-1])
@@ -419,7 +350,7 @@ class TestNormalizedDescriptorAndData:
 
         with tempfile.TemporaryDirectory() as tmp:
             src = (np.arange(4 * 32 * 64, dtype=np.uint16) % 251).reshape(4, 32, 64)
-            adapter = normalize_adapter(_zarr_adapter(tmp, src, ["x", "y", "z"]))
+            adapter = _zarr_adapter(tmp, src, ["x", "y", "z"])
             canonical = src.transpose(2, 1, 0)
 
             read_opt = TensorReadOption(
@@ -452,7 +383,7 @@ class TestNormalizedDescriptorAndData:
         the permutation has to reach inside them too."""
         with tempfile.TemporaryDirectory() as tmp:
             src = np.zeros((128, 64, 4), np.uint16)  # x, y, z
-            adapter = normalize_adapter(_zarr_adapter(tmp, src, ["x", "y", "z"]))
+            adapter = _zarr_adapter(tmp, src, ["x", "y", "z"])
             plan = adapter.plan_flight_info(
                 TensorReadOption(
                     array_id="src", fields=FieldMask(paths=["endpoints", "pyramid"])
@@ -498,11 +429,11 @@ class TestNormalizedDescriptorAndData:
         """
         with tempfile.TemporaryDirectory() as tmp:
             inner = _zarr_adapter(tmp, np.zeros((2, 3, 4), np.uint8), ["x", "y", "z"])
-            wrapper = normalize_adapter(inner)
-            assert wrapper.perm == (2, 1, 0)
+            wrapper = inner
+            assert wrapper._axis_perm() == (2, 1, 0)
 
             inner.dim_labels = ["z", "y", "x"]
-            assert wrapper.perm is None
+            assert wrapper._axis_perm() is None
             desc = wrapper.get_tensor_descriptor()
             assert list(desc.dim_labels) == ["z", "y", "x"]
             assert list(desc.shape) == [2, 3, 4]
@@ -512,31 +443,19 @@ class TestNormalizedDescriptorAndData:
         nothing is cached, the source normalizes normally once it can be."""
         with tempfile.TemporaryDirectory() as tmp:
             inner = _zarr_adapter(tmp, np.zeros((2, 3, 4), np.uint8), ["x", "y", "z"])
-            wrapper = normalize_adapter(inner)
+            wrapper = inner
             broken = {"raise": True}
-            real = inner.get_tensor_descriptor
+            real = inner._native_descriptor
 
             def flaky():
                 if broken["raise"]:
                     raise RuntimeError("upstream down")
                 return real()
 
-            inner.get_tensor_descriptor = flaky
-            assert wrapper.perm is None  # outage -> identity, not a crash
+            inner._native_descriptor = flaky
+            assert wrapper._axis_perm() is None  # outage -> identity, not a crash
             broken["raise"] = False
-            assert wrapper.perm == (2, 1, 0)  # recovered, not stranded
-
-    def test_delegated_identity_fields_are_not_shadowed(self):
-        """The wrapper inherits SourceAdapter's per-source class attributes, so
-        each has to be re-declared as a delegating property or it reads None."""
-        with tempfile.TemporaryDirectory() as tmp:
-            adapter, _ = self._wrapped(tmp)
-            assert adapter.source_id == "src"
-            assert adapter.array_id == "src"
-            assert adapter.source_type == "zarr"
-            assert adapter.source_url is not None
-            assert adapter.content_version is not None
-            assert adapter._source_url == adapter.source_url
+            assert wrapper._axis_perm() == (2, 1, 0)  # recovered, not stranded
 
 
 @requires_zarr
@@ -554,7 +473,7 @@ class TestNormalizedCaching:
             try:
                 cache = CacheManager.get_instance()
                 src = np.arange(2 * 3 * 4, dtype=np.uint16).reshape(2, 3, 4)
-                adapter = normalize_adapter(_zarr_adapter(tmp, src, ["x", "y", "z"]))
+                adapter = _zarr_adapter(tmp, src, ["x", "y", "z"])
                 plan = adapter.plan_flight_info(
                     TensorReadOption(
                         array_id="src", fields=FieldMask(paths=["endpoints"])
@@ -730,13 +649,14 @@ def _proxy_adapter(upstream_port, source_id="m", upstream_source_id="u"):
 def _legacy_upstream(tmp, arr, labels, name="u"):
     """A server advertising ``labels`` verbatim -- i.e. a pre-#596 upstream.
 
-    Registered straight into the registry dict rather than through
-    ``register_source``, which would normalize it and defeat the point: what is
-    under test is a *downstream* facing a server that never learned the
-    guarantee.
+    The adapter opts out of normalizing, which is what makes it advertise its
+    native order: what is under test is a *downstream* facing a server that
+    never learned the guarantee.
     """
     server = TensorFlightServer("localhost:0")
-    server.sources._sources[name] = _zarr_adapter(tmp, arr, labels, name)
+    adapter = _zarr_adapter(tmp, arr, labels, name)
+    adapter._normalizable_axes = False
+    server.sources._sources[name] = adapter
     server.mark_ready()
     threading.Thread(target=server.serve, daemon=True).start()
     time.sleep(0.8)
@@ -761,7 +681,7 @@ class TestRemoteProxyRefusesRatherThanPermutes:
             None,
         )
         assert canonical_permutation(["x", "y", "z"], [2, 3, 4]) is not None
-        assert normalize_adapter(proxy) is proxy
+        assert proxy._axis_perm() is None
         assert SourceRegistry().register("m", proxy) is proxy
 
     def test_a_legacy_upstream_is_refused_at_open(self):

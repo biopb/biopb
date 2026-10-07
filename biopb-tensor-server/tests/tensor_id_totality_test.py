@@ -61,7 +61,7 @@ class _SingleTensorAdapter(TensorAdapter):
         self._source_url = f"mock://{source_id}"
         self._source_type = "mock-single"
 
-    def get_tensor_descriptor(self) -> TensorDescriptor:
+    def _native_descriptor(self) -> TensorDescriptor:
         return TensorDescriptor(
             array_id=self.array_id,
             dim_labels=["y", "x"],
@@ -70,14 +70,14 @@ class _SingleTensorAdapter(TensorAdapter):
             dtype="uint8",
         )
 
-    def list_tensor_descriptors(self):
+    def _list_native_descriptors(self):
         return [self.get_tensor_descriptor()]
 
     def get_metadata(self) -> dict:
         return {}
 
-    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
-        super().get_data(bounds)
+    def _read_native(self, bounds: ChunkBounds) -> np.ndarray:
+        super()._read_native(bounds)
         shape = tuple(
             int(s - a) for a, s in zip(bounds.start, bounds.stop, strict=True)
         )

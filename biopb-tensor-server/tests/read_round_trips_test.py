@@ -32,7 +32,7 @@ class _QualifiedIdAdapter(MockMultifieldAdapter):
     qualified read miss its own catalog row.
     """
 
-    def list_tensor_descriptors(self):
+    def _list_native_descriptors(self):
         return [
             TensorDescriptor(
                 array_id=f"{self.source_id}/{tensor_id}",

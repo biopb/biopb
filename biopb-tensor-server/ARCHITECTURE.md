@@ -48,7 +48,7 @@ The `biopb_tensor_server` package is organized into layered subpackages:
 
 - **`core/`** — foundational primitives and contracts: adapter ABCs, the
   `claim()` discovery protocol, `config` (the schema and its file I/O, nothing
-  that reads a disk or a network), the `axes` vocabulary + its `normalize` seam.
+  that reads a disk or a network), the `axes` vocabulary + its `normalize` permutation helpers.
 - **`serving/`** — the runtime: `server` (Arrow Flight), `http_server` (FastAPI
   sidecar), `upload_manager`, `precache`, `renderer`, plus what those servers
   own directly: `metadata_db` (the DuckDB store whose `sources` / `rois` /
@@ -200,8 +200,8 @@ the catalog. A client that needs a grid describes the tensor; an empty
 
 ### Canonical axis order (biopb/biopb#596)
 
-Adapters read whatever axis order their upstream reader emits. The server
-normalizes that at the adapter seam, so the wire carries a guarantee instead of
+Adapters read whatever axis order their upstream reader emits. The adapter base
+normalizes that, so the wire carries a guarantee instead of
 each consumer re-deriving "which axis is Y/X/Z/S" with its own vocabulary:
 
 > **Z, Y, X and S appear last, in that relative order**; every other axis — T, C,
@@ -212,21 +212,24 @@ Relative order, not index: `[z, dimq, y, x]` normalizes to `[dimq, z, y, x]` —
 it. And only Z/Y/X/S count as trailing; T and C classify through the same
 vocabulary but have no canonical place, so they ride with the unlabeled.
 
-The rule is `core/axes.py::canonical_permutation`; `core/normalize.py` is the
-seam that applies it, and `SourceRegistry.register` — the single registration
-chokepoint — is where it attaches. An already-canonical adapter is returned
-**unchanged** (same object, same cost), which is nearly all of them: `bioio`
-fixes `TCZYXS` upstream, and OME-TIFF / QPTIFF / TIFF-sequence / ndtiff / DICOM
-are compliant by construction. `nifti` (which emits X before Y) is the one
-family whose behavior actually changes.
+The rule is `core/axes.py::canonical_permutation`; `core/normalize.py` holds the
+permutation helpers and `TensorAdapter` applies them. A leaf adapter implements
+the `_native_*` hooks (`_native_descriptor`, `_read_native`,
+`_list_native_descriptors`, `_decimated_native`, `_native_read_block_shape`,
+`_native_pyramid_levels`) in its reader's order; the public methods present them
+canonical, so the planner, scaled and streamed reads and the pyramid all work in
+canonical order with no translation of their own. Inside a leaf, `self` speaks
+native. Adapters that already emit canonical order (`bioio` fixes `TCZYXS`;
+OME-TIFF / QPTIFF / TIFF-sequence / ndtiff / DICOM) pay one `None` check per
+call.
 
 | | |
 |---|---|
 | **Not in scope** | Unlabeled stores (`zarr`) emit `dimN`, so nothing is reordered and nothing is relabeled — promoting a positional *guess* to a wire *assertion* would be wrong for e.g. an unlabeled `[y, x, c]`. Axis semantics come from the format; registration cannot relabel them. |
 | **Fail-safe** | Ambiguity degrades to identity rather than moving pixels on a guess: rank mismatch, a duplicated canonical axis, or an `S` label that fails `samples_axis`' size-3/4 gate. Same posture the render path took toward adapter-supplied labels. |
-| **chunk_ids** | Untouched — minted by the wrapped adapter and opaque here, so versioned / scaled / precompute-level ids all pass through. What is permuted is the client-visible geometry (descriptor + endpoint `bounds`) and the pixels. |
+| **chunk_ids** | Minted from the canonical geometry, like the rest of the plan. |
 | **Cache** | The transpose happens *before* the cache store, so a segment holds what the client is served and the localhost mmap fast path stays valid. `CACHE_FILE_FORMAT_VERSION` was bumped to `2` for that (same layout, reordered content); an older client declines the fast path and reads the same normalized chunk over `do_get`. |
-| **Plans** | `plan_flight_info` / `get_read_plan` are delegated and their answer permuted, not re-derived — which is what keeps the native-pyramid `precompute` routing working underneath. |
+| **Plans** | The base planner runs on the canonical descriptor; only the native-pyramid `precompute` routing translates a scale hint and level factors, because it matches on-disk levels. |
 
 An order this server does not own is **refused, not permuted** — permuting works
 only where the server owns the whole read path, and two seams don't. Both report

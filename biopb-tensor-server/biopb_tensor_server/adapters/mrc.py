@@ -279,7 +279,7 @@ class MrcAdapter(TensorAdapter):
         if underlying is not None:
             underlying.close()
 
-    def get_tensor_descriptor(self) -> TensorDescriptor:
+    def _native_descriptor(self) -> TensorDescriptor:
         return TensorDescriptor(
             array_id=self.array_id,
             dim_labels=self.dim_labels,
@@ -294,15 +294,15 @@ class MrcAdapter(TensorAdapter):
             dtype=self._dtype.str,
         )
 
-    def list_tensor_descriptors(self) -> List[TensorDescriptor]:
-        return [catalog_entry(self.get_tensor_descriptor())]
+    def _list_native_descriptors(self) -> List[TensorDescriptor]:
+        return [catalog_entry(self._native_descriptor())]
 
-    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
+    def _read_native(self, bounds: ChunkBounds) -> np.ndarray:
         """Read a sub-region through the source's shared mapping."""
-        super().get_data(bounds)
+        super()._read_native(bounds)
         return self._copy_out(self._bounds_to_slices(bounds))
 
-    def get_decimated_data(
+    def _decimated_native(
         self, bounds: ChunkBounds, step: Tuple[int, ...]
     ) -> Optional[np.ndarray]:
         """A strided slice of the same mapping: only the picked elements copy.
@@ -314,7 +314,7 @@ class MrcAdapter(TensorAdapter):
         page it steps across, which is why the saving is memcpy-and-cache first
         and I/O only where the stride outruns the readahead.
         """
-        super().get_data(bounds)
+        super()._read_native(bounds)
         return self._copy_out(self._bounds_to_strided_slices(bounds, step))
 
     def _copy_out(self, slices: Tuple[slice, ...]) -> np.ndarray:

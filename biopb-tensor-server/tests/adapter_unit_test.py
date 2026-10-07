@@ -385,10 +385,10 @@ class TestEmptyChunkShapeFallback:
                 dim_labels=list(dim_labels),
             )
 
-        def get_tensor_descriptor(self):
+        def _native_descriptor(self):
             return self._desc
 
-        def get_data(self, bounds):  # pragma: no cover - not exercised here
+        def _read_native(self, bounds):  # pragma: no cover - not exercised here
             raise NotImplementedError
 
         # The source half of the role, inherited since TensorAdapter subclasses
@@ -398,7 +398,7 @@ class TestEmptyChunkShapeFallback:
         def create_from_config(cls, source, credentials_config=None):
             raise NotImplementedError
 
-        def list_tensor_descriptors(self):
+        def _list_native_descriptors(self):
             return [self._desc]
 
         def get_metadata(self):

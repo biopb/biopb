@@ -83,7 +83,7 @@ class ScratchSource(SourceAdapter):
             "the scratch source is the server's own, never configured as a data source"
         )
 
-    def list_tensor_descriptors(self) -> List[TensorDescriptor]:
+    def _list_native_descriptors(self) -> List[TensorDescriptor]:
         """None of its own: every tensor here was uploaded, and
         the registry's listing appends the published ones after this."""
         return []

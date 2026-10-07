@@ -442,11 +442,7 @@ class RemoteTensorAdapter(TensorAdapter):
 
     # The upstream owns this source's axis order, so the server validates it
     # rather than permuting it (biopb/biopb#596) -- see
-    # ``_require_canonical_upstream`` and ``core.normalize``. Wrapping a proxy in
-    # a NormalizingAdapter would freeze a permutation derived from the labels the
-    # upstream advertised *at registration*, while ``seed_catalog`` keeps
-    # replacing those labels in place on every reconcile; an upstream that later
-    # upgraded to canonical order would then be re-permuted into the wrong one.
+    # ``_require_canonical_upstream`` and ``core.normalize``.
     _normalizable_axes = False
 
     # A miss here is an upstream round trip plus load on someone else's server,
@@ -800,7 +796,7 @@ class RemoteTensorAdapter(TensorAdapter):
             return {}
         return parsed if isinstance(parsed, dict) else {}
 
-    def list_tensor_descriptors(self) -> List[TensorDescriptor]:
+    def _list_native_descriptors(self) -> List[TensorDescriptor]:
         """Mirror this one upstream source's tensor descriptor(s).
 
         Fetched per-source via ``get_descriptor`` (a targeted GetFlightInfo), NOT
@@ -934,7 +930,7 @@ class RemoteTensorAdapter(TensorAdapter):
 
     # -------------------------------------------------------------- tensor layer
 
-    def get_tensor_descriptor(self) -> TensorDescriptor:
+    def _native_descriptor(self) -> TensorDescriptor:
         """Mirror the upstream tensor descriptor under the local array_id.
 
         Structure comes from the bulk-seeded cache when available
@@ -1097,14 +1093,14 @@ class RemoteTensorAdapter(TensorAdapter):
             flight_desc, options=self.client._call_options
         )
 
-    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
+    def _read_native(self, bounds: ChunkBounds) -> np.ndarray:
         """Fetch one region from the upstream (fallback / abstract-method satisfier).
 
         The hot path is ``resolve_chunk_data`` (it forwards the exact chunk_id so
         the upstream does any downsampling); this builds an upstream chunk_id for
         ``bounds`` and reads it back as a numpy array.
         """
-        super().get_data(bounds)  # validate bounds against the mirrored shape
+        super()._read_native(bounds)  # validate bounds against the mirrored shape
         upstream_chunk_id = encode_chunk_id(
             self._to_upstream_array_id(self.array_id), bounds
         )

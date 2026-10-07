@@ -107,8 +107,8 @@ def test_non_decimating_adapters_inherit_the_base(name):
     cls = _adapters().get(name)
     if cls is None:
         pytest.skip(f"{name} not importable in this environment")
-    owner = next((k for k in cls.__mro__ if "get_decimated_data" in vars(k)), None)
-    assert owner is TensorAdapter, f"{name} declares get_decimated_data"
+    owner = next((k for k in cls.__mro__ if "_decimated_native" in vars(k)), None)
+    assert owner is TensorAdapter, f"{name} declares _decimated_native"
 
 
 @pytest.mark.parametrize("name", sorted(DECIMATING))
@@ -116,7 +116,7 @@ def test_decimating_adapters_declare_it(name):
     cls = _adapters().get(name)
     if cls is None:
         pytest.skip(f"{name} not importable in this environment")
-    owner = next((k for k in cls.__mro__ if "get_decimated_data" in vars(k)), None)
+    owner = next((k for k in cls.__mro__ if "_decimated_native" in vars(k)), None)
     assert owner is not None and owner is not TensorAdapter, (
         f"{name} inherits the base None but is listed as decimating"
     )
@@ -124,7 +124,7 @@ def test_decimating_adapters_declare_it(name):
 
 def test_the_base_declines():
     """The default is to decline, which is what keeps a new adapter correct."""
-    assert TensorAdapter.get_decimated_data(None, None, None) is None
+    assert TensorAdapter._decimated_native(None, None, None) is None
 
 
 class TestDecimatedEqualsReadThenStride:
@@ -145,8 +145,13 @@ class TestDecimatedEqualsReadThenStride:
         assert picked.shape == expected.shape
         assert picked.dtype == expected.dtype
         assert np.array_equal(picked, expected)
-        # Rule 3: owned. A view onto a mapping outlives nothing safely.
-        assert picked.base is None
+        # Rule 3: owned. A view onto a mapping outlives nothing safely. A
+        # transpose over an owned array (a non-canonical adapter's canonical
+        # view) is fine, so follow the chain of arrays to its owner.
+        owner = picked
+        while isinstance(owner.base, np.ndarray):
+            owner = owner.base
+        assert owner.base is None
         return picked
 
     def test_mrc(self, tmp_path):
@@ -176,8 +181,8 @@ class TestDecimatedEqualsReadThenStride:
         create_synthetic_nifti(path, shape=(16, 12, 8), dtype=np.float32)
         adapter = NiftiAdapter(nib.load(str(path)), "nifti")
         try:
-            self._check(adapter, (0, 0, 0), (16, 12, 8), (4, 3, 2))
-            self._check(adapter, (3, 1, 0), (15, 12, 7), (5, 4, 3))
+            self._check(adapter, (0, 0, 0), (8, 12, 16), (2, 3, 4))
+            self._check(adapter, (0, 1, 3), (7, 12, 15), (3, 4, 5))
         finally:
             adapter.close()
 

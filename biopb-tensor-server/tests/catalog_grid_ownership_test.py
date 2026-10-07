@@ -111,7 +111,7 @@ def test_catalog_tensors_strips_a_grid_the_listing_leaked(live_sources):
         def is_resident(self):
             return True
 
-        def list_tensor_descriptors(self):
+        def _list_native_descriptors(self):
             return [
                 TensorDescriptor(
                     array_id="leaky",

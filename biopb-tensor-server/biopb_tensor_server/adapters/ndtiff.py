@@ -417,7 +417,7 @@ class NdTiffAdapter(TensorAdapter):
             summary=metadata,
         )
 
-    def get_tensor_descriptor(self) -> TensorDescriptor:
+    def _native_descriptor(self) -> TensorDescriptor:
         """Return TensorDescriptor for this adapter."""
         return TensorDescriptor(
             array_id=self.array_id,
@@ -427,12 +427,12 @@ class NdTiffAdapter(TensorAdapter):
             dtype=self._dtype,
         )
 
-    def list_tensor_descriptors(self) -> List[TensorDescriptor]:
+    def _list_native_descriptors(self) -> List[TensorDescriptor]:
         """List all tensors - single tensor source."""
-        return [catalog_entry(self.get_tensor_descriptor())]
+        return [catalog_entry(self._native_descriptor())]
 
     @property
-    def read_block_shape(self) -> Optional[Tuple[int, ...]]:
+    def _native_read_block_shape(self) -> Optional[Tuple[int, ...]]:
         """One plane -- the ``native=`` seed above, and the dask block behind it.
 
         A read slices the dask array, which materialises whole blocks whatever
@@ -440,7 +440,7 @@ class NdTiffAdapter(TensorAdapter):
         """
         return tuple([1] * (len(self._shape) - 2) + list(self._shape[-2:]))
 
-    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
+    def _read_native(self, bounds: ChunkBounds) -> np.ndarray:
         """Read data within bounds from the dask array.
 
         Args:
@@ -449,7 +449,7 @@ class NdTiffAdapter(TensorAdapter):
         Returns:
             Numpy array with data within the requested bounds
         """
-        super().get_data(bounds)
+        super()._read_native(bounds)
         slices = self._bounds_to_slices(bounds)
 
         with self._leased() as handle, handle.lock:

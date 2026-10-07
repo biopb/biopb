@@ -15,9 +15,9 @@ which decodes the scale and the reduction method from the chunk_id and calls
 get_scaled_data(bounds, scale_hint, reduction_method, cache_manager)
 ```
 
-An unscaled chunk calls `get_data(bounds)` instead. `NormalizingAdapter` needs
-nothing: it forwards the chunk_id verbatim, so the wrapped adapter reduces in
-native axis order and the wrapper transposes the small result.
+An unscaled chunk calls `get_data(bounds)` instead. Both are canonical-order
+surfaces: a non-canonical adapter implements the `_native_*` hooks and the base
+transposes.
 `RemoteTensorAdapter` forwards the chunk_id upstream and never reduces locally.
 
 ### The contract
