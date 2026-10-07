@@ -27,7 +27,6 @@ import re
 import struct
 import sys
 import xml.etree.ElementTree as ET
-from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
@@ -686,20 +685,12 @@ class OmeTiffAdapter(TensorAdapter):
             self._content_version,
         )
 
-    @contextmanager
     def _leased_store(self):
         """Lease this scene's store: pooled, or opened for this read alone when
         :meth:`_should_persist_store` says the file is too small to keep open."""
-        if self._should_persist_store():
-            with _store_pool.checkout(self._pool_key(), self._open_pooled) as handle:
-                yield handle
-            return
-        handle = self._open_pooled()
-        try:
-            yield handle
-        finally:
-            if handle is not None:
-                handle.close()
+        return _store_pool.checkout(
+            self._pool_key(), self._open_pooled, persist=self._should_persist_store()
+        )
 
     def _open_pooled(self) -> Optional[PooledHandle]:
         """Open this scene's store as a handle the pool (or the caller) closes.
@@ -718,7 +709,10 @@ class OmeTiffAdapter(TensorAdapter):
 
         def close():
             for obj in (store, tiff):
-                obj.close()
+                try:
+                    obj.close()
+                except Exception:
+                    logger.debug("error closing aszarr store", exc_info=True)
 
         return PooledHandle(self._pool_key(), (za, axes), close)
 

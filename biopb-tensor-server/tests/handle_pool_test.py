@@ -123,3 +123,31 @@ def test_the_process_ceiling_caps_the_pool_ttl():
         assert pool.ttl == 5.0
     finally:
         set_handle_reaper_ttl(float("inf"))
+
+
+def test_concurrent_misses_on_one_key_open_once(pool):
+    import threading
+
+    open_fn = _Opener("a")
+    slow = lambda: (time.sleep(0.05), open_fn())[1]  # noqa: E731
+    leased = []
+
+    def work():
+        with pool.checkout("a", slow) as handle:
+            leased.append(handle)
+
+    threads = [threading.Thread(target=work) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert open_fn.opened == 1
+    assert len({id(h) for h in leased}) == 1
+
+
+def test_a_non_persistent_checkout_closes_at_the_end_and_is_not_pooled(pool):
+    open_fn = _Opener("a")
+    with pool.checkout("a", open_fn, persist=False) as handle:
+        assert handle is not None
+        assert len(pool) == 0
+    assert open_fn.closed == 1

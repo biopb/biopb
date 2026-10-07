@@ -18,7 +18,7 @@ import time
 from contextlib import contextmanager
 from typing import Any, Callable, Dict, Hashable, Iterator, Optional
 
-from biopb_tensor_server.adapters._handle_reaper import _NO_CEILING, _configured_reapers
+from biopb_tensor_server.adapters._handle_reaper import TtlCeiling
 
 logger = logging.getLogger(__name__)
 
@@ -42,28 +42,18 @@ class PooledHandle:
             logger.debug("error closing pooled handle %r", self.key, exc_info=True)
 
 
-class HandlePool:
+class HandlePool(TtlCeiling):
+    """Open handles by key, with an idle TTL (``<= 0`` keeps nothing between
+    reads) and an LRU cap."""
+
     def __init__(self, ttl_seconds: float, max_handles: int, thread_name: str) -> None:
-        self._pool_ttl = float(ttl_seconds)
-        self._ceiling = _NO_CEILING
+        super().__init__(ttl_seconds)
         self.max_handles = int(max_handles)
         self._thread_name = thread_name
         self._handles: Dict[Hashable, PooledHandle] = {}
+        self._opening: Dict[Hashable, threading.Lock] = {}
         self._lock = threading.Lock()
         self._started = False
-        _configured_reapers.add(self)
-
-    @property
-    def ttl(self) -> float:
-        """This pool's own TTL, capped by the process-wide ceiling
-        (:func:`set_handle_reaper_ttl`). ``<= 0`` keeps nothing between reads."""
-        return min(self._pool_ttl, self._ceiling)
-
-    def set_ttl(self, seconds: float) -> None:
-        self._pool_ttl = float(seconds)
-
-    def set_ceiling(self, seconds: float) -> None:
-        self._ceiling = float(seconds)
 
     def __len__(self) -> int:
         with self._lock:
@@ -71,21 +61,45 @@ class HandlePool:
 
     @contextmanager
     def checkout(
-        self, key: Hashable, open_fn: Callable[[], Optional[PooledHandle]]
+        self,
+        key: Hashable,
+        open_fn: Callable[[], Optional[PooledHandle]],
+        *,
+        persist: bool = True,
     ) -> Iterator[Optional[PooledHandle]]:
         """Lease the handle for *key*, opening it with *open_fn* on a miss.
 
         ``open_fn`` returns a :class:`PooledHandle`, or None when the file has
-        no usable handle (the lease then yields None). Two threads missing at
-        once may both open; the first to publish wins and the other's is closed.
+        no usable handle (the lease then yields None). Concurrent misses on one
+        key open once: the rest wait for the first and lease its handle.
+        ``persist=False`` opens a handle for this lease alone and closes it at
+        the end, never publishing it.
         """
+        if not persist:
+            handle = open_fn()
+            try:
+                yield handle
+            finally:
+                if handle is not None:
+                    handle.close()
+            return
         handle = self._lease(key)
         if handle is None:
-            opened = open_fn()
-            if opened is None:
+            opening = self._opening_lock(key)
+            try:
+                with opening:
+                    handle = self._lease(key)
+                    if handle is None:
+                        opened = open_fn()
+                        if opened is not None:
+                            handle = self._publish(opened)
+            finally:
+                with self._lock:
+                    if self._opening.get(key) is opening:
+                        del self._opening[key]
+            if handle is None:
                 yield None
                 return
-            handle = self._publish(opened)
         try:
             yield handle
         finally:
@@ -121,28 +135,37 @@ class HandlePool:
         for h in idle:
             h.close()
 
+    def _opening_lock(self, key: Hashable) -> threading.Lock:
+        with self._lock:
+            return self._opening.setdefault(key, threading.Lock())
+
+    @staticmethod
+    def _touch(handle: PooledHandle) -> None:
+        handle.leases += 1
+        handle.last_access = time.monotonic()
+
     def _lease(self, key: Hashable) -> Optional[PooledHandle]:
         with self._lock:
             handle = self._handles.get(key)
             if handle is not None and not handle.doomed:
-                handle.leases += 1
-                handle.last_access = time.monotonic()
+                self._touch(handle)
                 return handle
         return None
 
     def _publish(self, opened: PooledHandle) -> PooledHandle:
+        """Pool *opened* leased once; an earlier handle for its key wins and
+        *opened* is closed."""
         excess = []
+        loser = None
         with self._lock:
-            existing = self._handles.get(opened.key)
-            if existing is not None and not existing.doomed:
-                existing.leases += 1
-                existing.last_access = time.monotonic()
-                winner, loser = existing, opened
+            winner = self._handles.get(opened.key)
+            if winner is not None and not winner.doomed:
+                loser = opened
             else:
-                opened.leases += 1
+                winner = opened
                 self._handles[opened.key] = opened
-                winner, loser = opened, None
                 excess = self._over_cap()
+            self._touch(winner)
             self._start_sweeper()
         if loser is not None:
             loser.close()

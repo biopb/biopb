@@ -118,6 +118,9 @@ class _QptiffFile:
         Default chunkmode, so the zarr chunks are the QPTIFF's native tile grid --
         the access granularity we advertise as ``chunk_shape``.
         """
+        cached = self._level_stores.get(level)
+        if cached is not None:
+            return cached
         with self.lock:
             cached = self._level_stores.get(level)
             if cached is not None:

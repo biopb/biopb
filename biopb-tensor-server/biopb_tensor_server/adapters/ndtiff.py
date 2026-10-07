@@ -228,7 +228,7 @@ class NdTiffAdapter(TensorAdapter):
     ) -> NdTiffAdapter:
         """Create adapter instance from SourceConfig.
 
-        Builds a ``reopen`` thunk capturing the url + credentials so the reaper
+        Builds a ``reopen`` thunk capturing the url + credentials so the pool
         can close the acquisition when idle and a later read can reopen it (see
         the module docstring), opens it once for the initial handle, and hands
         both to the adapter.
@@ -263,7 +263,7 @@ class NdTiffAdapter(TensorAdapter):
         """Return a zero-arg thunk that (re)opens the ``NDTiffDataset``.
 
         The same construction ``create_from_config`` used, replayable by the read
-        path after the reaper closes the dataset. Imports are deferred to call
+        path after the pool closes the dataset. Imports are deferred to call
         time so an env without ndtiff (or fsspec) still imports this module.
         """
 
@@ -310,7 +310,7 @@ class NdTiffAdapter(TensorAdapter):
             structure / summary: a restored source's axes, shape and dtype and its
                 summary metadata (``catalog_payload`` and the row), given with no
                 *dataset* (``None``) and a *reopen*: nothing is opened until a read
-                needs the acquisition, as after the reaper closes an idle one.
+                needs the acquisition, as after the pool closes an idle one.
         """
         self._reopen = reopen
         self.source_id = source_id
@@ -495,7 +495,7 @@ class NdTiffAdapter(TensorAdapter):
         """Return dataset summary metadata (MicroManager acquisition settings).
 
         Served from the snapshot taken at registration, so it stands even after
-        the reaper has closed the underlying dataset.
+        the pool has closed the underlying dataset.
         """
         return self._summary_metadata
 

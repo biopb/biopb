@@ -650,11 +650,9 @@ class CziAdapter(TensorAdapter):
         )
 
     def close(self) -> None:
-        """Release this file's reader (at its last lease) rather than waiting for
-        the pool's TTL."""
+        """Release this file's reader (shared by every scene; closed at its last
+        lease) rather than waiting for the pool's TTL."""
         _reader_pool.drop(self._pool_key())
-        for adapter in list(self._tensor_adapters.values()):
-            adapter.close()
 
     # ---- metadata -----------------------------------------------------------
 

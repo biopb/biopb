@@ -68,7 +68,7 @@ _NO_CEILING = float("inf")
 
 # Every constructed reaper, so one config knob can retune them all at startup.
 # Weak, so a reaper built in a test is not pinned for the process lifetime.
-_configured_reapers: "weakref.WeakSet[IdleHandleReaper]" = weakref.WeakSet()
+_configured_reapers: "weakref.WeakSet[TtlCeiling]" = weakref.WeakSet()
 
 
 def set_handle_reaper_ttl(seconds: float) -> None:
@@ -89,6 +89,33 @@ def set_handle_reaper_ttl(seconds: float) -> None:
         reaper.set_ceiling(seconds)
 
 
+class TtlCeiling:
+    """An idle TTL of the pool's own, capped by the process-wide ceiling.
+
+    Shared by :class:`IdleHandleReaper` and ``_handle_pool.HandlePool`` so one
+    :func:`set_handle_reaper_ttl` retunes both kinds.
+    """
+
+    def __init__(self, ttl_seconds: float) -> None:
+        self._pool_ttl = float(ttl_seconds)
+        self._ceiling = _NO_CEILING
+        _configured_reapers.add(self)
+
+    @property
+    def ttl(self) -> float:
+        """Effective TTL: this pool's own, capped by the process-wide ceiling."""
+        return min(self._pool_ttl, self._ceiling)
+
+    def set_ttl(self, seconds: float) -> None:
+        """Retune this pool's own TTL; ``<= 0`` disables the pool."""
+        self._pool_ttl = float(seconds)
+
+    def set_ceiling(self, seconds: float) -> None:
+        """Cap this pool's TTL from process-wide config. See
+        :func:`set_handle_reaper_ttl`."""
+        self._ceiling = float(seconds)
+
+
 @runtime_checkable
 class ReapableHandle(Protocol):
     """What the reaper needs from an adapter holding a persistent handle."""
@@ -106,7 +133,7 @@ class ReapableHandle(Protocol):
         ...
 
 
-class IdleHandleReaper:
+class IdleHandleReaper(TtlCeiling):
     """Closes persistent handles idle longer than a TTL, on one daemon thread.
 
     One instance per handle pool (e.g. one for OME-TIFF stores, one for NDTiff
@@ -138,8 +165,7 @@ class IdleHandleReaper:
                 OME-TIFF store holds a parsed IFD table, so there is no
                 defensible shared default to inherit by accident.
         """
-        self._pool_ttl = float(ttl_seconds)
-        self._ceiling = _NO_CEILING
+        super().__init__(ttl_seconds)
         self._max_handles = int(max_handles)
         self._thread_name = thread_name
         self._adapters: weakref.WeakSet = weakref.WeakSet()
@@ -149,28 +175,11 @@ class IdleHandleReaper:
         # itself.
         self._lock = threading.RLock()
         self._started = False
-        _configured_reapers.add(self)
-
-    @property
-    def ttl(self) -> float:
-        """Effective TTL: this pool's own, capped by the process-wide ceiling."""
-        return min(self._pool_ttl, self._ceiling)
 
     @property
     def enabled(self) -> bool:
         """Whether reaping is active (effective TTL > 0)."""
         return self.ttl > 0
-
-    def set_ttl(self, seconds: float) -> None:
-        """Retune this pool's own TTL. Read live by ``register``/``_sweep``, so a
-        value applied at startup (before the thread lazily starts) fully takes
-        effect; ``<= 0`` disables the pool."""
-        self._pool_ttl = float(seconds)
-
-    def set_ceiling(self, seconds: float) -> None:
-        """Cap this pool's TTL from process-wide config. See
-        :func:`set_handle_reaper_ttl`."""
-        self._ceiling = float(seconds)
 
     def register(self, adapter: ReapableHandle) -> None:
         """Track an adapter that just opened its handle; start the thread if needed.
