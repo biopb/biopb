@@ -8,6 +8,7 @@ import com.google.protobuf.InvalidProtocolBufferException;
 
 import net.imglib2.RandomAccess;
 import net.imglib2.type.NativeType;
+import net.imglib2.type.numeric.IntegerType;
 import net.imglib2.type.numeric.RealType;
 import net.imglib2.type.numeric.integer.ByteType;
 import net.imglib2.type.numeric.integer.IntType;
@@ -131,10 +132,9 @@ final class TensorChunkCodec {
      * read back as a {@link FloatType} loses every id above 2^24, silently --
      * which is exactly the case a label set is (biopb/biopb#1059).
      *
-     * <p>The type is right; the values reaching it are not yet. {@link
-     * ChunkDecoder} still decodes to {@code double[]} and {@link #writeChunk}
-     * still scatters with {@code setReal}, so {@code i8}/{@code u8} lose the
-     * same way above 2^53 -- biopb/biopb#1071.
+     * <p>Integer values reach it exactly: {@link ChunkDecoder} decodes the
+     * integer kinds to {@code long[]} and {@link #writeChunk} sets them with
+     * {@code setInteger}, so an {@code i8}/{@code u8} id above 2^53 survives.
      */
     static NativeType<?> createType(String dtype) {
         switch (normalizeDtype(dtype)) {
@@ -206,7 +206,35 @@ final class TensorChunkCodec {
             RandomAccess<T> access,
             ChunkBounds bounds,
             double[] values) {
+        scatter(access, bounds, values.length, (type, index) -> type.setReal(values[index]));
+    }
 
+    /**
+     * {@link #writeChunk(RandomAccess, ChunkBounds, double[])} for integer
+     * chunks, exact for every 64-bit value.
+     *
+     * <p>A target that is not an {@link IntegerType} takes the value as a
+     * {@code double}, as it would have before.
+     */
+    static <T extends NativeType<T> & RealType<T>> void writeChunk(
+            RandomAccess<T> access,
+            ChunkBounds bounds,
+            long[] values) {
+        if (access.get() instanceof IntegerType) {
+            scatter(access, bounds, values.length,
+                    (type, index) -> ((IntegerType<?>) type).setInteger(values[index]));
+        } else {
+            scatter(access, bounds, values.length, (type, index) -> type.setReal(values[index]));
+        }
+    }
+
+    /** Sets one element of the target type from the chunk's {@code index}th value. */
+    private interface Setter<T> {
+        void set(T type, int index);
+    }
+
+    private static <T extends NativeType<T> & RealType<T>> void scatter(
+            RandomAccess<T> access, ChunkBounds bounds, int count, Setter<T> setter) {
         long[] start = toLongArray(bounds.getStartList());
         long[] stop = toLongArray(bounds.getStopList());
         long[] chunkShape = new long[start.length];
@@ -215,19 +243,19 @@ final class TensorChunkCodec {
             chunkShape[axis] = stop[axis] - start[axis];
             expectedSize *= chunkShape[axis];
         }
-        if (expectedSize != values.length) {
+        if (expectedSize != count) {
             throw new IllegalStateException(
-                    "Chunk size mismatch: expected " + expectedSize + " values but received " + values.length);
+                    "Chunk size mismatch: expected " + expectedSize + " values but received " + count);
         }
 
         long[] localPosition = new long[chunkShape.length];
         long[] globalPosition = new long[chunkShape.length];
-        for (int index = 0; index < values.length; index++) {
+        for (int index = 0; index < count; index++) {
             for (int axis = 0; axis < chunkShape.length; axis++) {
                 globalPosition[axis] = start[axis] + localPosition[axis];
             }
             access.setPosition(globalPosition);
-            access.get().setReal(values[index]);
+            setter.set(access.get(), index);
             advanceRowMajor(localPosition, chunkShape);
         }
     }

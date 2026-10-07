@@ -135,6 +135,70 @@ public class TensorChunkCodecTest {
         TensorChunkCodec.writeChunk(img.randomAccess(), bounds, new double[] {1, 2, 3});
     }
 
+    private static byte[] leLongs(long... values) {
+        java.nio.ByteBuffer buf = java.nio.ByteBuffer.allocate(8 * values.length)
+                .order(java.nio.ByteOrder.LITTLE_ENDIAN);
+        for (long v : values) {
+            buf.putLong(v);
+        }
+        return buf.array();
+    }
+
+    /** A 1-D chunk of {@code n} elements at the origin. */
+    private static ChunkBounds line(int n) {
+        return ChunkBounds.newBuilder().addStart(0).addStop(n).build();
+    }
+
+    @Test
+    public void i8_ids_above_2_pow_53_survive_the_read_path() {
+        long[] ids = {1L, (1L << 53) + 1, (1L << 53) + 3, Long.MAX_VALUE - 1, Long.MIN_VALUE};
+        ChunkValues values = ChunkValues.decode(
+                Arrays.asList(leLongs(ids)), Arrays.asList("<i8"));
+        ArrayImg<LongType, ?> img = new ArrayImgFactory<>(new LongType()).create(ids.length);
+        values.writeTo(img.randomAccess(), line(ids.length));
+        RandomAccess<LongType> access = img.randomAccess();
+        for (int i = 0; i < ids.length; i++) {
+            access.setPosition(i, 0);
+            Assert.assertEquals(ids[i], access.get().get());
+        }
+    }
+
+    @Test
+    public void u8_ids_above_2_pow_63_survive_the_read_path() {
+        long[] ids = {(1L << 53) + 1, -2L /* 2^64 - 2 */};
+        ChunkValues values = ChunkValues.decode(
+                Arrays.asList(leLongs(ids)), Arrays.asList("<u8"));
+        ArrayImg<UnsignedLongType, ?> img =
+                new ArrayImgFactory<>(new UnsignedLongType()).create(ids.length);
+        values.writeTo(img.randomAccess(), line(ids.length));
+        RandomAccess<UnsignedLongType> access = img.randomAccess();
+        for (int i = 0; i < ids.length; i++) {
+            access.setPosition(i, 0);
+            Assert.assertEquals(ids[i], access.get().get());
+        }
+    }
+
+    @Test
+    public void unsigned_narrow_integers_are_zero_extended() {
+        long[] out = new long[2];
+        ChunkDecoder.decodeChunkIntegers(new byte[] {(byte) 0xFF, 1}, "|u1", out, 0);
+        Assert.assertArrayEquals(new long[] {255, 1}, out);
+        ChunkDecoder.decodeChunkIntegers(new byte[] {(byte) 0xFF, (byte) 0xFF, 1, 0}, "<u2", out, 0);
+        Assert.assertArrayEquals(new long[] {65535, 1}, out);
+    }
+
+    @Test
+    public void a_chunk_split_across_rows_decodes_in_order() {
+        ChunkValues values = ChunkValues.decode(
+                Arrays.asList(leLongs(1, 2), leLongs(3)), Arrays.asList("<i8", "<i8"));
+        Assert.assertEquals(3, values.length());
+    }
+
+    @Test(expected = IllegalStateException.class)
+    public void rows_mixing_integer_and_float_dtypes_are_refused() {
+        ChunkValues.decode(Arrays.asList(leLongs(1), leLongs(2)), Arrays.asList("<i8", "<f8"));
+    }
+
     private static float valueAt(RandomAccess<? extends NativeType<?>> access, long x, long y) {
         access.setPosition(new long[] {x, y});
         return ((FloatType) access.get()).get();

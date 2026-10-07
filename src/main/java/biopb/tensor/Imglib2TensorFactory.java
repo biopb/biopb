@@ -1,7 +1,6 @@
 package biopb.tensor;
 
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
 
 import org.apache.arrow.flight.FlightEndpoint;
@@ -143,7 +142,7 @@ final class Imglib2TensorFactory {
         RandomAccess<T> access = image.randomAccess();
 
         for (ChunkRef chunk : chunks) {
-            writeChunk(access, chunk.bounds, fetchChunkValues(chunk.ticket));
+            fetchChunkValues(chunk.ticket).writeTo(access, chunk.bounds);
         }
         return image;
     }
@@ -155,12 +154,13 @@ final class Imglib2TensorFactory {
         if (chunk == null) {
             throw new IllegalStateException("No Flight endpoint found for cell index " + cellIndex);
         }
-        writeChunk(cell.randomAccess(), chunk.bounds, fetchChunkValues(chunk.ticket));
+        fetchChunkValues(chunk.ticket).writeTo(cell.randomAccess(), chunk.bounds);
     }
 
-    private double[] fetchChunkValues(Ticket ticket) {
+    private ChunkValues fetchChunkValues(Ticket ticket) {
         try (FlightStream stream = session.getStream(ticket)) {
-            double[] values = new double[0];
+            List<byte[]> rows = new ArrayList<>();
+            List<String> dtypes = new ArrayList<>();
             while (stream.next()) {
                 FieldVector dataVector = stream.getRoot().getVector("data");
                 FieldVector dtypeVector = stream.getRoot().getVector("dtype");
@@ -175,14 +175,11 @@ final class Imglib2TensorFactory {
                                 + (rowObj == null ? "null" : rowObj.getClass()));
                     }
                     Object dtypeObj = dtypeVector.getObject(row);
-                    double[] decoded = ChunkDecoder.decodeChunkBytes((byte[]) rowObj,
-                            dtypeObj == null ? "" : dtypeObj.toString());
-                    int offset = values.length;
-                    values = Arrays.copyOf(values, offset + decoded.length);
-                    System.arraycopy(decoded, 0, values, offset, decoded.length);
+                    rows.add((byte[]) rowObj);
+                    dtypes.add(dtypeObj == null ? "" : dtypeObj.toString());
                 }
             }
-            return values;
+            return ChunkValues.decode(rows, dtypes);
         } catch (FlightRuntimeException error) {
             throw TensorErrorMapper.map(error);
         } catch (RuntimeException error) {
