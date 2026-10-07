@@ -19,7 +19,7 @@ pytest.importorskip("h5py")
 
 from biopb.tensor.ticket_pb2 import ChunkBounds  # noqa: E402
 
-from tests import catalog_server, register_and_catalog
+from tests import catalog_server, register_and_catalog, source_ids
 
 
 def create_synthetic_emd(
@@ -283,7 +283,7 @@ class TestEmdAdapterIntegration:
                     client = TensorFlightClient(
                         f"grpc://localhost:{server.port}", cache_bytes=10_000_000
                     )
-                    assert source_id in client.list_sources()
+                    assert source_id in source_ids(client)
                     darr = client.get_tensor(array_id)  # source_id/field
                     assert tuple(darr.shape) == tuple(expected.shape)
                     np.testing.assert_array_equal(darr.compute(), expected)

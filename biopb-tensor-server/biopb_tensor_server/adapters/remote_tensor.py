@@ -304,9 +304,7 @@ def list_upstream_source_ids(client, location: str) -> List[str]:
     canonical browse surface, biopb/biopb#225), paged past the upstream's row cap,
     so the result is complete and a caller may reconcile destructively against it.
 
-    An upstream with no readable catalog raises rather than degrading: the only
-    fallback there ever was is ``list_sources()``, which in protocol v2 runs
-    this same query and so fails identically.
+    An upstream with no readable catalog raises rather than degrading.
     """
     return [
         row["source_id"]
@@ -745,7 +743,7 @@ class RemoteTensorAdapter(TensorAdapter):
     def get_metadata(self) -> dict:
         """Mirror the upstream source's metadata dict (OME etc.), best-effort.
 
-        ``list_flights`` / ``list_sources`` is deliberately lean and leaves
+        ``list_flights`` is deliberately lean and leaves
         ``metadata_json`` empty, and the only *live* RPC that fills it
         (``GetFlightInfo(with_metadata=True)``) returns it *wrapped* in a
         ``{"type","dim_label","metadata"}`` envelope. Instead read it from the
@@ -789,7 +787,7 @@ class RemoteTensorAdapter(TensorAdapter):
         """Mirror this one upstream source's tensor descriptor(s).
 
         Fetched per-source via ``get_descriptor`` (a targeted GetFlightInfo), NOT
-        by scanning the upstream's whole ``list_sources()`` catalog: that call is
+        by scanning the upstream's whole catalog: a ``query`` is
         *capped* (``max_query_results``), so for a large upstream this source
         could be truncated out of it -- and it would re-fetch the entire catalog
         on every listing, an O(N^2) cost. A single source's descriptor has no
@@ -897,7 +895,7 @@ class RemoteTensorAdapter(TensorAdapter):
         descriptor it hands back *is* the artifact that would violate the
         guarantee -- a consumer that trusted it would mis-map its axes just as
         surely as one that read the pixels. The **catalog** surface is untouched:
-        ``list_flights`` / ``list_sources`` still enumerate the source, so an
+        ``list_flights`` still enumerates the source, so an
         operator sees the broken thing and a legible reason rather than a silent
         disappearance.
 

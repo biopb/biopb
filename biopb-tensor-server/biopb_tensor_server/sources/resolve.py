@@ -117,8 +117,7 @@ def _discover_tensor_server(
         return [replace(source, source_id=local_id)]
 
     # Bare-host form: mirror every source on the upstream. Enumerate via the
-    # complete server-side catalog (not the capped list_sources -- see
-    # list_upstream_source_ids).
+    # complete server-side catalog (see list_upstream_source_ids).
     from biopb.tensor import TensorFlightClient
 
     credentials = resolve_upstream_credentials(source, credentials_config)
@@ -213,7 +212,7 @@ def discover_sources(
         source: Source configuration
         registry: Optional adapter registry (uses default if None)
         credentials_config: Optional CredentialsConfig, used to authenticate the
-            upstream ``list_sources`` call when expanding a tensor-server source.
+            upstream catalog query when expanding a tensor-server source.
 
     Returns:
         List of concrete SourceConfig objects (one per data source, NOT expanded to tensors)

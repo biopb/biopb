@@ -21,7 +21,7 @@ from biopb_tensor_server.core.adapter_base import catalog_tensors
 from biopb_tensor_server.core.discovery import DiscoveryState
 from biopb_tensor_server.sources.roots import DND_URL_PREFIX, _drop_catalog_url
 
-from tests import catalog_server, make_manager
+from tests import catalog_server, make_manager, source_ids
 
 
 def _zarr_available() -> bool:
@@ -513,7 +513,7 @@ class TestAddSourceRoundtrip:
             assert not result.failed
 
             # The new source is now listable and readable.
-            assert sid in client.list_sources()
+            assert sid in source_ids(client)
             darr = client.get_tensor(sid)
             assert darr.compute().shape == (4, 8, 8)
 
@@ -661,14 +661,12 @@ class TestRemoveSourceRoundtrip:
             added = client.register_local_path(str(root))
             assert len(added.added) == 2
             sids = set(added.added)
-            assert sids <= set(client.list_sources())
+            assert sids <= source_ids(client)
 
-            # Remove the whole dropped branch by its dnd:// root, through the
-            # deprecated alias -- same RPC, so this doubles as its coverage.
-            with pytest.warns(DeprecationWarning, match="remove_source"):
-                result = client.remove_source("dnd://exp")
+            # Remove the whole dropped branch by its dnd:// root.
+            result = client.deregister_local_path("dnd://exp")
             assert set(result.removed) == sids and not result.failed
-            assert not (sids & set(client.list_sources()))
+            assert not (sids & source_ids(client))
 
             # A non-dnd root is refused server-side.
             import pyarrow.flight as flight

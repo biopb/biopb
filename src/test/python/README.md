@@ -42,7 +42,7 @@ mvn -B test
 ## Test coverage
 
 ### Client tests
-- `list_sources()` returns DataSourceDescriptor with tensor metadata
+- `query()` returns source rows with tensor metadata
 - `get_tensor(array_id)` returns lazy array
 - Chunk loading, caching, scaled reads
 - Error handling for invalid source/tensor IDs

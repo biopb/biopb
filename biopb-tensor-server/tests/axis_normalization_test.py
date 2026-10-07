@@ -34,7 +34,7 @@ from biopb_tensor_server.core.source_registry import SourceRegistry
 from biopb_tensor_server.serving.server import TensorFlightServer
 from google.protobuf.field_mask_pb2 import FieldMask
 
-from tests import catalog_server, register_and_catalog
+from tests import catalog_server, register_and_catalog, source_ids
 
 
 def _zarr_available() -> bool:
@@ -814,7 +814,7 @@ class TestRemoteProxyRefusesRatherThanPermutes:
         time.sleep(0.8)
         try:
             client = TensorFlightClient(f"grpc://localhost:{down.port}")
-            assert "m" in client.list_sources()
+            assert "m" in source_ids(client)
             with pytest.raises(Exception, match="canonical"):
                 client.get_descriptor("m")
             client.close()

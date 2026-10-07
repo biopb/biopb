@@ -1,6 +1,12 @@
 """Tests for biopb-tensor-server."""
 
 
+def source_ids(client):
+    """The ``source_id`` set of every source the server's catalog holds."""
+    rows = client.query("SELECT source_id FROM sources", format="records")
+    return {r["source_id"] for r in rows}
+
+
 def catalog_server(*args, **kwargs):
     """A ``TensorFlightServer`` with a catalog, wired the way ``cli.py`` wires one.
 

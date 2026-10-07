@@ -75,10 +75,8 @@ _OPT_SLICE = typer.Option(
 def _browse(client) -> dict:
     """The catalog as ``{source_id: row}``.
 
-    ``query`` rather than the deprecated ``list_sources``: same rows
-    and the same server-side cap, but a row carries ``is_resolved``, which the
-    listing needs to tell "not resolved yet" from "nothing readable in it"
-    (biopb/biopb#1032).
+    Rows carry ``is_resolved``, which the listing needs to tell "not resolved
+    yet" from "nothing readable in it".
     """
     rows = client.query(
         f"SELECT {client.source_row_columns()} FROM sources ORDER BY source_id",

@@ -8,7 +8,7 @@ Key components:
 - Connection: the data plane this machine's control names, dialed and shared
 - Proto messages: TensorTicket, ChunkBounds, TensorDescriptor, SliceHint
 - query / resolve hand back `sources` catalog rows; what you decode
-  them into is yours (descriptors_from_rows is the deprecated proto form)
+  them into is yours
 - CLI diagnostics: `biopb tensor` command for inspecting sources and tensors
 
 The CLI module provides the `biopb tensor` command with four subcommands:
@@ -20,7 +20,6 @@ The CLI module provides the `biopb tensor` command with four subcommands:
 Note: Server components have been moved to the biopb-tensor-server package.
 """
 
-from biopb.tensor._catalog_rows import descriptor_from_row, descriptors_from_rows
 from biopb.tensor._labels import (
     LABELS_SEGMENT,
     RESERVED_LABEL_PREFIX,
@@ -81,10 +80,6 @@ __all__ = [
     "ResolveProgress",
     "WarmProgress",
     "SerializedTensor",
-    # Deprecated: `sources` rows as DataSourceDescriptor (biopb/biopb#1032).
-    # There is no replacement -- a row is the data structure.
-    "descriptor_from_row",
-    "descriptors_from_rows",
     # Label sets: what an array_id says, and how a set lines up with its
     # image. Pure string/shape rules -- no client needed to ask them.
     "LABELS_SEGMENT",

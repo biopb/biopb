@@ -1749,7 +1749,7 @@ class TensorFlightServer(flight.FlightServerBase):
         Each carries the table's real Arrow schema and one endpoint whose
         ticket is ``SELECT * FROM <table>``, so a stock Flight client can list,
         see the columns, and DoGet the whole catalog without a biopb proto.
-        Browsing *sources* is a catalog query too (the SDK's ``list_sources``);
+        Browsing *sources* is a catalog query too (the SDK's ``query``);
         the pixels and annotations of one source are not listable, they are
         addressed.
         """
