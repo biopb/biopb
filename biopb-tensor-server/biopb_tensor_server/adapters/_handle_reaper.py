@@ -145,7 +145,11 @@ class IdleHandleReaper:
         self._max_handles = int(max_handles)
         self._thread_name = thread_name
         self._adapters: weakref.WeakSet = weakref.WeakSet()
-        self._lock = threading.Lock()
+        # Reentrant: the cycle collector can run an adapter's finalizer inside
+        # any block that holds this lock, and the finalizer releases its handle
+        # through :meth:`discard`. A plain lock would make that thread wait on
+        # itself.
+        self._lock = threading.RLock()
         self._started = False
         _configured_reapers.add(self)
 
