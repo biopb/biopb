@@ -3,7 +3,7 @@
 The third upload kind: selected by an ``array_id`` with no ``kind:`` prefix
 and a ``/@labels/`` segment, it creates a tensor of a source that already
 exists rather than a source. What that costs the boundary is a second place to
-look an upload up (the parent's ``label_uploads``, not the registry) and a
+look an upload up (the source's ``label_uploads``, not the upload registry) and a
 catalog row that is the parent's; what it buys the client is the ordinary
 ``setup_array_upload`` / ``upload_array`` / ``set_upload_status`` round trip, with
 a discard to free the name again.
@@ -19,10 +19,10 @@ from biopb.tensor._session import _parse_flight_endpoints
 from biopb_tensor_server.adapters.labels import labels_root, sidecar_dir
 from biopb_tensor_server.adapters.scratch import SCRATCH_SOURCE_ID
 from biopb_tensor_server.adapters.zarr import UPLOAD_PENDING, UPLOAD_READY, upload_state
-from biopb_tensor_server.core.adapter_base import catalog_tensors
 from biopb_tensor_server.core.chunk import content_version_of
 from biopb_tensor_server.core.config import SourceConfig
 from biopb_tensor_server.core.errors import WriteNotSupportedError
+from biopb_tensor_server.core.source_registry import SourceRegistry
 from biopb_tensor_server.fixtures import create_multiresolution_ome_zarr
 
 from tests import label_sets, register_and_catalog
@@ -218,10 +218,12 @@ class TestTheExtentOfASet:
         from types import SimpleNamespace
 
         store = _image_with_axes(tmp_path, "tcyx", (2, 3, 64, 64))
-        adapter = _adapter(store, "img")
+        reg = SourceRegistry()
+        adapter = reg.register("img", _adapter(store, "img"))
         old = SimpleNamespace(dim_labels=["t", "y", "x"], shape=[2, 64, 64])
 
-        assert "does not span" in adapter.label_binding_error("@labels/old", old)
+        why = reg.attached_to("img").label_binding_error(adapter, "@labels/old", old)
+        assert "does not span" in why
 
     def test_a_channel_axis_at_the_images_length_is_refused(
         self, writable_server, client, tmp_path
@@ -325,7 +327,9 @@ class TestWhatTheKindRefuses:
         registered = served.sources.get("oz1")
         client.upload_array(_create(client, "oz1/@labels/nuclei"), _labels())
         with pytest.raises(UploadSealedError):
-            registered.label_sets["@labels/nuclei"].put_chunk(None, None, None, None)
+            served.sources.attached_to("oz1").label_sets(registered)[
+                "@labels/nuclei"
+            ].put_chunk(None, None, None, None)
 
     def test_a_set_that_is_not_an_upload_refuses_a_write_outright(self, tmp_path):
         """A sidecar read back at startup tracks no upload at all."""
@@ -395,9 +399,11 @@ class TestTheSidecar:
         )
         try:
             registered = register_and_catalog(fresh, "oz1", _adapter(image))
-            assert "@labels/nuclei" in registered.label_sets
+            assert "@labels/nuclei" in fresh.sources.attached_to("oz1").label_sets(
+                registered
+            )
             assert "oz1/@labels/nuclei" in [
-                t.array_id for t in catalog_tensors(registered)
+                t.array_id for t in fresh.sources.catalog_tensors("oz1", registered)
             ]
         finally:
             fresh.shutdown()

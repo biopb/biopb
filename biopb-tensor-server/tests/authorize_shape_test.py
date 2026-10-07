@@ -33,23 +33,22 @@ CAPABILITY = "capability-token"
 
 
 class _Adapter:
-    """Minimal source double: an id, and the grants its tensors carry.
-
-    *tensor_tokens* is keyed by full ``array_id`` -- what
-    ``SourceAdapter.tensor_capability_token`` answers off its attachment index.
-    A source has no token of its own to offer, which is the point; the one set
-    in :class:`TestASourceCannotGateWhatIsAttachedToIt` is there to show it is
-    never consulted.
-    """
+    """Minimal source double: an id. A source has no token of its own to offer,
+    which is the point; the one set in
+    :class:`TestASourceCannotGateWhatIsAttachedToIt` is there to show it is
+    never consulted."""
 
     source_type = "zarr"
 
-    def __init__(self, source_id, tensor_tokens=None):
+    def __init__(self, source_id):
         self.source_id = source_id
-        self._tensor_tokens = dict(tensor_tokens or {})
 
-    def tensor_capability_token(self, array_id):
-        return self._tensor_tokens.get(array_id)
+
+class _Attached:
+    """A tensor attached to a source, carrying its own grant."""
+
+    def __init__(self, token):
+        self.capability_token = token
 
 
 class _Middleware:
@@ -79,16 +78,10 @@ GATED = "gated/@fields/result"
 def _server(token):
     server = TensorFlightServer("localhost:0", token=token)
     server.sources.register("open", _Adapter("open"))
-    server.sources.register(
-        "gated", _Adapter("gated", tensor_tokens={GATED: CAPABILITY})
-    )
-    server.sources.register(
-        "shared",
-        _Adapter(
-            "shared",
-            tensor_tokens={"shared/@fields/mine": TENSOR_CAPABILITY},
-        ),
-    )
+    server.sources.register("gated", _Adapter("gated"))
+    server.sources.attach("gated", "@fields/result", _Attached(CAPABILITY))
+    server.sources.register("shared", _Adapter("shared"))
+    server.sources.attach("shared", "@fields/mine", _Attached(TENSOR_CAPABILITY))
     return server
 
 

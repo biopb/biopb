@@ -516,6 +516,8 @@ class TensorFlightServer(flight.FlightServerBase):
 
         # The catalog, or None for a catalog-less server.
         self._metadata_db: Optional[MetadataDatabase] = metadata_db
+        if metadata_db is not None:
+            metadata_db.bind_registry(self.sources)
 
         # Authoritative resolution-pyramid knobs. Used to tweak the advertised
         # TensorDescriptor.pyramid in get_flight_info (computed levels) and shared
@@ -755,7 +757,7 @@ class TensorFlightServer(flight.FlightServerBase):
         applies". ``False`` is a real refusal.
 
         **A grant covers one tensor.** Only an attached tensor carries one
-        (:meth:`SourceAdapter.tensor_capability_token`), never the source it
+        (:meth:`SourceRegistry.tensor_capability_token`), never the source it
         hangs off: one source is shared by uploads with different producers, so
         a grant at source scope would open every sibling to whoever holds one
         of them.
@@ -765,10 +767,9 @@ class TensorFlightServer(flight.FlightServerBase):
         themselves.
         """
         source_id, _ = split_array_id(array_id)
-        adapter = self.sources.get(source_id)
-        if adapter is None:
+        if source_id not in self.sources:
             return None
-        expected = adapter.tensor_capability_token(array_id)
+        expected = self.sources.tensor_capability_token(source_id, array_id)
         if not expected:
             return None
         if provided is None or not hmac.compare_digest(provided, expected):
@@ -924,11 +925,7 @@ class TensorFlightServer(flight.FlightServerBase):
         Returns:
             TensorAdapter for the specified tensor, or None if not found
         """
-        source_adapter = self.sources.get_registered(source_id)
-        if source_adapter is None:
-            return None
-
-        return source_adapter.resolve_tensor(tensor_id)
+        return self.sources.resolve_tensor(source_id, tensor_id)
 
     def _get_adapter_for_chunk(
         self, chunk_id: bytes, array_id: Optional[str] = None
@@ -970,13 +967,10 @@ class TensorFlightServer(flight.FlightServerBase):
             source_id, *rest = array_id.split("/")
             rest = "/".join(rest) if rest else None
 
-            adapter = None
-            source_adapter = self.sources.get_registered(source_id)
-            if source_adapter is not None:
-                # A within-source suffix names a native pyramid level, a tensor
-                # field, or a label set (and a level under it); the source
-                # decides which (``SourceAdapter.resolve_chunk_adapter``).
-                adapter = source_adapter.resolve_chunk_adapter(rest)
+            # A within-source suffix names a native pyramid level, a tensor
+            # field, or a label set (and a level under it); the registry
+            # decides which (``SourceRegistry.resolve_chunk_adapter``).
+            adapter = self.sources.resolve_chunk_adapter(source_id, rest)
         except (
             SourceUnresolvedError,
             TensorResolutionError,

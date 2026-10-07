@@ -17,7 +17,6 @@ import numpy as np
 import pytest
 from biopb_tensor_server import TensorFlightServer
 from biopb_tensor_server.adapters import get_default_registry
-from biopb_tensor_server.core.adapter_base import catalog_tensors
 from biopb_tensor_server.core.discovery import DiscoveryState
 from biopb_tensor_server.sources.roots import DND_URL_PREFIX, _drop_catalog_url
 
@@ -768,7 +767,7 @@ class TestReDropRebuilds:
 
         adapter = server.sources.get(sid)
         assert adapter is not before, "the adapter was not rebuilt"
-        shape = tuple(catalog_tensors(adapter)[0].shape)
+        shape = tuple(server.sources.catalog_tensors(sid, adapter)[0].shape)
         assert shape[-2:] == (5, 5)
 
     def test_rebuild_moves_the_content_version(self, tmp_path):

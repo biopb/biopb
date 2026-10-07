@@ -28,7 +28,6 @@ from biopb_tensor_server.adapters.fields import (
     fields_root,
     source_fields_dir,
 )
-from biopb_tensor_server.core.adapter_base import catalog_tensors
 from biopb_tensor_server.core.attached import attached_field
 
 TTL = 10.0
@@ -135,7 +134,7 @@ class TestAQuietUploadExpires:
             chunk_shape=(2, 2),
             dim_labels=["y", "x"],
         )
-        parent = writable_server.sources.get(source)
+        writable_server.sources.get(source)
         store = source_fields_dir(fields_root(tmp_path), source) / "quiet"
         assert store.is_dir()
 
@@ -145,10 +144,12 @@ class TestAQuietUploadExpires:
         assert status["state"] == "DISCARDED"
         assert "expired" in status["reason"]
         assert not store.exists()
-        assert catalog_tensors(parent) == []
+        assert writable_server.sources.catalog_tensors(source) == []
 
         assert uploads.reap(now=_past_ttl(margin=2 * TTL)) == (0, 1)
-        assert attached_field("quiet") not in parent.attached_tensors
+        assert attached_field("quiet") not in writable_server.sources.attachments(
+            source
+        )
 
     def test_a_zero_ttl_disables_the_sweep(self, uploads, client, source):
         desc = _make(client, source)
@@ -167,9 +168,8 @@ class TestATombstoneIsReclaimed:
 
         assert uploads.reap(now=_past_ttl()) == (0, 1)
 
-        assert (
-            attached_field("reclaim")
-            not in writable_server.sources.get(source).attached_tensors
+        assert attached_field("reclaim") not in writable_server.sources.attachments(
+            source
         )
         assert client.get_upload_status(desc.array_id)["state"] == "UNKNOWN"
 

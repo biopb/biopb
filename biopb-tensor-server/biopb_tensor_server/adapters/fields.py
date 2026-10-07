@@ -9,7 +9,7 @@ bound as a tensor of the source it was added to -- id
 
 A field is a label sidecar without the label half: it binds to no image, is
 read from no format, and maps to no axes. So the shared machinery serves it
-unchanged -- ``SourceAdapter.attach_tensor``, ``resolve_tensor``,
+unchanged -- the registry's ``attach``, ``resolve_tensor``,
 ``catalog_tensors``, attach-on-READY -- and what is here is the layout and the
 scan that finds a source's finished fields.
 
@@ -70,6 +70,7 @@ def create_field_upload(
     desc: TensorDescriptor,
     *,
     fields_dir: Path,
+    attached: Any,
     expires_at: Optional[float] = None,
 ) -> TensorAdapter:
     """Mint the store for a new uploaded field on *parent* and track its upload.
@@ -101,7 +102,7 @@ def create_field_upload(
     # Folded, because NTFS, APFS and HFS+ are case-insensitive and HFS+ stores
     # NFD. Only against what is attached here: the marked segment is what keeps
     # the name off the parent's own tensors, so those cannot collide.
-    taken = folded_match(field, parent.attached_tensors)
+    taken = folded_match(field, attached.tensors)
     if taken is not None:
         raise ValueError(
             f"{array_id!r} already exists as {taken!r}. A field is taken for as "

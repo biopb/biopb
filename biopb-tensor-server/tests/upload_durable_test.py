@@ -25,7 +25,6 @@ from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
 from biopb_tensor_server.adapters.scratch import SCRATCH_SOURCE_ID
 from biopb_tensor_server.adapters.zarr import ZarrAdapter, upload_state
 from biopb_tensor_server.cache import CacheManager
-from biopb_tensor_server.core.adapter_base import catalog_tensors
 from biopb_tensor_server.core.attached import attached_field
 from biopb_tensor_server.core.chunk import encode_chunk_id
 from biopb_tensor_server.core.config import CacheConfig
@@ -77,15 +76,17 @@ class TestDiscardReleasesTheStore:
         desc = _create(client, source)
         _put(client, desc)
         client.set_upload_status(desc, "READY")
-        parent = writable_server.sources.get(source)
+        writable_server.sources.get(source)
         store = _store(writable_server, source)
         assert store.is_dir()
-        assert [d.array_id for d in catalog_tensors(parent)] == [desc.array_id]
+        assert [
+            d.array_id for d in writable_server.sources.catalog_tensors(source)
+        ] == [desc.array_id]
 
         writable_server.uploads.discard(desc.array_id, "operator said so")
 
         assert not store.exists()
-        assert catalog_tensors(parent) == []
+        assert writable_server.sources.catalog_tensors(source) == []
         # The *source* keeps its row: a member has none of its own, and the
         # source is still there to add another tensor to.
         assert source in _catalog_ids(writable_server.metadata_db)
@@ -138,9 +139,7 @@ class TestDiscardReleasesTheStore:
         _put(client, desc, fill=3)
         client.set_upload_status(desc, "READY")
         assert client.get_tensor(desc.array_id)[:2, :2].compute().max() == 3
-        adapter = writable_server.sources.get(source).attached_tensors[
-            "@fields/durable"
-        ]
+        adapter = writable_server.sources.attachments(source)["@fields/durable"]
         chunk_id = encode_chunk_id(
             desc.array_id, ChunkBounds(start=[0, 0], stop=[4, 4])
         )
@@ -165,9 +164,7 @@ class TestDiscardReleasesTheStore:
         """The write lock orders a write that passed the refusal ahead of the
         disposal: whichever wins, no directory is left behind."""
         desc = _create(client, source)
-        adapter = writable_server.sources.get(source).attached_tensors[
-            "@fields/durable"
-        ]
+        adapter = writable_server.sources.attachments(source)["@fields/durable"]
         store = _store(writable_server, source)
         errors = []
 
@@ -206,9 +203,8 @@ class TestAddOwnsItsDirectory:
 
         assert (theirs / "keep.txt").read_text() == "not yours"
         assert not (theirs / ".zarray").exists()
-        assert (
-            attached_field("taken")
-            not in writable_server.sources.get(source).attached_tensors
+        assert attached_field("taken") not in writable_server.sources.attachments(
+            source
         )
 
 
@@ -461,8 +457,8 @@ class TestTheBootSweepRemovesAPendingMember:
         try:
             assert not (fields / "crashed").exists()
             assert _marker(fields / "done") == "ready"
-            adopted = second.sources.get(source)
-            assert [d.array_id for d in catalog_tensors(adopted)] == [
+            second.sources.get(source)
+            assert [d.array_id for d in second.sources.catalog_tensors(source)] == [
                 f"{source}/@fields/done"
             ]
         finally:
@@ -563,9 +559,7 @@ class TestTheMarker:
         upload stays PENDING for a retry."""
         desc = _create(client, source)
         _put(client, desc)
-        adapter = writable_server.sources.get(source).attached_tensors[
-            "@fields/durable"
-        ]
+        adapter = writable_server.sources.attachments(source)["@fields/durable"]
         store = _store(writable_server, source)
 
         def refuse(state):

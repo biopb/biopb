@@ -87,11 +87,11 @@ class TestOneFieldOneAdapter:
         """The refused adapter is never attached -- the source's members are
         what show it."""
         _make(client, source, field="once")
-        tensors = dict(writable_server.sources.get(source).attached_tensors)
+        tensors = dict(writable_server.sources.attachments(source))
 
         with pytest.raises(flight.FlightServerError):
             _make(client, source, field="once")
-        assert dict(writable_server.sources.get(source).attached_tensors) == tensors
+        assert dict(writable_server.sources.attachments(source)) == tensors
 
     def test_the_refusal_says_how_to_proceed(self, client, source):
         """It names the field it collided with, since the caller holding a
@@ -296,9 +296,7 @@ class TestTheReadGate:
         _put(client, desc, (0, 0), (2, 2))
         _set(client, desc, "READY")
 
-        adapter = writable_server.sources.get(source).attached_tensors[
-            "@fields/lifecycle"
-        ]
+        adapter = writable_server.sources.attachments(source)["@fields/lifecycle"]
         bounds = ChunkBounds(start=[2, 2], stop=[4, 4])
         chunk_id = mint_chunk_id(
             adapter.array_id, bounds, content_version=adapter.content_version

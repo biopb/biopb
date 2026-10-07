@@ -25,7 +25,6 @@ from biopb_tensor_server.adapters.fields import (
 )
 from biopb_tensor_server.adapters.scratch import SCRATCH_SOURCE_ID
 from biopb_tensor_server.cache import CacheManager
-from biopb_tensor_server.core.adapter_base import catalog_tensors
 from biopb_tensor_server.core.config import CacheConfig
 
 from tests import catalog_server, label_sets
@@ -74,9 +73,7 @@ class TestOneSourceManyTensors:
         client.upload_array(published, _arr())
         _add(client, source, "filling")  # still PENDING
 
-        listed = [
-            d.array_id for d in catalog_tensors(writable_server.sources.get(source))
-        ]
+        listed = [d.array_id for d in writable_server.sources.catalog_tensors(source)]
         assert listed == [published.array_id]
 
     def test_a_pending_tensor_is_writable_but_not_readable(self, client, source):
@@ -178,9 +175,9 @@ class TestItSurvivesARestart:
         second = catalog_server(location="localhost:0", writable=True, write_dir=moved)
         try:
             assert second.sources.get(source) is not None
-            assert [
-                d.array_id for d in catalog_tensors(second.sources.get(source))
-            ] == [f"{source}/@fields/img"]
+            assert [d.array_id for d in second.sources.catalog_tensors(source)] == [
+                f"{source}/@fields/img"
+            ]
         finally:
             second.shutdown()
             CacheManager.reset()

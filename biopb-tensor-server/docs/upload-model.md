@@ -113,13 +113,15 @@ user's, and the scratch source holds none. It is adopted by the registry's boot 
 format's own tensors (of which the scratch source has none).
 
 A field and a label set are both **attached tensors**. `SourceRegistry` owns
-one `field -> adapter` index per source id, scanned from disk once at boot and
-handed to every adapter registered under the id (`bind_attachments`), so an
-adapter rebuilt by a refresh serves the same tensors and an upload in flight
-keeps routing. `label_sets`, `label_uploads` and `attached_fields` are checked
-views over the adapter's reference to it --
-`label_sets` is the attached tensors whose field parses as a set, each
-checked against `label_binding_error`. A field differs from a label set in
+one `Attachments` per source id (`core/attachments.py`), scanned from disk once
+at boot and independent of the adapter, so an adapter rebuilt by a refresh
+leaves the tensors and an upload in flight where they were. Adapters know
+nothing of them: the registry resolves a tensor id (`resolve_tensor`,
+`resolve_chunk_adapter`), lists a source (`catalog_tensors`) and answers the
+capability token. `label_sets`, `label_uploads` and `attached_fields` are
+checked views over the index -- `label_sets` is the attached tensors whose
+field parses as a set, plus the file's own, each checked against
+`label_binding_error`. A field differs from a label set in
 binding to nothing, decoding nothing, and mapping to no axes.
 
 A set may bind to an uploaded field, since a field is a tensor of its

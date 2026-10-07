@@ -31,8 +31,8 @@ group's ``labels/`` (called from ``OmeZarrAdapter.get_embedded_labels``),
 ``<write_dir>/labels/<source_id>/``, which the server scans at boot, and :func:`create_label_upload` for a set arriving over the wire.
 The readers skip only what they cannot *open* -- a float dtype, an unreadable
 ``.zattrs`` -- with a warning; whether a set spans its image is checked once
-for every origin where the sets meet (``SourceAdapter.label_binding_error``,
-from the upload's create and from ``label_sets``).
+for every origin where the sets meet (``Attachments.label_binding_error``,
+from the upload's create and from ``Attachments.label_sets``).
 """
 
 from __future__ import annotations
@@ -367,6 +367,7 @@ def create_label_upload(
     desc: TensorDescriptor,
     *,
     labels_dir: Path,
+    attached: Any,
     metadata: Optional[dict] = None,
     expires_at: Optional[float] = None,
 ) -> LabelSetAdapter:
@@ -380,6 +381,9 @@ def create_label_upload(
     any other), and is filled in with the image's axes when it named none --
     in place, because it is also the descriptor the client is answered with.
 
+    *attached* is the parent's ``Attachments``: the names taken and the tensors
+    a set may bind to.
+
     *expires_at* is the set's deadline, recorded with the store. A set is an
     uploaded tensor like any other here, so a source that caps lifetimes caps
     this one too.
@@ -387,7 +391,7 @@ def create_label_upload(
     Raises ``ValueError`` for a request the kind cannot serve -- an
     unresolved parent, a reserved name, a dtype that is not an unsigned
     integer, a name already taken on this parent, or a shape that does not
-    span the image (``SourceAdapter.label_binding_error``, the same rule the
+    span the image (``Attachments.label_binding_error``, the same rule the
     listing re-checks). Nothing touches disk until every one of them has
     passed, so a refused request leaves no store behind.
     """
@@ -426,7 +430,7 @@ def create_label_upload(
     # NFD: `Nuclei` and `nuclei` are two keys here and one sidecar directory
     # there, so an unfolded check mints a second set that the next boot on such
     # a host cannot tell from the first.
-    taken = folded_match(field, (*parent.label_sets, *parent.attached_tensors))
+    taken = folded_match(field, (*attached.label_sets(parent), *attached.tensors))
     if taken is not None:
         raise ValueError(
             f"{array_id!r} already exists as {taken!r}. A set's name is taken "
@@ -434,17 +438,17 @@ def create_label_upload(
             f"case or accent form are one name on Windows and macOS; delete it "
             f"first, or upload under another name."
         )
-    images = parent._normalized_tensors()
+    images = attached.normalized_tensors(parent)
     if not desc.dim_labels:
         # The extent rule leaves exactly one legal set of axes for this image,
         # so a request that named none is filled in rather than refused. In
         # place, so the descriptor ``add_tensor`` echoes back carries them:
         # everything downstream (the sidecar's NGFF, the chunk grid, the
         # client's own later calls) is built from that descriptor.
-        image = parent.label_image_descriptor(field, images=images)
+        image = attached.label_image_descriptor(parent, field, images=images)
         if image is not None:
             desc.dim_labels.extend(label_extent(image.dim_labels, image.shape)[0])
-    why = parent.label_binding_error(field, desc, images=images)
+    why = attached.label_binding_error(parent, field, desc, images=images)
     if why is not None:
         raise ValueError(f"{array_id!r} {why}")
 

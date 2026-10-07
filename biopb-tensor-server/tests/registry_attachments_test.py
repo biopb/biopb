@@ -18,11 +18,12 @@ class TestAttachmentsOutliveTheAdapter:
         old = registry.register("s", ScratchSource())
         tensor = _Tensor()
         registry.attach("s", "@fields/a", tensor)
-        assert old.attached_tensor("@fields/a") is tensor
+        assert registry.attached("s", "@fields/a") is tensor
 
         new, displaced = registry.swap("s", ScratchSource())
 
-        assert new.attached_tensor("@fields/a") is tensor
+        assert registry.attached("s", "@fields/a") is tensor
+        assert registry.get("s") is new
         assert displaced is old
 
     def test_closing_a_displaced_adapter_leaves_the_attachments_open(self):
@@ -43,17 +44,15 @@ class TestAttachmentsOutliveTheAdapter:
         registry.attach("s", "@fields/a", tensor)
 
         registry.unregister("s")
-        back = registry.register("s", ScratchSource())
+        registry.register("s", ScratchSource())
 
-        assert back.attached_tensor("@fields/a") is tensor
+        assert registry.attached("s", "@fields/a") is tensor
 
     def test_tensors_attached_before_registering_are_carried_in(self):
-        adapter = ScratchSource()
-        tensor = _Tensor()
-        adapter.attach_tensor("@fields/a", tensor)
-
         registry = SourceRegistry()
-        registry.register("s", adapter)
+        tensor = _Tensor()
+        registry.attach("s", "@fields/a", tensor)
+        registry.register("s", ScratchSource())
 
         assert registry.attached("s", "@fields/a") is tensor
 
@@ -65,8 +64,8 @@ class TestAdopt:
         registry.adopt({"later": {"@fields/a": tensor}})
 
         assert registry.attachments("later") == {"@fields/a": tensor}
-        adapter = registry.register("later", ScratchSource())
-        assert adapter.attached_tensor("@fields/a") is tensor
+        registry.register("later", ScratchSource())
+        assert registry.attached("later", "@fields/a") is tensor
 
     def test_close_all_closes_them_even_without_a_source(self):
         registry = SourceRegistry()

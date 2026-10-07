@@ -406,7 +406,7 @@ class UploadManager:
 
         The set is attached to its source, which routes its own writes and its
         status polls; it is not *listed* until it reaches READY
-        (``SourceAdapter.label_sets``). No catalog write at create: the row the
+        (``Attachments.label_sets``). No catalog write at create: the row the
         source already has still describes what a reader may see.
 
         It takes a deadline the same way a field does: a set is an uploaded
@@ -423,6 +423,7 @@ class UploadManager:
                 field,
                 req_desc,
                 labels_dir=labels_root(self._write_dir),
+                attached=self._registry.attached_to(parent.source_id),
                 metadata=metadata,
                 expires_at=self._deadline_for(parent, req_desc),
             )
@@ -718,6 +719,7 @@ class UploadManager:
                 scheme,
                 desc,
                 fields_dir=fields_root(self._write_dir),
+                attached=self._registry.attached_to(parent.source_id),
                 expires_at=expires_at,
             )
         except ValueError as e:

@@ -21,7 +21,6 @@ import pytest
 from biopb.tensor import TensorFlightClient
 from biopb_tensor_server.adapters.scratch import SCRATCH_SOURCE_ID
 from biopb_tensor_server.cache import CacheManager
-from biopb_tensor_server.core.adapter_base import catalog_tensors
 
 from tests import catalog_server
 
@@ -114,7 +113,7 @@ class TestItIsEmptyByDefault:
         uploads, and the catalog already models it."""
         adapter = writable_server.sources.get(SCRATCH_SOURCE_ID)
 
-        assert catalog_tensors(adapter) == []
+        assert writable_server.sources.catalog_tensors(SCRATCH_SOURCE_ID) == []
         assert adapter.get_metadata() == {}
 
     def test_the_sweep_leaves_it_alone(self, writable_server, client):
@@ -149,8 +148,7 @@ class TestItKeepsNoDirectoryOfItsOwn:
         second = _serve(tmp_path, writable=True)
         try:
             assert [
-                d.array_id
-                for d in catalog_tensors(second.sources.get(SCRATCH_SOURCE_ID))
+                d.array_id for d in second.sources.catalog_tensors(SCRATCH_SOURCE_ID)
             ] == [f"{SCRATCH_SOURCE_ID}/@fields/survivor"]
         finally:
             second.shutdown()

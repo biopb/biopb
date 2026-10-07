@@ -351,6 +351,7 @@ class TestFastMetadataRealBitmap:
 
     def test_get_embedded_labels_end_to_end(self, tmp_path):
         from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
+        from biopb_tensor_server.core.source_registry import SourceRegistry
 
         raw_bitmap = np.zeros((4, 4), dtype=np.uint8)
         raw_bitmap[1:3, 1:3] = 1
@@ -370,7 +371,10 @@ class TestFastMetadataRealBitmap:
         assert out[tuple([0] * (out.ndim - 2) + [0, 0])] == 0
 
         # And through the base SourceAdapter machinery: extent must match.
-        assert "Image:0/@labels/@ome" in adapter.label_sets
+        reg = SourceRegistry()
+        adapter = reg.register("src1", adapter)
+        attached = reg.attached_to("src1")
+        assert "Image:0/@labels/@ome" in attached.label_sets(adapter)
 
         adapter.release_registration_cache()
 
@@ -381,7 +385,7 @@ class TestFastMetadataRealBitmap:
         assert adapter._parsed_metadata_probed is False
         for scene in adapter._tensor_adapters.values():
             assert base64.b64encode(raw).decode("ascii") not in scene._reduced_ome_xml
-        cached_label_set = adapter.label_sets["Image:0/@labels/@ome"]
+        cached_label_set = attached.label_sets(adapter)["Image:0/@labels/@ome"]
         assert (
             cached_label_set.get_data(
                 ChunkBounds(start=[0] * len(desc.shape), stop=list(desc.shape))

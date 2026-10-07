@@ -30,7 +30,6 @@ from biopb_tensor_server.adapters.fields import (
 from biopb_tensor_server.adapters.ome_zarr import minimal_ome_metadata
 from biopb_tensor_server.adapters.scratch import SCRATCH_SOURCE_ID
 from biopb_tensor_server.cache import CacheManager
-from biopb_tensor_server.core.adapter_base import catalog_tensors
 from biopb_tensor_server.core.chunk import (
     content_version_of,
     encode_chunk_id,
@@ -665,7 +664,7 @@ class TestAddTensor:
         # The id it keeps is the one it was asked for, minus the scheme: the
         # format is a property of the stored tensor, not of its name.
         assert response.array_id == f"{source}/@fields/my-test"
-        member = server.sources.get(source).attached_tensors["@fields/my-test"]
+        member = server.sources.attachments(source)["@fields/my-test"]
         assert isinstance(member, CachedSourceAdapter)
 
     def test_the_physical_scale_survives_the_round_trip(self, tmp_path):
@@ -691,7 +690,7 @@ class TestAddTensor:
         assert list(response.physical_scale) == [2.0, 0.325, 0.325]
         assert list(response.physical_unit) == ["µm", "µm", "µm"]
 
-        member = server.sources.get(source).attached_tensors["@fields/calibrated"]
+        member = server.sources.attachments(source)["@fields/calibrated"]
         scale, unit = member._physical_scale()
         assert scale == [2.0, 0.325, 0.325]
         assert unit == ["µm", "µm", "µm"]
@@ -759,11 +758,13 @@ class TestAddTensor:
         )
 
         assert _catalog_ids(db) == {source}
-        parent = server.sources.get(source)
-        assert catalog_tensors(parent) == []  # PENDING is not listed
+        server.sources.get(source)
+        assert server.sources.catalog_tensors(source) == []  # PENDING is not listed
 
         server.uploads.set_status(desc.array_id, UploadStatus.READY)
-        assert [d.array_id for d in catalog_tensors(parent)] == [desc.array_id]
+        assert [d.array_id for d in server.sources.catalog_tensors(source)] == [
+            desc.array_id
+        ]
 
     def test_an_unregistered_source_is_refused(self, tmp_path):
         server = self._server(tmp_path)
@@ -1049,7 +1050,7 @@ class TestChunkUpload:
             )
         )
 
-        adapter = server.sources.get(source).attached_tensors["@fields/test"]
+        adapter = server.sources.attachments(source)["@fields/test"]
         chunk_id = _planned_chunk_id(adapter, [0, 0], [50, 50])
 
         # Create mock data
@@ -1089,7 +1090,7 @@ class TestChunkUpload:
         )
 
         bounds = ChunkBounds(start=[10, 20], stop=[40, 60])
-        adapter = server.sources.get(source).attached_tensors["@fields/test-shape"]
+        adapter = server.sources.attachments(source)["@fields/test-shape"]
 
         data = np.arange(30 * 40, dtype=np.uint8).reshape(30, 40)
         batch = pa.RecordBatch.from_arrays([pa.array(data.ravel())], ["data"])
@@ -1185,7 +1186,7 @@ class TestChunkUpload:
                 chunk_shape=[50, 50],
             )
         )
-        adapter = server.sources.get(source).attached_tensors["@fields/stale"]
+        adapter = server.sources.attachments(source)["@fields/stale"]
         stale = mint_chunk_id(
             adapter.array_id,
             ChunkBounds(start=[0, 0], stop=[50, 50]),
@@ -1229,7 +1230,7 @@ class TestZarrChunkAlignment:
 
             # 100x100 uint8 is one block of the transfer grid the store is
             # minted on, so the whole tensor is the aligned chunk.
-            adapter = server.sources.get(source).attached_tensors["@fields/test"]
+            adapter = server.sources.attachments(source)["@fields/test"]
             chunk_id = _planned_chunk_id(adapter, [0, 0], [100, 100])
 
             data = np.ones((100, 100), dtype=np.uint8)
@@ -1273,7 +1274,7 @@ class TestZarrChunkAlignment:
             )
 
             # Neither on the grid nor at the tensor edge
-            adapter = server.sources.get(source).attached_tensors["@fields/test"]
+            adapter = server.sources.attachments(source)["@fields/test"]
             chunk_id = _planned_chunk_id(adapter, [0, 0], [60, 70])
 
             data = np.ones((50, 50), dtype=np.uint8)
@@ -1732,21 +1733,18 @@ class TestDiscard:
         reader still unwinding learn the reason instead of "not found"."""
         desc = self._make_source(client, source, shape=(2, 2), chunk=(2, 2))
         self._put(client, desc, (0, 0), (2, 2))
-        adapter = writable_server.sources.get(source).attached_tensors[
-            "@fields/discard-me"
-        ]
+        adapter = writable_server.sources.attachments(source)["@fields/discard-me"]
 
         status = writable_server.uploads.discard(desc.array_id, "client went away")
 
         assert status["state"] == "DISCARDED"
         assert status["reason"] == "client went away"
         assert (
-            writable_server.sources.get(source).attached_tensors["@fields/discard-me"]
-            is adapter
+            writable_server.sources.attachments(source)["@fields/discard-me"] is adapter
         )
         assert client.get_upload_status(desc.array_id)["state"] == "DISCARDED"
         # It is a tombstone, not a tensor: its source no longer lists it.
-        assert catalog_tensors(writable_server.sources.get(source)) == []
+        assert writable_server.sources.catalog_tensors(source) == []
         chunk_id = encode_chunk_id(
             desc.array_id, ChunkBounds(start=[0, 0], stop=[2, 2])
         )
@@ -1822,9 +1820,9 @@ class TestDiscard:
         # How far it got is reported, but the chunk ids behind that number are
         # not kept: a tombstone outlives its upload and must not scale with it.
         assert (
-            writable_server.sources.get(source)
-            .attached_tensors["@fields/discard-me"]
-            .upload.uploaded_chunk_ids
+            writable_server.sources.attachments(source)[
+                "@fields/discard-me"
+            ].upload.uploaded_chunk_ids
             == set()
         )
 
@@ -1948,11 +1946,7 @@ class TestDiscard:
         tick -- so `after > before` is not merely flaky there, it is false.
         """
         desc = self._make_source(client, source, shape=(4, 2), chunk=(2, 2))
-        state = (
-            writable_server.sources.get(source)
-            .attached_tensors["@fields/discard-me"]
-            .upload
-        )
+        state = writable_server.sources.attachments(source)["@fields/discard-me"].upload
         assert state.updated_at > 0  # stamped at creation
 
         state.updated_at = -1.0
@@ -1968,9 +1962,7 @@ class TestDiscard:
     ):
         """Otherwise a retrying caller could keep a tombstone alive forever."""
         desc = self._make_source(client, source)
-        member = writable_server.sources.get(source).attached_tensors[
-            "@fields/discard-me"
-        ]
+        member = writable_server.sources.attachments(source)["@fields/discard-me"]
         writable_server.uploads.discard(desc.array_id, "first")
         first = member.upload.updated_at
 
@@ -2026,9 +2018,9 @@ def test_a_registered_source_lands_in_the_servers_catalog():
             assert source_id in _catalog_ids(server.metadata_db)
             # A member has no row of its own; it is a tensor of that one.
             assert desc.array_id not in _catalog_ids(server.metadata_db)
-            assert [
-                d.array_id for d in catalog_tensors(server.sources.get(source_id))
-            ] == [desc.array_id]
+            assert [d.array_id for d in server.sources.catalog_tensors(source_id)] == [
+                desc.array_id
+            ]
         finally:
             server.shutdown()
 

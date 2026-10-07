@@ -4,8 +4,7 @@
 
 Scope: `biopb-tensor-server`, the Python SDK, and the two viewers only as far
 as naming what they consume. Companion to [upload-model.md](upload-model.md), which covers
-`label_sets` / `label_uploads` / `attached_fields` as the shared attachment
-mechanism; this is the deep dive on label sets specifically.
+the registry-owned attachments (`core/attachments.py`) as the shared mechanism; this is the deep dive on label sets specifically.
 
 ## Goal
 
@@ -53,7 +52,7 @@ Axis *j* of a set is therefore axis *j* of its image among the axes that remain
 server states no mapping.
 
 The rule is checked twice: the upload refuses a set that would not span its
-image at create, and `SourceAdapter.label_sets` checks every set again where
+image at create, and `Attachments.label_sets` checks every set again where
 the origins meet (`extent_mismatch`, on normalized descriptors). Mismatched labels
 are dropped with a warning. That includes a set with no channel axis -- a native
 NGFF group (the spec lets it omit `c`) or a sidecar an older server wrote -- when
@@ -86,20 +85,20 @@ discovery root, otherwise the label is listed twice under two ids.
 
 ### Attachment to the parent
 
-Sets are tensors *of the parent source*, not sources. `SourceAdapter` owns the
-concept via a hook: `get_embedded_labels()` that an adapter class overrides
-(`OmeZarrAdapter` reads its NGFF `labels/` group there); `attach_label_set`
-/ `detach_label_set` are what the registry's boot scan (`SourceRegistry.adopt`)
-and the upload kind (at READY; discard) use.
+Sets are tensors *of the parent source*, not sources. A format says which sets
+its own file carries with `get_embedded_labels()` (`OmeZarrAdapter` reads its
+NGFF `labels/` group there). The rest are attached to the source id in the
+registry (`SourceRegistry.attach` / `detach`; `adopt` at boot) and the upload
+kind attaches and detaches them (at READY; discard).
 
-`label_uploads` is the second, smaller index: sets the upload path is still
+`Attachments.label_uploads()` is the second, smaller view: sets the upload path is still
 filling, and the tombstones of ones it gave up on. Routable but never listed,
 and what the DoPut boundary looks an upload up in and the reclaim sweep walks.
 
-`resolve_tensor(tensor_id)` and `resolve_chunk_adapter(field)` are the two
+`SourceRegistry.resolve_tensor(source_id, tensor_id)` and `resolve_chunk_adapter(source_id, field)` are the two
 lookups the serve path uses (`get_flight_info`, `do_get`, the precache): a
-`.../@labels/<name>[/<level>]` field answers from `label_sets`, everything
-else delegates to the format. `catalog_tensors` appends the sets after
+`.../@labels/<name>[/<level>]` field answers from the label sets, everything
+else delegates to the format. `SourceRegistry.catalog_tensors` appends the sets after
 `list_tensor_descriptors`, so a source's first tensor -- what every listing
 reads as its picture -- is never a set.
 
@@ -171,7 +170,7 @@ other two, the request's `array_id` *is* the final one. The kind:
   create) but not listed, and not readable.
 
 Reaching **READY** clears the pending marker, lists the set
-(`attach_label_set`) and re-syncs the parent's catalog row, in that order --
+(`SourceRegistry.attachment_changed`) and re-syncs the parent's catalog row, in that order --
 the catalog must not name a set a restart would sweep away.
 
 **Skipping zeros is per kind.** `upload_array` may drop all-zero chunks only

@@ -48,7 +48,6 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
 from biopb_tensor_server.cache import CacheManager
-from biopb_tensor_server.core.adapter_base import catalog_tensors
 from biopb_tensor_server.core.chunk import (
     compute_warm_selection,
     compute_warm_targets,
@@ -336,7 +335,9 @@ class PrecacheWorker:
 
         try:
             # The catalog's view: image tensors and label sets alike.
-            descriptors = catalog_tensors(source_adapter)
+            descriptors = self._server.sources.catalog_tensors(
+                source_id, source_adapter
+            )
         except Exception:
             logger.exception("precache: catalog_tensors failed for %s", source_id)
             return False
@@ -344,12 +345,12 @@ class PrecacheWorker:
         for td in descriptors:
             if self._stop.is_set():
                 return False
-            if self._process_tensor(source_adapter, td, cache_manager, backlog=backlog):
+            if self._process_tensor(source_id, td, cache_manager, backlog=backlog):
                 return True  # preempted mid-source
         return False
 
     def _process_tensor(
-        self, source_adapter, td, cache_manager, backlog: bool = False
+        self, source_id: str, td, cache_manager, backlog: bool = False
     ) -> bool:
         """Warm every level of this tensor's plan. Return True if preempted.
 
@@ -363,7 +364,7 @@ class PrecacheWorker:
         # (TensorFlightClient), so the request we build mirrors get_flight_info.
         tensor_id = td.array_id
         try:
-            tensor_adapter = source_adapter.resolve_tensor(tensor_id)
+            tensor_adapter = self._server.sources.resolve_tensor(source_id, tensor_id)
         except Exception:
             logger.exception("precache: resolve_tensor failed for %s", tensor_id)
             return False
