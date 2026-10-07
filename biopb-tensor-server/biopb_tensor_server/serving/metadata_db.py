@@ -1643,9 +1643,13 @@ class MetadataDatabase:
         """
         tensors = self._tensor_rows(self._catalog_tensors(source_id, adapter))
         conn = self._get_connection()
-        row = conn.execute(
-            "SELECT tensors FROM source_catalog WHERE source_id = ?", [source_id]
-        ).fetchone()
+        row = (
+            self._get_cursor()
+            .execute(
+                "SELECT tensors FROM source_catalog WHERE source_id = ?", [source_id]
+            )
+            .fetchone()
+        )
         if row is None or sorted(row[0], key=_array_id) == sorted(
             tensors, key=_array_id
         ):
@@ -1861,12 +1865,16 @@ class MetadataDatabase:
     ) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
         """``(payload, metadata)`` of a persisted source, or None when it has no
         payload (or it does not decode): what an adapter is rebuilt from without a
-        parse. One keyed read, made when the source is hydrated and not before."""
-        conn = self._get_connection()
-        row = conn.execute(
-            "SELECT payload, metadata_json FROM source_catalog WHERE source_id = ?",
-            [source_id],
-        ).fetchone()
+        parse. One keyed read, made when the source is hydrated and not before, on
+        a cursor because hydrations run on several threads at once."""
+        row = (
+            self._get_cursor()
+            .execute(
+                "SELECT payload, metadata_json FROM source_catalog WHERE source_id = ?",
+                [source_id],
+            )
+            .fetchone()
+        )
         if row is None or row[0] is None:
             return None
         try:
