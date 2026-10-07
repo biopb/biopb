@@ -89,8 +89,8 @@ logger = logging.getLogger(__name__)
 # added key needs none). A mismatch drops ``source_catalog`` whole at open.
 SOURCE_CATALOG_FORMAT = 4
 
-# The columns ``sources`` publishes, in table order. Both physical tables carry
-# them first, so the view is a plain UNION ALL.
+# The columns ``sources`` publishes, in table order. ``source_catalog`` carries
+# them first, then the claim.
 _SOURCE_COLUMNS = (
     "source_id, source_url, source_type, indexed_at, metadata_json, "
     "is_resolved, unresolved_reason, unresolved_error, tensors"
@@ -108,7 +108,6 @@ _CLAIM_COLUMN_NAMES = (
     "last_seen",
     "epoch",
 )
-_CLAIM_COLUMNS = ", ".join(_CLAIM_COLUMN_NAMES)
 # The columns a row is written with, in the order every writer builds its values.
 _ROW_COLUMN_NAMES = (
     "source_id",
@@ -1696,34 +1695,32 @@ class MetadataDatabase:
         claim_values = (
             None if record is None else self._claim_values(record, payload, indexed_at)
         )
+        if claim_values is None:
+            columns, values = _ROW_COLUMNS, row
+            update_set, upsert_set = _LISTING_SET, _LISTING_UPSERT_SET
+            set_values = row[1:]
+        else:
+            values = row[:1] + row[2:] + claim_values
+            columns, update_set, upsert_set = (
+                _PERSISTED_COLUMNS,
+                _UPDATE_SET,
+                _UPSERT_SET,
+            )
+            set_values = values[1:]
         with self._write_lock:
-            if claim_values is None:
-                updated = conn.execute(
-                    f"UPDATE source_catalog SET {_LISTING_SET} WHERE source_id = ?",
-                    row[1:] + [source_id],
-                ).fetchone()
-                if not updated or not updated[0]:
-                    conn.execute(
-                        f"INSERT INTO source_catalog ({_ROW_COLUMNS}) "
-                        f"VALUES ({', '.join('?' * len(row))}) "
-                        f"ON CONFLICT (source_id) DO UPDATE SET {_LISTING_UPSERT_SET}",
-                        row,
-                    )
-                return
-            persisted = row[:1] + row[2:]
             updated = conn.execute(
-                f"UPDATE source_catalog SET {_UPDATE_SET} WHERE source_id = ?",
-                persisted[1:] + claim_values + [source_id],
+                f"UPDATE source_catalog SET {update_set} WHERE source_id = ?",
+                set_values + [source_id],
             ).fetchone()
             if not updated or not updated[0]:
                 # A row that is there by now (the UPDATE did not see it) is
                 # overwritten, which is what was asked: a registration must not
                 # fail on the pending row its claim made.
                 conn.execute(
-                    f"INSERT INTO source_catalog ({_PERSISTED_COLUMNS}) "
-                    f"VALUES ({', '.join('?' * (len(persisted) + len(claim_values)))}) "
-                    f"ON CONFLICT (source_id) DO UPDATE SET {_UPSERT_SET}",
-                    persisted + claim_values,
+                    f"INSERT INTO source_catalog ({columns}) "
+                    f"VALUES ({', '.join('?' * len(values))}) "
+                    f"ON CONFLICT (source_id) DO UPDATE SET {upsert_set}",
+                    values,
                 )
 
     def sync_pending_source(
@@ -1755,10 +1752,13 @@ class MetadataDatabase:
     _PENDING_CHUNK = 500
 
     def _pending_inserts(
-        self, columns: str, rows: Sequence[PendingRow], now: datetime
+        self, rows: Sequence[PendingRow], now: datetime
     ) -> List[Tuple[str, List[Any]]]:
         """The multi-row ``INSERT ... DO NOTHING`` statements for *rows*, in chunks.
         All of *rows* have a record, or none does."""
+        columns = (
+            _ROW_COLUMNS if rows and rows[0].record is None else _PERSISTED_COLUMNS
+        )
         statements = []
         for i in range(0, len(rows), self._PENDING_CHUNK):
             chunk = rows[i : i + self._PENDING_CHUNK]
@@ -1801,12 +1801,12 @@ class MetadataDatabase:
         now = datetime.now()
         claimed = [r for r in rows if r.record is not None]
         unclaimed = [r for r in rows if r.record is None]
-        statements = self._pending_inserts(_PERSISTED_COLUMNS, claimed, now)
+        statements = self._pending_inserts(claimed, now) + self._pending_inserts(
+            unclaimed, now
+        )
         with self._write_lock:
             conn.execute("BEGIN TRANSACTION")
             try:
-                if unclaimed:
-                    statements += self._pending_inserts(_ROW_COLUMNS, unclaimed, now)
                 for sql, params in statements:
                     conn.execute(sql, params)
                 conn.execute("COMMIT")

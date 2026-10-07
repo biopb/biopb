@@ -10,23 +10,20 @@ import threading
 
 import numpy as np
 from biopb.tensor import TensorFlightClient
-from biopb_tensor_server.adapters import get_default_registry
 from biopb_tensor_server.adapters.fields import fields_root
-from biopb_tensor_server.core.discovery import DiscoveryState
 from biopb_tensor_server.serving.metadata_db import MetadataDatabase, catalog_tensors
 
-from tests import catalog_server, deferred_registration_test as drt, make_manager
+from tests import deferred_registration_test as drt
+from tests.restore_test import _Run as _RestoreRun
 
 
-class _Run:
-    """One server run over a catalog file and a ``write_dir``."""
+class _Run(_RestoreRun):
+    """A restore run on a writable server, listening, whose relists are recorded."""
 
     def __init__(self, tmp_path):
-        self.tmp = tmp_path
-        self.db = MetadataDatabase(
-            store_path=tmp_path / "catalog.duckdb", restore_sources=True
-        )
-        self.db.open()
+        super().__init__(tmp_path, writable=True, write_dir=tmp_path / "w")
+        self.server.mark_ready()
+        threading.Thread(target=self.server.serve, daemon=True).start()
         self.relisted = []
         relist = self.db.relist_tensors
 
@@ -36,22 +33,6 @@ class _Run:
             return changed
 
         self.db.relist_tensors = spy
-        self.server = catalog_server(
-            "localhost:0", metadata_db=self.db, writable=True, write_dir=tmp_path / "w"
-        )
-        self.server.mark_ready()
-        threading.Thread(target=self.server.serve, daemon=True).start()
-        self.monitored = tmp_path / "monitored"
-        self.monitored.mkdir(exist_ok=True)
-        self.manager = make_manager(
-            server=self.server,
-            registry=get_default_registry(),
-            discovery_state=DiscoveryState(),
-            metadata_db=self.db,
-            monitored_dirs={self.monitored},
-            stability_window=0,
-            registration_workers=0,
-        )
 
     def listed(self, source_id):
         rows = self.db.query(
@@ -60,10 +41,6 @@ class _Run:
         ).to_pylist()
         assert len(rows) == 1
         return rows[0]["ids"]
-
-    def stop(self):
-        self.server.shutdown()
-        self.db.close()
 
 
 def _first_run(tmp_path, fields=("raw",)):
@@ -89,7 +66,7 @@ def _first_run(tmp_path, fields=("raw",)):
 
 def _restart(tmp_path):
     run = _Run(tmp_path)
-    run.manager._restore_catalog()
+    run.restore()
     return run
 
 

@@ -1011,8 +1011,8 @@ class Reconciler:
         """Whether *claim*'s source is already held, spelled by a different path.
 
         The same file reached by a link or an overlapping root. It stays where it
-        is: re-spelling it would move it to another root, and so possibly between
-        the persisted table and the volatile one. Warns once.
+        is: re-spelling it would move it to another root, and so possibly change
+        its url. Warns once.
         """
         with self._lock:
             known = self._state.claims.get(claim.source_id)
