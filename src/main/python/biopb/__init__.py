@@ -1,22 +1,14 @@
-"""Top-level BioPB Python package metadata.
+"""BioPB Python package: version plus the client for a biopb control plane.
 
-Also the client for a biopb control plane (:mod:`biopb._control`, private):
-every name below except ``__version__`` is that package's content, re-exported
-here rather than at ``biopb.control`` so that dotted path is never mistaken
-for ``biopb-control``, the separate control-plane server distribution this is
-a client *of*. Stdlib only, so importing bare ``biopb`` stays cheap even
-though ``biopb.tensor``/``biopb.image`` (pyarrow, dask) are not imported here.
+Control-client names are re-exported from the private :mod:`biopb._control`
+(not ``biopb.control``, to avoid confusion with the ``biopb-control`` server
+distribution). Stdlib only, so a bare ``import biopb`` stays cheap.
 """
 
 from __future__ import annotations
 
-# The generated file first, dist-info METADATA only as the fallback -- the order
-# the other packages in this repo already use (biopb-control adopted it in
-# biopb/biopb#910). METADATA is stamped at install time and the generated file at
-# build time, so preferring METADATA reports whenever the SDK was last installed
-# rather than what is being imported: in an editable checkout that drifts behind
-# its own source. The `v*` tag line this package ships on is separate from the
-# product's `release-v*` line, but the drift is the same.
+# Prefer the build-time generated file: dist-info METADATA is stamped at install
+# time and goes stale in an editable checkout.
 try:
     from ._version import version as __version__
 except ImportError:

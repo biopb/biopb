@@ -13,7 +13,7 @@ must reap. Two owners share it: the tensor server (held by the control
 supervisor) and the biopb-mcp session child (held by the stdio shim, which in
 turn holds the kernel).
 
-* :mod:`biopb.lifecycle.owned_child` -- the ``OwnedChild`` handle itself.
+* :mod:`biopb.lifecycle._owned_child` -- the ``OwnedChild`` handle itself.
 * :mod:`biopb.lifecycle.winjob` -- Windows Job Object: kill-on-close bind (the
   child dies with its parent for any reason) plus a from-outside tree-kill.
 * :mod:`biopb.lifecycle.deathwatch` -- the child-side parent-death pipe watcher:
@@ -45,7 +45,7 @@ server wants it.
 """
 
 from . import daemon, deathwatch, file_lock, proc, winjob
-from .owned_child import OwnedChild, open_child_log
+from ._owned_child import OwnedChild, open_child_log
 
 __all__ = [
     "OwnedChild",

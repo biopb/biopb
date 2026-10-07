@@ -32,22 +32,14 @@ def start_control_detached() -> bool:
 
     Returns whether the launch was *issued* -- never whether the control is up.
 
-    Why fire-and-forget rather than a blocking ensure: the stdio shim must get its
-    bridge ready within the MCP client's initialize timeout, so it cannot pause to
-    verify the control -- lean as it is -- is fully listening. We fire the start and
-    return immediately; the control boots in the background, in parallel with the
-    session child's own (import-dominated) startup, which normally more than covers
-    the control's boot. If the control still isn't reachable when the child first
-    needs the data plane, :func:`biopb.ensure_data_plane` returns ``None``
-    and the connection surfaces the actionable "Run ``biopb control start``" status --
-    the mcp server, not the shim, is where a control-interaction failure belongs.
+    Fire-and-forget because the shim must answer the MCP initialize within its
+    timeout. If the control is still down when the child first needs the data
+    plane, :func:`biopb.ensure_data_plane` returns ``None`` and the connection
+    reports it.
 
-    The launched process is detached from the caller's process group / console, so
-    it (and the durable control it spawns) survives a client that disconnects during
-    the first seconds. Idempotent: ``biopb control start`` no-ops when a control is
-    already running and serializes concurrent starts (``biopb.lifecycle.file_lock``), so racing
-    shims are safe. ``--no-data-plane`` keeps the footprint minimal -- the data plane
-    comes up on demand when a session actually asks for it.
+    The process is detached, so it survives a client that disconnects early.
+    Idempotent: ``biopb control start`` no-ops when a control is running and
+    serializes concurrent starts. The data plane comes up on demand.
     """
     exe = _biopb_executable()
     if exe is None:
@@ -74,10 +66,7 @@ def start_control_detached() -> bool:
     except OSError as exc:
         logger.info("could not launch `biopb control start`: %s", exc)
         return False
-    # Reap the short-lived launcher (it exits within ~15s, after spawning the
-    # durable detached control) off a daemon thread, so we neither block here nor
-    # leave a zombie for the shim's possibly hours-long lifetime. Windows has no
-    # POSIX zombies; the durable control is unaffected either way.
+    # Reap the short-lived launcher off a daemon thread (no zombie; Windows has none).
     if os.name != "nt":
         threading.Thread(target=proc.wait, daemon=True).start()
     logger.info("launched `biopb control start --no-data-plane` (detached)")
@@ -104,10 +93,6 @@ def control_up(timeout: float = 1.0) -> bool:
 def ensure_control(wait: float) -> bool:
     """A control that answers, started here if need be; False if none does
     within *wait* seconds.
-
-    The one place the shim blocks on the control: asking it for a session is
-    only possible once it is up. Callers fall back to a session of their own
-    rather than fail, so a missing control costs a wait and no more.
     """
     import time
 
@@ -142,8 +127,7 @@ def launch_session(
     params = {
         "start_kernel": int(start_kernel),
         "display": json.dumps(display),
-        # Bounds the control's own wait under ours, so a slow start comes back
-        # as a verdict and not as a timeout that looks like no control.
+        # Keeps the control's own wait under ours, so a slow start returns a verdict.
         "client_timeout": timeout,
     }
     token = biopb.resolve_data_plane_token()

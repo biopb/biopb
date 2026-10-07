@@ -1,24 +1,10 @@
 """Validation for operator-supplied TLS material (``--tls-cert`` / ``--tls-key``).
 
-Three entry points resolve the same pair — ``biopb control start`` / ``run``,
-``python -m biopb_control run``, and the tensor server's own ``serve`` /
-``launch`` — and only the last of them actually reads the files. Anything the
-first two miss therefore surfaces inside the *supervised child*, which exits 2 on
-every spawn and crash-loops on backoff while the control reports a clean start,
-with the one useful sentence in tensor-server.log (biopb/biopb#913). One rule,
-here, so the three cannot drift and the fault lands on the command that was
-typed.
-
-``is_file()`` is not that rule: it passes for a file that can be stat'd and not
-read, which is the *normal* state of a private key (``0600``, often owned by
-root). :func:`read_pem` opens the file, because opening it is the thing the
-server will do.
-
-Stdlib only, deliberately: the BYO path exists so a plane can serve TLS without
-the ``cryptography`` extra, so nothing here may need it. That bounds this to what
-a byte-level look can decide — readable, non-empty, PEM, not passphrase-protected
-— and leaves the certificate's own contents (SANs, expiry, whether the key
-matches the cert) to whoever does have a parser.
+One rule shared by the control CLIs and the tensor server, so a bad file fails
+on the command that was typed rather than crash-looping the supervised child.
+:func:`read_pem` actually opens the file (``is_file()`` passes for an unreadable
+private key). Stdlib only (no ``cryptography``), so it checks only what bytes
+show: readable, non-empty, PEM, not passphrase-protected.
 """
 
 from __future__ import annotations
@@ -35,27 +21,21 @@ logger = logging.getLogger(__name__)
 #: Every PEM object starts with this, whatever it holds.
 _PEM_PREAMBLE = b"-----BEGIN"
 
-#: A passphrase-protected key, in either spelling: PKCS#8 says
-#: "ENCRYPTED PRIVATE KEY", the traditional OpenSSL format uses a Proc-Type
-#: header instead.
+#: A passphrase-protected key: PKCS#8 or traditional OpenSSL spelling.
 _ENCRYPTED_MARKERS = (b"ENCRYPTED PRIVATE KEY", b"Proc-Type: 4,ENCRYPTED")
 
 
 class TlsMaterialError(Exception):
     """TLS material that cannot be served, described with its fix.
 
-    Carries a complete, actionable sentence: callers render it verbatim (a CLI
-    prints it and exits 2), so the message is written for the operator rather
-    than for a traceback.
+    The message is an actionable sentence that callers render verbatim.
     """
 
 
 def expand_user_path(value: str | Path) -> Path:
     """*value* with a leading ``~`` expanded, or as given when there is no home.
 
-    ``~`` reaches us literally from a JSON profile, a ``.env`` or a scheduler
-    script. Windows reads ``USERPROFILE``, and with none set ``expanduser``
-    raises, which would hide the missing file this is about to name.
+    ``expanduser`` raises when no home is set, which would hide the missing file.
     """
     path = Path(value)
     try:
@@ -67,13 +47,7 @@ def expand_user_path(value: str | Path) -> Path:
 def read_pem(path: Path, label: str) -> bytes:
     """Read *path* as PEM, or raise :class:`TlsMaterialError` naming the fault.
 
-    *label* is how the caller names this file to the operator — the flag
-    (``--tls-cert``) for a value that came from the command line, the config key
-    (``tls_cert``) for one that came from the file, since the tensor server
-    accepts it from either.
-
-    Returns the bytes so the one caller that needs them does not read twice; the
-    two preflight callers discard them.
+    *label* names the file to the operator (the flag or the config key).
     """
     path = Path(path)
     if path.is_dir():
@@ -83,9 +57,7 @@ def read_pem(path: Path, label: str) -> bytes:
     try:
         data = path.read_bytes()
     except OSError as e:
-        # Overwhelmingly a permission problem on a key: readable by root, and the
-        # data plane runs as whoever started it. Name that, since the errno alone
-        # ("Permission denied") does not say whose permission was missing.
+        # Usually a key readable only by root; the message says whose permission.
         raise TlsMaterialError(
             f"{label} could not be read: {path} ({e.strerror}). The data plane "
             f"reads this file itself, as the user that starts it."
@@ -126,9 +98,8 @@ def choose_anchor(
 ) -> TlsAnchor:
     """The one anchor to trust when a config may name both: the CA wins.
 
-    The same rule as ``TensorFlightClient``'s constructor, said aloud: *source*
-    (who set them) is named in the warning, so nobody believes a fingerprint is
-    enforced when it is not.
+    Same rule as ``TensorFlightClient``'s constructor; *source* names who set
+    them in the warning.
     """
     fingerprint = (fingerprint or "").strip() or None
     if ca_pem and fingerprint:
@@ -144,15 +115,9 @@ def choose_anchor(
 def leaf_pem(bundle_pem: bytes) -> bytes:
     """The first certificate in *bundle_pem* — the leaf — as its own PEM block.
 
-    A ``--tls-cert`` may be a chain (leaf first, as the wire requires), and
-    everything that identifies "the certificate this server presents" means the
-    leaf: it is what a client verifies, and what ``PEM_cert_to_DER_cert`` refuses
-    to parse out of a bundle.
-
-    Returns the input unchanged when it holds a single certificate, and when it
-    holds nothing recognizable — the callers that matter validated it first with
-    :func:`read_pem`, and inventing a second failure here would only move the
-    error away from the check that owns it.
+    A ``--tls-cert`` may be a chain (leaf first). Returns the input unchanged
+    when it holds one certificate or nothing recognizable (callers validate with
+    :func:`read_pem` first).
     """
     marker = b"-----END CERTIFICATE-----"
     end = bundle_pem.find(marker)
@@ -164,13 +129,8 @@ def leaf_pem(bundle_pem: bytes) -> bytes:
 def fingerprint(cert_pem: bytes) -> str:
     """SHA-256 of a certificate's DER body — the identity clients check against.
 
-    Over the DER rather than the PEM text, so line endings and surrounding
-    whitespace cannot change the answer. One certificate only: pass a chain
-    through :func:`leaf_pem` first.
-
-    This is the one implementation. It used to exist three times over — server
-    side, client side, and in the pin store — for a value that has to agree
-    across all of them or trust silently fails.
+    Over the DER, so line endings and whitespace cannot change the answer. One
+    certificate only: pass a chain through :func:`leaf_pem` first.
     """
     der = ssl.PEM_cert_to_DER_cert(cert_pem.decode("ascii"))
     return hashlib.sha256(der).hexdigest()
@@ -179,8 +139,6 @@ def fingerprint(cert_pem: bytes) -> str:
 def format_fingerprint(hex_digest: str) -> str:
     """Colon-group a hex fingerprint for display (``AB:CD:...``).
 
-    Operators eyeball-compare these, so every printout uses the full digest in
-    this one grouped form — a truncated prefix is not something a human should be
-    asked to trust.
+    Always the full digest, since operators eyeball-compare these.
     """
     return ":".join(hex_digest[i : i + 2].upper() for i in range(0, len(hex_digest), 2))

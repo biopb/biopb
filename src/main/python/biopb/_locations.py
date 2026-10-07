@@ -1,47 +1,15 @@
-"""Single source of truth for where every biopb file lives — shared, stdlib-only.
+"""Single source of truth for where every biopb file lives (stdlib-only).
 
-Two concerns, one module because they answer the same question ("what path does
-this file have?") and every consumer needs both:
+Covers the config file (``biopb.json``, JSON only) and the runtime trees (logs,
+session registry, pids, stop sentinels, assets). Paths are resolved at call time,
+never cached, so tests can repoint ``Path.home()`` / ``BIOPB_*`` variables.
 
-1. **The config file** — *where* the tensor-server config lives, and its one
-   format. Imported by ``biopb-tensor-server`` (``config.find_config``) and the
-   umbrella ``biopb`` CLI.
-2. **The runtime trees** — the XDG base dirs and every log / session-registry /
-   pid / stop-sentinel / asset path derived from them. These used to be
-   open-coded as literal strings across five packages (the core CLI, biopb-mcp,
-   biopb-control, biopb-tensor-server, and both installers), which drifted
-   (``logs`` vs ``log``; a stray top-level ``biopb-mcp`` tree) and forced
-   hand-synced duplicates (the same ``tensor-server.stop`` literal in the
-   supervisor *and* the tensor server's shutdown listener). Centralizing them
-   here means a reader and a writer cannot disagree.
+Base directories use the same layout on every platform, each relocated by an
+ABSOLUTE ``BIOPB_*`` variable; the ``XDG_*`` variables are not read:
 
-**Base directories** (the same layout on every platform, matching the
-installer's ``~/.config``-everywhere convention rather than per-OS native dirs).
-Each is relocated by its own ``BIOPB_*`` variable, which must be an ABSOLUTE
-path; biopb does **not** read the ``XDG_*`` variables (see the note above
-``_tree``):
-
-- config  -> ``$BIOPB_CONFIG_HOME`` (default ``~/.config``)      ``biopb.json`` etc.
+- config  -> ``$BIOPB_CONFIG_HOME`` (default ``~/.config``)
 - state   -> ``$BIOPB_STATE_HOME``  (default ``~/.local/state``) logs, sessions, pids
 - data    -> ``$BIOPB_DATA_HOME``   (default ``~/.local/share``) webapp, samples
-
-Logs and the session registry are XDG **state** (per-machine, regenerable), not
-**data** (portable assets) — so they sit in the state tree, beside the pid and
-sentinel files, while the browser bundle and sample images stay in data.
-
-Deliberately stdlib-only (``os`` + ``pathlib`` + ``logging``) so importing it is
-cheap on every CLI invocation and so both ``biopb-control`` and
-``biopb-tensor-server`` (which already depend on core ``biopb``) can bind to it
-without a new dependency edge; it drags in none of the heavy adapter/discovery
-machinery ``biopb_tensor_server.core.config`` does. Paths are resolved **at call
-time**, never cached in a module constant, so a test that repoints
-``Path.home()`` / a ``BIOPB_*`` env var gets an isolated tree for free.
-
-JSON is the *only* on-disk config format: the config is machine-generated (the
-installer / the admin endpoint write it), and once nobody hand-edits it, TOML's
-hand-editing ergonomics stop paying for its one wart — no stdlib *writer*. JSON
-has a stdlib writer on both ends, unifies the format with biopb-mcp's
-``mcp-config.json``, and pairs with JSON Schema for validation (biopb/biopb#34).
 """
 
 from __future__ import annotations
@@ -54,77 +22,37 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# Env override for just the session-registry dir (predates this module). Kept so
-# a test / an unusual deployment can repoint the registry without moving the rest
-# of the state tree. BIOPB_STATE_HOME moves everything; this moves only sessions.
+# Env override for just the session-registry dir (BIOPB_STATE_HOME moves everything).
 SESSIONS_DIR_ENV = "BIOPB_SESSIONS_DIR"
 
-# Env var naming the file a session's own stdout/stderr went to, so the session
-# can report it (``server_status``) and an agent's ``execute_code`` can read it
-# from ``os.environ``. Set by whoever redirected that output -- the stdio shim
-# for the child it spawns, the control for a viewer it launches -- and read by
-# the session itself. Defined here because that is now three processes across
-# two packages that must agree on one string, and none of them may import the
-# others (control ARCHITECTURE.md, I2).
+# Env var naming the file a session's own stdout/stderr went to; set by whoever
+# redirected it (shim or control), read by the session. Defined here because the
+# processes involved may not import each other.
 MCP_SESSION_LOG_ENV = "BIOPB_MCP_SESSION_LOG"
 
-# Env var carrying a one-shot token that identifies *this* launch of a viewer
-# session. Set by the control on the child it spawns and written verbatim into
-# that child's registry record, so the launcher can recognise its own session
-# among all the live ones.
-#
-# It exists because the obvious signal -- match the record's pid against the
-# spawned ``Popen.pid`` -- is not reliable: on Windows a venv's
-# ``Scripts/python.exe`` is often a *trampoline* (uv, and pip's console-script
-# launchers) that re-spawns the real interpreter and waits on it, so the pid the
-# launcher holds is the stub's and the pid the child records is its own. They
-# never match, and the launcher waits out its whole timeout over a viewer that
-# opened seconds ago. A token also beats a pid on the merits: it cannot be
-# recycled, and it says "the process I started", not "a process with this
-# number". Defined here for the same reason MCP_SESSION_LOG_ENV is -- two
-# packages that may not import each other must agree on one string.
+# One-shot token identifying this launch of a viewer session, set by the control
+# on the child and echoed into the child's registry record. Matching on pid is
+# unreliable: on Windows a venv python.exe is often a trampoline whose pid differs
+# from the real interpreter's.
 MCP_LAUNCH_TOKEN_ENV = "BIOPB_MCP_LAUNCH_TOKEN"
 
-# The registry-record field the token above is echoed into (biopb._sessions
-# .register); named here, not just at each call site, so the two ends
-# (biopb-control reading it, biopb-mcp writing it) can't drift apart on the
-# key's spelling.
+# The registry-record field the token is echoed into (biopb._sessions.register).
 LAUNCH_TOKEN_FIELD = "launch_token"
 
 
 # --- base trees ---------------------------------------------------------- #
 #
-# biopb owns its own env namespace (``BIOPB_*_HOME``) and does NOT read the
-# ``XDG_*`` variables.
-#
-# It used to read them, and that was a bug (biopb/biopb#790). The XDG variables
-# are a freedesktop convention, but biopb honored them on every platform --
-# including Windows, where nothing owns them and any process may set them for
-# its own purposes. An MCP client that sets ``XDG_STATE_HOME`` to its own
-# working directory (opencode desktop does) has that value inherited by the
-# biopb-mcp shim it spawns, while a control plane started from a terminal keeps
-# the default. The two then disagree about where the state tree is, and the
-# session registry -- whose whole contract is that a session writes what the
-# control reads (see ``biopb._sessions``) -- silently splits in half.
-#
-# The other consumers of the state tree hid the same skew behind fallbacks: the
-# control endpoint record degrades to the default port, and the credential file
-# degrades to the tokenless path. Sessions were simply the one with no fallback.
-#
-# A ``BIOPB_*`` variable that merely takes *precedence* over ``XDG_*`` would not
-# fix this: the bug happens when the biopb variable is unset, which is the normal
-# case. So the XDG read is gone, not reordered. The DEFAULTS are unchanged
-# (``~/.config``, ``~/.local/state``, ``~/.local/share``), so an install that
-# never set an XDG variable sees no difference.
+# biopb owns its own env namespace (``BIOPB_*_HOME``) and does NOT read ``XDG_*``:
+# processes that inherit different XDG values would disagree about the state tree
+# and split the session registry. A mere precedence order would not fix that, so
+# the XDG read is absent entirely.
 
 _TREE_ENV_CONFIG = "BIOPB_CONFIG_HOME"
 _TREE_ENV_STATE = "BIOPB_STATE_HOME"
 _TREE_ENV_DATA = "BIOPB_DATA_HOME"
 _TREE_ENV_CACHE = "BIOPB_CACHE_HOME"
 
-# One warning per (biopb var) per process: relocating via XDG used to work, so a
-# stale deployment must be told its tree moved back to the default rather than
-# silently losing sight of its logs / certs / pids.
+# One warning per biopb var per process about an ignored XDG variable.
 _LEGACY_XDG_WARNED: set = set()
 
 
@@ -143,15 +71,8 @@ def _warn_legacy_xdg(biopb_var: str, xdg_var: str) -> None:
 def _require_absolute(env_var: str, raw: str) -> None:
     """Refuse a relative path in a location variable.
 
-    A relative value resolves against the **current working directory**, which
-    differs between the processes that must agree on these paths: the biopb-mcp
-    shim inherits its client's cwd, a control started from a terminal has that
-    terminal's, and the installer has whatever the user ran it from. So the same
-    variable would name a different directory in each -- the failure mode
-    biopb/biopb#790 already produced once, reintroduced through the override.
-
-    Loud rather than ignored-with-a-default: the value was set deliberately, and
-    silently relocating the tree somewhere else is exactly the drift this guards.
+    It would resolve against each process's own working directory, so processes
+    that must agree on a path would not.
     """
     if not os.path.isabs(raw):
         raise ValueError(
@@ -165,12 +86,8 @@ def _require_absolute(env_var: str, raw: str) -> None:
 def _tree(env_var: str, legacy_xdg_var: str, default_rel: str) -> Path:
     """The ``biopb`` subdir of a base dir.
 
-    Honors *env_var* when set, which must be an **absolute** path (see
-    :func:`_require_absolute`); otherwise falls back to ``~/<default_rel>``.
-    ``Path.home()`` is read at call time for test isolation.
-
-    *legacy_xdg_var* is only ever *detected*, never read for its value -- see the
-    note above.
+    Honors *env_var* when set (must be absolute, see :func:`_require_absolute`);
+    otherwise ``~/<default_rel>``. *legacy_xdg_var* is only detected, to warn.
     """
     raw = os.environ.get(env_var)
     if raw:
@@ -198,25 +115,10 @@ def data_dir() -> Path:
 def cache_dir() -> Path:
     """Cache tree: regenerable bytes, safe to delete.
 
-    ``~/.cache/biopb``, and ``%LOCALAPPDATA%\\biopb\\Cache`` on Windows.
-
-    Distinct from :func:`state_dir` precisely because everything here can be
-    thrown away without losing anything -- the SDK's on-disk chunk cache is the
-    first tenant, and its recovery story is "unlink whatever does not parse". A
-    user (or a distro's cache janitor) may empty this tree at any time.
-
-    **The one tree that is not the same layout on every platform.** The other
-    three hold kilobytes of config, state, and assets, so a uniform dotted layout
-    costs nothing. This one is sized to hold tens of gigabytes, which is exactly
-    what Windows separates ``%LOCALAPPDATA%`` (non-roaming, not backed up) from
-    the profile root to keep out of roaming profiles and Folder Redirection.
-    Syncing a chunk cache across a network profile is the harm; the divergence
-    buys avoiding it, and only here because only here is the tree big.
-
-    ``AppData/Local`` is derived from :func:`Path.home`, not read from
-    ``%LOCALAPPDATA%``. Trusting an inherited environment variable to place a
-    base tree is precisely the biopb/biopb#790 bug, and nothing about that lesson
-    changes for a variable Windows happens to own by convention.
+    ``~/.cache/biopb``, and ``%LOCALAPPDATA%\\biopb\\Cache`` on Windows (the one
+    platform-divergent tree: it can hold tens of gigabytes and must stay out of
+    roaming profiles). ``AppData/Local`` is derived from :func:`Path.home`, not
+    from ``%LOCALAPPDATA%``.
     """
     if sys.platform == "win32":
         raw = os.environ.get(_TREE_ENV_CACHE)
@@ -229,38 +131,26 @@ def cache_dir() -> Path:
 
 # --- config file (location + format) ------------------------------------- #
 
-# The config tree, resolved at import for the typer Option default; honors
-# ``$XDG_CONFIG_HOME``. ``config_dir()`` is the call-time source.
+# Resolved at import for the typer Option default; ``config_dir()`` is the call-time source.
 DEFAULT_CONFIG_DIR = config_dir()
 CANONICAL_CONFIG_NAME = "biopb.json"
 
-# biopb-mcp's own settings file, co-located in the same dir. Distinct from the
-# installer's client-definition ``mcp.json`` (which registers biopb-mcp with MCP
-# clients). Defined here so the three consumers that touch it -- biopb-mcp
-# (its config module) and the lean control plane + ``biopb._algorithms`` (which
-# read it WITHOUT importing biopb_mcp, invariant I2) -- agree on one location
-# and cannot drift. See biopb/biopb#34.
+# biopb-mcp's own settings file, in the config dir. Defined here so consumers that
+# may not import biopb_mcp agree on its location.
 MCP_CONFIG_NAME = "mcp-config.json"
 
 
 def mcp_config_path() -> Path:
-    """The biopb-mcp settings file (``~/.config/biopb/mcp-config.json``).
-
-    Computed at call time (not the import-time ``DEFAULT_CONFIG_DIR`` constant)
-    so a test that repoints ``Path.home()`` / ``$XDG_CONFIG_HOME`` gets an
-    isolated location.
-    """
+    """The biopb-mcp settings file (``~/.config/biopb/mcp-config.json``)."""
     return config_dir() / MCP_CONFIG_NAME
 
 
 def mcp_docs_dir() -> Path:
     """The agent's own docs (``~/.config/biopb/docs``).
 
-    The local tier of biopb-mcp's knowledge store: ``*.md`` files the agent
-    writes with ``write_doc``, plus the index it edits. A doc here shadows a
-    shipped one of the same id. Config-tree (user-authored), resolved at call
-    time for test isolation and **not created on access** -- the store creates
-    it when it seeds the index or writes the first doc.
+    The local tier of biopb-mcp's knowledge store (``*.md`` written by
+    ``write_doc``, plus its index); shadows a shipped doc of the same id. Not
+    created on access.
     """
     return config_dir() / "docs"
 
@@ -270,7 +160,7 @@ def algorithms_dir() -> Path:
 
     One entry per file, named by its stem: ``<name>.py`` is a server file the
     control runs under uv, ``<name>.json`` (``{"url": ...}``) a server someone
-    else runs. Resolved at call time for test isolation; not created on access.
+    else runs. Not created on access.
     """
     return config_dir() / "algorithms"
 
@@ -286,10 +176,7 @@ def algorithms_state_dir() -> Path:
 def find_config(config_dir: Path = DEFAULT_CONFIG_DIR) -> Path:
     """Resolve the config file in *config_dir*: ``biopb.json``.
 
-    Returns the canonical path whether or not it exists, so a caller that is
-    seeding a fresh config and one that is reading an existing one name the same
-    file. Callers that need a guaranteed-existing file should check
-    ``.exists()`` on the result.
+    Returns the canonical path whether or not it exists.
     """
     return config_dir / CANONICAL_CONFIG_NAME
 
@@ -318,10 +205,7 @@ def control_log() -> Path:
 
 
 def mcp_log_dir() -> Path:
-    """biopb-mcp's log subtree (``state/biopb/mcp``); created on access.
-
-    Replaces the former separate top-level ``~/.local/share/biopb-mcp/log`` tree.
-    """
+    """biopb-mcp's log subtree (``state/biopb/mcp``); created on access."""
     d = state_dir() / "mcp"
     d.mkdir(parents=True, exist_ok=True)
     return d
@@ -335,18 +219,8 @@ def mcp_server_log() -> Path:
 def mcp_viewer_log_dir() -> Path:
     """Where a viewer session the **control** launched writes its output.
 
-    Control-launched viewers are the one session kind whose output has no other
-    home: a shim-owned child logs to the shim's per-session file and a
-    ``biopb mcp view`` started by hand writes to that terminal, but a viewer
-    spawned from the dashboard has neither. Lives here, in the core SDK, because
-    the control may not import biopb-mcp (control ARCHITECTURE.md, I2) and so
-    cannot ask it where its logs go.
-
-    **One file per launch**, beside the shim's per-session directory and for the
-    same reason: concurrent viewers sharing one file interleave, and a log whose
-    lines cannot be attributed to a process is not a log you can diagnose a
-    running session from. Retention is the caller's (the control prunes to the
-    newest few, as the shim does).
+    One file per launch, so concurrent viewers do not interleave. Lives here
+    because the control may not import biopb-mcp. Retention is the caller's.
     """
     d = mcp_log_dir() / "viewers"
     d.mkdir(parents=True, exist_ok=True)
@@ -359,11 +233,8 @@ def mcp_viewer_log_dir() -> Path:
 def sessions_dir() -> Path:
     """The live-session registry dir; created on access.
 
-    ``BIOPB_SESSIONS_DIR`` overrides the location (used by tests and unusual
-    deployments); otherwise ``state/biopb/sessions``. The override must be an
-    absolute path -- this registry is the one directory a session and a control
-    *must* agree on, and they do not share a working directory
-    (:func:`_require_absolute`).
+    ``BIOPB_SESSIONS_DIR`` overrides the location (must be absolute);
+    otherwise ``state/biopb/sessions``.
     """
     raw = os.environ.get(SESSIONS_DIR_ENV)
     if raw:
@@ -376,16 +247,10 @@ def sessions_dir() -> Path:
 def tls_served_certs() -> Path:
     """What each local flight plane serves (``state/biopb/tls-served.json``).
 
-    Written by a plane that serves TLS, read by clients on the same machine so
-    they verify the certificate it is *actually* serving. Distinct from
-    :func:`tls_server_cert`, which is the pair the plane **mints** — an operator's
-    own ``--tls-cert`` never lands there, and copying it in would be wrong: its
-    key would have to follow, and a later plain ``--tls`` would then serve a
-    certificate whose key is not beside it (biopb/biopb#916).
-
-    Keyed by port, because that is what distinguishes two planes on one machine
-    and this file is only ever consulted for a loopback dial, where the host is
-    an alias. Machine-local, regenerable, and never created on access.
+    Written by a plane that serves TLS, read by same-machine clients so they
+    verify the certificate actually served. Distinct from :func:`tls_server_cert`
+    (the pair the plane mints; an operator's own ``--tls-cert`` never lands
+    there). Keyed by port; never created on access.
     """
     return state_dir() / "tls-served.json"
 
@@ -393,11 +258,8 @@ def tls_served_certs() -> Path:
 def tls_known_hosts() -> Path:
     """TOFU pin store for the tensor Flight client (``state/biopb/tls-known-hosts.json``).
 
-    Maps a ``host:port`` to the server certificate pinned on first connect (the
-    SSH ``known_hosts`` model, biopb/biopb#604). Machine-local, regenerable trust
-    state — hence the state tree, beside the pids/sentinels — not user-authored
-    config. Resolved at call time for test isolation; not created on access (an
-    absent file is the normal "nothing pinned yet" case).
+    Maps ``host:port`` to the certificate pinned on first connect (SSH
+    ``known_hosts`` model). Not created on access.
     """
     return state_dir() / "tls-known-hosts.json"
 
@@ -405,9 +267,7 @@ def tls_known_hosts() -> Path:
 def tls_server_cert() -> Path:
     """The tensor server's TLS certificate (``state/biopb/tls/server-cert.pem``).
 
-    Auto-generated self-signed cert served when the flight plane runs with
-    ``--tls`` (biopb/biopb#604). Public material — world-readable is fine — kept
-    in the state tree beside its key. Resolved at call time for test isolation.
+    Auto-generated self-signed cert served under ``--tls``; public material.
     """
     return state_dir() / "tls" / "server-cert.pem"
 
@@ -415,8 +275,7 @@ def tls_server_cert() -> Path:
 def tls_server_key() -> Path:
     """The tensor server's TLS private key (``state/biopb/tls/server-key.pem``).
 
-    The secret half of :func:`tls_server_cert`; written owner-only (``0600`` on
-    POSIX). Resolved at call time for test isolation.
+    The secret half of :func:`tls_server_cert`; written owner-only.
     """
     return state_dir() / "tls" / "server-key.pem"
 
@@ -429,20 +288,9 @@ def control_pid_file() -> Path:
 def control_runtime_file() -> Path:
     """Where a *serving* control publishes its endpoint (``state/biopb/control.json``).
 
-    The discovery half of what the pid file used to imply. ``control.pid`` is a
-    **lifecycle** record -- ``control start`` writes it about the daemon it
-    spawned so ``control stop`` can signal it later -- and a foreground
-    ``control run`` deliberately has none (its terminal or service manager owns
-    the process). But once the control's port became derivable from
-    ``--base-port`` rather than fixed at 8813, *both* forms need to publish
-    **where** they listen, or a client has no way to find a control that moved.
-
-    So the endpoint is written by whoever actually bound the socket
-    (``biopb_control._run``), on the path both commands share, beside the
-    ``tensor-server.token`` credential and on the same publish-on-serve /
-    retract-on-clean-stop lifetime. Not a secret -- the port is not a
-    credential -- so unlike the credential file it carries no owner-only perms
-    and is written unconditionally, including for a tokenless local plane.
+    Written by whoever bound the socket, for both ``control start`` and a
+    foreground ``control run`` (which has no pid file), and retracted on clean
+    stop. Not a secret, so no owner-only perms.
     """
     return state_dir() / "control.json"
 
@@ -455,9 +303,8 @@ def control_stop_sentinel() -> Path:
 def tensor_stop_sentinel() -> Path:
     """The data plane's Windows stop-sentinel.
 
-    Written by ``DataPlaneSupervisor`` and watched by the tensor server's
-    ``_install_windows_shutdown_listener`` — the single definition both bind to
-    (they previously duplicated the literal and relied on a "keep in sync" note).
+    Written by ``DataPlaneSupervisor``, watched by the tensor server's
+    ``_install_windows_shutdown_listener``.
     """
     return state_dir() / "tensor-server.stop"
 
@@ -465,17 +312,10 @@ def tensor_stop_sentinel() -> Path:
 def tensor_catalog_path(config_path: Path) -> Path:
     """The tensor server's on-disk DuckDB catalog for *config_path*.
 
-    Named by a digest of the resolved config path, because a tensor server is a
-    singleton only with respect to one set of data: two servers started from two
-    ``biopb.json`` files are a normal deployment, and a single shared file would
-    have them take turns clearing each other's ``sources``. DuckDB takes an
-    exclusive lock on the file, so the collision would surface as the second
-    server failing to start rather than as corruption -- but a per-config path
-    means it never arises.
-
-    In the state tree, not the cache tree: the catalog's ``sources`` rows are
-    regenerable, but its ``rois`` rows are hand-drawn and are not, and
-    :func:`cache_dir` is documented as safe for a janitor to empty.
+    Named by a digest of the resolved config path, so servers started from
+    different ``biopb.json`` files do not share (and lock-collide on) one file.
+    In the state tree, not the cache tree: its ``rois`` rows are hand-drawn and
+    not regenerable.
     """
     digest = hashlib.sha256(
         str(Path(config_path).expanduser().resolve()).encode("utf-8")
@@ -509,9 +349,6 @@ def rotate_log(
     """Rotate *log_file* if it exceeds *max_bytes*, keeping up to *backup_count*
     backups (``.1`` … ``.N``).
 
-    A size-triggered manual rotation: the core CLI calls it for ``control.log``
-    at ``control start``, and the control's ``RotatingLog`` calls it for each
-    supervised child's log, at open and whenever the file grows past the limit.
     """
     if not log_file.exists() or log_file.stat().st_size < max_bytes:
         return

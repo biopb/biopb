@@ -1,40 +1,11 @@
-"""Local data-plane credential handoff — shared, stdlib-only.
+"""Local data-plane credential handoff via an owner-only file in the state dir.
 
-The control plane is the single source of truth for the data plane (#413), but
-until now it handed clients the plane's *endpoint* without a *credential*: a
-local client (the napari widget, biopb-mcp) rediscovered the token from its own
-environment (``BIOPB_TENSOR_TOKEN``). That breaks the moment the control has a
-token but the client never inherited it — exactly the mode #468 introduced,
-where an agent spawns biopb-mcp over stdio with none of the control's env. And
-the endpoint cannot simply *return* the token: it is loopback-reachable by every
-uid on the box, so an unauthenticated reply would be a token oracle (#470).
-
-This module moves credential distribution off the HTTP API and onto the
-filesystem, the standard local-daemon handoff (Jupyter's runtime JSON, Docker):
-the control writes the resolved data-plane token to a single file in the user's
-own state dir, restricted to the owner, and local clients read it there. The
-token never crosses the very channel it protects, and the boundary becomes
-filesystem permissions — other uids cannot read a ``0600`` file, which is what
-"defense in depth on a shared host" means. It does not defend against a
-same-uid process, but neither does an env var (which additionally leaks via
-``/proc/<pid>/environ``, ``ps e``, and every inherited child).
-
-Deliberately stdlib-only (``os`` + ``pathlib`` + ``ctypes`` on Windows) so both
-``biopb-control`` (writer) and ``biopb-mcp`` (reader) — which already depend on
-core ``biopb`` but cannot import each other — bind to it without a new
-dependency edge, alongside ``_locations`` / ``_endpoints``.
-
-**The ``0600`` equivalent per platform.** On POSIX the file is created and
-``chmod``-ed to ``0o600`` (owner read/write, nobody else). Windows has no POSIX
-mode bits — ``os.chmod`` there only toggles the read-only attribute and cannot
-express "owner only" — so :func:`_harden_windows` instead sets the file's DACL
-to grant full access to *only* the current user's SID, with inheritance
-disabled (``SE_DACL_PROTECTED``), the faithful analogue of ``0600``. That
-explicit DACL is belt-and-suspenders over the state dir already living under
-``%USERPROFILE%``, whose default ACL restricts it to the owner — but the issue
-(#470) asked for an explicit check rather than trusting inheritance. All
-hardening is best-effort and logged at debug: a failure degrades to the
-inherited boundary rather than refusing to write the credential.
+The control writes the resolved token; local clients (napari widget, biopb-mcp)
+read it. The HTTP API never returns the token (loopback is reachable by every uid
+on the box), so the boundary is filesystem permissions. POSIX uses ``0o600``;
+Windows sets a protected DACL granting only the current user's SID
+(:func:`_harden_windows`). Hardening is best-effort and logged at debug.
+Stdlib-only, so both ``biopb-control`` and ``biopb-mcp`` can use it.
 """
 
 from __future__ import annotations
@@ -49,24 +20,15 @@ from ._locations import state_dir
 
 logger = logging.getLogger(__name__)
 
-# The data-plane credential the control writes and local clients read. State
-# tree (per-machine, regenerable), beside the pid / sentinel files. The ``.token``
-# suffix keeps it distinct from ``control.pid`` (whose own "token" field is an
-# unrelated PID-reuse guard, not a credential).
+# The data-plane credential file, in the state tree beside the pid / sentinel files.
 _CREDENTIAL_NAME = "tensor-server.token"
 
 
 def credential_file(name: str = _CREDENTIAL_NAME) -> Path:
     """Path to a local credential file (default: the data plane's).
 
-    Resolved at call time (not cached) so a test that repoints ``Path.home()`` /
-    ``$BIOPB_STATE_HOME`` gets an isolated location.
-
-    *name* exists because the reasoning in this module's docstring — owner-only
-    file over env var or API reply — is not specific to the data-plane token.
-    The chat client's provider key is stored the same way, and for a sharper
-    reason: it is a *foreign* credential with billing attached, so a leak reaches
-    past this machine in a way the data-plane token cannot.
+    Resolved at call time so tests can repoint the state dir. *name* selects
+    another credential stored the same way (e.g. the chat client's provider key).
     """
     return state_dir() / name
 
@@ -79,16 +41,12 @@ def _harden_posix(path: Path) -> None:
 def _harden_windows(path: Path) -> bool:
     """Restrict *path*'s DACL to the current user, protected against inheritance.
 
-    The Windows analogue of ``chmod 0600``: build a security descriptor whose
-    DACL grants full access (``FA``) to only the current process user's SID and
-    carries ``SE_DACL_PROTECTED`` (the ``P`` flag), so no ACE inherited from the
-    parent directory can widen it. Returns True on success; a False return
-    leaves the file protected only by the state dir's inherited ACL (owner-only
-    by default under ``%USERPROFILE%``).
+    The DACL grants full access only to the current user's SID and is protected
+    from inheritance. Returns True on success; False leaves the state dir's
+    inherited ACL in effect.
 
-    Raw ``ctypes`` with explicit ``argtypes``/``restype`` on every call — on
-    64-bit Windows an unannotated handle/pointer is truncated to ``c_int``,
-    corrupting the SID and SD pointers — mirroring ``biopb.lifecycle`` proc/job.
+    Every ctypes call needs explicit ``argtypes``/``restype``: on 64-bit Windows
+    unannotated handles/pointers are truncated to ``c_int``.
     """
     import ctypes
     from ctypes import wintypes
@@ -158,9 +116,7 @@ def _harden_windows(path: Path) -> bool:
             token, _TOKEN_USER, buf, size, ctypes.byref(size)
         ):
             return False
-        # TOKEN_USER := SID_AND_ATTRIBUTES { PSID Sid; DWORD Attributes }, so the
-        # first pointer-sized field of the buffer is the PSID (which points back
-        # into the trailing bytes of the same buffer).
+        # The first pointer-sized field of TOKEN_USER is the PSID.
         sid = ctypes.cast(buf, ctypes.POINTER(wintypes.LPVOID))[0]
         str_sid = wintypes.LPWSTR()
         if not advapi32.ConvertSidToStringSidW(sid, ctypes.byref(str_sid)):
@@ -176,9 +132,7 @@ def _harden_windows(path: Path) -> bool:
         return False
 
     # --- SDDL -> security descriptor -> file DACL --------------------------
-    # D:P(A;;FA;;;<sid>) — a protected (P: no inheritance) DACL with one ACE
-    # granting File-All to the current user's SID. The owner/group are left
-    # untouched (we set only DACL_SECURITY_INFORMATION).
+    # Protected DACL (P) with one File-All ACE for the current user; owner/group untouched.
     sddl = f"D:P(A;;FA;;;{sid_text})"
     sd = wintypes.LPVOID()
     if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -195,10 +149,8 @@ def _harden_windows(path: Path) -> bool:
 def _harden(path: Path) -> None:
     """Restrict *path* to the owner, cross-platform and best-effort.
 
-    POSIX ``0o600`` / Windows owner-only protected DACL. Any failure is logged
-    at debug and swallowed: on a shared host it weakens defense in depth but must
-    never abort writing the credential (a missing credential is a worse failure
-    than one protected by only the state dir's inherited ACL).
+    Failures are logged at debug and swallowed: a missing credential is worse
+    than one protected only by the state dir's ACL.
     """
     try:
         if sys.platform == "win32":
@@ -217,11 +169,8 @@ def _harden(path: Path) -> None:
 def write_credential(token: str, name: str = _CREDENTIAL_NAME) -> Path:
     """Write *token* to the owner-only credential file *name*; return its path.
 
-    Atomic (sibling temp + ``os.replace`` on the same filesystem) so a concurrent
-    reader never sees a half-written file, and hardened to owner-only *before* the
-    replace so the token is never momentarily readable at its final name. On POSIX
-    ``mkstemp`` already creates the temp file ``0600``; the explicit harden
-    re-asserts it (and does the DACL work on Windows).
+    Atomic, and hardened *before* the replace so the token is never readable at
+    its final name.
     """
     path = credential_file(name)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -246,10 +195,7 @@ def write_credential(token: str, name: str = _CREDENTIAL_NAME) -> Path:
 def read_credential(name: str = _CREDENTIAL_NAME) -> str | None:
     """Read a credential from the owner-only file *name*, or ``None``.
 
-    ``None`` on any of: the file is absent (the common tokenless-local case, or no
-    control has written one), unreadable, or empty. Best-effort by design — the
-    caller falls back to ``BIOPB_TENSOR_TOKEN`` / an actionable error, never
-    raises.
+    ``None`` if the file is absent, unreadable, or empty; never raises.
     """
     path = credential_file(name)
     try:

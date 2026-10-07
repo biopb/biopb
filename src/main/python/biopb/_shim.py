@@ -1,62 +1,44 @@
 """stdio bridge ("shim") to a biopb-mcp http session.
 
-``biopb-shim`` (``biopb-mcp --transport stdio`` runs the same code) does not serve
-MCP over fd 0/1 from a session. It is the SDK's own light process, needing only
-the ``mcp`` package (``biopb[shim]``), and it
+``biopb-shim`` (also ``biopb-mcp --transport stdio``) is a light process needing
+only the ``mcp`` package (``biopb[shim]``). It
 
-1. starts **unbound**, answering ``initialize`` with a paragraph that says to call
-   the local ``attach`` tool, which is the only tool it lists, so a client that
-   never attaches costs no session. It holds no copy of any session's tools,
-   resources, prompts or instructions;
-2. on ``attach``, takes the lease of a live session (``/api/lease``) and bridges
-   requests to its streamable-http endpoint, and tells the client its lists
-   changed (``list_changed``). For ``new`` it first asks the control to launch a
-   session, carrying this client's display environment -- an error if no control
-   answers, since a session without one has no data plane. Attaching returns the
-   session's own operating rules, and attaching again to the same session
-   returns them again;
+1. starts **unbound**: ``initialize`` says to call the local ``attach`` tool, the
+   only tool listed, so a client that never attaches costs no session;
+2. on ``attach``, takes the lease of a live session (``/api/lease``), bridges
+   requests to its streamable-http endpoint, and sends ``list_changed``. For
+   ``new`` it first asks the control to launch a session with this client's
+   display environment (an error if no control answers). Attaching returns the
+   session's own operating rules, again on re-attach;
 3. releases the lease on the way out.
 
-A client that cannot follow ``list_changed`` (Codex does not refresh its tool
-list within a turn) is served by ``--session`` instead: the shim binds an id,
-``new``, or ``auto`` (the newest free session, else a new one) *before* it
-answers ``initialize``, so the answer already carries the session's own
-instructions and tools, and the client never needs a refresh. The client gives up
-choosing a session in exchange.
+A client that cannot follow ``list_changed`` (Codex) uses ``--session``: the shim
+binds an id, ``new``, or ``auto`` (newest free session, else new) *before*
+answering ``initialize``, so the answer already carries the session's tools and
+instructions.
 
-The process that owns fd 1 as a protocol channel imports nothing that could write
-to stdout (no Qt, dask, uvicorn, kernel, or session code -- only the mcp SDK), so
-the fd-1 corruption class is structurally impossible here. The session reaches the
-shim only over HTTP: ``/api/lease``, ``/api/status``, ``/api/sessions`` and the
-session registry are the contract between the two packages.
+The shim imports nothing that could write to stdout (no Qt, dask, uvicorn, kernel
+or session code), so fd 1 stays a clean protocol channel. The session reaches it
+only over HTTP: ``/api/lease``, ``/api/status``, ``/api/sessions`` and the session
+registry.
 
 With ``--remote`` the sessions are another machine's, reached through its control
-under the token (``_Remote``): the same lease, status and ``/mcp``, at
-``<control>/session/<id>/...``. Everything below holds there too.
+under the token (``_Remote``), at ``<control>/session/<id>/...``.
 
-The shim owns no session. Every session is a detached process the control
-launched, or a person did (``biopb mcp view``, the dashboard), and it runs until
-a person stops it from the dashboard; the shim only holds its lease while the
-agent is attached, and the next agent can attach to the same session. A session
-that is stopped, or that another holder takes by force, unbinds the shim, and its
-next request says why. So there is nothing here to reap: no child, no process
-group, no Job Object.
+The shim owns no session: sessions are detached processes the control (or a
+person) launched, and it only holds a lease while attached. A session that is
+stopped, or taken by force, unbinds the shim, and its next request says why.
 
-What the shim does own is itself. A shim that outlived its client would go on
-renewing its lease and keep the session locked, so it releases and exits when the
-client goes: on stdin EOF, on SIGTERM/SIGHUP (``_install_release_on_signal``),
-and -- where a multi-process client can keep a duplicate of the stdin write
-handle open after it is gone, as Claude Code does on Windows, biopb#403 --
-through a watchdog on the client's process (``_install_client_death_watchdog``).
-A shim killed too hard to release leaves a lease that lapses by itself
-(``_lease.TTL``).
+The shim does own itself: a shim outliving its client would keep renewing the
+lease, so it releases and exits on stdin EOF, on SIGTERM/SIGHUP
+(``_install_release_on_signal``), and via a client-process watchdog
+(``_install_client_death_watchdog``) for clients that keep a duplicate stdin
+handle open after dying (Claude Code on Windows). A shim killed too hard to
+release leaves a lease that lapses by itself (``_lease.TTL``).
 
-The bridge itself is vendored rather than delegated to ``mcp-proxy``: mcp-proxy
-drops the initialize ``instructions`` field that carries biopb-mcp's operation
-guardrails, has no lifetime guard when the server dies, and floats its
-dependencies. Here an attach carries the session's own ``instructions`` back to
-the agent, a session that fails to start is a tool error the agent can read, and
-one that stops answering unbinds the shim rather than leaving a hung proxy.
+The bridge is vendored rather than delegated to ``mcp-proxy``, which drops the
+initialize ``instructions`` field, has no lifetime guard when the server dies,
+and floats its dependencies.
 """
 
 import json
@@ -85,17 +67,9 @@ logger = logging.getLogger(__name__)
 
 
 def _install_release_on_signal(release):
-    """POSIX: run *release* (give the session's lease back) if this shim is
-    signalled to exit.
-
-    A SIGTERM/SIGHUP would otherwise end the shim through Python's default
-    handler without running ``serve``'s ``finally``, leaving the lease to lapse
-    on its own 30 s later and the session locked until then. SIGINT is left to
-    its default: it raises KeyboardInterrupt out of ``anyio.run`` and ``serve``'s
-    ``finally`` releases. On Windows there are no such signals;
-    ``_install_client_death_watchdog`` covers the shim being *orphaned* by its
-    client, so this is a no-op there.
-    """
+    """POSIX: run *release* on SIGTERM/SIGHUP, which would otherwise skip
+    ``serve``'s ``finally`` and leave the lease locked until it lapses. SIGINT
+    keeps its default (``serve``'s ``finally`` releases). No-op on Windows."""
     if os.name == "nt":
         return
 
@@ -112,27 +86,17 @@ def _install_release_on_signal(release):
             pass
 
 
-# A process in *our own* launcher chain (the shim and any interpreter-launcher
-# stubs above it), as opposed to the MCP client that spawned it, shares the argv
-# the client invoked us with (``biopb-shim ...``, or the older ``biopb-mcp
-# --transport stdio``), and re-exec launchers (e.g. a venv built on Microsoft
-# Store Python inserts one) preserve it. The client's own cmdline (claude.exe, an
-# editor, a shell) matches neither.
+# Processes in our own launcher chain (the shim and launcher stubs above it, which
+# preserve argv) match; the MCP client's own cmdline does not.
 def _is_ours(cmdline):
     return "biopb" in cmdline and ("shim" in cmdline or "stdio" in cmdline)
 
 
 def _find_client_process():
-    """Walk up past our own launcher chain to the MCP client that owns us.
+    """The MCP client above our own launcher chain, or ``None`` if unknown.
 
-    ``os.getppid()`` is NOT the client when an interpreter-launcher stub sits
-    between us and it — the case that made a naive parent-watch useless: on a
-    venv built on Store Python the stub *outlives* the client (it only waits on
-    us), so watching it never fires. We instead climb ancestors while their
-    cmdline looks like our chain (:func:`_is_ours`) and return the first
-    foreign one — the real client. ``None`` if it can't be determined (psutil
-    missing, an unreadable/inaccessible ancestor, or the chain reaches the top),
-    in which case the watchdog simply does not arm.
+    ``os.getppid()`` can be a launcher stub that outlives the client, so climb
+    ancestors past those matching :func:`_is_ours`.
     """
     try:
         import psutil
@@ -153,38 +117,16 @@ def _find_client_process():
 
 
 def _is_windows() -> bool:
-    """Platform check, isolated as a seam the watchdog tests patch.
-
-    Tests must exercise the Windows-only branch below *without* forcing the global
-    ``os.name = "nt"`` — on a POSIX runner that makes ``pathlib.Path`` build a
-    ``WindowsPath``, which raises on Python < 3.12 and crashes pytest itself (its
-    coverage / cache / location machinery calls ``Path``). See the same note in
-    ``_tests/test_update.py``.
-    """
+    """Platform check; a seam for tests (patching ``os.name`` breaks pathlib)."""
     return os.name == "nt"
 
 
 def _install_client_death_watchdog(release):
-    """Windows: run *release* and exit if the stdio *client* dies unseen by stdin.
+    """Windows: release and exit when the stdio *client* dies without stdin EOF.
 
-    Normal teardown runs when the bridge returns on stdin EOF (client hung up)
-    or, on POSIX, when the client's process-group teardown / a SIGTERM fires
-    ``_install_release_on_signal``. Windows has neither group teardown nor those
-    signals, and a multi-process client can keep a duplicate of the shim's stdin
-    write handle open in a surviving helper after the launching process exits, so
-    EOF never arrives -- the shim blocks forever in the bridge, renewing its
-    lease for a client that is gone, and the session stays locked to it. This
-    watchdog closes that gap: it blocks on the client's process handle and, when
-    the client exits for any reason, releases the lease and exits.
-
-    The client is found by :func:`_find_client_process` (walking past our own
-    launcher stubs -- see its docstring for why ``os.getppid()`` is not enough).
-    We hold a handle to that exact process object, so the wait is immune to pid
-    reuse. If the client cannot be found or opened at arm time, we do not arm:
-    the shim is never ended off an uncertain baseline; stdin EOF remains the
-    backstop. A no-op off Windows.
-
-    Returns the watchdog thread (daemon), or ``None`` if not armed.
+    Waits on a handle to the client found by :func:`_find_client_process` (immune
+    to pid reuse). Not armed if the client cannot be found or opened. No-op off
+    Windows. Returns the daemon thread, or ``None`` if not armed.
     """
     if not _is_windows():
         return None
@@ -212,10 +154,7 @@ def _install_client_death_watchdog(release):
 def _client_deathwatch(handle, client_pid, release):
     """Block on the client's ``handle``; on its exit, release the lease and exit.
 
-    A wait error is treated as *undecided* -- we do not end the shim, since a
-    spurious exit would drop a live attachment. On a real exit this ``os._exit``s
-    past ``serve``'s ``finally`` (having already released), matching the signal
-    handler.
+    A wait error is undecided: the shim is left running.
     """
     if not _winjob.wait_for_process(handle):
         return  # undecided (wait errored) -- leave teardown to the other paths
@@ -344,11 +283,7 @@ def _format_listing(states):
 
 
 def _newest_free_session():
-    """The newest session nothing holds, or None.
-
-    What ``--session auto`` takes for a client that cannot choose: it decides
-    before it has said a word to the agent, so it cannot be asked.
-    """
+    """The newest session nothing holds, or None (what ``--session auto`` takes)."""
     for rec, status in _session_states():
         if status is not None and not _holder(status):
             return rec
@@ -386,13 +321,10 @@ class _Local:
 
     def launch(self):
         """``(session_id, base, mcp_url)`` of a session the control launched for
-        this client. ``AttachError`` when it cannot be reached or will not launch
-        one.
+        this client; ``AttachError`` if it cannot be reached or will not launch one.
 
-        There is deliberately no session of the shim's own to fall back to: a
-        session reaches the data and algorithm planes through the control, so one
-        started without it would attach "successfully" and fail on first use,
-        hiding the cause.
+        No fallback to a shim-owned session: without the control it would have no
+        data plane and fail on first use.
         """
         log = getattr(_locations, "control_log", None)
         where = f" (its log: {log()})" if log is not None else ""
@@ -611,12 +543,9 @@ class _Binding:
         return await anyio.to_thread.run_sync(self.plane.listing)
 
     async def attach(self, selector, force=False):
-        """Attach to *selector* (a session id, or ``new``); the text to hand
-        the agent. Raises :class:`AttachError`.
-
-        Attaching to the session already attached is not an error: it hands back
-        the same text, so an agent whose context no longer holds the rules can
-        ask for them again.
+        """Attach to *selector* (a session id, or ``new``); the text to hand the
+        agent. Re-attaching to the current session returns the same text.
+        Raises :class:`AttachError`.
         """
         async with self._lock:
             if self.session is not None:
@@ -652,10 +581,7 @@ class _Binding:
         ).strip()
 
     async def announce_change(self):
-        """Tell the client its tool, resource and prompt lists changed.
-
-        Best-effort: a client that ignores these is the one ``--session`` is for.
-        """
+        """Tell the client its tool, resource and prompt lists changed (best-effort)."""
         notifier = self.server_session
         if notifier is None:
             return
@@ -810,12 +736,9 @@ _ATTACH_PREFACE = (
 def build_proxy(binding):
     """Build the stdio-facing MCP server.
 
-    Until a session is attached, ``tools/list`` lists the local ``attach`` tool
-    alone, and resources and prompts are empty: the shim holds no copy of any
-    session's surface. Once attached, every list is the session's own, and the
-    client is told so by ``list_changed``. A client that cannot follow that is
-    served by binding first (``--session``; see :func:`_serve_stdio`), so its
-    first list is already the session's.
+    Until a session is attached, ``tools/list`` lists only the local ``attach``
+    tool and resources and prompts are empty; afterwards every list is the
+    session's own.
 
     Every other request awaits ``binding.connect()`` and is forwarded; with no
     session attached that is an error the agent reads, and a tool call as a tool
@@ -963,10 +886,8 @@ async def _serve_stdio(binding):
         binding.task_group = tg
         note = ""
         if binding.preselect is not None:
-            # Before the first byte is read: the client's `initialize` waits in
-            # the pipe, and what it gets back is the session's own tools and
-            # rules, so a client that never refreshes its tool list still has
-            # the right one.
+            # Bind before the first byte is read so `initialize` carries the
+            # session's own tools and rules.
             try:
                 await binding.attach(binding.preselect)
             except AttachError as e:
@@ -983,11 +904,8 @@ async def _serve_stdio(binding):
 def serve(session=None, remote=None, token=None, headers=None):
     """Bridge stdio to a session: attach on request, release on the way out.
 
-    The shim starts unbound; the agent's ``attach`` tool picks a session. Or
-    *session* (``--session`` / ``$BIOPB_SESSION``) binds one before the
-    handshake: an id, ``new`` (the control launches one), or ``auto`` (the newest
-    free session, else a new one). That is for a client that cannot follow
-    ``list_changed``.
+    Starts unbound unless *session* (``--session`` / ``$BIOPB_SESSION``: an id,
+    ``new``, or ``auto``) binds one before the handshake.
 
     *remote* is the URL of another machine's control (``--remote``): sessions are
     then that machine's, reached through it under *token* (and any extra

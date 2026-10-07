@@ -25,8 +25,7 @@ from biopb import _locations
 
 logger = logging.getLogger(__name__)
 
-# Default per-probe deadline (seconds). Kept short so a dead server does not
-# stall its row; statuses() probes concurrently, so this bounds the sweep too.
+# Default per-probe deadline (seconds); short so a dead server does not stall the sweep.
 _DEFAULT_TIMEOUT = 4.0
 
 _UNSAFE_IN_A_NAME = re.compile(r"[^A-Za-z0-9_-]+")
@@ -126,9 +125,7 @@ def _name_for(url: str) -> str:
 def migrate_from_mcp_config(directory: Optional[Path] = None) -> list[str]:
     """Move the mcp config's server URLs into url entries; answer the names.
 
-    Runs once: only while the registry directory does not exist, and it creates
-    the directory whether or not there was anything to write. The key leaves
-    the mcp config, which no longer reads it.
+    Runs once, while the registry directory does not exist (it is always created).
     """
     directory = directory or registry_dir()
     if directory.exists():

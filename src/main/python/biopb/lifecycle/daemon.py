@@ -1,6 +1,6 @@
 """Detached-daemon lifecycle: pidfile identity, graceful stop, console detach.
 
-The *other* process-lifecycle pattern in this package. Where :mod:`.owned_child`
+The *other* process-lifecycle pattern in this package. Where :mod:`._owned_child`
 covers a child a live parent holds by its OS handle and reaps, these helpers
 cover a **detached daemon**: a background process that outlives the command that
 spawned it, is found again by a pidfile rather than a handle, and is stopped by

@@ -25,10 +25,6 @@ from __future__ import annotations
 class Range:
     """A numeric bound. ``min``/``max`` are inclusive; ``exclusive_min``/
     ``exclusive_max`` are strict. Any subset may be omitted.
-
-    The exclusive forms express the common "must be strictly positive" leaf
-    (``exclusive_min=0``) -- e.g. a timeout, where ``0`` is nonsensical -- that
-    an inclusive floor cannot capture without an arbitrary epsilon.
     """
 
     def __init__(self, *, min=None, max=None, exclusive_min=None, exclusive_max=None):  # noqa: A002 - min/max are the natural, keyword-only vocabulary for a numeric range
@@ -82,8 +78,7 @@ class Enum:
     def __init__(self, allowed, *, case_insensitive=False):
         self.case_insensitive = case_insensitive
         self._display = set(allowed)
-        # When case-insensitive, fold the allowed set too so the comparison is
-        # symmetric (else a lowercased value never matches an upper-case member).
+        # Fold the allowed set too, so a lowercased value matches upper-case members.
         self.allowed = {
             a.lower() if (case_insensitive and isinstance(a, str)) else a
             for a in allowed
@@ -95,21 +90,15 @@ class Enum:
         try:
             return value in self.allowed
         except TypeError:
-            # An unhashable value (list / dict) can never be an enum member. Return
-            # False rather than letting the membership test raise, so ok() is total
-            # like Range.ok -- a bad-typed config leaf is rejected, not a crash
-            # (e.g. the control's PUT validator would otherwise 500 on it).
+            # Unhashable (list / dict): never a member; keep ok() total.
             return False
 
     def describe(self) -> str:
         return "one of: " + ", ".join(sorted(map(str, self._display)))
 
     def to_json_schema(self) -> dict:
-        """The allowed set as a JSON Schema ``enum`` -- but only for
-        case-sensitive enums. A case-insensitive set accepts any casing the
-        consumer folds, so a hard ``enum`` of the canonical members would reject
-        values that are actually honored; there we stay lenient and surface the
-        set via :meth:`describe` in the property description instead."""
+        """The allowed set as a JSON Schema ``enum``, for case-sensitive enums only
+        (a hard ``enum`` would reject casings the consumer honors)."""
         if self.case_insensitive:
             return {}
         return {"enum": sorted(self._display, key=str)}

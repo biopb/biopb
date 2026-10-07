@@ -122,7 +122,7 @@ standalone install.
 The repo has two lifecycle patterns and this is a choice between them, not a
 platform detail:
 
-- **Pattern O** (`_lifecycle/owned_child.py`) — the child dies with its parent.
+- **Pattern O** (`biopb/lifecycle/_owned_child.py`) — the child dies with its parent.
   POSIX: no `start_new_session`, so the parent's group teardown reaches it, plus
   a parent-death pipe (`_lifecycle/deathwatch.py`) for the uncatchable deaths.
   Windows: a kill-on-close Job Object.

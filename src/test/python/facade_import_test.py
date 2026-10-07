@@ -9,7 +9,7 @@ time. `biopb/image/_utils.py` sat in that state until #621, and
 
 `from <pkg> import <submodule>` is a different thing and is safe: importing a
 submodule does not require the parent `__init__` to have finished. The scan
-below tells the two apart, so `lifecycle/owned_child.py`'s `from . import
+below tells the two apart, so `lifecycle/_owned_child.py`'s `from . import
 winjob` is not a finding.
 
 The scan covers all four workspace packages and needs nothing but the standard

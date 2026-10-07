@@ -63,12 +63,7 @@ MISSING = object()
 
 @dataclasses.dataclass(frozen=True)
 class Problem:
-    """One constraint violation, located by its ``(section, key)`` path.
-
-    The path is what lets a caller merge these with JSON-Schema errors (dedupe by
-    path) and what lets a form highlight the offending field, so it travels with
-    the message rather than being baked into it.
-    """
+    """One constraint violation, located by its ``(section, key)`` path."""
 
     path: Tuple[str, ...]
     message: str
@@ -78,19 +73,9 @@ class Problem:
         return {"path": list(self.path), "message": self.message}
 
 
-# A cross-field rule reads the whole config through a ``get(section, key)``
-# accessor (returning MISSING for an absent key) and returns a Problem per field
-# it implicates -- empty when satisfied. Per-field constraints cannot express
-# "min <= max"; declaring these as data beside the _CONSTRAINTS table means every
-# surface that validates a config gets them, instead of the one that remembered
-# to open-code the comparison.
-#
-# *Every* implicated field, not just the first, because the clamping policy
-# resets exactly the paths it is handed: fixing only the `min` of an inverted
-# pair can leave it inverted the other way (a default `min` above the user's
-# `max`), while resetting both lands on two defaults that are consistent by
-# construction. The strict surfaces benefit equally -- the form highlights both
-# ends of the range the user has to reconcile.
+# A cross-field rule reads the config through ``get(section, key)`` (MISSING for
+# an absent key) and returns a Problem for *every* field it implicates, since
+# the clamping policy resets exactly the paths it is handed.
 CrossFieldRule = Callable[[Callable[[str, str], Any]], Sequence[Problem]]
 
 
@@ -100,13 +85,7 @@ def describe_violation(key: str, value: Any, constraint: Any) -> str:
 
 
 def _field(values: Any, key: str) -> Any:
-    """Read *key* off a section, whether it is a mapping or a dataclass instance.
-
-    The two packages hold a section differently -- biopb-mcp a plain dict, the
-    tensor server a constructed dataclass -- and that is the only difference
-    between their checks, so it is absorbed here rather than duplicated as two
-    walks.
-    """
+    """Read *key* off a section that is a mapping or a dataclass instance."""
     if isinstance(values, Mapping):
         return values.get(key, MISSING)
     return getattr(values, key, MISSING)
@@ -129,8 +108,7 @@ def check_sections(
             *values* is a mapping (a dataclass instance names its own class).
         cross_field: rules spanning two fields, applied after the per-field pass.
 
-    An absent key is skipped -- it is not a wrong value, and every caller has
-    already resolved absence to a default (merged dict / dataclass default).
+    An absent key is skipped.
     """
     problems: List[Problem] = []
     by_section = dict(sections)
@@ -166,16 +144,11 @@ def warn_and_clamp(
 ) -> None:
     """Log each problem and reset its field to the default -- the load-path policy.
 
-    *default_for* returns the default for a path (or :data:`MISSING` if there is
-    none, e.g. a cross-field rule whose path is only one of the two culprits) and
-    *apply* writes it back -- a setattr on a dataclass, an item assignment in a
-    dict. The message names the default in use, because "ignored your value" is
-    only actionable if the reader can see what ran instead.
+    *default_for* returns the default for a path (or :data:`MISSING` if none) and
+    *apply* writes it back.
     """
     for problem in problems:
-        # The message names the leaf ("port=70000 (expected ...)"); prefixing the
-        # section makes the log line carry the full dotted path a reader needs to
-        # find the key in the file.
+        # Prefix the section so the log line carries the full dotted path.
         located = f"{problem.path[0]}.{problem.message}"
         default = default_for(problem.path)
         if default is MISSING:
