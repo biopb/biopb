@@ -629,6 +629,8 @@ class CziAdapter(TensorAdapter):
                             f"expected {output[destination].shape}"
                         )
                     output[destination] = pixels
+            except _ZoomShapeMismatch:
+                raise
             except Exception:
                 # A half-open reader is not reusable; drop it so the next read
                 # reopens rather than failing on the same handle.

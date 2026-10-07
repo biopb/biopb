@@ -151,3 +151,18 @@ def test_a_non_persistent_checkout_closes_at_the_end_and_is_not_pooled(pool):
         assert handle is not None
         assert len(pool) == 0
     assert open_fn.closed == 1
+
+
+def test_a_handle_opened_at_the_cap_is_not_its_own_eviction():
+    """A handle stamped before a slow open sorts as the least recently used; the
+    pass that enforces the cap must not close it under the lease it returns."""
+    pool = HandlePool(ttl_seconds=60.0, max_handles=1, thread_name="cap-one")
+    with pool.checkout("old", _Opener("old")):
+        pass
+    fresh = _Opener("new")
+    slow_open = fresh()
+    slow_open.last_access = 0.0  # stamped before the other handle's last use
+    with pool.checkout("new", lambda: slow_open) as handle:
+        assert handle is slow_open
+        assert fresh.closed == 0
+    assert fresh.closed == 0

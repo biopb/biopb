@@ -164,8 +164,9 @@ class HandlePool(TtlCeiling):
             else:
                 winner = opened
                 self._handles[opened.key] = opened
-                excess = self._over_cap()
             self._touch(winner)
+            if loser is None:
+                excess = self._over_cap()
             self._start_sweeper()
         if loser is not None:
             loser.close()

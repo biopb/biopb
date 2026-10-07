@@ -161,9 +161,10 @@ class _QptiffLevelAdapter(ZarrAdapter):
         self._level = level
 
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
+        super(ZarrAdapter, self).get_data(bounds)  # validate against the level
+        slices = self._bounds_to_slices(bounds)
         with self._parent._file() as handle:
-            self.zarr_array = handle.level_store(self._level)[0]
-            return super().get_data(bounds)
+            return np.asarray(handle.level_store(self._level)[0][slices])
 
 
 class QptiffAdapter(TensorAdapter):
