@@ -586,14 +586,6 @@ class Reconciler:
                 catalog_url = self._pending[source_id]
 
             errors: List[str] = []
-            # A restored row is taken as it was written: the walk compares the
-            # files with its signature and refreshes what changed, as it does for
-            # any registered source.
-            hydrate = (
-                self._metadata_db.read_hydration(source_id)
-                if restored and self._metadata_db is not None
-                else None
-            )
             # A cloud source raises why it could not be opened (retriable or
             # not) instead of recording a failure: it stays ``needs_recall`` and
             # the client that resolved it hears the reason.
@@ -603,7 +595,7 @@ class Reconciler:
                 replace=True,
                 error_sink=errors,
                 recall=recall,
-                hydrate=hydrate,
+                restored=restored,
             ):
                 if not recall:
                     self._mark_registration_failed(source_id, errors)
@@ -1619,12 +1611,15 @@ class Reconciler:
         error_sink: Optional[List[str]] = None,
         recall: bool = False,
         signatures: Optional[Dict[str, Tuple[Any, ...]]] = None,
-        hydrate: Optional[Tuple[Dict[str, Any], Dict[str, Any]]] = None,
+        restored: bool = False,
     ) -> bool:
         """Create and register a source, rolling back on partial failure.
 
-        ``hydrate`` is a restored row's ``(payload, metadata)``: the adapter is
-        rebuilt from it when its type can be, and parsed from the claim when not.
+        ``restored`` says the source has a persisted row: it is taken as it was
+        written (the walk compares the files with its signature and refreshes what
+        changed, as it does for any registered source) and the adapter is rebuilt
+        from it. Without one the file is parsed once and the adapter is rebuilt
+        from that record (:func:`build_adapter`).
 
         ``signatures`` is the claim's member signature, taken by a caller that
         will keep it in state: it is persisted beside the parse and the caller
@@ -1657,7 +1652,7 @@ class Reconciler:
         """
         self._warn_if_experimental(claim)
         # Whether the adapter was rebuilt from the row it is already catalogued by.
-        from_payload = False
+        from_row = False
         # Taken before the adapter is built, so a file that changes during the
         # parse is recorded with the identity the parse started from.
         if signatures is None and self.is_pending(claim.source_id):
@@ -1681,26 +1676,9 @@ class Reconciler:
                     )
                     return False
 
-                adapter = None
-                if hydrate is not None:
-                    try:
-                        adapter = adapter_cls.create_from_payload(
-                            source_config, *hydrate, self._credentials_config
-                        )
-                        from_payload = adapter is not None
-                        if from_payload:
-                            self._stamp_persisted_version(adapter, claim)
-                    except Exception:
-                        logger.warning(
-                            "could not rebuild source %s from its stored payload; "
-                            "parsing it",
-                            claim.source_id,
-                            exc_info=True,
-                        )
-                if adapter is None:
-                    adapter = build_adapter(
-                        adapter_cls, source_config, self._credentials_config
-                    )
+                adapter, from_row = self._construct(
+                    claim, adapter_cls, source_config, restored
+                )
 
                 # Bulk-seed the catalog surface so sync_source_added below needs
                 # no per-source upstream RPC (biopb/biopb#266). Guarded by the
@@ -1775,7 +1753,7 @@ class Reconciler:
             # disk now, which the registration has just attached, so it relists
             # the tensors.
             if self._metadata_db is not None:
-                if not from_payload:
+                if not from_row:
                     self._metadata_db.sync_source_added(
                         claim.source_id, adapter, record
                     )
@@ -1818,6 +1796,38 @@ class Reconciler:
                 # rollback already closed it: close() must be safe twice.
                 close_adapter(adapter)
             return False
+
+    def _construct(
+        self, claim: SourceClaim, adapter_cls: Any, config: SourceConfig, restored: bool
+    ) -> Tuple[Any, bool]:
+        """The adapter for *claim*, and whether it was rebuilt from its own row.
+
+        One path for a restart, a hydration and a first registration: the adapter
+        is always built by ``create_from_payload`` from a record -- the persisted
+        row, or the one a probe of the file has just produced. A row that cannot
+        rebuild its adapter is parsed again.
+        """
+        row = (
+            self._metadata_db.read_hydration(claim.source_id)
+            if restored and self._metadata_db is not None
+            else None
+        )
+        if row is not None:
+            try:
+                adapter = adapter_cls.create_from_payload(
+                    config, *row, self._credentials_config
+                )
+            except Exception:
+                logger.warning(
+                    "could not rebuild source %s from its stored payload; parsing it",
+                    claim.source_id,
+                    exc_info=True,
+                )
+                adapter = None
+            if adapter is not None:
+                self._stamp_persisted_version(adapter, claim)
+                return adapter, True
+        return build_adapter(adapter_cls, config, self._credentials_config), False
 
     def _relist_tensors(self, source_id: str, adapter: Any) -> None:
         """Bring a hydrated source's listed tensors up to what it serves.
