@@ -1,8 +1,8 @@
-"""Evicting an OME-TIFF source while it is read and while the reaper sweeps (#1284).
+"""Evicting an OME-TIFF source while it is read and while the pool sweeps (#1284).
 
 Eviction drops a registered adapter and rebuilds it from its catalog row on the
 next use. These drive that churn against concurrent reads and against the idle
-reaper, and check what must hold throughout: every read returns the right bytes
+pool, and check what must hold throughout: every read returns the right bytes
 or a clear error, no thread hangs, and the process holds no more descriptors
 afterwards than before. Set ``BIOPB_TEST_OMETIFF`` to a large file to make the
 reopen window long enough to race reliably.
@@ -180,22 +180,20 @@ class TestEvictionAgainstReads:
         _assert_clean(c, before)
 
 
-class TestEvictionAgainstTheReaper:
+class TestEvictionAgainstThePoolSweep:
     @pytest.fixture(autouse=True)
-    def _tight_reaper(self):
-        reaper = ome_tiff_module._store_reaper
-        ttl, cap = reaper._pool_ttl, reaper._max_handles
-        reaper.set_ttl(0.0005)
-        reaper._max_handles = 1
+    def _tight_pool(self):
+        pool = ome_tiff_module._store_pool
+        ttl, cap = pool._pool_ttl, pool.max_handles
+        pool.set_ttl(0.0005)
+        pool.max_handles = 1
         yield
-        reaper.set_ttl(ttl)
-        reaper._max_handles = cap
+        pool.set_ttl(ttl)
+        pool.max_handles = cap
 
     def _sweeper(self, stop):
-        reaper = ome_tiff_module._store_reaper
         while not stop.is_set():
-            reaper._sweep()
-            reaper._close_over_cap()
+            ome_tiff_module._store_pool.sweep()
 
     def test_sweeps_and_a_one_handle_cap_under_reads(self, churn):
         c, before = churn
@@ -215,10 +213,9 @@ class TestEvictionAgainstTheReaper:
         _assert_clean(c, before)
 
 
-class TestFinalizersRacingTheReaper:
-    """A dropped adapter's ``__del__`` releases its handle and takes the reaper's
-    (non-reentrant) lock. When the cycle collector runs it inside a block that
-    holds that lock, the thread would wait on itself."""
+class TestCollectedAdaptersAgainstThePool:
+    """Adapters that only the cycle collector frees, collected at almost every
+    allocation while others register and sweep the pool."""
 
     def test_adapters_collected_by_the_cycle_collector_under_registration(self, churn):
         c, before = churn
@@ -232,10 +229,8 @@ class TestFinalizersRacingTheReaper:
                 c.read(c.scene(source))  # opens a handle and registers it
 
         def sweep(stop):
-            reaper = ome_tiff_module._store_reaper
             while not stop.is_set():
-                reaper._sweep()
-                reaper._close_over_cap()
+                ome_tiff_module._store_pool.sweep()
 
         try:
             _run(c, [make_cyclic_garbage, make_cyclic_garbage, sweep])

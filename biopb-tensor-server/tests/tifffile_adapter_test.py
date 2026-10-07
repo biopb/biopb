@@ -7,6 +7,7 @@ import pytest
 import tifffile
 from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server.adapters import TiffAdapter, get_default_registry
+from biopb_tensor_server.adapters.ome_tiff import _store_pool
 from biopb_tensor_server.adapters.tifffile_adapter import (
     _PERSISTENT_PAGE_THRESHOLD,
     _mapped_axes,
@@ -39,8 +40,9 @@ def test_plain_tiff_claims_as_tiff_and_reads_with_tifffile(tmp_path):
     bounds = ChunkBounds(start=[0, 0, 2, 3, 4], stop=[1, 1, 5, 7, 9])
     actual = scene.get_data(bounds)
     np.testing.assert_array_equal(actual, data[2:5, 3:7, 4:9][None, None])
-    assert scene._persistent_tiff is None
-    assert scene._persistent_store is None
+    assert (
+        scene._pool_key() not in _store_pool._handles
+    )  # a small file's store is closed after the read
 
 
 def test_native_store_persistence_starts_at_page_threshold(tmp_path):

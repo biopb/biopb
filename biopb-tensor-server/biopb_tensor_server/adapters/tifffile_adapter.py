@@ -262,7 +262,6 @@ class _TifffileAdapterBase(OmeTiffAdapter):
             self.source_id,
             scene_index=scene_index,
             tensor_descriptor=descriptors[scene_index],
-            io_lock=self._io_lock,
         )
         adapter._tensor_name = field
         self._seed_scene(adapter, descriptors[scene_index].array_id)
@@ -319,9 +318,7 @@ class _TifffileAdapterBase(OmeTiffAdapter):
             tiff.close()
             raise
 
-        self._persistent_tiff = tiff
-        self._persistent_store = store
-        return zarr_array, axes
+        return zarr_array, axes, store, tiff
 
     def _should_persist_store(self) -> bool:
         """Keep a native file handle only when the TIFF has many pages."""

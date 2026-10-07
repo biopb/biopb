@@ -1,5 +1,6 @@
 """Phase 2 coverage for the native CZI adapter (biopb/biopb#799)."""
 
+import time
 from pathlib import Path
 
 import numpy as np
@@ -192,25 +193,33 @@ def test_metadata_is_the_image_information_subtree(tmp_path):
     assert metadata["Image"]["SizeZ"] == "3"
 
 
+def _pooled_reader(adapter):
+    """The libCZI reader the pool holds for *adapter*'s file, opening it if needed."""
+    with czi_module._reader_pool.checkout(
+        adapter._pool_key(), adapter._open_reader
+    ) as handle:
+        return handle.value
+
+
 def test_reader_stays_warm_between_reads_and_closes_on_release(tmp_path):
     path, _ = create_zeiss_czi(str(tmp_path), n_c=1, n_z=2, image_shape=(8, 8))
     source = _native(path)
     scene = source.get_tensor_adapter(source.list_tensor_descriptors()[0].array_id)
+    pooled = czi_module._reader_pool._handles
 
-    assert scene._persistent_reader is None
+    assert scene._pool_key() not in pooled
     scene.get_data(ChunkBounds(start=[0] * 5, stop=[1, 1, 1, 8, 8]))
-    warm = scene._persistent_reader
-    assert warm is not None
+    warm = pooled[scene._pool_key()]
 
     scene.get_data(ChunkBounds(start=[0] * 5, stop=[1, 1, 2, 8, 8]))
-    assert scene._persistent_reader is warm
+    assert pooled[scene._pool_key()] is warm
 
     source.close()
-    assert scene._persistent_reader is None
+    assert scene._pool_key() not in pooled
 
     # A released reader reopens rather than staying broken.
     scene.get_data(ChunkBounds(start=[0] * 5, stop=[1, 1, 1, 8, 8]))
-    assert scene._persistent_reader is not None
+    assert scene._pool_key() in pooled
     source.close()
 
 
@@ -219,11 +228,18 @@ def test_idle_reader_is_reaped(tmp_path):
     source = _native(path)
     scene = source.get_tensor_adapter(source.list_tensor_descriptors()[0].array_id)
     scene.get_data(ChunkBounds(start=[0] * 5, stop=[1, 1, 1, 8, 8]))
-    assert scene._persistent_reader is not None
+    pool = czi_module._reader_pool
+    assert scene._pool_key() in pool._handles
 
-    scene._persistent_last_access -= czi_module._reader_reaper.ttl + 1
-    czi_module._reader_reaper._sweep()
-    assert scene._persistent_reader is None
+    ttl = pool._pool_ttl
+    pool.set_ttl(0.001)
+    time.sleep(0.01)
+    try:
+        pool.sweep()
+    finally:
+        pool.set_ttl(ttl)
+    assert scene._pool_key() not in pool._handles
+    source.close()
 
 
 @pytest.mark.parametrize(
@@ -511,7 +527,7 @@ class TestZoomServesNearest:
         bounds = self._bounds((0, 0, 0, 0, 0), (1, 1, 1, 120, 120))
         scale = (1, 1, 1, 4, 4)
 
-        reader = adapter._acquire_reader()
+        reader = _pooled_reader(adapter)
         reader_type = type(reader)
         real_read = reader_type.read
 
@@ -531,7 +547,7 @@ class TestZoomServesNearest:
         bounds = self._bounds((0, 0, 0, 0, 0), (1, 1, 1, 120, 120))
 
         zooms = []
-        reader = adapter._acquire_reader()
+        reader = _pooled_reader(adapter)
         real_read = reader.read
         monkeypatch.setattr(
             type(reader),

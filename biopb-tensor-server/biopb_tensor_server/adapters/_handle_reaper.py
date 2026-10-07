@@ -7,19 +7,17 @@ to tune, no handle held between reads. That is strictly better whenever it is
 affordable, so it is the default.
 
 This reaper is the **opt-in** alternative for the adapters where it is *not*
-affordable -- those whose open cost scales with something:
+affordable, and whose handle is cheap to keep per adapter (``nd2``, ``emd``,
+``mrc``'s mapping, ``dv``): the handle stays warm between reads and a background
+reaper closes it once it has been idle longer than a TTL -- bounding the
+steady-state pin (the Windows-undeletable / disk-not-reclaimed effects) rather
+than eliminating it, at the cost of one reopen on the next read after a lull.
 
-- ``ome-tiff`` -- open is linear in IFD count and unbounded (~615 ms extrapolated
-  for a 50k-page whole-slide file), so a reopen-per-read would be a >150%
-  regression on exactly the large files the format exists for.
-- ``ndtiff`` -- the reopen *unit* is the whole acquisition: ``NDTiffDataset``
-  eagerly opens every ``NDTiffStack_*.tif``, so a reopen-per-read would open
-  thousands of files to serve one plane.
-
-For those, the handle stays warm between reads and a background reaper closes it
-once it has been idle longer than a TTL -- bounding the steady-state pin (the
-Windows-undeletable / disk-not-reclaimed effects) rather than eliminating it, at
-the cost of one reopen on the next read after a lull.
+The formats whose reopen is expensive -- ``ome-tiff`` and the TIFF family
+(open is linear in IFD count), ``qptiff``, ``czi`` (the subblock directory) and
+``ndtiff`` (the whole acquisition) -- use :mod:`_handle_pool` instead, which
+keeps the handle by file identity so a rebuilt adapter finds it. Its TTL and cap
+are bounded the same way and share :func:`set_handle_reaper_ttl`.
 
 A pool is bounded on **two** axes, and both are properties of the pool rather
 than of the process:

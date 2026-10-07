@@ -18,6 +18,8 @@ import time
 from contextlib import contextmanager
 from typing import Any, Callable, Dict, Hashable, Iterator, Optional
 
+from biopb_tensor_server.adapters._handle_reaper import _NO_CEILING, _configured_reapers
+
 logger = logging.getLogger(__name__)
 
 
@@ -42,12 +44,26 @@ class PooledHandle:
 
 class HandlePool:
     def __init__(self, ttl_seconds: float, max_handles: int, thread_name: str) -> None:
-        self.ttl = float(ttl_seconds)
+        self._pool_ttl = float(ttl_seconds)
+        self._ceiling = _NO_CEILING
         self.max_handles = int(max_handles)
         self._thread_name = thread_name
         self._handles: Dict[Hashable, PooledHandle] = {}
         self._lock = threading.Lock()
         self._started = False
+        _configured_reapers.add(self)
+
+    @property
+    def ttl(self) -> float:
+        """This pool's own TTL, capped by the process-wide ceiling
+        (:func:`set_handle_reaper_ttl`). ``<= 0`` keeps nothing between reads."""
+        return min(self._pool_ttl, self._ceiling)
+
+    def set_ttl(self, seconds: float) -> None:
+        self._pool_ttl = float(seconds)
+
+    def set_ceiling(self, seconds: float) -> None:
+        self._ceiling = float(seconds)
 
     def __len__(self) -> int:
         with self._lock:
@@ -74,6 +90,10 @@ class HandlePool:
             yield handle
         finally:
             self._release(handle)
+
+    def put(self, opened: PooledHandle) -> None:
+        """Pool a handle the caller already opened, as if a checkout had."""
+        self._release(self._publish(opened))
 
     def drop(self, key: Hashable) -> None:
         """Close the handle for *key* now, or at its last lease."""
@@ -149,7 +169,7 @@ class HandlePool:
         with self._lock:
             handle.leases -= 1
             handle.last_access = time.monotonic()
-            if handle.doomed and not handle.leases:
+            if (handle.doomed or self.ttl <= 0) and not handle.leases:
                 if self._handles.get(handle.key) is handle:
                     del self._handles[handle.key]
                 close = True
