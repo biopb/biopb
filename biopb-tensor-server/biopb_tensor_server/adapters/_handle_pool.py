@@ -121,6 +121,18 @@ class HandlePool(TtlCeiling):
             del self._handles[key]
         handle.close()
 
+    def close_all(self) -> None:
+        """Close every unleased handle now and doom the leased ones, so no file
+        stays open past the caller (a test's temp dir, a shutdown)."""
+        with self._lock:
+            idle = [h for h in self._handles.values() if not h.leases]
+            for h in self._handles.values():
+                h.doomed = True
+            for h in idle:
+                del self._handles[h.key]
+        for h in idle:
+            h.close()
+
     def sweep(self) -> None:
         """Close idle handles past the TTL. Never touches a leased handle."""
         now = time.monotonic()

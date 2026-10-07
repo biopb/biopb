@@ -99,6 +99,22 @@ def _private_write_dir(monkeypatch, tmp_path_factory):
 
 
 @pytest.fixture(autouse=True)
+def _close_pooled_handles():
+    """Close the files the handle pools hold open after each test.
+
+    A pooled handle outlives the adapter that opened it, which is its purpose;
+    but a test's temp dir cannot be removed on Windows while one is open there
+    (WinError 32)."""
+    yield
+    from biopb_tensor_server.adapters._handle_pool import HandlePool
+    from biopb_tensor_server.adapters._handle_reaper import _configured_reapers
+
+    for pool in list(_configured_reapers):
+        if isinstance(pool, HandlePool):
+            pool.close_all()
+
+
+@pytest.fixture(autouse=True)
 def _reset_upstream_client_pool():
     """Isolate the process-wide upstream client pool (biopb/biopb#266 B1).
 
