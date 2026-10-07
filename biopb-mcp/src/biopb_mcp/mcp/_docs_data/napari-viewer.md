@@ -173,7 +173,7 @@ not add the array yourself.
 a client made and holds:
 
 ```python
-client.get_label_sets("src0")        # -> ['src0/@labels/@ome', 'src0/@labels/nuclei']
+# list them: query tensors whose array_id starts with 'src0/@labels/'
 viewer.add_tensor("src0/@labels/nuclei")   # a Labels layer, not an Image one
 ```
 

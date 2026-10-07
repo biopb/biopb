@@ -51,7 +51,6 @@ from biopb.tensor._catalog_rows import (
     tensor_descriptors_from_row,
     with_reason,
 )
-from biopb.tensor._labels import LABELS_SEGMENT
 from biopb.tensor._location import normalize_flight_location
 from biopb.tensor._pool import (
     _build_dask_array_from_chunk_map,
@@ -1269,17 +1268,6 @@ class CatalogClient:
             action, unavailable_hint="Source removal is unavailable"
         )
         return RemoveSourceResult.FromString(result_bytes)
-
-    # ---- label sets ----
-
-    def get_label_sets(self, image_array_id: str) -> List[str]:
-        """Backs TensorFlightClient.get_label_sets; see that method."""
-        prefix = sql_literal(f"{image_array_id}/{LABELS_SEGMENT}/")
-        table = self._query_table(
-            "SELECT t.array_id FROM sources, UNNEST(tensors) AS u(t) "
-            f"WHERE starts_with(t.array_id, {prefix}) ORDER BY t.array_id"
-        )
-        return table.column(0).to_pylist()
 
     # ---- ROI annotations ----
 

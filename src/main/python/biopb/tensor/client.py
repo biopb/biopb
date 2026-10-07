@@ -563,27 +563,6 @@ class TensorFlightClient:
         """
         return self._catalog.deregister_local_path(root_url)
 
-    # ---- label sets ----
-
-    def get_label_sets(self, image_array_id: str) -> List[str]:
-        """The ``array_id``s of the label sets served under an image.
-
-        A label set is an ordinary tensor of its image, named
-        ``<image array_id>/@labels/<name>``, so this is a catalog query over
-        the path and nothing more -- ``get_tensor`` / ``get_descriptor`` read
-        one like any other tensor. A set's descriptor carries an NGFF
-        ``image-label`` block in its ``metadata_json``, whose ``source.image``
-        names this image.
-
-        Args:
-            image_array_id: The image's ``array_id`` (``"src_ab12"``, or
-                ``"src_ab12/Image:0"`` on a multi-tensor source).
-
-        Returns:
-            The sets' ``array_id``s, sorted. Empty when the image has none.
-        """
-        return self._catalog.get_label_sets(image_array_id)
-
     # ---- ROI annotations ----
 
     def list_rois(self, array_id: str, set_name: str = "") -> RoiListResult:

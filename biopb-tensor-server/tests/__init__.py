@@ -7,6 +7,16 @@ def source_ids(client):
     return {r["source_id"] for r in rows}
 
 
+def label_sets(client, image_array_id):
+    """The ``array_id``s served under an image's ``@labels/`` prefix, sorted."""
+    prefix = image_array_id.replace("'", "''") + "/@labels/"
+    table = client.query(
+        "SELECT t.array_id FROM sources, UNNEST(tensors) AS u(t) "
+        f"WHERE starts_with(t.array_id, '{prefix}') ORDER BY t.array_id"
+    )
+    return table.column(0).to_pylist()
+
+
 def catalog_server(*args, **kwargs):
     """A ``TensorFlightServer`` with a catalog, wired the way ``cli.py`` wires one.
 

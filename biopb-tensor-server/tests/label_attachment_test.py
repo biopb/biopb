@@ -28,7 +28,6 @@ from biopb_tensor_server.core.adapter_base import catalog_tensors
 from biopb_tensor_server.core.config import PyramidConfig, SourceConfig
 from biopb_tensor_server.core.errors import TensorNotFound, WriteNotSupportedError
 from biopb_tensor_server.core.labels import (
-    RESERVED_PREFIX,
     extent_mismatch,
     label_extent,
     label_field,
@@ -403,62 +402,3 @@ class TestASidecarIsAttachedAtRegistration:
             .to_pylist()
         )
         assert "oz1/@labels/mine" in ids
-
-
-class TestTheSdkReadsTheSameRule:
-    """``biopb.tensor._labels`` is the client half of this module.
-
-    Kept honest against the server's own rule rather than against a fixture:
-    a client that splits an ``array_id`` differently, or maps the axes
-    differently, reads a plane of the wrong frame and shows a picture rather
-    than raising. The SDK copy exists because biopb-tensor-server is not an
-    installable dependency of a client (nor on PyPI).
-    """
-
-    @staticmethod
-    def _sdk():
-        from biopb.tensor._labels import (
-            is_reserved_label_name,
-            split_label_array_id,
-        )
-
-        return split_label_array_id, is_reserved_label_name
-
-    @pytest.mark.parametrize(
-        "array_id,expected",
-        [
-            ("src0/@labels/nuclei", ("src0", "nuclei", None)),
-            ("src0/A/1/@labels/nuclei", ("src0/A/1", "nuclei", None)),
-            ("src0/@labels/nuclei/2", ("src0", "nuclei", "2")),
-            # The last ``labels`` with a name after it wins, whatever the
-            # image's own field holds.
-            ("src0/@labels/a/@labels/b", ("src0/@labels/a", "b", None)),
-        ],
-    )
-    def test_splits_an_array_id_like_the_server_splits_a_field(
-        self, array_id, expected
-    ):
-        split, _ = self._sdk()
-        address = split(array_id)
-        assert (address.image_array_id, address.name, address.level) == expected
-        # ... and the server, handed the same id's field, agrees.
-        field = split_label_field(array_id.partition("/")[2])
-        assert (field.name, field.level) == expected[1:]
-
-    @pytest.mark.parametrize(
-        "array_id",
-        [
-            "src0",  # a plain tensor
-            "src0/labels",  # a trailing segment names no set
-            "@labels/nuclei",  # source_id is slash-free, so this is a source
-        ],
-    )
-    def test_names_no_set(self, array_id):
-        split, _ = self._sdk()
-        assert split(array_id) is None
-
-    def test_reserved_names_match(self):
-        _, reserved = self._sdk()
-        assert reserved("@ome") is True
-        assert reserved("nuclei") is False
-        assert RESERVED_PREFIX == "@"

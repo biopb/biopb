@@ -150,7 +150,7 @@ is cheap to send.
 Its `array_id` is the request's own minus the scheme, and its descriptor
 carries an NGFF `image-label` block naming the image it belongs to.
 
-- `client.get_label_sets(image_array_id)` lists what an image has, sorted.
+- `client.query("SELECT t.array_id FROM sources, UNNEST(tensors) AS u(t) WHERE starts_with(t.array_id, '<image>/@labels/')")` lists what an image has.
 - `client.get_tensor(set_id)` reads one back like any other tensor.
 - `client.set_upload_status(set_id, "DISCARDED", "replaced")` removes an
   *uploaded* set and its sidecar. It leaves alone a set the image's own file

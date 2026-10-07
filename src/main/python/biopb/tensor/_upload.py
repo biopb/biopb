@@ -33,6 +33,7 @@ import pyarrow.flight as flight
 from biopb.tensor._pool import (
     _get_shared_call_options,
     _get_thread_client,
+    is_label_set,
     wants_wire_compression,
 )
 from biopb.tensor._session import (
@@ -100,23 +101,6 @@ def _refused_from(exc: flight.FlightCancelledError) -> Optional[UploadRefused]:
         str(info.get("state", "")),
         str(info.get("detail", "")),
     )
-
-
-def _is_label_set(array_id: str) -> bool:
-    """Whether *array_id* names a label set rather than a source of its own.
-
-    The one upload kind whose unwritten chunks are meaningful *by declaration*:
-    a label set is a zarr with fill value 0, so a chunk that never arrives reads
-    back as background and skipping it is free (biopb/biopb#1059). Every
-    published upload now reads its gaps as zeros, so skipping would be safe for
-    the other kinds too -- but it would also stop reporting them: an all-zero
-    array would upload nothing at all and land READY with ``uploaded_chunks``
-    at 0. A set is where the caller is already writing a sparse mask and means
-    it; a ``cache:`` tensor is not.
-    """
-    from biopb.tensor._labels import split_label_array_id
-
-    return split_label_array_id(array_id) is not None
 
 
 def _state_value(state: Any) -> int:
@@ -561,7 +545,9 @@ class UploadSession:
             origin,
             arr.shape,
             arr.dtype,
-            skip_empty=_is_label_set(array_id),
+            # A label set reads unwritten chunks as background, so skipping them
+            # is free; for other uploads it would hide the gap.
+            skip_empty=is_label_set(array_id),
         )
         da.store(arr, target, lock=False)
 

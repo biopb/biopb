@@ -20,14 +20,6 @@ The CLI module provides the `biopb tensor` command with four subcommands:
 Note: Server components have been moved to the biopb-tensor-server package.
 """
 
-from biopb.tensor._labels import (
-    LABELS_SEGMENT,
-    RESERVED_LABEL_PREFIX,
-    LabelAddress,
-    is_reserved_label_name,
-    split_label_array_id,
-)
-
 # Import proto-generated classes with explicit paths
 from biopb.tensor.descriptor_pb2 import (
     CatalogQuery,
@@ -80,13 +72,6 @@ __all__ = [
     "ResolveProgress",
     "WarmProgress",
     "SerializedTensor",
-    # Label sets: what an array_id says, and how a set lines up with its
-    # image. Pure string/shape rules -- no client needed to ask them.
-    "LABELS_SEGMENT",
-    "RESERVED_LABEL_PREFIX",
-    "LabelAddress",
-    "is_reserved_label_name",
-    "split_label_array_id",
     # Client
     "Connection",
     "TensorFlightClient",
