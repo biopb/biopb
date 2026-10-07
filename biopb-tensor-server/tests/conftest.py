@@ -88,6 +88,17 @@ def _shut_down_what_a_test_started(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _private_write_dir(monkeypatch, tmp_path_factory):
+    """Keep the default ``write_dir`` out of the real ``~/.local/share``.
+
+    Every ``ServerConfig`` now carries one, so a test that builds a server
+    without naming a ``write_dir`` would otherwise upload into the developer's
+    own data tree.
+    """
+    monkeypatch.setenv("BIOPB_DATA_HOME", str(tmp_path_factory.mktemp("data-home")))
+
+
+@pytest.fixture(autouse=True)
 def _reset_upstream_client_pool():
     """Isolate the process-wide upstream client pool (biopb/biopb#266 B1).
 

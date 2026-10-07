@@ -946,7 +946,7 @@ def serve(
     writable: Optional[bool] = typer.Option(
         None,
         "--writable/--no-writable",
-        help="Enable write mode for source creation and data upload. Omitted, "
+        help="Serve the write path (data upload); on by default. Omitted, "
         "the config file's `server.writable` decides; the flag overrides it "
         "either way.",
     ),
@@ -1465,7 +1465,7 @@ def launch(
     writable: Optional[bool] = typer.Option(
         None,
         "--writable/--no-writable",
-        help="Enable write mode for source creation and data upload. Omitted, "
+        help="Serve the write path (data upload); on by default. Omitted, "
         "the config file's `server.writable` decides; the flag overrides it "
         "either way.",
     ),

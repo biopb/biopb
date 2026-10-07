@@ -100,6 +100,7 @@ from biopb._config_validate import (
 from biopb._locations import (
     CANONICAL_CONFIG_NAME as CANONICAL_CONFIG_NAME,
     DEFAULT_CONFIG_DIR as DEFAULT_CONFIG_DIR,
+    data_dir,
     find_config as find_config,
 )
 
@@ -145,6 +146,16 @@ def _default_file_cache_dir() -> Path:
 
 
 DEFAULT_FILE_CACHE_DIR = _default_file_cache_dir()
+
+
+def default_write_dir() -> Path:
+    """Where uploads go unless the config names a directory.
+
+    The data tree (``~/.local/share/biopb``), not the cache: uploaded tensors
+    are the user's results, and a cache janitor may empty a cache at any time.
+    Resolved at call time so ``BIOPB_DATA_HOME`` is honored per config.
+    """
+    return data_dir() / "tensor-server" / "uploads"
 
 
 # --- Declarative config validation (biopb/biopb#34) ---------------------------
@@ -964,16 +975,17 @@ class ServerConfig:
         },
     )
     writable: bool = field(
-        default=False,
-        metadata={"help": "Enable write mode: allow source creation and data upload."},
+        default=True,
+        metadata={"help": "Serve the write path: allow data upload."},
     )
     write_dir: Optional[Path] = field(
-        default=None,
+        default_factory=default_write_dir,
         metadata={
-            "help": "Directory for zarr-backed uploaded sources (unset = no zarr "
-            "uploads). Keep it outside every source directory: an uploaded "
-            "store is registered by the upload path, and discovery walking it "
-            "too would catalog it a second time."
+            "help": "Directory for uploaded tensors; the default is under "
+            "~/.local/share/biopb. An empty string disables uploads and the "
+            "scratch source. Keep it outside every source directory: an "
+            "uploaded store is registered by the upload path, and discovery "
+            "walking it too would catalog it a second time."
         },
     )
     cache: CacheConfig = field(default_factory=CacheConfig)
@@ -1385,9 +1397,10 @@ def _build_config(data: Dict[str, Any]) -> ServerConfig:
     _carry(server_kwargs, "walk_threads", server_data, cast=int)
     _carry(server_kwargs, "claim_generic_images", server_data, cast=bool)
     _carry(server_kwargs, "writable", server_data)
-    write_dir_str = server_data.get("write_dir")
-    if write_dir_str:
-        server_kwargs["write_dir"] = Path(write_dir_str)
+    if "write_dir" in server_data:
+        # Present but empty/null is the opt-out; absent keeps the default.
+        write_dir_str = server_data["write_dir"]
+        server_kwargs["write_dir"] = Path(write_dir_str) if write_dir_str else None
 
     # Parse cache settings. The wire form of two fields diverges from the
     # dataclass (MB/GB->bytes scaling); everything else is a direct carry.

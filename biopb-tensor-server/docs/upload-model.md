@@ -42,7 +42,9 @@ catalog. It holds no bytes **and no tensors** of its own: what is added to it
 is an uploaded field like any other, under `<write_dir>/fields/scratch/`
 (Uploaded fields).
 
-`write_dir`, not `writable`, is the switch: `writable` serves the Flight write
+`write_dir`, not `writable`, is the switch (both default on; `write_dir` defaults
+to `~/.local/share/biopb/tensor-server/uploads`, and `"write_dir": ""` turns it
+off): `writable` serves the Flight write
 verbs, and an in-process producer wants the scratch source without them. That
 is `biopb-image-base`'s embedded result cache, which calls `add_tensor`
 directly and leaves `add_tensor`, `set_upload_status` and DoPut refused on the

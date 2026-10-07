@@ -486,3 +486,20 @@ def test_per_upstream_tls_trust_survives_the_parse():
     profile = cfg.credentials.profiles[0]
     assert profile.tls_ca_file == "/etc/biopb/lab-ca.pem"
     assert profile.tls_fingerprint == "AB:CD:EF"
+
+
+def test_uploads_are_on_by_default_under_the_data_tree(monkeypatch, tmp_path):
+    monkeypatch.setenv("BIOPB_DATA_HOME", str(tmp_path))
+    cfgobj = parse_config({})
+    assert cfgobj.writable is True
+    assert cfgobj.write_dir == tmp_path / "biopb" / "tensor-server" / "uploads"
+
+
+@pytest.mark.parametrize("off", ["", None])
+def test_an_empty_write_dir_turns_uploads_off(off):
+    assert parse_config({"server": {"write_dir": off}}).write_dir is None
+
+
+def test_a_named_write_dir_wins(tmp_path):
+    cfgobj = parse_config({"server": {"write_dir": str(tmp_path / "w")}})
+    assert cfgobj.write_dir == tmp_path / "w"
