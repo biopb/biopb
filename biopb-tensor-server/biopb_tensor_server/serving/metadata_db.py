@@ -74,7 +74,8 @@ from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS
 from google.protobuf import json_format
 
 from biopb_tensor_server.adapters.ome_masks import strip_mask_bindata
-from biopb_tensor_server.core.adapter_base import catalog_tensors, to_catalog_url
+from biopb_tensor_server.core.adapter_base import to_catalog_url
+from biopb_tensor_server.core.attachments import Attachments
 from biopb_tensor_server.core.errors import AnnotationStoreError
 from biopb_tensor_server.core.labels import last_named_segment
 
@@ -782,6 +783,8 @@ class MetadataDatabase:
         self._conn: Optional[duckdb.DuckDBPyConnection] = None
         self._write_lock = threading.Lock()  # Lock for write operations only
         self._initialized = False
+        # Lists a source's tensors; see bind_registry.
+        self._registry: Any = None
 
         logger.info(
             "MetadataDatabase enabled (DuckDB backend will initialize on first access)"
@@ -1469,13 +1472,13 @@ class MetadataDatabase:
         conn = self._get_connection()
 
         # Read the row's fields off the adapter. This is the ONLY place a
-        # source's catalog row is built, so `catalog_tensors` is where the
+        # source's catalog row is built, so `SourceRegistry.catalog_tensors` is where the
         # "no chunk_shape on a catalog entry" invariant is enforced
         # (biopb/biopb#812).
         source_url = adapter.catalog_url
         source_type = adapter.source_type
         is_resolved = adapter.is_resolved()
-        catalog = catalog_tensors(adapter)
+        catalog = self._catalog_tensors(source_id, adapter)
         metadata = adapter.get_metadata()
 
         # Full per-tensor structural info (biopb/biopb#224): one struct per
@@ -1603,9 +1606,20 @@ class MetadataDatabase:
             )
         logger.debug(f"Synced source to metadata database: {source_id}")
 
+    def bind_registry(self, registry: Any) -> None:
+        """List tensors through *registry*, which holds the ones attached to a source."""
+        self._registry = registry
+
+    def _catalog_tensors(self, source_id: str, adapter: Any) -> List[Any]:
+        """The tensors a row lists: the registry's view when bound, else the
+        adapter's own (a catalog on its own has no attachments)."""
+        if self._registry is not None:
+            return self._registry.catalog_tensors(source_id, adapter)
+        return Attachments(source_id).catalog_tensors(adapter)
+
     @staticmethod
     def _tensor_rows(catalog: Sequence[Any]) -> List[Dict[str, Any]]:
-        """The ``tensors`` column for *catalog* (``catalog_tensors`` of an adapter)."""
+        """The ``tensors`` column for *catalog* (``SourceRegistry.catalog_tensors``)."""
         return [
             {
                 "array_id": t.array_id,
@@ -1627,7 +1641,7 @@ class MetadataDatabase:
         compared: a row lists fields in the order they were uploaded and the attach
         scan finds them by name, and neither is a change.
         """
-        tensors = self._tensor_rows(catalog_tensors(adapter))
+        tensors = self._tensor_rows(self._catalog_tensors(source_id, adapter))
         conn = self._get_connection()
         row = conn.execute(
             "SELECT tensors FROM source_catalog WHERE source_id = ?", [source_id]

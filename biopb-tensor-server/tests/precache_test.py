@@ -813,7 +813,7 @@ class TestBacklogWarming:
             adapter = server.sources.get("src")
             td = adapter.list_tensor_descriptors()[0]
             cm = CacheManager.get_instance()
-            preempted = worker._process_tensor(adapter, td, cm, backlog=True)
+            preempted = worker._process_tensor("src", td, cm, backlog=True)
             assert preempted is True
             assert cm.stats().misses == 0  # bailed before the first chunk
         finally:
@@ -833,7 +833,7 @@ class TestBacklogWarming:
             adapter = server.sources.get("src")
             td = adapter.list_tensor_descriptors()[0]
             cm = CacheManager.get_instance()
-            preempted = worker._process_tensor(adapter, td, cm, backlog=True)
+            preempted = worker._process_tensor("src", td, cm, backlog=True)
             assert preempted is True
             assert cm.stats().misses == 0  # no eviction-causing writes
         finally:
@@ -853,7 +853,7 @@ class TestBacklogWarming:
             td = adapter.list_tensor_descriptors()[0]
             cm = CacheManager.get_instance()
             # Empty live queue + plenty of headroom -> warms, no preempt.
-            preempted = worker._process_tensor(adapter, td, cm, backlog=True)
+            preempted = worker._process_tensor("src", td, cm, backlog=True)
             assert preempted is False
             assert cm.stats().misses > 0
         finally:
@@ -975,7 +975,7 @@ class TestSkipUnscaledCoarsestLevel:
             worker = PrecacheWorker(server, PrecacheConfig(idle_debounce_seconds=0.0))
             cm = CacheManager.get_instance()
             td = adapter.list_tensor_descriptors()[0]
-            preempted = worker._process_tensor(adapter, td, cm)
+            preempted = worker._process_tensor("src", td, cm)
             assert preempted is False
             return cm.stats().misses
         finally:

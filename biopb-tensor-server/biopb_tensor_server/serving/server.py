@@ -78,12 +78,8 @@ from biopb_tensor_server.adapters._writable import (
     unsettable_state_message,
     upload_of,
 )
-from biopb_tensor_server.adapters.fields import (
-    fields_attacher,
-    fields_root,
-    upload_attacher,
-)
-from biopb_tensor_server.adapters.labels import labels_root, sidecar_attacher
+from biopb_tensor_server.adapters.fields import fields_root, scan_source_fields
+from biopb_tensor_server.adapters.labels import labels_root, sidecar_label_sets
 from biopb_tensor_server.adapters.scratch import DEFAULT_SCRATCH_TTL
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.core.adapter_base import (
@@ -232,15 +228,35 @@ def _adapter_lookup_error(exc: Exception, miss_context: str) -> flight.FlightErr
 _RESOLVE_HEARTBEAT_SECONDS = 15.0
 
 
-def _upload_attacher(write_dir: Path):
-    """The registry's ``on_register`` hook over every layout the upload path owns.
+def _uploaded_tensors(write_dir: Path) -> Dict[str, Dict[str, TensorAdapter]]:
+    """The finished tensors the upload path left on disk, by source id.
 
-    Fields before sets, the order ``catalog_tensors`` lists them in.
+    Fields before sets, the order ``catalog_tensors`` lists them in. A source
+    whose tensors will not open costs those tensors, never the boot.
     """
-    return upload_attacher(
-        fields_attacher(fields_root(write_dir)),
-        sidecar_attacher(labels_root(write_dir)),
+    fields, labels = fields_root(write_dir), labels_root(write_dir)
+    source_ids = sorted(
+        {
+            d.name
+            for root in (fields, labels)
+            if root.is_dir()
+            for d in root.iterdir()
+            if d.is_dir()
+        }
     )
+    index: Dict[str, Dict[str, TensorAdapter]] = {}
+    for source_id in source_ids:
+        try:
+            found = {
+                **scan_source_fields(source_id, fields),
+                **sidecar_label_sets(source_id, labels),
+            }
+        except Exception:
+            logger.warning(f"scanning uploads of {source_id} failed", exc_info=True)
+            continue
+        if found:
+            index[source_id] = found
+    return index
 
 
 class _AuthMiddleware(flight.ServerMiddleware):
@@ -494,17 +510,14 @@ class TensorFlightServer(flight.FlightServerBase):
         # that dialed us (biopb/biopb#1158). None means advertise nothing.
         self._external_location: Optional[str] = external_location or None
 
-        # The source registry is the single chokepoint for adapter lifecycle.
-        # Sever with a write_dir set gets an on_register hook for attaching
-        # sidecar data.
-        self.sources = SourceRegistry(
-            on_register=_upload_attacher(Path(write_dir))
-            if write_dir is not None
-            else None
-        )
+        # The source registry is the single chokepoint for adapter lifecycle
+        # and owns the tensors attached to sources (adopted at boot, below).
+        self.sources = SourceRegistry()
 
         # The catalog, or None for a catalog-less server.
         self._metadata_db: Optional[MetadataDatabase] = metadata_db
+        if metadata_db is not None:
+            metadata_db.bind_registry(self.sources)
 
         # Authoritative resolution-pyramid knobs. Used to tweak the advertised
         # TensorDescriptor.pyramid in get_flight_info (computed levels) and shared
@@ -521,6 +534,8 @@ class TensorFlightServer(flight.FlightServerBase):
             self.sources, write_dir, self._metadata_db, ttl=upload_ttl
         )
         self.uploads.discard_unfinished_stores()
+        if write_dir is not None:
+            self.sources.adopt(_uploaded_tensors(Path(write_dir)))
         self.uploads.install_scratch(scratch_ttl if scratch_ttl > 0 else None)
         self.uploads.start_sweep()
 
@@ -742,7 +757,7 @@ class TensorFlightServer(flight.FlightServerBase):
         applies". ``False`` is a real refusal.
 
         **A grant covers one tensor.** Only an attached tensor carries one
-        (:meth:`SourceAdapter.tensor_capability_token`), never the source it
+        (:meth:`SourceRegistry.tensor_capability_token`), never the source it
         hangs off: one source is shared by uploads with different producers, so
         a grant at source scope would open every sibling to whoever holds one
         of them.
@@ -752,10 +767,7 @@ class TensorFlightServer(flight.FlightServerBase):
         themselves.
         """
         source_id, _ = split_array_id(array_id)
-        adapter = self.sources.get(source_id)
-        if adapter is None:
-            return None
-        expected = adapter.tensor_capability_token(array_id)
+        expected = self.sources.tensor_capability_token(source_id, array_id)
         if not expected:
             return None
         if provided is None or not hmac.compare_digest(provided, expected):
@@ -911,11 +923,7 @@ class TensorFlightServer(flight.FlightServerBase):
         Returns:
             TensorAdapter for the specified tensor, or None if not found
         """
-        source_adapter = self.sources.get_registered(source_id)
-        if source_adapter is None:
-            return None
-
-        return source_adapter.resolve_tensor(tensor_id)
+        return self.sources.resolve_tensor(source_id, tensor_id)
 
     def _get_adapter_for_chunk(
         self, chunk_id: bytes, array_id: Optional[str] = None
@@ -957,13 +965,10 @@ class TensorFlightServer(flight.FlightServerBase):
             source_id, *rest = array_id.split("/")
             rest = "/".join(rest) if rest else None
 
-            adapter = None
-            source_adapter = self.sources.get_registered(source_id)
-            if source_adapter is not None:
-                # A within-source suffix names a native pyramid level, a tensor
-                # field, or a label set (and a level under it); the source
-                # decides which (``SourceAdapter.resolve_chunk_adapter``).
-                adapter = source_adapter.resolve_chunk_adapter(rest)
+            # A within-source suffix names a native pyramid level, a tensor
+            # field, or a label set (and a level under it); the registry
+            # decides which (``SourceRegistry.resolve_chunk_adapter``).
+            adapter = self.sources.resolve_chunk_adapter(source_id, rest)
         except (
             SourceUnresolvedError,
             TensorResolutionError,

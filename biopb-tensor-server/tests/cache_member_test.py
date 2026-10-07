@@ -27,7 +27,6 @@ from biopb_tensor_server.adapters.fields import (
 from biopb_tensor_server.adapters.members import MEMBER_DESCRIPTOR
 from biopb_tensor_server.adapters.scratch import SCRATCH_SOURCE_ID
 from biopb_tensor_server.cache import CacheManager
-from biopb_tensor_server.core.adapter_base import catalog_tensors
 from biopb_tensor_server.core.attached import attached_field
 from biopb_tensor_server.core.chunk import mint_chunk_id
 from biopb_tensor_server.core.config import CacheConfig
@@ -50,7 +49,7 @@ def _add(client, source, field, arr=None, chunk_shape=CHUNK):
 
 
 def _member(server, source, field):
-    return server.sources.get(source).attached_tensors[attached_field(field)]
+    return server.sources.attached(source, attached_field(field))
 
 
 def _chunk_id(member, start, stop):
@@ -207,7 +206,7 @@ class TestItSurvivesARestart:
         second = self._server(tmp_path)
         try:
             assert not store.exists()
-            assert catalog_tensors(second.sources.get(source)) == []
+            assert second.sources.catalog_tensors(source) == []
         finally:
             second.shutdown()
             CacheManager.reset()

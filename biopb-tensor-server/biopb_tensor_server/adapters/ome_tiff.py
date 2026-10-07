@@ -558,7 +558,7 @@ class OmeTiffAdapter(TensorAdapter):
         # function of that already-cached string, so caching it costs nothing in
         # correctness and saves a second ome-types parse when both get_metadata
         # and get_embedded_labels run in the same registration (metadata_db.py
-        # calls the former directly; the latter is label_sets' one-time call).
+        # calls the former directly; the latter is the registry's one-time call per adapter).
         self._parsed_metadata: Optional[dict] = None
         self._parsed_metadata_probed = False
         # Set only after get_embedded_labels has handed every usable bitmap to
@@ -841,7 +841,7 @@ class OmeTiffAdapter(TensorAdapter):
         hand rather than re-opening the file for a string it would strip again --
         and the *dict* that parse produces is itself cached (``_parsed_metadata``),
         since it is a pure function of that same string: a caller that also
-        touches ``get_embedded_labels`` in the same registration (``label_sets``)
+        touches ``get_embedded_labels`` in the same registration (the registry's label-set view)
         gets the one parse already done, not a second one.
         """
         if self._parsed_metadata_probed:

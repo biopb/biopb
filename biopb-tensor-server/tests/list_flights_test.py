@@ -30,6 +30,9 @@ class _CatalogAdapter:
     def is_resident(self):
         return True
 
+    def get_embedded_labels(self):
+        return {}
+
     def is_resolved(self):
         return True
 
@@ -38,7 +41,7 @@ class _CatalogAdapter:
             TensorDescriptor(
                 array_id=self.source_id,
                 shape=[10, 10],
-                chunk_shape=[10, 10],  # stripped by catalog_tensors (#812)
+                chunk_shape=[10, 10],  # stripped by the catalog projection (#812)
                 dtype="uint8",
             )
         ]

@@ -154,9 +154,11 @@ class TestListingAndReading:
         client.upload_array(desc, _arr())
 
         adapter = writable_server.sources.get("theirs")
-        from biopb_tensor_server.core.adapter_base import catalog_tensors
 
-        assert [t.array_id for t in catalog_tensors(adapter)] == [
+        assert [
+            t.array_id
+            for t in writable_server.sources.catalog_tensors("theirs", adapter)
+        ] == [
             "theirs",
             "theirs/@fields/raw",
         ]
@@ -165,10 +167,10 @@ class TestListingAndReading:
         self, writable_server, client, discovered
     ):
         _add(client, discovered, "filling")
-        adapter = writable_server.sources.get("theirs")
+        attached = writable_server.sources.attached_to("theirs")
 
-        assert "@fields/filling" in adapter.attached_tensors
-        assert adapter.attached_fields == {}
+        assert "@fields/filling" in writable_server.sources.attachments("theirs")
+        assert attached.attached_fields() == {}
         status = client.get_upload_status("theirs/@fields/filling")
         assert status["state"] == "PENDING"
         with pytest.raises(flight.FlightError):
@@ -176,7 +178,7 @@ class TestListingAndReading:
 
     def test_a_label_set_binds_to_an_uploaded_field(self, client, discovered):
         """A field is a tensor of its source like any other, so a set may span
-        one (``SourceAdapter._normalized_tensors`` reads the attached fields)."""
+        one (``Attachments.normalized_tensors`` reads the attached fields)."""
         desc = _add(client, discovered, "raw")
         client.upload_array(desc, _arr())
 
@@ -297,8 +299,7 @@ class TestDiscardAndDelete:
         client.set_upload_status(desc.array_id, "DISCARDED")
 
         assert not store.exists()
-        adapter = writable_server.sources.get("theirs")
-        assert adapter.attached_fields == {}
+        assert writable_server.sources.attached_to("theirs").attached_fields() == {}
 
     def test_a_field_adopted_from_an_earlier_life_deletes(
         self, writable_server, client, tmp_path

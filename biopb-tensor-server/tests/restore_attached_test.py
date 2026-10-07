@@ -11,7 +11,7 @@ import threading
 import numpy as np
 from biopb.tensor import TensorFlightClient
 from biopb_tensor_server.adapters.fields import fields_root
-from biopb_tensor_server.serving.metadata_db import MetadataDatabase, catalog_tensors
+from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 
 from tests import deferred_registration_test as drt
 from tests.restore_test import _Run as _RestoreRun
@@ -103,7 +103,9 @@ class TestAHydratedSourceListsWhatIsOnDisk:
             assert run.listed(sid) == [sid, f"{sid}/@fields/raw"]  # restored as written
             adapter = run.server.sources.get_registered(sid)
             assert run.listed(sid) == [sid]
-            assert [t.array_id for t in catalog_tensors(adapter)] == [sid]
+            assert [
+                t.array_id for t in run.server.sources.catalog_tensors(sid, adapter)
+            ] == [sid]
         finally:
             run.stop()
 

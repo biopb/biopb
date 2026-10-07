@@ -198,12 +198,11 @@ class EmbeddedTensorCache:
         """The adapter serving one result, by the id ``add_tensor`` answered.
 
         A result is a tensor *attached* to the scratch source rather than a
-        source of its own, so it is reached through its parent instead of
-        through the registry.
+        source of its own, so it is reached through the registry's
+        attachments for its source.
         """
         source_id, _, field = array_id.partition("/")
-        parent = self._server.sources.get(source_id)
-        adapter = parent.attached_tensor(field) if parent is not None else None
+        adapter = self._server.sources.attached(source_id, field)
         if adapter is None:
             raise ValueError(f"Result not found: {array_id}")
         return adapter

@@ -159,20 +159,6 @@ def _refused(exc: UploadClosedError) -> flight.FlightCancelledError:
     return flight.FlightCancelledError(str(exc), json.dumps(payload).encode())
 
 
-def _attached(adapter: Any) -> Dict[str, Any]:
-    """The tensors the upload path put on *adapter*, or none.
-
-    By attribute, like :func:`upload_of`: the registry also holds adapters from
-    outside this package, and one that knows nothing about the upload path has
-    none of them.
-
-    One index for both kinds -- uploaded field and label set -- so this
-    boundary locates, publishes, unlists and reaps them alike
-    (``SourceAdapter.attached_tensors``).
-    """
-    return getattr(adapter, "attached_tensors", None) or {}
-
-
 def _reap_step(
     adapter: Any, now: float, ttl: float, wall_now: float
 ) -> Tuple[bool, bool]:
@@ -269,7 +255,7 @@ class UploadManager:
         parent = self._registry.get(source_id)
         if parent is None:
             return None, None, None
-        return _attached(parent).get(field), parent, field
+        return self._registry.attached(source_id, field), parent, field
 
     def status(self, source_id: str) -> Dict[str, Any]:
         """The ``upload_status`` answer: UNKNOWN for anything not tracking an upload."""
@@ -369,7 +355,7 @@ class UploadManager:
         parent = self._registry.get(source_id) if field else None
         if parent is None:
             return unknown_upload_status(array_id)
-        adapter = parent.detach_tensor(field)
+        adapter = self._registry.detach(source_id, field)
         if adapter is None:
             return unknown_upload_status(array_id)
         adapter.delete_store()
@@ -396,7 +382,7 @@ class UploadManager:
         writes -- and becomes *listed* by becoming readable, which its own
         upload record answers. So what is owed is the stale views and the row.
         """
-        parent.attachment_changed()
+        self._registry.attachment_changed(parent.source_id)
         self._sync_parent_row(parent)
 
     def _unlist(self, parent: Any, field: Optional[str]) -> None:
@@ -408,10 +394,9 @@ class UploadManager:
         """
         if parent is None or field is None:
             return
-        adapter = _attached(parent).get(field)
-        if adapter is None:
+        if self._registry.attached(parent.source_id, field) is None:
             return
-        parent.attachment_changed()
+        self._registry.attachment_changed(parent.source_id)
         self._sync_parent_row(parent)
 
     def _add_label_set(
@@ -421,7 +406,7 @@ class UploadManager:
 
         The set is attached to its source, which routes its own writes and its
         status polls; it is not *listed* until it reaches READY
-        (``SourceAdapter.label_sets``). No catalog write at create: the row the
+        (``Attachments.label_sets``). No catalog write at create: the row the
         source already has still describes what a reader may see.
 
         It takes a deadline the same way a field does: a set is an uploaded
@@ -438,12 +423,13 @@ class UploadManager:
                 field,
                 req_desc,
                 labels_dir=labels_root(self._write_dir),
+                attached=self._registry.attached_to(parent.source_id),
                 metadata=metadata,
                 expires_at=self._deadline_for(parent, req_desc),
             )
         except ValueError as e:
             raise flight.FlightServerError(f"add_tensor: {e}") from e
-        parent.attach_tensor(field, adapter)
+        self._registry.attach(parent.source_id, field, adapter)
         logger.info(f"Added label set {adapter.array_id}")
         return adapter.upload_response(req_desc)
 
@@ -707,7 +693,7 @@ class UploadManager:
         # published gate keeps it out of the source's tensors until READY. So no
         # catalog write is owed -- the row the source has still describes what a
         # reader may see.
-        parent.attach_tensor(field, adapter)
+        self._registry.attach(parent.source_id, field, adapter)
         logger.info(f"Added {scheme} tensor: {adapter.array_id}")
         return adapter.upload_response(req_desc)
 
@@ -733,6 +719,7 @@ class UploadManager:
                 scheme,
                 desc,
                 fields_dir=fields_root(self._write_dir),
+                attached=self._registry.attached_to(parent.source_id),
                 expires_at=expires_at,
             )
         except ValueError as e:
@@ -743,8 +730,7 @@ class UploadManager:
 
         Neither half is a walk: the id is fixed, and the source keeps no
         directory of its own -- its tensors come back through the
-        ``on_register`` hook that gives every source its uploaded fields
-        (``fields.fields_attacher``).
+        registry's attachments, adopted from ``fields`` at boot.
 
         *max_ttl* caps every upload added here, an unset one included; None
         leaves them undated. Returns the id, or None on a server with no
@@ -895,20 +881,11 @@ class UploadManager:
                     self._registry.unregister(source_id)
                     reclaimed += 1
                     logger.info(f"Reclaimed discarded upload {source_id}")
-            # ...and every tensor attached to it -- uploaded field or label
-            # set -- tracked on the source rather than in the registry,
-            # and taking the identical step.
+        # ...and every tensor attached to a source -- uploaded field or label
+        # set -- held by the registry and taking the identical step.
+        for source_id, tensors in self._registry.attachment_snapshot():
             tensor_expired, tensor_reclaimed = self._reap_tensors(
-                adapter,
-                source_id,
-                _attached(adapter),
-                # Lazy: an adapter with none to reap may not define this at all
-                # ("outside this package", per _attached). Bound as a default so
-                # the callable doesn't chase the loop's own name.
-                lambda field, adapter=adapter: adapter.detach_tensor(field),
-                now,
-                ttl,
-                wall_now,
+                source_id, tensors, now, ttl, wall_now
             )
             expired += tensor_expired
             reclaimed += tensor_reclaimed
@@ -916,24 +893,22 @@ class UploadManager:
 
     def _reap_tensors(
         self,
-        adapter: Any,
         source_id: str,
         tensors: Dict[str, Any],
-        detach: Any,
         now: float,
         ttl: float,
         wall_now: float,
     ) -> Tuple[int, int]:
-        """One reap pass over *adapter*'s attachment index."""
+        """One reap pass over *source_id*'s attachments."""
         expired = reclaimed = 0
-        for field, tensor in list(tensors.items()):
+        for field, tensor in tensors.items():
             expired_now, stale = _reap_step(tensor, now, ttl, wall_now)
             if expired_now:
-                self._unlist(adapter, field)
+                self._unlist(self._registry.get(source_id), field)
                 self._forget_rois(tensor.array_id)
                 expired += 1
             if stale:
-                detach(field)
+                self._registry.detach(source_id, field)
                 reclaimed += 1
                 logger.info(f"Reclaimed discarded tensor {source_id}/{field}")
         return expired, reclaimed

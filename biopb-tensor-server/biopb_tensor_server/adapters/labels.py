@@ -28,12 +28,12 @@ What a set adds over a plain OME-Zarr image:
 Three ways a set reaches a parent: :func:`native_label_sets` for an image
 group's ``labels/`` (called from ``OmeZarrAdapter.get_embedded_labels``),
 :func:`sidecar_label_sets` for the finished stores under
-``<write_dir>/labels/<source_id>/``, which :func:`sidecar_attacher` runs at
-registration, and :func:`create_label_upload` for a set arriving over the wire.
+``<write_dir>/labels/<source_id>/``, which the server scans at boot, and
+:func:`create_label_upload` for a set arriving over the wire.
 The readers skip only what they cannot *open* -- a float dtype, an unreadable
 ``.zattrs`` -- with a warning; whether a set spans its image is checked once
-for every origin where the sets meet (``SourceAdapter.label_binding_error``,
-from the upload's create and from ``label_sets``).
+for every origin where the sets meet (``Attachments.label_binding_error``,
+from the upload's create and from ``Attachments.label_sets``).
 """
 
 from __future__ import annotations
@@ -43,7 +43,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import numpy as np
 from biopb.tensor.descriptor_pb2 import PyramidLevel, TensorDescriptor
@@ -77,6 +77,9 @@ from biopb_tensor_server.core.labels import (
     split_label_field,
 )
 
+if TYPE_CHECKING:
+    from biopb_tensor_server.core.attachments import Attachments
+
 __all__ = [
     "LabelSetAdapter",
     "NearestPyramidMixin",
@@ -84,7 +87,6 @@ __all__ = [
     "labels_root",
     "native_label_sets",
     "open_label_set",
-    "sidecar_attacher",
     "sidecar_attrs",
     "sidecar_dir",
     "sidecar_label_sets",
@@ -277,7 +279,7 @@ def native_label_sets(
 def labels_root(write_dir: Path) -> Path:
     """Where every source's uploaded sets live: ``<write_dir>/labels/``.
 
-    The one definition of the sidecar layout: the attacher reads it, the
+    The one definition of the sidecar layout: the boot scan reads it, the
     upload kind writes under it, and the boot sweep globs it.
     """
     return write_dir / "labels"
@@ -369,6 +371,7 @@ def create_label_upload(
     desc: TensorDescriptor,
     *,
     labels_dir: Path,
+    attached: Attachments,
     metadata: Optional[dict] = None,
     expires_at: Optional[float] = None,
 ) -> LabelSetAdapter:
@@ -382,6 +385,9 @@ def create_label_upload(
     any other), and is filled in with the image's axes when it named none --
     in place, because it is also the descriptor the client is answered with.
 
+    *attached* is the parent's ``Attachments``: the names taken and the tensors
+    a set may bind to.
+
     *expires_at* is the set's deadline, recorded with the store. A set is an
     uploaded tensor like any other here, so a source that caps lifetimes caps
     this one too.
@@ -389,7 +395,7 @@ def create_label_upload(
     Raises ``ValueError`` for a request the kind cannot serve -- an
     unresolved parent, a reserved name, a dtype that is not an unsigned
     integer, a name already taken on this parent, or a shape that does not
-    span the image (``SourceAdapter.label_binding_error``, the same rule the
+    span the image (``Attachments.label_binding_error``, the same rule the
     listing re-checks). Nothing touches disk until every one of them has
     passed, so a refused request leaves no store behind.
     """
@@ -428,7 +434,7 @@ def create_label_upload(
     # NFD: `Nuclei` and `nuclei` are two keys here and one sidecar directory
     # there, so an unfolded check mints a second set that the next boot on such
     # a host cannot tell from the first.
-    taken = folded_match(field, (*parent.label_sets, *parent.attached_tensors))
+    taken = folded_match(field, (*attached.label_sets(parent), *attached.tensors))
     if taken is not None:
         raise ValueError(
             f"{array_id!r} already exists as {taken!r}. A set's name is taken "
@@ -436,17 +442,17 @@ def create_label_upload(
             f"case or accent form are one name on Windows and macOS; delete it "
             f"first, or upload under another name."
         )
-    images = parent._normalized_tensors()
+    images = attached.normalized_tensors(parent)
     if not desc.dim_labels:
         # The extent rule leaves exactly one legal set of axes for this image,
         # so a request that named none is filled in rather than refused. In
         # place, so the descriptor ``add_tensor`` echoes back carries them:
         # everything downstream (the sidecar's NGFF, the chunk grid, the
         # client's own later calls) is built from that descriptor.
-        image = parent.label_image_descriptor(field, images=images)
+        image = attached.label_image_descriptor(parent, field, images=images)
         if image is not None:
             desc.dim_labels.extend(label_extent(image.dim_labels, image.shape)[0])
-    why = parent.label_binding_error(field, desc, images=images)
+    why = attached.label_binding_error(parent, field, desc, images=images)
     if why is not None:
         raise ValueError(f"{array_id!r} {why}")
 
@@ -503,19 +509,3 @@ def create_label_upload(
     adapter._upload_store_path = store
     adapter.begin_upload(desc.shape, grid, expires_at)
     return adapter
-
-
-def sidecar_attacher(labels_dir: Path) -> Callable[[str, Any], None]:
-    """The registry's ``on_register`` hook: attach a source's finished sidecars.
-
-    Runs at the one registration chokepoint, because a sidecar is keyed by
-    ``source_id`` and no format knows about it. The registry stays ignorant of
-    the layout; this module owns it. A sidecar that will not open costs the
-    set, never the source.
-    """
-
-    def attach(source_id: str, adapter: Any) -> None:
-        for field, label_set in sidecar_label_sets(source_id, labels_dir).items():
-            adapter.attach_tensor(field, label_set)
-
-    return attach

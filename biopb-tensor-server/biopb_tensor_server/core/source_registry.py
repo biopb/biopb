@@ -18,7 +18,10 @@ import logging
 import threading
 from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
-from biopb_tensor_server.core.adapter_base import SourceAdapter
+from biopb.tensor.descriptor_pb2 import TensorDescriptor
+
+from biopb_tensor_server.core.adapter_base import SourceAdapter, TensorAdapter
+from biopb_tensor_server.core.attachments import Attachments
 from biopb_tensor_server.core.normalize import normalize_adapter
 
 logger = logging.getLogger(__name__)
@@ -32,26 +35,18 @@ def close_adapter(adapter: Optional[SourceAdapter]) -> None:
     the caller's -- and whoever swapped then needs this same never-raises close
     for the branch where the replace committed.
 
+    Closes the adapter only: its attached tensors belong to the registry
+    (:meth:`SourceRegistry.attached_to`) and outlive the adapter.
+
     ``SourceAdapter.close()`` is declared on the ABC with a no-op default, so
     this calls it rather than sniffing for it: a wrapper that forwards every
     other method but not ``close`` is then a visible omission in the interface
     instead of a silent skip (biopb/biopb#71). Never raises -- shutdown and
     unregister must not fail on a balky adapter, and the registry also accepts
     non-inheriting test doubles.
-
-    **Releases what was attached to the source as well.** An uploaded field or
-    a label set holds a store of its own that the source knows nothing about.
-    Done here, the mirror of :meth:`SourceRegistry.register` where the
-    attaching happens, rather than in a ``close()`` override each adapter with
-    handles of its own would have to remember to chain up to.
     """
     if adapter is None:  # unregister of an id that was never registered
         return
-    for tensor in getattr(adapter, "attached_tensors", {}).values():
-        try:
-            tensor.close()
-        except Exception:  # cleanup must not fail
-            logger.debug("error closing attached tensor", exc_info=True)
     try:
         adapter.close()
     except Exception:  # cleanup must not fail
@@ -61,18 +56,14 @@ def close_adapter(adapter: Optional[SourceAdapter]) -> None:
 class SourceRegistry:
     """The server's live ``source_id -> SourceAdapter`` map, thread-safe."""
 
-    def __init__(
-        self, on_register: Optional[Callable[[str, SourceAdapter], None]] = None
-    ) -> None:
-        """*on_register* runs on every registered adapter before it is
-        published, for what has to happen at the one chokepoint but is not
-        the registry's to know -- attaching a source's uploaded label sets
-        (``adapters.labels.sidecar_attacher``). Its failure is logged, never
-        the registration's: a source is its pixels first."""
+    def __init__(self) -> None:
         self._sources: Dict[str, SourceAdapter] = {}
         self._lock = threading.RLock()
-        self._on_register = on_register
         self._pending_check: Optional[Callable[[str], None]] = None
+        # Tensors attached to a source -- uploaded fields, label sets -- keyed
+        # by source id, not by adapter: an adapter is rebuilt on a refresh, and
+        # an upload in flight must keep routing across it.
+        self._attachments: Dict[str, Attachments] = {}
 
     def set_pending_check(self, check: Optional[Callable[[str], None]]) -> None:
         """Wire what :meth:`get_registered` asks when a source is not registered:
@@ -120,13 +111,6 @@ class SourceRegistry:
                 f"by splitting on the first '/'."
             )
         adapter = normalize_adapter(adapter)
-        if self._on_register is not None:
-            try:
-                self._on_register(source_id, adapter)
-            except Exception:
-                logger.warning(
-                    f"on_register hook failed for {source_id}", exc_info=True
-                )
         with self._lock:
             self._sources[source_id] = adapter
         logger.debug(f"Registered source: {source_id}")
@@ -136,6 +120,8 @@ class SourceRegistry:
         """Remove a source and release its adapter's resources.
 
         Returns the removed adapter (or ``None`` if it was not registered).
+        Its attached tensors stay: their stores are the server's, on disk, and
+        the id may come back; :meth:`close_all` releases them.
 
         Closed here, where :meth:`swap` hands its displaced adapter back open:
         the id is gone, so there is no rollback that could need this one back.
@@ -204,6 +190,102 @@ class SourceRegistry:
             adapter = self.get(source_id)  # registered while we checked
         return adapter
 
+    # -- attachments ----------------------------------------------------------
+
+    def attached_to(self, source_id: str) -> Attachments:
+        """The attachments of *source_id*, created empty on first ask."""
+        with self._lock:
+            attachments = self._attachments.get(source_id)
+            if attachments is None:
+                attachments = self._attachments[source_id] = Attachments(source_id)
+            return attachments
+
+    def adopt(self, index: Dict[str, Dict[str, TensorAdapter]]) -> None:
+        """Take the attached tensors a previous life left on disk, by source id.
+
+        Run once at boot, so a registration is a dict lookup rather than a
+        directory scan. A source not registered yet keeps its tensors here
+        until it is.
+        """
+        for source_id, tensors in index.items():
+            self.attached_to(source_id).tensors.update(tensors)
+
+    def attachments(self, source_id: str) -> Dict[str, TensorAdapter]:
+        """The tensors attached to *source_id*, whatever state: a copy."""
+        with self._lock:
+            found = self._attachments.get(source_id)
+            return dict(found.tensors) if found is not None else {}
+
+    def attached(self, source_id: str, field: str) -> Optional[TensorAdapter]:
+        """The tensor attached at *field* of *source_id*, whatever its state."""
+        with self._lock:
+            found = self._attachments.get(source_id)
+            return found.tensors.get(field) if found is not None else None
+
+    def attachment_snapshot(self) -> List[Tuple[str, Dict[str, TensorAdapter]]]:
+        """Every source's attachments, for a sweep that walks them all."""
+        with self._lock:
+            return [
+                (sid, dict(a.tensors))
+                for sid, a in self._attachments.items()
+                if a.tensors
+            ]
+
+    def attach(self, source_id: str, field: str, tensor: TensorAdapter) -> None:
+        """Make *tensor* answer for *field* on *source_id*."""
+        self.attached_to(source_id).attach(field, tensor)
+
+    def detach(self, source_id: str, field: str) -> Optional[TensorAdapter]:
+        """Stop answering for *field*; returns what was attached, or None."""
+        return self.attached_to(source_id).detach(field)
+
+    def attachment_changed(self, source_id: str) -> None:
+        """Rebuild the source's checked views: an attached tensor's state moved."""
+        self.attached_to(source_id).changed()
+
+    # -- reads through the attachments ---------------------------------------
+
+    def catalog_tensors(
+        self, source_id: str, adapter: Optional[SourceAdapter] = None
+    ) -> List[TensorDescriptor]:
+        """A source's tensors as the catalog stores them: the format's own, then
+        its attached fields and label sets (:meth:`Attachments.catalog_tensors`).
+
+        *adapter* is the one being described when it is not the registered one
+        yet; attachments are the id's either way.
+        """
+        adapter = adapter if adapter is not None else self.get(source_id)
+        return self.attached_to(source_id).catalog_tensors(adapter)
+
+    def resolve_tensor(
+        self, source_id: str, tensor_id: Optional[str]
+    ) -> Optional[TensorAdapter]:
+        """The adapter bound to *tensor_id* of *source_id*, None for an unknown
+        source. Raises what :meth:`get_registered` raises."""
+        adapter = self.get_registered(source_id)
+        if adapter is None:
+            return None
+        return self.attached_to(source_id).resolve_tensor(adapter, tensor_id)
+
+    def resolve_chunk_adapter(
+        self, source_id: str, field: Optional[str]
+    ) -> Optional[TensorAdapter]:
+        """The adapter that serves a chunk whose route is ``source_id/<field>``,
+        None for an unknown source. Raises what :meth:`get_registered` raises."""
+        adapter = self.get_registered(source_id)
+        if adapter is None:
+            return None
+        return self.attached_to(source_id).resolve_chunk_adapter(adapter, field)
+
+    def tensor_capability_token(
+        self, source_id: str, array_id: Optional[str]
+    ) -> Optional[str]:
+        """The grant the tensor *array_id* carries, or None (a source's own
+        tensors carry none)."""
+        with self._lock:
+            found = self._attachments.get(source_id)
+        return found.capability_token(array_id) if found is not None else None
+
     def snapshot(self) -> List[Tuple[str, SourceAdapter]]:
         """Return a stable snapshot of registered sources for iteration."""
         with self._lock:
@@ -219,6 +301,14 @@ class SourceRegistry:
         """
         with self._lock:
             adapters = list(self._sources.values())
+            attached = [
+                t for a in self._attachments.values() for t in a.tensors.values()
+            ]
+        for tensor in attached:
+            try:
+                tensor.close()
+            except Exception:  # cleanup must not fail
+                logger.debug("error closing attached tensor", exc_info=True)
         for adapter in adapters:
             close_adapter(adapter)
 

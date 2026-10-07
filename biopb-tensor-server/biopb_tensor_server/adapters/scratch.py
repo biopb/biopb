@@ -5,8 +5,8 @@ The id is fixed (:data:`SCRATCH_SOURCE_ID`), so there is no container to mint
 and nothing to remember between runs.
 
 It owns no directory. Its tensors are uploaded fields under
-``<write_dir>/fields/scratch/``, re-attached at boot by
-``fields.fields_attacher`` like any other source's, and an empty scratch source
+``<write_dir>/fields/scratch/``, adopted at boot by the
+registry's scan like any other source's, and an empty scratch source
 is simply one between uploads -- never reclaimed. What it does own is
 :attr:`~ScratchSource.max_upload_ttl`, the cap that keeps a temp store from
 accumulating forever.
@@ -51,6 +51,8 @@ class ScratchSource(SourceAdapter):
 
     _source_type = "scratch"
 
+    serves_attached_only = True
+
     def __init__(
         self,
         max_upload_ttl: Optional[float] = None,
@@ -83,7 +85,7 @@ class ScratchSource(SourceAdapter):
 
     def list_tensor_descriptors(self) -> List[TensorDescriptor]:
         """None of its own: every tensor here was uploaded, and
-        ``catalog_tensors`` appends the published ones after this."""
+        the registry's listing appends the published ones after this."""
         return []
 
     def get_metadata(self) -> dict:
@@ -92,11 +94,11 @@ class ScratchSource(SourceAdapter):
         return {}
 
     def get_tensor_adapter(self, tensor_id: Optional[str]) -> TensorAdapter:
-        """The source's default tensor, or a typed miss; never ``self``.
+        """A typed miss; never ``self``.
 
-        Reached only after ``resolve_tensor`` has missed the attachment index,
-        so a named field here names nothing, and an unnamed one asks for the
-        first published field -- of which an empty scratch source has none.
+        Reached only after the attachments have missed, so a named field here
+        names nothing, and an unnamed one asks for the first published field --
+        of which an empty scratch source has none.
         """
         field = self._within_source_field(tensor_id)
         if field:
@@ -104,11 +106,8 @@ class ScratchSource(SourceAdapter):
                 f"{self.source_id} has no tensor {field!r}.",
                 reason="unknown_field",
             )
-        default = next(iter(self.attached_fields.values()), None)
-        if default is None:
-            raise TensorNotFound(
-                f"{self.source_id} has no tensors yet: add one with "
-                f"add_tensor before reading it.",
-                reason="empty_source",
-            )
-        return default
+        raise TensorNotFound(
+            f"{self.source_id} has no tensors yet: add one with "
+            f"add_tensor before reading it.",
+            reason="empty_source",
+        )

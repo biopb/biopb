@@ -184,7 +184,7 @@ class TestMultifieldSourceLevel:
     def test_catalog_row_fields_cover_all_tensors(self):
         """What the source contributes to its catalog row: its own id/url/type,
         and a structural entry per tensor (not just tensors[0])."""
-        from biopb_tensor_server.core.adapter_base import catalog_tensors
+        from biopb_tensor_server.core.source_registry import SourceRegistry
 
         tensor_specs = [
             ("tensor_0", (64, 64), "uint8"),
@@ -195,7 +195,7 @@ class TestMultifieldSourceLevel:
         assert adapter.source_id == "multifield-source"
         assert adapter.catalog_url == "mock://multifield"
         assert adapter.source_type == "mock-multifield"
-        entries = catalog_tensors(adapter)
+        entries = SourceRegistry().catalog_tensors("multifield-source", adapter)
         assert [t.array_id for t in entries] == ["tensor_0", "tensor_1"]
         assert all(not t.chunk_shape for t in entries)  # #812
 

@@ -28,9 +28,9 @@ from biopb_tensor_server.adapters.zarr import ZarrAdapter
 from biopb_tensor_server.core.adapter_base import (
     SourceAdapter,
     catalog_entry,
-    catalog_tensors,
 )
 from biopb_tensor_server.core.config import PyramidConfig, SourceConfig
+from biopb_tensor_server.core.source_registry import SourceRegistry
 from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 from google.protobuf.field_mask_pb2 import FieldMask
 
@@ -90,7 +90,7 @@ def test_listing_is_structural_and_binding_answers_the_grid(live_sources, family
 def test_catalog_tensors_strips_a_grid_the_listing_leaked(live_sources):
     """The projection enforces it, not each adapter's good behaviour.
 
-    ``catalog_tensors`` is the only path into the DuckDB row, and the row is the
+    ``SourceRegistry.catalog_tensors`` is the only path into the DuckDB row, and the row is the
     only representation of a source that crosses the wire -- so an adapter that
     still names a grid cannot reach a client through it.
     """
@@ -122,7 +122,8 @@ def test_catalog_tensors_strips_a_grid_the_listing_leaked(live_sources):
                 )
             ]
 
-    (tensor,) = catalog_tensors(_LeakyAdapter())
+    reg = SourceRegistry()
+    (tensor,) = reg.catalog_tensors("leaky", reg.register("leaky", _LeakyAdapter()))
     assert list(tensor.shape) == [64, 64]  # structure survives
     assert tensor.dtype == "uint8"
     assert list(tensor.chunk_shape) == []  # the read plan does not

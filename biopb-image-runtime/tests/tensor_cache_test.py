@@ -227,13 +227,13 @@ def test_a_restart_does_not_adopt_the_last_run_s_results(tmp_path: Path):
             np.zeros((4, 4), dtype=np.float32), "cache:", ["Y", "X"]
         )
         field = array_id.partition("/")[2]
-        assert first.sources.get("scratch").attached_tensor(field) is not None
+        assert first.sources.attached("scratch", field) is not None
     finally:
         first.shutdown()
 
     second = _run(_free_tcp_port())
     try:
-        assert second.sources.get("scratch").attached_tensors == {}
+        assert second.sources.attachments("scratch") == {}
     finally:
         second.shutdown()
         CacheManager.reset()

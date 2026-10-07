@@ -1,6 +1,6 @@
 """Label sets are tensors of their image (biopb/biopb#1059 step 2).
 
-A source answers for them through the base API -- ``label_sets``,
+The registry answers for them -- ``attached_to(...).label_sets``,
 ``resolve_tensor``, ``resolve_chunk_adapter`` -- so the format's own listing
 and routing stay untouched, the catalog lists them after the image tensors, and
 the serve path reaches them by ``array_id`` like any tensor. Two origins here:
@@ -18,15 +18,18 @@ import zarr
 from biopb_tensor_server.adapters.labels import (
     LabelSetAdapter,
     open_label_set,
-    sidecar_attacher,
     sidecar_attrs,
     sidecar_dir,
+    sidecar_label_sets,
 )
 from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
 from biopb_tensor_server.adapters.zarr import UPLOAD_PENDING, with_upload_state
-from biopb_tensor_server.core.adapter_base import catalog_tensors
 from biopb_tensor_server.core.config import PyramidConfig, SourceConfig
-from biopb_tensor_server.core.errors import TensorNotFound, WriteNotSupportedError
+from biopb_tensor_server.core.errors import (
+    AttachedTensorMismatch,
+    TensorNotFound,
+    WriteNotSupportedError,
+)
 from biopb_tensor_server.core.labels import (
     extent_mismatch,
     label_extent,
@@ -37,7 +40,7 @@ from biopb_tensor_server.core.normalize import NormalizingAdapter
 from biopb_tensor_server.core.source_registry import SourceRegistry
 from biopb_tensor_server.fixtures import create_multiresolution_ome_zarr
 
-from tests import register_and_catalog
+from tests import catalog_server, register_and_catalog
 
 SHAPE = (64, 64)
 CHUNK = (32, 32)
@@ -118,11 +121,20 @@ def _adapter(root, source_id="oz1"):
 
 
 @pytest.fixture
-def registered(image):
-    return SourceRegistry().register("oz1", _adapter(image))
+def reg(image):
+    registry = SourceRegistry()
+    registry.register("oz1", _adapter(image))
+    return registry
+
+
+@pytest.fixture
+def registered(reg):
+    return reg.get("oz1")
 
 
 NATIVE = {"@labels/nuclei", "@labels/flat", "@labels/xy"}
+# Also in the fixture, listed but 32x32 on a 64x64 image: it refuses to be read.
+STALE_NATIVE = {"@labels/small"}
 
 
 class TestTheFieldShape:
@@ -189,84 +201,93 @@ class TestTheFieldShape:
 
 
 class TestANativeSetIsATensorOfItsImage:
-    def test_listed_after_the_image_and_readable_by_id(self, registered):
-        ids = [t.array_id for t in catalog_tensors(registered)]
+    def test_listed_after_the_image_and_readable_by_id(self, registered, reg):
+        ids = [t.array_id for t in reg.catalog_tensors("oz1", registered)]
         assert ids[0] == "oz1"
-        assert set(ids[1:]) == {f"oz1/{f}" for f in NATIVE}
+        assert set(ids[1:]) == {f"oz1/{f}" for f in NATIVE | STALE_NATIVE}
 
-        nuclei = registered.resolve_tensor("oz1/@labels/nuclei")
+        nuclei = reg.resolve_tensor("oz1", "oz1/@labels/nuclei")
         assert isinstance(nuclei, LabelSetAdapter)
         assert nuclei.array_id == "oz1/@labels/nuclei"
-        assert registered.resolve_tensor("@labels/nuclei") is nuclei
+        assert reg.resolve_tensor("oz1", "@labels/nuclei") is nuclei
         desc = nuclei.get_tensor_descriptor()
         assert (list(desc.shape), desc.dtype) == ([64, 64], "<u4")
 
-    def test_a_set_that_cannot_open_or_does_not_span_is_dropped(self, registered):
+    def test_a_set_that_does_not_span_is_listed_and_refuses_to_be_read(
+        self, registered, reg
+    ):
         """``bad`` is a float (the reader skips it); ``small`` is 32x32 on a
-        64x64 image (the merge drops it). The image registers either way."""
-        assert set(registered.label_sets) == NATIVE
-        assert registered.resolve_tensor("oz1").array_id == "oz1"
+        64x64 image: listed, but a read says why instead of serving it
+        misaligned. The image registers either way."""
+        sets = reg.attached_to("oz1").label_sets(registered)
+        assert set(sets) == NATIVE | STALE_NATIVE
+        with pytest.raises(AttachedTensorMismatch, match="does not span"):
+            reg.resolve_tensor("oz1", "@labels/small")
+        assert reg.resolve_tensor("oz1", "oz1").array_id == "oz1"
 
-    def test_an_unknown_set_is_the_formats_miss(self, registered):
+    def test_an_unknown_set_is_the_formats_miss(self, registered, reg):
         with pytest.raises(TensorNotFound):
-            registered.resolve_tensor("@labels/nope")
+            reg.resolve_tensor("oz1", "@labels/nope")
 
     def test_the_formats_own_routing_is_untouched(self, image):
         raw = _adapter(image)
-        adapter = SourceRegistry().register("oz1", raw)
+        reg = SourceRegistry()
+        reg.register("oz1", raw)
         assert [t.array_id for t in raw.list_tensor_descriptors()] == ["oz1"]
-        assert adapter.resolve_tensor(None).array_id == "oz1"
-        assert adapter.resolve_chunk_adapter("1").array_id == "oz1/1"
+        assert reg.resolve_tensor("oz1", None).array_id == "oz1"
+        assert reg.resolve_chunk_adapter("oz1", "1").array_id == "oz1/1"
 
-    def test_a_native_level_routes_under_the_set(self, registered):
+    def test_a_native_level_routes_under_the_set(self, registered, reg):
         """``nuclei``'s arrays carry their own ``.zattrs``, which used to stop
         the level-opening walk one directory too early."""
-        nuclei = registered.resolve_tensor("@labels/nuclei")
+        nuclei = reg.resolve_tensor("oz1", "@labels/nuclei")
 
-        level = registered.resolve_chunk_adapter("@labels/nuclei/1")
+        level = reg.resolve_chunk_adapter("oz1", "@labels/nuclei/1")
         assert level.array_id == "oz1/@labels/nuclei/1"
         assert list(level.get_tensor_descriptor().shape) == [32, 32]
         assert level.content_version == nuclei.content_version
-        assert registered.resolve_chunk_adapter("@labels/nuclei") is nuclei
+        assert reg.resolve_chunk_adapter("oz1", "@labels/nuclei") is nuclei
 
-    def test_content_version_is_the_images_for_set_and_levels_alike(self, registered):
-        nuclei = registered.resolve_tensor("@labels/nuclei")
+    def test_content_version_is_the_images_for_set_and_levels_alike(
+        self, registered, reg
+    ):
+        nuclei = reg.resolve_tensor("oz1", "@labels/nuclei")
         assert nuclei.content_version == registered.content_version is not None
         # The image's own native levels share it too: one token per source.
         assert (
-            registered.resolve_chunk_adapter("1").content_version
+            reg.resolve_chunk_adapter("oz1", "1").content_version
             == registered.content_version
         )
 
-    def test_the_ladder_is_native_or_nearest_never_area(self, registered):
+    def test_the_ladder_is_native_or_nearest_never_area(self, registered, reg):
         cfg = PyramidConfig(reduction_method="area")
-        nuclei = registered.resolve_tensor("@labels/nuclei")
+        nuclei = reg.resolve_tensor("oz1", "@labels/nuclei")
         native = nuclei._advertised_pyramid(nuclei.get_tensor_descriptor(), cfg)
         assert all(
             lvl.reduction_method == "precompute" and lvl.native for lvl in native
         )
 
-        flat = registered.resolve_tensor("@labels/flat")
+        flat = reg.resolve_tensor("oz1", "@labels/flat")
         computed = flat._advertised_pyramid(flat.get_tensor_descriptor(), cfg)
         assert computed and all(lvl.reduction_method == "nearest" for lvl in computed)
 
-    def test_metadata_names_the_image(self, registered):
-        meta = registered.resolve_tensor("@labels/nuclei").get_tensor_metadata()
+    def test_metadata_names_the_image(self, registered, reg):
+        meta = reg.resolve_tensor("oz1", "@labels/nuclei").get_tensor_metadata()
         assert meta["image-label"]["source"] == {"image": "oz1"}
         assert meta["image-label"]["colors"][0]["label-value"] == 7
         assert meta["multiscales"][0]["datasets"][1]["path"] == "1"
 
-    def test_a_set_is_read_only(self, registered):
+    def test_a_set_is_read_only(self, registered, reg):
         with pytest.raises(WriteNotSupportedError):
-            registered.resolve_tensor("@labels/nuclei").put_chunk(None, None, (), None)
+            reg.resolve_tensor("oz1", "@labels/nuclei").put_chunk(None, None, (), None)
 
-    def test_a_non_canonical_set_is_normalized_like_any_tensor(self, registered):
-        xy = registered.resolve_tensor("@labels/xy")
+    def test_a_non_canonical_set_is_normalized_like_any_tensor(self, registered, reg):
+        xy = reg.resolve_tensor("oz1", "@labels/xy")
         assert isinstance(xy, NormalizingAdapter)
         assert list(xy.get_tensor_descriptor().dim_labels) == ["y", "x"]
         assert [
             t.dim_labels[0]
-            for t in catalog_tensors(registered)
+            for t in reg.catalog_tensors("oz1", registered)
             if t.array_id.endswith("/xy")
         ] == ["y"]
 
@@ -332,6 +353,13 @@ def _sidecar(
     )
 
 
+def _adopting(labels_dir):
+    """A registry that took the finished sidecars of ``oz1`` at boot."""
+    registry = SourceRegistry()
+    registry.adopt({"oz1": sidecar_label_sets("oz1", labels_dir)})
+    return registry
+
+
 class TestASidecarIsAttachedAtRegistration:
     def test_a_ready_sidecar_is_a_set_a_pending_one_is_not(self, image, tmp_path):
         labels_dir = tmp_path / "labels"
@@ -339,28 +367,37 @@ class TestASidecarIsAttachedAtRegistration:
         _sidecar(labels_dir, "oz1", "half", state=UPLOAD_PENDING)
         _sidecar(labels_dir, "other", "theirs")
 
-        adapter = SourceRegistry(on_register=sidecar_attacher(labels_dir)).register(
-            "oz1", _adapter(image)
-        )
+        reg = _adopting(labels_dir)
+        adapter = reg.register("oz1", _adapter(image))
 
-        assert set(adapter.label_sets) == NATIVE | {"@labels/mine"}
-        mine = adapter.resolve_tensor("oz1/@labels/mine")
+        assert set(
+            reg.attached_to("oz1").label_sets(adapter)
+        ) == NATIVE | STALE_NATIVE | {"@labels/mine"}
+        mine = reg.resolve_tensor("oz1", "oz1/@labels/mine")
         assert mine.content_version == b"\x01\x02"
         assert mine.get_tensor_metadata()["image-label"]["source"] == {"image": "oz1"}
         assert "biopb" not in mine.get_tensor_metadata()
 
-    def test_one_that_does_not_span_or_bind_is_dropped(self, image, tmp_path):
+    def test_one_that_does_not_span_or_bind_is_listed_and_refuses_to_be_read(
+        self, image, tmp_path
+    ):
         labels_dir = tmp_path / "labels"
         _sidecar(labels_dir, "oz1", "small", shape=(32, 32))
         _sidecar(labels_dir, "oz1", "extra", shape=(2, 64, 64), axes=("z", "y", "x"))
         _sidecar(labels_dir, "oz1", "orphan", image_field="Image:9")
         _sidecar(labels_dir, "oz1", "fits")
 
-        adapter = SourceRegistry(on_register=sidecar_attacher(labels_dir)).register(
-            "oz1", _adapter(image)
-        )
+        reg = _adopting(labels_dir)
+        adapter = reg.register("oz1", _adapter(image))
 
-        assert set(adapter.label_sets) == NATIVE | {"@labels/fits"}
+        stale = {"@labels/small", "@labels/extra", "Image:9/@labels/orphan"}
+        assert set(reg.attached_to("oz1").label_sets(adapter)) == (
+            NATIVE | {"@labels/fits"} | stale
+        )
+        for name in sorted(stale):
+            with pytest.raises(AttachedTensorMismatch):
+                reg.resolve_tensor("oz1", name)
+        assert reg.resolve_tensor("oz1", "@labels/fits") is not None
 
     def test_a_store_without_a_token_is_corrupt_and_skipped(self, image, tmp_path):
         labels_dir = tmp_path / "labels"
@@ -369,33 +406,34 @@ class TestASidecarIsAttachedAtRegistration:
         del attrs["biopb"]["labels"]["content_version"]
         (group / ".zattrs").write_text(json.dumps(attrs))
 
-        adapter = SourceRegistry(on_register=sidecar_attacher(labels_dir)).register(
-            "oz1", _adapter(image)
-        )
-        assert "@labels/untokened" not in adapter.label_sets
+        reg = _adopting(labels_dir)
+        adapter = reg.register("oz1", _adapter(image))
+        assert "@labels/untokened" not in reg.attached_to("oz1").label_sets(adapter)
 
-    def test_no_hook_means_no_sidecars(self, image, tmp_path):
+    def test_nothing_adopted_means_no_sidecars(self, image, tmp_path):
         _sidecar(tmp_path / "labels", "oz1", "mine")
-        adapter = SourceRegistry().register("oz1", _adapter(image))
-        assert "@labels/mine" not in adapter.label_sets
+        reg = SourceRegistry()
+        adapter = reg.register("oz1", _adapter(image))
+        assert "@labels/mine" not in reg.attached_to("oz1").label_sets(adapter)
 
-    def test_attach_and_detach_by_hand(self, registered, tmp_path):
+    def test_attach_and_detach_by_hand(self, reg, tmp_path):
         group = _sidecar(tmp_path / "labels", "oz1", "late")
         late = open_label_set(
             group, source_id="oz1", image_field="", name="late", content_version=b"x"
         )
-        registered.attach_tensor("@labels/late", late)
-        assert registered.resolve_tensor("@labels/late").array_id == "oz1/@labels/late"
-        assert registered.detach_tensor("@labels/late") is not None
-        assert registered.detach_tensor("@labels/nuclei") is None  # the file's
+        reg.attach("oz1", "@labels/late", late)
+        assert reg.resolve_tensor("oz1", "@labels/late").array_id == "oz1/@labels/late"
+        assert reg.detach("oz1", "@labels/late") is not None
+        assert reg.detach("oz1", "@labels/nuclei") is None  # the file's
         with pytest.raises(TensorNotFound):
-            registered.resolve_tensor("@labels/late")
+            reg.resolve_tensor("oz1", "@labels/late")
 
-    def test_the_server_wires_its_write_dir(self, writable_server, image, tmp_path):
+    def test_the_server_adopts_its_write_dir_at_boot(self, image, tmp_path):
         _sidecar(tmp_path / "labels", "oz1", "mine")
-        register_and_catalog(writable_server, "oz1", _adapter(image))
+        server = catalog_server("localhost:0", writable=True, write_dir=tmp_path)
+        register_and_catalog(server, "oz1", _adapter(image))
         ids = (
-            writable_server.metadata_db.query(
+            server.metadata_db.query(
                 "SELECT t.array_id FROM sources, UNNEST(tensors) AS u(t)"
             )
             .column(0)
