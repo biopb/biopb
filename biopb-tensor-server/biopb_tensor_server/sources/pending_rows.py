@@ -30,7 +30,7 @@ class PendingRow:
     #: A cloud source: ``needs_recall`` instead of ``pending``.
     recall: bool = False
     #: The claim and signature to persist with the row; None for a source with no
-    #: claim to restore (a drop, a mirror), whose row is volatile.
+    #: claim to restore (a drop, a mirror), whose row has no claim columns.
     record: Optional[CatalogRecord] = None
 
 

@@ -22,7 +22,7 @@ it comes back.
         Reconciler: diff against the confirmed DiscoveryState
                       │  add / refresh / remove
                       ▼
-   register_source (server) + catalog row (source_catalog / sources_volatile)
+   register_source (server) + catalog row (source_catalog)
 ```
 
 - **One walker.** A drop, a one-shot directory and the periodic rescan of a monitored root
@@ -53,7 +53,7 @@ it comes back.
 | `Roots` (shared by `SourceManager` and `Reconciler`) | every known root: kind (monitored, scan-once, dropped, upstream), alias, cloud, `dnd://` label, `root_id`, `root_url` | Resolved root `Path`s; a drop's label |
 | `SourceManager` | `_unavailable_roots` | Resolved root `Path`s |
 | Adapter | `_source_url` (the raw claim path, or the library's own filename for nifti / bioio / dicom), `catalog_url` | Opens files with the raw path |
-| Catalog | `catalog_roots`, `source_catalog`, `sources_volatile`, the `sources` view (§7) | `root_id`; `source_id` |
+| Catalog | `catalog_roots`, `source_catalog`, the `sources` view (§7) | `root_id`; `source_id` |
 
 ## 3. Path invariants
 
@@ -88,9 +88,10 @@ adapter `claim()` normalizes the path it returns.
 6. **I/O follows the claim path.** `open` and `stat` of a claim path follow links, so a
    link claim reads and signs its target. Quietness and change signatures stat the spelled
    path (`entry_is_quiet`, `build_entry_signature`).
-7. **The catalog `source_url` is display, never an input.** For a persisted row it is
-   computed from its root (§7); for a volatile row it is `dnd://<label>` for a drop from
-   outside every known root, `cache://`, `scratch://`, or `grpc://<alias>/…` for a mirror.
+7. **The catalog `source_url` is display, never an input.** It is computed from the
+   row's root (§7): `dnd://<label>/…` for a drop from outside every known root,
+   `grpc://<alias>/…` for a mirror, the alias or file url of a configured root, and the
+   source's own url (`cache://`, `scratch://`) under the built-in root.
    It is not fed to the filesystem or to `generate_source_id`, and rows are found and
    removed by `source_id`. The one lookup by url is `remove_source`, which matches a
    `dnd://<label>/` prefix.
@@ -203,10 +204,12 @@ ever runs: cloud roots are never walked.
 
 ### What each event writes to the catalog
 
-A source with a claim under a monitored or scan-once root (cloud roots included) has its row
-in `source_catalog` from the moment the walk finds it; a source with none (a mirror, a drop,
-an upload) has it in `sources_volatile`. The row never changes table, and registration fills
-it in.
+Every source has one row in `source_catalog`, keyed by `source_id`, and sits under a root.
+A source under a monitored or scan-once root (cloud roots included) has its claim columns,
+from the moment the walk finds it; one under a drop or an upstream has the row without them.
+Registration fills the row in, and a write that carries no record (an upload re-listing its
+source) updates the public columns and leaves where the source sits, and its claim, as they
+were.
 
 | Event | Write |
 |---|---|
@@ -218,7 +221,7 @@ it in.
 | Gone | Delete |
 | Registration succeeds | `UPDATE` of `metadata_json`, `tensors`, `payload`, `indexed_at`, resolved |
 | Registration fails (a pending claim) | `UPDATE` to `failed` with `unresolved_error` |
-| A restored source rebuilt from its own row (§8) | None; its root's walk confirms it |
+| A restored source rebuilt from its own row (§8) | `UPDATE` of `tensors` if the uploaded fields and label sets now attached differ from the row's; its root's walk confirms it |
 
 "Resident" is `_claim_is_unresolved` being false: the adapter did not flag the claim, and
 under a cloud root no member is a dehydrated placeholder (a metadata `stat`, nothing is
@@ -264,7 +267,7 @@ path only**: the claims under it that are not under a monitored root (the rescan
 and not under a declined directory. A single-file drop skips this. Then each claim is
 refreshed if known, whatever its signature, else added. A drop whose path lies inside an
 already-owned directory source is rejected (`_find_containing_source`). A drop's sources
-are volatile and **session-only**: they are not persisted and not restored, and the marks
+have no claim and are **session-only**: they are not persisted and not restored, and the marks
 are remembered in memory only.
 
 ## 6. First scan versus re-scan
@@ -362,40 +365,49 @@ caller) and runs as a live addition; where it lands is decided after the lock is
 The catalog is a DuckDB database (`serving/metadata_db.py`). Persisted state is kept apart
 from the rest, and one view publishes both:
 
-- **`catalog_roots(root_id, root_url, epoch, last_scanned)`**: one row per configured
-  monitored or scan-once root, merged from config when the manager is built (`sync_roots`
-  keeps `epoch` and `last_scanned` and deletes the rows of a root no longer in config).
-  `root_id` is a hash of the resolved root path; `root_url` is the root's alias, or
-  `to_catalog_url` of its path. A cache of config, not state: config stays the one source of
-  truth.
-- **`source_catalog`**: every source that has a claim under a configured root, cloud roots
-  included. The public row columns, with `root_id` and `rel` (the forward-slashed path under
-  the root, `.` for the root itself) in place of `source_url`; the private claim
-  (`primary_path`, `member_paths`, `extra_config`, `source_type`); the claim-time signature;
-  the adapter `payload`; the `epoch` of its last write and `last_seen`. A row is resolved,
-  pending, `needs_recall` or failed.
-- **`sources_volatile`**: what has no claim to re-derive: mirrors (catalog rows only),
-  remote proxies, uploads, drops. Rebuilt empty at every open.
-- **`sources`**: a view over both exposing the published columns only. A persisted row's
-  `source_url` is `root_url`, or `root_url || '/' || rel`, which is what `Roots.display_url`
-  gives the claim, so an alias edit is one `catalog_roots` row and no source row can carry a
-  stale url. A volatile row keeps a literal `source_url`.
+- **`catalog_roots(root_id, root_url, persisted, epoch, last_scanned)`**: one row per root a
+  source sits under. The configured monitored and scan-once roots are `persisted`, merged
+  from config when the manager is built (`sync_roots` keeps `epoch` and `last_scanned` and
+  deletes the persisted roots no longer in config). A drop and an upstream are not persisted;
+  the reconciler records each (`ensure_root`) when it first files a source under it, and the
+  catalog has one built-in root (`internal`, no url) for a source under none of them (the
+  scratch source, one registered through the API). `root_id` is a hash of the resolved root
+  path for a persisted root, whose alias is display only. An upstream's is a hash of its
+  endpoint and alias together, because the alias namespaces its sources' ids
+  (`<alias>__<id>`): renaming it makes a new root. `root_url` is the root's alias, or
+  `to_catalog_url` of its path; for a drop its `dnd://` label; for an upstream its scheme and
+  authority (the alias when it has one). A cache of config, not state: config stays the one
+  source of truth.
+- **`source_catalog`**: one row per source. The public row columns; `root_id` and `rel` (the
+  forward-slashed path under the root, `.` for the root itself; for a row under the built-in
+  root, its whole url) in place of `source_url`; and, for a source under a persisted root,
+  the private claim (`primary_path`, `member_paths`, `extra_config`, `source_type`), the
+  claim-time signature, the adapter `payload`, and the `epoch` of its last write and
+  `last_seen`. A row is resolved, pending, `needs_recall` or failed. A source has a claim when
+  `primary_path` is not NULL. The rows under roots that are not persisted are deleted at every
+  open with those roots, and a restore reads only the rows with a claim.
+- **`sources`**: a view over it exposing the published columns only. `source_url` is the
+  root's `root_url`, or `root_url || '/' || rel` (the built-in root has none, so it is the
+  `rel`), which is what `Roots.display_url` gives a local claim and what a mirror's adapter
+  shows, so an alias edit of a local root is one `catalog_roots` row and no source row can
+  carry a stale url. A row whose root is gone is not listed.
 - **`source_confirmation(source_id, confirmed)`**: a second view, hidden from queries like the
-  tables, saying whether each source was verified this run (§8). It is not part of `sources`
+  tables, saying whether each source was verified this run (§8): a row under a persisted root
+  by its root's walk or its own write, any other row by being written this run. It is not part of `sources`
   because that is a published schema.
 
 The private columns are hidden because `sources` is queryable by everyone with read access
-and a claim can carry credential profile names, aliases and paths. The writer routes by
-whether the source has a claim; a source that moves between tables is deleted from the other
-in the same locked write, because a union view cannot enforce a unique `source_id`.
+and a claim can carry credential profile names, aliases and paths. `source_id` is the primary
+key, so a source cannot be listed twice whichever way it is written: a write with a record
+takes its place and claim, one without leaves them alone.
 
 A source's one root is the column `root_id`: a root's claim snapshot is `WHERE root_id = ?`,
 and `rel` is computed where the row is written, so path normalization stays out of SQL.
 
 The view is persistent, created at open (a `TEMP` view belongs to the connection that made
-it, and the read path takes a fresh cursor per call). At 100k rows a primary-key lookup
-through the union is a sequential scan of about 0.3 ms and a `source_url` lookup about
-1.1 ms; the indexes are not used through the union.
+it, and the read path takes a fresh cursor per call). At 100k rows a `source_id` lookup
+through the view takes about 1 ms and a `source_url` lookup about 10 ms, since the url is
+computed from the root.
 
 **The row.**
 
@@ -468,7 +480,11 @@ parsed at), as a registered one holds, so chunks read through a stale layout are
 under a version the walk's refresh replaces, and an unchanged file keeps its cache across
 the restart. A directory source takes the stat at build. A source with no payload is
 parsed. A source rebuilt from its own row is neither rewritten (a row can hold megabytes of
-metadata) nor confirmed: only its root's walk confirms it.
+metadata) nor confirmed: only its root's walk confirms it. Its registration does attach the
+uploaded fields and label sets on disk, which the row, written before they changed, cannot
+know, so it compares the row's tensor ids (as a set) with what the adapter lists and writes
+the `tensors` column alone when they differ. A failed write is logged and costs only the
+listing.
 
 **The contract of a payload.** Every file adapter has one: the OME-TIFF family (OME-TIFF,
 TIFF, LSM), nd2, czi, the BioIO family (Zeiss, Leica, Nikon, Olympus, Bioformats, aics),

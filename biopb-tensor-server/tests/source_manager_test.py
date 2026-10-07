@@ -63,6 +63,9 @@ class _FakeMetadataDb:
         self.seen_calls = 0
         self.pruned = []
 
+    def ensure_root(self, root_id, root_url):
+        pass
+
     def sync_roots(self, roots):
         self.roots = list(roots)
 

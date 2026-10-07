@@ -29,14 +29,6 @@ def _catalog_row(server, source_id):
     )
 
 
-def _volatile_count(server):
-    return (
-        server.metadata_db._get_connection()
-        .execute("SELECT count(*) FROM sources_volatile")
-        .fetchone()[0]
-    )
-
-
 def _touch(zarr_path):
     with open(os.path.join(zarr_path, "marker"), "w") as f:
         f.write("x")
@@ -53,7 +45,6 @@ class TestNewClaim:
         assert (resolved, reason, error) == (False, "pending", None)
         assert primary == path
         assert path in json.loads(signature)
-        assert _volatile_count(server) == 0
 
     def test_registration_fills_that_row_in(self, tmp_path):
         drt._make_zarr(tmp_path, "a.zarr")
@@ -67,7 +58,6 @@ class TestNewClaim:
         resolved, reason, _, primary, signature = _catalog_row(server, sid)
         assert (resolved, reason) == (True, None)
         assert (primary, signature) == before[3:]
-        assert _volatile_count(server) == 0
 
     def test_the_catalog_is_not_reread_so_a_rescan_leaves_resolved_rows_alone(
         self, tmp_path, monkeypatch
@@ -217,7 +207,6 @@ class TestFailedRefresh:
         after = _catalog_row(server, sid)
         assert after[:2] == (True, None)
         assert after[3] == before[3]
-        assert _volatile_count(server) == 0
         assert server.sources.get(sid) is not None
 
 
@@ -247,14 +236,19 @@ class TestRecord:
         record = manager._reconciler._catalog_record(claim)
         assert record is not None and not record.cloud
 
-    def test_a_drop_has_none(self, tmp_path):
+    def test_a_drop_sits_under_its_root_with_no_claim(self, tmp_path):
         manager = self._manager(tmp_path / "root")
         elsewhere = Path(tmp_path) / "dropped"
-        manager._roots.add(Root(RootKind.DROPPED, str(elsewhere), label="dnd://x"))
-        claim = SourceClaim("zarr", str(elsewhere / "a.zarr"), "x")
-        assert manager._reconciler._catalog_record(claim) is None
+        root = Root(RootKind.DROPPED, str(elsewhere), label="x")
+        manager._roots.add(root)
+        claim = SourceClaim("zarr", str(elsewhere / "sub" / "a.zarr"), "x")
 
-    def test_a_mirror_has_none(self, tmp_path):
+        record = manager._reconciler._catalog_record(claim)
+
+        assert record is not None and record.claim is None
+        assert (record.root_id, record.rel) == (root.root_id, "sub/a.zarr")
+
+    def test_a_mirror_of_no_known_upstream_has_none(self, tmp_path):
         manager = self._manager(tmp_path)
         claim = SourceClaim("tensor-server", str(tmp_path / "a.zarr"), "x")
         assert manager._reconciler._catalog_record(claim) is None

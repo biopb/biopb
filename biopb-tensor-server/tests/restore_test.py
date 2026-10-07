@@ -23,12 +23,23 @@ from tests import catalog_server, deferred_registration_test as drt, make_manage
 class _Run:
     """One server run over a catalog file, driven without the loop thread."""
 
-    def __init__(self, tmp_path, *, restore=True, aliases=None, once=(), cloud=False):
+    def __init__(
+        self,
+        tmp_path,
+        *,
+        restore=True,
+        aliases=None,
+        once=(),
+        cloud=False,
+        **server_kwargs,
+    ):
         self.db = MetadataDatabase(
             store_path=tmp_path / "catalog.duckdb", restore_sources=restore
         )
         self.db.open()
-        self.server = catalog_server("localhost:0", metadata_db=self.db)
+        self.server = catalog_server(
+            "localhost:0", metadata_db=self.db, **server_kwargs
+        )
         self.monitored = tmp_path / "monitored"
         self.monitored.mkdir(exist_ok=True)
         self.manager = make_manager(
