@@ -64,8 +64,6 @@ def test_scalar_defaults_emitted_and_match_dataclasses(schema):
         for f in dataclasses.fields(cls):
             if f.name.startswith("_"):
                 continue
-            if f.name == "write_dir":
-                continue  # resolved from the environment; the schema froze it at import
             value = getattr(inst, f.name)
             if dataclasses.is_dataclass(value) or isinstance(value, list):
                 continue

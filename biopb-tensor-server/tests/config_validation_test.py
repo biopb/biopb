@@ -488,18 +488,45 @@ def test_per_upstream_tls_trust_survives_the_parse():
     assert profile.tls_fingerprint == "AB:CD:EF"
 
 
-def test_uploads_are_on_by_default_under_the_data_tree(monkeypatch, tmp_path):
-    monkeypatch.setenv("BIOPB_DATA_HOME", str(tmp_path))
+def test_uploads_are_on_by_default():
     cfgobj = parse_config({})
     assert cfgobj.writable is True
-    assert cfgobj.write_dir == tmp_path / "biopb" / "tensor-server" / "uploads"
+    assert cfgobj.write_dir is None  # the default is resolved at startup
 
 
-@pytest.mark.parametrize("off", ["", None])
-def test_an_empty_write_dir_turns_uploads_off(off):
-    assert parse_config({"server": {"write_dir": off}}).write_dir is None
+def _write_dir_of(config, **kw):
+    from biopb_tensor_server import cli
+
+    server, _, _ = cli._setup_flight_server(config, port=0, **kw)
+    try:
+        return server.uploads.write_dir
+    finally:
+        server.shutdown()
 
 
-def test_a_named_write_dir_wins(tmp_path):
-    cfgobj = parse_config({"server": {"write_dir": str(tmp_path / "w")}})
-    assert cfgobj.write_dir == tmp_path / "w"
+def test_a_writable_server_defaults_its_write_dir_to_the_data_tree(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("BIOPB_DATA_HOME", str(tmp_path))
+    cfg = parse_config({"cache": {"file_cache_dir": str(tmp_path / "c")}})
+    assert _write_dir_of(cfg) == tmp_path / "biopb" / "tensor-server" / "uploads"
+
+
+def test_a_server_that_is_not_writable_has_no_default_write_dir(tmp_path):
+    cfg = parse_config(
+        {"server": {"writable": False}, "cache": {"file_cache_dir": str(tmp_path)}}
+    )
+    assert _write_dir_of(cfg) is None
+    # the flag overrides the config the same way
+    cfg = parse_config({"cache": {"file_cache_dir": str(tmp_path)}})
+    assert _write_dir_of(cfg, writable=False) is None
+
+
+def test_a_named_write_dir_is_honored_even_when_not_writable(tmp_path):
+    cfg = parse_config(
+        {
+            "server": {"writable": False, "write_dir": str(tmp_path / "w")},
+            "cache": {"file_cache_dir": str(tmp_path / "c")},
+        }
+    )
+    assert _write_dir_of(cfg) == tmp_path / "w"
