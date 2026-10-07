@@ -10,7 +10,11 @@ import asyncio
 
 import httpx
 import pytest
-from biopb._credentials import credential_file, remove_credential, write_credential
+from biopb._security.credentials import (
+    credential_file,
+    remove_credential,
+    write_credential,
+)
 
 from biopb_mcp._config import McpConfig
 from biopb_mcp.mcp import _model

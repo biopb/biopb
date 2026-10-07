@@ -28,7 +28,7 @@ import dataclasses
 import typing
 from typing import Any, Dict, Optional, Tuple
 
-from biopb._config_schema import scalar_property as _scalar_property_core
+from biopb._config.schema import scalar_property as _scalar_property_core
 
 from biopb_tensor_server.core.config import (
     _CONSTRAINTS,
@@ -134,7 +134,7 @@ def _empty_section() -> Dict[str, Any]:
 
 def _scalar_property(class_name: str, f: dataclasses.Field) -> Dict[str, Any]:
     # The per-field projection (type/default/help->description/constraint) is the
-    # shared core (biopb._config_schema); this wrapper only looks up the value +
+    # shared core (biopb._config.schema); this wrapper only looks up the value +
     # constraint for a (class, field) pair.
     value = getattr(_DEFAULT_INSTANCES[class_name], f.name)
     constraint = _CONSTRAINTS.get(class_name, {}).get(f.name)

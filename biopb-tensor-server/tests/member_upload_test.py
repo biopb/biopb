@@ -28,7 +28,7 @@ from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.core.adapter_base import catalog_tensors
 from biopb_tensor_server.core.config import CacheConfig
 
-from tests import catalog_server
+from tests import catalog_server, label_sets
 
 SHAPE = (4, 6)
 CHUNK = (2, 3)
@@ -256,7 +256,7 @@ class TestALabelSetOnAMember:
         client.upload_array(desc, labels)
 
         assert desc.array_id == f"{source}/@fields/img/@labels/nuclei"
-        assert client.get_label_sets(image.array_id) == [desc.array_id]
+        assert label_sets(client, image.array_id) == [desc.array_id]
         np.testing.assert_array_equal(
             client.get_tensor(desc.array_id).compute(), labels
         )

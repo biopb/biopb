@@ -1265,7 +1265,7 @@ class TestStorePathResolution:
     """Which file a server picks, which is what keeps two servers apart."""
 
     def test_the_default_is_derived_from_the_config_path(self, tmp_path):
-        from biopb._locations import tensor_catalog_path
+        from biopb._config.locations import tensor_catalog_path
         from biopb_tensor_server.cli import _catalog_store_path
 
         config = tmp_path / "biopb.json"
@@ -1274,7 +1274,7 @@ class TestStorePathResolution:
         )
 
     def test_two_configs_get_two_files(self, tmp_path):
-        from biopb._locations import tensor_catalog_path
+        from biopb._config.locations import tensor_catalog_path
 
         assert tensor_catalog_path(tmp_path / "a.json") != tensor_catalog_path(
             tmp_path / "b.json"

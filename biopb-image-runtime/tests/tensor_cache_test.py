@@ -330,7 +330,7 @@ def test_per_source_token_gates_readback(served_embedded_cache: EmbeddedTensorCa
     # caller that merely reaches the port cannot enumerate anything.
     location = served_embedded_cache._external_location
     with pytest.raises(flight.FlightUnauthenticatedError):
-        TensorFlightClient(location).list_sources()
+        TensorFlightClient(location).query("SELECT 1")
 
     # And behind it, this server is catalog-less (metadata_db=None): a result
     # is reachable only through the array_id its SerializedTensor carries. The
@@ -338,7 +338,7 @@ def test_per_source_token_gates_readback(served_embedded_cache: EmbeddedTensorCa
     with pytest.raises(flight.FlightError, match="no catalog"):
         TensorFlightClient(
             location, token=served_embedded_cache._server._server_token
-        ).list_sources()
+        ).query("SELECT 1")
 
 
 def test_finish_seals_the_result_and_refuses_later_writes(

@@ -142,12 +142,6 @@ class TestQuerySourcesFormat:
         with pytest.raises(ValueError, match="unknown format"):
             client.query("SELECT 1", format="polars")
 
-    def test_query_sources_is_a_deprecated_alias_for_query(self):
-        client = _offline_client()
-        with pytest.warns(DeprecationWarning, match="query_sources"):
-            with pytest.raises(ValueError, match="unknown format"):
-                client.query_sources("SELECT 1", format="polars")
-
 
 class TestGetPhysicalScale:
     """get_physical_scale describes the tensor, every call.
@@ -725,7 +719,7 @@ class TestExportedTrust:
 
 
 class TestGetTensorOutputSwitch:
-    """get_tensor's output="da"/"pb" switch replaces the separate get_tensor_pb
+    """get_tensor's output="da"/"pb" switch replaced the separate get_tensor_pb
     method, so both forms share one signature and cannot drift apart."""
 
     def test_unknown_output_rejected_before_network(self):
@@ -733,14 +727,13 @@ class TestGetTensorOutputSwitch:
         with pytest.raises(ValueError, match="unknown output"):
             client.get_tensor("test-tensor", output="numpy")
 
-    def test_get_tensor_pb_is_a_deprecated_alias(self):
+    def test_get_tensor_output_pb(self):
         client = _offline_client(raw_client=Mock())
         client._fetcher._plan_read = Mock(
             return_value=SimpleNamespace(serialize=lambda: b"fake-flight-info")
         )
 
-        with pytest.warns(DeprecationWarning, match="get_tensor_pb"):
-            pb = client.get_tensor_pb("test-tensor")
+        pb = client.get_tensor("test-tensor", output="pb")
 
         from biopb.tensor.serialized_pb2 import SerializedTensor
 
@@ -752,10 +745,9 @@ class TestGetTensorOutputSwitch:
             return_value=SimpleNamespace(serialize=lambda: b"fake-flight-info")
         )
 
-        with pytest.warns(DeprecationWarning):
-            pb = client.get_tensor_pb(
-                "test-tensor", export_location="grpc://override-host:9999"
-            )
+        pb = client.get_tensor(
+            "test-tensor", output="pb", export_location="grpc://override-host:9999"
+        )
 
         assert pb.location == "grpc://override-host:9999"
 

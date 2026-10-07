@@ -1,6 +1,6 @@
 """Detached-daemon lifecycle: pidfile identity, graceful stop, console detach.
 
-The *other* process-lifecycle pattern in this package. Where :mod:`.owned_child`
+The *other* process-lifecycle pattern in this package. Where :mod:`._owned_child`
 covers a child a live parent holds by its OS handle and reaps, these helpers
 cover a **detached daemon**: a background process that outlives the command that
 spawned it, is found again by a pidfile rather than a handle, and is stopped by
@@ -9,13 +9,13 @@ signalling that pid. The one such daemon in biopb is the **control plane**
 daemons are gone, so there is a single owner today.
 
 The delicate part is *identity across a reused pid*: a pidfile records the pid
-plus a process create-time token (see :mod:`biopb.lifecycle.proc`), so
+plus a process create-time token (see :mod:`biopb._lifecycle.proc`), so
 ``stop``/``status`` never signal or trust an unrelated process that later
 inherited the pid. The
 pidfile is written atomically so a racing reader — or a racing writer, now that
 the shim can start the control on demand — never sees a torn record.
 
-Kept **stdlib-only** (like the rest of :mod:`biopb.lifecycle`): the one place
+Kept **stdlib-only** (like the rest of :mod:`biopb._lifecycle`): the one place
 that wants to surface a message to a user, :func:`stop_daemon`, takes a ``notify``
 callback rather than importing a console, so this module never drags in ``rich``
 or ``typer``.

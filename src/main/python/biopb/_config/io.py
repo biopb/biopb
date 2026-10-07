@@ -25,15 +25,11 @@ def _atomic_write(
 ) -> None:
     """Write to *path* via a sibling temp file plus ``os.replace``.
 
-    *write_into* does the actual write, given the temp path to write into.
-    *raise_on_error* is the one real difference between the callers: an admin
-    endpoint must surface a permission/disk error to the user who clicked save,
-    while a best-effort settings write from a running session logs and carries on
-    rather than taking the session down with it.
+    *write_into* writes into the given temp path. With *raise_on_error* False an
+    error is logged instead of raised (best-effort writes from a running session).
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Unique per process *and* thread, so two concurrent writers never collide on
-    # the temp file (the MCP kernel writes settings from background threads).
+    # Unique per process and thread, so concurrent writers never share a temp file.
     tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     try:
         write_into(tmp)

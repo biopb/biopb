@@ -63,5 +63,5 @@ renders, which is the part that was worth keeping -- not the runtime switch.
 
 Register biopb as an MCP server in the harness's own config and drive the
 session that way. That is a different question from the one the ACP engine
-answered (`biopb._agents.status()` checks exactly this), it is what the
+answered (`biopb._control._agents.status()` checks exactly this), it is what the
 installer already sets up, and it works for every client, not just the one.

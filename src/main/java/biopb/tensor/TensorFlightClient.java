@@ -97,8 +97,8 @@ public class TensorFlightClient implements AutoCloseable {
 
     /**
      * The segment that marks a label set under its image, in a wire id:
-     * {@code <image array_id>/@labels/<name>}. Mirrors the Python SDK's
-     * {@code _labels.LABELS_SEGMENT} and the server's {@code core.labels}.
+     * {@code <image array_id>/@labels/<name>}. Mirrors the server's
+     * {@code core.labels}.
      *
      * <p>The marker is on the id only -- an OME-Zarr store's own NGFF group
      * stays {@code labels/}. It is what stops an uploaded tensor's id from
@@ -759,35 +759,6 @@ public class TensorFlightClient implements AutoCloseable {
         } catch (InvalidProtocolBufferException error) {
             throw new IOException("remove_source returned no RemoveSourceResult", error);
         }
-    }
-
-    // ---- label sets -------------------------------------------------------
-
-    /**
-     * The {@code array_id}s of the label sets served under an image.
-     *
-     * <p>A label set is an ordinary tensor of its image, named
-     * {@code <image array_id>/@labels/<name>}, so this is a catalog query over
-     * the path and nothing more -- {@link #getTensor} / {@link #getDescriptor}
-     * read one like any other tensor.
-     *
-     * @param imageArrayId the image's array_id
-     * @return the sets' array_ids, sorted; empty when the image has none
-     */
-    public List<String> getLabelSets(String imageArrayId) throws IOException {
-        List<String> sets = new ArrayList<>();
-        try (VectorSchemaRoot root = query(
-                "SELECT t.array_id FROM sources, UNNEST(tensors) AS u(t) WHERE starts_with(t.array_id, "
-                        + sqlLiteral(imageArrayId + "/" + LABELS_SEGMENT + "/")
-                        + ") ORDER BY t.array_id")) {
-            FieldVector ids = root.getVector("array_id");
-            for (int row = 0; row < root.getRowCount(); row++) {
-                if (ids != null && !ids.isNull(row)) {
-                    sets.add(String.valueOf(ids.getObject(row)));
-                }
-            }
-        }
-        return sets;
     }
 
     // ---- ROI annotations --------------------------------------------------
@@ -1502,7 +1473,7 @@ public class TensorFlightClient implements AutoCloseable {
      * down the ladder is refused.
      *
      * @param arrayId what {@link #setupArrayUpload} answered with, or a label set's
-     *        array_id as {@link #getLabelSets} reports it
+     *        array_id
      * @param state {@code READY} or {@code DISCARDED}
      * @param reason why, for {@code DISCARDED}; it is what a poller waiting on
      *        this result reads back, so write it for them

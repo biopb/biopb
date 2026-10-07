@@ -6,7 +6,7 @@ from __future__ import annotations
 import io
 import json
 
-import biopb
+import biopb._control
 import pytest
 from biopb._control import _client
 
@@ -15,7 +15,7 @@ from biopb._control import _client
 def _isolated(monkeypatch):
     monkeypatch.delenv("BIOPB_TENSOR_URL", raising=False)
     monkeypatch.delenv("BIOPB_TENSOR_TOKEN", raising=False)
-    monkeypatch.setattr("biopb._credentials.read_credential", lambda: None)
+    monkeypatch.setattr("biopb._security.credentials.read_credential", lambda: None)
 
 
 def _serve(monkeypatch, payload, status=200):
@@ -47,31 +47,40 @@ def _refuse(monkeypatch):
 
 class TestFindDataPlane:
     def test_names_the_plane_and_its_credential(self, monkeypatch):
-        monkeypatch.setattr("biopb._credentials.read_credential", lambda: "cred")
+        monkeypatch.setattr(
+            "biopb._security.credentials.read_credential", lambda: "cred"
+        )
         _serve(monkeypatch, {"data_plane": {"grpc_url": "grpc://x:5"}})
-        assert biopb.find_data_plane() == {"url": "grpc://x:5", "token": "cred"}
+        assert biopb._control.find_data_plane() == {
+            "url": "grpc://x:5",
+            "token": "cred",
+        }
 
     def test_the_env_token_wins_over_the_file(self, monkeypatch):
-        monkeypatch.setattr("biopb._credentials.read_credential", lambda: "cred")
+        monkeypatch.setattr(
+            "biopb._security.credentials.read_credential", lambda: "cred"
+        )
         monkeypatch.setenv("BIOPB_TENSOR_TOKEN", "env")
         _serve(monkeypatch, {"data_plane": {"grpc_url": "grpc://x:5"}})
-        assert biopb.find_data_plane()["token"] == "env"
+        assert biopb._control.find_data_plane()["token"] == "env"
 
     def test_no_control_is_none(self, monkeypatch):
         _refuse(monkeypatch)
-        assert biopb.find_data_plane() is None
+        assert biopb._control.find_data_plane() is None
 
     def test_a_control_naming_no_plane_is_none(self, monkeypatch):
         _serve(monkeypatch, {"data_plane": {}})
-        assert biopb.find_data_plane() is None
+        assert biopb._control.find_data_plane() is None
 
 
 class TestEnsureDataPlane:
     def test_posts_with_the_token_header(self, monkeypatch):
-        monkeypatch.setattr("biopb._credentials.read_credential", lambda: "tok")
+        monkeypatch.setattr(
+            "biopb._security.credentials.read_credential", lambda: "tok"
+        )
         seen = _serve(monkeypatch, {"data_plane": {"grpc_url": "grpc://x:5"}})
 
-        assert biopb.ensure_data_plane(timeout=5.0) == {
+        assert biopb._control.ensure_data_plane(timeout=5.0) == {
             "url": "grpc://x:5",
             "token": "tok",
         }
@@ -83,16 +92,16 @@ class TestEnsureDataPlane:
 
     def test_no_header_when_tokenless(self, monkeypatch):
         seen = _serve(monkeypatch, {"data_plane": {"grpc_url": "grpc://x:5"}})
-        biopb.ensure_data_plane(timeout=5.0)
+        biopb._control.ensure_data_plane(timeout=5.0)
         assert seen[0].get_header("X-biopb-token") is None
 
     def test_no_control_is_none(self, monkeypatch):
         _refuse(monkeypatch)
-        assert biopb.ensure_data_plane(timeout=1.0) is None
+        assert biopb._control.ensure_data_plane(timeout=1.0) is None
 
     def test_an_answer_without_a_url_is_none(self, monkeypatch):
         _serve(monkeypatch, {"data_plane": {"state": "failed"}})
-        assert biopb.ensure_data_plane(timeout=1.0) is None
+        assert biopb._control.ensure_data_plane(timeout=1.0) is None
 
 
 def test_importing_it_does_not_import_pyarrow():
@@ -104,3 +113,14 @@ def test_importing_it_does_not_import_pyarrow():
         [sys.executable, "-c", code], capture_output=True, text=True, check=True
     )
     assert out.stdout.strip() == "False"
+
+
+def test_the_root_package_exports_only_its_version():
+    assert biopb.__all__ == ["__version__"]
+
+
+def test_local_trust_error_is_public_on_biopb_tensor():
+    import biopb.tensor
+
+    assert biopb.tensor.LocalTrustError is biopb._control.LocalTrustError
+    assert "LocalTrustError" in biopb.tensor.__all__

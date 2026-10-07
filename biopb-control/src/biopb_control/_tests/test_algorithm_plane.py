@@ -16,8 +16,8 @@ import time
 from pathlib import Path
 
 import pytest
-from biopb import _algorithms
 
+from biopb_control import _registry
 from biopb_control._algorithm_plane import AlgorithmPlane
 
 _FAKE_UV = """
@@ -108,7 +108,7 @@ def plane(tmp_path, registry, monkeypatch):
 def _crash(entry) -> None:
     """Kill an entry's uv and server at once, as an OOM kill would."""
     if os.name == "nt":
-        from biopb.lifecycle import winjob
+        from biopb._lifecycle import winjob
 
         winjob.terminate_job(entry._winjob)
     else:
@@ -143,8 +143,8 @@ def test_ensure_starts_the_server_with_its_token(plane, registry):
     row = plane.ensure("seg", wait=30.0)
     assert row["state"] == "up", row["error"]
     assert row["url"].startswith("grpc://127.0.0.1:")
-    assert _algorithms.probe(row["url"], timeout=5)["state"] == "error"
-    answer = _algorithms.probe(row["url"], token=row["token"], timeout=5)
+    assert _registry.probe(row["url"], timeout=5)["state"] == "error"
+    answer = _registry.probe(row["url"], token=row["token"], timeout=5)
     assert answer["state"] == "up"
     # It was told where the data plane is.
     assert "tensor plane: grpc://127.0.0.1:8815" in "\n".join(
@@ -159,11 +159,11 @@ def test_an_edit_takes_effect_on_ensure(plane, registry):
     path.write_text(_server(["alpha", "gamma"]))
     row = plane.ensure("seg", wait=30.0)
     # The old server went with its uv.
-    assert _algorithms.probe(first["url"], timeout=2)["state"] == "unreachable"
+    assert _registry.probe(first["url"], timeout=2)["state"] == "unreachable"
     assert row["state"] == "up", row["error"]
     assert [o["name"] for o in row["ops"]] == ["alpha", "gamma"]
     assert row["url"] != first["url"] or row["token"] != first["token"]
-    answer = _algorithms.probe(row["url"], token=row["token"], timeout=5)
+    answer = _registry.probe(row["url"], token=row["token"], timeout=5)
     assert [o["name"] for o in answer["ops"]] == ["alpha", "gamma"]
 
 
@@ -186,14 +186,13 @@ def test_an_edit_is_stale_until_refresh_ensures_it(plane, registry):
     assert [o["name"] for o in row["ops"]] == ["alpha", "gamma"]
     # The old process is untouched and still answering.
     assert (
-        _algorithms.probe(first["url"], token=first["token"], timeout=5)["state"]
-        == "up"
+        _registry.probe(first["url"], token=first["token"], timeout=5)["state"] == "up"
     )
 
     row = plane.ensure("seg", wait=30.0)
     assert row["state"] == "up", row["error"]
-    assert _algorithms.probe(first["url"], timeout=2)["state"] == "unreachable"
-    answer = _algorithms.probe(row["url"], token=row["token"], timeout=5)
+    assert _registry.probe(first["url"], timeout=2)["state"] == "unreachable"
+    answer = _registry.probe(row["url"], token=row["token"], timeout=5)
     assert [o["name"] for o in answer["ops"]] == ["alpha", "gamma"]
 
 
@@ -254,7 +253,7 @@ def test_stop_and_logs(plane, registry):
     (registry / "seg.py").write_text(_server())
     url = plane.ensure("seg", wait=30.0)["url"]
     assert plane.stop("seg")["state"] == "stopped"
-    assert _algorithms.probe(url, timeout=2)["state"] == "unreachable"
+    assert _registry.probe(url, timeout=2)["state"] == "unreachable"
     logs = plane.logs("seg", 100)
     assert logs["exists"] and any(
         "starting algorithm seg" in line for line in logs["lines"]
@@ -269,7 +268,7 @@ def test_a_removed_file_stops_its_server(plane, registry):
     path.unlink()
     assert plane.rows(probe=False) == []
     # The server itself is gone, not only uv.
-    assert _algorithms.probe(row["url"], timeout=2)["state"] == "unreachable"
+    assert _registry.probe(row["url"], timeout=2)["state"] == "unreachable"
 
 
 def test_url_entries_are_not_managed(plane, registry):
@@ -345,7 +344,7 @@ def control(plane, tmp_path, monkeypatch):
 
 
 def test_client_verbs_over_http(control, registry):
-    import biopb as client
+    from biopb import _control as client
 
     (registry / "seg.py").write_text(_server())
     (registry / "remote.json").write_text(json.dumps({"url": "grpc://127.0.0.1:1"}))
@@ -367,7 +366,7 @@ def test_client_verbs_over_http(control, registry):
 
 
 def test_no_control_is_none(monkeypatch):
-    import biopb as client
+    from biopb import _control as client
 
     monkeypatch.setattr(
         "biopb._control._client.control_base_url", lambda: "http://127.0.0.1:1"

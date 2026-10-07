@@ -16,7 +16,7 @@ import pyarrow as pa
 import pytest
 from google.protobuf.field_mask_pb2 import FieldMask
 
-from tests import catalog_server, make_manager, register_and_catalog
+from tests import catalog_server, make_manager, register_and_catalog, source_ids
 
 
 def _zarr_available() -> bool:
@@ -177,7 +177,7 @@ class TestRemoteTensorProxy:
                 client = TensorFlightClient(f"grpc://localhost:{proxy.port}")
 
                 # catalog mirrored under the local (namespaced) source_id
-                sources = client.list_sources()
+                sources = source_ids(client)
                 assert "lab__img" in sources
                 assert "img" not in sources  # upstream id is not leaked
 
@@ -717,7 +717,7 @@ class TestRemoteTensorProxy:
             )
             try:
                 client = TensorFlightClient(f"grpc://localhost:{proxy.port}")
-                assert "img" in client.list_sources()
+                assert "img" in source_ids(client)
                 assert client.get_tensor("img").shape == shape
                 client.close()
             finally:
@@ -758,7 +758,7 @@ class TestBareHostExpansion:
             _serve(proxy)
             try:
                 client = TensorFlightClient(f"grpc://localhost:{proxy.port}")
-                assert set(client.list_sources()) == {"lab__img", "lab__img2"}
+                assert source_ids(client) == {"lab__img", "lab__img2"}
                 assert client.get_tensor("lab__img2").shape == shape
                 client.close()
             finally:
@@ -1405,18 +1405,18 @@ def test_monitored_upstream_relist_adds_and_removes(simple_zarr_array):
 
             # initial re-list mirrors the upstream's single source
             _relist(manager)
-            assert set(client.list_sources()) == {"lab__img"}
+            assert source_ids(client) == {"lab__img"}
 
             # a new upstream source appears -> mirrored on the next re-list
             up_register("img2")
             _relist(manager)
-            assert set(client.list_sources()) == {"lab__img", "lab__img2"}
+            assert source_ids(client) == {"lab__img", "lab__img2"}
             assert client.get_tensor("lab__img2").shape == shape
 
             # an upstream source disappears -> dropped on the next re-list
             up_unregister("img")
             _relist(manager)
-            assert set(client.list_sources()) == {"lab__img2"}
+            assert source_ids(client) == {"lab__img2"}
 
             client.close()
         finally:
@@ -1558,7 +1558,7 @@ def test_failed_upstream_retried_on_fast_incremental_cadence(simple_zarr_array):
         assert url in manager._failed_upstreams  # recorded as failed
         # the force-full was consumed, so the next rescan is NOT force-full
         assert manager._should_force_full_rescan() is False
-        assert set(client.list_sources()) == set()  # nothing mirrored yet
+        assert source_ids(client) == set()  # nothing mirrored yet
 
         # the upstream comes up on the SAME port with a populated metadata DB
         db = MetadataDatabase()
@@ -1571,7 +1571,7 @@ def test_failed_upstream_retried_on_fast_incremental_cadence(simple_zarr_array):
             # retried and recovers -- the whole point of the fast cadence
             assert manager._should_force_full_rescan() is False
             manager._handle_rescan()
-            assert set(client.list_sources()) == {"lab__img"}
+            assert source_ids(client) == {"lab__img"}
             assert manager._failed_upstreams == set()  # cleared on recovery
             client.close()
         finally:
@@ -1624,7 +1624,7 @@ def test_stable_upstream_backs_off_then_resets_on_change(simple_zarr_array):
             for _ in range(4):  # advance past the skipped ticks to the next due
                 manager._handle_rescan()
             assert period() == 1
-            assert set(client.list_sources()) == {"lab__img", "lab__img2"}
+            assert source_ids(client) == {"lab__img", "lab__img2"}
 
             client.close()
         finally:
@@ -2092,9 +2092,14 @@ def test_display_friendly_proxied_source_url(simple_zarr_array):
         _serve(proxy)
         try:
             client = TensorFlightClient(f"grpc://localhost:{proxy.port}")
-            sources = client.list_sources()
-            assert sources["lab__img"].source_url == "grpc://lab:img"
-            assert sources["img"].source_url == f"grpc://localhost:{upstream.port}:img"
+            urls = {
+                r["source_id"]: r["source_url"]
+                for r in client.query(
+                    "SELECT source_id, source_url FROM sources", format="records"
+                )
+            }
+            assert urls["lab__img"] == "grpc://lab:img"
+            assert urls["img"] == f"grpc://localhost:{upstream.port}:img"
             client.close()
         finally:
             proxy.shutdown()

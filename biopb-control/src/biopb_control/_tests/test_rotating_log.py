@@ -45,7 +45,7 @@ def test_a_failed_rotation_keeps_appending(tmp_path, monkeypatch):
     def boom(*a, **k):
         raise OSError("held open")
 
-    monkeypatch.setattr("biopb._locations.rotate_log", boom)
+    monkeypatch.setattr("biopb._config.locations.rotate_log", boom)
     for _ in range(10):
         log.write(b"y" * 30)
     log.close()

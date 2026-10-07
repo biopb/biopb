@@ -18,10 +18,10 @@ or logged-out control must not orphan the tensor server: an orphan keeps holding
 the gRPC port, which the next control start then reads as a *conflict* it refuses
 — so the installer's stop→start (and every restart) would wedge behind a plane
 nobody owns. The bind closes that: on POSIX the child inherits a parent-death
-pipe (:mod:`biopb.lifecycle.deathwatch`) and runs in its own session, so an
+pipe (:mod:`biopb._lifecycle.deathwatch`) and runs in its own session, so an
 *uncatchable* control death (SIGKILL/OOM/crash) EOFs the pipe and the plane
 group-kills itself; on Windows it is assigned to a kill-on-close Job Object
-(:mod:`biopb.lifecycle.winjob`) the control holds, so the OS reaps it when the
+(:mod:`biopb._lifecycle.winjob`) the control holds, so the OS reaps it when the
 control's last handle closes. This is orthogonal to the *graceful* stop path
 below (SIGTERM / the Windows sentinel), which still runs the plane's orderly
 shutdown when the control is alive to ask for it; the bind is only the backstop
@@ -46,8 +46,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
 
-from biopb import _locations
-from biopb.lifecycle import deathwatch as _deathwatch, winjob as _winjob
+from biopb._config import locations as _locations
+from biopb._lifecycle import deathwatch as _deathwatch, winjob as _winjob
 
 from biopb_control._rotating_log import RotatingLog, pump
 
@@ -254,7 +254,7 @@ class ServiceProcess:
 
         Creates a pipe, passes the read end to the child (fd inherited via
         ``pass_fds``, its number in ``BIOPB_PARENT_DEATH_FD``), and keeps the
-        write end on ``self._death_w``. The child's :func:`biopb.lifecycle.
+        write end on ``self._death_w``. The child's :func:`biopb._lifecycle.
         deathwatch.install` blocks on the read end and self-terminates on EOF, so
         an uncatchable control death takes the plane down. The child is put in its
         **own session** so the deathwatch's group-kill reaps only the plane and
@@ -711,7 +711,7 @@ class DataPlaneSupervisor(ServiceProcess):
     @staticmethod
     def _win_stop_sentinel() -> Path:
         # The one definition the tensor server's shutdown listener also binds to
-        # (biopb._locations.tensor_stop_sentinel), so writer and watcher
+        # (biopb._config.locations.tensor_stop_sentinel), so writer and watcher
         # cannot disagree — a single fixed name under the biopb state dir, not
         # keyed by PID.
         return _locations.tensor_stop_sentinel()

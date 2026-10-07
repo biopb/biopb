@@ -20,7 +20,7 @@ import sys
 from unittest.mock import patch
 
 import pytest
-from biopb import _web_auth
+from biopb._security import web_auth as _web_auth
 
 import biopb_control.__main__ as m
 

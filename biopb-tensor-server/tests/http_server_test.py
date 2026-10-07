@@ -1287,7 +1287,7 @@ class TestWindowsShutdownListener:
     """The graceful-stop listener the control supervisor drives on Windows."""
 
     def test_sentinel_path_matches_stop_side_contract(self):
-        from biopb import _locations
+        from biopb._config import locations as _locations
         from biopb_tensor_server.serving.http_server import shutdown_sentinel_path
 
         # Both this poller and DataPlaneSupervisor._win_stop_sentinel (the control

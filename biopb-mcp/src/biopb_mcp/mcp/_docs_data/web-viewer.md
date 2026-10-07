@@ -25,7 +25,7 @@ both:
 ## Building the link
 
 ```python
-from biopb import user_base_url
+from biopb._control import user_base_url
 url = f"{user_base_url()}/viewer?id={array_id}"
 ```
 

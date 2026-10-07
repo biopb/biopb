@@ -277,9 +277,8 @@ implicitly -- a set becomes a layer when it is asked for, never alongside its
 image.
 
 **The path is what says a tensor is a set**, here as in the browser:
-`biopb.tensor._labels` is the Python mirror of `core/labels.py` (the SDK's own
-copy, since biopb-tensor-server is not an installable dependency of a
-client). The Tensor Browser's `_group_tensors` files each set under its
+`core/labels.py` reads it on the server; the SDK exposes no label API and
+only checks it to decide wire compression. The Tensor Browser's `_group_tensors` files each set under its
 image.
 
 **The pyramid is the server's**, exactly as for an image -- safe for ids

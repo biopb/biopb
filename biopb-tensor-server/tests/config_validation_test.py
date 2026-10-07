@@ -2,7 +2,7 @@
 surfaces (biopb/biopb#34).
 
 Out-of-range / bad-enum knobs are caught where a config is *read* -- the shared
-``biopb._config_validate`` checker biopb-mcp and the control use too -- and
+``biopb._config.validate`` checker biopb-mcp and the control use too -- and
 replaced with their defaults, with a warning naming the key. They never reach the
 request path (the actual bug: ``downscale_factor=0`` -> ZeroDivisionError in
 GetFlightInfo), and they never stop a supervised server from starting either.

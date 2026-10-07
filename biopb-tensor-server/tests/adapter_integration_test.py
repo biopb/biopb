@@ -16,7 +16,7 @@ from biopb.tensor import (
 )
 from biopb_tensor_server import TensorFlightServer
 
-from tests import catalog_server, register_and_catalog
+from tests import catalog_server, register_and_catalog, source_ids
 
 
 def _zarr_available() -> bool:
@@ -87,8 +87,7 @@ class TestZarrIntegration:
             )
 
             # List sources
-            sources = client.list_sources()
-            assert "zarr-integration" in sources
+            assert "zarr-integration" in source_ids(client)
 
             # Get tensor (source_id matches tensor_id for single-tensor sources)
             darr = client.get_tensor("zarr-integration")
@@ -602,8 +601,7 @@ class TestMultiSeriesOmeTiffIntegration:
             )
 
             # List sources
-            sources = client.list_sources()
-            assert "multi-series-server" in sources
+            assert "multi-series-server" in source_ids(client)
 
             # Get actual scene IDs
             descriptors = adapter.list_tensor_descriptors()

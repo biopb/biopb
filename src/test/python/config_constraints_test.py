@@ -1,11 +1,11 @@
 """Unit tests for the shared config-constraint primitives.
 
-These primitives (:class:`biopb._config_constraints.Range` / ``Enum``) and the
+These primitives (:class:`biopb._config.constraints.Range` / ``Enum``) and the
 ``PYRAMID_CONSTRAINTS`` rows live in the core package, so their behavior is
 pinned here (biopb#34, #182).
 """
 
-from biopb._config_constraints import PYRAMID_CONSTRAINTS, Enum, Range
+from biopb._config.constraints import PYRAMID_CONSTRAINTS, Enum, Range
 
 
 class TestRange:

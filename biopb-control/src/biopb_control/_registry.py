@@ -1,5 +1,8 @@
 """The algorithm registry, and a probe of a server of the ``Ops`` protocol.
 
+Owned by the control: it is the only process that reads the registry and
+probes servers. Clients ask it over HTTP (``biopb._control.algorithms``).
+
 The registry is a directory, ``~/.config/biopb/algorithms/``. Each file is one
 entry, named by its stem; a stem starting with ``_`` is skipped:
 
@@ -21,12 +24,11 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
-from biopb import _locations
+from biopb._config import locations as _locations
 
 logger = logging.getLogger(__name__)
 
-# Default per-probe deadline (seconds). Kept short so a dead server does not
-# stall its row; statuses() probes concurrently, so this bounds the sweep too.
+# Default per-probe deadline (seconds); short so a dead server does not stall the sweep.
 _DEFAULT_TIMEOUT = 4.0
 
 _UNSAFE_IN_A_NAME = re.compile(r"[^A-Za-z0-9_-]+")
@@ -38,7 +40,7 @@ _UNSAFE_IN_A_NAME = re.compile(r"[^A-Za-z0-9_-]+")
 
 
 def registry_dir() -> Path:
-    """The registry directory; see :func:`biopb._locations.algorithms_dir`."""
+    """The registry directory; see :func:`biopb._config.locations.algorithms_dir`."""
     return _locations.algorithms_dir()
 
 
@@ -126,9 +128,7 @@ def _name_for(url: str) -> str:
 def migrate_from_mcp_config(directory: Optional[Path] = None) -> list[str]:
     """Move the mcp config's server URLs into url entries; answer the names.
 
-    Runs once: only while the registry directory does not exist, and it creates
-    the directory whether or not there was anything to write. The key leaves
-    the mcp config, which no longer reads it.
+    Runs once, while the registry directory does not exist (it is always created).
     """
     directory = directory or registry_dir()
     if directory.exists():
@@ -222,10 +222,9 @@ def probe(
     Never raises.
     """
     try:
+        import biopb.image as proto
         import grpc
         from google.protobuf import empty_pb2, json_format
-
-        import biopb.image as proto
     except ImportError as exc:  # pragma: no cover - grpc is a base dependency
         return _result("error", error=f"gRPC support unavailable: {exc}")
 
@@ -276,7 +275,7 @@ def probe(
 
 
 def row(entry: dict, **state) -> dict:
-    """One entry's row, as the control and ``biopb image servers`` list it:
+    """One entry's row, as the control and ``biopb algorithm list`` show it:
     ``{name, kind, url, target, scheme, state, ops, op_count, fingerprint,
     error}``. *state* supplies or overrides the live fields."""
     url = state.pop("url", None) or entry.get("url") or ""

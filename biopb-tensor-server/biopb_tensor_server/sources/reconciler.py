@@ -1263,7 +1263,7 @@ class Reconciler:
         Returns whether the mirrored set changed (a source was added or removed).
 
         The diff is the same add/remove model as the filesystem reconcile, but the
-        "scan" is a remote ``list_sources()`` and the unit is a source_id (not a
+        "scan" is a remote catalog query and the unit is a source_id (not a
         path signature): desired = the alias-namespaced ids the upstream lists now;
         current = the tensor-server claims already mirrored from this endpoint.
         """
@@ -1296,7 +1296,7 @@ class Reconciler:
             # A narrow id + indexed_at pass decides everything that follows, so a
             # steady re-list of a six-figure catalog moves two columns, not every
             # source's metadata. Complete (the server-side DuckDB catalog is not
-            # truncated like list_sources()), so what it no longer lists is gone.
+            # row-capped), so what it no longer lists is gone.
             versions = list_upstream_versions(client)
             desired = {namespaced_source_id(alias, up): up for up in versions}
 

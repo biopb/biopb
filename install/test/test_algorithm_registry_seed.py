@@ -3,7 +3,7 @@ only with consent, and only on a fresh install.
 
 Both installers are held to the same cases: install.sh's
 _seed_algorithm_registry and the engine's Set-AlgorithmRegistry. The seeded file
-is a registry url entry, ``{"url": ...}`` (biopb._algorithms).
+is a registry url entry, ``{"url": ...}`` (biopb_control._registry).
 """
 
 from __future__ import annotations

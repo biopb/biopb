@@ -25,7 +25,7 @@ is already bounded for every adapter by the streamed default.
 - On a network filesystem each extra band adds up to one RTT when readahead
   misses a band boundary. Estimated break-even around 2 ms RTT at scale 4; at
   coarse scales banding saves no time, only memory, which streaming already
-  bounds. Consult `biopb._fs_detect.network_filesystem_type` before enabling it
+  bounds. Consult `biopb.tensor._fs_detect.network_filesystem_type` before enabling it
   for a network-backed source.
 
 ## Still unmeasured

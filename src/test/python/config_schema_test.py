@@ -1,14 +1,14 @@
 """Unit tests for the shared config-schema projection primitives.
 
-:mod:`biopb._config_schema` is the per-field JSON-Schema projection reused by
+:mod:`biopb._config.schema` is the per-field JSON-Schema projection reused by
 both biopb-tensor-server and biopb-mcp (biopb#34). Its behavior is pinned here
 in the core package; each consumer's composer is tested in its own package.
 """
 
 import dataclasses
 
-from biopb._config_constraints import Enum, Range
-from biopb._config_schema import dataclass_section, json_type, scalar_property
+from biopb._config.constraints import Enum, Range
+from biopb._config.schema import dataclass_section, json_type, scalar_property
 
 
 class TestJsonType:

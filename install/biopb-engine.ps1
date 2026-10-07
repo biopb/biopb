@@ -137,7 +137,7 @@ if ((-not $env:UV_TOOL_DIR) -and $env:LOCALAPPDATA) {
     $env:UV_TOOL_DIR = Join-Path $env:LOCALAPPDATA "uv\tools"
 }
 
-# The `biopb` subdir of an XDG base dir, mirroring biopb._locations: config
+# The `biopb` subdir of an XDG base dir, mirroring biopb._config.locations: config
 # in the config tree, portable assets (webapp/samples) in the data tree, logs /
 # pid / sentinels in the STATE tree. Honors the XDG env var (as Python does on
 # every platform), defaulting to the conventional home-relative dir, so writer
@@ -146,16 +146,16 @@ if ((-not $env:UV_TOOL_DIR) -and $env:LOCALAPPDATA) {
 # BIOPB_DATA_HOME) and no longer reads the XDG_* variables -- on Windows nothing
 # owns those, and an app that set XDG_STATE_HOME for its own purposes used to
 # drag biopb's state tree along with it (biopb/biopb#790). Must stay in step with
-# biopb._locations._tree and install.sh, or the installer writes one tree while
+# biopb._config.locations._tree and install.sh, or the installer writes one tree while
 # the runtime reads another.
 $script:LegacyXdgWarned = @{}
 
 # A relative value resolves against each process's working directory, so the
 # installer and the runtime would place the tree differently. Refuse it, the way
-# biopb._locations._require_absolute does.
+# biopb._config.locations._require_absolute does.
 function Assert-BiopbAbsolute {
     param([string]$EnvVar, [string]$Value)
-    # Matches ntpath.isabs (what biopb._locations uses) rather than
+    # Matches ntpath.isabs (what biopb._config.locations uses) rather than
     # [IO.Path]::IsPathRooted, which accepts the DRIVE-RELATIVE "C:foo" -- a form
     # that resolves against that drive's working directory and so drifts exactly
     # like a bare relative path. IsPathFullyQualified would be right but is
@@ -713,7 +713,7 @@ function Set-McpClients {
     Report-Ok "MCP definition written: $ConfigDir\mcp.json"
 
     # Register with every detected client through the single source of truth:
-    # `biopb agents` (core biopb._agents) -- the same catalog + write logic the
+    # `biopb agents` (core biopb._control._agents) -- the same catalog + write logic the
     # control-plane dashboard uses. It resolves the absolute biopb-mcp path and
     # writes each client's own config (Claude Code via its CLI -- windowless, so no
     # stray console pops under the hidden GUI engine; the rest via an atomic JSON

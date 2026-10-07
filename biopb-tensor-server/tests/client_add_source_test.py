@@ -132,15 +132,6 @@ class TestAddSource:
         with pytest.raises(RuntimeError, match="too old"):
             client.register_local_path("/drop")
 
-    def test_add_source_is_a_deprecated_alias_for_register_local_path(self):
-        client = _bare_client()
-        client._state.client = _FakeFlight([_FakeResult(_result_body(added=["s1"]))])
-
-        with pytest.warns(DeprecationWarning, match="add_source"):
-            out = client.add_source("/drop")
-
-        assert list(out.added) == ["s1"]
-
     def test_no_terminal_result_raises(self):
         client = _bare_client()
         client._state.client = _FakeFlight(

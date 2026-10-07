@@ -25,7 +25,7 @@ from biopb_tensor_server.core.config import SourceConfig
 from biopb_tensor_server.core.errors import WriteNotSupportedError
 from biopb_tensor_server.fixtures import create_multiresolution_ome_zarr
 
-from tests import register_and_catalog
+from tests import label_sets, register_and_catalog
 from tests.label_attachment_test import _write_label_group
 
 SHAPE = (64, 64)
@@ -105,7 +105,7 @@ class TestTheRoundTrip:
         ids = _tensor_ids(served)
         assert ids[0] == "oz1"  # the image is still tensors[0]
         assert ids[-1] == "oz1/@labels/nuclei"
-        assert client.get_label_sets("oz1") == ["oz1/@labels/nuclei"]
+        assert label_sets(client, "oz1") == ["oz1/@labels/nuclei"]
 
     def test_the_descriptor_names_its_image(self, served, client):
         desc = _create(client, "oz1/@labels/nuclei")
@@ -122,7 +122,7 @@ class TestTheRoundTrip:
     def test_two_sets_coexist_under_one_image(self, served, client):
         for name in ("nuclei", "cells"):
             client.upload_array(_create(client, f"oz1/@labels/{name}"), _labels())
-        assert client.get_label_sets("oz1") == [
+        assert label_sets(client, "oz1") == [
             "oz1/@labels/cells",
             "oz1/@labels/nuclei",
         ]
@@ -420,7 +420,7 @@ class TestDiscard:
 
         assert self._gone(client, "oz1/@labels/nuclei")["state"] == "DISCARDED"
         assert not store.exists()
-        assert client.get_label_sets("oz1") == []
+        assert label_sets(client, "oz1") == []
 
     def test_a_pending_set_is_discardable_too(self, served, client, tmp_path):
         """It was never listed, so only the store goes."""
@@ -473,11 +473,11 @@ class TestDiscard:
         register_and_catalog(
             writable_server, "oz2", _adapter(Path(zarr_path), source_id="oz2")
         )
-        assert client.get_label_sets("oz2") == ["oz2/@labels/own"]
+        assert label_sets(client, "oz2") == ["oz2/@labels/own"]
 
         assert self._gone(client, "oz2/@labels/own")["state"] == "UNKNOWN"
         assert group.exists()
-        assert client.get_label_sets("oz2") == ["oz2/@labels/own"]
+        assert label_sets(client, "oz2") == ["oz2/@labels/own"]
 
 
 class TestTheSweep:
@@ -506,7 +506,7 @@ class TestTheSweep:
 
         client.upload_array(_create(client, "oz1/@labels/nuclei"), _labels())
         assert served.uploads.reap(now=time.monotonic() + 10_000) == (0, 0)
-        assert client.get_label_sets("oz1") == ["oz1/@labels/nuclei"]
+        assert label_sets(client, "oz1") == ["oz1/@labels/nuclei"]
 
     def test_a_crashed_upload_is_removed_at_boot(self, served, client, tmp_path):
         store = sidecar_dir(labels_root(Path(tmp_path)), "oz1") / "crashed.zarr"

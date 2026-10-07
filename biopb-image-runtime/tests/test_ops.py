@@ -14,15 +14,18 @@ import biopb.image as proto
 import grpc
 import numpy as np
 import pytest
-from biopb.image import deserialize_image_data, serialize_from_numpy_to_image_data
+from biopb.image import (
+    deserialize_image_data,
+    json_arg as _json,
+    json_value,
+    serialize_from_numpy_to_image_data,
+)
 from biopb_image_base import Tensor, op
 from biopb_image_base.ops import (
     _ambient_scheduler_configured,
     _EmbeddedSink,
     _InlineSink,
-    _json_arg as _json,
     _PlaneSink,
-    _read_value,
     build_server,
     describe,
 )
@@ -153,7 +156,7 @@ def _eager(array, labels=None) -> proto.Arg:
 def _value(arg: proto.Arg):
     kind = arg.WhichOneof("kind")
     if kind == "json":
-        return _read_value(arg.json)
+        return json_value(arg.json)
     if kind == "eager":
         return deserialize_image_data(proto.ImageData(eager_data=arg.eager))
     from biopb.tensor.client import TensorFlightClient

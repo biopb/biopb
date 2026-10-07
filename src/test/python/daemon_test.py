@@ -1,5 +1,5 @@
 """Unit tests for the detached-daemon lifecycle helpers in
-:mod:`biopb.lifecycle.daemon` (moved out of ``biopb.cli``).
+:mod:`biopb._lifecycle.daemon` (moved out of ``biopb.cli``).
 
 Focuses on the cross-platform graceful-stop path (POSIX SIGTERM vs the Windows
 stop-sentinel file) and the force-kill fallback, plus pidfile identity across a
@@ -10,7 +10,7 @@ platform; time.sleep is neutralized.
 from unittest.mock import MagicMock, patch
 
 import pytest
-from biopb.lifecycle import daemon
+from biopb._lifecycle import daemon
 
 
 @pytest.fixture(autouse=True)

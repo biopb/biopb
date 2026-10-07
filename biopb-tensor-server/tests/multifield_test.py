@@ -204,7 +204,7 @@ class TestMultifieldServerClient:
     """Tests for server/client with multifield sources."""
 
     def test_list_sources_returns_all_tensors_in_descriptor(self):
-        """list_sources() should return DataSourceDescriptor with all tensors."""
+        """The sources row should carry all tensors."""
         tensor_specs = [
             ("pos_0", (64, 64), "uint8"),
             ("pos_1", (100, 100), "uint8"),
@@ -221,14 +221,14 @@ class TestMultifieldServerClient:
         try:
             client = TensorFlightClient(f"grpc://localhost:{server.port}")
 
-            sources = client.list_sources()
-
-            assert "multifield-test" in sources
-            source_desc = sources["multifield-test"]
-            assert len(source_desc.tensors) == 2
+            (row,) = client.query(
+                "SELECT tensors FROM sources WHERE source_id = 'multifield-test'",
+                format="records",
+            )
+            tensors = row["tensors"]
+            assert len(tensors) == 2
             # Client has all tensor shape info upfront
-            assert source_desc.tensors[0].shape == [64, 64]
-            assert source_desc.tensors[1].shape == [100, 100]
+            assert sorted(list(t["shape"]) for t in tensors) == [[64, 64], [100, 100]]
 
             client.close()
         finally:
@@ -315,7 +315,7 @@ class TestMultifieldServerClient:
             server.shutdown()
 
     def test_get_descriptor_enumeration_vs_probe(self):
-        """Issue #75: enumeration is list_sources(); get_descriptor() is a single
+        """Issue #75: enumeration is the catalog query; get_descriptor() is a single
         tensor probe that reaches any scene and never clobbers the full
         enumeration."""
         tensor_specs = [
@@ -335,10 +335,14 @@ class TestMultifieldServerClient:
         try:
             client = TensorFlightClient(f"grpc://localhost:{server.port}")
 
-            # Enumeration: list_sources() carries ALL scenes for the source.
-            enumerated = client.list_sources()["multi"].tensors
+            # Enumeration: the sources row carries ALL scenes for the source.
+            (row,) = client.query(
+                "SELECT tensors FROM sources WHERE source_id = 'multi'",
+                format="records",
+            )
+            enumerated = row["tensors"]
             assert len(enumerated) == 3
-            assert sorted(list(t.shape) for t in enumerated) == [
+            assert sorted(list(t["shape"]) for t in enumerated) == [
                 [16, 16],
                 [32, 32],
                 [64, 64],
@@ -493,8 +497,11 @@ class TestMultifieldServerClient:
         try:
             client = TensorFlightClient(f"grpc://localhost:{server.port}")
 
-            sources = client.list_sources()
-            assert len(sources["single-source"].tensors) == 1
+            (row,) = client.query(
+                "SELECT tensors FROM sources WHERE source_id = 'single-source'",
+                format="records",
+            )
+            assert len(row["tensors"]) == 1
 
             # Access the single tensor -- a bare source id resolves the sole tensor.
             arr = client.get_tensor("single-source")

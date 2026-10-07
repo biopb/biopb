@@ -6,7 +6,6 @@ for accessing tensors stored in a Flight server.
 
 import json
 import logging
-import warnings
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import dask.array as da
@@ -57,7 +56,6 @@ from biopb.tensor._upload import UploadRefused as UploadRefused, UploadSession
 from biopb.tensor.descriptor_pb2 import (
     AddSourceProgress,
     AddSourceResult,
-    DataSourceDescriptor,
     RemoveSourceResult,
     ResolveProgress,
     TensorDescriptor,
@@ -190,63 +188,6 @@ class TensorFlightClient:
 
     # ---- Catalog / metadata / source lifecycle (delegated to CatalogClient) ----
 
-    def list_sources(self) -> Dict[str, DataSourceDescriptor]:
-        """List available data sources.
-
-        Deprecated:
-            Use :meth:`query`, which hands back rows in the format
-            you ask for and leaves the structure to you. This is a thin
-            wrapper around
-            ``SELECT ... FROM sources`` that inherits the server's query row
-            cap, so a large catalog comes back silently truncated -- and a
-            browse is exactly where that matters.
-
-        Returns:
-            Dictionary mapping source_id to DataSourceDescriptor.
-            Each DataSourceDescriptor.tensors carries the *structural* entry for
-            every tensor in that source -- array_id, dim_labels, shape, dtype.
-            The transfer ``chunk_shape`` is empty here by contract; ask
-            :meth:`get_descriptor` for the grid of a specific tensor
-            (biopb/biopb#812). ``is_resolved`` is not carried at all -- the
-            message has no field for it (biopb/biopb#1032).
-        """
-        warnings.warn(
-            "TensorFlightClient.list_sources() is deprecated and is capped by "
-            "the server's query row limit; use query(), which returns "
-            "rows in the format you ask for.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self._catalog.list_sources()
-
-    def get_source(self, source_id: str) -> Optional[DataSourceDescriptor]:
-        """One source's ``DataSourceDescriptor`` by id, or ``None``.
-
-        Deprecated:
-            Use :meth:`query` with a ``WHERE source_id = ...``.
-
-        The catalog is public: a source whose pixels need a capability token
-        still has its descriptor here. Knowing its id is not authority to read
-        it -- that is what the token gates, on :meth:`get_tensor` and
-        :meth:`list_rois`.
-
-        Args:
-            source_id: The source's id, e.g. ``"zarr_a3f2"``. This is a *source*
-                id, not an array_id: pass the routing prefix, not
-                ``"aics_7f3/Image:0"``.
-
-        Returns:
-            The ``DataSourceDescriptor``, or ``None`` when nothing answers to
-            that id.
-        """
-        warnings.warn(
-            "TensorFlightClient.get_source() is deprecated; use query() "
-            "with a WHERE source_id = ... instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self._catalog.get_source(source_id)
-
     def source_row_columns(self) -> str:
         """The columns a ``sources`` listing needs, as a SELECT list: the base
         columns, plus ``unresolved_reason`` when the server has it."""
@@ -306,23 +247,6 @@ class TensorFlightClient:
             ```
         """
         return self._catalog.query(sql, format=format)
-
-    def query_sources(self, sql: str, *, format: str = "arrow") -> Any:  # noqa: A002 - public, documented keyword API (mirrors DuckDB/pandas `format`)
-        """Deprecated alias for :meth:`query`.
-
-        .. deprecated::
-            Use :meth:`query`. Same signature, same behavior -- ``query_sources``
-            just names it in terms of what it queries rather than what it does,
-            which stopped matching once other catalog tables (ROIs, uploads)
-            became queryable too.
-        """
-        warnings.warn(
-            "TensorFlightClient.query_sources() is deprecated; use query() "
-            "instead (same signature).",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self.query(sql, format=format)
 
     @staticmethod
     def _format_query_result(table, format):  # noqa: A002 - public, documented keyword API (mirrors DuckDB/pandas `format`)
@@ -438,9 +362,6 @@ class TensorFlightClient:
         Note:
             Experimental. Cloud / remote source support (unresolved sources,
             resolve_source, and `warm_source`) is experimental and its behavior may change.
-            This returned a ``DataSourceDescriptor`` before biopb/biopb#1032
-            and now returns the row itself -- the same information, without
-            the SDK picking a structure for it.
 
         An *unresolved* source is catalogued by URL only -- its shape/dtype/field
         list are unknown until first access (its catalog row has
@@ -617,37 +538,6 @@ class TensorFlightClient:
             should_cancel=should_cancel,
         )
 
-    def add_source(
-        self,
-        url: str,
-        *,
-        source_type: str = "",
-        cloud: bool = False,
-        on_progress: Optional[Callable[[AddSourceProgress], None]] = None,
-        should_cancel: Optional[Callable[[], bool]] = None,
-    ) -> AddSourceResult:
-        """Deprecated alias for :meth:`register_local_path`.
-
-        .. deprecated::
-            Use :meth:`register_local_path`. Same signature, same behavior --
-            ``add_source`` read fine before the client had other kinds of
-            sources to add (an upload, a resolved cloud source); it no longer
-            says what's actually being added.
-        """
-        warnings.warn(
-            "TensorFlightClient.add_source() is deprecated; use "
-            "register_local_path() instead (same signature).",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self.register_local_path(
-            url,
-            source_type=source_type,
-            cloud=cloud,
-            on_progress=on_progress,
-            should_cancel=should_cancel,
-        )
-
     def deregister_local_path(self, root_url: str) -> RemoveSourceResult:
         """Deregister a drag-dropped source branch on the SERVER at runtime.
 
@@ -672,41 +562,6 @@ class TensorFlightClient:
                 returned no result.
         """
         return self._catalog.deregister_local_path(root_url)
-
-    def remove_source(self, root_url: str) -> RemoveSourceResult:
-        """Deprecated alias for :meth:`deregister_local_path`.
-
-        .. deprecated::
-            Use :meth:`deregister_local_path`. Same signature, same behavior.
-        """
-        warnings.warn(
-            "TensorFlightClient.remove_source() is deprecated; use "
-            "deregister_local_path() instead (same signature).",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self.deregister_local_path(root_url)
-
-    # ---- label sets ----
-
-    def get_label_sets(self, image_array_id: str) -> List[str]:
-        """The ``array_id``s of the label sets served under an image.
-
-        A label set is an ordinary tensor of its image, named
-        ``<image array_id>/@labels/<name>``, so this is a catalog query over
-        the path and nothing more -- ``get_tensor`` / ``get_descriptor`` read
-        one like any other tensor. A set's descriptor carries an NGFF
-        ``image-label`` block in its ``metadata_json``, whose ``source.image``
-        names this image.
-
-        Args:
-            image_array_id: The image's ``array_id`` (``"src_ab12"``, or
-                ``"src_ab12/Image:0"`` on a multi-tensor source).
-
-        Returns:
-            The sets' ``array_id``s, sorted. Empty when the image has none.
-        """
-        return self._catalog.get_label_sets(image_array_id)
 
     # ---- ROI annotations ----
 
@@ -890,37 +745,6 @@ class TensorFlightClient:
         """
         return self._fetcher.get_array(
             array_id, slice_hint, scale_hint, reduction_method
-        )
-
-    def get_tensor_pb(
-        self,
-        array_id: str,
-        slice_hint: Optional[Tuple[slice, ...]] = None,
-        scale_hint: Optional[Sequence[int]] = None,
-        reduction_method: Optional[str] = None,
-        *,
-        export_location: Optional[str] = None,
-    ) -> SerializedTensor:
-        """Deprecated alias for :meth:`get_tensor` with ``output="pb"``.
-
-        .. deprecated::
-            Use ``get_tensor(..., output="pb")``. Same planned read, same
-            ``SerializedTensor`` result -- a separate method just meant the
-            two could (and did) drift on every other parameter.
-        """
-        warnings.warn(
-            "TensorFlightClient.get_tensor_pb() is deprecated; use "
-            "get_tensor(..., output='pb') instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self.get_tensor(
-            array_id,
-            slice_hint,
-            scale_hint,
-            reduction_method,
-            output="pb",
-            export_location=export_location,
         )
 
     @staticmethod
@@ -1244,7 +1068,7 @@ class TensorFlightClient:
             - `source_count`: Number of registered sources
             - `metadata_db_enabled`: Whether the server offers a catalog.
                 False means it serves its sources by id alone and every
-                catalog surface (list_sources, query, resolve_source,
+                catalog surface (query, resolve_source,
                 annotations) refuses
             - `writable`: Whether server accepts uploads
             - `uptime_seconds`: Server uptime in seconds

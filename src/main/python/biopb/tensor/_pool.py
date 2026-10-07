@@ -43,7 +43,6 @@ from dask.highlevelgraph import HighLevelGraph
 from dask.utils import parse_bytes
 
 from biopb.tensor import _diskcache
-from biopb.tensor._labels import split_label_array_id
 from biopb.tensor._location import location_host
 from biopb.tensor._tls import NO_TLS, TlsTrust, concrete_trust
 from biopb.tensor.ticket_pb2 import TensorTicket
@@ -801,13 +800,18 @@ def _get_shared_cache(
 WIRE_WRITE_OPTIONS = pa.ipc.IpcWriteOptions(compression="zstd")
 
 
+def is_label_set(array_id: str) -> bool:
+    """Whether *array_id* names a label set: the last ``@labels`` segment, past
+    the source_id, with a name after it."""
+    parts = array_id.split("/")
+    return any(parts[i] == "@labels" and parts[i + 1] for i in range(1, len(parts) - 1))
+
+
 def wants_wire_compression(location: str, array_id: str) -> bool:
     """Whether a write of *array_id* to *location* goes compressed: a label set,
     on a server that is not this machine. Pixel data barely compresses, and
     compressing it costs the zero-copy path for nothing."""
-    return split_label_array_id(array_id) is not None and not _is_localhost_location(
-        location
-    )
+    return is_label_set(array_id) and not _is_localhost_location(location)
 
 
 def _build_call_options(

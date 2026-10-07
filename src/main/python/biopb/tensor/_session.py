@@ -4,7 +4,7 @@ Extracted from :mod:`biopb.tensor.client` (issue #278 item C). The two
 collaborators share the connection via :class:`_ClientState`:
 
 - :class:`CatalogClient` -- discovery / metadata / resolve / warm / source
-  registration (``list_sources`` / ``query`` / ``resolve`` / ... RPCs).
+  registration (``query`` / ``resolve`` / ... RPCs).
 - :class:`ChunkFetcher` -- tensor reads: plan a read with GetFlightInfo and
   build the lazy dask chunk-fetching array.
 
@@ -47,12 +47,10 @@ from biopb.image.annotation_pb2 import (
 )
 from biopb.tensor._catalog_rows import (
     SOURCE_ROW_COLUMNS,
-    _descriptor_from_row,
     sql_literal,
     tensor_descriptors_from_row,
     with_reason,
 )
-from biopb.tensor._labels import LABELS_SEGMENT
 from biopb.tensor._location import normalize_flight_location
 from biopb.tensor._pool import (
     _build_dask_array_from_chunk_map,
@@ -82,7 +80,6 @@ from biopb.tensor.descriptor_pb2 import (
     AddSourceResult,
     AddSourceStreamMessage,
     CatalogQuery,
-    DataSourceDescriptor,
     FlightRequest,
     RemoveSourceRequest,
     RemoveSourceResult,
@@ -725,36 +722,13 @@ def do_action_one_result(
 class CatalogClient:
     """Catalog, metadata, and source-lifecycle RPCs over one Flight connection.
 
-    Owns discovery (``list_sources`` / ``query``), per-tensor metadata
+    Owns discovery (``query``), per-tensor metadata
     probes, the experimental cloud ``resolve`` / ``warm`` streams, and runtime
     source registration. Reads and writes the shared ``_ClientState`` caches.
     """
 
     def __init__(self, state: "_ClientState"):
         self._state = state
-
-    _SOURCES_SQL = f"SELECT {SOURCE_ROW_COLUMNS} FROM sources"
-
-    def list_sources(self) -> Dict[str, DataSourceDescriptor]:
-        """Backs TensorFlightClient.list_sources; see that method for the full
-        documentation."""
-        table = self._query_table(self._SOURCES_SQL + " ORDER BY source_id")
-        source_descriptors = {}
-        for row in table.to_pylist():
-            source_desc = _descriptor_from_row(row)
-            source_descriptors[source_desc.source_id] = source_desc
-        logger.info(f"list_sources: returned {len(source_descriptors)} sources")
-        return source_descriptors
-
-    def get_source(self, source_id: str) -> Optional[DataSourceDescriptor]:
-        """Backs TensorFlightClient.get_source; see that method for the full
-        documentation."""
-        table = self._query_table(
-            f"{self._SOURCES_SQL} WHERE source_id = {sql_literal(source_id)}"
-        )
-        for row in table.to_pylist():
-            return _descriptor_from_row(row)
-        return None
 
     def query(self, sql: str, *, format: str = "arrow") -> Any:  # noqa: A002 - public, documented keyword API (mirrors DuckDB/pandas `format`)
         """Backs TensorFlightClient.query; see that method for the full
@@ -890,7 +864,7 @@ class CatalogClient:
 
         Backs the public ``get_descriptor`` (the array_id-keyed primitive). Uses
         the per-tensor ``GetFlightInfo`` RPC, which works even when the source is
-        beyond the (truncatable) ``list_sources()`` cap. A bare source_id ->
+        beyond the (truncatable) ``query`` row cap. A bare source_id ->
         the source's default (first) tensor (#44). This is a CHEAP probe: it
         does NOT resolve. An unresolved (cloud / synced-folder) source raises
         the directive ``_unresolved_source_error`` steering the caller to
@@ -1133,7 +1107,7 @@ class CatalogClient:
         # One dedicated, streaming ``resolve`` action: it is the SINGLE server
         # entry point that performs the (possibly minutes-long) recall, and its
         # terminal message carries the source's now-concrete catalog row -- no
-        # GetFlightInfo + list_sources two-step, so no truncation hole for
+        # GetFlightInfo + browse two-step, so no truncation hole for
         # multi-field sources beyond the list cap. The action streams
         # ``ResolveStreamMessage`` heartbeats (a ``progress`` arm) to keep the
         # connection warm under proxy idle timeouts. ``should_cancel`` /
@@ -1150,8 +1124,7 @@ class CatalogClient:
                 if on_progress is not None:
                     on_progress(msg.progress)
             elif which == "source_row":
-                # The same row list_sources reads, through the same decoder --
-                # one representation of a source, so a resolve and a subsequent
+                # The same row ``query`` reads: one representation of a source, so a resolve and a subsequent
                 # browse cannot disagree about it.
                 rows = pa.ipc.open_stream(msg.source_row).read_all().to_pylist()
                 if rows:
@@ -1295,17 +1268,6 @@ class CatalogClient:
             action, unavailable_hint="Source removal is unavailable"
         )
         return RemoveSourceResult.FromString(result_bytes)
-
-    # ---- label sets ----
-
-    def get_label_sets(self, image_array_id: str) -> List[str]:
-        """Backs TensorFlightClient.get_label_sets; see that method."""
-        prefix = sql_literal(f"{image_array_id}/{LABELS_SEGMENT}/")
-        table = self._query_table(
-            "SELECT t.array_id FROM sources, UNNEST(tensors) AS u(t) "
-            f"WHERE starts_with(t.array_id, {prefix}) ORDER BY t.array_id"
-        )
-        return table.column(0).to_pylist()
 
     # ---- ROI annotations ----
 

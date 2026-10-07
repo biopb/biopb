@@ -97,7 +97,7 @@ napari = [
     "pyqt6",
     "qtpy",
     # The Tensor Browser the kernel docks, and add_tensor's layer pipeline.
-    "biopb-napari-widget >= 0.1.1rc2",
+    "biopb-napari-widget >= 0.1.1rc4",
 ]
 
 # Test/dev dependencies live in a PEP 735 dependency *group* rather than a
@@ -154,7 +154,7 @@ testing = [
 
 [project.scripts]
 biopb-mcp = "biopb_mcp.mcp.__main__:main"
-# Light console entry (stdlib + biopb._locations only, no kernel/napari
+# Light console entry (stdlib + biopb._config.locations only, no kernel/napari
 # import) the installer calls to seed the bundled correctness-critical
 # algorithm-plane ops (biopb_mcp/algorithms/) into ~/.config/biopb/algorithms/.
 biopb-mcp-seed-algorithms = "biopb_mcp.algorithms._seed:_cli"

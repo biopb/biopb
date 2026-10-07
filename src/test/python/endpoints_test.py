@@ -92,7 +92,7 @@ class TestRuntimeRecord:
         """
         import os
 
-        from biopb.lifecycle.proc import process_create_time
+        from biopb._lifecycle.proc import process_create_time
 
         _endpoints.write_runtime_record("127.0.0.1", 9003, os.getpid())
         record = _endpoints.read_runtime_record()
@@ -127,7 +127,7 @@ class TestRuntimeRecord:
         Every client calls it before it can reach the control at all, so a hard
         failure here would break discovery entirely rather than degrade to 8813.
         """
-        from biopb._locations import control_runtime_file
+        from biopb._config.locations import control_runtime_file
 
         path = control_runtime_file()
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -163,7 +163,7 @@ class TestRuntimeRecord:
         and parse it as "none".
         """
         _endpoints.write_runtime_record("127.0.0.1", 9003, 4242)
-        from biopb._locations import control_runtime_file
+        from biopb._config.locations import control_runtime_file
 
         path = control_runtime_file()
         assert json.loads(path.read_text())["port"] == 9003
@@ -178,7 +178,7 @@ class TestRuntimeRecord:
         `control start` holds the start lock, so a foreground `control run` on
         the same state dir really can race it.
         """
-        from biopb._locations import control_runtime_file
+        from biopb._config.locations import control_runtime_file
 
         path = control_runtime_file()
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -200,7 +200,7 @@ class TestRuntimeRecord:
 
         The record is republished on every serve, so a leak here accumulates.
         """
-        from biopb._locations import control_runtime_file
+        from biopb._config.locations import control_runtime_file
 
         path = control_runtime_file()
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -265,7 +265,7 @@ class TestUserBaseUrl:
 
     @pytest.mark.parametrize("junk", [None, "", "  ", 7, ["a"], {"x": 1}])
     def test_a_malformed_record_field_is_ignored(self, junk):
-        from biopb._locations import control_runtime_file
+        from biopb._config.locations import control_runtime_file
 
         _endpoints.write_runtime_record("127.0.0.1", 9003, 4242)
         path = control_runtime_file()

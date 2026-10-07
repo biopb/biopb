@@ -15,14 +15,14 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from . import _agents, _locations, _tls_material, _web_auth
-from ._control import _endpoints
+from ._config import locations as _locations
+from ._config.locations import find_config
+from ._control import _agents, _endpoints
 from ._control._endpoints import (
     flight_port_for as _flight_port,
     sidecar_port_for as _sidecar_port,
 )
-from ._locations import find_config
-from .lifecycle.daemon import (
+from ._lifecycle.daemon import (
     detach_kwargs as _detach_kwargs,
     is_our_daemon as _is_our_daemon,
     read_pid_record as _read_pid_record,
@@ -30,11 +30,12 @@ from .lifecycle.daemon import (
     stop_daemon as _stop_daemon,
     write_pid_file as _write_pid_file,
 )
-from .lifecycle.file_lock import LockTimeout, file_lock
-from .lifecycle.proc import (
+from ._lifecycle.file_lock import LockTimeout, file_lock
+from ._lifecycle.proc import (
     is_process_running as _is_process_running,
     process_create_time as _process_create_time,
 )
+from ._security import tls_material as _tls_material, web_auth as _web_auth
 
 console = Console()
 
@@ -47,19 +48,11 @@ app = typer.Typer(
 class _LazySubcommands(typer.core.TyperGroup):
     """A subcommand group whose module is imported on first use, not at startup.
 
-    The tensor/image subcommands pull in optional dependencies (installed via
-    biopb[tensor]) that are heavy -- `biopb.tensor.client` alone imports
-    dask.array, which drags pandas and scipy along -- and that may be absent or
-    broken (e.g. a transient numcodecs/zarr ImportError). Importing them at
-    registration made every `biopb` invocation, `biopb version` included, pay
-    ~0.7 s for a module it never used. Here the group knows only its name and
-    help until something asks for its commands: the module loads when the group
-    is invoked, its own help is rendered, or a shell completion lists it.
-    `biopb --help` lists the group without loading it.
-
-    An import failure is reported the way the eager stub did: any `biopb <name>
-    ...` invocation prints the error and the install hint and exits 1, so the
-    rest of the CLI (version, server management) keeps working.
+    The tensor/image subcommands need heavy optional dependencies (biopb[tensor])
+    that may be absent or broken. The module loads when the group is invoked, its
+    help is rendered, or completion lists it; `biopb --help` lists it unloaded.
+    An import failure makes any `biopb <name> ...` print the error and install
+    hint and exit 1, leaving the rest of the CLI working.
     """
 
     import_path: str = ""  # set on the per-group subclass by `_add_optional_typer`
@@ -69,10 +62,8 @@ class _LazySubcommands(typer.core.TyperGroup):
         self._error: Optional[BaseException] = None
         super().__init__(**attrs)
 
-    # `TyperGroup` keeps its subcommands in a plain `commands` dict that every
-    # path reads (listing, resolution, help, suggestions); making it a property
-    # is the one hook that covers them all. The constructor's assignment of an
-    # empty dict is discarded.
+    # A property is the one hook covering every read of `commands`; the
+    # constructor's assignment of an empty dict is discarded.
     @property
     def commands(self) -> dict:
         self._ensure_loaded()
@@ -125,50 +116,28 @@ _add_optional_typer(
 # Ops client operations
 _add_optional_typer("image", "biopb.image.cli", "Call algorithm servers (Ops).")
 
-# The `biopb server` group is gone (biopb/biopb#615). Its lifecycle commands went
-# first, when the control plane took over the data-plane process; the one that
-# outlived them was not a group: `cache-stats` is a Flight query, so it moved to
-# `biopb tensor cache-stats` beside the other queries.
-
-# Daemon management constants. On-disk locations come from the shared
-# `_locations` module (XDG-aware): the installed webapp bundle is a portable
-# asset (data tree); logs / pid / sentinels are per-machine state (state tree).
+# On-disk locations come from the shared XDG-aware `_locations` module.
 DEFAULT_WEBAPP = _locations.webapp_dir()
 
-# Default config path. Shared with biopb-tensor-server and biopb-mcp via the (dependency-light)
-# core module, so resolving this typer Option default does not import the heavy
-# server config module (biopb/biopb#34).
+# Resolved via the dependency-light core module so the typer Option default does
+# not import the heavy server config module.
 DEFAULT_CONFIG = find_config()
 
-# biopb-control (control plane) management. The control plane is a separate, lean package
-# (`biopb-control`) started as `python -m biopb_control run` by `biopb control start`;
-# the lifecycle plumbing (pidfile / detach / stop-sentinel) lives here, reused
-# from the tensor-server / mcp daemons, so the package itself stays a pure
-# supervisor. It supervises the tensor server, which keeps writing the canonical
-# tensor-server.log (the state-tree logs dir) that the control's log endpoint
-# tails; the control plane's own supervision/control-API log is control.log.
+# The control plane (`biopb-control`) is started as `python -m biopb_control run`;
+# pidfile / detach / stop-sentinel plumbing lives here. It supervises the tensor
+# server (which writes tensor-server.log); its own log is control.log.
 CONTROL_PID_FILE = _locations.control_pid_file()
 
 
-# One release-v* tag versions this set together, so any installed member reports
-# the product version. (The biopb SDK ships on its own v* line, so its wheel
-# version differs.) Tried in order; the first one installed answers.
+# One release-v* tag versions these together; the first one installed answers.
 _RELEASE_PACKAGES = ("biopb-control", "biopb-mcp", "biopb-tensor-server")
 
 
 def _release_version() -> str:
     """The product deployment version, from whichever release-v* wheel is here.
 
-    Read from distribution metadata rather than the installer's
-    ``CONFIG_DIR/release.version`` marker, because the marker is *user-global*:
-    a ``biopb version`` run from another environment -- a dev venv, a second
-    tool install -- printed that environment's SDK beside a different
-    installation's deployment. Metadata is per-environment, so both lines now
-    describe the one you ran from, and a set upgraded by hand rather than by
-    the installer reports what is actually present.
-
-    The marker stays for the auto-updater, which reads it itself
-    (``biopb_mcp.mcp._update``).
+    Read from per-environment distribution metadata, not the user-global
+    ``CONFIG_DIR/release.version`` marker (which the auto-updater reads itself).
     """
     for name in _RELEASE_PACKAGES:
         found = _package_version(name)
@@ -180,16 +149,9 @@ def _release_version() -> str:
 def _package_version(dist_name: str) -> str:
     """Installed version of distribution `dist_name`, or 'not installed'.
 
-    Reads distribution metadata rather than importing the package, and that is
-    deliberate: this command reports what is *installed* here -- the same
-    question its release-marker line answers. A package's own ``__version__``
-    answers a different one, what is *running*, and resolves the build-time file
-    first (biopb/biopb#910), so in an editable checkout the two legitimately
-    differ until the next install.
-
-    Not importing also keeps `biopb version` from dragging in the packages'
-    heavy optional stacks just to print a number, and still reports a version
-    when a package is installed but its runtime imports are broken.
+    Reads metadata rather than importing: reports what is *installed* (an
+    editable checkout's ``__version__`` can differ), avoids heavy imports, and
+    works when a package's runtime imports are broken.
     """
     from importlib.metadata import PackageNotFoundError, version as _dist_version
 
@@ -205,16 +167,11 @@ def _package_version(dist_name: str) -> str:
 def version():
     """Show the two version lines: the product deployment and the biopb SDK."""
     rows = [
-        # The product line (release-v*): biopb-tensor-server / mcp / control / web
-        # all share this version, so one member stands in for the whole set --
-        # no need to list each wheel separately.
         ("release", _release_version()),
-        # The SDK line (v*): biopb ships to PyPI/Maven on its own tag, so its
-        # version is independent of the product bundle it is also packaged into.
+        # The SDK ships on its own v* tag, independent of the release.
         ("biopb", _package_version("biopb")),
     ]
 
-    # Left-align the labels so the versions line up in a readable column.
     width = max(len(name) for name, _ in rows) + 1  # +1 for the trailing ':'
     for name, ver in rows:
         console.print(f"{name + ':':<{width}} {ver}")
@@ -231,8 +188,6 @@ def _get_log_file() -> Path:
     return _locations.tensor_server_log()
 
 
-# The rotation helper lives in `_locations` so the supervisor shares one
-# rotator; re-exported here under the old name for the existing call sites.
 _rotate_log = _locations.rotate_log
 
 
@@ -335,8 +290,7 @@ def _tail_and_follow(
         )
         raise typer.Exit(0)
 
-    # Both logs rotate at 10 MB (_locations.rotate_log), so the current file is
-    # small enough to read whole and slice - no seek-based tail.
+    # Logs rotate at 10 MB, so the file is small enough to read whole.
     existing = log_file.read_text(errors="replace").splitlines()
     tail = existing if lines <= 0 else existing[-lines:]
     for line in _filter_lines(tail, min_level, level_of):
@@ -345,14 +299,10 @@ def _tail_and_follow(
     if not follow:
         raise typer.Exit(0)
 
-    # Flush the tail before blocking on new lines: piped/redirected stdout is
-    # block-buffered, so without this `logs -f > file` (or `| grep`) shows nothing
-    # until 4 KB accumulates -- and Ctrl-C before that loses the tail entirely.
+    # Piped stdout is block-buffered; flush so `logs -f | grep` shows the tail.
     sys.stdout.flush()
 
-    # Follow: poll for appended lines, reopening if the file is rotated or
-    # truncated out from under us (a restart rotates it mid-follow). Track the
-    # inode + size so a replaced or shrunk file restarts from the top.
+    # Poll for appended lines; a changed inode or shrunk size means rotation.
     try:
         f = open(log_file, errors="replace")  # noqa: SIM115 - handle kept open across the follow loop, reopened on rotation
     except OSError:
@@ -391,13 +341,8 @@ def _tail_and_follow(
 def _plane_bind(grpc_bind: str, base_port: int) -> Tuple[str, int]:
     """The flight plane's bind: the address from ``--grpc-bind``, port from the base.
 
-    The address used to be read out of ``biopb.json`` (``server.host``), which
-    made the deployment's exposure a *property of a file* the control snapshotted
-    at startup -- so a config edit could silently disagree with the running plane
-    (biopb/biopb#604). It is now the CLI's, and named for what it does: the flag
-    that exposes the plane is the one you type an address into, and everything
-    downstream (token required? TLS by default?) derives from that one address
-    through :func:`biopb._web_auth.host_is_public_bind`.
+    Everything downstream (token required? TLS by default?) derives from this
+    address through :func:`biopb._security.web_auth.host_is_public_bind`.
     """
     return (grpc_bind, _flight_port(base_port))
 
@@ -412,10 +357,8 @@ def _probe_hostport(grpc_bind: str, base_port: int) -> Tuple[str, int]:
 
 @dataclass
 class Probe:
-    """A daemon's liveness/health snapshot. `listening` says the daemon is up;
-    `health` is a richer status dict a daemon may expose (None if it exposes none,
-    or if the query failed -- probing never raises, so callers render either
-    daemon uniformly instead of guarding every query)."""
+    """A daemon's liveness snapshot. `health` is an optional richer status dict
+    (None if none is exposed or the query failed; probing never raises)."""
 
     listening: bool
     health: Optional[dict] = None
@@ -426,12 +369,8 @@ def _probe_daemon(
 ) -> Probe:
     """One uniform liveness/health snapshot for either SDK daemon (never raises).
 
-    Readiness and health are the same question at two fidelities, unified here. A
-    daemon that exposes a health RPC passes `health_fn`: its answer both fills
-    `health` and *defines* liveness (it answered -> it is up). A daemon with only
-    a bound port passes none, and a cheap TCP connect to (host, port) defines
-    liveness. Either way the caller gets a Probe it can render or poll without a
-    try/except -- a failed RPC comes back health=None, a closed port listening=False.
+    With `health_fn`, its answer fills `health` and defines liveness; without
+    one, a TCP connect to (host, port) does.
     """
     if health_fn is not None:
         health = health_fn()
@@ -453,14 +392,8 @@ def _emit_daemon_status(
 ) -> None:
     """Render one daemon's status (JSON or table); the command exits 0.
 
-    The running/stale/stopped verdict and the common PID / PID-file / Log-file
-    rows are identical for both daemons; `json_fields` and `table_rows` carry the
-    per-daemon extras (Flight health for the tensor server, the HTTP endpoint for
-    biopb-mcp). `table_rows` are inserted between the PID row and the trailing
-    PID-file / Log-file rows, preserving each command's original row order.
-
-    The JSON and not-running paths short-circuit via `typer.Exit(0)`; the
-    running-table path returns normally, which typer likewise maps to exit 0.
+    `json_fields` and `table_rows` carry per-daemon extras; `table_rows` go
+    between the PID row and the trailing PID-file / Log-file rows.
     """
     if json_output:
         print(
@@ -500,20 +433,13 @@ def _emit_daemon_status(
 # ---------------------------------------------------------------------------
 # biopb-mcp (`biopb mcp view`)
 #
-# The shared background MCP daemon (`biopb mcp start/stop/restart/status/logs`)
-# was retired with de-daemonization (biopb-mcp/docs/mcp-dedaemonization-
-# migration.md): each MCP client's stdio shim now spawns and owns its own
-# ephemeral session, and `biopb mcp view` covers the foreground/agentless case.
 # `view` runs the server in a child process (`python -m biopb_mcp.mcp --view`),
-# so this CLI never imports the heavy MCP/napari stack. The biopb-mcp package is
-# an optional dependency: the subcommand first calls _require_biopb_mcp(), which
-# surfaces a clear install hint (rather than a raw ImportError) when it is absent.
+# so this CLI never imports the heavy MCP/napari stack. biopb-mcp is optional;
+# _require_biopb_mcp() gives an install hint when it is absent.
 # ---------------------------------------------------------------------------
 
-# Every command below passes an explicit one-line `help=`. Typer prefers it over
-# the docstring, which keeps `--help` to a single sentence per command while the
-# docstring stays where the rationale belongs -- read by maintainers, not printed
-# at a user who asked what a command does.
+# Commands pass an explicit one-line `help=`, which Typer prefers over the
+# (maintainer-facing) docstring.
 mcp_app = typer.Typer(
     name="mcp",
     help="Run a foreground napari viewer session (biopb-mcp).",
@@ -523,8 +449,7 @@ mcp_app = typer.Typer(
 def _require_biopb_mcp() -> None:
     """Exit(1) with an install hint if the biopb-mcp package is not importable.
 
-    Checks the import *spec* (not a real import) so the heavy MCP/napari stack is
-    never loaded into this CLI process just to gate a command.
+    Checks the import spec only, so the MCP/napari stack is never loaded.
     """
     import importlib.util
 
@@ -540,20 +465,15 @@ def _require_biopb_mcp() -> None:
 def _require_control_for_view() -> None:
     """Exit(1) unless a control plane answers — or ``$BIOPB_TENSOR_URL`` is set.
 
-    The viewer's data comes from the plane the control owns (biopb/biopb#628), so
-    without one there is nothing to browse; failing here keeps the user from
-    watching napari load only to meet an empty Tensor Browser. The env override
-    names a plane directly and deliberately bypasses the control, so it must also
-    bypass this check — otherwise the escape hatch would not reach `view` at all.
+    The viewer's data comes from the control's plane; failing here avoids a
+    napari load into an empty Tensor Browser. The env override names a plane
+    directly, so it bypasses this check.
 
-    "Answered" is :func:`_query_control_health`, the module's one definition of a
-    responding control API (``control status`` reports the same probe), so the two
-    can never disagree about whether a control is up. Its 2s budget is deliberate:
-    ``/health`` takes the supervisor lock and does a blocking TCP liveness probe,
-    so a control busy in an ``ensure`` answers late — and here a false negative is
-    a hard exit, not a degraded reading.
+    "Answered" is :func:`_query_control_health`, shared with ``control status``.
+    Its 2s budget is deliberate: ``/health`` takes the supervisor lock, so a busy
+    control answers late, and a false negative here is a hard exit.
     """
-    from . import ENV_TENSOR_URL
+    from ._control import ENV_TENSOR_URL
 
     if os.environ.get(ENV_TENSOR_URL, "").strip():
         return
@@ -568,8 +488,7 @@ def _require_control_for_view() -> None:
 
 
 def _port_listening(host: str, port: int, timeout: float = 0.3) -> bool:
-    """Whether a TCP connection to (host, port) succeeds - a cheap liveness probe
-    for the daemon's HTTP listener (it binds before serving)."""
+    """Whether a TCP connection to (host, port) succeeds."""
     import socket
 
     try:
@@ -580,11 +499,9 @@ def _port_listening(host: str, port: int, timeout: float = 0.3) -> bool:
 
 
 def _await_listening(pid: int, host: str, port: int, timeout: float) -> bool:
-    """Block until (host, port) accepts a connection, returning True. Returns
-    False if the process dies first or `timeout` elapses without the port coming
-    up -- a readiness check (did the daemon actually bind?), strictly stronger
-    than "is the child process still alive". Callers re-check liveness to tell a
-    crash apart from a slow/wedged bind."""
+    """Block until (host, port) accepts a connection (True), or the process dies
+    or `timeout` elapses (False). Callers re-check liveness to tell a crash from
+    a slow bind."""
     deadline = time.monotonic() + timeout
     while True:
         if not _is_process_running(pid):
@@ -610,20 +527,12 @@ def mcp_view(
 ):
     """Open the napari viewer in the foreground (agentless).
 
-    Runs a biopb-mcp session in *this* terminal: the napari window opens
-    immediately and the process blocks until Ctrl-C. A foreground, user-owned
-    viewer that writes no PID file. It still serves /mcp on the chosen (default
-    dynamic) port, so an AI agent may optionally attach to the same live session.
+    Runs `biopb-mcp --view` as a foreground child sharing this terminal's stdio
+    and process group, so Ctrl-C reaches it. Writes no PID file; still serves
+    /mcp so an agent may attach.
 
-    Implemented by running `biopb-mcp --view` as a foreground child that shares
-    this terminal's stdio and process group, so Ctrl-C reaches it directly (its
-    own SIGINT handler reaps the kernel/viewer). This CLI stays free of the heavy
-    napari/Qt import — it only launches and waits.
-
-    Requires a running control plane (biopb/biopb#628), checked here rather than
-    after the child's multi-second napari import: the control is the only source
-    of a data plane, so a viewer started without one could open nothing. Unlike
-    the stdio shim we do not start it — a person is at this terminal and can.
+    Requires a running control plane, checked before the child's slow napari
+    import; it is not started here because a person is at the terminal.
     """
     _require_biopb_mcp()
     _require_control_for_view()
@@ -637,8 +546,7 @@ def mcp_view(
         str(resolved_port),
     ]
     console.print("[green]Opening biopb-mcp viewer (Ctrl-C to stop)...[/green]")
-    # Foreground: NO _detach_kwargs — inherit this terminal's stdio and stay in
-    # its process group so Ctrl-C (SIGINT / CTRL_C_EVENT) reaches the launcher.
+    # Foreground: no _detach_kwargs, so Ctrl-C reaches the child.
     try:
         process = subprocess.Popen(cmd, env=os.environ.copy())
     except OSError as exc:
@@ -647,8 +555,7 @@ def mcp_view(
     try:
         raise typer.Exit(process.wait())
     except KeyboardInterrupt:
-        # Ctrl-C already reached the child via the shared group; give it a moment
-        # to tear the kernel/viewer down, then force-reap if it overruns.
+        # Ctrl-C already reached the child; let it tear down, then force-reap.
         try:
             process.wait(timeout=20)
         except Exception:
@@ -662,11 +569,8 @@ app.add_typer(mcp_app, name="mcp")
 # ---------------------------------------------------------------------------
 # biopb control: the control plane (supervises the durable planes)
 # ---------------------------------------------------------------------------
-# `biopb control` manages the lean control-plane process (the `biopb-control`
-# package). Since the de-daemonization
-# (biopb-mcp/ARCHITECTURE.md): the control plane becomes the
-# durable root that supervises the tensor server, so `_connection` no longer
-# shells out `biopb server start` -- it asks the control plane to ensure the data plane.
+# `biopb control` manages the `biopb-control` process, the durable root that
+# supervises the tensor server.
 control_app = typer.Typer(
     name="control",
     help="Manage the control plane, which supervises the data plane.",
@@ -676,8 +580,7 @@ control_app = typer.Typer(
 def _require_biopb_control() -> None:
     """Exit(1) with an install hint if the biopb-control package is absent.
 
-    Checks the import *spec* (not a real import), matching _require_biopb_mcp, so
-    gating a command never imports the package.
+    Checks the import spec only, like _require_biopb_mcp.
     """
     import importlib.util
 
@@ -693,23 +596,14 @@ def _require_biopb_control() -> None:
 def _require_tls_extra() -> None:
     """Exit(2) with an install hint if ``--tls`` cannot possibly work.
 
-    ``cryptography`` is an opt-in extra (biopb/biopb#355 -- it drags a
-    Rust/OpenSSL build surface that breaks ``curl install.sh | bash`` on some
-    platforms), so a default install cannot mint the self-signed certificate
-    ``--tls`` needs.
+    ``cryptography`` is an opt-in extra, so a default install cannot mint the
+    self-signed certificate ``--tls`` needs. Without this check the control
+    starts cleanly while its supervised plane crash-loops, with the error only in
+    ``tensor-server.log``.
 
-    Without this check the failure lands in the *wrong place entirely*: the
-    control starts fine and reports success, then its supervised plane exits 2
-    on every spawn and crash-loops on backoff, with the one useful sentence
-    buried in ``tensor-server.log``. The user sees a control that started and a
-    data plane that never serves. Checking here fails the command the user
-    actually typed, before anything is spawned.
-
-    Same-interpreter check: the control is spawned as ``sys.executable -m
-    biopb_control`` and spawns the plane the same way, so this process's import
-    spec is the plane's (and ``sys.executable`` names the exact environment to
-    install into -- which a generic ``pip install`` hint would not, under the
-    ``uv tool`` layout the installer uses).
+    The control and plane are spawned via ``sys.executable``, so this process's
+    import spec is the plane's, and ``sys.executable`` names the environment to
+    install into.
     """
     import importlib.util
 
@@ -723,10 +617,8 @@ def _require_tls_extra() -> None:
     console.print(
         "[yellow]Install it into the environment that runs the data plane:[/yellow]"
     )
-    # The one line the reader must copy verbatim, so it gets the same treatment
-    # as a printed fingerprint: soft_wrap so a narrow terminal cannot break it
-    # across lines, and markup off because Rich reads a bare `[tls]` as a style
-    # tag and silently eats it.
+    # Copied verbatim: soft_wrap avoids line breaks; markup off because Rich
+    # would eat a bare `[tls]` as a style tag.
     console.print(
         f"    {sys.executable} -m pip install 'biopb-tensor-server[tls]'",
         soft_wrap=True,
@@ -743,14 +635,10 @@ def _require_tls_extra() -> None:
 def _control_endpoint() -> Tuple[str, int]:
     """Where to *find* a control: env override -> published record -> 8813.
 
-    The discovery form, for commands that talk to a control someone else started
-    (``status`` / ``stop`` / ``logs`` / ``dashboard``). A control started with a
-    non-default ``--base-port`` publishes its endpoint on serve, which is what
-    lets these follow it (see ``biopb._locations.control_runtime_file``).
-
-    Never used to decide a *bind* -- that is :func:`_control_bind_endpoint`.
-    Binding to a discovered value would mean a crashed control's stale record
-    dictates where the next one listens.
+    For commands that talk to a control someone else started; a non-default
+    ``--base-port`` is followed via ``biopb._config.locations.control_runtime_file``.
+    Never used to decide a *bind* (see :func:`_control_bind_endpoint`): a crashed
+    control's stale record must not dictate where the next one listens.
     """
     from ._control._endpoints import control_host, control_port
 
@@ -760,11 +648,9 @@ def _control_endpoint() -> Tuple[str, int]:
 def _control_bind_endpoint(base_port: int) -> Tuple[str, int]:
     """Where a control we are *starting* should listen: base+3, env still wins.
 
-    ``BIOPB_CONTROL_HOST`` / ``BIOPB_CONTROL_PORT`` keep top precedence so the
-    pre-base-port escape hatch still works and a reader and a writer that both
-    honor the env can never disagree; otherwise the port comes from the base and
-    nowhere else -- notably *not* from the published record, which describes some
-    other (possibly dead) control.
+    ``BIOPB_CONTROL_HOST`` / ``BIOPB_CONTROL_PORT`` take top precedence;
+    otherwise the port comes from the base, never from the published record
+    (which describes some other, possibly dead, control).
     """
     from ._control._endpoints import CONTROL_DEFAULT_HOST, control_port_for
 
@@ -781,19 +667,15 @@ def _control_bind_endpoint(base_port: int) -> Tuple[str, int]:
 def _print_ui_tunnel_hint(control_port: int) -> None:
     """Print the SSH-tunnel recipe for reaching the browser UI off-box.
 
-    ``--remote`` publishes the flight plane and nothing else: the control serves
-    plaintext HTTP and has no TLS support, so a public bind would carry the
-    data-plane token — which unlocks the data *and* admin API — in the clear
-    (biopb/biopb#614). A tunnel gets encryption and authentication for free, adds
-    no listener, and is the pattern Jupyter users already know. Print it here so
-    it is discoverable at the moment the user needs it, rather than folklore.
+    A public bind publishes the flight plane only: the control serves plaintext
+    HTTP, so publishing it would expose the data-plane token (which unlocks the
+    admin API) in the clear.
     """
     import socket
 
     host = socket.gethostname() or "<host>"
     console.print("  Browser UI: loopback only. From another machine, tunnel it:")
-    # soft_wrap so a narrow terminal cannot break the one line the reader has to
-    # copy verbatim (same treatment as the pip hint in _require_tls_extra).
+    # soft_wrap: the line is copied verbatim.
     console.print(
         f"    [bold]ssh -L {control_port}:localhost:{control_port} {host}[/bold]",
         soft_wrap=True,
@@ -803,8 +685,7 @@ def _print_ui_tunnel_hint(control_port: int) -> None:
 
 
 def _control_log_file() -> Path:
-    """The control plane's own supervision / control-API log (distinct from the data
-    plane's tensor-server.log, which the supervised server keeps writing)."""
+    """The control plane's own log (distinct from the data plane's tensor-server.log)."""
     return _locations.control_log()
 
 
@@ -818,20 +699,16 @@ def _remove_control_pid() -> None:
 
 
 def _control_shutdown_sentinel() -> Path:
-    """The control plane's Windows stop-sentinel path (watched by biopb_control._run).
-    A single fixed name under the biopb state dir, like the other daemons'."""
+    """The control plane's Windows stop-sentinel path (watched by biopb_control._run)."""
     return _locations.control_stop_sentinel()
 
 
 def _control_start_lock() -> Path:
     """Cross-process lock file serializing `biopb control start`.
 
-    The launcher, the installer, and -- once the shim starts the control on demand
-    -- racing agent sessions can all invoke `control start` at once. Holding this
-    lock across the check-then-spawn below makes it atomic between processes:
-    without it two starters can both see "no pidfile", both spawn a control, and
-    the bind-loser's parent overwrite/remove the live winner's pidfile, orphaning a
-    control that `control stop` can no longer reach. See biopb.lifecycle.file_lock.
+    Concurrent starters (launcher, installer, agent sessions) would otherwise
+    both see "no pidfile" and the bind-loser could clobber the winner's pidfile,
+    orphaning a control `control stop` cannot reach. See biopb._lifecycle.file_lock.
     """
     return CONTROL_PID_FILE.parent / "control.start.lock"
 
@@ -839,11 +716,8 @@ def _control_start_lock() -> Path:
 def _resolve_grpc_bind(grpc_bind: Optional[str], remote: bool) -> str:
     """The flight bind from ``--grpc-bind``, honoring the deprecated ``--remote``.
 
-    ``--remote`` named a *mode* back when it also published the browser UI. Since
-    biopb/biopb#614 it sets one thing — the flight address — so the flag is now
-    named for that. It survives as an alias because it is in install scripts,
-    service units, and every doc; an explicit ``--grpc-bind`` wins over it, since
-    naming an address is more specific than asking for "public".
+    ``--remote`` is a deprecated alias for ``--grpc-bind 0.0.0.0``; an explicit
+    ``--grpc-bind`` wins.
     """
     if grpc_bind is None:
         if remote:
@@ -863,17 +737,9 @@ def _resolve_grpc_bind(grpc_bind: Optional[str], remote: bool) -> str:
 def _resolve_tls(tls: Optional[bool], grpc_bind: str) -> bool:
     """Whether to serve the flight plane over TLS. **The bind decides the default.**
 
-    A public flight bind defaults TLS *on*; loopback defaults it off. Tying it
-    this way round — bind drives TLS, not TLS drives bind — keeps each flag's
-    name matching its own effect, and makes the dangerous combination the one you
-    have to ask for by name: ``--grpc-bind 0.0.0.0 --no-tls`` puts the access
-    token on the wire in cleartext on every gRPC call, which is precisely the
-    objection biopb/biopb#614 raised about the control, transplanted onto the
-    data plane. It stays *possible* — a trusted intranet is a real deployment —
-    but it is spelled out rather than defaulted into.
-
-    ``--tls`` alone therefore still means "encrypted, loopback only", which is
-    what exercising the TOFU pinning and SAN-verification paths (#606) needs.
+    A public flight bind defaults TLS on; loopback defaults it off. The
+    cleartext combination (``--grpc-bind 0.0.0.0 --no-tls``) must be asked for
+    by name. ``--tls`` alone means "encrypted, loopback only".
     """
     if tls is not None:
         return tls
@@ -885,19 +751,13 @@ def _resolve_tls_material(
 ) -> bool:
     """Validate BYO TLS material and return whether the plane serves TLS.
 
-    A supplied cert means TLS whether or not ``--tls`` was also passed: the plane
-    serves it either way, and this is also the flag the control advertises the
-    plane's scheme from, so leaving it false would publish ``grpc://`` for a
-    ``grpcs://`` plane.
+    A supplied cert means TLS even without ``--tls``; the control advertises the
+    plane's scheme from this result.
 
-    Validated here, in the command the user typed, for the same reason
-    :func:`_require_tls_extra` is: a half pair, or material the server cannot
-    read, exits 2 in the supervised child -- which crash-loops on backoff with
-    the one useful sentence in tensor-server.log while the control reports a
-    clean start (biopb/biopb#913). Each file is opened rather than stat'd: a key
-    readable only by root passes ``is_file()`` and fails everything after it. The
-    rule is shared with the other two entry points that resolve this same pair
-    (:mod:`biopb._tls_material`).
+    Validated here for the same reason as :func:`_require_tls_extra` (otherwise
+    the supervised child crash-loops under a clean-looking start). Each file is
+    opened rather than stat'd, since an unreadable key passes ``is_file()``. The
+    rule is shared via :mod:`biopb._security.tls_material`.
     """
     if (tls_cert is None) != (tls_key is None):
         console.print("[red]--tls-cert and --tls-key must be given together.[/red]")
@@ -927,34 +787,22 @@ def _warn_public_plaintext(grpc_bind: str, tls: bool) -> None:
 def _resolve_mode(grpc_bind: str, token: Optional[str]) -> Optional[str]:
     """Resolve the data-plane token for the chosen flight bind.
 
-    Token enforcement is **independent** of the network mode: a token may be
-    supplied — via ``--token`` or ``BIOPB_TENSOR_TOKEN`` — with *either* bind, so
-    a single-machine deployment can still gate its listeners for defense-in-depth
-    on a shared host. What ``--grpc-bind`` controls is who can reach the plane.
+    A token (``--token`` or ``BIOPB_TENSOR_TOKEN``) is enforced with either bind.
 
-    - **Loopback** (the default): a token is *optional*; when one is supplied it
-      is enforced (the browser then gates behind the unlock page just the same).
-    - **Public**: the flight server is reachable off-box, so a token is
-      **required** — supplied, or else generated and printed.
+    - **Loopback** (the default): optional.
+    - **Public**: required -- supplied, else generated and printed.
 
-    The control (the browser UI) stays on loopback with *either* bind; it is
-    plaintext HTTP with no TLS support, so publishing it would put this very
-    token on the wire in the clear (biopb/biopb#614). Reach it over an SSH tunnel.
-
-    "Public but unauthenticated" is therefore unrepresentable through this
-    command: the one address that decides exposure is the one this reads, through
-    the same :func:`biopb._web_auth.host_is_public_bind` the tensor ``launch`` and
-    the control's own bind guard use, so the three cannot drift.
+    The control (browser UI) stays on loopback with either bind (plaintext HTTP).
+    Exposure is decided by :func:`biopb._security.web_auth.host_is_public_bind`, shared with
+    the tensor ``launch`` and the control's bind guard, so they cannot drift.
 
     Returns the token to enforce (``None`` only when none is supplied on a
     loopback bind).
     """
     token = token or os.environ.get("BIOPB_TENSOR_TOKEN")
     if token:
-        # Validate here with the shared rule the tensor `launch` applies, so the
-        # two layers can't disagree: an invalid token this layer accepted would be
-        # silently regenerated (remote) or ignored (local) downstream, leaving the
-        # browser holding a token the data plane rejects.
+        # Same rule as the tensor `launch`; an invalid token accepted here would
+        # be silently regenerated or ignored downstream.
         token = token.strip()
         if not _web_auth.valid_token(token):
             console.print(
@@ -991,9 +839,7 @@ def _query_control_health(host: str, port: int, timeout: float = 2.0) -> Optiona
 def _flight_location(grpc_bind: str, base_port: int, tls: bool) -> str:
     """The flight plane's dial string, e.g. ``grpcs://0.0.0.0:8815``.
 
-    Printed at startup because ``--base-port`` makes the port a computation: an
-    operator who firewalled "8815" by habit needs to see where it actually landed,
-    and whether it is plaintext or TLS.
+    Printed at startup because ``--base-port`` makes the port a computation.
     """
     host, port = _plane_bind(grpc_bind, base_port)
     scheme = "grpcs" if tls else "grpc"
@@ -1004,14 +850,8 @@ def _flight_location(grpc_bind: str, base_port: int, tls: bool) -> str:
 def _guard_ports_free(base_port: int, grpc_bind: str, data_plane: bool) -> None:
     """Refuse to start into a port something already holds, naming which one.
 
-    Shared by ``control start`` and ``control run`` -- the foreground command used
-    to skip this entirely and crash-land in uvicorn's bind error instead, which is
-    the same deployment failing with a worse message.
-
-    All three listeners are checked. The sidecar was previously unguarded, which
-    was survivable while it was pinned to 8814 but is not now that ``--base-port``
-    can land it on anything: an unguarded collision surfaces as a control that
-    starts clean and then crash-loops its plane in the background.
+    Checks all three listeners; an unguarded collision surfaces as a control
+    that starts clean and then crash-loops its plane.
     """
     checks = [("Control-plane", *_control_bind_endpoint(base_port))]
     if data_plane:
@@ -1034,10 +874,8 @@ def _guard_ports_free(base_port: int, grpc_bind: str, data_plane: bool) -> None:
 def _resolve_url_prefix(url_prefix: Optional[str]) -> Optional[str]:
     """Normalize ``--url-prefix`` / ``$BIOPB_URL_PREFIX``, or exit naming the fault.
 
-    Rejected here, before anything is spawned or bound, because the prefix ends
-    up in the served ``<base href>``: a value that is not a plain same-origin
-    path would repoint every relative URL in the SPA (biopb/biopb#728). The rule
-    itself lives in biopb_control, next to the code that consumes it.
+    Rejected before anything is spawned: the prefix ends up in the served
+    ``<base href>``. The rule lives in biopb_control.
     """
     from biopb_control._control import normalize_url_prefix
 
@@ -1066,22 +904,12 @@ def _control_run_argv(
 ) -> List[str]:
     """Build the `python -m biopb_control run ...` argv `control start` spawns.
 
-    The core CLI resolves everything (binds, ports, token, log paths) and passes
-    it explicitly, so biopb_control imports no server config (invariant I2) and
-    knows nothing of the base-port convention -- it receives three already-derived
-    ports. The supervised tensor server logs to tensor-server.log; the control
-    plane's own output is redirected by the caller to control.log.
+    Everything (binds, ports, log paths) is resolved here and passed explicitly,
+    so biopb_control imports no server config and knows nothing of base ports.
 
-    The access token is **not** on this argv: a command line is world-readable
-    (`ps aux`, Task Manager) on exactly the multi-user hosts a token is meant to
-    protect (biopb/biopb#414). It travels only via ``BIOPB_TENSOR_TOKEN`` in the
-    child env (set by the caller).
-
-    No ``--remote`` either, and not because it is secret: ``--grpc-host`` below
-    already carries the one fact it used to signal. The child re-derives "is this
-    deployment public?" from that address with the shared predicate, so the two
-    layers cannot disagree about it (biopb/biopb#614). The control's own listener
-    stays on loopback regardless.
+    The access token is not on this argv (world-readable); it travels only via
+    ``BIOPB_TENSOR_TOKEN`` in the child env, set by the caller. The child
+    re-derives "public?" from ``--grpc-host``.
     """
     grpc_host, grpc_port = _plane_bind(grpc_bind, base_port)
     control_host, control_port = _control_bind_endpoint(base_port)
@@ -1115,17 +943,13 @@ def _control_run_argv(
     if static_dir and static_dir.exists():
         argv += ["--static-dir", str(static_dir)]
     if url_prefix:
-        # Not secret (it is a hostname and a port), unlike the token above.
         argv += ["--url-prefix", url_prefix]
     if grpc_external_location:
-        # Not secret either -- an address, not a credential.
         argv += ["--grpc-external-location", grpc_external_location]
     if not data_plane:
         argv.append("--no-data-plane")
     if tls:
         argv.append("--tls")
-    # Paths and hostnames, not secrets -- unlike the token above, these belong on
-    # the argv (biopb/biopb#913).
     if tls_cert and tls_key:
         argv += ["--tls-cert", str(tls_cert), "--tls-key", str(tls_key)]
     for name in san or ():
@@ -1135,12 +959,8 @@ def _control_run_argv(
 
 # --- shared `control start` / `control run` options ----------------------- #
 #
-# The two commands stand up the *same* deployment; only process ownership
-# differs (daemon vs foreground). Their flags therefore have to agree, and they
-# had drifted -- same option set, three different help texts, so `--help` told
-# you different things depending on which you asked. One `typer.Option` object
-# per flag, referenced by both, makes that unrepresentable instead of a review
-# item. Anything genuinely command-specific stays declared inline.
+# One `typer.Option` per flag, shared so the commands' flags and help agree.
+# Command-specific flags stay declared inline.
 
 _OPT_CONFIG = typer.Option(
     DEFAULT_CONFIG, "--config", "-c", help="Tensor-server config (biopb.json)"
@@ -1277,72 +1097,45 @@ def control_start(
 ):
     """Start the biopb control plane as a background daemon.
 
-    The control plane supervises the tensor (data) plane -- and by default brings it up
-    on start, so `biopb control start` is the single command that stands up a local
-    deployment. It is the *sole owner* of the plane: it always spawns and manages
-    its own tensor server, restarts it on crash, and answers clients that ask it
-    to ensure the plane is up. It does not adopt a server it did not start -- if
-    the gRPC port is already in use, `control start` refuses (stop the stray server
-    first), so `biopb control stop` is always a complete data-plane teardown.
+    The control plane is the sole owner of the tensor (data) plane: it spawns it
+    (by default on start), restarts it on crash, and never adopts a server it did
+    not start -- if the gRPC port is in use, `control start` refuses, so
+    `biopb control stop` is always a complete teardown.
 
-    **Ports** come from one number, ``--base-port`` (default 8810): control =
-    base+3, sidecar = base+4, flight = base+5 — the container's convention. A
-    control that moved off 8813 publishes where it landed, so `stop` / `status` /
-    `logs` and biopb-mcp follow it without being told.
+    **Ports** come from ``--base-port`` (default 8810): control = base+3,
+    sidecar = base+4, flight = base+5. A moved control publishes where it landed,
+    so `stop` / `status` / `logs` and biopb-mcp follow it.
 
-    **Exposure** comes from one address, ``--grpc-bind`` (default 127.0.0.1).
-    Loopback is the single-machine 90% case, tokenless unless you pass ``--token``
-    (defense-in-depth on a shared machine). A public address serves the data plane
-    to other machines, and then a token is *required* and TLS is on by default —
-    the bind is read once, through the predicate the tensor `launch` and the
-    control's own guard share, so "public but unauthenticated" is unrepresentable
-    rather than something to validate against (biopb/biopb#604).
+    **Exposure** comes from ``--grpc-bind`` (default 127.0.0.1), read through the
+    predicate shared with the tensor `launch` and the control's guard. A public
+    address requires a token and defaults TLS on, and also requires
+    ``--grpc-external-location`` (a wildcard bind is not dialable), forwarded
+    verbatim to the data plane, which enforces it.
 
-    A public ``--grpc-bind`` also requires ``--grpc-external-location`` -- the
-    address a *different* machine dials to reach the plane, since a wildcard
-    bind is not itself a dialable address (e.g. an HPC scheduler's assigned
-    FQDN). Forwarded verbatim to the data plane, which is where it is both
-    required and enforced.
+    **Long-lived certificate.** ``--tls`` alone mints a self-signed cert that
+    clients pin on first connect. ``--tls-cert`` / ``--tls-key`` serve an
+    operator's own cert instead (no ``cryptography`` needed); ``--san`` names
+    addresses a minted cert cannot discover. A supplied cert needs a
+    ``localhost`` / ``127.0.0.1`` SAN (the sidecar dials over loopback) and a
+    copy (never the key) at ``state/biopb/tls/server-cert.pem`` for local SDK
+    clients.
 
-    **A certificate that outlives one launch.** ``--tls`` alone mints a
-    self-signed cert into the state tree and clients pin it on first connect, so
-    a deployment that re-mints — a per-job state tree, an ephemeral container
-    volume — hands a returning client a certificate it refuses. ``--tls-cert`` /
-    ``--tls-key`` serve an operator's own long-lived cert instead (no
-    ``cryptography`` needed), and ``--san`` names addresses a minted cert could
-    not discover for itself; both are forwarded to the data plane.
-
-    A supplied cert has to satisfy the two consumers *on this machine*, which the
-    minted one satisfies by construction: the co-located sidecar dials the plane
-    over loopback, so the cert needs a ``localhost`` / ``127.0.0.1`` SAN, and a
-    local SDK client anchors on ``state/biopb/tls/server-cert.pem``, so a copy of
-    the cert (never the key) belongs there as well.
-
-    Only the flight plane is ever published. The tensor HTTP sidecar stays on
-    loopback (the control proxies it), and so does the control itself — the
-    browser UI is plaintext HTTP with no TLS support, so publishing it would send
-    the token that unlocks the whole data and admin API in the clear, which is
-    exactly the client class the TLS work set out to remove (biopb/biopb#614). To
-    open the UI from another machine, tunnel it: ``ssh -L 8813:localhost:8813
-    <host>``, then browse http://localhost:8813.
+    Only the flight plane is ever published; the sidecar and the control stay on
+    loopback (plaintext HTTP). To reach the UI from another machine, tunnel it:
+    ``ssh -L 8813:localhost:8813 <host>``.
     """
     _require_biopb_control()
     grpc_bind = _resolve_grpc_bind(grpc_bind, remote)
     url_prefix = _resolve_url_prefix(url_prefix)
     tls = _resolve_tls_material(_resolve_tls(tls, grpc_bind), tls_cert, tls_key)
-    # A BYO cert is read straight off disk, so it is the escape hatch when the
-    # extra is not installed -- only a cert the plane has to *mint* needs it.
+    # A BYO cert needs no `cryptography`; only a minted one does.
     if tls and tls_cert is None:
         _require_tls_extra()
     _warn_public_plaintext(grpc_bind, tls)
     _ensure_dirs()
 
-    # Serialize concurrent starts so the check-then-spawn below is atomic across
-    # processes (see _control_start_lock / biopb.lifecycle.file_lock). Held through the
-    # readiness wait too, so a second starter that was blocked wakes to a fully
-    # started control (pidfile written, port listening) and reports the idempotent
-    # "already running" rather than racing a half-up one. The lock auto-releases if
-    # a holder dies, so a crashed starter leaves nothing to clean up.
+    # Serialize concurrent starts (see _control_start_lock); held through the
+    # readiness wait so a blocked starter sees a fully started control.
     try:
         with file_lock(_control_start_lock(), timeout=30.0):
             existing_pid, existing_token = _read_pid_record(CONTROL_PID_FILE)
@@ -1357,9 +1150,7 @@ def control_start(
                 )
                 _remove_control_pid()
 
-            # A foreground `control run` writes no pid file, only the endpoint
-            # record; without this a second control would start on the default
-            # ports and overwrite that record.
+            # A foreground control writes only the endpoint record, no pid file.
             live = _live_foreground_control()
             if live:
                 record, live_pid = live
@@ -1376,8 +1167,7 @@ def control_start(
             argv = _control_run_argv(
                 config=config,
                 static_dir=static_dir,
-                # The sidecar always binds loopback; the control proxies it. The
-                # flight server is the only listener --grpc-bind can publish.
+                # The sidecar always binds loopback; the control proxies it.
                 web_host="127.0.0.1",
                 base_port=base_port,
                 log_level=log_level,
@@ -1397,9 +1187,7 @@ def control_start(
             console.print(f"  Config: {config}")
             env = os.environ.copy()
             if resolved_token:
-                # The token travels to the control child (and on to the tensor
-                # server) via the env only, never the argv (biopb/biopb#414):
-                # biopb_control reads it back off BIOPB_TENSOR_TOKEN.
+                # Env only, never the argv; biopb_control reads it back.
                 env["BIOPB_TENSOR_TOKEN"] = resolved_token
             with open(log_file, "a") as log:
                 log.write(
@@ -1450,16 +1238,10 @@ def control_start(
 def _live_foreground_control() -> Optional[Tuple[dict, int]]:
     """The published record of a live foreground control, as ``(record, pid)``.
 
-    A foreground `biopb control run` writes no pid file -- its terminal or
-    service manager owns it -- so this endpoint record is the only trace of it.
-    Verified for *identity*, not merely liveness: a clean stop retracts the
-    record, so the way to strand one is a crash, and a pid recycled since then
-    would otherwise read as a control still serving. `_is_our_daemon` compares
-    the recorded create-time token and refuses to vouch for a different process.
-
-    Falls back to liveness when the record carries no usable token (written
-    before the field existed, or a platform with no cheap create-time), matching
-    the pid file's own degradation -- never a false "not running".
+    A foreground control writes no pid file, so its endpoint record is the only
+    trace. Verified for identity, not just liveness: a crash can strand the
+    record and the pid may be recycled, so `_is_our_daemon` compares the recorded
+    create-time token. Falls back to liveness when the record has no usable token.
     """
     record = _endpoints.read_runtime_record()
     pid = record.get("pid")
@@ -1479,20 +1261,14 @@ def control_stop(
 ):
     """Stop the biopb control plane and the data plane it owns.
 
-    The control plane owns the data plane exclusively, so stopping it is a complete
-    teardown: the supervised tensor server is shut down too. This is the single
-    command an installer/upgrade uses to free the control-managed processes before
-    replacing files.
-
-    Only reaches a *daemonized* control (`biopb control start`). A foreground
-    `biopb control run` belongs to its terminal or service manager, so this
-    reports it and declines rather than signalling a process it does not own.
+    Stopping the control also shuts down the supervised tensor server. Only
+    reaches a daemonized control; a foreground one belongs to its terminal or
+    service manager, so this reports it and declines.
     """
     _require_biopb_control()
     pid, token = _read_pid_record(CONTROL_PID_FILE)
     if not pid:
-        # `status` reports a foreground control as Running, so "nothing running"
-        # here would flatly contradict it. Say which one is up and who owns it.
+        # `status` reports a foreground control as Running; stay consistent.
         live = _live_foreground_control()
         if live:
             record, record_pid = live
@@ -1546,10 +1322,7 @@ def control_status(
     running = _is_our_daemon(pid, token)
     stale = bool(pid and not running)
 
-    # A foreground `control run` writes no pid file -- the terminal or service
-    # manager owns it -- so it used to report "not running" however healthy it
-    # was. It does publish its endpoint, though, so fall back to that record and
-    # report it honestly rather than denying it exists.
+    # A foreground control has no pid file; fall back to its endpoint record.
     foreground = False
     if not running:
         live = _live_foreground_control()
@@ -1616,13 +1389,9 @@ def control_logs(
 ):
     """Show the control plane's log, or the data plane's with --data-plane.
 
-    Two logs, because the control plane is two processes: the control writes its
-    own supervision / control-API log (control.log, the default here), and the
-    tensor server it supervises keeps writing the data-plane log
-    (tensor-server.log) that the control redirects its child's output to.
-
-    Reads the file straight off disk rather than through the control API, so it
-    works on a stopped or wedged control -- which is when the log matters most.
+    Two logs: control.log (default) and the supervised tensor server's
+    tensor-server.log. Read straight off disk, so it works on a stopped or
+    wedged control.
     """
     log_file = (
         _get_log_file() if data_plane else _control_log_file()  # tensor-server.log
@@ -1640,24 +1409,7 @@ def control_logs(
     "true foreground process.",
 )
 def control_run() -> None:
-    """Removed (biopb/biopb#736).
-
-    This command built a ``DataPlaneSpec`` and called ``run_control()``
-    in-process, which bypassed the fail-closed guard on a public
-    ``--control-host`` that ``biopb-control run``/``python -m biopb_control
-    run`` (``biopb_control/__main__.py``) already enforces -- the same guard
-    `biopb control start` goes through as a matter of course, since it spawns
-    exactly that entry point as its child. Retiring the duplicate closes the
-    gap for good rather than keeping a second copy of the same check in sync
-    by hand.
-
-    For the same deployment with the same defaults, use `biopb control start`.
-    A true foreground process (a systemd/launchd unit, an Open OnDemand app,
-    debugging supervision) runs `biopb-control run` directly -- but unlike this
-    command, it fills in none of the defaults `--config`/`--static-dir` used to
-    resolve on their own, and every other setting individually rather than
-    deriving them from ``--base-port``; see `biopb-control run --help`.
-    """
+    """Removed; points to `biopb control start` or `biopb-control run`."""
     console.print(
         "[red]`biopb control run` has been removed (biopb/biopb#736).[/red]\n"
         "For the same deployment with the same defaults, use [bold]biopb "
@@ -1697,18 +1449,15 @@ def dashboard(
 ):
     """Open the biopb dashboard, starting the control plane first if needed.
 
-    The one-command way in: it makes sure the control plane (which owns the data
-    plane and serves the web UI) is running, then points your default web browser
-    at the dashboard. Idempotent -- if the control plane is already up it just
-    opens the page. This is what the desktop shortcut the installer creates runs.
+    Ensures the control plane is running, then opens the dashboard; idempotent.
+    This is what the installer's desktop shortcut runs.
 
     ``--base-port`` / ``--grpc-bind`` / ``--grpc-external-location`` are
     forwarded to `biopb control start` and only matter when there is nothing
     running to open.
     """
-    # Prefer a control that is already serving -- it publishes its endpoint, so
-    # this finds one that `--base-port` moved. Fall back to where we *would* start
-    # one, which is also what a first run resolves to.
+    # Prefer a serving control (finds one `--base-port` moved), else where we
+    # would start one.
     control_host, control_port = _control_endpoint()
     if not _port_listening(control_host, control_port):
         control_host, control_port = _control_bind_endpoint(base_port)
@@ -1717,15 +1466,11 @@ def dashboard(
     if _port_listening(control_host, control_port):
         console.print(f"[green]biopb control plane already running[/green] ({url})")
     else:
-        # Reuse `biopb control start`'s full start/port-guard/readiness logic (it
-        # returns only once the control API is listening). It signals its outcome
-        # by raising typer.Exit; a non-zero code means the plane never came up, so
-        # bail out rather than open a browser at a dead URL.
+        # control_start returns once the control API listens; a non-zero
+        # typer.Exit means it never came up.
         #
-        # EVERY parameter has to be passed explicitly: called as a plain function
-        # the typer defaults are not applied, so an omitted one arrives as the
-        # `OptionInfo` sentinel — truthy, and not the type the body expects.
-        # test_ui_passes_every_control_start_parameter holds this to the signature.
+        # Every parameter must be passed explicitly: called as a plain function,
+        # typer defaults are not applied and arrive as `OptionInfo` sentinels.
         try:
             control_start(
                 config=DEFAULT_CONFIG,
@@ -1765,10 +1510,7 @@ def dashboard(
 # ---------------------------------------------------------------------------
 # biopb agents: register biopb-mcp with local AI agent clients
 # ---------------------------------------------------------------------------
-# The installer wires biopb into detected MCP clients once at install time; these
-# commands do the same afterwards (install Claude Code later, register it now),
-# over the shared, stdlib-only catalog in biopb._agents -- the single source of
-# truth both this CLI and the control-plane dashboard call.
+# Uses the stdlib-only catalog in biopb._control._agents, shared with the dashboard.
 agents_app = typer.Typer(
     name="agents",
     help="Register biopb-mcp with local AI agent clients.",
@@ -1783,8 +1525,7 @@ _AGENT_STATE_STYLE = {
 
 
 def _agent_state_label(row: dict) -> str:
-    """Human label for a status row (``drifted`` annotated so a stale entry that
-    needs a Re-register is visible)."""
+    """Human label for a status row, annotating a stale (``drifted``) entry."""
     state = row["state"]
     if state == "registered" and row.get("drifted"):
         return "registered (drifted)"
@@ -1800,11 +1541,8 @@ def _resolve_agent_targets(
 ) -> List[str]:
     """The client ids a register/unregister should act on.
 
-    An explicit ``client`` acts on exactly that one (validated). ``--all`` acts on
-    every client whose current state is in ``states`` (e.g. skip ``not_installed``
-    for register, target only ``registered`` for unregister), matching the
-    installer's "only touch clients that are actually there" behavior. Exits 1 on
-    a bad/missing selector.
+    An explicit ``client`` acts on that one (validated); ``--all`` acts on every
+    client whose state is in ``states``. Exits 1 on a bad/missing selector.
     """
     ids = _known_agent_ids()
     if all_ and client:
@@ -1871,8 +1609,7 @@ def agents_register(
     ),
 ):
     """Register biopb-mcp with a client (or every detected client with --all)."""
-    # For --all, skip clients that aren't even installed; an explicit id is
-    # attempted regardless (a "register anyway" escape hatch).
+    # --all skips uninstalled clients; an explicit id is attempted regardless.
     targets = _resolve_agent_targets(client, all_, states={"installed", "registered"})
     if not targets:
         console.print("[yellow]No agent clients detected to register.[/yellow]")
@@ -1919,25 +1656,165 @@ def agents_unregister(
 app.add_typer(agents_app, name="agents")
 
 
+algorithm_app = typer.Typer(
+    name="algorithm",
+    help="List and manage the algorithm servers the control knows.",
+)
+
+_ALGORITHM_STATE_STYLE = {
+    "up": "green",
+    "installing": "yellow",
+    "starting": "yellow",
+    "new": "yellow",
+    "invalid": "yellow",
+    "unknown": "yellow",
+    "unreachable": "red",
+    "error": "red",
+}
+
+
+def _no_control() -> "typer.Exit":
+    console.print(
+        "[red]No control answered.[/red] Start it with [bold]biopb control start[/bold]."
+    )
+    return typer.Exit(1)
+
+
+def _algorithm_verb(call, *args, **kwargs):
+    """Run a control client verb, turning its errors into a message and exit 1."""
+    try:
+        return call(*args, **kwargs)
+    except (LookupError, ValueError, RuntimeError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+
+
+def _print_algorithm_rows(rows: list, json_output: bool) -> None:
+    if json_output:
+        print(json.dumps({"servers": rows}))
+        return
+    if not rows:
+        console.print(
+            "[yellow]No algorithm servers configured.[/yellow] Add a server file "
+            'or a {"url": ...} file to [bold]~/.config/biopb/algorithms/[/bold].'
+        )
+        return
+    table = Table(title="Algorithm servers")
+    table.add_column("Name", style="cyan")
+    table.add_column("Server", style="cyan")
+    table.add_column("Scheme", style="blue")
+    table.add_column("State")
+    table.add_column("Ops", style="magenta")
+    for r in rows:
+        if r["state"] == "up":
+            ops_cell = ", ".join(o.get("name", "") for o in r["ops"]) or "-"
+        else:
+            ops_cell = r.get("error") or "-"
+        style = _ALGORITHM_STATE_STYLE.get(r["state"], "white")
+        table.add_row(
+            r["name"],
+            r.get("target") or "-",
+            r.get("scheme") or "-",
+            f"[{style}]{r['state']}[/{style}]",
+            ops_cell,
+        )
+    console.print(table)
+
+
+@algorithm_app.command("list", help="List the algorithm servers with their state.")
+def algorithm_list(
+    json_output: bool = typer.Option(
+        False, "--json", help="Emit machine-readable JSON instead of a table"
+    ),
+    timeout: float = typer.Option(
+        4.0, "--timeout", help="Per-server probe deadline in seconds"
+    ),
+):
+    """List the entries of ~/.config/biopb/algorithms/ as the control reports
+    them: a server file the control runs, and a url entry it probes. Needs a
+    running control."""
+    from ._control import algorithms
+
+    # The control probes url entries under the same deadline before it answers.
+    rows = algorithms(timeout=timeout + 6)
+    if rows is None:
+        raise _no_control()
+    _print_algorithm_rows(rows, json_output)
+
+
+@algorithm_app.command("refresh", help="Re-read the registry and install new entries.")
+def algorithm_refresh(
+    json_output: bool = typer.Option(False, "--json", help="Emit JSON"),
+):
+    from ._control import refresh_algorithms
+
+    rows = refresh_algorithms()
+    if rows is None:
+        raise _no_control()
+    _print_algorithm_rows(rows, json_output)
+
+
+@algorithm_app.command(
+    "start", help="Bring a server file's server up, installing it first."
+)
+def algorithm_start(
+    name: str = typer.Argument(..., help="Registry entry name"),
+    timeout: float = typer.Option(600.0, "--timeout", help="Seconds to wait"),
+):
+    from ._control import ensure_algorithm
+
+    row = _algorithm_verb(ensure_algorithm, name, timeout=timeout)
+    _print_algorithm_rows([row], False)
+
+
+@algorithm_app.command("stop", help="Stop a server file's server.")
+def algorithm_stop(name: str = typer.Argument(..., help="Registry entry name")):
+    from ._control import stop_algorithm
+
+    row = _algorithm_verb(stop_algorithm, name)
+    _print_algorithm_rows([row], False)
+
+
+@algorithm_app.command(
+    "restart", help="Stop a server file's server and start it again."
+)
+def algorithm_restart(
+    name: str = typer.Argument(..., help="Registry entry name"),
+    timeout: float = typer.Option(600.0, "--timeout", help="Seconds to wait"),
+):
+    from ._control import restart_algorithm
+
+    row = _algorithm_verb(restart_algorithm, name, timeout=timeout)
+    _print_algorithm_rows([row], False)
+
+
+@algorithm_app.command("logs", help="Show the tail of a server file's log.")
+def algorithm_logs_cmd(
+    name: str = typer.Argument(..., help="Registry entry name"),
+    lines: int = typer.Option(200, "--lines", "-n", help="Lines to show"),
+):
+    from ._control import algorithm_logs
+
+    for line in _algorithm_verb(algorithm_logs, name, lines=lines):
+        print(line)
+
+
+app.add_typer(algorithm_app, name="algorithm")
+
+
 # ---------------------------------------------------------------------------
-# skip-windows-defender: Windows Defender exclusion for the biopb install (issue #384)
+# skip-windows-defender: Defender exclusion for the biopb install
 # ---------------------------------------------------------------------------
-# Windows Defender real-time scanning of biopb's DLLs / .pyd / .pyc on every
-# launch is the single largest first-start tax on Windows (see #384). Excluding
-# the install trees from scanning removes it -- both the uv tool env (deps) and
-# the base Python it runs on (stdlib .pyd + pythonXY.dll), which are separate
-# directories for a uv tool venv. This is the *privileged* half of #384 -- it
-# needs admin -- so it lives here as an opt-in command, separate from the
-# admin-free bytecode precompile the installer already does for everyone.
+# Defender scanning of biopb's DLLs / .pyd / .pyc is the largest first-start
+# cost on Windows. Excluding the install trees needs admin, so it is an opt-in
+# command, separate from the installer's admin-free bytecode precompile.
 
 
 def _is_windows() -> bool:
     """Whether we're on Windows.
 
-    A function (not an inline `os.name == "nt"`) so tests can simulate Windows
-    without monkeypatching the global `os.name` -- which `pathlib` reads to pick
-    WindowsPath vs PosixPath, so mutating it breaks every `Path(...)` in the
-    process (a WindowsPath can't be instantiated on POSIX before Python 3.13).
+    A function so tests can simulate Windows without patching `os.name`, which
+    `pathlib` reads.
     """
     return os.name == "nt"
 
@@ -1945,22 +1822,15 @@ def _is_windows() -> bool:
 def _defender_targets() -> List[str]:
     """The install trees to exclude -- every tree this interpreter reads at startup.
 
-    A uv tool venv is a venv pointing at a *separate* base Python, so two distinct
-    trees get read + Defender-scanned on every launch (verified against a real
-    installer-based install, #384):
+    A uv tool venv points at a separate base Python, so two trees are scanned:
 
-    * ``sys.prefix``      -- the tool env's ``Lib\\site-packages`` (numpy / PyQt6 /
-      grpcio / scipy / ... -- the heavy deps; ``Qt6\\bin`` alone is ~100 MB of DLLs).
-      It's ~half ``.pyd`` and ~half ``.dll``, so we exclude the *directory*, not
-      ``*.pyd``.
-    * ``sys.base_prefix`` -- the base interpreter + stdlib ``.pyd`` (``_ssl``,
-      ``_socket``, ``_ctypes``, ...) + ``pythonXY.dll``, loaded on every start.
+    * ``sys.prefix``      -- the tool env's site-packages (heavy deps; mixed
+      ``.pyd`` / ``.dll``, so the directory is excluded, not ``*.pyd``).
+    * ``sys.base_prefix`` -- the base interpreter, stdlib ``.pyd`` and
+      ``pythonXY.dll``.
 
-    They differ for a uv tool venv and coincide for a plain (non-venv) install, so
-    we dedup. Both come from the *running interpreter* -- never hardcode the uv
-    path, because the base Python can live outside ``%LOCALAPPDATA%\\uv`` entirely
-    (the installer's ``--python`` may pick a pre-existing interpreter). Sorted so
-    the elevated snippet and the status read agree on order.
+    They coincide for a non-venv install, so dedup. Taken from the running
+    interpreter, never a hardcoded uv path. Sorted for stable order.
     """
     return sorted({str(Path(p).resolve()) for p in (sys.prefix, sys.base_prefix)})
 
@@ -1973,18 +1843,11 @@ def _ps_string_array(paths: List[str]) -> str:
 def _run_elevated_ps(inner: str) -> int:
     """Run a PowerShell snippet elevated (one UAC prompt); return its exit code.
 
-    Writes the snippet to a temp .ps1 and launches it via
-    `Start-Process -Verb RunAs -Wait -PassThru`, propagating the elevated
-    process's exit code. A nonzero code also covers the launch itself failing --
-    most commonly the user declining the UAC prompt (Start-Process then throws,
-    so the outer shell exits nonzero).
+    A nonzero code also covers the launch failing (e.g. UAC declined).
     """
 
-    # utf-8-sig, not plain utf-8: Windows PowerShell 5.1 reads a BOM-less script
-    # as the ANSI code page, so a non-ASCII install path (e.g. an accented
-    # username in sys.prefix) would be misread -- and since the same misread $p
-    # feeds both Add-MpPreference and the -contains verify, the script would
-    # exit 0 while excluding the wrong path. The BOM pins UTF-8 decoding.
+    # utf-8-sig: PowerShell 5.1 reads a BOM-less script as the ANSI code page,
+    # misreading non-ASCII install paths while still exiting 0.
     with tempfile.NamedTemporaryFile(
         "w", suffix=".ps1", delete=False, encoding="utf-8-sig"
     ) as f:
@@ -2008,22 +1871,17 @@ def _run_elevated_ps(inner: str) -> int:
 
 
 def _defender_exclusion(targets: List[str], *, add: bool) -> None:
-    """Add/remove Defender exclusions for every tree in `targets` in ONE elevated
-    session (a single UAC prompt), then VERIFY.
+    """Add/remove Defender exclusions for `targets` in one elevated session, then verify.
 
-    Admin is necessary but not sufficient: Tamper Protection (consumer) or
-    Intune/GPO (managed) can silently no-op the write even when elevated. So the
-    elevated snippet re-reads Get-MpPreference and confirms *every* path reached
-    the intended state (exit 0 = all took, 3 = at least one blocked) rather than
-    assuming success from a clean return.
+    Tamper Protection or Intune/GPO can silently no-op the write even when
+    elevated, so the snippet re-reads Get-MpPreference (exit 0 = all took,
+    3 = at least one blocked).
     """
     verb = "Add" if add else "Remove"
-    # Verify each path reached its intended end-state; fail (exit 3) if any didn't.
     fail = "-not ($excl -contains $p)" if add else "($excl -contains $p)"
     ps_array = _ps_string_array(targets)
-    # Placeholder substitution (not an f-string) so PowerShell's literal { } blocks
-    # don't collide with brace escaping. Paths are substituted LAST so a path can
-    # never be re-interpreted as one of the other placeholders.
+    # Placeholders, not an f-string, to avoid escaping PowerShell braces; paths
+    # are substituted last so they cannot be re-interpreted as placeholders.
     inner = (
         "$ErrorActionPreference = 'Stop'\n"
         "$paths = @(__PATHS__)\n"
@@ -2072,13 +1930,10 @@ def _defender_exclusion(targets: List[str], *, add: bool) -> None:
 
 
 def _defender_status(targets: List[str]) -> None:
-    """Print whether the biopb trees are currently Defender exclusions
-    (best-effort, no admin).
+    """Print whether the biopb trees are Defender exclusions (best-effort, no admin).
 
-    Get-MpPreference is usually readable by a normal user; when it isn't we say
-    'unknown' rather than guess. With more than one tree the state can also be
-    PARTIAL (some excluded, some not -- e.g. after upgrading from the earlier
-    single-path version that excluded only sys.prefix).
+    Reports 'unknown' when Get-MpPreference is unreadable, and PARTIAL when only
+    some trees are excluded.
     """
     ps_array = _ps_string_array(targets)
     inner = (
@@ -2144,12 +1999,9 @@ def skip_windows_defender(
 ):
     """Speed up biopb startup on Windows via a Defender exclusion (issue #384).
 
-    Windows Defender rescans biopb's DLLs / .pyd / .pyc on every launch, which
-    dominates the first-start wait. This adds (or removes, with --disable) Defender
-    exclusions for the biopb install trees -- both the tool env (heavy deps) and
-    the base Python it runs on (stdlib .pyd + pythonXY.dll) -- so those files
-    aren't rescanned. It needs admin -- one UAC prompt -- and is fully reversible.
-    Windows only.
+    Adds (or removes, with --disable) Defender exclusions for the tool env and
+    base Python so biopb's files aren't rescanned. Needs admin (one UAC prompt);
+    reversible. Windows only.
     """
     if not _is_windows():
         console.print(
@@ -2185,11 +2037,9 @@ def uninstall(
 ):
     """Uninstall biopb by running the uninstaller saved by the install.
 
-    Each install saves its own release's uninstaller under the data tree, so the
-    code that installed biopb is the code that removes it; this command only hands
-    over to it. The uninstaller deletes the tool environment this process runs
-    from, so it replaces the process (POSIX) or outlives it in its own console
-    (Windows) rather than running as a child that holds the environment open.
+    Hands over to the uninstaller saved by the install. It deletes the
+    environment this process runs from, so it replaces the process (POSIX) or
+    outlives it in its own console (Windows).
     """
     script = _saved_uninstaller()
     if not script.is_file():

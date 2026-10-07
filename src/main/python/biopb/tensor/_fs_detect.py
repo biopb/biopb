@@ -1,32 +1,13 @@
-"""Best-effort classification of a cache directory's storage: plain local disk,
-or something -- network, cloud-synced, or RAM -- that an mmap cache can't use.
+"""Best-effort classification of a cache directory's storage: local disk, or
+network / cloud-synced / RAM storage that an mmap cache can't use.
 
-Lives in the core ``biopb`` SDK rather than the tensor server because it has two
-tenants that may not import each other: the server's Arrow file cache, and the
-SDK's own on-disk chunk cache (``biopb.tensor._diskcache``, which cannot import
-the server -- it isn't on PyPI). Same reasoning that put ``lifecycle.file_lock``
-and the ``_config_*`` modules here. Stdlib-only, so it costs an importer nothing.
+Network filesystems can SIGBUS/ESTALE a mapping of a removed file, and cloud
+Files-On-Demand folders stall mmap reads on a recall; callers fall back to the
+in-memory backend. Stdlib-only (shared by the server and the SDK disk cache).
 
-The file cache mmaps its segment files -- both the server (segment reads, boot
-index) and the localhost client fast path (Option C, biopb/biopb#571) map them
-and rely on local-POSIX semantics: an unlinked-but-mapped inode keeps its blocks
-until the last close, and a mapped page never vanishes under the reader. Network
-filesystems (NFS/CIFS/...) break that -- touching a mapping to a file the server
-removed can SIGBUS/ESTALE -- and cloud "Files On-Demand" folders
-(OneDrive/iCloud/Dropbox) dehydrate idle files, so a later mmap read stalls on a
-recall. So the launcher classifies the configured ``cache_dir`` once at startup
-and falls back to the in-memory backend when it isn't local disk (which also
-disables the client fast path for free: a memory backend never locates a chunk).
-
-Design rules for every probe here:
-
-- **Metadata only.** Never opens or reads a file, so it can never trigger a
-  cloud recall while trying to detect one.
-- **Never raises.** Any failure -> ``None`` ("undeterminable").
-- **Positive signals only.** We downgrade to memory solely on a *positive*
-  network/cloud signal; an unknown or exotic-but-local filesystem returns
-  ``None`` and keeps the file cache, so working deployments are never demoted by
-  a detection gap.
+Every probe is metadata-only (never opens a file, so it cannot trigger a cloud
+recall), never raises (failure -> ``None``), and acts on positive signals only,
+so an unknown filesystem is treated as local.
 """
 
 import os
@@ -82,16 +63,11 @@ _NETWORK_FUSE_SUBTYPES = frozenset(
     }
 )
 
-# RAM-backed filesystem types. Not "unsafe" in the mmap-semantics sense -- these
-# are local POSIX and mmap fine -- but a cache placed here is stored in the very
-# resource it exists to conserve, so its pages are unevictable RAM plus a mapping
-# that is also RAM. Strictly worse than the in-memory LRU it would be replacing,
-# and silently so, which is why the client's disk cache refuses one.
+# RAM-backed filesystem types: mmap-safe, but a cache here just spends the RAM it
+# exists to save.
 _MEMORY_FSTYPES = frozenset({"tmpfs", "ramfs", "devtmpfs"})
 
-# Windows file-attribute bits marking non-resident (cloud placeholder / HSM stub)
-# content. Mirrors core.discovery's mask -- kept local so this module stays
-# import-free of the discovery machinery; these are stable OS constants.
+# Windows file-attribute bits marking non-resident (cloud placeholder / HSM stub) content.
 _FILE_ATTRIBUTE_OFFLINE = 0x00001000
 _FILE_ATTRIBUTE_RECALL_ON_OPEN = 0x00040000
 _FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS = 0x00400000
@@ -106,14 +82,9 @@ def unsafe_cache_dir_reason(path, *, reject_memory: bool = False) -> Optional[st
     """One-line reason an mmap cache should not use *path*, or None if it is
     local disk (or undeterminable, treated as local).
 
-    Network storage is checked first, then cloud-sync; the returned string is
-    meant to be dropped straight into a launcher warning.
-
-    ``reject_memory`` adds RAM-backed filesystems to that list. Opt-in because
-    the two tenants disagree about what to do next: the server's answer to an
-    unusable cache_dir is its *memory* backend, so demoting a tmpfs dir would
-    trade RAM for the same RAM. The SDK's disk cache has no such fallback and
-    exists precisely to keep bytes out of RAM, so it passes True.
+    The string is meant for a launcher warning. ``reject_memory`` also rejects
+    RAM-backed filesystems; opt-in because the server's fallback is a memory
+    backend, which a tmpfs dir would not improve on.
     """
     net = network_filesystem_type(path)
     if net:
@@ -132,8 +103,6 @@ def memory_filesystem_type(path) -> Optional[str]:
     """Return the RAM-backed filesystem type behind *path* (e.g. ``"tmpfs"``),
     or None if it is real storage or cannot be determined. Never raises.
 
-    Positive-signal-only like every probe here: an fstype we cannot read, or a
-    platform with no mount table to read, returns None and is treated as disk.
     """
     try:
         fstype = _raw_fstype(_nearest_existing(Path(path)))
@@ -166,16 +135,12 @@ def cloud_sync_hint(path) -> Optional[str]:
     """
     try:
         original = Path(path)
-        # The Windows placeholder attribute needs a real path to stat; walk up to
-        # the nearest existing ancestor (the cloud folder exists even if the leaf
-        # cache dir doesn't yet).
+        # Stat the nearest existing ancestor (the leaf may not exist yet).
         if os.name == "nt":
             attrs = getattr(_nearest_existing(original).stat(), "st_file_attributes", 0)
             if attrs and (attrs & _OFFLINE_ATTR_MASK):
                 return "Windows cloud placeholder"
-        # The path-component heuristic reads the *configured* path, so a not-yet-
-        # created dir under a cloud root is still flagged (its marker component is
-        # intact even though the leaf doesn't exist).
+        # Uses the configured path, so a not-yet-created dir is still flagged.
         return _cloud_path_hint(original)
     except Exception:
         return None
@@ -230,12 +195,7 @@ def _windows_network_type(path: Path) -> Optional[str]:
 
 
 def _raw_fstype(path: Path) -> Optional[str]:
-    """The filesystem type backing *path*, unclassified, or None.
-
-    Split out of the network probes so the memory probe reads the same mount
-    table rather than growing a second parser. Windows has no equivalent name to
-    report (its network check is UNC / drive-type based), so it returns None.
-    """
+    """The filesystem type backing *path*, unclassified, or None (always None on Windows)."""
     if os.name == "nt":
         return None
     if sys.platform.startswith("linux"):
@@ -259,13 +219,8 @@ def _linux_fstype(path: Path) -> Optional[str]:
     """Find *path*'s mount in /proc/self/mountinfo and return its fstype.
 
     Picks the mount whose mount point is the longest prefix of the resolved
-    path, so a network export mounted below a local root is detected. When two
-    mounts share the *same* mount point (the standard automount layout: an
-    ``autofs`` entry with the real ``nfs`` mounted on top of it at the identical
-    path), the later-listed one wins -- mountinfo lists mounts bottom-to-top, so
-    the last entry at a point is the effective (topmost) mount. Using ``>=`` (not
-    ``>``) for the tie is what surfaces the ``nfs`` shadowing an ``autofs`` at
-    ``/home``; a strict ``>`` would keep the first-seen ``autofs`` and miss it.
+    path. On a tie (e.g. ``nfs`` mounted over ``autofs``) the last-listed, i.e.
+    topmost, mount wins.
     """
     target = os.path.realpath(path)
     best_len = -1
@@ -284,8 +239,7 @@ def _linux_fstype(path: Path) -> Optional[str]:
                 continue
             mount_point = _unescape_mountinfo(fields[4])
             fstype = fields[sep + 1]
-            # >= so a mount shadowing an earlier one at the same point (autofs ->
-            # nfs) wins; ties resolve to the last-listed (topmost) mount.
+            # >= so the topmost of same-point mounts wins.
             if _path_under(target, mount_point) and len(mount_point) >= best_len:
                 best_len = len(mount_point)
                 best_type = fstype

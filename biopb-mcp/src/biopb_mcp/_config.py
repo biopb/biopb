@@ -13,7 +13,7 @@ tensor server's ``biopb.json`` and the installer's client-definition ``mcp.json`
 (a *distinct* file: that one registers biopb-mcp with MCP clients; this one is
 biopb-mcp's own runtime settings). Logs -- runtime state, not config -- live in
 the shared biopb XDG *state* tree (``~/.local/state/biopb/mcp``), resolved via
-:mod:`biopb._locations` (no more separate top-level ``biopb-mcp`` dir).
+:mod:`biopb._config.locations` (no more separate top-level ``biopb-mcp`` dir).
 
 Sections are flat (no ``mcp.``/``widget.`` wrapper): ``transport`` / ``kernel`` /
 ``viewer`` / ``services`` / ``observe`` / ``update`` are
@@ -45,11 +45,11 @@ from typing import List, Optional
 # Shared with the tensor server: the constraint primitives (so a knob is judged
 # by the same rules in both packages; biopb/biopb#182, #34) and the config-file
 # location.
-from biopb import _locations
-from biopb._config_constraints import Enum, Range
-from biopb._config_io import atomic_write_json
-from biopb._config_validate import MISSING, Problem, check_sections, warn_and_clamp
-from biopb._locations import mcp_config_path
+from biopb._config import locations as _locations
+from biopb._config.constraints import Enum, Range
+from biopb._config.io import atomic_write_json
+from biopb._config.locations import mcp_config_path
+from biopb._config.validate import MISSING, Problem, check_sections, warn_and_clamp
 
 logger = logging.getLogger(__name__)
 
@@ -279,7 +279,7 @@ class ChatConfig:
     The provider key is deliberately not here either. This file is served whole
     by the control's ``GET /api/mcp_config`` so the admin page can edit it, and a
     key in it would be rendered in a browser; it lives in an owner-only
-    credential file instead (``biopb._credentials``, name ``chat-provider.token``)
+    credential file instead (``biopb._security.credentials``, name ``chat-provider.token``)
     for the same reasons that module was written. What is here is configuration
     a person may reasonably want to change and no one needs to keep secret.
     """
@@ -520,7 +520,7 @@ def get_setting(config: dict, path: str, default=_MISSING):
 def get_config_path() -> Path:
     """Path to the config file (``~/.config/biopb/mcp-config.json``).
 
-    Delegates to :func:`biopb._locations.mcp_config_path` so biopb-mcp and
+    Delegates to :func:`biopb._config.locations.mcp_config_path` so biopb-mcp and
     the core-``biopb`` readers (control plane / ``_algorithms``) share one location.
     """
     return mcp_config_path()
@@ -532,7 +532,7 @@ def get_log_dir() -> Path:
     Logs are persistent runtime state, not user-editable config, so they live in
     the shared biopb *state* tree (``$BIOPB_STATE_HOME``), beside the tensor
     server's ``logs/`` and the session registry. Delegates to
-    :func:`biopb._locations.mcp_log_dir`, which creates it on access.
+    :func:`biopb._config.locations.mcp_log_dir`, which creates it on access.
     """
     return _locations.mcp_log_dir()
 
@@ -622,7 +622,7 @@ def config_problems(config: dict) -> List[Problem]:
 def _validate_and_clamp(config: dict) -> dict:
     """Warn on each out-of-range leaf and reset it to its default, in place.
 
-    The load-path policy (see :mod:`biopb._config_validate`): a bad value must
+    The load-path policy (see :mod:`biopb._config.validate`): a bad value must
     not reach the runtime, but must not take the session down either -- a raise
     here is a dead MCP client and no viewer. A leaf absent from the merged dict
     is skipped (nothing to check). Returns *config*.

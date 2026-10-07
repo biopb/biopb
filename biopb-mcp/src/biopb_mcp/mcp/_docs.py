@@ -39,7 +39,7 @@ from datetime import date
 from importlib import resources
 from pathlib import Path
 
-from biopb._config_io import atomic_write_json, atomic_write_text
+from biopb._config.io import atomic_write_json, atomic_write_text
 
 logger = logging.getLogger(__name__)
 
@@ -189,7 +189,7 @@ def local_dir() -> Path | None:
     if configured:
         return Path(configured).expanduser()
     try:
-        from biopb import _locations
+        from biopb._config import locations as _locations
 
         if hasattr(_locations, "mcp_docs_dir"):
             return _locations.mcp_docs_dir()

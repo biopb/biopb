@@ -468,7 +468,7 @@ def _viewer_base_url() -> str:
     :func:`_viewer_user_url` for the link to give them.
     """
     try:
-        from biopb import base_url
+        from biopb._control import base_url
 
         return base_url()
     except Exception:  # pragma: no cover - core SDK always present in practice
@@ -479,7 +479,7 @@ def _viewer_base_url() -> str:
 def _viewer_user_url() -> str:
     """Where the *user's* browser reaches the control, for a link handed to them
     (the proxied form behind a reverse proxy, else :func:`_viewer_base_url`)."""
-    from biopb import user_base_url
+    from biopb._control import user_base_url
 
     return user_base_url()
 

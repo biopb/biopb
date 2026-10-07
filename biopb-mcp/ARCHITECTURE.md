@@ -175,7 +175,7 @@ no TLS of its own, so a published control needs the operator's proxy for it.
 
 The shim and a session meet only over HTTP and the registry: `/api/lease/*`,
 `/api/status`, `/mcp`, the control's `/api/sessions`, `/api/sessions/new`,
-`/health` (`mcp_proxied`) and its `/session/<id>/...` proxy, and `biopb._sessions`.
+`/health` (`mcp_proxied`) and its `/session/<id>/...` proxy, and `biopb._lifecycle.sessions`.
 A change to any of them is a change to the SDK and biopb-mcp together.
 
 ### The kernel

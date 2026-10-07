@@ -42,7 +42,6 @@ from biopb.image.annotation_pb2 import (
     RoiPutResult,
     RoiUnseen,
 )
-from biopb.tensor._labels import split_label_array_id
 from biopb.tensor._pool import WIRE_WRITE_OPTIONS
 from biopb.tensor._roi_rows import (
     rois_to_table,
@@ -109,6 +108,7 @@ from biopb_tensor_server.core.errors import (
     TensorResolutionError,
     UnknownResolutionError,
 )
+from biopb_tensor_server.core.labels import split_label_field
 from biopb_tensor_server.core.read_mask import (
     IS_RESIDENT,
     METADATA_JSON,
@@ -1749,7 +1749,7 @@ class TensorFlightServer(flight.FlightServerBase):
         Each carries the table's real Arrow schema and one endpoint whose
         ticket is ``SELECT * FROM <table>``, so a stock Flight client can list,
         see the columns, and DoGet the whole catalog without a biopb proto.
-        Browsing *sources* is a catalog query too (the SDK's ``list_sources``);
+        Browsing *sources* is a catalog query too (the SDK's ``query``);
         the pixels and annotations of one source are not listable, they are
         addressed.
         """
@@ -2054,9 +2054,9 @@ class TensorFlightServer(flight.FlightServerBase):
             )
             # A label set over a real network compresses 25-50x (biopb#1111);
             # anything else goes raw, keeping the zero-copy path.
-            compressed = split_label_array_id(array_id) is not None and _peer_is_remote(
-                context.peer()
-            )
+            compressed = split_label_field(
+                array_id.partition("/")[2]
+            ) is not None and _peer_is_remote(context.peer())
             return flight.RecordBatchStream(
                 reader, options=WIRE_WRITE_OPTIONS if compressed else None
             )

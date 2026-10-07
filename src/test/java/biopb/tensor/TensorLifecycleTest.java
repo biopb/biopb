@@ -190,21 +190,6 @@ public class TensorLifecycleTest {
         }
     }
 
-    // ---- label sets -------------------------------------------------------
-
-    @Test
-    public void testGetLabelSetsIsACatalogQueryOverThePath() throws Exception {
-        try (TestServer server = new TestServer()) {
-            try (TensorFlightClient client = new TensorFlightClient("localhost", server.getPort())) {
-                Assert.assertEquals(
-                        Arrays.asList("src_ab12/@labels/@ome", "src_ab12/@labels/nuclei"),
-                        client.getLabelSets("src_ab12"));
-                // The prefix is the image's own path, quoted for the SQL surface.
-                Assert.assertTrue(server.producer.lastSql.contains("'src_ab12/@labels/'"));
-            }
-        }
-    }
-
     @Test
     public void testDiscardingALabelSetNamesItByItsArrayId() throws Exception {
         // Removing an uploaded set is discarding its upload; there is no

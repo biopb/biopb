@@ -10,10 +10,10 @@ nothing policy-specific:
   to name a pid-reused stranger.
 * **bind** -- the child dies with its parent. POSIX: no ``start_new_session``, so
   the child shares the parent's process group and the parent's group-teardown
-  reaches it (a parent-death pipe, :mod:`biopb.lifecycle.deathwatch`, covers the
+  reaches it (a parent-death pipe, :mod:`biopb._lifecycle.deathwatch`, covers the
   *uncatchable* parent death; the owner wires that in when its child installs the
   watcher). Windows: a kill-on-close Job Object the OS empties when the parent's
-  last handle closes (:mod:`biopb.lifecycle.winjob`).
+  last handle closes (:mod:`biopb._lifecycle.winjob`).
 * **stop** -- graceful-then-hard reap: SIGTERM -> wait -> SIGKILL on POSIX;
   ``TerminateJobObject`` (tree-kill) + a ``TerminateProcess`` backstop on Windows,
   then the job handle is released.

@@ -17,10 +17,14 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 import typer
-from biopb import _tls_material, _tls_record, _web_auth
-from biopb._fs_detect import unsafe_cache_dir_reason
-from biopb._locations import tensor_catalog_path, tls_server_cert
-from biopb.lifecycle import deathwatch as _deathwatch
+from biopb._config.locations import tensor_catalog_path, tls_server_cert
+from biopb._lifecycle import deathwatch as _deathwatch
+from biopb._security import (
+    tls_material as _tls_material,
+    tls_record as _tls_record,
+    web_auth as _web_auth,
+)
+from biopb.tensor._fs_detect import unsafe_cache_dir_reason
 from biopb.tensor._location import realign_transport_scheme
 from rich.console import Console
 from rich.markup import escape as _rich_escape
@@ -460,7 +464,7 @@ def _resolve_tls_material(
     # and by the shared rule, so what the control's preflight accepted is exactly
     # what this accepts.
     if tls_cert is not None:
-        from biopb._tls_material import TlsMaterialError, read_pem
+        from biopb._security.tls_material import TlsMaterialError, read_pem
 
         try:
             cert_pem = read_pem(tls_cert, "tls_cert")
@@ -529,7 +533,7 @@ def cert_init(
     reading off the fingerprint a client will pin on first connect (TOFU,
     biopb/biopb#604).
     """
-    from biopb._locations import tls_server_key
+    from biopb._config.locations import tls_server_key
 
     from biopb_tensor_server.serving.tls import (
         cert_fingerprint,
@@ -1087,7 +1091,7 @@ def serve(
         # so shutdown is clean.
         _install_sigterm_handler()
         # If launched under the control supervisor, self-terminate when it dies
-        # uncatchably (no-op when run standalone; see biopb.lifecycle.deathwatch).
+        # uncatchably (no-op when run standalone; see biopb._lifecycle.deathwatch).
         _deathwatch.install()
 
         server.serve()
@@ -1582,7 +1586,7 @@ def launch(
 
     # If launched under the control supervisor, self-terminate when it dies
     # uncatchably so a crashed/killed control never orphans this plane into a
-    # port-holding conflict (no-op standalone; see biopb.lifecycle.deathwatch).
+    # port-holding conflict (no-op standalone; see biopb._lifecycle.deathwatch).
     _deathwatch.install()
 
     # --- Token management ---

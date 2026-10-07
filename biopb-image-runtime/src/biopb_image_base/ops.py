@@ -63,13 +63,16 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import biopb.image as proto
 import grpc
 import numpy as np
-from biopb._web_auth import host_is_public_bind
+from biopb._security.web_auth import host_is_public_bind
 from biopb.image import (
+    NDIM_LABELS,
     deserialize_image_data,
+    json_arg,
+    json_value,
     normalize_array_dims,
     serialize_from_numpy_to_image_data,
 )
-from google.protobuf import json_format, struct_pb2
+from google.protobuf import json_format
 
 from biopb_image_base.common import (
     _MAX_EAGER_SIZE,
@@ -91,17 +94,6 @@ TOKEN_ENV = "BIOPB_ALGORITHM_TOKEN"
 _INPUT_MODES = ("eager", "lazy", "blocks")
 _SPATIAL_AXES = frozenset("ZYX")
 
-# biopb's ndim -> axis-label convention (see biopb.image._utils).
-_NDIM_LABELS = {
-    2: ["Y", "X"],
-    3: ["Y", "X", "C"],
-    4: ["Z", "Y", "X", "C"],
-    5: ["T", "Z", "Y", "X", "C"],
-}
-
-
-# =============================================================================
-# Declaring ops
 # =============================================================================
 
 
@@ -343,78 +335,6 @@ def describe(definitions: Sequence[_OpDef]) -> proto.OpList:
 # =============================================================================
 
 
-def _jsonable(value: Any) -> Any:
-    """*value* as plain JSON types: numpy values converted, tables as columns."""
-    if value is None or isinstance(value, (bool, str)):
-        return value
-    if isinstance(value, (int, float)):
-        return value
-    if isinstance(value, np.generic):
-        return _jsonable(value.item())
-    if isinstance(value, np.ndarray):
-        # Only complex needs the element walk: a bare complex isn't JSON.
-        items = value.tolist()
-        return _jsonable(items) if value.dtype.kind == "c" else items
-    if isinstance(value, dict):
-        return {str(k): _jsonable(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_jsonable(v) for v in value]
-    to_dict = getattr(value, "to_dict", None)
-    if callable(to_dict):  # a pandas DataFrame or Series
-        try:
-            return _jsonable(to_dict(orient="list"))
-        except TypeError:
-            return _jsonable(to_dict())
-    raise TypeError(f"an output of type {type(value).__name__} is not JSON")
-
-
-def _fill_value(target: struct_pb2.Value, value: Any) -> None:
-    """Set *target* from plain JSON types, field by field.
-
-    Not ``json_format.ParseDict``/``MessageToDict``: those are JSON *text*
-    guards, and a ``Value`` on the wire is protobuf binary, where
-    ``number_value`` is a double that carries nan and inf unchanged -- a
-    measurement may legitimately be either.
-    """
-    if value is None:
-        target.null_value = struct_pb2.NULL_VALUE
-    elif isinstance(value, bool):
-        target.bool_value = value
-    elif isinstance(value, (int, float)):
-        target.number_value = value
-    elif isinstance(value, str):
-        target.string_value = value
-    elif isinstance(value, dict):
-        target.struct_value.Clear()
-        for key, item in value.items():
-            _fill_value(target.struct_value.fields[key], item)
-    else:
-        target.list_value.Clear()
-        for item in value:
-            _fill_value(target.list_value.values.add(), item)
-
-
-def _read_value(value: struct_pb2.Value) -> Any:
-    kind = value.WhichOneof("kind")
-    if kind == "number_value":
-        return value.number_value
-    if kind == "string_value":
-        return value.string_value
-    if kind == "bool_value":
-        return value.bool_value
-    if kind == "struct_value":
-        return {k: _read_value(v) for k, v in value.struct_value.fields.items()}
-    if kind == "list_value":
-        return [_read_value(v) for v in value.list_value.values]
-    return None
-
-
-def _json_arg(value: Any) -> proto.Arg:
-    arg = proto.Arg()
-    _fill_value(arg.json, _jsonable(value))
-    return arg
-
-
 @dataclass
 class _Pixels:
     """A decoded tensor argument: the array and its axis labels."""
@@ -442,7 +362,7 @@ def _decode_pixels(name: str, arg: proto.Arg) -> _Pixels:
     else:
         raise ValueError(f"{name} is a tensor argument; got {kind or 'nothing'}")
     if not labels:
-        labels = _NDIM_LABELS.get(array.ndim)
+        labels = NDIM_LABELS.get(array.ndim)
         if labels is None:
             raise ValueError(f"{name}: a {array.ndim}D input needs its dim_labels")
     if len(labels) != array.ndim:
@@ -455,7 +375,7 @@ def _decode_pixels(name: str, arg: proto.Arg) -> _Pixels:
 def _decode_kwarg(definition: _OpDef, name: str, arg: proto.Arg) -> Any:
     if arg.WhichOneof("kind") != "json":
         raise ValueError(f"{name} is not a tensor argument of {definition.name}")
-    value = _read_value(arg.json)
+    value = json_value(arg.json)
     if (
         name in definition.int_kwargs
         and isinstance(value, float)
@@ -800,7 +720,7 @@ class _OpsServicer(proto.OpsServicer):
                 ):
                     compressible = True
             else:
-                event.outputs[key].CopyFrom(_json_arg(item))
+                event.outputs[key].CopyFrom(json_arg(item))
         if self._compress and not compressible:
             context.disable_next_message_compression()
         return event
@@ -960,7 +880,7 @@ def serve(
     setup_logging(get_log_level_from_env())
     # Under the control, die with it: it passes a parent-death pipe, so a
     # control that dies uncatchably leaves no server holding a GPU.
-    from biopb.lifecycle import deathwatch
+    from biopb._lifecycle import deathwatch
 
     deathwatch.install()
     token = os.environ.get(TOKEN_ENV) or None

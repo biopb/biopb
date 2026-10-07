@@ -8,7 +8,7 @@ Commands:
     cache-stats  Show the server's cache hit/miss diagnostics
 
 Every command dials the *same* plane through the one resolver,
-:func:`biopb.resolve_data_plane` (biopb/biopb#615): ``--server`` -> ``BIOPB_TENSOR_URL`` ->
+:func:`biopb._control.resolve_data_plane` (biopb/biopb#615): ``--server`` -> ``BIOPB_TENSOR_URL`` ->
 the control plane's published endpoint -> the default. ``--server`` stays because
 a plane launched directly on a custom port is recorded nowhere and so cannot be
 discovered; everything else is asked for rather than reconstructed.
@@ -27,7 +27,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from biopb import (
+from biopb._control import (
     ENV_TENSOR_TOKEN,
     DataPlaneEndpoint,
     LocalTrustError,
@@ -75,10 +75,8 @@ _OPT_SLICE = typer.Option(
 def _browse(client) -> dict:
     """The catalog as ``{source_id: row}``.
 
-    ``query`` rather than the deprecated ``list_sources``: same rows
-    and the same server-side cap, but a row carries ``is_resolved``, which the
-    listing needs to tell "not resolved yet" from "nothing readable in it"
-    (biopb/biopb#1032).
+    Rows carry ``is_resolved``, which the listing needs to tell "not resolved
+    yet" from "nothing readable in it".
     """
     rows = client.query(
         f"SELECT {client.source_row_columns()} FROM sources ORDER BY source_id",

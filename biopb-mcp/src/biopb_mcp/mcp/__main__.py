@@ -21,7 +21,7 @@ import signal
 import socket
 import sys
 
-from biopb._locations import (
+from biopb._config.locations import (
     LAUNCH_TOKEN_FIELD,
     MCP_LAUNCH_TOKEN_ENV,
     MCP_SESSION_LOG_ENV,
@@ -63,7 +63,7 @@ def _register_session(port, mcp_url, launched_by=None, mode=None):
     its discoverability and nothing else. Returns ``None`` in that case, leaving
     the caller nothing to de-register.
     """
-    from biopb import _sessions
+    from biopb._lifecycle import sessions as _sessions
 
     extra = {LAUNCH_TOKEN_FIELD: launched_by} if launched_by else {}
     if mode:
@@ -90,12 +90,12 @@ def _unregister_session(session_id):
 
     Best-effort like the publish: teardown must not fail because a record was
     already gone. The registry's own pid-liveness prune
-    (:func:`biopb._sessions.list_sessions`) is the backstop for a kill abrupt
+    (:func:`biopb._lifecycle.sessions.list_sessions`) is the backstop for a kill abrupt
     enough that this never runs.
     """
     if session_id is None:
         return
-    from biopb import _sessions
+    from biopb._lifecycle import sessions as _sessions
 
     try:
         _sessions.unregister(session_id)

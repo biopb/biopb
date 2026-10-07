@@ -1058,18 +1058,21 @@ class TestRemote:
             _shim.main(["--remote", self.URL, "--token", "t", "--header", "nonsense"])
 
     def test_the_local_credential_file_is_never_sent(self, monkeypatch):
-        import biopb
+        import biopb._control
 
         monkeypatch.delenv("BIOPB_TENSOR_TOKEN", raising=False)
         monkeypatch.setattr(
-            "biopb._credentials.read_credential", lambda: "the-local-secret"
+            "biopb._security.credentials.read_credential", lambda: "the-local-secret"
         )
-        assert biopb.resolve_data_plane_token(None, allow_credential_file=False) is None
+        assert (
+            biopb._control.resolve_data_plane_token(None, allow_credential_file=False)
+            is None
+        )
 
     def test_remote_without_a_token_is_a_usage_error(self, monkeypatch):
         monkeypatch.delenv("BIOPB_TENSOR_TOKEN", raising=False)
         monkeypatch.setattr(
-            "biopb._credentials.read_credential", lambda: "the-local-secret"
+            "biopb._security.credentials.read_credential", lambda: "the-local-secret"
         )
         with pytest.raises(SystemExit):
             _shim.main(["--remote", self.URL])

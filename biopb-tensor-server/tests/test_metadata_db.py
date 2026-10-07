@@ -525,64 +525,6 @@ class TestSourceRowProjection:
         assert sources[0]["is_resolved"] is False
 
 
-class TestDeprecatedDescriptorProjection:
-    """The proto decoder still answers, and still cannot carry `is_resolved`."""
-
-    def _rows(self, db):
-        from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS
-
-        return db.query(
-            f"SELECT {SOURCE_ROW_COLUMNS} FROM sources ORDER BY source_id"
-        ).to_pylist()
-
-    def test_still_builds_the_same_descriptor(self):
-        import warnings
-
-        from biopb.tensor import descriptors_from_rows
-
-        db = MetadataDatabase()
-        db.sync_source_added(
-            "s1", MockAdapter("s1", "/data/s1.zarr", "zarr", [8, 512, 512], "uint16")
-        )
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            (d,) = descriptors_from_rows(self._rows(db))
-
-        assert d.source_id == "s1"
-        assert d.source_url == "/data/s1.zarr"
-        # Nothing to decode, so the field stays unset rather than claiming False.
-        assert not d.HasField("data_resident")
-        assert d.metadata_json == ""  # lean: filled only by GetFlightInfo
-        assert list(d.tensors[0].shape) == [8, 512, 512]
-        assert any(issubclass(w.category, DeprecationWarning) for w in caught)
-
-    def test_cannot_carry_is_resolved(self):
-        """The reason for the deprecation, pinned: an unresolved source decodes
-        to a descriptor indistinguishable from a resolved-but-empty one."""
-        import warnings
-
-        from biopb.tensor import descriptors_from_rows
-
-        db = MetadataDatabase()
-        db.sync_source_added(
-            "u",
-            MultiTensorAdapter(
-                "u",
-                "s3://b/x.zarr",
-                "zarr",
-                [],
-                is_resolved=False,
-            ),
-        )
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            (d,) = descriptors_from_rows(self._rows(db))
-
-        assert not hasattr(d, "is_resolved")
-        # The row itself answers.
-        assert _sources(db)[0]["is_resolved"] is False
-
-
 class TestGetMetadataJson:
     """Local metadata read-back for the serve path (biopb/biopb#253)."""
 

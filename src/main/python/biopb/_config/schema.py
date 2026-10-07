@@ -11,12 +11,12 @@ description(help), constraint?, bounds…}`` by the exact same rules.
 
 That identical core lives here so neither package re-implements it (and
 biopb-mcp, which cannot import biopb-tensor-server -- not on PyPI -- reuses it
-the same way it already shares :mod:`biopb._config_constraints`). Each package
+the same way it already shares :mod:`biopb._config.constraints`). Each package
 keeps its own *composer* that calls :func:`dataclass_section` for its scalar
 sections and adds whatever bespoke array/alias parts it has.
 
-Deliberately stdlib-only, like the sibling :mod:`biopb._config_constraints` and
-:mod:`biopb._locations`: it duck-types the constraint objects
+Deliberately stdlib-only, like the sibling :mod:`biopb._config.constraints` and
+:mod:`biopb._config.locations`: it duck-types the constraint objects
 (``to_json_schema`` / ``describe``) and never imports the constraint classes, so
 it pulls in none of the heavy adapter/discovery machinery.
 """
@@ -49,18 +49,11 @@ def scalar_property(
 ) -> Dict[str, Any]:
     """Project one scalar config field to a JSON Schema property.
 
-    - ``default`` echoes the dataclass default so an editor can render the
-      effective value of an omitted key (a default-true boolean shows checked);
-      a ``None`` default is omitted ("unset", not a meaningful echo). Non
-      JSON-native defaults (e.g. a ``Path``) are coerced to ``str`` to match
-      their ``"string"`` wire type and stay JSON-serializable.
-    - ``description`` is prose, from the field's ``metadata["help"]`` -- the
-      single source of truth, so there is no second doc table to drift.
-    - a *constraint* (any object exposing ``to_json_schema`` / ``describe``)
-      contributes its bounds/enum keywords, and its human rule rides a separate
-      ``constraint`` key so ``description`` stays pure prose. The
-      case-insensitive-enum accepted set (which ``to_json_schema`` deliberately
-      keeps out of a hard ``enum``) survives there.
+    - ``default`` echoes the dataclass default (omitted for ``None``; non
+      JSON-native values such as ``Path`` become ``str``).
+    - ``description`` is the field's ``metadata["help"]``.
+    - a *constraint* contributes its bounds/enum keywords; its human rule goes in
+      a separate ``constraint`` key, which also carries case-insensitive enums.
     """
     prop: Dict[str, Any] = {"type": json_type(value)}
     if value is not None:
@@ -84,12 +77,9 @@ def dataclass_section(
 ) -> Dict[str, Dict[str, Any]]:
     """Project a dataclass's **scalar** fields to ``{on-disk key: property}``.
 
-    Nested dataclass and list fields are skipped -- they are their own
-    sections/arrays and belong to the caller's bespoke composer. ``constraints``
-    is the per-class ``{field name: constraint}`` map (the value at
-    ``_CONSTRAINTS[cls.__name__]``). ``key_map`` remaps the few field names whose
-    wire key diverges from the dataclass field (identity otherwise);
-    ``default_instance`` lets a caller reuse an already-built default instance.
+    Nested dataclass and list fields are skipped (the caller composes those).
+    ``constraints`` is ``_CONSTRAINTS[cls.__name__]``; ``key_map`` remaps field
+    names whose wire key differs; ``default_instance`` reuses a built default.
     """
     inst = default_instance if default_instance is not None else cls()
     constraints = constraints or {}
