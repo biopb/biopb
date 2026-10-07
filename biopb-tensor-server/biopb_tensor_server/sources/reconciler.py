@@ -102,7 +102,7 @@ _EXPERIMENTAL_WARNED: set = set()
 _EXPERIMENTAL_SOURCE_MESSAGES = {
     "cloud": (
         "Cloud / synced-folder sources (cloud=true, e.g. OneDrive Files "
-        "On-Demand) are EXPERIMENTAL: resolve-on-serve and hydrate-ahead behavior "
+        "On-Demand) are EXPERIMENTAL: resolve-on-serve behavior "
         "may change."
     ),
     "tensor-server": (

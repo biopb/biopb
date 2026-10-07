@@ -228,10 +228,10 @@ def should_skip_walk_entry(
     return _is_offline_placeholder(path, stat_result)
 
 
-# Bound on directory_is_resident's sample -- large enough that a resolved-but-
-# never-warmed cloud source (every data file still a placeholder) is caught by
-# the first file checked, small enough that this stays a cheap, recall-free
-# probe rather than the full walk `warm` itself does.
+# Bound on directory_is_resident's sample -- large enough that a resolved
+# cloud source whose data files are all still placeholders is caught by the
+# first file checked, small enough that this stays a cheap, recall-free probe
+# rather than a full walk.
 _RESIDENCY_SAMPLE_LIMIT = 32
 
 
@@ -244,7 +244,7 @@ def directory_is_resident(root: Path, max_files: int = _RESIDENCY_SAMPLE_LIMIT) 
     does not apply the file-level check to the directory path itself. This
     instead samples a bounded number of the *files* inside it and applies
     that same check to each, short-circuiting on the first placeholder found.
-    A cloud source that has been resolved but never warmed has every data
+    A cloud source that has been resolved but not read has every data
     file still dehydrated, so a small sample reliably catches that case; this
     is not a full-tree scan and gives no guarantee for a directory that is
     only partially rehydrated.

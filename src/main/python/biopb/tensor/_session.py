@@ -3,7 +3,7 @@
 Extracted from :mod:`biopb.tensor.client` (issue #278 item C). The two
 collaborators share the connection via :class:`_ClientState`:
 
-- :class:`CatalogClient` -- discovery / metadata / resolve / warm / source
+- :class:`CatalogClient` -- discovery / metadata / resolve / source
   registration (``query`` / ``resolve`` / ... RPCs).
 - :class:`ChunkFetcher` -- tensor reads: plan a read with GetFlightInfo and
   build the lazy dask chunk-fetching array.
@@ -89,8 +89,6 @@ from biopb.tensor.descriptor_pb2 import (
     TensorDescriptor,
     TensorReadOption,
     UploadStatus as UploadStatusPb,
-    WarmProgress,
-    WarmStreamMessage,
 )
 from biopb.tensor.serialized_pb2 import SerializedTensor
 from biopb.tensor.ticket_pb2 import (
@@ -723,7 +721,7 @@ class CatalogClient:
     """Catalog, metadata, and source-lifecycle RPCs over one Flight connection.
 
     Owns discovery (``query``), per-tensor metadata
-    probes, the experimental cloud ``resolve`` / ``warm`` streams, and runtime
+    probes, the experimental cloud ``resolve`` stream, and runtime
     source registration. Reads and writes the shared ``_ClientState`` caches.
     """
 
@@ -1062,7 +1060,7 @@ class CatalogClient:
         """Iterate a streaming ``do_action``, yielding ``(which, msg, body)`` per
         non-empty message.
 
-        The loop shared by :meth:`resolve_source` / :meth:`warm_source` / :meth:`register_local_path`:
+        The loop shared by :meth:`resolve_source` / :meth:`register_local_path`:
         the ``do_action`` call, the empty-body heartbeat skip, the envelope parse
         into ``msg_cls`` (a bad parse yields ``which=None``, which every caller
         ignores -- the SDK refuses a pre-v2 server at connect), and the old-server
@@ -1071,7 +1069,7 @@ class CatalogClient:
         propagates unchanged.
 
         Cancellation is deliberately NOT handled here: its semantics differ per
-        caller (resolve/warm raise, register_local_path returns what it has), and the poll
+        caller (resolve raises, register_local_path returns what it has), and the poll
         must run *after* a message is consumed so a terminal already in hand is
         never discarded by a cancel landing on it (issue #4). Each caller polls
         ``should_cancel`` around its own dispatch.
@@ -1135,42 +1133,6 @@ class CatalogClient:
                 "(server closed the stream without a result)"
             )
         return dict(row)
-
-    def warm_source(
-        self,
-        source_id: str,
-        *,
-        on_progress: Optional[Callable[["WarmProgress"], None]] = None,
-        should_cancel: Optional[Callable[[], bool]] = None,
-    ) -> "WarmProgress":
-        """Backs TensorFlightClient.warm_source; see that method for the full
-        documentation."""
-        action = flight.Action("warm", source_id.encode("utf-8"))
-        done: Optional[WarmProgress] = None
-        unknown = (
-            "Hydrate-ahead is unavailable: the tensor server is too old "
-            "to support the 'warm' action. Upgrade the server, or just "
-            "read the data on demand (it will recall lazily)."
-        )
-        for which, msg, _ in self._iter_action_messages(
-            action, WarmStreamMessage, unknown_action_msg=unknown
-        ):
-            if should_cancel is not None and should_cancel():
-                raise ResolveCancelled(
-                    f"warm_source('{source_id}') cancelled by caller"
-                )
-            if which == "progress":
-                if on_progress is not None:
-                    on_progress(msg.progress)
-            elif which == "done":
-                done = WarmProgress()
-                done.CopyFrom(msg.done)
-        if done is None:
-            raise RuntimeError(
-                f"warm_source('{source_id}') returned no terminal status "
-                "(server closed the stream without a 'done')"
-            )
-        return done
 
     def get_upload_status(self, array_id: str) -> Dict[str, Any]:
         """Backs TensorFlightClient.get_upload_status; see that method for the full

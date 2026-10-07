@@ -828,8 +828,7 @@ class RemoteTensorAdapter(TensorAdapter):
         return [catalog_entry(self._localize_descriptor(desc))]
 
     # No is_resident() override: a mirror's bytes are on another machine, so the
-    # base's "remote scheme -> non-resident" is the true answer, and `warm`
-    # refuses a remote url outright. Do not override it to report reachability
+    # base's "remote scheme -> non-resident" is the true answer. Do not override it to report reachability
     # -- that is is_resolved()'s job below (biopb/biopb#1035).
 
     def is_resolved(self) -> bool:

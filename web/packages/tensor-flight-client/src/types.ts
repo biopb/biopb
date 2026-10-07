@@ -26,7 +26,7 @@ export interface DataSourceDescriptor {
    * Deterministic: does a real, hydrated adapter back this source right now?
    * False for an unresolved cloud/synced-folder source awaiting an explicit
    * `resolve`, and for a local source whose registration has not run yet (see
-   * `unresolved_reason`). Unlike a residency/warm-state flag, this never flips
+   * `unresolved_reason`). Unlike a residency flag, this never flips
    * back to false once true for the life of the server process.
    */
   is_resolved: boolean;
@@ -43,21 +43,19 @@ export interface DataSourceDescriptor {
 }
 
 /**
- * One resolve or warm job on one source, as `/api/sources/{id}/{kind}/status`
- * reports it.
+ * One resolve job on one source, as `/api/sources/{id}/{kind}/status` reports it.
  *
- * Both hydrate cloud / synced-folder data and both can run for minutes, so they
- * are jobs rather than requests: start, poll, optionally cancel. The recall
+ * A resolve hydrates cloud / synced-folder data and can run for minutes, so it
+ * is a job rather than a request: start, poll, optionally cancel. The recall
  * lives on the server and outlives any one HTTP request.
  */
 export interface SourceJobStatus {
-  kind: "resolve" | "warm";
+  kind: "resolve";
   source_id: string;
   state: "running" | "done" | "error" | "cancelled";
   /**
-   * Kind-specific counters. Resolve reports `elapsed_seconds`, `target_name`
-   * and `target_bytes`; warm reports files/bytes done vs total plus
-   * `current_name`. Empty until the first heartbeat lands.
+   * `elapsed_seconds`, `target_name` and `target_bytes`. Empty until the first
+   * heartbeat lands.
    */
   progress: Partial<SourceJobProgress>;
   /** Reason, on `state === "error"` only. */
@@ -75,25 +73,13 @@ export interface SourceJobStatus {
   source?: DataSourceDescriptor;
 }
 
-/** The union of both job kinds' progress counters; each reports its own subset. */
+/** A resolve's progress counters. */
 export interface SourceJobProgress {
   elapsed_seconds: number;
-  /** Resolve: basename of the recall target. */
+  /** Basename of the recall target. */
   target_name: string;
-  /** Resolve: size of the recall target, 0 when unknown. */
+  /** Size of the recall target, 0 when unknown. */
   target_bytes: number;
-  /**
-   * Warm: files discovered under the source. **0 on a finished warm means the
-   * source had nothing to warm** -- it is single-file, and resolve already
-   * recalled it. That is the server's own structural answer, so no client
-   * keeps its own list of which source types are multi-file.
-   */
-  files_total: number;
-  files_done: number;
-  bytes_total: number;
-  bytes_done: number;
-  /** Warm: the file being recalled right now. */
-  current_name: string;
 }
 
 /** Parameters for a single array-slice request. */

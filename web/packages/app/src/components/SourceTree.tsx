@@ -3,7 +3,6 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useAppStore } from "../store";
 import { readRecents, subscribeRecents } from "../utils/recentSources";
-import { WarmTray } from "./WarmTray";
 import {
   type TreeNode,
   FAILED_TOOLTIP,
@@ -768,7 +767,6 @@ export function SourceTree() {
           </>
         )}
       </div>
-      <WarmTray />
     </section>
   );
 }

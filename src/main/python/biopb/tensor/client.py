@@ -59,7 +59,6 @@ from biopb.tensor.descriptor_pb2 import (
     RemoveSourceResult,
     ResolveProgress,
     TensorDescriptor,
-    WarmProgress,
 )
 from biopb.tensor.serialized_pb2 import SerializedTensor
 from biopb.tensor.ticket_pb2 import ChunkBounds
@@ -360,8 +359,8 @@ class TensorFlightClient:
         """Resolve an unresolved source and return its ``sources`` catalog row.
 
         Note:
-            Experimental. Cloud / remote source support (unresolved sources,
-            resolve_source, and `warm_source`) is experimental and its behavior may change.
+            Experimental. Cloud / remote source support (unresolved sources
+            and resolve_source) is experimental and its behavior may change.
 
         An *unresolved* source is catalogued by URL only -- its shape/dtype/field
         list are unknown until first access (its catalog row has
@@ -392,74 +391,15 @@ class TensorFlightClient:
             ``query(..., format="records")`` -- ``SOURCE_ROW_COLUMNS``,
             with every tensor enumerated under ``tensors``.
 
-            Unlike `warm_source`, which returns a *status* because residency is
-            not a durable catalog fact (biopb/biopb#1035) and its file counts
-            exist nowhere else, this returns the *result*: resolving is defined
-            by what it writes to the row. The recall's elapsed time and target
-            size ride ``on_progress`` instead -- both are things a caller can
-            already measure or derive, where `warm_source`'s counts are not.
+            Resolving is defined by what it writes to the row, so this returns
+            that row. The recall's elapsed time and target size ride
+            ``on_progress`` instead -- both are things a caller can already
+            measure or derive.
 
         Raises:
             ResolveCancelled: if ``should_cancel`` asked to stop mid-resolve.
         """
         return self._catalog.resolve_source(
-            source_id, on_progress=on_progress, should_cancel=should_cancel
-        )
-
-    def warm_source(
-        self,
-        source_id: str,
-        *,
-        on_progress: Optional[Callable[[WarmProgress], None]] = None,
-        should_cancel: Optional[Callable[[], bool]] = None,
-    ) -> WarmProgress:
-        """Hydrate-ahead: recall a resolved source's member files on the server.
-
-        Note:
-            Experimental. Cloud / remote source support (`resolve_source` and
-            this hydrate-ahead path) is experimental and its behavior may change.
-
-        `resolve_source` populates a source's *metadata* but, for a multi-file
-        cloud source (zarr / ome-zarr / ndtiff / tiff-sequence / micromanager),
-        leaves the bulk pixel data dehydrated -- each member file then recalls
-        one-at-a-time, slowly, the first time a read touches it (the viewer
-        scrubbing planes is the worst case). ``warm_source`` opts into pulling
-        them all resident up front so later reads never stall.
-
-        The recall happens **entirely server-side** (the server walks the source
-        directory and reads each file to force the sync engine's recall); no
-        pixels cross the wire, only progress. It is idempotent -- already-resident
-        files are cheap local reads -- so a ``warm_source`` re-run after a cancel
-        simply finishes the remainder. Only meaningful for multi-file sources; a
-        single-file source returns immediately (resolve already recalled it), and
-        a remote-url source (an object store, or a ``grpc://`` mirror) raises --
-        nothing on the serving machine can be made resident.
-
-        Args:
-            source_id: The (already-resolved) source to warm.
-            on_progress: Optional callback invoked with a ``WarmProgress``
-                (files/bytes done vs total, current file name, elapsed) on each
-                progress message. Called on the calling thread; keep it cheap.
-            should_cancel: Optional predicate polled per message; when it returns
-                True the client closes the stream -- which the server observes and
-                stops the recall promptly -- and this raises
-                `ResolveCancelled`. Files already recalled stay resident.
-
-        Returns:
-            The terminal ``WarmProgress`` snapshot (``files_done`` /
-            ``bytes_done`` reflect what was made resident). ``files_total == 0``
-            means the source was local and had nothing to warm -- how a client
-            learns it is single-file. It never means "not applicable"; that
-            case raises (biopb/biopb#1035).
-
-        Raises:
-            ResolveCancelled: if ``should_cancel`` asked to stop mid-warm.
-            RuntimeError: if the server predates the ``warm`` action (too old for
-                hydrate-ahead), or closes the stream without a terminal status.
-            FlightServerError: if the source's url is remote. Warm it on the
-                server that holds the data.
-        """
-        return self._catalog.warm_source(
             source_id, on_progress=on_progress, should_cancel=should_cancel
         )
 

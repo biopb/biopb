@@ -67,14 +67,13 @@ client.resolve_source("source_id")     # downloads the whole thing; minutes, dis
 
 Resolving is deliberately explicit — browsing never triggers it — because it is
 a full download. It returns the source's `sources` row, now populated. For a
-multi-file source it fetches metadata only; `client.warm_source(source_id)` pulls the
-member files resident up front, server-side, if you are about to read all of it.
+multi-file source it fetches metadata only; the member files recall as they are read.
 
 **Resolved is not the same as local.** `is_resolved` says the server has read
 the source's structure; it says nothing about where the bytes are, and a synced
 folder re-dehydrates under storage pressure. Assume any cloud or synced-folder
 source may need to fetch on first read — slow, and impossible offline — and plan
-for it: warn the user before a long read rather than after it, and crop or warm
+for it: warn the user before a long read rather than after it, and crop
 rather than reaching for the whole thing.
 
 **Filter footgun:** an unresolved source has an empty `tensors`, so

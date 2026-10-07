@@ -108,20 +108,6 @@ class TestItIsThereBeforeAnythingAsks:
         )
 
 
-class TestItCanBeWarmed:
-    def test_a_published_field_is_warmable(self, writable_server, client):
-        """biopb/biopb#1139: warming reads ``adapter.source_url`` as the
-        recall root, so it must stay the real ``<write_dir>/fields/scratch``
-        directory the published bytes live in, not the catalog's display
-        alias -- #1138 briefly conflated the two."""
-        _publish(client, _add(client, "warmed"))
-
-        result = client.warm_source(SCRATCH_SOURCE_ID)
-
-        assert result.files_total >= 1
-        assert result.files_done == result.files_total
-
-
 class TestItIsEmptyByDefault:
     def test_an_empty_one_is_a_source_with_no_tensors(self, writable_server):
         """Not a degenerate state: it is what a scrap heap looks like between

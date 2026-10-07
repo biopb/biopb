@@ -104,9 +104,7 @@ SPA has the same shape through its HTTP sidecar (`POST
 by a pollable job): an unresolved row in `SourceTree` renders as a plain div
 with a "Resolve…" control (not a disabled button — interactive content can't
 nest inside one) instead of being hidden, and a finished resolve reloads the
-catalog listing. `warm()` (`do_action("warm")` / `POST
-/api/sources/{id}/warm`) separately recalls a resolved multi-file source's
-member files server-side, for hydrate-ahead.
+catalog listing.
 
 **Format choice matters more on cloud than local.** Pyramidal, per-chunk-object
 stores (OME-Zarr) are the supported cloud path: separable metadata
@@ -129,17 +127,8 @@ time.
   own single-file source. No later reconstruction.
 - **Resolve of a multi-file source leaks bulk recall onto the read path.**
   For a monolith-per-file fallback the actual whole-object recall happens
-  lazily on the subsequent `do_get` reads, not during resolve; `warm` exists
-  to pull that recall server-side up front. For zarr/OME-Zarr, resolve reads
+  lazily on the subsequent `do_get` reads, not during resolve. For zarr/OME-Zarr, resolve reads
   only the metadata and per-chunk reads stay fine-grained.
-- **No UI auto-warms after a resolve.** Both the napari widget
-  (`_AUTO_WARM_AFTER_RESOLVE`) and the SPA store (`AUTO_WARM_AFTER_RESOLVE`)
-  gate the post-resolve hydrate-ahead off by default; the chunk cache serves
-  segments by mmap, so warming a source larger than RAM walks the page-cache
-  LRU and evicts every *other* source's segments, and `warm` guarantees disk
-  residency, not page-cache warmth. Both still expose a manual warm trigger
-  (napari's "Hydrate all files…", the SPA's `WarmTray`). Flip the flags back
-  once `warm` has a retention policy.
 - **Cloud roots are walked only on a `force_full` rescan.**
   `SourceManager._rescan_monitored_dirs` does not walk a cloud root on an
   incremental rescan (the reconcile leaves its sources registered) and walks it

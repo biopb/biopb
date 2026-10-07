@@ -354,7 +354,7 @@ class _SidecarContext:
         # Lazy-init Flight client (first request will connect)
         self._client_lock = threading.Lock()
         self._client_holder: Dict[str, Optional[TensorFlightClient]] = {"client": None}
-        # In-flight resolve/warm recalls. Per-app, so two apps in one process
+        # In-flight resolve recalls. Per-app, so two apps in one process
         # (tests) cannot see each other's jobs.
         self.jobs = _SourceJobs()
 
@@ -438,9 +438,9 @@ class _SidecarContext:
 
 
 # ---------------------------------------------------------------------------
-# Resolve / warm jobs
+# Resolve jobs
 #
-# Both are minutes-long, consenting recalls of cloud / synced-folder data, which
+# A resolve is a minutes-long, consenting recall of cloud / synced-folder data, which
 # is longer than any request should be held open. They run on a daemon thread
 # and the browser polls; the shape is start -> poll -> (optionally) cancel.
 #
@@ -466,7 +466,7 @@ _JOB_RUNNING = "running"
 
 
 class _SourceJob:
-    """One resolve or warm, in flight or recently finished.
+    """One resolve, in flight or recently finished.
 
     Every field a route reads is taken under ``_lock``: the worker thread writes
     progress on the Flight client's callback while a request thread is rendering
@@ -539,7 +539,7 @@ class _SourceJob:
 
 
 class _SourceJobs:
-    """The per-app registry of resolve/warm jobs, keyed by ``(kind, source_id)``.
+    """The per-app registry of resolve jobs, keyed by ``(kind, source_id)``.
 
     Keyed by the pair, not by a generated job id, because that key *is* the
     idempotency the callers need: a double-click, a retry, or a second tab must
@@ -2117,7 +2117,7 @@ async def get_chunk(source_id: str, ticket_hex: str, request: Request) -> Respon
         )
 
 
-# -- Resolve / warm (consented cloud recalls) --------------------------------
+# -- Resolve (a consented cloud recall) --------------------------------
 #
 # Registered above the greedy /api/sources/{source_id:path} catch-all, the same
 # way /metadata and /ticket are: route order is what keeps a sub-path from being
@@ -2130,7 +2130,7 @@ def _run_recall(
     call: Callable[[], Any],
     on_success: Callable[[Any], None] = lambda _result: None,
 ) -> None:
-    """Shared try/except/finish skeleton for a resolve or warm job.
+    """Shared try/except/finish skeleton for a resolve job.
 
     ``call`` does the blocking Flight-client recall; ``on_success`` gets its
     return value to record any final progress before the job finishes done.
@@ -2184,39 +2184,6 @@ def _resolve_worker(ctx: _SidecarContext, job: _SourceJob) -> None:
         job,
         _call,
         on_success=lambda row: _attach_resolved_row(job, row),
-    )
-
-
-def _warm_worker(ctx: _SidecarContext, job: _SourceJob) -> None:
-    """Body of a warm job. Runs on the registry's daemon thread."""
-
-    def _snapshot(p: Any) -> Dict[str, Any]:
-        # Coerced, not passed through: `progress` is rendered straight to JSON
-        # by the status route, so anything unserializable landing here would
-        # turn every subsequent poll into a 500 rather than a failed job.
-        return {
-            "files_total": int(p.files_total),
-            "files_done": int(p.files_done),
-            "bytes_total": int(p.bytes_total),
-            "bytes_done": int(p.bytes_done),
-            "current_name": str(p.current_name),
-            "elapsed_seconds": float(p.elapsed_seconds),
-        }
-
-    def _call() -> Any:
-        return ctx.get_client().warm_source(
-            job.source_id,
-            on_progress=lambda p: job.set_progress(_snapshot(p)),
-            should_cancel=job.cancel_requested,
-        )
-
-    # The terminal counts, not the last heartbeat: a fast warm can finish
-    # without ever emitting one, and `files_total == 0` is how a client learns
-    # the source had nothing to warm (single-file -- resolve already recalled
-    # it). That is the server's own structural answer, so no client has to
-    # keep its own list of which source types are multi-file.
-    _run_recall(
-        ctx, job, _call, on_success=lambda final: job.set_progress(_snapshot(final))
     )
 
 
@@ -2291,30 +2258,6 @@ async def start_resolve(source_id: str, request: Request) -> JSONResponse:
     second recall of the same bytes.
     """
     return _start_job("resolve", _resolve_worker, source_id, request)
-
-
-@_router.post("/api/sources/{source_id:path}/warm/cancel")
-async def cancel_warm(source_id: str, request: Request) -> JSONResponse:
-    """Ask an in-flight warm to stop. Files already recalled stay resident."""
-    return _cancel_job("warm", source_id, request)
-
-
-@_router.get("/api/sources/{source_id:path}/warm/status")
-async def warm_status(source_id: str, request: Request) -> JSONResponse:
-    """Progress of the warm on this source. 404 if none was ever started."""
-    return _job_status("warm", source_id, request)
-
-
-@_router.post("/api/sources/{source_id:path}/warm")
-async def start_warm(source_id: str, request: Request) -> JSONResponse:
-    """Hydrate-ahead: recall a resolved source's member files server-side.
-
-    Idempotent and safe to call on any resolved source -- one with nothing to
-    warm finishes immediately with ``files_total == 0``, which is how a client
-    tells a single-file source from a multi-file one without keeping its own
-    list of source types.
-    """
-    return _start_job("warm", _warm_worker, source_id, request)
 
 
 @_router.get("/api/sources/{source_id:path}")

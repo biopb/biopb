@@ -3749,60 +3749,11 @@ class TestResolveWarmJobs:
         body = _await_state(tc, "resolve", "cloud0", "error")
         assert "offline" in body["error"]
 
-    def test_warm_reports_the_terminal_counts_not_the_last_heartbeat(self, auth_client):
-        tc, mock_fc = auth_client
-        mock_fc.warm_source.return_value = SimpleNamespace(
-            files_total=12,
-            files_done=12,
-            bytes_total=2048,
-            bytes_done=2048,
-            current_name="",
-            elapsed_seconds=3.0,
-        )
-        tc.post("/api/sources/cloud0/warm", headers=_bearer(_TOKEN))
-        body = _await_state(tc, "warm", "cloud0", "done")
-        assert body["progress"]["files_done"] == 12
-        assert body["progress"]["bytes_total"] == 2048
-
-    def test_warm_on_a_single_file_source_reports_nothing_to_do(self, auth_client):
-        # files_total == 0 is how a client tells single-file from multi-file
-        # without keeping its own list of source types.
-        tc, mock_fc = auth_client
-        mock_fc.warm_source.return_value = SimpleNamespace(
-            files_total=0,
-            files_done=0,
-            bytes_total=0,
-            bytes_done=0,
-            current_name="",
-            elapsed_seconds=0.0,
-        )
-        tc.post("/api/sources/cloud0/warm", headers=_bearer(_TOKEN))
-        body = _await_state(tc, "warm", "cloud0", "done")
-        assert body["progress"]["files_total"] == 0
-
-    def test_resolve_and_warm_are_separate_jobs_on_one_source(self, auth_client):
-        tc, mock_fc = auth_client
-        mock_fc.warm_source.return_value = SimpleNamespace(
-            files_total=1,
-            files_done=1,
-            bytes_total=8,
-            bytes_done=8,
-            current_name="",
-            elapsed_seconds=0.1,
-        )
-        tc.post("/api/sources/cloud0/resolve", headers=_bearer(_TOKEN))
-        tc.post("/api/sources/cloud0/warm", headers=_bearer(_TOKEN))
-        _await_state(tc, "resolve", "cloud0", "done")
-        _await_state(tc, "warm", "cloud0", "done")
-
     def test_every_route_requires_the_token(self, auth_client):
         tc, _ = auth_client
         for method, path in [
             ("post", "/api/sources/c/resolve"),
             ("get", "/api/sources/c/resolve/status"),
             ("post", "/api/sources/c/resolve/cancel"),
-            ("post", "/api/sources/c/warm"),
-            ("get", "/api/sources/c/warm/status"),
-            ("post", "/api/sources/c/warm/cancel"),
         ]:
             assert getattr(tc, method)(path).status_code == 401, path
