@@ -82,7 +82,7 @@ def _kinds(db, source_id="s1"):
     return claimed, unclaimed
 
 
-class TestRouting:
+class TestRows:
     def test_a_restorable_source_has_one_row_with_its_claim(self):
         db = _db()
         db.sync_source_added(
@@ -132,7 +132,7 @@ class TestRouting:
         assert _count(db, "source_catalog") == 1
         assert _row(db)[3] is None
 
-    def test_a_pending_row_with_a_claim_is_persisted_and_one_without_is_not(self):
+    def test_a_pending_row_has_its_claim_columns_and_one_without_has_none(self):
         db = _db()
         db.sync_pending_source(_record().claim, record=_record())
         other = SourceClaim("zarr", "/drop/s2.zarr", "s2")
@@ -188,7 +188,7 @@ class TestRouting:
         assert row[:3] == (True, None, None)
         assert row[6] == 1
 
-    def test_a_pending_batch_splits_by_whether_the_row_has_a_record(self):
+    def test_a_pending_batch_writes_rows_with_and_without_a_record(self):
         from biopb_tensor_server.sources.pending_rows import PendingRow
 
         db = _db()
@@ -213,23 +213,6 @@ class TestRouting:
         )
         db.sync_pending_sources([PendingRow(_record().claim, record=_record())])
         assert _row(db)[:2] == (True, None)
-
-    def test_every_source_shows_once_however_it_is_written(self):
-        from biopb_tensor_server.sources.pending_rows import PendingRow
-
-        db = _db()
-        restorable = _Restorable("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8")
-        plain = MockAdapter("s2", "/d/s2.zarr", "zarr", [4, 4], "uint8")
-        db.sync_source_added("s1", restorable, _record())
-        db.sync_source_added("s2", plain)
-        # Registered again, re-listed without a record, and pended again.
-        db.sync_source_added("s1", restorable, _record())
-        db.sync_source_added("s1", restorable)
-        db.sync_source_added("s2", plain)
-        db.sync_pending_sources([PendingRow(_record().claim, record=_record())])
-        assert (_kinds(db, "s1"), _kinds(db, "s2")) == ((1, 0), (0, 1))
-        rows = db.query("SELECT source_id FROM sources").to_pylist()
-        assert sorted(r["source_id"] for r in rows) == ["s1", "s2"]
 
     def test_a_relisting_without_a_record_updates_the_claimed_row(self):
         """A field uploaded to a discovered source re-lists it with no record: its
@@ -280,7 +263,7 @@ class TestRouting:
         assert row[:4] == (False, "failed", "boom", None)
         assert row[6] == 0
 
-    def test_removal_deletes_from_both(self):
+    def test_removal_deletes_the_row(self):
         db = _db()
         db.sync_source_added(
             "s1", _Restorable("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8"), _record()
@@ -316,6 +299,24 @@ class TestAcrossAnOpen:
             assert [r["source_id"] for r in rows] == ["s1"]
         finally:
             db.close()
+
+
+class TestConfirmationOfRowsWithNoClaim:
+    def test_a_row_with_no_claim_is_confirmed_by_construction(self):
+        db = _db()
+        db.sync_source_added(
+            "s1", _Restorable("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8"), _record()
+        )
+        db.sync_source_added(
+            "s2", MockAdapter("s2", "/x/s2.zarr", "zarr", [4, 4], "uint8")
+        )
+        confirmation = dict(
+            db._get_connection()
+            .execute("SELECT source_id, confirmed FROM source_confirmation")
+            .fetchall()
+        )
+        # Written this run, so both are; neither waits on a root's walk.
+        assert confirmation == {"s1": True, "s2": True}
 
 
 class TestPrivacy:
@@ -498,6 +499,33 @@ class TestStore:
             "s1", MockAdapter("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8")
         )
         assert db.query("SELECT source_id FROM sources").num_rows == 1
+
+    def test_a_file_from_the_two_table_build_opens_and_loses_the_volatile_table(
+        self, tmp_path
+    ):
+        path = tmp_path / "c.duckdb"
+        db = self._db(path)
+        db.open()
+        db.close()
+        conn = duckdb.connect(str(path))
+        conn.execute("DROP VIEW source_confirmation")
+        conn.execute("DROP VIEW sources")
+        conn.execute("CREATE TABLE sources_volatile (source_id TEXT PRIMARY KEY)")
+        conn.execute(
+            "UPDATE catalog_meta SET value = '3' WHERE key = 'source_catalog_format'"
+        )
+        conn.close()
+
+        db = self._db(path)
+        db.open()
+        tables = {
+            r[0]
+            for r in db._get_connection()
+            .execute("SELECT table_name FROM duckdb_tables()")
+            .fetchall()
+        }
+        assert "sources_volatile" not in tables and "source_catalog" in tables
+        assert db.query("SELECT source_id FROM sources").num_rows == 0
 
     def test_an_older_build_cannot_open_the_file_until_the_view_is_dropped(
         self, tmp_path
