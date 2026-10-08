@@ -186,7 +186,7 @@ def test_file_url_is_read_as_a_local_path(tmp_path):
 
 def test_metadata_is_the_image_information_subtree(tmp_path):
     path, _ = create_zeiss_czi(str(tmp_path), n_c=2, n_z=3, image_shape=(8, 8))
-    metadata = _native(path).get_metadata()
+    metadata = _native(path).registration_record([], import_rois=False).metadata
 
     assert metadata["Image"]["SizeC"] == "2"
     assert metadata["Image"]["SizeZ"] == "3"

@@ -1507,7 +1507,7 @@ class MetadataDatabase:
 
         # The file's metadata and ROIs (#951), built together by the adapter:
         # the FORMAT decides whether its file carries annotations, because the
-        # server does not police what get_metadata() returns -- a `rois` key in
+        # server does not police what registration_record returns -- a `rois` key in
         # an EMD's original_metadata or an OME-Zarr's .zattrs means whatever that
         # format meant by it. A server that does not serve the annotation actions
         # does not parse a file's ROIs either: the rows would be unreadable
@@ -2064,11 +2064,11 @@ class MetadataDatabase:
     def get_metadata_json(self, source_id: str) -> Optional[dict]:
         """Return a source's stored metadata as a dict, or ``None`` when empty.
 
-        The catalog stores ``json.dumps(adapter.get_metadata())`` -- the **raw**
+        The catalog stores ``json.dumps(adapter.registration_record)`` -- the **raw**
         dict, no envelope -- so the serve path can read metadata back with a
         cheap local ``SELECT`` instead of recomputing it on the adapter
         (biopb/biopb#253), and for a remote proxy without an upstream RPC (read
-        the local mirror row directly, never ``adapter.get_metadata()``). The
+        the local mirror row directly, never ``adapter.registration_record``). The
         stored JSON is parsed here so callers get a ready dict.
 
         Returns ``None`` when the source has no usable stored metadata -- which is

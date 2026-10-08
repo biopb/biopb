@@ -35,7 +35,6 @@ import pyarrow.flight as flight
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.adapters._metadata_record import MetadataRecordMixin
 from biopb_tensor_server.adapters._writable import WritableSource
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.core.adapter_base import (
@@ -53,6 +52,10 @@ from biopb_tensor_server.core.chunk import (
 from biopb_tensor_server.core.chunk_batch import CHUNK_WIRE_SCHEMA, unpack_chunk_array
 from biopb_tensor_server.core.errors import StaleChunkError
 from biopb_tensor_server.core.normalize import canonical_axes
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import SourceConfig
@@ -61,7 +64,7 @@ logger = logging.getLogger(__name__)
 
 
 @canonical_axes
-class CachedSourceAdapter(MetadataRecordMixin, WritableSource, TensorAdapter):
+class CachedSourceAdapter(WritableSource, TensorAdapter):
     """An uploaded tensor kept in the chunk cache.
 
     One instance per uploaded tensor, registered in the server's registry. It
@@ -295,9 +298,11 @@ class CachedSourceAdapter(MetadataRecordMixin, WritableSource, TensorAdapter):
         """Cache sources are single-tensor."""
         return [catalog_entry(self._native_descriptor())]
 
-    def get_metadata(self) -> dict:
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
         """Return OME metadata."""
-        return self._ome_metadata
+        return metadata_record(self._ome_metadata)
 
     def _physical_scale(self) -> Optional[Tuple[List[float], List[str]]]:
         """Echo the uploader's physical calibration onto the wire descriptor.

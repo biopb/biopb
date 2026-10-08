@@ -323,7 +323,7 @@ _STRIP_PER_PLANE = re.compile(
 # form `<BinData BigEndian="true"/>` or the open-but-empty form
 # `<BinData BigEndian="true"></BinData>`. It carries no catalog data, but
 # ome-types/pydantic rejects it ("length Field required"), so `from_xml` raises
-# and the whole fast path returns None -> `get_metadata` yields `{}` for these
+# and the whole fast path returns None -> `registration_record` yields `{}` for these
 # files (biopb/biopb#199). Dropping the empty placeholder lets `from_xml` succeed
 # and produce the real structural dict.
 #
@@ -531,7 +531,7 @@ class OmeTiffAdapter(TensorAdapter):
         self._reduced_ome_xml_probed = False
         # The dict _reduced_ome_xml parses into (biopb/biopb#1059 step 4): a pure
         # function of that already-cached string, so caching it costs nothing in
-        # correctness and saves a second ome-types parse when both get_metadata
+        # correctness and saves a second ome-types parse when both registration_record
         # and get_embedded_labels run in the same registration (metadata_db.py
         # calls the former directly; the latter is the registry's one-time call per adapter).
         self._parsed_metadata: Optional[dict] = None
@@ -567,7 +567,7 @@ class OmeTiffAdapter(TensorAdapter):
 
         The scene descriptors (with their transfer grid) and each scene's physical
         scale come from the payload. The metadata is the row's, which is the whole
-        of it for a file with no ROIs; a file that has them keeps ``get_metadata``,
+        of it for a file with no ROIs; a file that has them keeps the metadata,
         the record's ROIs and the ``@ome`` labels lazy, parsing the file when
         asked, since the row holds neither the ROIs nor the mask bitmaps.
 
@@ -805,25 +805,6 @@ class OmeTiffAdapter(TensorAdapter):
 
     # ---- metadata / physical scale -----------------------------------------
 
-    def get_metadata(self) -> dict:
-        """OME metadata dict from the stripped OME-XML (biopb/biopb#168), else {}.
-        The catalog row's producer; the adapter itself reads :meth:`_ome_metadata`.
-
-        Parses the OME-XML with per-plane ``<Plane>``/``<TiffData>`` elements
-        stripped -- the same ome-types structure MINUS the per-plane arrays at a
-        fraction of the cost. Runs at registration (the metadata-DB sync calls
-        get_metadata), so keeping it cheap is what moves the OME parse off startup.
-
-        Goes through ``_reduced_ome_xml_cached()``, not the raw string, so a re-sync
-        (an unresolved source resolving) re-parses the stripped form already in
-        hand rather than re-opening the file for a string it would strip again --
-        and the *dict* that parse produces is itself cached (``_parsed_metadata``),
-        since it is a pure function of that same string: a caller that also
-        touches ``get_embedded_labels`` in the same registration (the registry's label-set view)
-        gets the one parse already done, not a second one.
-        """
-        return self._ome_metadata()
-
     def _ome_metadata(self) -> dict:
         """The parsed stripped OME metadata, parsed once and kept."""
         if self._parsed_metadata_probed:
@@ -837,7 +818,14 @@ class OmeTiffAdapter(TensorAdapter):
     def registration_record(
         self, tensors, *, import_rois=True, max_rois_per_tensor=None
     ):
-        """The metadata and the OME-XML ``<ROI>`` elements this file carries.
+        """The OME metadata and the ``<ROI>`` elements this file carries.
+
+        The metadata is the OME-XML parsed with per-plane ``<Plane>``/``<TiffData>``
+        elements stripped (biopb/biopb#168) -- the same ome-types structure minus
+        the per-plane arrays at a fraction of the cost, so registration stays
+        cheap. It goes through ``_reduced_ome_xml_cached()``, not the raw string,
+        so a re-sync re-parses the stripped form already in hand rather than
+        re-opening the file.
 
         ROIs are matched by id: ``_ome_scene_ids`` puts the OME image id straight
         into the array_id's field half, so the two id spaces are the same one.
@@ -856,7 +844,7 @@ class OmeTiffAdapter(TensorAdapter):
             )
 
         record = ome_registration_record(
-            self.get_metadata(), read_rois, import_rois=import_rois
+            self._ome_metadata(), read_rois, import_rois=import_rois
         )
         try:
             self._drop_registration_state()
@@ -1013,7 +1001,7 @@ class OmeTiffAdapter(TensorAdapter):
         acquisition (40,000 timepoints is real) that is tens of MB per source.
 
         Kept: ``_reduced_ome_xml``, which carries every ``<Image>``/``<Pixels>``
-        header and so still answers ``get_metadata`` and ``_physical_scale``
+        header and so still answers ``registration_record`` and ``_physical_scale``
         without touching the file. Also kept is ``_raw_ome_xml_probed`` -- the
         release marks ``_raw_ome_xml_released`` instead of un-probing, or every
         later call would re-open the file and we would have traded a memory leak
@@ -1027,7 +1015,7 @@ class OmeTiffAdapter(TensorAdapter):
         Derives the stripped form BEFORE dropping the source string, and hands
         it down to every scene, because what a scene inherited in
         ``get_tensor_adapter`` is a snapshot of whatever existed when it was
-        built. A scene built between descriptor discovery and ``get_metadata``
+        built. A scene built between descriptor discovery and ``registration_record``
         -- the window the reconciler opens by registering a source before
         syncing it, during which a ``GetFlightInfo`` or a precache warm can land
         -- holds the raw string and no stripped one. Releasing that scene
@@ -1067,7 +1055,7 @@ class OmeTiffAdapter(TensorAdapter):
                 self._parsed_metadata = None
                 self._parsed_metadata_probed = False
         if self._hydrated_metadata is None:
-            # Built, written and gone: a later get_metadata parses the stripped
+            # Built, written and gone: a later registration_record parses the stripped
             # XML again rather than the adapter holding the dict for its life.
             self._parsed_metadata = None
             self._parsed_metadata_probed = False
@@ -1206,13 +1194,13 @@ class OmeTiffAdapter(TensorAdapter):
         removes only ``<Plane>``/``<TiffData>``, so every ``<Image>``/
         ``<Pixels>`` header survives it, and after the post-registration release
         it is the only document left (biopb/biopb#783). Registration always
-        computes it (``get_metadata`` does), so post-release it is always there.
+        computes it (``registration_record`` does), so post-release it is always there.
 
         Never *computes* it just for this: ``iterparse`` stops at the requested
         image's ``<Pixels>``, which is cheaper than the whole-document strip that
         would produce the reduced form. Falling back to the raw document is also
         what happens if the stripped one fails to parse -- which would equally
-        have failed ``get_metadata``. A stripped document that parses and names
+        have failed ``registration_record``. A stripped document that parses and names
         no physical size is a legitimate ``None``, not a reason to re-read.
         Never raises.
         """

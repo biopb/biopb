@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, List, Mapping
+from typing import Any, List, Mapping, Optional
 
 
 @dataclass(frozen=True)
@@ -19,6 +19,15 @@ class RegistrationRecord:
     metadata: Mapping[str, Any]
     rois: Mapping[str, List[Any]] = field(default_factory=dict)
     report: Any = None
+
+
+def metadata_record(metadata: Optional[Mapping[str, Any]]) -> RegistrationRecord:
+    """A :class:`RegistrationRecord` of just *metadata*, minus any mask bitmaps.
+
+    For a format whose catalog entry is its metadata dict and nothing else; a
+    mask's bitmap is arbitrary binary and never reaches the SQL-queryable column.
+    """
+    return RegistrationRecord(strip_mask_bindata(metadata or {}))
 
 
 def strip_mask_bindata(metadata: Mapping[str, Any]) -> Mapping[str, Any]:

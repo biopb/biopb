@@ -7,8 +7,11 @@ suite runs on every platform; a small stub adapter checks the descriptor build
 sites actually apply it.
 """
 
-from biopb_tensor_server.adapters._metadata_record import MetadataRecordMixin
 from biopb_tensor_server.core.adapter_base import SourceAdapter, to_catalog_url
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 
 
 class TestToCatalogUrl:
@@ -62,7 +65,7 @@ class TestToCatalogUrl:
         assert to_catalog_url("rel/dir/x.tif") == "file:///rel/dir/x.tif"
 
 
-class _StubAdapter(MetadataRecordMixin, SourceAdapter):
+class _StubAdapter(SourceAdapter):
     """Minimal concrete SourceAdapter to exercise ``catalog_url``."""
 
     def __init__(self, source_url: str, source_type: str = "aics"):
@@ -77,8 +80,10 @@ class _StubAdapter(MetadataRecordMixin, SourceAdapter):
     def list_tensors(self):
         return []
 
-    def get_metadata(self):
-        return {}
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
+        return metadata_record({})
 
     def is_resident(self):
         # Avoid touching the filesystem for a fabricated path.

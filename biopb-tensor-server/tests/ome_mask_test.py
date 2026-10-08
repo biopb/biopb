@@ -343,7 +343,7 @@ class TestFastMetadataRealBitmap:
         raw = bytes([0xFF, 0x00, 0xFE, 0x80, 0x01, 0x00])  # not valid UTF-8
         path = self._write(tmp_path, raw)
         adapter = OmeTiffAdapter(path, "src1")
-        metadata = adapter.get_metadata()
+        metadata = adapter._ome_metadata()
         assert metadata  # used to come back {} entirely
         assert metadata["images"][0]["id"] == "Image:0"
         mask = metadata["rois"][0]["union"]["masks"][0]
@@ -392,7 +392,7 @@ class TestFastMetadataRealBitmap:
             )[tuple([0] * (out.ndim - 2) + [2, 2])]
             == 1
         )
-        metadata_after_release = adapter.get_metadata()
+        metadata_after_release = adapter._ome_metadata()
         mask_after_release = metadata_after_release["rois"][0]["union"]["masks"][0]
         assert mask_after_release["bin_data"]["value"] == ""
 
@@ -448,8 +448,8 @@ class TestFastMetadataRealBitmap:
 
         monkeypatch.setattr(ome_tiff_module, "_fast_ome_metadata", counting)
 
-        adapter.get_metadata()
-        adapter.get_embedded_labels()  # calls self.get_metadata() again internally
-        adapter.get_metadata()
+        adapter._ome_metadata()
+        adapter.get_embedded_labels()  # calls self._ome_metadata() again internally
+        adapter._ome_metadata()
 
         assert len(calls) == 1

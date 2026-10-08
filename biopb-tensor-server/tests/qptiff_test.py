@@ -334,7 +334,7 @@ class TestQptiffAdapter:
             create_synthetic_qptiff(p, n_channels=3, baseline_marker="DAPI")
             adapter = _adapter(p)
             try:
-                meta = adapter.get_metadata()
+                meta = adapter.registration_record([], import_rois=False).metadata
                 assert meta["format"] == "qptiff"
                 # channels is positional (one entry per channel): the named
                 # baseline plus None gaps -- NOT collapsed to ["DAPI"], which

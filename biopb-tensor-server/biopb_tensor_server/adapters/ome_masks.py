@@ -28,7 +28,6 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.adapters._metadata_record import MetadataRecordMixin
 from biopb_tensor_server.adapters._ome_rois import Tensor
 from biopb_tensor_server.adapters.labels import NearestPyramidMixin
 from biopb_tensor_server.core.adapter_base import (
@@ -40,7 +39,11 @@ from biopb_tensor_server.core.adapter_base import (
 from biopb_tensor_server.core.axes import labeled_axis_index
 from biopb_tensor_server.core.chunk import default_transfer_chunk_shape
 from biopb_tensor_server.core.errors import WriteNotSupportedError
-from biopb_tensor_server.core.registration import strip_mask_bindata
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+    strip_mask_bindata,
+)
 
 __all__ = ["RasterizedMaskAdapter", "masks_by_image", "strip_mask_bindata"]
 
@@ -189,7 +192,7 @@ def masks_by_image(
     return out
 
 
-class RasterizedMaskAdapter(MetadataRecordMixin, NearestPyramidMixin, TensorAdapter):
+class RasterizedMaskAdapter(NearestPyramidMixin, TensorAdapter):
     """The ``@ome`` label set: OME ``<Mask>`` shapes painted into one tensor.
 
     Computed, not stored -- there is no backend to read again, only the
@@ -245,8 +248,10 @@ class RasterizedMaskAdapter(MetadataRecordMixin, NearestPyramidMixin, TensorAdap
     def dim_labels(self) -> List[str]:
         return self._dim_labels
 
-    def get_metadata(self) -> dict:
-        return {}
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
+        return metadata_record({})
 
     def get_embedded_labels(self) -> Dict[str, TensorAdapter]:
         return {}  # a set has no sets of its own

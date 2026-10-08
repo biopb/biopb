@@ -301,7 +301,7 @@ class TestDicomAdapter:
             ds = pydicom.dcmread(str(dcm_path))
             adapter = DicomAdapter(ds, "test_source")
 
-            metadata = adapter.get_metadata()
+            metadata = adapter.registration_record([], import_rois=False).metadata
 
             assert metadata["format"] == "dicom"
             assert "tags" in metadata
@@ -440,7 +440,12 @@ class TestDicomAdapterReads:
             assert "PixelData" not in adapter.ds
             # Header survives the strip: shape, metadata and the read path.
             assert adapter._shape == (16, 16)
-            assert adapter.get_metadata()["patient"]["PatientID"] == "P1"
+            assert (
+                adapter.registration_record([], import_rois=False).metadata["patient"][
+                    "PatientID"
+                ]
+                == "P1"
+            )
             got = adapter.get_data(ChunkBounds(start=[0, 0], stop=[16, 16]))
             assert np.array_equal(got, expected)
 
@@ -610,7 +615,7 @@ class TestDicomSeriesAdapter:
 
             adapter = DicomSeriesAdapter(tmpdir, "test_series")
 
-            metadata = adapter.get_metadata()
+            metadata = adapter.registration_record([], import_rois=False).metadata
 
             assert metadata["format"] == "dicom"
             assert "series" in metadata

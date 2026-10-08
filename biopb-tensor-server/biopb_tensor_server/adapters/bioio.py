@@ -786,16 +786,6 @@ class _BioioAdapterBase(TensorAdapter):
         """
         return None
 
-    def get_metadata(self) -> dict:
-        """Return OME metadata as a dict (bioio ``ome_metadata`` model_dump).
-
-        Returns:
-            OME metadata as dict, or empty dict if unavailable.
-        """
-        if self._hydration is not None:
-            return copy.deepcopy(self._hydration.metadata)
-        return self._read_metadata()
-
     def _read_metadata(self) -> dict:
         """The metadata as the file holds it, opening the file if need be."""
         try:
@@ -847,9 +837,12 @@ class _BioioAdapterBase(TensorAdapter):
                 max_per_tensor=max_rois_per_tensor,
             )
 
-        return ome_registration_record(
-            self.get_metadata(), read_rois, import_rois=import_rois
+        metadata = (
+            copy.deepcopy(self._hydration.metadata)
+            if self._hydration is not None
+            else self._read_metadata()
         )
+        return ome_registration_record(metadata, read_rois, import_rois=import_rois)
 
     def _hydrated_scale(self) -> Any:
         """The stored scale of this scene (the first, at source level), or

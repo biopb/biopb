@@ -45,7 +45,6 @@ from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.adapters._handle_reaper import IdleHandleReaper
-from biopb_tensor_server.adapters._metadata_record import MetadataRecordMixin
 from biopb_tensor_server.adapters._scale import MICRON, scale_by_label
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
@@ -60,6 +59,10 @@ from biopb_tensor_server.core.chunk import (
 )
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.normalize import canonical_axes
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import SourceConfig
@@ -78,7 +81,7 @@ _mapping_reaper = IdleHandleReaper(_MAPPING_TTL, "dv-mapping-reaper", max_handle
 
 
 @canonical_axes
-class DeltaVisionAdapter(MetadataRecordMixin, TensorAdapter):
+class DeltaVisionAdapter(TensorAdapter):
     """Reads DeltaVision DV volumes through ``mrc.DVFile``. Single-tensor source."""
 
     SOURCE_TYPE = "deltavision"
@@ -297,7 +300,9 @@ class DeltaVisionAdapter(MetadataRecordMixin, TensorAdapter):
         values = {"x": self._voxel.x, "y": self._voxel.y, "z": self._voxel.z}
         return scale_by_label(self.dim_labels, values, MICRON)
 
-    def get_metadata(self) -> dict:
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
         """The DV header as a JSON-safe dict; skips the per-frame extended
         header (biopb/biopb#799 -- O(sections), not worth paying for a catalog
         listing nobody asked to see frame-by-frame acquisition metadata in).
@@ -305,16 +310,16 @@ class DeltaVisionAdapter(MetadataRecordMixin, TensorAdapter):
         An adapter rebuilt from a row answers with the summary the row holds.
         """
         if self._stored_metadata is not None:
-            return self._stored_metadata
+            return metadata_record(self._stored_metadata)
         try:
             import mrc
 
             with mrc.DVFile(self._url) as probe:
                 header = dict(probe.hdr._asdict())
         except Exception:
-            return {"format": "dv"}
+            return metadata_record({"format": "dv"})
         header.pop("blank", None)
-        return {"format": "dv", "header": header}
+        return metadata_record({"format": "dv", "header": header})
 
 
 __all__ = ["DeltaVisionAdapter"]

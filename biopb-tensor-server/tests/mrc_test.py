@@ -284,7 +284,7 @@ class TestMrcAdapter:
     def test_metadata(self):
         with self._temporary_directory() as tmpdir:
             adapter, _ = self._adapter(tmpdir)
-            meta = adapter.get_metadata()
+            meta = adapter.registration_record([], import_rois=False).metadata
             assert meta["format"] == "mrc"
             assert "std_header" in meta
 

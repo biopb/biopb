@@ -17,7 +17,6 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.adapters._metadata_record import MetadataRecordMixin
 from biopb_tensor_server.adapters._scale import (
     MICRON,
     mm_summary_scale,
@@ -40,6 +39,10 @@ from biopb_tensor_server.core.discovery import (
     _is_offline_placeholder,
 )
 from biopb_tensor_server.core.normalize import canonical_axes
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 from biopb_tensor_server.core.remote import is_remote_url
 
 if TYPE_CHECKING:
@@ -161,7 +164,7 @@ def _natural_key(name: str) -> List[Tuple[int, Any]]:
     position and int/str never compare directly (no ``TypeError`` on names of
     differing structure). Gives the stacked file axis a sensible *default* order;
     the authoritative interpretation of that axis is the agent's, via
-    :meth:`TiffSequenceAdapter.get_metadata`.
+    :meth:`TiffSequenceAdapter.registration_record`.
     """
     return [
         (0, int(t)) if t.isdigit() else (1, t.lower())
@@ -375,7 +378,7 @@ class _PerFileTiffLockMixin:
 
 
 @canonical_axes
-class TiffSequenceAdapter(MetadataRecordMixin, _PerFileTiffLockMixin, TensorAdapter):
+class TiffSequenceAdapter(_PerFileTiffLockMixin, TensorAdapter):
     """Adapter for plain TIFF file sequences in a directory (no metadata).
 
     Handles datasets where multiple TIFF files form a single logical image:
@@ -393,7 +396,7 @@ class TiffSequenceAdapter(MetadataRecordMixin, _PerFileTiffLockMixin, TensorAdap
     is stacked along an opaque file axis (label ``i``); the axis's semantic
     structure (channel / time / site / z -- e.g. MetaMorph ``_w/_s/_t`` or
     ``_red/_green/_blue``) is deliberately NOT inferred here. Instead the per-file
-    names are exposed via ``get_metadata`` so a downstream agent can parse them
+    names are exposed via ``registration_record`` so a downstream agent can parse them
     and reshape / relabel. Differing dtype and spatial size are normalized into
     the stack (#198: widest dtype, zero-pad to the max plane); only a differing
     page count (or an unreadable file) is left out, and listed as a sibling. This
@@ -535,7 +538,7 @@ class TiffSequenceAdapter(MetadataRecordMixin, _PerFileTiffLockMixin, TensorAdap
         # decision; by now the directory is claimed and its subtree pruned, so
         # every TIFF here is a member. Natural-sort for a stable, numeric-aware
         # default order (``img_2`` before ``img_10``); what that order *means* is
-        # the agent's to decide (see get_metadata), not ours.
+        # the agent's to decide (see registration_record), not ours.
         all_tiffs = sorted(
             (
                 p
@@ -556,7 +559,7 @@ class TiffSequenceAdapter(MetadataRecordMixin, _PerFileTiffLockMixin, TensorAdap
         # member's values clip) and the per-axis max plane (smaller frames
         # zero-pad in get_data). So we bucket only by page count; files with a
         # different page count are not stacked but are surfaced via
-        # get_metadata(), as are unreadable ones. We do not parse what the file
+        # registration_record, as are unreadable ones. We do not parse what the file
         # axis means (channel / time / site / z): that is delegated to the agent,
         # which gets the per-file names alongside the array.
         #
@@ -992,7 +995,9 @@ class TiffSequenceAdapter(MetadataRecordMixin, _PerFileTiffLockMixin, TensorAdap
             )
             return None
 
-    def get_metadata(self) -> dict:
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
         """Expose per-file provenance so the agent can interpret the file axis.
 
         The file axis (label ``i``) is an opaque stack of every uniformly-shaped
@@ -1009,7 +1014,7 @@ class TiffSequenceAdapter(MetadataRecordMixin, _PerFileTiffLockMixin, TensorAdap
         md: Dict[str, Any] = {"files": [p.name for p in self._tiff_files]}
         if self._unstacked_files:
             md["unstacked_files"] = [p.name for p in self._unstacked_files]
-        return md
+        return metadata_record(md)
 
 
 # =============================================================================
@@ -1018,9 +1023,7 @@ class TiffSequenceAdapter(MetadataRecordMixin, _PerFileTiffLockMixin, TensorAdap
 
 
 @canonical_axes
-class MicroManagerLegacyAdapter(
-    MetadataRecordMixin, _PerFileTiffLockMixin, TensorAdapter
-):
+class MicroManagerLegacyAdapter(_PerFileTiffLockMixin, TensorAdapter):
     """Adapter for legacy MicroManager datasets with JSON metadata.
 
     Handles MicroManager v1 v2 datasets with metadata.txt containing:
@@ -1617,6 +1620,8 @@ class MicroManagerLegacyAdapter(
         summary = self._raw_metadata.get("Summary", {})
         return mm_summary_scale(summary, self.dim_labels)
 
-    def get_metadata(self) -> dict:
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
         """Return parsed MicroManager metadata."""
-        return self._raw_metadata
+        return metadata_record(self._raw_metadata)

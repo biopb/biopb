@@ -14,13 +14,15 @@ import math
 import pytest
 from biopb.image.annotation_pb2 import RoiAnnotation
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
-from biopb_tensor_server.adapters._metadata_record import MetadataRecordMixin
 from biopb_tensor_server.adapters._ome_rois import (
     OME_SET_NAME,
     imported_annotations,
     ome_registration_record,
     tensors_by_field,
     tensors_by_image_order,
+)
+from biopb_tensor_server.core.registration import (
+    metadata_record,
 )
 from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 
@@ -436,9 +438,6 @@ class _FakeAdapter:
             for scene, dims in self._tensors
         ]
 
-    def get_metadata(self):
-        return self._metadata
-
 
 def _reserved(db, array_id=ARRAY_0):
     rois, _ = db.list_rois(array_id, set_name=OME_SET_NAME)
@@ -701,7 +700,10 @@ class TestTheFormatDecides:
     class _PlainAdapter(_FakeAdapter):
         """A format that stores something else under `rois`."""
 
-        registration_record = MetadataRecordMixin.registration_record
+        def registration_record(
+            self, tensors, *, import_rois=True, max_rois_per_tensor=None
+        ):
+            return metadata_record(self._metadata)
 
     def test_a_format_that_carries_nothing_is_not_parsed(self):
         db = MetadataDatabase()
@@ -726,17 +728,23 @@ class TestTheFormatDecides:
         assert record.metadata == {"x": 1}
 
     def test_which_real_adapters_implement_it(self):
+        import inspect
+
         from biopb_tensor_server.adapters.bioio import _BioioAdapterBase
         from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
         from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
         from biopb_tensor_server.adapters.zarr import ZarrAdapter
 
-        declares = lambda cls: "registration_record" in vars(cls)  # noqa: E731
-        assert declares(OmeTiffAdapter)
-        assert declares(_BioioAdapterBase)  # and so every vendor subclass
+        def imports(cls):
+            return "ome_registration_record" in inspect.getsource(
+                cls.registration_record
+            )
+
+        assert imports(OmeTiffAdapter)
+        assert imports(_BioioAdapterBase)  # and so every vendor subclass
         # .zattrs is NGFF, not an ome-types dump -- the name is the trap.
-        assert not declares(OmeZarrAdapter)
-        assert not declares(ZarrAdapter)
+        assert not imports(OmeZarrAdapter)
+        assert not imports(ZarrAdapter)
 
 
 class TestAnnotationsDisabled:

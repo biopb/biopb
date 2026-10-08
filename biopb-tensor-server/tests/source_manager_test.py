@@ -6,11 +6,14 @@ import time
 from datetime import datetime, timedelta
 
 import pytest
-from biopb_tensor_server.adapters._metadata_record import MetadataRecordMixin
 from biopb_tensor_server.core.discovery import (
     DiscoveryState,
     SourceClaim,
     generate_source_id,
+)
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
 )
 from biopb_tensor_server.sources.roots import RootKind
 
@@ -1912,8 +1915,6 @@ class _CatalogStubAdapter:
     static source can flow through the real registration + catalog-sync path.
     """
 
-    registration_record = MetadataRecordMixin.registration_record
-
     def __init__(self, source_id, source_url):
         self._source_id = source_id
         self._source_url = source_url
@@ -1939,8 +1940,10 @@ class _CatalogStubAdapter:
 
         return [TensorDescriptor(array_id=self._source_id, shape=[8, 8], dtype="uint8")]
 
-    def get_metadata(self):
-        return {}
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
+        return metadata_record({})
 
 
 class _CatalogStubRegistry(_FakeRegistry):

@@ -9,7 +9,10 @@ import pyarrow.flight as flight
 import pytest
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import TensorTicket
-from biopb_tensor_server.adapters._metadata_record import MetadataRecordMixin
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 from biopb_tensor_server.serving.server import TensorFlightServer
 
@@ -18,8 +21,6 @@ class _CatalogAdapter:
     """Adapter double that syncs cleanly into the metadata DB."""
 
     capability_token = None
-
-    registration_record = MetadataRecordMixin.registration_record
 
     def __init__(self, source_id):
         self.source_id = source_id
@@ -49,8 +50,10 @@ class _CatalogAdapter:
             )
         ]
 
-    def get_metadata(self):
-        return {}
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
+        return metadata_record({})
 
 
 class _Context:

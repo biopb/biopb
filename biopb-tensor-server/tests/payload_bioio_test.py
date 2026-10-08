@@ -40,7 +40,11 @@ def _as_stored(adapter):
     which the annotation store owns once a registration has imported them."""
     # Once: BioIO numbers the OME ids it generates from a counter, so two reads of
     # one parsed adapter already disagree on them, which is not what is under test.
-    stored = {k: v for k, v in adapter.get_metadata().items() if k != "rois"}
+    stored = {
+        k: v
+        for k, v in adapter.registration_record([], import_rois=False).metadata.items()
+        if k != "rois"
+    }
     adapter.get_metadata = lambda: stored
     return adapter
 
@@ -240,7 +244,7 @@ class TestSharedBase:
         scene = rebuilt.get_tensor_adapter(entries[1].array_id)
         scene.get_tensor_descriptor()
         scene._physical_scale()
-        rebuilt.get_metadata()
+        rebuilt.registration_record([], import_rois=False)
         assert _FakeBioImage.opened == 0
 
         shape = list(scene.get_tensor_descriptor().shape)

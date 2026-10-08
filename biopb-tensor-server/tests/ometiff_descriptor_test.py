@@ -627,7 +627,7 @@ class TestFastMetadata:
                 return None
 
         adapter._bio_image = Recorder()
-        md = adapter.get_metadata()
+        md = adapter.registration_record([], import_rois=False).metadata
 
         assert hits == [], f"AICSImage accessed in get_metadata: {hits}"
         assert "images" in md and md["images"][0]["pixels"]["planes"] == []
@@ -668,7 +668,9 @@ class TestFastMetadata:
             return real_tifffile(*a, **k)
 
         monkeypatch.setattr(tifffile, "TiffFile", _counting)
-        assert scene.get_metadata()  # served from the inherited OME-XML
+        assert scene.registration_record(
+            [], import_rois=False
+        ).metadata  # served from the inherited OME-XML
         scene._physical_scale()  # value or None; must not open either
         assert opens == [], f"scene re-opened the TIFF for OME-XML: {opens}"
 

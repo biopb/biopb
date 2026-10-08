@@ -383,7 +383,9 @@ class TestNdTiffPooledReopen:
         # dataset is closed between reads.
         adapter, _, _ = self._adapter()
         self._idle_sweep()
-        assert adapter.get_metadata() == {"PixelSize_um": 0.1}
+        assert adapter.registration_record([], import_rois=False).metadata == {
+            "PixelSize_um": 0.1
+        }
 
 
 @pytest.mark.skipif(not _ndtiff_available(), reason="ndtiff not installed")

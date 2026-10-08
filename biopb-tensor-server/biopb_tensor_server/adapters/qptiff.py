@@ -31,7 +31,7 @@ is a **native-pyramid** adapter -- only the second after ``OmeZarrAdapter``:
 
 v1 exposes only the baseline pyramidal multichannel image as one tensor
 (``c,y,x``); the auxiliary Thumbnail/Overview/Label series are surfaced in
-``get_metadata()`` but not as separate tensors (biopb/biopb#135 open question).
+``registration_record`` but not as separate tensors (biopb/biopb#135 open question).
 """
 
 import logging
@@ -46,7 +46,6 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.adapters._handle_pool import HandlePool, PooledHandle
 from biopb_tensor_server.adapters._handle_reaper import DEFAULT_HANDLE_REAPER_TTL
-from biopb_tensor_server.adapters._metadata_record import MetadataRecordMixin
 from biopb_tensor_server.adapters._scale import MICRON, scale_by_label
 from biopb_tensor_server.adapters.zarr import ZarrAdapter
 from biopb_tensor_server.core.adapter_base import (
@@ -62,6 +61,10 @@ from biopb_tensor_server.core.chunk import (
 )
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.normalize import canonical_axes
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +76,7 @@ QPTIFF_EXTENSIONS = (".qptiff",)
 
 # The vendor XML block in a QPTIFF's ImageDescription is rooted at
 # <PerkinElmer-QPI-ImageDescription>; this substring gates channel/marker-name
-# extraction in get_metadata() (the file is already open there, so this is a
+# extraction in registration_record (the file is already open there, so this is a
 # read of in-hand bytes -- not a claim-time recall).
 _QPI_XML_MARKER = "PerkinElmer-QPI"
 
@@ -174,7 +177,7 @@ class _QptiffLevelAdapter(ZarrAdapter):
 
 
 @canonical_axes
-class QptiffAdapter(MetadataRecordMixin, TensorAdapter):
+class QptiffAdapter(TensorAdapter):
     """Adapter for Akoya PhenoImager QPTIFF (pyramidal multiplex BigTIFF).
 
     Single tensor (the baseline pyramidal multichannel image) served straight from
@@ -525,7 +528,9 @@ class QptiffAdapter(MetadataRecordMixin, TensorAdapter):
             logger.debug("qptiff: physical scale unavailable", exc_info=True)
             return None
 
-    def get_metadata(self) -> dict:
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
         """Marker/channel names + the raw vendor XML, best-effort and JSON-safe.
 
         Channel markers are read from the per-channel level-0 pages' vendor XML.
@@ -533,7 +538,7 @@ class QptiffAdapter(MetadataRecordMixin, TensorAdapter):
         does not expose them as tensors (biopb/biopb#135).
         """
         if self._stored is not None:
-            return dict(self._stored["metadata"])
+            return metadata_record(dict(self._stored["metadata"]))
         meta: dict = {"format": "qptiff"}
         try:
             with self._file() as handle:
@@ -565,7 +570,7 @@ class QptiffAdapter(MetadataRecordMixin, TensorAdapter):
                     meta["auxiliary_series"] = aux
         except Exception:
             logger.debug("qptiff: metadata parse failed", exc_info=True)
-        return meta
+        return metadata_record(meta)
 
     @staticmethod
     def _marker_name(desc: str) -> Optional[str]:

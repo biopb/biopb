@@ -7,17 +7,20 @@ import numpy as np
 import pytest
 from biopb.tensor import TensorFlightClient
 from biopb_tensor_server import TensorFlightServer
-from biopb_tensor_server.adapters._metadata_record import MetadataRecordMixin
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
     TensorDescriptor,
     strip_source_prefix,
 )
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 
 from tests import catalog_server, register_and_catalog
 
 
-class MockMultifieldAdapter(MetadataRecordMixin, TensorAdapter):
+class MockMultifieldAdapter(TensorAdapter):
     """Mock adapter simulating a multifield source with different-shaped tensors."""
 
     @classmethod
@@ -84,8 +87,12 @@ class MockMultifieldAdapter(MetadataRecordMixin, TensorAdapter):
             return self._tensor_adapters[tensor_id]
         raise ValueError(f"Unknown tensor: {tensor_id}")
 
-    def get_metadata(self) -> dict:
-        return {"multifield": True, "n_tensors": len(self.tensor_specs)}
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
+        return metadata_record(
+            {"multifield": True, "n_tensors": len(self.tensor_specs)}
+        )
 
     def get_data(self, bounds):
         """Mock get_data - raises since multifield adapter delegates to tensor adapters."""
@@ -94,7 +101,7 @@ class MockMultifieldAdapter(MetadataRecordMixin, TensorAdapter):
         )
 
 
-class MockSingleTensorAdapter(MetadataRecordMixin, TensorAdapter):
+class MockSingleTensorAdapter(TensorAdapter):
     """Mock adapter for a single tensor within a multifield source."""
 
     @classmethod
@@ -141,9 +148,11 @@ class MockSingleTensorAdapter(MetadataRecordMixin, TensorAdapter):
         )
         return np.full(shape, self.value, dtype=self.dtype)
 
-    def get_metadata(self) -> dict:
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
         """Return mock metadata."""
-        return {"mock_tensor": True, "value": self.value}
+        return metadata_record({"mock_tensor": True, "value": self.value})
 
 
 class TestMultifieldSourceLevel:
@@ -531,7 +540,7 @@ class TestMultifieldDifferentDtypes:
         assert descriptors[2].dtype == "uint16"
 
 
-class MockImage0Adapter(MetadataRecordMixin, TensorAdapter):
+class MockImage0Adapter(TensorAdapter):
     """Single-tensor source whose tensor is named "Image:0".
 
     Models a single-scene aicsimageio file: every such file names its one
@@ -586,8 +595,10 @@ class MockImage0Adapter(MetadataRecordMixin, TensorAdapter):
             )
         ]
 
-    def get_metadata(self) -> dict:
-        return {}
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
+        return metadata_record({})
 
     def _physical_scale(self):
         return list(self._phys_scale), list(self._phys_unit)

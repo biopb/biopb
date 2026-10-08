@@ -14,7 +14,6 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.adapters._metadata_record import MetadataRecordMixin
 from biopb_tensor_server.adapters._scale import (
     scale_by_label,
     scale_from_payload,
@@ -36,6 +35,10 @@ from biopb_tensor_server.core.discovery import (
     SourceClaim,
 )
 from biopb_tensor_server.core.normalize import canonical_axes
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import SourceConfig
@@ -331,7 +334,7 @@ def _dicom_common_metadata(ds) -> dict:
 # Image/Instance-level attributes that vary slice-to-slice within a series
 # (DICOM PS3.3 assigns them to the Image IE, not Patient/Study/Series). Reading
 # them off the first slice and reporting them as the series' value is misleading,
-# so ``DicomSeriesAdapter.get_metadata`` drops them from the shared first-slice
+# so ``DicomSeriesAdapter.registration_record`` drops them from the shared first-slice
 # metadata. Surfacing the real per-slice values is tracked in #560.
 _SERIES_NONINVARIANT_TAGS = frozenset(
     {
@@ -363,7 +366,7 @@ _SERIES_NONINVARIANT_SPATIAL = frozenset({"origin_mm", "slice_location_mm"})
 
 
 @canonical_axes
-class DicomAdapter(MetadataRecordMixin, TensorAdapter):
+class DicomAdapter(TensorAdapter):
     """Adapter for single DICOM files.
 
     Handles .dcm and .dicom files with pixel data.
@@ -683,12 +686,14 @@ class DicomAdapter(MetadataRecordMixin, TensorAdapter):
             return self._stored["scale"]
         return _dicom_physical_scale(self.ds, self.dim_labels)
 
-    def get_metadata(self) -> dict:
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
         """Extract DICOM metadata: format identifier, tags, derived spatial info,
         and patient/study info."""
         if self._stored is not None:
-            return copy.deepcopy(self._stored["metadata"])
-        return _dicom_common_metadata(self.ds)
+            return metadata_record(copy.deepcopy(self._stored["metadata"]))
+        return metadata_record(_dicom_common_metadata(self.ds))
 
 
 # =============================================================================
@@ -697,7 +702,7 @@ class DicomAdapter(MetadataRecordMixin, TensorAdapter):
 
 
 @canonical_axes
-class DicomSeriesAdapter(MetadataRecordMixin, TensorAdapter):
+class DicomSeriesAdapter(TensorAdapter):
     """Adapter for multi-file DICOM series forming a 3D volume.
 
     Handles directories where multiple DICOM files share the same SeriesInstanceUID.
@@ -955,7 +960,7 @@ class DicomSeriesAdapter(MetadataRecordMixin, TensorAdapter):
         if self._num_slices == 0:
             raise ValueError(f"No valid DICOM files found in series: {directory}")
 
-        # Read the first slice's header (shape/dtype + the tags get_metadata and
+        # Read the first slice's header (shape/dtype + the tags registration_record and
         # _physical_scale later report). Header-only -- everything read from
         # _first_ds lives in the header, so stop_before_pixels avoids loading and
         # retaining a whole slice's pixel data for the source's lifetime.
@@ -1048,13 +1053,15 @@ class DicomSeriesAdapter(MetadataRecordMixin, TensorAdapter):
 
         X/Y from ``PixelSpacing``; the ``z`` (slice) axis from
         ``SpacingBetweenSlices`` / ``SliceThickness`` -- both read off
-        ``_first_ds``, the same slice ``get_metadata`` reports from.
+        ``_first_ds``, the same slice ``registration_record`` reports from.
         """
         if self._stored is not None:
             return self._stored["scale"]
         return _dicom_physical_scale(self._first_ds, self.dim_labels)
 
-    def get_metadata(self) -> dict:
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
         """Extract DICOM series metadata: the first slice's *series-invariant*
         per-file metadata plus a series-level block.
 
@@ -1064,7 +1071,7 @@ class DicomSeriesAdapter(MetadataRecordMixin, TensorAdapter):
         series-wide. Full per-slice metadata is tracked in #560.
         """
         if self._stored is not None:
-            return copy.deepcopy(self._stored["metadata"])
+            return metadata_record(copy.deepcopy(self._stored["metadata"]))
         metadata = _dicom_common_metadata(self._first_ds)
         for section in ("tags", "patient"):
             for name in _SERIES_NONINVARIANT_TAGS:
@@ -1075,4 +1082,4 @@ class DicomSeriesAdapter(MetadataRecordMixin, TensorAdapter):
             "num_slices": self._num_slices,
             "directory": str(self.directory),
         }
-        return metadata
+        return metadata_record(metadata)

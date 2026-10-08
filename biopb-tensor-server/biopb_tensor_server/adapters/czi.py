@@ -42,7 +42,6 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.adapters._handle_pool import HandlePool, PooledHandle
 from biopb_tensor_server.adapters._handle_reaper import DEFAULT_HANDLE_REAPER_TTL
-from biopb_tensor_server.adapters._metadata_record import MetadataRecordMixin
 from biopb_tensor_server.adapters._scale import MICRON, scale_by_label
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
@@ -57,6 +56,10 @@ from biopb_tensor_server.core.chunk import (
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import TensorNotFound
 from biopb_tensor_server.core.normalize import canonical_axes
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 
 if TYPE_CHECKING:
     from biopb_tensor_server.cache.manager import CacheManager
@@ -282,7 +285,7 @@ def read_layout(path: str) -> _CziLayout:
 
 
 @canonical_axes
-class CziAdapter(MetadataRecordMixin, TensorAdapter):
+class CziAdapter(TensorAdapter):
     """Reads Zeiss CZI scenes through libCZI, one tensor per scene."""
 
     SOURCE_TYPE = "czi"
@@ -674,9 +677,11 @@ class CziAdapter(MetadataRecordMixin, TensorAdapter):
         """Voxel size per descriptor axis, from the document's Scaling items."""
         return scale_by_label(self.dim_labels, self._layout.scale_um, MICRON)
 
-    def get_metadata(self) -> dict:
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
         """The CZI Information subtree: sizes, channels, acquisition summary."""
-        return dict(self._layout.information)
+        return metadata_record(dict(self._layout.information))
 
 
 __all__ = ["CziAdapter"]

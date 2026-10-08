@@ -35,7 +35,6 @@ from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.adapters._handle_reaper import IdleHandleReaper
-from biopb_tensor_server.adapters._metadata_record import MetadataRecordMixin
 from biopb_tensor_server.adapters._scale import axes_scale
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
@@ -50,6 +49,10 @@ from biopb_tensor_server.core.chunk import (
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import InvalidTensorId, TensorNotFound
 from biopb_tensor_server.core.normalize import canonical_axes
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -208,7 +211,7 @@ class _EmdHandle:
 
 
 @canonical_axes
-class EmdAdapter(MetadataRecordMixin, TensorAdapter):
+class EmdAdapter(TensorAdapter):
     """Adapter for EMD electron-microscopy files (NCEM and Velox flavors).
 
     Dual-role, like the bioio adapter:
@@ -463,7 +466,9 @@ class EmdAdapter(MetadataRecordMixin, TensorAdapter):
             return None
         return axes_scale(self._axes, self.dim_labels or [])
 
-    def get_metadata(self) -> dict:
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
         """Source-level EMD metadata, JSON-safe.
 
         EMD metadata is genuinely per-signal, and the source-level adapter
@@ -473,8 +478,10 @@ class EmdAdapter(MetadataRecordMixin, TensorAdapter):
         :meth:`get_tensor_metadata` (biopb/biopb#253).
         """
         if self._original_metadata is None:
-            return {"format": "emd"}
-        return {"format": "emd", "original_metadata": self._original_metadata}
+            return metadata_record({"format": "emd"})
+        return metadata_record(
+            {"format": "emd", "original_metadata": self._original_metadata}
+        )
 
     def get_tensor_metadata(self) -> Optional[dict]:
         """This signal's ``original_metadata`` as the delta over the source row.

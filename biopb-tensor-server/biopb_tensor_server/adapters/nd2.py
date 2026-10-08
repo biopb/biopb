@@ -52,7 +52,6 @@ from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.adapters._handle_reaper import IdleHandleReaper
-from biopb_tensor_server.adapters._metadata_record import MetadataRecordMixin
 from biopb_tensor_server.adapters._scale import MICRON, scale_by_label
 from biopb_tensor_server.core import chunk as chunk_policy
 from biopb_tensor_server.core.adapter_base import (
@@ -70,6 +69,10 @@ from biopb_tensor_server.core.chunk import (
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import TensorNotFound
 from biopb_tensor_server.core.normalize import canonical_axes
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import SourceConfig
@@ -266,7 +269,7 @@ def read_layout(path: str) -> _Nd2Layout:
 
 
 @canonical_axes
-class Nd2Adapter(MetadataRecordMixin, TensorAdapter):
+class Nd2Adapter(TensorAdapter):
     """Reads a Nikon ND2 file through the ``nd2`` package, one tensor per XY
     stage position.
 
@@ -611,8 +614,10 @@ class Nd2Adapter(MetadataRecordMixin, TensorAdapter):
             return None
         return scale_by_label(self.dim_labels, self._layout.voxel_um, MICRON)
 
-    def get_metadata(self) -> dict:
-        return dict(self._layout.ome_summary)
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
+        return metadata_record(dict(self._layout.ome_summary))
 
 
 __all__ = ["Nd2Adapter"]

@@ -23,7 +23,6 @@ import numpy as np
 import pytest
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
-from biopb_tensor_server.adapters._metadata_record import MetadataRecordMixin
 from biopb_tensor_server.core.adapter_base import TensorAdapter, _get_read_plan
 from biopb_tensor_server.core.chunk import (
     _CV_SENTINEL,
@@ -47,6 +46,10 @@ from biopb_tensor_server.core.chunk import (
     wrap_content_version,
 )
 from biopb_tensor_server.core.errors import StaleChunkError
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 
 CV = b"1700000000000000000:4096"
 
@@ -518,7 +521,7 @@ class TestContentVersionFromPath:
 # (client.py's dask graph binds concrete chunk_ids once).
 
 
-class _VersionedStubAdapter(MetadataRecordMixin, TensorAdapter):
+class _VersionedStubAdapter(TensorAdapter):
     """Minimal tensor adapter with a settable content_version and real get_data."""
 
     def __init__(self, shape, content_version):
@@ -547,8 +550,10 @@ class _VersionedStubAdapter(MetadataRecordMixin, TensorAdapter):
     def list_tensors(self):
         return [self.get_tensor_descriptor()]
 
-    def get_metadata(self):
-        return {}
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
+        return metadata_record({})
 
 
 class TestResolveChunkDataRejectsStaleVersion:

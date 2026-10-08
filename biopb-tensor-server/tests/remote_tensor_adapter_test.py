@@ -14,8 +14,11 @@ import time
 import numpy as np
 import pyarrow as pa
 import pytest
-from biopb_tensor_server.adapters._metadata_record import MetadataRecordMixin
 from biopb_tensor_server.core.discovery import source_is_resident
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 from google.protobuf.field_mask_pb2 import FieldMask
 
 from tests import catalog_server, make_manager, register_and_catalog, source_ids
@@ -1057,8 +1060,10 @@ def _meta_zarr_cls():
     from biopb_tensor_server import ZarrAdapter
 
     class _MetaZarr(ZarrAdapter):
-        def get_metadata(self):
-            return {"ome": {"channel": "DAPI"}}
+        def registration_record(
+            self, tensors, *, import_rois=True, max_rois_per_tensor=None
+        ) -> RegistrationRecord:
+            return metadata_record({"ome": {"channel": "DAPI"}})
 
     return _MetaZarr
 
@@ -1109,7 +1114,9 @@ def test_get_metadata_reads_from_upstream_metadata_db(simple_zarr_array):
             upstream_location=f"grpc://localhost:{upstream.port}",
             upstream_source_id="img",
         )
-        assert adapter.get_metadata() == {"ome": {"channel": "DAPI"}}
+        assert adapter.registration_record([], import_rois=False).metadata == {
+            "ome": {"channel": "DAPI"}
+        }
     finally:
         upstream.shutdown()
 
@@ -1179,7 +1186,9 @@ def test_get_metadata_mirrors_an_upstreams_catalog(simple_zarr_array):
             upstream_source_id="img",
         )
         assert adapter.list_tensors()  # reachable -> mirrored
-        assert adapter.get_metadata() == {"ome": {"channel": "DAPI"}}
+        assert adapter.registration_record([], import_rois=False).metadata == {
+            "ome": {"channel": "DAPI"}
+        }
     finally:
         upstream.shutdown()
 
@@ -2340,7 +2349,9 @@ def test_seed_catalog_short_circuits_catalog_surface_without_dialing():
     assert [d.array_id for d in descs] == ["lab__img", "lab__img/A2"]
     assert list(descs[0].shape) == [4, 4]
     assert descs[1].dtype == "uint16"
-    assert adapter.get_metadata() == {"ome": "meta"}
+    assert adapter.registration_record([], import_rois=False).metadata == {
+        "ome": "meta"
+    }
     # the whole point: no upstream RPC was made
     assert adapter._client is None
 
@@ -2478,7 +2489,7 @@ def test_seed_catalog_empty_metadata_normalizes_to_dict():
     )
     adapter.seed_catalog([], None)  # unresolved upstream source: no tensors
     assert adapter.list_tensors() == []
-    assert adapter.get_metadata() == {}
+    assert adapter.registration_record([], import_rois=False).metadata == {}
     assert adapter._client is None
 
 
@@ -2877,8 +2888,6 @@ class _CatalogRowAdapter:
     """Minimal adapter to seed a controllable upstream catalog row
     (is_resolved / tensors / metadata)."""
 
-    registration_record = MetadataRecordMixin.registration_record
-
     def __init__(self, source_id, tensors, resolved=None, metadata=None):
         self.source_id = source_id
         self._source_url = f"/data/{source_id}"
@@ -2906,8 +2915,10 @@ class _CatalogRowAdapter:
 
         return [TensorDescriptor(**t) for t in self._tensors]
 
-    def get_metadata(self):
-        return self._metadata
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
+        return metadata_record(self._metadata)
 
 
 def test_seed_catalog_carries_resolution_and_detects_change():

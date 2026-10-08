@@ -54,7 +54,10 @@ class TestPlainTiff:
         )
         parsed, rebuilt = _check(TiffAdapter, path, "tiff", monkeypatch)
         assert rebuilt.get_tensor_adapter("src/Image:0")._physical_scale() is not None
-        assert rebuilt.get_metadata() == parsed.get_metadata()
+        assert (
+            rebuilt.registration_record([], import_rois=False).metadata
+            == parsed.registration_record([], import_rois=False).metadata
+        )
 
     def test_an_rgb_tiff(self, tmp_path, monkeypatch):
         path = tmp_path / "rgb.tif"
@@ -96,7 +99,10 @@ class TestLsm:
             photometric="minisblack",
         )
         parsed, rebuilt = _check(LsmAdapter, path, "lsm", monkeypatch)
-        assert rebuilt.get_metadata() == parsed.get_metadata()
+        assert (
+            rebuilt.registration_record([], import_rois=False).metadata
+            == parsed.registration_record([], import_rois=False).metadata
+        )
 
 
 class TestOmeTiff:

@@ -12,7 +12,6 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.adapters._metadata_record import MetadataRecordMixin
 from biopb_tensor_server.adapters._scale import scale_from_payload, scale_to_payload
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
@@ -27,6 +26,10 @@ from biopb_tensor_server.core.chunk import (
 )
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.normalize import canonical_axes
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import SourceConfig
@@ -40,7 +43,7 @@ _NIFTI_SPATIAL_UNIT = {1: "m", 2: "mm", 3: "µm"}
 
 
 @canonical_axes
-class NiftiAdapter(MetadataRecordMixin, TensorAdapter):
+class NiftiAdapter(TensorAdapter):
     """Adapter for NIfTI files (.nii and .nii.gz).
 
     Uses nibabel for lazy loading and header parsing.
@@ -436,14 +439,16 @@ class NiftiAdapter(MetadataRecordMixin, TensorAdapter):
         except Exception:
             return None
 
-    def get_metadata(self) -> dict:
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
         """Extract NIfTI header metadata.
 
         Returns:
             Dictionary with format identifier, header fields, and affine matrix
         """
         if self._stored is not None:
-            return copy.deepcopy(self._stored["metadata"])
+            return metadata_record(copy.deepcopy(self._stored["metadata"]))
         metadata = {
             "format": "nifti",
             "header": {},
@@ -547,7 +552,7 @@ class NiftiAdapter(MetadataRecordMixin, TensorAdapter):
             intent_code, f"code_{intent_code}"
         )
 
-        return metadata
+        return metadata_record(metadata)
 
     # ---- lifecycle ----------------------------------------------------------
 

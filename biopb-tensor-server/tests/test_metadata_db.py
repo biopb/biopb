@@ -12,7 +12,10 @@ import json
 
 import duckdb
 import pytest
-from biopb_tensor_server.adapters._metadata_record import MetadataRecordMixin
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 
 
@@ -20,8 +23,6 @@ class MockAdapter:
     """Mock adapter for testing metadata sync."""
 
     capability_token = None
-
-    registration_record = MetadataRecordMixin.registration_record
 
     def __init__(
         self,
@@ -64,8 +65,10 @@ class MockAdapter:
             )
         ]
 
-    def get_metadata(self):
-        return {"test_key": "test_value", "nested": {"a": 1, "b": 2}}
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
+        return metadata_record({"test_key": "test_value", "nested": {"a": 1, "b": 2}})
 
 
 class TestMetadataDatabaseInit:
@@ -139,17 +142,21 @@ class TestSourceSync:
         """Test that numpy scalar types are serialized correctly."""
         import numpy as np
 
-        class NumpyMockAdapter(MetadataRecordMixin, MockAdapter):
-            def get_metadata(self):
-                return {
-                    "int16": np.int16(42),
-                    "int32": np.int32(100),
-                    "float32": np.float32(3.14),
-                    "float64": np.float64(2.71),
-                    "array": np.array([1, 2, 3]),
-                    "bytes_utf8": b"hello",
-                    "bytes_binary": b"\xff\xfe",
-                }
+        class NumpyMockAdapter(MockAdapter):
+            def registration_record(
+                self, tensors, *, import_rois=True, max_rois_per_tensor=None
+            ) -> RegistrationRecord:
+                return metadata_record(
+                    {
+                        "int16": np.int16(42),
+                        "int32": np.int32(100),
+                        "float32": np.float32(3.14),
+                        "float64": np.float64(2.71),
+                        "array": np.array([1, 2, 3]),
+                        "bytes_utf8": b"hello",
+                        "bytes_binary": b"\xff\xfe",
+                    }
+                )
 
         db = MetadataDatabase()
         adapter = NumpyMockAdapter(
@@ -226,8 +233,6 @@ class TestSourceSync:
 class MultiTensorAdapter:
     """Mock adapter exposing several tensors (multi-field / HCS source)."""
 
-    registration_record = MetadataRecordMixin.registration_record
-
     def __init__(
         self,
         source_id,
@@ -260,8 +265,10 @@ class MultiTensorAdapter:
 
         return [TensorDescriptor(**t) for t in self._tensors]
 
-    def get_metadata(self):
-        return {}
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
+        return metadata_record({})
 
 
 class TestPerTensorCatalog:
@@ -573,7 +580,7 @@ class TestGetMetadataJson:
         assert db.get_metadata_json("s1") is None
 
     def test_none_for_empty_metadata(self):
-        # MultiTensorAdapter.get_metadata() -> {} -> stored as SQL NULL.
+        # MultiTensorAdapter.registration_record([], import_rois=False).metadata -> {} -> stored as SQL NULL.
         db = MetadataDatabase()
         db.sync_source_added(
             "s2",
@@ -899,8 +906,6 @@ class TestNoResidencyColumn:
         """A cloud / synced-folder source catalogued by URL only: no tensors,
         and not resident until resolved."""
 
-        registration_record = MetadataRecordMixin.registration_record
-
         def __init__(self, source_id, source_url):
             self.source_id = source_id
             self._source_url = source_url
@@ -917,8 +922,10 @@ class TestNoResidencyColumn:
         def list_tensors(self):
             return []  # nothing to say about shape or dtype yet
 
-        def get_metadata(self):
-            return {}
+        def registration_record(
+            self, tensors, *, import_rois=True, max_rois_per_tensor=None
+        ) -> RegistrationRecord:
+            return metadata_record({})
 
     def test_the_column_is_gone(self):
         import duckdb

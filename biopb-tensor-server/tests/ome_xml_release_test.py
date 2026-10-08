@@ -44,7 +44,7 @@ def registered(per_plane_tiff):
     """A source adapter taken through the registration calls, before release."""
     adapter = OmeTiffAdapter(per_plane_tiff, "perplane")
     adapter.list_tensors()
-    adapter.get_metadata()
+    adapter._ome_metadata()
     return adapter
 
 
@@ -99,10 +99,10 @@ def test_release_is_idempotent(registered):
 
 
 def test_metadata_after_release_reparses_without_reopening(registered, count_opens):
-    before = registered.get_metadata()
+    before = registered._ome_metadata()
     registered._drop_registration_state()
 
-    after = registered.get_metadata()
+    after = registered._ome_metadata()
 
     assert after == before
     assert after["images"][0]["pixels"]["planes"] == []  # stripped, as always
@@ -152,7 +152,7 @@ def test_scene_built_in_the_registration_gap_is_settled_by_the_release(
     assert scene._reduced_ome_xml  # settled on the way down
     count_opens.clear()
     assert scene._physical_scale() is not None
-    assert scene.get_metadata()["images"][0]["pixels"]["id"] == "Pixels:0"
+    assert scene._ome_metadata()["images"][0]["pixels"]["id"] == "Pixels:0"
     assert count_opens == []
     assert scene._raw_ome_xml is None  # and never re-cached the raw string
 
@@ -287,4 +287,4 @@ def test_the_record_drops_what_it_was_built_from(tmp_path):
     assert record.metadata["images"][0]["pixels"]["id"]
     assert adapter._raw_ome_xml is None
     assert adapter._parsed_metadata is None
-    assert adapter.get_metadata()["images"][0]["pixels"]["id"]
+    assert adapter._ome_metadata()["images"][0]["pixels"]["id"]

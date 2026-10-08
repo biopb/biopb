@@ -324,7 +324,9 @@ def test_get_metadata_returns_the_ome_summary(tmp_path, monkeypatch):
     path.write_bytes(b"\x00")
     _install_fake(monkeypatch, ome_payload={"images": [{"id": "Image:0"}]})
     source = Nd2Adapter.create_from_config(_source(path))
-    assert source.get_metadata() == {"images": [{"id": "Image:0"}]}
+    assert source.registration_record([], import_rois=False).metadata == {
+        "images": [{"id": "Image:0"}]
+    }
 
 
 def test_component_axes_are_never_split_across_a_chunk(tmp_path, monkeypatch):

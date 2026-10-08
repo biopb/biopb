@@ -121,10 +121,15 @@ class TestNd2:
         rebuilt = Nd2Adapter(
             nd2_adapter._url,
             nd2_adapter.source_id,
-            layout=_Nd2Layout.from_payload(payload, nd2_adapter.get_metadata()),
+            layout=_Nd2Layout.from_payload(
+                payload, nd2_adapter.registration_record([], import_rois=False).metadata
+            ),
         )
         assert _descriptors(rebuilt) == _descriptors(nd2_adapter)
-        assert rebuilt.get_metadata() == nd2_adapter.get_metadata()
+        assert (
+            rebuilt.registration_record([], import_rois=False).metadata
+            == nd2_adapter.registration_record([], import_rois=False).metadata
+        )
 
     def test_a_position_adapter_has_no_payload(self, nd2_adapter):
         position = nd2_adapter.get_tensor_adapter("P:0")
@@ -163,10 +168,15 @@ class TestCzi:
         rebuilt = CziAdapter(
             czi_adapter._url,
             czi_adapter.source_id,
-            layout=_CziLayout.from_payload(payload, czi_adapter.get_metadata()),
+            layout=_CziLayout.from_payload(
+                payload, czi_adapter.registration_record([], import_rois=False).metadata
+            ),
         )
         assert _descriptors(rebuilt) == _descriptors(czi_adapter)
-        assert rebuilt.get_metadata() == czi_adapter.get_metadata()
+        assert (
+            rebuilt.registration_record([], import_rois=False).metadata
+            == czi_adapter.registration_record([], import_rois=False).metadata
+        )
 
     def test_a_scene_adapter_has_no_payload(self, czi_adapter):
         scene = czi_adapter.get_tensor_adapter(czi_adapter.list_tensors()[0].array_id)

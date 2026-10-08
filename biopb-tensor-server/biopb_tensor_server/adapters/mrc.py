@@ -54,7 +54,6 @@ from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.adapters._handle_reaper import IdleHandleReaper
-from biopb_tensor_server.adapters._metadata_record import MetadataRecordMixin
 from biopb_tensor_server.adapters._scale import axes_scale
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
@@ -69,6 +68,10 @@ from biopb_tensor_server.core.chunk import (
 )
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.normalize import canonical_axes
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import SourceConfig
@@ -82,7 +85,7 @@ MRC_EXTENSIONS = (".mrc", ".mrcs", ".rec", ".st", ".map")
 # follows, then the raw data.
 _MRC_HEADER_BYTES = 1024
 
-# The header blocks ``get_metadata`` reports, and so the part of rsciio's
+# The header blocks ``registration_record`` reports, and so the part of rsciio's
 # ``original_metadata`` the row keeps.
 _HEADER_KEYS = ("std_header", "fei_header")
 
@@ -113,7 +116,7 @@ _mapping_reaper = IdleHandleReaper(_MAPPING_TTL, "mrc-mapping-reaper", max_handl
 
 
 @canonical_axes
-class MrcAdapter(MetadataRecordMixin, TensorAdapter):
+class MrcAdapter(TensorAdapter):
     """Adapter for MRC electron-microscopy volumes.
 
     Uses rosettasciio to parse the header and an own ``np.memmap`` for lazy,
@@ -398,10 +401,12 @@ class MrcAdapter(MetadataRecordMixin, TensorAdapter):
         """
         return axes_scale(self._axes, self.dim_labels)
 
-    def get_metadata(self) -> dict:
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
         """MRC header as a JSON-safe dict (rsciio hex-encodes byte/void fields)."""
         meta = {"format": "mrc"}
         for key in _HEADER_KEYS:
             if key in self._original_metadata:
                 meta[key] = self._original_metadata[key]
-        return meta
+        return metadata_record(meta)

@@ -17,7 +17,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, List, Optional, Union
 
-from biopb_tensor_server.adapters._metadata_record import MetadataRecordMixin
 from biopb_tensor_server.core.adapter_base import (
     SourceAdapter,
     TensorAdapter,
@@ -25,6 +24,10 @@ from biopb_tensor_server.core.adapter_base import (
     strip_source_prefix,
 )
 from biopb_tensor_server.core.errors import TensorNotFound
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 
 __all__ = ["DEFAULT_SCRATCH_TTL", "SCRATCH_SOURCE_ID", "ScratchSource"]
 
@@ -40,7 +43,7 @@ DEFAULT_SCRATCH_TTL = 86400.0
 SCRATCH_SOURCE_ID = "scratch"
 
 
-class ScratchSource(MetadataRecordMixin, SourceAdapter):
+class ScratchSource(SourceAdapter):
     """An empty source that takes attachments, and caps their lifetime.
 
     Empty as the catalog already models it -- a resolved source with an empty
@@ -89,10 +92,12 @@ class ScratchSource(MetadataRecordMixin, SourceAdapter):
         the registry's listing appends the published ones after this."""
         return []
 
-    def get_metadata(self) -> dict:
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
         """Nothing. Metadata describes an acquisition; the tensors here have
         nothing to do with each other and bring their own axes and shape."""
-        return {}
+        return metadata_record({})
 
     def get_tensor_adapter(self, tensor_id: Optional[str]) -> TensorAdapter:
         """A typed miss; never ``self``.

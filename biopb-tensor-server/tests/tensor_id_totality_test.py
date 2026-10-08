@@ -26,7 +26,6 @@ import pytest
 from biopb.tensor.descriptor_pb2 import FlightRequest, TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server import TensorFlightServer
-from biopb_tensor_server.adapters._metadata_record import MetadataRecordMixin
 from biopb_tensor_server.core.adapter_base import TensorAdapter, strip_source_prefix
 from biopb_tensor_server.core.errors import (
     InvalidTensorId,
@@ -35,6 +34,10 @@ from biopb_tensor_server.core.errors import (
     TensorNotFound,
     TensorResolutionError,
     UnknownResolutionError,
+)
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
 )
 from biopb_tensor_server.serving.server import (
     _adapter_lookup_error,
@@ -45,7 +48,7 @@ from biopb_tensor_server.serving.server import (
 # --------------------------------------------------------------------------- #
 # Minimal adapters
 # --------------------------------------------------------------------------- #
-class _SingleTensorAdapter(MetadataRecordMixin, TensorAdapter):
+class _SingleTensorAdapter(TensorAdapter):
     """A single-tensor source whose sole tensor is addressed by ``source_id``."""
 
     @classmethod
@@ -74,8 +77,10 @@ class _SingleTensorAdapter(MetadataRecordMixin, TensorAdapter):
     def list_tensors(self):
         return [self.get_tensor_descriptor()]
 
-    def get_metadata(self) -> dict:
-        return {}
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
+        return metadata_record({})
 
     def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         super().get_data(bounds)

@@ -15,7 +15,6 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
-from biopb_tensor_server.adapters._metadata_record import MetadataRecordMixin
 from biopb_tensor_server.adapters._writable import WritableSource
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
@@ -29,6 +28,10 @@ from biopb_tensor_server.core.chunk import (
 )
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.normalize import canonical_axes
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    metadata_record,
+)
 from biopb_tensor_server.core.remote import is_remote_url
 
 if TYPE_CHECKING:
@@ -216,7 +219,7 @@ class _LazyZarrArray:
 
 
 @canonical_axes
-class ZarrAdapter(MetadataRecordMixin, WritableSource, TensorAdapter):
+class ZarrAdapter(WritableSource, TensorAdapter):
     """Adapter for Zarr/N5 chunked arrays.
 
     Supports both local filesystem and remote storage (S3, GCS, etc.) via fsspec.
@@ -312,8 +315,10 @@ class ZarrAdapter(MetadataRecordMixin, WritableSource, TensorAdapter):
 
         return None
 
-    def get_metadata(self):
-        return {}
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ) -> RegistrationRecord:
+        return metadata_record({})
 
     def catalog_payload(self) -> Optional[Dict[str, Any]]:
         """The array's structure: everything a descriptor is made of.
