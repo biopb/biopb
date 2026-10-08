@@ -26,6 +26,7 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.adapters._handle_pool import HandlePool, PooledHandle
 from biopb_tensor_server.adapters._handle_reaper import DEFAULT_HANDLE_REAPER_TTL
+from biopb_tensor_server.adapters._metadata_record import MetadataRecordMixin
 from biopb_tensor_server.adapters._scale import mm_summary_scale
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
@@ -174,7 +175,7 @@ def _extract_summary(dataset) -> dict:
 
 
 @canonical_axes
-class NdTiffAdapter(TensorAdapter):
+class NdTiffAdapter(MetadataRecordMixin, TensorAdapter):
     """Adapter for Micro-Manager NDTiff storage format.
 
     Single-tensor source exposing full 5D/6D array.

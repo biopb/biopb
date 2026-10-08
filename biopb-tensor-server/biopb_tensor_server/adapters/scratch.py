@@ -17,6 +17,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, List, Optional, Union
 
+from biopb_tensor_server.adapters._metadata_record import MetadataRecordMixin
 from biopb_tensor_server.core.adapter_base import (
     SourceAdapter,
     TensorAdapter,
@@ -39,7 +40,7 @@ DEFAULT_SCRATCH_TTL = 86400.0
 SCRATCH_SOURCE_ID = "scratch"
 
 
-class ScratchSource(SourceAdapter):
+class ScratchSource(MetadataRecordMixin, SourceAdapter):
     """An empty source that takes attachments, and caps their lifetime.
 
     Empty as the catalog already models it -- a resolved source with an empty

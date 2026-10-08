@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 from biopb.tensor import TensorFlightClient
 from biopb_tensor_server import TensorFlightServer
+from biopb_tensor_server.adapters._metadata_record import MetadataRecordMixin
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
     TensorDescriptor,
@@ -16,7 +17,7 @@ from biopb_tensor_server.core.adapter_base import (
 from tests import catalog_server, register_and_catalog
 
 
-class MockMultifieldAdapter(TensorAdapter):
+class MockMultifieldAdapter(MetadataRecordMixin, TensorAdapter):
     """Mock adapter simulating a multifield source with different-shaped tensors."""
 
     @classmethod
@@ -93,7 +94,7 @@ class MockMultifieldAdapter(TensorAdapter):
         )
 
 
-class MockSingleTensorAdapter(TensorAdapter):
+class MockSingleTensorAdapter(MetadataRecordMixin, TensorAdapter):
     """Mock adapter for a single tensor within a multifield source."""
 
     @classmethod
@@ -530,7 +531,7 @@ class TestMultifieldDifferentDtypes:
         assert descriptors[2].dtype == "uint16"
 
 
-class MockImage0Adapter(TensorAdapter):
+class MockImage0Adapter(MetadataRecordMixin, TensorAdapter):
     """Single-tensor source whose tensor is named "Image:0".
 
     Models a single-scene aicsimageio file: every such file names its one

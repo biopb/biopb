@@ -83,10 +83,7 @@ from biopb_tensor_server.core.normalize import (
     to_native,
 )
 from biopb_tensor_server.core.read_mask import ENDPOINTS, PYRAMID, read_mask
-from biopb_tensor_server.core.registration import (
-    RegistrationRecord,
-    strip_mask_bindata,
-)
+from biopb_tensor_server.core.registration import RegistrationRecord
 from biopb_tensor_server.core.retention import (
     computed_ladder,
     record_decode,
@@ -375,20 +372,6 @@ class SourceAdapter(ABC):
         """
 
     @abstractmethod
-    def get_metadata(self) -> dict:
-        """Return the source-level metadata as a dict. Usually OME metadata.
-
-        Read by :meth:`registration_record`, once per registration, to populate
-        ``sources.metadata_json``; a changed file or a source that resolves
-        registers a new adapter. (A remote mirror's re-seed and a rolled-back
-        replace sync the same adapter again.) The serve path reads that row back,
-        never this method (biopb/biopb#253), and nothing else calls it: an adapter
-        that needs a value from its metadata keeps a private copy of that value.
-        The catalog is the cache, so this need not memoize. Genuinely per-tensor
-        metadata that the source row cannot represent is exposed on the tensor
-        adapter via :meth:`TensorAdapter.get_tensor_metadata` instead.
-        """
-
     def registration_record(
         self,
         tensors: Sequence[Tuple[str, Sequence[str]]],
@@ -414,10 +397,11 @@ class SourceAdapter(ABC):
         mirror and a rolled-back replace sync the same adapter again, so that
         must be recoverable.
 
-        The default is :meth:`get_metadata` alone, minus any mask bitmaps (never
-        for a SQL-queryable column).
+        Source-level metadata is the format's own business: ``metadata`` is what
+        ``sources.metadata_json`` holds, and the serve path reads that row back,
+        never the adapter (biopb/biopb#253). Genuinely per-tensor metadata the
+        row cannot represent is :meth:`TensorAdapter.get_tensor_metadata`.
         """
-        return RegistrationRecord(strip_mask_bindata(self.get_metadata() or {}))
 
     # -- attached tensors (biopb/biopb#1059) -----------------------------------
     # The tensors the upload path attached to a source -- uploaded fields, label
@@ -1240,7 +1224,7 @@ class TensorAdapter(SourceAdapter):
         """Per-tensor metadata fields the source-level catalog row does not carry.
 
         The serve path (``GetFlightInfo(with_metadata)``) reads a source's
-        metadata from the catalog row that :meth:`SourceAdapter.get_metadata`
+        metadata from the catalog row that :meth:`SourceAdapter.registration_record`
         produced once at registration -- the cache -- and **merges** this method's
         return over it (``row.update(get_tensor_metadata())``). So a tensor
         adapter returns only the *delta*: the cheap, per-tensor fields the
@@ -1266,7 +1250,7 @@ class TensorAdapter(SourceAdapter):
         Returns ``None`` when no physical sizes are known. This is the compact
         ~200-byte summary the tensor-load hot path needs (issue #31), so it must
         be **cheap** -- read it straight off the resident metadata model, never a
-        full ``get_metadata()`` dump. Default ``None``; format adapters that carry
+        full metadata dump. Default ``None``; format adapters that carry
         physical voxel sizes override it. There is no standalone public accessor:
         physical scale reaches clients only via the descriptor's
         ``physical_scale`` / ``physical_unit`` fields, filled by
@@ -1318,7 +1302,6 @@ _SOURCE_SCOPED_API = frozenset(
         "create_from_config",
         "create_from_payload",
         "list_tensors",
-        "get_metadata",
         "registration_record",
         "catalog_url",
         "is_resolved",

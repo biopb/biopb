@@ -26,6 +26,7 @@ import pytest
 from biopb.tensor.descriptor_pb2 import FlightRequest, TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server import TensorFlightServer
+from biopb_tensor_server.adapters._metadata_record import MetadataRecordMixin
 from biopb_tensor_server.core.adapter_base import TensorAdapter, strip_source_prefix
 from biopb_tensor_server.core.errors import (
     InvalidTensorId,
@@ -44,7 +45,7 @@ from biopb_tensor_server.serving.server import (
 # --------------------------------------------------------------------------- #
 # Minimal adapters
 # --------------------------------------------------------------------------- #
-class _SingleTensorAdapter(TensorAdapter):
+class _SingleTensorAdapter(MetadataRecordMixin, TensorAdapter):
     """A single-tensor source whose sole tensor is addressed by ``source_id``."""
 
     @classmethod

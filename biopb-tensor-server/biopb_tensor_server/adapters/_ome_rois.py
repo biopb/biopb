@@ -2,7 +2,7 @@
 
 An OME-TIFF carries its own ROIs, and they already reach the catalog: the fast
 metadata path strips only ``<Plane>``/``<TiffData>``, so ``<ROI>`` survives into
-the ome-types dump that ``SourceAdapter.get_metadata()`` returns. This module is
+the ome-types dump an OME adapter's metadata is. This module is
 the pure half of importing them -- dict in, ``RoiAnnotation`` out -- so the store
 can file them in the reserved ``@ome`` set that #952 made read-only.
 

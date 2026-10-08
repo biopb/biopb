@@ -14,6 +14,7 @@ import math
 import pytest
 from biopb.image.annotation_pb2 import RoiAnnotation
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
+from biopb_tensor_server.adapters._metadata_record import MetadataRecordMixin
 from biopb_tensor_server.adapters._ome_rois import (
     OME_SET_NAME,
     imported_annotations,
@@ -21,7 +22,6 @@ from biopb_tensor_server.adapters._ome_rois import (
     tensors_by_field,
     tensors_by_image_order,
 )
-from biopb_tensor_server.core.adapter_base import SourceAdapter
 from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 
 SOURCE_ID = "ometiff_a1b2c3"
@@ -701,7 +701,7 @@ class TestTheFormatDecides:
     class _PlainAdapter(_FakeAdapter):
         """A format that stores something else under `rois`."""
 
-        registration_record = SourceAdapter.registration_record
+        registration_record = MetadataRecordMixin.registration_record
 
     def test_a_format_that_carries_nothing_is_not_parsed(self):
         db = MetadataDatabase()

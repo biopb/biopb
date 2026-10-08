@@ -46,6 +46,7 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.adapters._handle_pool import HandlePool, PooledHandle
 from biopb_tensor_server.adapters._handle_reaper import DEFAULT_HANDLE_REAPER_TTL
+from biopb_tensor_server.adapters._metadata_record import MetadataRecordMixin
 from biopb_tensor_server.adapters._scale import MICRON, scale_by_label
 from biopb_tensor_server.adapters.zarr import ZarrAdapter
 from biopb_tensor_server.core.adapter_base import (
@@ -173,7 +174,7 @@ class _QptiffLevelAdapter(ZarrAdapter):
 
 
 @canonical_axes
-class QptiffAdapter(TensorAdapter):
+class QptiffAdapter(MetadataRecordMixin, TensorAdapter):
     """Adapter for Akoya PhenoImager QPTIFF (pyramidal multiplex BigTIFF).
 
     Single tensor (the baseline pyramidal multichannel image) served straight from

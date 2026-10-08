@@ -17,6 +17,7 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
+from biopb_tensor_server.adapters._metadata_record import MetadataRecordMixin
 from biopb_tensor_server.adapters._scale import (
     MICRON,
     mm_summary_scale,
@@ -374,7 +375,7 @@ class _PerFileTiffLockMixin:
 
 
 @canonical_axes
-class TiffSequenceAdapter(_PerFileTiffLockMixin, TensorAdapter):
+class TiffSequenceAdapter(MetadataRecordMixin, _PerFileTiffLockMixin, TensorAdapter):
     """Adapter for plain TIFF file sequences in a directory (no metadata).
 
     Handles datasets where multiple TIFF files form a single logical image:
@@ -1017,7 +1018,9 @@ class TiffSequenceAdapter(_PerFileTiffLockMixin, TensorAdapter):
 
 
 @canonical_axes
-class MicroManagerLegacyAdapter(_PerFileTiffLockMixin, TensorAdapter):
+class MicroManagerLegacyAdapter(
+    MetadataRecordMixin, _PerFileTiffLockMixin, TensorAdapter
+):
     """Adapter for legacy MicroManager datasets with JSON metadata.
 
     Handles MicroManager v1 v2 datasets with metadata.txt containing:

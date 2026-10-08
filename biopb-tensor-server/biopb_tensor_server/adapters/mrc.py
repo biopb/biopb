@@ -54,6 +54,7 @@ from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.adapters._handle_reaper import IdleHandleReaper
+from biopb_tensor_server.adapters._metadata_record import MetadataRecordMixin
 from biopb_tensor_server.adapters._scale import axes_scale
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
@@ -112,7 +113,7 @@ _mapping_reaper = IdleHandleReaper(_MAPPING_TTL, "mrc-mapping-reaper", max_handl
 
 
 @canonical_axes
-class MrcAdapter(TensorAdapter):
+class MrcAdapter(MetadataRecordMixin, TensorAdapter):
     """Adapter for MRC electron-microscopy volumes.
 
     Uses rosettasciio to parse the header and an own ``np.memmap`` for lazy,

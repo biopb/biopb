@@ -6,7 +6,7 @@ import time
 from datetime import datetime, timedelta
 
 import pytest
-from biopb_tensor_server.core.adapter_base import SourceAdapter
+from biopb_tensor_server.adapters._metadata_record import MetadataRecordMixin
 from biopb_tensor_server.core.discovery import (
     DiscoveryState,
     SourceClaim,
@@ -1912,7 +1912,7 @@ class _CatalogStubAdapter:
     static source can flow through the real registration + catalog-sync path.
     """
 
-    registration_record = SourceAdapter.registration_record
+    registration_record = MetadataRecordMixin.registration_record
 
     def __init__(self, source_id, source_url):
         self._source_id = source_id

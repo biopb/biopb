@@ -65,6 +65,7 @@ from biopb.tensor.descriptor_pb2 import (
 from biopb.tensor.ticket_pb2 import ChunkBounds, TensorTicket
 from google.protobuf.field_mask_pb2 import FieldMask
 
+from biopb_tensor_server.adapters._metadata_record import MetadataRecordMixin
 from biopb_tensor_server.adapters.scratch import SCRATCH_SOURCE_ID
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
@@ -439,7 +440,7 @@ def fetch_upstream_rows(
         )
 
 
-class RemoteTensorAdapter(TensorAdapter):
+class RemoteTensorAdapter(MetadataRecordMixin, TensorAdapter):
     """Caching passthrough proxy for one source on an upstream tensor server."""
 
     # The upstream owns this source's axis order, so the server validates it

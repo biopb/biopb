@@ -21,6 +21,7 @@ from biopb.tensor.descriptor_pb2 import (
     TensorDescriptor,
     TensorReadOption,
 )
+from biopb_tensor_server.adapters._metadata_record import MetadataRecordMixin
 from biopb_tensor_server.adapters.bioio import ZeissAdapter
 from biopb_tensor_server.adapters.ome_tiff import OmeTiffAdapter
 from biopb_tensor_server.adapters.ome_zarr import OmeZarrAdapter
@@ -97,7 +98,7 @@ def test_the_catalog_lists_entries_that_cannot_name_a_grid():
     serving facts.
     """
 
-    class _Adapter(SourceAdapter):
+    class _Adapter(MetadataRecordMixin, SourceAdapter):
         source_id = "listed"
         _source_url = "/data/listed.zarr"
         _catalog_url = "file:///data/listed.zarr"

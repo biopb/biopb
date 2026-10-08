@@ -9,7 +9,7 @@ import pyarrow.flight as flight
 import pytest
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import TensorTicket
-from biopb_tensor_server.core.adapter_base import SourceAdapter
+from biopb_tensor_server.adapters._metadata_record import MetadataRecordMixin
 from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 from biopb_tensor_server.serving.server import TensorFlightServer
 
@@ -19,7 +19,7 @@ class _CatalogAdapter:
 
     capability_token = None
 
-    registration_record = SourceAdapter.registration_record
+    registration_record = MetadataRecordMixin.registration_record
 
     def __init__(self, source_id):
         self.source_id = source_id

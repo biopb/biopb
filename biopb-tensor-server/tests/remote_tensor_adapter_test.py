@@ -14,7 +14,7 @@ import time
 import numpy as np
 import pyarrow as pa
 import pytest
-from biopb_tensor_server.core.adapter_base import SourceAdapter
+from biopb_tensor_server.adapters._metadata_record import MetadataRecordMixin
 from biopb_tensor_server.core.discovery import source_is_resident
 from google.protobuf.field_mask_pb2 import FieldMask
 
@@ -2877,7 +2877,7 @@ class _CatalogRowAdapter:
     """Minimal adapter to seed a controllable upstream catalog row
     (is_resolved / tensors / metadata)."""
 
-    registration_record = SourceAdapter.registration_record
+    registration_record = MetadataRecordMixin.registration_record
 
     def __init__(self, source_id, tensors, resolved=None, metadata=None):
         self.source_id = source_id

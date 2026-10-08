@@ -35,6 +35,7 @@ import pyarrow.flight as flight
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
+from biopb_tensor_server.adapters._metadata_record import MetadataRecordMixin
 from biopb_tensor_server.adapters._writable import WritableSource
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.core.adapter_base import (
@@ -60,7 +61,7 @@ logger = logging.getLogger(__name__)
 
 
 @canonical_axes
-class CachedSourceAdapter(WritableSource, TensorAdapter):
+class CachedSourceAdapter(MetadataRecordMixin, WritableSource, TensorAdapter):
     """An uploaded tensor kept in the chunk cache.
 
     One instance per uploaded tensor, registered in the server's registry. It

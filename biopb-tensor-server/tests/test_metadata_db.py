@@ -12,7 +12,7 @@ import json
 
 import duckdb
 import pytest
-from biopb_tensor_server.core.adapter_base import SourceAdapter
+from biopb_tensor_server.adapters._metadata_record import MetadataRecordMixin
 from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 
 
@@ -21,7 +21,7 @@ class MockAdapter:
 
     capability_token = None
 
-    registration_record = SourceAdapter.registration_record
+    registration_record = MetadataRecordMixin.registration_record
 
     def __init__(
         self,
@@ -139,7 +139,7 @@ class TestSourceSync:
         """Test that numpy scalar types are serialized correctly."""
         import numpy as np
 
-        class NumpyMockAdapter(MockAdapter):
+        class NumpyMockAdapter(MetadataRecordMixin, MockAdapter):
             def get_metadata(self):
                 return {
                     "int16": np.int16(42),
@@ -226,7 +226,7 @@ class TestSourceSync:
 class MultiTensorAdapter:
     """Mock adapter exposing several tensors (multi-field / HCS source)."""
 
-    registration_record = SourceAdapter.registration_record
+    registration_record = MetadataRecordMixin.registration_record
 
     def __init__(
         self,
@@ -899,7 +899,7 @@ class TestNoResidencyColumn:
         """A cloud / synced-folder source catalogued by URL only: no tensors,
         and not resident until resolved."""
 
-        registration_record = SourceAdapter.registration_record
+        registration_record = MetadataRecordMixin.registration_record
 
         def __init__(self, source_id, source_url):
             self.source_id = source_id

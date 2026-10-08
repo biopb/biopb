@@ -32,6 +32,7 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
+from biopb_tensor_server.adapters._metadata_record import MetadataRecordMixin
 from biopb_tensor_server.adapters._scale import MICRON, scale_by_label
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
@@ -186,7 +187,7 @@ def _dtype_for(info: Dict[str, Any]) -> np.dtype:
 
 
 @canonical_axes
-class LifAdapter(TensorAdapter):
+class LifAdapter(MetadataRecordMixin, TensorAdapter):
     """Reads Leica LIF images through readlif, one tensor per image."""
 
     SOURCE_TYPE = "lif"

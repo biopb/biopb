@@ -15,6 +15,7 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
+from biopb_tensor_server.adapters._metadata_record import MetadataRecordMixin
 from biopb_tensor_server.adapters._writable import WritableSource
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
@@ -215,7 +216,7 @@ class _LazyZarrArray:
 
 
 @canonical_axes
-class ZarrAdapter(WritableSource, TensorAdapter):
+class ZarrAdapter(MetadataRecordMixin, WritableSource, TensorAdapter):
     """Adapter for Zarr/N5 chunked arrays.
 
     Supports both local filesystem and remote storage (S3, GCS, etc.) via fsspec.

@@ -14,6 +14,7 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
+from biopb_tensor_server.adapters._metadata_record import MetadataRecordMixin
 from biopb_tensor_server.adapters._scale import (
     scale_by_label,
     scale_from_payload,
@@ -362,7 +363,7 @@ _SERIES_NONINVARIANT_SPATIAL = frozenset({"origin_mm", "slice_location_mm"})
 
 
 @canonical_axes
-class DicomAdapter(TensorAdapter):
+class DicomAdapter(MetadataRecordMixin, TensorAdapter):
     """Adapter for single DICOM files.
 
     Handles .dcm and .dicom files with pixel data.
@@ -696,7 +697,7 @@ class DicomAdapter(TensorAdapter):
 
 
 @canonical_axes
-class DicomSeriesAdapter(TensorAdapter):
+class DicomSeriesAdapter(MetadataRecordMixin, TensorAdapter):
     """Adapter for multi-file DICOM series forming a 3D volume.
 
     Handles directories where multiple DICOM files share the same SeriesInstanceUID.

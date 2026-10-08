@@ -16,6 +16,7 @@ exactly that, so an override of a source-scoped method onto ``TensorAdapter``
 still fails.
 """
 
+from biopb_tensor_server.adapters._metadata_record import MetadataRecordMixin
 from biopb_tensor_server.core.adapter_base import (
     _SOURCE_SCOPED_API,
     _TENSOR_SCOPED_API,
@@ -62,7 +63,7 @@ def test_pyramid_and_scale_methods_are_tensor_scoped():
 def test_has_native_pyramid_derives_from_levels_by_default():
     """The base TensorAdapter derives has_native_pyramid from the levels method."""
 
-    class _NoPyramid(TensorAdapter):
+    class _NoPyramid(MetadataRecordMixin, TensorAdapter):
         def _native_descriptor(self):  # abstract
             raise NotImplementedError
 
@@ -123,7 +124,7 @@ def test_close_is_a_declared_capability_not_a_duck_typed_one():
 def test_close_default_is_a_harmless_no_op():
     """An adapter holding no handles inherits close() and it does nothing."""
 
-    class _Handleless(SourceAdapter):
+    class _Handleless(MetadataRecordMixin, SourceAdapter):
         source_id = "x"
 
         def list_tensors(self):

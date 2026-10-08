@@ -12,6 +12,7 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
+from biopb_tensor_server.adapters._metadata_record import MetadataRecordMixin
 from biopb_tensor_server.adapters._scale import scale_from_payload, scale_to_payload
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
@@ -39,7 +40,7 @@ _NIFTI_SPATIAL_UNIT = {1: "m", 2: "mm", 3: "µm"}
 
 
 @canonical_axes
-class NiftiAdapter(TensorAdapter):
+class NiftiAdapter(MetadataRecordMixin, TensorAdapter):
     """Adapter for NIfTI files (.nii and .nii.gz).
 
     Uses nibabel for lazy loading and header parsing.

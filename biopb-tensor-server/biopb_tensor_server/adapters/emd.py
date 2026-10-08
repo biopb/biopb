@@ -35,6 +35,7 @@ from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.adapters._handle_reaper import IdleHandleReaper
+from biopb_tensor_server.adapters._metadata_record import MetadataRecordMixin
 from biopb_tensor_server.adapters._scale import axes_scale
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
@@ -207,7 +208,7 @@ class _EmdHandle:
 
 
 @canonical_axes
-class EmdAdapter(TensorAdapter):
+class EmdAdapter(MetadataRecordMixin, TensorAdapter):
     """Adapter for EMD electron-microscopy files (NCEM and Velox flavors).
 
     Dual-role, like the bioio adapter:

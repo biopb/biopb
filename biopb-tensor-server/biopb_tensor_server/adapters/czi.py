@@ -42,6 +42,7 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.adapters._handle_pool import HandlePool, PooledHandle
 from biopb_tensor_server.adapters._handle_reaper import DEFAULT_HANDLE_REAPER_TTL
+from biopb_tensor_server.adapters._metadata_record import MetadataRecordMixin
 from biopb_tensor_server.adapters._scale import MICRON, scale_by_label
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
@@ -281,7 +282,7 @@ def read_layout(path: str) -> _CziLayout:
 
 
 @canonical_axes
-class CziAdapter(TensorAdapter):
+class CziAdapter(MetadataRecordMixin, TensorAdapter):
     """Reads Zeiss CZI scenes through libCZI, one tensor per scene."""
 
     SOURCE_TYPE = "czi"

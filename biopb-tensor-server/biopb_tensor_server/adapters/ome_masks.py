@@ -28,6 +28,7 @@ import numpy as np
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
+from biopb_tensor_server.adapters._metadata_record import MetadataRecordMixin
 from biopb_tensor_server.adapters._ome_rois import Tensor
 from biopb_tensor_server.adapters.labels import NearestPyramidMixin
 from biopb_tensor_server.core.adapter_base import (
@@ -188,7 +189,7 @@ def masks_by_image(
     return out
 
 
-class RasterizedMaskAdapter(NearestPyramidMixin, TensorAdapter):
+class RasterizedMaskAdapter(MetadataRecordMixin, NearestPyramidMixin, TensorAdapter):
     """The ``@ome`` label set: OME ``<Mask>`` shapes painted into one tensor.
 
     Computed, not stored -- there is no backend to read again, only the

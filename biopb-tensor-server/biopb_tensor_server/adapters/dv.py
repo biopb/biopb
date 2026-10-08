@@ -45,6 +45,7 @@ from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.adapters._handle_reaper import IdleHandleReaper
+from biopb_tensor_server.adapters._metadata_record import MetadataRecordMixin
 from biopb_tensor_server.adapters._scale import MICRON, scale_by_label
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
@@ -77,7 +78,7 @@ _mapping_reaper = IdleHandleReaper(_MAPPING_TTL, "dv-mapping-reaper", max_handle
 
 
 @canonical_axes
-class DeltaVisionAdapter(TensorAdapter):
+class DeltaVisionAdapter(MetadataRecordMixin, TensorAdapter):
     """Reads DeltaVision DV volumes through ``mrc.DVFile``. Single-tensor source."""
 
     SOURCE_TYPE = "deltavision"
