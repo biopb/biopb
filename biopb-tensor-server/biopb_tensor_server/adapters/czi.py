@@ -54,6 +54,7 @@ from biopb_tensor_server.core.chunk import (
 )
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import TensorNotFound
+from biopb_tensor_server.core.normalize import canonical_axes
 
 if TYPE_CHECKING:
     from biopb_tensor_server.cache.manager import CacheManager
@@ -278,6 +279,7 @@ def read_layout(path: str) -> _CziLayout:
     )
 
 
+@canonical_axes
 class CziAdapter(TensorAdapter):
     """Reads Zeiss CZI scenes through libCZI, one tensor per scene."""
 
@@ -413,7 +415,7 @@ class CziAdapter(TensorAdapter):
             dtype=layout.dtype,
         )
 
-    def _list_native_tensors(self) -> List[TensorEntry]:
+    def list_tensors(self) -> List[TensorEntry]:
         # Structural entries only: every scene shares one layout here, so the
         # grid would be right -- but the catalog is not where a grid is
         # published, whoever could compute it (biopb/biopb#812).
@@ -461,7 +463,7 @@ class CziAdapter(TensorAdapter):
     # ---- reads --------------------------------------------------------------
 
     @property
-    def _native_read_block_shape(self) -> Optional[Tuple[int, ...]]:
+    def read_block_shape(self) -> Optional[Tuple[int, ...]]:
         """None: a libCZI ROI read composes only the subblocks it touches.
 
         Deliberately *not* the ``native=`` plane that seeds the transfer grid.
@@ -473,7 +475,7 @@ class CziAdapter(TensorAdapter):
         """
         return None
 
-    def _read_native(self, bounds: ChunkBounds) -> np.ndarray:
+    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read the requested region, one libCZI read per plane coordinate."""
         return self._read_planes(bounds, factor=None)
 
@@ -582,7 +584,7 @@ class CziAdapter(TensorAdapter):
         if self.scene_position is None:
             raise ValueError("Cannot get data from source-level adapter")
 
-        super()._read_native(bounds)  # validate bounds against the descriptor
+        super().get_data(bounds)  # validate bounds against the descriptor
         scene = self._scene()
         layout = self._layout
         starts = [int(value) for value in bounds.start]

@@ -67,6 +67,7 @@ from biopb_tensor_server.core.chunk import (
 )
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import TensorNotFound
+from biopb_tensor_server.core.normalize import canonical_axes
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import SourceConfig
@@ -262,6 +263,7 @@ def read_layout(path: str) -> _Nd2Layout:
     )
 
 
+@canonical_axes
 class Nd2Adapter(TensorAdapter):
     """Reads a Nikon ND2 file through the ``nd2`` package, one tensor per XY
     stage position.
@@ -419,7 +421,7 @@ class Nd2Adapter(TensorAdapter):
             dtype=dtype,
         )
 
-    def _list_native_tensors(self) -> List[TensorEntry]:
+    def list_tensors(self) -> List[TensorEntry]:
         return [
             catalog_entry(self._descriptor_for(position))
             for position in range(self._layout.n_positions)
@@ -512,14 +514,14 @@ class Nd2Adapter(TensorAdapter):
     # ---- reads --------------------------------------------------------------
 
     @property
-    def _native_read_block_shape(self) -> Optional[Tuple[int, ...]]:
+    def read_block_shape(self) -> Optional[Tuple[int, ...]]:
         """None: ``read_frame`` returns an mmap view, then this adapter crops."""
         return None
 
-    def _read_native(self, bounds: ChunkBounds) -> np.ndarray:
+    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         return self._read(bounds, (1,) * len(bounds.start))
 
-    def _decimated_native(
+    def get_decimated_data(
         self, bounds: ChunkBounds, step: Tuple[int, ...]
     ) -> Optional[np.ndarray]:
         """The step selects frames on T/Z and strides the mmap view inside one."""
@@ -529,7 +531,7 @@ class Nd2Adapter(TensorAdapter):
         if self.position is None:
             raise ValueError("Cannot get data from source-level adapter")
 
-        super()._read_native(bounds)  # validate bounds against the descriptor
+        super().get_data(bounds)  # validate bounds against the descriptor
         labels = [label.upper() for label in self.dim_labels]
         starts = tuple(int(value) for value in bounds.start)
         stops = tuple(int(value) for value in bounds.stop)

@@ -107,8 +107,8 @@ def test_non_decimating_adapters_inherit_the_base(name):
     cls = _adapters().get(name)
     if cls is None:
         pytest.skip(f"{name} not importable in this environment")
-    owner = next((k for k in cls.__mro__ if "_decimated_native" in vars(k)), None)
-    assert owner is TensorAdapter, f"{name} declares _decimated_native"
+    owner = next((k for k in cls.__mro__ if "get_decimated_data" in vars(k)), None)
+    assert owner is TensorAdapter, f"{name} declares get_decimated_data"
 
 
 @pytest.mark.parametrize("name", sorted(DECIMATING))
@@ -116,7 +116,7 @@ def test_decimating_adapters_declare_it(name):
     cls = _adapters().get(name)
     if cls is None:
         pytest.skip(f"{name} not importable in this environment")
-    owner = next((k for k in cls.__mro__ if "_decimated_native" in vars(k)), None)
+    owner = next((k for k in cls.__mro__ if "get_decimated_data" in vars(k)), None)
     assert owner is not None and owner is not TensorAdapter, (
         f"{name} inherits the base None but is listed as decimating"
     )
@@ -124,7 +124,7 @@ def test_decimating_adapters_declare_it(name):
 
 def test_the_base_declines():
     """The default is to decline, which is what keeps a new adapter correct."""
-    assert TensorAdapter._decimated_native(None, None, None) is None
+    assert TensorAdapter.get_decimated_data(None, None, None) is None
 
 
 class TestDecimatedEqualsReadThenStride:

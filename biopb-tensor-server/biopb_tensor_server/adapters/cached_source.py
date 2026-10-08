@@ -50,6 +50,7 @@ from biopb_tensor_server.core.chunk import (
 )
 from biopb_tensor_server.core.chunk_batch import CHUNK_WIRE_SCHEMA, unpack_chunk_array
 from biopb_tensor_server.core.errors import StaleChunkError
+from biopb_tensor_server.core.normalize import canonical_axes
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import SourceConfig
@@ -57,6 +58,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+@canonical_axes
 class CachedSourceAdapter(WritableSource, TensorAdapter):
     """An uploaded tensor kept in the chunk cache.
 
@@ -305,7 +307,7 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
             dtype=self._dtype,
         )
 
-    def _list_native_tensors(self) -> List[TensorEntry]:
+    def list_tensors(self) -> List[TensorEntry]:
         """Cache sources are single-tensor."""
         return [catalog_entry(self._native_descriptor())]
 
@@ -327,7 +329,7 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
             return None
         return list(self._physical_scale_vec), list(self._physical_unit_vec)
 
-    def _read_native(self, bounds: ChunkBounds) -> np.ndarray:
+    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """The region at *bounds*, assembled from the chunks that were uploaded.
 
         There is no backend: an upload's cache entries are its only copy, so
@@ -351,8 +353,8 @@ class CachedSourceAdapter(WritableSource, TensorAdapter):
         off it (only the ``cache:`` kind allows one) -- and it is what keeps a
         misplanned read returning the pixels rather than a blank frame.
         """
-        # Validate bounds via the base TensorAdapter._read_native contract.
-        super()._read_native(bounds)
+        # Validate bounds via the base TensorAdapter.get_data contract.
+        super().get_data(bounds)
 
         exact = mint_chunk_id(
             self.array_id, bounds, content_version=self.content_version

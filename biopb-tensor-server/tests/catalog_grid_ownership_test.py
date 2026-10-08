@@ -112,7 +112,7 @@ def test_the_catalog_lists_entries_that_cannot_name_a_grid():
         def is_resident(self):
             return True
 
-        def _list_native_tensors(self):
+        def list_tensors(self):
             return [
                 TensorEntry(
                     array_id="listed",

@@ -63,7 +63,7 @@ class MockMultifieldAdapter(TensorAdapter):
             dtype=first_spec[2],
         )
 
-    def _list_native_tensors(self):
+    def list_tensors(self):
         """Return descriptors for all tensors - multifield override."""
         descriptors = []
         for tensor_id, shape, dtype in self.tensor_specs:
@@ -86,7 +86,7 @@ class MockMultifieldAdapter(TensorAdapter):
     def get_metadata(self) -> dict:
         return {"multifield": True, "n_tensors": len(self.tensor_specs)}
 
-    def _read_native(self, bounds):
+    def get_data(self, bounds):
         """Mock get_data - raises since multifield adapter delegates to tensor adapters."""
         raise NotImplementedError(
             "MockMultifieldAdapter.get_data() should not be called directly"
@@ -128,12 +128,12 @@ class MockSingleTensorAdapter(TensorAdapter):
             dtype=self.dtype,
         )
 
-    def _list_native_tensors(self):
+    def list_tensors(self):
         return [self.get_tensor_descriptor()]
 
-    def _read_native(self, bounds) -> np.ndarray:
+    def get_data(self, bounds) -> np.ndarray:
         """Return mock data within bounds."""
-        super()._read_native(bounds)
+        super().get_data(bounds)
         shape = tuple(
             int(stop - start)
             for start, stop in zip(bounds.start, bounds.stop, strict=True)
@@ -568,7 +568,7 @@ class MockImage0Adapter(TensorAdapter):
             dtype="uint8",
         )
 
-    def _list_native_tensors(self):
+    def list_tensors(self):
         # Source-level listing: bare array_id, like aicsimageio.
         return [
             TensorDescriptor(
@@ -586,8 +586,8 @@ class MockImage0Adapter(TensorAdapter):
     def _physical_scale(self):
         return list(self._phys_scale), list(self._phys_unit)
 
-    def _read_native(self, bounds) -> np.ndarray:
-        super()._read_native(bounds)
+    def get_data(self, bounds) -> np.ndarray:
+        super().get_data(bounds)
         shape = tuple(
             int(stop - start)
             for start, stop in zip(bounds.start, bounds.stop, strict=True)

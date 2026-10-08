@@ -173,12 +173,12 @@ def test_unopenable_file_raises_instead_of_falling_back(tmp_path):
 def test_close_releases_the_mapping_and_a_later_read_reopens(tmp_path):
     path, expected = create_deltavision_dv(str(tmp_path), n_z=4, image_shape=(8, 8))
     source = _native(path)
-    expected = expected.transpose(1, 0, 2, 3, 4)
+    expected = expected.transpose(1, 2, 0, 3, 4)  # TZCYX as stored -> TCZYX served
 
-    bounds = ChunkBounds(start=[0, 0, 0, 0, 0], stop=[1, 1, 4, 8, 8])
-    first = source._read_native(bounds)
+    bounds = ChunkBounds(start=[0, 0, 0, 0, 0], stop=[1, 4, 1, 8, 8])
+    first = source.get_data(bounds)
     source.close()
     assert source._persistent_handle is None
-    second = source._read_native(bounds)
+    second = source.get_data(bounds)
     np.testing.assert_array_equal(first, expected)
     np.testing.assert_array_equal(second, expected)

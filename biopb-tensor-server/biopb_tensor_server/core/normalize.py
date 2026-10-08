@@ -8,10 +8,11 @@ re-derive "which axis is Y/X/Z/S" for itself:
     and any unrecognized label -- keeps its relative order ahead of them.
 
 The rule lives in :func:`biopb_tensor_server.core.axes.canonical_permutation`.
-:class:`~biopb_tensor_server.core.adapter_base.TensorAdapter` applies it: a leaf
-adapter implements the ``_native_*`` hooks in its reader's own order, and the
-public ``get_tensor_descriptor`` / ``get_data`` / ``read_block_shape`` /
-``get_decimated_data`` / ``get_native_pyramid_levels`` present them canonical.
+A leaf adapter is written in its reader's own order and carries
+:func:`canonical_axes`: the decorator wraps the leaf's ``get_data`` /
+``get_decimated_data`` / ``read_block_shape`` / ``get_native_pyramid_levels`` /
+``list_tensors`` to present them canonical, and the base permutes
+``get_tensor_descriptor`` to match (the leaf implements ``_native_descriptor``).
 Everything built on those -- the read planner, scaled and streamed reads, the
 pyramid advertisement -- therefore works in canonical order with no translation
 of its own, and a cached segment holds exactly what a client is served.
@@ -34,7 +35,7 @@ silently permuting reads would desynchronize them from what ``put_chunk`` wrote.
 
 **The remote proxy.** Its upstream owns the order in exactly the same sense: that
 server mints the chunk_ids, plans the reads (biopb/biopb#295) and sizes the grid.
-So ``adapters.remote_tensor`` opts out (``_normalizable_axes = False``) and
+So ``adapters.remote_tensor`` does not carry :func:`canonical_axes` and
 refuses a non-canonical upstream at its read boundary instead.
 
 Refusing rather than repairing keeps the guarantee *unconditional* while leaving
@@ -45,9 +46,10 @@ has not cannot be silently mis-served.
 
 from __future__ import annotations
 
+import functools
 import logging
 from dataclasses import replace
-from typing import Any, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
@@ -170,3 +172,110 @@ def log_reordering(source_id: str, entries: Sequence[Any]) -> None:
                 permute(native, perm),
                 native,
             )
+
+
+# --- the class decorator ------------------------------------------------------
+#
+# A leaf adapter is written in its reader's own axis order; ``@canonical_axes``
+# makes what it *serves* canonical. It wraps the leaf's own definitions of the
+# public methods below -- each wrapper reads ``self._axis_perm()`` -- and sets
+# ``_canonical_axes`` so the base permutes the descriptor to match. Inside a
+# decorated class the wrapped names are therefore canonical; a leaf wanting its
+# own native geometry reads ``self._native_descriptor()``.
+
+
+def _wrap_read(fn: Callable) -> Callable:
+    @functools.wraps(fn)
+    def get_data(self, bounds):
+        perm = self._axis_perm()
+        if perm is None:
+            return fn(self, bounds)
+        return fn(self, permute_bounds(bounds, invert(perm))).transpose(perm)
+
+    return get_data
+
+
+def _wrap_decimated(fn: Callable) -> Callable:
+    @functools.wraps(fn)
+    def get_decimated_data(self, bounds, step):
+        perm = self._axis_perm()
+        if perm is None:
+            return fn(self, bounds, step)
+        out = fn(
+            self, permute_bounds(bounds, invert(perm)), tuple(to_native(step, perm))
+        )
+        return None if out is None else out.transpose(perm)
+
+    return get_decimated_data
+
+
+def _wrap_block_shape(prop: property) -> property:
+    fget = prop.fget
+
+    @functools.wraps(fget)
+    def read_block_shape(self):
+        block = fget(self)
+        return block if block is None else tuple(to_canonical(block, self._axis_perm()))
+
+    return property(read_block_shape)
+
+
+def _wrap_levels(fn: Callable) -> Callable:
+    @functools.wraps(fn)
+    def get_native_pyramid_levels(self):
+        levels = fn(self)
+        perm = self._axis_perm()
+        if levels is None or perm is None:
+            return levels
+        out = []
+        for level in levels:
+            copy = type(level)()
+            copy.CopyFrom(level)
+            permute_level(copy, perm)
+            out.append(copy)
+        return out
+
+    return get_native_pyramid_levels
+
+
+def _wrap_listing(fn: Callable) -> Callable:
+    # Each entry is normalized by its OWN labels: a multi-tensor source (HCS
+    # fields, a multi-scene file) may mix ranks and labellings.
+    @functools.wraps(fn)
+    def list_tensors(self):
+        out = []
+        for entry in fn(self):
+            perm = self._permutation_of(entry)
+            out.append(entry if perm is None else permute_entry(entry, perm))
+        return out
+
+    return list_tensors
+
+
+_WRAPPERS: Dict[str, Callable] = {
+    "get_data": _wrap_read,
+    "get_decimated_data": _wrap_decimated,
+    "read_block_shape": _wrap_block_shape,
+    "get_native_pyramid_levels": _wrap_levels,
+    "list_tensors": _wrap_listing,
+}
+
+
+def canonical_axes(cls):
+    """Class decorator: serve ``cls`` in canonical axis order (#596).
+
+    Wraps the public methods ``cls`` itself defines -- inherited ones are already
+    wrapped by whichever class defined them, so a decorated subclass overriding
+    one must not call ``super()`` into a decorated parent for it.
+    """
+    for name, wrap in _WRAPPERS.items():
+        member = cls.__dict__.get(name)
+        if member is not None:
+            setattr(cls, name, wrap(member))
+    cls._canonical_axes = True
+    return cls
+
+
+def unwrapped(method: Callable) -> Callable:
+    """The native-order function behind a wrapped public method."""
+    return getattr(method, "__wrapped__", method)

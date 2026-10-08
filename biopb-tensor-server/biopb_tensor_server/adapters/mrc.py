@@ -65,6 +65,7 @@ from biopb_tensor_server.core.chunk import (
     default_transfer_chunk_shape,
 )
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
+from biopb_tensor_server.core.normalize import canonical_axes
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import SourceConfig
@@ -108,6 +109,7 @@ _MAPPING_TTL = 5.0
 _mapping_reaper = IdleHandleReaper(_MAPPING_TTL, "mrc-mapping-reaper", max_handles=8)
 
 
+@canonical_axes
 class MrcAdapter(TensorAdapter):
     """Adapter for MRC electron-microscopy volumes.
 
@@ -295,15 +297,15 @@ class MrcAdapter(TensorAdapter):
             dtype=self._dtype.str,
         )
 
-    def _list_native_tensors(self) -> List[TensorEntry]:
+    def list_tensors(self) -> List[TensorEntry]:
         return [catalog_entry(self._native_descriptor())]
 
-    def _read_native(self, bounds: ChunkBounds) -> np.ndarray:
+    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read a sub-region through the source's shared mapping."""
-        super()._read_native(bounds)
+        super().get_data(bounds)
         return self._copy_out(self._bounds_to_slices(bounds))
 
-    def _decimated_native(
+    def get_decimated_data(
         self, bounds: ChunkBounds, step: Tuple[int, ...]
     ) -> Optional[np.ndarray]:
         """A strided slice of the same mapping: only the picked elements copy.
@@ -315,7 +317,7 @@ class MrcAdapter(TensorAdapter):
         page it steps across, which is why the saving is memcpy-and-cache first
         and I/O only where the stride outruns the readahead.
         """
-        super()._read_native(bounds)
+        super().get_data(bounds)
         return self._copy_out(self._bounds_to_strided_slices(bounds, step))
 
     def _copy_out(self, slices: Tuple[slice, ...]) -> np.ndarray:

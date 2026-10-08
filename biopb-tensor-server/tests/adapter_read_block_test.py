@@ -97,7 +97,7 @@ def test_unquantized_adapters_report_none(name):
     cls = _adapters().get(name)
     if cls is None:
         pytest.skip(f"{name} not importable in this environment")
-    prop = getattr(cls, "_native_read_block_shape", None)
+    prop = getattr(cls, "read_block_shape", None)
     assert isinstance(prop, property)
     source = inspect.getsource(prop.fget)
     assert "return None" in source, f"{name} must report no quantization"
@@ -109,10 +109,10 @@ def test_quantized_adapters_declare_a_block(name):
     cls = _adapters().get(name)
     if cls is None:
         pytest.skip(f"{name} not importable in this environment")
-    prop = getattr(cls, "_native_read_block_shape", None)
+    prop = getattr(cls, "read_block_shape", None)
     assert isinstance(prop, property), f"{name} has no read_block_shape"
     owner = next(
-        (k for k in cls.__mro__ if "_native_read_block_shape" in vars(k)),
+        (k for k in cls.__mro__ if "read_block_shape" in vars(k)),
         None,
     )
     assert owner is not None and owner is not TensorAdapter, (

@@ -218,6 +218,50 @@ class TestTheAdapterOwnsTheOrder:
             assert "['z', 'y', 'x']" in said and "['x', 'y', 'z']" in said
 
 
+class TestEveryAdapterDeclaresItsOrder:
+    #: Adapters whose axis order another party owns (see ``core.normalize``).
+    NOT_CANONICAL = {"RemoteTensorAdapter", "RasterizedMaskAdapter", "ScratchSource"}
+
+    @staticmethod
+    def _adapter_classes():
+        import importlib
+        import inspect
+        import pkgutil
+
+        import biopb_tensor_server.adapters as adapters
+        from biopb_tensor_server.core.adapter_base import SourceAdapter
+
+        classes = {}
+        for info in pkgutil.iter_modules(adapters.__path__):
+            try:
+                mod = importlib.import_module(f"{adapters.__name__}.{info.name}")
+            except ImportError:  # optional reader not installed
+                continue
+            for _, cls in inspect.getmembers(mod, inspect.isclass):
+                if issubclass(cls, SourceAdapter) and cls.__module__ == mod.__name__:
+                    classes[cls.__name__] = cls
+        return classes.values()
+
+    def test_a_class_defining_a_wrapped_method_is_decorated(self):
+        """A leaf that defines ``get_data`` & co. without ``@canonical_axes``
+        would serve its descriptor canonical and its bytes native."""
+        for cls in self._adapter_classes():
+            own = [n for n in _normalize._WRAPPERS if n in cls.__dict__]
+            if cls.__name__ in self.NOT_CANONICAL or not own:
+                continue
+            for name in own:
+                assert (
+                    hasattr(getattr(cls, name, None), "__wrapped__")
+                    or isinstance(cls.__dict__[name], property)
+                    and hasattr(cls.__dict__[name].fget, "__wrapped__")
+                ), f"{cls.__name__}.{name} is not wrapped by @canonical_axes"
+
+    def test_the_opt_outs_are_not_canonical(self):
+        for cls in self._adapter_classes():
+            if cls.__name__ in self.NOT_CANONICAL:
+                assert not cls._canonical_axes, cls.__name__
+
+
 @requires_zarr
 class TestNormalizedDescriptorAndData:
     """Every per-axis surface moves together, or the view is incoherent."""
@@ -653,7 +697,7 @@ def _legacy_upstream(tmp, arr, labels, name="u"):
     """
     server = TensorFlightServer("localhost:0")
     adapter = _zarr_adapter(tmp, arr, labels, name)
-    adapter._normalizable_axes = False
+    adapter._canonical_axes = False
     server.sources._sources[name] = adapter
     server.mark_ready()
     threading.Thread(target=server.serve, daemon=True).start()

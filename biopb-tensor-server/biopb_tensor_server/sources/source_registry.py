@@ -24,7 +24,7 @@ from biopb_tensor_server.core.adapter_base import (
     TensorEntry,
 )
 from biopb_tensor_server.core.attachments import Attachments
-from biopb_tensor_server.core.normalize import log_reordering
+from biopb_tensor_server.core.normalize import log_reordering, unwrapped
 
 logger = logging.getLogger(__name__)
 
@@ -337,10 +337,10 @@ def _log_reordering(source_id: str, adapter: SourceAdapter) -> None:
     Never fails a registration: a duck-typed double, or an adapter that cannot
     list yet (an unresolved cloud source), just reports nothing.
     """
-    if not getattr(adapter, "_normalizable_axes", False):
+    if not getattr(adapter, "_canonical_axes", False):
         return
     try:
-        log_reordering(source_id, adapter._list_native_tensors())
+        log_reordering(source_id, unwrapped(type(adapter).list_tensors)(adapter))
     except Exception:
         logger.debug(
             "axis normalization: could not inspect %r", source_id, exc_info=True

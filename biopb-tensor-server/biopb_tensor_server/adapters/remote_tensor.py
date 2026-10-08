@@ -444,7 +444,6 @@ class RemoteTensorAdapter(TensorAdapter):
     # The upstream owns this source's axis order, so the server validates it
     # rather than permuting it (biopb/biopb#596) -- see
     # ``_require_canonical_upstream``.
-    _normalizable_axes = False
 
     # A miss here is an upstream round trip plus load on someone else's server,
     # none of which the local hand-off contains. Measured, a LAN upstream clocks
@@ -797,7 +796,7 @@ class RemoteTensorAdapter(TensorAdapter):
             return {}
         return parsed if isinstance(parsed, dict) else {}
 
-    def _list_native_tensors(self) -> List[TensorEntry]:
+    def list_tensors(self) -> List[TensorEntry]:
         """Mirror this one upstream source's tensor descriptor(s).
 
         Fetched per-source via ``get_descriptor`` (a targeted GetFlightInfo), NOT
@@ -1094,14 +1093,14 @@ class RemoteTensorAdapter(TensorAdapter):
             flight_desc, options=self.client._call_options
         )
 
-    def _read_native(self, bounds: ChunkBounds) -> np.ndarray:
+    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Fetch one region from the upstream (fallback / abstract-method satisfier).
 
         The hot path is ``resolve_chunk_data`` (it forwards the exact chunk_id so
         the upstream does any downsampling); this builds an upstream chunk_id for
         ``bounds`` and reads it back as a numpy array.
         """
-        super()._read_native(bounds)  # validate bounds against the mirrored shape
+        super().get_data(bounds)  # validate bounds against the mirrored shape
         upstream_chunk_id = encode_chunk_id(
             self._to_upstream_array_id(self.array_id), bounds
         )

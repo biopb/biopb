@@ -58,6 +58,7 @@ from biopb_tensor_server.core.chunk import (
     default_transfer_chunk_shape,
 )
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
+from biopb_tensor_server.core.normalize import canonical_axes
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +147,7 @@ class _QptiffFile:
             logger.debug("error closing qptiff handle", exc_info=True)
 
 
+@canonical_axes
 class _QptiffLevelAdapter(ZarrAdapter):
     """A native pyramid level's backend, reading under a lease on its parent's
     pooled handle.
@@ -161,13 +163,14 @@ class _QptiffLevelAdapter(ZarrAdapter):
         self._parent = parent
         self._level = level
 
-    def _read_native(self, bounds: ChunkBounds) -> np.ndarray:
-        super(ZarrAdapter, self)._read_native(bounds)  # validate against the level
+    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
+        super(ZarrAdapter, self).get_data(bounds)  # validate against the level
         slices = self._bounds_to_slices(bounds)
         with self._parent._file() as handle:
             return np.asarray(handle.level_store(self._level)[0][slices])
 
 
+@canonical_axes
 class QptiffAdapter(TensorAdapter):
     """Adapter for Akoya PhenoImager QPTIFF (pyramidal multiplex BigTIFF).
 
@@ -366,14 +369,14 @@ class QptiffAdapter(TensorAdapter):
         )
         return self._cached_descriptor
 
-    def _list_native_tensors(self) -> List[TensorEntry]:
+    def list_tensors(self) -> List[TensorEntry]:
         return [catalog_entry(self._native_descriptor())]
 
     # ---- reads --------------------------------------------------------------
 
-    def _read_native(self, bounds: ChunkBounds) -> np.ndarray:
+    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read a sub-region of the baseline (full-resolution) image."""
-        super()._read_native(bounds)  # validate against the base descriptor
+        super().get_data(bounds)  # validate against the base descriptor
         return self._read_level(0, bounds)
 
     # ---- native pyramid -----------------------------------------------------
@@ -393,7 +396,7 @@ class QptiffAdapter(TensorAdapter):
             logger.debug("qptiff: level enumeration failed", exc_info=True)
             return False
 
-    def _native_pyramid_levels(self) -> Optional[List[PyramidLevel]]:
+    def get_native_pyramid_levels(self) -> Optional[List[PyramidLevel]]:
         """One ``precompute`` level per on-disk resolution (level 0 = full res).
 
         Each level's ``scale_hint`` is its integer downsample factor vs level 0 --

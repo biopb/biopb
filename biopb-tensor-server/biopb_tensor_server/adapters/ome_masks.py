@@ -244,8 +244,6 @@ class RasterizedMaskAdapter(NearestPyramidMixin, TensorAdapter):
     singleton channel is just another axis painted across.
     """
 
-    _normalizable_axes = False
-
     def __init__(
         self,
         source_id: str,
@@ -302,7 +300,7 @@ class RasterizedMaskAdapter(NearestPyramidMixin, TensorAdapter):
             "OmeTiffAdapter.get_embedded_labels(), not from config"
         )
 
-    def _list_native_tensors(self) -> List[TensorEntry]:
+    def list_tensors(self) -> List[TensorEntry]:
         return [catalog_entry(self._native_descriptor())]
 
     def _native_descriptor(self) -> TensorDescriptor:
@@ -358,8 +356,8 @@ class RasterizedMaskAdapter(NearestPyramidMixin, TensorAdapter):
         self._bitmaps[key] = cached
         return cached
 
-    def _read_native(self, bounds: ChunkBounds) -> np.ndarray:
-        super()._read_native(bounds)
+    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
+        super().get_data(bounds)
         starts = [int(s) for s in bounds.start]
         stops = [int(e) for e in bounds.stop]
         out = np.zeros(

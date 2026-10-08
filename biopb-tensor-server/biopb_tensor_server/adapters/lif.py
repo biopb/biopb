@@ -44,6 +44,7 @@ from biopb_tensor_server.core.chunk import (
 )
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import TensorNotFound
+from biopb_tensor_server.core.normalize import canonical_axes
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import SourceConfig
@@ -183,6 +184,7 @@ def _dtype_for(info: Dict[str, Any]) -> np.dtype:
     return np.dtype(np.uint8 if depth == 8 else np.uint16)
 
 
+@canonical_axes
 class LifAdapter(TensorAdapter):
     """Reads Leica LIF images through readlif, one tensor per image."""
 
@@ -302,7 +304,10 @@ class LifAdapter(TensorAdapter):
             dtype=dtype,
         )
 
-    def _list_native_tensors(self) -> List[TensorEntry]:
+    def list_tensors(self) -> List[TensorEntry]:
+        return self._native_entries()
+
+    def _native_entries(self) -> List[TensorEntry]:
         return [
             catalog_entry(self._descriptor_for(position))
             for position in range(len(self._layout.image_list))
@@ -311,7 +316,7 @@ class LifAdapter(TensorAdapter):
     def _native_descriptor(self) -> TensorDescriptor:
         if self.image_position is not None:
             return self._descriptor_for(self.image_position)
-        entries = self._list_native_tensors()
+        entries = self._native_entries()
         if not entries:
             raise TensorNotFound(
                 f"source {self.source_id!r} exposes no images",
@@ -347,7 +352,7 @@ class LifAdapter(TensorAdapter):
     # ---- reads --------------------------------------------------------------
 
     @property
-    def _native_read_block_shape(self) -> Optional[Tuple[int, ...]]:
+    def read_block_shape(self) -> Optional[Tuple[int, ...]]:
         """One whole plane: readlif has no ROI, ``get_frame`` reads it whole.
 
         Full rank, matching the ``native=`` seed in :meth:`_descriptor_for` --
@@ -359,10 +364,10 @@ class LifAdapter(TensorAdapter):
         shape = _native_shape(self._layout.image_list[self.image_position])
         return tuple([1] * (len(shape) - 2)) + tuple(shape[-2:])
 
-    def _read_native(self, bounds: ChunkBounds) -> np.ndarray:
+    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         return self._read(bounds, step=None)
 
-    def _decimated_native(
+    def get_decimated_data(
         self, bounds: ChunkBounds, step: Tuple[int, ...]
     ) -> Optional[np.ndarray]:
         """Skip whole planes the stride would drop on T/C/Z/M; Y/X still crop
@@ -373,7 +378,7 @@ class LifAdapter(TensorAdapter):
         if self.image_position is None:
             raise ValueError("Cannot get data from source-level adapter")
 
-        super()._read_native(bounds)  # validate bounds against the descriptor
+        super().get_data(bounds)  # validate bounds against the descriptor
         info = self._layout.image_list[self.image_position]
         labels = [label.upper() for label in self.dim_labels]
         starts = [int(value) for value in bounds.start]

@@ -33,6 +33,7 @@ from biopb_tensor_server.core.discovery import (
     ClaimContext,
     SourceClaim,
 )
+from biopb_tensor_server.core.normalize import canonical_axes
 
 if TYPE_CHECKING:
     from biopb_tensor_server.core.config import SourceConfig
@@ -359,6 +360,7 @@ _SERIES_NONINVARIANT_SPATIAL = frozenset({"origin_mm", "slice_location_mm"})
 # =============================================================================
 
 
+@canonical_axes
 class DicomAdapter(TensorAdapter):
     """Adapter for single DICOM files.
 
@@ -612,11 +614,11 @@ class DicomAdapter(TensorAdapter):
             dtype=self._dtype,
         )
 
-    def _list_native_tensors(self) -> List[TensorEntry]:
+    def list_tensors(self) -> List[TensorEntry]:
         return [catalog_entry(self._native_descriptor())]
 
     @property
-    def _native_read_block_shape(self) -> Optional[Tuple[int, ...]]:
+    def read_block_shape(self) -> Optional[Tuple[int, ...]]:
         """One frame, which is the least a decode can hand back.
 
         ``get_data`` decodes per frame and crops, so a Y/X window costs its whole
@@ -641,7 +643,7 @@ class DicomAdapter(TensorAdapter):
         else:
             yield str(self._source_url)
 
-    def _read_native(self, bounds: ChunkBounds) -> np.ndarray:
+    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read data within bounds from DICOM pixel data.
 
         Only the frames the bounds cover are decoded: ``pydicom.pixels`` parses
@@ -660,7 +662,7 @@ class DicomAdapter(TensorAdapter):
         """
         from pydicom.pixels import iter_pixels, pixel_array
 
-        super()._read_native(bounds)
+        super().get_data(bounds)
         slices = self._bounds_to_slices(bounds)
 
         # Serialize IO for thread safety
@@ -692,6 +694,7 @@ class DicomAdapter(TensorAdapter):
 # =============================================================================
 
 
+@canonical_axes
 class DicomSeriesAdapter(TensorAdapter):
     """Adapter for multi-file DICOM series forming a 3D volume.
 
@@ -984,15 +987,15 @@ class DicomSeriesAdapter(TensorAdapter):
             dtype=self._dtype,
         )
 
-    def _list_native_tensors(self) -> List[TensorEntry]:
+    def list_tensors(self) -> List[TensorEntry]:
         return [catalog_entry(self._native_descriptor())]
 
     @property
-    def _native_read_block_shape(self) -> Optional[Tuple[int, ...]]:
+    def read_block_shape(self) -> Optional[Tuple[int, ...]]:
         """One slice -- the ``native=`` seed above, and pydicom's decode unit."""
         return tuple([1] * (len(self._shape) - 2) + [self._rows, self._cols])
 
-    def _read_native(self, bounds: ChunkBounds) -> np.ndarray:
+    def get_data(self, bounds: ChunkBounds) -> np.ndarray:
         """Read data within bounds from DICOM series.
 
         Reads multiple slices if needed and stacks them into a contiguous array.
@@ -1008,7 +1011,7 @@ class DicomSeriesAdapter(TensorAdapter):
         """
         from pydicom.pixels import pixel_array
 
-        super()._read_native(bounds)
+        super().get_data(bounds)
         slices = self._bounds_to_slices(bounds)
         slice_start = int(bounds.start[0])
         slice_stop = int(bounds.stop[0])

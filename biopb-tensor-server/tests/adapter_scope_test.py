@@ -66,7 +66,7 @@ def test_has_native_pyramid_derives_from_levels_by_default():
         def _native_descriptor(self):  # abstract
             raise NotImplementedError
 
-        def _read_native(self, bounds):  # abstract
+        def get_data(self, bounds):  # abstract
             raise NotImplementedError
 
         # Inherited from the SourceAdapter half of the role (biopb/biopb#380).
@@ -74,14 +74,14 @@ def test_has_native_pyramid_derives_from_levels_by_default():
         def create_from_config(cls, source, credentials_config=None):  # abstract
             raise NotImplementedError
 
-        def _list_native_tensors(self):  # abstract
+        def list_tensors(self):  # abstract
             raise NotImplementedError
 
         def get_metadata(self):  # abstract
             raise NotImplementedError
 
     class _WithPyramid(_NoPyramid):
-        def _native_pyramid_levels(self):
+        def get_native_pyramid_levels(self):
             return ["level0", "level1"]  # non-None -> has a native pyramid
 
     assert _NoPyramid().has_native_pyramid() is False
@@ -126,7 +126,7 @@ def test_close_default_is_a_harmless_no_op():
     class _Handleless(SourceAdapter):
         source_id = "x"
 
-        def _list_native_tensors(self):
+        def list_tensors(self):
             return []
 
         def get_metadata(self):
