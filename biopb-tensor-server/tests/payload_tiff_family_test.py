@@ -140,7 +140,7 @@ class TestOmeTiff:
 
         forbid_opens(monkeypatch, (tifffile, "TiffFile"))
         stored(rebuilt)  # get_metadata, get_embedded_rois, payload, release
-        assert rebuilt.get_embedded_labels() == {}
+        assert rebuilt._embedded_sets() == {}
 
     def test_a_file_with_a_mask_keeps_its_rois_and_labels(self, tmp_path, monkeypatch):
         bitmap = np.zeros((4, 4), dtype=np.uint8)
@@ -167,7 +167,7 @@ class TestOmeTiff:
         assert {k: len(v) for k, v in rois.items()} == {
             k: len(v) for k, v in expected.items()
         }
-        assert set(rebuilt.get_embedded_labels()) == set(parsed.get_embedded_labels())
+        assert set(rebuilt._embedded_sets()) == set(parsed._embedded_sets())
 
     def test_a_payload_without_the_scale_is_parsed_instead(self, tmp_path):
         path = tmp_path / "plain.ome.tif"

@@ -30,9 +30,6 @@ class _CatalogAdapter:
     def is_resident(self):
         return True
 
-    def get_embedded_labels(self):
-        return {}
-
     def is_resolved(self):
         return True
 

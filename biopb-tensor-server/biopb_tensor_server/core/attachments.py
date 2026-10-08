@@ -26,7 +26,12 @@ from biopb_tensor_server.core.adapter_base import (
     catalog_entry,
     strip_source_prefix,
 )
-from biopb_tensor_server.core.attached import is_published, split_attached_field
+from biopb_tensor_server.core.attached import (
+    MARKER,
+    is_published,
+    owning_field,
+    split_attached_field,
+)
 from biopb_tensor_server.core.errors import AttachedTensorMismatch
 from biopb_tensor_server.core.labels import (
     extent_mismatch,
@@ -51,8 +56,6 @@ class Attachments:
         self._view: Optional[Tuple[Any, Dict[str, TensorAdapter]]] = None
         # Why a listed set cannot be read, by field; rebuilt with the view.
         self._mismatch: Dict[str, str] = {}
-        # The sets the parent's own file carries, read once per parent.
-        self._embedded: Optional[Tuple[Any, Dict[str, TensorAdapter]]] = None
 
     def attach(self, field: str, tensor: TensorAdapter) -> None:
         """Make *tensor* answer for *field*."""
@@ -76,22 +79,12 @@ class Attachments:
 
     # -- the views ---------------------------------------------------------------
 
-    def _labels(self, *, published: bool) -> Dict[str, TensorAdapter]:
+    def _published_labels(self) -> Dict[str, TensorAdapter]:
         return {
             field: tensor
             for field, tensor in self.tensors.items()
-            if split_label_field(field) is not None
-            and is_published(tensor) is published
+            if split_label_field(field) is not None and is_published(tensor)
         }
-
-    def label_uploads(self) -> Dict[str, TensorAdapter]:
-        """Label sets the upload path is still filling, by field.
-
-        Plus the tombstones of ones it gave up on: routable, so a status poll
-        and a straggler's write both find their adapter, but never listed. A set
-        reaches :meth:`label_sets` by becoming readable, not by being moved.
-        """
-        return self._labels(published=False)
 
     def attached_fields(self) -> Dict[str, TensorAdapter]:
         """The published fields uploaded onto this source, keyed by field.
@@ -111,33 +104,29 @@ class Attachments:
     def label_sets(self, parent: SourceAdapter) -> Dict[str, TensorAdapter]:
         """Every label set of *parent*, keyed by within-source field.
 
-        The file's own (``get_embedded_labels``, read once) and the published
-        label sets attached here, each normalized like any registered tensor and
-        each checked -- whatever its origin -- against the image it binds to:
-        that image must be a tensor of the source, and the set must span it
-        (:func:`~biopb_tensor_server.core.labels.extent_mismatch`). A set that
+        The published label sets attached here, each checked against the image
+        it binds to: that image must be a tensor of the source, and the set must
+        span it (:func:`~biopb_tensor_server.core.labels.extent_mismatch`). The
+        sets the source's own file carries are its own tensors (``list_tensors``)
+        and are not checked: the file is the user's. A set that
         fails stays listed, is logged as an error, and raises
         :class:`AttachedTensorMismatch` when read, rather than being served
         misaligned or vanishing. Empty until the source is resolved, since its
         tensors are unknown before that.
 
         This is the *published* view -- what the catalog lists and what a read
-        resolves first. A set still being uploaded is in :meth:`label_uploads`
-        and joins this one when its upload reaches READY.
+        resolves first. A set still being uploaded, or the tombstone of one that
+        was discarded, is routable through ``tensors`` and joins this view when
+        its upload reaches READY.
         """
         if self._view is not None and self._view[0] is parent:
             return self._view[1]
         if not parent.is_resolved():
             return {}
-        if self._embedded is None or self._embedded[0] is not parent:
-            # By attribute: the registry also holds adapters from outside this
-            # package, and one that knows nothing of labels has none.
-            embedded = getattr(parent, "get_embedded_labels", None)
-            self._embedded = (parent, dict(embedded()) if embedded else {})
-        candidates = {**self._embedded[1], **self._labels(published=True)}
+        candidates = self._published_labels()
+        images = self.normalized_tensors(parent) if candidates else {}
         view: Dict[str, TensorAdapter] = {}
         self._mismatch = {}
-        images = self.normalized_tensors(parent) if candidates else {}
         for field, tensor in candidates.items():
             why = self.label_binding_error(
                 parent, field, tensor.get_tensor_descriptor(), images=images
@@ -152,13 +141,19 @@ class Attachments:
     def normalized_tensors(self, parent: SourceAdapter) -> Dict[str, TensorEntry]:
         """*parent*'s tensors by ``array_id``, in canonical axis order.
 
-        What a label set is checked against, and read once per check rather
+        The images, not the sets the file carries. What a label set is checked
+        against, and read once per check rather
         than per set -- ``list_tensors`` re-derives on an HCS plate.
         The uploaded fields are in it because a set may bind to one: a field is
         a tensor of this source like any other, and only its bytes live
         elsewhere.
         """
-        entries = list(parent.list_tensors())
+        entries = [
+            e
+            for e in parent.list_tensors()
+            if split_label_field(strip_source_prefix(self.source_id, e.array_id))
+            is None
+        ]
         entries += [
             catalog_entry(t.get_tensor_descriptor())
             for t in self.attached_fields().values()
@@ -239,49 +234,33 @@ class Attachments:
     ) -> Optional[TensorAdapter]:
         """The attached tensor answering for within-source *field*, or None.
 
-        Only a **marked** field reaches one: a label set through its
-        right-to-left parse, an uploaded field through the whole of its
-        ``@fields/<name>``. Everything else is the format's own routing, which
-        is the whole of the rule -- the upload path mints no bare field.
-        """
-        key, is_set = self._key(field)
-        if key is None:
-            return None
-        return self._label_set_for(parent, key) if is_set else self.tensors.get(key)
-
-    @staticmethod
-    def _key(field: Optional[str]) -> Tuple[Optional[str], bool]:
-        """The index key that answers for within-source *field*, and whether it
-        is a label set; ``(None, False)`` for a field no attachment answers.
-
-        The one parse of the marked-segment grammar, shared by routing and by
-        the capability gate so the two cannot disagree.
-        """
-        parsed = split_label_field(field)
-        if parsed is not None:
-            return (
-                (None, False) if parsed.level is not None else (parsed.set_field, True)
-            )
-        return (
-            (field, False) if split_attached_field(field) is not None else (None, False)
-        )
-
-    def _label_set_for(
-        self, parent: SourceAdapter, set_field: str
-    ) -> Optional[TensorAdapter]:
-        """The adapter answering for label field *set_field*, listed or in flight.
+        Only a **marked** field reaches one (:mod:`~biopb_tensor_server.core.attached`);
+        everything else is the format's own routing, which is the whole of the
+        rule -- the upload path mints no bare field. The tensor is the one whose
+        field is the longest prefix of *field*, and it resolves what remains
+        itself, so a native level of a label set is routed like any other id.
 
         A set being uploaded is addressable from ``add_tensor`` onwards -- that
-        is how its producer polls it to READY (biopb/biopb#1048) -- so both
-        views are consulted, the published one first.
+        is how its producer polls it to READY (biopb/biopb#1048) -- so the
+        published sets are consulted first, then the whole index.
         """
-        label_set = self.label_sets(parent).get(set_field)
-        if label_set is not None:
-            why = self._mismatch.get(set_field)
+        if not field or MARKER not in field:
+            return None
+        sets = self.label_sets(parent)
+        key = owning_field(field, sets)
+        if key is not None:
+            why = self._mismatch.get(key)
             if why is not None:
-                raise AttachedTensorMismatch(f"{self.source_id}/{set_field} {why}")
-            return label_set
-        return self.label_uploads().get(set_field)
+                raise AttachedTensorMismatch(f"{self.source_id}/{key} {why}")
+            tensor = sets[key]
+        else:
+            key = owning_field(field, self.tensors)
+            if key is None:
+                return None
+            tensor = self.tensors[key]
+        if field == key:
+            return tensor
+        return tensor.get_tensor_adapter(join_fields(self.source_id, field))
 
     def resolve_tensor(
         self, parent: SourceAdapter, tensor_id: Optional[str]
@@ -297,12 +276,6 @@ class Attachments:
         attached = self.for_field(parent, field)
         if attached is not None:
             return attached
-        parsed = split_label_field(field)
-        if parsed is not None and parsed.level:
-            # a native level of a label set rides under the set's own field
-            label_set = self._label_set_for(parent, parsed.set_field)
-            if label_set is not None:
-                return label_set.get_tensor_adapter(tensor_id)
         return parent.get_tensor_adapter(tensor_id)
 
     def capability_token(self, array_id: Optional[str]) -> Optional[str]:
@@ -323,6 +296,6 @@ class Attachments:
         """
         if not self.tensors:
             return None
-        key, _ = self._key(strip_source_prefix(self.source_id, array_id))
-        tensor = self.tensors.get(key) if key is not None else None
-        return tensor.capability_token if tensor is not None else None
+        field = strip_source_prefix(self.source_id, array_id)
+        key = owning_field(field, self.tensors) if field and MARKER in field else None
+        return self.tensors[key].capability_token if key is not None else None
