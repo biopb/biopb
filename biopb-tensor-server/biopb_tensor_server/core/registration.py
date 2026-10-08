@@ -14,11 +14,17 @@ class RegistrationRecord:
     whatever the format moved elsewhere (ROIs it imported, mask bitmaps).
     ``rois`` are the annotations its file carries, by ``array_id``, and ``report``
     is an opaque summary for the log (``summary()``), or ``None``.
+
+    ``is_resolved`` is whether the source is backed by anything yet: false
+    only for a mirror of an upstream source that has not resolved, which
+    lists no tensors. A source of this server that is not resolved has no
+    adapter at all, only a catalog row.
     """
 
     metadata: Mapping[str, Any]
     rois: Mapping[str, List[Any]] = field(default_factory=dict)
     report: Any = None
+    is_resolved: bool = True
 
 
 def metadata_record(metadata: Optional[Mapping[str, Any]]) -> RegistrationRecord:

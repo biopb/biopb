@@ -1932,9 +1932,6 @@ class _CatalogStubAdapter:
     def is_resident(self):
         return True
 
-    def is_resolved(self):
-        return True
-
     def list_tensors(self):
         from biopb.tensor.descriptor_pb2 import TensorDescriptor
 

@@ -403,17 +403,6 @@ class SourceAdapter(ABC):
         row cannot represent is :meth:`TensorAdapter.get_tensor_metadata`.
         """
 
-    def is_resolved(self) -> bool:
-        """Deterministic: is there a hydrated adapter backing this source?
-
-        True by default; only a remote proxy mirroring an unresolved upstream
-        source overrides it. A source of this server that is not resolved has no
-        adapter at all, only a catalog row (``sources.unresolved_reason`` says why). Unlike
-        residency (:func:`~biopb_tensor_server.core.discovery.source_is_resident`),
-        this never flips back to False once True.
-        """
-        return True
-
     def get_tensor_adapter(self, tensor_id: str | None) -> TensorAdapter:
         """Factory method to return adapter with specific tensor context.
 
@@ -1294,7 +1283,6 @@ _SOURCE_SCOPED_API = frozenset(
         "list_tensors",
         "registration_record",
         "catalog_url",
-        "is_resolved",
         "get_tensor_adapter",
         "close",
         "catalog_payload",

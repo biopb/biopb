@@ -71,7 +71,6 @@ def snapshot(adapter, *, read: bool = True) -> Dict[str, Any]:
     out: Dict[str, Any] = {
         "metadata": adapter.registration_record([], import_rois=False).metadata,
         "content_version": adapter.content_version,
-        "is_resolved": adapter.is_resolved(),
         "listing": [asdict(d) for d in adapter.list_tensors()],
     }
     for entry in adapter.list_tensors():

@@ -27,7 +27,7 @@ image files* into one multidimensional tensor:
   stem), natural-sorts them (`_natural_key`, `tiff.py:84`), buckets by page count,
   and stacks the dominant bucket along an **opaque `i` axis**. It deliberately does
   **not** infer whether `i` is Z/T/C/position — it exposes the filename list via
-  `get_metadata()` and leaves semantics to the caller.
+  its registration metadata and leaves semantics to the caller.
 - **`DicomSeriesAdapter`** (`adapters/dicom.py:407`, registered `dicom-series`) —
   groups files by `SeriesInstanceUID` (`dicom.py:470-482`) and sorts slices by
   `InstanceNumber` → `SliceLocation` → `ImagePositionPatient[z]`

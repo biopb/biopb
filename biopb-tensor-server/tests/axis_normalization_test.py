@@ -720,10 +720,7 @@ class TestRemoteProxyRefusesRatherThanPermutes:
         because it enforces the contract itself."""
         proxy = _proxy_adapter(1)
         proxy.seed_catalog(
-            [{"array_id": "u", "dim_labels": ["x", "y", "z"], "shape": [2, 3, 4]}],
-            {},
-            True,
-            None,
+            [{"array_id": "u", "dim_labels": ["x", "y", "z"], "shape": [2, 3, 4]}], None
         )
         assert canonical_permutation(["x", "y", "z"], [2, 3, 4]) is not None
         assert proxy._axis_perm() is None
@@ -839,13 +836,13 @@ class TestRemoteProxyRefusesRatherThanPermutes:
 
         proxy = _proxy_adapter(1)
 
-        proxy.seed_catalog(row(["x", "y", "z"], [2, 3, 4]), {}, True, None)
+        proxy.seed_catalog(row(["x", "y", "z"], [2, 3, 4]), None)
         with pytest.raises(flight.FlightServerError, match="canonical"):
             proxy.get_read_plan(proxy.get_tensor_descriptor())
 
         # Same adapter object, no re-registration: the upstream upgraded and the
         # mirror follows on the very next read.
-        proxy.seed_catalog(row(["z", "y", "x"], [4, 3, 2]), {}, True, None)
+        proxy.seed_catalog(row(["z", "y", "x"], [4, 3, 2]), None)
         plan = proxy.get_read_plan(proxy.get_tensor_descriptor())
         assert list(plan.descriptor.dim_labels) == ["z", "y", "x"]
         assert list(plan.descriptor.shape) == [4, 3, 2]
@@ -877,10 +874,7 @@ class TestRemoteProxyRefusesRatherThanPermutes:
             )
         proxy = _proxy_adapter(1)
         proxy.seed_catalog(
-            [{"array_id": "u", "dim_labels": ["x", "y"], "shape": [4, 5]}],
-            {},
-            True,
-            None,
+            [{"array_id": "u", "dim_labels": ["x", "y"], "shape": [4, 5]}], None
         )
         with pytest.raises(flight.FlightServerError) as proxy_exc:
             proxy.get_read_plan(proxy.get_tensor_descriptor())

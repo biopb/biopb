@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 from biopb_tensor_server.adapters import get_default_registry
 from biopb_tensor_server.core.discovery import DiscoveryState, SourceClaim
+from biopb_tensor_server.core.registration import RegistrationRecord
 from biopb_tensor_server.serving.metadata_db import (
     INTERNAL_ROOT_ID,
     SOURCE_CATALOG_FORMAT,
@@ -115,10 +116,13 @@ class TestRows:
 
     def test_an_unresolved_row_with_a_claim_is_persisted_without_a_payload(self):
         db = _db()
-        adapter = _Restorable(
-            "s1", "/d/s1.zarr", "zarr", [4, 4], "uint8", is_resolved=False
+        adapter = _Restorable("s1", "/d/s1.zarr", "zarr", [4, 4], "uint8")
+        db.sync_source_added(
+            "s1",
+            adapter,
+            _record(),
+            registration=RegistrationRecord({}, is_resolved=False),
         )
-        db.sync_source_added("s1", adapter, _record())
         assert _kinds(db) == (1, 0)
         assert _row(db)[3] is None
 

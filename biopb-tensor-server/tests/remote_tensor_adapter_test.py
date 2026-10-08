@@ -66,34 +66,34 @@ class TestMirrorSourceUrlTree:
 
     def test_seed_folds_upstream_path_into_display_url(self):
         a = self._adapter()
-        a.seed_catalog([], {}, True, "file:///labs/Yu/exp1/img.tif")
+        a.seed_catalog([], "file:///labs/Yu/exp1/img.tif")
         assert a._source_url == "grpc://store:8815/labs/Yu/exp1/img.tif"
 
     def test_alias_is_the_authority(self):
         a = self._adapter(alias="lab")
-        a.seed_catalog([], {}, True, "file:///data/x.tif")
+        a.seed_catalog([], "file:///data/x.tif")
         assert a._source_url == "grpc://lab/data/x.tif"
 
     def test_remote_scheme_upstream_keeps_bucket(self):
         a = self._adapter()
-        a.seed_catalog([], {}, True, "s3://bucket/key/img.zarr")
+        a.seed_catalog([], "s3://bucket/key/img.zarr")
         assert a._source_url == "grpc://store:8815/bucket/key/img.zarr"
 
     def test_empty_upstream_url_falls_back_to_source_id_form(self):
         a = self._adapter()
-        a.seed_catalog([], {}, True, None)
+        a.seed_catalog([], None)
         assert a._source_url == "grpc://store:8815:img"
 
     def test_url_change_flags_changed_for_resync(self):
         a = self._adapter()
-        assert a.seed_catalog([], {}, True, "file:///a/x.tif") is True
-        assert a.seed_catalog([], {}, True, "file:///a/x.tif") is False
-        assert a.seed_catalog([], {}, True, "file:///a/y.tif") is True
+        assert a.seed_catalog([], "file:///a/x.tif") is True
+        assert a.seed_catalog([], "file:///a/x.tif") is False
+        assert a.seed_catalog([], "file:///a/y.tif") is True
 
     def test_catalog_url_carries_the_tree_url(self):
         # catalog_url is what the metadata-DB row stores.
         a = self._adapter()
-        a.seed_catalog([], {}, True, "file:///labs/exp/img.tif")
+        a.seed_catalog([], "file:///labs/exp/img.tif")
         assert a.catalog_url == "grpc://store:8815/labs/exp/img.tif"
 
 
@@ -331,9 +331,7 @@ class TestRemoteTensorProxy:
                             "chunk_shape": [],
                             "dtype": ">i2",
                         }
-                    ],
-                    metadata={},
-                    is_resolved=True,
+                    ]
                 )
                 proxy = catalog_server("localhost:0")
                 register_and_catalog(proxy, "hpc__aics", adapter)
@@ -406,8 +404,6 @@ class TestRemoteTensorProxy:
                             "dtype": "<i2",
                         }
                     ],
-                    metadata={},
-                    is_resolved=True,
                     indexed_at="2026-07-19 00:00:00",
                 )
                 plan = adapter.forward_flight_info(
@@ -477,9 +473,7 @@ class TestRemoteTensorProxy:
                             "chunk_shape": [64, 64],
                             "dtype": "uint8",
                         }
-                    ],
-                    metadata={},
-                    is_resolved=True,
+                    ]
                 )
                 plan = adapter.forward_flight_info(
                     TensorReadOption(
@@ -538,9 +532,7 @@ class TestRemoteTensorProxy:
                             "chunk_shape": [64, 64],
                             "dtype": "uint8",
                         }
-                    ],
-                    metadata={},
-                    is_resolved=True,
+                    ]
                 )
                 plan = adapter.forward_flight_info(
                     TensorReadOption(array_id="hpc__ome")
@@ -643,9 +635,7 @@ class TestRemoteTensorProxy:
                     "chunk_shape": [1, 40, 50],
                     "dtype": "<i2",
                 }
-            ],
-            metadata={},
-            is_resolved=True,
+            ]
         )
         with pytest.raises(flight.FlightError):
             adapter.plan_flight_info(TensorReadOption(array_id="hpc__aics"), None)
@@ -674,9 +664,7 @@ class TestRemoteTensorProxy:
                     "chunk_shape": [1, 40, 50],
                     "dtype": "<i2",
                 }
-            ],
-            metadata={},
-            is_resolved=True,
+            ]
         )
         # A valid descriptor but a junk endpoint (no .ticket) -> the parse loop
         # raises inside the guarded LOGIC block (not the transport block).
@@ -1099,26 +1087,18 @@ def _upstream_with_metadata(zarr_path):
     return upstream
 
 
-@pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-def test_get_metadata_reads_from_upstream_metadata_db(simple_zarr_array):
-    """Source metadata is read from the upstream's metadata catalog via a SQL query
-    (sources.metadata_json stores the raw dict) -- list_flights is lean and the
-    buggy list_sources() path returned {}."""
+def test_a_mirror_holds_no_metadata_and_asks_nobody():
+    """A mirror's metadata is the upstream row's, written with the catalog row; the
+    adapter has none of its own and makes no per-source query for it."""
     from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
 
-    zarr_path, _, _ = simple_zarr_array
-    upstream = _upstream_with_metadata(zarr_path)
-    try:
-        adapter = RemoteTensorAdapter(
-            source_id="lab__img",
-            upstream_location=f"grpc://localhost:{upstream.port}",
-            upstream_source_id="img",
-        )
-        assert adapter.registration_record([], import_rois=False).metadata == {
-            "ome": {"channel": "DAPI"}
-        }
-    finally:
-        upstream.shutdown()
+    adapter = RemoteTensorAdapter(
+        source_id="lab__img",
+        upstream_location="grpc://localhost:1",  # never dialed
+        upstream_source_id="img",
+    )
+    assert adapter.registration_record([], import_rois=False).metadata == {}
+    assert adapter._client is None
 
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
@@ -1126,31 +1106,38 @@ def test_metadata_flows_through_proxy_single_wrapped(simple_zarr_array):
     """End-to-end: a client GetFlightInfo through the proxy carries the upstream's
     metadata, wrapped exactly once (not empty, not double-wrapped).
 
-    The proxy serves metadata from its own catalog, populated at registration
-    from the mirrored ``get_metadata()`` -- the serve path never recomputes on
-    the adapter (biopb/biopb#253), so a real proxy carries a metadata DB.
+    The proxy serves metadata from its own catalog, written at the re-list from
+    the upstream's row -- the serve path never recomputes on the adapter
+    (biopb/biopb#253).
     """
     import json
 
     from biopb.tensor import TensorFlightClient
-    from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+    from biopb_tensor_server import TensorFlightServer
+    from biopb_tensor_server.adapters import get_default_registry
+    from biopb_tensor_server.core.config import SourceConfig
+    from biopb_tensor_server.core.discovery import DiscoveryState
     from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 
     zarr_path, _, _ = simple_zarr_array
     upstream = _upstream_with_metadata(zarr_path)
     try:
-        from biopb_tensor_server import TensorFlightServer
-
         proxy_db = MetadataDatabase()
         proxy = TensorFlightServer("localhost:0", metadata_db=proxy_db)
-        proxy_adapter = RemoteTensorAdapter(
-            source_id="lab__img",
-            upstream_location=f"grpc://localhost:{upstream.port}",
-            upstream_source_id="img",
-        )
-        register_and_catalog(proxy, "lab__img", proxy_adapter)
         _serve(proxy)
         try:
+            manager = make_manager(
+                server=proxy,
+                registry=get_default_registry(),
+                discovery_state=DiscoveryState(),
+                monitored_dirs=set(),
+                metadata_db=proxy_db,
+                monitored_upstreams=[
+                    SourceConfig(url=f"grpc://localhost:{upstream.port}", alias="lab")
+                ],
+            )
+            _relist(manager)
+
             client = TensorFlightClient(f"grpc://localhost:{proxy.port}")
             desc = client.get_descriptor(
                 "lab__img", with_metadata=True
@@ -1168,27 +1155,56 @@ def test_metadata_flows_through_proxy_single_wrapped(simple_zarr_array):
 
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-def test_get_metadata_mirrors_an_upstreams_catalog(simple_zarr_array):
+def test_the_mirror_row_carries_the_upstreams_metadata_and_follows_it(
+    simple_zarr_array,
+):
     """Source-level metadata reaches the mirror through the upstream's catalog
-    row -- the mirror reads what the upstream catalogued, not its adapter."""
+    row, and a change to it alone -- same tensors, same url -- refreshes the row."""
     import zarr
-    from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+    from biopb_tensor_server import TensorFlightServer
+    from biopb_tensor_server.adapters import get_default_registry
+    from biopb_tensor_server.core.config import SourceConfig
+    from biopb_tensor_server.core.discovery import DiscoveryState
+    from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 
     zarr_path, _, _ = simple_zarr_array
     arr = zarr.open_array(zarr_path, mode="r")
-    upstream = catalog_server("localhost:0")
-    register_and_catalog(upstream, "img", _meta_zarr_cls()(arr, "img", ["y", "x"]))
+    up_db = MetadataDatabase()
+    upstream = TensorFlightServer("localhost:0", metadata_db=up_db)
+    up_db.sync_source_added("img", _meta_zarr_cls()(arr, "img", ["y", "x"]))
+    upstream.register_source("img", _meta_zarr_cls()(arr, "img", ["y", "x"]))
     _serve(upstream)
     try:
-        adapter = RemoteTensorAdapter(
-            source_id="lab__img",
-            upstream_location=f"grpc://localhost:{upstream.port}",
-            upstream_source_id="img",
-        )
-        assert adapter.list_tensors()  # reachable -> mirrored
-        assert adapter.registration_record([], import_rois=False).metadata == {
-            "ome": {"channel": "DAPI"}
-        }
+        local_db = MetadataDatabase()
+        proxy = TensorFlightServer("localhost:0", metadata_db=local_db)
+        _serve(proxy)
+        try:
+            manager = make_manager(
+                server=proxy,
+                registry=get_default_registry(),
+                discovery_state=DiscoveryState(),
+                monitored_dirs=set(),
+                metadata_db=local_db,
+                monitored_upstreams=[
+                    SourceConfig(url=f"grpc://localhost:{upstream.port}", alias="lab")
+                ],
+            )
+            _relist(manager)
+            assert local_db.get_metadata_json("lab__img") == {
+                "ome": {"channel": "DAPI"}
+            }
+
+            class _Renamed(_meta_zarr_cls()):
+                def registration_record(self, tensors, **kwargs):
+                    return metadata_record({"ome": {"channel": "GFP"}})
+
+            time.sleep(0.01)  # the upstream re-registers: its indexed_at moves
+            up_db.sync_source_added("img", _Renamed(arr, "img", ["y", "x"]))
+            _relist(manager)
+
+            assert local_db.get_metadata_json("lab__img") == {"ome": {"channel": "GFP"}}
+        finally:
+            proxy.shutdown()
     finally:
         upstream.shutdown()
 
@@ -1360,9 +1376,7 @@ def test_server_get_flight_info_fails_when_upstream_is_gone(simple_zarr_array):
                     "chunk_shape": [64, 64],
                     "dtype": "uint8",
                 }
-            ],
-            metadata={},
-            is_resolved=True,
+            ]
         )
         proxy = catalog_server("localhost:0")
         register_and_catalog(proxy, "lab__img", adapter)
@@ -2300,15 +2314,15 @@ def test_seed_catalog_sets_content_version_from_indexed_at():
     )
     assert adapter.content_version is None  # unseeded -> unversioned
 
-    adapter.seed_catalog([], {}, True, None, "2026-07-19 12:00:00")
+    adapter.seed_catalog([], None, "2026-07-19 12:00:00")
     assert adapter.content_version == b"iat:2026-07-19 12:00:00"
 
     # A re-register (a new indexed_at) moves the version.
-    adapter.seed_catalog([], {}, True, None, "2026-07-19 13:30:00")
+    adapter.seed_catalog([], None, "2026-07-19 13:30:00")
     assert adapter.content_version == b"iat:2026-07-19 13:30:00"
 
     # An upstream with no indexed_at leaves the proxy unversioned.
-    adapter.seed_catalog([], {}, True, None, None)
+    adapter.seed_catalog([], None, None)
     assert adapter.content_version is None
 
 
@@ -2316,7 +2330,7 @@ def test_seed_catalog_sets_content_version_from_indexed_at():
 
 
 def test_seed_catalog_short_circuits_catalog_surface_without_dialing():
-    """A seeded proxy answers list_tensors/get_metadata from the seed,
+    """A seeded proxy answers list_tensors from the seed,
     localizing array_ids, without ever dialing the upstream."""
     from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
 
@@ -2341,17 +2355,13 @@ def test_seed_catalog_short_circuits_catalog_surface_without_dialing():
                 "chunk_shape": [2, 2],
                 "dtype": "uint16",
             },
-        ],
-        {"ome": "meta"},
+        ]
     )
 
     descs = adapter.list_tensors()
     assert [d.array_id for d in descs] == ["lab__img", "lab__img/A2"]
     assert list(descs[0].shape) == [4, 4]
     assert descs[1].dtype == "uint16"
-    assert adapter.registration_record([], import_rois=False).metadata == {
-        "ome": "meta"
-    }
     # the whole point: no upstream RPC was made
     assert adapter._client is None
 
@@ -2450,8 +2460,7 @@ def test_get_tensor_descriptor_served_from_seed_without_rpc():
                 "shape": [2, 2],
                 "dtype": "uint16",
             },
-        ],
-        {"ome": "meta"},
+        ]
     )
 
     # the mirrored catalog surface is structural, and complete
@@ -2487,7 +2496,7 @@ def test_seed_catalog_empty_metadata_normalizes_to_dict():
         upstream_location="grpc://localhost:1",
         upstream_source_id="u",
     )
-    adapter.seed_catalog([], None)  # unresolved upstream source: no tensors
+    adapter.seed_catalog([])  # unresolved upstream source: no tensors
     assert adapter.list_tensors() == []
     assert adapter.registration_record([], import_rois=False).metadata == {}
     assert adapter._client is None
@@ -2805,7 +2814,6 @@ def test_reconcile_bulk_seeds_adapters_without_per_source_rpc(simple_zarr_array)
             for sid in ("lab__img", "lab__img2"):
                 adapter = proxy.sources.get(sid)
                 assert adapter._descriptors_cache is not None  # seeded, not live
-                assert adapter._metadata_cache is not None
                 assert adapter._client is None  # no per-source upstream dial
                 # source_url mirrors the upstream path under the endpoint root, so
                 # a browser trees it by filepath instead of a flat node (#297).
@@ -2907,9 +2915,6 @@ class _CatalogRowAdapter:
     def is_resident(self):
         raise AssertionError("the catalog never asks an adapter about residency")
 
-    def is_resolved(self):
-        return self._resolved
-
     def list_tensors(self):
         from biopb.tensor.descriptor_pb2 import TensorDescriptor
 
@@ -2918,15 +2923,19 @@ class _CatalogRowAdapter:
     def registration_record(
         self, tensors, *, import_rois=True, max_rois_per_tensor=None
     ) -> RegistrationRecord:
-        return metadata_record(self._metadata)
+        return RegistrationRecord(self._metadata, is_resolved=self._resolved)
 
 
 def test_seed_catalog_carries_resolution_and_detects_change():
     """An unresolved upstream source (is_resolved=false, empty tensors) mirrors as
     unresolved; re-seeding reports change only when something differs, and an
-    in-place resolution flips the flag and the tensors together.
-    """
-    from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
+    in-place resolution flips the flag and the tensors together. The flag and the
+    metadata ride the seed's record, to the catalog write: the adapter holds
+    neither."""
+    from biopb_tensor_server.adapters.remote_tensor import (
+        MirrorSeed,
+        RemoteTensorAdapter,
+    )
 
     adapter = RemoteTensorAdapter(
         source_id="lab__cloud",
@@ -2934,31 +2943,36 @@ def test_seed_catalog_carries_resolution_and_detects_change():
         upstream_source_id="cloud",
     )
 
-    changed = adapter.seed_catalog([], None, is_resolved=False)
-    assert changed is True
+    unresolved = MirrorSeed.from_row(
+        {"tensors": [], "is_resolved": False, "metadata_json": None}
+    )
+    assert unresolved.registration.is_resolved is False
+    assert unresolved.seed(adapter) is True
     assert adapter.list_tensors() == []
-    assert adapter.is_resolved() is False  # mirrors the upstream's own flag
     assert adapter._client is None
 
     # identical re-seed -> no change (so the caller skips a redundant re-sync)
-    assert adapter.seed_catalog([], None, is_resolved=False) is False
+    assert unresolved.seed(adapter) is False
 
     # in-place resolution upstream -> change detected, now resident with tensors
-    changed = adapter.seed_catalog(
-        [
-            {
-                "array_id": "cloud",
-                "dim_labels": ["y", "x"],
-                "shape": [4, 4],
-                "chunk_shape": [4, 4],
-                "dtype": "uint8",
-            }
-        ],
-        {"ome": "m"},
-        is_resolved=True,
+    resolved = MirrorSeed.from_row(
+        {
+            "tensors": [
+                {
+                    "array_id": "cloud",
+                    "dim_labels": ["y", "x"],
+                    "shape": [4, 4],
+                    "chunk_shape": [4, 4],
+                    "dtype": "uint8",
+                }
+            ],
+            "is_resolved": True,
+            "metadata_json": '{"ome": "m"}',
+        }
     )
-    assert changed is True
-    assert adapter.is_resolved() is True
+    assert resolved.registration.is_resolved is True
+    assert resolved.registration.metadata == {"ome": "m"}
+    assert resolved.seed(adapter) is True
     # Resolution upstream does not make anything local here.
     assert source_is_resident(adapter.source_url) is False
     assert [d.array_id for d in adapter.list_tensors()] == ["lab__cloud"]
@@ -2970,7 +2984,7 @@ def test_a_mirror_is_never_resident():
     read, whatever the endpoint's reachability or the upstream's resolution.
 
     Do not reinstate an override here -- "should a client offer to resolve this"
-    is `is_resolved()`, and a mirror cannot be warmed anyway
+    is the row's `is_resolved`, and a mirror cannot be warmed anyway
     (`test_warm_refuses_a_remote_source`), which is what residency decides.
     """
     from biopb_tensor_server.adapters.remote_tensor import RemoteTensorAdapter
@@ -2981,7 +2995,7 @@ def test_a_mirror_is_never_resident():
         upstream_source_id="img",
     )
     assert source_is_resident(adapter.source_url) is False
-    # Seeding a resolved upstream row moves is_resolved, and only that.
+    # Seeding a resolved upstream row changes nothing about residency.
     adapter.seed_catalog(
         [
             {
@@ -2990,11 +3004,8 @@ def test_a_mirror_is_never_resident():
                 "shape": [4, 4],
                 "dtype": "uint8",
             }
-        ],
-        None,
-        is_resolved=True,
+        ]
     )
-    assert adapter.is_resolved() is True
     assert source_is_resident(adapter.source_url) is False
     assert adapter._client is None  # and none of it dialed
 
@@ -3047,7 +3058,6 @@ def test_reconcile_mirrors_unresolved_then_refreshes_on_resolve():
             resolved, tensors = _row()
             assert resolved is False  # unresolved mirror, not advertised readable
             assert tensors == []
-            assert proxy.sources.get("lab__cloud").is_resolved() is False
 
             # upstream resolves the source in place (same source_id)
             up_db.sync_source_added(
@@ -3073,7 +3083,6 @@ def test_reconcile_mirrors_unresolved_then_refreshes_on_resolve():
             assert resolved is True  # refreshed from the bulk re-list
             assert len(tensors) == 1
             assert tensors[0]["array_id"] == "lab__cloud"  # localized
-            assert proxy.sources.get("lab__cloud").is_resolved() is True
         finally:
             proxy.shutdown()
     finally:
@@ -3226,7 +3235,7 @@ class TestAliasAndSchemeSurviveRegistration:
         try:
             adapter = server.sources.get("lab__example-source")
             # what a bulk upstream re-list seeds (biopb/biopb#297)
-            adapter.seed_catalog([], {}, True, "file:///data/example")
+            adapter.seed_catalog([], "file:///data/example")
             assert adapter._source_url == "grpcs://lab/data/example"
             assert adapter.catalog_url == "grpcs://lab/data/example"
         finally:

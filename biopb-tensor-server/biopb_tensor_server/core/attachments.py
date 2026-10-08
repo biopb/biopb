@@ -111,8 +111,9 @@ class Attachments:
         and are not checked: the file is the user's. A set that
         fails stays listed, is logged as an error, and raises
         :class:`AttachedTensorMismatch` when read, rather than being served
-        misaligned or vanishing. Empty until the source is resolved, since its
-        tensors are unknown before that.
+        misaligned or vanishing. Empty while the source lists no tensor (a mirror
+        of an upstream source that has not resolved), since there is no image
+        for a set to bind to.
 
         This is the *published* view -- what the catalog lists and what a read
         resolves first. A set still being uploaded, or the tombstone of one that
@@ -121,10 +122,10 @@ class Attachments:
         """
         if self._view is not None and self._view[0] is parent:
             return self._view[1]
-        if not parent.is_resolved():
-            return {}
         candidates = self._published_labels()
         images = self.normalized_tensors(parent) if candidates else {}
+        if candidates and not images:
+            return {}  # not cached: the source may list tensors by the next call
         view: Dict[str, TensorAdapter] = {}
         self._mismatch = {}
         for field, tensor in candidates.items():
