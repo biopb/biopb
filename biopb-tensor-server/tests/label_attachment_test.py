@@ -438,3 +438,16 @@ class TestASidecarIsAttachedAtRegistration:
             .to_pylist()
         )
         assert "oz1/@labels/mine" in ids
+
+
+class TestOwningField:
+    """Attached fields route by longest prefix, so a level rides with its tensor."""
+
+    def test_the_longest_key_wins_and_a_prefix_must_end_at_a_slash(self):
+        from biopb_tensor_server.core.attachments import _owning_field
+
+        keys = ["@fields/raw", "@fields/raw/@labels/nuclei", "@fields/ra"]
+        assert _owning_field("@fields/raw", keys) == "@fields/raw"
+        assert _owning_field("@fields/raw/@labels/nuclei/1", keys) == keys[1]
+        assert _owning_field("@fields/raw/2", keys) == "@fields/raw"
+        assert _owning_field("@fields/rawx", keys) is None

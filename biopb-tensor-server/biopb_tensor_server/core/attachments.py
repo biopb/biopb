@@ -17,7 +17,7 @@ status poll and a straggler's write both have to find their adapter.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from biopb_tensor_server.core.adapter_base import (
     SourceAdapter,
@@ -26,7 +26,7 @@ from biopb_tensor_server.core.adapter_base import (
     catalog_entry,
     strip_source_prefix,
 )
-from biopb_tensor_server.core.attached import is_published, split_attached_field
+from biopb_tensor_server.core.attached import MARKER, is_published, split_attached_field
 from biopb_tensor_server.core.errors import AttachedTensorMismatch
 from biopb_tensor_server.core.labels import (
     extent_mismatch,
@@ -37,6 +37,17 @@ from biopb_tensor_server.core.labels import (
 __all__ = ["Attachments"]
 
 logger = logging.getLogger(__name__)
+
+
+def _owning_field(field: str, keys: Iterable[str]) -> Optional[str]:
+    """The longest of *keys* that is *field* or a ``/``-delimited prefix of it."""
+    owner = None
+    for key in keys:
+        if (field == key or field.startswith(f"{key}/")) and (
+            owner is None or len(key) > len(owner)
+        ):
+            owner = key
+    return owner
 
 
 class Attachments:
@@ -239,49 +250,33 @@ class Attachments:
     ) -> Optional[TensorAdapter]:
         """The attached tensor answering for within-source *field*, or None.
 
-        Only a **marked** field reaches one: a label set through its
-        right-to-left parse, an uploaded field through the whole of its
-        ``@fields/<name>``. Everything else is the format's own routing, which
-        is the whole of the rule -- the upload path mints no bare field.
-        """
-        key, is_set = self._key(field)
-        if key is None:
-            return None
-        return self._label_set_for(parent, key) if is_set else self.tensors.get(key)
-
-    @staticmethod
-    def _key(field: Optional[str]) -> Tuple[Optional[str], bool]:
-        """The index key that answers for within-source *field*, and whether it
-        is a label set; ``(None, False)`` for a field no attachment answers.
-
-        The one parse of the marked-segment grammar, shared by routing and by
-        the capability gate so the two cannot disagree.
-        """
-        parsed = split_label_field(field)
-        if parsed is not None:
-            return (
-                (None, False) if parsed.level is not None else (parsed.set_field, True)
-            )
-        return (
-            (field, False) if split_attached_field(field) is not None else (None, False)
-        )
-
-    def _label_set_for(
-        self, parent: SourceAdapter, set_field: str
-    ) -> Optional[TensorAdapter]:
-        """The adapter answering for label field *set_field*, listed or in flight.
+        Only a **marked** field reaches one (:mod:`~biopb_tensor_server.core.attached`);
+        everything else is the format's own routing, which is the whole of the
+        rule -- the upload path mints no bare field. The tensor is the one whose
+        field is the longest prefix of *field*, and it resolves what remains
+        itself, so a native level of a label set is routed like any other id.
 
         A set being uploaded is addressable from ``add_tensor`` onwards -- that
-        is how its producer polls it to READY (biopb/biopb#1048) -- so both
-        views are consulted, the published one first.
+        is how its producer polls it to READY (biopb/biopb#1048) -- so the
+        published sets are consulted first, then the whole index.
         """
-        label_set = self.label_sets(parent).get(set_field)
-        if label_set is not None:
-            why = self._mismatch.get(set_field)
+        if not field or MARKER not in field:
+            return None
+        sets = self.label_sets(parent)
+        key = _owning_field(field, sets)
+        if key is not None:
+            why = self._mismatch.get(key)
             if why is not None:
-                raise AttachedTensorMismatch(f"{self.source_id}/{set_field} {why}")
-            return label_set
-        return self.label_uploads().get(set_field)
+                raise AttachedTensorMismatch(f"{self.source_id}/{key} {why}")
+            tensor = sets[key]
+        else:
+            key = _owning_field(field, self.tensors)
+            if key is None:
+                return None
+            tensor = self.tensors[key]
+        if field == key:
+            return tensor
+        return tensor.get_tensor_adapter(join_fields(self.source_id, field))
 
     def resolve_tensor(
         self, parent: SourceAdapter, tensor_id: Optional[str]
@@ -297,12 +292,6 @@ class Attachments:
         attached = self.for_field(parent, field)
         if attached is not None:
             return attached
-        parsed = split_label_field(field)
-        if parsed is not None and parsed.level:
-            # a native level of a label set rides under the set's own field
-            label_set = self._label_set_for(parent, parsed.set_field)
-            if label_set is not None:
-                return label_set.get_tensor_adapter(tensor_id)
         return parent.get_tensor_adapter(tensor_id)
 
     def capability_token(self, array_id: Optional[str]) -> Optional[str]:
@@ -323,6 +312,6 @@ class Attachments:
         """
         if not self.tensors:
             return None
-        key, _ = self._key(strip_source_prefix(self.source_id, array_id))
-        tensor = self.tensors.get(key) if key is not None else None
-        return tensor.capability_token if tensor is not None else None
+        field = strip_source_prefix(self.source_id, array_id)
+        key = _owning_field(field, self.tensors) if field else None
+        return self.tensors[key].capability_token if key is not None else None
