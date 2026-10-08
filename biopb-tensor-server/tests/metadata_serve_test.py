@@ -138,10 +138,10 @@ def test_the_catalog_row_is_the_metadata_cache(simple_zarr_array):
 
 
 @pytest.mark.skipif(not _zarr_available(), reason="zarr not available")
-def test_a_catalog_less_server_reads_metadata_off_the_adapter(simple_zarr_array):
-    """With no catalog there is no metadata cache -- and nothing released the
-    adapter's registration copy either, since ``sync_source_added`` is what does
-    that. So the adapter answers, and a descriptor still carries its metadata.
+def test_a_catalog_less_server_serves_no_metadata(simple_zarr_array):
+    """Source-level metadata is a catalog concern: with no catalog there is no
+    row to read it from, and the adapter is never asked, so a descriptor carries
+    none.
 
     ``get_source_metadata`` is a catalog query, so that one refuses: the
     embedded in-process cache serves a result it was asked for by id, it does
@@ -163,7 +163,7 @@ def test_a_catalog_less_server_reads_metadata_off_the_adapter(simple_zarr_array)
     try:
         client = TensorFlightClient(f"grpc://localhost:{server.port}")
         desc = client.get_descriptor("img", with_metadata=True)
-        assert json.loads(desc.metadata_json)["metadata"] == {"ome": {"channel": "GFP"}}
+        assert not desc.metadata_json
         with pytest.raises(flight.FlightUnavailableError, match="no catalog"):
             client.get_source_metadata("img")
         client.close()

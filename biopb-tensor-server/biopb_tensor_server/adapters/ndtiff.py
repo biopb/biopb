@@ -489,10 +489,9 @@ class NdTiffAdapter(TensorAdapter):
 
         ``PixelSize_um`` (isotropic X/Y) and the z-step, projected onto the
         ``x`` / ``y`` / ``z`` axes; position / time / channel axes get
-        ``0.0`` / ``""``. Reads the same summary dict :meth:`get_metadata`
-        returns.
+        ``0.0`` / ``""``. Reads the summary snapshot taken at construction.
         """
-        return mm_summary_scale(self.get_metadata(), self.dim_labels)
+        return mm_summary_scale(self._summary_metadata, self.dim_labels)
 
     def get_metadata(self) -> dict:
         """Return dataset summary metadata (MicroManager acquisition settings).

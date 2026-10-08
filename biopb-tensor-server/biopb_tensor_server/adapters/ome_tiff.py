@@ -804,6 +804,7 @@ class OmeTiffAdapter(TensorAdapter):
 
     def get_metadata(self) -> dict:
         """OME metadata dict from the stripped OME-XML (biopb/biopb#168), else {}.
+        The catalog row's producer; the adapter itself reads :meth:`_ome_metadata`.
 
         Parses the OME-XML with per-plane ``<Plane>``/``<TiffData>`` elements
         stripped -- the same ome-types structure MINUS the per-plane arrays at a
@@ -818,6 +819,10 @@ class OmeTiffAdapter(TensorAdapter):
         touches ``get_embedded_labels`` in the same registration (the registry's label-set view)
         gets the one parse already done, not a second one.
         """
+        return self._ome_metadata()
+
+    def _ome_metadata(self) -> dict:
+        """The parsed stripped OME metadata, parsed once and kept."""
         if self._parsed_metadata_probed:
             return self._parsed_metadata or {}
         self._parsed_metadata_probed = True
@@ -872,7 +877,7 @@ class OmeTiffAdapter(TensorAdapter):
         decoded here, so the catalog can list the label tensors without it."""
         descriptors = self._scene_descriptors()
         by_image = masks_by_image(
-            self.get_metadata(),
+            self._ome_metadata(),
             tensors_by_field([(d.array_id, list(d.dim_labels)) for d in descriptors]),
         )
         plan = []
@@ -942,7 +947,7 @@ class OmeTiffAdapter(TensorAdapter):
         scenes = self._scene_descriptors()
         if not scenes:
             return None
-        has_rois = bool(self.get_metadata().get("rois"))
+        has_rois = bool(self._ome_metadata().get("rois"))
         scales = {}
         for d in scenes:
             scale = self.get_tensor_adapter(d.array_id)._physical_scale()

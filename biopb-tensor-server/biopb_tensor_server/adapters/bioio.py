@@ -385,7 +385,7 @@ class _BioioAdapterBase(TensorAdapter):
         has_rois = (
             self._hydration.has_rois
             if self._hydration is not None
-            else bool(self.get_metadata().get("rois"))
+            else bool(self._read_metadata().get("rois"))
         )
         return {"listing": listing, "scenes": scenes, "has_rois": has_rois}
 
