@@ -376,7 +376,7 @@ class TestFastMetadataRealBitmap:
         attached = reg.attached_to("src1")
         assert "Image:0/@labels/@ome" in attached.label_sets(adapter)
 
-        adapter.release_registration_cache()
+        adapter._drop_registration_state()
 
         # The label adapter keeps the decoded bitmap, while the source retains
         # neither the base64 payload nor its parsed duplicate.
@@ -399,7 +399,7 @@ class TestFastMetadataRealBitmap:
     def test_release_survives_a_reduced_xml_the_stripper_cannot_parse(
         self, tmp_path, monkeypatch
     ):
-        """release_registration_cache() is documented to never raise. A reduced
+        """Dropping the registration state must never raise. A reduced
         XML the mask stripper's ET.fromstring rejects must not abort the raw-XML
         drop or the cascade to scene adapters below it -- it is left un-redacted
         instead (biopb/biopb#1081)."""
@@ -422,7 +422,7 @@ class TestFastMetadataRealBitmap:
             ome_tiff_module, "_strip_mask_bindata_payloads", _broken_strip
         )
 
-        adapter.release_registration_cache()  # must not raise
+        adapter._drop_registration_state()  # must not raise
 
         assert adapter._raw_ome_xml is None
         assert adapter._raw_ome_xml_released is True

@@ -26,11 +26,12 @@ import json
 import logging
 import math
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from biopb.image.annotation_pb2 import RoiAnnotation
 from biopb.image.roi_pb2 import ROI, Ellipse, Point, Polygon, Polyline, Rectangle
 
+from biopb_tensor_server.core.adapter_base import RegistrationRecord
 from biopb_tensor_server.core.axes import canonical_axis
 
 logger = logging.getLogger(__name__)
@@ -526,3 +527,40 @@ def _roi_id(ome_roi: Mapping[str, Any], shape: Mapping[str, Any]) -> str:
     """
     raw = shape.get("id") or ome_roi.get("id") or "shape"
     return str(raw).replace(",", "_")
+
+
+def ome_registration_record(
+    metadata: Optional[Mapping[str, Any]],
+    read_rois: Optional[
+        Callable[[Mapping[str, Any]], Tuple[Dict[str, List[RoiAnnotation]], Any]]
+    ],
+) -> RegistrationRecord:
+    """A :class:`RegistrationRecord` for a format whose metadata is OME's.
+
+    *read_rois* maps the metadata to ``imported_annotations``' result with the
+    format's own image-to-tensor join, or is ``None`` when annotations are off.
+    Once they are read the store owns them: a second copy in the row would be
+    duplicated bulk, and would keep them in ``GET /api/sources/{id}/metadata``,
+    which annotations do not appear on. A read that raised, or never ran, leaves
+    ``rois`` where it was rather than dropping the one copy left -- but a mask's
+    ``bin_data`` is arbitrary binary and never reaches the SQL-queryable column
+    whatever the reason (biopb/biopb#1059 step 4).
+    """
+    # Here, not at the top: ome_masks imports this module.
+    from biopb_tensor_server.adapters.ome_masks import strip_mask_bindata
+
+    metadata = metadata or {}
+    imported: Dict[str, List[RoiAnnotation]] = {}
+    report = None
+    if read_rois is not None:
+        try:
+            imported, report = read_rois(metadata)
+        except Exception:
+            # Documented as a bug in the adapter, and still not fatal here.
+            logger.exception("ome rois: could not read the set")
+            imported, report = {}, None
+    if report is not None and "rois" in metadata:
+        metadata = {k: v for k, v in metadata.items() if k != "rois"}
+    elif "rois" in metadata:
+        metadata = strip_mask_bindata(metadata)
+    return RegistrationRecord(metadata, imported, report)

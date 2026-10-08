@@ -23,7 +23,7 @@ import logging
 import re
 import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -215,6 +215,21 @@ def validate_bounds(bounds: ChunkBounds, shape: Tuple[int, ...]) -> None:
 
 
 @dataclass(frozen=True)
+class RegistrationRecord:
+    """What a source contributes to its catalog entry at registration.
+
+    ``metadata`` is the ``sources.metadata_json`` payload, already stripped of
+    whatever the format moved elsewhere (ROIs it imported, mask bitmaps).
+    ``rois`` are the annotations its file carries, by ``array_id``, and ``report``
+    is an opaque summary for the log (``summary()``), or ``None``.
+    """
+
+    metadata: Mapping[str, Any]
+    rois: Mapping[str, List[Any]] = field(default_factory=dict)
+    report: Any = None
+
+
+@dataclass(frozen=True)
 class TensorEntry:
     """What a *source* lists about one of its tensors: the **structural** facts.
 
@@ -375,8 +390,7 @@ class SourceAdapter(ABC):
     def get_metadata(self) -> dict:
         """Return the source-level metadata as a dict. Usually OME metadata.
 
-        Called once per registered adapter, by
-        :meth:`MetadataDatabase.sync_source_added`, to populate
+        Read by :meth:`registration_record`, once per registration, to populate
         ``sources.metadata_json``; a changed file or a source that resolves
         registers a new adapter. (A remote mirror's re-seed and a rolled-back
         replace sync the same adapter again.) The serve path reads that row back,
@@ -387,28 +401,40 @@ class SourceAdapter(ABC):
         adapter via :meth:`TensorAdapter.get_tensor_metadata` instead.
         """
 
-    def get_embedded_rois(
+    def registration_record(
         self,
-        metadata: Mapping[str, Any],
         tensors: Sequence[Tuple[str, Sequence[str]]],
         *,
-        max_per_tensor: Optional[int] = None,
-    ) -> Tuple[Dict[str, List[Any]], Any]:
-        """ROIs this source's own file carries, keyed by ``array_id``.
+        import_rois: bool = True,
+        max_rois_per_tensor: Optional[int] = None,
+    ) -> RegistrationRecord:
+        """Everything this source contributes to its catalog entry, built once.
 
-        Some formats store annotations beside their pixels -- OME-XML ``<ROI>``
-        elements, ImageJ overlays, a GeoJSON sidecar. Those land in the reserved
-        ``@ome``-style set the catalog keeps read-only (biopb/biopb#951).
+        Called by :meth:`MetadataDatabase.sync_source_added`, which writes it in
+        one transaction with the row. *tensors* are the ``(array_id, dim_labels)``
+        the catalog lists, to key ROIs by; *import_rois* is false on a server that
+        does not serve annotations, so the file's are not parsed at all.
 
-        Returns:
-            ``(rois_by_array_id, report)``. The report is opaque to the caller
-            beyond having a ``summary()`` for the log, and may be ``None``.
+        A format that stores annotations beside its pixels -- OME-XML ``<ROI>``
+        elements -- returns them in ``rois``, which land in the read-only reserved
+        set (biopb/biopb#951), and the metadata without them. Failing to read them
+        is not fatal and not silent: the source is its pixels first, so the
+        metadata is kept whole and the next registration retries.
 
-        Raising is not fatal but IS a bug: the caller runs this inside source
-        registration and swallows failures, because a source is its pixels first
-        and an imported set is rebuilt on the next registration anyway.
+        The record is built from the adapter and held by no one, so an adapter
+        that parked an intermediate to produce it drops it here. A re-seeded
+        mirror and a rolled-back replace sync the same adapter again, so that
+        must be recoverable.
+
+        The default is :meth:`get_metadata` alone, minus any mask bitmaps (never
+        for a SQL-queryable column).
         """
-        return {}, None
+        from biopb_tensor_server.adapters.ome_masks import strip_mask_bindata
+
+        metadata = self.get_metadata() or {}
+        if "rois" in metadata:
+            metadata = strip_mask_bindata(metadata)
+        return RegistrationRecord(metadata)
 
     # -- attached tensors (biopb/biopb#1059) -----------------------------------
     # The tensors the upload path attached to a source -- uploaded fields, label
@@ -417,7 +443,7 @@ class SourceAdapter(ABC):
     def get_embedded_labels(self) -> Dict[str, TensorAdapter]:
         """Label sets this source's own file carries, keyed by within-source field.
 
-        The pixel counterpart of :meth:`get_embedded_rois`: a format that stores
+        The pixel counterpart of the ROIs in :meth:`registration_record`: a format that stores
         labels beside its image -- an OME-Zarr's NGFF ``labels/`` group -- says
         here how to read them. Read once per adapter by the registry's label-set view.
         Default: none. Keys are ``[<image field>/]labels/<name>``
@@ -497,15 +523,6 @@ class SourceAdapter(ABC):
         the meaning of one bumps ``SOURCE_CATALOG_FORMAT``. Optional.
         """
         return None
-
-    def release_registration_cache(  # noqa: B027 - concrete no-op default
-        self,
-    ) -> None:
-        """Drop whatever was held only to answer registration, keeping derived state.
-
-        Called by :meth:`MetadataDatabase.sync_source_added` once the catalog row
-        is committed.
-        """
 
 
 class TensorAdapter(SourceAdapter):
@@ -1319,12 +1336,11 @@ _SOURCE_SCOPED_API = frozenset(
         "create_from_payload",
         "list_tensors",
         "get_metadata",
-        "get_embedded_rois",
+        "registration_record",
         "catalog_url",
         "is_resolved",
         "get_tensor_adapter",
         "close",
-        "release_registration_cache",
         "catalog_payload",
         "get_embedded_labels",
     }

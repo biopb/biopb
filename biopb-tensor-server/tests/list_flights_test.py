@@ -9,6 +9,7 @@ import pyarrow.flight as flight
 import pytest
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import TensorTicket
+from biopb_tensor_server.core.adapter_base import SourceAdapter
 from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 from biopb_tensor_server.serving.server import TensorFlightServer
 
@@ -17,6 +18,8 @@ class _CatalogAdapter:
     """Adapter double that syncs cleanly into the metadata DB."""
 
     capability_token = None
+
+    registration_record = SourceAdapter.registration_record
 
     def __init__(self, source_id):
         self.source_id = source_id

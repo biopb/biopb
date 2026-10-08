@@ -139,7 +139,7 @@ class TestOmeTiff:
         rebuilt = hydrate(OmeTiffAdapter.create_from_config(source), source)
 
         forbid_opens(monkeypatch, (tifffile, "TiffFile"))
-        stored(rebuilt)  # get_metadata, get_embedded_rois, payload, release
+        stored(rebuilt)  # the registration record and the payload
         assert rebuilt.get_embedded_labels() == {}
 
     def test_a_file_with_a_mask_keeps_its_rois_and_labels(self, tmp_path, monkeypatch):
@@ -162,8 +162,8 @@ class TestOmeTiff:
 
         # The ROIs and the label tensor come from the file, when asked.
         tensors = [(t.array_id, list(t.dim_labels)) for t in rebuilt.list_tensors()]
-        rois, _ = rebuilt.get_embedded_rois(rebuilt.get_metadata(), tensors)
-        expected, _ = parsed.get_embedded_rois(parsed.get_metadata(), tensors)
+        rois = rebuilt.registration_record(tensors).rois
+        expected = parsed.registration_record(tensors).rois
         assert {k: len(v) for k, v in rois.items()} == {
             k: len(v) for k, v in expected.items()
         }

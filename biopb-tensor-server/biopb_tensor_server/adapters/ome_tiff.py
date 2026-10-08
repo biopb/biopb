@@ -39,6 +39,7 @@ from biopb_tensor_server.adapters._handle_reaper import DEFAULT_HANDLE_REAPER_TT
 from biopb_tensor_server.adapters._ome_rois import (
     OME_SET_NAME,
     imported_annotations,
+    ome_registration_record,
     tensors_by_field,
 )
 from biopb_tensor_server.adapters._signature_memo import Signature, SignatureMemo
@@ -516,8 +517,8 @@ class OmeTiffAdapter(TensorAdapter):
         #
         # The raw string is registration-scope only: it is tens of MB on a
         # per-plane acquisition (one <Plane> + one <TiffData> per T*C*Z), and
-        # ``release_registration_cache`` drops it once the catalog owns the
-        # metadata (biopb/biopb#783). ``_raw_ome_xml_released`` is the third
+        # ``registration_record`` drops it once the record is built
+        # (biopb/biopb#783). ``_raw_ome_xml_released`` is the third
         # state -- "there IS XML in the file, we just are not holding it" -- so a
         # later consumer re-reads instead of seeing a false None. Only the
         # plane-stripped ``_reduced_ome_xml`` (hundreds of bytes to a few KB)
@@ -536,7 +537,7 @@ class OmeTiffAdapter(TensorAdapter):
         self._parsed_metadata: Optional[dict] = None
         self._parsed_metadata_probed = False
         # Set only after get_embedded_labels has handed every usable bitmap to
-        # its RasterizedMaskAdapter.  release_registration_cache may also run
+        # its RasterizedMaskAdapter.  registration_record may also run
         # on an adapter that has never entered label discovery, in which case
         # its metadata must remain complete for that later discovery.
         self._mask_payloads_transferred = False
@@ -567,7 +568,7 @@ class OmeTiffAdapter(TensorAdapter):
         The scene descriptors (with their transfer grid) and each scene's physical
         scale come from the payload. The metadata is the row's, which is the whole
         of it for a file with no ROIs; a file that has them keeps ``get_metadata``,
-        ``get_embedded_rois`` and the ``@ome`` labels lazy, parsing the file when
+        the record's ROIs and the ``@ome`` labels lazy, parsing the file when
         asked, since the row holds neither the ROIs nor the mask bitmaps.
 
         ``None`` for a payload that predates the scale (the source is parsed).
@@ -833,25 +834,43 @@ class OmeTiffAdapter(TensorAdapter):
             self._parsed_metadata = _fast_ome_metadata(reduced, already_reduced=True)
         return self._parsed_metadata or {}
 
-    def get_embedded_rois(self, metadata, tensors, *, max_per_tensor=None):
-        """The OME-XML ``<ROI>`` elements this file carries (see the base).
+    def registration_record(
+        self, tensors, *, import_rois=True, max_rois_per_tensor=None
+    ):
+        """The metadata and the OME-XML ``<ROI>`` elements this file carries.
 
-        Matched by id: ``_ome_scene_ids`` puts the OME image id straight into
-        the array_id's field half, so the two id spaces are the same one.
+        ROIs are matched by id: ``_ome_scene_ids`` puts the OME image id straight
+        into the array_id's field half, so the two id spaces are the same one.
+
+        Built from what registration parked on the adapter, and the last reader
+        of it: the raw XML, the parsed dict and each scene's copies go once the
+        record exists (biopb/biopb#783).
         """
-        return imported_annotations(
-            metadata,
-            tensors_by_field(tensors),
-            content_version=self.content_version,
-            max_per_tensor=max_per_tensor,
+        record = ome_registration_record(
+            self.get_metadata(),
+            (
+                lambda metadata: imported_annotations(
+                    metadata,
+                    tensors_by_field(tensors),
+                    content_version=self.content_version,
+                    max_per_tensor=max_rois_per_tensor,
+                )
+            )
+            if import_rois
+            else None,
         )
+        try:
+            self._drop_registration_state()
+        except Exception:  # pragma: no cover - dropping is an optimization
+            logger.debug("could not drop the registration state", exc_info=True)
+        return record
 
     def get_embedded_labels(self) -> Dict[str, TensorAdapter]:
         """The ``@ome`` set: this file's own ``<Mask>`` ROI shapes, rasterized.
 
         One tensor per scene that carries at least one mask, keyed
         ``[<scene field>/]labels/@ome`` (see ``adapters/ome_masks.py``). Same
-        OME-image-id join as :meth:`get_embedded_rois` (``tensors_by_field``):
+        OME-image-id join as :meth:`registration_record` (``tensors_by_field``):
         the field half of a scene's ``array_id`` IS the OME image id for this
         format, so the match is string equality, not inference.
         """
@@ -941,7 +960,7 @@ class OmeTiffAdapter(TensorAdapter):
         Source-level only. Each is the serving descriptor (``array_id``, axes,
         shape, dtype and the transfer grid seeded from the page geometry), plus
         ``has_rois`` and the embedded mask label tensors. Call it before
-        :meth:`release_registration_cache`, which drops the mask bitmaps the
+        :meth:`registration_record`, which drops the mask bitmaps the
         label plan reads. ``None`` when tifffile declined the source.
         """
         if self.scene_index is not None:
@@ -985,12 +1004,12 @@ class OmeTiffAdapter(TensorAdapter):
             ],
         }
 
-    def release_registration_cache(self) -> None:
-        """Drop the raw OME-XML now that the catalog holds the metadata (#783).
+    def _drop_registration_state(self) -> None:
+        """Drop the raw OME-XML and the parsed dict once the record is built (#783).
 
-        The raw string exists to build the catalog row; once that row is
-        committed it is an uncompressed duplicate of something DuckDB already
-        stores in stripped form, resident for as long as the source is
+        The raw string exists to build the catalog row; once the record is
+        built it is an uncompressed duplicate of something DuckDB will store in
+        stripped form, resident for as long as the source is
         registered -- i.e. forever, in a serving process. On a per-plane
         acquisition (40,000 timepoints is real) that is tens of MB per source.
 
@@ -1026,7 +1045,7 @@ class OmeTiffAdapter(TensorAdapter):
             # to settle, and settling would open the file.
             for adapter in list(self._tensor_adapters.values()):
                 if adapter is not self:
-                    adapter.release_registration_cache()
+                    adapter._drop_registration_state()
             return
         # Settle first, drop second: a get_tensor_adapter racing this then
         # inherits either (raw, unsettled) and gets cascaded below, or (no raw,
@@ -1048,6 +1067,11 @@ class OmeTiffAdapter(TensorAdapter):
                 self._reduced_ome_xml = reduced
                 self._parsed_metadata = None
                 self._parsed_metadata_probed = False
+        if self._hydrated_metadata is None:
+            # Built, written and gone: a later get_metadata parses the stripped
+            # XML again rather than the adapter holding the dict for its life.
+            self._parsed_metadata = None
+            self._parsed_metadata_probed = False
         if self._raw_ome_xml is not None:
             self._raw_ome_xml = None
             self._raw_ome_xml_released = True
@@ -1063,7 +1087,7 @@ class OmeTiffAdapter(TensorAdapter):
                 adapter._parsed_metadata = None
                 adapter._parsed_metadata_probed = False
                 adapter._mask_payloads_transferred = True
-            adapter.release_registration_cache()
+            adapter._drop_registration_state()
 
     # ---- OME-XML internals --------------------------------------------------
 
@@ -1075,7 +1099,7 @@ class OmeTiffAdapter(TensorAdapter):
         metadata, and physical-scale paths. Returns None for remote or non-OME
         sources.
 
-        After ``release_registration_cache`` the cache is gone but the file
+        After ``_drop_registration_state`` the cache is gone but the file
         still has the XML, so this re-reads it (biopb/biopb#783). That re-read
         is the price of asking for the full document post-registration -- no
         in-tree caller does; both remaining consumers read the stripped form.

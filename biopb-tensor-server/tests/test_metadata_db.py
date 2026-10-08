@@ -12,6 +12,7 @@ import json
 
 import duckdb
 import pytest
+from biopb_tensor_server.core.adapter_base import SourceAdapter
 from biopb_tensor_server.serving.metadata_db import MetadataDatabase
 
 
@@ -19,6 +20,8 @@ class MockAdapter:
     """Mock adapter for testing metadata sync."""
 
     capability_token = None
+
+    registration_record = SourceAdapter.registration_record
 
     def __init__(
         self,
@@ -222,6 +225,8 @@ class TestSourceSync:
 
 class MultiTensorAdapter:
     """Mock adapter exposing several tensors (multi-field / HCS source)."""
+
+    registration_record = SourceAdapter.registration_record
 
     def __init__(
         self,
@@ -893,6 +898,8 @@ class TestNoResidencyColumn:
     class _UnresolvedAdapter:
         """A cloud / synced-folder source catalogued by URL only: no tensors,
         and not resident until resolved."""
+
+        registration_record = SourceAdapter.registration_record
 
         def __init__(self, source_id, source_url):
             self.source_id = source_id

@@ -6,6 +6,7 @@ import time
 from datetime import datetime, timedelta
 
 import pytest
+from biopb_tensor_server.core.adapter_base import SourceAdapter
 from biopb_tensor_server.core.discovery import (
     DiscoveryState,
     SourceClaim,
@@ -1910,6 +1911,8 @@ class _CatalogStubAdapter:
     get_metadata surface that MetadataDatabase.sync_source_added reads, so a
     static source can flow through the real registration + catalog-sync path.
     """
+
+    registration_record = SourceAdapter.registration_record
 
     def __init__(self, source_id, source_url):
         self._source_id = source_id

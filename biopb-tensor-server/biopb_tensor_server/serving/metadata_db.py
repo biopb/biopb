@@ -73,7 +73,6 @@ from biopb.image.roi_pb2 import ROI
 from biopb.tensor._catalog_rows import SOURCE_ROW_COLUMNS
 from google.protobuf import json_format
 
-from biopb_tensor_server.adapters.ome_masks import strip_mask_bindata
 from biopb_tensor_server.core.adapter_base import to_catalog_url
 from biopb_tensor_server.core.attachments import Attachments
 from biopb_tensor_server.core.errors import AnnotationStoreError
@@ -1460,10 +1459,6 @@ class MetadataDatabase:
         The row and the ROIs the file carries are one transaction, so a raise
         leaves the previous row and ROIs both as they were.
 
-        Once the row is committed this calls
-        ``adapter.release_registration_cache()``: the catalog now holds the
-        metadata, so the adapter may drop whatever it kept only to produce it.
-
         Args:
             source_id: Unique source identifier
             adapter: Backend adapter for the source
@@ -1482,7 +1477,6 @@ class MetadataDatabase:
         source_type = adapter.source_type
         is_resolved = adapter.is_resolved()
         catalog = self._catalog_tensors(source_id, adapter)
-        metadata = adapter.get_metadata()
 
         # Full per-tensor structural info (biopb/biopb#224): one struct per
         # tensor, not just tensors[0]. Expensive/lazy fields (metadata_json,
@@ -1491,78 +1485,11 @@ class MetadataDatabase:
         # have no tensors -> empty list.
         tensors = self._tensor_rows(catalog)
 
-        # ROIs the file carries, filed in the reserved @ome set (#951). Derived
-        # HERE because this method is already the replace-on-rescan mechanism --
-        # re-registration is driven by the same stat signature content_version
-        # comes from -- so an imported set needs no freshness bookkeeping of its
-        # own, only the same lifecycle as the row below. It is also free here:
-        # get_metadata() has just been called, so this is a dict walk, not a
-        # second parse.
-        # The FORMAT decides whether its file carries annotations, because the
-        # server does not police what get_metadata() returns: a `rois` key in an
-        # EMD's original_metadata or an OME-Zarr's .zattrs means whatever that
-        # format meant by it. getattr, because this method only duck-types its
-        # argument and several adapters supply that surface without inheriting
-        # the base -- which is also why they read as "carries nothing".
-        report = None
-        imported: Dict[str, List[RoiAnnotation]] = {}
-        get_embedded = (
-            getattr(adapter, "get_embedded_rois", None)
-            # A deployment that does not serve the annotation actions does not
-            # parse a file's ROIs either: the rows would be unreadable through
-            # every surface (the SQL one drops the table from allowed_tables
-            # too), so the work and the storage buy nothing. It also leaves
-            # `rois` in metadata_json, since nothing read them -- stripping is
-            # gated on a completed read, so that falls out.
-            if self._annotations_enabled
-            else None
-        )
-        try:
-            if get_embedded is not None:
-                imported, report = get_embedded(
-                    # `or {}`: get_metadata is typed -> dict, but an
-                    # upload-backed source returns whatever OME metadata it was
-                    # given, which may be None. The line below has always
-                    # tolerated that, so does this one.
-                    metadata or {},
-                    [(t.array_id, list(t.dim_labels)) for t in catalog],
-                    max_per_tensor=self._max_rois_per_tensor,
-                )
-        except Exception:
-            # Documented as a bug in the adapter, and still not fatal here: a
-            # source is its pixels first, and the next registration retries.
-            logger.exception("ome rois: could not read the set for %s", source_id)
-            imported, report = {}, None
-
-        if report:
-            logger.info("ome rois for %s: %s", source_id, report.summary())
-        # Only when the read completed. A wholesale failure leaves `rois` in the
-        # column rather than dropping the one copy that is left -- partial drops
-        # are counted in the report above, but this would be silent loss.
-        if report is not None and metadata and "rois" in metadata:
-            # The store owns them now. A second copy here would be duplicated
-            # bulk and would keep them in GET /api/sources/{id}/metadata, which
-            # is the surface the design says annotations do not appear on.
-            # Safe: the derivation above reads the adapter's fresh dict, never
-            # this column, so nothing rebuilds from what is dropped.
-            metadata = {k: v for k, v in metadata.items() if k != "rois"}
-        elif metadata and "rois" in metadata:
-            # report is None here either because annotations are off, or
-            # because get_embedded_rois raised (caught above) -- either way
-            # nothing dropped the whole `rois` key, so it stays. But a Mask's
-            # `bin_data` is arbitrary binary, unlike every other shape kind,
-            # and must never reach this SQL-queryable column regardless of
-            # why annotation import didn't run (biopb/biopb#1059 step 4,
-            # "Rasterizing OME masks").
-            metadata = strip_mask_bindata(metadata)
-
-        # Build row data
-        indexed_at = datetime.now()
-        metadata_json = json.dumps(metadata, cls=NumpyEncoder) if metadata else None
-
         # Every source with a claim is persisted; the payload only lets a
         # restart skip the parse, so an adapter without one (or a cloud row, or
         # one that is not resolved) stores NULL and is rebuilt from its claim.
+        # Before the record, which is the adapter's cue to drop what it parked
+        # for it: the payload reads the same intermediates.
         payload = None
         if (
             record is not None
@@ -1571,6 +1498,27 @@ class MetadataDatabase:
             and not record.cloud
         ):
             payload = adapter.catalog_payload()
+
+        # The file's metadata and ROIs (#951), built together by the adapter:
+        # the FORMAT decides whether its file carries annotations, because the
+        # server does not police what get_metadata() returns -- a `rois` key in
+        # an EMD's original_metadata or an OME-Zarr's .zattrs means whatever that
+        # format meant by it. A server that does not serve the annotation actions
+        # does not parse a file's ROIs either: the rows would be unreadable
+        # through every surface, so the work and the storage buy nothing.
+        registration = adapter.registration_record(
+            [(t.array_id, list(t.dim_labels)) for t in catalog],
+            import_rois=self._annotations_enabled,
+            max_rois_per_tensor=self._max_rois_per_tensor,
+        )
+        metadata = registration.metadata
+        imported = registration.rois
+        if registration.report:
+            logger.info("ome rois for %s: %s", source_id, registration.report.summary())
+
+        # Build row data
+        indexed_at = datetime.now()
+        metadata_json = json.dumps(metadata, cls=NumpyEncoder) if metadata else None
 
         self._upsert_source_row(
             conn,
@@ -1596,17 +1544,6 @@ class MetadataDatabase:
             ),
         )
 
-        # The row is committed, so the catalog -- not the adapter -- now owns this
-        # source's metadata (biopb/biopb#253). Let the adapter drop whatever it
-        # parked on itself only to build the row; OME-TIFF's raw OME-XML is tens
-        # of MB on a per-plane acquisition (biopb/biopb#783). Best-effort: a
-        # balky release must not fail a registration that already succeeded.
-        try:
-            adapter.release_registration_cache()
-        except Exception:  # pragma: no cover - release is an optimization
-            logger.debug(
-                "release_registration_cache failed for %s", source_id, exc_info=True
-            )
         logger.debug(f"Synced source to metadata database: {source_id}")
 
     def bind_registry(self, registry: Any) -> None:

@@ -73,7 +73,7 @@ def test_release_drops_the_raw_xml_and_keeps_the_stripped_one(registered):
     raw_len = len(registered._raw_ome_xml)
     assert registered._reduced_ome_xml  # computed by get_metadata
 
-    registered.release_registration_cache()
+    registered._drop_registration_state()
 
     assert registered._raw_ome_xml is None
     # The stripped form is O(structure), the raw one O(plane count): the whole
@@ -83,14 +83,14 @@ def test_release_drops_the_raw_xml_and_keeps_the_stripped_one(registered):
 
 def test_release_marks_released_without_unprobing(registered):
     # The trap in #783: un-probing would make every later call reopen the file.
-    registered.release_registration_cache()
+    registered._drop_registration_state()
     assert registered._raw_ome_xml_probed is True
     assert registered._raw_ome_xml_released is True
 
 
 def test_release_is_idempotent(registered):
-    registered.release_registration_cache()
-    registered.release_registration_cache()
+    registered._drop_registration_state()
+    registered._drop_registration_state()
     assert registered._raw_ome_xml is None
     assert registered._reduced_ome_xml
 
@@ -100,7 +100,7 @@ def test_release_is_idempotent(registered):
 
 def test_metadata_after_release_reparses_without_reopening(registered, count_opens):
     before = registered.get_metadata()
-    registered.release_registration_cache()
+    registered._drop_registration_state()
 
     after = registered.get_metadata()
 
@@ -117,7 +117,7 @@ def test_scene_built_after_release_keeps_physical_scale_without_reopening(
     expected = registered.get_tensor_adapter(FIELD)._physical_scale()
     assert expected is not None
     registered._tensor_adapters.clear()
-    registered.release_registration_cache()
+    registered._drop_registration_state()
     count_opens.clear()
 
     scene = registered.get_tensor_adapter(FIELD)
@@ -165,7 +165,7 @@ def test_release_settles_the_stripped_form_even_if_metadata_never_ran(per_plane_
     source.list_tensors()
     scene = source.get_tensor_adapter(FIELD)
 
-    source.release_registration_cache()
+    source._drop_registration_state()
 
     assert source._raw_ome_xml is None and source._reduced_ome_xml
     assert scene._raw_ome_xml is None and scene._reduced_ome_xml
@@ -175,7 +175,7 @@ def test_scene_created_before_release_is_released_too(registered):
     scene = registered.get_tensor_adapter(FIELD)
     assert scene._raw_ome_xml
 
-    registered.release_registration_cache()
+    registered._drop_registration_state()
 
     assert scene._raw_ome_xml is None
     assert scene._raw_ome_xml_released is True
@@ -210,7 +210,7 @@ def test_physical_scale_does_not_force_the_strip(per_plane_tiff):
 
 def test_the_full_xml_can_be_read_back_after_release(registered):
     full = registered._raw_ome_xml
-    registered.release_registration_cache()
+    registered._drop_registration_state()
 
     recovered = registered._local_ome_xml()
 
@@ -230,7 +230,7 @@ def test_source_without_ome_xml_is_untouched(tmp_path, count_opens):
     assert adapter._local_ome_xml() is None
     count_opens.clear()
 
-    adapter.release_registration_cache()
+    adapter._drop_registration_state()
 
     assert adapter._raw_ome_xml_released is False
     assert adapter._local_ome_xml() is None
@@ -278,11 +278,13 @@ def test_registering_on_a_bare_server_releases_into_its_own_catalog(per_plane_ti
         server.shutdown()
 
 
-def test_every_source_adapter_answers_the_release(tmp_path):
-    # It is declared on the ABC precisely so a wrapper author sees it; the
-    # default is a no-op, and an adapter that holds nothing keeps it.
+def test_the_record_drops_what_it_was_built_from(tmp_path):
+    # The record is the last reader of the registration state: built, handed
+    # over, and nothing about it stays on the adapter.
     path, _, _ = create_tiled_ome_tiff(str(tmp_path), shape=(2, 16, 16))
     adapter = OmeTiffAdapter(path, "tiled")
-    adapter.get_metadata()
-    adapter.release_registration_cache()
+    record = adapter.registration_record([], import_rois=False)
+    assert record.metadata["images"][0]["pixels"]["id"]
+    assert adapter._raw_ome_xml is None
+    assert adapter._parsed_metadata is None
     assert adapter.get_metadata()["images"][0]["pixels"]["id"]

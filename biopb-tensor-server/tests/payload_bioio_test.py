@@ -274,16 +274,12 @@ class TestEmbeddedRois:
         parsed, source, payload, metadata = self._sources(tmp_path, monkeypatch, True)
         assert payload["has_rois"] is True
         assert "rois" not in metadata
-        expected, _ = parsed.get_embedded_rois(
-            parsed.get_metadata(), self._tensors(parsed)
-        )
+        expected = parsed.registration_record(self._tensors(parsed)).rois
         assert expected  # the fixture has a rectangle on the first image
 
         rebuilt = OlympusAdapter.create_from_payload(source, payload, metadata, None)
         _FakeBioImage.opened = 0
-        got, _ = rebuilt.get_embedded_rois(
-            rebuilt.get_metadata(), self._tensors(rebuilt)
-        )
+        got = rebuilt.registration_record(self._tensors(rebuilt)).rois
 
         assert {k: [a.SerializeToString() for a in v] for k, v in got.items()} == {
             k: [a.SerializeToString() for a in v] for k, v in expected.items()
@@ -298,9 +294,7 @@ class TestEmbeddedRois:
 
         rebuilt = OlympusAdapter.create_from_payload(source, payload, metadata, None)
         _FakeBioImage.opened = 0
-        got, _ = rebuilt.get_embedded_rois(
-            rebuilt.get_metadata(), self._tensors(rebuilt)
-        )
+        got = rebuilt.registration_record(self._tensors(rebuilt)).rois
 
         assert got == {}
         assert _FakeBioImage.opened == 0
