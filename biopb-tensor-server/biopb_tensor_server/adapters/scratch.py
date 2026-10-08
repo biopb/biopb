@@ -21,6 +21,7 @@ from biopb_tensor_server.core.adapter_base import (
     SourceAdapter,
     TensorAdapter,
     TensorEntry,
+    strip_source_prefix,
 )
 from biopb_tensor_server.core.errors import TensorNotFound
 
@@ -99,7 +100,7 @@ class ScratchSource(SourceAdapter):
         Reached only after the attachments have missed, so a field named here
         names nothing, and an unnamed id has no tensor to resolve to.
         """
-        field = self._within_source_field(tensor_id)
+        field = strip_source_prefix(self.source_id, tensor_id)
         if field:
             raise TensorNotFound(
                 f"{self.source_id} has no tensor {field!r}.",

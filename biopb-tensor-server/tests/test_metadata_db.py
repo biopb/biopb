@@ -47,8 +47,6 @@ class MockAdapter:
     def source_type(self):
         return self._source_type
 
-    # No is_resident(): the catalog does not ask, and a fake that answers a
-    # question nothing puts would only invite putting it (biopb/biopb#1035).
     def is_resolved(self):
         return self._is_resolved
 
@@ -249,8 +247,6 @@ class MultiTensorAdapter:
     def source_type(self):
         return self._source_type
 
-    # No is_resident(): the catalog does not ask, and a fake that answers a
-    # question nothing puts would only invite putting it (biopb/biopb#1035).
     def is_resolved(self):
         return self._is_resolved
 
@@ -908,9 +904,6 @@ class TestNoResidencyColumn:
         def catalog_url(self):
             return self._source_url
 
-        def is_resident(self):
-            raise AssertionError("sync_source_added must not ask about residency")
-
         def is_resolved(self):
             return False
 
@@ -931,10 +924,7 @@ class TestNoResidencyColumn:
         with pytest.raises(duckdb.BinderException):
             db._get_connection().execute("SELECT data_resident FROM sources")
 
-    def test_registration_never_asks_the_adapter(self):
-        """The upsert reads no residency at all, so an adapter that refuses to
-        answer still registers -- a `directory_is_resident()` walk is not
-        free."""
+    def test_an_unresolved_adapter_registers_as_unresolved(self):
         db = MetadataDatabase()
         db.sync_source_added(
             "cloud-1", self._UnresolvedAdapter("cloud-1", "https://x/y.zarr")
@@ -973,7 +963,7 @@ class TestNoResidencyColumn:
 class TestIsResolvedColumn:
     """The `is_resolved` column: deterministic, which is what lets it be a
     column at all. It answers "does a client need to resolve this"; whether the
-    bytes are cheap to read right now is the `is_resident` action's question,
+    bytes are cheap to read right now is answered live (`source_is_resident`),
     and is stored nowhere."""
 
     def test_resolved_source_is_true(self):

@@ -37,15 +37,15 @@ present?"):
 | Bit | Meaning | Gates | Lives in |
 |---|---|---|---|
 | `is_resolved` | descriptor known (shape/dtype/fields) — immutable once true | serving; the resolution boundary | a `sources` column |
-| residency | content local & cheap to read right now — volatile | pre-cache warming; leave-no-trace | the `is_resident` action |
+| residency | content local & cheap to read right now — volatile | pre-cache warming; leave-no-trace | the `is_resident` read-mask field |
 
 `is_resolved` is monotonic — false to true once, never back — so a stored
 copy can only lag in the direction that costs nothing. Residency goes both
 ways: a synced-folder provider re-dehydrates under storage pressure, in the
 same running process, with no event to hang a refresh on. So there is no
-residency column and no descriptor field; `do_action("is_resident", [...])`
-calls straight through to `adapter.is_resident()` on every invocation — a
-live lookup, not a row. Unresolved sources (empty `tensors`) stay filterable
+residency column, and `GetFlightInfo` fills `descriptor.is_resident` only when
+the read mask asks for it, computing `source_is_resident(source_url)` on every
+request — a live lookup, not a row. Unresolved sources (empty `tensors`) stay filterable
 on purpose via `WHERE NOT is_resolved`, instead of being silently dropped by
 a `WHERE tensors[1].dtype = …` predicate.
 
@@ -150,7 +150,7 @@ time.
   auto-skips (empty shape), but once resolved-and-persisted it returns with a
   concrete shape, so a naive backlog would re-warm it on restart. Residency
   has to be its own bit, checked live: `Reconciler.should_warm()` asks the
-  registered adapter's `is_resident()` at warm time rather than trusting the
+  `source_is_resident` of the registered adapter's `source_url` at warm time rather than trusting the
   claim's shape.
 
 ## Not done / future

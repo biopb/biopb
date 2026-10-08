@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 from biopb_tensor_server.adapters.emd import EmdAdapter
+from biopb_tensor_server.core.adapter_base import strip_source_prefix
 from biopb_tensor_server.core.config import SourceConfig
 from biopb_tensor_server.core.discovery import ClaimContext, DiscoveryState
 
@@ -127,7 +128,9 @@ class TestEmdAdapter:
             with _emd_adapter(p) as adapter:
                 expected = _emd_expected(p)
 
-                field = adapter._within_source_field(adapter.list_tensors()[0].array_id)
+                field = strip_source_prefix(
+                    adapter.source_id, adapter.list_tensors()[0].array_id
+                )
                 ta = adapter.get_tensor_adapter(field)
                 assert ta.get_tensor_descriptor().array_id == f"{adapter.source_id}/0"
 

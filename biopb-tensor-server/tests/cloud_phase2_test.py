@@ -18,7 +18,6 @@ import threading
 import pytest
 from biopb_tensor_server.adapters import tiff as tiff_mod
 from biopb_tensor_server.core import discovery
-from biopb_tensor_server.core.adapter_base import SourceAdapter
 from biopb_tensor_server.core.config import SourceConfig, parse_config
 from biopb_tensor_server.core.discovery import (
     ClaimContext,
@@ -80,7 +79,7 @@ class TestCloudConfig:
 class TestClaimContextResidency:
     def test_directory_is_resident(self, tmp_path):
         # A directory legitimately reports st_blocks == 0 on some filesystems;
-        # never flag it (mirrors the phase-1 SourceAdapter.is_resident fix).
+        # never flag it (mirrors the phase-1 residency fix).
         assert ClaimContext(tmp_path).is_resident() is True
 
     def test_resident_file(self, tmp_path):
@@ -496,17 +495,14 @@ class TestUnresolvedDecision:
 
 
 class _ResidencyAdapter:
-    """Stand-in carrying the *real* ``is_resident()`` off the adapter base.
+    """Stand-in carrying only the ``source_url`` the gate asks about.
 
     Not a canned bool: the gate's failure mode is asking a weaker question than
-    the adapter would, so the test runs the adapter's own answer.
+    ``source_is_resident`` would, so the test runs the real answer on the url.
     """
 
     def __init__(self, source_url):
-        self._source_url = str(source_url)
-
-    def is_resident(self):
-        return SourceAdapter.is_resident(self)
+        self.source_url = str(source_url)
 
 
 class TestShouldWarm:

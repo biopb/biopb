@@ -541,45 +541,10 @@ class SourceAdapter(ABC):
         True by default; only a remote proxy mirroring an unresolved upstream
         source overrides it. A source of this server that is not resolved has no
         adapter at all, only a catalog row (``sources.unresolved_reason`` says why). Unlike
-        ``is_resident()``, this never flips back to False once True.
+        residency (:func:`~biopb_tensor_server.core.discovery.source_is_resident`),
+        this never flips back to False once True.
         """
         return True
-
-    def is_resident(self) -> bool:
-        """Best-effort, recall-free: is this source's content local and cheap to
-        read right now?
-
-        Remote (fsspec) sources are never resident until their pixels are
-        materialized into a local copy (a later phase); a local source is
-        resident unless it is an offline cloud placeholder. This is the
-        authoritative, point-in-time residency gate -- VOLATILE, so evaluate it
-        at the moment of use and never cache the result. Nothing stores the
-        answer: the catalog has no residency column and the ``is_resident``
-        action re-asks this on every call (biopb/biopb#1035).
-        """
-        # Lazy import: base <-> discovery only cross-import under TYPE_CHECKING,
-        # so importing these at module scope would be circular.
-        from pathlib import Path
-
-        from biopb_tensor_server.core.discovery import (
-            _is_offline_placeholder,
-            directory_is_resident,
-        )
-        from biopb_tensor_server.core.remote import is_remote_url
-
-        if is_remote_url(self._source_url):
-            return False
-        path = Path(self._source_url)
-        # The offline-placeholder signal (st_blocks == 0) is a per-*file* concept
-        # -- discovery only consults it for files (see should_skip_walk_entry,
-        # which gates it on `not is_dir`). A directory-based source (zarr,
-        # ome-zarr store) legitimately reports st_blocks == 0 on some filesystems
-        # (e.g. macOS APFS), so applying the file check to the directory path
-        # itself would wrongly flag an entirely local store as non-resident.
-        # `directory_is_resident` instead samples files *inside* the directory.
-        if path.is_dir():
-            return directory_is_resident(path)
-        return not _is_offline_placeholder(path)
 
     def get_tensor_adapter(self, tensor_id: str | None) -> TensorAdapter:
         """Factory method to return adapter with specific tensor context.
@@ -597,7 +562,7 @@ class SourceAdapter(ABC):
         NOT_FOUND) -- the miss is representable rather than silently returning the
         base tensor under the wrong ``array_id``. Three inputs still resolve to
         that sole tensor (reduced to a within-source field by
-        ``_within_source_field``): an empty/``None`` id, the source's own id (a
+        ``strip_source_prefix``): an empty/``None`` id, the source's own id (a
         bare ``source_id`` or the full ``source_id`` array_id -> falsy or
         ``== source_id``), and -- for a source whose one tensor carries a name --
         that ``_tensor_name`` (a single-scene aicsimageio file names its lone
@@ -610,7 +575,7 @@ class SourceAdapter(ABC):
         Raises:
             TensorNotFound: ``tensor_id`` names a field this source does not have.
         """
-        field = self._within_source_field(tensor_id)
+        field = strip_source_prefix(self.source_id, tensor_id)
         if field and field != self.source_id and field != self._tensor_name:
             raise TensorNotFound(
                 f"tensor {tensor_id!r} not found in source {self.source_id!r} "
@@ -618,31 +583,6 @@ class SourceAdapter(ABC):
                 reason="unknown_field",
             )
         return self
-
-    def put_chunk(
-        self,
-        bounds: ChunkBounds,
-        data: pa.Array | pa.ChunkedArray,
-        expected_shape: Tuple[int, ...],
-        dtype: Any,
-    ) -> None:
-        """Write one uploaded chunk into this source's backing store.
-
-        The DoPut path calls this after reading a chunk's Arrow payload, instead
-        of sniffing the adapter's attributes. The default rejects the write --
-        most source formats are read-only. Writable formats override with their
-        own contract: ``ZarrAdapter`` enforces chunk-grid alignment, while
-        ``CachedSourceAdapter`` accepts arbitrary bounds.
-
-        Args:
-            bounds: Chunk start/stop coordinates for the write.
-            data: The chunk's flattened element values as a primitive Arrow array.
-            expected_shape: Logical chunk shape implied by ``bounds``.
-            dtype: NumPy dtype (or string) of the chunk elements.
-        """
-        raise WriteNotSupportedError(
-            f"source {self.source_id!r} ({self._source_type}) does not support writes"
-        )
 
     def close(self) -> None:  # noqa: B027 - concrete no-op default, not abstract
         """Release any long-lived OS handles this source holds.
@@ -721,18 +661,6 @@ class SourceAdapter(ABC):
         else to live.
         """
 
-    def _within_source_field(self, tensor_id: Optional[str]) -> Optional[str]:
-        """Reduce a source-qualified array_id to its within-source field, for the
-        multi-tensor ``get_tensor_adapter`` overrides.
-
-        A caller may legitimately hand them the full array_id ("a tensor is
-        identifiable by array_id alone"); this strips the ``source_id/`` prefix
-        (pure reduction -- see :func:`strip_source_prefix`), leaving a bare field
-        unchanged. This layer never invents ``None``: "default tensor" is decided
-        upstream at the server chokepoint, not here.
-        """
-        return strip_source_prefix(self.source_id, tensor_id)
-
 
 class TensorAdapter(SourceAdapter):
     """Abstract base class for tensor-level adapters.
@@ -806,6 +734,31 @@ class TensorAdapter(SourceAdapter):
         if self._tensor_name is None:
             return self.source_id
         return f"{self.source_id}/{self._tensor_name}"
+
+    def put_chunk(
+        self,
+        bounds: ChunkBounds,
+        data: pa.Array | pa.ChunkedArray,
+        expected_shape: Tuple[int, ...],
+        dtype: Any,
+    ) -> None:
+        """Write one uploaded chunk into this source's backing store.
+
+        The DoPut path calls this after reading a chunk's Arrow payload, instead
+        of sniffing the adapter's attributes. The default rejects the write --
+        most source formats are read-only. Writable formats override with their
+        own contract: ``ZarrAdapter`` enforces chunk-grid alignment, while
+        ``CachedSourceAdapter`` accepts arbitrary bounds.
+
+        Args:
+            bounds: Chunk start/stop coordinates for the write.
+            data: The chunk's flattened element values as a primitive Arrow array.
+            expected_shape: Logical chunk shape implied by ``bounds``.
+            dtype: NumPy dtype (or string) of the chunk elements.
+        """
+        raise WriteNotSupportedError(
+            f"source {self.source_id!r} ({self._source_type}) does not support writes"
+        )
 
     # Whether timing ``get_data`` measures what re-producing the chunk would
     # cost -- the premise the measured retention rule rests on, since "cheap"
@@ -1755,10 +1708,8 @@ _SOURCE_SCOPED_API = frozenset(
         "get_metadata",
         "get_embedded_rois",
         "catalog_url",
-        "is_resident",
         "is_resolved",
         "get_tensor_adapter",
-        "put_chunk",
         "close",
         "release_registration_cache",
         "catalog_payload",
@@ -1773,6 +1724,7 @@ _TENSOR_SCOPED_API = frozenset(
     {
         "capability_token",
         "array_id",
+        "put_chunk",
         "get_tensor_descriptor",
         "get_transfer_chunk_size",
         "read_block_shape",

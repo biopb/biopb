@@ -94,6 +94,7 @@ from biopb_tensor_server.core.chunk import (
     routing_array_id,
 )
 from biopb_tensor_server.core.config import PyramidConfig
+from biopb_tensor_server.core.discovery import source_is_resident
 from biopb_tensor_server.core.errors import (
     SourceResolveRetriableError,
     SourceUnresolvedError,
@@ -1282,8 +1283,8 @@ class TensorFlightServer(flight.FlightServerBase):
 
         The row, not a descriptor rebuilt from the adapter: resolution has
         already written it, and returning a second encoding of the same
-        projection let the two disagree (the adapter answers ``is_resident()``
-        live, the row is a snapshot).
+        projection let the two disagree (residency is answered live from the
+        source's url, the row is a snapshot).
 
         Resolving registers a source that has no adapter yet -- a cloud source
         (downloading it), a local one whose registration is pending, or one that
@@ -1664,7 +1665,9 @@ class TensorFlightServer(flight.FlightServerBase):
         # is already on disk.
         if IS_RESIDENT in mask:
             try:
-                read_plan.descriptor.is_resident = bool(source_adapter.is_resident())
+                read_plan.descriptor.is_resident = source_is_resident(
+                    source_adapter.source_url
+                )
             except Exception:  # noqa: BLE001 -- a balky adapter is not the request
                 logger.debug("is_resident failed for %s", source_id, exc_info=True)
 

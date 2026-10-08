@@ -26,7 +26,7 @@ import pytest
 from biopb.tensor.descriptor_pb2 import FlightRequest, TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server import TensorFlightServer
-from biopb_tensor_server.core.adapter_base import TensorAdapter
+from biopb_tensor_server.core.adapter_base import TensorAdapter, strip_source_prefix
 from biopb_tensor_server.core.errors import (
     InvalidTensorId,
     SourceResolveRetriableError,
@@ -99,7 +99,7 @@ class _LegacyMissAdapter(_SingleTensorAdapter):
     verbs' fallback must coerce this to NOT_FOUND, not leak it as INTERNAL."""
 
     def get_tensor_adapter(self, tensor_id):
-        field = self._within_source_field(tensor_id)
+        field = strip_source_prefix(self.source_id, tensor_id)
         if field and field != self.source_id:
             raise ValueError(f"legacy: unknown field {field!r}")
         return self
@@ -395,7 +395,9 @@ class TestEmdTotality:
 
     def test_valid_signal_index_resolves(self, tmp_path):
         adapter = self._emd_adapter(tmp_path)
-        field = adapter._within_source_field(adapter.list_tensors()[0].array_id)
+        field = strip_source_prefix(
+            adapter.source_id, adapter.list_tensors()[0].array_id
+        )
         ta = adapter.get_tensor_adapter(field)
         assert ta.get_tensor_descriptor().array_id == f"{adapter.source_id}/0"
 

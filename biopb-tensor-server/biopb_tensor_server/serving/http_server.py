@@ -3279,7 +3279,7 @@ def _source_row_to_dict(row: Dict[str, Any]) -> Dict[str, Any]:
         "metadata_json": None,
         # There is no residency field here, and no column to read one from:
         # "are the bytes local right now" is answered live by the `is_resident`
-        # action, never by a row (biopb/biopb#1035). `is_resolved` is the
+        # read-mask field, never by a row (biopb/biopb#1035). `is_resolved` is the
         # opposite case and belongs here -- monotonic, so a persisted row can
         # only lag in the harmless direction. Default True for a row from a
         # server predating the column, the right reading for every pre-existing

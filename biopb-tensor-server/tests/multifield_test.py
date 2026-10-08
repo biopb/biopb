@@ -630,7 +630,7 @@ class TestFieldWithinSource:
 
 class TestStripSourcePrefix:
     """strip_source_prefix: the pure, policy-free reduction shared by the server
-    chokepoint and the adapters' _within_source_field (biopb/biopb#277 item F)."""
+    chokepoint and the adapters' strip_source_prefix (biopb/biopb#277 item F)."""
 
     def test_strips_prefix(self):
         assert strip_source_prefix("src", "src/Image:0") == "Image:0"

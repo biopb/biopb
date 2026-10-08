@@ -19,7 +19,11 @@ from biopb_tensor_server.adapters.zarr import (
     is_unfinished_upload,
     is_upload_subsystem_store,
 )
-from biopb_tensor_server.core.adapter_base import TensorEntry, catalog_entry
+from biopb_tensor_server.core.adapter_base import (
+    TensorEntry,
+    catalog_entry,
+    strip_source_prefix,
+)
 from biopb_tensor_server.core.axes import canonical_axis
 from biopb_tensor_server.core.discovery import ClaimContext, SourceClaim
 from biopb_tensor_server.core.errors import InvalidTensorId, TensorNotFound
@@ -729,7 +733,7 @@ class OmeZarrAdapter(ZarrAdapter):
             "channel_names": list(self.channel_names),
             "fields": [
                 {
-                    "field": self._within_source_field(d.array_id),
+                    "field": strip_source_prefix(self.source_id, d.array_id),
                     "dim_labels": list(d.dim_labels),
                     "shape": [int(s) for s in d.shape],
                     "dtype": d.dtype,
@@ -1075,7 +1079,7 @@ class OmeZarrAdapter(ZarrAdapter):
 
         # Accept either the within-source field ('well/field') or the full
         # source-qualified array_id 'source_id/well/field' (identity policy).
-        tensor_id = self._within_source_field(tensor_id)
+        tensor_id = strip_source_prefix(self.source_id, tensor_id)
 
         # HCS plate: create field-level adapter
         # Parse tensor_id as 'well_name/field_index'

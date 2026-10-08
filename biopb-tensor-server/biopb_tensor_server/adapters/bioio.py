@@ -49,6 +49,7 @@ from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
     TensorEntry,
     catalog_entry,
+    strip_source_prefix,
 )
 from biopb_tensor_server.core.chunk import (
     compute_transfer_chunk_size,
@@ -355,7 +356,7 @@ class _BioioAdapterBase(TensorAdapter):
             return None
         listing, scenes = [], []
         for entry in entries:
-            field = self._within_source_field(entry.array_id)
+            field = strip_source_prefix(self.source_id, entry.array_id)
             listing.append(
                 {
                     "field": field,
@@ -721,7 +722,7 @@ class _BioioAdapterBase(TensorAdapter):
         """
         if self._cached_descriptors is not None:
             for i, d in enumerate(self._cached_descriptors):
-                if self._within_source_field(d.array_id) == field:
+                if strip_source_prefix(self.source_id, d.array_id) == field:
                     return i
             raise TensorNotFound(f"Unknown scene: {field}", reason="unknown_field")
         with self._io_lock:
@@ -749,7 +750,7 @@ class _BioioAdapterBase(TensorAdapter):
 
         # Accept either the within-source field (scene id) or the full
         # source-qualified array_id (identity policy: array_id = source_id/field).
-        tensor_id = self._within_source_field(tensor_id)
+        tensor_id = strip_source_prefix(self.source_id, tensor_id)
 
         # Source-level: lazy initialize tensor level adapters
         scene_idx = self._scene_index_for_field(tensor_id)

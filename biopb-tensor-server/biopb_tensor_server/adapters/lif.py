@@ -37,6 +37,7 @@ from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
     TensorEntry,
     catalog_entry,
+    strip_source_prefix,
 )
 from biopb_tensor_server.core.chunk import (
     content_version_from_path,
@@ -325,7 +326,7 @@ class LifAdapter(TensorAdapter):
         return self.get_tensor_adapter(entries[0].array_id)._native_descriptor()
 
     def get_tensor_adapter(self, tensor_id: Optional[str]) -> "LifAdapter":
-        field = self._within_source_field(tensor_id)
+        field = strip_source_prefix(self.source_id, tensor_id)
         position = self._position_for_field(field)
         cached = self._tensor_adapters.get(field)
         if cached is not None:

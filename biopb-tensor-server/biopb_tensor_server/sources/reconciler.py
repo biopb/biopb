@@ -60,6 +60,7 @@ from biopb_tensor_server.core.discovery import (
     SourceClaim,
     _is_offline_placeholder,
     resolve_local_path,
+    source_is_resident,
 )
 from biopb_tensor_server.core.errors import (
     SourceRegistrationError,
@@ -1498,7 +1499,7 @@ class Reconciler:
         if adapter is None:
             return False
         try:
-            return bool(adapter.is_resident())
+            return source_is_resident(adapter.source_url)
         except Exception:  # noqa: BLE001 -- a gate that cannot see fails closed
             return False
 
