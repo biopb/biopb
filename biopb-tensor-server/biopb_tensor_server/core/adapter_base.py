@@ -171,12 +171,7 @@ class TensorEntry:
 
     ``array_id`` / ``dim_labels`` / ``shape`` / ``dtype`` -- stable per tensor,
     derivable from the container's own index, and what the DuckDB
-    ``sources.tensors`` rows carry. Never a wire type: the one
-    ``TensorDescriptor`` a client receives comes from the bound tensor's
-    :meth:`TensorAdapter.get_tensor_descriptor`, because the serving facts (the
-    transfer grid, the pyramid, the physical scale) depend on a selection a
-    source-level adapter has not made (biopb/biopb#812). A record with no field
-    for them cannot publish a guess at them.
+    ``sources.tensors`` rows carry.
     """
 
     array_id: str
@@ -240,101 +235,55 @@ class SourceAdapter(ABC):
     # Optional content-version token (biopb/biopb#178), folded into every
     # chunk_id this adapter mints and hence into the cache key, so a
     # re-registered source with new bytes gets a fresh cache namespace instead
-    # of serving stale chunks. None means unversioned: no header, and an adapter
-    # opts in only when it has a cheap, reliable change signal (a local file's
-    # stat signature). Opaque -- the codec namespaces by it, never reads it.
-    #
-    # Declared on the source because a source is the usual owner of a content
-    # lifetime, but the value is per TENSOR. A tensor whose bytes live elsewhere
-    # carries its own (an uploaded label set, ``adapters/labels.py``); one
-    # reading out of the source file keeps the source's (a discovered NGFF set).
-    # Read it off the adapter that serves the bytes, not off the source the
-    # array_id happens to name.
+    # of serving stale chunks. None means unversioned. Opaque -- the codec
+    # namespaces by it, never reads it.
+    # Declared on the source because the value is per TENSOR. A tensor whose bytes
+    # live elsewhere carries its own (e.g., uploaded label set).
     _content_version: Optional[bytes] = None
 
-    # Display-only override for the catalog ``source_url`` (the descriptor field
-    # the tensor-browser / web viewer group the tree by). Normally None, so the
-    # descriptor derives ``source_url`` from the raw path via ``to_catalog_url``.
-    # The drag-drop runtime-add path sets it to a re-rooted url so each drop
+    # Display-only override for the catalog ``source_url``. Optional, because the
+    # adapter could use the path string, ``_source_url``.
+    # The ``register_local_path`` path sets it to a re-rooted url so each drop
     # renders as its own top-level root instead of nesting deep under the shared
-    # absolute-path tree (see SourceManager._drop_catalog_url). It never touches
-    # ``_source_url`` (filesystem ops) or ``source_id`` (path hash), so it is
-    # purely cosmetic and needs no re-index.
+    # absolute-path tree (see SourceManager._drop_catalog_url).
     _catalog_url: Optional[str] = None
 
     @property
     def source_url(self) -> Optional[str]:
         """The source's real, addressable URL/path: a filesystem path this
         adapter reads bytes from, or the dial address of an upstream it
-        proxies. Every filesystem op (residency checks) and the remote check
-        (``is_remote_url``) trust this to be genuine.
-
-        Wraps the backing ``_source_url``; None when the adapter never set one.
-        An adapter that wants a different, cosmetic identity in the catalog
-        (grouping, a cleaner display name) sets :attr:`_catalog_url` instead --
-        never repurpose this field for display, or every filesystem consumer
-        silently breaks (biopb/biopb#1139).
+        proxies.
         """
         return self._source_url
 
     @property
     def source_type(self) -> Optional[str]:
-        """Format/source-type identifier (e.g. ``"ome_zarr"``).
-
-        Wraps the backing ``_source_type``; None when the adapter never set one.
-        """
+        """Format/source-type identifier (e.g. ``"ome_zarr"``)."""
         return self._source_type
 
     @property
     def catalog_url(self) -> str:
-        """The URL the catalog row carries -- what clients group the tree by.
-
-        The display form of :attr:`source_url`: a ``_catalog_url`` override when
-        one was set (drag-drop re-rooting), else the raw path normalized by
-        :func:`to_catalog_url`. Never used for filesystem ops.
-        """
+        """The display URL the catalog row carries -- what clients group the tree by."""
         return self._catalog_url or to_catalog_url(self._source_url)
 
     @property
     def content_version(self) -> Optional[bytes]:
         """Opaque content-version token folded into this adapter's chunk_ids, or
         None when its content is unversioned (see ``_content_version``).
-
-        The version of the bytes THIS adapter serves, which for a multi-tensor
-        source is not always the source's own -- see ``_content_version``.
-
-        The content signal alone. A chunk_id also carries the server's
-        serving-semantics epoch, framed separately (``core.chunk``); a cache
-        misses on either, while a consumer asking "did the data change?" -- an
-        ROI's ``drawn_against_version``, the descriptor field -- wants this one.
         """
         return self._content_version
 
     def check_readable(self) -> None:  # noqa: B027 - concrete no-op default
         """Raise if this source cannot answer a pixel read right now.
 
-        A no-op for everything that reads a file: a store on disk is readable
-        whenever it is registered. An upload is not -- it is published by its
-        producer, and refuses until then (``WritableSource.check_readable``).
-
-        Asked by every read path that can serve bytes: ``resolve_chunk_data``
-        and, because it answers a warm chunk without calling it, the localhost
-        locate path (``server._handle_chunk_locate``). Pure in-memory, like
-        :meth:`check_chunk_version` beside it, so both are cheap enough to run
-        on every read.
+        Usually a noop. An unfinished upload is a notable exception.
         """
 
     def check_chunk_version(self, chunk_id: bytes) -> None:
         """Raise :class:`StaleChunkError` if ``chunk_id`` predates a re-registration.
 
-        Pure in-memory comparison of the chunk_id's framed versions against
-        this source's and this server's -- no adapter I/O -- so a caller can run it as a
-        cheap guard ahead of a cache lookup (``server._handle_chunk_locate``) as
-        well as ahead of an actual read (:meth:`TensorAdapter.resolve_chunk_data`),
-        without paying for a second adapter lookup or (for a native-pyramid
-        adapter) forcing a lazy level open just to validate. A legacy
-        unversioned chunk_id (``held_version`` None) always passes, matching the
-        byte-identical-format backward-compat promise in ``chunk.py``.
+        Pure in-memory comparison and a cheap guard ahead of an actual read.
+        A unversioned chunk_id (``held_version`` None) always passes.
 
         :class:`RemoteTensorAdapter` overrides this to compare the proxy
         envelope's own version instead -- it never mints a plain (non-envelope)
@@ -391,10 +340,7 @@ class SourceAdapter(ABC):
 
     @abstractmethod
     def list_tensors(self) -> List[TensorEntry]:
-        """List this source's tensors as **structural catalog entries**. A
-        ``@canonical_axes`` class implements this in its reader's order and is
-        served in canonical order (biopb/biopb#596), each entry normalized by its
-        own labels.
+        """List this source's tensors as **structural catalog entries**.
 
         The source-listing/discovery surface: what the DuckDB catalog stores in
         ``sources.tensors``. It returns lightweight entries without expensive
@@ -403,32 +349,7 @@ class SourceAdapter(ABC):
         Returns:
             List of :class:`TensorEntry`, each a :func:`catalog_entry` projection:
 
-            Required fields:
-            - array_id: Unique tensor identifier (for single-tensor: source_id;
-              for multi-tensor: source_id/tensor_name)
-            - shape: Tensor shape as list of ints
-
-            Optional fields:
-            - dtype: Data type string. Can be omitted if expensive to compute.
-              Must be populated by get_tensor_descriptor() for actual reads.
-
-            Recommended optional fields:
-            - dim_labels: Dimension labels (cheap to include)
-
-            Required to be EMPTY:
-            - chunk_shape: the transfer grid is a *serving* fact owned by the
-              tensor-bound adapter (:meth:`TensorAdapter.get_tensor_descriptor`),
-              not a catalog one. A source lists every tensor without binding any
-              of them, so any grid it names here is a guess about a scene it has
-              not selected -- published as fact to every client
-              (biopb/biopb#812). ``GetFlightInfo`` resolves the tensor adapter
-              first and is the one place a grid is answered.
-            - pyramid / physical_scale / metadata_json: likewise open-time only.
-
-        Implementations return :func:`catalog_entry` of whatever they have;
-        ``Attachments.catalog_tensors`` re-applies it so the invariant holds for the
-        catalog even if an implementation forgets. A single-tensor source returns
-        ``[catalog_entry(self._native_descriptor())]``.
+        A single-tensor source returns ``[catalog_entry(self._native_descriptor())]``.
         """
 
     @abstractmethod
@@ -458,23 +379,7 @@ class SourceAdapter(ABC):
 
         Some formats store annotations beside their pixels -- OME-XML ``<ROI>``
         elements, ImageJ overlays, a GeoJSON sidecar. Those land in the reserved
-        ``@ome``-style set the catalog keeps read-only (biopb/biopb#951), and
-        this is where a format says how to read its own.
-
-        Default ``({}, None)``: no source carries annotations unless it says so.
-        That is the safe default rather than a conservative one -- the server
-        does not police what :meth:`get_metadata` returns, so a ``rois`` key in
-        an EMD's ``original_metadata`` or an OME-Zarr's ``.zattrs`` means
-        whatever that format meant by it, and reading it as OME-XML would invent
-        annotations. It is deliberately not keyed on ``source_type`` either:
-        that is a name, and it lies in both directions -- ``ome-zarr`` carries
-        NGFF, while ``zeiss`` / ``leica`` / ``nikon`` and the rest are ome-types
-        dumps through bioio.
-
-        ``metadata`` is what this adapter just returned from
-        :meth:`get_metadata` and ``tensors`` is ``(array_id, dim_labels)`` per
-        tensor -- both passed in rather than recomputed, since the caller holds
-        them and ``get_metadata`` is a pure producer that would re-parse.
+        ``@ome``-style set the catalog keeps read-only (biopb/biopb#951).
 
         Returns:
             ``(rois_by_array_id, report)``. The report is opaque to the caller
@@ -506,13 +411,6 @@ class SourceAdapter(ABC):
     def resolve_chunk_adapter(self, field: Optional[str]) -> TensorAdapter:
         """The adapter that serves a chunk whose route carries *field*, for the
         source's own tensors.
-
-        A within-source suffix on a chunk names either a native pyramid level
-        (OME-Zarr / QPTIFF precompute) or a tensor field. A native-pyramid
-        adapter answers the level's backend from :meth:`get_level_adapter`;
-        every other adapter (and a bare suffix) answers None and the read routes
-        to the tensor. Attached tensors are the registry's
-        (:meth:`~biopb_tensor_server.core.attachments.Attachments.resolve_chunk_adapter`).
         """
         level = self.get_level_adapter(field) if field is not None else None
         return level or self.get_tensor_adapter(field)
@@ -520,18 +418,10 @@ class SourceAdapter(ABC):
     def get_level_adapter(self, path: str) -> Optional[TensorAdapter]:
         """Backend adapter for native pyramid level ``path``, or ``None``.
 
-        Declared here -- rather than sniffed with ``hasattr`` in the chunk
-        dispatch -- for the same reason :meth:`close` and :meth:`put_chunk`
-        are: an optional capability the dispatch drives on every registered
-        source belongs in the interface, where a delegating wrapper's author
-        can see it (biopb/biopb#557). On the source role because the chunk
-        route is source-scoped: ``source_id/<field>`` is split before the
-        lookup, and every registered source answers it. The default ``None`` means "no native levels," so
-        :meth:`resolve_chunk_adapter` falls back to :meth:`get_tensor_adapter`.
         A native-pyramid adapter overrides this to return the level's own
-        backend adapter, whose ``array_id`` is ``source_id/{level}`` -- the
-        value a precompute chunk_id carries, so ``DoGet`` routes the level's
-        chunks straight back here.
+        backend adapter, whose ``array_id`` is ``source_id/{level}``.
+        ``source_id/<field>`` is split before the lookup. The default ``None``
+        means "no native levels".
         """
         return None
 
@@ -557,17 +447,6 @@ class SourceAdapter(ABC):
         self that cannot serve pixels.
         Multi-tensor adapters override this to return a new adapter for the tensor.
 
-        Total by contract: a single-tensor source has exactly one tensor, so any
-        *unknown nonempty* field is rejected with a typed ``TensorNotFound`` (gRPC
-        NOT_FOUND) -- the miss is representable rather than silently returning the
-        base tensor under the wrong ``array_id``. Three inputs still resolve to
-        that sole tensor (reduced to a within-source field by
-        ``strip_source_prefix``): an empty/``None`` id, the source's own id (a
-        bare ``source_id`` or the full ``source_id`` array_id -> falsy or
-        ``== source_id``), and -- for a source whose one tensor carries a name --
-        that ``_tensor_name`` (a single-scene aicsimageio file names its lone
-        tensor, e.g. ``"Image:0"``, so ``source_id/Image:0`` is a valid read).
-
         Args:
             tensor_id: Identifier for the specific tensor within this source
         Returns:
@@ -587,25 +466,8 @@ class SourceAdapter(ABC):
     def close(self) -> None:  # noqa: B027 - concrete no-op default, not abstract
         """Release any long-lived OS handles this source holds.
 
-        Declared here, rather than sniffed with ``getattr(adapter, "close",
-        None)``, for the same reason :meth:`put_chunk` is: an optional capability
-        the registry drives on every adapter belongs in the interface, where a
-        delegating wrapper's author can see it: a wrapper forwarding
-        everything *except* ``close`` is precisely what a duck-typed hook could
-        not catch (biopb/biopb#71).
-
-        Most adapters hold nothing between reads -- see the file-handle policy in
-        ARCHITECTURE.md -- so the default is a no-op and only the persistent-handle
-        adapters override it. An override must be safe to call twice.
-
-        **An in-flight read is this method's problem, not its caller's.** Nothing
-        drains before calling: ``SourceRegistry.unregister`` and ``close_all``
-        close on the spot, and a replace closes the displaced adapter as soon as
-        the swap has committed (``SourceRegistry.swap``). So an override holding
-        a handle that a read is decoding through must deal with it itself --
-        drain on ``_active_reads`` under a deadline (``OmeTiffAdapter``), decline
-        and leave the release to the idle reaper (mrc / dv / qptiff), or release
-        under ``_io_lock`` (czi / nd2 / ndtiff / bioio).
+        **An in-flight read is this method's problem, not its caller's.** An override
+        holding a handle that a read is decoding through must deal with it itself.
         """
 
     @classmethod
@@ -628,12 +490,9 @@ class SourceAdapter(ABC):
     def catalog_payload(self) -> Optional[Dict[str, Any]]:
         """What a restart needs to rebuild this adapter without parsing its file.
 
-        An optimization, not a requirement: ``None`` (the default) means a
-        restart rebuilds the adapter from its claim, which parses on first use.
-        JSON-serializable and written beside the catalog row. The payload carries
-        the serve path's derived state, such as descriptors with their transfer
-        grid, never what the row already holds. Adding a key needs no version
-        bump; changing the meaning of one bumps ``SOURCE_CATALOG_FORMAT``.
+        The payload carries the serve path's derived state, such as descriptors
+        with their transfer grid. Adding a key needs no version bump; changing
+        the meaning of one bumps ``SOURCE_CATALOG_FORMAT``. Optional.
         """
         return None
 
@@ -643,22 +502,7 @@ class SourceAdapter(ABC):
         """Drop whatever was held only to answer registration, keeping derived state.
 
         Called by :meth:`MetadataDatabase.sync_source_added` once the catalog row
-        is committed -- the moment the catalog, not the adapter, owns this
-        source's metadata (biopb/biopb#253). An adapter that parked a bulky
-        intermediate on itself to build that row may release it here; anything
-        the serve path still needs must survive.
-
-        Declared on the interface rather than sniffed with ``getattr`` for the
-        same reason :meth:`close` is: a delegating wrapper's author has to see it
-        (biopb/biopb#71). Default no-op -- only adapters with something big to
-        drop override it. Like ``close``, an override must be safe to call twice,
-        and must not make the released state unrecoverable: ``sync_source_added``
-        runs again when an unresolved source resolves.
-
-        A server with no catalog (the embedded image-base cache builds its
-        ``TensorFlightServer`` with ``metadata_db=None``) never calls this, so
-        nothing is released out from under a source whose metadata has nowhere
-        else to live.
+        is committed.
         """
 
 
@@ -668,58 +512,22 @@ class TensorAdapter(SourceAdapter):
     This interface provides methods to read specific tensors, get chunk layouts,
     and read chunk data. It is returned by get_tensor_adapter() on the source adapter.
 
-    Tensor-level adapters are created for specific tensors within a source, allowing
-    them to maintain tensor-specific state (e.g., current scene in multi-scene files).
-
     **A tensor adapter is a source adapter that can also serve pixels.** The two
     roles nest rather than sit side by side, because every tensor adapter in this
-    codebase is in fact a full source object: single-tensor formats return ``self``
-    from ``get_tensor_adapter``, the multi-tensor ones (bioio / OME-TIFF / EMD)
-    return a clone of their own class with tensor context set, and the OME-Zarr /
-    QPTIFF level and HCS-field adapters are plain ``ZarrAdapter`` instances. The
-    serve path relies on it -- an HCS field's per-field metadata comes from the
-    tensor adapter's :meth:`get_tensor_metadata`, which the plate's source-level
-    catalog row cannot represent (biopb/biopb#253). Nesting types that reality
-    instead of contradicting it (biopb/biopb#380).
-
-    The converse does not hold: a source can have no tensors (a multi-tensor
-    container), and stays a plain ``SourceAdapter``. So "source" is the general
-    role and "tensor" the specialization, which is the direction this inheritance
-    encodes.
-
-    The role *scopes* stay disjoint at the point of declaration -- see the
-    role-scope guard below -- so a tensor-scoped method still can never be declared
-    on ``SourceAdapter``.
+    codebase is in fact a full source object. The role *scopes* stay disjoint at the
+    point of declaration -- see the role-scope guard below -- so a tensor-scoped method
+    still can never be declared on ``SourceAdapter``.
     """
 
     # The grant this tensor carries of its own. When set, reading it takes
     # either this or the server-wide token
     # (``TensorFlightServer._authorize_read``); None = no gate here, and the
-    # server-wide rule alone. Declared at tensor scope because that is the only
-    # scope that is read: ``Attachments.capability_token`` answers off
-    # the attachment index, so a token set on an adapter serving as a *source*
-    # gates nothing.
+    # server-wide rule alone.
     _capability_token: Optional[str] = None
 
     @property
     def capability_token(self) -> Optional[str]:
-        """The grant this tensor carries, or None for the server-wide rule.
-
-        A *narrow grant*, never a replacement: it opens this tensor's pixels
-        and annotations to a holder with no server-wide token, and the
-        server-wide token still opens them (``_authorize_read``). Reads only --
-        writes and ``resolve`` take full access, because their cost is not
-        scoped to one tensor. The catalog row stays public either way.
-
-        Per tensor rather than per source, because a source is shared: an
-        uploaded result has one producer and lands beside everyone else's on
-        the scratch source, so a grant covering the source would open theirs
-        too. The embedded result cache (``biopb-image-base``) mints one per
-        result through the setter below.
-
-        Assign via this property, never the backing ``_capability_token``
-        field: the typed seam is the whole point (#278E).
-        """
+        """The grant this tensor carries, or None for the server-wide rule."""
         return self._capability_token
 
     @capability_token.setter
