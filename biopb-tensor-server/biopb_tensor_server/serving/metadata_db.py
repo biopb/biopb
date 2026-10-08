@@ -1511,13 +1511,15 @@ class MetadataDatabase:
             import_rois=self._annotations_enabled,
             max_rois_per_tensor=self._max_rois_per_tensor,
         )
-        metadata = registration.metadata
-        imported = registration.rois
         if registration.report:
             logger.info("ome rois for %s: %s", source_id, registration.report.summary())
-
-        # Build row data
         indexed_at = datetime.now()
+        # Prepared before the write lock: nothing in it needs the connection.
+        rois = self._prepare_imported(
+            source_id, source_url, registration.rois, indexed_at
+        )
+
+        metadata = registration.metadata
         metadata_json = json.dumps(metadata, cls=NumpyEncoder) if metadata else None
 
         self._upsert_source_row(
@@ -1539,9 +1541,7 @@ class MetadataDatabase:
             # registration and a raise leaves the previous pair intact. A store
             # that cannot take an annotation cannot be trusted with the row
             # either; what the importer merely refuses is skipped inside.
-            also=lambda c: self._replace_imported_locked(
-                c, source_id, source_url, imported, indexed_at
-            ),
+            also=lambda c: self._replace_imported(c, source_id, rois),
         )
 
         logger.debug(f"Synced source to metadata database: {source_id}")
@@ -1955,42 +1955,23 @@ class MetadataDatabase:
                 [root_id, root_url],
             )
 
-    def _replace_imported_locked(
+    def _prepare_imported(
         self,
-        conn: duckdb.DuckDBPyConnection,
         source_id: str,
         source_url: str,
-        imported: Dict[str, List[RoiAnnotation]],
+        imported: Mapping[str, List[RoiAnnotation]],
         now: datetime,
-    ) -> None:
-        """Swap a source's reserved rows for the ones its file now carries.
-
-        Delete-then-insert scoped by ``source_id``, not per tensor: a tensor
-        whose ROIs were removed upstream has to lose its rows too, and it has no
-        entry in ``imported`` to drive that from.
+    ) -> List[List[Any]]:
+        """The ``rois`` rows a file's imported annotations become.
 
         No rev/created_at carry-forward, unlike :meth:`put_rois`. These rows are
         not edited, they are re-derived -- there is no history to preserve, and
         pretending otherwise would put a monotonic rev on a value that only ever
-        restates the file.
-
-        Runs inside the row's transaction (:meth:`_upsert_source_row`).
+        restates the file. Needs no connection, so it runs before the write lock.
         """
-        conn.execute(
-            "DELETE FROM rois WHERE source_id = ? AND starts_with(set_name, ?)",
-            [source_id, RESERVED_SET_PREFIX],
-        )
-        if not imported:
-            return
-
-        insert_sql = (
-            "INSERT INTO rois "
-            f"(roi_id, array_id, source_id, {', '.join(self._ROI_CLIENT_COLUMNS)}, "
-            "rev, created_at, updated_at, source_url, last_seen_at) "
-            f"VALUES ({', '.join('?' * (len(self._ROI_CLIENT_COLUMNS) + 8))})"
-        )
-        for array_id, rows in imported.items():
-            for annotation in rows:
+        rows: List[List[Any]] = []
+        for array_id, found in imported.items():
+            for annotation in found:
                 # allow_reserved: this is the one writer the @ome namespace has.
                 # Still through _prepare_roi, so bbox and the canonical geometry
                 # JSON are derived exactly as they are for a hand-drawn row --
@@ -2001,19 +1982,44 @@ class MetadataDatabase:
                     # _prepare_roi stays the single authority on what is
                     # storable -- an over-long id, say -- so the importer skips
                     # what it refuses instead of carrying a second copy of the
-                    # rules. Python-side, so the transaction is still intact.
+                    # rules.
                     logger.debug(
                         "ome rois: %s rejected by the store", annotation.roi_id
                     )
                     continue
-                conn.execute(
-                    insert_sql,
+                rows.append(
                     [prep.roi_id, array_id, source_id]
                     + prep.column_values(self._ROI_CLIENT_COLUMNS)
                     # last_seen_at is `now` unconditionally: the source is being
                     # registered, which IS the sighting these rows record.
-                    + [1, now, now, source_url, now],
+                    + [1, now, now, source_url, now]
                 )
+        return rows
+
+    def _replace_imported(
+        self,
+        conn: duckdb.DuckDBPyConnection,
+        source_id: str,
+        rows: List[List[Any]],
+    ) -> None:
+        """Swap a source's reserved rows for *rows*, inside the caller's transaction.
+
+        Delete-then-insert scoped by ``source_id``, not per tensor: a tensor
+        whose ROIs were removed upstream has to lose its rows too, and it has no
+        entry in the import to drive that from.
+        """
+        conn.execute(
+            "DELETE FROM rois WHERE source_id = ? AND starts_with(set_name, ?)",
+            [source_id, RESERVED_SET_PREFIX],
+        )
+        if rows:
+            conn.executemany(
+                "INSERT INTO rois "
+                f"(roi_id, array_id, source_id, {', '.join(self._ROI_CLIENT_COLUMNS)}, "
+                "rev, created_at, updated_at, source_url, last_seen_at) "
+                f"VALUES ({', '.join('?' * (len(self._ROI_CLIENT_COLUMNS) + 8))})",
+                rows,
+            )
 
     def source_row_ipc(self, source_id: str) -> Optional[bytes]:
         """One source's catalog row as an Arrow IPC stream, or ``None``.

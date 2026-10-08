@@ -537,7 +537,7 @@ class OmeTiffAdapter(TensorAdapter):
         self._parsed_metadata: Optional[dict] = None
         self._parsed_metadata_probed = False
         # Set only after get_embedded_labels has handed every usable bitmap to
-        # its RasterizedMaskAdapter.  registration_record may also run
+        # its RasterizedMaskAdapter.  The drop after the record may also run
         # on an adapter that has never entered label discovery, in which case
         # its metadata must remain complete for that later discovery.
         self._mask_payloads_transferred = False
@@ -846,18 +846,17 @@ class OmeTiffAdapter(TensorAdapter):
         of it: the raw XML, the parsed dict and each scene's copies go once the
         record exists (biopb/biopb#783).
         """
-        record = ome_registration_record(
-            self.get_metadata(),
-            (
-                lambda metadata: imported_annotations(
-                    metadata,
-                    tensors_by_field(tensors),
-                    content_version=self.content_version,
-                    max_per_tensor=max_rois_per_tensor,
-                )
+
+        def read_rois(metadata):
+            return imported_annotations(
+                metadata,
+                tensors_by_field(tensors),
+                content_version=self.content_version,
+                max_per_tensor=max_rois_per_tensor,
             )
-            if import_rois
-            else None,
+
+        record = ome_registration_record(
+            self.get_metadata(), read_rois, import_rois=import_rois
         )
         try:
             self._drop_registration_state()

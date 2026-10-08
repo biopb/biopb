@@ -848,7 +848,7 @@ class _BioioAdapterBase(TensorAdapter):
             )
 
         return ome_registration_record(
-            self.get_metadata(), read_rois if import_rois else None
+            self.get_metadata(), read_rois, import_rois=import_rois
         )
 
     def _hydrated_scale(self) -> Any:

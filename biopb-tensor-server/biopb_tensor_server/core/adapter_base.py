@@ -23,13 +23,12 @@ import logging
 import re
 import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
     Any,
     Dict,
     List,
-    Mapping,
     Optional,
     Sequence,
     Tuple,
@@ -84,6 +83,10 @@ from biopb_tensor_server.core.normalize import (
     to_native,
 )
 from biopb_tensor_server.core.read_mask import ENDPOINTS, PYRAMID, read_mask
+from biopb_tensor_server.core.registration import (
+    RegistrationRecord,
+    strip_mask_bindata,
+)
 from biopb_tensor_server.core.retention import (
     computed_ladder,
     record_decode,
@@ -212,21 +215,6 @@ def validate_bounds(bounds: ChunkBounds, shape: Tuple[int, ...]) -> None:
             raise ValueError(f"Bounds stop[{ax}]={e} exceeds shape[{ax}]={dim}")
         if s >= e:
             raise ValueError(f"Bounds start[{ax}]={s} >= stop[{ax}]={e}")
-
-
-@dataclass(frozen=True)
-class RegistrationRecord:
-    """What a source contributes to its catalog entry at registration.
-
-    ``metadata`` is the ``sources.metadata_json`` payload, already stripped of
-    whatever the format moved elsewhere (ROIs it imported, mask bitmaps).
-    ``rois`` are the annotations its file carries, by ``array_id``, and ``report``
-    is an opaque summary for the log (``summary()``), or ``None``.
-    """
-
-    metadata: Mapping[str, Any]
-    rois: Mapping[str, List[Any]] = field(default_factory=dict)
-    report: Any = None
 
 
 @dataclass(frozen=True)
@@ -429,12 +417,7 @@ class SourceAdapter(ABC):
         The default is :meth:`get_metadata` alone, minus any mask bitmaps (never
         for a SQL-queryable column).
         """
-        from biopb_tensor_server.adapters.ome_masks import strip_mask_bindata
-
-        metadata = self.get_metadata() or {}
-        if "rois" in metadata:
-            metadata = strip_mask_bindata(metadata)
-        return RegistrationRecord(metadata)
+        return RegistrationRecord(strip_mask_bindata(self.get_metadata() or {}))
 
     # -- attached tensors (biopb/biopb#1059) -----------------------------------
     # The tensors the upload path attached to a source -- uploaded fields, label

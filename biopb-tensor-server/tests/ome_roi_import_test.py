@@ -407,16 +407,13 @@ class _FakeAdapter:
     ):
         return ome_registration_record(
             self._metadata,
-            (
-                lambda metadata: self._read(
-                    metadata,
-                    tensors,
-                    content_version=self.content_version,
-                    max_per_tensor=max_rois_per_tensor,
-                )
-            )
-            if import_rois
-            else None,
+            lambda metadata: self._read(
+                metadata,
+                tensors,
+                content_version=self.content_version,
+                max_per_tensor=max_rois_per_tensor,
+            ),
+            import_rois=import_rois,
         )
 
     catalog_url = "/data/exp.ome.tif"
@@ -683,7 +680,7 @@ class TestRegistrationSurvivesABadImport:
             raise RuntimeError("write failed")
 
         before = db.get_metadata_json(SOURCE_ID)
-        monkeypatch.setattr(MetadataDatabase, "_replace_imported_locked", boom)
+        monkeypatch.setattr(MetadataDatabase, "_replace_imported", boom)
         with pytest.raises(RuntimeError, match="write failed"):
             db.sync_source_added(
                 SOURCE_ID,
