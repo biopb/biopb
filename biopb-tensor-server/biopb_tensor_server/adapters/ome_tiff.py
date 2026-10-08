@@ -46,7 +46,9 @@ from biopb_tensor_server.adapters.ome_masks import RasterizedMaskAdapter, masks_
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
     TensorEntry,
+    bounds_to_slices,
     catalog_entry,
+    strip_source_prefix,
 )
 from biopb_tensor_server.core.chunk import (
     content_version_from_path,
@@ -666,7 +668,7 @@ class OmeTiffAdapter(TensorAdapter):
             raise ValueError("Cannot get data from source-level adapter")
 
         super().get_data(bounds)  # validate bounds against the descriptor
-        slices = self._bounds_to_slices(bounds)
+        slices = bounds_to_slices(bounds)
 
         with self._leased_store() as handle:
             if handle is None:
@@ -757,7 +759,7 @@ class OmeTiffAdapter(TensorAdapter):
         re-derives it and reads straight from the aszarr store.
         """
         descriptors = self._scene_descriptors()
-        field = self._within_source_field(tensor_id)
+        field = strip_source_prefix(self.source_id, tensor_id)
         scene_idx = self._scene_index_for_field(field)
 
         if field in self._tensor_adapters:
@@ -796,7 +798,7 @@ class OmeTiffAdapter(TensorAdapter):
         scene index (and the aszarr ``series[index]`` the read opens).
         """
         for i, d in enumerate(self._scene_descriptors()):
-            if self._within_source_field(d.array_id) == field:
+            if strip_source_prefix(self.source_id, d.array_id) == field:
                 return i
         raise TensorNotFound(f"Unknown scene: {field}", reason="unknown_field")
 
@@ -804,6 +806,7 @@ class OmeTiffAdapter(TensorAdapter):
 
     def get_metadata(self) -> dict:
         """OME metadata dict from the stripped OME-XML (biopb/biopb#168), else {}.
+        The catalog row's producer; the adapter itself reads :meth:`_ome_metadata`.
 
         Parses the OME-XML with per-plane ``<Plane>``/``<TiffData>`` elements
         stripped -- the same ome-types structure MINUS the per-plane arrays at a
@@ -818,6 +821,10 @@ class OmeTiffAdapter(TensorAdapter):
         touches ``get_embedded_labels`` in the same registration (the registry's label-set view)
         gets the one parse already done, not a second one.
         """
+        return self._ome_metadata()
+
+    def _ome_metadata(self) -> dict:
+        """The parsed stripped OME metadata, parsed once and kept."""
         if self._parsed_metadata_probed:
             return self._parsed_metadata or {}
         self._parsed_metadata_probed = True
@@ -872,7 +879,7 @@ class OmeTiffAdapter(TensorAdapter):
         decoded here, so the catalog can list the label tensors without it."""
         descriptors = self._scene_descriptors()
         by_image = masks_by_image(
-            self.get_metadata(),
+            self._ome_metadata(),
             tensors_by_field([(d.array_id, list(d.dim_labels)) for d in descriptors]),
         )
         plan = []
@@ -882,7 +889,7 @@ class OmeTiffAdapter(TensorAdapter):
                 continue
             dim_labels, shape = label_extent(list(desc.dim_labels), list(desc.shape))
             field = label_field(
-                self._within_source_field(desc.array_id) or "", OME_SET_NAME
+                strip_source_prefix(self.source_id, desc.array_id) or "", OME_SET_NAME
             )
             plan.append((desc, field, dim_labels, shape, masks))
         return plan
@@ -942,7 +949,7 @@ class OmeTiffAdapter(TensorAdapter):
         scenes = self._scene_descriptors()
         if not scenes:
             return None
-        has_rois = bool(self.get_metadata().get("rois"))
+        has_rois = bool(self._ome_metadata().get("rois"))
         scales = {}
         for d in scenes:
             scale = self.get_tensor_adapter(d.array_id)._physical_scale()
@@ -1140,7 +1147,7 @@ class OmeTiffAdapter(TensorAdapter):
                     # path's native unit, so the transfer grid stays a whole
                     # multiple of it rather than straddling pages; a page above
                     # the Arrow ceiling is still re-split by
-                    # get_transfer_chunk_size (biopb/biopb#809).
+                    # transfer_chunk_size (biopb/biopb#809).
                     descriptors.append(
                         TensorDescriptor(
                             # Identity policy: array_id = source_id/field; the

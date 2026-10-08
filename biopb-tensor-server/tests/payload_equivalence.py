@@ -18,6 +18,7 @@ from typing import Any, Callable, Dict, Iterable, Optional, Tuple
 
 import numpy as np
 from biopb.tensor.ticket_pb2 import ChunkBounds
+from biopb_tensor_server.core.adapter_base import transfer_chunk_size
 from biopb_tensor_server.core.discovery import SourceClaim
 from biopb_tensor_server.serving.metadata_db import (
     CatalogRecord,
@@ -77,7 +78,7 @@ def snapshot(adapter, *, read: bool = True) -> Dict[str, Any]:
         tensor = adapter.get_tensor_adapter(entry.array_id)
         facts: Dict[str, Any] = {
             "descriptor": MessageToDict(tensor.get_tensor_descriptor()),
-            "transfer_chunk": list(tensor.get_transfer_chunk_size()),
+            "transfer_chunk": list(transfer_chunk_size(tensor.get_tensor_descriptor())),
             "scale": tensor._physical_scale(),
             "pyramid": [
                 MessageToDict(level)

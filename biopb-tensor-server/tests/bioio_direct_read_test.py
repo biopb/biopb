@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server.adapters.bioio import NikonAdapter
+from biopb_tensor_server.core.adapter_base import transfer_chunk_size
 
 nd2 = pytest.importorskip("nd2")
 
@@ -406,7 +407,9 @@ def test_source_listing_publishes_no_grid(tmp_path, monkeypatch, fast_path):
         assert descriptor.dtype == data.dtype.str
 
     # ... and the scene that IS bound answers it, C whole (biopb/biopb#806).
-    served = _adapter(tmp_path, data, "TCZYX", chunks).get_transfer_chunk_size()
+    served = transfer_chunk_size(
+        _adapter(tmp_path, data, "TCZYX", chunks).get_tensor_descriptor()
+    )
     assert served[1] == 4
 
 

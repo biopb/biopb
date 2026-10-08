@@ -58,6 +58,7 @@ from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
     TensorEntry,
     catalog_entry,
+    strip_source_prefix,
 )
 from biopb_tensor_server.core.chunk import (
     compute_transfer_chunk_size,
@@ -433,7 +434,7 @@ class Nd2Adapter(TensorAdapter):
         return self.get_tensor_adapter(f"{_POSITION_AXIS}:0")._native_descriptor()
 
     def get_tensor_adapter(self, tensor_id: Optional[str]) -> "Nd2Adapter":
-        field = self._within_source_field(tensor_id)
+        field = strip_source_prefix(self.source_id, tensor_id)
         position = self._position_for_field(field)
         cached = self._tensor_adapters.get(field)
         if cached is not None:

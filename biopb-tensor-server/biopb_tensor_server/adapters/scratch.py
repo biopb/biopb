@@ -21,6 +21,7 @@ from biopb_tensor_server.core.adapter_base import (
     SourceAdapter,
     TensorAdapter,
     TensorEntry,
+    strip_source_prefix,
 )
 from biopb_tensor_server.core.errors import TensorNotFound
 
@@ -45,15 +46,12 @@ class ScratchSource(SourceAdapter):
     tensor list -- so the base resolves and lists what is attached to it exactly
     as it does for a discovered source.
 
-    Its ``content_version`` is None, the base's word for content this adapter
-    does not serve. Every member carries its own token, minted when it is
-    uploaded, so a name reclaimed after a discard never inherits the chunk-id
-    namespace of what held it before.
+    It has no content version of its own: every member carries its own token,
+    minted when it is uploaded, so a name reclaimed after a discard never
+    inherits the chunk-id namespace of what held it before.
     """
 
     _source_type = "scratch"
-
-    serves_attached_only = True
 
     def __init__(
         self,
@@ -98,11 +96,10 @@ class ScratchSource(SourceAdapter):
     def get_tensor_adapter(self, tensor_id: Optional[str]) -> TensorAdapter:
         """A typed miss; never ``self``.
 
-        Reached only after the attachments have missed, so a named field here
-        names nothing, and an unnamed one asks for the first published field --
-        of which an empty scratch source has none.
+        Reached only after the attachments have missed, so a field named here
+        names nothing, and an unnamed id has no tensor to resolve to.
         """
-        field = self._within_source_field(tensor_id)
+        field = strip_source_prefix(self.source_id, tensor_id)
         if field:
             raise TensorNotFound(
                 f"{self.source_id} has no tensor {field!r}.",

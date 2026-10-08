@@ -78,7 +78,11 @@ from biopb_tensor_server.adapters.zarr import (
 )
 from biopb_tensor_server.core.attached import FIELDS_SEGMENT
 from biopb_tensor_server.core.axes import noncanonical_order
-from biopb_tensor_server.core.chunk import get_bounds_from_chunk_id
+from biopb_tensor_server.core.chunk import (
+    MAX_ARROW_BATCH_BYTES,
+    estimate_chunk_bytes,
+    get_bounds_from_chunk_id,
+)
 from biopb_tensor_server.core.errors import (
     SourceUnresolvedError,
     TensorResolutionError,
@@ -595,6 +599,30 @@ class UploadManager:
             f"uploading."
         )
 
+    @staticmethod
+    def _require_bounded_grid(req_desc: TensorDescriptor) -> None:
+        """Reject an upload whose write grid exceeds the Arrow batch ceiling.
+
+        The write grid is the transfer grid: a read plans on the chunks that
+        were stored, and a chunk above ``MAX_ARROW_BATCH_BYTES`` cannot be
+        streamed whole nor re-split into chunks no upload stored. Splitting it
+        before upload is the client-side fix.
+        """
+        shape = [int(dim) for dim in req_desc.shape]
+        if not shape or len(req_desc.chunk_shape) != len(shape):
+            return
+        grid = tuple(
+            min(max(1, int(chunk)), dim)
+            for chunk, dim in zip(req_desc.chunk_shape, shape, strict=True)
+        )
+        nbytes = estimate_chunk_bytes(grid, req_desc.dtype)
+        if nbytes > MAX_ARROW_BATCH_BYTES:
+            raise flight.FlightServerError(
+                f"add_tensor: chunk_shape {list(grid)} is {nbytes} bytes, above "
+                f"the {MAX_ARROW_BATCH_BYTES}-byte limit of one chunk; "
+                f"upload in smaller chunks."
+            )
+
     def add_tensor(self, req_desc: TensorDescriptor) -> TensorDescriptor:
         """Add a tensor to a source that already exists; answer its descriptor.
 
@@ -620,6 +648,7 @@ class UploadManager:
         tensor that is no longer its own with nothing to tell it so.
         """
         self._require_canonical_axes(req_desc)
+        self._require_bounded_grid(req_desc)
         if self._write_dir is None:
             raise flight.FlightServerError(
                 "add_tensor: write_dir is not configured, so there is nowhere "

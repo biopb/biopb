@@ -27,6 +27,7 @@ from biopb_tensor_server.adapters.fields import (
 from biopb_tensor_server.adapters.members import MEMBER_DESCRIPTOR
 from biopb_tensor_server.adapters.scratch import SCRATCH_SOURCE_ID
 from biopb_tensor_server.cache import CacheManager
+from biopb_tensor_server.core.adapter_base import transfer_chunk_size
 from biopb_tensor_server.core.attached import attached_field
 from biopb_tensor_server.core.chunk import mint_chunk_id
 from biopb_tensor_server.core.config import CacheConfig
@@ -308,7 +309,11 @@ class TestTheStoreFollowsThePlan:
 
         assert tuple(desc.chunk_shape) == CHUNK
         assert (
-            tuple(_member(writable_server, source, "img").get_transfer_chunk_size())
+            tuple(
+                transfer_chunk_size(
+                    _member(writable_server, source, "img").get_tensor_descriptor()
+                )
+            )
             == CHUNK
         )
 

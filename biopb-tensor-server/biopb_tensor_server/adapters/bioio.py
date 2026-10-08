@@ -48,7 +48,10 @@ from biopb_tensor_server.core import chunk as chunk_policy
 from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
     TensorEntry,
+    bounds_to_slices,
+    bounds_to_strided_slices,
     catalog_entry,
+    strip_source_prefix,
 )
 from biopb_tensor_server.core.chunk import (
     compute_transfer_chunk_size,
@@ -355,7 +358,7 @@ class _BioioAdapterBase(TensorAdapter):
             return None
         listing, scenes = [], []
         for entry in entries:
-            field = self._within_source_field(entry.array_id)
+            field = strip_source_prefix(self.source_id, entry.array_id)
             listing.append(
                 {
                     "field": field,
@@ -385,7 +388,7 @@ class _BioioAdapterBase(TensorAdapter):
         has_rois = (
             self._hydration.has_rois
             if self._hydration is not None
-            else bool(self.get_metadata().get("rois"))
+            else bool(self._read_metadata().get("rois"))
         )
         return {"listing": listing, "scenes": scenes, "has_rois": has_rois}
 
@@ -524,7 +527,7 @@ class _BioioAdapterBase(TensorAdapter):
             raise ValueError("Cannot get data from source-level adapter")
 
         super().get_data(bounds)
-        slices = self._bounds_to_slices(bounds)
+        slices = bounds_to_slices(bounds)
         with self._io_lock:
             return self._scene_dask()[slices].compute()
 
@@ -721,7 +724,7 @@ class _BioioAdapterBase(TensorAdapter):
         """
         if self._cached_descriptors is not None:
             for i, d in enumerate(self._cached_descriptors):
-                if self._within_source_field(d.array_id) == field:
+                if strip_source_prefix(self.source_id, d.array_id) == field:
                     return i
             raise TensorNotFound(f"Unknown scene: {field}", reason="unknown_field")
         with self._io_lock:
@@ -749,7 +752,7 @@ class _BioioAdapterBase(TensorAdapter):
 
         # Accept either the within-source field (scene id) or the full
         # source-qualified array_id (identity policy: array_id = source_id/field).
-        tensor_id = self._within_source_field(tensor_id)
+        tensor_id = strip_source_prefix(self.source_id, tensor_id)
 
         # Source-level: lazy initialize tensor level adapters
         scene_idx = self._scene_index_for_field(tensor_id)
@@ -1402,9 +1405,9 @@ class NikonAdapter(_BioioAdapterBase):
         paid reading the extent and striding it.
         """
         slices = (
-            self._bounds_to_slices(bounds)
+            bounds_to_slices(bounds)
             if step is None
-            else self._bounds_to_strided_slices(bounds, step)
+            else bounds_to_strided_slices(bounds, step)
         )
         with self._io_lock:
             self._bio_image.set_scene(self.scene_index)

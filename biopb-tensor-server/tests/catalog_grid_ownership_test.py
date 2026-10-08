@@ -29,6 +29,7 @@ from biopb_tensor_server.core.adapter_base import (
     SourceAdapter,
     TensorEntry,
     catalog_entry,
+    transfer_chunk_size,
 )
 from biopb_tensor_server.core.config import PyramidConfig, SourceConfig
 from biopb_tensor_server.serving.metadata_db import MetadataDatabase
@@ -108,9 +109,6 @@ def test_the_catalog_lists_entries_that_cannot_name_a_grid():
 
         def get_metadata(self):
             return {}
-
-        def is_resident(self):
-            return True
 
         def list_tensors(self):
             return [
@@ -308,7 +306,7 @@ def test_the_catalog_is_structural_and_get_flight_info_carries_the_grid(
         PyramidConfig(),
     )
     grid = list(plan.descriptor.chunk_shape)
-    assert grid == list(tensor_adapter.get_transfer_chunk_size())
+    assert grid == list(transfer_chunk_size(tensor_adapter.get_tensor_descriptor()))
     assert grid
 
 

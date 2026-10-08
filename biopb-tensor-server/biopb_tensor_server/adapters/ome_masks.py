@@ -34,6 +34,7 @@ from biopb_tensor_server.core.adapter_base import (
     TensorAdapter,
     TensorEntry,
     catalog_entry,
+    strip_source_prefix,
 )
 from biopb_tensor_server.core.axes import labeled_axis_index
 from biopb_tensor_server.core.chunk import default_transfer_chunk_shape
@@ -299,6 +300,14 @@ class RasterizedMaskAdapter(NearestPyramidMixin, TensorAdapter):
             "RasterizedMaskAdapter is built from a parent's OME metadata by "
             "OmeTiffAdapter.get_embedded_labels(), not from config"
         )
+
+    def get_tensor_adapter(self, tensor_id: str | None) -> TensorAdapter:
+        """Itself for its own name, as well as for the source's."""
+        if self._tensor_name is not None and (
+            strip_source_prefix(self.source_id, tensor_id) == self._tensor_name
+        ):
+            return self
+        return super().get_tensor_adapter(tensor_id)
 
     def list_tensors(self) -> List[TensorEntry]:
         return [catalog_entry(self._native_descriptor())]

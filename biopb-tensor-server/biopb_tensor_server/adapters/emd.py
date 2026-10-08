@@ -36,7 +36,12 @@ from biopb.tensor.ticket_pb2 import ChunkBounds
 
 from biopb_tensor_server.adapters._handle_reaper import IdleHandleReaper
 from biopb_tensor_server.adapters._scale import axes_scale
-from biopb_tensor_server.core.adapter_base import TensorAdapter, TensorEntry
+from biopb_tensor_server.core.adapter_base import (
+    TensorAdapter,
+    TensorEntry,
+    bounds_to_slices,
+    strip_source_prefix,
+)
 from biopb_tensor_server.core.chunk import (
     content_version_from_path,
     default_transfer_chunk_shape,
@@ -398,7 +403,7 @@ class EmdAdapter(TensorAdapter):
         caller's mistake, terminal -- never the bare ``ValueError`` that would
         leak as ``FlightInternalError`` (issue #378).
         """
-        field = self._within_source_field(tensor_id)
+        field = strip_source_prefix(self.source_id, tensor_id)
         try:
             index = int(field)
         except (TypeError, ValueError) as e:
@@ -447,7 +452,7 @@ class EmdAdapter(TensorAdapter):
         if self.signal_index is None:
             raise ValueError("Cannot get data from source-level EMD adapter")
         super().get_data(bounds)
-        slices = self._bounds_to_slices(bounds)
+        slices = bounds_to_slices(bounds)
         with self._io_lock:
             return self._handle.array(self.signal_index)[slices].compute()
 

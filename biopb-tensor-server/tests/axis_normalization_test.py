@@ -25,6 +25,7 @@ from biopb.tensor.descriptor_pb2 import TensorDescriptor, TensorReadOption
 from biopb.tensor.ticket_pb2 import ChunkBounds
 from biopb_tensor_server.cache import CacheManager
 from biopb_tensor_server.core import normalize as _normalize
+from biopb_tensor_server.core.adapter_base import transfer_chunk_size
 from biopb_tensor_server.core.axes import canonical_axis, canonical_permutation
 from biopb_tensor_server.core.config import CacheConfig, PyramidConfig
 from biopb_tensor_server.serving.server import TensorFlightServer
@@ -259,7 +260,7 @@ class TestEveryAdapterDeclaresItsOrder:
     def test_the_opt_outs_are_not_canonical(self):
         for cls in self._adapter_classes():
             if cls.__name__ in self.NOT_CANONICAL:
-                assert not cls._canonical_axes, cls.__name__
+                assert not _normalize.is_canonical(cls), cls.__name__
 
 
 @requires_zarr
@@ -309,7 +310,9 @@ class TestNormalizedDescriptorAndData:
                 ._native_descriptor()
                 .chunk_shape
             )
-            assert adapter.get_transfer_chunk_size() == tuple(native[::-1])
+            assert transfer_chunk_size(adapter.get_tensor_descriptor()) == tuple(
+                native[::-1]
+            )
 
     def test_get_data_takes_and_returns_canonical_axes(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -691,13 +694,13 @@ def _proxy_adapter(upstream_port, source_id="m", upstream_source_id="u"):
 def _legacy_upstream(tmp, arr, labels, name="u"):
     """A server advertising ``labels`` verbatim -- i.e. a pre-#596 upstream.
 
-    The adapter opts out of normalizing, which is what makes it advertise its
+    The adapter is not canonical-marked, which is what makes it advertise its
     native order: what is under test is a *downstream* facing a server that
     never learned the guarantee.
     """
     server = TensorFlightServer("localhost:0")
     adapter = _zarr_adapter(tmp, arr, labels, name)
-    adapter._canonical_axes = False
+    adapter.__class__ = type("_Legacy", (type(adapter),), {"_canonical_axes": False})
     server.sources._sources[name] = adapter
     server.mark_ready()
     threading.Thread(target=server.serve, daemon=True).start()

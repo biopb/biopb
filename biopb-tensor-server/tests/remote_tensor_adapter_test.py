@@ -14,6 +14,7 @@ import time
 import numpy as np
 import pyarrow as pa
 import pytest
+from biopb_tensor_server.core.discovery import source_is_resident
 from google.protobuf.field_mask_pb2 import FieldMask
 
 from tests import catalog_server, make_manager, register_and_catalog, source_ids
@@ -1984,7 +1985,9 @@ class TestUnreachableUpstream:
         )
         # no raise: empty placeholder catalog row
         assert adapter.list_tensors() == []
-        assert adapter.is_resident() is False  # never local, up or down
+        assert (
+            source_is_resident(adapter.source_url) is False
+        )  # never local, up or down
 
     def test_serve_surface_still_raises_when_unreachable(self):
         from biopb.tensor.ticket_pb2 import ChunkBounds
@@ -2030,7 +2033,7 @@ class TestUnreachableUpstream:
             assert len(descs) == 1
             assert descs[0].array_id == "lab__img"  # localized
             # Recovery shows in the catalog surface, never in residency.
-            assert adapter.is_resident() is False
+            assert source_is_resident(adapter.source_url) is False
             assert tuple(adapter.get_tensor_descriptor().shape) == shape
         finally:
             upstream.shutdown()
@@ -2943,7 +2946,7 @@ def test_seed_catalog_carries_resolution_and_detects_change():
     assert changed is True
     assert adapter.is_resolved() is True
     # Resolution upstream does not make anything local here.
-    assert adapter.is_resident() is False
+    assert source_is_resident(adapter.source_url) is False
     assert [d.array_id for d in adapter.list_tensors()] == ["lab__cloud"]
     assert adapter._client is None
 
@@ -2963,7 +2966,7 @@ def test_a_mirror_is_never_resident():
         upstream_location="grpc://localhost:1",  # never dialed
         upstream_source_id="img",
     )
-    assert adapter.is_resident() is False
+    assert source_is_resident(adapter.source_url) is False
     # Seeding a resolved upstream row moves is_resolved, and only that.
     adapter.seed_catalog(
         [
@@ -2978,7 +2981,7 @@ def test_a_mirror_is_never_resident():
         is_resolved=True,
     )
     assert adapter.is_resolved() is True
-    assert adapter.is_resident() is False
+    assert source_is_resident(adapter.source_url) is False
     assert adapter._client is None  # and none of it dialed
 
 

@@ -71,6 +71,7 @@ from biopb_tensor_server.core.adapter_base import (
     TensorEntry,
     TensorReadPlan,
     catalog_entry,
+    strip_source_prefix,
 )
 from biopb_tensor_server.core.axes import noncanonical_order
 from biopb_tensor_server.core.chunk import (
@@ -840,10 +841,6 @@ class RemoteTensorAdapter(TensorAdapter):
             return []  # unreachable / unresolved upstream -> placeholder row
         return [catalog_entry(self._localize_descriptor(desc))]
 
-    # No is_resident() override: a mirror's bytes are on another machine, so the
-    # base's "remote scheme -> non-resident" is the true answer. Do not override it to report reachability
-    # -- that is is_resolved()'s job below (biopb/biopb#1035).
-
     def is_resolved(self) -> bool:
         """Whether the upstream has hydrated the source this mirrors.
 
@@ -856,7 +853,7 @@ class RemoteTensorAdapter(TensorAdapter):
 
     def get_tensor_adapter(self, tensor_id: Optional[str]):
         """Return a tensor-layer view bound to the requested within-source field."""
-        field = self._within_source_field(tensor_id)
+        field = strip_source_prefix(self.source_id, tensor_id)
         if field == self._tensor_name:
             return self
         view = copy.copy(self)

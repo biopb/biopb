@@ -276,6 +276,24 @@ def directory_is_resident(root: Path, max_files: int = _RESIDENCY_SAMPLE_LIMIT) 
     return True
 
 
+def source_is_resident(source_url: str) -> bool:
+    """Best-effort, recall-free: is the source at *source_url* local and cheap to
+    read right now?
+
+    A remote url never is. The offline-placeholder signal (``st_blocks == 0``) is
+    a per-*file* concept -- :func:`should_skip_walk_entry` only consults it for
+    files -- and a directory-based source (zarr, ome-zarr store) legitimately
+    reports it on some filesystems (macOS APFS), so a directory is judged by
+    :func:`directory_is_resident`, which samples the files inside it.
+    """
+    if is_remote_url(source_url):
+        return False
+    path = Path(source_url)
+    if path.is_dir():
+        return directory_is_resident(path)
+    return not _is_offline_placeholder(path)
+
+
 class ClaimContext(abc.ABC):
     """Unified path access for the claim protocol.
 

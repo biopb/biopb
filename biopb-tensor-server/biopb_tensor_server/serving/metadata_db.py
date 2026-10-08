@@ -1058,7 +1058,7 @@ class MetadataDatabase:
                 --
                 -- Residency deliberately has no column beside it. It swings both
                 -- ways with no event to refresh a row from, so the `is_resident`
-                -- action answers it live (biopb/biopb#1035).
+                -- read-mask field answers it live (biopb/biopb#1035).
                 is_resolved BOOLEAN NOT NULL DEFAULT TRUE,
                 -- Why is_resolved is FALSE: 'needs_recall' (a cloud placeholder;
                 -- opening it is a consented download), 'pending' (registration

@@ -94,6 +94,7 @@ from biopb_tensor_server.core.chunk import (
     routing_array_id,
 )
 from biopb_tensor_server.core.config import PyramidConfig
+from biopb_tensor_server.core.discovery import source_is_resident
 from biopb_tensor_server.core.errors import (
     SourceResolveRetriableError,
     SourceUnresolvedError,
@@ -1282,8 +1283,8 @@ class TensorFlightServer(flight.FlightServerBase):
 
         The row, not a descriptor rebuilt from the adapter: resolution has
         already written it, and returning a second encoding of the same
-        projection let the two disagree (the adapter answers ``is_resident()``
-        live, the row is a snapshot).
+        projection let the two disagree (residency is answered live from the
+        source's url, the row is a snapshot).
 
         Resolving registers a source that has no adapter yet -- a cloud source
         (downloading it), a local one whose registration is pending, or one that
@@ -1593,18 +1594,15 @@ class TensorFlightServer(flight.FlightServerBase):
 
             # Populate metadata_json in response descriptor if requested
             if METADATA_JSON in mask:
-                # One scheme (biopb/biopb#253): the source-level metadata is
-                # computed once at registration and read back from the catalog --
-                # the cache -- never recomputed on the adapter. A DB read error
-                # propagates (no fallback); a NULL row is a legitimate "no
-                # metadata" (empty base). A catalog-less server has no cache to
-                # read, and nothing released the adapter's registration copy
-                # either (``sync_source_added`` is what does that), so there it
-                # is the adapter that answers.
+                # Source-level metadata is a catalog concern (biopb/biopb#253):
+                # computed once at registration and read back from the catalog,
+                # never from the adapter. A DB read error propagates (no
+                # fallback); a NULL row is a legitimate "no metadata" (empty
+                # base), and so is a server without a catalog.
                 raw_metadata = (
                     self._metadata_db.get_metadata_json(source_id)
                     if self._metadata_db is not None
-                    else source_adapter.get_metadata()
+                    else None
                 ) or {}
                 # Overlay the tensor adapter's cheap per-tensor delta -- fields the
                 # source-level row cannot carry (an OME-Zarr HCS field's own OME
@@ -1667,7 +1665,9 @@ class TensorFlightServer(flight.FlightServerBase):
         # is already on disk.
         if IS_RESIDENT in mask:
             try:
-                read_plan.descriptor.is_resident = bool(source_adapter.is_resident())
+                read_plan.descriptor.is_resident = source_is_resident(
+                    source_adapter.source_url
+                )
             except Exception:  # noqa: BLE001 -- a balky adapter is not the request
                 logger.debug("is_resident failed for %s", source_id, exc_info=True)
 

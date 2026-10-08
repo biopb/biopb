@@ -46,6 +46,7 @@ import pyarrow as pa
 from biopb.tensor.descriptor_pb2 import TensorDescriptor
 from biopb.tensor.ticket_pb2 import ChunkBounds
 
+from biopb_tensor_server.core.adapter_base import transfer_chunk_size
 from biopb_tensor_server.core.attached import MARKER
 from biopb_tensor_server.core.chunk import (
     default_transfer_chunk_shape,
@@ -522,7 +523,7 @@ class WritableSource:
             array_id=self.array_id,
             dim_labels=desc.dim_labels,
             shape=desc.shape,
-            chunk_shape=list(self.get_transfer_chunk_size()),
+            chunk_shape=list(transfer_chunk_size(self.get_tensor_descriptor())),
             dtype=desc.dtype,
         )
         remaining = self.remaining_ttl()
